@@ -241,7 +241,9 @@ use yggui::{
     standard_decelerate_transition, standard_transition, tree_parent_path, tree_path_contains,
     valid_drop_target as valid_tree_drop_target,
 };
-use yggui_contract::{UiTheme, YgguiClipboardContents, YgguiThemeSpec};
+use yggui_contract::{
+    ChromeOrientation, ChromeSlot, SidebarEdge, UiTheme, YgguiClipboardContents, YgguiThemeSpec,
+};
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(true);
 static PREVIEW_BLOCK_CACHE: OnceCell<Mutex<PreviewBlockCache>> = OnceCell::new();
@@ -1025,12 +1027,22 @@ const TITLEBAR_RESPONSIVE_CSS: &str = r#"
     [data-yggterm-workspace-row="1"] > [data-yggui-side-rail="1"] {
         position: absolute !important;
         top: 0 !important;
+        left: auto !important;
         right: 0 !important;
         bottom: 0 !important;
         height: auto !important;
         z-index: 170 !important;
         background: var(--yggterm-panel-color, rgba(255,255,255,0.98)) !important;
         box-shadow: -12px 0 28px rgba(30, 42, 55, 0.12), inset 1px 0 0 var(--yggterm-border-color, rgba(201,214,226,0.70)) !important;
+    }
+    /* Mirrored, the rail is the LEFT panel: it floats over the workspace from
+       the other edge, so its depth shadow and its inset hairline both fall on
+       the opposite side. Every property the base rule sets is re-set here —
+       a partial override would leave the rail shadowed from the wrong side. */
+    [data-yggterm-workspace-row="1"][data-chrome-mirrored="true"] > [data-yggui-side-rail="1"] {
+        left: 0 !important;
+        right: auto !important;
+        box-shadow: 12px 0 28px rgba(30, 42, 55, 0.12), inset -1px 0 0 var(--yggterm-border-color, rgba(201,214,226,0.70)) !important;
     }
 }
 @media (max-width: 620px) {
@@ -9868,14 +9880,33 @@ const WEB_SURFACE_GEOMETRY_EVAL_JS: &str = r#"(function(){
     // (context menu, rename, drag, resize, KeyTips) rather than by the
     // pointer merely resting on the edge — Rust resizes for the first
     // and translates for the second.
+    // WHICH EDGE a side panel claims is read off its OWN RECT, never off which
+    // panel it is. The chrome mirror can put the cwd tree on the right and the
+    // rail on the left; a selector-to-edge map would then inset the page on the
+    // wrong side and the page would sit under the panel. Geometry cannot
+    // disagree with the DOM, so geometry decides.
+    const edgeOf = (selector, fallback) => {
+        const el = document.querySelector(selector);
+        if (!el) { return fallback; }
+        const r = el.getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) { return fallback; }
+        return r.left <= (window.innerWidth - r.right) ? 'left' : 'right';
+    };
+    const reach = (edge) => edge === 'left'
+        ? (r) => r.right
+        : (r) => window.innerWidth - r.left;
+    const treeEdge = edgeOf('[data-sidebar-auto-hide="true"]', 'left');
+    const railEdge = edgeOf('[data-yggui-side-rail-auto-hide="1"]', 'right');
     const chrome = {
         top: claim('[data-yggterm-titlebar="1"]', 'data-titlebar-revealed', 'true',
                    'data-titlebar-autohide-pin', (r) => r.bottom),
-        left: claim('[data-sidebar-auto-hide="true"]', 'data-sidebar-autohide-revealed', 'true',
-                    'data-sidebar-autohide-pin', (r) => r.right),
-        right: claim('[data-yggui-side-rail-auto-hide="1"]', 'data-yggui-side-rail-autohide-revealed', '1',
-                     'data-yggui-side-rail-autohide-pin', (r) => window.innerWidth - r.left),
+        left: [0, 0],
+        right: [0, 0],
     };
+    chrome[treeEdge] = claim('[data-sidebar-auto-hide="true"]', 'data-sidebar-autohide-revealed', 'true',
+                    'data-sidebar-autohide-pin', reach(treeEdge));
+    chrome[railEdge] = claim('[data-yggui-side-rail-auto-hide="1"]', 'data-yggui-side-rail-autohide-revealed', '1',
+                     'data-yggui-side-rail-autohide-pin', reach(railEdge));
     const rawBox = (r) => {
         const left = Math.round(r.left);
         const top = Math.round(r.top);
@@ -10041,11 +10072,14 @@ fn web_surface_reveal_edge_from_name(name: &str) -> Option<SidebarEdge> {
 /// setting gate included — is a pure function the immersion locks DRIVE. The
 /// loop holds a live eval channel no test can enter; anything decided inline
 /// there could be made to swallow edges without a test noticing.
+/// Named by PANEL, not by side: after a chrome mirror the tree is the
+/// right-edge panel, and a variant called `LeftSidebar` would be a lie the
+/// compiler cannot catch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WebSurfaceEdgeReveal {
     Titlebar,
-    LeftSidebar,
-    RightRail,
+    Tree,
+    Rail,
 }
 
 /// Which panel an engine edge-motion named `edge_name` reveals, if any.
@@ -10059,13 +10093,21 @@ enum WebSurfaceEdgeReveal {
 /// flashing the titlebar for an edge the shell cannot place is chrome the user
 /// never went near (the same rule `web_surface_reveal_edge_from_name` states
 /// for the sides).
+/// The engine reports a PHYSICAL edge the pointer reached; which panel lives
+/// there is [`ChromeOrientation`]'s answer, so a mirrored window reveals the
+/// rail from the left edge and the tree from the right. Hard-coding
+/// left⇒tree here would make the mirror unreachable over any native page —
+/// the one place a user cannot fall back to the shell's own hover sensors.
 fn web_surface_edge_motion_reveal_target(
     edge_name: &str,
     auto_hide_titlebar: bool,
+    orientation: ChromeOrientation,
 ) -> Option<WebSurfaceEdgeReveal> {
     match web_surface_reveal_edge_from_name(edge_name) {
-        Some(SidebarEdge::Left) => Some(WebSurfaceEdgeReveal::LeftSidebar),
-        Some(SidebarEdge::Right) => Some(WebSurfaceEdgeReveal::RightRail),
+        Some(edge) => Some(match orientation.slot(edge) {
+            ChromeSlot::Tree => WebSurfaceEdgeReveal::Tree,
+            ChromeSlot::Rail => WebSurfaceEdgeReveal::Rail,
+        }),
         None if edge_name == "top" => auto_hide_titlebar.then_some(WebSurfaceEdgeReveal::Titlebar),
         None => None,
     }
@@ -10086,8 +10128,8 @@ fn web_surface_edge_motion_reveal_target(
 async fn web_surface_edge_motion_reveal_loop(
     state: Signal<ShellState>,
     titlebar: AutoHideSignals,
-    left_sidebar: AutoHideSignals,
-    right_rail: AutoHideSignals,
+    tree_sidebar: AutoHideSignals,
+    rail: AutoHideSignals,
 ) {
     loop {
         let mut eval =
@@ -10101,10 +10143,11 @@ async fn web_surface_edge_motion_reveal_loop(
             match web_surface_edge_motion_reveal_target(
                 &edge,
                 state.peek().settings.auto_hide_titlebar,
+                state.peek().settings.chrome_orientation,
             ) {
                 Some(WebSurfaceEdgeReveal::Titlebar) => titlebar.reveal(),
-                Some(WebSurfaceEdgeReveal::LeftSidebar) => left_sidebar.reveal(),
-                Some(WebSurfaceEdgeReveal::RightRail) => right_rail.reveal(),
+                Some(WebSurfaceEdgeReveal::Tree) => tree_sidebar.reveal(),
+                Some(WebSurfaceEdgeReveal::Rail) => rail.reveal(),
                 None => {}
             }
         }
@@ -19981,11 +20024,21 @@ impl ShellState {
         });
         self.last_action = "sidebar resize started".to_string();
     }
+    /// The edge a chrome slot is docked against, from the ONE owner. Every
+    /// shell-side geometry decision that used to hard-code a side goes through
+    /// here.
+    fn chrome_edge(&self, slot: ChromeSlot) -> SidebarEdge {
+        self.settings.chrome_orientation.edge(slot)
+    }
     fn update_sidebar_resize(&mut self, client_x: f64) {
         let Some(drag) = self.sidebar_resize_drag else {
             return;
         };
-        let delta = (client_x - drag.origin_client_x) as f32;
+        // The grip is on the panel's inner edge, so which pointer direction
+        // WIDENS it is a property of the edge — mirrored, dragging LEFT grows
+        // the tree. Hard-coding the sign per panel is what would break here.
+        let sign = self.chrome_edge(ChromeSlot::Tree).resize_delta_sign();
+        let delta = sign * (client_x - drag.origin_client_x) as f32;
         let next_width = clamp_sidebar_width(drag.origin_width + delta);
         if (next_width - self.sidebar_width).abs() < 0.5 {
             return;
@@ -20009,9 +20062,10 @@ impl ShellState {
                 format!("sidebar resized to {}px", self.sidebar_width.round() as i64);
         }
     }
-    // The right rail's resize is the MIRROR of the left tree's: same drag record,
-    // but the handle lives on the rail's INNER (left) edge, so dragging LEFT (a
-    // negative x delta) makes it WIDER — hence the negated delta below.
+    // The rail's resize is the mirror image of the tree's: same drag record, and
+    // the sign now comes from the EDGE it is docked against
+    // (`SidebarEdge::resize_delta_sign`) rather than from a comment-justified
+    // negation, so flipping the chrome flips both panels' drags for free.
     fn start_rail_resize(&mut self, client_x: f64) {
         // Grabbing a HIDDEN rail's grip docks it (to the last mode it showed) and
         // resizes — exactly as the left tree's grip re-opens the tree. So the
@@ -20032,7 +20086,8 @@ impl ShellState {
         let Some(drag) = self.rail_resize_drag else {
             return;
         };
-        let delta = (drag.origin_client_x - client_x) as f32;
+        let sign = self.chrome_edge(ChromeSlot::Rail).resize_delta_sign();
+        let delta = sign * (client_x - drag.origin_client_x) as f32;
         let next_width = clamp_rail_width(drag.origin_width + delta);
         if (next_width - self.rail_width).abs() < 0.5 {
             return;
@@ -26035,6 +26090,22 @@ impl ShellState {
             "titlebar auto-hide enabled".to_string()
         } else {
             "titlebar auto-hide disabled".to_string()
+        };
+    }
+    /// The ONE writer of the chrome mirror. Everything else in the shell READS
+    /// `settings.chrome_orientation` through [`ChromeOrientation`]'s questions;
+    /// nothing else assigns it, and nothing else keeps a copy that could drift.
+    fn set_chrome_mirrored(&mut self, mirrored: bool) {
+        let next = ChromeOrientation::new(mirrored);
+        if self.settings.chrome_orientation == next {
+            return;
+        }
+        self.settings.chrome_orientation = next;
+        self.persist_settings_async("chrome_orientation");
+        self.last_action = if mirrored {
+            "chrome mirrored (tree right, rail left)".to_string()
+        } else {
+            "chrome restored (tree left, rail right)".to_string()
         };
     }
     fn adjust_ui_zoom(&mut self, delta_steps: i32) {
@@ -40068,14 +40139,16 @@ fn rail_autohide_pinned(snapshot: &RenderSnapshot) -> bool {
 fn rail_autohide_pinned_flags(alt_overlay_active: bool, theme_editor_open: bool) -> bool {
     alt_overlay_active || theme_editor_open
 }
-/// Which window edge an auto-hidden sidebar reveals from. The reveal STATE
-/// MACHINE is shared with the titlebar (`AutoHideSignals` + the `autohide_*`
-/// functions); only the geometry differs, and it differs by exactly this enum —
-/// a second copy is how two edges start behaving differently.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SidebarEdge {
-    Left,
-    Right,
+/// Which window edge an auto-hidden sidebar reveals from is `SidebarEdge`, and
+/// which panel is on which edge is [`ChromeOrientation`] — both owned by
+/// `yggui-contract` so the shell, the shared yggui chrome and the persisted
+/// settings all read one answer. There used to be a shell-local copy of the
+/// edge enum; a second copy is how two edges start behaving differently.
+///
+/// Never write `SidebarEdge::Left` for "the tree" or `Right` for "the rail".
+/// Ask `snapshot.settings.chrome_orientation.edge(ChromeSlot::Tree)`.
+fn chrome_slot_edge(snapshot: &RenderSnapshot, slot: ChromeSlot) -> SidebarEdge {
+    snapshot.settings.chrome_orientation.edge(slot)
 }
 fn autohide_revealed(
     auto_hide_enabled: bool,
@@ -40317,6 +40390,24 @@ fn sidebar_edge_anchor(edge: SidebarEdge) -> &'static str {
         SidebarEdge::Left => "left:0; right:auto;",
         SidebarEdge::Right => "right:0; left:auto;",
     }
+}
+/// A panel's width grip lives on its INNER edge — the one facing the workspace
+/// — so it is always the OPPOSITE of the edge the panel is docked against. One
+/// helper for the tree and the rail alike: before the mirror they each hard-
+/// coded their own side, which is two places answering one question.
+///
+/// Both `left` and `right` are emitted in every branch (the Dioxus style-key
+/// trap): a grip that flipped side by dropping a key would keep the stale
+/// anchor and end up spanning the whole panel.
+fn sidebar_resize_handle_style(edge: SidebarEdge) -> String {
+    let grip = edge.opposite();
+    format!(
+        "position:absolute; top:0; {}:0; {}:auto; width:{}px; height:100%; cursor:ew-resize; z-index:18; \
+         background:transparent;",
+        grip.css_near(),
+        grip.css_far(),
+        SIDEBAR_RESIZE_HANDLE_WIDTH
+    )
 }
 /// The CARD — the visible panel. In-flow it fills the outer transparently (the
 /// docked look, unchanged: `palette.sidebar` is transparent and the app-bg
@@ -40588,17 +40679,37 @@ fn titlebar_inner_style(auto_hide_enabled: bool, revealed: bool) -> String {
         transition
     )
 }
-fn titlebar_autohide_content_offset_style(auto_hide_enabled: bool, revealed: bool) -> String {
+/// The workspace row: tree | viewport | rail, in DOM order.
+///
+/// The MIRROR lives here and nowhere else in the flow layout — one
+/// `flex-direction` reverses the docked order of all three children at once,
+/// which is why no component has to know its neighbour's side. The out-of-flow
+/// (auto-hidden) panels are anchored by `SidebarEdge` instead, because
+/// `row-reverse` cannot move a `position:absolute` box.
+///
+/// `flex-direction` is emitted in BOTH branches (the Dioxus style-key trap): a
+/// key present in one arm and dropped in the other never clears, so un-mirroring
+/// would leave the workspace reversed forever.
+fn titlebar_autohide_content_offset_style(
+    auto_hide_enabled: bool,
+    revealed: bool,
+    orientation: ChromeOrientation,
+) -> String {
     let top_padding = 0.0;
     let transition = if auto_hide_enabled && revealed {
         emphasized_enter_transition(&["opacity"])
     } else {
         emphasized_exit_transition(&["opacity"])
     };
+    let flex_direction = if orientation.is_mirrored() {
+        "row-reverse"
+    } else {
+        "row"
+    };
     format!(
-        "position:relative; display:flex; flex:1; min-height:0; overflow:hidden; box-sizing:border-box; padding-top:{}px; \
+        "position:relative; display:flex; flex-direction:{}; flex:1; min-height:0; overflow:hidden; box-sizing:border-box; padding-top:{}px; \
          will-change:auto; transition:{};",
-        top_padding, transition
+        flex_direction, top_padding, transition
     )
 }
 fn preview_summary_metadata_value(session: &ManagedSessionView, label: &str) -> Option<String> {
@@ -49114,28 +49225,48 @@ fn ui_zoom_factor(ui_font_size: f32) -> f64 {
 /// unclickable. That is the user's reported clipping, in the mirror image of the
 /// rail case: the rail's menu grows leftward out of the rail, the tree's grows
 /// rightward out of the tree.
-fn sidebar_context_menu_band(sidebar_width: f64, ui_zoom: f64) -> ContextMenuBand {
+/// The strip a docked panel of `panel_width` occupies when it is against
+/// `edge`. ONE piece of band arithmetic for both panels — the two callers below
+/// differ only in which edge they are told, which is how the chrome mirror
+/// moves a menu's band without either caller learning that the mirror exists.
+fn panel_context_menu_band(
+    edge: SidebarEdge,
+    window_width: f64,
+    panel_width: f64,
+    ui_zoom: f64,
+) -> ContextMenuBand {
     let zoom = if ui_zoom.is_finite() && ui_zoom > 0.0 {
         ui_zoom
     } else {
         1.0
     };
-    ContextMenuBand {
-        left: 0.0,
-        right: (sidebar_width * zoom).max(0.0),
+    let on_screen_width = (panel_width * zoom).max(0.0);
+    match edge {
+        SidebarEdge::Left => ContextMenuBand {
+            left: 0.0,
+            right: on_screen_width,
+        },
+        SidebarEdge::Right => ContextMenuBand {
+            left: (window_width - on_screen_width).max(0.0),
+            right: window_width,
+        },
     }
 }
-fn rail_context_menu_band(window_width: f64, rail_width: f64, ui_zoom: f64) -> ContextMenuBand {
-    let zoom = if ui_zoom.is_finite() && ui_zoom > 0.0 {
-        ui_zoom
-    } else {
-        1.0
-    };
-    let on_screen_width = (rail_width * zoom).max(0.0);
-    ContextMenuBand {
-        left: (window_width - on_screen_width).max(0.0),
-        right: window_width,
-    }
+fn sidebar_context_menu_band(
+    edge: SidebarEdge,
+    window_width: f64,
+    sidebar_width: f64,
+    ui_zoom: f64,
+) -> ContextMenuBand {
+    panel_context_menu_band(edge, window_width, sidebar_width, ui_zoom)
+}
+fn rail_context_menu_band(
+    edge: SidebarEdge,
+    window_width: f64,
+    rail_width: f64,
+    ui_zoom: f64,
+) -> ContextMenuBand {
+    panel_context_menu_band(edge, window_width, rail_width, ui_zoom)
 }
 /// Physical window pixels → CSS pixels.
 ///
@@ -50630,6 +50761,18 @@ fn describe_app_state_snapshot(
                 clamp_theme_spec(&shell.settings.yggui_theme)
             },
             "titlebar_auto_hide_enabled": shell.settings.auto_hide_titlebar,
+            // The mirror, reported as the two ANSWERS it gives rather than as a
+            // raw flag: an agent asking "which side is the tree on?" gets the
+            // same value the renderer used, not a boolean it has to interpret.
+            "chrome_mirrored": shell.settings.chrome_orientation.is_mirrored(),
+            "chrome_tree_edge": match shell.settings.chrome_orientation.edge(ChromeSlot::Tree) {
+                SidebarEdge::Left => "left",
+                SidebarEdge::Right => "right",
+            },
+            "chrome_rail_edge": match shell.settings.chrome_orientation.edge(ChromeSlot::Rail) {
+                SidebarEdge::Left => "left",
+                SidebarEdge::Right => "right",
+            },
             "titlebar_auto_hide_pinned": titlebar_autohide_pinned_flags(
                 shell.search_focused,
                 titlebar_search_dropdown_open(&snapshot),
@@ -77001,10 +77144,17 @@ fn app() -> Element {
         (inner.width as f64, inner.height as f64),
         desktop.scale_factor(),
     );
+    // ★ THE MIRROR, asked ONCE per render. Every side-dependent decision below —
+    // workspace order, panel edges, resize signs, menu bands, page-edge reveal —
+    // reads this and nothing else. Adding a second place that tests
+    // `settings.chrome_orientation` to decide a side is the SSOT violation this
+    // whole type exists to prevent.
+    let chrome_orientation = snapshot.settings.chrome_orientation;
     // The RAIL's band, derived once, handed to the mounts whose menus are raised
     // from the rail. See [`ContextMenuBand`]: in legacy stacking anything that
     // spills out of the rail is eaten by the native page beside it.
     let context_menu_rail_band = rail_context_menu_band(
+        chrome_orientation.edge(ChromeSlot::Rail),
         context_menu_window_size.0,
         snapshot.rail_width as f64,
         ui_zoom_factor(snapshot.settings.ui_font_size),
@@ -77016,6 +77166,8 @@ fn app() -> Element {
     // tree is eaten.
     let context_menu_sidebar_band = snapshot.active_web_surface_overlay.as_ref().map(|_| {
         sidebar_context_menu_band(
+            chrome_orientation.edge(ChromeSlot::Tree),
+            context_menu_window_size.0,
             snapshot.sidebar_width as f64,
             ui_zoom_factor(snapshot.settings.ui_font_size),
         )
@@ -78270,9 +78422,11 @@ fn app() -> Element {
                     "data-yggterm-workspace-row": "1",
                     "data-titlebar-auto-hide-enabled": if titlebar_auto_hide_enabled { "true" } else { "false" },
                     "data-titlebar-revealed": if titlebar_revealed { "true" } else { "false" },
+                    "data-chrome-mirrored": if chrome_orientation.is_mirrored() { "true" } else { "false" },
                     style: titlebar_autohide_content_offset_style(
                         titlebar_auto_hide_enabled,
                         titlebar_revealed,
+                        chrome_orientation,
                     ),
                     if !chrome_hidden {
                         Sidebar {
@@ -78556,6 +78710,9 @@ fn app() -> Element {
                                 if !enabled {
                                     titlebar_autohide_hovered.set(false);
                                 }
+                            },
+                            on_set_chrome_mirrored: move |mirrored: bool| {
+                                state.with_mut(|shell| shell.set_chrome_mirrored(mirrored));
                             },
                             on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
                             on_set_ui_zoom: move |percent: i32| state.with_mut(|shell| shell.set_ui_zoom_percent(percent)),
@@ -79198,19 +79355,30 @@ fn Titlebar(
         search_input_style(snapshot.palette.text, palette_is_dark(snapshot.palette))
     };
     let titlebar_session_panel_background = floating_panel_background;
+    // The mirror's ONE question, asked once per titlebar render. Everything the
+    // titlebar flips — which cluster is on which edge, which way each cluster
+    // reads, which side its menus hang from — comes from this answer.
+    let orientation = snapshot.settings.chrome_orientation;
+    let tree_edge = orientation.edge(ChromeSlot::Tree);
+    let rail_edge = orientation.edge(ChromeSlot::Rail);
     rsx! {
         TitlebarChrome {
             background: snapshot.palette.titlebar.to_string(),
             zoom_percent: zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
+            leading_edge: tree_edge,
+            leading_inset_px: titlebar_leading_inset,
             on_request_window_drag: on_request_window_drag,
             on_toggle_maximized: on_toggle_maximized,
-            left: rsx! {
+            leading: rsx! {
                 div {
+                    // ⚠ LEGACY NAME. This is the TREE cluster, which the chrome
+                    // mirror can put on the right; the honest, side-free stamp is
+                    // `data-yggui-titlebar-cluster="leading"` on the box around
+                    // it. Kept because the responsive CSS and the app-control
+                    // probes select on it — those selectors mean "the tree's
+                    // half", not "the left half".
                     "data-yggterm-titlebar-left": "1",
-                    style: format!(
-                        "display:flex; align-items:center; gap:12px; min-width:0; max-width:100%; padding-left:{}px;",
-                        titlebar_leading_inset
-                    ),
+                    style: titlebar_cluster_row_style(orientation, 12, ""),
                     button {
                         "data-titlebar-sidebar-button": "1",
                         style: icon_button_style(snapshot.palette),
@@ -79277,10 +79445,7 @@ fn Titlebar(
                         }
                     }
                     div {
-                        style: format!(
-                            "display:flex; align-items:center; gap:{}px; min-width:0; flex:1 1 auto;",
-                            6
-                        ),
+                        style: titlebar_cluster_row_style(orientation, 6, " flex:1 1 auto;"),
                         div {
                             class: "yggterm-titlebar-new-shell",
                             style: "position:relative; display:flex; align-items:flex-start; height:100%; overflow:visible;",
@@ -79329,8 +79494,10 @@ fn Titlebar(
                                 div {
                                     "data-titlebar-new-menu": "1",
                                     style: format!(
-                                        "position:absolute; left:0; top:1px; z-index:210; display:flex; flex-direction:column; align-items:flex-start; \
+                                        "position:absolute; {} top:1px; z-index:210; display:flex; flex-direction:column; align-items:{}; \
                                          min-width:184px; background:transparent; overflow:visible; pointer-events:none;",
+                                        titlebar_menu_anchor_style(tree_edge, 0.0),
+                                        tree_edge.css_justify(),
                                     ),
                                     div {
                                         "data-titlebar-new-button": "1",
@@ -79355,8 +79522,9 @@ fn Titlebar(
                                         "data-titlebar-new-menu-shell": "1",
                                         "data-yggterm-menu-surface": "1",
                                         style: format!(
-                                            "display:flex; flex-direction:column; gap:8px; width:min(292px, 72vw); margin-top:-1px; padding:12px; border-radius:0 16px 16px 16px; \
+                                            "display:flex; flex-direction:column; gap:8px; width:min(292px, 72vw); margin-top:-1px; padding:12px; border-radius:{}; \
                                              background:{}; box-shadow:{}; pointer-events:auto; box-sizing:border-box; overflow:hidden;",
+                                            titlebar_attached_menu_radius(tree_edge),
                                             floating_panel_background,
                                             floating_panel_attached_box_shadow,
                                         ),
@@ -79561,7 +79729,8 @@ fn Titlebar(
                                 div {
                                     "data-titlebar-summary-shell": "1",
                                     style: format!(
-                                        "position:absolute; left:0; top:{}px; z-index:240; width:{}; min-width:max(100%, 352px); height:1px; overflow:visible; pointer-events:none;",
+                                        "position:absolute; {} top:{}px; z-index:240; width:{}; min-width:max(100%, 352px); height:1px; overflow:visible; pointer-events:none;",
+                                        titlebar_menu_anchor_style(tree_edge, 0.0),
                                         titlebar_modal_tab_height - 1,
                                         titlebar_modal_width,
                                     ),
@@ -79569,9 +79738,10 @@ fn Titlebar(
                                         "data-titlebar-summary-menu": "1",
                                         style: format!(
                                             "display:flex; flex-direction:column; gap:12px; width:{}; min-width:max(100%, 352px); margin-top:-1px; \
-                                             padding:14px; border:none; border-radius:0 16px 16px 16px; background:{}; \
+                                             padding:14px; border:none; border-radius:{}; background:{}; \
                                              box-shadow:{}; pointer-events:auto; box-sizing:border-box; overflow:hidden;",
                                             titlebar_modal_width,
+                                            titlebar_attached_menu_radius(tree_edge),
                                             titlebar_session_panel_background,
                                             floating_panel_attached_box_shadow,
                                         ),
@@ -79873,10 +80043,15 @@ fn Titlebar(
                     }
                 }
             },
-            right: rsx! {
+            trailing: rsx! {
                 div {
+                    // ⚠ LEGACY NAME, as above: this is the RAIL cluster, and the
+                    // mirror can put it on the left.
                     "data-yggterm-titlebar-right": "1",
-                    style: "position:relative; display:flex; align-items:center; justify-content:flex-end; gap:8px; min-width:0; max-width:100%;",
+                    style: format!(
+                        "position:relative; justify-content:flex-end; {}",
+                        titlebar_cluster_row_style(orientation, 8, "")
+                    ),
                     onclick: |evt| evt.stop_propagation(),
                     style { "{TITLEBAR_RESPONSIVE_CSS}" }
                     if let Some(update) = snapshot.pending_update_restart.clone() {
@@ -80088,8 +80263,12 @@ fn Titlebar(
                         div {
                             "data-titlebar-overflow-menu": "1",
                             style: format!(
-                                "position:absolute; right:110px; top:34px; z-index:220; min-width:196px; padding:8px; border-radius:14px; \
+                                "position:absolute; {} top:34px; z-index:220; min-width:196px; padding:8px; border-radius:14px; \
                                  background:{}; box-shadow:{}; display:flex; flex-direction:column; gap:6px;",
+                                // The overflow menu hangs off the RAIL cluster's
+                                // edge, not off its own trigger box, so its inset
+                                // follows the rail.
+                                titlebar_menu_anchor_style(rail_edge, 110.0),
                                 if palette_is_dark(snapshot.palette) {
                                     "rgba(14,19,24,0.98)"
                                 } else {
@@ -80146,6 +80325,17 @@ fn Titlebar(
                             }
                         }
                     }
+                }
+            },
+            // NOT mirrored: the window buttons belong to the platform. The
+            // mirror is an app-chrome preference; where the compositor expects
+            // minimise/maximise/close is not ours to flip, so this slot rides
+            // whichever cluster shares the physical right edge and stays
+            // outermost on it.
+            window_controls: rsx! {
+                div {
+                    "data-yggterm-titlebar-window-controls": "1",
+                    style: "display:flex; align-items:center; height:100%;",
                     div { style: "flex:1; min-width:24px; max-width:40px; height:100%;" }
                     if native_macos_titlebar {
                         WindowControlsStrip {
@@ -80339,14 +80529,18 @@ fn Sidebar(
     // revealed floating card). Fixed keys are load-bearing — see
     // `SidebarPanelMode`: diverging keys left overlay props lingering when the
     // panel toggled back to docked.
+    // ASK the orientation, never assume the tree is on the left: the mirror
+    // toggle moves this whole panel — its card, its shadow, its collapse slide
+    // and its resize grip — to the other edge in one answer.
+    let tree_edge = chrome_slot_edge(&snapshot, ChromeSlot::Tree);
     let outer_style = sidebar_panel_outer_style(
-        SidebarEdge::Left,
+        tree_edge,
         mode,
         snapshot.sidebar_width,
         zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
     );
     let content_style =
-        sidebar_panel_card_style(SidebarEdge::Left, mode, snapshot.sidebar_width, snapshot.palette);
+        sidebar_panel_card_style(tree_edge, mode, snapshot.sidebar_width, snapshot.palette);
     rsx! {
         div {
             id: "yggterm-sidebar",
@@ -80364,7 +80558,10 @@ fn Sidebar(
             // gets its rect back, and the legacy native-webview path clamps the
             // page beside it (`WEB_SURFACE_GEOMETRY_EVAL_JS`). Collapsed, the
             // 6px sensor stays UNdeclared: the page owns its own left edge.
-            "data-covers-web-surface": if auto_hide && autohide_revealed { "sidebar-left" },
+            // Named by PANEL, not by side. The reconciler consumes the RECT, so
+            // this string is only ever read by a human — and after a mirror
+            // "sidebar-left" would be that human's first wrong turn.
+            "data-covers-web-surface": if auto_hide && autohide_revealed { "sidebar-tree" },
             "data-sidebar-width": "{snapshot.sidebar_width.round() as i64}",
             style: outer_style,
             tabindex: "0",
@@ -80775,11 +80972,7 @@ fn Sidebar(
                 }
                 div {
                     "data-sidebar-resize-handle": "1",
-                    style: format!(
-                        "position:absolute; top:0; right:0; width:{}px; height:100%; cursor:ew-resize; z-index:18; \
-                         background:transparent;",
-                        SIDEBAR_RESIZE_HANDLE_WIDTH
-                    ),
+                    style: sidebar_resize_handle_style(tree_edge),
                     onmousedown: move |evt| {
                         evt.stop_propagation();
                         on_start_sidebar_resize.call(evt.client_coordinates().x);
@@ -100709,6 +100902,10 @@ fn reclaim_active_terminal_input_after_search_blur(mut state: Signal<ShellState>
 /// One owner: the renderer stamps this same constant as the row's
 /// `data-settings-field-key`, so the focus target cannot drift from the DOM.
 const SETTINGS_FIRST_FIELD_KEY: &str = "auto-hide-titlebar";
+/// The chrome-mirror toggle's field key, same one-owner rule as above: the
+/// renderer stamps this constant and the app-control probe queries it, so the
+/// two cannot drift.
+const SETTINGS_MIRROR_CHROME_FIELD_KEY: &str = "mirror-chrome";
 fn focus_settings_field(mut state: Signal<ShellState>, field_key: &str) {
     let active_session_path = {
         let mut shell = state.write();
@@ -114630,6 +114827,8 @@ fn RightRail(
     on_set_terminal_telemetry: EventHandler<bool>,
     on_set_perf_profiling: EventHandler<bool>,
     on_set_titlebar_auto_hide: EventHandler<bool>,
+    /// Flip the whole app chrome about the window's vertical centre line.
+    on_set_chrome_mirrored: EventHandler<bool>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_set_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
@@ -114701,32 +114900,33 @@ fn RightRail(
         SidebarPanelMode::Collapsed
     };
     let rail_width = snapshot.rail_width;
+    // Same rule as the tree: ASK which edge this panel is on. Mirrored, the rail
+    // is the LEFT panel and everything about it — anchor, shadow, collapse
+    // slide, grip side, drag sign — follows from this one answer.
+    let rail_edge = chrome_slot_edge(&snapshot, ChromeSlot::Rail);
     let outer_style = sidebar_panel_outer_style(
-        SidebarEdge::Right,
+        rail_edge,
         mode,
         rail_width,
         zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
     );
-    let content_style = sidebar_panel_card_style(SidebarEdge::Right, mode, rail_width, snapshot.palette);
+    let content_style = sidebar_panel_card_style(rail_edge, mode, rail_width, snapshot.palette);
     let rail_reveal = (!visible).then(|| SideRailReveal {
         on_reveal: EventHandler::new(move |_| autohide.reveal()),
         on_reveal_if_idle: EventHandler::new(move |_| autohide.reveal_if_idle()),
         on_mouse_leave: EventHandler::new(move |_| autohide.handle_mouse_leave()),
         on_focus_within: EventHandler::new(move |focused: bool| autohide.set_focus_within(focused)),
     });
-    // A grip on the rail's INNER (left) edge, mirroring the tree's grip on its
-    // right edge — rendered in EVERY mode so a hidden rail is draggable too (the
-    // grip lives inside the card; a fully-collapsed card is un-clickable, so you
-    // hover-reveal first, then drag, and the drag docks + resizes). `start_rail_
-    // resize` un-hides to the last shown mode.
+    // A grip on the rail's INNER edge, mirroring the tree's grip on ITS inner
+    // edge — same helper, so the mirror moves both without either being told
+    // about the other. Rendered in EVERY mode so a hidden rail is draggable too
+    // (the grip lives inside the card; a fully-collapsed card is un-clickable,
+    // so you hover-reveal first, then drag, and the drag docks + resizes).
+    // `start_rail_resize` un-hides to the last shown mode.
     let rail_resize_handle = Some(rsx! {
         div {
             "data-rail-resize-handle": "1",
-            style: format!(
-                "position:absolute; top:0; left:0; width:{}px; height:100%; cursor:ew-resize; z-index:18; \
-                 background:transparent;",
-                SIDEBAR_RESIZE_HANDLE_WIDTH
-            ),
+            style: sidebar_resize_handle_style(rail_edge),
             onmousedown: move |evt| {
                 evt.stop_propagation();
                 on_start_rail_resize.call(evt.client_coordinates().x);
@@ -114744,6 +114944,7 @@ fn RightRail(
             content_style: content_style,
             reveal: rail_reveal,
             resize_handle: rail_resize_handle,
+            cover_label: "sidebar-rail",
             body: rsx!{
             if rendered_mode == RightPanelMode::Metadata {
                 MetadataRailBody { snapshot: snapshot.clone(), on_daemon_hot_restart }
@@ -114765,6 +114966,7 @@ fn RightRail(
                     on_set_terminal_telemetry,
                     on_set_perf_profiling,
                     on_set_titlebar_auto_hide,
+                    on_set_chrome_mirrored,
                     on_adjust_ui_zoom,
                     on_set_ui_zoom,
                     on_adjust_main_zoom,
@@ -118383,6 +118585,7 @@ fn SettingsRailBody(
     on_set_terminal_telemetry: EventHandler<bool>,
     on_set_perf_profiling: EventHandler<bool>,
     on_set_titlebar_auto_hide: EventHandler<bool>,
+    on_set_chrome_mirrored: EventHandler<bool>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_set_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
@@ -118415,7 +118618,9 @@ fn SettingsRailBody(
             ChromeBehaviorSettingsSection {
                 palette: snapshot.palette,
                 auto_hide_titlebar: snapshot.settings.auto_hide_titlebar,
+                chrome_mirrored: snapshot.settings.chrome_orientation.is_mirrored(),
                 on_change: on_set_titlebar_auto_hide,
+                on_change_mirror: on_set_chrome_mirrored,
             }
             style { "{UPDATE_CTA_CSS}" }
             InstallUpdateRow {
@@ -122439,7 +122644,9 @@ fn KeytipsSettingsSection(
 fn ChromeBehaviorSettingsSection(
     palette: Palette,
     auto_hide_titlebar: bool,
+    chrome_mirrored: bool,
     on_change: EventHandler<bool>,
+    on_change_mirror: EventHandler<bool>,
 ) -> Element {
     rsx! {
         div {
@@ -122457,6 +122664,14 @@ fn ChromeBehaviorSettingsSection(
                     enabled: auto_hide_titlebar,
                     palette,
                     on_change,
+                }
+                InlineSettingsToggleRow {
+                    field_key: SETTINGS_MIRROR_CHROME_FIELD_KEY.to_string(),
+                    label: "Mirror Chrome".to_string(),
+                    description: "Reflect the window about its centre: the session tree, its ☰ toggle, the view toggle and + move right; the rail and its buttons move left. The search box stays put.".to_string(),
+                    enabled: chrome_mirrored,
+                    palette,
+                    on_change: on_change_mirror,
                 }
             }
         }
@@ -125153,6 +125368,60 @@ fn primary_action_style(palette: Palette) -> String {
 /// App/Both/System. NOT for binary on/off switches — those use the
 /// `inline_toggle_*` track+thumb (e.g. Auto-hide Titlebar, Sound).
 /// See DESIGN.md "Segmented controls".
+/// A row of titlebar controls that REFLECTS with the chrome mirror.
+///
+/// The rule ([[DESIGN.md]] §Mirrored chrome): a mirror reflects the
+/// ARRANGEMENT of controls, not the inside of a control. So the cluster rows
+/// either side of the search box reverse — the `☰` that opens the tree stays
+/// against the tree's own edge, and the button nearest the search box stays
+/// nearest the search box — while a single control's own parts (the
+/// segmented Web View/Terminal toggle, the window-button strip) keep their
+/// order, because they are one thing rather than an arrangement.
+///
+/// `flex-direction` is emitted in BOTH branches: Dioxus applies `style`
+/// property-by-property and never clears a dropped key, so a one-sided
+/// `row-reverse` would survive un-mirroring forever.
+fn titlebar_cluster_row_style(orientation: ChromeOrientation, gap_px: u32, extra: &str) -> String {
+    format!(
+        "display:flex; flex-direction:{}; align-items:center; gap:{}px; min-width:0; max-width:100%;{}",
+        if orientation.is_mirrored() {
+            "row-reverse"
+        } else {
+            "row"
+        },
+        gap_px,
+        extra,
+    )
+}
+/// Where a titlebar popover hangs from its trigger.
+///
+/// A menu grows AWAY from the window edge its cluster is anchored to, so it
+/// stays on screen in both orientations: the `+` menu drops down-and-right from
+/// a left-hand cluster and down-and-LEFT from a mirrored one. `offset_px` is the
+/// distance from that edge (0 for a menu pinned to its trigger, a fixed inset
+/// for the overflow menu, which hangs from the titlebar rather than a box).
+///
+/// Both `left` and `right` are emitted every time — the style-key trap again: a
+/// popover that anchored by omission would keep the previous orientation's
+/// anchor and be pinned to both edges at once.
+fn titlebar_menu_anchor_style(edge: SidebarEdge, offset_px: f64) -> String {
+    format!(
+        "{}:{}px; {}:auto;",
+        edge.css_near(),
+        offset_px,
+        edge.css_far()
+    )
+}
+/// The corner radius of a panel ATTACHED under a tab at one end of its top
+/// edge: square where the tab meets it, rounded everywhere else. The square
+/// corner follows the cluster's edge, so the seam stays under the tab after a
+/// mirror instead of appearing on the far side of the menu.
+fn titlebar_attached_menu_radius(edge: SidebarEdge) -> &'static str {
+    match edge {
+        SidebarEdge::Left => "0 16px 16px 16px",
+        SidebarEdge::Right => "16px 0 16px 16px",
+    }
+}
 fn segmented_control_track_style(palette: Palette) -> String {
     format!(
         "display:flex; align-items:center; gap:4px; padding:3px; border:none; border-radius:999px; background:{}; box-shadow: inset 0 0 0 1px {}; user-select:none; -webkit-user-select:none; transition:{};",
@@ -136530,12 +136799,114 @@ mod tests {
     }
     #[test]
     fn titlebar_autohide_content_offset_only_applies_while_revealed() {
-        let collapsed = titlebar_autohide_content_offset_style(true, false);
+        let natural = ChromeOrientation::natural();
+        let collapsed = titlebar_autohide_content_offset_style(true, false, natural);
         assert!(collapsed.contains("padding-top:0px"));
-        let revealed = titlebar_autohide_content_offset_style(true, true);
+        let revealed = titlebar_autohide_content_offset_style(true, true, natural);
         assert!(revealed.contains("padding-top:0px"));
-        let always_visible = titlebar_autohide_content_offset_style(false, true);
+        let always_visible = titlebar_autohide_content_offset_style(false, true, natural);
         assert!(always_visible.contains("padding-top:0px"));
+    }
+    /// THE workspace mirror: one `flex-direction` reverses tree | viewport |
+    /// rail. Both arms must emit the key — Dioxus never clears a dropped style
+    /// property, so a one-sided `row-reverse` would survive un-mirroring and
+    /// leave the workspace backwards for the rest of the session.
+    #[test]
+    fn the_workspace_row_reverses_only_when_the_chrome_is_mirrored() {
+        for (auto_hide, revealed) in [(true, false), (true, true), (false, true)] {
+            let natural = titlebar_autohide_content_offset_style(
+                auto_hide,
+                revealed,
+                ChromeOrientation::natural(),
+            );
+            let mirrored = titlebar_autohide_content_offset_style(
+                auto_hide,
+                revealed,
+                ChromeOrientation::mirrored(),
+            );
+            assert!(
+                natural.contains("flex-direction:row;"),
+                "the natural workspace must SAY row, not imply it: {natural}"
+            );
+            assert!(
+                mirrored.contains("flex-direction:row-reverse;"),
+                "a mirrored workspace must reverse tree | viewport | rail: {mirrored}"
+            );
+            assert_eq!(
+                style_property_keys(&natural),
+                style_property_keys(&mirrored),
+                "the two orientations must emit an IDENTICAL key set (the Dioxus \
+                 style-key trap); only values may differ"
+            );
+        }
+    }
+    /// A panel's grip is on its INNER edge in both orientations, and both
+    /// horizontal anchors are always spelled out.
+    #[test]
+    fn a_resize_grip_moves_to_the_panels_inner_edge() {
+        let on_left = sidebar_resize_handle_style(SidebarEdge::Left);
+        let on_right = sidebar_resize_handle_style(SidebarEdge::Right);
+        assert!(on_left.contains("right:0;") && on_left.contains("left:auto;"), "{on_left}");
+        assert!(on_right.contains("left:0;") && on_right.contains("right:auto;"), "{on_right}");
+        assert_eq!(
+            style_property_keys(&on_left),
+            style_property_keys(&on_right),
+            "the grip must emit the same keys on both edges"
+        );
+    }
+    /// A titlebar popover grows AWAY from its cluster's window edge, and the
+    /// attached panel's square corner follows the tab it hangs from.
+    #[test]
+    fn titlebar_popovers_hang_from_their_clusters_edge() {
+        let natural = titlebar_menu_anchor_style(SidebarEdge::Left, 0.0);
+        let mirrored = titlebar_menu_anchor_style(SidebarEdge::Right, 0.0);
+        assert_eq!(natural, "left:0px; right:auto;");
+        assert_eq!(mirrored, "right:0px; left:auto;");
+        assert_eq!(
+            titlebar_menu_anchor_style(SidebarEdge::Right, 110.0),
+            "right:110px; left:auto;"
+        );
+        assert_eq!(titlebar_attached_menu_radius(SidebarEdge::Left), "0 16px 16px 16px");
+        assert_eq!(titlebar_attached_menu_radius(SidebarEdge::Right), "16px 0 16px 16px");
+    }
+    /// The mirror reflects the ARRANGEMENT of titlebar controls, never the
+    /// inside of a single control.
+    #[test]
+    fn a_mirrored_titlebar_cluster_reads_the_other_way() {
+        let natural = titlebar_cluster_row_style(ChromeOrientation::natural(), 12, "");
+        let mirrored = titlebar_cluster_row_style(ChromeOrientation::mirrored(), 12, "");
+        assert!(natural.contains("flex-direction:row;"), "{natural}");
+        assert!(mirrored.contains("flex-direction:row-reverse;"), "{mirrored}");
+        assert_eq!(style_property_keys(&natural), style_property_keys(&mirrored));
+    }
+    /// Both panels' resize drags widen when the pointer moves AWAY from the
+    /// edge the panel is docked against — in both orientations, from one owner.
+    #[test]
+    fn mirroring_the_chrome_flips_both_resize_drags() {
+        for mirrored in [false, true] {
+            let mut shell =
+                ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
+            shell.settings.chrome_orientation = ChromeOrientation::new(mirrored);
+            shell.sidebar_width = 300.0;
+            shell.settings.tree_width = 300.0;
+            shell.rail_width = 300.0;
+            shell.settings.rail_width = 300.0;
+
+            // Drag 40px toward the middle of the window from each panel's grip.
+            shell.start_sidebar_resize(500.0);
+            shell.handle_sidebar_resize_pointer(if mirrored { 460.0 } else { 540.0 }, true);
+            assert_eq!(
+                shell.sidebar_width, 340.0,
+                "the tree must WIDEN when dragged away from its own edge (mirrored={mirrored})"
+            );
+
+            shell.start_rail_resize(500.0);
+            shell.handle_rail_resize_pointer(if mirrored { 540.0 } else { 460.0 });
+            assert_eq!(
+                shell.rail_width, 340.0,
+                "the rail must WIDEN when dragged away from its own edge (mirrored={mirrored})"
+            );
+        }
     }
     #[test]
     fn sidebar_resize_pointer_without_primary_button_keeps_drag_until_release() {
@@ -144155,7 +144526,7 @@ mod tests {
         // the menu's left edge at 1100-90-224 = 786 — 22px INTO the page rect,
         // which in legacy stacking is the clipped slice the user photographed.
         // The band pulls it back inside the rail.
-        let rail = rail_context_menu_band(1100.0, 292.0, 1.0);
+        let rail = rail_context_menu_band(SidebarEdge::Right, 1100.0, 292.0, 1.0);
         let banded =
             context_menu_placement((1010.0, 770.0), (1100.0, 820.0), (224.0, 420.0), Some(rail));
         assert_eq!(banded.left, None);
@@ -172637,6 +173008,7 @@ mod webtabs_menu_switcher_locks {
         // name on the move page — are exempt: their length is not ours to
         // choose, which is exactly what the ellipsis and the tooltip are for.
         let drawable = context_menu_width(Some(rail_context_menu_band(
+            SidebarEdge::Right,
             1920.0,
             RAIL_MIN_WIDTH as f64,
             1.0,
@@ -173656,7 +174028,7 @@ mod webtabs_menu_switcher_locks {
     fn a_rail_row_menu_is_placed_fully_inside_the_rail_band() {
         let window = (1600.0, 900.0);
         let rail_width = SIDE_RAIL_WIDTH as f64;
-        let band = rail_context_menu_band(window.0, rail_width, 1.0);
+        let band = rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, 1.0);
         let width = context_menu_width(Some(band));
 
         // Every column of the rail: hard against the right edge, just past the
@@ -173715,7 +174087,7 @@ mod webtabs_menu_switcher_locks {
     #[test]
     fn a_narrow_rail_narrows_the_menu_in_the_placement_and_in_the_box() {
         let window = (1280.0, 800.0);
-        let band = rail_context_menu_band(window.0, RAIL_MIN_WIDTH as f64, 1.0);
+        let band = rail_context_menu_band(SidebarEdge::Right, window.0, RAIL_MIN_WIDTH as f64, 1.0);
         let width = context_menu_width(Some(band));
         assert_eq!(
             width,
@@ -173761,7 +174133,7 @@ mod webtabs_menu_switcher_locks {
         // A rail with room gets the full design width from the same owner, and
         // an unbanded menu is unchanged.
         assert_eq!(
-            context_menu_width(Some(rail_context_menu_band(window.0, 400.0, 1.0))),
+            context_menu_width(Some(rail_context_menu_band(SidebarEdge::Right, window.0, 400.0, 1.0))),
             CONTEXT_MENU_WIDTH_PX,
         );
         assert_eq!(context_menu_width(None), CONTEXT_MENU_WIDTH_PX);
@@ -174116,7 +174488,7 @@ mod webtabs_menu_switcher_locks {
     #[test]
     fn the_tree_menu_lands_inside_the_tree_when_a_page_owns_the_viewport() {
         // A 270px tree at 100% zoom, a click 143px in — the screenshot's shape.
-        let band = sidebar_context_menu_band(270.0, 1.0);
+        let band = sidebar_context_menu_band(SidebarEdge::Left, 1920.0, 270.0, 1.0);
         assert_eq!((band.left, band.right), (0.0, 270.0));
         // The drawn box, whichever edge it anchors from: `right` is a distance
         // from the WINDOW's right edge, so the box's own left edge is
@@ -174139,7 +174511,7 @@ mod webtabs_menu_switcher_locks {
         );
         // …and the UI-zoom control cannot push it out: at 50% the tree is half
         // as wide on screen, so the band must halve with it.
-        let zoomed = sidebar_context_menu_band(270.0, 0.5);
+        let zoomed = sidebar_context_menu_band(SidebarEdge::Left, 1920.0, 270.0, 0.5);
         assert_eq!(zoomed.right, 135.0, "the band follows the tree ON SCREEN");
         let zoomed_placement =
             context_menu_placement((100.0, 300.0), (1920.0, 1080.0), (224.0, 420.0), Some(zoomed));
@@ -174163,6 +174535,50 @@ mod webtabs_menu_switcher_locks {
     /// Which menus are banded is decided AT THE MOUNT, and there is exactly one
     /// derivation of the rail band. A global "is a web surface open" sniff would
     /// silently re-band the cwd tree's menu the day the user opens ychrome.
+    /// ★ THE MIRROR'S SSOT LOCK. A panel's edge must come from
+    /// `ChromeOrientation`, never from a literal written at the call site: a
+    /// hard-coded `SidebarEdge::Left` for "the tree" is exactly the second
+    /// answer to "which side is the sidebar on?" that the type exists to
+    /// prevent, and it fails silently — the panel simply does not move.
+    #[test]
+    fn no_panel_geometry_call_hard_codes_its_own_edge() {
+        let product = product_source();
+        for (line_no, line) in product.iter().enumerate() {
+            for helper in [
+                "sidebar_panel_outer_style(",
+                "sidebar_panel_card_style(",
+                "sidebar_resize_handle_style(",
+            ] {
+                let Some(at) = line.find(helper) else { continue };
+                // The definitions themselves take `edge` as a parameter.
+                if line.trim_start().starts_with("fn ") {
+                    continue;
+                }
+                let args = &line[at + helper.len()..];
+                assert!(
+                    !args.contains("SidebarEdge::"),
+                    "line {}: a panel's edge must be ASKED for \
+                     (`chrome_slot_edge(&snapshot, ChromeSlot::…)`), never written down:\n{}",
+                    line_no + 1,
+                    line
+                );
+            }
+        }
+    }
+    /// The render body resolves the mirror ONCE. A second derivation is a
+    /// second reader of the setting, and two readers can disagree mid-render.
+    #[test]
+    fn the_render_body_reads_the_chrome_orientation_once() {
+        let product = product_source();
+        assert_eq!(
+            product
+                .iter()
+                .filter(|line| line.contains("let chrome_orientation = snapshot.settings.chrome_orientation"))
+                .count(),
+            1,
+            "the workspace render must resolve the mirror exactly once"
+        );
+    }
     #[test]
     fn each_menu_mount_names_its_own_band() {
         let product = product_source();
@@ -174626,7 +175042,7 @@ mod webtabs_menu_switcher_locks {
         assert_eq!(zoom, 0.5);
         let on_screen = rail_width * zoom;
 
-        let band = rail_context_menu_band(window.0, rail_width, zoom);
+        let band = rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, zoom);
         assert_eq!(
             band.left,
             window.0 - on_screen,
@@ -174652,7 +175068,7 @@ mod webtabs_menu_switcher_locks {
 
         // The regression this lock exists for: the UNZOOMED width, which is what
         // `snapshot.rail_width` is.
-        let unzoomed = rail_context_menu_band(window.0, rail_width, 1.0);
+        let unzoomed = rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, 1.0);
         let unzoomed_width = context_menu_width(Some(unzoomed));
         let (left, _) = drawn_x(
             context_menu_placement(
@@ -174673,19 +175089,19 @@ mod webtabs_menu_switcher_locks {
 
         // 100% is the identity, so nothing about the default host moved…
         assert_eq!(
-            rail_context_menu_band(window.0, rail_width, ui_zoom_factor(14.0)),
+            rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, ui_zoom_factor(14.0)),
             unzoomed,
         );
         // …and a nonsense zoom cannot mint a zero-width band.
-        assert_eq!(rail_context_menu_band(window.0, rail_width, 0.0), unzoomed);
+        assert_eq!(rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, 0.0), unzoomed);
         assert_eq!(
-            rail_context_menu_band(window.0, rail_width, f64::NAN),
+            rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, f64::NAN),
             unzoomed
         );
         // The narrowest rail at the lowest zoom still holds a real menu: 240 ×
         // 0.5 = 120 on screen, 96 after the margins, which is where the floor is
         // set — so the floor never bites and the box never crosses the band.
-        let narrowest = rail_context_menu_band(window.0, RAIL_MIN_WIDTH as f64, zoom);
+        let narrowest = rail_context_menu_band(SidebarEdge::Right, window.0, RAIL_MIN_WIDTH as f64, zoom);
         let narrow_width = context_menu_width(Some(narrowest));
         assert_eq!(narrow_width, CONTEXT_MENU_MIN_BAND_WIDTH_PX);
         let (left, right) = drawn_x(
@@ -174759,7 +175175,7 @@ mod webtabs_menu_switcher_locks {
         // The consequence: on a scale-2 host a click at the CSS right edge still
         // flips to a right anchor and still lands inside the rail.
         let window = window_css_size((2560.0, 1600.0), 2.0);
-        let band = rail_context_menu_band(window.0, SIDE_RAIL_WIDTH as f64, 1.0);
+        let band = rail_context_menu_band(SidebarEdge::Right, window.0, SIDE_RAIL_WIDTH as f64, 1.0);
         let width = context_menu_width(Some(band));
         let placement = context_menu_placement(
             (window.0 - 8.0, 700.0),
@@ -174781,7 +175197,7 @@ mod webtabs_menu_switcher_locks {
             (window.0 - 8.0, 700.0),
             (2560.0, 1600.0),
             (width, CONTEXT_MENU_HEIGHT_PX),
-            Some(rail_context_menu_band(2560.0, SIDE_RAIL_WIDTH as f64, 1.0)),
+            Some(rail_context_menu_band(SidebarEdge::Right, 2560.0, SIDE_RAIL_WIDTH as f64, 1.0)),
         );
         assert!(
             unconverted.left.expect("no flip happened") > window.0,
@@ -177683,36 +178099,53 @@ mod web_surface_immersion_locks {
     // performance of it stopped).
     #[test]
     fn each_engine_edge_reveals_its_own_panel_and_unknown_edges_reveal_nothing() {
+        let natural = ChromeOrientation::natural();
+        let mirrored = ChromeOrientation::mirrored();
         for auto_hide_titlebar in [false, true] {
             assert_eq!(
-                web_surface_edge_motion_reveal_target("left", auto_hide_titlebar),
-                Some(WebSurfaceEdgeReveal::LeftSidebar),
+                web_surface_edge_motion_reveal_target("left", auto_hide_titlebar, natural),
+                Some(WebSurfaceEdgeReveal::Tree),
                 "the hidden tree must be revealable over a page whatever the titlebar setting"
             );
             assert_eq!(
-                web_surface_edge_motion_reveal_target("right", auto_hide_titlebar),
-                Some(WebSurfaceEdgeReveal::RightRail),
+                web_surface_edge_motion_reveal_target("right", auto_hide_titlebar, natural),
+                Some(WebSurfaceEdgeReveal::Rail),
                 "the hidden rail must be revealable over a page whatever the titlebar setting"
             );
+            // MIRRORED: the physical edge is unchanged, the panel behind it is
+            // not. Getting this backwards makes a mirrored panel unreachable
+            // over a native page — the one surface with no fallback sensor.
+            assert_eq!(
+                web_surface_edge_motion_reveal_target("left", auto_hide_titlebar, mirrored),
+                Some(WebSurfaceEdgeReveal::Rail),
+                "mirrored, the LEFT window edge belongs to the rail"
+            );
+            assert_eq!(
+                web_surface_edge_motion_reveal_target("right", auto_hide_titlebar, mirrored),
+                Some(WebSurfaceEdgeReveal::Tree),
+                "mirrored, the RIGHT window edge belongs to the tree"
+            );
         }
-        assert_eq!(
-            web_surface_edge_motion_reveal_target("top", true),
-            Some(WebSurfaceEdgeReveal::Titlebar),
-            "top-edge motion must reveal the auto-hidden titlebar"
-        );
-        assert_eq!(
-            web_surface_edge_motion_reveal_target("top", false),
-            None,
-            "a titlebar the user did NOT auto-hide must not be revealed by edge motion"
-        );
-        for junk in ["bottom", "", "TOP", "player"] {
-            for auto_hide_titlebar in [false, true] {
-                assert_eq!(
-                    web_surface_edge_motion_reveal_target(junk, auto_hide_titlebar),
-                    None,
-                    "an edge name this shell cannot place ({junk:?}) must reveal NOTHING — \
-                     flashing the titlebar for it is chrome the user never went near"
-                );
+        for orientation in [natural, mirrored] {
+            assert_eq!(
+                web_surface_edge_motion_reveal_target("top", true, orientation),
+                Some(WebSurfaceEdgeReveal::Titlebar),
+                "top-edge motion must reveal the auto-hidden titlebar"
+            );
+            assert_eq!(
+                web_surface_edge_motion_reveal_target("top", false, orientation),
+                None,
+                "a titlebar the user did NOT auto-hide must not be revealed by edge motion"
+            );
+            for junk in ["bottom", "", "TOP", "player"] {
+                for auto_hide_titlebar in [false, true] {
+                    assert_eq!(
+                        web_surface_edge_motion_reveal_target(junk, auto_hide_titlebar, orientation),
+                        None,
+                        "an edge name this shell cannot place ({junk:?}) must reveal NOTHING — \
+                         flashing the titlebar for it is chrome the user never went near"
+                    );
+                }
             }
         }
     }
@@ -177819,11 +178252,48 @@ mod web_surface_immersion_locks {
                 },
             })
         };
+        // The SAME chrome after a mirror: the tree is now the right-edge panel
+        // and the rail the left-edge one. The eval must read each panel's edge
+        // off its own rect, or a mirrored window insets the page on the wrong
+        // side and the page hides under the panel.
+        let mirrored_chrome = |revealed: bool| {
+            json!({
+                "[data-yggterm-titlebar=\"1\"]": {
+                    "attrs": {
+                        "data-titlebar-revealed": if revealed { "true" } else { "false" },
+                        "data-titlebar-autohide-pin": "0",
+                    },
+                    "rect": [0, 0, 1920, 40],
+                },
+                "[data-sidebar-auto-hide=\"true\"]": {
+                    "attrs": {
+                        "data-sidebar-autohide-revealed": if revealed { "true" } else { "false" },
+                        "data-sidebar-autohide-pin": "0",
+                    },
+                    "rect": if revealed { json!([1600, 0, 1920, 1080]) } else { json!([1914, 0, 1920, 1080]) },
+                },
+                "[data-yggui-side-rail-auto-hide=\"1\"]": {
+                    "attrs": {
+                        "data-yggui-side-rail-autohide-revealed": if revealed { "1" } else { "0" },
+                        "data-yggui-side-rail-autohide-pin": "0",
+                    },
+                    "rect": if revealed { json!([0, 0, 320, 1080]) } else { json!([0, 0, 6, 1080]) },
+                },
+            })
+        };
         let page = json!([{ "name": "ws", "rect": [0, 0, 1920, 1080] }]);
         let scenarios = json!({
             "collapsed": {
                 "underGlass": false, "viewport": [1920, 1080],
                 "chrome": chrome(false, false), "pages": page,
+            },
+            "mirrored_collapsed": {
+                "underGlass": false, "viewport": [1920, 1080],
+                "chrome": mirrored_chrome(false), "pages": page,
+            },
+            "mirrored_revealed": {
+                "underGlass": false, "viewport": [1920, 1080],
+                "chrome": mirrored_chrome(true), "pages": page,
             },
             "revealed_hover": {
                 "underGlass": false, "viewport": [1920, 1080],
@@ -177873,11 +178343,24 @@ mod web_surface_immersion_locks {
         };
         // THE regression this lock exists for: collapsed chrome — including
         // the 6px sensors, which HAVE nonzero rects — claims nothing.
-        for edge in ["top", "left", "right"] {
+        for scenario in ["collapsed", "mirrored_collapsed"] {
+            for edge in ["top", "left", "right"] {
+                assert_eq!(
+                    claim(scenario, edge),
+                    vec![0, 0],
+                    "collapsed {edge} chrome ({scenario}) claimed a strip — the reserved strip is back"
+                );
+            }
+        }
+        // MIRRORED: the tree is the right-edge claim and the rail the left one,
+        // and both still measure their true reach. A selector-to-edge map would
+        // put 320px in the wrong slot here and the page would sit under a panel.
+        for (edge, px) in [("top", 40), ("left", 320), ("right", 320)] {
             assert_eq!(
-                claim("collapsed", edge),
-                vec![0, 0],
-                "collapsed {edge} chrome claimed a strip — the reserved strip is back"
+                claim("mirrored_revealed", edge),
+                vec![px, 0],
+                "mirrored, a revealed {edge} must still claim [{px}, 0] — the eval \
+                 must read each panel's edge off its own rect, not off its selector"
             );
         }
         // Revealed chrome claims exactly its reach, and the pin stamp rides.
@@ -178017,11 +178500,17 @@ mod web_surface_immersion_locks {
             // the loop (freezing the toggle at spawn, until app restart)
             // necessarily rewrites the argument to a binding — and reddens
             // here.
-            "match web_surface_edge_motion_reveal_target(\n                &edge,\n                state.peek().settings.auto_hide_titlebar,\n            ) {",
-            // ...and performs every arm of its answer.
+            // The chrome ORIENTATION is read at message time too, for the same
+            // reason: a mirror flipped after app start must move which panel
+            // the left window edge reveals, or the panel becomes unreachable
+            // over every native page.
+            "match web_surface_edge_motion_reveal_target(\n                &edge,\n                state.peek().settings.auto_hide_titlebar,\n                state.peek().settings.chrome_orientation,\n            ) {",
+            // ...and performs every arm of its answer. The arms are named by
+            // PANEL, not by side — the mirror can put either panel on either
+            // edge, and the dispatch above is what decides which.
             "Some(WebSurfaceEdgeReveal::Titlebar) => titlebar.reveal(),",
-            "Some(WebSurfaceEdgeReveal::LeftSidebar) => left_sidebar.reveal(),",
-            "Some(WebSurfaceEdgeReveal::RightRail) => right_rail.reveal(),",
+            "Some(WebSurfaceEdgeReveal::Tree) => tree_sidebar.reveal(),",
+            "Some(WebSurfaceEdgeReveal::Rail) => rail.reveal(),",
         ] {
             assert!(
                 scanned.contains(needle),
