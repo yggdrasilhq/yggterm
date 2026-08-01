@@ -33162,12 +33162,22 @@ terminal_window_id: None,
         );
     }
 
-    /// The create runner is the ONE place a stamp is written, and it must not
-    /// let a failed stamp swallow the create: an agent that is told nothing
-    /// happened, while a row exists, is the invisible-row bug this lane is part
-    /// of fixing. Structural because the runner needs a live GUI worker and a
-    /// live daemon; scanned over the product half of the file so this lock's
-    /// own text cannot satisfy it (field guide §7.1).
+    /// The create is the ONE place a stamp is written, and it must not let a
+    /// failed stamp swallow the create: an agent that is told nothing happened,
+    /// while a row exists, is the invisible-row bug this lane is part of fixing.
+    /// Structural because the runner needs a live GUI worker and a live daemon;
+    /// scanned over the product half of the file so this lock's own text cannot
+    /// satisfy it (field guide §7.1).
+    ///
+    /// ⚠ REWRITTEN, not weakened, when the automation executor needed the
+    /// created `session_path` back instead of on stdout. The create split into a
+    /// value-returning core (`create_terminal_with_tenancy`) and the printing
+    /// wrapper that was always here. Both halves of the original promise still
+    /// have to hold, so both are still asserted — the stamp moved to the core,
+    /// and the wrapper is now separately pinned to print what the core returned
+    /// rather than re-deriving it. Deleting either arm because "the shape
+    /// changed" would retire the lock, which is the one thing a contract change
+    /// may never do.
     #[test]
     fn the_create_runner_stamps_the_row_and_reports_the_row_either_way() {
         let source = yggterm_core::agent_cli::product_lines(include_str!("lib.rs"))
@@ -33175,7 +33185,36 @@ terminal_window_id: None,
             .map(|(_index, line)| line)
             .collect::<Vec<_>>()
             .join("\n");
-        let runner = source
+        let core = source
+            .split("pub fn create_terminal_with_tenancy(")
+            .nth(1)
+            .expect("the create core")
+            .split("\n/// ")
+            .next()
+            .expect("the end of the core");
+        assert!(
+            core.contains("stamp_created_terminal_tenancy(&home, &response, &tenancy)"),
+            "a create carrying a tenancy must actually declare it, or --ephemeral is a no-op"
+        );
+        let stamped = core
+            .find("stamp_created_terminal_tenancy(")
+            .expect("the stamp call");
+        let returned = core
+            .find("Ok(payload)")
+            .expect("the core still returns its result");
+        assert!(
+            stamped < returned,
+            "the declaration rides WITH the create result, not instead of it"
+        );
+        assert!(
+            !core.contains("?;\n    Ok(payload)"),
+            "a failed stamp must not abort before the caller learns the row exists"
+        );
+        // The printing wrapper must PRINT WHAT THE CORE RETURNED. If it called
+        // the app-control command itself it would be a second create path, and
+        // the one that forgot to stamp is exactly the one an agent would reach
+        // for.
+        let wrapper = source
             .split("pub fn run_app_control_create_terminal_with_tenancy(")
             .nth(1)
             .expect("the create runner")
@@ -33183,22 +33222,16 @@ terminal_window_id: None,
             .next()
             .expect("the end of the runner");
         assert!(
-            runner.contains("stamp_created_terminal_tenancy(&home, &response, &tenancy)"),
-            "a create carrying a tenancy must actually declare it, or --ephemeral is a no-op"
-        );
-        let stamped = runner
-            .find("stamp_created_terminal_tenancy(")
-            .expect("the stamp call");
-        let printed = runner
-            .find("write_stdout_payload(")
-            .expect("the runner still prints its result");
-        assert!(
-            stamped < printed,
-            "the declaration is reported WITH the create result, not instead of it"
+            wrapper.contains("create_terminal_with_tenancy("),
+            "the printing wrapper must delegate to the one create, never re-implement it"
         );
         assert!(
-            !runner.contains("?;\n        write_stdout_payload"),
-            "a failed stamp must not abort before the caller learns the row exists"
+            !wrapper.contains("AppControlCommand::CreateTerminal"),
+            "a second create path is how --ephemeral becomes a no-op on one of them"
+        );
+        assert!(
+            wrapper.contains("write_stdout_payload("),
+            "the wrapper still prints its result"
         );
         // What `"declared"` actually SAYS is not scanned for here. The first
         // cut asserted both string literals appear in the helper, which a
