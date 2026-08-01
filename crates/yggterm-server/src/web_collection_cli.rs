@@ -61,6 +61,8 @@ pub fn web_collection_usage_block(binary: &str) -> String {
   {binary} collection open <id> [--folder <path>] [--json]
   {binary} collection export <id> [--as md|json] [--out <file>]
   {binary} collection prune [--profile <p>] [--dry-run]
+  {binary} collection import --browser <id> [--source-profile <p>] [--dry-run]
+    an alias for `web-import run`, which is the implementation — one owner
   {binary} snapshot now [--profile <p>] (--url <u> [--title <t>])... [--stdin] [--name <n>]
 
   Every verb defaults to --profile default. A collection IS a Markdown file at
@@ -612,6 +614,16 @@ pub fn run_web_collection_cli(args: &[String]) -> anyhow::Result<()> {
                 }
             }
         }
+        // `collection import` DELEGATES to the browser-import plane rather than
+        // re-implementing it. The import lane landed its verb as
+        // `web-import run` because this dispatcher had already merged without
+        // an import arm; the two must not become two ways to do one thing, so
+        // this arm forwards and the other stays the implementation.
+        "import" => {
+            let mut forwarded: Vec<String> = vec!["web-import".to_string(), "run".to_string()];
+            forwarded.extend(args.iter().skip(2).cloned());
+            return crate::run_browser_import_cli(&forwarded);
+        }
         "prune" => {
             let dry_run = args.iter().any(|arg| arg == "--dry-run");
             let policy = PrunePolicy {
@@ -871,6 +883,7 @@ mod tests {
             "open",
             "export",
             "prune",
+            "import",
         ] {
             assert!(
                 usage.contains(&format!("collection {verb}")),
