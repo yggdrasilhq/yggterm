@@ -9,6 +9,30 @@ and referenced from here.
 says the answer changed.
 
 
+## ★★★ 3.0.0 IS THE libyggterm SEPARATION RELEASE (2026-08-02)
+
+**Settled by the user, verbatim:** *"I previously reserved v3 for all platform
+builds but libyggterm MPL separation is the major change in our repos."*
+
+This **redefines** 3.0.0. It was scoped as the Windows/macOS platform-builds
+release; it is now the release that separates `libyggterm` (MPL-2.0) from
+yggterm (GPL-3.0-or-later). Do not re-open it by pointing at the old scope.
+
+- **3.0.0 gates on:** the rewire building, suites green, install path verified
+  on the release lane. Linux.
+- **3.0.0 does NOT gate on:** Windows or macOS building — those become 3.x
+  milestones; nor on eMudhra/TM-A, which gates Substack posts naming yggterm
+  and never gates a release.
+- **Releases are load-bearing** (yggclient pins fetch them): additive only,
+  never delete or replace an old release.
+
+The estate side of the same call, so it is not re-derived: the cut is `yggui` +
+`yggui-contract` **only**. `emd-renderer` and `yggterm-platform` stay GPL —
+only what third-party apps must LINK goes MPL, because everything under MPL can
+be combined into proprietary works, so each crate moved out of the GPL fence is
+moat spent. Under-cutting is reversible in one commit on sole copyright;
+over-cutting is a one-way door.
+
 ## ★★★ USER-SETTLED CALLS + FEATURE REQUESTS
 
 **★★★ USER-SETTLED CALLS + FEATURE REQUESTS (2026-07-26, verbatim intent).**

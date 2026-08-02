@@ -183413,22 +183413,31 @@ mod web_surface_immersion_locks {
     // cropped) while both crates' own suites stay green.
     #[test]
     fn the_rail_pin_stamp_survives_the_crate_boundary() {
-        let rails_source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../yggui/src/rails.rs"
-        ))
-        .expect("the yggui rails.rs is readable");
-        // PRODUCT lines only, same as the vendor read above: a future
-        // rails.rs test module quoting a stamp must not satisfy this lock.
-        let rails = product(&rails_source);
-        for stamp in [
-            "\"data-yggui-side-rail-auto-hide\": if auto_hide { \"1\" } else { \"0\" },",
-            "\"data-yggui-side-rail-autohide-revealed\": if revealed { \"1\" } else { \"0\" },",
-            "\"data-yggui-side-rail-autohide-pin\": if pinned { \"1\" } else { \"0\" },",
+        // This lock used to read `../yggui/src/rails.rs` off disk. That worked
+        // only while yggui lived in this tree; when it left for libyggterm
+        // (3.0.0) the read failed outright — a useful failure, because the
+        // contract it guards got MORE fragile, not less: yggui is now a
+        // separate repository pinned to a tag, so a rename there reaches us
+        // only when someone bumps the pin.
+        //
+        // So the contract moved into `yggui-contract`, which both sides depend
+        // on, and the check split in two. libyggterm locks that rails.rs WRITES
+        // every attribute the contract names. This locks that the shell's
+        // embedded CSS/JS SAMPLES them. Rename a stamp and the constant moves,
+        // the literals in this file do not, and this reddens — instead of the
+        // geometry eval silently sampling an attribute nothing writes any more.
+        use yggui_contract::side_rail_stamps as stamps;
+        let scanned = product(&shell_source());
+        for name in [
+            stamps::RAIL,
+            stamps::VISIBLE,
+            stamps::AUTO_HIDE,
+            stamps::AUTOHIDE_REVEALED,
+            stamps::AUTOHIDE_PIN,
         ] {
             assert!(
-                rails.contains(stamp),
-                "the rail stopped stamping what the geometry eval samples: {stamp}"
+                scanned.contains(name),
+                "the shell stopped sampling a contract stamp: {name}"
             );
         }
     }
