@@ -19,11 +19,26 @@ Closed narratives from before 2026-08-02 are in
 
 **The observation owed:** on a daemon+GUI carrying this fix, right-click a
 `remote-cc://dev/…` row and see dev's own apps in the menu — specifically
-`yggdrasil-maker` (installed on dev, absent on the GUI host) PRESENT, and
-`yrdp` (installed on the GUI host, absent on dev) ABSENT. It cannot be observed
-on the running fleet yet: the GUI reads `RemoteMachineSnapshot::apps`, which
-only the daemon can fill, so this needs a daemon handover as well as a GUI
-swap. Binaries are deployed and it activates on the next swap.
+`yggdrasil-maker` (installed on dev, absent on the GUI host) PRESENT, and the
+GUI host's own `yrdp` ABSENT. The GUI reads `RemoteMachineSnapshot::apps`, which
+only a daemon can fill, so this needs a daemon handover as well as a GUI swap;
+the GUI host went off the network before either could be done, and the binary is
+deployed and waiting.
+
+**The remote half IS proven** (2026-08-02, new binary installed at
+`~/.yggterm/bin/yggterm` on both dev and oc):
+
+```
+dev: {"name":"ychrome",…} {"name":"yedit",…} {"name":"yggdrasil-maker",…}
+oc : {"name":"ychrome",…} {"name":"yedit",…} {"name":"yrdp",…}
+```
+
+Two machines, two different registries, each its own — and `yggdrasil-maker` is
+exactly the app that a right-click on a dev row could never show before. The
+back-compat path is proven the same way: oc on its OLD binary answered
+`Error: unsupported server command: remote`, a clean refusal, which is what
+makes `fetch_remote_machine_apps` return `None` and keep that machine's previous
+list instead of blanking its menu.
 
 User-reported 2026-08-02: *"why does ychrome only launch on jojo even if I right
 click on dev or oc sessions. This is undesired behavior."*
