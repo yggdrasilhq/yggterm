@@ -107,11 +107,21 @@ weakness in our own design.
 
 **This is the highest-value load-bearing work in the project.**
 
-## Pending bugs
+## Pending bugs — and the docs SSOT law
 
 Open, user-confirmed bugs live in `docs/pending-bugs.md`. When the user says
 "finish the pending bugs" (or similar), that file is the work queue. Remove an
 entry in the same commit as its verified fix.
+
+⛔ **`docs/docs-ssot.md` is the law for every status document, and it is
+enforced** (`scripts/check-docs-ssot.sh`, run by
+`docs_ssot::the_bug_file_lists_only_open_items`). One question, one owner: the
+queue says what is OPEN, git + CHANGELOG say what SHIPPED, the field guide says
+which instruments lie, the specs say how it should behave, the campaign memory
+says why a call was made, and `docs/archive/` + `~/.claude/memory-archive/` hold
+the past — searched, never loaded. **Never answer a status question from a file
+that does not own it**; a duplicate is how a queue rots unseen, which cost a
+session on 2026-08-02.
 
 ## Core working rules
 
