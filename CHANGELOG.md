@@ -9,7 +9,7 @@ This file tracks user-visible changes in `yggterm`.
 - **libyggterm is now its own repository, under MPL-2.0.** `yggui` and
   `yggui-contract` have left this tree for
   [`yggdrasilhq/libyggterm`](https://github.com/yggdrasilhq/libyggterm), and
-  yggterm consumes them as a git dependency pinned to `v0.1.0`. This is the
+  yggterm consumes them as a git dependency pinned to `v0.1.1`. This is the
   major version's reason for existing: the licence boundary changed.
 
   yggterm stays GPL-3.0-or-later. The library an app author links is MPL-2.0,
