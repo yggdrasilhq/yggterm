@@ -36,8 +36,8 @@ license = "GPL-3.0-or-later"
 # of yggterm always builds; bump the tag here and nowhere else. For working on
 # both trees at once, use a local [patch] in .cargo/config.toml (git-ignored) —
 # never commit a path override, that is how a repo stops building from a clone.
-yggui = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.1.1" }
-yggui-contract = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.1.1" }
+yggui = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.2.0" }
+yggui-contract = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.2.0" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
