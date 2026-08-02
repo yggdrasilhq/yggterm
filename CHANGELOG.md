@@ -29,7 +29,9 @@ This file tracks user-visible changes in `yggterm`.
   strip is now a fallback for a session with no timeline rather than a
   companion printed above the conversation it summarises.
 
-  All three libyggterm pins move to `v0.4.0`.
+  All three libyggterm pins move to `v0.4.1`, which also carries the
+  composer and the OTP entry — the other half of the same design language —
+  and makes the library buildable for web and Android targets.
 
 
 - **The titlebar search field joins the field skin.** It was the one text box
