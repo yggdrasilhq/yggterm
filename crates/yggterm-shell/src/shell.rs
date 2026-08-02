@@ -15618,6 +15618,27 @@ enum PreviewLayoutMode {
     Chat,
     Graph,
 }
+/// The tone's wire word. One table, so the reply and the request cannot disagree
+/// about which tone was raised.
+fn tone_wire_word(tone: NotificationTone) -> &'static str {
+    match tone {
+        NotificationTone::Info => "info",
+        NotificationTone::Success => "success",
+        NotificationTone::Warning => "warning",
+        NotificationTone::Error => "error",
+    }
+}
+
+/// Per-notification overrides for the one fan-out. Defaults reproduce exactly what
+/// every existing caller got before the control plane could raise one.
+#[derive(Clone, Copy, Default)]
+struct NotificationOptions {
+    /// Suppress the chime for this notification only. Never forces it on.
+    silent: bool,
+    /// Stay until dismissed rather than auto-expiring.
+    persistent: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NotificationDeliveryMode {
     InApp,
@@ -29331,6 +29352,22 @@ impl ShellState {
         title: impl Into<String>,
         message: impl Into<String>,
     ) {
+        self.push_notification_with(tone, title, message, NotificationOptions::default());
+    }
+
+    /// THE one fan-out: in-app toast, system notification, chime. Every notification
+    /// in the product arrives through here, including the control plane's, so a
+    /// caller cannot invent a fourth delivery path or skip a user's setting.
+    ///
+    /// ⛔ `silent` may only SUPPRESS the chime. There is deliberately no way to force
+    /// sound on: a user who turned it off is not overridden by a caller.
+    fn push_notification_with(
+        &mut self,
+        tone: NotificationTone,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        options: NotificationOptions,
+    ) {
         let title = title.into();
         let message = message.into();
         if self.settings.in_app_notifications {
@@ -29350,7 +29387,7 @@ impl ShellState {
                     created_at_ms: now,
                     job_key: None,
                     progress: None,
-                    persistent: false,
+                    persistent: options.persistent,
                 });
                 self.next_notification_id += 1;
             }
@@ -29358,7 +29395,7 @@ impl ShellState {
         if self.settings.system_notifications {
             emit_system_notification(&title, &message);
         }
-        if self.settings.notification_sound {
+        if self.settings.notification_sound && !options.silent {
             emit_notification_chime(tone);
         }
         if self.notifications.len() > 1000 {
@@ -36858,7 +36895,7 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
         (mode == WorkspaceViewMode::Rendered)
             .then(|| shell.server.active_session_path().map(str::to_string))
             .flatten()
-            .filter(|path| path.starts_with("remote-session://"))
+            .filter(|path| session_preview_syncs_from_remote(path))
     });
     let terminal_launch_path = state.with(|shell| {
         (mode == WorkspaceViewMode::Terminal)
@@ -37212,7 +37249,9 @@ fn spawn_open_session_row_with_mode_retry_inner(
     let prefer_terminal = prefer_terminal && state.with(|shell| row_supports_terminal(shell, &row));
     let mut retained_live_terminal = false;
     let staged_remote_preview_session = (!prefer_terminal)
-        .then(|| parse_remote_scanned_session_path(&row.full_path).map(|_| row.full_path.clone()))
+        .then(|| {
+            session_preview_syncs_from_remote(&row.full_path).then(|| row.full_path.clone())
+        })
         .flatten();
     if prefer_terminal && state.with(|shell| session_is_hot_terminal_row(shell, &row)) {
         state.with_mut(|shell| {
@@ -72382,6 +72421,103 @@ async fn process_pending_app_control_requests(
                 error: None,
             }
         }
+        AppControlCommand::Notify {
+            title,
+            message,
+            tone,
+            job,
+            progress,
+            persistent,
+            silent,
+            delay_ms,
+        } => {
+            // ⛔ An unknown tone is REFUSED, never defaulted. A typo that quietly
+            // downgraded an `error` to `info` would make the one notification that
+            // mattered look like the ones that did not.
+            let parsed_tone = match tone.as_deref().map(str::trim) {
+                None | Some("") | Some("info") => Some(NotificationTone::Info),
+                Some("success") => Some(NotificationTone::Success),
+                Some("warning") | Some("warn") => Some(NotificationTone::Warning),
+                Some("error") => Some(NotificationTone::Error),
+                Some(_) => None,
+            };
+            let data = match (parsed_tone, title.trim().is_empty()) {
+                (None, _) => json!({
+                    "command": "notify",
+                    "delivered": false,
+                    "reason": "unknown_tone",
+                    "tone": tone,
+                    "accepted_tones": ["info", "success", "warning", "error"],
+                }),
+                // A toast with no title is a rectangle that says nothing.
+                (_, true) => json!({
+                    "command": "notify",
+                    "delivered": false,
+                    "reason": "empty_title",
+                }),
+                (Some(tone), false) => {
+                    let options = NotificationOptions { silent, persistent };
+                    let job_reported = job.clone();
+                    let progress = progress.map(|p| (p / 100.0).clamp(0.0, 1.0));
+                    let delay = delay_ms.unwrap_or(0);
+                    let deliver = move |mut state: Signal<ShellState>| {
+                        state.with_mut(|shell| match job.as_deref() {
+                            // A keyed notification UPSERTS, so a long job reports
+                            // progress in one row instead of burying the rest.
+                            Some(key) => shell.upsert_job_notification(
+                                key,
+                                tone,
+                                title.clone(),
+                                message.clone(),
+                                progress,
+                                shell.settings.system_notifications,
+                            ),
+                            None => shell.push_notification_with(
+                                tone,
+                                title.clone(),
+                                message.clone(),
+                                options,
+                            ),
+                        });
+                    };
+                    if delay > 0 {
+                        // The alarm clock. ⚠ The timer lives in THIS process, so a
+                        // GUI restart forgets it. Said plainly in the reply rather
+                        // than implied, because a silent alarm is worse than none.
+                        spawn(async move {
+                            sleep(Duration::from_millis(delay)).await;
+                            deliver(state);
+                        });
+                        json!({
+                            "command": "notify",
+                            "delivered": false,
+                            "scheduled": true,
+                            "delay_ms": delay,
+                            "due_at_ms": current_millis() as u64 + delay,
+                            "note": "the timer lives in the running GUI; a restart forgets it",
+                        })
+                    } else {
+                        deliver(state);
+                        json!({
+                            "command": "notify",
+                            "delivered": true,
+                            "tone": tone_wire_word(tone),
+                            "job": job_reported,
+                            "persistent": persistent,
+                            "silent": silent,
+                        })
+                    }
+                }
+            };
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(data),
+                error: None,
+            }
+        }
         AppControlCommand::TriggerUpdateCheck => {
             spawn_update_workflow(state, UpdateWorkflowTrigger::Manual);
             sleep(Duration::from_millis(40)).await;
@@ -79141,7 +79277,7 @@ fn app() -> Element {
         if server_busy {
             return;
         }
-        if !session.session_path.starts_with("remote-session://") {
+        if !session_preview_syncs_from_remote(&session.session_path) {
             set_signal_if_changed(last_preview_refresh_marker, None);
             return;
         }
@@ -100641,6 +100777,20 @@ fn should_retry_terminal_ensure(error: &anyhow::Error) -> bool {
         || text.contains("reading daemon response")
         || text.contains("parsing daemon response: \"\"")
         || text.contains("timed out")
+}
+/// A row whose PREVIEW must be fetched from the machine that owns it.
+///
+/// ⚠ BOTH remote agent schemes, not just Codex — the third time this exact
+/// omission has been fixed in this file (see `terminal_input_write_path_for_runtime`
+/// and `terminal_ensure_session_is_remote` below, whose comments say the same
+/// thing). Every gate on the preview-sync path asked
+/// `starts_with("remote-session://")`, so the GUI never sent `RefreshPreview`
+/// for a `remote-cc://` row: the daemon's hydration was reachable and simply
+/// never asked for. On a fleet of remote Claude Code rows that is EVERY Web
+/// View, and it renders as two launch-scaffold lines rather than as an error.
+fn session_preview_syncs_from_remote(session_path: &str) -> bool {
+    let trimmed = session_path.trim_start();
+    trimmed.starts_with("remote-session://")
 }
 /// A `remote-cc://` session is a REMOTE session: its ensure crosses SSH just
 /// like `remote-session://`, so it gets the remote attempt budget. It used to
@@ -140404,6 +140554,41 @@ mod tests {
         session.session_path = "local://preview-probe".to_string();
         session.ssh_target = None;
         session
+    }
+
+    /// ★ A remote CLAUDE CODE row's preview syncs from its machine, exactly as
+    /// a Codex row's does.
+    ///
+    /// Every gate on the preview-sync path asked
+    /// `starts_with("remote-session://")`, so the GUI never sent
+    /// `RefreshPreview` for a `remote-cc://` row — the daemon's hydration was
+    /// reachable and simply never asked for. On a fleet of remote Claude Code
+    /// rows that is EVERY Web View, and it renders as two launch-scaffold lines
+    /// rather than as an error, so no instrument anywhere reports a problem.
+    ///
+    /// ⚠ THIRD time this omission has been fixed in this file; the other two
+    /// carry the same warning in their own doc comments
+    /// (`terminal_input_write_path_for_runtime`, `terminal_ensure_session_is_remote`).
+    #[test]
+    fn a_remote_agent_rows_preview_syncs_from_remote_for_both_schemes() {
+        assert!(session_preview_syncs_from_remote("remote-cc://dev/abc-123"));
+        assert!(session_preview_syncs_from_remote(
+            "remote-session://dev/abc-123"
+        ));
+        // Nothing else may qualify: a local row has no machine to fetch from,
+        // and asking would spend an ssh round trip per refresh for nothing.
+        for path in [
+            "local://abc-123",
+            "cc-runtime://abc-123",
+            "codex-runtime://abc-123",
+            "ssh://dev",
+            "/home/user/.claude/projects/x/abc.jsonl",
+        ] {
+            assert!(
+                !session_preview_syncs_from_remote(path),
+                "{path} must not trigger a remote preview fetch"
+            );
+        }
     }
 
     /// ★ An assistant run SPLITS: work collects, prose does not.
@@ -183277,6 +183462,51 @@ mod media_capture_locks {
     /// ⛔ The control plane answers through the SAME terminus as the human.
     ///
     /// The temptation is to have the verb call
+    /// ⛔ ONE FAN-OUT. Every notification in the product, including the control
+    /// plane's, goes through `push_notification_with`. A second delivery path is how
+    /// a caller ends up bypassing a user's "sound off" setting.
+    #[test]
+    fn every_notification_goes_through_one_fan_out() {
+        let product = product_source();
+        let body = function_body(&product, "fn push_notification_with(");
+        for needle in [
+            "if self.settings.in_app_notifications {",
+            "if self.settings.system_notifications {",
+            "if self.settings.notification_sound && !options.silent {",
+        ] {
+            assert!(body.contains(needle), "the notification fan-out lost `{needle}`");
+        }
+        // ⛔ `silent` may only SUPPRESS. There must be no path that turns sound ON
+        // for a user who turned it off.
+        assert!(
+            !body.contains("options.silent ||") && !body.contains("|| options.silent"),
+            "`silent` has become a way to FORCE the chime; it may only suppress it",
+        );
+    }
+
+    /// ⛔ An unknown tone is REFUSED, never defaulted. A typo that quietly downgraded
+    /// an `error` to `info` would make the one notification that mattered look like
+    /// the ones that did not.
+    #[test]
+    fn the_notify_verb_refuses_a_tone_it_does_not_know() {
+        let product = product_source();
+        let arm = function_body(&product, "AppControlCommand::Notify {");
+        assert!(
+            arm.contains("Some(_) => None,") && arm.contains("\"unknown_tone\""),
+            "the notify verb no longer refuses an unknown tone by name",
+        );
+        assert!(
+            arm.contains("\"empty_title\""),
+            "a titleless notification is accepted; that is a rectangle that says nothing",
+        );
+        // The alarm clock must SAY that its timer dies with the GUI. A silent alarm
+        // is worse than no alarm.
+        assert!(
+            arm.contains("a restart forgets it"),
+            "the scheduled path no longer states that a GUI restart forgets the timer",
+        );
+    }
+
     /// `resolve_web_surface_media_permission` directly — it is one line and it
     /// "works". It would also skip clearing the dialog and skip persisting the
     /// remembered decision, so the modal would stay on screen over an

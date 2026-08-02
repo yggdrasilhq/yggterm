@@ -19039,6 +19039,129 @@ pub fn run_app_control_set_theme_editor_values(
     Ok(())
 }
 
+/// `--in 90s` / `10m` / `2h` / a bare number of seconds, as milliseconds.
+///
+/// One owner for both binaries: two parsers would eventually disagree about whether
+/// a bare `5` means seconds or minutes, and an alarm that fires at the wrong scale
+/// is worse than one that refuses.
+pub fn parse_duration_ms(spec: &str) -> anyhow::Result<u64> {
+    let spec = spec.trim().to_ascii_lowercase();
+    let (value, mult) = match spec.chars().last() {
+        Some('s') => (&spec[..spec.len() - 1], 1_000u64),
+        Some('m') => (&spec[..spec.len() - 1], 60_000),
+        Some('h') => (&spec[..spec.len() - 1], 3_600_000),
+        // A bare number is SECONDS, stated here because it is the ambiguity.
+        _ => (spec.as_str(), 1_000),
+    };
+    let n: f64 = value
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("cannot read duration {spec:?} (try 90s, 10m, 2h)"))?;
+    if n < 0.0 {
+        anyhow::bail!("duration {spec:?} is negative");
+    }
+    Ok((n * mult as f64) as u64)
+}
+
+/// `--at 07:30` as a delay in milliseconds, resolving to the NEXT occurrence.
+///
+/// Deliberately local-clock and next-occurrence: an alarm for 07:30 typed at
+/// 23:00 means tomorrow morning, which is what a person means and what a naive
+/// same-day parser gets wrong by firing immediately or refusing.
+pub fn parse_clock_delay_ms(when: &str) -> anyhow::Result<u64> {
+    let when = when.trim();
+    let (h, m) = when
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("cannot read time {when:?} (try 07:30)"))?;
+    let h: u32 = h.trim().parse().map_err(|_| anyhow::anyhow!("bad hour in {when:?}"))?;
+    let m: u32 = m.trim().parse().map_err(|_| anyhow::anyhow!("bad minute in {when:?}"))?;
+    if h > 23 || m > 59 {
+        anyhow::bail!("{when:?} is not a time of day");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("clock is before the epoch: {e}"))?;
+    let secs = now.as_secs();
+    let local_offset = local_utc_offset_secs();
+    let local_now = secs as i64 + local_offset;
+    let day_start = local_now - local_now.rem_euclid(86_400);
+    let mut target = day_start + (h as i64) * 3600 + (m as i64) * 60;
+    if target <= local_now {
+        target += 86_400; // the next occurrence, not a time that already passed
+    }
+    Ok(((target - local_now) * 1000) as u64)
+}
+
+/// The local clock's offset from UTC in seconds, read from the system rather than
+/// assumed. Falls back to UTC, which makes `--at` wrong by the offset rather than
+/// panicking; `--in` is unaffected either way.
+fn local_utc_offset_secs() -> i64 {
+    std::process::Command::new("date")
+        .arg("+%z")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|s| {
+            let s = s.trim();
+            let sign = if s.starts_with('-') { -1 } else { 1 };
+            let digits = s.trim_start_matches(['+', '-']);
+            (digits.len() == 4).then(|| {
+                let hh: i64 = digits[..2].parse().ok()?;
+                let mm: i64 = digits[2..].parse().ok()?;
+                Some(sign * (hh * 3600 + mm * 60))
+            })?
+        })
+        .unwrap_or(0)
+}
+
+/// Raise a notification on the user's desktop from anywhere: an agent, a cron job,
+/// a `/loop` waking up, or a libyggterm app.
+///
+/// ⛔ The CLI never builds the command itself; both binaries route here, so the two
+/// cannot grow two spellings of "warning". Refusals are named and exit non-zero,
+/// because a notification verb that silently does nothing is indistinguishable from
+/// a user who missed the toast.
+#[allow(clippy::too_many_arguments)]
+pub fn run_app_control_notify(
+    title: &str,
+    message: &str,
+    tone: Option<&str>,
+    job: Option<&str>,
+    progress: Option<f32>,
+    persistent: bool,
+    silent: bool,
+    delay_ms: Option<u64>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::Notify {
+            title: title.to_string(),
+            message: message.to_string(),
+            tone: tone.map(str::to_string),
+            job: job.map(str::to_string),
+            progress,
+            persistent,
+            silent,
+            delay_ms,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    let data = response.data.clone().unwrap_or(serde_json::Value::Null);
+    let ok = data.get("delivered").and_then(serde_json::Value::as_bool).unwrap_or(false)
+        || data.get("scheduled").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    if !ok {
+        let reason = data
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        anyhow::bail!("notification not delivered: {reason}");
+    }
+    Ok(())
+}
+
 pub fn run_app_control_trigger_update_check(timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(&home, AppControlCommand::TriggerUpdateCheck, timeout_ms)?;
