@@ -2765,6 +2765,16 @@ struct AppPaneSchema {
     /// pane exactly like `widgets`.
     #[serde(default)]
     footer: Vec<AppPaneWidget>,
+    /// Where the SPLIT view's gutter sits — the fraction of the surface given
+    /// to the first half. Absent means centred, which is what an app that has
+    /// never been dragged should get; a split that opens off-centre makes the
+    /// user's first action "fix the layout".
+    ///
+    /// The app owns this value: the host renders it, reports a drag back, and
+    /// the app decides whether to persist. Clamped through the contract so the
+    /// host and the app cannot disagree about how far a drag may go.
+    #[serde(default)]
+    split_ratio: Option<f32>,
 }
 
 fn app_pane_text_input_word_wrap_default() -> bool {
@@ -120315,6 +120325,16 @@ fn DocumentSurfaceBody(
         && body_widgets
             .iter()
             .any(|w| matches!(w, AppPaneWidget::Markdown { .. }));
+    // Where the gutter sits. The app may declare it; absent means centred.
+    // Clamped through the contract so host and app cannot disagree about the
+    // limit — a disagreement shows up as a gutter that snaps back mid-drag.
+    let split_ratio = yggui_contract::clamp_document_split_ratio(
+        schema
+            .as_ref()
+            .and_then(|s| s.split_ratio)
+            .unwrap_or(yggui_contract::DOCUMENT_SPLIT_DEFAULT_RATIO),
+    );
+    let split_first_pct = split_ratio * 100.0;
 
     rsx! {
         div {
@@ -120572,10 +120592,17 @@ fn DocumentSurfaceBody(
                 for (index, widget) in body_widgets.iter().enumerate() {
                     div {
                         key: "half-{widget.key(index, &value_epochs)}",
+                        "{yggui_contract::document_split_stamps::HALF}": if split_view {
+                            if index == 0 { "first" } else { "second" }
+                        } else { "" },
                         style: if split_view {
+                            // flex-basis carries the ratio; grow is 0 so the
+                            // gutter's position is the ratio and nothing else.
+                            // The border is gone — the gutter IS the divider now.
                             format!(
-                                "flex:1 1 50%; min-width:0; min-height:0; overflow:auto; {}",
-                                if index == 0 { format!("border-right:1px solid {};", doc.border) } else { String::new() },
+                                "order:{}; flex:0 1 calc({}% - 3px); min-width:0; min-height:0; overflow:auto;",
+                                index * 2,
+                                if index == 0 { split_first_pct } else { 100.0 - split_first_pct },
                             )
                         } else {
                             "display:contents;".to_string()
@@ -120768,6 +120795,29 @@ fn DocumentSurfaceBody(
                             _ => rsx! { span { key: "{widget_key}" } },
                         }
                     }
+                    }
+                }
+                // THE SPLIT GUTTER. Rendered after the halves and pulled
+                // back over the seam, so it is one element regardless of how
+                // many widgets the app declared. Dragging it sets a CSS var the
+                // halves are sized from, and releases POST the ratio to the app
+                // — the app owns the value, the host only reports the gesture.
+                //
+                // It carries the contract stamps so an agent can find and drive
+                // it through yggui exactly as a pointer does; that is the point
+                // of naming them in yggui-contract rather than inline here.
+                if split_view {
+                    div {
+                        "{yggui_contract::document_split_stamps::GUTTER}": "1",
+                        "{yggui_contract::document_split_stamps::RATIO}": "{split_ratio}",
+                        role: "separator",
+                        "aria-orientation": "vertical",
+                        "aria-valuenow": "{(split_ratio * 100.0) as i64}",
+                        title: "Drag to resize · double-click to centre",
+                        style: format!(
+                            "order:1; flex:0 0 6px; z-index:2; cursor:col-resize;                              background:{}; opacity:0.55; transition:opacity 120ms;                              touch-action:none; user-select:none;",
+                            doc.border,
+                        ),
                     }
                 }
             }
