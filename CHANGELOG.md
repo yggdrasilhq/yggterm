@@ -4,10 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The titlebar search field joins the field skin.** It was the one text box
+  still drawing its own flat inline fill (libyggterm `v0.3.1` makes the shell
+  style box-only); it now wears `data-yggui-field` like every other field, and
+  the field stylesheet gained a `:focus-within` arm so a container field rings
+  when the input inside it takes focus. All three libyggterm pins move to
+  `v0.3.1`.
+
 - **The markdown document engine left this repository.** `emd-renderer` — the
   extended-markdown model and parser behind every document surface — now lives
   in [`yggdrasilhq/libyggterm`](https://github.com/yggdrasilhq/libyggterm) under
-  MPL-2.0, and yggterm consumes it as a git dependency pinned to `v0.3.0`, the
+  MPL-2.0, and yggterm consumes it as a git dependency pinned to `v0.3.1`, the
   same pin as `yggui` and `yggui-contract`.
 
   The reason is the rule the 3.0.0 cut was made by, applied to a crate whose
