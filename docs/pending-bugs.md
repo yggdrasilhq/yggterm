@@ -13,93 +13,94 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
-## ★★★ EVERY REMOTE CLAUDE CODE ROW'S WEB VIEW IS EMPTY — the preview lane cannot see the `remote-cc://` scheme
+## ★★★ EVERY REMOTE CLAUDE CODE ROW'S WEB VIEW IS EMPTY — the preview lane could not see the `remote-cc://` scheme
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*(root-caused; the fix is daemon-side and ships only with a daemon deploy)*
+**The observation owed:** on a DAEMON carrying this fix, open a `remote-cc://`
+row's Web View and see a transcript instead of the two launch-scaffold lines —
+equivalently, `server snapshot` reporting a preview block count **greater than
+2** for a remote Claude Code session. It cannot be observed yet: this is
+daemon-side, and the idle gate defers the handover
+(`session_survival_required`) while agent sessions are live. The binary is
+installed and waiting.
 
-Found 2026-08-03 immediately after the Web View rework shipped, by asking the
-daemon what it actually holds:
+### What was wrong
 
-```
-$ yggterm-headless server snapshot | (preview block count per live session)
-(2, 'remote-cc://dev/e1497434-…')   (2, 'remote-cc://dev/cfab47a1-…')
-(2, 'remote-cc://dev/b00fb6ad-…')   (2, 'remote-cc://dev/a4114db6-…')
-…  every single one: 2
-```
+Every live session on the GUI host reported exactly **2** preview blocks, and
+two is the launch scaffold `build_live_session` pushes. So no remote agent row
+had a transcript in its Web View — and the fleet is all `remote-cc://` rows.
 
-**Two is the launch scaffold.** `build_live_session` pushes exactly two blocks
-("This Claude Code session stays attached to the daemon…" / "Claude Code is
-launched locally and will receive /exit…"). So on the GUI host **not one remote
-agent row has a transcript in its Web View**, and since the user's fleet is all
-`remote-cc://dev/…` rows, that is every row they have.
+`refresh_session_preview_from_source_with_remote_payload` gated on
+`parse_remote_scanned_session_path`, which strips `remote-session://` **only**.
+A Claude Code row answered `None`, and since the entire `LiveSsh` arm body sat
+inside that `if let`, **nothing ran at all** — no cache refresh, no payload
+fetch.
 
-### The root cause, and it is a rule this repo already wrote down
+⛔ **`remote_agent_row_target`'s own doc comment already forbade this**: resolve
+through the one scheme table, "never by re-parsing one scheme and treating the
+other as absent. Doing exactly that is what left remote Claude Code agents
+running after their row was removed." Same bug, same file, second surface.
 
-`refresh_session_preview_from_source_with_remote_payload`
-(`crates/yggterm-server/src/lib.rs`, the entry at ~2931 and the `LiveSsh` arm at
-~2949) gates everything on:
+**And a second scheme assumption underneath it.** Both refresh functions wrote
+their result to `remote_scanned_session_path(machine_key, session_id)` — which
+rebuilds `remote-session://` unconditionally. So even past the parse, a Claude
+Code session's freshly-fetched preview would have landed on a key no row owns
+while the `remote-cc://` row it was fetched for stayed empty: a write that
+succeeds into nowhere.
 
-```rust
-fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
-    let rest = path.strip_prefix("remote-session://")?;   // ← Codex ONLY
-```
+### The fix
 
-A Claude Code row is `remote-cc://`, so the `if let` **never matches** and the
-`LiveSsh` arm runs *nothing at all* — no cache refresh, no full payload. The
-session keeps its two scaffold blocks forever.
+`parse_remote_agent_session_path` (one owner, both schemes) guards the lane, and
+`remote_scanned_row_path` takes the SCANNER'S OWN `session_path` instead of
+rebuilding one — the scanner already knows which CLI wrote the file. The
+rebuild survives only as the fallback for a remote binary too old to send
+`session_path`, a vintage that had no Claude Code rows to get wrong. The
+`LiveSsh` match arm is now empty on purpose, with a comment saying why: a live
+remote session that is not an agent row is a plain ssh shell with no transcript
+to reach.
 
-⛔ **`remote_agent_row_target`'s own doc comment forbids exactly this**, in as
-many words: it is "the ONE table mapping `remote-session://` → Codex and
-`remote-cc://` → Claude Code", and every remote agent op "must resolve through
-here …, **never by re-parsing one scheme and treating the other as absent.
-Doing exactly that is what left remote Claude Code agents running after their
-row was removed.**" The preview lane does the forbidden thing. **Same bug, same
-file, second surface.**
+Two locks, each mutation-proven RED before restoring:
+`a_remote_agent_row_resolves_for_both_schemes` (single-scheme parse ⇒
+`left: None`) and
+`a_scanned_rows_preview_is_written_to_the_scheme_the_scanner_declared`
+(rebuild ⇒ `left: "remote-session://…"`).
 
-⚠ **It is not one call site.** `rg 'parse_remote_scanned_session_path'` returns
-~30, and the ones downstream of the preview lane
-(`remote_direct_attach_launch_command_for_path`, `remote_shutdown_targets`,
-`remote_shutdown_target_for_path`, `refresh_remote_scanned_session_preview_*`)
-are scheme-bound too. Fixing the two gates alone may only move the failure one
-level down — audit the lane, do not patch the first `if let`.
+### Proven live, on the half that produces the content
 
-### The second gate, which is right but worth knowing
+`server remote preview-tail <a real CC .jsonl> 48` returns **48 blocks**
+(`ToolCall` and `Message` kinds, `Messages: 0 user · 18 assistant`). The remote
+reader was always CLI-agnostic — it dispatches through the agent-CLI registry —
+so the transcript was there the whole time and only the daemon's addressing was
+blind.
 
-```rust
-fn should_fetch_remote_preview_full_payload(&self, path: &str) -> bool {
-    self.active_view_mode == WorkspaceViewMode::Rendered
-        && self.active_session_path.as_deref() == Some(path)
-}
-```
+### ⚠ Residual, smaller and separate: the SCAN's context is Codex-shaped
 
-The full remote payload is fetched only for the session the **daemon** thinks is
-active *in Rendered mode*. That is a sensible cost gate, but it means a SHADOW
-client flipping to Web View can never trigger hydration — the daemon's own
-`active_view_mode` is the active client's. **So this cannot be reproduced or
-verified from a shadow**; it needs the daemon's active session in Rendered, i.e.
-the user's own GUI on the Web View toggle.
+The cached path (`apply_remote_scanned_session_preview` →
+`parse_recent_context_sections`) reads `scanned.recent_context`. Measured on the
+live fleet: a Codex record carries a structured ~5 KB `PRIMARY USER GOALS:` block
+that parser is written for; a Claude Code record carries a flat ~270-char
+`·`-joined summary, and its `user_message_count` / `assistant_message_count` are
+**both 0**. So a CC row's *cached* preview will stay thin even after this fix.
 
-### Why it was not caught by the surface rework
+That is not what fills the Web View — the full `preview-tail` payload does, and
+it fires when the daemon's active view mode is Rendered on that session, i.e.
+when the user opens it. But the sidebar's shallow preview and the message counts
+are wrong for every remote CC row until the remote scanner learns the CC shape.
 
-The rework was proven in an isolated sandbox against a **stored** `.jsonl`
-(`SessionSource::Stored` → `refresh_stored_session_preview`, a path that works),
-and live on jojo against remote rows whose *scaffold* rendered correctly in the
-new language. Both were true; neither exercised remote hydration. **A surface
-that renders its empty state beautifully looks identical to a surface with
-nothing to render.**
+### ⚠ Why the surface rework did not catch it
 
-### Owed
+It was proven against a **stored** transcript (`SessionSource::Stored` →
+`refresh_stored_session_preview`, a path that works) and against remote rows
+whose *scaffold* rendered correctly in the new language. Both true; neither
+exercised remote hydration. **A surface that renders its empty state beautifully
+looks identical to a surface with nothing to render** — ask the daemon what it
+HOLDS, not the screen what it SHOWS.
 
-1. One resolver for "which machine and session id does this remote agent row
-   name", covering both schemes, used by the preview lane —
-   `parse_remote_scanned_session_path(path).or_else(|| parse_remote_cc_session_path(path))`
-   is the shape, but see the audit warning above.
-2. A lock that a `remote-cc://` row reaches the same hydration a
-   `remote-session://` row does, red-proven by restoring the single-scheme parse.
-3. ⚠ **Ships only with a DAEMON deploy**, which the idle gate currently defers
-   (`session_survival_required`). The GUI half of the Web View is already live.
+⚠ Also: this cannot be reproduced or verified from a shadow client. The
+full-payload fetch requires the **daemon's** own `active_view_mode` to be
+`Rendered`, and only the active client sets that.
+
 
 ## ★★ TWO `web fill-vault` CALLS IN A ROW INTERLEAVE, AND CORRUPT BOTH FIELDS
 

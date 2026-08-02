@@ -2928,7 +2928,14 @@ impl YggtermServer {
         path: &str,
         fetch_full_remote_payload: bool,
     ) -> anyhow::Result<()> {
-        if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
+        // ⚠ BOTH schemes. This gate used to ask `parse_remote_scanned_session_path`,
+        // which strips `remote-session://` only, so a `remote-cc://` row fell
+        // through here AND failed the identical test in the `LiveSsh` arm below —
+        // and the arm's whole body sat inside that `if let`, so nothing ran at
+        // all. Every remote Claude Code session kept its two launch-scaffold
+        // blocks forever, which is an empty Web View that looks like a rendered
+        // one.
+        if let Some((raw_machine_key, session_id)) = parse_remote_agent_session_path(&path) {
             let machine_key = normalize_machine_key(raw_machine_key);
             self.refresh_remote_scanned_session_preview_from_cache(&machine_key, session_id);
             if fetch_full_remote_payload || self.should_fetch_remote_preview_full_payload(path) {
@@ -2945,24 +2952,10 @@ impl YggtermServer {
         match session.source {
             SessionSource::Stored => self.refresh_stored_session_preview(path, &session)?,
             SessionSource::LiveLocal => self.refresh_live_local_session_preview(path, &session)?,
-            SessionSource::LiveSsh => {
-                if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(path)
-                {
-                    let machine_key = normalize_machine_key(raw_machine_key);
-                    self.refresh_remote_scanned_session_preview_from_cache(
-                        &machine_key,
-                        session_id,
-                    );
-                    if fetch_full_remote_payload
-                        || self.should_fetch_remote_preview_full_payload(path)
-                    {
-                        self.refresh_remote_scanned_session_preview_from_remote_full(
-                            &machine_key,
-                            session_id,
-                        )?;
-                    }
-                }
-            }
+            // A live remote session whose path is neither remote-agent scheme
+            // has no transcript this daemon can reach — a plain ssh shell. The
+            // agent rows are all handled by the gate above.
+            SessionSource::LiveSsh => {}
         }
         Ok(())
     }
@@ -8661,7 +8654,7 @@ impl YggtermServer {
         else {
             return;
         };
-        let path = remote_scanned_session_path(&machine_key, session_id);
+        let path = remote_scanned_row_path(&scanned, &machine_key, session_id);
         if let Some(session) = self.sessions.get_mut(&path) {
             apply_remote_scanned_session_preview(
                 session,
@@ -8733,7 +8726,7 @@ impl YggtermServer {
         })?;
         Ok(apply_remote_preview_payload_for_path_with_hydration(
             self,
-            &remote_scanned_session_path(&machine_key, session_id),
+            &remote_scanned_row_path(&scanned, &machine_key, session_id),
             payload,
             hydration,
         ))
@@ -9106,10 +9099,54 @@ fn remote_scanned_session_path(machine_key: &str, session_id: &str) -> String {
     format!("remote-session://{machine_key}/{session_id}")
 }
 
+/// The row key a scanned remote session belongs to.
+///
+/// ⚠ Takes the SCANNER'S OWN answer (`scanned.session_path`) rather than
+/// rebuilding one. The scanner already knows which agent CLI wrote the file and
+/// stamps the scheme accordingly; re-deriving it here means guessing, and the
+/// guess was `remote-session://` unconditionally — so a Claude Code session's
+/// freshly-fetched preview was written to a `remote-session://` key that no row
+/// owns, and the `remote-cc://` row it was fetched for stayed empty.
+///
+/// The rebuild survives only as the fallback for a machine running a remote
+/// binary old enough not to send `session_path` at all; on that vintage there
+/// were no Claude Code rows to get wrong.
+fn remote_scanned_row_path(
+    scanned: &RemoteScannedSession,
+    machine_key: &str,
+    session_id: &str,
+) -> String {
+    let declared = scanned.session_path.trim();
+    if declared.is_empty() {
+        return remote_scanned_session_path(machine_key, session_id);
+    }
+    declared.to_string()
+}
+
 fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix("remote-session://")?;
     let (machine_key, session_id) = rest.split_once('/')?;
     Some((machine_key, session_id))
+}
+
+/// The machine and session id a remote AGENT row names — **either scheme**.
+///
+/// `parse_remote_scanned_session_path` answers for Codex only. A caller that
+/// asks it "which machine owns this row" and treats `None` as "not remote"
+/// silently excludes every Claude Code row, and the failure is invisible
+/// because the code it guards simply does not run.
+///
+/// That is not hypothetical twice over: it left remote Claude Code agents
+/// running after their row was removed (see `remote_agent_row_target`, which
+/// says so in its own doc comment), and it left every remote Claude Code
+/// session's Web View holding nothing but its two launch-scaffold blocks —
+/// found 2026-08-03 by asking the daemon what it held rather than looking at
+/// the screen, on a fleet where every row is `remote-cc://`.
+///
+/// ⚠ Use this whenever the question is "which remote agent session is this",
+/// and reach for the scheme-specific parser ONLY when the answer must be Codex.
+fn parse_remote_agent_session_path(path: &str) -> Option<(&str, &str)> {
+    parse_remote_scanned_session_path(path).or_else(|| parse_remote_cc_session_path(path))
 }
 
 fn remote_runtime_codex_session_key(session_id: &str) -> String {
@@ -24934,6 +24971,93 @@ mod tests {
     use super::PreviewBlockKind;
     use super::app_control_open_path_ready;
     use super::canonicalize_remote_machine_alias;
+    use super::{parse_remote_agent_session_path, remote_scanned_row_path};
+
+    fn scanned_row(session_path: &str, session_id: &str) -> super::RemoteScannedSession {
+        super::RemoteScannedSession {
+            session_path: session_path.to_string(),
+            session_id: session_id.to_string(),
+            cwd: "/home/user".to_string(),
+            started_at: String::new(),
+            modified_epoch: 0,
+            event_count: 0,
+            user_message_count: 0,
+            assistant_message_count: 0,
+            title_hint: String::new(),
+            recent_context: String::new(),
+            cached_precis: None,
+            cached_summary: None,
+            live_runtime: true,
+            storage_path: "/home/user/.claude/projects/x/abc.jsonl".to_string(),
+        }
+    }
+
+    /// ★ A remote CLAUDE CODE row must resolve to its machine, exactly as a
+    /// Codex row does.
+    ///
+    /// The whole `LiveSsh` preview-refresh body sat inside
+    /// `if let Some(..) = parse_remote_scanned_session_path(path)`, which
+    /// strips `remote-session://` only. A `remote-cc://` row answered `None`,
+    /// so the arm ran NOTHING — no cache refresh, no payload fetch — and every
+    /// remote Claude Code session kept only its two launch-scaffold blocks.
+    /// An empty Web View that renders its scaffold correctly looks exactly like
+    /// a working one, which is why this went unseen.
+    #[test]
+    fn a_remote_agent_row_resolves_for_both_schemes() {
+        assert_eq!(
+            parse_remote_agent_session_path("remote-cc://dev/abc-123"),
+            Some(("dev", "abc-123")),
+            "a Claude Code row must resolve"
+        );
+        assert_eq!(
+            parse_remote_agent_session_path("remote-session://dev/abc-123"),
+            Some(("dev", "abc-123")),
+            "a Codex row must still resolve"
+        );
+        // Anything that is not a remote agent row must still answer None, or
+        // the gate stops discriminating at all.
+        for path in [
+            "local://abc-123",
+            "cc-runtime://abc-123",
+            "codex-runtime://abc-123",
+            "/home/user/.claude/projects/x/abc.jsonl",
+            "remote-cc://dev",
+        ] {
+            assert_eq!(
+                parse_remote_agent_session_path(path),
+                None,
+                "{path} is not a remote agent row"
+            );
+        }
+    }
+
+    /// ★ A fetched preview is written to the row the SCANNER named, not to a
+    /// path rebuilt from a guessed scheme.
+    ///
+    /// The rebuild was `remote-session://` unconditionally, so a Claude Code
+    /// session's freshly-fetched blocks landed on a key no row owns while the
+    /// `remote-cc://` row it was fetched for stayed empty — a write that
+    /// succeeds into nowhere, with nothing to report.
+    #[test]
+    fn a_scanned_rows_preview_is_written_to_the_scheme_the_scanner_declared() {
+        let cc = scanned_row("remote-cc://dev/abc-123", "abc-123");
+        assert_eq!(
+            remote_scanned_row_path(&cc, "dev", "abc-123"),
+            "remote-cc://dev/abc-123"
+        );
+        let codex = scanned_row("remote-session://dev/abc-123", "abc-123");
+        assert_eq!(
+            remote_scanned_row_path(&codex, "dev", "abc-123"),
+            "remote-session://dev/abc-123"
+        );
+        // A remote binary too old to send `session_path` falls back to the
+        // rebuild — that vintage had no Claude Code rows to get wrong.
+        let legacy = scanned_row("", "abc-123");
+        assert_eq!(
+            remote_scanned_row_path(&legacy, "dev", "abc-123"),
+            "remote-session://dev/abc-123"
+        );
+    }
     use super::{
         local_cc_current_session_id_in, local_cc_registry_session_id_in,
         owning_daemon_endpoint_from_statuses, parse_remote_agent_runtime_alive_output,
