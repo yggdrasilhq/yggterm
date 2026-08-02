@@ -2364,6 +2364,41 @@ fn main() -> Result<()> {
                     other => anyhow::bail!("unsupported app theme-editor action: {other}"),
                 }
             }
+            // NOTIFICATIONS. One verb for every plane: an agent, a cron job, a
+            // /loop waking up, or a libyggterm app. `--in`/`--at` is the alarm clock.
+            "notify" => {
+                let positional = cli_positional_args(&args, 3);
+                let title = positional
+                    .first()
+                    .map(|s| s.to_string())
+                    .or_else(|| cli_flag_value(&args, "--title").map(str::to_string))
+                    .context("missing title for server app notify")?;
+                let message = positional
+                    .get(1)
+                    .map(|s| s.to_string())
+                    .or_else(|| cli_flag_value(&args, "--message").map(str::to_string))
+                    .unwrap_or_default();
+                let delay_ms = match (cli_flag_value(&args, "--in"), cli_flag_value(&args, "--at")) {
+                    (Some(spec), _) => Some(yggterm_server::parse_duration_ms(spec)?),
+                    (None, Some(when)) => Some(yggterm_server::parse_clock_delay_ms(when)?),
+                    (None, None) => None,
+                };
+                let progress = cli_flag_value(&args, "--progress")
+                    .map(|v| v.parse::<f32>())
+                    .transpose()
+                    .map_err(|_| anyhow::anyhow!("--progress takes a number 0..100"))?;
+                yggterm_server::run_app_control_notify(
+                    &title,
+                    &message,
+                    cli_flag_value(&args, "--tone").as_deref(),
+                    cli_flag_value(&args, "--job").as_deref(),
+                    progress,
+                    args.iter().any(|a| a == "--persistent"),
+                    args.iter().any(|a| a == "--silent"),
+                    delay_ms,
+                    timeout_ms,
+                )
+            }
             "update" => {
                 let action = cli_positional_args(&args, 3)
                     .into_iter()

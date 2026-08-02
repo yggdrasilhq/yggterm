@@ -49,6 +49,43 @@ This skill is an agent's "human eye + keyboard/mouse" for a **Dioxus desktop UX*
 - **Web UX is OUT of scope.** Driving a web app (e.g. samplers / samplenotes-webapp running in Chrome) is the job of the **separate agent-browser CLI skill**, not this one. Clear lanes: this skill = Dioxus desktop; browser skill = web.
 - **Today this drives yggterm.** It generalizes to any Dioxus desktop app only once app-control is extracted into a reusable crate (`finding-yggui-app-control-not-reusable` in memory) — relevant when samplers / samplenotes-webapp ship desktop builds, not now (they're webapp + Android in the current prototyping phase).
 
+## Notifications and audio alerts — `server app notify` (WIRED 2026-08-03)
+
+**The one way anything reaches the human.** An agent, a `/loop` waking up, a cron job,
+or any libyggterm app raises a notification the same way, so a toast from a background
+agent and one from the app itself are the same object.
+
+```bash
+yggterm-headless server app notify "<title>" "<message>" [--tone info|success|warning|error]
+    [--job <key> --progress 0..100]   # upserts ONE row instead of stacking N toasts
+    [--persistent]                    # stays until dismissed
+    [--silent]                        # suppress the chime for this one
+    [--in 90s|10m|2h] [--at 07:30]    # the alarm clock
+```
+
+It fans out three ways at once, each gated by the user's own setting: an in-app toast,
+a real desktop notification, and a synthesized chime. **⛔ `--silent` may only SUPPRESS.
+There is deliberately no way to force sound on for a user who turned it off.**
+
+**Refusals are named and exit non-zero** (`unknown_tone`, `empty_title`), because a
+notification verb that silently does nothing is indistinguishable from a human who
+missed the toast. An unknown tone is refused rather than defaulted: a typo that quietly
+downgraded an `error` to `info` would make the one notification that mattered look like
+the ones that did not.
+
+**Use it for:** a long job that needs his attention, a `/loop` reporting that it woke
+and found something, a delegate session that has hit a question, an alarm. **Do not use
+it for** chatter: every notification spends his attention, which is the scarcest input
+on this fleet.
+
+⚠ **`--in`/`--at` timers live in the running GUI process, so a GUI restart forgets
+them.** The reply says so in its own `note` field. For anything that must survive a
+restart, use a cron entry that calls this verb rather than a long `--in`.
+
+⚠ It is a NOTIFICATION, not a dialog: it informs and cannot ask. Anything needing an
+answer belongs in a modal the shell owns.
+
+
 ## Live Host
 
 The live desktop host SSH alias is stored in `.agents/config/live-host` (one line, e.g. `jojo`).

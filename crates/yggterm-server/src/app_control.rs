@@ -615,6 +615,47 @@ pub enum AppControlCommand {
         #[serde(default)]
         grain: Option<f32>,
     },
+    /// Raise a notification on the user's desktop: an in-app toast, a real system
+    /// notification, and a chime, exactly as the app's own events do.
+    ///
+    /// **Why this exists.** Every piece of the machinery was already built and none
+    /// of it was reachable: an agent, a cron job, or a libyggterm app had no way to
+    /// tell the human anything. One verb for all three planes, deliberately, so a
+    /// notification from a background agent and one from the app itself are the same
+    /// object and the human cannot be made to care which sent it.
+    ///
+    /// ⚠ It is a NOTIFICATION, not a dialog: it informs and cannot ask. Anything
+    /// needing an answer belongs in a modal the shell owns.
+    Notify {
+        title: String,
+        #[serde(default)]
+        message: String,
+        /// `info` · `success` · `warning` · `error`. An unknown word is REFUSED,
+        /// never defaulted, so a typo cannot silently downgrade an error.
+        #[serde(default)]
+        tone: Option<String>,
+        /// Group repeated updates under one row instead of stacking N toasts. The
+        /// same key upserts; this is what makes a long job report progress without
+        /// burying everything else.
+        #[serde(default)]
+        job: Option<String>,
+        /// 0..=100. Only meaningful with `job`.
+        #[serde(default)]
+        progress: Option<f32>,
+        /// Stay until dismissed instead of auto-expiring.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        persistent: bool,
+        /// Suppress the chime for this one notification, whatever the global
+        /// sound setting is. The inverse is deliberately NOT offered: a user who
+        /// turned sound off does not get overridden by a caller.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        silent: bool,
+        /// Deliver after this many milliseconds instead of now. This is the alarm
+        /// clock, and it is honest about its limit: the timer lives in the running
+        /// GUI, so a GUI restart forgets it.
+        #[serde(default)]
+        delay_ms: Option<u64>,
+    },
     TriggerUpdateCheck,
     /// Restart into a staged update.
     ///
@@ -1379,6 +1420,7 @@ impl AppControlCommand {
             Self::SetThemeEditorOpen { .. } => "set_theme_editor_open",
             Self::ResetThemeEditor => "reset_theme_editor",
             Self::SetThemeEditorValues { .. } => "set_theme_editor_values",
+            Self::Notify { .. } => "notify",
             Self::TriggerUpdateCheck => "trigger_update_check",
             Self::RestartPendingUpdate { .. } => "restart_pending_update",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
