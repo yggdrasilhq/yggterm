@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A page waiting on the camera is now visible, and answerable, from outside
+  the window.** `server app state` reports `pending_media_capture` — the
+  camera/microphone prompt a page has raised and nobody has answered, with the
+  origin, the devices asked for, and the `request_id` — and
+  `server app media answer <allow|deny-once|block-site> [--request <id>]`
+  answers it. Both binaries carry the verb.
+
+  The answer goes through the dialog's own terminus, not around it: the same
+  code path the Allow button runs, so the modal closes, the engine is released,
+  and a remembered decision is written exactly as a click would write it. A
+  quoted `--request` that no longer matches the pending prompt is REFUSED rather
+  than applied to whichever prompt is up now, and every refusal is named
+  (`unknown_answer`, `no_pending_request`, `request_mismatch`) with a non-zero
+  exit, so a script cannot read one as a grant.
+
+  Answering a camera prompt is a grant, so it is now audited: every answer —
+  from the CLI, from the button, or from Escape — leaves one
+  `web_surface/media_permission_answered` trace row naming its `source`.
+
 ## 3.0.0
 
 - **libyggterm is now its own repository, under MPL-2.0.** `yggui` and

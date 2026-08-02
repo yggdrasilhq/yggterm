@@ -579,6 +579,43 @@ content height** before drawing anything.
 `entry_count` is one per LOGICAL line, not per visual row — a file of 412 lines
 reads 412 however many of them wrap.
 
+### `pending_media_capture` — a page is waiting on the CAMERA, and you can answer it
+
+```bash
+LIVE_HOST=$(cat .agents/config/live-host)
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app state" | jq .pending_media_capture
+# null, or:
+# { "request_id": 1, "native_id": 3, "session_path": "local://…",
+#   "origin": "https://emudhradigital.com", "display": "https://emudhradigital.com",
+#   "audio": false, "video": true }
+
+# Answer it. The three words are the dialog's own three; `deny` and `block` are
+# accepted short forms. `--request <id>` is optional and, when given, REFUSES on
+# a mismatch rather than answering whatever prompt is up now.
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app media answer allow --request 1"
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app media answer deny-once"
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app media answer block-site"
+```
+
+- A non-null value means a page's `getUserMedia()` promise is **blocked** on this
+  prompt. Until it is answered the site sees nothing — no stream, no error.
+- **Read `answered`, not the exit alone** — the verb exits non-zero on a refusal
+  and names it: `unknown_answer`, `no_pending_request` (already answered, or
+  retired by the engine's 120 s deadline), `request_mismatch`.
+- `allow` also asks the owning app (ychrome) to REMEMBER the origin, exactly as
+  the human's Allow button does; `deny-once` remembers nothing; `block-site`
+  remembers a refusal. One terminus, so the CLI and the button cannot diverge.
+- Every answer — yours and the human's — writes a
+  `web_surface/media_permission_answered` trace row carrying `source`
+  (`app_control` · `dialog_click` · `keyboard_dismiss`). That row is the proof
+  your answer landed.
+
+⛔ **A prompt only exists for a surface WebKit has PRESENTED.** On a stashed or
+never-revealed surface the engine raises no `permission-request` at all, so
+`pending_media_capture` stays `null` while the page hangs — measured on jojo
+2026-08-02, both arms on one GUI build. `document.visibilityState` does not tell
+you which arm you are on. See the top entry of `docs/pending-bugs.md`.
+
 ### Drag gestures — TWO independent ones, and they read differently
 
 The cwd tree and the contributed app rail (yedit's file list, ychrome's tabs)

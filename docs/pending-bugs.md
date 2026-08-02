@@ -51,35 +51,69 @@ someone else's.**
   WORKED — his KYC page, camera live, face in the preview — was a genuinely
   revealed surface under the previous GUI.
 
-### The hypothesis, and what would settle it
+### ✔ THE BISECT IS DONE — it is PRESENTATION, and the version is exonerated
 
-**A permission request is only raised for a genuinely VISIBLE surface; on a
-hidden/stashed one WebKit swallows it, so the page waits on a promise nobody
-will ever settle.** That is the worst possible failure shape: no prompt for the
-user, no error for the page, no row for the operator.
+Measured on jojo, 2026-08-02 20:42–20:53, **one GUI (3.0.0, pid 641263), one
+page, one origin** (`http://127.0.0.1:8899/probe.html`, a secure context), the
+same `getUserMedia({video:true})` raced against a 12 s timer. Only the surface
+differed:
 
-⚠ **Not ruled out, and it must be, before anyone believes the hypothesis:** the
-working observation is from GUI **2.12.24** and every failing one is from
-**3.0.0** (the libyggterm split), and 3.0.0 also carries the new
-`install_tls_pin_handler` call added at the top of
-`attach_surface_message_channel` the same day. **Bisect the GUI version before
-blaming visibility.**
+| surface | `document.visibilityState` | `web_surface/media_permission_request` | outcome |
+|---|---|---|---|
+| stashed (agent's `web ensure`, never revealed) | `"hidden"` | **none** | `TIMEOUT` at 12 s |
+| revealed in a shadow client (`app open --client`) | `"visible"` | **raised**, `media_permission_policy verdict:"ask"` | prompt up, page waits on the human |
+
+So the failing arm and the working arm are the SAME BUILD. **The "2.12.24 worked,
+3.0.0 broke it" reading was the presented/not-presented difference wearing a
+version's clothes**, and `install_tls_pin_handler` is exonerated with it (it also
+returns before connecting anything unless `~/.yggterm/tls-pins.json` has an entry
+for the host).
+
+Two other claims above are now falsified and are kept only so nobody re-derives
+them:
+
+- **The grant DOES persist.** At 20:23 on this same GUI a fresh
+  `emudhradigital.com` surface answered `media_permission_policy verdict:"allow"`
+  from ychrome's remembered per-origin decision. The earlier re-ask "went
+  nowhere" because that surface was not presented, not because the memory was
+  lost.
+- **`navigator.permissions.query({name:'camera'})` reading `prompt` means
+  nothing here.** It reads `prompt` on the arm that works too.
+
+⚠ **`document.visibilityState` is not the discriminator either** — it is only
+correlated. Ask GTK whether the webview and its toplevel are MAPPED.
 
 ### Owed
 
-1. Reproduce on a surface that is provably visible (`visibilityState:"visible"`),
-   and on 2.12.14 vs 3.0.0, to separate visibility from the version.
+1. ~~Separate visibility from the version.~~ Done — see the table above.
 2. Whatever the cause: **`getUserMedia` must never hang.** If a surface cannot
    raise a prompt, the request has to be refused with a reason the page receives
    as a rejection — a `NotAllowedError` the site can report beats an eternal
-   pending promise.
-3. Surface pending media permissions in `server app state` and give the control
-   plane a verb to answer one. Today an operator cannot even see that a page is
-   waiting on a camera.
+   pending promise. **Still open.** Note where the deadline has to live: the
+   engine parks nothing, so `MEDIA_PERMISSION_TIMEOUT` never arms — there is no
+   engine-side object to hang a timer on, and the ask has to be visible to us
+   before it can be refused.
+3. ~~Surface pending media permissions in `server app state`, and give the
+   control plane a verb to answer one.~~ In code on
+   `lane/dev/gum-never-hangs`, **live proof owed**: `server app state` →
+   `pending_media_capture`, answered by
+   `server app media answer <allow|deny-once|block-site> [--request <id>]`
+   through the dialog's own terminus. **The observation owed:** raise a prompt on
+   a presented surface, see it in `app state`, answer it from the CLI, and watch
+   the page's promise resolve — with a `web_surface/media_permission_answered`
+   trace row reading `source:"app_control"`.
+
+⚠ **A prompt raised on a surface nobody is looking at is its own half of this
+bug.** On the revealed-shadow arm the engine asked, the policy said `ask`, and
+the modal went up in a window with no human in front of it — the page then waits
+the full 120 s `MEDIA_PERMISSION_TIMEOUT` before being denied. Bounded, so not a
+hang, but the verb in (3) is what makes it answerable at all.
 
 Reproduction script: race `getUserMedia` against a timer and read
 `navigator.permissions.query({name:'camera'})`; both halves are in the
-2026-08-02 session transcript.
+2026-08-02 session transcript. The A/B above needs no camera hardware to
+reproduce — the discriminator is whether the trace grows a
+`media_permission_request` row, not whether a stream arrives.
 
 
 ## The launcher OFFERS the GUI host's apps for a row on another machine

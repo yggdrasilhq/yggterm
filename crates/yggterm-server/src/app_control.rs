@@ -1255,6 +1255,37 @@ pub enum AppControlCommand {
     SetKeytipsOverlay {
         open: bool,
     },
+    /// Answer the camera/microphone prompt a page raised.
+    ///
+    /// The dialog is reported by `server app state` under
+    /// `pending_media_capture`; this is the verb that ANSWERS it. Before both
+    /// existed an operator could see neither that a page was waiting on a
+    /// camera nor do anything about it, which is how an eSign video KYC was
+    /// left waiting on a prompt nobody could reach (2026-08-02).
+    ///
+    /// ⛔ It drives the SAME terminus as the human's click
+    /// (`resolve_media_capture_dialog` in yggterm-shell) — never a second path
+    /// to a device. The three answers are exactly the dialog's own three, and
+    /// `MediaCaptureAnswer::as_str` there is the ONE owner of that vocabulary,
+    /// which is why this field is a string rather than a second enum that could
+    /// drift from the buttons.
+    ///
+    /// ⚠ It can GRANT. That is deliberate and it does not widen the trust
+    /// boundary: app-control is already a local, filesystem-authenticated plane
+    /// that can type into any PTY and fill a vault credential. It does widen the
+    /// AUDIT surface, so every answer — this one and the human's — leaves a
+    /// `web_surface/media_permission_answered` trace row naming its source.
+    AnswerMediaCapture {
+        /// The parked request this answer is for, as `server app state` reports
+        /// it. Optional because there is at most ONE dialog at a time; when it
+        /// is given and does not match, the answer is REFUSED rather than
+        /// applied to whatever happens to be up now — an operator who read a
+        /// request id must not be able to answer a different page's prompt.
+        #[serde(default)]
+        request_id: Option<u64>,
+        /// `allow` · `deny-once` · `block-site`, the dialog's own words.
+        answer: String,
+    },
     /// A well-formed request whose `kind` this build DOES know, but whose
     /// FIELDS it cannot read.
     ///
@@ -1427,6 +1458,7 @@ impl AppControlCommand {
             Self::ListCommands => "list_commands",
             Self::KeytipsAudit => "keytips_audit",
             Self::SetKeytipsOverlay { .. } => "set_keytips_overlay",
+            Self::AnswerMediaCapture { .. } => "answer_media_capture",
             Self::Unsupported => "unsupported",
             Self::Unreadable { .. } => "unreadable",
         }
@@ -2287,6 +2319,43 @@ mod tests {
         let hide: AppControlCommand =
             serde_json::from_str(r#"{ "kind": "set_keytips_overlay", "open": false }"#).unwrap();
         assert_eq!(hide, AppControlCommand::SetKeytipsOverlay { open: false });
+    }
+
+    /// The camera/microphone answer rides the wire, and it is never read-only.
+    ///
+    /// `request_id` is optional on purpose (there is at most one prompt), so an
+    /// old caller that omits it must still parse — but a build that ever
+    /// classified this as read-only would let it run without a re-render, and
+    /// a granted camera that leaves the modal on screen is worse than no verb.
+    #[test]
+    fn the_capture_answer_rides_the_wire() {
+        let bare: AppControlCommand =
+            serde_json::from_str(r#"{ "kind": "answer_media_capture", "answer": "allow" }"#)
+                .unwrap();
+        assert_eq!(
+            bare,
+            AppControlCommand::AnswerMediaCapture {
+                request_id: None,
+                answer: "allow".to_string(),
+            },
+        );
+        assert_eq!(bare.name(), "answer_media_capture");
+        assert!(
+            !bare.is_read_only(),
+            "answering a capture prompt settles a blocked engine request and can \
+             hand over a device; it mutates as much as anything in this enum",
+        );
+        let targeted: AppControlCommand = serde_json::from_str(
+            r#"{ "kind": "answer_media_capture", "request_id": 7, "answer": "block-site" }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            targeted,
+            AppControlCommand::AnswerMediaCapture {
+                request_id: Some(7),
+                answer: "block-site".to_string(),
+            },
+        );
     }
 
     /// The other half of the contract: genuinely malformed JSON must still be

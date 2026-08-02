@@ -18856,6 +18856,49 @@ pub fn run_app_control_keytips_overlay(open: bool, timeout_ms: u64) -> anyhow::R
     Ok(())
 }
 
+/// `server app media answer <allow|deny-once|block-site> [--request <id>]` —
+/// answer the camera/microphone prompt a page raised.
+///
+/// The read half is `server app state` → `pending_media_capture` (which carries
+/// the `request_id` this takes); this is the write half. Together they are what
+/// makes a page waiting on a camera both visible and answerable from outside the
+/// GUI — before them it was neither, and an eSign video KYC was left waiting on
+/// a prompt no operator could reach.
+///
+/// Non-zero exit when the answer was NOT applied, so a script cannot read a
+/// refusal as a grant: the refusal reason (`unknown_answer`,
+/// `no_pending_request`, `request_mismatch`) is in the printed payload.
+pub fn run_app_control_media_answer(
+    answer: String,
+    request_id: Option<u64>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::AnswerMediaCapture { request_id, answer },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    let answered = response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("answered"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !answered {
+        let reason = response
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        anyhow::bail!("capture prompt not answered: {reason}");
+    }
+    Ok(())
+}
+
 /// `server app keytips audit [--json]` — the §12 no-orphan-affordance audit.
 /// The GUI runs the ONE interactable walk (the same JS the overlay's derive
 /// pass runs) in audit mode; this prints the §12.1-corrected THREE numbers —
