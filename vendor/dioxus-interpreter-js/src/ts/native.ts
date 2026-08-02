@@ -11,6 +11,10 @@ import { SerializedEvent, serializeEvent, SerializedFileData, extractSerializedF
 // we're going to bind the JSChannel_ object to the JSChannel object, and then extend it
 var JSChannel_: typeof BaseInterpreter;
 
+// Backstop for the edit-batch acknowledgement when `requestAnimationFrame`
+// never fires. Long enough that it never races a frame that was merely slow.
+const EDITS_FLUSH_FALLBACK_MS = 1000;
+
 // @ts-ignore - this is coming from the host
 if (RawInterpreter !== undefined && RawInterpreter !== null) {
   // @ts-ignore - this is coming from the host
@@ -442,18 +446,40 @@ export class NativeInterpreter extends JSChannel_ {
   }
 
   // Run the edits the next animation frame
+  //
+  // The host does not render, run effects, or poll ANY task on this webview's
+  // VirtualDom until `markEditsFinished` acknowledges the batch. So the ack is
+  // load-bearing: skip it once and the app freezes for good. Both ways that
+  // used to happen are closed here — an exception while applying the edits now
+  // still acks (the DOM is damaged either way; a frozen app helps nobody), and
+  // a `requestAnimationFrame` that never fires, which is what an occluded or
+  // unmapped window gets, is backstopped by a timer. Timers are throttled in a
+  // hidden page but, unlike rAF, they still run.
   rafEdits(bytes: ArrayBuffer) {
     // In headless mode, the requestAnimationFrame callback is never called, so we need to run the bytes directly
     if (this.headless) {
-      // @ts-ignore
-      this.run_from_bytes(bytes);
-      this.markEditsFinished();
+      try {
+        // @ts-ignore
+        this.run_from_bytes(bytes);
+      } finally {
+        this.markEditsFinished();
+      }
     } else {
       this.enqueueBytes(bytes);
-      requestAnimationFrame(() => {
-        this.flushQueuedBytes();
-        this.markEditsFinished();
-      });
+      let acknowledged = false;
+      const flush = () => {
+        if (acknowledged) {
+          return;
+        }
+        acknowledged = true;
+        try {
+          this.flushQueuedBytes();
+        } finally {
+          this.markEditsFinished();
+        }
+      };
+      requestAnimationFrame(flush);
+      setTimeout(flush, EDITS_FLUSH_FALLBACK_MS);
     }
   }
 
@@ -495,7 +521,15 @@ export class NativeInterpreter extends JSChannel_ {
   markEditsFinished() {
     // Send an empty ArrayBuffer to the edits websocket to signal that the edits are finished
     // This is used to signal that the edits are done and the next request can be processed
-    this.edits.send(new ArrayBuffer(0));
+    //
+    // A closed or closing socket throws here. That is survivable — the host
+    // reconnects and re-sends — but it must not escape, because this runs in a
+    // `finally` whose whole job is to make the acknowledgement unconditional.
+    try {
+      this.edits.send(new ArrayBuffer(0));
+    } catch (err) {
+      console.error("failed to acknowledge edits", err);
+    }
   }
 
   kickAllStylesheetsOnPage() {
