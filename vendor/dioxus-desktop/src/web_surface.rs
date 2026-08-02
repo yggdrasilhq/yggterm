@@ -455,12 +455,132 @@ pub struct SurfaceCloseRequest {
 /// script-message handler it speaks to. Every surface gets it — a popup because
 /// it is the whole point, a normal tab because the shell must be able to tell
 /// the two apart and refuse the one it should refuse.
+/// One excepted (host, certificate) pair, read from `~/.yggterm/tls-pins.json`.
+///
+/// ⚠ **SSOT: ychrome's `tls` verb is the only WRITER of that file, and the only
+/// thing that may add an entry.** It refuses to write one unless `openssl` can
+/// verify a path through the certificates the server itself presented, against
+/// the distribution's stock root program. This side only ENFORCES what is
+/// already written, and does no verification of its own — the two halves must
+/// never both decide, or they will disagree about what is trusted.
+struct TlsPin {
+    host: String,
+    sha256: String,
+}
+
+/// Let a surface load a page whose certificate this host has explicitly pinned.
+///
+/// **Why this exists at all.** `ipindiaonline.gov.in` — the trademark and patent
+/// e-filing portal — presents seven certificates containing two paths for the
+/// same intermediate: a dead one under a retired Comodo root Debian dropped,
+/// listed FIRST, and a live one under a root Debian ships. GnuTLS matches the
+/// issuer against the first candidate and does not backtrack, so WebKitGTK says
+/// `Unacceptable TLS certificate` while Chromium and Firefox load the site.
+/// Measured: the only other thing that satisfies GnuTLS is trusting the retired
+/// root machine-wide, which would widen trust for every connection this machine
+/// makes. This is per host and per certificate instead.
+///
+/// It fails CLOSED in every direction: no pins file, an unparseable one, a host
+/// that is not listed, or a certificate that does not match — the refusal
+/// stands, exactly as it does for every other site.
+fn install_tls_pin_handler(webview: &wry::WebView) {
+    use webkit2gtk::gio::prelude::TlsCertificateExt as _;
+    use webkit2gtk::{WebContextExt as _, WebViewExt as _};
+    use wry::WebViewExtUnix as _;
+
+    let pins = load_tls_pins();
+    if pins.is_empty() {
+        return;
+    }
+    webview
+        .webview()
+        .connect_load_failed_with_tls_errors(move |view, failing_uri, certificate, _errors| {
+            let Some(host) = failing_uri
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .and_then(|rest| rest.split('/').next())
+                .map(|authority| {
+                    authority
+                        .rsplit_once('@')
+                        .map_or(authority, |(_, host)| host)
+                        .split(':')
+                        .next()
+                        .unwrap_or_default()
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase()
+                })
+            else {
+                return false;
+            };
+            let Some(der) = certificate.certificate() else {
+                return false;
+            };
+            let fingerprint = {
+                use sha2::{Digest as _, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&der[..]);
+                hasher
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            };
+            if !pins
+                .iter()
+                .any(|pin| pin.host == host && pin.sha256 == fingerprint)
+            {
+                return false;
+            }
+            let Some(context) = view.web_context() else {
+                return false;
+            };
+            // Scoped to this host by the API itself, so the exception cannot
+            // reach another site even if the same certificate appears there.
+            context.allow_tls_certificate_for_host(certificate, &host);
+            view.load_uri(failing_uri);
+            true
+        });
+}
+
+fn load_tls_pins() -> Vec<TlsPin> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let path = std::path::Path::new(&home)
+        .join(".yggterm")
+        .join("tls-pins.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(items) = value.get("pins").and_then(|pins| pins.as_array()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let host = item.get("host")?.as_str()?.trim().to_ascii_lowercase();
+            let sha256: String = item
+                .get("sha256")?
+                .as_str()?
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect();
+            (!host.is_empty() && !sha256.is_empty()).then_some(TlsPin { host, sha256 })
+        })
+        .collect()
+}
+
 fn attach_surface_message_channel(
     webview: &wry::WebView,
     surface_id: u64,
     close_requests: &Rc<RefCell<Vec<SurfaceCloseRequest>>>,
     theme_colors: &Rc<RefCell<HashMap<u64, String>>>,
 ) {
+    install_tls_pin_handler(webview);
     use webkit2gtk::{UserContentManagerExt as _, WebViewExt as _};
     use wry::WebViewExtUnix as _;
     let webkit = webview.webview();
