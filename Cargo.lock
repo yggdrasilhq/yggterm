@@ -7032,7 +7032,7 @@ dependencies = [
 [[package]]
 name = "yggui"
 version = "0.1.0"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.1.0#97d9f33b5d62112cb404fc37a72c0fc085620042"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.1.1#4bd258c0859cae75950556c6c51f5b275115a62f"
 dependencies = [
  "anyhow",
  "base64",
@@ -7053,7 +7053,7 @@ dependencies = [
 [[package]]
 name = "yggui-contract"
 version = "0.1.0"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.1.0#97d9f33b5d62112cb404fc37a72c0fc085620042"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.1.1#4bd258c0859cae75950556c6c51f5b275115a62f"
 dependencies = [
  "serde",
 ]
