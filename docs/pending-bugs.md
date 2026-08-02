@@ -96,17 +96,40 @@ the production call site yourself.**
 
 ## Agent engine: ctl fill is documented but has no route
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-**Agent engine: `ctl fill` is documented but has no route** (found 2026-08-01
-while an agent filed a GitHub support ticket headlessly). `agent-engine.md`
-§4 documents `ychrome ctl fill`, but the daemon exposes no `/engine/fill`,
-so vault autofill does not exist on the engine plane — the agent had to post
-raw input events to the daemon socket with the secret in a 0600 file to keep
-it off the command line. Either ship `/engine/fill` (vault-item → field, the
-engine-plane sibling of `web fill --entry`) or fix the doc; shipping it is
-the right call, the workaround is fragile and every credentialed engine run
-will need it.
+**The observation owed:** `ychrome ctl fill page_id=<p> entry=<item>` answering
+`{"filled":"filled"}` against a real login form, with the page-side field
+length read back afterwards. It cannot be observed yet: the dev daemon is
+still serving pre-fix code and **refuses to retire under 4 live surfaces, one
+of them the operator's linked WhatsApp Web session** (a restart costs a phone
+QR re-scan). ychrome's contract makes that handover the operator's call, so
+the binary is installed and waiting at `~/.local/bin/ychrome`; the verb goes
+live on the next `ychrome daemon restart`.
+
+**What shipped** (ychrome `95b116a`, plus the doc correction): `/engine/fill`
+takes `{page_id, entry, user?}` and answers
+`{ok, entry, filled: "filled"|"user-only"|"no-fields"}`, with a locked vault
+answering `502 vault: …` so it cannot be mistaken for a page error. The
+secret goes agent → eval script → dropped, exactly as the sidebar's own fill
+action does; the reply names fields, never values. Two tests hold it: `fill`
+is in `DRIVES_A_PAGE` (else the governor could park the page between `open`
+and `fill` and the fill would land on nothing while answering 200), and the
+route is asserted never to mention a password field.
+
+⚠ **The fix landed inside a commit whose message is about something else.**
+Another agent's `git add` swept these files up mid-edit, so `95b116a` reads
+as a stale-port docs commit and contains the engine route. It was already
+pushed, and rewriting shared history in THIS repo is the trap that cost the
+relicence pass, so it stays. **Do not go looking for a `feat(engine)` commit
+— there isn't one.** The general lesson: on a fleet where agents share a
+checkout, `git add -A` is not a safe habit; stage explicit paths.
+
+*(original report, 2026-08-01, found while an agent filed a GitHub support
+ticket headlessly: `agent-engine.md` §4 documented `ychrome ctl fill` but the
+daemon exposed no `/engine/fill`, so the agent had to post raw input events
+to the daemon socket with the secret in a 0600 file to keep it off the
+command line.)*
 >
 > Earlier rounds closed: the tab rail becoming the cwdtree with folder icons,
 > nesting, the drag gesture and the density pass; Cloudflare challenges;
