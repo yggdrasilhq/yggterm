@@ -148995,7 +148995,7 @@ mod tests {
     fn merged_sidebar_rows_compress_single_child_remote_folder_chains() {
         let expanded_paths = HashSet::from([
             "__remote_machine__/guihost".to_string(),
-            "__remote_folder__/guihost/mnt/net/data/netshare/dada/obsidian/codex".to_string(),
+            "__remote_folder__/guihost/mnt/net/data/netshare/notes/obsidian/codex".to_string(),
         ]);
         let rows = merged_sidebar_rows(
             &[],
@@ -149010,7 +149010,7 @@ mod tests {
                 sessions: vec![RemoteScannedSession {
                     session_path: "remote-session://guihost/1".to_string(),
                     session_id: "1".to_string(),
-                    cwd: "/mnt/net/data/netshare/dada/obsidian/codex".to_string(),
+                    cwd: "/mnt/net/data/netshare/notes/obsidian/codex".to_string(),
                     started_at: "2026-03-24T10:00:00Z".to_string(),
                     modified_epoch: 1,
                     event_count: 1,
@@ -149031,8 +149031,8 @@ mod tests {
         assert!(rows.iter().any(|row| {
             row.kind == BrowserRowKind::Group
                 && row.full_path
-                    == "__remote_folder__/guihost/mnt/net/data/netshare/dada/obsidian/codex"
-                && row.label == "/mnt/net/data/netshare/dada/obsidian/codex"
+                    == "__remote_folder__/guihost/mnt/net/data/netshare/notes/obsidian/codex"
+                && row.label == "/mnt/net/data/netshare/notes/obsidian/codex"
         }));
         assert!(
             !rows
@@ -151601,7 +151601,7 @@ mod tests {
             scanned_sessions: vec![RemoteScannedSession {
                 session_path: "remote-session://guihost/1".to_string(),
                 session_id: "1".to_string(),
-                cwd: "/mnt/net/data/netshare/dada/obsidian/codex".to_string(),
+                cwd: "/mnt/net/data/netshare/notes/obsidian/codex".to_string(),
                 started_at: "2026-03-24T10:00:00Z".to_string(),
                 modified_epoch: 1,
                 event_count: 1,
@@ -151618,9 +151618,9 @@ mod tests {
         assert_eq!(
             compressed_remote_folder_paths(
                 &machine.scanned_sessions,
-                "/mnt/net/data/netshare/dada/obsidian/codex",
+                "/mnt/net/data/netshare/notes/obsidian/codex",
             ),
-            vec!["/mnt/net/data/netshare/dada/obsidian/codex".to_string()]
+            vec!["/mnt/net/data/netshare/notes/obsidian/codex".to_string()]
         );
     }
     #[test]

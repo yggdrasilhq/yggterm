@@ -131,6 +131,69 @@ callers and the npm bundle is never built. Dead or not, while the files are in t
 repository the obligation above stands. If it is ever removed, remove this section
 in the same commit.
 
+## Bundled assets
+
+⚠ **This section was missing until 2026-08-02**, and the omission is the same
+shape as the `third_party/t3code-timeline` gap recorded above: source that
+carries an obligation, shipped in the binary, named nowhere a redistributor
+would look. Vendored *code* was audited; vendored *assets* were not, because
+they are not crates and so never appeared in a `cargo` licence sweep. **A
+licence obligation does not care whether the file compiles.**
+
+Worse, most of these arrived as build artifacts with their headers already
+stripped, so the files cannot speak for themselves. Only `assets/xterm/xterm.css`
+still carries its own MIT header; the three JavaScript bundles beside it are
+minified and carry nothing. **A minified asset is a notice-erasing operation**,
+which is precisely when the top-level notice has to do the work instead.
+
+### `assets/xterm/` — MIT
+
+xterm.js (© 2017 The xterm.js authors; portions © 2012-2013 Christopher Jeffrey),
+distributed as prebuilt bundles: `xterm.js`, `addon-fit.js`, `addon-webgl.js`,
+and `xterm.css`.
+
+MIT requires the copyright and permission notice to travel with the copy.
+`xterm.css` retains its header inline. The three `.js` bundles are minified and
+do **not**, so this section is their notice and must not be deleted while those
+files are in the repository.
+
+### `assets/terminal-themes/ghostty/` — MIT
+
+463 colour-scheme files in Ghostty's `palette = N=#RRGGBB` format, bundled so the
+terminal can offer the same theme names users know from Ghostty
+(<https://github.com/ghostty-org/ghostty>, MIT). Ghostty's theme set is itself
+largely derived from **iTerm2-Color-Schemes**
+(<https://github.com/mbadolato/iTerm2-Color-Schemes>, MIT).
+
+The directory carries no licence file of its own — unlike `vendor/wry` and
+`third_party/t3code-timeline`, which ship theirs. It should: see the follow-up
+below.
+
+⚠ **Colour values are facts and a palette is thin on originality**, so some of
+these files may carry no protectable expression at all. That argument is not
+worth relying on when the upstream terms are MIT and the compliance cost is one
+paragraph. Attribute, and stop thinking about it.
+
+### `crates/yggterm-shell/assets/symbols-nerd-mono.woff2.b64` — MIT
+
+Symbols Nerd Font Mono, from Nerd Fonts
+(<https://github.com/ryanoasis/nerd-fonts>), base64-encoded for inlining. The
+symbols-only font is MIT. It sits alone in that directory with no adjacent
+notice, so this entry is it.
+
+⚠ **This applies to the symbols-only font specifically.** Nerd Fonts also ships
+*patched* versions of other typefaces which inherit their upstream licences —
+several are OFL, one is a different licence again. If a patched font is ever
+bundled, it needs its own entry here; do not assume this one covers it.
+
+### Follow-up owed
+
+`assets/terminal-themes/ghostty/` and `crates/yggterm-shell/assets/` should each
+gain a small `LICENSE`/`NOTICE` file the way `vendor/` and `third_party/` trees
+do, so a copy of the directory alone still carries its terms. Listing them here
+satisfies the notice obligation for a copy of the *repository*; it does not help
+someone who lifts one directory.
+
 ## No filter data lives here
 
 ⚠ **The reason changed on 2026-08-01; the rule did not.** yggterm once shipped

@@ -152,7 +152,7 @@ When choosing whether to ship a feature, ask: "does this advance baseline parity
 - When durable design preferences emerge during collaboration, update `DESIGN.md` instead of leaving them implicit in chat history.
 - Upstream-first integration: prefer proven layout patterns from `../zed` and a thin adapter boundary around terminal/runtime dependencies instead of reimplementing behavior blindly.
 - Minimize forks: keep Yggterm-specific code as adapter layers around upstream crates/APIs so upstream pulls stay low-friction.
-- Keep Yggterm-owned shell chrome and session UI in local crates so the desktop frontend stays maintainable and Apache-licensed.
+- Keep Yggterm-owned shell chrome and session UI in local crates so the desktop frontend stays maintainable and stays under the project's own licence.
 - Reuse upstream Zed layout ideas and `codex-session-tui` browser behavior, but do not couple the active shell to GPUI crates again unless that tradeoff is revisited explicitly.
 - Replace editor-centric open flows with terminal-centric behavior: selecting a tree node should open, restore, or focus Yggterm PTY sessions rather than text buffers.
 - The central viewport should host embedded xterm.js terminal views in place of file editors.
@@ -286,8 +286,15 @@ When choosing whether to ship a feature, ask: "does this advance baseline parity
 
 ## Licensing
 
-- Repository license: Apache License 2.0.
-- Markdown documentation license: CC BY-SA 4.0.
+- Repository license: GNU General Public License, version 3 or later
+  (`GPL-3.0-or-later`); see `LICENSE`. This changed on 2026-08-01 and the
+  history was re-rooted to match, so there is no Apache-licensed lineage left
+  to inherit from — do not reintroduce that claim anywhere.
+- Markdown documentation license: CC BY-SA 4.0; see `LICENSE-CC-BY-SA-4.0`.
+- `LICENSE-APACHE` is retained only for third-party code under `vendor/` and
+  `third_party/`. It is not a grant over yggterm's own source.
+- Third-party obligations, including the bundled assets, are recorded in
+  `THIRD-PARTY-NOTICES.md`.
 - Copyright owner: Avikalpa Kundu.
 
 ## README And Release Notes Contract
