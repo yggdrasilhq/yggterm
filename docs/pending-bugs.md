@@ -387,6 +387,22 @@ all, which is why `rail_autohide_pinned`'s new menu term is unit-proven but
 not yet live-proven end-to-end.
 
 
+## ⚠ TOOLING: agents have no first-class access layer for DELEGATE sessions
+
+**Status:** OPEN (feature debt, user-requested 2026-08-02 — "easy for you
+(agents) access layer on yggui automations")
+
+The delegate-session pattern (a guiding agent launches an interactive
+CC/codex session in a yggterm row for the user to answer) is now the standing
+work pattern, and every step of it is hand-rolled: `--kind claude-code`
+cannot pin model/permission-mode (and inherits the user's default model — a
+live cost trap), a pending AskUserQuestion is invisible off-screen (JSONL
+gets it only when answered; client read-buffer is blank for never-activated
+rows), row order is only a debug field, and `terminal send`'s `accepted:true`
+cannot see whether the old child still owns the PTY. Eight ranked, costed
+feature asks: **[`docs/agent-bg-sessions-dream-2026-08-02.md`](agent-bg-sessions-dream-2026-08-02.md)**.
+Interim recipe + traps: data-fabric skill §THE BG-SESSION PLANE.
+
 ## ⚠ TOOLING: app state's DOM debug snapshot times out on jojo, so every DOM
 
 **Status:** OPEN

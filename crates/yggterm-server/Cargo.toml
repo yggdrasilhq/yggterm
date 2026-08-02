@@ -27,7 +27,7 @@ tracing.workspace = true
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 vt100 = "0.16.2"
-yggui-contract = { path = "../yggui-contract" }
+yggui-contract.workspace = true
 yggterm-core = { path = "../yggterm-core" }
 yggterm-ghostty-bridge = { path = "../yggterm-ghostty-bridge", default-features = false }
 yggterm-gtk-glue = { path = "../yggterm-gtk-glue" }
