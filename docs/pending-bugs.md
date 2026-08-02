@@ -13,6 +13,59 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ★★ TWO `web fill-vault` CALLS IN A ROW INTERLEAVE, AND CORRUPT BOTH FIELDS
+
+**Status:** OPEN
+
+Found 2026-08-02 driving the IP India TM-A filing — on a login form, with a
+vault password, which is the worst place for it.
+
+**What happened.** Two fills fired back-to-back against the same page:
+
+```
+web fill-vault --field username --selector '#TBUserName'   # vault holds "avikalpa"
+web fill-vault --field password --selector '#TBPassword'   # vault holds 14 chars
+```
+
+The username field read back **`avikalpad`** — one character too many — and the
+password field read **15** characters on one probe and **16** on the next read
+of the same field, against a vault value of **14**. Filling them again with a
+4-second settle between the calls produced exactly `avikalpa` / 14, repeatably.
+
+**So the verb returns before its typing has landed.** It types with real key
+events (that is the point — a synthetic `value` set does not survive React or
+ASP.NET validators), but the reply comes back on dispatch rather than on
+completion, so a second fill starts while the first is still emitting and the
+keystrokes cross fields.
+
+⛔ **The reply is the LIE-OF-SUCCESS shape**: both calls answered
+`"is_trusted": true` with no error, and the `"matched": false` field says
+nothing about the damage. Nothing in the envelope indicates the field now holds
+something other than what the vault holds.
+
+**Why it matters more than a typo.** A password field silently gaining a
+character is an authentication failure the user reads as a wrong password — and
+on portals that lock after N attempts, three scripted retries burn the account.
+It also defeats the one defence the co-browse plane has, which is reading the
+page-side effect back: the read itself races the fill, so a readback taken too
+early reports a length that is neither the old nor the final value (15, then 16,
+then settling at 14).
+
+**Owed:**
+1. `web do fill` / `web fill-vault` / `web fill-card` must not answer until the
+   last keystroke has been dispatched to the page — the verb owns the
+   completion, not the caller's `sleep`.
+2. Until then the envelope should carry the resulting field LENGTH so a caller
+   can compare without a second round trip that races.
+3. ⚠ Do not "fix" this by going back to setting `.value` directly; the trusted
+   typing is load-bearing (`web do click` refuses a zero-size input for the same
+   family of reasons).
+
+**Interim recipe for anyone filing a form:** one fill per call, settle ~3-4 s
+between them, and read back the LENGTH against the vault's own
+(`ychrome-vault get <item> <user> --field password | tr -d '\n' | wc -c`).
+
+
 ## eMudhra's video-KYC recording timer never advanced — NOT explained by the hang
 
 **Status:** OPEN
