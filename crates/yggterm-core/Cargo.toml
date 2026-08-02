@@ -20,7 +20,7 @@ flate2 = "1"
 semver = "1"
 sha2 = "0.11.0"
 tar = "0.4"
-yggui-contract = { path = "../yggui-contract" }
+yggui-contract.workspace = true
 
 # `gl_probe` asks libEGL what this host rasterizes with. dlopen rather than link:
 # a terminal must start on a host with no GL at all, and this crate must not grow a
