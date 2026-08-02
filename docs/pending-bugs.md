@@ -1436,47 +1436,20 @@ symptoms, and the last two are strongly suspected to share a root:
      obvious follow-up; (c) suspending reads for a long handover can overrun the
      daemon's 512-chunk ring, which lands on the existing `resync_required`
      path (scrollback-preserving screen reconcile), unchanged by this lane.
-  8. **AUDIO NOTIFICATIONS NEED A PRE-ROLL.** Bluetooth speakers clip roughly the
-     first ~300 ms while the link wakes, so the start of every notification is
-     lost. The user suggested ~150 ms and invited a better figure. **Use
-     very-low-amplitude noise, not silence** — many A2DP stacks drop or fail
-     to prime the link on pure digital silence, so the pre-roll needs a little
-     real energy (a dither-level noise floor is enough to be inaudible). Better
-     still, make it adaptive: skip the pre-roll when another notification played
-     within the last few seconds, since the link is already awake.
+  8. ✅ **AUDIO NOTIFICATIONS NEED A PRE-ROLL — CLOSED 2026-08-02, CONFIRMED BY
+     THE USER BY EAR.** The premise the first implementation was built on was
+     wrong (the webview never made a sound at all), so the shipped path is native
+     Rust and the numbers are the measured ones: **pre-roll 0.70 s**, flush tail
+     **1.10 s**, TPDF dither at ~-57 dBFS **spanning the whole render, not just
+     the front** — the tune is mostly silence by duration, so a front-only
+     pre-roll left every later note exposed to a sink that had gone back to
+     sleep, which was the reported ending-clip. The context is long-lived rather
+     than opened per chime, the adaptive skip is real
+     (`NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS`, 10 s, traced as
+     `notification_sound_preroll`), and `yggterm_core::notification_audio` owns
+     pre-roll, tail and dither for BOTH players so the native CLI and the webview
+     script cannot drift into two different chimes.
 
-     ⚠ **THE DESCRIPTION THAT USED TO STAND HERE IS SUPERSEDED (2026-07-27).**
-     It recorded the first webview implementation — a 400 ms pre-roll on an
-     `AudioContext` the emitter closed 80 ms after the last note. Both of those
-     figures are gone, and so is the premise: **the webview never made a sound
-     at all** (see the notification-audio entry above for the A/B), so the path
-     is now native Rust and the shipped numbers are the MEASURED ones:
-     - **Pre-roll 0.70 s**, flush tail **1.10 s**, TPDF dither at ~-57 dBFS.
-     - **The dither spans the WHOLE render, not just the front.** The tune is
-       mostly silence by duration (1.03 s inside a pair, 2.4 s between pairs),
-       so a front-only pre-roll leaves every later note exposed to a sink that
-       went back to sleep — which is exactly the reported ending-clip. Locked:
-       no 50 ms window of any rendered tone is digitally silent.
-     - **The context is long-lived**, not opened and closed per chime; the
-       closing context was itself part of the clipped-tail report.
-     - The registry `yggterm_core::notification_audio` owns pre-roll, tail and
-       dither for BOTH players, so the native CLI and the webview script cannot
-       drift into two different chimes.
-     **What survives from the old description, still true and still wanted:** the
-     adaptive skip is real in the GUI path — one owner
-     (`NOTIFICATION_CHIME_LAST_PLAYED_MS`, written only by the emitter) through
-     the pure `notification_preroll_decision(now, last_played)` with a 10 s
-     `NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS`, plus a
-     `notification_sound_preroll {applied, reason, tone, preroll_ms,
-     since_last_ms}` trace row; and a notification with sound off emits neither
-     chime nor pre-roll. The native CLI takes `--preroll on|off|auto` and `auto`
-     resolves to ON, deliberately: there is no shared state across CLI
-     invocations to remember with, and a wasted pre-roll beats a clipped alert.
-     **Still to do, unchanged:** hear it on jojo through the user's Bluetooth
-     speaker (the whole point is a physical A2DP link) — first note intact on a
-     cold link, later notes intact on a warm one — and confirm
-     `notification_sound_preroll` in `server trace tail`. Do not close this
-     entry until that is done.
 
 - **★★★ USER REQUIREMENTS FOR THE SESSION-ROW LIFECYCLE (stated 2026-07-26, after
   curating the list by hand TWICE).** The user's words: *"A daemon bump and
@@ -2710,42 +2683,6 @@ symptoms, and the last two are strongly suspected to share a root:
   `terminal_bootstrap_lease_reclaims_stale_never_ready_attach`). (1) dev
   daemon consolidation stays parked with B1 (user call: investigate-only).
   Remove this entry once a wedged resume recovers without manual intervention.
-
-## Deployed live on jojo, faithful-gesture confirmation pending
-
-- **Middle-click a link in a web surface → new tab.** **The 2.10.15 entry that
-  used to sit here claimed this was fixed; it never was, and the claim survived
-  fifteen releases because nobody could take the faithful pixel that would have
-  falsified it.** What 2.10.15 (c6542edc) actually shipped was the
-  `new_window_req_handler`, which fixes `window.open` and `target="_blank"` — and
-  nothing else. WebKit raises its `create` signal for a NEW_WINDOW_ACTION only, so
-  a middle-click on a plain `<a href>` with no `target` never reached that
-  handler at all: it arrived as an ordinary navigation of the current frame, and
-  with no navigation handler installed on a web surface (`web_surface.rs` never
-  called `with_navigation_handler`, and wry only connected `decide-policy` when
-  one was set) there was nobody listening. The click did NOTHING.
-  - **Now built (lane `lane/dev/middle-click`, GUI-only, no protocol bump):** wry
-    gained a `link_gesture_handler` and the `decide-policy` connection is hoisted
-    above the navigation-handler gate, so the gesture is tested whether or not an
-    embedder wants a navigation policy; a handled gesture answers
-    `webkit_policy_decision_ignore`, which is what keeps the opener page put. The
-    surface host queues a `SurfaceLinkOpen` (no webview — there is none to hand
-    back) and the shell's reconcile loop OPENS the tab with the same
-    `open_command_tab` + `navigate_web_surface_tab` pair the `open_tab` command
-    uses, never the popup-adopt path (whose `effective_url == url` would leave
-    the tab blank). Trace event: `web_surface / new_tab_from_link`. Adjacent
-    one-liner fixed in the same lane: `build_popup_webview` installed no
-    new-window handler, so a `target="_blank"` INSIDE an adopted popup was
-    silently dropped one level down; both doors are now installed on popups too.
-  - **Still pending, and this is the same gap that let the false claim stand:** a
-    FAITHFUL confirmation, which needs a real middle-click. The Xvfb harness is
-    native-surface-blind, app-control clicks never reach a child webview,
-    WebKitGTK blocks synthetic `window.open` (no user gesture), and jojo's
-    Wayland input injection is unreliable (ydotoold). Ask the user to
-    middle-click a link in a ychrome surface; confirm via the
-    `web_surface / new_tab_from_link` trace event. **Do not mark this fixed on
-    unit tests again** — the locks prove the wiring, not that WebKit delivers a
-    middle-click as a `LinkClicked` NavigationAction on this engine build.
 
 ## 3.0.0 — the product does not build for Windows or macOS (NOT NOW; ~2 months out)
 
