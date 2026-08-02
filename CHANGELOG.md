@@ -4,6 +4,28 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Every remote Claude Code session's Web View was empty, and the transcript
+  was there the whole time.** The daemon's preview lane gated its entire
+  `LiveSsh` arm on a parser that strips `remote-session://` only, so a
+  `remote-cc://` row resolved to nothing and the arm ran nothing — no cache
+  refresh, no payload fetch. Every remote Claude Code row kept only the two
+  launch-scaffold blocks, which renders as a tidy, correct, empty page.
+  Underneath it, both refresh paths wrote their result to a rebuilt
+  `remote-session://` key, so even a matching parse would have filed the
+  fetched preview under a row that does not exist.
+
+  One resolver now answers "which remote agent row is this" for both schemes,
+  and the write takes the scanner's own `session_path` instead of guessing one.
+  The `preview-tail` reader was always CLI-agnostic — measured returning 48
+  real blocks off a Claude Code transcript — so this was addressing, not
+  reading.
+
+  ⚠ Residual: the remote SCAN's `recent_context` is still Codex-shaped, so a
+  remote Claude Code row's *cached* sidebar preview and its message counts stay
+  thin until the scanner learns the CC shape. The Web View itself is fed by the
+  full payload.
+
+
 - **The session Web View is a document now, and its design language is a
   shared component set.** The transcript surface was shell markup with its
   colours spelled at the call site — one header alone carried
