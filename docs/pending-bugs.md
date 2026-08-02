@@ -13,6 +13,58 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ychrome launches on the GUI host no matter which machine the session lives on
+
+**Status:** OPEN
+
+User-reported 2026-08-02: *"why does ychrome only launch on jojo even if I right
+click on dev or oc sessions. This is undesired behavior."*
+
+**Root cause, read not guessed.** `cached_app_registry()`
+(`crates/yggterm-server/src/lib.rs:2478`) resolves
+`yggterm_core::resolve_yggterm_home()` — **the daemon's OWN home** — and scans
+`<that home>/apps/`. The registry is therefore keyed to ONE host while sessions
+are keyed to MACHINES, so a right-click on a `remote-cc://dev/…` row offers, and
+launches, the GUI host's ychrome. Nothing in the path ever asks where the
+session lives.
+
+That is a single-source-of-truth mismatch of the kind `CLAUDE.md` forbids: two
+concepts (which apps exist, and where a session runs) that must agree and have
+no shared owner.
+
+**Shape of a fix:** resolve the registry PER MACHINE — scan the session's host
+over the existing remote-command path, cached the same way (the 5 s rescan
+window and the prune-on-scan behaviour should survive), and build the launch
+command to run there rather than locally. The remote binary path is already
+known to the remote wrapper layer (`~/.yggterm/bin/`).
+
+⚠ Adjacent, do not conflate: the ychrome ENGINE not existing off the GUI host is
+a separate, already-closed ychrome entry. This one is about the launcher, and it
+affects the ordinary right-click a human uses.
+
+## A ychrome session whose last tab is closed should close itself
+
+**Status:** OPEN
+
+User-reported 2026-08-02: *"In a specific ychrome session, if all tabs are
+closed then ychrome session itself should close itself."*
+
+Today the ychrome CLI keeps its session alive after its last tab goes, leaving a
+row that owns nothing — the inverse of the settled rule that a row with no
+runtime is fine and desirable (`docs/settled-calls.md` call #4). That rule is
+about a row the USER can click to restart; this is a live session with a live
+process and nothing to show, which is different and is clutter.
+
+**Where it lives:** ychrome's `drive_surface` loop (`ychrome/src/main.rs`) owns
+the session's lifetime and emits the `close` OSC; the GUI owns tab removal
+(`web_surface_tabs`). The count that matters is the GUI's, so the honest fix is
+for the surface-close path to tell the app its last tab is gone rather than for
+the app to infer it.
+
+⚠ Do not implement this by having the app poll for tabs — that is a second
+encoding of a count the GUI already owns.
+
+
 ## Two supernumerary daemons persist holding unmigratable local:// shells
 
 **Status:** OPEN
