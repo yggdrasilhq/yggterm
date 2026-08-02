@@ -13,6 +13,94 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ★★★ EVERY REMOTE CLAUDE CODE ROW'S WEB VIEW IS EMPTY — the preview lane cannot see the `remote-cc://` scheme
+
+**Status:** OPEN
+
+*(root-caused; the fix is daemon-side and ships only with a daemon deploy)*
+
+Found 2026-08-03 immediately after the Web View rework shipped, by asking the
+daemon what it actually holds:
+
+```
+$ yggterm-headless server snapshot | (preview block count per live session)
+(2, 'remote-cc://dev/e1497434-…')   (2, 'remote-cc://dev/cfab47a1-…')
+(2, 'remote-cc://dev/b00fb6ad-…')   (2, 'remote-cc://dev/a4114db6-…')
+…  every single one: 2
+```
+
+**Two is the launch scaffold.** `build_live_session` pushes exactly two blocks
+("This Claude Code session stays attached to the daemon…" / "Claude Code is
+launched locally and will receive /exit…"). So on the GUI host **not one remote
+agent row has a transcript in its Web View**, and since the user's fleet is all
+`remote-cc://dev/…` rows, that is every row they have.
+
+### The root cause, and it is a rule this repo already wrote down
+
+`refresh_session_preview_from_source_with_remote_payload`
+(`crates/yggterm-server/src/lib.rs`, the entry at ~2931 and the `LiveSsh` arm at
+~2949) gates everything on:
+
+```rust
+fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("remote-session://")?;   // ← Codex ONLY
+```
+
+A Claude Code row is `remote-cc://`, so the `if let` **never matches** and the
+`LiveSsh` arm runs *nothing at all* — no cache refresh, no full payload. The
+session keeps its two scaffold blocks forever.
+
+⛔ **`remote_agent_row_target`'s own doc comment forbids exactly this**, in as
+many words: it is "the ONE table mapping `remote-session://` → Codex and
+`remote-cc://` → Claude Code", and every remote agent op "must resolve through
+here …, **never by re-parsing one scheme and treating the other as absent.
+Doing exactly that is what left remote Claude Code agents running after their
+row was removed.**" The preview lane does the forbidden thing. **Same bug, same
+file, second surface.**
+
+⚠ **It is not one call site.** `rg 'parse_remote_scanned_session_path'` returns
+~30, and the ones downstream of the preview lane
+(`remote_direct_attach_launch_command_for_path`, `remote_shutdown_targets`,
+`remote_shutdown_target_for_path`, `refresh_remote_scanned_session_preview_*`)
+are scheme-bound too. Fixing the two gates alone may only move the failure one
+level down — audit the lane, do not patch the first `if let`.
+
+### The second gate, which is right but worth knowing
+
+```rust
+fn should_fetch_remote_preview_full_payload(&self, path: &str) -> bool {
+    self.active_view_mode == WorkspaceViewMode::Rendered
+        && self.active_session_path.as_deref() == Some(path)
+}
+```
+
+The full remote payload is fetched only for the session the **daemon** thinks is
+active *in Rendered mode*. That is a sensible cost gate, but it means a SHADOW
+client flipping to Web View can never trigger hydration — the daemon's own
+`active_view_mode` is the active client's. **So this cannot be reproduced or
+verified from a shadow**; it needs the daemon's active session in Rendered, i.e.
+the user's own GUI on the Web View toggle.
+
+### Why it was not caught by the surface rework
+
+The rework was proven in an isolated sandbox against a **stored** `.jsonl`
+(`SessionSource::Stored` → `refresh_stored_session_preview`, a path that works),
+and live on jojo against remote rows whose *scaffold* rendered correctly in the
+new language. Both were true; neither exercised remote hydration. **A surface
+that renders its empty state beautifully looks identical to a surface with
+nothing to render.**
+
+### Owed
+
+1. One resolver for "which machine and session id does this remote agent row
+   name", covering both schemes, used by the preview lane —
+   `parse_remote_scanned_session_path(path).or_else(|| parse_remote_cc_session_path(path))`
+   is the shape, but see the audit warning above.
+2. A lock that a `remote-cc://` row reaches the same hydration a
+   `remote-session://` row does, red-proven by restoring the single-scheme parse.
+3. ⚠ **Ships only with a DAEMON deploy**, which the idle gate currently defers
+   (`session_survival_required`). The GUI half of the Web View is already live.
+
 ## ★★ TWO `web fill-vault` CALLS IN A ROW INTERLEAVE, AND CORRUPT BOTH FIELDS
 
 **Status:** OPEN
