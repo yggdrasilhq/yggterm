@@ -131389,6 +131389,7 @@ mod tests {
             title: "Doc".to_string(),
             widgets: Vec::new(),
             footer: Vec::new(),
+            split_ratio: None,
         };
 
         let seq_a = shell.document_pane_next_request("local://a");
@@ -132738,6 +132739,7 @@ mod tests {
                 line_numbers: true,
                 word_wrap: true,
             }],
+            split_ratio: None,
             footer: Vec::new(),
         }
     }
