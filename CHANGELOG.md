@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.1
+
+⚠ **The version number is load-bearing here, not ceremonial.** The daemon
+hot-swap handover is keyed on the server protocol version
+(`SERVER_PROTOCOL_VERSION = env!("CARGO_PKG_VERSION")`), so a SAME-version
+deploy has no mechanism to replace a running daemon: the on-disk binary is
+adopted by nobody and `hot_update_pending` stays false forever. The
+remote-preview fix below is daemon-side, so without this bump it would have sat
+installed and inert.
+
 - **Every remote Claude Code session's Web View was empty, and the transcript
   was there the whole time.** The daemon's preview lane gated its entire
   `LiveSsh` arm on a parser that strips `remote-session://` only, so a
