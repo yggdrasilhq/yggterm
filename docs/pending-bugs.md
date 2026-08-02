@@ -15,7 +15,9 @@ Closed narratives from before 2026-08-02 are in
 
 ## ★★★ `getUserMedia` HANGS FOREVER ON A WEB SURFACE — no prompt, no trace, no rejection
 
-**Status:** OPEN — user-reported, root cause narrowed but NOT fixed.
+**Status:** OPEN
+
+User-reported; root cause narrowed but NOT fixed.
 
 **How it reached the user, 2026-08-02.** He was doing the eMudhra video KYC for
 his eSign enrolment in a yggterm surface. He pressed START RECORDING; the
