@@ -1417,6 +1417,22 @@ struct WebSurfaceUiState {
     /// is a fact about this browsing session, and the saved tree is what the
     /// user chose to keep.
     closed_tabs: Vec<Vec<ClosedWebTab>>,
+    /// The user closed this surface's LAST content tab — a latch, set only by a
+    /// close and cleared by the next tab that opens.
+    ///
+    /// ⛔ **It is a latched EVENT, not the count `tabs.len() == 1`, and the
+    /// difference is load-bearing.** A surface legitimately holds nothing but
+    /// its app tab in the window between the app declaring and its first page
+    /// arriving, so an app told "you have no content tabs" would exit at launch
+    /// every time. What the user did — closed the last one — happens exactly
+    /// once and cannot be confused with not having opened one yet. Same rule as
+    /// §THE QUIET-GATE LAW in the campaign: prefer the positive fact over the
+    /// absence that resembles it.
+    ///
+    /// Delivered to the app on the `/ping` it already answers, on every ping
+    /// while set rather than once, so a dropped tick costs nothing and the app
+    /// needs no acknowledgement to send back.
+    last_content_tab_closed: bool,
 }
 
 /// How many close GESTURES a surface can undo. Ten is Chrome's own depth, and
@@ -13277,7 +13293,7 @@ async fn rebuild_sidebar_contribution_from_daemon_declare(
         // Liveness only, before any contribution exists — so there is no
         // declared token yet, and none is needed: `/ping`'s stamps are open.
         let alive =
-            control_ping_request(&build_control_ping_url(&effective, None, None), None).is_ok();
+            control_ping_request(&build_control_ping_url(&effective, None, None, false), None).is_ok();
         // The probe's own forward is dropped here; the rebuild opens the one it
         // keeps. Leaving this one alive would leak an `ssh -L` per probe.
         drop(forward);
@@ -18313,6 +18329,7 @@ impl ShellState {
                 find: None,
                 // A fresh surface has closed nothing yet.
                 closed_tabs: Vec::new(),
+                last_content_tab_closed: false,
             },
         ) {
             kill_web_surface_forward(&replaced);
@@ -18425,6 +18442,7 @@ impl ShellState {
                 }),
                 find: None,
                 closed_tabs: Vec::new(),
+                last_content_tab_closed: false,
             },
         ) {
             kill_web_surface_forward(&replaced);
@@ -19529,6 +19547,11 @@ impl ShellState {
             .map(|tab| tab.profile.clone())
             .unwrap_or_else(|| "default".to_string());
         let placement = web_tab_placement(&web_tab_placement_rows(&surface.tabs), &request.origin);
+        // A surface with a page in it again is not a surface whose last tab was
+        // closed. Clearing here means a reopened tab (undo, a routed open, a
+        // link) retracts the signal before the next ping carries it, so an app
+        // is never told to leave a surface the user just filled.
+        surface.last_content_tab_closed = false;
         let id = surface.next_tab_id;
         surface.next_tab_id += 1;
         surface.tabs.insert(
@@ -19624,6 +19647,9 @@ impl ShellState {
             &web_tab_placement_rows(&surface.tabs),
             &WebTabOrigin::Opener(opener_id),
         );
+        // Same retraction as the ordinary open: a popup is a page, and a surface
+        // with a page in it is not one the user emptied.
+        surface.last_content_tab_closed = false;
         let id = surface.next_tab_id;
         surface.next_tab_id += 1;
         surface.tabs.insert(
@@ -19806,10 +19832,32 @@ impl ShellState {
             // A pane pinned to the closed tab has nothing left to show
             // ([[campaign-libyggterm]] Phase 3).
             self.prune_web_view_panes();
+            // Did that close leave the app tab alone? Then the user closed the
+            // last page this surface was showing, and the app owning it has
+            // nothing left to be for. Latched HERE — in the one removal path —
+            // so every close verb in the product reports it by construction and
+            // no bulk-close path has to remember to. See the field's own note
+            // for why this is a latch and never `tabs.len() == 1`.
+            if let Some(surface) = self.web_surfaces.get_mut(session_path)
+                && surface.tabs.len() == 1
+            {
+                surface.last_content_tab_closed = true;
+            }
         }
         // Closing a FILED tab removes it from the saved tree — a folder must not
         // resurrect a tab the user closed on the next visit.
         self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
+    }
+    /// Has the user closed this session's last content tab? The one reader of
+    /// the latch, so the ping path never touches the surface map itself.
+    ///
+    /// A session with no web surface answers `false`: a plain terminal has no
+    /// tabs to have closed, and saying otherwise would tell an app that owns no
+    /// surface to go away.
+    fn web_surface_last_content_tab_closed(&self, session_path: &str) -> bool {
+        self.web_surfaces
+            .get(session_path)
+            .is_some_and(|surface| surface.last_content_tab_closed)
     }
     /// Which omnibox input is on screen for the active surface, by DOM id.
     ///
@@ -31319,9 +31367,18 @@ fn ping_query_encode(value: &str) -> String {
 /// Build the `<control>/ping` URL. Phase 5 widens it: `?session=<env_id>` is
 /// both the command-target hint AND the routing-capability marker (a daemon
 /// enables `/route` only once it has seen a `?session=` ping); `?ack=<batch>`
-/// retires the last drained command batch. Both are omitted when absent, so a
-/// pre-Phase-5 app sees exactly the old bare `/ping`.
-fn build_control_ping_url(control_url: &str, env_id: Option<&str>, ack_batch: Option<&str>) -> String {
+/// retires the last drained command batch. `?last_tab_closed=1` says the user
+/// closed the last content tab of this session's surface — the one thing the
+/// GUI knows and the app cannot, since the tab count is the GUI's to own.
+/// Every param is omitted when absent, so a pre-Phase-5 app sees exactly the
+/// old bare `/ping` and an app that does not know the new one ignores it, as
+/// every unknown query param is ignored.
+fn build_control_ping_url(
+    control_url: &str,
+    env_id: Option<&str>,
+    ack_batch: Option<&str>,
+    last_tab_closed: bool,
+) -> String {
     let base = format!("{}/ping", control_url.trim_end_matches('/'));
     let mut query: Vec<String> = Vec::new();
     if let Some(env_id) = env_id.filter(|id| !id.is_empty()) {
@@ -31329,6 +31386,9 @@ fn build_control_ping_url(control_url: &str, env_id: Option<&str>, ack_batch: Op
     }
     if let Some(ack) = ack_batch.filter(|id| !id.is_empty()) {
         query.push(format!("ack={}", ping_query_encode(ack)));
+    }
+    if last_tab_closed {
+        query.push("last_tab_closed=1".to_string());
     }
     if query.is_empty() {
         base
@@ -31348,7 +31408,7 @@ async fn sidebar_endpoint_ping_tick(
     trace_home: std::path::PathBuf,
     tick: u64,
 ) {
-    let targets: Vec<(String, String, Option<String>, Option<String>, String)> =
+    let targets: Vec<(String, String, Option<String>, Option<String>, String, bool)> =
         state.with(|shell| {
         let active = shell.sidebar_reads_live_path();
         let mut targets = Vec::new();
@@ -31361,6 +31421,7 @@ async fn sidebar_endpoint_ping_tick(
                 contribution.env_id.clone(),
                 contribution.acked_command_batch.clone(),
                 contribution.control_token.clone(),
+                shell.web_surface_last_content_tab_closed(active),
             ));
         }
         // The background sweep: every 4th tick, ping the other live
@@ -31377,12 +31438,13 @@ async fn sidebar_endpoint_ping_tick(
                     contribution.env_id.clone(),
                     contribution.acked_command_batch.clone(),
                     contribution.control_token.clone(),
+                    shell.web_surface_last_content_tab_closed(session_path),
                 ));
             }
         }
             targets
         });
-    for (session_path, control_url, env_id, ack_batch, control_token) in targets {
+    for (session_path, control_url, env_id, ack_batch, control_token, last_tab_closed) in targets {
         spawn(ping_and_apply_contribution(
             state,
             session_path,
@@ -31390,6 +31452,7 @@ async fn sidebar_endpoint_ping_tick(
             env_id,
             ack_batch,
             control_token,
+            last_tab_closed,
             trace_home.clone(),
         ));
     }
@@ -31410,9 +31473,17 @@ async fn ping_and_apply_contribution(
     // through the appctl bridge, so an app that gates it withholds the batch
     // from anyone who cannot prove they are the GUI.
     control_token: String,
+    // The user closed this surface's last content tab. Carried per ping rather
+    // than once, so a dropped tick costs nothing and the app owes no ack.
+    last_tab_closed: bool,
     trace_home: std::path::PathBuf,
 ) {
-    let ping_url = build_control_ping_url(&control_url, env_id.as_deref(), ack_batch.as_deref());
+    let ping_url = build_control_ping_url(
+        &control_url,
+        env_id.as_deref(),
+        ack_batch.as_deref(),
+        last_tab_closed,
+    );
     let Ok(Ok(reply)) = task::spawn_blocking(move || {
         control_ping_request(&ping_url, Some(control_token.as_str()))
     })
@@ -130666,6 +130737,7 @@ mod tests {
                 find: None,
                 // A fresh surface has closed nothing yet.
                 closed_tabs: Vec::new(),
+                last_content_tab_closed: false,
             },
         );
     }
@@ -130698,22 +130770,81 @@ mod tests {
     #[test]
     fn build_control_ping_url_widens_with_session_and_ack() {
         assert_eq!(
-            build_control_ping_url("http://127.0.0.1:9/", None, None),
+            build_control_ping_url("http://127.0.0.1:9/", None, None, false),
             "http://127.0.0.1:9/ping"
         );
         assert_eq!(
-            build_control_ping_url("http://127.0.0.1:9", Some("env-1"), None),
+            build_control_ping_url("http://127.0.0.1:9", Some("env-1"), None, false),
             "http://127.0.0.1:9/ping?session=env-1"
         );
         assert_eq!(
-            build_control_ping_url("http://127.0.0.1:9", Some("env 1"), Some("b#2")),
+            build_control_ping_url("http://127.0.0.1:9", Some("env 1"), Some("b#2"), false),
             "http://127.0.0.1:9/ping?session=env%201&ack=b%232"
         );
         // Empty ids read as absent, so a bare /ping still goes out.
         assert_eq!(
-            build_control_ping_url("http://127.0.0.1:9", Some(""), Some("")),
+            build_control_ping_url("http://127.0.0.1:9", Some(""), Some(""), false),
             "http://127.0.0.1:9/ping"
         );
+        // The last-tab-closed signal rides the same query, and only when set —
+        // an app that never sees the param is an app whose surface still holds
+        // a page.
+        assert_eq!(
+            build_control_ping_url("http://127.0.0.1:9", Some("env-1"), None, true),
+            "http://127.0.0.1:9/ping?session=env-1&last_tab_closed=1"
+        );
+        assert_eq!(
+            build_control_ping_url("http://127.0.0.1:9", None, None, true),
+            "http://127.0.0.1:9/ping?last_tab_closed=1"
+        );
+    }
+
+    /// Closing the last CONTENT tab tells the app; having none yet does not.
+    ///
+    /// The second half is the one that matters. A surface holds only its app tab
+    /// between the app declaring and its first page arriving, so a signal derived
+    /// from `tabs.len() == 1` would order every ychrome to quit at launch. Only a
+    /// close sets the latch.
+    #[test]
+    fn closing_the_last_content_tab_signals_the_app_but_having_none_yet_does_not() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://ws"));
+        seed_web_surface(&mut shell, "local://ws");
+        // The fixture seeds an app tab plus one filed tab; drop the filed one so
+        // this starts at "declared, nothing opened yet".
+        shell.web_surfaces.get_mut("local://ws").unwrap().tabs.truncate(1);
+
+        assert!(
+            !shell.web_surface_last_content_tab_closed("local://ws"),
+            "a surface that has not opened a page yet must not read as emptied"
+        );
+
+        let opened = shell
+            .web_surface_open_tab("local://ws", &WebTabOpenRequest::blank())
+            .expect("a content tab opens");
+        assert!(!shell.web_surface_last_content_tab_closed("local://ws"));
+
+        shell.web_surface_close_tab("local://ws", opened);
+        assert!(
+            shell.web_surface_last_content_tab_closed("local://ws"),
+            "closing the last content tab is what the app is told about"
+        );
+
+        // And a page arriving retracts it before any ping can carry it.
+        shell
+            .web_surface_open_tab("local://ws", &WebTabOpenRequest::blank())
+            .expect("a second content tab opens");
+        assert!(
+            !shell.web_surface_last_content_tab_closed("local://ws"),
+            "a surface the user filled again must not be told to close"
+        );
+    }
+
+    /// A session with no web surface has no tabs to have closed. Saying
+    /// otherwise would tell an app that owns no surface to go away.
+    #[test]
+    fn a_session_without_a_web_surface_never_reports_a_closed_last_tab() {
+        let shell = ShellState::new(test_shell_bootstrap_with_active_session("local://plain"));
+        assert!(!shell.web_surface_last_content_tab_closed("local://plain"));
     }
 
     #[test]
