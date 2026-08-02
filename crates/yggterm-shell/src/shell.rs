@@ -100790,7 +100790,7 @@ fn should_retry_terminal_ensure(error: &anyhow::Error) -> bool {
 /// View, and it renders as two launch-scaffold lines rather than as an error.
 fn session_preview_syncs_from_remote(session_path: &str) -> bool {
     let trimmed = session_path.trim_start();
-    trimmed.starts_with("remote-session://")
+    trimmed.starts_with("remote-session://") || trimmed.starts_with("remote-cc://")
 }
 /// A `remote-cc://` session is a REMOTE session: its ensure crosses SSH just
 /// like `remote-session://`, so it gets the remote attempt budget. It used to
