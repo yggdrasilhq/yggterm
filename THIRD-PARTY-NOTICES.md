@@ -51,7 +51,7 @@ The cases that needed a named judgement rather than a glance:
 | Licence | Crates | Why it is fine under GPL-3.0 |
 |---|---|---|
 | Apache-2.0 | 14 direct, plus most dual arms | Compatible with GPL**v3** in one direction: Apache code may go into a GPLv3 work, not the reverse. It is *not* compatible with GPLv2 — one reason the target is v3-or-later. |
-| MPL-2.0 | `cssparser`, `cssparser-macros`, `dtoa-short`, `selectors`, `option-ext` | MPL-2.0 §3.3 explicitly permits combining with a "Secondary License", and names the GPL. This was the one caveat under Apache; under GPL it is simply allowed. |
+| MPL-2.0 | `cssparser`, `cssparser-macros`, `dtoa-short`, `selectors`, `option-ext`, and libyggterm's own `yggui`, `yggui-contract`, `emd-renderer` | MPL-2.0 §3.3 explicitly permits combining with a "Secondary License", and names the GPL. This was the one caveat under Apache; under GPL it is simply allowed — and it is the arrangement the libyggterm split deliberately produces, which is why plain MPL is used there and the "Incompatible With Secondary Licenses" notice never is. |
 | Apache-2.0 OR LGPL-2.1-or-later OR MIT | `r-efi` (×2) | Permissive arms available anyway, and the "or later" on the LGPL arm reaches LGPL-3, which is GPLv3-compatible. |
 | Unicode-3.0 | 18 ICU crates | Permissive with a disclaimer; no copyleft, no advertising clause. |
 | BSL-1.0, Zlib, ISC, BSD-2-Clause, BSD-3-Clause, NCSA, 0BSD, CC0-1.0, Unlicense | 30-odd | Plain permissive licences, none with an advertising clause. |

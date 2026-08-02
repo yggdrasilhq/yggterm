@@ -120247,10 +120247,14 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
 
 use emd_renderer::{MdBlock, MdInline, parse_markdown_blocks, top_level_block_ranges};
 
-// The typed markdown model + parser live in the `emd-renderer` crate now
-// (docs/spec-emd-renderer.md — the markdown-superset engine that yedit,
-// paper and ztlkn share). This file keeps only the Dioxus RENDER of those
-// blocks; extracting the render is the spec's next seam.
+// The typed markdown model + parser live in `emd-renderer`, which is no longer
+// in this tree: it moved to libyggterm (MPL-2.0) on 2026-08-02, because the
+// markdown-superset engine is a platform organ every pipeline app links —
+// yedit and ztlkasten's document surfaces, breezed, charts-webapp — not a part of
+// the terminal. Its spec moved with it and is the one owner of how it behaves:
+// docs/spec-emd-renderer.md in github.com/yggdrasilhq/libyggterm. This file
+// keeps only the Dioxus RENDER of those blocks; extracting the render into
+// libyggterm as well is the spec's next seam.
 
 /// The document reading typography (user spec 2026-07-18 "readability like
 /// The New York Times", REFINED 2026-07-23: **sans-serif**, very legible,

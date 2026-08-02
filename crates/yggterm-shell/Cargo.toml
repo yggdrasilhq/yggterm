@@ -6,8 +6,12 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-pulldown-cmark = { version = "0.12", default-features = false }
-emd-renderer = { path = "../emd-renderer" }
+# ⛔ `pulldown-cmark` is deliberately NOT here. It was left behind when the
+# parser moved into `emd-renderer` (2026-07-23) and nothing in this crate has
+# named `pulldown_cmark` since — the same dead-dependency class that made
+# `yggui` unbuildable outside this workspace. The parser is emd-renderer's
+# business; this crate only renders the typed blocks it hands back.
+emd-renderer.workspace = true
 anyhow.workspace = true
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 base64 = "0.22"
