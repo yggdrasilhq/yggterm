@@ -1008,9 +1008,10 @@ fn text_field_css(palette: Palette) -> String {
         "[{FIELD_ATTR}]{{background:{fill}; \
            transition:background-color {ease}, box-shadow {ease}, border-color {ease};}} \
          [{FIELD_ATTR}=\"true\"]{{box-shadow:inset 0 0 0 1px {hairline};}} \
-         [{FIELD_ATTR}]:hover:not(:focus){{background:{fill_hover};}} \
-         [{FIELD_ATTR}=\"true\"]:hover:not(:focus){{box-shadow:inset 0 0 0 1px {hairline_hover};}} \
-         [{FIELD_ATTR}]:focus,[{FIELD_ATTR}]:focus-visible\
+         [{FIELD_ATTR}]:hover:not(:focus):not(:focus-within){{background:{fill_hover};}} \
+         [{FIELD_ATTR}=\"true\"]:hover:not(:focus):not(:focus-within)\
+           {{box-shadow:inset 0 0 0 1px {hairline_hover};}} \
+         [{FIELD_ATTR}]:focus,[{FIELD_ATTR}]:focus-visible,[{FIELD_ATTR}]:focus-within\
            {{background:{fill_focus}; box-shadow:{ring}; outline:none;}} \
          [{FIELD_ATTR}]::placeholder{{color:{muted}; opacity:0.9;}} \
          [{FIELD_ATTR}][{FIELD_STORED_ATTR}=\"true\"]::placeholder\
@@ -82353,6 +82354,11 @@ fn Titlebar(
                             style: "{search_modal_style}",
                             div {
                                 "data-titlebar-search-field-shell": "1",
+                                // The shell is a CONTAINER (the input sits inside it), so it
+                                // wears the shared field skin and the stylesheet's
+                                // :focus-within arm rings it when the inner input focuses.
+                                // libyggterm's style is box-only as of v0.3.1.
+                                "data-yggui-field": "true",
                                 style: "{search_field_shell_style}",
                                 onmousedown: move |evt| {
                                     evt.prevent_default();
