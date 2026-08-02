@@ -566,6 +566,45 @@ cannot see whether the old child still owns the PTY. Eight ranked, costed
 feature asks: **[`docs/agent-bg-sessions-dream-2026-08-02.md`](agent-bg-sessions-dream-2026-08-02.md)**.
 Interim recipe + traps: data-fabric skill §THE BG-SESSION PLANE.
 
+## ⚠ TOOLING: `app open --view preview` never settles, so a Web View change cannot be verified through the documented instrument
+
+**Status:** OPEN
+
+Found 2026-08-03 while live-proving the Web View rework, on jojo 3.0.0, against
+a shadow client on the new binary.
+
+`server app open <session> --view preview` **always** exits non-zero with
+`ready:false, reason:"preview surface not mounted"`, on every session tried
+(stored `.jsonl` rows, live `remote-cc://` rows, a plain shell), and it also
+reports `last_error=timed out waiting for app control response … after 750 ms`.
+
+**Falsified, so this is narrow and not a general app-control failure.** The same
+verb with `--view terminal` on the same session, same client, same second, DID
+switch the row (`ACTIVE: remote-cc://dev/a033a728-… Terminal`). And a second
+`--view preview` call against the row that was ALREADY active DID flip the mode
+(`… Rendered`) — so the switch itself works; it is the READINESS GATE that never
+closes.
+
+**Where it is.** `terminal_observe.rs` refuses `ready` when
+`dom.preview_scroll_count == 0 && document_editor_count == 0`. On this host the
+`app state` DOM snapshot returns **no `preview_*` keys at all** — measured
+directly: `[k for k in state["dom"] if "preview" in k]` is `[]` while the
+viewport is visibly showing a rendered transcript. So the gate is reading a
+field that is not there, concludes the surface is unmounted, and can never
+answer otherwise.
+
+⚠ **Related to but NOT the same as the `dom_debug_snapshot_timeout` entry
+below.** That one is about the snapshot failing wholesale; here the snapshot
+returns fine (terminal-host fields, buffer samples, cursor rects are all
+present) and the preview fields are simply absent from it.
+
+**Cost.** The one documented way to point a client at a Web View and confirm it
+rendered cannot be used, so a Web View change has to be proven from a
+screenshot alone, or in an isolated sandbox
+(`scripts/underglass-sandbox.sh` with a seeded transcript, which is what the
+2026-08-03 rework used). Fix the snapshot to publish `preview_scroll_count`
+again, or move the gate onto a field that exists.
+
 ## ⚠ TOOLING: app state's DOM debug snapshot times out on jojo, so every DOM
 
 **Status:** OPEN

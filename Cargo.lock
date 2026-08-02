@@ -1447,8 +1447,8 @@ dependencies = [
 
 [[package]]
 name = "emd-renderer"
-version = "0.4.0"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.4.0#ac6446f39beb87a6f1c7a2fabb4b27c78c055a97"
+version = "0.4.1"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.4.1#c6da9f3d41a1e4abfc4a6b1cd0853b5b33e64172"
 dependencies = [
  "pulldown-cmark",
 ]
@@ -7032,29 +7032,22 @@ dependencies = [
 
 [[package]]
 name = "yggui"
-version = "0.4.0"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.4.0#ac6446f39beb87a6f1c7a2fabb4b27c78c055a97"
+version = "0.4.1"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.4.1#c6da9f3d41a1e4abfc4a6b1cd0853b5b33e64172"
 dependencies = [
  "anyhow",
- "base64",
  "dioxus",
- "include_dir",
- "libc",
  "once_cell",
- "png 0.18.1",
  "serde",
  "serde_json",
- "tao",
- "time",
- "tokio",
  "tracing",
  "yggui-contract",
 ]
 
 [[package]]
 name = "yggui-contract"
-version = "0.4.0"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.4.0#ac6446f39beb87a6f1c7a2fabb4b27c78c055a97"
+version = "0.4.1"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.4.1#c6da9f3d41a1e4abfc4a6b1cd0853b5b33e64172"
 dependencies = [
  "serde",
 ]
