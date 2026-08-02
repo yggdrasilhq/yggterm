@@ -227,6 +227,13 @@ use yggterm_server::{
     remote_agent_row_runtime_after_removal, verify_session_removal,
     wait_for_app_control_response,
 };
+// The conversation surface is a SHARED component set (`yggui::conversation`),
+// not shell-local markup: the same design language has to hold for this Web
+// View and for every other Yggdrasil app that renders an agent timeline.
+use yggui::conversation::{
+    AssistantTurn, ChangedFileChips, ConversationColumn, ConversationTokens, TurnAction, UserTurn,
+    WORK_GROUP_COLLAPSED_ROWS, WorkGroup, WorkMark, WorkRow,
+};
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
     HoveredChromeControl as HoveredControl, MOTION_EMPHASIZED_DECELERATE, MOTION_ENTER_DURATION_MS,
@@ -87002,10 +87009,12 @@ fn ConversationWebView(
     on_toggle_block: EventHandler<usize>,
     on_copy_block: EventHandler<String>,
 ) -> Element {
-    // The session's own transcript, read once per render and tail-limited.
-    // Empty for a remote agent — its JSONL lives on its own host — which is
-    // what keeps the summary strip as the fallback rather than a blank pane.
-    let transcript_chat_entries = local_transcript_chat_entries(&session);
+    // ⛔ There is ONE reader of "what did this session say", and it is not
+    // here. The shell used to ALSO parse the JSONL off disk itself and draw a
+    // second chat under the first — same session, two renderers, two visual
+    // languages, and only one of them could see a remote agent. The daemon's
+    // preview model owns the answer; this component draws it.
+    let tokens = conversation_tokens(palette);
     let read_only_attr = provider.read_only.to_string();
     let can_send_attr = provider.can_send.to_string();
     let can_edit_attr = provider.can_edit.to_string();
@@ -87029,7 +87038,13 @@ fn ConversationWebView(
             "data-preview-window-client-height": "{preview_window.viewport_height_px.round() as i64}",
             "data-preview-window-scroll-height": "{preview_window.scroll_height_px.round() as i64}",
             "data-preview-window-overscan": "{preview_window.overscan_px.round() as i64}",
-            style: "display:flex; flex-direction:column; gap:14px; min-width:0; width:min(1020px, 100%); margin:0 auto;",
+            // The reading column, its stylesheet and its theme variables all
+            // come from the shared component — this surface no longer owns a
+            // width, a gap or a font of its own.
+            style: "display:flex; flex-direction:column; min-width:0; width:100%;",
+            ConversationColumn {
+            tokens,
+            surface_id: session.session_path.clone(),
             ConversationProviderHeader {
                 session: session.clone(),
                 provider: provider.clone(),
@@ -87091,105 +87106,90 @@ fn ConversationWebView(
                         .await;
                 },
             }
-            // The real transcript, rendered as a chat, when this session has one
-            // on THIS host. It supersedes the summary strip rather than sitting
-            // beside it: the strip is a 3-line-per-card précis, and showing a
-            // précis above the conversation it summarises is just noise.
-            //
-            // Empty means no local JSONL — a remote agent's transcript lives on
-            // its own host — so the strip stays and nothing regresses.
-            if !transcript_chat_entries.is_empty() {
-                TranscriptChat {
-                    entries: transcript_chat_entries.clone(),
-                    palette,
-                }
-            } else if !rendered_sections.is_empty() {
+            // The summary strip is the FALLBACK, not a companion: a session
+            // with a timeline shows the timeline, and a précis printed above
+            // the conversation it summarises is noise.
+            if visible_block_count == 0 && !rendered_sections.is_empty() {
                 RenderedSectionsStrip {
                     sections: rendered_sections.clone(),
                     palette,
                 }
             }
+            }
         }
     }
 }
+/// Who is speaking, where from, and whether the reader may answer.
+///
+/// One quiet metadata line, not four pills. It used to be four, each with a
+/// hardcoded `rgba(255,255,255,…)` surface — invisible-to-unreadable in dark,
+/// because the colours were spelled at the call site instead of taken from the
+/// theme. Everything here now reads from [`ConversationTokens`], and the only
+/// term that is allowed to carry colour is the one that says whether this
+/// session can be typed into, because that is the one the user acts on.
 #[component]
 fn ConversationProviderHeader(
     session: ManagedSessionView,
     provider: ConversationProviderModel,
     palette: Palette,
 ) -> Element {
+    let tokens = conversation_tokens(palette);
     let host_label = if session.host_label.trim().is_empty() {
         "local".to_string()
     } else {
         session.host_label.clone()
     };
+    let term_style = format!(
+        "min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:{};",
+        tokens.meta,
+    );
+    let separator_style = format!("flex:0 0 auto; opacity:0.5; color:{};", tokens.meta);
     rsx! {
         div {
             "data-conversation-provider-header": "1",
             style: format!(
-                "display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; \
-                 min-width:0; padding:0 8px 2px 8px; color:{}; font-family:{};",
-                palette.muted,
-                interface_font_family()
+                "display:flex; align-items:center; justify-content:space-between; gap:12px; \
+                 flex-wrap:wrap; min-width:0; padding:0 2px 2px 2px; border-bottom:1px solid {}; \
+                 font-family:{}; font-size:10.5px; letter-spacing:0.04em; color:{};",
+                tokens.hairline, tokens.ui_font, tokens.meta,
             ),
             div {
-                style: "display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:wrap;",
+                style: "display:flex; align-items:center; gap:8px; min-width:0;",
                 div {
+                    style: format!(
+                        "width:6px; height:6px; border-radius:999px; flex:0 0 auto; background:{};",
+                        if provider.read_only { tokens.meta } else { tokens.accent },
+                    ),
+                }
+                span {
                     "data-conversation-provider-label": "1",
                     style: format!(
-                        "display:inline-flex; align-items:center; gap:7px; min-width:0; max-width:min(100%, 320px); \
-                         padding:6px 10px; border-radius:999px; background:rgba(255,255,255,0.72); color:{}; \
-                         font-size:11px; font-weight:760; box-shadow:inset 0 0 0 1px rgba(170,190,212,0.18);",
-                        palette.text
+                        "min-width:0; max-width:min(100%, 320px); overflow:hidden; \
+                         text-overflow:ellipsis; white-space:nowrap; font-weight:660; color:{};",
+                        tokens.work_ink,
                     ),
-                    div {
-                        style: format!(
-                            "width:7px; height:7px; border-radius:999px; background:{}; flex:0 0 auto;",
-                            palette.accent
-                        )
-                    }
-                    span {
-                        style: "min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
-                        "{provider.label}"
-                    }
+                    "{provider.label}"
                 }
-                div {
+                span { style: "{separator_style}", "·" }
+                span {
                     "data-conversation-source-label": "1",
-                    style: format!(
-                        "display:inline-flex; align-items:center; max-width:min(100%, 260px); padding:6px 9px; \
-                         border-radius:999px; background:rgba(255,255,255,0.48); color:{}; font-size:11px; font-weight:650; \
-                         box-shadow:inset 0 0 0 1px rgba(170,190,212,0.13);",
-                        palette.muted
-                    ),
-                    span {
-                        style: "min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
-                        "{provider.source_label}"
-                    }
+                    style: "{term_style}",
+                    "{provider.source_label}"
                 }
             }
             div {
-                style: "display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:wrap; justify-content:flex-end;",
-                div {
+                style: "display:flex; align-items:center; gap:8px; min-width:0; justify-content:flex-end;",
+                span {
                     "data-conversation-host-label": "1",
-                    style: format!(
-                        "display:inline-flex; align-items:center; max-width:min(100%, 220px); padding:6px 9px; \
-                         border-radius:999px; background:rgba(255,255,255,0.48); color:{}; font-size:11px; font-weight:650; \
-                         box-shadow:inset 0 0 0 1px rgba(170,190,212,0.13);",
-                        palette.muted
-                    ),
-                    span {
-                        style: "min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
-                        "{host_label}"
-                    }
+                    style: "{term_style}",
+                    "{host_label}"
                 }
-                div {
+                span { style: "{separator_style}", "·" }
+                span {
                     "data-conversation-capability-label": "{provider.capability_label}",
                     style: format!(
-                        "display:inline-flex; align-items:center; gap:7px; padding:6px 10px; border-radius:999px; \
-                         background:{}; color:{}; font-size:11px; font-weight:760; \
-                         box-shadow:inset 0 0 0 1px rgba(170,190,212,0.16);",
-                        if provider.read_only { "rgba(255,255,255,0.62)" } else { "rgba(95,168,255,0.14)" },
-                        if provider.read_only { palette.muted } else { palette.accent }
+                        "flex:0 0 auto; white-space:nowrap; font-weight:660; color:{};",
+                        if provider.read_only { tokens.meta } else { tokens.accent },
                     ),
                     "{provider.capability_label}"
                 }
@@ -87731,156 +87731,6 @@ fn PreviewGraph(
         }
     }
 }
-/// How much of a live transcript the chat view reads.
-///
-/// Transcripts run to tens of megabytes on a long session. The reader is
-/// tail-limited because the useful end of a conversation is the recent end, and
-/// because parsing the whole file on every snapshot would stall the GUI thread.
-const TRANSCRIPT_CHAT_MAX_ENTRIES: usize = 400;
-
-/// Read a LOCAL agent session's transcript for the chat view.
-///
-/// Local only, deliberately. A remote agent's JSONL lives on its own host and
-/// reaching it is the remote-scan problem — the same boundary the loopback
-/// transcript server draws when it returns `Ok(None)` for a non-local session.
-/// Returning nothing here leaves the existing summary strip in place rather
-/// than inventing a half-transcript.
-fn local_transcript_chat_entries(
-    session: &ManagedSessionView,
-) -> Vec<yggterm_core::TranscriptEntry> {
-    if session.source != SessionSource::LiveLocal && session.source != SessionSource::Stored {
-        return Vec::new();
-    }
-    let uuid = session
-        .session_path
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    if uuid.is_empty() {
-        return Vec::new();
-    }
-    let Some(path) = yggterm_core::local_cc_session_jsonl_path(&uuid) else {
-        return Vec::new();
-    };
-    yggterm_core::read_agent_transcript_entries_tail_limited(
-        &path,
-        TRANSCRIPT_CHAT_MAX_ENTRIES,
-    )
-    .unwrap_or_default()
-}
-
-/// The rendered transcript, as a chat.
-///
-/// This is the native half of what the vendored T3 timeline drew in a webview.
-/// It exists in Dioxus rather than as a bundled web app because the bundle was
-/// a gitignored npm build product that no packaging step ever shipped: the
-/// asset resolver's only working fallback was the repo path, so every installed
-/// copy fell through and rendered a placeholder. A native view has no assets to
-/// lose.
-///
-/// Tool calls fold to their headline. That is the whole reason the reader
-/// carries one — a call the user has to expand to identify defeats folding.
-#[component]
-fn TranscriptChat(
-    entries: Vec<yggterm_core::TranscriptEntry>,
-    palette: Palette,
-) -> Element {
-    use yggterm_core::{TranscriptEntryKind, TranscriptRole};
-    rsx! {
-        div {
-            "data-transcript-chat": "1",
-            style: "display:flex; flex-direction:column; gap:14px; padding:18px 22px 40px 22px;                     max-width:920px; width:100%; margin:0 auto; box-sizing:border-box;",
-            for (index, entry) in entries.iter().enumerate() {
-                {
-                    let is_user = entry.role == TranscriptRole::User;
-                    let accent: &'static str = match entry.role {
-                        TranscriptRole::User => palette.accent,
-                        TranscriptRole::Assistant => palette.text,
-                        TranscriptRole::System => palette.muted,
-                    };
-                    match entry.kind {
-                        TranscriptEntryKind::ToolCall => {
-                            let tool = entry.tool.clone().unwrap_or_default();
-                            let stats = if tool.added_lines > 0 || tool.removed_lines > 0 {
-                                format!("  +{} −{}", tool.added_lines, tool.removed_lines)
-                            } else {
-                                String::new()
-                            };
-                            rsx! {
-                                details {
-                                    key: "tool-{index}",
-                                    "data-transcript-tool": "{tool.tool}",
-                                    style: format!(
-                                        "border-radius:12px; padding:8px 12px;                                          background:{}; box-shadow:inset 0 0 0 1px {};",
-                                        palette.panel_alt, palette.border,
-                                    ),
-                                    summary {
-                                        style: format!(
-                                            "cursor:pointer; font-size:12px; font-family:ui-monospace,monospace;                                              color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                                            if tool.failed { "#e06c75" } else { palette.muted },
-                                        ),
-                                        // The tool's own name, never translated.
-                                        span {
-                                            style: format!("font-weight:700; color:{};", accent),
-                                            "{tool.tool}"
-                                        }
-                                        "  {tool.headline}{stats}"
-                                    }
-                                    if !tool.detail.is_empty() {
-                                        pre {
-                                            style: format!(
-                                                "margin:8px 0 2px 0; font-size:12px; line-height:1.45;                                                  white-space:pre-wrap; word-break:break-word; color:{};",
-                                                palette.text,
-                                            ),
-                                            "{tool.detail.join(\"\n\")}"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {
-                            let body = entry.lines.join("\n");
-                            let label = match entry.kind {
-                                TranscriptEntryKind::Reasoning => "THINKING",
-                                _ => entry.role.display_label(),
-                            };
-                            let dim = entry.kind == TranscriptEntryKind::Reasoning;
-                            rsx! {
-                                div {
-                                    key: "msg-{index}",
-                                    "data-transcript-role": "{label}",
-                                    style: format!(
-                                        "display:flex; flex-direction:column; gap:5px;                                          align-self:{}; max-width:{};",
-                                        if is_user { "flex-end" } else { "flex-start" },
-                                        if is_user { "84%" } else { "100%" },
-                                    ),
-                                    div {
-                                        style: format!(
-                                            "font-size:10px; font-weight:700; letter-spacing:0.08em; color:{};",
-                                            if dim { palette.muted } else { accent },
-                                        ),
-                                        "{label}"
-                                    }
-                                    div {
-                                        style: format!(
-                                            "font-size:13px; line-height:1.55; white-space:pre-wrap;                                              word-break:break-word; border-radius:14px; padding:10px 14px;                                              background:{}; color:{}; {}",
-                                            if is_user { palette.panel_alt } else { "transparent" },
-                                            if dim { palette.muted } else { palette.text },
-                                            if dim { "font-style:italic;" } else { "" },
-                                        ),
-                                        "{body}"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[component]
 fn RenderedSectionsStrip(sections: Vec<SessionRenderedSection>, palette: Palette) -> Element {
     rsx! {
@@ -88530,6 +88380,15 @@ fn AgentModeSelector(
         }
     }
 }
+/// One stretch of the timeline that belongs to a single side of the
+/// conversation, drawn through the shared conversation components.
+///
+/// An assistant run is not one thing: it interleaves prose the user came to
+/// read with tool calls and thinking they did not. So the run is SPLIT before
+/// it is drawn — consecutive activity collects into one [`WorkGroup`], and each
+/// prose block becomes its own [`AssistantTurn`] at full reading weight. A user
+/// run is always one card; consecutive asks with nothing between them are one
+/// thing the person said.
 #[component]
 fn PreviewRunBlock(
     session_id: String,
@@ -88538,163 +88397,289 @@ fn PreviewRunBlock(
     on_toggle_block: EventHandler<usize>,
     on_copy_block: EventHandler<String>,
 ) -> Element {
-    let user_run = run.tone == PreviewTone::User;
-    let row_justify = if user_run { "flex-end" } else { "center" };
-    let serif_stack = "\"Source Serif 4\", \"Noto Serif\", \"Iowan Old Style\", Georgia, serif";
-    let column_style = if user_run {
-        format!(
-            "display:flex; flex-direction:column; gap:0; width:auto; max-width:min(72%, 720px); \
-             min-width:0; box-sizing:border-box; font-family:{};",
-            serif_stack
-        )
-    } else {
-        format!(
-            "display:flex; flex-direction:column; gap:0; width:min(100%, 740px); max-width:min(100%, 740px); min-width:0; \
-             box-sizing:border-box; font-family:{};",
-            serif_stack
-        )
-    };
-    let dark = palette_is_dark(palette);
-    let background = if user_run {
-        if dark {
-            "rgba(52,56,64,0.96)"
-        } else {
-            "rgba(241,243,246,0.98)"
-        }
-    } else {
-        "transparent"
-    };
-    let border = if user_run {
-        if dark {
-            "rgba(96,104,116,0.32)"
-        } else {
-            "rgba(223,227,233,0.98)"
-        }
-    } else {
-        "transparent"
-    };
-    let shadow = if user_run {
-        if dark {
-            "0 12px 24px rgba(0,0,0,0.18)"
-        } else {
-            "0 10px 20px rgba(148,163,184,0.10)"
-        }
-    } else {
-        "none"
-    };
+    let tokens = conversation_tokens(palette);
+    if run.tone == PreviewTone::User {
+        let copy_text = run
+            .entries
+            .iter()
+            .map(|entry| entry.block.lines.join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let timestamp = run
+            .entries
+            .first()
+            .map(|entry| entry.display_timestamp.clone())
+            .unwrap_or_default();
+        return rsx! {
+            UserTurn {
+                tokens,
+                timestamp,
+                actions: preview_copy_actions(&copy_text, on_copy_block),
+                for entry in run.entries.iter().cloned() {
+                    div {
+                        key: "{entry.block_ix}",
+                        id: "{preview_block_dom_id(&session_id, entry.block_ix)}",
+                        "data-preview-entry": "1",
+                        "data-preview-tone": "user",
+                        "data-preview-block-ix": "{entry.block_ix}",
+                        "data-preview-raw-timestamp": "{entry.block.timestamp}",
+                        style: "width:100%; min-width:0;",
+                        PreviewContent { lines: entry.block.lines.clone(), palette }
+                    }
+                }
+            }
+        };
+    }
     rsx! {
-        div {
-            style: format!("display:flex; justify-content:{}; width:100%; padding:0 8px; box-sizing:border-box;", row_justify),
-            div {
-                style: "{column_style}",
-                div {
-                    style: format!(
-                        "display:flex; flex-direction:column; gap:0; background:{}; border-radius:{}px; \
-                         box-shadow:{}; {} box-sizing:border-box; min-width:0; overflow:visible; {}",
-                        background,
-                        if user_run { 22 } else { 0 },
-                        shadow,
-                        if user_run {
-                            format!("border:1px solid {};", border)
-                        } else {
-                            String::new()
-                        },
-                        if user_run {
-                            String::new()
-                        } else {
-                            "border:none !important; outline:none !important; box-shadow:none !important; background:transparent !important;".to_string()
-                        }
-                    ),
-                    for (entry_ix, entry) in run.entries.iter().cloned().enumerate() {
-                        div {
-                            key: "{entry.block_ix}",
-                            id: "{preview_block_dom_id(&session_id, entry.block_ix)}",
-                            "data-preview-entry": "1",
-                            "data-preview-tone": if user_run { "user" } else { "assistant" },
-                            "data-preview-block-ix": "{entry.block_ix}",
-                            "data-preview-raw-timestamp": "{entry.block.timestamp}",
-                            style: format!(
-                                "width:100%; min-width:0; box-sizing:border-box; text-align:left; background:transparent; padding:{}; \
-                                 {} {} {}",
-                                if user_run { "13px 16px" } else { "12px 16px 14px 16px" },
-                                if entry_ix > 0 {
-                                    if user_run {
-                                        if dark {
-                                            "border-top:1px solid rgba(100,108,120,0.24);".to_string()
-                                        } else {
-                                            "border-top:1px solid rgba(223,227,233,0.92);".to_string()
-                                        }
-                                    } else {
-                                        "border-top:none;".to_string()
-                                    }
-                                } else {
-                                    String::new()
-                                },
-                                if user_run {
-                                    "border-radius:0;".to_string()
-                                } else {
-                                    String::new()
-                                },
-                                if user_run {
-                                    String::new()
-                                } else {
-                                    "border:none !important; outline:none !important; box-shadow:none !important; background:transparent !important;".to_string()
-                                }
-                            ),
-                            if preview_block_is_activity(&entry.block) {
-                                PreviewActivityBlock {
-                                    block: entry.block.clone(),
-                                    block_ix: entry.block_ix,
-                                    palette,
-                                    on_toggle: on_toggle_block,
+        for segment in split_preview_run_segments(&run.entries).into_iter() {
+            match segment {
+                PreviewRunSegment::Work(entries) => rsx! {
+                    PreviewWorkSeam {
+                        key: "work:{entries.first().map(|entry| entry.block_ix).unwrap_or_default()}",
+                        session_id: session_id.clone(),
+                        entries,
+                        palette,
+                        on_toggle_block,
+                    }
+                },
+                PreviewRunSegment::Prose(entry) => rsx! {
+                    div {
+                        key: "prose:{entry.block_ix}",
+                        id: "{preview_block_dom_id(&session_id, entry.block_ix)}",
+                        "data-preview-entry": "1",
+                        "data-preview-tone": "assistant",
+                        "data-preview-block-ix": "{entry.block_ix}",
+                        "data-preview-raw-timestamp": "{entry.block.timestamp}",
+                        style: "width:100%; min-width:0;",
+                        AssistantTurn {
+                            tokens,
+                            timestamp: entry.display_timestamp.clone(),
+                            actions: preview_prose_actions(&entry, on_copy_block, on_toggle_block),
+                            if entry.block.folded {
+                                div {
+                                    style: format!(
+                                        "font-family:{}; font-size:11.5px; color:{};",
+                                        tokens.ui_font, tokens.meta,
+                                    ),
+                                    "{entry.block.lines.len()} lines hidden"
                                 }
                             } else {
-                                div {
-                                    "data-preview-timestamp": "1",
-                                    style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
-                                    if !entry.display_timestamp.trim().is_empty() {
-                                        div {
-                                            style: format!("font-size:10px; color:{}; opacity:0.82;", palette.muted),
-                                            "{entry.display_timestamp}"
-                                        }
-                                    } else {
-                                        div { style: "flex:1 1 auto;" }
-                                    }
-                                    // Per-message copy. A transcript exists to be
-                                    // taken somewhere else; a reader that can only
-                                    // be read from makes the user re-select prose
-                                    // by hand out of a virtualised list.
-                                    PreviewCopyButton {
-                                        text: entry.block.lines.join("\n"),
-                                        palette,
-                                        on_copy: on_copy_block,
-                                    }
-                                    if entry.block.folded || entry.block.lines.len() > 8 {
-                                        button {
-                                            style: format!(
-                                                "border:none; background:transparent; color:{}; font-size:10px; opacity:0.72; padding:0;",
-                                                palette.muted
-                                            ),
-                                            onclick: move |_| on_toggle_block.call(entry.block_ix),
-                                            {if entry.block.folded { "Expand".to_string() } else { "Collapse".to_string() }}
-                                        }
-                                    }
-                                }
-                                if entry.block.folded {
-                                    div {
-                                        style: format!("font-size:11px; color:{};", palette.muted),
-                                        "{entry.block.lines.len()} lines hidden"
-                                    }
-                                } else {
-                                    PreviewContent { lines: entry.block.lines.clone(), palette }
-                                }
+                                PreviewContent { lines: entry.block.lines.clone(), palette }
                             }
                         }
                     }
+                },
+            }
+        }
+    }
+}
+/// A run of consecutive machine work, as one card that can also hide its own
+/// tail.
+///
+/// The group-level fold is LOCAL state, not a daemon fact: it answers "how much
+/// of this run do I want on screen", which is a property of the reader looking
+/// at it, not of the session. Per-row folding stays with the daemon, because
+/// that IS a property of the block and has to survive a scroll out of the
+/// virtual window.
+#[component]
+fn PreviewWorkSeam(
+    session_id: String,
+    entries: Vec<PreviewRunEntry>,
+    palette: Palette,
+    on_toggle_block: EventHandler<usize>,
+) -> Element {
+    let tokens = conversation_tokens(palette);
+    let mut show_all = use_signal(|| false);
+    let total = entries.len();
+    let visible = if show_all() {
+        total
+    } else {
+        total.min(WORK_GROUP_COLLAPSED_ROWS)
+    };
+    let hidden = total.saturating_sub(visible);
+    // Reasoning-only runs are named for what they are. A run that mixes
+    // thinking with calls is "Work", which is the honest superset.
+    let label = if entries
+        .iter()
+        .all(|entry| entry.block.kind == PreviewBlockKind::Reasoning)
+    {
+        "Thinking"
+    } else {
+        "Work"
+    };
+    rsx! {
+        WorkGroup {
+            tokens,
+            label: label.to_string(),
+            count: total,
+            hidden_count: hidden,
+            expanded: show_all(),
+            on_toggle_group: move |_| show_all.toggle(),
+            for entry in entries.iter().take(visible).cloned() {
+                PreviewWorkRow {
+                    key: "{entry.block_ix}",
+                    session_id: session_id.clone(),
+                    entry,
+                    palette,
+                    on_toggle_block,
                 }
             }
         }
     }
+}
+/// One tool call or one turn of thinking.
+#[component]
+fn PreviewWorkRow(
+    session_id: String,
+    entry: PreviewRunEntry,
+    palette: Palette,
+    on_toggle_block: EventHandler<usize>,
+) -> Element {
+    let tokens = conversation_tokens(palette);
+    let block = entry.block.clone();
+    let block_ix = entry.block_ix;
+    let activity = block.activity.clone().unwrap_or_default();
+    let is_reasoning = block.kind == PreviewBlockKind::Reasoning;
+    let label = if is_reasoning {
+        "Thinking".to_string()
+    } else {
+        activity.tool.clone()
+    };
+    let headline = if is_reasoning {
+        block.lines.first().cloned().unwrap_or_default()
+    } else {
+        activity.headline.clone()
+    };
+    // A row with neither output nor changed files has nothing to open, and
+    // must not offer a chevron that does nothing.
+    let has_body = !block.lines.is_empty() || !activity.changed_files.is_empty();
+    let changed = activity.changed_files.clone();
+    let body_lines = block.lines.join("\n");
+    rsx! {
+        div {
+            id: "{preview_block_dom_id(&session_id, block_ix)}",
+            "data-preview-entry": "1",
+            "data-preview-tone": "assistant",
+            "data-preview-block-ix": "{block_ix}",
+            "data-preview-raw-timestamp": "{block.timestamp}",
+            "data-preview-activity": "1",
+            "data-preview-activity-tool": "{label}",
+            "data-preview-activity-folded": if block.folded { "1" } else { "0" },
+            style: "width:100%; min-width:0;",
+            WorkRow {
+                tokens,
+                mark: preview_work_mark(&block),
+                label: label.clone(),
+                headline,
+                added_lines: activity.added_lines,
+                removed_lines: activity.removed_lines,
+                failed: activity.failed,
+                folded: block.folded,
+                on_toggle: if has_body {
+                    Some(EventHandler::new(move |_| on_toggle_block.call(block_ix)))
+                } else {
+                    None
+                },
+                expanded_body: if has_body {
+                    Some(rsx! {
+                        if !changed.is_empty() {
+                            ChangedFileChips { tokens, files: changed.clone() }
+                        }
+                        if body_lines.trim().is_empty() {
+                            div {
+                                style: format!("color:{}; opacity:0.8;", tokens.meta),
+                                "No output recorded."
+                            }
+                        } else {
+                            div { style: "min-width:0;", "{body_lines}" }
+                        }
+                    })
+                } else {
+                    None
+                },
+            }
+        }
+    }
+}
+/// Whether a stretch of an assistant run is prose or machine work.
+enum PreviewRunSegment {
+    Prose(PreviewRunEntry),
+    Work(Vec<PreviewRunEntry>),
+}
+/// Split an assistant run so consecutive work collects and prose does not.
+///
+/// This is the whole reason the surface reads as a document: without it every
+/// tool call is a peer of the answer around it, and a run of forty buries the
+/// two paragraphs the reader actually came for.
+fn split_preview_run_segments(entries: &[PreviewRunEntry]) -> Vec<PreviewRunSegment> {
+    let mut segments: Vec<PreviewRunSegment> = Vec::new();
+    for entry in entries.iter().cloned() {
+        if preview_block_is_activity(&entry.block) {
+            if let Some(PreviewRunSegment::Work(run)) = segments.last_mut() {
+                run.push(entry);
+            } else {
+                segments.push(PreviewRunSegment::Work(vec![entry]));
+            }
+        } else {
+            segments.push(PreviewRunSegment::Prose(entry));
+        }
+    }
+    segments
+}
+/// The hover-revealed controls on a prose turn.
+///
+/// Copy is unconditional — a transcript exists to be taken somewhere else, and
+/// without it the user is re-selecting prose by hand out of a virtualised list
+/// whose rows may not be mounted. The fold control appears only for a block
+/// long enough for folding to mean something.
+fn preview_prose_actions(
+    entry: &PreviewRunEntry,
+    on_copy_block: EventHandler<String>,
+    on_toggle_block: EventHandler<usize>,
+) -> Vec<TurnAction> {
+    let block_ix = entry.block_ix;
+    let text = entry.block.lines.join("\n");
+    preview_prose_action_labels(entry)
+        .into_iter()
+        .map(|label| TurnAction {
+            label: label.to_string(),
+            on_activate: if label == "Copy" {
+                let text = text.clone();
+                EventHandler::new(move |_| on_copy_block.call(text.clone()))
+            } else {
+                EventHandler::new(move |_| on_toggle_block.call(block_ix))
+            },
+        })
+        .collect()
+}
+/// WHICH controls a prose turn offers — the policy, with no handler in it.
+///
+/// Separated so the decision can be tested: `EventHandler::new` needs a live
+/// Dioxus runtime, so a policy welded to its handlers can only be checked by
+/// rendering, which is not a unit test.
+fn preview_prose_action_labels(entry: &PreviewRunEntry) -> Vec<&'static str> {
+    let mut labels = Vec::new();
+    if !entry.block.lines.join("\n").trim().is_empty() {
+        labels.push("Copy");
+    }
+    if entry.block.folded {
+        labels.push("Expand");
+    } else if entry.block.lines.len() > PREVIEW_FOLDABLE_PROSE_LINES {
+        labels.push("Collapse");
+    }
+    labels
+}
+/// How many lines a prose block needs before folding it is worth offering.
+const PREVIEW_FOLDABLE_PROSE_LINES: usize = 8;
+fn preview_copy_actions(text: &str, on_copy_block: EventHandler<String>) -> Vec<TurnAction> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let text = text.to_string();
+    vec![TurnAction {
+        label: "Copy".to_string(),
+        on_activate: EventHandler::new(move |_| on_copy_block.call(text.clone())),
+    }]
 }
 /// Copy a Web View block's text through the app's ONE clipboard owner.
 ///
@@ -88720,280 +88705,41 @@ fn copy_preview_block_text(mut state: Signal<ShellState>, text: String) {
         ),
     });
 }
-/// Which mark a tool wears. A NAMED SET with one owner (DESIGN.md: marks come
-/// from a named set, never path data invented at the call site) — and it is
-/// keyed by what the tool DOES, not by its name, so a CLI that calls its shell
-/// tool `exec_command` and one that calls it `Bash` wear the same mark.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreviewActivityMark {
-    Command,
-    FileChange,
-    FileRead,
-    Search,
-    Thinking,
-    Generic,
+/// The design tokens the conversation surface draws with, derived from the
+/// shell's own palette.
+///
+/// ONE crossing point between the app's theme and the shared components. Every
+/// colour, face and measure the transcript uses comes from here, so a component
+/// below can never invent an rgba that a theme switch will not reach — which is
+/// exactly how the old header ended up with white pills that vanished in dark.
+fn conversation_tokens(palette: Palette) -> ConversationTokens {
+    ConversationTokens::from_palette(
+        palette_is_dark(palette),
+        palette.text,
+        palette.muted,
+        palette.accent,
+    )
 }
-fn preview_activity_mark(block: &SessionPreviewBlock) -> PreviewActivityMark {
+/// Which mark a tool wears — keyed by what the tool DOES, not by its name, so a
+/// CLI that calls its shell tool `exec_command` and one that calls it `Bash`
+/// wear the same mark. The mark SET (and its path data) lives in
+/// `yggui::conversation`; this is only the yggterm-side mapping from a block.
+fn preview_work_mark(block: &SessionPreviewBlock) -> WorkMark {
     if block.kind == PreviewBlockKind::Reasoning {
-        return PreviewActivityMark::Thinking;
+        return WorkMark::Thinking;
     }
     let Some(activity) = block.activity.as_ref() else {
-        return PreviewActivityMark::Generic;
+        return WorkMark::Generic;
     };
-    if !activity.changed_files.is_empty() && (activity.added_lines + activity.removed_lines) > 0 {
-        return PreviewActivityMark::FileChange;
+    if activity.changed_files.iter().len() > 0 {
+        return WorkMark::FileChange;
     }
     match activity.tool.to_ascii_lowercase().as_str() {
-        "bash" | "exec" | "exec_command" | "shell" | "write_stdin" | "wait" => {
-            PreviewActivityMark::Command
-        }
-        "edit" | "write" | "apply_patch" | "notebookedit" => PreviewActivityMark::FileChange,
-        "read" | "view_image" => PreviewActivityMark::FileRead,
-        "grep" | "glob" | "web_search" | "toolsearch" | "webfetch" => PreviewActivityMark::Search,
-        _ => PreviewActivityMark::Generic,
-    }
-}
-/// The mark itself. One box, one stroke weight, `currentColor` so the row's own
-/// tone reaches the glyph without a second palette.
-#[component]
-fn PreviewActivityGlyph(mark: PreviewActivityMark) -> Element {
-    let path = match mark {
-        // a terminal chevron + rule
-        PreviewActivityMark::Command => "M3.2 4.4 6 7.2 3.2 10M7.4 10.4h4.6",
-        // a pencil over a page edge
-        PreviewActivityMark::FileChange => "M4 11.6h2.2l5-5a1.2 1.2 0 0 0-1.7-1.7l-5 5V11.6Z",
-        // an eye
-        PreviewActivityMark::FileRead => "M1.8 7.5S3.9 3.9 7.5 3.9s5.7 3.6 5.7 3.6-2.1 3.6-5.7 3.6S1.8 7.5 1.8 7.5Z",
-        // a magnifier
-        PreviewActivityMark::Search => "M6.8 10.4a3.6 3.6 0 1 0 0-7.2 3.6 3.6 0 0 0 0 7.2ZM9.6 9.6l2.6 2.6",
-        // a thought curve
-        PreviewActivityMark::Thinking => "M3 8.6a2 2 0 0 1 1.2-3.7 2.6 2.6 0 0 1 5-.5 2 2 0 0 1 .4 3.9M5 11.4h5",
-        // a wrench
-        PreviewActivityMark::Generic => "M10.6 3.4a2.8 2.8 0 0 0-3.5 3.5l-3.6 3.6 1.4 1.4 3.6-3.6a2.8 2.8 0 0 0 3.5-3.5L10.1 6.4 8.6 4.9Z",
-    };
-    rsx! {
-        svg {
-            width: "13",
-            height: "13",
-            view_box: "0 0 15 15",
-            fill: "none",
-            path {
-                d: "{path}",
-                stroke: "currentColor",
-                stroke_width: "1.25",
-                stroke_linecap: "round",
-                stroke_linejoin: "round",
-            }
-        }
-    }
-}
-/// The tone a tool row wears. A failed call leans toward WARNING; it never takes
-/// the status vocabulary's `RED`, which means a dead runtime (DESIGN.md) — a
-/// command exiting non-zero is a normal event in a working session.
-fn preview_activity_row_color(palette: Palette, failed: bool) -> String {
-    if failed {
-        PREVIEW_ACTIVITY_FAILED_COLOR.to_string()
-    } else {
-        palette.muted.to_string()
-    }
-}
-const PREVIEW_ACTIVITY_FAILED_COLOR: &str = "#b4525f";
-/// The diff stat's two colours. Named here rather than spelled at the call site
-/// so the added/removed pair has ONE owner — and the removed side deliberately
-/// REUSES the failed-call colour: both mean "this went away", and a third red
-/// in one row would read as a third meaning.
-const PREVIEW_DIFF_ADDED_COLOR: &str = "#2f855a";
-const PREVIEW_DIFF_REMOVED_COLOR: &str = PREVIEW_ACTIVITY_FAILED_COLOR;
-/// The folded tool row's style. ONE owner, and every branch emits the IDENTICAL
-/// property-key set — Dioxus applies `style` property-by-property and never
-/// clears a key a later render omits, so a branch that drops one leaves the
-/// previous branch's value painted (DESIGN.md; two live bugs in this repo).
-fn preview_activity_row_style(palette: Palette, failed: bool) -> String {
-    format!(
-        "display:flex; align-items:center; gap:8px; width:100%; box-sizing:border-box; \
-         padding:3px 6px; border:none; border-radius:8px; background:transparent; \
-         text-align:left; cursor:pointer; color:{}; \
-         font-family:'JetBrains Mono', 'Iosevka Term', ui-monospace, monospace; \
-         font-size:11px; line-height:1.55;",
-        preview_activity_row_color(palette, failed)
-    )
-}
-/// The folded row's LABEL style. Same rule: one key set, two value sets.
-fn preview_activity_label_style(palette: Palette, failed: bool) -> String {
-    format!(
-        "flex:0 0 auto; font-weight:700; letter-spacing:0.01em; color:{};",
-        if failed {
-            PREVIEW_ACTIVITY_FAILED_COLOR.to_string()
-        } else {
-            palette.text.to_string()
-        }
-    )
-}
-/// A tool call or a reasoning turn, as ONE row that folds.
-///
-/// The single biggest thing the flat preview model could not draw. Folded it is
-/// `[mark] Tool — headline` on one line with its diff stat; the whole row is the
-/// control, because expand/collapse is not something a reader should have to
-/// hover to discover (DESIGN.md, the expander slot rule).
-///
-/// ⚠ Every style below emits a FIXED key set and varies only VALUES. Dioxus
-/// applies `style` property-by-property and never clears a key a later render
-/// omits, so a branch that drops a key leaves the previous branch's value
-/// painted (DESIGN.md, the sidebar-panel lesson).
-#[component]
-fn PreviewActivityBlock(
-    block: SessionPreviewBlock,
-    block_ix: usize,
-    palette: Palette,
-    on_toggle: EventHandler<usize>,
-) -> Element {
-    let activity = block.activity.clone().unwrap_or_default();
-    let is_reasoning = block.kind == PreviewBlockKind::Reasoning;
-    let mark = preview_activity_mark(&block);
-    let label = if is_reasoning {
-        "Thinking".to_string()
-    } else {
-        activity.tool.clone()
-    };
-    let headline = if is_reasoning {
-        block
-            .lines
-            .first()
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        activity.headline.clone()
-    };
-    let tooltip = if headline.trim().is_empty() {
-        label.clone()
-    } else {
-        format!("{label} — {headline}")
-    };
-    let changed = activity.changed_files.clone();
-    let stat_visible = activity.added_lines + activity.removed_lines > 0;
-    let row_style = preview_activity_row_style(palette, activity.failed);
-    rsx! {
-        div {
-            "data-preview-activity": "1",
-            "data-preview-activity-tool": "{label}",
-            "data-preview-activity-folded": if block.folded { "1" } else { "0" },
-            style: "display:flex; flex-direction:column; gap:4px; width:100%; min-width:0;",
-            button {
-                style: "{row_style}",
-                title: "{tooltip}",
-                onclick: move |_| on_toggle.call(block_ix),
-                span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; \
-                            width:15px; height:15px; flex:0 0 auto; opacity:0.9;",
-                    PreviewActivityGlyph { mark }
-                }
-                span {
-                    style: preview_activity_label_style(palette, activity.failed),
-                    "{label}"
-                }
-                span {
-                    // The headline is USER text of unbounded length; it
-                    // ellipsizes and keeps its tooltip rather than wrapping the
-                    // row into a paragraph.
-                    style: "flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; \
-                            white-space:nowrap; opacity:0.86;",
-                    "{headline}"
-                }
-                if stat_visible {
-                    span {
-                        "data-preview-diff-stat": "1",
-                        style: "flex:0 0 auto; display:inline-flex; gap:6px; font-weight:700;",
-                        span {
-                            style: format!("color:{PREVIEW_DIFF_ADDED_COLOR};"),
-                            "+{activity.added_lines}"
-                        }
-                        span {
-                            style: format!("color:{PREVIEW_DIFF_REMOVED_COLOR};"),
-                            "−{activity.removed_lines}"
-                        }
-                    }
-                }
-                span {
-                    style: "flex:0 0 auto; opacity:0.6;",
-                    {if block.folded { "▸" } else { "▾" }}
-                }
-            }
-            if !block.folded {
-                div {
-                    style: format!(
-                        "display:flex; flex-direction:column; gap:6px; margin:0 0 4px 23px; \
-                         padding:8px 10px; border-radius:8px; background:{}; color:{}; \
-                         font-family:'JetBrains Mono', 'Iosevka Term', ui-monospace, monospace; \
-                         font-size:11px; line-height:1.6;",
-                        palette.accent_soft, palette.text
-                    ),
-                    if !changed.is_empty() {
-                        div {
-                            style: "display:flex; flex-wrap:wrap; gap:6px;",
-                            for path in changed.iter().take(PREVIEW_CHANGED_FILE_CHIP_LIMIT) {
-                                span {
-                                    key: "{path}",
-                                    title: "{path}",
-                                    style: format!(
-                                        "max-width:100%; overflow:hidden; text-overflow:ellipsis; \
-                                         white-space:nowrap; padding:2px 7px; border-radius:6px; \
-                                         background:rgba(255,255,255,0.62); color:{};",
-                                        palette.muted
-                                    ),
-                                    {preview_changed_file_label(path)}
-                                }
-                            }
-                            if changed.len() > PREVIEW_CHANGED_FILE_CHIP_LIMIT {
-                                span {
-                                    style: format!("padding:2px 4px; color:{};", palette.muted),
-                                    "+{changed.len() - PREVIEW_CHANGED_FILE_CHIP_LIMIT}"
-                                }
-                            }
-                        }
-                    }
-                    if block.lines.is_empty() {
-                        div {
-                            style: format!("opacity:0.7; color:{};", palette.muted),
-                            "No output recorded."
-                        }
-                    } else {
-                        div {
-                            style: "white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
-                            {block.lines.join("\n")}
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-/// How many changed-file chips an expanded tool block draws before it counts.
-const PREVIEW_CHANGED_FILE_CHIP_LIMIT: usize = 4;
-/// A changed file as a chip label: the trailing path, not the whole absolute
-/// path, which is the same for every file in a repo and pushes the part that
-/// identifies it off the end.
-fn preview_changed_file_label(path: &str) -> String {
-    let parts = path.rsplit('/').take(2).collect::<Vec<_>>();
-    if parts.len() < 2 {
-        return path.to_string();
-    }
-    format!("{}/{}", parts[1], parts[0])
-}
-/// Per-message copy.
-#[component]
-fn PreviewCopyButton(text: String, palette: Palette, on_copy: EventHandler<String>) -> Element {
-    rsx! {
-        button {
-            "data-preview-copy": "1",
-            style: format!(
-                "border:none; background:transparent; color:{}; font-size:10px; opacity:0.72; \
-                 padding:0; cursor:pointer; margin-left:auto;",
-                palette.muted
-            ),
-            title: "Copy this message",
-            onclick: move |_| on_copy.call(text.clone()),
-            "Copy"
-        }
+        "bash" | "exec_command" | "shell" | "run_command" | "local_shell" => WorkMark::Command,
+        "edit" | "write" | "apply_patch" | "notebookedit" => WorkMark::FileChange,
+        "read" | "view_image" => WorkMark::FileRead,
+        "grep" | "glob" | "web_search" | "toolsearch" | "webfetch" => WorkMark::Search,
+        _ => WorkMark::Generic,
     }
 }
 #[component]
@@ -89001,11 +88747,12 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
     let blocks = preview_content_blocks(&lines);
     rsx! {
         div {
-            style: format!(
-                "display:flex; flex-direction:column; gap:9px; color:{}; \
-                 font-family:\"Source Serif 4\", \"Noto Serif\", \"Iowan Old Style\", Georgia, serif;",
-                palette.text
-            ),
+            // ⚠ No face and no size here. The TURN owns both — sans for what
+            // the person wrote, serif for what the machine answered — and a
+            // serif asserted at this level set the user's own words in the
+            // answer's face.
+            style: "display:flex; flex-direction:column; gap:9px; font-family:inherit; \
+                    font-size:inherit; color:inherit;",
             for block in blocks.into_iter() {
                 match block {
                     PreviewContentBlock::Heading { level, text } => rsx! {
@@ -89013,9 +88760,9 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             style: format!(
                                 "font-size:{}px; line-height:1.38; font-weight:750; letter-spacing:-0.01em; color:{}; white-space:pre-wrap; padding-top:{}px;",
                                 match level {
-                                    1 => 18,
-                                    2 => 16,
-                                    _ => 14,
+                                    1 => 20,
+                                    2 => 17,
+                                    _ => 15,
                                 },
                                 palette.text,
                                 if level == 1 { 4 } else { 2 }
@@ -89025,7 +88772,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                     },
                     PreviewContentBlock::Paragraph(text) => rsx! {
                         div {
-                            style: "font-size:14px; line-height:1.76; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
+                            style: "font-size:inherit; line-height:1.66; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
                             PreviewInlineText { text, palette, muted: false }
                         }
                     },
@@ -89036,7 +88783,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                                 style: format!("width:6px; height:6px; border-radius:999px; background:{}; margin-top:8px; flex:0 0 auto;", palette.accent_soft),
                             }
                             div {
-                                style: "font-size:14px; line-height:1.76; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
+                                style: "font-size:inherit; line-height:1.66; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
                                 PreviewInlineText { text, palette, muted: false }
                             }
                         }
@@ -89049,7 +88796,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                                 "{number}."
                             }
                             div {
-                                style: "font-size:14px; line-height:1.76; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
+                                style: "font-size:inherit; line-height:1.66; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
                                 PreviewInlineText { text, palette, muted: false }
                             }
                         }
@@ -89070,7 +88817,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             }
                             div {
                                 style: format!(
-                                    "font-size:14px; line-height:1.76; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; color:{};",
+                                    "font-size:inherit; line-height:1.66; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; color:{};",
                                     if done { palette.muted } else { palette.text }
                                 ),
                                 PreviewInlineText { text, palette, muted: done }
@@ -89084,7 +88831,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                                 style: format!("width:3px; border-radius:999px; background:{}; flex:0 0 auto;", palette.accent_soft),
                             }
                             div {
-                                style: format!("font-size:14px; line-height:1.76; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; color:{};", palette.muted),
+                                style: format!("font-size:inherit; line-height:1.66; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; color:{};", palette.muted),
                                 PreviewInlineText { text, palette, muted: true }
                             }
                         }
@@ -89100,7 +88847,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             }
                             if let Some(text) = text.filter(|value| !value.trim().is_empty()) {
                                 div {
-                                    style: "font-size:14px; line-height:1.76; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; flex:1 1 240px;",
+                                    style: "font-size:inherit; line-height:1.66; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; flex:1 1 240px;",
                                     PreviewInlineText { text, palette, muted: false }
                                 }
                             }
@@ -140659,42 +140406,84 @@ mod tests {
         session
     }
 
-    /// ★ The same fixed-property-key invariant, for the Web View's tool row.
+    /// ★ An assistant run SPLITS: work collects, prose does not.
     ///
-    /// A failed tool call and a normal one differ only in VALUES. If the failed
-    /// branch ever grows a key the normal branch lacks, a row that once failed
-    /// keeps that property forever — the ghost-rail bug, in a list where rows are
-    /// recycled by a virtual window.
+    /// This is the whole reason the surface reads as a document rather than a
+    /// log. Without it every tool call is a peer of the answer around it, and a
+    /// run of forty buries the two paragraphs the reader came for. The
+    /// invariant is that CONSECUTIVE activity lands in ONE segment and that a
+    /// prose block always breaks the run — a splitter that merged across prose
+    /// would collect the whole session into a single card.
     #[test]
-    fn preview_activity_style_keys_are_identical_across_failure_states() {
-        let keys = |style: &str| -> Vec<String> {
-            let mut ks: Vec<String> = style
-                .split(';')
-                .filter_map(|decl| decl.split(':').next())
-                .map(|k| k.trim().to_string())
-                .filter(|k| !k.is_empty())
-                .collect();
-            ks.sort();
-            ks
+    fn an_assistant_run_collects_consecutive_work_and_never_swallows_prose() {
+        let entry = |ix: usize, kind: PreviewBlockKind| PreviewRunEntry {
+            block_ix: ix,
+            display_timestamp: String::new(),
+            block: SessionPreviewBlock {
+                role: "ASSISTANT",
+                timestamp: "now".to_string(),
+                tone: PreviewTone::Assistant,
+                folded: kind != PreviewBlockKind::Message,
+                lines: vec!["x".to_string()],
+                kind,
+                activity: (kind != PreviewBlockKind::Message)
+                    .then(yggterm_server::PreviewActivity::default),
+            },
         };
-        for theme in [UiTheme::ZedLight, UiTheme::ZedDark] {
-            let p = palette(theme);
-            assert_eq!(
-                keys(&preview_activity_row_style(p, false)),
-                keys(&preview_activity_row_style(p, true)),
-                "{theme:?} row keys"
-            );
-            assert_eq!(
-                keys(&preview_activity_label_style(p, false)),
-                keys(&preview_activity_label_style(p, true)),
-                "{theme:?} label keys"
-            );
-            // …and the values DO differ, or the test above is vacuous.
-            assert_ne!(
-                preview_activity_row_style(p, false),
-                preview_activity_row_style(p, true)
-            );
-        }
+        let entries = vec![
+            entry(0, PreviewBlockKind::Message),
+            entry(1, PreviewBlockKind::ToolCall),
+            entry(2, PreviewBlockKind::Reasoning),
+            entry(3, PreviewBlockKind::ToolCall),
+            entry(4, PreviewBlockKind::Message),
+            entry(5, PreviewBlockKind::ToolCall),
+        ];
+        let shapes: Vec<(&str, usize)> = split_preview_run_segments(&entries)
+            .iter()
+            .map(|segment| match segment {
+                PreviewRunSegment::Prose(_) => ("prose", 1),
+                PreviewRunSegment::Work(run) => ("work", run.len()),
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![("prose", 1), ("work", 3), ("prose", 1), ("work", 1)],
+            "consecutive work must collect, and prose must break the run"
+        );
+    }
+
+    /// A prose turn always offers Copy; the fold control appears only when
+    /// folding would mean something. A transcript exists to be taken somewhere
+    /// else, and without a per-message copy the user is re-selecting prose by
+    /// hand out of a VIRTUALISED list whose rows may not be mounted.
+    #[test]
+    fn a_prose_turn_offers_copy_always_and_a_fold_only_when_it_is_long() {
+        let make = |lines: usize, folded: bool| PreviewRunEntry {
+            block_ix: 7,
+            display_timestamp: String::new(),
+            block: SessionPreviewBlock {
+                role: "ASSISTANT",
+                timestamp: "now".to_string(),
+                tone: PreviewTone::Assistant,
+                folded,
+                lines: vec!["line".to_string(); lines],
+                kind: PreviewBlockKind::Message,
+                activity: None,
+            },
+        };
+        let labels = |entry: &PreviewRunEntry| preview_prose_action_labels(entry);
+        assert_eq!(labels(&make(2, false)), vec!["Copy"]);
+        assert_eq!(labels(&make(40, false)), vec!["Copy", "Collapse"]);
+        assert_eq!(
+            labels(&make(2, true)),
+            vec!["Copy", "Expand"],
+            "a folded block offers Expand however short it is — it is already hidden"
+        );
+        // An empty block has nothing to copy, and a control that copies nothing
+        // is a control that reports success for doing nothing.
+        let mut empty = make(0, false);
+        empty.block.lines = vec![String::new()];
+        assert!(labels(&empty).is_empty());
     }
 
     /// ★ A row's fold index is the DAEMON'S, not its position in what survived
@@ -140855,9 +140644,10 @@ mod tests {
         assert_eq!(visible.len(), 2, "{visible:?}");
     }
 
-    /// Marks are keyed by what a tool DOES, not by its name, so a CLI that calls
-    /// its shell tool `exec_command` and one that calls it `Bash` wear the same
-    /// mark (DESIGN.md, the named-set rule).
+    /// The mark is keyed to what a tool DOES, never to what it is called, so a
+    /// CLI naming its shell tool `exec_command` and one naming it `Bash` wear
+    /// the same mark. The mark SET itself lives in `yggui::conversation`; this
+    /// locks yggterm's mapping into it.
     #[test]
     fn the_activity_mark_is_keyed_by_what_the_tool_does() {
         let tool = |name: &str| SessionPreviewBlock {
@@ -140873,44 +140663,17 @@ mod tests {
             }),
         };
         assert_eq!(
-            preview_activity_mark(&tool("Bash")),
-            preview_activity_mark(&tool("exec_command")),
+            preview_work_mark(&tool("Bash")),
+            preview_work_mark(&tool("exec_command")),
         );
-        assert_eq!(
-            preview_activity_mark(&tool("Bash")),
-            PreviewActivityMark::Command
-        );
-        assert_eq!(
-            preview_activity_mark(&tool("Edit")),
-            PreviewActivityMark::FileChange
-        );
-        assert_eq!(
-            preview_activity_mark(&tool("Read")),
-            PreviewActivityMark::FileRead
-        );
-        assert_eq!(
-            preview_activity_mark(&tool("Grep")),
-            PreviewActivityMark::Search
-        );
+        assert_eq!(preview_work_mark(&tool("Bash")), WorkMark::Command);
+        assert_eq!(preview_work_mark(&tool("Edit")), WorkMark::FileChange);
+        assert_eq!(preview_work_mark(&tool("Read")), WorkMark::FileRead);
+        assert_eq!(preview_work_mark(&tool("Grep")), WorkMark::Search);
         let mut thinking = tool("");
         thinking.kind = PreviewBlockKind::Reasoning;
         thinking.activity = None;
-        assert_eq!(
-            preview_activity_mark(&thinking),
-            PreviewActivityMark::Thinking
-        );
-    }
-
-    /// A chip shows the identifying tail of a path. Every file in a repo shares
-    /// the same absolute prefix, which pushes the part that names it off the end
-    /// of a chip narrow enough to fit four of them.
-    #[test]
-    fn a_changed_file_chip_keeps_the_identifying_tail() {
-        assert_eq!(
-            preview_changed_file_label("/home/user/gh/yggterm/crates/yggterm-shell/src/shell.rs"),
-            "src/shell.rs"
-        );
-        assert_eq!(preview_changed_file_label("Cargo.toml"), "Cargo.toml");
+        assert_eq!(preview_work_mark(&thinking), WorkMark::Thinking);
     }
 
     // ★ THE fixed-property-key invariant (the docked-rail-ghost fix): the outer

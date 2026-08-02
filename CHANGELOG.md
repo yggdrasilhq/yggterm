@@ -4,6 +4,34 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The session Web View is a document now, and its design language is a
+  shared component set.** The transcript surface was shell markup with its
+  colours spelled at the call site — one header alone carried
+  `rgba(255,255,255,0.72)` four times, which is a light-only design wearing a
+  theme switch. It is now an adapter onto `yggui::conversation` (libyggterm
+  `v0.4.0`, MPL-2.0), so the same design language covers this surface and every
+  other Yggdrasil app that draws an agent timeline.
+
+  What changed on screen: a person's ask is a bounded card set against the
+  page; the machine's answer has no card at all and IS the page, in serif, one
+  step up in size. Consecutive tool calls and thinking collect into ONE quiet
+  monospace seam labelled with its own count, which hides its tail past six
+  rows instead of burying the prose either side of it. Metadata drops to a
+  single 10px wide-tracked level in tabular figures, and turn actions are
+  hover-revealed in flow so revealing one never moves the turn. Both themes are
+  derived from the app's own palette rather than spelled per component.
+
+  ⛔ **And there is now ONE reader of "what did this session say".** The shell
+  was ALSO parsing the session JSONL off disk itself and drawing a second chat
+  under the first — same session, two renderers, two visual languages, and only
+  one of them could see a remote agent. That second reader is deleted; the
+  daemon's preview model owns the answer and this surface draws it. The summary
+  strip is now a fallback for a session with no timeline rather than a
+  companion printed above the conversation it summarises.
+
+  All three libyggterm pins move to `v0.4.0`.
+
+
 - **The titlebar search field joins the field skin.** It was the one text box
   still drawing its own flat inline fill (libyggterm `v0.3.1` makes the shell
   style box-only); it now wears `data-yggui-field` like every other field, and
