@@ -387,6 +387,60 @@ all, which is why `rail_autohide_pinned`'s new menu term is unit-proven but
 not yet live-proven end-to-end.
 
 
+## ⚠ yRDP: "open yRDP here" may open on jojo instead of the row's host
+
+**Status:** OPEN
+
+User-reported 2026-08-02: *"all working fleet sessions' right click context menu
+and open yRDP here was opening yRDP in jojo instead of that host. I do not know
+if this issue is fixed or not."*
+
+Unverified either way — recorded so it is not lost. What is known so far: the
+`yRDP` string in `shell.rs` around 152610 is a **test fixture**
+(`/home/gui-host/.local/bin/yrdp`), not the live path. Real dispatch goes through
+the manifest-based per-host app registry via `resolve_app_verb_for_row`, which
+does take the row, so the plumbing to honour the row's host exists.
+
+**What to check:** whether the manifest the verb resolves to is the ROW host's or
+the GUI host's. "Always opens on jojo" is exactly what resolving against the GUI
+host would look like, and jojo is the GUI host.
+
+Reproduce on a `dev` or `oc` row from the jojo GUI, then compare against the same
+verb invoked on a jojo-local row.
+
+## ⚠ FEATURE: the document split gutter does not drag yet
+
+**Status:** OPEN
+
+User-requested 2026-08-02, as an end-to-end test of the
+yggterm ⇄ libyggterm ⇄ yedit ecosystem: *"In Markdown/text split mode the split
+bar should be in the center of the viewport, and should be draggable by the user
+or agent via yggui as they feel fit."*
+
+**Half of it is built** (`lane/dev/yedit-split-gutter`). The split view no longer
+hardcodes `flex:1 1 50%` with a `border-right` pretending to be a bar. There is a
+real gutter element carrying the `yggui_contract::document_split_stamps`, the
+halves are sized from `AppPaneSchema.split_ratio`, and absent a declaration it is
+centred. libyggterm `v0.2.0` owns the stamps, the centred default and the clamp —
+the clamp lives there because a host and an app that disagree about the minimum
+produce a gutter that snaps back under the pointer.
+
+**What remains:**
+
+1. **Drag.** This codebase does pointer drags with Dioxus handlers, not injected
+   JS (see the `onpointerdown` around `shell.rs:86063`). Needs
+   pointerdown/move/up, a live ratio signal so the halves track the pointer, and
+   pointer capture so a fast drag does not escape the gutter.
+2. **Report the release back** as an action so the app can persist the ratio —
+   the app owns the value, the host only reports the gesture.
+3. **`yedit` must emit `split_ratio`** and persist it; today every split still
+   opens centred because nothing declares one.
+4. **Agent path via yggui** — the stamps exist so an agent can drive the gutter
+   exactly as a pointer does; that path is unproven.
+
+⚠ Not live-verified. The gutter compiles and is a strict improvement over the
+border, but no screenshot has confirmed it renders where intended.
+
 ## ⚠ TOOLING: agents have no first-class access layer for DELEGATE sessions
 
 **Status:** OPEN
