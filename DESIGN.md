@@ -309,6 +309,96 @@ If a user says “this does not look like a button”, that is a design failure.
     don't miss the browser UI they know.
 - Inputs must remain visible against the supporting chrome.
 
+##### A field is one control, and it ANSWERS
+
+There is ONE text field in a Yggdrasil app. The omnibox, the titlebar search, a
+Settings box, an app pane's input, the vault's form and yedit's editor are the
+same control wearing different geometry, and they take their skin from one
+owner: `text_field_css` in `yggterm-shell`, reached by wearing
+`data-yggui-field`. A surface that hand-rolls a fill and a hairline is a second
+encoding, and it always drifts (the in-place rename field carried a white fill
+and a grey border, which was a light-theme-only box, until 2026-08-02).
+
+**The skin is a STYLESHEET, and it has to be.** Hover, focus and placeholder are
+CSS *states*; an inline `style` attribute cannot express one. That is why every
+field in this app was flat and inert until the user reported it (2026-08-02:
+*"I want the input box colors on ychrome omnibox, vaults, and in yedit to look
+youthful and not lifeless too"*). A field that does not answer the pointer or
+the keyboard is a picture of a field.
+
+⛔ **The style function emits the BOX, never the FILL.** An inline `background`
+out-specifies a stylesheet, so a single one silently kills hover and focus for
+that surface. `settings_input_style` and `web_chrome_input_style` therefore emit
+padding, radius and type — and no `background`, no `box-shadow`.
+
+The tokens, all derived from the theme accent so a re-themed shell re-themes its
+fields:
+
+| Token | Light | Dark |
+|---|---|---|
+| Resting fill | `accent 5% / white 72%` | `accent 7% / white 4.5%` |
+| Hover fill | `accent 9% / white 88%` | `accent 12% / white 7.5%` |
+| Focus fill | `accent 7% / white` | `accent 15% / white 8.5%` |
+| Resting hairline (inset 1px) | `accent 22% / slate 28%` | `accent 26% / white 14%` |
+| Hover hairline | `accent 42% / slate 30%` | `accent 48% / white 18%` |
+| Focus ring | `0 0 0 1px accent, 0 0 0 3px accent 26%` | same |
+| Placeholder | `muted` at 0.9 | `muted` at 0.9 |
+| Radius / padding | 10px / 8px 11px (rail), 9px / 32px tall (settings) | same |
+| Transition | 140ms `cubic-bezier(0.2,0,0,1)` on fill + shadow | same |
+
+- **The focus ring is the dialog focus ring's vocabulary** (see *Keyboard focus
+  ring*): the accent, outside the control, following the control's own radius.
+  One ring language in the product, not one per control family.
+- **A pill keeps its own border** (`data-yggui-field="pill"`): on the omnibox and
+  the find bar that border carries STATE — red when a find has no matches — and
+  a second inset hairline would double it. It takes the fill, the hover and the
+  focus ring like everything else.
+- Fields sit on **section cards** in a form (see below), never floating on the
+  bare rail.
+
+##### A stored value: mask dots, an eye, a copy — ON the field
+
+A field that holds something it is not showing draws a **fixed-length run of
+mask dots**, and its verbs sit inside its trailing edge. This is Bitwarden's
+Edit Login shape and it is what the user asked for by name (2026-08-02: *"I
+cannot see passwords in edit mode"*), about a form whose boxes were all blank —
+a blank box says "there is nothing here", which was a lie about the entry.
+
+- **The dots are a PLACEHOLDER, never a value.** A placeholder cannot be
+  submitted, cannot be read back by an action, and vanishes on the first
+  keystroke. That is what lets a secret-free form show that a secret exists
+  without ever holding one.
+- **The length is fixed**, because a real value's length is itself information
+  about it.
+- **A revealed value is display-only.** It reaches the DOM so the user can read
+  and copy it, and never the form draft — otherwise pressing the eye and then
+  Save would re-send a password nobody touched.
+- **The verbs are quiet at rest and lit on hover**, in the accent, and are
+  reserved room by the box so a long value ellipsizes behind them rather than
+  running under them.
+- **No eye for a value that is not there.** A field the entry does not hold is
+  an ordinary empty box that ADDS one, with its own placeholder.
+
+#### Section cards (a form is a card, a list is not)
+
+A form group — heading plus the fields under it — sits in a card:
+`settings_section_card_style`'s fill and inset hairline, 14px radius, 11–12px
+padding. The Settings rail is the reference; the user named it as the in-house
+liveliness standard (2026-08-02) against a vault pane that read as *"lifeless
+with dullness everywhere"*: one undifferentiated grey column of prose and blank
+boxes with no rhythm to it.
+
+- **Opt-in, per section, and it stays opt-in.** A card around a long list is a
+  stack of nested boxes, which the Brand intent rules out by name. A file tree,
+  a tab rail, an item list: no card.
+- **The heading is the structural voice** — 10px, 800, uppercase, tracked
+  0.07em, in the TEXT colour. Muted-on-muted headings are what made the column
+  read as one block.
+- **Explanatory prose is kept and demoted**: muted, 10.5px, `text-wrap:pretty`,
+  under the control it explains rather than above it.
+- **A form's primary action is PINNED**, not scrolled: a rail form is taller
+  than the rail, so Save lives in the pinned footer bar and wears the accent.
+
 #### Search in chrome
 
 - If the product has a global or sidebar search, the default preference is a centered search field in the titlebar.
