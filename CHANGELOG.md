@@ -4,6 +4,44 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **`getUserMedia()` can no longer hang forever.** A page that asked for a
+  camera or a microphone on a web surface used to wait on a promise nobody would
+  ever settle: no prompt, no error, no trace row. Measured cause — WebKitGTK
+  **defers** a capture request indefinitely on a surface it has not presented,
+  and raises no signal at all, so nothing on the engine side existed to time out.
+  It cost a real eSign video KYC, which the user finished in another browser.
+
+  Every surface now reports its own `getUserMedia()` calls, and a request the
+  engine has not taken up within five seconds is rejected with a
+  `NotAllowedError` naming the reason (`surface_not_presented`,
+  `engine_did_not_ask`) — something a site can report, and retry, instead of a
+  spinner that never stops. An ask the engine DID take up is left alone and
+  keeps the full human decision window, so a prompt someone is reading is never
+  cut off. `server app state` lists what is waiting, under
+  `pending_capture_asks`.
+
+  ⚠ Not a permission change: this can only REFUSE. A page still reaches a device
+  only through a prompt a human (or `server app media answer`) approves.
+
+- **A page waiting on the camera is now visible, and answerable, from outside
+  the window.** `server app state` reports `pending_media_capture` — the
+  camera/microphone prompt a page has raised and nobody has answered, with the
+  origin, the devices asked for, and the `request_id` — and
+  `server app media answer <allow|deny-once|block-site> [--request <id>]`
+  answers it. Both binaries carry the verb.
+
+  The answer goes through the dialog's own terminus, not around it: the same
+  code path the Allow button runs, so the modal closes, the engine is released,
+  and a remembered decision is written exactly as a click would write it. A
+  quoted `--request` that no longer matches the pending prompt is REFUSED rather
+  than applied to whichever prompt is up now, and every refusal is named
+  (`unknown_answer`, `no_pending_request`, `request_mismatch`) with a non-zero
+  exit, so a script cannot read one as a grant.
+
+  Answering a camera prompt is a grant, so it is now audited: every answer —
+  from the CLI, from the button, or from Escape — leaves one
+  `web_surface/media_permission_answered` trace row naming its `source`.
+
 ## 3.0.0
 
 - **libyggterm is now its own repository, under MPL-2.0.** `yggui` and

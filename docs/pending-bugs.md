@@ -13,73 +13,58 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
-## ★★★ `getUserMedia` HANGS FOREVER ON A WEB SURFACE — no prompt, no trace, no rejection
+## eMudhra's video-KYC recording timer never advanced — NOT explained by the hang
 
 **Status:** OPEN
 
-User-reported; root cause narrowed but NOT fixed.
+The residual of the `getUserMedia` hang, which is fixed (git: "the camera ask
+the engine never raises"). The hang was real, root-caused and closed; **it does
+not account for what the user actually saw**, and this entry exists so nobody
+assumes it did.
 
-**How it reached the user, 2026-08-02.** He was doing the eMudhra video KYC for
-his eSign enrolment in a yggterm surface. He pressed START RECORDING; the
-`0:00 / 0:40` timer never advanced, so the STOP button never armed and the
-recording could not be submitted. He completed the KYC in Helium (Chromium)
-instead. **A statutory identity verification failed in our browser and worked in
-someone else's.**
+**What he saw, 2026-08-02.** Doing the eMudhra video KYC for his eSign
+enrolment, in a surface he was looking at, with the camera preview live and his
+face in it. He pressed START RECORDING and the `0:00 / 0:40` timer never
+advanced, so STOP never armed and the recording could not be submitted. He
+finished the KYC in Helium (Chromium). **A statutory identity verification
+failed in our browser and worked in someone else's.**
 
-### What is measured
+**Why the hang does not explain it.** The hang needs a surface WebKit has not
+presented; his was presented, which is exactly why his preview was live.
 
-- `MediaRecorder` is NOT missing: it exists and `isTypeSupported` answers true
-  for `video/webm`, vp8, vp9, `video/mp4`.
-- On a surface, `navigator.mediaDevices.getUserMedia({video:true})` **never
-  settles** — it does not resolve and does not reject. Raced against a 12 s
-  timer it comes back `TIMEOUT:gum` every time.
-- `navigator.permissions.query({name:'camera'})` reads **`prompt`**.
-- **The permission gate never sees the request.** `connect_media_permission_gate`
-  is wired and the shell has a whole decision flow
-  (`begin_media_capture_decision`, `pending_media_capture`, a deadline, and
-  retirement), but the trace shows **ZERO `web_surface/media_permission_request`
-  events for the current GUI pid**, while the `app_control/request_begin` rows
-  for the probes that triggered them are right there. WebKit is not raising
-  `permission-request` at all.
-- It reproduces on an origin that was **already allowed**: the trace holds
-  `media_permission_policy … verdict:"allow"` for `emudhradigital.com` at
-  17:33 under the OLD GUI (pid 314700), and a fresh surface on that same origin
-  now reads `permission:"prompt"` and hangs. So a grant does not persist and the
-  re-ask goes nowhere.
-- Every surface I could make reads `document.visibilityState:"hidden"`, and
-  stays hidden even after `server app open` (activate). The one case that
-  WORKED — his KYC page, camera live, face in the preview — was a genuinely
-  revealed surface under the previous GUI.
+### Hypotheses already falsified — do not re-derive these
 
-### The hypothesis, and what would settle it
+| Hypothesis | What killed it |
+|---|---|
+| A missing codec / `MediaRecorder` gap | On a presented surface it records: 5 chunks / 21.6 MB in 5 s (vp8), and 345 KB in 4.9 s off a 640x480@30 track in the other lane's run. `isTypeSupported` answers true for webm, vp8, vp9, mp4. |
+| A dead or unreachable camera | `getUserMedia` resolves in 215 ms with `video:Integrated Camera (V4L2)`. Audio+video resolves too. |
+| He switched away mid-recording, and hiding the surface stopped it | **Measured false.** A recorder already running keeps producing at the same rate while its window is hidden: ~2.1 MB/s before, during and after, `track.readyState:"live"`, `muted:false` throughout. |
+| A lost per-origin grant | The grant DOES persist — a fresh `emudhradigital.com` surface answered `verdict:"allow"` from ychrome's remembered decision. |
+| `permissions.query({name:'camera'}) == "prompt"` means something | It reads `prompt` on the arm that WORKS too. |
 
-**A permission request is only raised for a genuinely VISIBLE surface; on a
-hidden/stashed one WebKit swallows it, so the page waits on a promise nobody
-will ever settle.** That is the worst possible failure shape: no prompt for the
-user, no error for the page, no row for the operator.
+### One measured fact worth carrying into the next attempt
 
-⚠ **Not ruled out, and it must be, before anyone believes the hypothesis:** the
-working observation is from GUI **2.12.24** and every failing one is from
-**3.0.0** (the libyggterm split), and 3.0.0 also carries the new
-`install_tls_pin_handler` call added at the top of
-`attach_surface_message_channel` the same day. **Bisect the GUI version before
-blaming visibility.**
+**Our vp8 bitrate is enormous: ~2.1 MB/s at 640x480 (~17 Mbit/s).** A 40 s KYC
+clip is therefore ~85 MB. That is not a timer explanation, but it is a plausible
+SUBMISSION explanation, and it is the kind of thing a site with an upload cap
+rejects without saying so. Chromium's default for the same constraints is one to
+two orders of magnitude smaller.
 
-### Owed
+### What to do next — with a camera, on the real page
 
-1. Reproduce on a surface that is provably visible (`visibilityState:"visible"`),
-   and on 2.12.14 vs 3.0.0, to separate visibility from the version.
-2. Whatever the cause: **`getUserMedia` must never hang.** If a surface cannot
-   raise a prompt, the request has to be refused with a reason the page receives
-   as a rejection — a `NotAllowedError` the site can report beats an eternal
-   pending promise.
-3. Surface pending media permissions in `server app state` and give the control
-   plane a verb to answer one. Today an operator cannot even see that a page is
-   waiting on a camera.
+⛔ **Do not open a fresh investigation from telemetry.** This needs the actual
+site. The one probe that would settle it: on a PRESENTED surface at
+`emudhradigital.com`, start the recording and watch, in this order — whether
+`MediaRecorder.state` reaches `"recording"`, whether `ondataavailable` fires,
+whether the `<video>` element's `currentTime` advances, and whether the page's
+own timer is driven by `requestAnimationFrame` (which a compositing stall would
+starve) or by a plain interval (which nothing here would touch). The answer is
+in which of those four stops first.
 
-Reproduction script: race `getUserMedia` against a timer and read
-`navigator.permissions.query({name:'camera'})`; both halves are in the
-2026-08-02 session transcript.
+⚠ The user completed the enrolment elsewhere, so this is not blocking him. It is
+open because "the browser we ship could not do a video KYC" is worth closing
+properly, and because the next person to hit it should start from the table
+above rather than from `getUserMedia`.
 
 
 ## The launcher OFFERS the GUI host's apps for a row on another machine
