@@ -7358,7 +7358,7 @@ Weekly limit:                21% left
 
 › Implement {feature}
 
-  gpt-5.5 medium · ~/data/netshare/dada/obsidian/codex";
+  gpt-5.5 medium · ~/data/netshare/notes/obsidian/codex";
         let host = json!({
             "session_path": "remote-session://oc/79ffb29d",
             "text_sample": text_tail,

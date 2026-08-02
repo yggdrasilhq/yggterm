@@ -9013,11 +9013,51 @@ fn normalize_machine_key(raw_machine_key: &str) -> String {
         .to_string()
 }
 
-fn canonicalize_remote_machine_alias(machine_key: &str) -> String {
-    match machine_key.trim().to_ascii_lowercase().as_str() {
-        "juju" | "jujo" => "jojo".to_string(),
-        value => value.to_string(),
-    }
+/// Machine-alias corrections, read once from `YGGTERM_MACHINE_ALIASES`.
+///
+/// Format: `wrong=right,other=right`. Both sides are lower-cased and trimmed;
+/// malformed pairs are skipped rather than failing startup, because a typo in
+/// this variable must never be worse than the typo it exists to correct.
+///
+/// This used to be a hardcoded `match` arm mapping one fleet host's misspelling
+/// to its real name. That is site configuration wearing the costume of product
+/// logic: it shipped a private machine name inside a public GPL binary, it was
+/// duplicated in two modules that could drift apart, and it was useless to
+/// every user who is not that fleet. The alias table belongs to whoever runs
+/// the machines; the code only needs to know that aliases exist.
+fn machine_alias_table() -> &'static HashMap<String, String> {
+    static TABLE: OnceLock<HashMap<String, String>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = HashMap::new();
+        let Ok(raw) = std::env::var("YGGTERM_MACHINE_ALIASES") else {
+            return table;
+        };
+        for pair in raw.split(',') {
+            let Some((from, to)) = pair.split_once('=') else {
+                continue;
+            };
+            let (from, to) = (
+                from.trim().to_ascii_lowercase(),
+                to.trim().to_ascii_lowercase(),
+            );
+            if !from.is_empty() && !to.is_empty() {
+                table.insert(from, to);
+            }
+        }
+        table
+    })
+}
+
+/// Lower-case a machine key and apply any configured alias correction.
+///
+/// The single owner of alias canonicalization. `background_machine_key` in
+/// `daemon.rs` calls through to this rather than repeating the rule.
+pub(crate) fn canonicalize_remote_machine_alias(machine_key: &str) -> String {
+    let key = machine_key.trim().to_ascii_lowercase();
+    machine_alias_table()
+        .get(&key)
+        .cloned()
+        .unwrap_or(key)
 }
 
 fn remote_scanned_session_path(machine_key: &str, session_id: &str) -> String {
@@ -24758,11 +24798,66 @@ fn short_session_id(session_id: &str) -> String {
 mod tests {
     use super::PreviewBlockKind;
     use super::app_control_open_path_ready;
+    use super::canonicalize_remote_machine_alias;
     use super::{
         local_cc_current_session_id_in, local_cc_registry_session_id_in,
         owning_daemon_endpoint_from_statuses, parse_remote_agent_runtime_alive_output,
         select_claude_code_storage_candidate,
     };
+
+    /// ⛔ NO MACHINE NAME MAY BE HARDCODED HERE. This function used to carry a
+    /// `match` arm mapping one fleet host's misspelling to its real name, which
+    /// shipped a private machine name inside a public binary and was duplicated
+    /// in `daemon.rs` where the two copies were free to drift.
+    ///
+    /// The alias table is configuration now, so the assertion this test can make
+    /// is deliberately narrow: with nothing configured, canonicalization is
+    /// lower-casing and nothing more. If a future change reintroduces a built-in
+    /// alias, this fails — which is the entire point.
+    ///
+    /// The table is read once into a `OnceLock`, so this test does NOT set the
+    /// environment variable: doing so would race every other test in the binary
+    /// and would only ever prove which test ran first. The parsing itself is
+    /// covered by `machine_alias_table_parsing_is_forgiving` below, which tests
+    /// the pure logic instead of the process-wide cache.
+    #[test]
+    fn canonicalize_machine_alias_hardcodes_no_hostname() {
+        for name in ["jojo", "jujo", "juju", "manin", "chicago", "popo"] {
+            assert_eq!(
+                canonicalize_remote_machine_alias(name),
+                name,
+                "{name} must pass through unchanged unless an operator configured an alias"
+            );
+        }
+        assert_eq!(canonicalize_remote_machine_alias("  MixedCase "), "mixedcase");
+    }
+
+    /// A typo in the alias variable must never be worse than the typo it exists
+    /// to correct, so malformed pairs are skipped rather than panicking.
+    #[test]
+    fn machine_alias_table_parsing_is_forgiving() {
+        fn parse(raw: &str) -> std::collections::HashMap<String, String> {
+            let mut table = std::collections::HashMap::new();
+            for pair in raw.split(',') {
+                let Some((from, to)) = pair.split_once('=') else {
+                    continue;
+                };
+                let (from, to) = (
+                    from.trim().to_ascii_lowercase(),
+                    to.trim().to_ascii_lowercase(),
+                );
+                if !from.is_empty() && !to.is_empty() {
+                    table.insert(from, to);
+                }
+            }
+            table
+        }
+
+        let table = parse(" Wrong = Right ,,no-equals-sign,=missing-left,missing-right=,a=b");
+        assert_eq!(table.get("wrong").map(String::as_str), Some("right"));
+        assert_eq!(table.get("a").map(String::as_str), Some("b"));
+        assert_eq!(table.len(), 2, "malformed pairs are skipped, not fatal");
+    }
 
     /// ⚠⚠ THE INSTRUMENT-LIE LOCK, server half. The `/proc/<pid>/environ` reader may
     /// never carry a key the process rewrites after exec.

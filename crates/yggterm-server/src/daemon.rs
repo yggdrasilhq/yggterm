@@ -8746,22 +8746,27 @@ fn source_updated_at_for_remote_epoch(epoch: i64) -> Option<OffsetDateTime> {
         .flatten()
 }
 
+/// Slug form of a machine key, with alias correction applied first.
+///
+/// The alias rule itself lives in `canonicalize_remote_machine_alias` and is
+/// read from `YGGTERM_MACHINE_ALIASES`. This module used to carry its own copy
+/// of that rule as a `match` arm, which meant two encodings of one concept in
+/// two files, either free to drift; it also hardcoded a private fleet hostname
+/// into a public binary. One owner now, and no machine names in the source.
 fn background_machine_key(raw_machine_key: &str) -> String {
-    match raw_machine_key.trim().to_ascii_lowercase().as_str() {
-        "juju" | "jujo" => "jojo".to_string(),
-        value => value
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() {
-                    ch.to_ascii_lowercase()
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>()
-            .trim_matches('-')
-            .to_string(),
-    }
+    let canonical = crate::canonicalize_remote_machine_alias(raw_machine_key);
+    canonical
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }
 
 fn collect_local_copy_candidates(node: &SessionNode, out: &mut Vec<BackgroundCopyCandidate>) {
