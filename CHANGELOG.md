@@ -15,7 +15,23 @@ remote-preview fix below is daemon-side, so without this bump it would have sat
 installed and inert.
 
 - **Every remote Claude Code session's Web View was empty, and the transcript
-  was there the whole time.** The daemon's preview lane gated its entire
+  was there the whole time.** ✅ Live-proven on the GUI host: a remote Claude
+  Code row now hydrates (`Preview Hydration = tail`, 48 blocks in the daemon's
+  active-session payload) and the Web View draws real conversation instead of
+  two launch-scaffold lines.
+
+  ⚠ It took THREE fixes, not one, and the first two changed nothing visible
+  because the third gate sat in front of them: the GUI's own preview-sync path
+  also asked `starts_with("remote-session://")`, so `RefreshPreview` was never
+  SENT for a `remote-cc://` row and the daemon's (now correct) hydration was
+  never asked for. That gate is the third instance of this identical omission in
+  `shell.rs`; the other two carry the same warning in their own doc comments.
+  It now sits behind one named predicate, `session_preview_syncs_from_remote`.
+
+  ⚠ A separate limit is filed and still open: the surface renders **2** of the
+  48 entries it holds.
+
+  The original defect: The daemon's preview lane gated its entire
   `LiveSsh` arm on a parser that strips `remote-session://` only, so a
   `remote-cc://` row resolved to nothing and the arm ran nothing — no cache
   refresh, no payload fetch. Every remote Claude Code row kept only the two
