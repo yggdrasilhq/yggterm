@@ -1,10 +1,8 @@
 [workspace]
 members = [
   "apps/yggterm",
-  "crates/yggui-contract",
   "crates/yggterm-core",
   "crates/yggterm-server",
-  "crates/yggui",
   "crates/yggterm-shell",
   "crates/yggterm-webprobe",
   "crates/yggterm-gtk-glue",
@@ -25,7 +23,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.12.24"
+version = "3.0.0"
 edition = "2024"
 authors = ["Yggdrasil HQ"]
 # One owner for the licence. Members inherit with `license.workspace = true`;
@@ -34,6 +32,12 @@ authors = ["Yggdrasil HQ"]
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
+# libyggterm — extracted 2026-08-02, MPL-2.0. Pinned to a tag so a clean clone
+# of yggterm always builds; bump the tag here and nowhere else. For working on
+# both trees at once, use a local [patch] in .cargo/config.toml (git-ignored) —
+# never commit a path override, that is how a repo stops building from a clone.
+yggui = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.1.1" }
+yggui-contract = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.1.1" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
