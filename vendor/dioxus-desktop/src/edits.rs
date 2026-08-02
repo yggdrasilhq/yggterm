@@ -58,6 +58,7 @@ impl WryQueue {
         let serialized_edits = myself.mutation_state.export_memory();
         let receiver = myself.websocket.send_edits(webview_id, serialized_edits);
         myself.edits_in_progress = Some(receiver);
+        myself.edits_deadline = Some(Box::pin(tokio::time::sleep(EDITS_FLUSH_TIMEOUT)));
     }
 
     /// Wait until all pending edits have been rendered in the webview
@@ -66,11 +67,58 @@ impl WryQueue {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
         let mut self_mut = self.inner.borrow_mut();
-        if let Some(receiver) = self_mut.edits_in_progress.as_mut() {
-            receiver.poll_unpin(cx).map(|_| ())
-        } else {
-            std::task::Poll::Ready(())
+        if self_mut.edits_in_progress.is_none() {
+            return std::task::Poll::Ready(());
         }
+
+        let flushed = self_mut
+            .edits_in_progress
+            .as_mut()
+            .expect("checked above")
+            .poll_unpin(cx)
+            .is_ready();
+        if flushed {
+            self_mut.edits_in_progress = None;
+            self_mut.edits_deadline = None;
+            return std::task::Poll::Ready(());
+        }
+
+        // The webview may never acknowledge a batch. Two ways it happens in
+        // practice, both observed: applying the edits throws inside
+        // `run_from_bytes`, or the `requestAnimationFrame` that carries the ack
+        // never fires because the window is occluded and the compositor has
+        // stopped delivering frame callbacks.
+        //
+        // This gate is a best-effort ORDERING nicety — it exists so effects do
+        // not run against a DOM that has not caught up yet. It is not a
+        // correctness invariant, and it must never be able to outlive the
+        // webview's answer: `poll_vdom` returns early while it is held, so a
+        // permanently-held gate starves EVERY task on the VirtualDom — renders,
+        // effects and spawned futures alike — while the event loop itself stays
+        // healthy and idle. That presents as a completely frozen app that no
+        // OS-level instrument can distinguish from a well-behaved idle one.
+        //
+        // So: wait, but not forever. Polling the deadline here also registers
+        // our waker with the timer, which is what guarantees we are polled again
+        // to observe the timeout at all.
+        let timed_out = match self_mut.edits_deadline.as_mut() {
+            Some(deadline) => deadline.as_mut().poll(cx).is_ready(),
+            None => false,
+        };
+        if timed_out {
+            let webview_id = self_mut.location.webview_id;
+            tracing::error!(
+                webview_id,
+                timeout_ms = EDITS_FLUSH_TIMEOUT.as_millis() as u64,
+                "webview never acknowledged an edit batch; releasing the flush gate \
+                 so the VirtualDom keeps running (the UI may be one frame stale)"
+            );
+            self_mut.edits_in_progress = None;
+            self_mut.edits_deadline = None;
+            return std::task::Poll::Ready(());
+        }
+
+        std::task::Poll::Pending
     }
 
     /// Check if there is a new location for the websocket edits server.
@@ -111,11 +159,20 @@ impl WryQueue {
     }
 }
 
+/// How long to wait for the webview to acknowledge an edit batch before giving
+/// up on it and letting the VirtualDom run again. Generous enough that a slow
+/// frame never trips it, short enough that a lost acknowledgement is a blip
+/// rather than a hang.
+const EDITS_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub(crate) struct WryQueueInner {
     location: WebviewWebsocketLocation,
     websocket: EditWebsocket,
     // If this webview is currently waiting for an edit to be flushed. We don't run the virtual dom while this is true to avoid running effects before the dom has been updated
     edits_in_progress: Option<oneshot::Receiver<()>>,
+    // Deadline for the above. See `poll_edits_flushed` for why a missing
+    // acknowledgement must not be able to wedge the VirtualDom forever.
+    edits_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     // The socket may be killed by the OS while running. If it does, this channel will receive the new server location
     server_location_changed: Arc<Notify>,
     server_location_changed_future: Pin<Box<dyn Future<Output = ()>>>,
@@ -388,6 +445,7 @@ impl EditWebsocket {
                 location: WebviewWebsocketLocation { webview_id, server },
                 websocket: self.clone(),
                 edits_in_progress: None,
+                edits_deadline: None,
                 mutation_state: MutationState::default(),
             })),
         }
