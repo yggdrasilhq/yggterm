@@ -923,6 +923,109 @@ fn session_row_hover_css(_palette: Palette) -> String {
      [data-session-row]:focus-within [data-session-row-actions] *{pointer-events:auto;}"
         .to_string()
 }
+// ===== THE TEXT FIELD =======================================================
+//
+// ⛔ ONE SKIN FOR EVERY TEXT FIELD IN THE WINDOW. The omnibox, the titlebar
+// search, a Settings box, a contributed app pane's input, yedit's editor and
+// the vault's form are all the SAME control, so they wear the same fill, the
+// same radius, the same hover and the same focus ring — and they get there by
+// wearing [`FIELD_ATTR`], not by each surface copying a rule.
+//
+// WHY IT IS A STYLESHEET AND NOT A STYLE STRING: hover, focus and placeholder
+// are CSS STATES. An inline `style` attribute cannot express one, which is
+// exactly why every field in this app was flat and inert until 2026-08-02 —
+// the user's report was "our vault UX looks so lifeless with dullness
+// everywhere" and "I want the input box colors … to look youthful and not
+// lifeless too". A field that does not answer the pointer or the keyboard
+// reads as a picture of a field.
+//
+// The tokens are DESIGN.md → Core System → Control language → Inputs.
+
+/// The attribute a text field wears to inherit [`text_field_css`]. Every
+/// `input`/`textarea` the shell draws for the USER to type in carries it; the
+/// xterm helper textarea and hidden inputs deliberately do not.
+const FIELD_ATTR: &str = "data-yggui-field";
+
+/// The mark a field wears when it HOLDS a stored value it is not showing —
+/// the vault's password box. Its placeholder is decorative mask dots, and this
+/// attribute is what lifts them out of placeholder-grey into something that
+/// reads as content (Bitwarden's shape).
+///
+/// ⛔ The dots are a PLACEHOLDER, never a value. A placeholder cannot be
+/// submitted, cannot be read back by an action, and vanishes the instant a
+/// character is typed — which is the whole reason the mask can be drawn at all
+/// without breaking "the edit form is never prefilled with a real secret".
+const FIELD_STORED_ATTR: &str = "data-yggui-field-stored";
+
+/// Every text field's hover / focus / placeholder behaviour, resolved against
+/// the window's palette.
+///
+/// Injected ONCE at the shell root beside [`session_row_hover_css`], for the
+/// same reason: a rule injected per surface only reaches the surfaces that
+/// remembered to inject it.
+fn text_field_css(palette: Palette) -> String {
+    let accent = palette.accent;
+    let dark = palette_is_dark(palette);
+    let mix = |pct: u32, base: &str| format!("color-mix(in srgb, {accent} {pct}%, {base})");
+    // The RESTING fill. Not flat grey: a hair of the accent's own hue, so a
+    // field reads as part of the accent language rather than as a hole punched
+    // in the chrome. This is what "youthful, not lifeless" buys.
+    let (fill, fill_hover, fill_focus) = if dark {
+        (
+            mix(7, "rgba(255,255,255,0.045)"),
+            mix(12, "rgba(255,255,255,0.075)"),
+            mix(15, "rgba(255,255,255,0.085)"),
+        )
+    } else {
+        (
+            mix(5, "rgba(255,255,255,0.72)"),
+            mix(9, "rgba(255,255,255,0.88)"),
+            mix(7, "#ffffff"),
+        )
+    };
+    let (hairline, hairline_hover) = if dark {
+        (
+            mix(26, "rgba(255,255,255,0.14)"),
+            mix(48, "rgba(255,255,255,0.18)"),
+        )
+    } else {
+        (
+            mix(22, "rgba(120,140,160,0.28)"),
+            mix(42, "rgba(120,140,160,0.30)"),
+        )
+    };
+    // The FOCUS RING is the dialog focus ring's vocabulary (DESIGN.md
+    // "Keyboard focus ring"): the accent, OUTSIDE the control, following the
+    // control's own corner radius. A box-shadow rather than an `outline` so the
+    // 1px edge and the soft halo ride one property.
+    let ring = format!("0 0 0 1px {accent}, 0 0 0 3px {}", mix(26, "transparent"));
+    let ease = "140ms cubic-bezier(0.2,0,0,1)";
+    format!(
+        // `[attr]` reaches BOTH variants: the standard box and the pill. Only
+        // the resting hairline is variant-specific — a pill (the omnibox, the
+        // find bar) draws its own border inline because that border carries
+        // STATE there (red = no matches), and two hairlines would double up.
+        "[{FIELD_ATTR}]{{background:{fill}; \
+           transition:background-color {ease}, box-shadow {ease}, border-color {ease};}} \
+         [{FIELD_ATTR}=\"true\"]{{box-shadow:inset 0 0 0 1px {hairline};}} \
+         [{FIELD_ATTR}]:hover:not(:focus){{background:{fill_hover};}} \
+         [{FIELD_ATTR}=\"true\"]:hover:not(:focus){{box-shadow:inset 0 0 0 1px {hairline_hover};}} \
+         [{FIELD_ATTR}]:focus,[{FIELD_ATTR}]:focus-visible\
+           {{background:{fill_focus}; box-shadow:{ring}; outline:none;}} \
+         [{FIELD_ATTR}]::placeholder{{color:{muted}; opacity:0.9;}} \
+         [{FIELD_ATTR}][{FIELD_STORED_ATTR}=\"true\"]::placeholder\
+           {{color:{text}; opacity:0.62; letter-spacing:0.16em;}} \
+         [{FIELD_ATTR}][disabled]{{opacity:0.55;}} \
+         [data-yggui-field-action]{{transition:opacity {ease}, background-color {ease}, color {ease};}} \
+         [data-yggui-field-action]:hover\
+           {{opacity:1; color:{accent}; background:{action_hover};}} \
+         [data-yggui-field-action]:focus-visible\
+           {{opacity:1; outline:2px solid {accent}; outline-offset:1px;}}",
+        muted = palette.muted,
+        text = palette.text,
+        action_hover = mix(15, "transparent"),
+    )
+}
 /// The vertical-tabs left pane slides in from the edge as the top chrome
 /// collapses (max-height transition on the tab bar + nav bar).
 const WEB_SURFACE_VTAB_CSS: &str = "@keyframes ygg-vtab-slide-in { from { transform: translateX(-14px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }";
@@ -2847,6 +2950,23 @@ impl AppPaneWidget {
         }
     }
 
+    /// Is this widget's declared value a REVEAL rather than a DRAFT?
+    ///
+    /// ⛔ A `stored` field's value belongs to the APP, not to the form. The vault
+    /// declares the stored password's value for exactly one render when the user
+    /// presses the eye; if that landed in `app_pane_values` the very next action
+    /// POST would carry the secret back up and a Save would re-encrypt an
+    /// unchanged password for nothing. So the value reaches the DOM (through the
+    /// epoch remount) and never reaches the draft.
+    ///
+    /// The user typing over it is a different thing entirely: `oninput` writes
+    /// the draft, so a REPLACEMENT is sent and a REVEAL never is. That is what
+    /// lets one box be both Bitwarden's "here is your password" and our
+    /// "empty means leave it alone".
+    fn value_is_display_only(&self) -> bool {
+        matches!(self, AppPaneWidget::TextInput { stored: true, .. })
+    }
+
     /// `(id, value_key)` — WHICH buffer this widget's slot currently holds, for
     /// the widgets that can hold more than one over their lifetime.
     ///
@@ -2897,6 +3017,117 @@ fn app_pane_row_rename_value_id(row_id: &str) -> String {
     format!("rename:{row_id}")
 }
 
+/// One BAND of a contributed pane: a `section` and everything drawn under it,
+/// up to the next section.
+///
+/// A pane's schema is a flat `Vec<AppPaneWidget>` in draw order, and it stays
+/// flat — sections are boundaries, not containers, exactly as `list-row` depth
+/// is a number rather than a `children` array. The banding is computed at DRAW
+/// time so nothing about the wire schema had to change to give a form the card
+/// it wants.
+#[derive(Debug, Clone, PartialEq)]
+struct AppPaneBand {
+    /// Indices into the pane's widget list, in draw order.
+    indices: Vec<usize>,
+    /// Does this band draw inside a card? Only a `section` can ask, and the
+    /// leading band (whatever precedes the first section) never can.
+    card: bool,
+}
+
+/// Split a pane's widgets into [`AppPaneBand`]s.
+///
+/// Every widget lands in exactly one band and the order is untouched, so a pane
+/// that opts into no cards draws precisely what it drew before bands existed
+/// (one band, `card:false`, holding everything).
+fn app_pane_bands(widgets: &[AppPaneWidget]) -> Vec<AppPaneBand> {
+    let mut bands: Vec<AppPaneBand> = Vec::new();
+    for (index, widget) in widgets.iter().enumerate() {
+        let starts_band = matches!(widget, AppPaneWidget::Section { .. });
+        if starts_band || bands.is_empty() {
+            let card = match widget {
+                AppPaneWidget::Section { card, .. } => *card,
+                _ => false,
+            };
+            bands.push(AppPaneBand {
+                indices: Vec::new(),
+                card,
+            });
+        }
+        bands
+            .last_mut()
+            .expect("a band was just pushed if none existed")
+            .indices
+            .push(index);
+    }
+    bands
+}
+
+/// The decorative mask a `stored` field wears at rest.
+///
+/// A FIXED length, deliberately: the real value's length is itself information
+/// about the secret, and every other client draws a constant run of dots for
+/// the same reason.
+const APP_PANE_FIELD_MASK: &str = "••••••••••••";
+
+/// Where a field's inline verbs sit on its box.
+///
+/// Centred on a single-line field, pinned to the top on a textarea (a notes box
+/// is 6 rows tall and a vertically-centred eye would float in the middle of the
+/// text). BOTH arms name `top` AND `transform`, per the fixed-property-key
+/// invariant.
+fn app_pane_field_action_bar_style(multiline: bool) -> String {
+    format!(
+        "position:absolute; right:5px; top:{}; transform:{}; display:flex; align-items:center; \
+         gap:1px; z-index:1;",
+        if multiline { "6px" } else { "50%" },
+        if multiline { "none" } else { "translateY(-50%)" },
+    )
+}
+
+/// One inline field verb. Quiet at rest, lit on hover — the hover half is
+/// [`text_field_css`]'s, because it is a CSS state.
+fn app_pane_field_action_button_style(palette: Palette) -> String {
+    format!(
+        "border:none; background:transparent; color:{}; cursor:pointer; font-size:12px; \
+         line-height:1; padding:4px 4px; border-radius:7px; flex:0 0 auto; opacity:0.7; \
+         transition:{};",
+        palette.muted,
+        standard_transition(&["opacity", "background-color", "color"])
+    )
+}
+
+/// A band's own box.
+///
+/// ⚠ BOTH ARMS EMIT THE SAME PROPERTY KEYS. Dioxus applies `style`
+/// property-by-property and never clears a key the next render drops, so a
+/// card-only `padding` would stay applied forever after a section stopped
+/// asking for a card — the `SidebarPanelMode` trap, which this file has paid
+/// for twice. The non-card arm is `display:contents`, so its children remain
+/// direct flex items of the pane column and the layout is bit-identical to the
+/// pre-band one.
+fn app_pane_band_style(palette: Palette, card: bool) -> String {
+    if card {
+        format!(
+            "display:flex; flex-direction:column; gap:9px; padding:11px 12px 12px 12px; \
+             border-radius:14px; background:{}; box-shadow:inset 0 0 0 1px {}; margin:0;",
+            if palette_is_dark(palette) {
+                "rgba(255,255,255,0.04)"
+            } else {
+                "rgba(255,255,255,0.30)"
+            },
+            if palette_is_dark(palette) {
+                "rgba(141,160,178,0.16)"
+            } else {
+                "rgba(198,212,224,0.36)"
+            },
+        )
+    } else {
+        "display:contents; flex-direction:column; gap:0; padding:0; \
+         border-radius:0; background:transparent; box-shadow:none; margin:0;"
+            .to_string()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum AppPaneWidget {
@@ -2911,6 +3142,18 @@ enum AppPaneWidget {
         action_label: String,
         #[serde(default)]
         action_title: String,
+        /// Draw this heading and everything under it (up to the next section)
+        /// inside a CARD — the same card yggterm's own Settings rail uses
+        /// ([`settings_section_card_style`]), so a contributed form and the
+        /// app's own settings read as one product.
+        ///
+        /// OPT-IN, and it must stay opt-in: a card around a long `list-row`
+        /// list is a stack of nested boxes, which DESIGN.md rules out ("a stack
+        /// of nested cards inside more cards"). A form wants the card; a file
+        /// tree does not. Absent ⇒ exactly the flat band every pane written
+        /// before this drew.
+        #[serde(default)]
+        card: bool,
     },
     /// Static text. `muted` renders it as secondary prose.
     Label {
@@ -2990,6 +3233,33 @@ enum AppPaneWidget {
         /// default"); the app may declare it off or toggle it per action.
         #[serde(default = "app_pane_text_input_word_wrap_default")]
         word_wrap: bool,
+        /// Icon verbs drawn INSIDE the field's trailing edge — Bitwarden's eye
+        /// and copy, sitting on the box they act on rather than in a detached
+        /// list somewhere below it. Each fires with the field's own `id` as its
+        /// value, so an app needs no second encoding of "which field".
+        ///
+        /// The field reserves the room they take, so a long value ellipsizes
+        /// behind them instead of running under them.
+        #[serde(default)]
+        actions: Vec<AppPaneRowAction>,
+        /// This field HOLDS a value it is not showing: draw decorative mask
+        /// dots at rest. The vault's password box, and the reason the user
+        /// could say *"I cannot see passwords in edit mode"* about a form whose
+        /// boxes were all blank — a blank box says "there is nothing here",
+        /// which was a lie about the entry.
+        ///
+        /// ⛔ THE DOTS ARE A PLACEHOLDER, NOT A VALUE, and that is load-bearing
+        /// rather than incidental. A placeholder is never submitted, is never
+        /// read back by an action, and disappears on the first keystroke — so
+        /// the field can show that something is stored while the binding
+        /// invariant ("the edit form is never prefilled with a real secret")
+        /// holds by construction rather than by care.
+        ///
+        /// A field that declares `stored` and ALSO carries a value is showing a
+        /// revealed secret for this one render; the value wins and the dots
+        /// stand down, because there is nothing left to mask.
+        #[serde(default)]
+        stored: bool,
     },
     NumberInput {
         id: String,
@@ -21738,7 +22008,11 @@ impl ShellState {
                 id.clone(),
                 if unchanged { epoch } else { epoch.wrapping_add(1) },
             );
-            values.insert(id, declared);
+            // A revealed secret reaches the DOM and stops there — see
+            // [`AppPaneWidget::value_is_display_only`].
+            if !widget.value_is_display_only() {
+                values.insert(id, declared);
+            }
         }
         self.app_pane_values = values;
         self.app_pane_error = None;
@@ -79458,6 +79732,9 @@ fn app() -> Element {
     // The session-style row's reveal rule, resolved against THIS window's
     // palette (the frosted chip's wash is the surface's own colour).
     let session_row_hover_css = session_row_hover_css(snapshot.palette);
+    // Every text field's skin, resolved against THIS window's palette. Same
+    // reason it is here and not in a rail body: one owner, every surface.
+    let text_field_css = text_field_css(snapshot.palette);
     let context_menu_overlay = snapshot.context_menu_row.clone();
     rsx! {
         div {
@@ -79791,6 +80068,10 @@ fn app() -> Element {
             // injected per rail body only reached the bodies that remembered to
             // inject it (the tab rail never did).
             style { "{session_row_hover_css}" }
+            // The text field's hover / focus / placeholder rule, declared ONCE
+            // for the whole window: the omnibox, the titlebar search, Settings,
+            // and every contributed app pane draw the same control.
+            style { "{text_field_css}" }
             style { "{DOCUMENT_SURFACE_STANDDOWN_CSS}" }
             style { "{WEB_UNDER_GLASS_CSS}" }
             style { "{MENU_SURFACE_CSS}" }
@@ -118709,9 +118990,14 @@ fn web_chrome_input_style(foreground: &str, compact: bool, border: &str, flex: &
     } else {
         ("0", "0", "5px 14px", "14px", "12.5px")
     };
+    // ⛔ NO `background`: the pill's fill, hover and focus ring belong to
+    // `text_field_css` (it wears `data-yggui-field="pill"`), and an inline
+    // background out-specifies a stylesheet — which would leave the omnibox the
+    // one flat, inert field in the window. The BORDER stays inline because here
+    // it carries state: red when a find has no matches.
     format!(
         "flex:{flex}; order:{order}; min-width:0; margin-top:{margin_top}; padding:{padding}; \
-         border-radius:{radius}; border:1px solid {border}; background:rgba(127,127,127,0.12); \
+         border-radius:{radius}; border:1px solid {border}; \
          color:{foreground}; font-size:{font_size}; outline:none;",
     )
 }
@@ -118994,6 +119280,7 @@ fn WebOmniboxBar(
             }
             input {
                 id: "{input_id}",
+                "data-yggui-field": "pill",
                 style: "{input_style}",
                 value: "{address_text}",
                 spellcheck: "false",
@@ -119451,6 +119738,7 @@ fn WebFindBar(
             "data-covers-web-surface": "web-find",
             input {
                 id: "{WEB_FIND_INPUT_ID}",
+                "data-yggui-field": "pill",
                 style: "{input_style}",
                 value: "{find.query}",
                 spellcheck: "false",
@@ -121287,28 +121575,50 @@ fn AppPaneRailBody(
     state: Signal<ShellState>,
 ) -> Element {
     let palette = snapshot.palette;
-    let muted_style = format!("font-size:10px; line-height:1.5; color:{};", palette.muted);
-    let section_style = format!(
-        "font-size:11px; font-weight:800; color:{};",
+    let muted_style = format!(
+        "font-size:10.5px; line-height:1.55; color:{}; text-wrap:pretty;",
         palette.muted
     );
-    let text_style = format!("font-size:11px; color:{};", palette.text);
+    // A section heading is the pane's structural voice: caps, tracked out, in
+    // the TEXT colour rather than the muted one. It used to be muted-on-muted,
+    // which made a form read as one undifferentiated grey column.
+    let section_style = format!(
+        "font-size:10px; font-weight:800; letter-spacing:0.07em; text-transform:uppercase; color:{};",
+        palette.text
+    );
+    let text_style = format!("font-size:11.5px; color:{};", palette.text);
+    // A field's own name. Bitwarden's shape: small, quiet, sitting directly on
+    // the box it names — but WEIGHTED, so a column of fields reads as a form
+    // rather than as prose with boxes in it.
+    let field_label_style = format!(
+        "font-size:10.5px; font-weight:650; line-height:1.3; color:{};",
+        palette.muted
+    );
+    // ⛔ NO `background`, NO `box-shadow`: the SKIN belongs to `text_field_css`
+    // (hover, focus, placeholder are CSS states an inline style cannot reach),
+    // and an inline background would out-specify it and kill the whole thing.
+    // This string is the BOX only.
     let field_style = format!(
-        "flex:1 1 auto; min-width:0; padding:6px 10px; border-radius:9px; \
-         border:1px solid rgba(127,127,127,0.35); background:rgba(127,127,127,0.10); \
-         color:{}; font-size:11px; outline:none;",
+        "flex:1 1 auto; width:100%; min-width:0; box-sizing:border-box; padding:8px 11px; \
+         border-radius:10px; border:none; color:{}; font-size:12px; line-height:1.4; \
+         outline:none; font-family:inherit;",
         palette.text,
     );
     let primary_button_style = format!(
-        "align-self:flex-start; padding:7px 14px; border:0; border-radius:9px; \
-         background:{}; color:#fff; font-size:11px; font-weight:700; cursor:pointer;",
-        palette.accent
+        "align-self:flex-start; padding:8px 15px; border:0; border-radius:10px; \
+         background:{}; color:#fff; font-size:11.5px; font-weight:700; cursor:pointer; \
+         box-shadow:0 1px 2px color-mix(in srgb, {} 45%, transparent); transition:{};",
+        palette.accent,
+        palette.accent,
+        standard_transition(&["background-color", "box-shadow", "transform"])
     );
     let plain_button_style = format!(
-        "align-self:flex-start; padding:7px 14px; border:1px solid rgba(127,127,127,0.35); \
-         border-radius:9px; background:transparent; color:{}; font-size:11px; \
-         font-weight:600; cursor:pointer;",
-        palette.text
+        "align-self:flex-start; padding:8px 15px; border:1px solid color-mix(in srgb, {} 30%, rgba(127,127,127,0.34)); \
+         border-radius:10px; background:transparent; color:{}; font-size:11.5px; \
+         font-weight:600; cursor:pointer; transition:{};",
+        palette.accent,
+        palette.text,
+        standard_transition(&["background-color", "border-color"])
     );
     let pane_state = snapshot
         .app_pane_schema
@@ -121364,8 +121674,13 @@ fn AppPaneRailBody(
                 if let Some(error) = error {
                     div { style: "{muted_style}", "{error}" }
                 } else if let Some(schema) = schema {
-                    for (index, widget) in schema.widgets.iter().cloned().enumerate() {
+                    for (band_ix, band) in app_pane_bands(&schema.widgets).into_iter().enumerate() {
+                    div {
+                        key: "band-{band_ix}",
+                        style: app_pane_band_style(palette, band.card),
+                    for index in band.indices.iter().copied() {
                         {
+                        let widget = schema.widgets[index].clone();
                         let widget_key = widget.key(index, &value_epochs);
                         // Consecutive list-rows form one tight LIST: the 10px
                         // widget gap between them collapses to ~2px, so a file
@@ -121376,7 +121691,7 @@ fn AppPaneRailBody(
                                 (AppPaneWidget::ListRow { .. }, AppPaneWidget::ListRow { .. })
                             );
                         match widget {
-                            AppPaneWidget::Section { text, action, action_label, action_title } => rsx! {
+                            AppPaneWidget::Section { text, action, action_label, action_title, .. } => rsx! {
                                 div {
                                     key: "{widget_key}",
                                     style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
@@ -121467,6 +121782,7 @@ fn AppPaneRailBody(
                                 input {
                                     key: "{widget_key}",
                                     "data-app-pane-input": "{id}",
+                                    "data-yggui-field": "true",
                                     style: "{field_style}",
                                     r#type: "text",
                                     placeholder: "{placeholder}",
@@ -121487,53 +121803,114 @@ fn AppPaneRailBody(
                                     },
                                 }
                             },
-                            AppPaneWidget::TextInput { id, label, placeholder, value, action, secret, multiline, rows, .. } => rsx! {
+                            AppPaneWidget::TextInput { id, label, placeholder, value, action, secret, multiline, rows, actions, stored, .. } => {
+                                // A field that HOLDS something it is not showing
+                                // draws mask dots — decorative, fixed length, and
+                                // a PLACEHOLDER, so nothing about them can be
+                                // typed over, submitted or read back. Once a
+                                // value is present there is nothing left to mask.
+                                // Dots when the app said nothing else. A stored
+                                // field that DECLARES a placeholder gets it —
+                                // masking a notes box would be theatre, and the
+                                // app knows which of its fields is a secret.
+                                let masked = stored && value.is_empty() && placeholder.is_empty();
+                                let placeholder = if masked {
+                                    APP_PANE_FIELD_MASK.to_string()
+                                } else {
+                                    placeholder.clone()
+                                };
+                                // The verbs sit ON the box, so the box gives up
+                                // the room. Emitted ALWAYS (the no-action case is
+                                // the base padding), never conditionally — a
+                                // dropped `padding-right` would never clear.
+                                let field_box = format!(
+                                    "{field_style} padding-right:{}px;",
+                                    11 + actions.len() * 22
+                                );
+                                rsx! {
                                 div {
                                     key: "{widget_key}",
-                                    style: "display:flex; flex-direction:column; gap:4px;",
+                                    style: "display:flex; flex-direction:column; gap:5px; min-width:0;",
                                     if !label.is_empty() {
-                                        div { style: "{muted_style}", "{label}" }
+                                        div { style: "{field_label_style}", "{label}" }
                                     }
-                                    // A masked textarea is nonsense, so `secret`
-                                    // always wins and forces a single-line input.
-                                    if multiline && !secret {
-                                        textarea {
-                                            "data-app-pane-input": "{id}",
-                                            // `resize:vertical` is the drag-to-expand handle;
-                                            // `field_style` gives it the same skin as an input.
-                                            style: "{field_style} resize:vertical; min-height:1.6em; line-height:1.4; font-family:inherit;",
-                                            rows: "{rows.max(1)}",
-                                            placeholder: "{placeholder}",
-                                            initial_value: "{value}",
-                                            oninput: {
-                                                let id = id.clone();
-                                                let on_app_pane_value = on_app_pane_value.clone();
-                                                move |evt: FormEvent| on_app_pane_value.call((id.clone(), evt.value()))
-                                            },
-                                        }
-                                    } else {
-                                        input {
-                                            "data-app-pane-input": "{id}",
-                                            style: "{field_style}",
-                                            r#type: if secret { "password" } else { "text" },
-                                            placeholder: "{placeholder}",
-                                            initial_value: "{value}",
-                                            oninput: {
-                                                let id = id.clone();
-                                                let on_app_pane_value = on_app_pane_value.clone();
-                                                move |evt: FormEvent| on_app_pane_value.call((id.clone(), evt.value()))
-                                            },
-                                            onkeydown: {
-                                                let (pane_id, action) = (pane_id.clone(), action.clone());
-                                                let on_app_pane_action = on_app_pane_action.clone();
-                                                move |evt: KeyboardEvent| {
-                                                    if evt.key() == Key::Enter && !action.is_empty() {
-                                                        on_app_pane_action.call((pane_id.clone(), action.clone(), None));
+                                    div {
+                                        style: "position:relative; display:flex; align-items:stretch; min-width:0;",
+                                        // A masked textarea is nonsense, so `secret`
+                                        // always wins and forces a single-line input.
+                                        if multiline && !secret {
+                                            textarea {
+                                                "data-app-pane-input": "{id}",
+                                                "data-yggui-field": "true",
+                                                "data-yggui-field-stored": if masked { "true" } else { "false" },
+                                                // `resize:vertical` is the drag-to-expand handle;
+                                                // `field_style` gives it the same skin as an input.
+                                                style: "{field_box} resize:vertical; min-height:1.6em;",
+                                                rows: "{rows.max(1)}",
+                                                placeholder: "{placeholder}",
+                                                initial_value: "{value}",
+                                                oninput: {
+                                                    let id = id.clone();
+                                                    let on_app_pane_value = on_app_pane_value.clone();
+                                                    move |evt: FormEvent| on_app_pane_value.call((id.clone(), evt.value()))
+                                                },
+                                            }
+                                        } else {
+                                            input {
+                                                "data-app-pane-input": "{id}",
+                                                "data-yggui-field": "true",
+                                                "data-yggui-field-stored": if masked { "true" } else { "false" },
+                                                style: "{field_box}",
+                                                r#type: if secret { "password" } else { "text" },
+                                                placeholder: "{placeholder}",
+                                                initial_value: "{value}",
+                                                oninput: {
+                                                    let id = id.clone();
+                                                    let on_app_pane_value = on_app_pane_value.clone();
+                                                    move |evt: FormEvent| on_app_pane_value.call((id.clone(), evt.value()))
+                                                },
+                                                onkeydown: {
+                                                    let (pane_id, action) = (pane_id.clone(), action.clone());
+                                                    let on_app_pane_action = on_app_pane_action.clone();
+                                                    move |evt: KeyboardEvent| {
+                                                        if evt.key() == Key::Enter && !action.is_empty() {
+                                                            on_app_pane_action.call((pane_id.clone(), action.clone(), None));
+                                                        }
                                                     }
+                                                },
+                                            }
+                                        }
+                                        // The field's own verbs — Bitwarden's eye
+                                        // and copy, on the box they act on. Each
+                                        // fires with the FIELD's id as its value,
+                                        // so the app needs no second encoding of
+                                        // "which field".
+                                        div {
+                                            style: app_pane_field_action_bar_style(multiline && !secret),
+                                            for field_action in actions.iter().cloned() {
+                                                button {
+                                                    key: "{field_action.action}",
+                                                    r#type: "button",
+                                                    "data-app-pane-field-action": "{field_action.action}",
+                                                    "data-yggui-field-action": "true",
+                                                    style: app_pane_field_action_button_style(palette),
+                                                    title: "{field_action.title}",
+                                                    onclick: {
+                                                        let (pane_id, action, field_id) =
+                                                            (pane_id.clone(), field_action.action.clone(), id.clone());
+                                                        let on_app_pane_action = on_app_pane_action.clone();
+                                                        move |_| on_app_pane_action.call((
+                                                            pane_id.clone(),
+                                                            action.clone(),
+                                                            Some(field_id.clone()),
+                                                        ))
+                                                    },
+                                                    "{field_action.label}"
                                                 }
-                                            },
+                                            }
                                         }
                                     }
+                                }
                                 }
                             },
                             AppPaneWidget::NumberInput { id, label, value, min, max } => rsx! {
@@ -121541,10 +121918,11 @@ fn AppPaneRailBody(
                                     key: "{widget_key}",
                                     style: "display:flex; align-items:center; gap:6px;",
                                     if !label.is_empty() {
-                                        div { style: "{muted_style}", "{label}" }
+                                        div { style: "{field_label_style}", "{label}" }
                                     }
                                     input {
                                         "data-app-pane-input": "{id}",
+                                        "data-yggui-field": "true",
                                         style: "{field_style} max-width:88px;",
                                         r#type: "number",
                                         min: "{min}",
@@ -121632,11 +122010,15 @@ fn AppPaneRailBody(
                                             ),
                                             input {
                                                 "data-app-pane-input": "{draft_id}",
+                                                // The SHARED field skin (text_field_css) — it
+                                                // used to hand-roll a white fill and a grey
+                                                // hairline, which was a light-theme-only box
+                                                // that never answered focus.
+                                                "data-yggui-field": "true",
                                                 style: format!(
                                                     "flex:1; min-width:0; height:29px; border:none; border-radius:10px; \
-                                                     background:rgba(255,255,255,0.92); color:{}; font-size:12px; \
-                                                     font-weight:600; padding:0 10px; \
-                                                     box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
+                                                     color:{}; font-size:12px; font-weight:600; padding:0 10px; \
+                                                     outline:none;",
                                                     palette.text
                                                 ),
                                                 r#type: "text",
@@ -122099,6 +122481,8 @@ fn AppPaneRailBody(
                         }
                         }
                     }
+                    }
+                    }
                 } else {
                     div { style: "{muted_style}", "Loading…" }
                 }
@@ -122155,14 +122539,22 @@ fn AppPaneRailBody(
                                 "{label}"
                             }
                         },
-                        AppPaneWidget::Button { id, label, action, .. } => rsx! {
+                        // A footer button is an ACTION BAR button: pinned under
+                        // the scroll area, always reachable. `primary` reaches it
+                        // for the same reason it reaches the body — a form whose
+                        // Save scrolls away is a form with no Save.
+                        AppPaneWidget::Button { id, label, action, primary } => rsx! {
                             button {
                                 key: "{widget_key}",
                                 "data-app-pane-footer-button": "{id}",
+                                "data-app-pane-footer-button-primary": if primary { "true" } else { "false" },
                                 style: format!(
-                                    "padding:3px 9px; border:1px solid rgba(127,127,127,0.35); border-radius:7px; \
-                                     background:transparent; color:{}; font-size:10px; font-weight:600; cursor:pointer;",
-                                    palette.text
+                                    "padding:6px 13px; border:{}; border-radius:9px; \
+                                     background:{}; color:{}; font-size:11px; font-weight:{}; cursor:pointer;",
+                                    if primary { "0".to_string() } else { format!("1px solid color-mix(in srgb, {} 30%, rgba(127,127,127,0.34))", palette.accent) },
+                                    if primary { palette.accent } else { "transparent" },
+                                    if primary { "#fff" } else { palette.text },
+                                    if primary { "700" } else { "600" },
                                 ),
                                 onclick: {
                                     let action = action.clone();
@@ -126445,6 +126837,7 @@ fn SettingsField(
             }
             input {
                 "data-settings-field-key": "{field_key}",
+                "data-yggui-field": "true",
                 r#type: if secret { "password" } else { "text" },
                 value: "{value}",
                 placeholder: "{placeholder}",
@@ -129513,22 +129906,17 @@ fn settings_section_card_style(palette: Palette) -> String {
         standard_transition(&["background-color", "box-shadow"])
     )
 }
+/// A Settings box.
+///
+/// ⛔ NO `background`, NO `box-shadow`: the SKIN is `text_field_css`'s (it wears
+/// `data-yggui-field="true"`), because hover and focus are CSS states an inline
+/// style cannot express. This function is the BOX — height, padding, radius,
+/// type — and nothing else.
 fn settings_input_style(palette: Palette) -> String {
     format!(
-        "height:30px; padding:0 10px; border:none; border-radius:8px; background:{}; \
-         color:{}; outline:none; font-size:11px; box-shadow: inset 0 0 0 1px {}; transition:{};",
-        if palette_is_dark(palette) {
-            "rgba(18,24,31,0.88)"
-        } else {
-            "rgba(255,255,255,0.58)"
-        },
+        "height:32px; padding:0 11px; border:none; border-radius:9px; \
+         color:{}; outline:none; font-size:11.5px;",
         palette.text,
-        if palette_is_dark(palette) {
-            "rgba(93,116,134,0.56)"
-        } else {
-            "rgba(255,255,255,0.34)"
-        },
-        standard_transition(&["background-color", "box-shadow", "color"])
     )
 }
 fn zoom_button_style(palette: Palette) -> String {
@@ -133141,6 +133529,8 @@ mod tests {
                 rows: 0,
                 line_numbers: true,
                 word_wrap: true,
+                actions: Vec::new(),
+                stored: false,
             }],
             split_ratio: None,
             footer: Vec::new(),
@@ -143598,6 +143988,7 @@ mod tests {
             action: String::new(),
             action_label: String::new(),
             action_title: String::new(),
+            card: false,
         };
         let label = AppPaneWidget::Label { text: "unlocked".into(), muted: true };
         assert_ne!(section.key(1, &epochs), label.key(1, &epochs));
@@ -143714,6 +144105,8 @@ mod tests {
             secret: true,
             multiline: false,
             rows: 0,
+            actions: Vec::new(),
+            stored: false,
         };
         let bumped = HashMap::from([("password".to_string(), 1u64)]);
         assert_ne!(field.key(0, &epochs), field.key(0, &bumped));
@@ -143950,6 +144343,177 @@ mod tests {
             "a pushed value must rebuild the node"
         );
         assert_eq!(shell.app_pane_values["password"], "");
+    }
+
+    // ⛔ A REVEALED SECRET REACHES THE DOM AND STOPS THERE.
+    //
+    // The vault's password box is one box doing two jobs: it SHOWS what is
+    // stored (when the eye is pressed) and it REPLACES it (when the user
+    // types). Those two must not be the same value, or pressing the eye and
+    // then Save would re-send the password the user never touched — a pointless
+    // re-encrypt that bumps `revisionDate` for every other client, with the
+    // secret riding an action POST to get there.
+    //
+    // So a `stored` field's declared value bumps the epoch (the node remounts
+    // and the user SEES it) and never lands in `app_pane_values`.
+    #[test]
+    fn a_stored_fields_revealed_value_is_shown_and_never_re_sent() {
+        let field = |stored: bool, value: &str| {
+            json!({
+                "kind": "text-input", "id": "edit_password", "value": value,
+                "secret": value.is_empty(), "stored": stored,
+            })
+        };
+        let schema = |stored: bool, value: &str| -> AppPaneSchema {
+            serde_json::from_value(json!({"widgets": [field(stored, value)]}))
+                .expect("schema parses")
+        };
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
+
+        let seq = shell.app_pane_next_request();
+        shell.app_pane_apply_schema(seq, "vault", schema(true, ""));
+        let at_rest = shell.app_pane_schema.as_ref().unwrap().value_epochs["edit_password"];
+        assert!(
+            !shell.app_pane_values.contains_key("edit_password"),
+            "a stored field seeded the draft at rest",
+        );
+
+        // The eye. The value arrives, the node remounts to show it...
+        let seq = shell.app_pane_next_request();
+        shell.app_pane_apply_schema(seq, "vault", schema(true, "hunter2-correct-horse"));
+        assert_ne!(
+            shell.app_pane_schema.as_ref().unwrap().value_epochs["edit_password"],
+            at_rest,
+            "a revealed value must rebuild the node or nobody sees it",
+        );
+        // ...and the next action POST carries nothing of it.
+        let posted = shell.app_pane_values_json().to_string();
+        assert!(
+            !posted.contains("hunter2"),
+            "a revealed secret rode the next action: {posted}",
+        );
+
+        // Typing IS a replacement, and does reach the draft.
+        shell.set_app_pane_value("edit_password", "a new one".to_string());
+        assert_eq!(shell.app_pane_values["edit_password"], "a new one");
+
+        // A field that does NOT declare `stored` behaves exactly as before.
+        let seq = shell.app_pane_next_request();
+        shell.app_pane_apply_schema(seq, "vault", schema(false, ""));
+        assert_eq!(shell.app_pane_values["edit_password"], "");
+    }
+
+    // A pane's widgets are partitioned into bands, LOSSLESSLY and IN ORDER: a
+    // card is a drawing decision, never a chance to drop or reorder a widget.
+    #[test]
+    fn app_pane_bands_partition_the_widgets_and_cards_are_opt_in() {
+        let widgets: Vec<AppPaneWidget> = serde_json::from_value(json!([
+            {"kind": "label", "text": "before any section"},
+            {"kind": "section", "text": "Item details", "card": true},
+            {"kind": "text-input", "id": "a"},
+            {"kind": "text-input", "id": "b"},
+            {"kind": "section", "text": "Files"},
+            {"kind": "list-row", "id": "r1", "title": "one"},
+        ]))
+        .expect("widgets parse");
+        let bands = app_pane_bands(&widgets);
+        assert_eq!(
+            bands
+                .iter()
+                .map(|band| (band.indices.clone(), band.card))
+                .collect::<Vec<_>>(),
+            vec![
+                (vec![0], false),
+                (vec![1, 2, 3], true),
+                (vec![4, 5], false),
+            ],
+        );
+        // Every widget, exactly once, in draw order.
+        let flat: Vec<usize> = bands.iter().flat_map(|band| band.indices.clone()).collect();
+        assert_eq!(flat, (0..widgets.len()).collect::<Vec<_>>());
+
+        // A pane that never heard of cards draws one flat band, which is what
+        // every pane written before bands existed drew.
+        let flat_pane: Vec<AppPaneWidget> = serde_json::from_value(json!([
+            {"kind": "list-row", "id": "r1", "title": "one"},
+            {"kind": "list-row", "id": "r2", "title": "two"},
+        ]))
+        .expect("widgets parse");
+        let bands = app_pane_bands(&flat_pane);
+        assert_eq!(bands.len(), 1);
+        assert!(!bands[0].card);
+        assert!(app_pane_bands(&[]).is_empty());
+    }
+
+    // ⚠ THE FIXED-PROPERTY-KEY INVARIANT, on the band box. Dioxus never clears a
+    // key the next render drops, so a card-only `padding` would stay applied
+    // forever after a section stopped asking for a card.
+    #[test]
+    fn a_band_emits_the_same_property_keys_carded_or_not() {
+        let keys = |style: String| -> Vec<String> {
+            style
+                .split(';')
+                .filter_map(|decl| decl.split_once(':'))
+                .map(|(key, _)| key.trim().to_string())
+                .collect()
+        };
+        for theme in [UiTheme::ZedLight, UiTheme::ZedDark] {
+            assert_eq!(
+                keys(app_pane_band_style(palette(theme), true)),
+                keys(app_pane_band_style(palette(theme), false)),
+                "{theme:?}: a band's two arms name different properties",
+            );
+        }
+    }
+
+    // ⛔ ONE SKIN FOR EVERY TEXT FIELD, and it is a STYLESHEET because hover,
+    // focus and placeholder are CSS states an inline style cannot express. This
+    // is the user's 2026-08-02 report ("I want the input box colors … to look
+    // youthful and not lifeless too") turned into a property.
+    #[test]
+    fn every_text_field_wears_one_skin_that_answers_the_pointer_and_the_keyboard() {
+        for theme in [UiTheme::ZedLight, UiTheme::ZedDark] {
+            let css = text_field_css(palette(theme));
+            let accent = palette(theme).accent;
+            for expected in [
+                "[data-yggui-field]",
+                "[data-yggui-field]:hover:not(:focus)",
+                "[data-yggui-field]:focus",
+                "[data-yggui-field]::placeholder",
+                "[data-yggui-field][data-yggui-field-stored=\"true\"]::placeholder",
+                "[data-yggui-field-action]:hover",
+            ] {
+                assert!(css.contains(expected), "{theme:?}: no rule for {expected}");
+            }
+            // The focus ring is the ACCENT, per DESIGN.md's focus-ring rule —
+            // not a grey that reads as "nothing happened".
+            assert!(css.contains(accent), "{theme:?}: the skin is accent-free");
+            assert!(
+                !css.contains("rgba(127,127,127"),
+                "{theme:?}: the flat grey the user called lifeless came back",
+            );
+        }
+
+        // The BOX functions must emit no fill of their own: an inline background
+        // out-specifies the stylesheet and would kill hover and focus outright.
+        for style in [
+            settings_input_style(palette(UiTheme::ZedLight)),
+            web_chrome_input_style("#fff", false, "rgba(0,0,0,0.2)", "1 1 auto"),
+        ] {
+            assert!(
+                !style.contains("background"),
+                "an inline background would out-specify the shared skin: {style}",
+            );
+        }
+
+        // Injected ONCE, at the shell root, beside the row-reveal rule — a rule
+        // injected per surface only reaches the surfaces that remember to.
+        let product = shell_product_source();
+        assert_eq!(
+            product.matches("style { \"{text_field_css}\" }").count(),
+            1,
+            "the field skin must be injected exactly once, at the shell root",
+        );
     }
 
     // A draft the app stops declaring is dropped, so a password typed into the

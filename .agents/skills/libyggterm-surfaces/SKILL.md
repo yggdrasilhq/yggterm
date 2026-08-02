@@ -231,6 +231,47 @@ vault pane is a CONTRIBUTION now, not yggterm chrome.
     the row's text colour (a black dot in the light theme) and shoved the name
     one character right. "This row is the one in use" is `selected: true`, not a
     dot.
+  - **⭐ `section` CARDS (2026-08-02, the vault form was the forcing consumer):**
+    a `section` may carry `card: true`. The heading and everything under it, up
+    to the next `section`, is drawn inside a card — the SAME card yggterm's own
+    Settings rail uses, so a contributed form and the app's own settings read as
+    one product. **Opt-in, and it must stay opt-in:** a card around a long
+    `list-row` list is the "stack of nested cards inside more cards" DESIGN.md
+    rules out. A form wants the card; a file tree does not. Absent ⇒ exactly the
+    flat band every pane written before this drew (the banding is computed at
+    DRAW time; the wire schema is still a flat list in draw order).
+  - **⭐ `text-input` INLINE VERBS — `actions` (2026-08-02):** a field may carry
+    `actions: [{action, label, title?}]`, drawn INSIDE its trailing edge —
+    Bitwarden's eye and copy, on the box they act on. Each POSTs with the
+    FIELD's own `id` as its value, so an app needs no second encoding of "which
+    field". The box reserves the room they take, so a long value ellipsizes
+    behind them instead of running under them. Quiet at rest, accent on hover.
+    - ⚠ If your verb needs a target yggterm cannot know (ychrome's field spec),
+      encode it in the ACTION name (`edit-reveal:password`), the `copy-row:`
+      grammar — the field id is a widget slot, not your domain identity.
+  - **⭐ `text-input` STORED VALUES — `stored` (2026-08-02, the vault's password
+    box was the forcing consumer):** `stored: true` says the field HOLDS a value
+    it is not showing. Two things follow, and both are load-bearing for a
+    secret-free pane:
+    1. **Mask dots at rest, as a PLACEHOLDER.** Fixed length (a real value's
+       length is information about it). A placeholder cannot be submitted,
+       cannot be read back by an action, and vanishes on the first keystroke —
+       so a form can SAY a secret exists while never holding one. Declare your
+       own `placeholder` to opt out of the dots (a notes box masked with dots is
+       theatre); yggterm masks only when `stored`, the value is empty, AND no
+       placeholder was declared.
+    2. **The declared value is a REVEAL, not a DRAFT.** yggterm pushes it to the
+       DOM (the epoch remount makes the user see it) and keeps it OUT of
+       `app_pane_values`. Without that, an app that reveals a password into the
+       box would get it back on the very next action POST and re-save an
+       unchanged secret. The user typing over it is a different thing: `oninput`
+       writes the draft, so a REPLACEMENT is sent and a REVEAL never is.
+    This is what lets ONE box be both "here is your password" and our
+    "an empty box means leave this alone".
+  - **⭐ `footer` buttons honour `primary` (2026-08-02):** a form taller than the
+    rail must not scroll its Save away. Put the form's primary action in the
+    schema `footer` and mark it `primary: true`; it draws as the accent action
+    bar, pinned under the scroll area.
   - **`text-input` BUFFER IDENTITY — `value_key` (2026-07-26):** an editor slot
     that holds different content over its life MUST declare which content is
     loaded: `{"kind": "text-input", "id": "editor", "value_key": "<note id>",
