@@ -86482,6 +86482,10 @@ fn ConversationWebView(
     on_toggle_block: EventHandler<usize>,
     on_copy_block: EventHandler<String>,
 ) -> Element {
+    // The session's own transcript, read once per render and tail-limited.
+    // Empty for a remote agent — its JSONL lives on its own host — which is
+    // what keeps the summary strip as the fallback rather than a blank pane.
+    let transcript_chat_entries = local_transcript_chat_entries(&session);
     let read_only_attr = provider.read_only.to_string();
     let can_send_attr = provider.can_send.to_string();
     let can_edit_attr = provider.can_edit.to_string();
@@ -86567,7 +86571,19 @@ fn ConversationWebView(
                         .await;
                 },
             }
-            if !rendered_sections.is_empty() {
+            // The real transcript, rendered as a chat, when this session has one
+            // on THIS host. It supersedes the summary strip rather than sitting
+            // beside it: the strip is a 3-line-per-card précis, and showing a
+            // précis above the conversation it summarises is just noise.
+            //
+            // Empty means no local JSONL — a remote agent's transcript lives on
+            // its own host — so the strip stays and nothing regresses.
+            if !transcript_chat_entries.is_empty() {
+                TranscriptChat {
+                    entries: transcript_chat_entries.clone(),
+                    palette,
+                }
+            } else if !rendered_sections.is_empty() {
                 RenderedSectionsStrip {
                     sections: rendered_sections.clone(),
                     palette,
@@ -87195,6 +87211,156 @@ fn PreviewGraph(
         }
     }
 }
+/// How much of a live transcript the chat view reads.
+///
+/// Transcripts run to tens of megabytes on a long session. The reader is
+/// tail-limited because the useful end of a conversation is the recent end, and
+/// because parsing the whole file on every snapshot would stall the GUI thread.
+const TRANSCRIPT_CHAT_MAX_ENTRIES: usize = 400;
+
+/// Read a LOCAL agent session's transcript for the chat view.
+///
+/// Local only, deliberately. A remote agent's JSONL lives on its own host and
+/// reaching it is the remote-scan problem — the same boundary the loopback
+/// transcript server draws when it returns `Ok(None)` for a non-local session.
+/// Returning nothing here leaves the existing summary strip in place rather
+/// than inventing a half-transcript.
+fn local_transcript_chat_entries(
+    session: &ManagedSessionView,
+) -> Vec<yggterm_core::TranscriptEntry> {
+    if session.source != SessionSource::LiveLocal && session.source != SessionSource::Stored {
+        return Vec::new();
+    }
+    let uuid = session
+        .session_path
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    if uuid.is_empty() {
+        return Vec::new();
+    }
+    let Some(path) = yggterm_core::local_cc_session_jsonl_path(&uuid) else {
+        return Vec::new();
+    };
+    yggterm_core::read_agent_transcript_entries_tail_limited(
+        &path,
+        TRANSCRIPT_CHAT_MAX_ENTRIES,
+    )
+    .unwrap_or_default()
+}
+
+/// The rendered transcript, as a chat.
+///
+/// This is the native half of what the vendored T3 timeline drew in a webview.
+/// It exists in Dioxus rather than as a bundled web app because the bundle was
+/// a gitignored npm build product that no packaging step ever shipped: the
+/// asset resolver's only working fallback was the repo path, so every installed
+/// copy fell through and rendered a placeholder. A native view has no assets to
+/// lose.
+///
+/// Tool calls fold to their headline. That is the whole reason the reader
+/// carries one — a call the user has to expand to identify defeats folding.
+#[component]
+fn TranscriptChat(
+    entries: Vec<yggterm_core::TranscriptEntry>,
+    palette: Palette,
+) -> Element {
+    use yggterm_core::{TranscriptEntryKind, TranscriptRole};
+    rsx! {
+        div {
+            "data-transcript-chat": "1",
+            style: "display:flex; flex-direction:column; gap:14px; padding:18px 22px 40px 22px;                     max-width:920px; width:100%; margin:0 auto; box-sizing:border-box;",
+            for (index, entry) in entries.iter().enumerate() {
+                {
+                    let is_user = entry.role == TranscriptRole::User;
+                    let accent: &'static str = match entry.role {
+                        TranscriptRole::User => palette.accent,
+                        TranscriptRole::Assistant => palette.text,
+                        TranscriptRole::System => palette.muted,
+                    };
+                    match entry.kind {
+                        TranscriptEntryKind::ToolCall => {
+                            let tool = entry.tool.clone().unwrap_or_default();
+                            let stats = if tool.added_lines > 0 || tool.removed_lines > 0 {
+                                format!("  +{} −{}", tool.added_lines, tool.removed_lines)
+                            } else {
+                                String::new()
+                            };
+                            rsx! {
+                                details {
+                                    key: "tool-{index}",
+                                    "data-transcript-tool": "{tool.tool}",
+                                    style: format!(
+                                        "border-radius:12px; padding:8px 12px;                                          background:{}; box-shadow:inset 0 0 0 1px {};",
+                                        palette.panel_alt, palette.border,
+                                    ),
+                                    summary {
+                                        style: format!(
+                                            "cursor:pointer; font-size:12px; font-family:ui-monospace,monospace;                                              color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                            if tool.failed { "#e06c75" } else { palette.muted },
+                                        ),
+                                        // The tool's own name, never translated.
+                                        span {
+                                            style: format!("font-weight:700; color:{};", accent),
+                                            "{tool.tool}"
+                                        }
+                                        "  {tool.headline}{stats}"
+                                    }
+                                    if !tool.detail.is_empty() {
+                                        pre {
+                                            style: format!(
+                                                "margin:8px 0 2px 0; font-size:12px; line-height:1.45;                                                  white-space:pre-wrap; word-break:break-word; color:{};",
+                                                palette.text,
+                                            ),
+                                            "{tool.detail.join(\"\n\")}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            let body = entry.lines.join("\n");
+                            let label = match entry.kind {
+                                TranscriptEntryKind::Reasoning => "THINKING",
+                                _ => entry.role.display_label(),
+                            };
+                            let dim = entry.kind == TranscriptEntryKind::Reasoning;
+                            rsx! {
+                                div {
+                                    key: "msg-{index}",
+                                    "data-transcript-role": "{label}",
+                                    style: format!(
+                                        "display:flex; flex-direction:column; gap:5px;                                          align-self:{}; max-width:{};",
+                                        if is_user { "flex-end" } else { "flex-start" },
+                                        if is_user { "84%" } else { "100%" },
+                                    ),
+                                    div {
+                                        style: format!(
+                                            "font-size:10px; font-weight:700; letter-spacing:0.08em; color:{};",
+                                            if dim { palette.muted } else { accent },
+                                        ),
+                                        "{label}"
+                                    }
+                                    div {
+                                        style: format!(
+                                            "font-size:13px; line-height:1.55; white-space:pre-wrap;                                              word-break:break-word; border-radius:14px; padding:10px 14px;                                              background:{}; color:{}; {}",
+                                            if is_user { palette.panel_alt } else { "transparent" },
+                                            if dim { palette.muted } else { palette.text },
+                                            if dim { "font-style:italic;" } else { "" },
+                                        ),
+                                        "{body}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn RenderedSectionsStrip(sections: Vec<SessionRenderedSection>, palette: Palette) -> Element {
     rsx! {
