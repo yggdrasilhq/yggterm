@@ -108,6 +108,9 @@ before anyone "fixes" it.
 
 **Status:** OPEN
 
+*(the yggterm half is built and locked; the ychrome half is not, and the item
+does not close until both are live)*
+
 User-reported 2026-08-02: *"In a specific ychrome session, if all tabs are
 closed then ychrome session itself should close itself."*
 
@@ -117,14 +120,34 @@ runtime is fine and desirable (`docs/settled-calls.md` call #4). That rule is
 about a row the USER can click to restart; this is a live session with a live
 process and nothing to show, which is different and is clutter.
 
-**Where it lives:** ychrome's `drive_surface` loop (`ychrome/src/main.rs`) owns
-the session's lifetime and emits the `close` OSC; the GUI owns tab removal
-(`web_surface_tabs`). The count that matters is the GUI's, so the honest fix is
-for the surface-close path to tell the app its last tab is gone rather than for
-the app to infer it.
+**The yggterm half, built 2026-08-02.** `WebSurfaceUiState::last_content_tab_closed`
+is latched in `web_surface_close_tab` — the ONE removal path, so every close verb
+reports it by construction and no bulk close has to remember — and cleared by the
+next tab that opens, including a popup and an undo. It rides the `/ping` the GUI
+already sends per session as `&last_tab_closed=1`, on every ping while set rather
+than once, so a dropped tick costs nothing and the app owes no acknowledgement.
+An app that does not know the param ignores it like any unknown query value.
+
+⛔ **It is a latched EVENT and must never become the count `tabs.len() == 1`.**
+A surface holds nothing but its app tab in the window between the app declaring
+and its first page arriving, so a signal derived from the count would order every
+ychrome to quit at launch. Locked by
+`closing_the_last_content_tab_signals_the_app_but_having_none_yet_does_not`,
+whose second half is exactly that case, and mutation-proven by removing the latch.
+
+**What ychrome still owes.** Its `/ping` handler (`src/daemon.rs`, the
+`request.path == "/ping"` arm) reads `session` and `ack` from the query and must
+also read `last_tab_closed`, recording it on that `SessionEntry`. The view
+client's `drive_surface` loop already talks to the daemon every ~4 s through
+`declare_current`, so that reply is where the answer belongs: on seeing it, the
+loop sets its `stop` flag and falls into the shutdown it already has
+(`emit_close` → `deregister` → the `close` OSC), which is precisely what Ctrl+C
+does. Nothing new needs writing on the teardown side.
 
 ⚠ Do not implement this by having the app poll for tabs — that is a second
 encoding of a count the GUI already owns.
+
+⚠ Live proof owed for the whole item, and it needs both halves plus a GUI swap.
 
 
 ## Two supernumerary daemons persist holding unmigratable local:// shells
