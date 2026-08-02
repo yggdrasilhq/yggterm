@@ -15450,9 +15450,18 @@ struct RenderSnapshot {
     /// app is live and declaring — which is what keeps app chrome out of the
     /// rail. yggterm never invents one of these.
     sidebar_panes: Vec<SidebarPaneDeclaration>,
-    /// The host's libyggterm app registry. THE source for every launcher
-    /// surface: the titlebar `+` menu, the cwd-tree context menu, and the start
-    /// page. No surface may hardcode an app entry, and none may keep its own list.
+    /// The libyggterm app registry of the machine a "launch at here" would run
+    /// on — the selected row's machine, else the active session's, else this
+    /// host ([`app_registry_for_launch_anchor`]). THE source for the titlebar
+    /// `+` menu, the start page's quick buttons and the ALT ladder's New… scope.
+    ///
+    /// ⚠ It is NOT unconditionally the GUI host's registry, and it used to be.
+    /// A row can live on any machine, and an app's manifest — including the
+    /// ABSOLUTE binary path a launch types into a PTY — lives on the machine
+    /// that installed it. The cwd-tree row menu resolves its own row's machine
+    /// rather than reading this field, because the user named the row.
+    ///
+    /// No surface may hardcode an app entry, and none may keep its own list.
     apps: Vec<AppManifest>,
     /// The schema currently rendered for `RightPanelMode::AppPane`, and any
     /// error from fetching it.
@@ -17710,7 +17719,9 @@ impl ShellState {
                     split_candidate_paths_for(row, &selected_tree_paths, &self.split_groups);
                 let items = row_menu_items(
                     row,
-                    self.server.apps(),
+                    // The apps of the machine THIS ROW lives on, not the GUI
+                    // host's — see [`app_registry_for_row`].
+                    &app_registry_for_row(self, row),
                     keep_alive_plan.as_ref(),
                     &split_members,
                     split_candidates.len(),
@@ -17745,8 +17756,19 @@ impl ShellState {
                     .as_deref()
                     .map(normalize_live_session_path)
             });
+        // Every "launch at here" surface — the titlebar `+`, the start page's
+        // quick buttons and the ALT ladder's New… scope — draws THIS list, the
+        // apps of the machine "here" resolves to. One derivation for three
+        // surfaces, so they cannot offer different apps; the cwd-tree row menu
+        // resolves its own row's machine instead, which is the same rule applied
+        // to a row the user named explicitly.
+        let launch_anchor_apps = app_registry_for_launch_anchor(
+            self,
+            selected_row.as_ref(),
+            active_session_path.as_deref(),
+        );
         let keytip_tree =
-            build_keytip_tree(&self.keytip_config, self.server.apps(), &row_menu_items);
+            build_keytip_tree(&self.keytip_config, &launch_anchor_apps, &row_menu_items);
         // The WebTabs rail's row menu, resolved against THIS frame's tab tree so
         // "Close 12 other tabs" is a promise the frame can keep.
         let (web_tab_menu_items, web_tab_menu_title) = self.web_tab_menu_view();
@@ -17851,7 +17873,7 @@ impl ShellState {
                 .as_deref()
                 .and_then(|path| self.web_surface_overlay_for_session(path, current_millis())),
             sidebar_panes,
-            apps: self.server.apps().to_vec(),
+            apps: launch_anchor_apps,
             app_pane_schema: self.app_pane_schema.clone(),
             app_pane_error: self.app_pane_error.clone(),
             app_pane_context_menu: self.app_pane_context_menu.clone(),
@@ -45076,14 +45098,11 @@ fn dispatch_keytip_node(mut state: Signal<ShellState>, key: &str) {
             state.with_mut(|shell| shell.clear_alt_overlay());
             return;
         };
-        let entry = state.read().server.apps().iter().find_map(|app| {
-            if app.name != app_name {
-                return None;
-            }
-            app.verbs
-                .iter()
-                .find(|verb| verb.id == verb_id)
-                .map(|verb| (app.clone(), verb.clone()))
+        // Resolve against the registry of the machine "here" resolves to — the
+        // same list the ladder drew this entry from.
+        let entry = state.with(|shell| {
+            let anchor = here_row(shell);
+            resolve_app_verb_for_row(shell, anchor.as_ref(), app_name, verb_id)
         });
         let Some((app, verb)) = entry else {
             state.with_mut(|shell| shell.clear_alt_overlay());
@@ -51433,6 +51452,93 @@ fn sidebar_row_launch_cwd(shell: &ShellState, row: &BrowserRow) -> Option<String
                 let cwd = metadata_value(session, "Cwd");
                 (!cwd.trim().is_empty()).then_some(cwd)
             })
+        })
+}
+
+/// The libyggterm apps installed on the machine THIS ROW lives on.
+///
+/// ⛔ **The one owner. Every launcher surface must ask this, never
+/// `shell.server.apps()` directly**, because that field is the GUI host's own
+/// registry and a row can live on any machine.
+///
+/// It resolves the host through [`remote_machine_for_sidebar_row`] — the SAME
+/// function [`terminal_launch_context_for_row`] uses to decide where the launch
+/// RUNS. That shared resolver is the point: what a menu OFFERS and where the
+/// command EXECUTES are then two readings of one fact and cannot drift. They
+/// did drift, and the symptom was "ychrome only launches on guihost": a
+/// `remote-cc://dev/…` row correctly ran its command on `dev` while the menu
+/// beside it was drawn from the GUI host's registry, so an app installed only
+/// on `dev` never appeared and an app installed only on the GUI host was
+/// offered — with the GUI host's absolute binary path — to run on `dev`.
+///
+/// A remote machine we have not reached yet reports no apps; that is honest
+/// and shows an empty section rather than another host's list.
+fn app_registry_for_row(shell: &ShellState, row: &BrowserRow) -> Vec<AppManifest> {
+    match remote_machine_for_sidebar_row(shell, row) {
+        Some(machine) => machine.apps.clone(),
+        None => shell.server.apps().to_vec(),
+    }
+}
+
+/// The app registry for the row a launch would anchor to, for surfaces that
+/// have no explicit row (the titlebar `+`, the ALT KeyTip ladder). Same owner,
+/// same resolution — `None` here means "no row at all", which only the empty
+/// workspace produces, and then the GUI host's own registry is the honest
+/// answer because that is where the launch would run.
+fn app_registry_for_optional_row(shell: &ShellState, row: Option<&BrowserRow>) -> Vec<AppManifest> {
+    match row {
+        Some(row) => app_registry_for_row(shell, row),
+        None => shell.server.apps().to_vec(),
+    }
+}
+
+/// The registry for a launch anchored at "here" — the selected row, else the
+/// active session, else this host.
+///
+/// The fallback chain deliberately mirrors [`terminal_launch_context`] step for
+/// step, because the two answer halves of one question: this one says which
+/// apps the anchor's machine has, that one says where the command will run.
+/// Written from `RenderSnapshot`'s locals rather than by calling `here_row`,
+/// which would re-enter `snapshot()`.
+fn app_registry_for_launch_anchor(
+    shell: &ShellState,
+    selected_row: Option<&BrowserRow>,
+    active_session_path: Option<&str>,
+) -> Vec<AppManifest> {
+    if let Some(row) = selected_row {
+        return app_registry_for_row(shell, row);
+    }
+    if let Some(machine) = active_session_path
+        .and_then(|path| remote_machine_for_session_path(&shell.server, path))
+    {
+        return machine.apps.clone();
+    }
+    shell.server.apps().to_vec()
+}
+
+/// Resolve `app:<name>:<verb>` against the registry of the machine the launch
+/// will run on.
+///
+/// Every menu that OFFERS an app verb must resolve it through here, against the
+/// same row it drew the entry from. Resolving against the GUI host's registry
+/// instead is how a menu entry becomes a silent no-op: the row menu would offer
+/// a remote machine's app and the click would find nothing to launch, with no
+/// error anywhere — a launcher that lies about having launched.
+fn resolve_app_verb_for_row(
+    shell: &ShellState,
+    row: Option<&BrowserRow>,
+    app_name: &str,
+    verb_id: &str,
+) -> Option<(AppManifest, AppVerb)> {
+    app_registry_for_optional_row(shell, row)
+        .into_iter()
+        .find(|app| app.name == app_name)
+        .and_then(|app| {
+            app.verbs
+                .iter()
+                .find(|verb| verb.id == verb_id)
+                .cloned()
+                .map(|verb| (app, verb))
         })
 }
 
@@ -124100,14 +124206,9 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
         else {
             return;
         };
-        let entry = state.read().server.apps().iter().find_map(|app| {
-            (app.name == app_name).then(|| {
-                app.verbs
-                    .iter()
-                    .find(|verb| verb.id == verb_id)
-                    .map(|verb| (app.clone(), verb.clone()))
-            })?
-        });
+        // Same registry the menu was drawn from: this row's machine.
+        let entry =
+            state.with(|shell| resolve_app_verb_for_row(shell, Some(&row), app_name, verb_id));
         if let Some((app, verb)) = entry {
             // cwd AND sidebar anchor both from the clicked row, like the "New …
             // Here" items above it.
@@ -148424,6 +148525,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "pi-raspberry".to_string(),
                 label: "raspberry".to_string(),
                 ssh_target: "pi@raspberry".to_string(),
@@ -148474,6 +148576,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
                 ssh_target: "pi@guihost".to_string(),
@@ -148538,6 +148641,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
                 ssh_target: "guihost".to_string(),
@@ -148597,6 +148701,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "pi-raspberry".to_string(),
                 label: "raspberry".to_string(),
                 ssh_target: "pi@raspberry".to_string(),
@@ -148795,6 +148900,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
                 ssh_target: "dev".to_string(),
@@ -148939,6 +149045,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
                 ssh_target: "guihost".to_string(),
@@ -149000,6 +149107,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
                 ssh_target: "guihost".to_string(),
@@ -149045,6 +149153,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "oc".to_string(),
                 label: "oc [ok]".to_string(),
                 ssh_target: "oc".to_string(),
@@ -149524,6 +149633,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "oc".to_string(),
                 label: "oc [ok]".to_string(),
                 ssh_target: "oc".to_string(),
@@ -149633,6 +149743,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
                 ssh_target: "dev".to_string(),
@@ -149706,6 +149817,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
                 ssh_target: "dev".to_string(),
@@ -149787,6 +149899,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
                 ssh_target: "dev".to_string(),
@@ -149865,6 +149978,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
                 ssh_target: "dev".to_string(),
@@ -149941,6 +150055,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let remote_machines = vec![RemoteMachineSnapshot {
+            apps: Vec::new(),
             machine_key: "oc".to_string(),
             label: "oc [ok]".to_string(),
             ssh_target: "oc".to_string(),
@@ -149994,6 +150109,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "oc".to_string(),
                 label: "oc [ok]".to_string(),
                 ssh_target: "oc".to_string(),
@@ -150104,6 +150220,7 @@ mod tests {
     #[test]
     fn live_session_label_prefers_remote_cached_generated_title() {
         let remote_machines = vec![RemoteMachineSnapshot {
+            apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
             ssh_target: "dev".to_string(),
@@ -150187,6 +150304,7 @@ mod tests {
             storage_path: format!("/home/user/.codex/sessions/{id}.jsonl"),
         };
         RemoteMachineSnapshot {
+            apps: Vec::new(),
             machine_key: "guihost".to_string(),
             label: "guihost".to_string(),
             ssh_target: "guihost".to_string(),
@@ -150953,6 +151071,7 @@ mod tests {
             session_kind: None,
         }];
         let machines = vec![RemoteMachineSnapshot {
+            apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
             ssh_target: "dev".to_string(),
@@ -151386,6 +151505,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
                 ssh_target: "guihost".to_string(),
@@ -151527,6 +151647,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
                 ssh_target: "guihost".to_string(),
@@ -151648,6 +151769,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[stored_remote_folder],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "practice".to_string(),
                 label: "practice".to_string(),
                 ssh_target: "practice".to_string(),
@@ -151749,6 +151871,7 @@ mod tests {
             &visible_stored_rows,
             &projection_rows,
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "practice".to_string(),
                 label: "practice".to_string(),
                 ssh_target: "practice".to_string(),
@@ -151816,6 +151939,7 @@ mod tests {
             &[],
             &projection_rows,
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "practice".to_string(),
                 label: "practice".to_string(),
                 ssh_target: "practice".to_string(),
@@ -151850,6 +151974,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
                 ssh_target: "guihost".to_string(),
@@ -151878,6 +152003,7 @@ mod tests {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
                 ssh_target: "guihost".to_string(),
@@ -151925,6 +152051,7 @@ mod tests {
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
             remote_machines: vec![RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
                 ssh_target: "pi@dev".to_string(),
@@ -152063,6 +152190,7 @@ mod tests {
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
             remote_machines: vec![RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "practice".to_string(),
                 label: "practice".to_string(),
                 ssh_target: "practice".to_string(),
@@ -152133,6 +152261,7 @@ mod tests {
             active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: vec![RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
                 ssh_target: "pi@dev".to_string(),
@@ -152334,6 +152463,138 @@ mod tests {
         );
         assert_eq!(tree.resolve("ja"), ChordResolution::Invalid);
     }
+    /// Build a shell holding one remote machine `dev` whose app registry differs
+    /// from the local host's, plus a `remote-cc://dev/…` row on it.
+    ///
+    /// The two registries deliberately share NO app name: every assertion below
+    /// can then tell which host answered, which is the whole point of the bug
+    /// this fixture exists for.
+    fn test_shell_with_divergent_remote_app_registry() -> (ShellState, BrowserRow) {
+        test_shell_with_remote_app_registry(true)
+    }
+
+    fn test_shell_with_remote_app_registry(remote_has_apps: bool) -> (ShellState, BrowserRow) {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
+        let local_only = AppManifest {
+            name: "yrdp".to_string(),
+            label: "yRDP".to_string(),
+            icon: String::new(),
+            binary: "/home/gui-host/.local/bin/yrdp".to_string(),
+            verbs: vec![AppVerb {
+                id: "new".to_string(),
+                label: "New yRDP".to_string(),
+                args: Vec::new(),
+                keytip: String::new(),
+            }],
+            keytip: String::new(),
+        };
+        let remote_only = AppManifest {
+            name: "yggdrasil-maker".to_string(),
+            label: "Yggdrasil Maker".to_string(),
+            icon: String::new(),
+            binary: "/home/dev/.local/bin/yggdrasil-maker".to_string(),
+            verbs: vec![AppVerb {
+                id: "new".to_string(),
+                label: "New Yggdrasil Maker".to_string(),
+                args: Vec::new(),
+                keytip: String::new(),
+            }],
+            keytip: String::new(),
+        };
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: vec![local_only],
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: vec![RemoteMachineSnapshot {
+                machine_key: "dev".to_string(),
+                label: "dev [ok]".to_string(),
+                ssh_target: "dev".to_string(),
+                prefix: None,
+                remote_binary_expr: None,
+                remote_deploy_state: RemoteDeployState::Ready,
+                health: RemoteMachineHealth::Healthy,
+                sessions: Vec::new(),
+                apps: if remote_has_apps {
+                    vec![remote_only]
+                } else {
+                    Vec::new()
+                },
+            }],
+            ssh_targets: Vec::new(),
+            live_sessions: Vec::new(),
+        });
+        let mut row = test_sidebar_row("remote-cc://dev/1f6db1cd");
+        row.host_label = "dev".to_string();
+        row.session_cwd = Some("/home/user/gh/yggterm".to_string());
+        (shell, row)
+    }
+
+    /// The offer and the execution must agree about the host, because they now
+    /// resolve it through the same function.
+    ///
+    /// Red before the fix in its first half: the row menu drew
+    /// `shell.server.apps()` — the GUI host's list — beside a launch context
+    /// that already, correctly, targeted `dev`. That disagreement is the whole
+    /// "ychrome only launches on guihost" report.
+    #[test]
+    fn a_remote_row_offers_its_own_machines_apps_and_launches_there() {
+        let (shell, row) = test_shell_with_divergent_remote_app_registry();
+
+        let offered = app_registry_for_row(&shell, &row);
+        assert_eq!(
+            offered.iter().map(|app| app.name.as_str()).collect::<Vec<_>>(),
+            vec!["yggdrasil-maker"],
+            "a row on dev must offer dev's apps, never the GUI host's"
+        );
+        assert_eq!(
+            offered[0].binary, "/home/dev/.local/bin/yggdrasil-maker",
+            "the binary path must be the one that resolves ON dev"
+        );
+
+        match terminal_launch_context_for_row(&shell, &row) {
+            TerminalLaunchContext::Remote { ssh_target, .. } => {
+                assert_eq!(ssh_target, "dev", "the launch must run on the row's machine");
+            }
+            other => panic!("expected a remote launch context, got {other:?}"),
+        }
+    }
+
+    /// A menu entry must resolve to something launchable, from the SAME registry
+    /// the entry was drawn from. Resolving against the GUI host's list instead
+    /// made a remote app's menu item a silent no-op — the launcher's own
+    /// lie-of-success shape.
+    #[test]
+    fn an_app_verb_resolves_against_the_registry_its_menu_entry_came_from() {
+        let (shell, row) = test_shell_with_divergent_remote_app_registry();
+
+        let (app, verb) = resolve_app_verb_for_row(&shell, Some(&row), "yggdrasil-maker", "new")
+            .expect("a dev app offered on a dev row must resolve when clicked");
+        assert_eq!(app.binary, "/home/dev/.local/bin/yggdrasil-maker");
+        assert_eq!(verb.id, "new");
+
+        assert!(
+            resolve_app_verb_for_row(&shell, Some(&row), "yrdp", "new").is_none(),
+            "an app installed only on the GUI host must not resolve for a dev row"
+        );
+        assert!(
+            resolve_app_verb_for_row(&shell, None, "yrdp", "new").is_some(),
+            "with no row, this host's own registry is the honest answer"
+        );
+    }
+
+    /// A machine we could not reach reports nothing rather than borrowing the
+    /// GUI host's list — an empty section is honest, another host's apps are not.
+    #[test]
+    fn an_unreached_remote_machine_offers_no_apps_instead_of_the_gui_hosts() {
+        let (shell, row) = test_shell_with_remote_app_registry(false);
+
+        assert!(
+            app_registry_for_row(&shell, &row).is_empty(),
+            "an unreached machine must not inherit the GUI host's registry"
+        );
+    }
+
     #[test]
     fn launch_anchor_row_is_the_selected_row_then_the_active_session() {
         let session_path = "local://abc";
@@ -152600,6 +152861,7 @@ mod tests {
         }];
         set_sidebar_search_context(
             &[RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
                 ssh_target: "dev".to_string(),
@@ -152696,6 +152958,7 @@ mod tests {
     fn search_expanded_paths_include_collapsed_remote_sessions() {
         let stored_rows = Vec::<BrowserRow>::new();
         let remote_machines = vec![RemoteMachineSnapshot {
+            apps: Vec::new(),
             machine_key: "oc".to_string(),
             label: "oc [ok]".to_string(),
             ssh_target: "oc".to_string(),
@@ -154024,6 +154287,7 @@ mod tests {
     #[test]
     fn pending_remote_machine_refreshes_include_stale_offline_machine() {
         let remote_machines = vec![RemoteMachineSnapshot {
+            apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
             ssh_target: "dev".to_string(),
@@ -154054,6 +154318,7 @@ mod tests {
     #[test]
     fn pending_remote_machine_refreshes_include_restored_machine_without_target() {
         let remote_machines = vec![RemoteMachineSnapshot {
+            apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
             ssh_target: "dev".to_string(),
@@ -154092,6 +154357,7 @@ mod tests {
     #[test]
     fn pending_remote_machine_refreshes_respect_retry_cooldown() {
         let remote_machines = vec![RemoteMachineSnapshot {
+            apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
             ssh_target: "dev".to_string(),
@@ -154124,6 +154390,7 @@ mod tests {
     #[test]
     fn pending_remote_machine_refreshes_refresh_healthy_machines_by_ttl() {
         let remote_machines = vec![RemoteMachineSnapshot {
+            apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
             ssh_target: "dev".to_string(),
@@ -154223,6 +154490,7 @@ mod tests {
     #[test]
     fn pending_managed_cli_refreshes_include_local_and_new_machine() {
         let remote_machines = vec![RemoteMachineSnapshot {
+            apps: Vec::new(),
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
             ssh_target: "dev".to_string(),
@@ -163868,6 +164136,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // unknown) machines must bypass the deferral; Healthy machines keep
         // deferring.
         let machine = |key: &str, health: RemoteMachineHealth| RemoteMachineSnapshot {
+            apps: Vec::new(),
             machine_key: key.to_string(),
             label: key.to_string(),
             ssh_target: key.to_string(),
@@ -163928,6 +164197,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(
             pending_remote_machine_refreshes(
                 &[RemoteMachineSnapshot {
+                    apps: Vec::new(),
                     machine_key: "oc".to_string(),
                     label: "oc".to_string(),
                     ssh_target: "oc".to_string(),
@@ -164302,6 +164572,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session: None,
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: vec![RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "guihost".to_string(),
                 label: "guihost".to_string(),
                 ssh_target: "pi@guihost".to_string(),
@@ -168519,6 +168790,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
             remote_machines: vec![RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
                 ssh_target: "pi@dev".to_string(),
@@ -168596,6 +168868,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Rendered,
             remote_machines: vec![
                 RemoteMachineSnapshot {
+                    apps: Vec::new(),
                     machine_key: "dev".to_string(),
                     label: "dev".to_string(),
                     ssh_target: "pi@dev".to_string(),
@@ -168611,6 +168884,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     ],
                 },
                 RemoteMachineSnapshot {
+                    apps: Vec::new(),
                     machine_key: "oc".to_string(),
                     label: "oc".to_string(),
                     ssh_target: "pi@oc".to_string(),
@@ -168690,6 +168964,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Rendered,
             remote_machines: vec![
                 RemoteMachineSnapshot {
+                    apps: Vec::new(),
                     machine_key: "dev".to_string(),
                     label: "dev".to_string(),
                     ssh_target: "pi@dev".to_string(),
@@ -168700,6 +168975,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     sessions: vec![remote_session("dev", "dev-home", "/home/user", 50)],
                 },
                 RemoteMachineSnapshot {
+                    apps: Vec::new(),
                     machine_key: "practice".to_string(),
                     label: "practice".to_string(),
                     ssh_target: "pi@practice".to_string(),
@@ -168893,6 +169169,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: vec![RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev".to_string(),
                 ssh_target: "pi@dev".to_string(),
@@ -170233,6 +170510,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session: Some(snapshot_session_view_for_ui(session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: vec![RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
                 ssh_target: "dev".to_string(),
@@ -170393,6 +170671,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session: Some(snapshot_session_view_for_ui(session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: vec![RemoteMachineSnapshot {
+                apps: Vec::new(),
                 machine_key: "dev".to_string(),
                 label: "dev [ok]".to_string(),
                 ssh_target: "dev".to_string(),
