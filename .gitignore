@@ -34,3 +34,6 @@ tools/xterm-harness/package-lock.json
 # lane merge; nothing in this tree should ever track one.
 *.orig
 *.rej
+
+# Local-only cargo overrides (the libyggterm path patch); never tracked
+.cargo/

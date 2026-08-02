@@ -910,6 +910,62 @@ and two reds in one row would read as two meanings.
 Without a per-message copy the user is re-selecting prose by hand out of a
 virtualised list, where the rows they are dragging across may not be mounted.
 
+#### The conversation is a SHARED component set, and it lives in `yggui`
+
+⛔ **This surface is not shell markup.** It is
+`yggui::conversation` in libyggterm (MPL-2.0) — `ConversationColumn`,
+`UserTurn`, `AssistantTurn`, `SystemTurn`, `WorkGroup`, `WorkRow`, `DiffStat`,
+`ChangedFileChips`, `TurnDivider`, `WorkingIndicator`,
+`ConversationEmptyState`, all reading from one `ConversationTokens`. yggterm's
+Web View is an ADAPTER onto it, and so is every other Yggdrasil app that shows
+an agent timeline. A second hand-rolled chat in any of them is the bug this
+extraction exists to prevent.
+
+The module owns the SHAPE of a conversation and deliberately not the message
+BODY: each host keeps its own content pipeline (`PreviewContent` here) and hands
+it in as an `Element`. That is the seam that actually needs sharing — one design
+language over two different content models, with neither importing the other.
+
+`cargo run -p yggui --example conversation_gallery`, or
+`libyggterm/scripts/gallery-shot.sh`, renders every component in both themes
+against fixture data. **A design change to this surface is argued from that
+screenshot**, not from source and not by rebuilding a host.
+
+#### The rules that surface encodes
+
+**A person asks; the document answers.** The user's turn is a bounded card
+(≤78% of the column, ≤560px) set against the page and right-aligned, with the
+bottom-right corner flattened so it points back at who wrote it. The assistant's
+turn has no card at all — it IS the page, full column, one step up in size.
+Two facing bubbles is a messenger idiom, and it makes a 900-line answer look
+like a text message while making a two-line one look like small talk.
+
+**One reading column, 720px.** A measure of ~78 characters at the prose size.
+Prose that runs the width of a maximised window is not read, it is scanned. The
+column is a token, not a literal at three call sites.
+
+**Three faces, one meaning each — mono is the machine, sans is the person,
+serif is the answer.** A face never changes for decoration. This is why the work
+seam is monospace at 11px and the answer is serif at 15.5px: the reader can tell
+what kind of thing they are looking at before they read a word of it.
+
+**Metadata is 10px, wide-tracked, and dim.** Timestamps, counts, group labels
+and controls all sit at the same quiet level, in tabular figures so a changing
+number does not shift the row under it. Nothing at this level is ever
+load-bearing enough to be always-on: turn actions are hover-revealed and always
+in flow, so revealing one never moves the turn.
+
+**Decoration must not move text.** The live rule down a streaming answer changes
+its COLOUR only; it used to change the padding as well, so every answer slid
+12px sideways the moment it finished — a jump under the reader's eye, on every
+turn.
+
+**No component invents a colour.** `ConversationTokens::from_palette` takes the
+host's `ink`/`muted`/`accent` and derives every surface, hairline, tint and
+semantic pair per theme. The previous surface spelled `rgba(255,255,255,0.72)`
+at four call sites in one header, which is how a light-only design survives a
+theme switch looking broken.
+
 ### Native page surfaces (the browser viewport)
 
 A native page surface — a real web page rendered by the engine and layered over
