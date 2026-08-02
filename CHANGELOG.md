@@ -4,6 +4,46 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.0
+
+- **libyggterm is now its own repository, under MPL-2.0.** `yggui` and
+  `yggui-contract` have left this tree for
+  [`yggdrasilhq/libyggterm`](https://github.com/yggdrasilhq/libyggterm), and
+  yggterm consumes them as a git dependency pinned to `v0.1.0`. This is the
+  major version's reason for existing: the licence boundary changed.
+
+  yggterm stays GPL-3.0-or-later. The library an app author links is MPL-2.0,
+  which is file-scoped copyleft — improvements to the library's own files come
+  back, and an app built on top may ship under its own terms, including
+  proprietary ones. GPL there would have foreclosed the app ecosystem, and LGPL
+  fights Rust's static linking. Plain MPL-2.0, deliberately without the
+  "Incompatible With Secondary Licenses" notice, so a GPL application linking an
+  MPL library — exactly what yggterm now is — remains permitted.
+
+  The cut is deliberately narrow. Only what a third-party app must *link* moved:
+  `emd-renderer` and `yggterm-platform` stay here under GPL. Everything under
+  MPL can be combined into proprietary work, so each crate moved out is moat
+  spent; under-cutting is reversible in a commit, over-cutting is not.
+
+- **Fixed on the way out: `yggui` declared three dependencies it never used.**
+  `dioxus-desktop`, `wry` and `webkit2gtk` appeared in its manifest with zero
+  references in its source, carried over from the crate it was carved out of.
+  Inside this workspace they resolved only because `[patch.crates-io]` redirects
+  `wry` to a vendored 0.55 fork. Extracted, they were fatal — upstream
+  `dioxus-desktop` 0.7.9 requires `wry ^0.53.5` and therefore `webkit2gtk
+  =2.0.1`, against the `=2.0.2` that was pinned, and no resolution exists. The
+  library could not have been built by anyone outside this repo. Removed.
+
+- **Note for anyone building both:** the committed dependency is a pinned git
+  tag so a clean clone always builds. To work on both trees at once, add a local
+  `[patch]` to `.cargo/config.toml` (git-ignored) rather than committing a path
+  dependency — a path dependency to a sibling checkout is how a repository stops
+  building from a clone.
+
+- **Windows and macOS are still not building.** 3.0.0 was once reserved for the
+  platform builds; the licence separation took the major version instead. Those
+  builds become 3.x milestones.
+
 ## 2.12.24
 
 - **Fixed: browser keyboard shortcuts work without clicking the page first.**
