@@ -389,8 +389,10 @@ not yet live-proven end-to-end.
 
 ## ⚠ TOOLING: agents have no first-class access layer for DELEGATE sessions
 
-**Status:** OPEN (feature debt, user-requested 2026-08-02 — "easy for you
-(agents) access layer on yggui automations")
+**Status:** OPEN
+
+Feature debt, user-requested 2026-08-02: *"easy for you (agents) access layer
+on yggui automations"*.
 
 The delegate-session pattern (a guiding agent launches an interactive
 CC/codex session in a yggterm row for the user to answer) is now the standing
