@@ -878,6 +878,9 @@ fn print_server_app_help() {
       [--machine-key <k>] [--no-activate] [--purpose <text>]
       [--ephemeral (--ephemeral-owner-pid <pid> | --ephemeral-idle-ttl-secs <n>)]
   yggterm server app keytips <audit [--json]|show|hide>
+  yggterm server app media answer <allow|deny-once|block-site> [--request <id>]
+    answers the camera/microphone prompt `server app state` reports under
+    pending_media_capture; non-zero exit + a named reason when it was NOT applied
   yggterm server app command <list|invoke <id>>
 {web_usage}
 row tenancy (server app terminal new): these flags are parsed by the SAME reader
@@ -2614,6 +2617,34 @@ fn main() -> Result<()> {
                     "show" => yggterm_server::run_app_control_keytips_overlay(true, timeout_ms),
                     "hide" => yggterm_server::run_app_control_keytips_overlay(false, timeout_ms),
                     other => anyhow::bail!("unsupported app keytips action: {other}"),
+                }
+            }
+            // CAMERA / MICROPHONE. The twin of yggterm-headless's arm — both
+            // binaries or neither. Read the prompt from `server app state`
+            // (`pending_media_capture`), answer it here.
+            "media" => {
+                let action = args.get(3).map(String::as_str).unwrap_or("answer");
+                match action {
+                    "answer" => {
+                        let answer = args
+                            .get(4)
+                            .filter(|arg| !arg.starts_with("--"))
+                            .map(String::to_string)
+                            .context(
+                                "missing answer for server app media answer \
+                                 (allow | deny-once | block-site)",
+                            )?;
+                        let request_id = cli_flag_value(&args, "--request")
+                            .map(|value| value.parse::<u64>())
+                            .transpose()
+                            .map_err(|_| {
+                                anyhow::anyhow!("--request takes the numeric request_id")
+                            })?;
+                        yggterm_server::run_app_control_media_answer(
+                            answer, request_id, timeout_ms,
+                        )
+                    }
+                    other => anyhow::bail!("unsupported app media action: {other}"),
                 }
             }
             // The `command invoke <id>` probe that `execute_shell_command`'s doc
@@ -5497,6 +5528,53 @@ mod tests {
                 headless_arm.contains(verb),
                 "the HEADLESS keytips arm must route `{verb}` — a verb on one \
                  binary only is the split-dispatch trap"
+            );
+        }
+    }
+
+    /// ★ THE CAPTURE-ANSWER PARITY LOCK. `server app media answer` is how an
+    /// operator releases a page blocked on a camera prompt, and the binary
+    /// agents are told to drive is `yggterm-headless` — a verb that exists on
+    /// the GUI binary only would read to them as "this build cannot answer it",
+    /// which is indistinguishable from the hang the verb exists to end.
+    ///
+    /// Also pinned: the CLI never builds the command itself. One owner
+    /// (`yggterm_server::run_app_control_media_answer`), or the two binaries
+    /// grow two spellings of "allow".
+    #[test]
+    fn both_binaries_route_the_capture_answer_to_its_one_owner() {
+        for (binary, source) in [
+            ("yggterm", include_str!("main.rs")),
+            ("yggterm-headless", include_str!("bin/yggterm-headless.rs")),
+        ] {
+            let start = source.find("\"media\" => {").unwrap_or_else(|| {
+                panic!(
+                    "{binary} has no `server app media` arm — a page blocked on a \
+                     camera prompt cannot be answered from this binary at all"
+                )
+            });
+            // Bounded at THIS arm's own close brace, never at a byte count and
+            // never at the next arm. A byte count can land mid-codepoint (both
+            // files are full of `⛔`/`★`) and panic; "up to the next arm" swept
+            // in the doc comment that introduces it, which names
+            // `AppControlCommand::InvokeCommand` and failed the second
+            // assertion below for a line that is not even code. `find` returns
+            // a char boundary.
+            let rest = &source[start..];
+            let end = rest
+                .find("\n            }")
+                .map(|offset| offset + "\n            }".len())
+                .unwrap_or_else(|| panic!("{binary}'s media arm has no close brace"));
+            let arm = &rest[..end];
+            assert!(
+                arm.contains("yggterm_server::run_app_control_media_answer("),
+                "{binary}'s media arm does not route the ONE owner; a dispatch of \
+                 its own here is the split-dispatch trap"
+            );
+            assert!(
+                !arm.contains("AppControlCommand::"),
+                "{binary}'s media arm builds the app-control command itself — the \
+                 wire shape has one owner and it is not a CLI arm"
             );
         }
     }

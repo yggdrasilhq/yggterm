@@ -416,6 +416,31 @@ by `window_focused` and by `daemon_request/terminal_read` rate. `gpu_ms` zero in
 - **`grep -c` on a binary counts LINES.** Use `strings | grep -c`, and pick a
   string the fix definitely contains — a format string, not a code identifier
   that may be inlined away.
+- **`document.visibilityState` is a LYING INSTRUMENT for anything WebKit gates
+  on page presentation** — capture permission above all. MEASURED on jojo
+  (WebKitGTK 2.52.5, 2026-08-02) in a bare GTK+WebKit harness with no yggterm in
+  the process:
+
+  | arm | `visibilityState` | GTK `mapped` | `permission-request` | `getUserMedia` |
+  |---|---|---|---|---|
+  | shown toplevel | `visible` | true | raised at 145 ms | resolved, 215 ms |
+  | window never shown | `hidden` | false | **never** | **never settles** |
+  | `GtkOffscreenWindow` | `visible` | **true** | **never** | **never settles** |
+  | shown late (t=4 s) | — | — | raised 11 ms after the reveal | resolved |
+
+  The offscreen row is the one that matters: the page says `visible`, GTK says
+  `mapped`, and WebKit defers anyway. **Ask GTK whether the webview is mapped in
+  a mapped toplevel; never ask the page.** A repro that qualifies a surface as
+  "provably visible" by reading `visibilityState` is measuring something else,
+  and this was already written into a bug entry as the discriminator to use.
+- **A version difference can be a visibility difference wearing a version's
+  clothes.** The same bug read as "worked on GUI 2.12.24, fails on 3.0.0" — one
+  working observation on a surface the user had open, every failing one on
+  agent-made surfaces nobody revealed. The bisect was queued and would have
+  found nothing. **The harness that removes the product from the process is the
+  cheap discriminator**: 60 lines of PyGObject against `gir1.2-webkit2-4.1`
+  reproduced it with no yggterm code at all, which killed the version
+  hypothesis outright in one run. Reach for that before bisecting a build.
 
 ### 7.5 The reaper can be the cause
 

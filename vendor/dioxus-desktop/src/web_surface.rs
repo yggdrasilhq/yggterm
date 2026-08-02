@@ -579,6 +579,9 @@ fn attach_surface_message_channel(
     surface_id: u64,
     close_requests: &Rc<RefCell<Vec<SurfaceCloseRequest>>>,
     theme_colors: &Rc<RefCell<HashMap<u64, String>>>,
+    capture_asks: &Rc<RefCell<Vec<PendingCaptureAsk>>>,
+    fresh_capture_asks: &Rc<RefCell<Vec<SurfaceCaptureAsk>>>,
+    engine_capture_asks: &Rc<RefCell<HashMap<u64, u64>>>,
 ) {
     install_tls_pin_handler(webview);
     use webkit2gtk::{UserContentManagerExt as _, WebViewExt as _};
@@ -591,6 +594,9 @@ fn attach_surface_message_channel(
     // wry's ipc channel uses. Registering first can drop the first message.
     let close_requests = close_requests.clone();
     let theme_colors = theme_colors.clone();
+    let capture_asks = capture_asks.clone();
+    let fresh_capture_asks = fresh_capture_asks.clone();
+    let engine_capture_asks = engine_capture_asks.clone();
     manager.connect_script_message_received(Some(SURFACE_MESSAGE_HANDLER), move |_, result| {
         let Some(value) = result.js_value() else {
             return;
@@ -598,6 +604,55 @@ fn attach_surface_message_channel(
         let Ok(message) = serde_json::from_str::<serde_json::Value>(&value.to_string()) else {
             return;
         };
+        // A page reporting that it is waiting on `getUserMedia()`. The engine
+        // will not tell us this on an unpresented surface — see
+        // §THE ASK THE ENGINE NEVER RAISES — so the page's own word is the only
+        // record there is, and it is why an operator can see the wait at all.
+        if message.get("type").and_then(|kind| kind.as_str()) == Some("capture-ask") {
+            let Some(ask_id) = message.get("askId").and_then(serde_json::Value::as_u64) else {
+                return;
+            };
+            let ask = SurfaceCaptureAsk {
+                surface_id,
+                ask_id,
+                audio: message
+                    .get("audio")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                video: message
+                    .get("video")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                href: message
+                    .get("href")
+                    .and_then(|href| href.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+            capture_asks.borrow_mut().push(PendingCaptureAsk {
+                ask: ask.clone(),
+                deadline: std::time::Instant::now() + CAPTURE_ASK_GRACE,
+                engine_asks_at_ask: engine_capture_asks
+                    .borrow()
+                    .get(&surface_id)
+                    .copied()
+                    .unwrap_or(0),
+            });
+            fresh_capture_asks.borrow_mut().push(ask);
+            return;
+        }
+        // Settled by the engine, by the page, or by our own refusal — the shim
+        // reports all three the same way, so this host never has to guess which
+        // of them happened to drop an entry.
+        if message.get("type").and_then(|kind| kind.as_str()) == Some("capture-settled") {
+            let Some(ask_id) = message.get("askId").and_then(serde_json::Value::as_u64) else {
+                return;
+            };
+            capture_asks
+                .borrow_mut()
+                .retain(|pending| pending.ask.surface_id != surface_id || pending.ask.ask_id != ask_id);
+            return;
+        }
         // The page's theme color (see `THEME_COLOR_SHIM_JS`). Recorded, never
         // interpreted: the shell owns what a seam does with it.
         if message.get("type").and_then(|kind| kind.as_str()) == Some("theme-color") {
@@ -1888,6 +1943,17 @@ pub struct WebSurfaceHost {
     /// Request ids. Separate from `next_id` because these are not surfaces and
     /// sharing the counter would make a trace row ambiguous about which it names.
     next_media_permission_id: Rc<Cell<u64>>,
+    /// Pages waiting on `getUserMedia()` that neither the engine nor this host
+    /// has settled. The engine raises nothing for an unpresented surface, so
+    /// without this list a hanging page is invisible to everyone.
+    /// See §THE ASK THE ENGINE NEVER RAISES.
+    capture_asks: Rc<RefCell<Vec<PendingCaptureAsk>>>,
+    /// New asks the shell has not been told about yet, drained per tick.
+    fresh_capture_asks: Rc<RefCell<Vec<SurfaceCaptureAsk>>>,
+    /// Per surface: how many CAPTURE `permission-request`s the engine has
+    /// raised. The positive signal a pending ask waits on — an absence-gate
+    /// here could never open, because a deferred ask is silent by definition.
+    engine_capture_asks: Rc<RefCell<HashMap<u64, u64>>>,
 }
 
 /// The top-edge motion zone (window coords, logical px) that forwards to the
@@ -2490,6 +2556,171 @@ pub struct SurfaceMediaPermissionRequest {
     pub uri: String,
 }
 
+// ---------------------------------------------------------------------------
+// THE ASK THE ENGINE NEVER RAISES
+// ---------------------------------------------------------------------------
+//
+// ⚠ MEASURED on the live host (jojo, WebKitGTK 2.52.5, 2026-08-02) in a bare
+// GTK+WebKit harness with no yggterm code in the process at all, so nothing
+// below is inferred from our own plumbing:
+//
+//   arm                        visibilityState   permission-request   getUserMedia
+//   shown toplevel             "visible"         raised at 145 ms     resolved, 215 ms
+//   window never shown         "hidden"          NEVER                NEVER SETTLES
+//   GtkOffscreenWindow         "visible"         NEVER                NEVER SETTLES
+//   never shown, shown at 4 s  —                 raised 11 ms AFTER the reveal
+//
+// Three conclusions, and every one of them had already cost a wrong answer:
+//
+// 1. **WebKit DEFERS a capture ask on a page that is not presented** — silently,
+//    with no signal, no rejection and no timeout of its own. So there is nothing
+//    on the engine side to hang a deadline on, which is why the shell's entire
+//    decision flow (`begin_media_capture_decision`, the dialog, the 120 s
+//    `MEDIA_PERMISSION_TIMEOUT`) was correct and still never ran: all of it is
+//    downstream of a signal that was never emitted.
+// 2. **`document.visibilityState` is a LYING INSTRUMENT for this question.** The
+//    offscreen arm reads `"visible"`, has `mapped == true`, and is deferred
+//    exactly like the hidden one. A repro that qualifies a surface as "provably
+//    visible" by asking the page is measuring something else.
+// 3. **The engine version is NOT the variable.** The harness reproduces this
+//    with no yggterm in it, so the "2.12.24 worked, 3.0.0 failed" reading was
+//    the presented/not-presented difference wearing a version's clothes.
+//
+// The user-facing cost was a statutory identity verification — an eSign video
+// KYC — that could not be completed in yggterm and completed in Chromium.
+//
+// ⛔ THE INVARIANT THIS SECTION HOLDS: **`getUserMedia()` must never hang.** A
+// rejection the page can report and retry beats a promise nobody will ever
+// settle. Since the engine will not tell us the ask exists, the PAGE tells us
+// (`CAPTURE_ASK_SHIM_JS`), and the host refuses that ask itself when no matching
+// `permission-request` arrives within `CAPTURE_ASK_GRACE`.
+//
+// Per the quiet-gate law the release condition is a POSITIVE signal — not "no
+// output for a while" but "the engine raised a capture request for this
+// surface", a counter `connect_media_permission_gate` bumps. An ask whose
+// counter moves is the engine's business again and keeps the full human window.
+
+/// How long a page's own `getUserMedia()` report waits for the engine to raise
+/// the matching `permission-request` before this host refuses it page-side.
+///
+/// Sized off the measurement rather than guessed: on a presented surface the
+/// engine raised the request 145 ms after the call, and 11 ms after a late
+/// reveal. Five seconds is thirty times the worst of those and still a bounded
+/// wait — and it is only ever reached by an ask the engine declined to raise.
+const CAPTURE_ASK_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The page's own report that it called `getUserMedia()`, and the door this host
+/// refuses it through.
+///
+/// ⛔ It grants nothing and decides nothing. The only thing it can do to a
+/// capture request is REJECT it; a device is still reached solely through
+/// `connect_media_permission_gate` → the shell's dialog → `allow()`. Read it as
+/// the page volunteering "I am about to wait on this", not as a policy hook.
+///
+/// It reports `capture-ask` before calling the real `getUserMedia`, and
+/// `capture-settled` whichever way that promise ends — so the host's list of
+/// in-flight asks is maintained by the one code path that owns the promise, and
+/// cannot drift from it.
+const CAPTURE_ASK_SHIM_JS: &str = r#"(function(){
+  if (window.__yggtermCaptureAskShim) { return; }
+  window.__yggtermCaptureAskShim = true;
+  var devices = navigator.mediaDevices;
+  if (!devices || typeof devices.getUserMedia !== 'function') { return; }
+  var native = devices.getUserMedia.bind(devices);
+  var seq = 0;
+  var live = new Map();
+  var post = function (payload) {
+    try {
+      window.webkit.messageHandlers.yggtermSurface.postMessage(JSON.stringify(payload));
+    } catch (e) {}
+  };
+  // Called by the HOST, and only by the host, when the engine never raised the
+  // ask. Returns whether there was still a promise to reject.
+  window.__yggtermRefuseCaptureAsk = function (askId, reason) {
+    var entry = live.get(askId);
+    if (!entry) { return false; }
+    live.delete(askId);
+    entry.refuse(String(reason || 'unavailable'));
+    return true;
+  };
+  devices.getUserMedia = function (constraints) {
+    var askId = ++seq;
+    var wanted = constraints || {};
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      live.set(askId, { refuse: function (reason) {
+        if (done) { return; }
+        done = true;
+        post({ type: 'capture-settled', askId: askId, outcome: 'refused', reason: reason });
+        reject(new DOMException(
+          'yggterm refused this camera/microphone request: ' + reason +
+          '. The browser engine never raised a permission prompt for it, so the ' +
+          'page would have waited forever.', 'NotAllowedError'));
+      } });
+      post({
+        type: 'capture-ask', askId: askId,
+        audio: !!wanted.audio, video: !!wanted.video,
+        href: String(location.href),
+      });
+      var settle = function (outcome, finish, value) {
+        if (done) { return; }
+        done = true;
+        live.delete(askId);
+        post({ type: 'capture-settled', askId: askId, outcome: outcome });
+        finish(value);
+      };
+      var call;
+      try { call = native(constraints); }
+      catch (e) { settle('threw', reject, e); return; }
+      call.then(
+        function (stream) { settle('resolved', resolve, stream); },
+        function (error) { settle('rejected', reject, error); }
+      );
+    });
+  };
+})();"#;
+
+/// A page waiting on `getUserMedia()`, as the shell needs it.
+///
+/// Said by the PAGE, which is the only party that knows: the engine does not
+/// raise anything for an unpresented surface. So this is a report, not a
+/// capability — see [`CAPTURE_ASK_SHIM_JS`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceCaptureAsk {
+    /// The surface whose channel it arrived on.
+    pub surface_id: u64,
+    /// Page-local id — the page counts its own calls, so this is unique per
+    /// surface and NOT across surfaces. The pair is the key.
+    pub ask_id: u64,
+    /// The page asked for a microphone.
+    pub audio: bool,
+    /// The page asked for a camera.
+    pub video: bool,
+    /// `location.href` at the moment of the call.
+    pub href: String,
+}
+
+/// An ask this host rejected page-side because the engine never raised it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceCaptureAskRefusal {
+    pub surface_id: u64,
+    pub ask_id: u64,
+    /// Why, in the words the page was given. `surface_not_presented` is the
+    /// measured cause; `engine_did_not_ask` is the honest name for a presented
+    /// surface the engine still stayed silent about.
+    pub reason: &'static str,
+}
+
+/// An in-flight ask, with the two things the deadline needs.
+struct PendingCaptureAsk {
+    ask: SurfaceCaptureAsk,
+    /// When this host stops waiting for `permission-request` and refuses.
+    deadline: std::time::Instant,
+    /// The surface's engine-ask count when the page called. The release
+    /// condition is this number MOVING — a positive signal, not a silence.
+    engine_asks_at_ask: u64,
+}
+
 /// Turn the engine's capture capability on for ONE web surface.
 ///
 /// Three settings, one place, because they are one capability:
@@ -2499,12 +2730,18 @@ pub struct SurfaceMediaPermissionRequest {
 ///   on jojo's WebKitGTK 2.52.5 `navigator.mediaDevices.getUserMedia` was
 ///   already exposed and already reached `permission-request` with this
 ///   setting untouched. Do not describe it as "the fix" — the gate below is.
-/// * `enable-webrtc` — the peer-connection half, and the one setting here whose
-///   absence WAS directly observable: `window.RTCPeerConnection` read
-///   `undefined` before this line existed. A capture stream you cannot send
-///   anywhere covers only the local-preview case, and every real use of a
+/// * `enable-webrtc` — the peer-connection half. A capture stream you cannot
+///   send anywhere covers only the local-preview case, and every real use of a
 ///   camera in a browser (a call, a meeting, a recorder that uploads) is the
 ///   other one.
+///   ⚠ **CORRECTION, measured 2026-08-02.** This line used to claim
+///   `window.RTCPeerConnection` appeared once the setting was set. It does not,
+///   on this host: a bare harness that sets it, reads it back `true`, and loads
+///   a page still finds `RTCPeerConnection` `undefined` — Debian's WebKitGTK
+///   2.52.5 has no WebRTC in the build. Keep the line (it is correct in intent
+///   and costs nothing) but do NOT cite it as the measured one, and do not use
+///   it to explain why capture works: `MediaRecorder` and `getUserMedia` were
+///   both measured working WITHOUT a peer connection existing.
 /// * `enable-media-capabilities` — `navigator.mediaCapabilities`, which the
 ///   calling sites feature-detect to pick a codec before they ever ask for a
 ///   device.
@@ -2538,6 +2775,7 @@ fn connect_media_permission_gate(
     requests: &Rc<RefCell<Vec<SurfaceMediaPermissionRequest>>>,
     parked: &Rc<RefCell<HashMap<u64, ParkedMediaPermission>>>,
     next_id: &Rc<Cell<u64>>,
+    engine_capture_asks: &Rc<RefCell<HashMap<u64, u64>>>,
 ) {
     use webkit2gtk::glib::prelude::*;
     use webkit2gtk::{PermissionRequestExt as _, UserMediaPermissionRequestExt as _};
@@ -2545,6 +2783,7 @@ fn connect_media_permission_gate(
     let requests = requests.clone();
     let parked = parked.clone();
     let next_id = next_id.clone();
+    let engine_capture_asks = engine_capture_asks.clone();
     webkit.connect_permission_request(move |view, request| {
         let (kind, audio, video) = match request.downcast_ref::<UserMediaPermissionRequest>() {
             Some(media) => (
@@ -2558,6 +2797,19 @@ fn connect_media_permission_gate(
             // Not ours. The engine's default (deny) still applies, unchanged.
             None => return false,
         };
+        // THE POSITIVE SIGNAL a page-side ask waits on: the engine has raised a
+        // capture request for this surface. Bumped before any early return
+        // below, because every branch from here on SETTLES the page's promise —
+        // which is exactly the condition that makes the page-side deadline moot.
+        // ⛔ Capture only. `DeviceInfo` is deferred on an unpresented surface in
+        // precisely the same way, so counting it would let one silent ask vouch
+        // for another. See §THE ASK THE ENGINE NEVER RAISES.
+        if kind == SurfaceMediaPermissionKind::Capture {
+            *engine_capture_asks
+                .borrow_mut()
+                .entry(surface_id)
+                .or_insert(0) += 1;
+        }
         // A capture ask for neither device has nothing to grant. Denying it here
         // is not a policy decision — there is no device in it to decide about —
         // and it keeps the shell from ever seeing an empty prompt.
@@ -3560,6 +3812,11 @@ struct SurfaceWindowPlumbing {
     media_permission_requests: Rc<RefCell<Vec<SurfaceMediaPermissionRequest>>>,
     parked_media_permissions: Rc<RefCell<HashMap<u64, ParkedMediaPermission>>>,
     next_media_permission_id: Rc<Cell<u64>>,
+    // ...and a popup's page can hang on that ask exactly as a tab's can, so the
+    // page-side report and its deadline travel with the gate.
+    capture_asks: Rc<RefCell<Vec<PendingCaptureAsk>>>,
+    fresh_capture_asks: Rc<RefCell<Vec<SurfaceCaptureAsk>>>,
+    engine_capture_asks: Rc<RefCell<HashMap<u64, u64>>>,
     userscripts: Vec<SurfaceUserscript>,
     adblock_ruleset: Option<std::path::PathBuf>,
 }
@@ -3713,6 +3970,9 @@ fn build_popup_webview(
         media_permission_requests,
         parked_media_permissions,
         next_media_permission_id,
+        capture_asks,
+        fresh_capture_asks,
+        engine_capture_asks,
         userscripts,
         adblock_ruleset,
         ..
@@ -3759,6 +4019,10 @@ fn build_popup_webview(
         .with_initialization_script_for_main_only(SCROLL_NAV_SHIM_JS, true)
         // A popup paints its page's own colour behind it like any surface.
         .with_initialization_script_for_main_only(THEME_COLOR_SHIM_JS, true)
+        // ...and a popup's `getUserMedia()` can hang exactly as a tab's can —
+        // the "verify with your camera" window IS a popup. See
+        // §THE ASK THE ENGINE NEVER RAISES.
+        .with_initialization_script_for_main_only(CAPTURE_ASK_SHIM_JS, true)
         // A popup is a SURFACE, so both new-window doors are its too. Without
         // these a `target="_blank"` inside an already-popped-up page (the
         // "Continue with Google" on a consent screen) was answered with a null
@@ -3798,7 +4062,15 @@ fn build_popup_webview(
     // `window.close()`: the page's own report (the engine will not tell us), plus
     // the native signal in case it ever does. A script-opened window may close
     // itself, and the tab it became must go with it.
-    attach_surface_message_channel(&webview, popup_id, close_requests, theme_colors);
+    attach_surface_message_channel(
+        &webview,
+        popup_id,
+        close_requests,
+        theme_colors,
+        capture_asks,
+        fresh_capture_asks,
+        engine_capture_asks,
+    );
     // Capture: the SAME gate a page surface gets, for the same reason a popup
     // gets the passkey shim — the window a site pops up to "verify you" is
     // exactly where a camera ask lands. Connected before the settings below
@@ -3810,6 +4082,7 @@ fn build_popup_webview(
         media_permission_requests,
         parked_media_permissions,
         next_media_permission_id,
+        engine_capture_asks,
     );
     let webkit = webview.webview();
     // Same engine-side scroll feel as the surface that opened it (see `open`):
@@ -4038,6 +4311,9 @@ impl WebSurfaceHost {
             parked_media_permissions: Rc::new(RefCell::new(HashMap::new())),
             retired_media_permissions: Rc::new(RefCell::new(Vec::new())),
             next_media_permission_id: Rc::new(Cell::new(1)),
+            capture_asks: Rc::new(RefCell::new(Vec::new())),
+            fresh_capture_asks: Rc::new(RefCell::new(Vec::new())),
+            engine_capture_asks: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -4225,6 +4501,9 @@ impl WebSurfaceHost {
             media_permission_requests: self.media_permission_requests.clone(),
             parked_media_permissions: self.parked_media_permissions.clone(),
             next_media_permission_id: self.next_media_permission_id.clone(),
+            capture_asks: self.capture_asks.clone(),
+            fresh_capture_asks: self.fresh_capture_asks.clone(),
+            engine_capture_asks: self.engine_capture_asks.clone(),
             userscripts: userscripts.to_vec(),
             adblock_ruleset: adblock_ruleset.map(|path| path.to_path_buf()),
         }
@@ -4346,6 +4625,124 @@ impl WebSurfaceHost {
             self.resolve_media_permission(request_id, false);
             self.retired_media_permissions.borrow_mut().push(request_id);
         }
+    }
+
+    /// Drain the capture asks the PAGES have reported since the last tick.
+    ///
+    /// Distinct from [`Self::take_media_permission_requests`] and the difference
+    /// is the whole point: that one is the ENGINE asking us to decide, this one
+    /// is a page telling us it is waiting. On an unpresented surface only the
+    /// second ever arrives — see §THE ASK THE ENGINE NEVER RAISES.
+    pub fn take_capture_asks(&self) -> Vec<SurfaceCaptureAsk> {
+        std::mem::take(&mut self.fresh_capture_asks.borrow_mut())
+    }
+
+    /// Every page currently waiting on `getUserMedia()`, for `server app state`.
+    ///
+    /// Before this existed an operator could not see that a page was waiting on
+    /// a camera at all: the engine raises nothing, so there was nothing to show.
+    pub fn pending_capture_asks(&self) -> Vec<SurfaceCaptureAsk> {
+        self.capture_asks
+            .borrow()
+            .iter()
+            .map(|pending| pending.ask.clone())
+            .collect()
+    }
+
+    /// Whether surface `id` is PRESENTED — mapped, in a toplevel that is itself
+    /// mapped. Measured to be the condition WebKit defers a capture ask on.
+    ///
+    /// ⛔ Not `document.visibilityState`: a `GtkOffscreenWindow` reads
+    /// `"visible"` to the page and is deferred anyway. Ask GTK, not the page.
+    fn surface_is_presented(&self, id: u64) -> bool {
+        use gtk::prelude::*;
+        let surfaces = self.surfaces.borrow();
+        let Some(surface) = surfaces.get(&id) else {
+            return false;
+        };
+        let webkit = {
+            use wry::WebViewExtUnix as _;
+            surface.webview.webview()
+        };
+        if !webkit.is_mapped() {
+            return false;
+        }
+        webkit
+            .toplevel()
+            .map(|toplevel| toplevel.is_mapped())
+            .unwrap_or(false)
+    }
+
+    /// Refuse every page-side ask the engine never raised, and hand back what
+    /// was refused. Called once per reconcile tick, beside the engine sweep.
+    ///
+    /// ⛔ THE INVARIANT: `getUserMedia()` must never hang. An ask survives here
+    /// only while the engine's capture counter for its surface is MOVING — a
+    /// positive signal, because an ask WebKit has deferred is silent forever and
+    /// an absence-gate over it could never open (the quiet-gate law). Once the
+    /// engine has the ask, the human's own 120 s window takes over and this
+    /// deadline is irrelevant to it.
+    pub fn expire_unraised_capture_asks(&self) -> Vec<SurfaceCaptureAskRefusal> {
+        let now = std::time::Instant::now();
+        let mut refusals: Vec<SurfaceCaptureAskRefusal> = Vec::new();
+        self.capture_asks.borrow_mut().retain(|pending| {
+            if pending.deadline > now {
+                return true;
+            }
+            // The engine spoke for this surface after the page asked, so the ask
+            // is the engine's business now — and the shim will report how it ends.
+            let engine_asked = self
+                .engine_capture_asks
+                .borrow()
+                .get(&pending.ask.surface_id)
+                .copied()
+                .unwrap_or(0)
+                > pending.engine_asks_at_ask;
+            if engine_asked {
+                return true;
+            }
+            refusals.push(SurfaceCaptureAskRefusal {
+                surface_id: pending.ask.surface_id,
+                ask_id: pending.ask.ask_id,
+                reason: if self.surface_is_presented(pending.ask.surface_id) {
+                    "engine_did_not_ask"
+                } else {
+                    "surface_not_presented"
+                },
+            });
+            false
+        });
+        for refusal in &refusals {
+            tracing::warn!(
+                surface_id = refusal.surface_id,
+                ask_id = refusal.ask_id,
+                reason = refusal.reason,
+                "web surface: refusing a capture ask the engine never raised"
+            );
+            // The page's own promise is the only thing left to settle: there is
+            // no parked engine request to deny, which is precisely the defect.
+            let _ = self.eval(
+                refusal.surface_id,
+                &format!(
+                    "window.__yggtermRefuseCaptureAsk && \
+                     window.__yggtermRefuseCaptureAsk({}, {})",
+                    refusal.ask_id,
+                    serde_json::Value::String(refusal.reason.to_string()),
+                ),
+                |_| {},
+            );
+        }
+        refusals
+    }
+
+    /// A closing surface takes its pending asks with it. Nothing to reject —
+    /// the page is going away with its promise — but leaving them listed would
+    /// show an operator a wait that no longer exists.
+    fn retire_capture_asks_for_surface(&self, surface_id: u64) {
+        self.capture_asks
+            .borrow_mut()
+            .retain(|pending| pending.ask.surface_id != surface_id);
+        self.engine_capture_asks.borrow_mut().remove(&surface_id);
     }
 
 
@@ -4489,6 +4886,10 @@ impl WebSurfaceHost {
             // ...and every surface reports its THEME COLOR, so no shell pixel
             // beside the page is ever a color the page did not choose.
             .with_initialization_script_for_main_only(THEME_COLOR_SHIM_JS, true)
+            // ...and every surface reports a `getUserMedia()` it is WAITING on,
+            // because the engine reports nothing at all for a page it has not
+            // presented. See §THE ASK THE ENGINE NEVER RAISES.
+            .with_initialization_script_for_main_only(CAPTURE_ASK_SHIM_JS, true)
             .with_url(url);
         if let Some(port) = socks_port {
             builder = builder.with_proxy_config(ProxyConfig::Socks5(ProxyEndpoint {
@@ -4603,6 +5004,7 @@ impl WebSurfaceHost {
                 &self.media_permission_requests,
                 &self.parked_media_permissions,
                 &self.next_media_permission_id,
+                &self.engine_capture_asks,
             );
         }
         // Downloads, wired to the ENGINE this surface runs on. Once per context
@@ -4729,7 +5131,15 @@ impl WebSurfaceHost {
         // `window.close()`: the page's report (the engine will not tell us) plus
         // the native signal in case it ever does. What the shell DOES with it is
         // the shell's call — a normal tab may not close itself.
-        attach_surface_message_channel(&webview, id, &self.close_requests, &self.theme_colors);
+        attach_surface_message_channel(
+            &webview,
+            id,
+            &self.close_requests,
+            &self.theme_colors,
+            &self.capture_asks,
+            &self.fresh_capture_asks,
+            &self.engine_capture_asks,
+        );
         {
             use webkit2gtk::WebViewExt as _;
             use wry::WebViewExtUnix as _;
@@ -5055,6 +5465,7 @@ impl WebSurfaceHost {
         // plus a dialog on screen for a page that is gone. Deny, and tell the
         // shell so the dialog goes with it.
         self.retire_media_permissions_for_surface(id);
+        self.retire_capture_asks_for_surface(id);
     }
 
     /// Stash surface `id`: detach its container from the overlay WITHOUT
@@ -7313,6 +7724,127 @@ mod media_capture_locks {
         assert!(
             close.contains("self.retire_media_permissions_for_surface(id);"),
             "`close` no longer retires the surface's parked capture asks",
+        );
+    }
+
+    /// ⛔ THE HANG INVARIANT — the reason §THE ASK THE ENGINE NEVER RAISES
+    /// exists. The sweep above only reaches asks the engine actually raised, and
+    /// MEASURED (WebKitGTK 2.52.5): on a surface WebKit has not presented it
+    /// raises none, forever. So without the page-side shim on every builder,
+    /// `getUserMedia()` on an unrevealed surface hangs with no signal, no
+    /// rejection and no trace row anywhere — which is what cost a live eSign
+    /// video KYC.
+    #[test]
+    fn every_surface_builder_installs_the_capture_ask_shim() {
+        let product = product_lines();
+        for builder in ["pub fn open(", "fn build_popup_webview("] {
+            let body = body_of(&product, builder);
+            assert!(
+                body.contains(
+                    ".with_initialization_script_for_main_only(CAPTURE_ASK_SHIM_JS, true)"
+                ),
+                "`{builder}` no longer installs the capture-ask shim — a page it \
+                 creates that calls `getUserMedia()` while the surface is not \
+                 presented waits on a promise nothing will ever settle, and no \
+                 operator can even see that it is waiting",
+            );
+        }
+    }
+
+    /// ⛔ THE SECURITY HALF of the shim: it can REFUSE a capture request and it
+    /// can do nothing else. There is exactly one source of a MediaStream in it —
+    /// the native `getUserMedia` it wrapped — so no path through this script can
+    /// invent, cache or re-hand a device, and the gate remains the only way one
+    /// is reached.
+    #[test]
+    fn the_capture_ask_shim_can_only_refuse_never_grant() {
+        assert_eq!(
+            CAPTURE_ASK_SHIM_JS.matches("native(").count(),
+            1,
+            "the capture-ask shim calls the native `getUserMedia` from more than \
+             one place; there must be exactly one, so the shim can never be a \
+             second door to a device",
+        );
+        for needle in [
+            "var native = devices.getUserMedia.bind(devices);",
+            "'NotAllowedError'",
+            "window.__yggtermRefuseCaptureAsk = function (askId, reason) {",
+            "type: 'capture-ask'",
+            "type: 'capture-settled'",
+        ] {
+            assert!(
+                CAPTURE_ASK_SHIM_JS.contains(needle),
+                "the capture-ask shim lost `{needle}`",
+            );
+        }
+        // A refusal must reach the page as a REJECTION. A shim that resolved
+        // with nothing (or with an empty stream) would turn a hang into a
+        // silent failure, which is the same defect wearing a better face.
+        assert!(
+            CAPTURE_ASK_SHIM_JS.contains("reject(new DOMException("),
+            "the capture-ask shim no longer REJECTS a refused ask — the page gets \
+             no error it can report, and `getUserMedia()` is back to failing \
+             silently",
+        );
+    }
+
+    /// The release condition is a POSITIVE signal — "the engine raised a capture
+    /// request for this surface" — not a silence. An absence-gate here could
+    /// never open: a deferred ask is silent BY DEFINITION, which is the whole
+    /// defect (the quiet-gate law, third instance).
+    ///
+    /// ⛔ Capture only. `DeviceInfo` is deferred on an unpresented surface in
+    /// exactly the same way, so counting it would let one silent ask vouch for
+    /// another and the deadline would never fire on the case it exists for.
+    #[test]
+    fn the_gate_counts_capture_requests_as_the_signal_an_ask_waits_on() {
+        let product = product_lines();
+        let gate = body_of(&product, "fn connect_media_permission_gate(");
+        assert!(
+            gate.contains("if kind == SurfaceMediaPermissionKind::Capture {")
+                && gate.contains("*engine_capture_asks"),
+            "the gate no longer counts the capture requests it raises — every \
+             page-side ask would be refused after the grace even on a surface \
+             whose prompt is up and waiting for the human",
+        );
+        let expire = body_of(&product, "pub fn expire_unraised_capture_asks(");
+        assert!(
+            expire.contains("> pending.engine_asks_at_ask")
+                && expire.contains("if engine_asked {"),
+            "`expire_unraised_capture_asks` no longer spares an ask the engine \
+             took up — it would cut a human off mid-decision five seconds into a \
+             prompt they are still reading",
+        );
+    }
+
+    /// ⛔ The refusal settles the PAGE and never the engine. There is no parked
+    /// request to deny — that absence IS the defect — so a refusal that reached
+    /// for `resolve_media_permission` would be answering some other page's ask.
+    #[test]
+    fn a_page_side_refusal_settles_the_page_and_touches_no_engine_request() {
+        let product = product_lines();
+        let expire = body_of(&product, "pub fn expire_unraised_capture_asks(");
+        assert!(
+            expire.contains("window.__yggtermRefuseCaptureAsk("),
+            "`expire_unraised_capture_asks` no longer rejects the page's promise \
+             — the ask is dropped from the list and the page hangs anyway, which \
+             is worse than before: the wait is now invisible too",
+        );
+        assert!(
+            !expire.contains("resolve_media_permission"),
+            "a page-side refusal reaches for `resolve_media_permission` — there \
+             is no parked engine request behind one of these asks, so that call \
+             can only answer a DIFFERENT page's prompt",
+        );
+        // ...and the reason is measured, not guessed: GTK mapping, never
+        // `document.visibilityState`, which reads "visible" on an offscreen
+        // window that is deferred exactly like a hidden one.
+        let presented = body_of(&product, "fn surface_is_presented(");
+        assert!(
+            presented.contains("webkit.is_mapped()") && presented.contains("toplevel()"),
+            "`surface_is_presented` no longer asks GTK whether the surface is \
+             mapped in a mapped toplevel — the only instrument measured to agree \
+             with what WebKit actually defers on",
         );
     }
 

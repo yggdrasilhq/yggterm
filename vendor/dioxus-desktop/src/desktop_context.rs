@@ -852,6 +852,58 @@ impl DesktopService {
             .unwrap_or_default()
     }
 
+    /// Drain the `getUserMedia()` calls PAGES have reported since the last tick.
+    ///
+    /// The engine raises nothing for a surface it has not presented, so on those
+    /// surfaces this is the only evidence a page is waiting at all — see
+    /// `web_surface`'s §THE ASK THE ENGINE NEVER RAISES.
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub fn take_web_surface_capture_asks(&self) -> Vec<crate::web_surface::SurfaceCaptureAsk> {
+        self.web_surface_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.take_capture_asks())
+            .unwrap_or_default()
+    }
+
+    /// Every page currently waiting on `getUserMedia()`, for `server app state`.
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub fn web_surface_pending_capture_asks(&self) -> Vec<crate::web_surface::SurfaceCaptureAsk> {
+        self.web_surface_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.pending_capture_asks())
+            .unwrap_or_default()
+    }
+
+    /// Reject every page-side capture ask whose surface the engine never raised
+    /// a `permission-request` for. THE invariant: `getUserMedia()` never hangs.
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub fn expire_web_surface_capture_asks(
+        &self,
+    ) -> Vec<crate::web_surface::SurfaceCaptureAskRefusal> {
+        self.web_surface_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.expire_unraised_capture_asks())
+            .unwrap_or_default()
+    }
+
     /// How many downloads are running right now, across every surface. A
     /// transfer outlives the tab that started it, so this can be non-zero with
     /// no surface open.
