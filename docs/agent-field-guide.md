@@ -553,3 +553,96 @@ hand-made `pre-gui-restart-*` snapshots share the directory and are never swept.
   before styling anything; add durable decisions there rather than in comments.
 - `.agents/skills/yggui-app-control/SKILL.md` — the agent's hands and eyes on
   the live desktop.
+
+## 7.9 Transplanted from the bug queue (2026-08-02)
+
+These are traps, not bugs: they describe instruments that lie and rules that
+must be read before acting. They lived in `docs/pending-bugs.md`, which owns
+open DEFECTS, so they were moved here, which owns what wastes an agent's time.
+
+
+### ⛔⛔ PRE-REWRITE GIT LINEAGE
+
+**⛔⛔ PRE-REWRITE GIT LINEAGE — read before merging ANY old branch/worktree
+(2026-08-01, updated after the SECOND churn).** All public yggdrasilhq
+histories were rewritten in place so GPL-3.0-or-later holds from commit
+zero, and force-pushed. yggterm's hashes then changed a SECOND time the same
+night (user-ordered root-commit-message fix: the root no longer claims
+apache; root `c92495da`, tip `53995093` at the time of writing). Anything on
+an older lineage silently REINTRODUCES the old history if merged or pushed —
+`git merge-base --is-ancestor c92495da HEAD` failing is the tell for
+yggterm. Fleet state after cleanup: dev main + 9 lane worktrees + jojo + oc
+all on the final lineage (merged lanes reset; tree-identical proof used, so
+nothing was lost). STILL ON OLD LINEAGE, rebase before ANY use:
+`lane/dev/chord-focus` (dirty WIP worktree), `lane/dev/agent-liveness`
+(1 unique commit, replay with cherry-pick onto new main), oc's yggterm
+spare edits if any reappear, and dev's `~/gh/yggdocs` (4 dirty files) +
+`~/gh/yggdrasil` (13 dirty files) — both repointed from the deleted Forgejo
+mirrors to GitHub origins but NOT yet reset. Pre-rewrite bundles:
+`/home/user/repo-bundles-pre-gpl0-20260801/`. Releases: yggterm's 185 +
+yggsync's 4 + yggcli's 6 Apache-era releases deleted (user-ordered); live
+lanes start at yggterm v2.12.23 and yggsync v0.3.2 (yggclient fetch pins
+bumped to v0.3.2 in `bc59617` — yggsync releases are LOAD-BEARING for phone
+provisioning, never delete without a replacement release first).
+
+
+### ★★ THE FOURTH FOCUS PATH
+
+**★★ THE FOURTH FOCUS PATH — FOUND AND FIXED 2026-07-24 (2.12.9). Read this
+before ever "fixing" a focus steal again.** The user could not type in yedit;
+three previous fixes all missed, because every one of them hardened something
+NAMED like a focus path (the reclaim script, the input-policy script, the
+`uiOwnsFocus` allowlist, the covered-host `pointer-events:none`). The actual
+thief is the shell root's **`onclick` handler** in `fn app()`: it fires for
+every click anywhere in the window and `document::eval`s a script that
+refocuses the active terminal's helper textarea. It bailed out for a live WEB
+surface — the same bug was found and fixed there once ("click the new-profile
+field and it loses focus immediately") — but nobody taught it about the
+DOCUMENT surface, which did not exist yet when that bail was written.
+**How it was finally caught** (the method matters more than the fix): patch
+`HTMLElement.prototype.focus` on the live GUI to log any call landing on an
+`.xterm-helper-textarea`, AND wrap the registry's `focusTerminal` /
+`setInputEnabled` / `term.focus` so a hit says WHICH closure ran; then drive a
+REAL `server app pointer click` into the editor. The log read: click lands in
+the editor, ~93 ms later `helper.focus()` fires with an EMPTY marks list and a
+`global code@dioxus://index.html` stack — i.e. a freshly-eval'd script, not
+any registry closure. That empty marks list is what convicted the click
+handler. ⚠ A JS `el.focus()` probe passes while the bug is live; only a real
+pointer click reproduces it, because the thief is a DOM click handler.
+**Fixes:** the Rust bail now includes `document_surface_visible_for`, the
+script is extracted as `root_click_terminal_focus_script` carrying the shared
+`UI_FOCUS_OWNER_SELECTORS` guard (so it also stops yanking focus out of the
+sidebar, the theme editor and settings fields), and
+`every_helper_textarea_focus_site_is_guarded_or_a_recorded_probe` scans the
+source so a FIFTH script cannot hide the same way — enumerating these by hand
+is exactly what let this one survive three rounds.
+
+
+### THE STALE-DAEMON TRAP
+
+**THE STALE-DAEMON TRAP — read before diagnosing ANY "the fix didn't work".**
+A deploy that lands new binaries does NOT mean the new code is running. The
+daemon's idle gate defers its own retirement while any owned session is
+actively working — and on a campaign machine an agent session is ~always
+working, so the daemon can stay pinned indefinitely. On jojo 2026-07-11 the
+daemon ran **2.10.3 for 19h44m while 2.10.13 sat on disk**: the CR-faithful
+sanitizer fix and the CC re-birth fix from campaign run 1 were compiled,
+deployed, and never executed. Both bugs were still live for the user, and run 1
+had recorded them as "fixed on branch, live-verify pending" — the gap was
+invisible.
+**Always check `yggterm-headless server status → server_version` against the
+on-disk binary BEFORE concluding anything about a fix.** As of 2.10.14 the
+metadata sidebar's Daemon section surfaces version, uptime, a
+newer-build-on-disk flag, and the daemon's own deferral reason, plus a manual
+hot-restart button — so this is visible in the product rather than only to an
+agent who thinks to look.
+
+
+### Diagnostics available
+
+Diagnostics available
+
+- `~/.yggterm/event-trace*.jsonl` — up to 3 days of trace generations (2.10.2).
+- `~/.yggterm/agent-incidents.jsonl` — durable agent resume-error incidents.
+- `scripts/render_fail_patterns.py` — groups render fail patterns.
+
