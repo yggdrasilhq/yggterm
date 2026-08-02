@@ -593,6 +593,7 @@ fn discover_remote_machines_from_app_state() -> Result<Vec<RemoteMachineSnapshot
         .machines
         .into_iter()
         .map(|machine| RemoteMachineSnapshot {
+            apps: Vec::new(),
             machine_key: machine.machine_key,
             label: machine.label,
             ssh_target: machine.ssh_target,

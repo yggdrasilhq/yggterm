@@ -13,34 +13,81 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
-## ychrome launches on the GUI host no matter which machine the session lives on
+## The launcher OFFERS the GUI host's apps for a row on another machine
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**The observation owed:** on a daemon+GUI carrying this fix, right-click a
+`remote-cc://dev/…` row and see dev's own apps in the menu — specifically
+`yggdrasil-maker` (installed on dev, absent on the GUI host) PRESENT, and
+`yrdp` (installed on the GUI host, absent on dev) ABSENT. It cannot be observed
+on the running fleet yet: the GUI reads `RemoteMachineSnapshot::apps`, which
+only the daemon can fill, so this needs a daemon handover as well as a GUI
+swap. Binaries are deployed and it activates on the next swap.
 
 User-reported 2026-08-02: *"why does ychrome only launch on jojo even if I right
 click on dev or oc sessions. This is undesired behavior."*
 
-**Root cause, read not guessed.** `cached_app_registry()`
-(`crates/yggterm-server/src/lib.rs:2478`) resolves
-`yggterm_core::resolve_yggterm_home()` — **the daemon's OWN home** — and scans
-`<that home>/apps/`. The registry is therefore keyed to ONE host while sessions
-are keyed to MACHINES, so a right-click on a `remote-cc://dev/…` row offers, and
-launches, the GUI host's ychrome. Nothing in the path ever asks where the
-session lives.
+⛔ **The first filed root cause was HALF WRONG, and the wrong half is the one
+the title carried.** It claimed the right-click "offers, and launches, the GUI
+host's ychrome". The OFFER half is true. **The LAUNCH half is false**, and
+believing it would have sent the next session to rewrite a launch path that is
+already correct.
 
-That is a single-source-of-truth mismatch of the kind `CLAUDE.md` forbids: two
-concepts (which apps exist, and where a session runs) that must agree and have
-no shared owner.
+**What the repro actually proved** (2026-08-02, jojo 2.12.24 + dev):
+`terminal_launch_context_for_row` resolves a `remote-cc://dev/…` row through
+`remote_machine_for_sidebar_row`, which falls through to `row.host_label`
+(`"dev"`), finds the machine, and returns
+`Remote { ssh_target: "dev" }` — locked by
+`a_remote_row_offers_its_own_machines_apps_and_launches_there`. Driven live: a
+session created on dev, `echo MACHINE=$(hostname)` → `MACHINE=dev`, then the
+manifest's own command typed in → `ychrome` running **on dev** (pid on dev, not
+on the GUI host), which then declared its surface up the ssh chain and
+`web ensure` on the GUI host answered
+`rebuilt_from_daemon_declare: true, tabs: 1`. The remote path works end to end.
 
-**Shape of a fix:** resolve the registry PER MACHINE — scan the session's host
-over the existing remote-command path, cached the same way (the 5 s rescan
-window and the prune-on-scan behaviour should survive), and build the launch
-command to run there rather than locally. The remote binary path is already
-known to the remote wrapper layer (`~/.yggterm/bin/`).
+⚠ **The first repro was a false negative and is worth remembering.** It launched
+bare `ychrome`, which stops at the profile picker, and the picker declare is
+`("web-surface", "pick") => Retention::Ignore` — the daemon deliberately never
+retains a prompt awaiting a human. So `web ensure` answered `no_declare` for a
+reason that had nothing to do with the machine, and on a `--no-activate` session
+there was no mounted xterm host to parse it live either. **A discriminator that
+answers the same way on the working host is not a discriminator.** Re-run with
+`--profile <name>` so the real `open` declare fires.
+
+**What was actually broken.** `cached_app_registry()`
+(`crates/yggterm-server/src/lib.rs`) scans the DAEMON'S OWN home, and every
+launcher surface read that one list for every row. So the menu beside a dev row
+was drawn from the GUI host's registry: an app installed only on dev never
+appeared, an app installed only on the GUI host was offered for execution on
+dev, and the manifest's ABSOLUTE `binary` path — which by contract means
+something only on the host that wrote it — was the path typed into dev's PTY.
+On this fleet the paths happen to coincide, which is exactly why it looked like
+it worked and read as "it always launches jojo's ychrome".
+
+That is the single-source-of-truth mismatch `CLAUDE.md` forbids: "which apps
+exist" was keyed to a HOST while "where does this session run" is keyed to a
+MACHINE, with nothing making them agree.
+
+**The fix.** A machine reports its own registry (`server remote apps`, one
+manifest per line, pruned by the same scanner the local host uses), the daemon
+fetches it on the existing refresh and stores it on `RemoteMachineSnapshot::apps`,
+and the GUI resolves "which apps does this row have" through
+`app_registry_for_row` — which calls **the same `remote_machine_for_sidebar_row`
+that decides where the launch runs**. Offer and execution are now two readings of
+one fact. `resolve_app_verb_for_row` closes the other half: a clicked entry
+resolves against the registry it was drawn from, so a remote app's menu item can
+never be a silent no-op. A failed fetch keeps the machine's previous list
+(`None` ≠ `Some(vec![])`), so one flaky ssh round trip cannot blank a host's menus.
 
 ⚠ Adjacent, do not conflate: the ychrome ENGINE not existing off the GUI host is
-a separate, already-closed ychrome entry. This one is about the launcher, and it
-affects the ordinary right-click a human uses.
+a separate, already-closed ychrome entry.
+
+⚠ **Still open and NOT this entry:** the browser surface itself always renders in
+the GUI host's process, so a dev-launched ychrome uses the GUI host's web
+profiles and cookie jars while its vault/settings panes come from dev's ychrome
+daemon. That split is architectural, was not reported, and needs the user's call
+before anyone "fixes" it.
 
 ## A ychrome session whose last tab is closed should close itself
 
