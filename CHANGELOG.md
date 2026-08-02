@@ -4,6 +4,28 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The markdown document engine left this repository.** `emd-renderer` — the
+  extended-markdown model and parser behind every document surface — now lives
+  in [`yggdrasilhq/libyggterm`](https://github.com/yggdrasilhq/libyggterm) under
+  MPL-2.0, and yggterm consumes it as a git dependency pinned to `v0.3.0`, the
+  same pin as `yggui` and `yggui-contract`.
+
+  The reason is the rule the 3.0.0 cut was made by, applied to a crate whose
+  role was restated: a library third-party apps must LINK is MPL. emd is a
+  platform organ of the app pipeline — yedit and ztlkasten's document surfaces,
+  breezed, charts-webapp all render the same typed block tree — not a part of the
+  terminal that happened to be reusable. yggterm keeps the Dioxus render of
+  those blocks and stays GPL-3.0-or-later. Its spec moved with the crate, so
+  there is exactly one document describing how the engine behaves.
+
+  Nothing user-visible changes: the same parser, the same round-trip locks, now
+  resolved from a tag instead of a path.
+
+- **Fixed on the way out: `yggterm-shell` declared `pulldown-cmark` and never
+  used it.** It was left behind when the parser was extracted in July and no
+  source file in the crate has named `pulldown_cmark` since — the same dead
+  dependency class that made `yggui` unbuildable outside this workspace.
+
 - **`getUserMedia()` can no longer hang forever.** A page that asked for a
   camera or a microphone on a web surface used to wait on a promise nobody would
   ever settle: no prompt, no error, no trace row. Measured cause — WebKitGTK

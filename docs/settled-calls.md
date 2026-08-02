@@ -33,6 +33,32 @@ be combined into proprietary works, so each crate moved out of the GPL fence is
 moat spent. Under-cutting is reversible in one commit on sole copyright;
 over-cutting is a one-way door.
 
+⚠ **The `emd-renderer` half of that sentence was superseded by the user the
+same day — see the next entry.** It is left standing rather than edited,
+because this file records what he settled and when; what it must not do is
+answer the licence question twice. For `emd-renderer`, the next entry is the
+answer. `yggterm-platform` still stands exactly as written.
+
+## ★★★ `emd-renderer` IS A PLATFORM LIB — MPL, IN libyggterm (2026-08-02)
+
+**Settled by the user, later the same day, and it OVERRIDES the entry above
+where that entry says `emd-renderer` stays GPL.** The earlier call named the
+crate as staying inside the GPL fence; the user then applied the
+licence-by-role rule to it directly: emd is a **platform organ of the app
+pipeline**, and its intended consumers are every pipeline app — yedit and
+ztlkasten's document surfaces, breezed, charts-webapp. A library those apps must
+LINK is MPL by the same rule that put `yggui` there. It is not a part of the
+terminal that happened to be reused.
+
+Executed 2026-08-02: the crate and its spec moved to
+`yggdrasilhq/libyggterm` (MPL-2.0, tag `v0.3.0`) and yggterm consumes it as a
+pinned git dependency like the rest of libyggterm. `yggterm-platform` is
+untouched by this call and stays GPL.
+
+⛔ Do not read the two entries as a contradiction to be resolved by argument.
+The first is the narrow-cut *rule*; this is the user applying that rule to one
+crate whose role he restated. Only the user moves another crate.
+
 ## ★★★ USER-SETTLED CALLS + FEATURE REQUESTS
 
 **★★★ USER-SETTLED CALLS + FEATURE REQUESTS (2026-07-26, verbatim intent).**

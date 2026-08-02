@@ -408,11 +408,16 @@ Each release artifact should also ship with a checksum.
 - `apps/yggterm`: CLI entrypoint and desktop launcher
 - `crates/yggterm-core`: settings, workspace store, title generation, install detection, and browser state
 - `crates/yggterm-server`: daemon, IPC, PTY runtime, and session orchestration
-- `crates/yggui`: Dioxus shell and app interaction surface
+- `crates/yggterm-shell`: the Dioxus shell and app interaction surface
 - `crates/yggterm-platform`: platform detection helpers
 - `crates/yggterm-ghostty-bridge`: optional legacy bridge code, not part of the default path
 - `scripts/`: installers, packaging, and release helpers
 - `debian/`: Debian package metadata
+
+Not here, deliberately: `yggui`, `yggui-contract` and `emd-renderer` live in
+[`yggdrasilhq/libyggterm`](https://github.com/yggdrasilhq/libyggterm) under
+MPL-2.0 and are consumed as a git dependency pinned to one tag. A library that
+third-party apps must LINK is MPL; the application is GPL.
 
 ## License
 
