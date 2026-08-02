@@ -222,6 +222,9 @@ fn print_server_app_help() {
       [--machine-key <k>] [--no-activate] [--purpose <text>]
       [--ephemeral (--ephemeral-owner-pid <pid> | --ephemeral-idle-ttl-secs <n>)]
   yggterm-headless server app keytips <audit [--json]|show|hide>
+  yggterm-headless server app media answer <allow|deny-once|block-site> [--request <id>]
+    answers the camera/microphone prompt `server app state` reports under
+    pending_media_capture; non-zero exit + a named reason when it was NOT applied
 {web_usage}
 row tenancy (server app terminal new): every create from this CLI is stamped
   with the creating pid, this host, and --purpose if given; read it back with
@@ -2771,6 +2774,37 @@ fn main() -> Result<()> {
                     "show" => yggterm_server::run_app_control_keytips_overlay(true, timeout_ms),
                     "hide" => yggterm_server::run_app_control_keytips_overlay(false, timeout_ms),
                     other => anyhow::bail!("unsupported app keytips action: {other}"),
+                }
+            }
+            // CAMERA / MICROPHONE. The twin of main.rs's arm — both binaries or
+            // neither, per the split-dispatch trap the web plane already paid
+            // for. Read the prompt from `server app state`
+            // (`pending_media_capture`), answer it here.
+            "media" => {
+                let action = args.get(3).map(String::as_str).unwrap_or("answer");
+                match action {
+                    "answer" => {
+                        let answer = args
+                            .get(4)
+                            .filter(|arg| !arg.starts_with("--"))
+                            .map(String::to_string)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing answer for server app media answer \
+                                     (allow | deny-once | block-site)"
+                                )
+                            })?;
+                        let request_id = cli_flag_value(&args, "--request")
+                            .map(|value| value.parse::<u64>())
+                            .transpose()
+                            .map_err(|_| {
+                                anyhow::anyhow!("--request takes the numeric request_id")
+                            })?;
+                        yggterm_server::run_app_control_media_answer(
+                            answer, request_id, timeout_ms,
+                        )
+                    }
+                    other => anyhow::bail!("unsupported app media action: {other}"),
                 }
             }
             // THE web verb plane, on the binary agents actually drive. It used

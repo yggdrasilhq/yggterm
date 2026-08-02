@@ -12538,6 +12538,55 @@ async fn web_surface_native_reconcile_loop(
                 );
             }
         }
+        // THE ASK THE ENGINE NEVER RAISES. WebKit defers `getUserMedia()` on a
+        // surface it has not presented — no signal, no rejection, no timeout —
+        // so the loop above can run empty while a page waits forever. The PAGE
+        // reports its own call (`CAPTURE_ASK_SHIM_JS`); these two drains are
+        // what make that wait visible and what end it.
+        //
+        // ⚠ A row here with NO `media_permission_request` beside it is the
+        // signature of the defect: the page asked, the engine did not.
+        for ask in desktop.take_web_surface_capture_asks() {
+            let session_path = applied
+                .iter()
+                .find(|(_, entry)| entry.native_id == ask.surface_id)
+                .map(|((session_path, _), _)| session_path.clone());
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "web_surface",
+                "capture_ask",
+                json!({
+                    "ask_id": ask.ask_id,
+                    "native_id": ask.surface_id,
+                    "session_path": session_path,
+                    "audio": ask.audio,
+                    "video": ask.video,
+                    "href": ask.href,
+                }),
+            );
+        }
+        // The invariant, enforced: a page-side ask the engine never took up is
+        // REJECTED rather than left pending. `NotAllowedError` is a thing the
+        // site can report and retry; an eternal promise is not.
+        for refusal in desktop.expire_web_surface_capture_asks() {
+            let session_path = applied
+                .iter()
+                .find(|(_, entry)| entry.native_id == refusal.surface_id)
+                .map(|((session_path, _), _)| session_path.clone());
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "web_surface",
+                "capture_ask_refused",
+                json!({
+                    "ask_id": refusal.ask_id,
+                    "native_id": refusal.surface_id,
+                    "session_path": session_path,
+                    "reason": refusal.reason,
+                }),
+            );
+        }
         // Downloads. A link that saves a file used to be INVISIBLE, not inert:
         // wry's own default handler answered WebKit's `decide-destination` with
         // a path it guessed itself (`dirs::download_dir()`, or the GUI's CWD
@@ -39310,6 +39359,7 @@ fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
                     dioxus_desktop::window(),
                     dialog,
                     MediaCaptureAnswer::DenyOnce,
+                    "keyboard_dismiss",
                 );
                 return true;
             }
@@ -51846,6 +51896,38 @@ fn describe_app_state_snapshot(
         .cloned()
         .collect::<Vec<_>>();
     selected_tree_paths.sort();
+    // The camera/microphone prompt a page has raised and a human has not yet
+    // answered. Reported because an operator could not previously see that a
+    // page was waiting on a camera AT ALL — the prompt lives in the GUI's own
+    // modal stack and nothing outside it knew. `request_id` is the handle
+    // `server app media answer` takes.
+    let pending_media_capture_debug = shell.pending_media_capture.as_ref().map(|pending| {
+        json!({
+            "request_id": pending.request_id,
+            "native_id": pending.surface_id,
+            "session_path": pending.session_path.clone(),
+            "origin": pending.origin.clone(),
+            "display": pending.display.clone(),
+            "audio": pending.audio,
+            "video": pending.video,
+        })
+    });
+    // Every page waiting on a `getUserMedia()` the engine may never have
+    // raised. Its twin (`pending_media_capture_debug`, the prompt a HUMAN is
+    // being asked) is built just above.
+    let pending_capture_asks_debug = desktop
+        .web_surface_pending_capture_asks()
+        .into_iter()
+        .map(|ask| {
+            json!({
+                "ask_id": ask.ask_id,
+                "native_id": ask.surface_id,
+                "audio": ask.audio,
+                "video": ask.video,
+                "href": ask.href,
+            })
+        })
+        .collect::<Vec<_>>();
     let pending_delete_debug = shell.pending_delete.as_ref().map(|pending| {
         json!({
             "document_paths": pending.document_paths.clone(),
@@ -52198,6 +52280,17 @@ fn describe_app_state_snapshot(
             "selected_tree_paths": selected_tree_paths,
             "selection_anchor": shell.selection_anchor,
             "pending_delete": pending_delete_debug,
+            // CAMERA / MICROPHONE: the prompt a page raised and nobody has
+            // answered. `null` is the normal state. A non-null value means a
+            // page's `getUserMedia()` promise is BLOCKED on this — answer it
+            // with `server app media answer <allow|deny-once|block-site>`.
+            "pending_media_capture": pending_media_capture_debug,
+            // ...and its twin: every page WAITING on `getUserMedia()`, said by
+            // the page itself. On a surface WebKit has not presented,
+            // `pending_capture_asks` is non-empty while `pending_media_capture`
+            // is `null` and no engine event exists anywhere — that PAIR is the
+            // signature of the hang.
+            "pending_capture_asks": pending_capture_asks_debug,
             "tree_rename_path": shell.tree_rename_path,
             "tree_rename_depth": shell.tree_rename_depth,
             "tree_rename_value": shell.tree_rename_value,
@@ -60277,6 +60370,37 @@ impl MediaCaptureAnswer {
             MediaCaptureAnswer::BlockSite => "block-site",
         }
     }
+
+    /// The control plane's word for an answer, back to the answer itself.
+    ///
+    /// ⛔ This enum stays the ONE owner of the answer vocabulary:
+    /// `AppControlCommand::AnswerMediaCapture` carries a STRING precisely so
+    /// there is no second enum on the wire that could grow a fourth variant the
+    /// buttons do not have. `as_str` writes the words, this reads them, and
+    /// `every_capture_answer_round_trips_through_its_wire_word` locks the pair.
+    ///
+    /// The two short forms are aliases, not a second vocabulary — an operator
+    /// types `deny`, and refusing that in favour of `deny-once` would only ever
+    /// produce a typo at the moment someone is trying to refuse a camera.
+    fn from_wire(word: &str) -> Option<Self> {
+        match word.trim() {
+            "allow" => Some(MediaCaptureAnswer::Allow),
+            "deny-once" | "deny" => Some(MediaCaptureAnswer::DenyOnce),
+            "block-site" | "block" => Some(MediaCaptureAnswer::BlockSite),
+            _ => None,
+        }
+    }
+
+    /// Every answer the control plane accepts, for a refusal that tells the
+    /// caller what it could have typed. Derived from the enum, so a new variant
+    /// cannot be missing from the message.
+    fn wire_words() -> [&'static str; 3] {
+        [
+            MediaCaptureAnswer::Allow.as_str(),
+            MediaCaptureAnswer::DenyOnce.as_str(),
+            MediaCaptureAnswer::BlockSite.as_str(),
+        ]
+    }
 }
 
 /// A page asked for the camera or the microphone: consult the app that owns the
@@ -60411,12 +60535,41 @@ async fn begin_media_capture_decision(
 /// Order matters. The engine request is resolved FIRST and unconditionally — a
 /// failed or slow write to the app must never leave the page hanging, and a
 /// grant the user made must not depend on a network round trip succeeding.
+///
+/// ⛔ THE ONE TERMINUS. The dialog's buttons, its Escape key and
+/// `AppControlCommand::AnswerMediaCapture` all arrive here; there is no second
+/// path from an answer to a device. `source` is the only thing that differs
+/// between them, and it exists so the trace row can say WHO answered — a camera
+/// granted from the control plane and one granted by a human click are the same
+/// grant and must not be the same record.
 fn resolve_media_capture_dialog(
     mut state: Signal<ShellState>,
     desktop: dioxus::desktop::DesktopContext,
     dialog: PendingMediaCaptureDialog,
     answer: MediaCaptureAnswer,
+    source: &'static str,
 ) {
+    // Taken before the state write below, because that write clears the dialog
+    // and this is the last moment the whole decision is in one place.
+    let trace_home = perf_home_dir(&state.peek().bootstrap.settings_path);
+    append_trace_event(
+        &trace_home,
+        "ui",
+        "web_surface",
+        "media_permission_answered",
+        json!({
+            "request_id": dialog.request_id,
+            "native_id": dialog.surface_id,
+            "session_path": dialog.session_path.clone(),
+            "origin": dialog.origin.clone(),
+            "audio": dialog.audio,
+            "video": dialog.video,
+            "answer": answer.as_str(),
+            "allows": answer.allows(),
+            "remembered": answer.remembered(),
+            "source": source,
+        }),
+    );
     let (control_url, control_token) = state.with_mut(|shell| {
         // Clear it whichever way the user answered, so a second click cannot
         // double-answer and the modal closes immediately.
@@ -72781,6 +72934,85 @@ async fn process_pending_app_control_requests(
                 error: None,
             }
         }
+        AppControlCommand::AnswerMediaCapture { request_id, answer } => {
+            // The control plane's door to the SAME terminus the dialog's buttons
+            // use. Every refusal below is named, because the failure this verb
+            // exists to end — a page waiting forever on a prompt nobody could
+            // reach — must never be replaced by a verb that silently does
+            // nothing.
+            // ⚠ Bound to a local BEFORE the match, never read inside the
+            // scrutinee. A `match state.peek()…` holds the signal's read guard
+            // for the whole match, and the arm below calls back into
+            // `with_mut` — which is a borrow panic at the exact moment an
+            // operator answers a camera prompt.
+            let pending = state.peek().pending_media_capture.clone();
+            let data = match MediaCaptureAnswer::from_wire(&answer) {
+                None => json!({
+                    "command": "answer_media_capture",
+                    "answered": false,
+                    "reason": "unknown_answer",
+                    "answer": answer,
+                    "accepted_answers": MediaCaptureAnswer::wire_words(),
+                }),
+                Some(parsed) => match pending {
+                    None => json!({
+                        "command": "answer_media_capture",
+                        "answered": false,
+                        // Not an error state: a prompt that was already answered,
+                        // that the engine's own deadline retired, or that never
+                        // existed all look like this. `server app state` →
+                        // `pending_media_capture` is the one place to look.
+                        "reason": "no_pending_request",
+                    }),
+                    // An operator who quoted a request id must not be able to
+                    // answer a DIFFERENT page's prompt because the one they read
+                    // was retired between the read and the answer.
+                    Some(dialog)
+                        if request_id.is_some_and(|wanted| wanted != dialog.request_id) =>
+                    {
+                        json!({
+                            "command": "answer_media_capture",
+                            "answered": false,
+                            "reason": "request_mismatch",
+                            "requested_request_id": request_id,
+                            "pending_request_id": dialog.request_id,
+                        })
+                    }
+                    Some(dialog) => {
+                        let answered = json!({
+                            "command": "answer_media_capture",
+                            "answered": true,
+                            "request_id": dialog.request_id,
+                            "native_id": dialog.surface_id,
+                            "session_path": dialog.session_path.clone(),
+                            "origin": dialog.origin.clone(),
+                            "display": dialog.display.clone(),
+                            "audio": dialog.audio,
+                            "video": dialog.video,
+                            "answer": parsed.as_str(),
+                            "allows": parsed.allows(),
+                            "remembered": parsed.remembered(),
+                        });
+                        resolve_media_capture_dialog(
+                            state,
+                            desktop.clone(),
+                            dialog,
+                            parsed,
+                            "app_control",
+                        );
+                        answered
+                    }
+                },
+            };
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(data),
+                error: None,
+            }
+        }
         AppControlCommand::Key { command } => {
             let script = app_control_key_script(&command);
             let _ = document::eval(&script);
@@ -81029,6 +81261,7 @@ fn app() -> Element {
                                     dioxus_desktop::window(),
                                     dialog.clone(),
                                     answer,
+                                    "dialog_click",
                                 )
                             }
                         },
@@ -182569,6 +182802,48 @@ mod media_capture_locks {
             "nothing drains the retirements — a dialog would stay on screen after \
              its request timed out or its surface closed under it",
         );
+        // ...and the THIRD queue, which is the one that exists because the other
+        // two can both run empty forever. MEASURED (WebKitGTK 2.52.5): on a
+        // surface WebKit has not presented, no `permission-request` is ever
+        // raised — so the page's own report is the only evidence it is waiting,
+        // and this sweep is the only thing that ends the wait.
+        assert!(
+            body.contains("for ask in desktop.take_web_surface_capture_asks()"),
+            "nothing drains the PAGE-side capture asks — a `getUserMedia()` on an \
+             unpresented surface becomes invisible again: no prompt for the user, \
+             no error for the page, no row for the operator",
+        );
+        assert!(
+            body.contains("for refusal in desktop.expire_web_surface_capture_asks()"),
+            "nothing expires the page-side capture asks — `getUserMedia()` hangs \
+             forever on an unpresented surface, which is exactly the defect that \
+             cost a live eSign video KYC",
+        );
+    }
+
+    /// Both halves of "who is waiting on a camera" reach `server app state`.
+    ///
+    /// They answer different questions and only the first used to exist: the
+    /// dialog is the engine asking a HUMAN; the ask list is a PAGE waiting on a
+    /// promise. A non-empty ask list beside a null dialog, with no
+    /// `media_permission_request` row anywhere, IS the signature of the hang —
+    /// and before this an operator could not see any of it.
+    #[test]
+    fn app_state_reports_both_the_capture_dialog_and_the_pages_waiting_on_one() {
+        let product = product_source();
+        let body = function_body(&product, "fn describe_app_state_snapshot(");
+        for needle in [
+            "\"pending_media_capture\": pending_media_capture_debug,",
+            "\"pending_capture_asks\": pending_capture_asks_debug,",
+            ".web_surface_pending_capture_asks()",
+        ] {
+            assert!(
+                body.contains(needle),
+                "`app state` lost `{needle}` — an operator cannot see that a page \
+                 is waiting on a camera, which is the observability half of the \
+                 getUserMedia hang",
+            );
+        }
     }
 
     /// ⛔ Every dismissal is a DENIAL. Escape, the backdrop and "Not now" all
@@ -182614,6 +182889,127 @@ mod media_capture_locks {
             "the capture dialog offers {grants} ways to grant a device; there must \
              be exactly one, on the button labelled Allow",
         );
+    }
+
+    /// The wire word and the enum are ONE vocabulary.
+    ///
+    /// `AppControlCommand::AnswerMediaCapture` carries a string precisely so the
+    /// wire cannot grow a fourth answer the buttons do not have — which only
+    /// holds while every variant this enum has survives the round trip. A
+    /// variant added without a `from_wire` arm fails here rather than at a
+    /// camera prompt an operator cannot answer.
+    #[test]
+    fn every_capture_answer_round_trips_through_its_wire_word() {
+        for answer in [
+            MediaCaptureAnswer::Allow,
+            MediaCaptureAnswer::DenyOnce,
+            MediaCaptureAnswer::BlockSite,
+        ] {
+            assert_eq!(
+                MediaCaptureAnswer::from_wire(answer.as_str()),
+                Some(answer),
+                "{} does not survive the wire round trip",
+                answer.as_str(),
+            );
+            assert!(
+                MediaCaptureAnswer::wire_words().contains(&answer.as_str()),
+                "{} is missing from the accepted-answers list a refusal prints",
+                answer.as_str(),
+            );
+        }
+        // The two operator short forms, and nothing else.
+        assert_eq!(
+            MediaCaptureAnswer::from_wire("deny"),
+            Some(MediaCaptureAnswer::DenyOnce),
+        );
+        assert_eq!(
+            MediaCaptureAnswer::from_wire("block"),
+            Some(MediaCaptureAnswer::BlockSite),
+        );
+        assert_eq!(MediaCaptureAnswer::from_wire(" allow "), Some(MediaCaptureAnswer::Allow));
+        for word in ["", "yes", "ok", "grant", "allow-always", "DENY"] {
+            assert_eq!(
+                MediaCaptureAnswer::from_wire(word),
+                None,
+                "{word:?} was read as an answer; only the dialog's own three words \
+                 and their two short forms may be",
+            );
+        }
+    }
+
+    /// ⛔ The control plane answers through the SAME terminus as the human.
+    ///
+    /// The temptation is to have the verb call
+    /// `resolve_web_surface_media_permission` directly — it is one line and it
+    /// "works". It would also skip clearing the dialog and skip persisting the
+    /// remembered decision, so the modal would stay on screen over an
+    /// already-answered request and the site would ask again forever. One
+    /// terminus, or the two paths drift.
+    #[test]
+    fn the_control_plane_answers_through_the_dialogs_own_terminus() {
+        let product = product_source();
+        let arm = function_body(
+            &product,
+            "AppControlCommand::AnswerMediaCapture { request_id, answer } => {",
+        );
+        assert!(
+            arm.contains("resolve_media_capture_dialog("),
+            "the media-answer verb no longer routes through the dialog's terminus; \
+             it would settle the engine while leaving the modal up and the \
+             per-origin decision unwritten",
+        );
+        assert!(
+            !arm.contains("desktop.resolve_web_surface_media_permission("),
+            "the media-answer verb reaches the parked engine request directly — \
+             that is the second path to a device this lock exists to forbid",
+        );
+        assert!(
+            arm.contains("MediaCaptureAnswer::from_wire(&answer)"),
+            "the verb no longer reads its answer through the enum that owns the \
+             vocabulary; a second spelling of \"allow\" could appear on the wire",
+        );
+        // A refusal must be NAMED. A verb that silently does nothing is the same
+        // failure mode as the hang it exists to end.
+        for reason in ["unknown_answer", "no_pending_request", "request_mismatch"] {
+            assert!(
+                arm.contains(reason),
+                "the verb lost its `{reason}` refusal — an operator would see \
+                 `answered: false` with no way to tell why",
+            );
+        }
+        // The id guard: quoting a request id that is no longer the pending one
+        // must REFUSE, never answer whatever happens to be up now.
+        assert!(
+            arm.contains("request_id.is_some_and(|wanted| wanted != dialog.request_id)"),
+            "the request-id guard is gone; an operator who quoted a retired id \
+             would answer a different page's camera prompt",
+        );
+    }
+
+    /// Every answer leaves a record, and the record says WHO answered.
+    ///
+    /// A camera granted from the control plane and one granted by a human click
+    /// are the same grant. They must not be the same audit row, and neither may
+    /// be missing: the trace lives at the one terminus so no path can skip it.
+    #[test]
+    fn every_capture_answer_is_traced_with_its_source() {
+        let product = product_source();
+        let body = function_body(&product, "fn resolve_media_capture_dialog(");
+        assert!(
+            body.contains("\"media_permission_answered\"") && body.contains("\"source\": source,"),
+            "the one terminus no longer records who answered a capture prompt",
+        );
+        let joined = product.join("\n");
+        for (call, source) in [
+            ("MediaCaptureAnswer::DenyOnce,\n                    \"keyboard_dismiss\",", "Escape"),
+            ("answer,\n                                    \"dialog_click\",", "the dialog buttons"),
+            ("parsed,\n                            \"app_control\",", "the control plane"),
+        ] {
+            assert!(
+                joined.contains(call),
+                "{source} no longer names itself when it answers a capture prompt",
+            );
+        }
     }
 }
 
