@@ -188,6 +188,9 @@ version = "1.0.225"
 [dependencies.serde_json]
 version = "1.0.140"
 
+[dependencies.sha2]
+version = "0.10"
+
 [dependencies.slab]
 version = "0.4.10"
 
