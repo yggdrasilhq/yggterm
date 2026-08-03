@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.8
+
+- **libyggterm is pinned to a published tag again** (v0.4.2), so a clean clone
+  builds what jojo runs. 3.0.6–3.0.7 were built against a local `[patch]` while
+  `MdInline::Image` and the spine seam were still unreleased; that patch is
+  gone.
+
 ## 3.0.7
 
 **The Web View was unreadable and unscrollable, and both had the same shape.**
