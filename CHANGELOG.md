@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.18
+
+- **The user's chat bubble stops looking like a UI panel** (libyggterm v0.8.0).
+  Drop shadow and border gone, the blue cast out of the fill, the card wider so
+  a three-line question stops wrapping to five, and the timestamp moved outside
+  it. Measured against t3code, which is the reference the user named.
+- **A work run collapses to one line** — `Worked · N`, expandable — instead of
+  laying six rows of machinery between every pair of paragraphs.
+
 ## 3.0.17
 
 - **The Web View stops rendering two turns of a 298-turn conversation.** A
