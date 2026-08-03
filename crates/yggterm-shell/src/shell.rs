@@ -40253,13 +40253,20 @@ fn restore_browser_tree_preserving_sidebar_view(
 /// A claim of `tail`/`full` that holds no more than the cheap list's cap is
 /// therefore treated as undelivered. Re-fetching is idempotent, and the
 /// refresh marker dedupes it to one attempt per state change.
-fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
+/// A `Preview Hydration` marker of `tail`/`full` on a row holding no more
+/// content than the cheap list's cap.
+///
+/// Its own predicate because TWO gates need it and only one of them had it, so
+/// the second quietly overruled the first — see
+/// `remote_preview_should_auto_sync`.
+fn remote_preview_hydration_claim_is_unbacked(session: &ManagedSessionView) -> bool {
     let hydration = metadata_value(session, "Preview Hydration");
-    let claims_hydrated = matches!(hydration.as_str(), "tail" | "full");
-    let holds_no_more_than_the_cap =
-        session.preview.blocks.len() <= yggterm_server::LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT;
+    matches!(hydration.as_str(), "tail" | "full")
+        && session.preview.blocks.len() <= yggterm_server::LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT
+}
+fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
     session_preview_syncs_from_remote(&session.session_path)
-        && ((claims_hydrated && holds_no_more_than_the_cap)
+        && (remote_preview_hydration_claim_is_unbacked(session)
             || session.preview.blocks.is_empty()
             || metadata_value(session, "Preview Hydration") == "head"
             || metadata_value(session, "Preview Hydration") == "loading"
@@ -40303,7 +40310,22 @@ fn remote_preview_should_auto_sync(session: &ManagedSessionView) -> bool {
     if !remote_preview_needs_refresh(session) {
         return false;
     }
-    if !matches!(hydration.as_str(), "head" | "loading")
+    // ⚠ AN UNBACKED CLAIM OUTRANKS READABLE SCAN CONTENT, and the missing
+    // `&&` here cost the user their Web View.
+    //
+    // The clause below exists so a row that already shows something useful does
+    // not re-fetch on every tick. But a row whose marker says `tail` while it
+    // holds two blocks is not "already showing something useful" — it is
+    // showing the SCAN, a one-line summary, in place of the conversation. The
+    // gate above had just established exactly that, and this one overruled it
+    // because the scaffold happens to carry readable `remote:scan` text.
+    //
+    // Live on guihost 2026-08-03, client 3.0.16: a 298-block transcript rendered
+    // two turns and left the rest of the pane empty, permanently, because
+    // "already hydrated" and "has readable content" were both true and neither
+    // was about the conversation.
+    if !remote_preview_hydration_claim_is_unbacked(session)
+        && !matches!(hydration.as_str(), "head" | "loading")
         && remote_preview_has_readable_scan_content(session)
     {
         return false;
@@ -140770,6 +140792,78 @@ mod tests {
                  be guessed wrong"
             );
         }
+    }
+
+    /// ★★★ A HYDRATION CLAIM WITH NO CONTENT BEHIND IT MUST WIN OVER
+    /// "IT ALREADY SHOWS SOMETHING".
+    ///
+    /// Two gates decide whether a remote row re-fetches its transcript, and
+    /// only one of them knew that `Preview Hydration: tail` on a two-block row
+    /// is a lie. The other saw readable `remote:scan` text and concluded the
+    /// surface was fine — so the first gate's verdict was discarded every time.
+    ///
+    /// Measured on the user's own GUI (guihost, client 3.0.16): a 298-block
+    /// transcript drew two turns and left the rest of the pane empty, and never
+    /// recovered, because "already hydrated" and "has readable content" were
+    /// both true and neither was about the conversation. Their words: *"the
+    /// content is not rendered in half of the screen."*
+    #[test]
+    fn an_unbacked_hydration_claim_outranks_readable_scan_content() {
+        let scan_block = |text: &str| {
+            SessionPreviewBlock::message(
+                "ASSISTANT",
+                "remote:scan".to_string(),
+                PreviewTone::Assistant,
+                vec![text.to_string()],
+            )
+        };
+        let row = |blocks: Vec<SessionPreviewBlock>, hydration: &str| {
+            let mut session = test_managed_conversation_session(SessionKind::ClaudeCode);
+            session.session_path = "remote-cc://dev/91527c7b".to_string();
+            session.preview.blocks = blocks;
+            session.metadata.retain(|entry| entry.label != "Preview Hydration");
+            session.metadata.push(SessionMetadataEntry {
+                label: "Preview Hydration",
+                value: hydration.to_string(),
+            });
+            session
+        };
+
+        // The live case: claims `tail`, holds the two-block scaffold, and that
+        // scaffold carries perfectly readable scan text.
+        let starved = row(
+            vec![
+                scan_block("Continue atlasstore and lookup-app work"),
+                scan_block("running · idle"),
+            ],
+            "tail",
+        );
+        assert!(remote_preview_hydration_claim_is_unbacked(&starved));
+        assert!(
+            remote_preview_has_readable_scan_content(&starved),
+            "the readable-content clause must really be firing, or this test \
+             proves nothing about the interaction"
+        );
+        assert!(
+            remote_preview_should_auto_sync(&starved),
+            "a row showing the SCAN in place of the conversation must re-fetch"
+        );
+
+        // A row that genuinely holds its transcript does NOT re-fetch on every
+        // tick — the clause that was overruling still has to do its job.
+        let mut blocks = Vec::new();
+        for ix in 0..40 {
+            blocks.push(SessionPreviewBlock::message(
+                "ASSISTANT",
+                format!("2026-08-03T00:00:{ix:02}Z"),
+                PreviewTone::Assistant,
+                vec![format!("turn {ix}")],
+            ));
+        }
+        blocks.push(scan_block("Continue atlasstore and lookup-app work"));
+        let hydrated = row(blocks, "tail");
+        assert!(!remote_preview_hydration_claim_is_unbacked(&hydrated));
+        assert!(!remote_preview_should_auto_sync(&hydrated));
     }
 
     /// ★★ THE D-PAD IS A REVEAL, AND IT MEASURES FROM THE END.
