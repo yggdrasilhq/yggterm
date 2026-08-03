@@ -86339,14 +86339,16 @@ fn MainSurface(
     let preview_history_expanding_path = state.read().preview_history_expanding.clone();
     // The pad appears once the reader is far enough from the end to want it —
     // the transcript's answer to the same question the terminal asks in rows
-    // against its prompt. No script needed: the scroller already reports its
-    // own geometry on every scroll, so this is arithmetic on signals the
-    // surface holds rather than a second source of truth in JS.
-    let preview_dpad_visible = preview_dpad_should_reveal(
-        *preview_scroll_top.read(),
-        *preview_scroll_client_height.read(),
-        *preview_scroll_height.read(),
-    );
+    // against its prompt. No script needed.
+    //
+    // ⚠ It reads the VIRTUAL WINDOW's geometry, not the raw scroll signals.
+    // Those are only written by an `onscroll` event, so on a freshly opened
+    // transcript they still hold their initial values and the pad would stay
+    // hidden on a 30,000px document until the reader scrolled — which is
+    // exactly when they no longer need to be told it exists. The window carries
+    // a height estimated from the blocks themselves, so this is right on the
+    // first frame.
+
     use_effect(move || {
         let Some((session_path, pin_key, initial_scroll_top)) = preview_latest_pin_request.clone()
         else {
@@ -86896,7 +86898,14 @@ fn MainSurface(
                                         latest_anchor_key: preview_latest_anchor_key.clone(),
                                         preview_history_expanding: preview_history_expanding_path.as_deref()
                                             == Some(session.session_path.as_str()),
-                                        preview_dpad_visible,
+                                        // Computed here because it reads the
+                                        // virtual window, which is resolved
+                                        // further down than the other flags.
+                                        preview_dpad_visible: preview_dpad_should_reveal(
+                                            preview_window.scroll_top_px,
+                                            preview_window.viewport_height_px,
+                                            preview_window.scroll_height_px,
+                                        ),
                                         palette: snapshot.palette,
                                         on_toggle_block: move |ix| on_toggle_preview_block.call(ix),
                                         on_copy_block: move |text: String| {
@@ -140712,6 +140721,11 @@ mod tests {
     /// being read, so "how far down am I" answers differently every few seconds
     /// while "how far from the end" is stable, and it is the one the reader
     /// feels.
+    ///
+    /// It reads the virtual window's geometry rather than the raw scroll
+    /// signals, which an `onscroll` event has not written yet on a freshly
+    /// opened surface — the pad would be hidden on a 30,000px document until
+    /// the reader scrolled, which is when they least need to be told it exists.
     #[test]
     fn the_reading_pad_reveals_on_distance_from_the_end() {
         // Sitting at the bottom of a long document: nothing to offer.
