@@ -1143,12 +1143,37 @@ article feel:
 - Links: accent color only, no underline (markdown has no underline syntax, so
   underlines are never ours to add).
 - Code (inline + blocks) stays monospace at a reduced em so it sits quietly
-  inside serif body text.
-- The compact rail-pane markdown widget keeps the interface font and the rail's
-  own size — reading typography applies to document-scale surfaces only.
+  inside body text — and it is the project monospace (`JetBrains Mono`), not
+  whatever the platform calls `ui-monospace`.
 
-One code owner: `document_reading_typography()` in `yggterm-shell/src/shell.rs`.
-Change the stack here first, then there.
+##### Three reading surfaces, one type system
+
+`emd-renderer` says what a document IS; **`yggui::prose` in libyggterm says how
+it reads**, and it is the ONE owner of every face, size and rhythm below. A host
+supplies its brand colours (`ProseInk`) and nothing else — no host may spell a
+face, a size, a leading or a tracking of its own. Locked by
+`the_markdown_adapter_owns_no_typography_of_its_own`.
+
+Three surfaces, each NAMED by its call site (never inferred from a flag):
+
+| `ProseTokens::` | Surface | Body copy |
+|---|---|---|
+| `document()` | markdown reader, live preview, click-to-edit | owns it: the sans reading stack, 16px/1.7/0.002em |
+| `conversation()` | the Web View transcript | **inherits** it from the turn |
+| `rail()` | contributed 300px pane | inherits face+size, tightens leading to 1.55 |
+
+The transcript inherits because the turn above it has already decided, and the
+two sides of a conversation are deliberately unequal: the person's ask is sans
+at 15px, the machine's answer serif at 16px/1.72, and one renderer serves both
+(`ProseBody::CONVERSATION_ASK` / `CONVERSATION_ANSWER`). A markdown root that
+re-decides silently wins over the turn — that is not hypothetical, it shipped:
+answers drew at 1.55 for as long as the surface shared a `compact` flag with the
+rail pane.
+
+Everything BELOW body copy — headings, code, lists, tables, quotes, rules — is
+identical on all three. A heading is a heading.
+
+Change a value in `crates/yggui/src/prose.rs` first, then here.
 
 ## Project Overlay: Yggterm
 

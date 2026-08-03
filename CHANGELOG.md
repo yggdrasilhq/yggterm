@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.11
+
+- **One type system for every reading surface** (libyggterm **v0.5.0**,
+  `yggui::prose`). `emd-renderer` says what a document IS; it has no opinion
+  about how it reads, so each host invented one — and three of them had already
+  drifted apart. The Web View drew code in `ui-monospace` while the token set in
+  the same binary named JetBrains Mono. Now `ProseTokens` owns every face, size
+  and rhythm, yggterm supplies only its brand colours, and a test holds the
+  adapter to it: **no face, no size, no leading, no tracking may be spelled in
+  yggterm again.**
+- **The transcript's answers read at the leading they were designed for.** The
+  Web View and the 300px rail pane shared one `compact` flag, so the reading
+  surface inherited the rail's tighter leading: every answer drew at
+  line-height 1.55 while the turn around it — and 3.0.9's type scale — said
+  1.72. Three surfaces now name themselves (`document()`, `conversation()`,
+  `rail()`) and none is inferred from a boolean.
+- **Code in a document or a transcript wears JetBrains Mono**, the project
+  monospace, instead of whatever the platform calls `ui-monospace`.
+
 ## 3.0.10
 
 - **A light-mode text field is WHITE** (user call). Every field mixed 5% of the
