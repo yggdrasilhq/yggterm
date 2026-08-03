@@ -43299,24 +43299,31 @@ fn estimate_preview_block_height(block: &SessionPreviewBlock) -> f64 {
             continue;
         }
         let chars = trimmed.chars().count().max(1) as f64;
+        // ⚠ Characters per line at the CHAT scale (14px in the 720px column),
+        // not the 16px serif this was written for. Under-estimating is the safe
+        // direction: it makes the window render a few blocks more than it needs
+        // to. Over-estimating starves the viewport, which is what a stale 62
+        // did — the window believed it had filled the screen after four turns
+        // and left the bottom half of the surface blank.
         let wrap_width = if in_code {
-            88.0
+            96.0
         } else if trimmed.starts_with('#') {
-            42.0
+            64.0
         } else {
-            62.0
+            92.0
         };
         let wrapped_lines = (chars / wrap_width).ceil().max(1.0);
         let line_height = if in_code {
-            18.0
+            17.0
         } else if trimmed.starts_with('#') {
-            24.0
+            22.0
         } else {
-            20.0
+            // 14px x 1.625, rounded down for the same reason.
+            22.0
         };
         height += wrapped_lines * line_height;
     }
-    height.max(88.0)
+    height.max(72.0)
 }
 fn preview_virtual_window(
     blocks: &[SessionPreviewBlock],
@@ -43381,9 +43388,13 @@ fn preview_virtual_window(
             .map(estimate_preview_block_height)
             .sum::<f64>();
     }
-    if end_index <= start_index {
-        end_index = (start_index + PREVIEW_BLOCK_WINDOW).min(blocks.len());
-    }
+    // ⚠ A FLOOR, not a fallback. `end_index` is chosen by walking ESTIMATED
+    // heights, so an estimator that runs ahead of reality stops the walk while
+    // real viewport is still empty — and the reader sees a half-drawn page with
+    // a spacer under it. Guaranteeing a block count makes that failure mode
+    // cost a few extra rows instead of half a screen. It happened: the type
+    // scale moved to 14px and the estimator did not.
+    end_index = end_index.max((start_index + PREVIEW_BLOCK_WINDOW).min(blocks.len()));
     let bottom_spacer_px = blocks[end_index..]
         .iter()
         .map(estimate_preview_block_height)
@@ -86411,7 +86422,12 @@ fn MainSurface(
     let rendered_surface_zoom_percent =
         zoom_percent_f32(snapshot.settings.rendered_font_size, 10.0);
     let rendered_surface_zoom_style = format!(
-        "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%; zoom:{}%;",
+        // `position:relative` so the floating controls anchor to the SURFACE
+        // and not to the scrolled content. A pad inside the scroller scrolls
+        // away with the page, which is the one thing a scroll control must
+        // never do.
+        "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; \
+         height:100%; position:relative; zoom:{}%;",
         rendered_surface_zoom_percent
     );
     let preview_surface_visible = snapshot.active_view_mode == WorkspaceViewMode::Rendered;
@@ -86856,17 +86872,14 @@ fn MainSurface(
                         div {
                             key: "{session.session_path}:preview-surface",
                             style: "{rendered_surface_zoom_style}",
-                            div {
-                                style: "display:flex; align-items:flex-start; justify-content:flex-end; gap:12px; padding:8px 24px 0 24px;",
-                                PreviewToolbar {
-                                    palette: snapshot.palette,
-                                    preview_layout: snapshot.preview_layout,
-                                    preview_loading: snapshot.preview_loading,
-                                    server_busy: snapshot.server_busy,
-                                    on_expand_preview: move |_| on_expand_preview.call(()),
-                                    on_collapse_preview: move |_| on_collapse_preview.call(()),
-                                    on_set_preview_layout: move |mode| on_set_preview_layout.call(mode),
-                                }
+                            // ⛔ The Expand All / Collapse All / graph-view bar
+                            // is GONE (user, 2026-08-03: "should entirely be
+                            // scrapped"). The timeline view supersedes the
+                            // graph, and the bar was also what pushed every
+                            // floating control out of the true top-right.
+                            PreviewScrollController {
+                                session_path: session.session_path.clone(),
+                                palette: snapshot.palette,
                             }
                             div {
                                 key: "{session.session_path}:preview-scroll",
@@ -86898,14 +86911,6 @@ fn MainSurface(
                                         latest_anchor_key: preview_latest_anchor_key.clone(),
                                         preview_history_expanding: preview_history_expanding_path.as_deref()
                                             == Some(session.session_path.as_str()),
-                                        // Computed here because it reads the
-                                        // virtual window, which is resolved
-                                        // further down than the other flags.
-                                        preview_dpad_visible: preview_dpad_should_reveal(
-                                            preview_window.scroll_top_px,
-                                            preview_window.viewport_height_px,
-                                            preview_window.scroll_height_px,
-                                        ),
                                         palette: snapshot.palette,
                                         on_toggle_block: move |ix| on_toggle_preview_block.call(ix),
                                         on_copy_block: move |text: String| {
@@ -87257,7 +87262,6 @@ fn ConversationWebView(
     pin_latest_on_mount: bool,
     latest_anchor_key: String,
     preview_history_expanding: bool,
-    preview_dpad_visible: bool,
     palette: Palette,
     on_toggle_block: EventHandler<usize>,
     on_copy_block: EventHandler<String>,
@@ -87299,11 +87303,6 @@ fn ConversationWebView(
             // come from the shared component — this surface no longer owns a
             // width, a gap or a font of its own.
             style: "display:flex; flex-direction:column; min-width:0; width:100%; position:relative;",
-            PreviewScrollController {
-                session_path: session.session_path.clone(),
-                palette,
-                visible: preview_dpad_visible,
-            }
             ConversationColumn {
             tokens,
             surface_id: session.session_path.clone(),
@@ -89144,6 +89143,53 @@ impl TerminalScrollControlAction {
 /// the gesture that works here. A 596-block conversation is not navigable by
 /// wheel alone, and the keyboard route (PageUp/PageDown/Home/End) is invisible
 /// until someone tells you it exists.
+/// Reveal the reading surface's D-pad from the LIVE scroller.
+///
+/// The terminal does exactly this for its own pad, and for the same reason the
+/// Rust-side attempt could not: the numbers that decide it are the scroller's,
+/// they change on every wheel notch, and the surface only learns them through
+/// an event. A render-time computation reads whatever the last event left
+/// behind — which on a freshly opened transcript is nothing at all, and after a
+/// virtual-window re-estimate is a height the DOM never had.
+///
+/// So the DOM watches itself. One listener, installed once per surface and
+/// keyed so a remount cannot stack a second one.
+fn preview_dpad_watch_script(session_path: &str) -> String {
+    let lookup = preview_scroller_lookup_js(session_path);
+    let session_path_literal =
+        serde_json::to_string(session_path).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(function() {{
+{lookup}
+  const path = {session_path_literal};
+  const pad = Array.from(document.querySelectorAll('[data-preview-dpad-host="1"]'))
+    .filter((node) => node.isConnected)
+    .filter((node) => node.getAttribute('data-preview-session-path') === path)
+    .pop();
+  if (!pad) return;
+  const sync = () => {{
+    const viewport = Math.max(1, scroller.clientHeight);
+    const distance = scroller.scrollHeight - (scroller.scrollTop + viewport);
+    // More than half a viewport from the END, and at least 240px. Below that
+    // the reader is already looking at the newest turn and the pad is just
+    // something covering it.
+    const show = distance > Math.max(viewport * 0.5, 240);
+    pad.style.opacity = show ? '1' : '0';
+    pad.style.pointerEvents = show ? 'auto' : 'none';
+    pad.setAttribute('data-preview-dpad-visible', show ? 'true' : 'false');
+    pad.setAttribute('data-preview-dpad-distance', String(Math.round(distance)));
+  }};
+  if (scroller.__yggtermDpadSync) {{
+    scroller.removeEventListener('scroll', scroller.__yggtermDpadSync);
+  }}
+  scroller.__yggtermDpadSync = sync;
+  scroller.addEventListener('scroll', sync, {{ passive: true }});
+  // And once now, because the transcript may already be taller than the
+  // viewport before anyone has touched it.
+  sync();
+}})();"#
+    )
+}
 /// Whether the reading surface's D-pad has earned its place on screen.
 ///
 /// The same rule the terminal applies to its own pad, in the unit a transcript
@@ -89315,23 +89361,36 @@ fn PreviewHistoryControl(
     }
 }
 #[component]
-fn PreviewScrollController(session_path: String, palette: Palette, visible: bool) -> Element {
+fn PreviewScrollController(session_path: String, palette: Palette) -> Element {
+    let watcher = preview_dpad_watch_script(&session_path);
+    let host_path = session_path.clone();
     rsx! {
         style { {DPAD_CSS} }
-        ScrollDpad {
-            palette: DpadPalette::new(palette.text, palette.muted),
-            surface_id: session_path.clone(),
-            // Top-right, exactly where the terminal keeps its own. A control
-            // that moves between two surfaces of the same app is a control the
-            // hand has to look for twice.
-            placement: DpadPlacement::TopRight,
-            visible,
-            on_action: move |action: DpadAction| {
-                trigger_preview_scroll_control(
-                    session_path.clone(),
-                    TerminalScrollControlAction::from_dpad(action),
-                )
+        div {
+            // Anchored to the SURFACE, outside the scroller, so it holds the
+            // top-right corner beside the scrollbar instead of scrolling away
+            // with the page.
+            style: "position:absolute; top:10px; right:10px; z-index:9; \
+                    opacity:0; pointer-events:none; transition:opacity 140ms ease;",
+            "data-preview-dpad-host": "1",
+            "data-preview-session-path": "{host_path}",
+            onmounted: move |_| {
+                let watcher = watcher.clone();
+                async move {
+                    let _ = document::eval(&watcher);
+                }
             },
+            ScrollDpad {
+                palette: DpadPalette::new(palette.text, palette.muted),
+                surface_id: session_path.clone(),
+                placement: DpadPlacement::Inline,
+                on_action: move |action: DpadAction| {
+                    trigger_preview_scroll_control(
+                        session_path.clone(),
+                        TerminalScrollControlAction::from_dpad(action),
+                    )
+                },
+            }
         }
     }
 }
