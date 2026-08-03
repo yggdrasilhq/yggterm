@@ -4,6 +4,37 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.3
+
+**ONE MARKDOWN RENDERER, and the Web View finally uses it** (user directive).
+The conversation surface carried a second parser of its own —
+`preview_content_blocks` + `preview_inline_segments` — which knew headings,
+bullets and inline code and had **no** Strong, Emphasis, Link, Table or
+Strikethrough. So an agent writing `**emphasis**` reached the reader as literal
+asterisks and a markdown table as a wall of pipes, while `emd-renderer` sat in
+the same binary rendering the document surface correctly. Two parsers for one
+grammar is the same defect class as two copies of a session record: the weaker
+one wins wherever it happens to be wired. The second parser, its enums, its
+component, its cache and its tests are deleted, and a test asserts the
+constructs it could not produce so it cannot come back.
+
+- **emd-renderer learned images** (`MdInline::Image { src, alt }`). It used to
+  degrade an image to a 🖼 glyph plus a link, which would have made "one
+  renderer" quietly cost the inline screenshots an agent transcript is full of.
+  The node is typed and the HOST draws it, so the library stays platform-neutral
+  and charts inherits the same capability.
+- **The provider header is gone.** One line of chrome saying "Claude Code
+  transcript · Claude conversation · dev · Read only" above every conversation,
+  restating what the row already said.
+- **A remote transcript fetch reaches 600 blocks, not 48.** `a033a728` parses to
+  670; the reader was showing the last 7% with nothing to say the rest existed.
+  Measured: the whole payload is 614 KB and parses in 90 ms. Still a bound —
+  paging on scroll-up is filed.
+- **The rail's conversation count is the transcript's, not the scan's guess.**
+  It read `0 user · 0 assistant` beside 48 rendered turns, because the
+  remote-payload path replaced `preview` wholesale while the rail reads
+  `metadata`, and the remote scanner counts Codex-shaped records.
+
 ## 3.0.2
 
 **The Web View held the whole transcript and drew two turns of it.** 3.0.1 got
