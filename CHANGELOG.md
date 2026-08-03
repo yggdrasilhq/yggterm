@@ -4,6 +4,42 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.2
+
+**The Web View held the whole transcript and drew two turns of it.** 3.0.1 got
+the conversation as far as the GUI; this release is about what the GUI then did
+with it.
+
+- **The sidebar's cap became the reader's transcript.** One snapshot carries the
+  active session TWICE — in full under `active_session`, and clipped to 2 preview
+  blocks of 6 lines under `live_sessions[]`, because that list ships on every
+  refresh. `apply_snapshot` applied the clipped list second, so it overwrote the
+  full record microseconds after hydration wrote it, on every single refresh.
+  The Web View therefore drew exactly `LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT` turns
+  of a 133-turn conversation while `Preview Hydration` went on truthfully
+  reporting `tail` — metadata is not clipped, so only the content disappeared.
+  The two copies are now MERGED under one rule: the live row owns identity and
+  liveness, the active record owns content, and neither may discard content in
+  favour of a smaller copy of the same session.
+- **A remote Claude Code row could never refresh its own preview.** Five gates on
+  the preview plane still asked `starts_with("remote-session://")`, so a
+  `remote-cc://` row could not need a refresh, be marked dirty, be kicked, hide
+  its launch scaffold, or pin to its newest turn — it just sat on two lines of
+  launch boilerplate that no instrument called an error. They now go through
+  `session_preview_syncs_from_remote`, guarded by a test that asserts the
+  BEHAVIOUR of each gate rather than the spelling of one predicate. ⚠ Fourth
+  recurrence of this omission.
+- **A shadow view client may now read a transcript** (`RefreshPreview` moves to
+  the role gate's allow set). Re-reading a transcript from its own file touches
+  no PTY, no input, no lifecycle and no view; denying it made the Web View
+  structurally unreachable from the agent's own surface, which is both the
+  project's default test surface and the CONSTITUTION's co-browse case.
+- **A readiness gate no longer invents what it could not see.** The DOM snapshot
+  behind `app open --view preview` can time out, and `preview_scroll_count` was
+  read through `unwrap_or(0)` — so a failed measurement became a confident
+  "preview surface not mounted" about a surface that was mounted and painting.
+  It now answers `preview readiness unmeasured (<why>)`.
+
 ## 3.0.1
 
 ⚠ **The version number is load-bearing here, not ceremonial.** The daemon

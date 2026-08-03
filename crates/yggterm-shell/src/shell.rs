@@ -25103,7 +25103,7 @@ impl ShellState {
         let Some(session) = self.server.active_session().cloned() else {
             return;
         };
-        if !session.session_path.starts_with("remote-session://") {
+        if !session_preview_syncs_from_remote(&session.session_path) {
             return;
         }
         if !remote_preview_needs_refresh(&session) {
@@ -40249,7 +40249,7 @@ fn restore_browser_tree_preserving_sidebar_view(
     shell.sync_browser_settings();
 }
 fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
-    session.session_path.starts_with("remote-session://")
+    session_preview_syncs_from_remote(&session.session_path)
         && (session.preview.blocks.is_empty()
             || metadata_value(session, "Preview Hydration") == "head"
             || metadata_value(session, "Preview Hydration") == "loading"
@@ -40718,7 +40718,7 @@ fn kick_active_remote_preview_sync(state: Signal<ShellState>, reason: &'static s
         let Some(session) = shell.server.active_session().cloned() else {
             return None;
         };
-        if !session.session_path.starts_with("remote-session://")
+        if !session_preview_syncs_from_remote(&session.session_path)
             || !remote_preview_should_auto_sync(&session)
         {
             return None;
@@ -43205,7 +43205,7 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
         .collect()
 }
 fn preview_should_hide_stale_placeholder_content(session: &ManagedSessionView) -> bool {
-    if !session.session_path.starts_with("remote-session://") {
+    if !session_preview_syncs_from_remote(&session.session_path) {
         return false;
     }
     let hydration = metadata_value(session, "Preview Hydration");
@@ -43381,7 +43381,7 @@ fn preview_should_pin_latest_on_open(
     if view_mode != WorkspaceViewMode::Rendered
         || layout != PreviewLayoutMode::Chat
         || search_active
-        || !session.session_path.starts_with("remote-session://")
+        || !session_preview_syncs_from_remote(&session.session_path)
     {
         return false;
     }
@@ -140587,6 +140587,73 @@ mod tests {
             assert!(
                 !session_preview_syncs_from_remote(path),
                 "{path} must not trigger a remote preview fetch"
+            );
+        }
+    }
+
+    /// ★★ THE WHOLE PREVIEW PLANE, not just the one gate that got fixed.
+    ///
+    /// The test above proves the PREDICATE knows about `remote-cc://`. It does
+    /// not prove the predicate is what the plane asks, and on 2026-08-03 it was
+    /// not: four more gates still asked `starts_with("remote-session://")`
+    /// directly, so a remote Claude Code row could never need a refresh, never
+    /// be marked dirty, never be kicked, never hide its launch scaffold and
+    /// never pin to its newest turn. The row rendered two scaffold lines and
+    /// every instrument called that a healthy preview.
+    ///
+    /// This test asserts the BEHAVIOUR of each gate on a `remote-cc://` row, so
+    /// a fifth site cannot reintroduce the omission by copying the string.
+    #[test]
+    fn every_preview_gate_treats_a_remote_cc_row_like_a_remote_session_row() {
+        let scaffolded = |path: &str| {
+            let mut session = test_managed_conversation_session(SessionKind::ClaudeCode);
+            session.session_path = path.to_string();
+            session.preview.blocks = vec![SessionPreviewBlock::message(
+                "ASSISTANT",
+                "server:launch".to_string(),
+                PreviewTone::Assistant,
+                vec!["Claude Code is launched locally.".to_string()],
+            )];
+            session.rendered_sections = Vec::new();
+            session
+        };
+
+        for path in ["remote-cc://dev/abc-123", "remote-session://dev/abc-123"] {
+            let session = scaffolded(path);
+            assert!(
+                remote_preview_needs_refresh(&session),
+                "{path}: a launch-scaffold preview is exactly what a refresh is for"
+            );
+            assert!(
+                remote_preview_should_auto_sync(&session),
+                "{path}: nothing else will ask, so auto-sync has to"
+            );
+            assert!(
+                preview_should_hide_stale_placeholder_content(&session),
+                "{path}: the scaffold must not masquerade as the transcript"
+            );
+
+            // Once hydrated, the reader opens at the NEWEST turn. A 133-turn
+            // transcript that opens at turn 1 is a different product.
+            let mut hydrated = session.clone();
+            hydrated.metadata.push(SessionMetadataEntry {
+                label: "Preview Hydration",
+                value: "tail".to_string(),
+            });
+            hydrated.preview.blocks = vec![SessionPreviewBlock::message(
+                "USER",
+                "Aug 03, 2026 11:00 AM UTC+0530".to_string(),
+                PreviewTone::User,
+                vec!["the newest turn".to_string()],
+            )];
+            assert!(
+                preview_should_pin_latest_on_open(
+                    &hydrated,
+                    WorkspaceViewMode::Rendered,
+                    PreviewLayoutMode::Chat,
+                    false,
+                ),
+                "{path}: a hydrated remote transcript pins to its latest turn"
             );
         }
     }
