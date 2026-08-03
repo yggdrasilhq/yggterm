@@ -4,6 +4,20 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.15
+
+- **The reading surface's D-pad moves to the top right and becomes a reveal**,
+  which is where and how the terminal's already behaves — a control that changes
+  corner between two surfaces of one app is a control the hand looks for twice.
+  It appears once the reader is more than half a viewport (and at least 240px)
+  from the END of the transcript, never on a surface already at its bottom.
+  Measured from the end rather than from the top on purpose: a live transcript
+  grows while it is being read, so "how far down am I" answers differently every
+  few seconds while "how far from the end" is stable.
+- **DM Sans is installed on the desktop host** (SIL Open Font License, from
+  `googlefonts/dm-fonts`), so the chat face is the one the design actually names
+  instead of falling through to Noto Sans.
+
 ## 3.0.14
 
 - **ONE D-pad, and it keeps the hole in the middle** (libyggterm **v0.6.2**,
