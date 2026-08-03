@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.19
+
+- **A long user turn gets a lid** (libyggterm v0.8.1). A Codex rollout's first
+  "user message" is its entire instruction scaffold — hundreds of bullets — and
+  wrapped in a chat card it filled the screen with grey. It was also impossible
+  to read past: the virtual window is block-granular, so one enormous block
+  cannot be scrolled in stages, and passing its top threw the reader over the
+  whole thing to the first answer. Asks over 14 lines now clamp with a fade and
+  a "Show more".
+
 ## 3.0.18
 
 - **The user's chat bubble stops looking like a UI panel** (libyggterm v0.8.0).
