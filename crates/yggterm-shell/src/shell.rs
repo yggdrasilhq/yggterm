@@ -241,6 +241,9 @@ use yggui::conversation::{
 use yggui::prose::{ProseInk, ProseTokens};
 // ONE four-way scroll control, shared by the terminal and the reading surface.
 use yggui::dpad::{DPAD_CSS, DpadAction, DpadPalette, DpadPlacement, ScrollDpad};
+// The floating bar that replaced the docked header — find, the match stepper
+// and the light switch, costing no layout.
+use yggui::pill_toolbar::{PILL_TOOLBAR_CSS, PillStep, PillToolbar, PillToolbarPalette};
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
     HoveredChromeControl as HoveredControl, MOTION_EMPHASIZED_DECELERATE, MOTION_ENTER_DURATION_MS,
@@ -86915,6 +86918,11 @@ fn MainSurface(
                             // scrapped"). The timeline view supersedes the
                             // graph, and the bar was also what pushed every
                             // floating control out of the true top-right.
+                            PreviewReadingToolbar {
+                                session_path: session.session_path.clone(),
+                                palette: snapshot.palette,
+                                state,
+                            }
                             PreviewScrollController {
                                 session_path: session.session_path.clone(),
                                 palette: snapshot.palette,
@@ -89191,6 +89199,172 @@ impl TerminalScrollControlAction {
 /// the gesture that works here. A 596-block conversation is not navigable by
 /// wheel alone, and the keyboard route (PageUp/PageDown/Home/End) is invisible
 /// until someone tells you it exists.
+/// The reading surface's floating bar.
+///
+/// Holds the find query (the toolbar deliberately holds nothing) and hands the
+/// two settled questions back to their owners: the theme goes to
+/// `set_ui_theme`, the same call the settings rail and the KeyTip both use, and
+/// the highlight goes to the DOM.
+#[component]
+fn PreviewReadingToolbar(
+    session_path: String,
+    palette: Palette,
+    state: Signal<ShellState>,
+) -> Element {
+    let mut query = use_signal(String::new);
+    let mut match_label = use_signal(String::new);
+    let is_dark = palette_is_dark(palette);
+    let toolbar_palette = PillToolbarPalette::new(
+        palette.text,
+        palette.muted,
+        if is_dark {
+            "rgba(22,27,34,0.72)"
+        } else {
+            "rgba(255,255,255,0.78)"
+        },
+        palette.border,
+        palette.sidebar_hover,
+    );
+    let run_find = move |session_path: String, needle: String, step: Option<PillStep>| -> () {
+        spawn(async move {
+            let script = preview_find_script(&session_path, &needle, step);
+            if let Ok(value) = document::eval(&script).await {
+                let label = value.as_str().unwrap_or_default().to_string();
+                match_label.set(label);
+            }
+        });
+    };
+    // ::highlight() paints nothing without a rule for it — the API registers
+    // ranges, the stylesheet decides how they look.
+    let highlight_css = format!(
+        "::highlight(yggterm-find) {{ background:{}; color:{}; }}\n\
+         ::highlight(yggterm-find-active) {{ background:{}; color:{}; }}",
+        if is_dark { "rgba(255,214,102,0.26)" } else { "rgba(255,214,102,0.55)" },
+        palette.text,
+        palette.accent,
+        if is_dark { "#0e1418" } else { "#ffffff" },
+    );
+    rsx! {
+        style { {PILL_TOOLBAR_CSS} }
+        style { "{highlight_css}" }
+        PillToolbar {
+            palette: toolbar_palette,
+            query: query(),
+            match_label: match_label(),
+            placeholder: "Search this conversation".to_string(),
+            is_dark,
+            on_query: {
+                let session_path = session_path.clone();
+                move |value: String| {
+                    query.set(value.clone());
+                    if value.trim().is_empty() {
+                        match_label.set(String::new());
+                    }
+                    run_find(session_path.clone(), value, None);
+                }
+            },
+            on_step: {
+                let session_path = session_path.clone();
+                move |step: PillStep| {
+                    let needle = query.peek().clone();
+                    if needle.trim().is_empty() {
+                        return;
+                    }
+                    run_find(session_path.clone(), needle, Some(step));
+                }
+            },
+            on_toggle_theme: move |_| {
+                // ONE owner for the theme, and it is not this bar.
+                let next = if is_dark {
+                    UiTheme::ZedLight
+                } else {
+                    UiTheme::ZedDark
+                };
+                state.with_mut(|shell| shell.set_ui_theme(next));
+            },
+        }
+    }
+}
+/// Find-in-conversation, WITHOUT touching the DOM Dioxus owns.
+///
+/// ⚠ This is the whole design constraint. The obvious implementation — walk the
+/// text nodes and wrap matches in `<mark>` — mutates a tree Dioxus is diffing
+/// against its own virtual copy, and the next render either drops the marks or
+/// panics on a node that is no longer where the framework left it.
+///
+/// So: the **CSS Custom Highlight API**, which paints ranges the DOM does not
+/// know about, with `window.find()` as the fallback where it is missing. Both
+/// leave the tree exactly as the framework built it.
+///
+/// Returns the `3/17` label, or an empty string when there is nothing to count.
+fn preview_find_script(session_path: &str, needle: &str, step: Option<PillStep>) -> String {
+    let lookup = preview_scroller_lookup_js(session_path);
+    let needle_literal = serde_json::to_string(needle).unwrap_or_else(|_| "\"\"".to_string());
+    let step_literal = match step {
+        Some(PillStep::Previous) => "-1",
+        Some(PillStep::Next) => "1",
+        None => "0",
+    };
+    format!(
+        r#"(function() {{
+{lookup}
+  const needle = {needle_literal};
+  const step = {step_literal};
+  const store = (window.__yggtermPreviewFind ||= {{ ranges: [], index: 0, needle: '' }});
+  const paint = () => {{
+    if (!window.CSS || !CSS.highlights) return;
+    CSS.highlights.delete('yggterm-find');
+    CSS.highlights.delete('yggterm-find-active');
+    if (!store.ranges.length) return;
+    const all = new Highlight(...store.ranges);
+    CSS.highlights.set('yggterm-find', all);
+    const current = store.ranges[store.index];
+    if (current) CSS.highlights.set('yggterm-find-active', new Highlight(current));
+  }};
+  if (!needle.trim()) {{
+    store.ranges = []; store.index = 0; store.needle = '';
+    paint();
+    return '';
+  }}
+  if (store.needle !== needle) {{
+    // Re-scan. Text nodes only, so nothing structural is read or written.
+    store.needle = needle;
+    store.index = 0;
+    store.ranges = [];
+    const walker = document.createTreeWalker(scroller, NodeFilter.SHOW_TEXT);
+    const lower = needle.toLowerCase();
+    let node;
+    while ((node = walker.nextNode())) {{
+      const text = node.nodeValue ? node.nodeValue.toLowerCase() : '';
+      let from = text.indexOf(lower);
+      while (from !== -1) {{
+        const range = document.createRange();
+        range.setStart(node, from);
+        range.setEnd(node, from + needle.length);
+        store.ranges.push(range);
+        from = text.indexOf(lower, from + needle.length);
+      }}
+    }}
+  }} else if (step !== 0 && store.ranges.length) {{
+    store.index = (store.index + step + store.ranges.length) % store.ranges.length;
+  }}
+  if (!store.ranges.length) {{
+    paint();
+    return '0/0';
+  }}
+  paint();
+  const current = store.ranges[store.index];
+  if (current) {{
+    const rect = current.getBoundingClientRect();
+    const view = scroller.getBoundingClientRect();
+    if (rect.top < view.top || rect.bottom > view.bottom) {{
+      scroller.scrollTop += rect.top - view.top - (scroller.clientHeight / 3);
+    }}
+  }}
+  return (store.index + 1) + '/' + store.ranges.length;
+}})();"#
+    )
+}
 /// Reveal the reading surface's D-pad from the LIVE scroller.
 ///
 /// The terminal does exactly this for its own pad, and for the same reason the
@@ -140996,6 +141170,55 @@ mod tests {
         let reader_at = 5_000.0;
         assert!(!preview_dpad_should_reveal(reader_at, 1_000.0, 6_000.0));
         assert!(preview_dpad_should_reveal(reader_at, 1_000.0, 7_000.0));
+    }
+
+    /// ★★★ FIND MUST NOT TOUCH THE DOM DIOXUS OWNS.
+    ///
+    /// The obvious implementation of highlighting is to walk the text nodes and
+    /// wrap each match in a `<mark>`. That mutates a tree the framework is
+    /// diffing against its own virtual copy, and the next render either drops
+    /// the marks or panics on a node that is no longer where it left it — on a
+    /// LIVE transcript, which re-renders whenever the agent speaks.
+    ///
+    /// So the script only ever creates `Range`s and hands them to the CSS
+    /// Custom Highlight API, which paints without the DOM knowing. This lock
+    /// names the mutating calls, because the tempting fix for "highlighting
+    /// looks hard" is exactly the one that corrupts the surface.
+    #[test]
+    fn find_paints_ranges_and_never_edits_the_tree() {
+        let script = preview_find_script("remote-cc://dev/abc", "needle", None);
+        for banned in [
+            "innerHTML",
+            "outerHTML",
+            "createElement",
+            "appendChild",
+            "insertBefore",
+            "replaceChild",
+            "surroundContents",
+            "removeChild",
+        ] {
+            assert!(
+                !script.contains(banned),
+                "`{banned}` mutates a tree Dioxus is diffing:\n{script}"
+            );
+        }
+        assert!(script.contains("CSS.highlights"), "{script}");
+        assert!(script.contains("document.createRange"), "{script}");
+
+        // The stepper's direction reaches the script as a number, and stepping
+        // wraps rather than running off either end.
+        assert!(preview_find_script("x", "n", Some(PillStep::Next)).contains("const step = 1;"));
+        assert!(
+            preview_find_script("x", "n", Some(PillStep::Previous)).contains("const step = -1;")
+        );
+        assert!(script.contains("const step = 0;"), "a query edit re-scans");
+        assert!(
+            script.contains("% store.ranges.length"),
+            "stepping must wrap: {script}"
+        );
+
+        // An empty needle clears rather than matching everything.
+        assert!(script.contains("if (!needle.trim())"), "{script}");
     }
 
     /// ★★ A PASTED SCREENSHOT PATH IS A SCREENSHOT.
