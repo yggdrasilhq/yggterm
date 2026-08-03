@@ -499,6 +499,13 @@ const TERMINAL_INLINE_STATUS_ANIMATION_SUSTAINED_AFTER_MS: u64 = 4_000;
 const TERMINAL_INLINE_STATUS_ANIMATION_LONG_AFTER_MS: u64 = 15_000;
 const TERMINAL_FORWARD_PROTOCOL_TRACE_THROTTLE_MS: u64 = 2_000;
 const PREVIEW_BLOCK_WINDOW: usize = 24;
+/// How many lines an ask may carry before it is clamped with a "Show more".
+///
+/// Twelve is a question; two hundred is a document that happens to have arrived
+/// through the user's channel — which is exactly what a Codex rollout's opening
+/// scaffold is.
+const ASK_COLLAPSE_LINE_THRESHOLD: usize = 14;
+
 /// Above this many blocks the reader VIRTUALISES instead of drawing everything.
 ///
 /// It was 600 and never fired, because a remote transcript could only ever hold
@@ -88640,9 +88647,19 @@ fn PreviewRunBlock(
             .first()
             .map(|entry| entry.display_timestamp.clone())
             .unwrap_or_default();
+        // A Codex rollout opens with its whole instruction scaffold as the
+        // first "user message". Anything past a dozen lines gets a lid rather
+        // than a screen of grey — and the block-granular virtual window makes
+        // an un-clamped one impossible to scroll past in stages.
+        let ask_lines: usize = run
+            .entries
+            .iter()
+            .map(|entry| entry.block.lines.len())
+            .sum();
         return rsx! {
             UserTurn {
                 tokens,
+                collapsible: ask_lines > ASK_COLLAPSE_LINE_THRESHOLD,
                 timestamp,
                 actions: preview_copy_actions(&copy_text, on_copy_block),
                 for entry in run.entries.iter().cloned() {
