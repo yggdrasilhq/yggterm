@@ -4,6 +4,38 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.7
+
+**The Web View was unreadable and unscrollable, and both had the same shape.**
+
+- **A blank line is SYNTAX, and the preview stripped every one.**
+  `normalize_preview_text` did `.trim()` per line and dropped empties — harmless
+  for a line-based mini-parser, fatal for a real markdown one. A blank line
+  separates paragraphs and DELIMITS tables, lists and fenced code, and leading
+  whitespace marks nesting. A table written under a paragraph came out as its
+  cells stacked down the page with a rule between them. Structure is preserved
+  now; runs of blanks still collapse to one.
+- **The viewport was welded to the last 24 blocks.** An "open at the newest
+  turn" pin selected a second window that hard-pins the tail and ignores scroll,
+  so a 596-block transcript was a 24-block one. Three attempts to make the flag
+  turn off each failed differently — `.is_some()` on a steady state, then a
+  content-keyed latch that re-armed on every new turn, then a component-local
+  latch that resets whenever the surface remounts. So the second window is GONE:
+  the pin is a SCROLL POSITION, which is all it ever meant, and there is one
+  window computed from where the reader actually is. Measured after: the scroll
+  container spans 57,123 px of transcript instead of 2,231.
+- **Virtualisation never engaged**, because its threshold (600) sat exactly at
+  the new payload size. 120 — short sessions keep the simple path, long ones
+  materialise as the reader travels.
+- **A hydration marker can no longer vouch for content it did not carry.**
+  `Preview Hydration = tail` over exactly `LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT`
+  blocks is the fingerprint of a capped payload, not a fetched transcript — and
+  because `needs_refresh` believed the marker, a 670-block conversation was
+  frozen at 2 blocks with no way to recover. Third instance today of metadata
+  surviving a clip that content did not.
+- **The work seam is a spine, not ninety-six cards** (libyggterm 47e30a9), and
+  its label is legible.
+
 ## 3.0.3
 
 **ONE MARKDOWN RENDERER, and the Web View finally uses it** (user directive).
