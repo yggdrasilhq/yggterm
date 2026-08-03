@@ -234,6 +234,11 @@ use yggui::conversation::{
     AssistantTurn, ChangedFileChips, ConversationColumn, ConversationTokens, TurnAction, UserTurn,
     WORK_GROUP_COLLAPSED_ROWS, WorkGroup, WorkMark, WorkRow,
 };
+// ONE type system for every reading surface — the Web View's transcript, the
+// document reader and a contributed rail pane. `emd-renderer` says what a
+// document IS; `yggui::prose` says how it reads, and this host supplies only
+// its brand colours.
+use yggui::prose::{ProseInk, ProseTokens};
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
     HoveredChromeControl as HoveredControl, MOTION_EMPHASIZED_DECELERATE, MOTION_ENTER_DURATION_MS,
@@ -88541,7 +88546,7 @@ fn PreviewRunBlock(
                                 div {
                                     style: format!(
                                         "font-family:{}; font-size:11.5px; color:{};",
-                                        tokens.ui_font, tokens.meta,
+                                        tokens.prose.ui_font, tokens.meta,
                                     ),
                                     "{entry.block.lines.len()} lines hidden"
                                 }
@@ -88847,7 +88852,10 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
         div {
             style: "display:flex; flex-direction:column; font-family:inherit; \
                     font-size:inherit; color:inherit;",
-            {markdown_widget_body(&source, &doc, true)}
+            // The TRANSCRIPT surface: the turn above has already decided the
+            // face and the size (sans at 15px for the person, serif at 16px for
+            // the machine), and this must inherit both rather than re-decide.
+            {markdown_widget_body(&source, &doc, ProseTokens::conversation())}
         }
     }
 }
@@ -120048,11 +120056,14 @@ use emd_renderer::{MdBlock, MdInline, parse_markdown_blocks, top_level_block_ran
 /// markdown didn't ask for). ONE owner: the markdown reader root and the
 /// block click-to-edit reader both use exactly this string. The stack is the
 /// DESIGN.md "document reading font" entry — change it there first.
-fn document_reading_typography() -> &'static str {
-    "font-size:16px; line-height:1.7; \
-     font-family:'Inter', 'SF Pro Text', 'Segoe UI', 'Noto Sans', \
-     'Liberation Sans', 'Helvetica Neue', Arial, sans-serif; \
-     letter-spacing:0.002em; text-rendering:optimizeLegibility;"
+/// The document reader's body type — now a token, not a literal.
+///
+/// One owner for every reading surface's typography: `yggui::prose` in
+/// libyggterm. It lived here for as long as yggterm was the only host, and
+/// stopped being tenable the moment the Web View, the document reader and a
+/// chat app each needed the same answer.
+fn document_reading_typography() -> String {
+    ProseTokens::document().root_style()
 }
 
 /// A markdown image `src` as something a webview will actually load.
@@ -120088,24 +120099,19 @@ fn md_inline_plain_text(items: &[MdInline]) -> String {
     out
 }
 
-fn md_inline_nodes(items: &[MdInline], palette: &DocTheme) -> Element {
-    let code_style = format!(
-        "background:{}; border:1px solid {}; \
-         border-radius:4px; padding:1px 5px; font-family:ui-monospace, monospace; \
-         font-size:0.82em; color:{};",
-        palette.chrome, palette.border, palette.fg
-    );
-    // No underline unless the markdown itself asks for one (user spec): a link
-    // is distinguished by the accent color alone, the NYT body-link idiom.
-    let link_style = format!("color:{}; text-decoration:none;", palette.accent);
+fn md_inline_nodes(items: &[MdInline], prose: &ProseTokens, ink: &ProseInk) -> Element {
+    let code_style = prose.inline_code_style(ink);
+    let link_style = prose.link_style(ink);
+    let image_frame_style = prose.image_frame_style();
+    let image_style = prose.image_style();
     rsx! {
         for (index, item) in items.iter().enumerate() {
             match item {
                 MdInline::Text(text) => rsx! { span { key: "t{index}", "{text}" } },
                 MdInline::Code(code) => rsx! { code { key: "c{index}", style: "{code_style}", "{code}" } },
-                MdInline::Strong(children) => rsx! { b { key: "b{index}", {md_inline_nodes(children, palette)} } },
-                MdInline::Emphasis(children) => rsx! { i { key: "i{index}", {md_inline_nodes(children, palette)} } },
-                MdInline::Strikethrough(children) => rsx! { s { key: "s{index}", {md_inline_nodes(children, palette)} } },
+                MdInline::Strong(children) => rsx! { b { key: "b{index}", {md_inline_nodes(children, prose, ink)} } },
+                MdInline::Emphasis(children) => rsx! { i { key: "i{index}", {md_inline_nodes(children, prose, ink)} } },
+                MdInline::Strikethrough(children) => rsx! { s { key: "s{index}", {md_inline_nodes(children, prose, ink)} } },
                 MdInline::Link { href, children } => rsx! {
                     a {
                         key: "a{index}",
@@ -120113,7 +120119,7 @@ fn md_inline_nodes(items: &[MdInline], palette: &DocTheme) -> Element {
                         title: "{href}",
                         href: "{href}",
                         prevent_default: "onclick",
-                        {md_inline_nodes(children, palette)}
+                        {md_inline_nodes(children, prose, ink)}
                     }
                 },
                 // An image is DISPLAYED, not linked. This is the one place a
@@ -120126,12 +120132,11 @@ fn md_inline_nodes(items: &[MdInline], palette: &DocTheme) -> Element {
                     rsx! {
                         span {
                             key: "img{index}",
-                            style: "display:block; margin:8px 0 4px 0;",
+                            style: "{image_frame_style}",
                             img {
                                 src: "{file_url}",
                                 alt: "{alt_text}",
-                                style: "display:block; width:auto; max-width:min(100%, 560px); \
-                                        max-height:320px; border-radius:14px; object-fit:contain;",
+                                style: "{image_style}",
                             }
                         }
                     }
@@ -120142,106 +120147,70 @@ fn md_inline_nodes(items: &[MdInline], palette: &DocTheme) -> Element {
     }
 }
 
-fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
-    let border = palette.border.as_str();
+fn md_block_node(block: &MdBlock, prose: &ProseTokens, ink: &ProseInk, index: usize) -> Element {
     match block {
         MdBlock::Heading { level, children } => {
-            // NYT-style headlines: heavier weight, more air above than below,
-            // and NO rule/underline — decoration the markdown didn't ask for
-            // (user spec 2026-07-18; the old h1/h2 border-bottom is gone).
-            let (size, weight, margin, spacing) = match level {
-                1 => ("1.8em", "800", "34px 0 16px 0", "-0.015em"),
-                2 => ("1.42em", "780", "30px 0 14px 0", "-0.01em"),
-                3 => ("1.18em", "740", "26px 0 12px 0", "0"),
-                _ => ("1.04em", "720", "20px 0 10px 0", "0"),
-            };
-            let style = format!(
-                "font-size:{size}; font-weight:{weight}; margin:{margin}; \
-                 letter-spacing:{spacing}; line-height:1.25; color:{};",
-                palette.fg,
-            );
-            rsx! { div { key: "h{index}", style: "{style}", {md_inline_nodes(children, palette)} } }
+            let style = prose.heading_style(*level, ink);
+            rsx! { div { key: "h{index}", style: "{style}", {md_inline_nodes(children, prose, ink)} } }
         }
         MdBlock::Paragraph(children) => rsx! {
             p {
                 key: "p{index}",
-                style: format!("margin:0 0 14px 0; color:{};", palette.fg),
-                {md_inline_nodes(children, palette)}
+                style: prose.paragraph_style(ink),
+                {md_inline_nodes(children, prose, ink)}
             }
         },
         MdBlock::CodeBlock(code) => rsx! {
             pre {
                 key: "pre{index}",
-                style: format!(
-                    "background:{}; border:1px solid {border}; \
-                     border-radius:8px; padding:12px 16px; overflow-x:auto; margin:14px 0; \
-                     font-family:ui-monospace, monospace; font-size:0.8em; line-height:1.55; color:{};",
-                    palette.chrome, palette.fg
-                ),
+                style: prose.code_block_style(ink),
                 "{code}"
             }
         },
         MdBlock::BlockQuote(body) => rsx! {
             div {
                 key: "q{index}",
-                // Obsidian-style: the accent bar carries the quote; the text
-                // stays upright (italic-everything read as decoration).
-                style: format!(
-                    "border-left:3px solid {}; margin:14px 0; padding:2px 0 2px 16px; \
-                     color:{};",
-                    palette.accent, palette.muted
-                ),
+                style: prose.blockquote_style(ink),
                 for (child_index, child) in body.iter().enumerate() {
-                    {md_block_node(child, palette, child_index)}
+                    {md_block_node(child, prose, ink, child_index)}
                 }
             }
         },
         MdBlock::List { ordered, items } => {
+            let item_style = prose.list_item_style();
             let list_body = rsx! {
                 for (item_index, item) in items.iter().enumerate() {
                     li {
                         key: "li{item_index}",
-                        style: "margin:6px 0;",
+                        style: "{item_style}",
                         for (child_index, child) in item.iter().enumerate() {
-                            {md_block_node(child, palette, child_index)}
+                            {md_block_node(child, prose, ink, child_index)}
                         }
                     }
                 }
             };
             if *ordered {
-                rsx! { ol { key: "ol{index}", style: format!("margin:0 0 14px 0; padding-left:28px; color:{};", palette.fg), {list_body} } }
+                rsx! { ol { key: "ol{index}", style: prose.list_style(ink), {list_body} } }
             } else {
-                rsx! { ul { key: "ul{index}", style: format!("margin:0 0 14px 0; padding-left:28px; color:{};", palette.fg), {list_body} } }
+                rsx! { ul { key: "ul{index}", style: prose.list_style(ink), {list_body} } }
             }
         }
         MdBlock::Table { header, rows } => {
-            // Obsidian-style table: horizontal separators only — no vertical
-            // grid, no header fill. The full cell grid read as a spreadsheet;
-            // an article's table is rows of text with quiet rules.
-            let cell_style = format!(
-                "border:0; border-bottom:1px solid {border}; padding:8px 14px 8px 0; \
-                 text-align:left; vertical-align:top; line-height:1.55; color:{};",
-                palette.fg
-            );
-            let head_style = format!(
-                "border:0; border-bottom:2px solid {border}; padding:8px 14px 8px 0; \
-                 text-align:left; vertical-align:top; line-height:1.55; \
-                 font-weight:700; color:{};",
-                palette.fg
-            );
+            let cell_style = prose.table_cell_style(ink);
+            let head_style = prose.table_head_cell_style(ink);
             rsx! {
                 // Wide tables scroll inside their own container; the document
                 // never scrolls horizontally (the triage-board acceptance rule).
                 div {
                     key: "tw{index}",
-                    style: "overflow-x:auto; margin:14px 0;",
+                    style: prose.table_wrap_style(),
                     table {
-                        style: "border-collapse:collapse; font-size:0.88em;",
+                        style: prose.table_style(),
                         if !header.is_empty() {
                             thead {
                                 tr {
                                     for (cell_index, cell) in header.iter().enumerate() {
-                                        th { key: "th{cell_index}", style: "{head_style}", {md_inline_nodes(cell, palette)} }
+                                        th { key: "th{cell_index}", style: "{head_style}", {md_inline_nodes(cell, prose, ink)} }
                                     }
                                 }
                             }
@@ -120251,7 +120220,7 @@ fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
                                 tr {
                                     key: "tr{row_index}",
                                     for (cell_index, cell) in row.iter().enumerate() {
-                                        td { key: "td{cell_index}", style: "{cell_style}", {md_inline_nodes(cell, palette)} }
+                                        td { key: "td{cell_index}", style: "{cell_style}", {md_inline_nodes(cell, prose, ink)} }
                                     }
                                 }
                             }
@@ -120261,27 +120230,28 @@ fn md_block_node(block: &MdBlock, palette: &DocTheme, index: usize) -> Element {
             }
         }
         MdBlock::Rule => rsx! {
-            div { key: "hr{index}", style: format!("border-top:1px solid {border}; margin:20px 0;") }
+            div { key: "hr{index}", style: prose.rule_style(ink) }
         },
     }
 }
 
-/// The `markdown` widget's body: parse + render. `compact` keeps the caller's
-/// interface typography (the 300px rail pane, which sizes its own wrapper —
-/// the old always-on inner font-size silently overrode it); the default is the
-/// serif document reading typography (one owner, [`document_reading_typography`]).
-fn markdown_widget_body(source: &str, palette: &DocTheme, compact: bool) -> Element {
+/// Parse + render a markdown source onto ONE of the three reading surfaces.
+///
+/// The surface is named by the caller and never inferred. It used to be a
+/// `compact: bool`, which conflated two surfaces that only look alike: the
+/// 300px rail pane, which must keep its caller's interface size, and the Web
+/// View's transcript, which must keep the TURN's reading size. Sharing one flag
+/// meant the transcript silently inherited the rail's leading — every answer on
+/// the reading surface drew at line-height 1.55 while the turn around it, and
+/// the token set, said 1.72. Three surfaces, three names, no guessing.
+fn markdown_widget_body(source: &str, palette: &DocTheme, prose: ProseTokens) -> Element {
     let blocks = parse_markdown_blocks(source);
-    let root_style = if compact {
-        "font-size:inherit; line-height:1.55;"
-    } else {
-        document_reading_typography()
-    };
+    let ink = palette.prose_ink();
     rsx! {
         div {
-            style: "{root_style}",
+            style: prose.root_style(),
             for (index, block) in blocks.iter().enumerate() {
-                {md_block_node(block, palette, index)}
+                {md_block_node(block, &prose, &ink, index)}
             }
         }
     }
@@ -120347,6 +120317,8 @@ fn EditableMarkdownBody(
         "[data-md-editable-block]:hover {{ box-shadow: inset 2px 0 0 {}; cursor:text; }}",
         doc.accent
     );
+    let document_prose = ProseTokens::document();
+    let document_ink = doc.prose_ink();
     rsx! {
         style { "{block_hover_css}" }
         div {
@@ -120423,7 +120395,7 @@ fn EditableMarkdownBody(
                                 }
                             }
                         },
-                        {md_block_node(block, &doc, index)}
+                        {md_block_node(block, &document_prose, &document_ink, index)}
                     }
                 }
             }
@@ -120477,6 +120449,22 @@ impl DocTheme {
             bg,
             fg,
         }
+    }
+
+    /// This theme as the brand half of the prose type system.
+    ///
+    /// The ONE crossing point between yggterm's document colours and
+    /// [`ProseTokens`]: a host overrides brand and nothing else, so every face,
+    /// size and rhythm below comes from libyggterm and only these five colours
+    /// come from here.
+    fn prose_ink(&self) -> ProseInk {
+        ProseInk::new(
+            self.fg.clone(),
+            self.muted.clone(),
+            self.accent.clone(),
+            self.border.clone(),
+            self.chrome.clone(),
+        )
     }
 }
 
@@ -120889,7 +120877,11 @@ fn DocumentSurfaceBody(
                                         // in the editor, not here.
                                         {
                                             let live = document_values.get(live_from).cloned();
-                                            markdown_widget_body(live.as_deref().unwrap_or(source), &doc, false)
+                                            markdown_widget_body(
+                                                live.as_deref().unwrap_or(source),
+                                                &doc,
+                                                ProseTokens::document(),
+                                            )
                                         }
                                     }
                                 }
@@ -122040,7 +122032,14 @@ fn AppPaneRailBody(
                                     key: "{widget_key}",
                                     "data-app-pane-markdown": "{id}",
                                     style: "font-size:11px; min-width:0; overflow-wrap:anywhere;",
-                                    {markdown_widget_body(&source, &DocTheme::from_terminal(&snapshot.terminal_palette), true)}
+                                    // The RAIL surface: reading typography is
+                                    // for document-scale surfaces, and this
+                                    // pane is 300px wide at 11px.
+                                    {markdown_widget_body(
+                                        &source,
+                                        &DocTheme::from_terminal(&snapshot.terminal_palette),
+                                        ProseTokens::rail(),
+                                    )}
                                 }
                             },
                         }
@@ -140460,6 +140459,83 @@ mod tests {
                 "{banned} is a second markdown parser; emd-renderer is the only one"
             );
         }
+    }
+
+    /// ★★ ONE TYPE SYSTEM, AND THE MARKDOWN ADAPTER SPELLS NONE OF IT.
+    ///
+    /// `emd-renderer` says what a document IS; `yggui::prose` says how it
+    /// reads. Between them there is nothing for a host to decide except brand
+    /// colour — so the adapter must contain no face, no size, no leading and no
+    /// tracking of its own. It contained all four until 2026-08-03, which is
+    /// how the Web View came to draw code in `ui-monospace` while the token set
+    /// in the same binary named JetBrains Mono, and how a transcript whose
+    /// turns were set at line-height 1.72 rendered its paragraphs at 1.55.
+    #[test]
+    fn the_markdown_adapter_owns_no_typography_of_its_own() {
+        let source = include_str!("shell.rs");
+        let implementation = source.split("\nmod tests {").next().unwrap_or(source);
+        let start = implementation
+            .find("fn md_inline_nodes(")
+            .expect("the adapter must still be here");
+        let end = implementation[start..]
+            .find("/// The pure-Markdown reader")
+            .map(|offset| start + offset)
+            .expect("the adapter's tail marker moved");
+        let adapter = &implementation[start..end];
+
+        for banned in [
+            concat!("font-", "family:"),
+            concat!("font-", "size:"),
+            concat!("line-", "height:"),
+            concat!("letter-", "spacing:"),
+            concat!("font-", "weight:"),
+            "monospace",
+        ] {
+            assert!(
+                !adapter.contains(banned),
+                "the markdown adapter spells `{banned}` again; that decision \
+                 belongs to yggui::prose, which every other host reads too"
+            );
+        }
+
+        // And each of the three reading surfaces is NAMED by its call site. A
+        // boolean once stood in for this and conflated the transcript with a
+        // 300px rail pane.
+        for surface in [
+            "ProseTokens::conversation()",
+            "ProseTokens::document()",
+            "ProseTokens::rail()",
+        ] {
+            assert!(
+                implementation.contains(surface),
+                "{surface} has no call site; a surface that names itself cannot \
+                 be guessed wrong"
+            );
+        }
+    }
+
+    /// The transcript inherits its body copy; the document reader owns its own.
+    ///
+    /// This is the live defect, in one assertion: the reading surface sits
+    /// inside a turn that has already chosen the face and the size, and a root
+    /// that re-chooses silently wins over it.
+    #[test]
+    fn the_transcript_defers_to_its_turn_and_the_document_does_not() {
+        let transcript = ProseTokens::conversation().root_style();
+        assert!(transcript.contains("line-height:inherit"), "{transcript}");
+        assert!(transcript.contains("font-size:inherit"), "{transcript}");
+
+        let document = ProseTokens::document().root_style();
+        assert!(document.contains("line-height:1.7"), "{document}");
+        assert!(document.contains("font-size:16px"), "{document}");
+
+        // The rhythm below body copy is the same on both — a heading is a
+        // heading, whichever surface it lands on.
+        let ink = DocTheme::from_palette(&palette(UiTheme::ZedLight)).prose_ink();
+        assert_eq!(
+            ProseTokens::conversation().heading_style(2, &ink),
+            ProseTokens::document().heading_style(2, &ink),
+        );
     }
 
     /// ★ A remote CLAUDE CODE row's preview syncs from its machine, exactly as
