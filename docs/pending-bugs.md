@@ -67,6 +67,32 @@ deserves its own design pass.
 `data-preview-window-total` — it must equal the block count the reader reports
 for that transcript, not 2.
 
+### ⚠ IT IS NOT A SHADOW-ONLY DEFECT — measured on the USER'S GUI, 2026-08-03
+
+Filed above as an agentic-surface problem. It is not: the same 2-block payload
+reaches the user's own window whenever the daemon's active session is not the
+row they are looking at.
+
+Measured on jojo, client 3.0.16 against a 3.0.15 daemon, with
+`remote-cc://dev/91527c7b…` open in the Web View:
+
+- `server app state` → `dom.preview_visible_block_count` = **2**, block ids `-0`
+  and `-1`, `preview_viewport_rect.height` = 429 inside a ~1160px pane.
+- The same transcript reads **298 blocks** through `server remote preview-tail`
+  on the host that owns the file.
+- Still 2 after a 45 s settle, so it is not a hydration race.
+
+**The user's report is the symptom, in their words: "the content is not rendered
+in half of the screen."** Two turns render, the rest of the pane is empty — and
+it looks like a layout bug, which is what sent the first investigation at the
+block-height estimator instead of at the payload. Anything diagnosing a
+short/blank transcript must read `preview_visible_block_count` FIRST; a surface
+drawing exactly 2 blocks is this bug and no amount of layout work will move it.
+
+That also raises the priority. The rule above says a Web View change "cannot be
+pixel-proven anywhere except the user's own GUI" — that consolation is gone,
+because the user's own GUI hits it too the moment another row is active.
+
 
 ## ★★ TWO `web fill-vault` CALLS IN A ROW INTERLEAVE, AND CORRUPT BOTH FIELDS
 
