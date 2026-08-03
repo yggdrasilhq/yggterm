@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.17
+
+- **The Web View stops rendering two turns of a 298-turn conversation.** A
+  remote row restored with `Preview Hydration: tail` but only the two-block
+  scaffold never re-fetched, because two gates disagreed and the wrong one won:
+  one knew the hydration marker was unbacked, the other saw readable
+  `remote:scan` text and concluded the surface was fine. It was showing the
+  SCAN — a one-line summary — in place of the conversation, permanently. An
+  unbacked claim now outranks readable scan content.
+  **Diagnosing a short or blank transcript starts at
+  `dom.preview_visible_block_count`; a surface drawing exactly 2 is this bug and
+  no layout work will move it.**
+
 ## 3.0.16
 
 - **The Expand All / Collapse All / graph-view bar is GONE** (user directive).
