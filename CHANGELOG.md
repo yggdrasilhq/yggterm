@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.9
+
+- **The reading surface gets the terminal's four-way pad.** ↑/↓ are the edges,
+  ←/→ are pages — the same vocabulary as `TerminalScrollControlAction`, so the
+  gesture learned in the terminal is the gesture that works in the transcript.
+  A 596-block conversation is not navigable by wheel, and the keyboard route
+  (PageUp/PageDown/Home/End) is invisible until told. A page keeps 48 px of
+  overlap so the reader never loses their place.
+- **The conversation type scale, measured against t3code** (libyggterm v0.4.3):
+  the answer at 16px/1.72 with a hair of negative tracking; the ask at 15px
+  rather than a full step below it, uniformly rounded; the footer at 11px with
+  near-zero tracking, so a timestamp reads as a number.
+
 ## 3.0.8
 
 - **libyggterm is pinned to a published tag again** (v0.4.2), so a clean clone
