@@ -4966,16 +4966,45 @@ impl YggtermServer {
             .iter()
             .map(|session| session.session_path.clone())
             .collect();
+        // ONE RECORD PER SESSION, MERGED — never one copy silently winning.
+        //
+        // The active session arrives in this payload TWICE, and the two copies
+        // are authoritative about DIFFERENT things:
+        //
+        // * `live_sessions` is authoritative about IDENTITY AND LIVENESS. It is
+        //   built from the live runtime order, so when a stored record and a
+        //   live one share a path the live one is the real session (locked by
+        //   `shell_snapshot_prefers_live_remote_over_stored_session_with_same_path`).
+        //   But it is deliberately LOSSY about content: `snapshot_live_session_view`
+        //   keeps 2 preview blocks of 6 lines, 2 rendered sections of 10 lines
+        //   and 48 terminal lines, because that list ships on every refresh.
+        //
+        // * `active_session` is authoritative about CONTENT. It goes through
+        //   `snapshot_session_view`, which clips nothing, because the active
+        //   session is the one actually being read.
+        //
+        // Taking either copy whole loses something real, which is how both of
+        // these were true at once: applying the list second made the Web View
+        // render exactly `LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT` turns of a
+        // 133-turn transcript (the sidebar's cap, mistaken for the
+        // conversation, and invisible because the `Preview Hydration` metadata
+        // is not clipped and kept saying `tail`); applying it first would hand
+        // a stored placeholder the active row. So they are MERGED, under one
+        // rule that cannot lose either way: keep the live record, and never
+        // discard content in favour of a smaller copy of the same session.
         self.sessions.clear();
-        if let Some(active) = snapshot.active_session {
-            let key = active.session_path.clone();
-            self.sessions
-                .insert(key, managed_session_from_snapshot(active));
-        }
         for live in snapshot.live_sessions {
             let key = live.session_path.clone();
             self.sessions
                 .insert(key, managed_session_from_snapshot(live));
+        }
+        if let Some(active) = snapshot.active_session {
+            let key = active.session_path.clone();
+            let merged = match self.sessions.remove(&key) {
+                Some(live) => merge_live_row_with_active_record(live, active),
+                None => managed_session_from_snapshot(active),
+            };
+            self.sessions.insert(key, merged);
         }
         if let Some(active_path) = self.active_session_path.clone()
             && !self.sessions.contains_key(&active_path)
@@ -8617,11 +8646,9 @@ impl YggtermServer {
         }
         if let Some(session) = self.sessions.get_mut(path) {
             session.preview.blocks = blocks;
-            upsert_session_metadata(
-                &mut session.preview.summary,
-                "Messages",
-                format!("{user_messages} user · {assistant_messages} assistant"),
-            );
+            // Hydration PARSED the transcript, so its count is the true one and
+            // must replace the scan's estimate everywhere it is displayed.
+            upsert_session_message_count(session, user_messages, assistant_messages);
             upsert_session_metadata(
                 &mut session.metadata,
                 "Preview Hydration",
@@ -11852,6 +11879,13 @@ fn apply_remote_preview_payload_for_path_with_hydration(
     let refreshed_summary = payload.cached_summary.clone();
     if let Some(session) = server.sessions.get_mut(session_path) {
         apply_remote_preview_payload(session, payload);
+        // `apply_remote_preview_payload` REPLACES `session.preview` wholesale,
+        // so the reader's true count lands in `preview.summary` and the rail —
+        // which reads `session.metadata` — keeps whatever the machine scan
+        // guessed. For a `remote-cc://` row that guess is `0 user · 0
+        // assistant`, because the remote scanner counts Codex-shaped records,
+        // so the rail read zero beside a fully rendered 48-turn transcript.
+        sync_session_message_count_to_metadata(session);
         upsert_session_metadata(
             &mut session.metadata,
             "Preview Hydration",
@@ -11895,7 +11929,25 @@ fn try_apply_remote_preview_head_payload(
     }
 }
 
-const REMOTE_PREVIEW_TAIL_BLOCK_LIMIT: usize = 48;
+/// How much of a remote transcript one fetch pulls across the wire.
+///
+/// This is the ceiling on what the Web View can possibly show, and at 48 it was
+/// the reason a reader saw a WINDOW rather than a conversation: measured on
+/// `a033a728`, the transcript parses to **670 blocks** and the surface drew the
+/// last 48 — seven per cent of it, with no indication that the rest existed.
+///
+/// 600 is chosen against the measurement, not by feel: the whole 670-block
+/// payload is **614 KB** and parses in **90 ms**, so ~550 KB is what a full
+/// pull costs, once, for the ONE session being read (only the active row
+/// refreshes). It also matches `PREVIEW_SAFE_FULL_RENDER_BLOCK_LIMIT` in the
+/// shell, so everything fetched is inside the range the reader draws without
+/// engaging the virtual window.
+///
+/// ⚠ It is still a bound, so a session longer than this shows its most recent
+/// 600 blocks. Genuinely unbounded reading needs paging on scroll-up — filed in
+/// `docs/pending-bugs.md`, because a silently truncated transcript is exactly
+/// the defect this constant just stopped causing.
+const REMOTE_PREVIEW_TAIL_BLOCK_LIMIT: usize = 600;
 
 fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: RemotePreviewPayload) {
     if let Some(title_hint) = payload
@@ -23108,6 +23160,54 @@ pub fn snapshot_session_view_for_ui(session: ManagedSessionView) -> SnapshotSess
     snapshot_session_view(session)
 }
 
+/// Total lines across a preview's blocks — the measure of "how much of the
+/// transcript is in this copy", counting the per-block clip and not only the
+/// per-list one.
+fn preview_block_line_total(blocks: &[SessionPreviewBlock]) -> usize {
+    blocks.iter().map(|block| block.lines.len()).sum()
+}
+
+/// The same measure for rendered sections, which are clipped both ways too.
+fn rendered_section_line_total(sections: &[SessionRenderedSection]) -> usize {
+    sections.iter().map(|section| section.lines.len()).sum()
+}
+
+/// Merge the two copies of ONE session that a single snapshot carries.
+///
+/// `live` is the row from `live_sessions` and `active` is `active_session`.
+/// Neither is wholly authoritative: the live row owns identity and liveness
+/// (a live record must never be replaced by a stored one for the same path),
+/// while the active record owns CONTENT, because the live list deliberately
+/// clips three fields — preview blocks, rendered sections and terminal lines —
+/// to keep a payload that ships on every refresh cheap.
+///
+/// The rule is therefore monotone: **never discard content in favour of a
+/// smaller copy of the same session.** That is safe precisely because the two
+/// copies are built from one store in one `snapshot()` call, so they cannot
+/// genuinely disagree about how much of a transcript exists — any difference
+/// between them is the clip, and the clip is what this undoes.
+fn merge_live_row_with_active_record(
+    live: ManagedSessionView,
+    active: SnapshotSessionView,
+) -> ManagedSessionView {
+    let active = managed_session_from_snapshot(active);
+    let mut merged = live;
+    if active.terminal_lines.len() > merged.terminal_lines.len() {
+        merged.terminal_lines = active.terminal_lines;
+    }
+    if rendered_section_line_total(&active.rendered_sections)
+        > rendered_section_line_total(&merged.rendered_sections)
+    {
+        merged.rendered_sections = active.rendered_sections;
+    }
+    if preview_block_line_total(&active.preview.blocks)
+        > preview_block_line_total(&merged.preview.blocks)
+    {
+        merged.preview.blocks = active.preview.blocks;
+    }
+    merged
+}
+
 fn canonical_static_label(value: String) -> &'static str {
     match value.as_str() {
         "ASSISTANT" => "ASSISTANT",
@@ -24738,6 +24838,46 @@ fn upsert_session_metadata(
     } else {
         metadata.push(SessionMetadataEntry { label, value });
     }
+}
+
+/// ONE WRITER for "how many messages this conversation has".
+///
+/// The count is READ from `session.metadata` (the rail's History group maps
+/// `Conversation` → `Messages` through `metadata_value`) and also lives in
+/// `session.preview.summary`, which the preview's own summary strip shows. Two
+/// stores, one fact — so it gets one writer, or they drift.
+///
+/// They did drift: the machine SCAN wrote both, but HYDRATION — the pass that
+/// actually parses the transcript and therefore knows the real number — wrote
+/// only `preview.summary`. So the rail kept showing the scan's answer, and for
+/// a `remote-cc://` row the remote scanner reports `0 user · 0 assistant`
+/// (it counts Codex-shaped records). The result was a rail reading
+/// **"Conversation: 0 user · 0 assistant"** beside 48 rendered turns.
+fn sync_session_message_count_to_metadata(session: &mut ManagedSessionView) {
+    let Some(value) = session
+        .preview
+        .summary
+        .iter()
+        .find(|entry| entry.label == "Messages")
+        .map(|entry| entry.value.clone())
+    else {
+        return;
+    };
+    upsert_session_metadata(&mut session.metadata, "Messages", value);
+}
+
+/// Write a freshly COUNTED total to both stores, through the one mirror above.
+fn upsert_session_message_count(
+    session: &mut ManagedSessionView,
+    user_messages: usize,
+    assistant_messages: usize,
+) {
+    upsert_session_metadata(
+        &mut session.preview.summary,
+        "Messages",
+        format!("{user_messages} user · {assistant_messages} assistant"),
+    );
+    sync_session_message_count_to_metadata(session);
 }
 
 fn metadata_value(session: &ManagedSessionView, label: &str) -> String {
@@ -35592,6 +35732,252 @@ terminal_window_id: None,
         assert_eq!(server.active_session_path(), None);
         assert!(server.live_sessions().is_empty());
         assert!(!server.sessions.contains_key(stale_path));
+    }
+
+    /// THE SIDEBAR'S CAP MUST NOT BECOME THE WEB VIEW'S TRANSCRIPT.
+    ///
+    /// The active session is also a live session, so one snapshot carries it
+    /// twice: the full record in `active_session`, and a
+    /// `LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT`-capped copy in the `live_sessions`
+    /// list. Applying the list last overwrote the full record on every
+    /// refresh, so a hydrated remote transcript rendered exactly two turns —
+    /// while `Preview Hydration` truthfully still said `tail`, because
+    /// metadata is not capped and only the CONTENT was thrown away.
+    ///
+    /// Both sides here are built by the real producers, so the test cannot
+    /// pass by encoding an assumption about them that later drifts.
+    #[test]
+    fn apply_snapshot_keeps_the_full_active_record_the_live_list_carries_capped() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = "remote-cc://dev/a033a728-69ff-439b-ba00-2459f6bc3fb3";
+        let hydrated = ManagedSessionView {
+            id: "a033a728-69ff-439b-ba00-2459f6bc3fb3".to_string(),
+            session_path: path.to_string(),
+            title: "Orbitstore Campaign Progress".to_string(),
+            kind: SessionKind::ClaudeCode,
+            host_label: "dev".to_string(),
+            source: SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "claude -r".to_string(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: (0..48)
+                    .map(|ix| {
+                        SessionPreviewBlock::message(
+                            "USER",
+                            "Aug 03, 2026 11:00 AM UTC+0530".to_string(),
+                            PreviewTone::User,
+                            vec![format!("turn {ix}")],
+                        )
+                    })
+                    .collect(),
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Preview Hydration",
+                value: "tail".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+            working: None,
+        };
+
+        // The producers the daemon actually uses, for the very same session.
+        let full = crate::snapshot_session_view(hydrated.clone());
+        let capped = crate::snapshot_live_session_view(&hydrated);
+        assert_eq!(full.preview.blocks.len(), 48);
+        assert_eq!(
+            capped.preview.blocks.len(),
+            crate::LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT,
+            "the live list is supposed to be lossy — that is why this test exists"
+        );
+
+        server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(path.to_string()),
+            active_session: Some(full),
+            active_view_mode: WorkspaceViewMode::Rendered,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![capped],
+            apps: Vec::new(),
+        });
+
+        let stored = server
+            .active_session()
+            .expect("the active session survives its own snapshot");
+        assert_eq!(
+            stored.preview.blocks.len(),
+            48,
+            "the sidebar's capped copy overwrote the record the Web View reads"
+        );
+        // The row is still exactly one row, in the list, in order.
+        assert_eq!(server.live_sessions().len(), 1);
+        assert_eq!(server.live_session_order, vec![path.to_string()]);
+
+        // ⚠ AND THE MERGE MUST NOT SWING THE OTHER WAY. The obvious fix —
+        // "apply the active record last" — silently hands a STORED placeholder
+        // the active row whenever both copies exist, which
+        // `shell_snapshot_prefers_live_remote_over_stored_session_with_same_path`
+        // exists to forbid. Content is taken from the fuller copy; identity is
+        // not taken at all.
+        let mut stored_placeholder = hydrated.clone();
+        stored_placeholder.source = SessionSource::Stored;
+        stored_placeholder.title = "Stored Placeholder".to_string();
+        stored_placeholder.launch_phase = TerminalLaunchPhase::Queued;
+        stored_placeholder.preview.blocks.clear();
+        let mut live_row = hydrated.clone();
+        live_row.title = "Live Remote".to_string();
+
+        server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(path.to_string()),
+            active_session: Some(crate::snapshot_session_view(stored_placeholder)),
+            active_view_mode: WorkspaceViewMode::Rendered,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![crate::snapshot_live_session_view(&live_row)],
+            apps: Vec::new(),
+        });
+
+        let stored = server.active_session().expect("the live row stays active");
+        assert_eq!(stored.title, "Live Remote", "the live row owns identity");
+        assert_eq!(stored.source, SessionSource::LiveSsh);
+        assert_eq!(
+            stored.preview.blocks.len(),
+            crate::LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT,
+            "an emptier active copy must not take content away either"
+        );
+    }
+
+    /// ★ THE RAIL SAID "0 user · 0 assistant" NEXT TO 48 RENDERED TURNS.
+    ///
+    /// Two stores hold the count — `preview.summary` (the summary strip) and
+    /// `metadata` (what the rail's History group reads through
+    /// `metadata_value`) — and the remote-payload path replaced `preview`
+    /// wholesale without touching `metadata`. The machine scan's guess
+    /// therefore survived hydration, and for a `remote-cc://` row that guess is
+    /// zero, because the remote scanner counts Codex-shaped records.
+    #[test]
+    fn hydrating_a_remote_preview_corrects_the_count_the_rail_reads() {
+        let mut session = ManagedSessionView {
+            id: "a033a728".to_string(),
+            session_path: "remote-cc://dev/a033a728".to_string(),
+            title: "Orbitstore Campaign Progress".to_string(),
+            kind: SessionKind::ClaudeCode,
+            host_label: "dev".to_string(),
+            source: SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "claude -r".to_string(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            // What the scan left behind: the rail's source, already wrong.
+            metadata: vec![SessionMetadataEntry {
+                label: "Messages",
+                value: "0 user · 0 assistant".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+            working: None,
+        };
+
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = session.session_path.clone();
+        server.sessions.insert(path.clone(), session);
+
+        // What the reader on the OWNING host actually found, in the shape the
+        // remote reader really sends it.
+        let payload = RemotePreviewPayload {
+            title_hint: None,
+            cached_precis: None,
+            cached_summary: None,
+            preview: SnapshotPreview {
+                summary: vec![crate::SnapshotMetadataEntry {
+                    label: "Messages".to_string(),
+                    value: "12 user · 25 assistant".to_string(),
+                }],
+                blocks: Vec::new(),
+            },
+            rendered_sections: Vec::new(),
+        };
+        assert!(crate::apply_remote_preview_payload_for_path_with_hydration(
+            &mut server,
+            &path,
+            payload,
+            "tail",
+        ));
+
+        let hydrated = server.sessions.get(&path).expect("session survives");
+        assert_eq!(
+            crate::metadata_value(hydrated, "Messages"),
+            "12 user · 25 assistant",
+            "the rail reads session.metadata, so hydration has to correct it THERE"
+        );
     }
 
     #[test]

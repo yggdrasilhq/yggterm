@@ -22,7 +22,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "3.0.1"
+version = "3.0.2"
 edition = "2024"
 authors = ["Yggdrasil HQ"]
 # One owner for the licence. Members inherit with `license.workspace = true`;

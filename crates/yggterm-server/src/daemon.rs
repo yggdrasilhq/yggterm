@@ -2548,7 +2548,29 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         // that dies on its first crash with no way back, which is precisely the
         // "visible dead surface with no recovery" the doctrine forbids.
         | ServerRequest::Wpe { .. }
-        | ServerRequest::WpeAgent { .. } => ShadowAccess::Allow,
+        | ServerRequest::WpeAgent { .. }
+        // Re-reading a transcript from ITS OWN FILE is the least
+        // ownership-claiming thing a viewer can do. `RefreshPreview` touches no
+        // PTY, writes no input, moves no view and changes no lifecycle: it makes
+        // the daemon's cached copy of a session's preview agree with the
+        // transcript on disk. The update is convergent and idempotent — it can
+        // only produce the state the source already holds — and the user's own
+        // GUI issues it on these same rows continuously.
+        //
+        // Denied, it made the Web View STRUCTURALLY UNREACHABLE from the shadow:
+        // a remote agent transcript is fetched by exactly this request, so an
+        // agent's own surface could never render the product's primary content,
+        // and every remote row on it stayed on two launch-scaffold lines. That
+        // is not a safety property (nothing of the user's was being protected),
+        // it is the same dead-feature shape the WPE note above rejects — and it
+        // contradicts both "the agentic surface is the default test surface" and
+        // the CONSTITUTION's co-browse guarantee, which is about READING a
+        // session someone else owns.
+        //
+        // Same reasoning as `AcquireProfileWriteLock` above: the alternative was
+        // "never co-browse at all". Contrast the PTY-ownership paths below —
+        // those hijack the user's live session and stay denied.
+        | ServerRequest::RefreshPreview { .. } => ShadowAccess::Allow,
         // ---- everything else: ownership, input, lifecycle, or shared-view
         // mutation. Default-deny, listed explicitly (no wildcard) so a newly
         // added variant cannot silently inherit Allow. ----
@@ -2565,7 +2587,6 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::OpenRemoteSession { .. }
         | ServerRequest::RefreshRemoteMachine { .. }
         | ServerRequest::RefreshManagedCli { .. }
-        | ServerRequest::RefreshPreview { .. }
         | ServerRequest::UpdateSessionCopy { .. }
         | ServerRequest::RemoveSshTarget { .. }
         | ServerRequest::RemoveSession { .. }
@@ -16998,6 +17019,25 @@ mod tests {
             // probe surface — auditing what a predecessor left running is the
             // whole point of the verb.
             ServerRequest::TerminalTenants { path: None },
+            // ★★ READING A TRANSCRIPT IS NOT OWNING A SESSION.
+            //
+            // This one was denied, and the denial had a cost nobody had
+            // measured: a remote agent transcript reaches the daemon through
+            // exactly this request, so a shadow could never render one, and
+            // every remote row on the agent's own surface stayed on two
+            // launch-scaffold lines. The Web View — the product's primary
+            // content — was structurally unreachable from the surface the
+            // project names as its default test surface, and from the
+            // co-browse case the CONSTITUTION asks for.
+            //
+            // It is safe for the same reason the reads above are: no PTY, no
+            // input, no lifecycle, no view movement. It only makes the daemon's
+            // cached preview agree with the transcript file, which is
+            // convergent and idempotent.
+            ServerRequest::RefreshPreview {
+                path: "remote-cc://dev/abc-123".into(),
+                full_remote_payload: true,
+            },
         ];
         for req in &allowed {
             assert_eq!(

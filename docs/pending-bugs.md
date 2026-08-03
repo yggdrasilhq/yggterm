@@ -13,58 +13,48 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
-## ★★ THE WEB VIEW RENDERS 2 OF THE 48 ENTRIES IT HOLDS
+## ★★★ A CLIENT ONLY EVER GETS THE FULL RECORD FOR THE *DAEMON'S* ACTIVE SESSION
 
 **Status:** OPEN
 
-Found 2026-08-03 immediately after the remote-Claude-Code hydration fix landed
-and was proven — this is the NEXT thing between the user and a usable Web View,
-and it is a different defect from the one just closed.
+This is the CONSTITUTION's co-browse guarantee, measured.
 
-**Measured on the live GUI (jojo, 3.0.1 client + 3.0.1 daemon 1325229), on
-`remote-cc://dev/a033a728-…`:**
+Found 2026-08-03 while fixing the Web View's 2-of-N truncation, which is the
+same defect seen from the other side.
 
-| Layer | Blocks |
-|---|---|
-| The remote reader (`server remote preview-tail <file> 48`, run on dev) | **48** (27 ToolCall, 21 Message; all 48 have non-blank lines) |
-| The daemon's `active_session` snapshot payload | **48** |
-| Rendered on screen | **2** |
+**The shape.** `ServerUiSnapshot` has exactly one uncapped session record:
+`active_session`, and it is the record for the path the DAEMON considers
+active. Every other session arrives through `live_sessions[]`, which
+`snapshot_live_session_view` clips to `LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT` (2)
+preview blocks of 6 lines. A client whose viewport is its OWN — which is
+precisely what `viewport_is_client_owned_for_role` grants a Shadow, and the
+whole reason a shadow exists — can therefore never receive more than 2 clipped
+turns of the session it is looking at.
 
-The two on screen are the LAST two of the 48 — verified by printing the
-reader's tail and matching it against the screenshot — so nothing is being
-fetched wrongly. The full transcript reaches the GUI and the GUI draws two
-turns of it. `Preview Hydration = tail`, and three consecutive faithful
-screenshots minutes apart show the same two turns, so it is not adoption lag.
+**So the agentic surface cannot render the product's primary content.** That
+collides with two standing rules at once: *the agentic surface is the default
+test surface*, and the CONSTITUTION's *"click it and CO-BROWSE it"*. A Web View
+change cannot be pixel-proven anywhere except the user's own GUI, which the
+shadow-probe law exists to keep us off.
 
-### What has been ELIMINATED, with the measurement
+**Half of it is fixed; this is the half that is not.** A shadow used to be
+refused `RefreshPreview` outright (`shadow_cannot_own`), so its remote rows sat
+on launch scaffold forever — that gate is now `Allow`, and a shadow hydrates.
+What remains is the payload shape: hydration fills the DAEMON's store, and the
+snapshot still hands this client the clipped copy of its own viewport.
 
-- **The sanitizer** — `sanitize_snapshot_preview_blocks` drops only blocks whose
-  lines sanitize to empty; all 48 have non-blank lines.
-- **`LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT = 2`** (`lib.rs`) — real, but it caps
-  `snapshot_live_session_view`, the SESSION-LIST payload, not the active
-  session. ⚠ **It is why an early reading of this was ambiguous**: `server
-  snapshot | live_sessions[]` reports 2 for every session whether it is
-  scaffold-only or fully hydrated, which is the same number the bug produced.
-  Read `active_session`, never `live_sessions[]`, when asking what the Web View
-  has.
-- **`SNAPSHOT_PREVIEW_BLOCK_LIMIT = 2`** (`shell.rs`) — also real, also not
-  this: it caps `snapshot_retained_terminal_session_view`. The active-session
-  builder does `preview: session.preview.clone()`, uncapped.
+⛔ **Do not fix this by widening the read-only hatch or by adding a second
+"full record" field next to `active_session`** — two fields answering "what is
+this session's record" is the same duplication that caused the truncation bug.
+The CONSTITUTION already names the right shape: **per-viewer geometry and
+per-viewer records over a shared session**, i.e. the snapshot serves the
+requesting client's viewport, not the daemon's. That is a protocol change and
+deserves its own design pass.
 
-### Still suspect
-
-`visible_preview_blocks` (scaffold/duplicate filtering) or the virtual window
-(`PreviewVirtualWindow` — `start_index`/`end_index` are driven by measured
-scroll and viewport height, and a container that has just mounted may report a
-height that windows down to almost nothing).
-
-⛔ **The probe that would settle it is DEAD on this host.** The surface stamps
-exactly the right diagnostics (`data-preview-window-total`, `-start`, `-end`,
-`-scroll-height`, `-client-height`), but `server app dom-eval` returns `null`
-for everything — **including the control `dom-eval "1+1"`**. That is the
-instrument, not the page. Fix `dom-eval` (or read the stamps another way) and
-this becomes a five-minute diagnosis; guessing between the two suspects without
-it is how a wrong root cause gets filed.
+**Falsification that would close it:** on a shadow whose viewport is a
+`remote-cc://` row that the daemon's active session is NOT, read
+`data-preview-window-total` — it must equal the block count the reader reports
+for that transcript, not 2.
 
 
 ## ★★ TWO `web fill-vault` CALLS IN A ROW INTERLEAVE, AND CORRUPT BOTH FIELDS
@@ -640,24 +630,38 @@ switch the row (`ACTIVE: remote-cc://dev/a033a728-… Terminal`). And a second
 closes.
 
 **Where it is.** `terminal_observe.rs` refuses `ready` when
-`dom.preview_scroll_count == 0 && document_editor_count == 0`. On this host the
-`app state` DOM snapshot returns **no `preview_*` keys at all** — measured
-directly: `[k for k in state["dom"] if "preview" in k]` is `[]` while the
-viewport is visibly showing a rendered transcript. So the gate is reading a
-field that is not there, concludes the surface is unmounted, and can never
-answer otherwise.
+`dom.preview_scroll_count == 0 && document_editor_count == 0`.
 
-⚠ **Related to but NOT the same as the `dom_debug_snapshot_timeout` entry
-below.** That one is about the snapshot failing wholesale; here the snapshot
-returns fine (terminal-host fields, buffer samples, cursor rects are all
-present) and the preview fields are simply absent from it.
+### ⚠ THE DIAGNOSIS ABOVE WAS HALF WRONG — corrected 2026-08-03 (later)
 
-**Cost.** The one documented way to point a client at a Web View and confirm it
-rendered cannot be used, so a Web View change has to be proven from a
-screenshot alone, or in an isolated sandbox
-(`scripts/underglass-sandbox.sh` with a seeded transcript, which is what the
-2026-08-03 rework used). Fix the snapshot to publish `preview_scroll_count`
-again, or move the gate onto a field that exists.
+This entry used to say the DOM "returns **no `preview_*` keys at all**" and that
+it was therefore **NOT** the same bug as the `dom_debug_snapshot_timeout` entry
+below. Both halves are false, and the correction is worth carrying because the
+wrong half sent a session looking for a stamp that had never gone away:
+
+- **The DOM publishes `data-preview-scroll="1"` to this day.** Measured on the
+  live GUI host with `dom-eval`:
+  `{any_preview_scroll: 1, values: ["1"], strict_count: 1}`.
+- **The keys are absent because the SNAPSHOT is absent.** A timed-out capture
+  returns `{"error": "dom_debug_snapshot_timeout"}` and nothing else, so every
+  `preview_*` key is missing together — which is exactly what "no preview keys"
+  looked like. It IS the entry below.
+
+**FIXED IN CODE — the gate no longer lies.** `preview_scroll_count` was read
+through `.unwrap_or(0)`, which turned a FAILED MEASUREMENT into a confident
+claim about the page. It now answers
+`preview readiness unmeasured (dom_debug_snapshot_timeout)`. That does not make
+the verb settle — the underlying timeout below is still the blocker — but the
+verb now names the instrument that failed instead of accusing the surface.
+
+**What is still OPEN here** is therefore only the timeout below. Fix that and
+this verb settles.
+
+⛔ **`dom-eval` was never the dead instrument either.** The note that it
+"returns null even for the control `dom-eval "1+1"`" was a mis-written control:
+the verb takes a **`return`-style body**, so `1+1` is an expression statement
+evaluating to `undefined`. `dom-eval "return 1+1"` answers `{"result": 2}`.
+Every DOM question in this file can be answered today.
 
 ## ⚠ TOOLING: app state's DOM debug snapshot times out on jojo, so every DOM
 
