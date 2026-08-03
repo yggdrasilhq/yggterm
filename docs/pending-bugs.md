@@ -39,9 +39,20 @@ shadow-probe law exists to keep us off.
 
 **Half of it is fixed; this is the half that is not.** A shadow used to be
 refused `RefreshPreview` outright (`shadow_cannot_own`), so its remote rows sat
-on launch scaffold forever — that gate is now `Allow`, and a shadow hydrates.
-What remains is the payload shape: hydration fills the DAEMON's store, and the
-snapshot still hands this client the clipped copy of its own viewport.
+on launch scaffold forever — that gate is now `Allow`. What remains is the
+payload shape: hydration fills the DAEMON's store, and the snapshot still hands
+this client the clipped copy of its own viewport.
+
+⚠ **AND THE GATE FIX ONLY LANDS WHEN THE SESSION'S OWNER CARRIES IT.** Measured
+on jojo 2026-08-03 with a 3.0.2 daemon SERVING and a 3.0.1 daemon still OWNING
+the rows: a shadow's `refresh_preview` was still refused, and the trace names
+the refuser — `pid 1325229, component daemon, shadow_refused` — which is the
+OLD daemon. The request is proxied to the row's owner, so the answer comes from
+the owner's compiled-in `role_gate`, not the server's. **A daemon-side gate
+change is therefore inert for every session an older daemon still owns**, which
+on a version-coexisting fleet is all of them until ownership migrates. Same
+family as the pre-2.12.10 declare-proxy failure: check WHICH pid answered
+before concluding a daemon-side fix is live.
 
 ⛔ **Do not fix this by widening the read-only hatch or by adding a second
 "full record" field next to `active_session`** — two fields answering "what is
@@ -782,6 +793,37 @@ shows the placeholder for preserved-owner rows (the documented
 snapshot-lies trap), and `update-daemons --force` PRESERVES runtimes on the
 old socket rather than migrating them — neither is the recovery; the
 per-row `terminal restart` is.
+
+### ⚠ NOT REPRODUCED on 3.0.1 → 3.0.2 (jojo, 2026-08-03) — do not assume it is live
+
+A GUI relaunch onto a 3.0.2 client spawned a 3.0.2 daemon (pid 1657885) beside
+the 3.0.1 owner (1325229), unintentionally — see the correction below. It is
+the cleanest observation of this transition anyone has recorded, and **nothing
+wedged**:
+
+| Check | Result |
+|---|---|
+| `claude` processes on the remote host | **47 alive**, one per session sampled |
+| Remote rows re-attaching AFTER the handover | ssh chains for `90a6a23f` and `ddbdb609` created at 14:40, i.e. post-swap — so the launch request DOES fire for an adopted row |
+| Sessions lost | none |
+
+⛔ **The reading that looks like the wedge is the snapshot-lies trap.** Every
+`remote-cc://` row reports `launch_phase: RemoteBootstrap` when you ask the
+daemon that does NOT own it — `apply_terminal_runtime_truth_to_snapshot` stamps
+that on any row whose runtime the answering daemon lacks. 16 of 16 rows read
+`RemoteBootstrap` while their processes were all alive. **Ask WHICH daemon owns
+the row before reading a phase as a symptom.**
+
+So this entry stays OPEN because the 2.12.18→2.12.19 evidence was real and the
+root cause was never found — not because it was seen again. Anyone re-testing
+should mount a remote row in TERMINAL view after a handover (the wedge is a
+terminal-viewport symptom; the Web View path was exercised here and was fine).
+
+⚠ **A client-only deploy does NOT avoid a handover.** `resolve_client_daemon_endpoint`
+documents a newer client falling back to a reachable older daemon, and that is
+NOT what happens end to end: relaunching the GUI on a newer binary brought up a
+daemon of its own version, which then took over the older `server-<v>.sock`
+aliases. Plan a client deploy as a daemon deploy.
 
 
 ## ★ THE SUPERVISOR DIES WITH ITS CHILD
