@@ -261,7 +261,6 @@ use yggui_contract::{
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(true);
 static PREVIEW_BLOCK_CACHE: OnceCell<Mutex<PreviewBlockCache>> = OnceCell::new();
-static PREVIEW_CONTENT_CACHE: OnceCell<Mutex<PreviewContentCache>> = OnceCell::new();
 static PREVIEW_RUN_CACHE: OnceCell<Mutex<PreviewRunCache>> = OnceCell::new();
 
 const UNMAXIMIZED_SHELL_RADIUS_PX: u8 = 10;
@@ -443,7 +442,6 @@ static PRIMARY_APP_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 static DAEMON_ENSURE_IN_FLIGHT: OnceCell<Mutex<HashSet<String>>> = OnceCell::new();
 static RECENT_DAEMON_STARTS: OnceCell<Mutex<HashMap<String, u64>>> = OnceCell::new();
 const PREVIEW_BLOCK_CACHE_LIMIT: usize = 256;
-const PREVIEW_CONTENT_CACHE_LIMIT: usize = 256;
 const PREVIEW_RUN_CACHE_LIMIT: usize = 256;
 const SIDEBAR_MERGE_CACHE_LIMIT: usize = 128;
 const SIDEBAR_SEARCH_CACHE_LIMIT: usize = 256;
@@ -16913,41 +16911,6 @@ struct Palette {
     shadow: &'static str,
     panel_shadow: &'static str,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PreviewContentBlock {
-    Heading {
-        level: u8,
-        text: String,
-    },
-    Paragraph(String),
-    Bullet(String),
-    Numbered {
-        number: usize,
-        text: String,
-    },
-    Task {
-        done: bool,
-        text: String,
-    },
-    Quote(String),
-    ImageReference {
-        label: String,
-        text: Option<String>,
-    },
-    ImageAttachment {
-        path: String,
-    },
-    Code {
-        language: Option<String>,
-        code: String,
-    },
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PreviewInlineSegment {
-    Text(String),
-    Code(String),
-    ImageReference(String),
-}
 #[derive(Debug, Clone, PartialEq)]
 struct PreviewRun {
     tone: PreviewTone,
@@ -17135,11 +17098,6 @@ struct PreviewBlockCache {
     order: VecDeque<u64>,
     // Keyed rows, not bare blocks: the raw index is part of what is cached.
     entries: HashMap<u64, Vec<(usize, SessionPreviewBlock)>>,
-}
-#[derive(Default)]
-struct PreviewContentCache {
-    order: VecDeque<u64>,
-    entries: HashMap<u64, Vec<PreviewContentBlock>>,
 }
 #[derive(Default)]
 struct PreviewRunCache {
@@ -42569,9 +42527,6 @@ fn preview_block_cache_key(blocks: &[SessionPreviewBlock]) -> u64 {
         0xfe_u8.hash(&mut hasher);
     }
     hasher.finish()
-}
-fn preview_content_cache() -> &'static Mutex<PreviewContentCache> {
-    PREVIEW_CONTENT_CACHE.get_or_init(|| Mutex::new(PreviewContentCache::default()))
 }
 fn preview_run_cache() -> &'static Mutex<PreviewRunCache> {
     PREVIEW_RUN_CACHE.get_or_init(|| Mutex::new(PreviewRunCache::default()))
@@ -87181,11 +87136,6 @@ fn ConversationWebView(
             ConversationColumn {
             tokens,
             surface_id: session.session_path.clone(),
-            ConversationProviderHeader {
-                session: session.clone(),
-                provider: provider.clone(),
-                palette,
-            }
             if let Some((fallback_title, fallback_summary)) = visible_terminal_resume_context_fallback.clone() {
                 TerminalResumeContextFallback {
                     title: fallback_title,
@@ -87251,84 +87201,6 @@ fn ConversationWebView(
                     palette,
                 }
             }
-            }
-        }
-    }
-}
-/// Who is speaking, where from, and whether the reader may answer.
-///
-/// One quiet metadata line, not four pills. It used to be four, each with a
-/// hardcoded `rgba(255,255,255,…)` surface — invisible-to-unreadable in dark,
-/// because the colours were spelled at the call site instead of taken from the
-/// theme. Everything here now reads from [`ConversationTokens`], and the only
-/// term that is allowed to carry colour is the one that says whether this
-/// session can be typed into, because that is the one the user acts on.
-#[component]
-fn ConversationProviderHeader(
-    session: ManagedSessionView,
-    provider: ConversationProviderModel,
-    palette: Palette,
-) -> Element {
-    let tokens = conversation_tokens(palette);
-    let host_label = if session.host_label.trim().is_empty() {
-        "local".to_string()
-    } else {
-        session.host_label.clone()
-    };
-    let term_style = format!(
-        "min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:{};",
-        tokens.meta,
-    );
-    let separator_style = format!("flex:0 0 auto; opacity:0.5; color:{};", tokens.meta);
-    rsx! {
-        div {
-            "data-conversation-provider-header": "1",
-            style: format!(
-                "display:flex; align-items:center; justify-content:space-between; gap:12px; \
-                 flex-wrap:wrap; min-width:0; padding:0 2px 2px 2px; border-bottom:1px solid {}; \
-                 font-family:{}; font-size:10.5px; letter-spacing:0.04em; color:{};",
-                tokens.hairline, tokens.ui_font, tokens.meta,
-            ),
-            div {
-                style: "display:flex; align-items:center; gap:8px; min-width:0;",
-                div {
-                    style: format!(
-                        "width:6px; height:6px; border-radius:999px; flex:0 0 auto; background:{};",
-                        if provider.read_only { tokens.meta } else { tokens.accent },
-                    ),
-                }
-                span {
-                    "data-conversation-provider-label": "1",
-                    style: format!(
-                        "min-width:0; max-width:min(100%, 320px); overflow:hidden; \
-                         text-overflow:ellipsis; white-space:nowrap; font-weight:660; color:{};",
-                        tokens.work_ink,
-                    ),
-                    "{provider.label}"
-                }
-                span { style: "{separator_style}", "·" }
-                span {
-                    "data-conversation-source-label": "1",
-                    style: "{term_style}",
-                    "{provider.source_label}"
-                }
-            }
-            div {
-                style: "display:flex; align-items:center; gap:8px; min-width:0; justify-content:flex-end;",
-                span {
-                    "data-conversation-host-label": "1",
-                    style: "{term_style}",
-                    "{host_label}"
-                }
-                span { style: "{separator_style}", "·" }
-                span {
-                    "data-conversation-capability-label": "{provider.capability_label}",
-                    style: format!(
-                        "flex:0 0 auto; white-space:nowrap; font-weight:660; color:{};",
-                        if provider.read_only { tokens.meta } else { tokens.accent },
-                    ),
-                    "{provider.capability_label}"
-                }
             }
         }
     }
@@ -88878,429 +88750,32 @@ fn preview_work_mark(block: &SessionPreviewBlock) -> WorkMark {
         _ => WorkMark::Generic,
     }
 }
+/// The body of a prose turn, rendered as MARKDOWN.
+///
+/// ⭐ ONE MARKDOWN RENDERER, and it is `emd-renderer` (user directive
+/// 2026-08-03). This surface used to carry a second, weaker parser of its own —
+/// `preview_content_blocks` + `preview_inline_segments` — which knew headings,
+/// bullets and inline code but had NO Strong, Emphasis, Link, Table or
+/// Strikethrough. So an agent's `**emphasis**` reached the reader as literal
+/// asterisks and a markdown table as a wall of pipes, while the real parser sat
+/// in the same binary rendering the document surface correctly. Two parsers for
+/// one grammar is the same defect class as two copies of a session record: the
+/// weaker one wins wherever it happens to be wired.
+///
+/// `compact` typography: the TURN owns the face and size (sans for the person,
+/// serif for the machine), so the markdown body inherits both rather than
+/// asserting the document reading scale.
 #[component]
 fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
-    let blocks = preview_content_blocks(&lines);
+    let doc = DocTheme::from_palette(&palette);
+    let source = lines.join("\n");
     rsx! {
         div {
-            // ⚠ No face and no size here. The TURN owns both — sans for what
-            // the person wrote, serif for what the machine answered — and a
-            // serif asserted at this level set the user's own words in the
-            // answer's face.
-            style: "display:flex; flex-direction:column; gap:9px; font-family:inherit; \
+            style: "display:flex; flex-direction:column; font-family:inherit; \
                     font-size:inherit; color:inherit;",
-            for block in blocks.into_iter() {
-                match block {
-                    PreviewContentBlock::Heading { level, text } => rsx! {
-                        div {
-                            style: format!(
-                                "font-size:{}px; line-height:1.38; font-weight:750; letter-spacing:-0.01em; color:{}; white-space:pre-wrap; padding-top:{}px;",
-                                match level {
-                                    1 => 20,
-                                    2 => 17,
-                                    _ => 15,
-                                },
-                                palette.text,
-                                if level == 1 { 4 } else { 2 }
-                            ),
-                            PreviewInlineText { text, palette, muted: false }
-                        }
-                    },
-                    PreviewContentBlock::Paragraph(text) => rsx! {
-                        div {
-                            style: "font-size:inherit; line-height:1.66; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
-                            PreviewInlineText { text, palette, muted: false }
-                        }
-                    },
-                    PreviewContentBlock::Bullet(text) => rsx! {
-                        div {
-                            style: "display:flex; align-items:flex-start; gap:10px;",
-                            div {
-                                style: format!("width:6px; height:6px; border-radius:999px; background:{}; margin-top:8px; flex:0 0 auto;", palette.accent_soft),
-                            }
-                            div {
-                                style: "font-size:inherit; line-height:1.66; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
-                                PreviewInlineText { text, palette, muted: false }
-                            }
-                        }
-                    },
-                    PreviewContentBlock::Numbered { number, text } => rsx! {
-                        div {
-                            style: "display:flex; align-items:flex-start; gap:10px;",
-                            div {
-                                style: format!("min-width:22px; color:{}; font-size:13px; font-weight:700; line-height:1.7; flex:0 0 auto;", palette.accent),
-                                "{number}."
-                            }
-                            div {
-                                style: "font-size:inherit; line-height:1.66; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
-                                PreviewInlineText { text, palette, muted: false }
-                            }
-                        }
-                    },
-                    PreviewContentBlock::Task { done, text } => rsx! {
-                        div {
-                            style: "display:flex; align-items:flex-start; gap:10px;",
-                            div {
-                                style: format!(
-                                    "width:16px; height:16px; border-radius:5px; margin-top:2px; flex:0 0 auto; \
-                                     display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:800; \
-                                     color:{}; background:{}; box-shadow:inset 0 0 0 1px {};",
-                                    if done { "white" } else { "transparent" },
-                                    if done { palette.accent.to_string() } else { "rgba(255,255,255,0.82)".to_string() },
-                                    if done { palette.accent.to_string() } else { "rgba(170,190,212,0.28)".to_string() }
-                                ),
-                                {if done { "✓" } else { "" }}
-                            }
-                            div {
-                                style: format!(
-                                    "font-size:inherit; line-height:1.66; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; color:{};",
-                                    if done { palette.muted } else { palette.text }
-                                ),
-                                PreviewInlineText { text, palette, muted: done }
-                            }
-                        }
-                    },
-                    PreviewContentBlock::Quote(text) => rsx! {
-                        div {
-                            style: "display:flex; align-items:stretch; gap:12px; padding:2px 0;",
-                            div {
-                                style: format!("width:3px; border-radius:999px; background:{}; flex:0 0 auto;", palette.accent_soft),
-                            }
-                            div {
-                                style: format!("font-size:inherit; line-height:1.66; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; color:{};", palette.muted),
-                                PreviewInlineText { text, palette, muted: true }
-                            }
-                        }
-                    },
-                    PreviewContentBlock::ImageReference { label, text } => rsx! {
-                        div {
-                            style: "display:flex; flex-wrap:wrap; align-items:flex-start; gap:10px;",
-                            div {
-                                style: "display:inline-flex; align-items:center; justify-content:center; padding:4px 10px; border-radius:999px; \
-                                        background:rgba(73,160,153,0.12); color:#2c8c83; font-size:12px; font-weight:700; \
-                                        letter-spacing:0.01em; font-family:'JetBrains Mono', 'Iosevka Term', monospace;",
-                                "{label}"
-                            }
-                            if let Some(text) = text.filter(|value| !value.trim().is_empty()) {
-                                div {
-                                    style: "font-size:inherit; line-height:1.66; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; flex:1 1 240px;",
-                                    PreviewInlineText { text, palette, muted: false }
-                                }
-                            }
-                        }
-                    },
-                    PreviewContentBlock::ImageAttachment { path } => {
-                        let exists = local_image_path_exists(&path);
-                        let file_url = format!("file://{}", path);
-                        rsx! {
-                            div {
-                                style: "display:flex; flex-direction:column; gap:10px; padding:12px; border-radius:18px; background:rgba(247,250,253,0.92); \
-                                        box-shadow:inset 0 0 0 1px rgba(170,190,212,0.16);",
-                                div {
-                                    style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
-                                    div {
-                                        style: format!("font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{};", palette.muted),
-                                        "Image Attachment"
-                                    }
-                                    div {
-                                        style: format!("font-size:11px; color:{};", palette.muted),
-                                        if exists { "local file" } else { "path only" }
-                                    }
-                                }
-                                if exists {
-                                    img {
-                                        src: "{file_url}",
-                                        style: "display:block; width:auto; max-width:min(100%, 560px); max-height:320px; border-radius:14px; object-fit:contain; background:rgba(255,255,255,0.86); \
-                                                box-shadow:inset 0 0 0 1px rgba(170,190,212,0.14);",
-                                    }
-                                }
-                                div {
-                                    style: format!("font-size:11px; line-height:1.6; color:{}; font-family:'JetBrains Mono', 'Iosevka Term', monospace; white-space:pre-wrap; overflow-wrap:anywhere;", palette.muted),
-                                    "{path}"
-                                }
-                            }
-                        }
-                    },
-                    PreviewContentBlock::Code { language, code } => rsx! {
-                        div {
-                            style: "display:flex; flex-direction:column; gap:8px; border-radius:16px; background:rgba(15,23,42,0.92); color:#e5eef8; overflow:hidden;",
-                            div {
-                                style: "display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 14px; border-bottom:1px solid rgba(255,255,255,0.08);",
-                                div {
-                                    style: format!(
-                                        "font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:rgba(226,232,240,0.78); font-family:{};",
-                                        interface_font_family()
-                                    ),
-                                    "{language.clone().unwrap_or_else(|| \"Code\".to_string())}"
-                                }
-                            }
-                            pre {
-                                style: "margin:0; padding:14px 16px 16px 16px; overflow:auto; white-space:pre-wrap; font-size:11px; line-height:1.66; font-family:'JetBrains Mono', 'Iosevka Term', monospace;",
-                                code { "{code}" }
-                            }
-                        }
-                    },
-                }
-            }
+            {markdown_widget_body(&source, &doc, true)}
         }
     }
-}
-fn preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
-    let key = preview_content_cache_key(lines);
-    if let Ok(cache) = preview_content_cache().lock()
-        && let Some(cached) = cache.entries.get(&key)
-    {
-        return cached.clone();
-    }
-    let parsed = build_preview_content_blocks(lines);
-    if let Ok(mut cache) = preview_content_cache().lock() {
-        if !cache.entries.contains_key(&key) {
-            cache.order.push_back(key);
-        }
-        cache.entries.insert(key, parsed.clone());
-        while cache.order.len() > PREVIEW_CONTENT_CACHE_LIMIT {
-            if let Some(stale) = cache.order.pop_front() {
-                cache.entries.remove(&stale);
-            }
-        }
-    }
-    parsed
-}
-fn preview_inline_segments(text: &str) -> Vec<PreviewInlineSegment> {
-    let mut segments = Vec::new();
-    let mut index = 0usize;
-    while index < text.len() {
-        let remaining = &text[index..];
-        let code_start = remaining.find('`').map(|offset| index + offset);
-        let image_start = remaining.find("[Image #").map(|offset| index + offset);
-        let next_start = match (code_start, image_start) {
-            (Some(code), Some(image)) => Some(code.min(image)),
-            (Some(code), None) => Some(code),
-            (None, Some(image)) => Some(image),
-            (None, None) => None,
-        };
-        let Some(start) = next_start else {
-            if !remaining.is_empty() {
-                segments.push(PreviewInlineSegment::Text(remaining.to_string()));
-            }
-            break;
-        };
-        if start > index {
-            segments.push(PreviewInlineSegment::Text(text[index..start].to_string()));
-        }
-        if Some(start) == image_start
-            && let Some(end_offset) = text[start..].find(']')
-        {
-            let end = start + end_offset + 1;
-            segments.push(PreviewInlineSegment::ImageReference(
-                text[start..end].to_string(),
-            ));
-            index = end;
-            continue;
-        }
-        if Some(start) == code_start
-            && let Some(end_offset) = text[start + 1..].find('`')
-        {
-            let end = start + 1 + end_offset;
-            let code = &text[start + 1..end];
-            if !code.is_empty() {
-                segments.push(PreviewInlineSegment::Code(code.to_string()));
-                index = end + 1;
-                continue;
-            }
-        }
-        segments.push(PreviewInlineSegment::Text(
-            text[start..start + 1].to_string(),
-        ));
-        index = start + 1;
-    }
-    segments
-        .into_iter()
-        .filter(|segment| match segment {
-            PreviewInlineSegment::Text(text) => !text.is_empty(),
-            PreviewInlineSegment::Code(text) => !text.is_empty(),
-            PreviewInlineSegment::ImageReference(text) => !text.is_empty(),
-        })
-        .collect()
-}
-#[component]
-fn PreviewInlineText(text: String, palette: Palette, muted: bool) -> Element {
-    let segments = preview_inline_segments(&text);
-    rsx! {
-        span {
-            for (ix, segment) in segments.into_iter().enumerate() {
-                match segment {
-                    PreviewInlineSegment::Text(value) => rsx! {
-                        span { key: "text-{ix}", "{value}" }
-                    },
-                    PreviewInlineSegment::Code(value) => rsx! {
-                        span {
-                            key: "code-{ix}",
-                            style: format!(
-                                "font-family:'JetBrains Mono', 'Iosevka Term', monospace; font-size:0.92em; \
-                                 padding:0.08em 0.42em; border-radius:0.5em; background:{}; color:{}; \
-                                 box-shadow:inset 0 0 0 1px {};",
-                                if muted { "rgba(15,23,42,0.06)" } else { "rgba(15,23,42,0.07)" },
-                                if muted { palette.muted.to_string() } else { palette.text.to_string() },
-                                if muted { "rgba(148,163,184,0.18)" } else { "rgba(148,163,184,0.22)" }
-                            ),
-                            "{value}"
-                        }
-                    },
-                    PreviewInlineSegment::ImageReference(value) => rsx! {
-                        span {
-                            key: "image-{ix}",
-                            style: "display:inline-flex; align-items:center; justify-content:center; padding:0.08em 0.48em; \
-                                    border-radius:999px; background:rgba(73,160,153,0.12); color:#2c8c83; \
-                                    font-size:0.86em; font-weight:700; letter-spacing:0.01em; \
-                                    font-family:'JetBrains Mono', 'Iosevka Term', monospace;",
-                            "{value}"
-                        }
-                    },
-                }
-            }
-        }
-    }
-}
-fn build_preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
-    let mut blocks = Vec::new();
-    let mut paragraph = Vec::<String>::new();
-    let mut code = Vec::<String>::new();
-    let mut code_language = None::<String>;
-    let mut in_code = false;
-    let flush_paragraph = |blocks: &mut Vec<PreviewContentBlock>, paragraph: &mut Vec<String>| {
-        if paragraph.is_empty() {
-            return;
-        }
-        let text = paragraph.join("\n").trim().to_string();
-        if !text.is_empty() {
-            blocks.push(PreviewContentBlock::Paragraph(text));
-        }
-        paragraph.clear();
-    };
-    for raw in lines {
-        let line = raw.trim_end();
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            if in_code {
-                blocks.push(PreviewContentBlock::Code {
-                    language: code_language.take(),
-                    code: code.join("\n"),
-                });
-                code.clear();
-                in_code = false;
-            } else {
-                flush_paragraph(&mut blocks, &mut paragraph);
-                let language = trimmed.trim_start_matches('`').trim();
-                code_language = (!language.is_empty()).then_some(language.to_string());
-                in_code = true;
-            }
-            continue;
-        }
-        if in_code {
-            code.push(line.to_string());
-            continue;
-        }
-        if trimmed.is_empty() {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            continue;
-        }
-        if let Some(heading) = trimmed.strip_prefix("### ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(PreviewContentBlock::Heading {
-                level: 3,
-                text: heading.trim().to_string(),
-            });
-            continue;
-        }
-        if let Some(heading) = trimmed.strip_prefix("## ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(PreviewContentBlock::Heading {
-                level: 2,
-                text: heading.trim().to_string(),
-            });
-            continue;
-        }
-        if let Some(heading) = trimmed.strip_prefix("# ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(PreviewContentBlock::Heading {
-                level: 1,
-                text: heading.trim().to_string(),
-            });
-            continue;
-        }
-        if let Some(task) = trimmed
-            .strip_prefix("- [ ] ")
-            .or_else(|| trimmed.strip_prefix("* [ ] "))
-        {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(PreviewContentBlock::Task {
-                done: false,
-                text: task.trim().to_string(),
-            });
-            continue;
-        }
-        if let Some(task) = trimmed
-            .strip_prefix("- [x] ")
-            .or_else(|| trimmed.strip_prefix("* [x] "))
-            .or_else(|| trimmed.strip_prefix("- [X] "))
-            .or_else(|| trimmed.strip_prefix("* [X] "))
-        {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(PreviewContentBlock::Task {
-                done: true,
-                text: task.trim().to_string(),
-            });
-            continue;
-        }
-        if let Some(bullet) = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-        {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(PreviewContentBlock::Bullet(bullet.trim().to_string()));
-            continue;
-        }
-        if let Some((number, item)) = parse_numbered_preview_item(trimmed) {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(PreviewContentBlock::Numbered { number, text: item });
-            continue;
-        }
-        if let Some(quote) = trimmed.strip_prefix("> ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(PreviewContentBlock::Quote(quote.trim().to_string()));
-            continue;
-        }
-        if trimmed == "</image>" {
-            continue;
-        }
-        if let Some((label, residue)) = extract_named_image_reference_from_line(line) {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(PreviewContentBlock::ImageReference {
-                label,
-                text: residue,
-            });
-            continue;
-        }
-        if let Some((image_path, residue)) = extract_image_path_from_line(line) {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            if let Some(text) = residue.filter(|value| !value.trim().is_empty()) {
-                blocks.push(PreviewContentBlock::Paragraph(text));
-            }
-            blocks.push(PreviewContentBlock::ImageAttachment { path: image_path });
-            continue;
-        }
-        paragraph.push(line.to_string());
-    }
-    if in_code {
-        blocks.push(PreviewContentBlock::Code {
-            language: code_language,
-            code: code.join("\n"),
-        });
-    } else {
-        flush_paragraph(&mut blocks, &mut paragraph);
-    }
-    merge_adjacent_image_reference_blocks(blocks)
 }
 fn parse_numbered_preview_item(line: &str) -> Option<(usize, String)> {
     let (number, text) = line.split_once(". ")?;
@@ -89350,35 +88825,6 @@ fn extract_named_image_reference_from_line(line: &str) -> Option<(String, Option
         return Some((label, (!residue.is_empty()).then_some(residue.to_string())));
     }
     None
-}
-fn merge_adjacent_image_reference_blocks(
-    blocks: Vec<PreviewContentBlock>,
-) -> Vec<PreviewContentBlock> {
-    let mut merged = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        match block {
-            PreviewContentBlock::ImageReference { label, text } => {
-                if let Some(PreviewContentBlock::ImageReference {
-                    label: previous_label,
-                    text: previous_text,
-                }) = merged.last_mut()
-                {
-                    if *previous_label == label {
-                        if previous_text
-                            .as_ref()
-                            .is_none_or(|value| value.trim().is_empty())
-                        {
-                            *previous_text = text.filter(|value| !value.trim().is_empty());
-                        }
-                        continue;
-                    }
-                }
-                merged.push(PreviewContentBlock::ImageReference { label, text });
-            }
-            other => merged.push(other),
-        }
-    }
-    merged
 }
 fn looks_like_image_path(path: &str) -> bool {
     if looks_like_session_or_remote_uri(path) {
@@ -120460,6 +119906,39 @@ fn document_reading_typography() -> &'static str {
      letter-spacing:0.002em; text-rendering:optimizeLegibility;"
 }
 
+/// A markdown image `src` as something a webview will actually load.
+///
+/// An absolute path is a local file the agent pasted; anything already carrying
+/// a scheme is left alone, because rewriting `https://` to `file://` would turn
+/// a working image into a broken one.
+fn preview_image_file_url(src: &str) -> String {
+    let trimmed = src.trim();
+    if trimmed.starts_with('/') {
+        format!("file://{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// The plain text under a run of inline nodes — for an `alt`, which is an
+/// attribute and cannot hold markup.
+fn md_inline_plain_text(items: &[MdInline]) -> String {
+    let mut out = String::new();
+    for item in items {
+        match item {
+            MdInline::Text(text) => out.push_str(text),
+            MdInline::Code(code) => out.push_str(code),
+            MdInline::Strong(children)
+            | MdInline::Emphasis(children)
+            | MdInline::Strikethrough(children) => out.push_str(&md_inline_plain_text(children)),
+            MdInline::Link { children, .. } => out.push_str(&md_inline_plain_text(children)),
+            MdInline::Image { alt, .. } => out.push_str(&md_inline_plain_text(alt)),
+            MdInline::HardBreak => out.push(' '),
+        }
+    }
+    out
+}
+
 fn md_inline_nodes(items: &[MdInline], palette: &DocTheme) -> Element {
     let code_style = format!(
         "background:{}; border:1px solid {}; \
@@ -120488,6 +119967,26 @@ fn md_inline_nodes(items: &[MdInline], palette: &DocTheme) -> Element {
                         {md_inline_nodes(children, palette)}
                     }
                 },
+                // An image is DISPLAYED, not linked. This is the one place a
+                // transcript full of pasted screenshots differs from a document,
+                // and it is why `MdInline::Image` is a typed node in
+                // emd-renderer rather than a 🖼 glyph plus a link.
+                MdInline::Image { src, alt } => {
+                    let file_url = preview_image_file_url(src);
+                    let alt_text = md_inline_plain_text(alt);
+                    rsx! {
+                        span {
+                            key: "img{index}",
+                            style: "display:block; margin:8px 0 4px 0;",
+                            img {
+                                src: "{file_url}",
+                                alt: "{alt_text}",
+                                style: "display:block; width:auto; max-width:min(100%, 560px); \
+                                        max-height:320px; border-radius:14px; object-fit:contain;",
+                            }
+                        }
+                    }
+                }
                 MdInline::HardBreak => rsx! { br { key: "br{index}" } },
             }
         }
@@ -120804,6 +120303,20 @@ struct DocTheme {
 }
 
 impl DocTheme {
+    /// The document palette for a SHELL surface (the Web View's conversation),
+    /// as opposed to a terminal's. One constructor per palette kind so the
+    /// markdown renderer never has to guess which one it was handed.
+    fn from_palette(palette: &Palette) -> Self {
+        Self {
+            bg: palette.panel.to_string(),
+            fg: palette.text.to_string(),
+            muted: palette.muted.to_string(),
+            accent: palette.accent.to_string(),
+            border: palette.border.to_string(),
+            chrome: palette.panel_alt.to_string(),
+        }
+    }
+
     fn from_terminal(palette: &crate::terminal_themes::TerminalPaletteSpec) -> Self {
         let fg = palette.foreground.clone();
         let bg = palette.background.clone();
@@ -140556,6 +140069,93 @@ mod tests {
         session
     }
 
+    /// ★★ ONE MARKDOWN RENDERER, AND THE WEB VIEW USES IT.
+    ///
+    /// The conversation surface carried a second parser of its own until
+    /// 2026-08-03. It knew headings, bullets and inline code and had NO Strong,
+    /// Emphasis, Link, Table or Strikethrough — so an agent writing
+    /// `**emphasis**` reached the reader as literal asterisks, and a markdown
+    /// table as a wall of pipes, while `emd-renderer` sat in the SAME BINARY
+    /// rendering the document surface correctly.
+    ///
+    /// This asserts the behaviour the deleted parser could not produce. It is
+    /// deliberately about the constructs that were MISSING rather than about
+    /// which function is called, so it keeps holding if the call site moves.
+    #[test]
+    fn the_web_views_markdown_is_emd_renderers_and_knows_what_the_old_parser_did_not() {
+        use emd_renderer::{MdBlock, MdInline, parse_markdown_blocks};
+
+        fn flatten(items: &[MdInline], out: &mut Vec<&'static str>) {
+            for item in items {
+                match item {
+                    MdInline::Strong(children) => {
+                        out.push("strong");
+                        flatten(children, out);
+                    }
+                    MdInline::Emphasis(children) => {
+                        out.push("emphasis");
+                        flatten(children, out);
+                    }
+                    MdInline::Strikethrough(children) => {
+                        out.push("strikethrough");
+                        flatten(children, out);
+                    }
+                    MdInline::Link { children, .. } => {
+                        out.push("link");
+                        flatten(children, out);
+                    }
+                    MdInline::Image { alt, .. } => {
+                        out.push("image");
+                        flatten(alt, out);
+                    }
+                    MdInline::Code(_) => out.push("code"),
+                    MdInline::Text(_) => {}
+                    MdInline::HardBreak => {}
+                }
+            }
+        }
+
+        let blocks = parse_markdown_blocks(
+            "Plain **bold** and *italic* and ~~gone~~ and [a link](https://example.invalid) \
+             and `code`.\n\n![shot](/tmp/shot.png)\n\n| a | b |\n| - | - |\n| 1 | 2 |\n",
+        );
+
+        let mut marks = Vec::new();
+        for block in &blocks {
+            if let MdBlock::Paragraph(children) = block {
+                flatten(children, &mut marks);
+            }
+        }
+        for expected in ["strong", "emphasis", "strikethrough", "link", "code", "image"] {
+            assert!(
+                marks.contains(&expected),
+                "the renderer the Web View uses must produce {expected}; got {marks:?}"
+            );
+        }
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, MdBlock::Table { .. })),
+            "a table has to be a table, not a wall of pipes"
+        );
+
+        // And the surface must not have grown a second parser again.
+        let source = include_str!("shell.rs");
+        // ⚠ Split so this list does not match ITSELF — `include_str!` includes
+        // this test, and a self-matching guard fails the moment it is written.
+        for banned in [
+            concat!("fn preview_", "content_blocks"),
+            concat!("fn preview_", "inline_segments"),
+            concat!("enum Preview", "ContentBlock"),
+            concat!("enum Preview", "InlineSegment"),
+        ] {
+            assert!(
+                !source.contains(banned),
+                "{banned} is a second markdown parser; emd-renderer is the only one"
+            );
+        }
+    }
+
     /// ★ A remote CLAUDE CODE row's preview syncs from its machine, exactly as
     /// a Codex row's does.
     ///
@@ -149578,61 +149178,8 @@ mod tests {
         assert_eq!(banded.bottom, placement.bottom);
     }
     #[test]
-    fn preview_content_blocks_render_markdown_shapes() {
-        let blocks = preview_content_blocks(&[
-            "# Heading".to_string(),
-            String::new(),
-            "- bullet".to_string(),
-            "1. first".to_string(),
-            "- [x] done".to_string(),
-            "> quoted".to_string(),
-            "```rust".to_string(),
-            "fn main() {}".to_string(),
-            "```".to_string(),
-        ]);
-        assert!(matches!(
-            blocks.first(),
-            Some(PreviewContentBlock::Heading { level: 1, text }) if text == "Heading"
-        ));
-        assert!(
-            blocks.iter().any(
-                |block| matches!(block, PreviewContentBlock::Bullet(text) if text == "bullet")
-            )
-        );
-        assert!(blocks.iter().any(|block| matches!(block, PreviewContentBlock::Numbered { number: 1, text } if text == "first")));
-        assert!(blocks.iter().any(|block| matches!(block, PreviewContentBlock::Task { done: true, text } if text == "done")));
-        assert!(
-            blocks
-                .iter()
-                .any(|block| matches!(block, PreviewContentBlock::Quote(text) if text == "quoted"))
-        );
-        assert!(blocks.iter().any(|block| matches!(block, PreviewContentBlock::Code { language: Some(language), code } if language == "rust" && code == "fn main() {}")));
-    }
     #[test]
-    fn preview_content_blocks_collapse_named_image_markup() {
-        let blocks = preview_content_blocks(&[
-            "<image name=[Image #1]> </image> [Image #1] This is how excel looks.".to_string(),
-        ]);
-        assert!(matches!(
-            blocks.first(),
-            Some(PreviewContentBlock::ImageReference { label, text })
-                if label == "[Image #1]" && text.as_deref() == Some("This is how excel looks.")
-        ));
-    }
     #[test]
-    fn preview_content_blocks_collapse_split_named_image_markup() {
-        let blocks = preview_content_blocks(&[
-            "[Image #1]".to_string(),
-            "</image>".to_string(),
-            "[Image #1] We need to increase the disk size.".to_string(),
-        ]);
-        assert_eq!(blocks.len(), 1);
-        assert!(matches!(
-            blocks.first(),
-            Some(PreviewContentBlock::ImageReference { label, text })
-                if label == "[Image #1]" && text.as_deref() == Some("We need to increase the disk size.")
-        ));
-    }
     #[test]
     fn preview_image_path_detection_rejects_session_uris() {
         assert!(looks_like_image_path("/home/user/.tmp/yggterm-shot.png"));

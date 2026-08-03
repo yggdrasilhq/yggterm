@@ -1448,7 +1448,6 @@ dependencies = [
 [[package]]
 name = "emd-renderer"
 version = "0.4.1"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.4.1#c6da9f3d41a1e4abfc4a6b1cd0853b5b33e64172"
 dependencies = [
  "pulldown-cmark",
 ]
@@ -6876,7 +6875,7 @@ checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
 
 [[package]]
 name = "yggterm"
-version = "3.0.2"
+version = "3.0.3"
 dependencies = [
  "anyhow",
  "ctrlc",
@@ -6898,7 +6897,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-core"
-version = "3.0.2"
+version = "3.0.3"
 dependencies = [
  "anyhow",
  "dirs",
@@ -6920,7 +6919,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-ghostty-bridge"
-version = "3.0.2"
+version = "3.0.3"
 dependencies = [
  "anyhow",
  "thiserror 2.0.18",
@@ -6929,11 +6928,11 @@ dependencies = [
 
 [[package]]
 name = "yggterm-gtk-glue"
-version = "3.0.2"
+version = "3.0.3"
 
 [[package]]
 name = "yggterm-platform"
-version = "3.0.2"
+version = "3.0.3"
 dependencies = [
  "anyhow",
  "objc2",
@@ -6947,7 +6946,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-server"
-version = "3.0.2"
+version = "3.0.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -6972,7 +6971,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-shell"
-version = "3.0.2"
+version = "3.0.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -7021,7 +7020,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-webprobe"
-version = "3.0.2"
+version = "3.0.3"
 dependencies = [
  "gtk",
  "serde_json",
@@ -7033,7 +7032,6 @@ dependencies = [
 [[package]]
 name = "yggui"
 version = "0.4.1"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.4.1#c6da9f3d41a1e4abfc4a6b1cd0853b5b33e64172"
 dependencies = [
  "anyhow",
  "dioxus",
@@ -7047,7 +7045,6 @@ dependencies = [
 [[package]]
 name = "yggui-contract"
 version = "0.4.1"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.4.1#c6da9f3d41a1e4abfc4a6b1cd0853b5b33e64172"
 dependencies = [
  "serde",
 ]
