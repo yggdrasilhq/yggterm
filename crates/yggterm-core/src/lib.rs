@@ -129,10 +129,10 @@ pub use trace::{
     follow_trace_lines, read_trace_tail,
 };
 pub use transcript::{
-    TranscriptEntry, TranscriptEntryKind, TranscriptMessage, TranscriptRole, TranscriptToolCall,
-    TranscriptViewMessage, generation_context_from_messages, message_lines_from_payload,
-    read_agent_transcript_entries, read_agent_transcript_entries_tail_limited,
-    read_agent_transcript_messages,
+    TranscriptEntry, TranscriptEntryKind, TranscriptMessage, TranscriptRole, TranscriptTail,
+    TranscriptToolCall, TranscriptViewMessage, generation_context_from_messages,
+    message_lines_from_payload, read_agent_transcript_entries,
+    read_agent_transcript_entries_tail_limited, read_agent_transcript_messages,
     read_claude_code_transcript_entries, read_claude_code_transcript_messages,
     read_codex_transcript_entries, read_codex_transcript_messages,
     read_codex_transcript_messages_limited, read_codex_transcript_messages_tail_limited,

@@ -112,6 +112,7 @@ pub use daemon::{
     open_remote_session_with_view, open_stored_session, open_stored_session_with_view, ping, working_flags,
     prepare_client_close, prepare_update_restart, raise_external_window,
     reachable_versioned_daemon_statuses, refresh_managed_cli, refresh_preview,
+    refresh_preview_with_history,
     refresh_remote_machine, remove_session, remove_ssh_target, reorder_live_sessions,
     reorder_live_sessions_scoped, row_order_ledger_report,
     request_terminal_launch, request_terminal_launch_for_path, retire_daemon,
@@ -374,6 +375,23 @@ impl SessionPreviewBlock {
 pub struct SessionPreview {
     pub summary: Vec<SessionMetadataEntry>,
     pub blocks: Vec<SessionPreviewBlock>,
+    /// Whether the TRANSCRIPT READER stopped at its budget rather than at the
+    /// start of the file — that is, whether asking for more would actually
+    /// return more.
+    ///
+    /// The blocks are always a bounded tail: the file is tens of megabytes and
+    /// the reader runs on every refresh. Without this the bound is invisible —
+    /// a 670-block conversation drew its last 600 and nothing on screen
+    /// admitted the first 70 existed.
+    ///
+    /// ⚠ It describes the TRANSCRIPT, never a particular payload, and every
+    /// capped copy of a preview therefore carries it UNCHANGED. Making a
+    /// clipped copy report `true` for its OWN clipping is the tempting move and
+    /// it is wrong twice over: it is a second meaning for one field, and the
+    /// only consumer is a control that must appear exactly when the daemon can
+    /// fetch more. It shipped that way for one build and put a "Load earlier
+    /// turns" button on a 298-block conversation that had nothing behind it.
+    pub older_available: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2411,6 +2429,17 @@ const LIVE_LOCAL_PREVIEW_ENTRY_BUDGET: usize = 400;
 pub struct SnapshotPreview {
     pub summary: Vec<SnapshotMetadataEntry>,
     pub blocks: Vec<SnapshotPreviewBlock>,
+    /// Whether the transcript holds turns older than `blocks[0]` — see
+    /// [`SessionPreview::older_available`].
+    ///
+    /// ⚠ `serde(default)` is load-bearing, not tidiness. An older daemon does
+    /// not send this field, and a mixed-version snapshot must degrade to "there
+    /// is nothing older" — the pre-paging behaviour — rather than fail to
+    /// deserialise and lose the whole session view (version-coexisting daemons,
+    /// CLAUDE.md ⚖). It is also how a NEW client reading an OLD remote host's
+    /// `preview-tail` output stays honest: it offers no page it cannot fetch.
+    #[serde(default)]
+    pub older_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2833,6 +2862,19 @@ pub struct YggtermServer {
     /// `TerminalManager::session_size` (daemon-owned); this is the persisted
     /// last-known used only at re-resume time.
     session_pty_grids: HashMap<String, (u16, u16)>,
+    /// How far back a reader has asked to see, per session path, in transcript
+    /// ENTRIES. Absent means the default one page.
+    ///
+    /// The daemon owns this rather than the client because the daemon owns the
+    /// blocks: a client that kept its own idea of how far back it had read
+    /// would own half the transcript while the reader owned the other half, and
+    /// the two would disagree the first time a refresh landed mid-page. So
+    /// reading further back GROWS this number and re-hydrates; the client only
+    /// ever receives the whole tail and keeps its scroll position.
+    ///
+    /// Deliberately NOT persisted: it is a reading position, not session
+    /// identity, and a daemon handover that reset it costs one click.
+    preview_history_budgets: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2876,6 +2918,7 @@ impl YggtermServer {
             live_session_order: Vec::new(),
             local_cc_sessions,
             session_pty_grids: HashMap::new(),
+            preview_history_budgets: HashMap::new(),
         };
 
         this
@@ -3829,6 +3872,7 @@ impl YggtermServer {
             .chain(removed_remote_sessions.into_iter())
         {
             self.sessions.remove(&path);
+            self.forget_preview_history_budget(&path);
             self.live_session_order.retain(|entry| entry != &path);
             if self.active_session_path.as_deref() == Some(path.as_str()) {
                 self.active_session_path = None;
@@ -3852,6 +3896,7 @@ impl YggtermServer {
         }
         self.promote_remote_codex_live_session_to_scanned(&resolved_key, &session, false);
         self.sessions.remove(&resolved_key);
+        self.forget_preview_history_budget(&resolved_key);
         self.live_session_order
             .retain(|existing| existing != &resolved_key);
         if self.active_session_path.as_deref() == Some(resolved_key.as_str())
@@ -8602,6 +8647,54 @@ impl YggtermServer {
     /// read is TAIL-BOUNDED because a live session's transcript grows without
     /// limit and this runs on refresh — the reader must cost what is shown, not
     /// what exists.
+    /// How many transcript entries this session's preview may hold, honouring
+    /// any reader who has asked to see further back.
+    fn preview_history_budget(&self, path: &str, default_page: usize) -> usize {
+        self.preview_history_budgets
+            .get(path)
+            .copied()
+            .unwrap_or(default_page)
+            .max(default_page)
+    }
+
+    /// Ask for one more page of history on `path`, and say whether the ask
+    /// changed anything.
+    ///
+    /// `false` means the reader is already at the beginning of the file — the
+    /// affordance should stop offering, rather than the daemon quietly
+    /// re-reading the same window on every click. It refuses on a session whose
+    /// preview already knows it holds the whole transcript, so a client that
+    /// asks anyway (a stale surface, a double click) costs nothing.
+    pub fn expand_preview_history(&mut self, path: &str) -> bool {
+        let Some(session) = self.sessions.get(path) else {
+            return false;
+        };
+        if !session.preview.older_available {
+            return false;
+        }
+        // Keyed on the PATH SCHEME, which is the same predicate
+        // `refresh_session_preview_from_source_with_remote_payload` routes on.
+        // Asking `session.source` instead would be a second way to decide which
+        // reader owns this row, and the two would eventually disagree — that is
+        // exactly how every remote Claude Code row once kept its launch
+        // scaffold forever.
+        let page = if parse_remote_agent_session_path(path).is_some() {
+            REMOTE_PREVIEW_TAIL_BLOCK_LIMIT
+        } else {
+            LIVE_LOCAL_PREVIEW_ENTRY_BUDGET
+        };
+        let next = self.preview_history_budget(path, page).saturating_add(page);
+        self.preview_history_budgets.insert(path.to_string(), next);
+        true
+    }
+
+    /// Forget a session's reading position. Called when the row goes away, so a
+    /// long-lived daemon does not accumulate budgets for sessions that no
+    /// longer exist.
+    fn forget_preview_history_budget(&mut self, path: &str) {
+        self.preview_history_budgets.remove(path);
+    }
+
     fn refresh_live_local_session_preview(
         &mut self,
         path: &str,
@@ -8615,10 +8708,12 @@ impl YggtermServer {
         };
         let started_at = session_metadata_value(existing, "Started")
             .unwrap_or_else(|| format_display_datetime(OffsetDateTime::now_utc()));
-        let entries = yggterm_core::read_agent_transcript_entries_tail_limited(
+        let tail = yggterm_core::read_agent_transcript_entries_tail_limited(
             &file,
-            LIVE_LOCAL_PREVIEW_ENTRY_BUDGET,
+            self.preview_history_budget(path, LIVE_LOCAL_PREVIEW_ENTRY_BUDGET),
         )?;
+        let older_available = tail.older_available;
+        let entries = tail.entries;
         let mut blocks = Vec::new();
         let mut metadata_entries = Vec::new();
         let mut user_messages = 0usize;
@@ -8646,6 +8741,7 @@ impl YggtermServer {
         }
         if let Some(session) = self.sessions.get_mut(path) {
             session.preview.blocks = blocks;
+            session.preview.older_available = older_available;
             // Hydration PARSED the transcript, so its count is the true one and
             // must replace the scan's estimate everywhere it is displayed.
             upsert_session_message_count(session, user_messages, assistant_messages);
@@ -8732,10 +8828,11 @@ impl YggtermServer {
             prefix: machine.prefix.clone(),
             cwd: Some(scanned.cwd.clone()),
         };
+        let row_path = remote_scanned_row_path(&scanned, &machine_key, session_id);
         let (payload, hydration) = fetch_remote_preview_tail_payload(
             &target,
             storage_path,
-            REMOTE_PREVIEW_TAIL_BLOCK_LIMIT,
+            self.preview_history_budget(&row_path, REMOTE_PREVIEW_TAIL_BLOCK_LIMIT),
         )
         .map(|payload| (payload, "tail"))
         .or_else(|tail_error| {
@@ -8752,10 +8849,7 @@ impl YggtermServer {
             format!("fetching bounded remote preview for {machine_key}/{session_id}")
         })?;
         Ok(apply_remote_preview_payload_for_path_with_hydration(
-            self,
-            &remote_scanned_row_path(&scanned, &machine_key, session_id),
-            payload,
-            hydration,
+            self, &row_path, payload, hydration,
         ))
     }
 
@@ -11966,6 +12060,7 @@ fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: Remot
                 value: entry.value,
             })
             .collect(),
+        older_available: payload.preview.older_available,
         blocks: sanitize_snapshot_preview_blocks(payload.preview.blocks)
             .into_iter()
             .map(|block| SessionPreviewBlock {
@@ -12002,6 +12097,11 @@ fn build_remote_preview_payload_from_messages(
     title_store: &SessionTitleStore,
     title_hint: Option<String>,
     entries: Vec<yggterm_core::TranscriptEntry>,
+    // `older_available`: whether the reader that produced `entries` left older
+    // ones behind. A PARAMETER rather than something derived here, because only
+    // the reader knows — a payload builder counting blocks cannot tell a short
+    // conversation from a truncated one.
+    older_available: bool,
 ) -> anyhow::Result<RemotePreviewPayload> {
     let started_at = entries
         .iter()
@@ -12058,6 +12158,7 @@ fn build_remote_preview_payload_from_messages(
                 },
             ],
             blocks: blocks.into_iter().map(snapshot_preview_block).collect(),
+            older_available,
         },
         rendered_sections: Vec::new(),
     })
@@ -12304,6 +12405,7 @@ fn remote_preview_payload_for_path(
                 .into_iter()
                 .map(snapshot_preview_block)
                 .collect(),
+            older_available: session.preview.older_available,
         },
         rendered_sections: sanitize_snapshot_rendered_sections(
             session
@@ -12354,6 +12456,10 @@ fn remote_preview_head_payload_for_path(
         title_store,
         title_hint,
         entries,
+        // The HEAD fallback already starts at the beginning of the file, so
+        // there is nothing older by construction — whatever it dropped is
+        // NEWER, and paging backwards from the first turn is meaningless.
+        false,
     )?))
 }
 
@@ -12368,7 +12474,7 @@ fn remote_preview_tail_payload_for_path(
     let title_hint = title_store
         .get_title(&session_id)?
         .filter(|value| !value.trim().is_empty() && !looks_like_generated_fallback_title(value));
-    let entries = yggterm_core::read_agent_transcript_entries_tail_limited(path, max_blocks)
+    let tail = yggterm_core::read_agent_transcript_entries_tail_limited(path, max_blocks)
         .with_context(|| format!("reading remote transcript tail {}", path.display()))?;
     Ok(Some(build_remote_preview_payload_from_messages(
         &session_id,
@@ -12376,7 +12482,8 @@ fn remote_preview_tail_payload_for_path(
         path,
         title_store,
         title_hint,
-        entries,
+        tail.entries,
+        tail.older_available,
     )?))
 }
 
@@ -23039,6 +23146,7 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
                 .into_iter()
                 .map(snapshot_preview_block)
                 .collect(),
+            older_available: session.preview.older_available,
         },
         metadata: snapshot_metadata_entries(&session.metadata),
         terminal_process_id: session.terminal_process_id,
@@ -23144,6 +23252,13 @@ fn snapshot_live_session_view(session: &ManagedSessionView) -> SnapshotSessionVi
             .into_iter()
             .map(snapshot_preview_block)
             .collect(),
+            // Carried UNCHANGED even though this copy is capped at
+            // `LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT`: the flag is about the
+            // transcript, not about this payload. How much THIS copy dropped is
+            // a different question, and it is answered by the block count next
+            // to it — not by overloading a field whose only consumer is a
+            // control that must appear exactly when more can be fetched.
+            older_available: session.preview.older_available,
         },
         metadata: snapshot_metadata_entries(&session.metadata),
         terminal_process_id: session.terminal_process_id,
@@ -23315,6 +23430,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
             })
             .collect(),
         preview: SessionPreview {
+            older_available: session.preview.older_available,
             summary: session
                 .preview
                 .summary
@@ -23493,6 +23609,9 @@ fn build_session(
         }
     }
     let preview = SessionPreview {
+        // The stored path reads the WHOLE transcript, so there is nothing
+        // older by construction.
+        older_available: false,
         summary: preview_summary,
         blocks: transcript
             .as_ref()
@@ -23873,6 +23992,8 @@ fn build_live_session(
         ],
         rendered_sections: vec![],
         preview: SessionPreview {
+            // A session being queued has no transcript yet.
+            older_available: false,
             summary: vec![
                 SessionMetadataEntry {
                     label: "UUID",
@@ -24155,6 +24276,8 @@ fn hydrate_document_session(session: &mut ManagedSessionView, document: &Workspa
         ));
     }
     session.preview = SessionPreview {
+        // A document IS its body — there is no bounded tail to page past.
+        older_available: false,
         summary: vec![
             SessionMetadataEntry {
                 label: "Document",
@@ -25113,6 +25236,7 @@ mod recipe_tests {
             terminal_lines: Vec::new(),
             rendered_sections: vec![],
             preview: SessionPreview {
+                older_available: false,
                 summary: vec![],
                 blocks: vec![],
             },
@@ -26621,6 +26745,7 @@ mod tests {
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SnapshotPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -28844,6 +28969,7 @@ mod tests {
                     lines: vec!["goal line".to_string()],
                 }],
                 preview: SessionPreview {
+                    older_available: false,
                     summary: vec![SessionMetadataEntry {
                         label: "Summary",
                         value: "summary text".to_string(),
@@ -28946,6 +29072,7 @@ mod tests {
                 lines: heavy_rendered_lines.clone(),
             }],
             preview: SessionPreview {
+                older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
                     value: "Active summary".to_string(),
@@ -28997,6 +29124,7 @@ mod tests {
                 lines: heavy_rendered_lines,
             }],
             preview: SessionPreview {
+                older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
                     value: "Inactive summary".to_string(),
@@ -29416,6 +29544,7 @@ mod tests {
             cached_precis: None,
             cached_summary: None,
             preview: SnapshotPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: vec![
                     SnapshotPreviewBlock {
@@ -29793,6 +29922,7 @@ mod tests {
                 ],
             }],
             preview: SessionPreview {
+                older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
                     value: "I want you to ssh to root@server.example.com and inspect the litellm container.".to_string(),
@@ -31675,6 +31805,7 @@ terminal_window_id: None,
             cached_precis: None,
             cached_summary: None,
             preview: SnapshotPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: vec![
                     SnapshotPreviewBlock {
@@ -31775,6 +31906,7 @@ terminal_window_id: None,
                 cached_precis: None,
                 cached_summary: None,
                 preview: SnapshotPreview {
+                    older_available: false,
                     summary: Vec::new(),
                     blocks: Vec::new(),
                 },
@@ -31823,6 +31955,7 @@ terminal_window_id: None,
                 cached_precis: None,
                 cached_summary: None,
                 preview: SnapshotPreview {
+                    older_available: false,
                     summary: Vec::new(),
                     blocks: Vec::new(),
                 },
@@ -31908,6 +32041,7 @@ terminal_window_id: None,
             cached_precis: None,
             cached_summary: None,
             preview: SnapshotPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: vec![
                     SnapshotPreviewBlock {
@@ -31988,6 +32122,7 @@ terminal_window_id: None,
             cached_precis: None,
             cached_summary: None,
             preview: SnapshotPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: vec![SnapshotPreviewBlock {
                     role: "USER".to_string(),
@@ -32374,6 +32509,7 @@ terminal_window_id: None,
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SnapshotPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: vec![
                     SnapshotPreviewBlock {
@@ -35701,6 +35837,7 @@ terminal_window_id: None,
                 terminal_lines: vec![],
                 rendered_sections: vec![],
                 preview: SessionPreview {
+                    older_available: false,
                     summary: vec![],
                     blocks: vec![],
                 },
@@ -35790,6 +35927,7 @@ terminal_window_id: None,
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: (0..48)
                     .map(|ix| {
@@ -35913,6 +36051,7 @@ terminal_window_id: None,
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -35964,6 +36103,7 @@ terminal_window_id: None,
             cached_precis: None,
             cached_summary: None,
             preview: SnapshotPreview {
+                older_available: false,
                 summary: vec![crate::SnapshotMetadataEntry {
                     label: "Messages".to_string(),
                     value: "12 user · 25 assistant".to_string(),
