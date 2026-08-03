@@ -4,6 +4,21 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.21
+
+- **The floating pill toolbar** (libyggterm v0.9.0) takes the place the scrapped
+  header left: find in the centre, a `3/17` match stepper beside it, and the
+  light/dark switch at the far right — floating over the page rather than taking
+  a permanent strip off the top of it.
+- **Find highlights without touching the DOM.** The obvious implementation wraps
+  matches in `<mark>`, which mutates a tree Dioxus is diffing against its own
+  copy — on a LIVE transcript that re-renders whenever the agent speaks, that
+  drops the marks or panics. It uses the CSS Custom Highlight API instead, which
+  paints ranges the DOM never learns about. A test names every mutating call and
+  refuses them.
+- The theme switch calls `set_ui_theme`, the same owner the settings rail and
+  the KeyTip use — the toolbar holds no state of its own.
+
 ## 3.0.20
 
 - **The blank page after "Load earlier turns" is gone, and the virtual window
