@@ -14,9 +14,12 @@ This file tracks user-visible changes in `yggterm`.
   Measured from the end rather than from the top on purpose: a live transcript
   grows while it is being read, so "how far down am I" answers differently every
   few seconds while "how far from the end" is stable.
-- **DM Sans is installed on the desktop host** (SIL Open Font License, from
-  `googlefonts/dm-fonts`), so the chat face is the one the design actually names
-  instead of falling through to Noto Sans.
+- **The chat face is Inter, not DM Sans** (libyggterm **v0.6.4**). 3.0.13 took
+  t3code's face along with their scale, but the host had no DM Sans — so the
+  face that actually rendered, and that read well, was our own Inter Variable
+  fallback. Installing DM Sans changed the surface and the user rejected it on
+  sight. The SCALE is what was worth taking and it is unchanged: 14px/1.625,
+  weight-600 headings, the tighter block rhythm.
 
 ## 3.0.14
 
