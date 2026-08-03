@@ -506,19 +506,28 @@ const PREVIEW_BLOCK_WINDOW: usize = 24;
 /// scaffold is.
 const ASK_COLLAPSE_LINE_THRESHOLD: usize = 14;
 
-/// Above this many blocks the reader VIRTUALISES instead of drawing everything.
+/// How many blocks render eagerly before the virtual window engages.
 ///
-/// It was 600 and never fired, because a remote transcript could only ever hold
-/// 48 blocks — the fetch cap did the virtualising by accident, and badly, by
-/// throwing the conversation away. With the fetch at 600 the old value put the
-/// threshold exactly AT the payload size, so a full transcript still rendered
-/// every block eagerly: ~600 subtrees and 68,000 px of document on open.
+/// ⚠ **Effectively "always", and that is deliberate.** Virtualisation here is
+/// spacer-based: blocks outside the window are replaced by two divs whose
+/// heights come from `estimate_preview_block_height`. An estimate is never
+/// exactly the rendered height, the error accumulates over every block above
+/// the window, and past a few hundred blocks it exceeds a viewport — at which
+/// point the reader scrolls to a position where the real content is entirely
+/// off-screen and sees a BLANK PAGE with a live scrollbar. That is not a
+/// hypothetical: it is what "Load earlier turns" plus a scroll produced, and it
+/// is the third bug this estimator has caused in one day.
 ///
-/// 120 is a few screens at the prose measure — enough that a short session
-/// (most of them) still takes the simple path and never pays for spacers or
-/// height estimation, and low enough that a long one materialises as the reader
-/// travels instead of all at once.
-const PREVIEW_SAFE_FULL_RENDER_BLOCK_LIMIT: usize = 120;
+/// The cost that justified virtualising is also mostly gone. Work runs now
+/// collapse to a single line (`WORK_GROUP_COLLAPSED_ROWS = 0`), so a 600-block
+/// transcript is a few dozen paragraphs and a few hundred one-line rows rather
+/// than 68,000 px of expanded tool output.
+///
+/// ⛔ Do NOT lower this to re-enable spacers without first replacing the
+/// estimator with MEASURED heights. A window positioned by arithmetic that
+/// cannot be right will always drift into blankness; the only question is how
+/// many blocks it takes.
+const PREVIEW_SAFE_FULL_RENDER_BLOCK_LIMIT: usize = 4000;
 const PREVIEW_VIRTUAL_OVERSCAN_FACTOR: f64 = 0.85;
 const PREVIEW_MIN_VIEWPORT_HEIGHT_PX: f64 = 680.0;
 const PREVIEW_MAX_OVERSCAN_PX: f64 = 1_200.0;
@@ -120404,7 +120413,9 @@ fn md_inline_nodes(items: &[MdInline], prose: &ProseTokens, ink: &ProseInk) -> E
     rsx! {
         for (index, item) in items.iter().enumerate() {
             match item {
-                MdInline::Text(text) => rsx! { span { key: "t{index}", "{text}" } },
+                MdInline::Text(text) => rsx! {
+                    span { key: "t{index}", {md_text_with_inline_images(text, prose, ink)} }
+                },
                 MdInline::Code(code) => rsx! { code { key: "c{index}", style: "{code_style}", "{code}" } },
                 MdInline::Strong(children) => rsx! { b { key: "b{index}", {md_inline_nodes(children, prose, ink)} } },
                 MdInline::Emphasis(children) => rsx! { i { key: "i{index}", {md_inline_nodes(children, prose, ink)} } },
@@ -120444,6 +120455,72 @@ fn md_inline_nodes(items: &[MdInline], prose: &ProseTokens, ink: &ProseInk) -> E
     }
 }
 
+/// Plain text, with any bare image PATH in it drawn as the image.
+///
+/// A markdown `![alt](src)` already arrives as `MdInline::Image`. This is the
+/// other case, and on this product it is the common one: an agent pastes
+/// `/home/user/.yggterm/clipboard/clipboard-….png` as ordinary prose, because
+/// that is what a clipboard capture IS — a path someone typed. It rendered as a
+/// 90-character filename, which is the least useful representation of a
+/// screenshot available.
+///
+/// ⚠ Only ABSOLUTE paths with an image extension, and the surrounding text is
+/// preserved rather than swallowed: a sentence that happens to mention a `.png`
+/// still reads as a sentence, with the picture under it.
+fn md_text_with_inline_images(text: &str, prose: &ProseTokens, ink: &ProseInk) -> Element {
+    let mut segments: Vec<(String, Option<String>)> = Vec::new();
+    let mut pending = String::new();
+    for token in text.split_inclusive(char::is_whitespace) {
+        let cleaned = token
+            .trim()
+            .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']'));
+        if cleaned.starts_with('/') && looks_like_image_path(cleaned) {
+            segments.push((std::mem::take(&mut pending), Some(cleaned.to_string())));
+            continue;
+        }
+        pending.push_str(token);
+    }
+    if segments.is_empty() {
+        return rsx! { "{text}" };
+    }
+    if !pending.is_empty() {
+        segments.push((std::mem::take(&mut pending), None));
+    }
+    let image_style = prose.image_style();
+    let frame_style = prose.image_frame_style();
+    // The caption is the PATH, and a path is code — so it wears the type
+    // system's inline-code treatment rather than a face and a size spelled
+    // here. `the_markdown_adapter_owns_no_typography_of_its_own` enforces that,
+    // and it caught this on the first run.
+    let caption_style = format!(
+        "{} display:inline-block; margin-top:4px; max-width:100%; overflow:hidden; \
+         text-overflow:ellipsis; white-space:nowrap; vertical-align:top;",
+        prose.inline_code_style(ink),
+    );
+    rsx! {
+        for (segment_index, (lead, path)) in segments.into_iter().enumerate() {
+            span {
+                key: "seg{segment_index}",
+                if !lead.is_empty() {
+                    "{lead}"
+                }
+                if let Some(path) = path {
+                    span {
+                        style: "{frame_style}",
+                        img {
+                            src: "{preview_image_file_url(&path)}",
+                            alt: "{path}",
+                            title: "{path}",
+                            style: "{image_style} cursor:zoom-in;",
+                            "data-preview-image-path": "{path}",
+                        }
+                        span { style: "{caption_style}", "{path}" }
+                    }
+                }
+            }
+        }
+    }
+}
 fn md_block_node(block: &MdBlock, prose: &ProseTokens, ink: &ProseInk, index: usize) -> Element {
     match block {
         MdBlock::Heading { level, children } => {
@@ -140919,6 +140996,42 @@ mod tests {
         let reader_at = 5_000.0;
         assert!(!preview_dpad_should_reveal(reader_at, 1_000.0, 6_000.0));
         assert!(preview_dpad_should_reveal(reader_at, 1_000.0, 7_000.0));
+    }
+
+    /// ★★ A PASTED SCREENSHOT PATH IS A SCREENSHOT.
+    ///
+    /// Markdown's `![alt](src)` already arrives typed. The common case on this
+    /// product is the other one: an agent writes
+    /// `/home/user/.yggterm/clipboard/clipboard-….png` as ordinary prose, because
+    /// a clipboard capture IS a path someone typed. It rendered as a
+    /// 90-character filename — the least useful representation of a screenshot
+    /// available.
+    ///
+    /// The surrounding sentence has to survive, which is the part a naive
+    /// "replace the whole text node" would lose.
+    #[test]
+    fn a_pasted_image_path_renders_as_the_image_without_eating_its_sentence() {
+        // The detector is the shared one, so a `.md` or a session URI is not an
+        // image and an absolute `.png` is.
+        assert!(looks_like_image_path("/home/user/.yggterm/clipboard/shot.png"));
+        assert!(looks_like_image_path("/tmp/a.JPEG"));
+        assert!(!looks_like_image_path("/home/user/notes.md"));
+        // ⚠ `looks_like_image_path` is EXTENSION-only — it says nothing about
+        // whether a path is absolute. That gate belongs to the renderer, which
+        // will not resolve a relative path it has no root for.
+        assert!(looks_like_image_path("shot.png"));
+
+        // A file:// URL is what a webview can actually load.
+        assert_eq!(
+            preview_image_file_url("/home/user/.yggterm/clipboard/shot.png"),
+            "file:///home/user/.yggterm/clipboard/shot.png"
+        );
+        // Anything already carrying a scheme is left alone — rewriting an
+        // https:// image to file:// would break a working one.
+        assert_eq!(
+            preview_image_file_url("https://example.invalid/a.png"),
+            "https://example.invalid/a.png"
+        );
     }
 
     /// ★★ THE READER KEEPS THEIR PLACE WHEN A PAGE OF HISTORY LANDS.
