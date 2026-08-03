@@ -4,6 +4,24 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.22
+
+- **Anything yggterm copies can now be pasted into other applications.** Every
+  clipboard write called arboard's `exclude_from_history()`, which on Linux adds
+  the MIME type `x-kde-passwordManagerHint: secret` — KDE's Klipper then refuses
+  to record the entry, and arboard additionally *releases clipboard ownership*
+  for data it believes sensitive, so the content is gone as soon as the write
+  returns. Every write still reported success, so the app said "Message Copied"
+  while the system clipboard kept whatever was there before.
+
+  Sensitivity is now a decision per call site. Copies are `Shareable`; exactly
+  one path is `Secret` — the vault TOTP code, where a credential sitting in
+  Klipper's history outlives its usefulness by hours — and a test enforces that
+  count.
+
+  ⚠ Linux only. The non-Linux arms never carried the marker, so Windows and
+  macOS were unaffected, and the mobile targets do not use this path.
+
 ## 3.0.21
 
 - **The floating pill toolbar** (libyggterm v0.9.0) takes the place the scrapped
