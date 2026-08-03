@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.20
+
+- **The blank page after "Load earlier turns" is gone, and the virtual window
+  with it.** Virtualisation here was spacer-based: blocks outside the window
+  became two divs sized by `estimate_preview_block_height`. An estimate is never
+  the rendered height, the error accumulates over every block above the window,
+  and past a few hundred blocks it exceeds a viewport — at which point the
+  reader scrolls to a position where the real content is entirely off-screen and
+  sees a blank page with a live scrollbar. Third bug from that estimator in a
+  day. The threshold now renders everything; the cost that justified spacers is
+  mostly gone anyway, because work runs collapse to one line.
+  ⛔ Do not re-enable spacers without replacing the estimator with MEASURED
+  heights — arithmetic that cannot be right will always drift into blankness.
+- **A pasted screenshot path renders as the screenshot.** An agent writing
+  `/home/user/.yggterm/clipboard/….png` in prose was showing a 90-character
+  filename, which is the least useful representation of a picture available.
+  Absolute image paths now draw inline with the path as a caption, and the
+  sentence around them survives.
+
 ## 3.0.19
 
 - **A long user turn gets a lid** (libyggterm v0.8.1). A Codex rollout's first
