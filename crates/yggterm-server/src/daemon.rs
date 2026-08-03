@@ -2018,6 +2018,18 @@ pub enum ServerRequest {
         path: String,
         #[serde(default)]
         full_remote_payload: bool,
+        /// Ask for one more page of history BEFORE re-hydrating.
+        ///
+        /// A flag on the existing verb rather than a verb of its own: reading
+        /// further back IS a preview refresh, only with a wider window, and two
+        /// verbs would be two paths that have to agree about hydration,
+        /// persistence and shadow access forever.
+        ///
+        /// ⚠ `serde(default)` because an older daemon has no such field and
+        /// will simply perform the ordinary refresh — the click does nothing
+        /// rather than failing the request (version-coexisting daemons).
+        #[serde(default)]
+        expand_history: bool,
     },
     UpdateSessionCopy {
         path: String,
@@ -7165,14 +7177,25 @@ impl DaemonRuntime {
             ServerRequest::RefreshPreview {
                 path,
                 full_remote_payload,
+                expand_history,
             } => {
+                // Widen the window FIRST, so the re-hydration below is the one
+                // that reads further back. Two round trips would show the
+                // reader the old window once more before the new one arrived.
+                let expanded = expand_history && self.server.expand_preview_history(&path);
                 self.server
                     .refresh_session_preview_from_source_with_remote_payload(
                         &path,
-                        full_remote_payload,
+                        // Reading further back means re-fetching the transcript,
+                        // not re-reading whatever the last scan cached.
+                        full_remote_payload || expanded,
                     )?;
                 self.persist()?;
-                self.snapshot_response(Some(format!("refreshed preview {path}")))
+                self.snapshot_response(Some(if expanded {
+                    format!("expanded preview history {path}")
+                } else {
+                    format!("refreshed preview {path}")
+                }))
             }
             ServerRequest::UpdateSessionCopy {
                 path,
@@ -10875,11 +10898,25 @@ pub fn refresh_preview(
     path: &str,
     full_remote_payload: bool,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
+    refresh_preview_with_history(endpoint, path, full_remote_payload, false)
+}
+
+/// A preview refresh that may also widen the transcript window by one page.
+///
+/// One function with a flag rather than two: a second entry point would be a
+/// second thing to keep in step with hydration, persistence and shadow access.
+pub fn refresh_preview_with_history(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    full_remote_payload: bool,
+    expand_history: bool,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::RefreshPreview {
             path: path.to_string(),
             full_remote_payload,
+            expand_history,
         },
     )?)
 }
@@ -16826,9 +16863,14 @@ mod tests {
             super::ServerRequest::RefreshPreview {
                 path,
                 full_remote_payload,
+                expand_history,
             } => {
                 assert_eq!(path, "remote-session://dev/a");
                 assert!(!full_remote_payload);
+                // A client that predates paging asks for the ordinary refresh,
+                // never for a wider window — the version-coexistence guarantee
+                // this `serde(default)` exists to keep.
+                assert!(!expand_history);
             }
             other => panic!("unexpected request {other:?}"),
         }
@@ -16836,9 +16878,11 @@ mod tests {
         let encoded = serde_json::to_value(super::ServerRequest::RefreshPreview {
             path: "remote-session://dev/a".to_string(),
             full_remote_payload: true,
+            expand_history: true,
         })
         .expect("request should encode");
         assert_eq!(encoded["full_remote_payload"], true);
+        assert_eq!(encoded["expand_history"], true);
     }
 
     #[test]
@@ -17037,6 +17081,7 @@ mod tests {
             ServerRequest::RefreshPreview {
                 path: "remote-cc://dev/abc-123".into(),
                 full_remote_payload: true,
+                expand_history: false,
             },
         ];
         for req in &allowed {
@@ -18061,6 +18106,7 @@ mod tests {
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SnapshotPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -19283,6 +19329,7 @@ mod tests {
             super::daemon_request_io_timeout_ms(&super::ServerRequest::RefreshPreview {
                 path: "remote-session://dev/session".to_string(),
                 full_remote_payload: true,
+                expand_history: false,
             }),
             super::DAEMON_LONG_REQUEST_IO_TIMEOUT_MS
         );
@@ -22239,8 +22286,8 @@ mod tests {
         // Re-stamped for 2.12.18: `ServerRequest`/`ServerResponse` gained `Wpe`
         // (one proxied verb on the Lane-A agent plane) and `WpeAgent`
         // (supervision of the agent process), the wire half of increment 3.
-        const STAMPED_AT_VERSION: &str = "2.12.18";
-        const STAMPED_SHAPE_HASH: u64 = 0xb77cb20cd04d626f;
+        const STAMPED_AT_VERSION: &str = "3.0.13";
+        const STAMPED_SHAPE_HASH: u64 = 0x3de56568f3710879;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

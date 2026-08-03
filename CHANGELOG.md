@@ -4,6 +4,34 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.13
+
+- **The transcript stops being an article** (libyggterm **v0.6.0**). The Web
+  View wore a serif at 16px with article headings — an h2 at 22.7px/780 with
+  34px of air above it — and read as shouting beside t3code's chat surface. The
+  user asked for that serif and withdrew it on seeing the two together: *"their
+  design language of the chat interface is superior and I have changed my
+  mind."* The conversation now takes t3code's measured scale: **14px/1.625 in
+  DM Sans**, both sides at one size, headings at weight 600 with 20px above,
+  blocks 10px apart, lists indented 20px. The document reader keeps the article
+  scale it was given in July — only the transcript changed.
+- **A transcript can be read past its fetch limit.** The Web View draws a
+  bounded TAIL — 600 blocks for a remote row, 400 entries for a local one —
+  and said nothing about the bound, so a 670-block conversation stranded its
+  oldest ~70 turns with nothing on screen admitting they existed. The reader
+  now reports whether it left anything behind, that answer travels with the
+  blocks to every surface that draws them, and a **Load earlier turns** control
+  appears at the top of a transcript that has more behind it.
+- **The daemon owns how far back a reader has read.** Asking for more widens
+  the daemon's own window and re-hydrates; the client receives the whole tail
+  and never stitches a page onto a list it half-owns. There is no page cursor
+  to drift out of step with what is on screen.
+- **The reader keeps their place.** A page is prepended, so the scroll anchor
+  is a distance from the BOTTOM of the document — invariant under a prepend,
+  unlike `scrollTop` or a block index, and independent of the height estimate.
+- A capped copy of a preview now admits its own clipping instead of inheriting
+  a flag that would vouch for blocks it dropped.
+
 ## 3.0.11
 
 - **One type system for every reading surface** (libyggterm **v0.5.0**,

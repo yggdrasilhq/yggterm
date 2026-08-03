@@ -303,6 +303,7 @@ impl ShellArm {
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
