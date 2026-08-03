@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.10
+
+- **A light-mode text field is WHITE** (user call). Every field mixed 5% of the
+  accent into a 72%-opaque white, which over the shell's tinted chrome reads as
+  a grey box rather than a place to type. The hairline and the focus ring
+  already carry the accent, so the fill does not have to: a field is white
+  paper, and the ring is what says it is yours. Search, settings and vault
+  fields all wear the one `data-yggui-field` skin, so this is a single value.
+
 ## 3.0.9
 
 - **The reading surface gets the terminal's four-way pad.** ↑/↓ are the edges,

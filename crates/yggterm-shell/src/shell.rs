@@ -994,11 +994,13 @@ fn text_field_css(palette: Palette) -> String {
             mix(15, "rgba(255,255,255,0.085)"),
         )
     } else {
-        (
-            mix(5, "rgba(255,255,255,0.72)"),
-            mix(9, "rgba(255,255,255,0.88)"),
-            mix(7, "#ffffff"),
-        )
+        // ⭐ LIGHT MODE FIELDS ARE WHITE (user call 2026-08-03). They used to be
+        // 5% of the accent mixed into a 72%-opaque white, which over the shell's
+        // tinted chrome reads as a grey box rather than a place to type. The
+        // hairline and the focus ring already carry the accent, so the fill does
+        // not have to — a field is white paper, and the ring is what says it is
+        // yours. Hover and focus stay white and let the ring do the talking.
+        ("#ffffff".to_string(), "#ffffff".to_string(), "#ffffff".to_string())
     };
     let (hairline, hairline_hover) = if dark {
         (
@@ -129475,6 +129477,13 @@ fn settings_section_card_style(palette: Palette) -> String {
 /// `data-yggui-field="true"`), because hover and focus are CSS states an inline
 /// style cannot express. This function is the BOX — height, padding, radius,
 /// type — and nothing else.
+/// A settings / vault field.
+///
+/// ⚠ It sets NO fill, not even `transparent`. The element wears
+/// `data-yggui-field`, so the resting fill, hairline, hover and focus ring all
+/// come from the one field stylesheet the search box uses — and ANY inline
+/// background, transparent included, out-specifies that stylesheet and kills
+/// hover and focus outright. `every_text_field_wears_one_skin_…` locks it.
 fn settings_input_style(palette: Palette) -> String {
     format!(
         "height:32px; padding:0 11px; border:none; border-radius:9px; \
