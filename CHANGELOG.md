@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.14
+
+- **ONE D-pad, and it keeps the hole in the middle** (libyggterm **v0.6.2**,
+  `yggui::dpad`). The terminal and the Web View each had their own four-way
+  control in `shell.rs`, and only the terminal's was a D-pad: a 3×3 grid on a
+  glass panel with the arrows where a thumb expects them. The reading surface's
+  was a squashed 3×2 that put "go to bottom" in the hole where the centre
+  belongs, which is why it read as four buttons in a box rather than as a pad.
+  Both surfaces now mount the same component, so the gesture learned on one
+  works on the other and looks the same doing it. The terminal keeps its own
+  wrapper, because revealing the pad from the xterm buffer position is a
+  condition only the terminal can evaluate.
+
 ## 3.0.13
 
 - **The transcript stops being an article** (libyggterm **v0.6.0**). The Web
