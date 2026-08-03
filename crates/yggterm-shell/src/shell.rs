@@ -87200,7 +87200,11 @@ fn ConversationWebView(
             // The reading column, its stylesheet and its theme variables all
             // come from the shared component — this surface no longer owns a
             // width, a gap or a font of its own.
-            style: "display:flex; flex-direction:column; min-width:0; width:100%;",
+            style: "display:flex; flex-direction:column; min-width:0; width:100%; position:relative;",
+            PreviewScrollController {
+                session_path: session.session_path.clone(),
+                palette,
+            }
             ConversationColumn {
             tokens,
             surface_id: session.session_path.clone(),
@@ -88983,6 +88987,81 @@ impl TerminalScrollControlAction {
             Self::PageUp => "←",
             Self::PageDown => "→",
             Self::Bottom => "↓",
+        }
+    }
+}
+/// The reading surface's page pad — the terminal's four-way control, for a
+/// transcript.
+///
+/// Same vocabulary as [`TerminalScrollControlAction`] deliberately: ↑/↓ are the
+/// edges and ←/→ are pages, so the gesture a reader learns in the terminal is
+/// the gesture that works here. A 596-block conversation is not navigable by
+/// wheel alone, and the keyboard route (PageUp/PageDown/Home/End) is invisible
+/// until someone tells you it exists.
+fn preview_scroll_control_script(session_path: &str, action: TerminalScrollControlAction) -> String {
+    let session_path_literal =
+        serde_json::to_string(session_path).unwrap_or_else(|_| "\"\"".to_string());
+    let (delta, edge) = match action {
+        TerminalScrollControlAction::Top => ("0", "top"),
+        TerminalScrollControlAction::Bottom => ("0", "bottom"),
+        TerminalScrollControlAction::PageUp => ("-1", "none"),
+        TerminalScrollControlAction::PageDown => ("1", "none"),
+    };
+    format!(
+        r#"(function() {{
+  const path = {session_path_literal};
+  const all = Array.from(document.querySelectorAll('[data-preview-scroll="1"]'))
+    .filter((node) => node.isConnected);
+  const mine = all.filter((node) => node.getAttribute('data-preview-session-path') === path);
+  const scroller = (mine.length ? mine : all).pop();
+  if (!scroller) return;
+  const edge = "{edge}";
+  if (edge === "top") {{ scroller.scrollTo({{ top: 0, behavior: 'smooth' }}); return; }}
+  if (edge === "bottom") {{ scroller.scrollTo({{ top: scroller.scrollHeight, behavior: 'smooth' }}); return; }}
+  // A page keeps two lines of overlap so the reader never loses their place.
+  const page = Math.max(120, scroller.clientHeight - 48);
+  scroller.scrollBy({{ top: page * ({delta}), behavior: 'smooth' }});
+}})();"#
+    )
+}
+fn trigger_preview_scroll_control(session_path: String, action: TerminalScrollControlAction) {
+    spawn(async move {
+        let _ = document::eval(&preview_scroll_control_script(&session_path, action));
+    });
+}
+#[component]
+fn PreviewScrollController(session_path: String, palette: Palette) -> Element {
+    let button = format!(
+        "display:flex; align-items:center; justify-content:center; width:24px; height:24px; \
+         border:none; border-radius:7px; background:{}; color:{}; font-size:13px; \
+         font-weight:800; line-height:1; padding:0; cursor:pointer;",
+        palette.panel_alt, palette.muted,
+    );
+    rsx! {
+        div {
+            "data-preview-scroll-pad": "1",
+            style: "position:absolute; right:14px; bottom:14px; display:grid; \
+                    grid-template-columns:repeat(3, 24px); grid-template-rows:repeat(2, 24px); \
+                    gap:3px; z-index:6; opacity:0.85;",
+            for (action, area) in [
+                (TerminalScrollControlAction::Top, "grid-column:2; grid-row:1;"),
+                (TerminalScrollControlAction::PageUp, "grid-column:1; grid-row:2;"),
+                (TerminalScrollControlAction::Bottom, "grid-column:2; grid-row:2;"),
+                (TerminalScrollControlAction::PageDown, "grid-column:3; grid-row:2;"),
+            ] {
+                button {
+                    key: "{action.js_action()}",
+                    r#type: "button",
+                    title: "{action.title()}",
+                    "data-preview-scroll-action": "{action.js_action()}",
+                    style: "{button}{area}",
+                    onclick: {
+                        let session_path = session_path.clone();
+                        move |_| trigger_preview_scroll_control(session_path.clone(), action)
+                    },
+                    "{action.glyph()}"
+                }
+            }
         }
     }
 }
