@@ -86337,6 +86337,16 @@ fn MainSurface(
     // Named per session rather than a bare bool: two surfaces can be mounted
     // and only the one that asked should read as busy.
     let preview_history_expanding_path = state.read().preview_history_expanding.clone();
+    // The pad appears once the reader is far enough from the end to want it —
+    // the transcript's answer to the same question the terminal asks in rows
+    // against its prompt. No script needed: the scroller already reports its
+    // own geometry on every scroll, so this is arithmetic on signals the
+    // surface holds rather than a second source of truth in JS.
+    let preview_dpad_visible = preview_dpad_should_reveal(
+        *preview_scroll_top.read(),
+        *preview_scroll_client_height.read(),
+        *preview_scroll_height.read(),
+    );
     use_effect(move || {
         let Some((session_path, pin_key, initial_scroll_top)) = preview_latest_pin_request.clone()
         else {
@@ -86886,6 +86896,7 @@ fn MainSurface(
                                         latest_anchor_key: preview_latest_anchor_key.clone(),
                                         preview_history_expanding: preview_history_expanding_path.as_deref()
                                             == Some(session.session_path.as_str()),
+                                        preview_dpad_visible,
                                         palette: snapshot.palette,
                                         on_toggle_block: move |ix| on_toggle_preview_block.call(ix),
                                         on_copy_block: move |text: String| {
@@ -87237,6 +87248,7 @@ fn ConversationWebView(
     pin_latest_on_mount: bool,
     latest_anchor_key: String,
     preview_history_expanding: bool,
+    preview_dpad_visible: bool,
     palette: Palette,
     on_toggle_block: EventHandler<usize>,
     on_copy_block: EventHandler<String>,
@@ -87281,6 +87293,7 @@ fn ConversationWebView(
             PreviewScrollController {
                 session_path: session.session_path.clone(),
                 palette,
+                visible: preview_dpad_visible,
             }
             ConversationColumn {
             tokens,
@@ -89122,6 +89135,33 @@ impl TerminalScrollControlAction {
 /// the gesture that works here. A 596-block conversation is not navigable by
 /// wheel alone, and the keyboard route (PageUp/PageDown/Home/End) is invisible
 /// until someone tells you it exists.
+/// Whether the reading surface's D-pad has earned its place on screen.
+///
+/// The same rule the terminal applies to its own pad, in the unit a transcript
+/// has: reveal once the reader is more than half a viewport from the end. Below
+/// that they are already looking at the newest turn and a floating control is
+/// just something covering it.
+///
+/// ⚠ Distance from the BOTTOM, not scroll position. A transcript grows while it
+/// is being read, so "how far down am I" answers a different question every few
+/// seconds, while "how far from the end" is stable — and it is the one the
+/// reader actually feels.
+fn preview_dpad_should_reveal(
+    scroll_top_px: f64,
+    viewport_height_px: f64,
+    scroll_height_px: f64,
+) -> bool {
+    // ⚠ NOT clamped to `PREVIEW_MIN_VIEWPORT_HEIGHT_PX`. That floor exists so
+    // the virtual window's arithmetic stays sane on a viewport it has not
+    // measured yet; borrowing it here would tell a genuinely short surface that
+    // it is 680px tall and leave the pad permanently hidden on it.
+    let viewport = viewport_height_px.max(1.0);
+    let distance_from_bottom = scroll_height_px - (scroll_top_px + viewport);
+    // A floor as well as a ratio: on a short viewport half of it is a few
+    // lines, and a pad that flickers on every wheel notch is worse than one
+    // that never appears.
+    distance_from_bottom > (viewport * 0.5).max(240.0)
+}
 fn preview_scroll_control_script(session_path: &str, action: TerminalScrollControlAction) -> String {
     let session_path_literal =
         serde_json::to_string(session_path).unwrap_or_else(|_| "\"\"".to_string());
@@ -89266,16 +89306,17 @@ fn PreviewHistoryControl(
     }
 }
 #[component]
-fn PreviewScrollController(session_path: String, palette: Palette) -> Element {
+fn PreviewScrollController(session_path: String, palette: Palette, visible: bool) -> Element {
     rsx! {
         style { {DPAD_CSS} }
         ScrollDpad {
             palette: DpadPalette::new(palette.text, palette.muted),
             surface_id: session_path.clone(),
-            // The reading surface keeps its pad on screen. A transcript is
-            // scrolled deliberately and at length, unlike a terminal that
-            // mostly sits at its prompt.
-            placement: DpadPlacement::BottomRight,
+            // Top-right, exactly where the terminal keeps its own. A control
+            // that moves between two surfaces of the same app is a control the
+            // hand has to look for twice.
+            placement: DpadPlacement::TopRight,
+            visible,
             on_action: move |action: DpadAction| {
                 trigger_preview_scroll_control(
                     session_path.clone(),
@@ -140661,6 +140702,39 @@ mod tests {
                  be guessed wrong"
             );
         }
+    }
+
+    /// ★★ THE D-PAD IS A REVEAL, AND IT MEASURES FROM THE END.
+    ///
+    /// The terminal reveals its pad once the viewport is far enough from the
+    /// prompt; the transcript asks the same question in pixels. Distance from
+    /// the BOTTOM, never scroll position — a live transcript grows while it is
+    /// being read, so "how far down am I" answers differently every few seconds
+    /// while "how far from the end" is stable, and it is the one the reader
+    /// feels.
+    #[test]
+    fn the_reading_pad_reveals_on_distance_from_the_end() {
+        // Sitting at the bottom of a long document: nothing to offer.
+        assert!(!preview_dpad_should_reveal(9_000.0, 1_000.0, 10_000.0));
+        // Half a viewport up is still not enough — the floor is 240px and half
+        // a 1000px viewport is 500.
+        assert!(!preview_dpad_should_reveal(8_600.0, 1_000.0, 10_000.0));
+        // A long way up: the pad earns its place.
+        assert!(preview_dpad_should_reveal(2_000.0, 1_000.0, 10_000.0));
+
+        // A document shorter than its viewport can never reveal it.
+        assert!(!preview_dpad_should_reveal(0.0, 1_000.0, 400.0));
+
+        // The floor bites on a short viewport, where half of it is a few lines
+        // and a ratio alone would flicker the pad on every wheel notch.
+        assert!(!preview_dpad_should_reveal(0.0, 200.0, 400.0));
+        assert!(preview_dpad_should_reveal(0.0, 200.0, 600.0));
+
+        // Growing the document while the reader stays put reveals it — that is
+        // the live-transcript case, and it is why the measure is from the end.
+        let reader_at = 5_000.0;
+        assert!(!preview_dpad_should_reveal(reader_at, 1_000.0, 6_000.0));
+        assert!(preview_dpad_should_reveal(reader_at, 1_000.0, 7_000.0));
     }
 
     /// ★★ THE READER KEEPS THEIR PLACE WHEN A PAGE OF HISTORY LANDS.

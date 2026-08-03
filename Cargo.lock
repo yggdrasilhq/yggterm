@@ -1447,8 +1447,8 @@ dependencies = [
 
 [[package]]
 name = "emd-renderer"
-version = "0.6.2"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.6.2#c19a20685bef1c777168ef03627b6de5b63652c1"
+version = "0.6.3"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.6.3#ab4d64de61abe6fb2f4990088b2dca44c77ac149"
 dependencies = [
  "pulldown-cmark",
 ]
@@ -6876,7 +6876,7 @@ checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
 
 [[package]]
 name = "yggterm"
-version = "3.0.14"
+version = "3.0.15"
 dependencies = [
  "anyhow",
  "ctrlc",
@@ -6898,7 +6898,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-core"
-version = "3.0.14"
+version = "3.0.15"
 dependencies = [
  "anyhow",
  "dirs",
@@ -6920,7 +6920,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-ghostty-bridge"
-version = "3.0.14"
+version = "3.0.15"
 dependencies = [
  "anyhow",
  "thiserror 2.0.18",
@@ -6929,11 +6929,11 @@ dependencies = [
 
 [[package]]
 name = "yggterm-gtk-glue"
-version = "3.0.14"
+version = "3.0.15"
 
 [[package]]
 name = "yggterm-platform"
-version = "3.0.14"
+version = "3.0.15"
 dependencies = [
  "anyhow",
  "objc2",
@@ -6947,7 +6947,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-server"
-version = "3.0.14"
+version = "3.0.15"
 dependencies = [
  "anyhow",
  "base64",
@@ -6972,7 +6972,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-shell"
-version = "3.0.14"
+version = "3.0.15"
 dependencies = [
  "anyhow",
  "arboard",
@@ -7021,7 +7021,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-webprobe"
-version = "3.0.14"
+version = "3.0.15"
 dependencies = [
  "gtk",
  "serde_json",
@@ -7032,8 +7032,8 @@ dependencies = [
 
 [[package]]
 name = "yggui"
-version = "0.6.2"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.6.2#c19a20685bef1c777168ef03627b6de5b63652c1"
+version = "0.6.3"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.6.3#ab4d64de61abe6fb2f4990088b2dca44c77ac149"
 dependencies = [
  "anyhow",
  "dioxus",
@@ -7046,8 +7046,8 @@ dependencies = [
 
 [[package]]
 name = "yggui-contract"
-version = "0.6.2"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.6.2#c19a20685bef1c777168ef03627b6de5b63652c1"
+version = "0.6.3"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.6.3#ab4d64de61abe6fb2f4990088b2dca44c77ac149"
 dependencies = [
  "serde",
 ]
