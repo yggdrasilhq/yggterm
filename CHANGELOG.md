@@ -4,6 +4,28 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.16
+
+- **The Expand All / Collapse All / graph-view bar is GONE** (user directive).
+  The timeline view supersedes the graph, and the bar was also what pushed every
+  floating control out of the true top-right corner.
+- **The D-pad holds the top-right corner and stops scrolling away.** It was
+  anchored inside the scrolled column, so it drifted off-screen the moment the
+  reader moved — a scroll control doing the one thing a scroll control must not.
+  It now hangs off the SURFACE, beside the scrollbar, on every scrolling view.
+- **Its reveal is driven by the live scroller**, the way the terminal's already
+  is. A render-time computation could only read what the last scroll event left
+  behind, which on a freshly opened transcript is nothing, and after a
+  virtual-window re-estimate is a height the DOM never had.
+- **The half-blank page is fixed.** The block-height estimator was written for a
+  16px serif body; 3.0.13 moved the transcript to 14px and the estimator did
+  not, so the virtual window believed it had filled the screen after a few turns
+  and left the bottom half empty. Retuned to the chat scale, and the window now
+  renders a guaranteed floor of blocks so a future drift costs extra rows rather
+  than half a screen.
+- Body copy gets **hinting and a hair more weight** (libyggterm v0.7.0); the
+  pad's glass goes **90% transparent**.
+
 ## 3.0.15
 
 - **The reading surface's D-pad moves to the top right and becomes a reveal**,
