@@ -722,14 +722,35 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
             Some("no active session selected".to_string()),
         )
     } else if active_view_mode == "Rendered" {
-        let preview_scroll_count = dom
-            .get("preview_scroll_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        // ⚠ ABSENT IS NOT ZERO, and this branch is the reason that matters.
+        //
+        // Every field below comes from a DOM snapshot, which is an eval against
+        // a live webview and can simply not answer — it times out, and the
+        // payload comes back carrying an `error` and none of these keys.
+        // `unwrap_or(0)` then turned a FAILED MEASUREMENT into a confident
+        // claim about the page: `app open --view preview` reported "preview
+        // surface not mounted" for a surface that was mounted and painting,
+        // and the diagnosis that followed went looking for a stamp the DOM had
+        // never stopped publishing. A gate may say it could not see; it may not
+        // invent what it saw.
+        let measured_preview_scroll_count = dom.get("preview_scroll_count").and_then(Value::as_u64);
+        let preview_scroll_count = measured_preview_scroll_count.unwrap_or(0);
         let preview_has_content = preview_scroll_count > 0
             && ((preview_visible_block_count > 0 || !preview_rendered_sections.is_empty())
                 || (!preview_text_sample.is_empty() && !preview_placeholder));
-        if preview_loading && !preview_has_content {
+        if measured_preview_scroll_count.is_none() {
+            let detail = dom
+                .get("error")
+                .and_then(Value::as_str)
+                .map(|error| format!(" ({error})"))
+                .unwrap_or_default();
+            (
+                false,
+                false,
+                None::<String>,
+                Some(format!("preview readiness unmeasured{detail}")),
+            )
+        } else if preview_loading && !preview_has_content {
             (
                 false,
                 false,
@@ -7847,6 +7868,50 @@ Weekly limit:                21% left
                 .get("active_terminal_identity_problem")
                 .and_then(Value::as_str),
             viewport.get("reason").and_then(Value::as_str)
+        );
+    }
+
+    /// ★★ A GATE MAY SAY IT COULD NOT SEE; IT MAY NOT INVENT WHAT IT SAW.
+    ///
+    /// The DOM snapshot is an eval against a live webview and it can time out,
+    /// in which case the payload has an `error` and none of the preview keys.
+    /// Read through `unwrap_or(0)` that looked exactly like a measured zero, so
+    /// `app open --view preview` answered "preview surface not mounted" about a
+    /// surface that was mounted and painting — and the investigation that
+    /// followed concluded the DOM had stopped publishing a stamp it publishes
+    /// to this day.
+    #[test]
+    fn describe_viewport_snapshot_never_reports_an_unmeasured_preview_as_unmounted() {
+        let snapshot = json!({
+            "active_session_path": "remote-cc://dev/a033a728",
+            "active_session_source": "LiveSsh",
+            "active_view_mode": "Rendered",
+            "shell": {
+                "terminal_attach_in_flight": [],
+                "notifications": []
+            },
+            "active_surface_requests": []
+        });
+        // What a timed-out capture actually returns: an error and nothing else.
+        let dom = json!({ "error": "dom_debug_snapshot_timeout" });
+
+        let viewport = describe_viewport_snapshot(&snapshot, &dom);
+        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(false));
+        let reason = viewport
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            reason.starts_with("preview readiness unmeasured"),
+            "an unanswered DOM snapshot must report itself, not the page: {reason}"
+        );
+        assert!(
+            reason.contains("dom_debug_snapshot_timeout"),
+            "and it must carry WHY it could not see: {reason}"
+        );
+        assert!(
+            !reason.contains("not mounted"),
+            "the one claim it must never make about a page it did not read: {reason}"
         );
     }
 
