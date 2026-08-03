@@ -239,6 +239,8 @@ use yggui::conversation::{
 // document IS; `yggui::prose` says how it reads, and this host supplies only
 // its brand colours.
 use yggui::prose::{ProseInk, ProseTokens};
+// ONE four-way scroll control, shared by the terminal and the reading surface.
+use yggui::dpad::{DPAD_CSS, DpadAction, DpadPalette, DpadPlacement, ScrollDpad};
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
     HoveredChromeControl as HoveredControl, MOTION_EMPHASIZED_DECELERATE, MOTION_ENTER_DURATION_MS,
@@ -89071,6 +89073,20 @@ enum TerminalScrollControlAction {
     Bottom,
 }
 impl TerminalScrollControlAction {
+    /// The shared D-pad's vocabulary, in this shell's terms.
+    ///
+    /// One conversion in one place: the pad reports a gesture, and what that
+    /// gesture MEANS is the host's — "bottom" is the prompt on a terminal and
+    /// the newest turn on a transcript.
+    fn from_dpad(action: DpadAction) -> Self {
+        match action {
+            DpadAction::Top => Self::Top,
+            DpadAction::PageUp => Self::PageUp,
+            DpadAction::PageDown => Self::PageDown,
+            DpadAction::Bottom => Self::Bottom,
+        }
+    }
+
     fn js_action(self) -> &'static str {
         match self {
             Self::Top => "top",
@@ -89251,37 +89267,21 @@ fn PreviewHistoryControl(
 }
 #[component]
 fn PreviewScrollController(session_path: String, palette: Palette) -> Element {
-    let button = format!(
-        "display:flex; align-items:center; justify-content:center; width:24px; height:24px; \
-         border:none; border-radius:7px; background:{}; color:{}; font-size:13px; \
-         font-weight:800; line-height:1; padding:0; cursor:pointer;",
-        palette.panel_alt, palette.muted,
-    );
     rsx! {
-        div {
-            "data-preview-scroll-pad": "1",
-            style: "position:absolute; right:14px; bottom:14px; display:grid; \
-                    grid-template-columns:repeat(3, 24px); grid-template-rows:repeat(2, 24px); \
-                    gap:3px; z-index:6; opacity:0.85;",
-            for (action, area) in [
-                (TerminalScrollControlAction::Top, "grid-column:2; grid-row:1;"),
-                (TerminalScrollControlAction::PageUp, "grid-column:1; grid-row:2;"),
-                (TerminalScrollControlAction::Bottom, "grid-column:2; grid-row:2;"),
-                (TerminalScrollControlAction::PageDown, "grid-column:3; grid-row:2;"),
-            ] {
-                button {
-                    key: "{action.js_action()}",
-                    r#type: "button",
-                    title: "{action.title()}",
-                    "data-preview-scroll-action": "{action.js_action()}",
-                    style: "{button}{area}",
-                    onclick: {
-                        let session_path = session_path.clone();
-                        move |_| trigger_preview_scroll_control(session_path.clone(), action)
-                    },
-                    "{action.glyph()}"
-                }
-            }
+        style { {DPAD_CSS} }
+        ScrollDpad {
+            palette: DpadPalette::new(palette.text, palette.muted),
+            surface_id: session_path.clone(),
+            // The reading surface keeps its pad on screen. A transcript is
+            // scrolled deliberately and at length, unlike a terminal that
+            // mostly sits at its prompt.
+            placement: DpadPlacement::BottomRight,
+            on_action: move |action: DpadAction| {
+                trigger_preview_scroll_control(
+                    session_path.clone(),
+                    TerminalScrollControlAction::from_dpad(action),
+                )
+            },
         }
     }
 }
@@ -89293,90 +89293,29 @@ fn trigger_terminal_scroll_control(session_path: String, action: TerminalScrollC
 }
 #[component]
 fn TerminalScrollController(session_path: String, host_id: String, palette: Palette) -> Element {
-    let button_style = format!(
-        "display:flex; align-items:center; justify-content:center; width:26px; height:26px; \
-         border:none; border-radius:7px; background:rgba(255,255,255,0.16); color:{}; \
-         font-size:15px; font-weight:800; line-height:1; padding:0; \
-         box-shadow:inset 0 0 0 1px rgba(255,255,255,0.20);",
-        palette.text
-    );
-    let center_style = format!(
-        "display:flex; align-items:center; justify-content:center; width:26px; height:26px; \
-         border-radius:7px; color:{}; font-size:13px; font-weight:800; opacity:0.7;",
-        palette.muted
-    );
-    let top_session_path = session_path.clone();
-    let page_up_session_path = session_path.clone();
-    let page_down_session_path = session_path.clone();
-    let bottom_session_path = session_path;
     rsx! {
+        style { {DPAD_CSS} }
+        // The WRAPPER stays yggterm's: `syncTerminalScrollController` looks it
+        // up by this id and drives `opacity` / `pointer-events` from the xterm
+        // buffer position, which is a condition only the terminal can evaluate.
+        // The pad inside it is the shared one — same geometry, same material,
+        // same gesture as the reading surface's.
         div {
             id: "yggterm-scroll-controller-{host_id}",
             "data-yggterm-scroll-controller": "1",
             "data-yggterm-scroll-controller-visible": "false",
-            style: "position:absolute; top:12px; right:12px; z-index:8; display:grid; grid-template-columns:26px 26px 26px; grid-template-rows:26px 26px 26px; gap:4px; \
-                    padding:6px; border-radius:8px; background:rgba(22,27,34,0.58); backdrop-filter:blur(12px) saturate(130%); \
-                    box-shadow:inset 0 0 0 1px rgba(255,255,255,0.10), 0 12px 28px rgba(0,0,0,0.22); \
+            style: "position:absolute; top:12px; right:12px; z-index:8; \
                     opacity:0; pointer-events:none; transition:opacity 120ms ease;",
-            onmousedown: |evt| {
-                evt.prevent_default();
-                evt.stop_propagation();
-            },
-            onclick: |evt| {
-                evt.prevent_default();
-                evt.stop_propagation();
-            },
-            button {
-                r#type: "button",
-                title: "{TerminalScrollControlAction::Top.title()}",
-                "data-yggterm-scroll-control-action": "top",
-                style: format!("{button_style} grid-column:2; grid-row:1;"),
-                onclick: move |evt| {
-                    evt.prevent_default();
-                    evt.stop_propagation();
-                    trigger_terminal_scroll_control(top_session_path.clone(), TerminalScrollControlAction::Top);
+            ScrollDpad {
+                palette: DpadPalette::new(palette.text, palette.muted),
+                surface_id: session_path.clone(),
+                placement: DpadPlacement::Inline,
+                on_action: move |action: DpadAction| {
+                    trigger_terminal_scroll_control(
+                        session_path.clone(),
+                        TerminalScrollControlAction::from_dpad(action),
+                    )
                 },
-                "{TerminalScrollControlAction::Top.glyph()}"
-            }
-            button {
-                r#type: "button",
-                title: "{TerminalScrollControlAction::PageUp.title()}",
-                "data-yggterm-scroll-control-action": "page-up",
-                style: format!("{button_style} grid-column:1; grid-row:2;"),
-                onclick: move |evt| {
-                    evt.prevent_default();
-                    evt.stop_propagation();
-                    trigger_terminal_scroll_control(page_up_session_path.clone(), TerminalScrollControlAction::PageUp);
-                },
-                "{TerminalScrollControlAction::PageUp.glyph()}"
-            }
-            div {
-                style: format!("{center_style} grid-column:2; grid-row:2;"),
-                "+"
-            }
-            button {
-                r#type: "button",
-                title: "{TerminalScrollControlAction::PageDown.title()}",
-                "data-yggterm-scroll-control-action": "page-down",
-                style: format!("{button_style} grid-column:3; grid-row:2;"),
-                onclick: move |evt| {
-                    evt.prevent_default();
-                    evt.stop_propagation();
-                    trigger_terminal_scroll_control(page_down_session_path.clone(), TerminalScrollControlAction::PageDown);
-                },
-                "{TerminalScrollControlAction::PageDown.glyph()}"
-            }
-            button {
-                r#type: "button",
-                title: "{TerminalScrollControlAction::Bottom.title()}",
-                "data-yggterm-scroll-control-action": "bottom",
-                style: format!("{button_style} grid-column:2; grid-row:3;"),
-                onclick: move |evt| {
-                    evt.prevent_default();
-                    evt.stop_propagation();
-                    trigger_terminal_scroll_control(bottom_session_path.clone(), TerminalScrollControlAction::Bottom);
-                },
-                "{TerminalScrollControlAction::Bottom.glyph()}"
             }
         }
     }
@@ -140833,12 +140772,25 @@ mod tests {
         assert!(document.contains("line-height:1.7"), "{document}");
         assert!(document.contains("font-size:16px"), "{document}");
 
-        // The rhythm below body copy is the same on both — a heading is a
-        // heading, whichever surface it lands on.
+        // And a transcript's headings are QUIETER than a document's. They were
+        // the same until 2026-08-03, when the user put the two surfaces beside
+        // t3code's: an article's h2 inside a turn — 22.7px at weight 780 with
+        // 34px of air above — reads as shouting, because the turn is already
+        // the boundary the heading was trying to be.
         let ink = DocTheme::from_palette(&palette(UiTheme::ZedLight)).prose_ink();
-        assert_eq!(
+        assert_ne!(
             ProseTokens::conversation().heading_style(2, &ink),
             ProseTokens::document().heading_style(2, &ink),
+        );
+        assert!(
+            ProseTokens::conversation().headings[1].weight
+                < ProseTokens::document().headings[1].weight
+        );
+        // What IS shared is the treatment: one mono face, one code em, one
+        // table rule, wherever markdown lands.
+        assert_eq!(
+            ProseTokens::conversation().inline_code_style(&ink),
+            ProseTokens::document().inline_code_style(&ink),
         );
     }
 
