@@ -15509,9 +15509,29 @@ struct NativeClipboardOwner {
     kind: NativeClipboardOwnerKind,
     updated_at_ms: u64,
 }
+/// Whether a clipboard write may be RECORDED by the desktop's clipboard
+/// manager — and, on Linux, whether the app keeps serving it at all.
+///
+/// ⚠ This is not a nicety. `arboard`'s `exclude_from_history()` adds the MIME
+/// type `x-kde-passwordManagerHint: secret`, which tells KDE's Klipper not to
+/// record the entry, and arboard also RELEASES clipboard ownership for data it
+/// believes is sensitive — so the content is gone as soon as the write returns.
+/// Applied to ordinary copies it means nothing yggterm copies can be pasted
+/// anywhere, while every write still reports success.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClipboardSensitivity {
+    /// A message, a URL, a terminal selection, a screenshot. The point of
+    /// copying it is to paste it into another application.
+    Shareable,
+    /// A credential — a TOTP code, a vault fill. Worth losing pasteability for,
+    /// because a password sitting in Klipper's history outlives its usefulness
+    /// by hours.
+    Secret,
+}
 #[derive(Clone, Debug)]
 struct TerminalClipboardOwnerRequest {
     text: String,
+    sensitivity: ClipboardSensitivity,
     trace_home: PathBuf,
     session_path: String,
     action: String,
@@ -46432,14 +46452,14 @@ fn terminal_clipboard_owner_loop(
                 .ok_or_else(|| anyhow!("native clipboard owner is unavailable"))?;
             #[cfg(target_os = "linux")]
             {
-                clipboard
-                    .set()
-                    .clipboard(LinuxClipboardKind::Clipboard)
-                    .exclude_from_history()
-                    .text(request.text.as_str())
-                    .map_err(|error| {
-                        anyhow!("failed to seed terminal selection clipboard text: {error}")
-                    })?;
+                let set = clipboard.set().clipboard(LinuxClipboardKind::Clipboard);
+                let set = match request.sensitivity {
+                    ClipboardSensitivity::Shareable => set,
+                    ClipboardSensitivity::Secret => set.exclude_from_history(),
+                };
+                set.text(request.text.as_str()).map_err(|error| {
+                    anyhow!("failed to seed terminal selection clipboard text: {error}")
+                })?;
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -46478,6 +46498,21 @@ fn copy_terminal_selection_to_clipboard(
     text: String,
     trace_home: PathBuf,
 ) -> Result<&'static str> {
+    copy_terminal_text_to_clipboard(
+        session_path,
+        action,
+        text,
+        trace_home,
+        ClipboardSensitivity::Shareable,
+    )
+}
+fn copy_terminal_text_to_clipboard(
+    session_path: &str,
+    action: &str,
+    text: String,
+    trace_home: PathBuf,
+    sensitivity: ClipboardSensitivity,
+) -> Result<&'static str> {
     if text.is_empty() {
         return Err(anyhow!(
             "Select terminal text before using the clipboard shortcut."
@@ -46494,6 +46529,7 @@ fn copy_terminal_selection_to_clipboard(
     sender
         .send(TerminalClipboardOwnerRequest {
             text,
+            sensitivity,
             trace_home: trace_home.clone(),
             session_path: session_path.to_string(),
             action: action.to_string(),
@@ -46632,6 +46668,31 @@ fn finish_terminal_image_paste_claim(
     }
 }
 
+/// Put something on the SYSTEM clipboard, so it can be pasted into any other
+/// application.
+///
+/// ⛔ **Do not add `exclude_from_history()` here.** All four callers are
+/// [`ClipboardSensitivity::Shareable`] — a copied message, a tab address twice,
+/// and the agent verb — and every one of them used to carry that call. It is
+/// why nothing yggterm copied could be pasted anywhere else.
+///
+/// On Linux it adds `x-kde-passwordManagerHint: secret`, which tells KDE's
+/// Klipper not to record the entry, and arboard also releases clipboard
+/// ownership for data it believes is sensitive — so the content is gone as soon
+/// as the write returns. The write reports success either way, which is why
+/// this survived: the app said "Message Copied", the notification appeared, and
+/// the system clipboard still held whatever was there before.
+///
+/// Measured on guihost 2026-08-04: `server app clipboard text --value <probe>`
+/// answered `{"kind":"text","error":null}` while Klipper still reported the
+/// previous entry (`▨ 1920x1200`, an old screenshot).
+///
+/// A credential opts in at its own call site — see the TOTP path, which is the
+/// only genuine one.
+///
+/// ⚠ Linux only. The `#[cfg(not(target_os = "linux"))]` arms never carried the
+/// marker, so Windows and macOS were never affected, and the mobile targets do
+/// not use this path.
 fn set_native_clipboard_contents(
     state: Signal<ShellState>,
     contents: &YgguiClipboardContents,
@@ -46644,7 +46705,6 @@ fn set_native_clipboard_contents(
                     clipboard
                         .set()
                         .clipboard(LinuxClipboardKind::Clipboard)
-                        .exclude_from_history()
                         .text(text.as_str())
                         .map_err(|error| {
                             anyhow!("failed to seed native clipboard text: {error}")
@@ -46680,7 +46740,6 @@ fn set_native_clipboard_contents(
                         clipboard
                             .set()
                             .clipboard(LinuxClipboardKind::Clipboard)
-                            .exclude_from_history()
                             .image(image)
                             .map_err(|error| {
                                 anyhow!("failed to seed native clipboard image: {error}")
@@ -69735,9 +69794,19 @@ async fn web_surface_totp_for(
         }
     };
     // Clipboard as the escape hatch (some 2FA screens defeat scripted fills).
-    // exclude_from_history keeps clipboard managers from archiving the code.
+    // The ONE genuinely secret copy in the shell: a TOTP code in Klipper's
+    // history outlives its usefulness by hours, so this one accepts the cost
+    // that `Secret` carries — the desktop will not record it, and on Linux the
+    // app stops serving it almost immediately.
     let clipboard = if let Ok(home) = yggterm_core::resolve_yggterm_home() {
-        copy_terminal_selection_to_clipboard(&session, "vault_totp", code.clone(), home).is_ok()
+        copy_terminal_text_to_clipboard(
+            &session,
+            "vault_totp",
+            code.clone(),
+            home,
+            ClipboardSensitivity::Secret,
+        )
+        .is_ok()
     } else {
         false
     };
@@ -141170,6 +141239,57 @@ mod tests {
         let reader_at = 5_000.0;
         assert!(!preview_dpad_should_reveal(reader_at, 1_000.0, 6_000.0));
         assert!(preview_dpad_should_reveal(reader_at, 1_000.0, 7_000.0));
+    }
+
+    /// ★★★ A COPY THE SYSTEM CANNOT KEEP IS NOT A COPY.
+    ///
+    /// Every clipboard write in this shell called `exclude_from_history()`,
+    /// which on Linux adds `x-kde-passwordManagerHint: secret`. KDE's Klipper
+    /// then refuses to record the entry, and arboard additionally releases
+    /// clipboard ownership for data it believes sensitive — so the content is
+    /// gone as soon as the write returns, while the write REPORTS SUCCESS.
+    /// Nothing yggterm copied could be pasted into anything, for a year, and
+    /// the surface said "Message Copied" every time.
+    ///
+    /// So sensitivity is a decision per call site, and the default is the one
+    /// that makes copying mean something. This lock names the shape rather than
+    /// the call: exactly one path may be `Secret`, and it is the TOTP code.
+    #[test]
+    fn only_a_credential_may_be_excluded_from_the_clipboard() {
+        let source = include_str!("shell.rs");
+        let implementation = source.split("\nmod tests {").next().unwrap_or(source);
+        // CODE only. The rule is written out at length in two doc comments, and
+        // counting those as call sites would make the lock unmaintainable.
+        let code: String = implementation
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The escape hatch exists exactly once, and it is gated on the enum
+        // rather than applied unconditionally.
+        assert_eq!(
+            code.matches("exclude_from_history()").count(),
+            1,
+            "an unconditional exclusion makes copies unpastable everywhere"
+        );
+        assert!(
+            code.contains("ClipboardSensitivity::Secret => set.exclude_from_history()"),
+            "the exclusion must hang off the sensitivity, not off the call site"
+        );
+
+        // And only the credential path asks for it.
+        let secret_callers = code.matches("ClipboardSensitivity::Secret").count();
+        assert_eq!(
+            secret_callers, 2,
+            "expected the enum arm and ONE caller (the TOTP code); a second \
+             secret caller is either a new credential path that must be \
+             reviewed, or an ordinary copy that will silently stop working"
+        );
+        assert!(code.contains("\"vault_totp\""));
     }
 
     /// ★★★ FIND MUST NOT TOUCH THE DOM DIOXUS OWNS.
