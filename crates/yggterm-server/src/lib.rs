@@ -23061,7 +23061,14 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
 const LIVE_SNAPSHOT_TERMINAL_LINE_LIMIT: usize = 48;
 const LIVE_SNAPSHOT_RENDERED_SECTION_LIMIT: usize = 2;
 const LIVE_SNAPSHOT_RENDERED_SECTION_LINE_LIMIT: usize = 10;
-const LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT: usize = 2;
+/// How many preview blocks the SIDEBAR list carries per session.
+///
+/// `pub` because the shell has to recognise this exact count as the fingerprint
+/// of a capped payload: a preview that claims `Preview Hydration = tail` while
+/// holding no more than this many blocks did not arrive through hydration, it
+/// arrived through the cheap list. Spelling `2` at the other end instead would
+/// be a second copy of the one number that defines the cap.
+pub const LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT: usize = 2;
 const LIVE_SNAPSHOT_PREVIEW_BLOCK_LINE_LIMIT: usize = 6;
 
 fn snapshot_live_session_view(session: &ManagedSessionView) -> SnapshotSessionView {

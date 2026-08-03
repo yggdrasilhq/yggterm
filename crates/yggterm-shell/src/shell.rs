@@ -492,7 +492,19 @@ const TERMINAL_INLINE_STATUS_ANIMATION_SUSTAINED_AFTER_MS: u64 = 4_000;
 const TERMINAL_INLINE_STATUS_ANIMATION_LONG_AFTER_MS: u64 = 15_000;
 const TERMINAL_FORWARD_PROTOCOL_TRACE_THROTTLE_MS: u64 = 2_000;
 const PREVIEW_BLOCK_WINDOW: usize = 24;
-const PREVIEW_SAFE_FULL_RENDER_BLOCK_LIMIT: usize = 600;
+/// Above this many blocks the reader VIRTUALISES instead of drawing everything.
+///
+/// It was 600 and never fired, because a remote transcript could only ever hold
+/// 48 blocks — the fetch cap did the virtualising by accident, and badly, by
+/// throwing the conversation away. With the fetch at 600 the old value put the
+/// threshold exactly AT the payload size, so a full transcript still rendered
+/// every block eagerly: ~600 subtrees and 68,000 px of document on open.
+///
+/// 120 is a few screens at the prose measure — enough that a short session
+/// (most of them) still takes the simple path and never pays for spacers or
+/// height estimation, and low enough that a long one materialises as the reader
+/// travels instead of all at once.
+const PREVIEW_SAFE_FULL_RENDER_BLOCK_LIMIT: usize = 120;
 const PREVIEW_VIRTUAL_OVERSCAN_FACTOR: f64 = 0.85;
 const PREVIEW_MIN_VIEWPORT_HEIGHT_PX: f64 = 680.0;
 const PREVIEW_MAX_OVERSCAN_PX: f64 = 1_200.0;
@@ -40206,9 +40218,28 @@ fn restore_browser_tree_preserving_sidebar_view(
     shell.record_restore_issue_telemetry("restore_browser_tree_preserving_sidebar_view");
     shell.sync_browser_settings();
 }
+/// True when a remote row's preview is not the conversation it claims to be.
+///
+/// ⚠ THE LAST CLAUSE IS THE ONE THAT KEEPS BEING NEEDED. `Preview Hydration`
+/// is METADATA, and metadata is not clipped by any of the payloads that clip
+/// CONTENT — the sidebar list, a peer daemon's snapshot during a handover. So a
+/// row can arrive holding exactly `LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT` blocks
+/// while carrying a marker that says its whole tail was fetched, and every gate
+/// downstream believes the marker. Live on guihost 2026-08-03: a 670-block
+/// transcript sat at `hydration: 'tail', blocks: 2` and could never refresh,
+/// because "already hydrated" is exactly what it claimed to be.
+///
+/// A claim of `tail`/`full` that holds no more than the cheap list's cap is
+/// therefore treated as undelivered. Re-fetching is idempotent, and the
+/// refresh marker dedupes it to one attempt per state change.
 fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
+    let hydration = metadata_value(session, "Preview Hydration");
+    let claims_hydrated = matches!(hydration.as_str(), "tail" | "full");
+    let holds_no_more_than_the_cap =
+        session.preview.blocks.len() <= yggterm_server::LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT;
     session_preview_syncs_from_remote(&session.session_path)
-        && (session.preview.blocks.is_empty()
+        && ((claims_hydrated && holds_no_more_than_the_cap)
+            || session.preview.blocks.is_empty()
             || metadata_value(session, "Preview Hydration") == "head"
             || metadata_value(session, "Preview Hydration") == "loading"
             || session.preview.blocks.iter().any(|block| {
@@ -43357,12 +43388,23 @@ fn preview_latest_pin_request(session: &ManagedSessionView) -> (String, String) 
             )
         })
         .unwrap_or_default();
+    // ⚠ THE KEY IS THE SESSION AND ITS HYDRATION STATE — NOT ITS CONTENT.
+    //
+    // It used to include the block count and the last block's signature, which
+    // makes the key change every time the transcript GROWS. On a live session
+    // that is continuously, so the pin re-armed forever and the reader could
+    // never scroll up: measured on this very session at
+    // `pinPending: true, window 572 -> 596`, with the window welded to the tail.
+    //
+    // Keyed on hydration instead, it fires exactly when it should — once when
+    // the transcript arrives (scaffold -> `tail` is a key change) — and then
+    // hands the viewport back. Following new output live is the TERMINAL view's
+    // job; the Web View is for reading.
+    let _ = &last_signature;
     let pin_key = format!(
-        "{}:{}:{}:{}",
+        "{}:{}",
         session.session_path,
         metadata_value(session, "Preview Hydration"),
-        visible.len(),
-        last_signature
     );
     (session.session_path.clone(), pin_key)
 }
@@ -86208,7 +86250,24 @@ fn MainSurface(
         .as_ref()
         .map(|(_, pin_key, _)| pin_key.clone())
         .unwrap_or_default();
-    let preview_pin_latest_on_mount = preview_latest_pin_request.is_some();
+    // ⚠ THE PIN IS AN EVENT, NOT A STEADY STATE — and it was written as one.
+    //
+    // "Open this transcript at its newest turn" is something that happens ONCE
+    // per transcript. `preview_latest_pin_request` is recomputed on every
+    // render and stays `Some` for as long as the session is hydrated, so a flag
+    // derived from `.is_some()` is true forever. It then selected
+    // `preview_latest_materialized_window`, which hard-pins
+    // `start = len - PREVIEW_BLOCK_WINDOW, end = len` and ignores scroll
+    // entirely — so the reader could never reach an older turn by scrolling up,
+    // on a surface that had just been taught to hold 600 of them.
+    //
+    // The pin is therefore released the moment it has been APPLIED (the same
+    // `pin_key` latch the scroll effect below already keeps), after which the
+    // window is scroll-driven again. Same shape as the daemon-handover veil:
+    // arm on a transition, and make sure the transition can END.
+    let preview_latest_pin_pending = preview_latest_pin_request
+        .as_ref()
+        .is_some_and(|(_, pin_key, _)| *preview_latest_pin_key.read() != *pin_key);
     use_effect(move || {
         let Some((session_path, pin_key, initial_scroll_top)) = preview_latest_pin_request.clone()
         else {
@@ -86404,16 +86463,22 @@ fn MainSurface(
                 *preview_scroll_height.read(),
                 snapshot.search_active,
             );
-            let preview_window =
-                if preview_pin_latest_on_mount && visible_blocks.len() > PREVIEW_BLOCK_WINDOW {
-                    preview_latest_materialized_window(
-                        &visible_blocks,
-                        *preview_scroll_client_height.read(),
-                        *preview_scroll_height.read(),
-                    )
-                } else {
-                    preview_window
-                };
+            // ⭐ ONE WINDOW, ALWAYS SCROLL-DRIVEN.
+            //
+            // There used to be a second window here that hard-pinned the last
+            // `PREVIEW_BLOCK_WINDOW` blocks and ignored scroll, selected while
+            // an "open at the newest turn" flag was set. Every attempt to make
+            // that flag turn off failed differently — it was `.is_some()` on a
+            // steady state, then a latch in a component-local signal that
+            // resets whenever the surface remounts, which for a live session is
+            // constantly. Measured after each fix: `pinPending: true, window
+            // 572 -> 596` on a 596-block transcript nobody could scroll.
+            //
+            // So the pin no longer chooses a WINDOW at all. It is what it always
+            // meant: a SCROLL POSITION, applied once by the effect above. The
+            // window is computed from wherever the reader actually is, so
+            // "scrolled to the top" renders the top and no flag can weld it shut.
+            let preview_window = preview_window;
             let rendered_rows =
                 visible_rows[preview_window.start_index..preview_window.end_index].to_vec();
             let grouped_runs = group_preview_runs(&rendered_rows);
@@ -86748,7 +86813,7 @@ fn MainSurface(
                                         preview_window: preview_window.clone(),
                                         visible_block_count: visible_blocks.len(),
                                         grouped_runs: grouped_runs.clone(),
-                                        pin_latest_on_mount: preview_pin_latest_on_mount,
+                                        pin_latest_on_mount: preview_latest_pin_pending,
                                         latest_anchor_key: preview_latest_anchor_key.clone(),
                                         palette: snapshot.palette,
                                         on_toggle_block: move |ix| on_toggle_preview_block.call(ix),
@@ -87122,6 +87187,9 @@ fn ConversationWebView(
             "data-preview-window-end": "{preview_window.end_index}",
             "data-preview-session-path": "{session.session_path}",
             "data-preview-window-total": "{visible_block_count}",
+            // The pin is an EVENT; stamped so a probe can see whether it is
+            // still armed rather than inferring it from spacer arithmetic.
+            "data-preview-pin-pending": "{pin_latest_on_mount}",
             "data-preview-window-top-spacer": "{preview_window.top_spacer_px.round() as i64}",
             "data-preview-window-bottom-spacer": "{preview_window.bottom_spacer_px.round() as i64}",
             "data-preview-window-total-height": "{preview_window.total_height_px.round() as i64}",
@@ -140069,6 +140137,156 @@ mod tests {
         session
     }
 
+    /// ★★ A LIVE TRANSCRIPT MUST STILL BE SCROLLABLE.
+    ///
+    /// The pin key used to include the block count and the last block's
+    /// signature, so it changed every time the conversation GREW — which on a
+    /// live agent session is continuously. The pin therefore re-armed forever
+    /// and welded the viewport to the tail: measured at
+    /// `pinPending: true, window 572 -> 596` on a session that was still being
+    /// written to. Keyed on the session and its hydration state, it fires once
+    /// when the transcript arrives and then hands the viewport back.
+    #[test]
+    fn the_latest_pin_does_not_rearm_every_time_the_transcript_grows() {
+        let mut session = test_managed_conversation_session(SessionKind::ClaudeCode);
+        session.session_path = "remote-cc://dev/ddbdb609".to_string();
+        session.metadata.push(SessionMetadataEntry {
+            label: "Preview Hydration",
+            value: "tail".to_string(),
+        });
+        let turn = |ix: usize| {
+            SessionPreviewBlock::message(
+                "ASSISTANT",
+                "Aug 03, 2026 05:00 PM UTC+0530".to_string(),
+                PreviewTone::Assistant,
+                vec![format!("turn {ix}")],
+            )
+        };
+        session.preview.blocks = (0..40).map(turn).collect();
+        let (_, before) = preview_latest_pin_request(&session);
+
+        // The agent writes more. Same session, same hydration state.
+        session.preview.blocks.push(turn(40));
+        session.preview.blocks.push(turn(41));
+        let (_, after) = preview_latest_pin_request(&session);
+        assert_eq!(
+            before, after,
+            "growth must NOT re-arm the pin, or a live session can never scroll up"
+        );
+
+        // Arriving content — scaffold to hydrated — IS a re-arm.
+        let mut fresh = session.clone();
+        fresh.metadata.retain(|entry| entry.label != "Preview Hydration");
+        let (_, unhydrated) = preview_latest_pin_request(&fresh);
+        assert_ne!(
+            unhydrated, after,
+            "hydration arriving is exactly when the reader should be placed"
+        );
+    }
+
+    /// ★★★ A HYDRATION MARKER CANNOT VOUCH FOR CONTENT IT DID NOT CARRY.
+    ///
+    /// Measured on guihost 2026-08-03, on a 670-block transcript:
+    /// `hydration: 'tail'`, `blocks: 2`, `Storage:` present — and it could
+    /// never refresh, because every gate downstream believed the marker.
+    ///
+    /// `Preview Hydration` is METADATA, and none of the payloads that clip
+    /// CONTENT clip metadata: not the sidebar list, not a peer daemon's
+    /// snapshot during a version handover. So the marker crosses intact while
+    /// the conversation is reduced to the cap, and the row is permanently stuck
+    /// asserting it is complete. This is the same defect as the morning's
+    /// `apply_snapshot` clobber, one layer out.
+    #[test]
+    fn a_tail_marker_over_a_capped_payload_still_needs_a_refresh() {
+        let block = |ix: usize| {
+            SessionPreviewBlock::message(
+                "USER",
+                "Jul 25, 2026 02:06 PM UTC+0530".to_string(),
+                PreviewTone::User,
+                vec![format!("real turn {ix}")],
+            )
+        };
+        let session_with = |count: usize| {
+            let mut session = test_managed_conversation_session(SessionKind::ClaudeCode);
+            session.session_path = "remote-cc://dev/a033a728".to_string();
+            session.rendered_sections = Vec::new();
+            session.preview.blocks = (0..count).map(block).collect();
+            session.metadata.push(SessionMetadataEntry {
+                label: "Preview Hydration",
+                value: "tail".to_string(),
+            });
+            session
+        };
+
+        // Exactly the cap, claiming a full tail: that is the sidebar's copy
+        // wearing hydration's badge.
+        let capped = session_with(yggterm_server::LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT);
+        assert!(
+            remote_preview_needs_refresh(&capped),
+            "a tail marker over {} blocks is the cap, not a transcript",
+            yggterm_server::LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT
+        );
+        assert!(
+            remote_preview_should_auto_sync(&capped),
+            "and nothing else will ever ask for it"
+        );
+
+        // A genuinely delivered tail must NOT re-fetch on every render.
+        let delivered = session_with(yggterm_server::LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT + 40);
+        assert!(
+            !remote_preview_needs_refresh(&delivered),
+            "a real tail is done; re-asking forever would be its own bug"
+        );
+    }
+
+    /// ★★ THE "OPEN AT THE NEWEST TURN" PIN MUST BE ABLE TO END.
+    ///
+    /// `preview_latest_materialized_window` hard-pins the last
+    /// `PREVIEW_BLOCK_WINDOW` blocks and ignores scroll completely — which is
+    /// right for placing a reader on open and catastrophic as a steady state:
+    /// while it is selected, scrolling up cannot render an older turn, so a
+    /// 600-block transcript is a 24-block one. The flag that chose it was
+    /// derived from a request that is recomputed every render and stays `Some`
+    /// for as long as the session is hydrated, so it never turned off.
+    ///
+    /// This asserts the WINDOW's behaviour, not the flag's: pinned while the
+    /// pin is pending, scroll-driven once it has been applied.
+    #[test]
+    fn the_latest_pin_yields_to_scroll_once_it_has_been_applied() {
+        let blocks = (0..120)
+            .map(|ix| {
+                SessionPreviewBlock::message(
+                    "ASSISTANT",
+                    "Aug 03, 2026 04:00 PM UTC+0530".to_string(),
+                    PreviewTone::Assistant,
+                    vec![format!("turn {ix}")],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // Scrolled to the BOTTOM, the window sits on the newest turns — which
+        // is all "open at the latest" ever needed, and it costs no second
+        // window that can weld itself shut.
+        let at_bottom = preview_virtual_window(&blocks, 40_000.0, 800.0, 40_000.0, false);
+        assert_eq!(
+            at_bottom.end_index,
+            blocks.len(),
+            "at the bottom the reader sees the newest turn"
+        );
+
+        // Scrolled to the very top, the window must reach block 0. The removed
+        // pinned window ignored scroll entirely, so this was unreachable.
+        let at_top = preview_virtual_window(&blocks, 0.0, 800.0, 40_000.0, false);
+        assert_eq!(
+            at_top.start_index, 0,
+            "scrolled to the top, the reader must reach the FIRST turn"
+        );
+        assert!(
+            at_top.end_index > 0,
+            "and the window must still contain something"
+        );
+    }
+
     /// ★★ ONE MARKDOWN RENDERER, AND THE WEB VIEW USES IT.
     ///
     /// The conversation surface carried a second parser of its own until
@@ -147678,6 +147896,24 @@ mod tests {
             value: "tail".to_string(),
         });
 
+        // ⚠ CONTRACT CHANGED 2026-08-03. This used to assert that ONE block
+        // plus a `tail` marker needs no resync. That combination is now
+        // distrusted on purpose: holding no more than
+        // `LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT` while claiming a full tail is the
+        // fingerprint of a CAPPED payload wearing hydration's badge, and
+        // trusting it froze a 670-block transcript at 2 blocks forever on the
+        // live host. A delivered tail is one that carries more than the cap.
+        for ix in 0..=yggterm_server::LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT {
+            session.preview.blocks.push(SessionPreviewBlock {
+                role: "ASSISTANT",
+                timestamp: format!("2026-05-22 delivered {ix}"),
+                tone: PreviewTone::Assistant,
+                folded: false,
+                lines: vec![format!("delivered turn {ix}")],
+                kind: PreviewBlockKind::Message,
+                activity: None,
+            });
+        }
         assert!(!remote_preview_needs_refresh(&session));
         assert!(!remote_preview_should_auto_sync(&session));
     }
@@ -147717,8 +147953,15 @@ mod tests {
 
         let (path, key) = preview_latest_pin_request(&session);
         assert_eq!(path, "remote-session://dev/preview");
-        assert!(key.contains("tail"));
-        assert!(key.contains("latest transcript tail"));
+        assert!(key.contains("tail"), "the key carries the hydration state");
+        // ⚠ CONTRACT CHANGED 2026-08-03: the key deliberately does NOT carry
+        // the last block's text any more. Including it made the key change
+        // every time the transcript grew, so on a live session the pin re-armed
+        // forever and the reader could never scroll up.
+        assert!(
+            !key.contains("latest transcript tail"),
+            "content must not key the pin, or a growing session re-pins forever"
+        );
         assert!(preview_latest_initial_scroll_top(&session) >= 0.0);
         for ix in 0..(PREVIEW_BLOCK_WINDOW + 3) {
             session.preview.blocks.push(SessionPreviewBlock {

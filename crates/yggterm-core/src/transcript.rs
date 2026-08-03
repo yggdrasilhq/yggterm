@@ -816,13 +816,43 @@ fn extract_text_fragment(value: &Value) -> Option<&str> {
         .or_else(|| value.get("value").and_then(Value::as_str))
 }
 
+/// Split message text into preview lines, KEEPING the structure markdown needs.
+///
+/// ⚠ This used to `.trim()` every line and drop every empty one. Both are
+/// destructive now that the reader is a real markdown parser rather than a
+/// line-based one:
+///
+/// - **A blank line is a block boundary.** Dropping it welds paragraphs
+///   together and, worse, deletes the delimiter a table, list or fenced code
+///   block needs to start. A table written under a paragraph came out as its
+///   cells stacked down the page with a rule between them — seen on the live
+///   host 2026-08-03.
+/// - **Leading whitespace is syntax.** It marks nested list items and indented
+///   code; `trim()` flattened a nested list into a flat one.
+///
+/// Runs of blank lines collapse to one, and leading/trailing blanks are
+/// dropped, so the structure is preserved without paying for vertical noise.
 fn normalize_preview_text(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter(|line| !preview_transcript_scaffold_line(line))
-        .map(ToOwned::to_owned)
-        .collect()
+    let mut lines: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        if preview_transcript_scaffold_line(raw) {
+            continue;
+        }
+        let line = raw.trim_end();
+        if line.trim().is_empty() {
+            // Collapse runs, and never open with a blank.
+            if lines.last().is_none_or(|last| last.trim().is_empty()) {
+                continue;
+            }
+            lines.push(String::new());
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    while lines.last().is_some_and(|last| last.trim().is_empty()) {
+        lines.pop();
+    }
+    lines
 }
 
 fn preview_transcript_scaffold_line(trimmed: &str) -> bool {
@@ -970,6 +1000,37 @@ fn looks_like_generation_noise(text: &str, role: TranscriptRole) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// ★★ A BLANK LINE IS SYNTAX, and stripping it destroyed every block.
+    ///
+    /// The reader is a real markdown parser now. A blank line separates
+    /// paragraphs and DELIMITS tables, lists and fenced code; leading
+    /// whitespace marks nesting. The old normaliser trimmed both away, so a
+    /// table written under a paragraph rendered as its cells stacked down the
+    /// page — seen on the live host 2026-08-03.
+    #[test]
+    fn preview_text_keeps_the_structure_markdown_needs() {
+        let lines = super::normalize_preview_text(
+            "A paragraph.\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\n- top\n    - nested\n\n\nEnd.\n",
+        );
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("A paragraph.\n\n| a | b |"),
+            "the blank line before a table is what makes it a table: {joined:?}"
+        );
+        assert!(
+            joined.contains("    - nested"),
+            "leading whitespace marks nesting and must survive: {joined:?}"
+        );
+        assert!(
+            !joined.contains("\n\n\n"),
+            "runs of blanks collapse to one: {joined:?}"
+        );
+        assert!(
+            !joined.starts_with('\n') && !joined.ends_with('\n'),
+            "no leading or trailing blank: {joined:?}"
+        );
+    }
     use super::{
         TranscriptMessage, TranscriptRole, generation_context_from_messages,
         read_codex_transcript_messages, read_codex_transcript_messages_tail_limited,
