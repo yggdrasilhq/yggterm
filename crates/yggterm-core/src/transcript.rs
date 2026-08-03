@@ -1462,18 +1462,43 @@ pub fn read_agent_transcript_entries(path: &Path) -> Result<Vec<TranscriptEntry>
     }
 }
 
-/// The TAIL of a transcript, at most `max_entries` entries.
+/// A bounded read of a transcript's tail, and whether it left anything behind.
 ///
-/// The reason a transcript view needs this: a long session's JSONL is tens of
-/// megabytes and the reader runs on every snapshot refresh. Reading the whole
-/// file to show the last screen is the difference between a surface that opens
-/// and one that hitches. Windowing at the BYTE level and re-widening (the shape
-/// `read_codex_transcript_messages_tail_limited` already uses) keeps that cost
-/// proportional to what is shown rather than to what exists.
+/// `older_available` is the load-bearing half. A bound that cannot say it was
+/// reached is a bound that truncates SILENTLY, and a reader looking at the last
+/// 600 blocks of a 670-block conversation has no way to learn that the other 70
+/// exist — which is the defect this type is here to make impossible to
+/// reintroduce. Every consumer that carries `entries` across a surface must
+/// carry this flag with it.
+#[derive(Debug, Clone)]
+pub struct TranscriptTail {
+    pub entries: Vec<TranscriptEntry>,
+    /// `true` when the file holds entries OLDER than the first one returned.
+    pub older_available: bool,
+}
+
+/// The TAIL of a transcript, at most `max_entries` entries, and whether it left
+/// anything older behind.
+///
+/// The reason a transcript view needs the bound at all: a long session's JSONL
+/// is tens of megabytes and the reader runs on every snapshot refresh. Reading
+/// the whole file to show the last screen is the difference between a surface
+/// that opens and one that hitches. Windowing at the BYTE level and re-widening
+/// (the shape `read_codex_transcript_messages_tail_limited` already uses) keeps
+/// that cost proportional to what is shown rather than to what exists.
+///
+/// Reading further back is expressed by GROWING `max_entries` rather than by a
+/// cursor, and the caller that pages keeps no cursor of its own. A byte offset
+/// would be a second, weaker identity for a position in the file — one a
+/// partial-line skip at a window boundary can move by itself — and a caller
+/// holding one would then own half the transcript while the reader owned the
+/// other half. Re-reading costs a re-parse of what is already on screen: 90 ms
+/// for 670 blocks, on a user-initiated action, in exchange for never having to
+/// reconcile two ideas of where the reader is.
 pub fn read_agent_transcript_entries_tail_limited(
     path: &Path,
     max_entries: usize,
-) -> Result<Vec<TranscriptEntry>> {
+) -> Result<TranscriptTail> {
     const INITIAL_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
     const MAX_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -1515,12 +1540,22 @@ pub fn read_agent_transcript_entries_tail_limited(
                 }
             }
         }
-        if entries.len() >= max_entries || start == 0 || window >= MAX_WINDOW_BYTES {
+        let exhausted_file = start == 0;
+        if entries.len() >= max_entries || exhausted_file || window >= MAX_WINDOW_BYTES {
             // Keep the TAIL: the newest entries are the ones a reader opens on.
-            if entries.len() > max_entries {
+            let older_available = if entries.len() > max_entries {
                 entries.drain(..entries.len() - max_entries);
-            }
-            return Ok(entries);
+                true
+            } else {
+                // The window reached byte 0 and still did not overflow, so
+                // there is genuinely nothing older. Anything else means the
+                // read stopped at a bound rather than at the beginning.
+                !exhausted_file
+            };
+            return Ok(TranscriptTail {
+                entries,
+                older_available,
+            });
         }
         window = (window.saturating_mul(2))
             .min(MAX_WINDOW_BYTES)
@@ -1879,9 +1914,61 @@ mod timeline_tests {
             &lines.iter().map(String::as_str).collect::<Vec<_>>(),
         );
         let tail = read_agent_transcript_entries_tail_limited(&path, 5).unwrap();
-        assert_eq!(tail.len(), 5);
-        assert_eq!(tail[4].lines, vec!["turn 49".to_string()]);
-        assert_eq!(tail[0].lines, vec!["turn 45".to_string()]);
+        assert_eq!(tail.entries.len(), 5);
+        assert_eq!(tail.entries[4].lines, vec!["turn 49".to_string()]);
+        assert_eq!(tail.entries[0].lines, vec!["turn 45".to_string()]);
+        // And it SAYS it left 45 behind. A bound that cannot report itself is a
+        // silent truncation, which is the whole reason the reader returns a
+        // struct instead of a Vec.
+        assert!(tail.older_available);
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// ★★ THE READER KNOWS WHEN IT HAS REACHED THE START, AND SAYS SO.
+    ///
+    /// A 670-block conversation showed its last 600 and stranded the oldest 70
+    /// with nothing on screen admitting they existed. Reading further back is
+    /// GROWING this bound, so the flag has to be exact at the edges: a phantom
+    /// "older" offers a page that does not exist, and a missing one hides the
+    /// beginning of a conversation behind a control that never appears.
+    #[test]
+    fn the_tail_reader_names_the_beginning_of_the_file() {
+        let root = scratch_root("tail-page").join(".codex/sessions/2026/08/03");
+        let lines = (0..50)
+            .map(|index| {
+                format!(
+                    r#"{{"timestamp":"2026-08-03T00:00:00.000Z","type":"event_msg","payload":{{"type":"user_message","message":"turn {index}"}}}}"#
+                )
+            })
+            .collect::<Vec<_>>();
+        let path = write_at(
+            &root,
+            "rollout-2026-08-03T00-00-00-page.jsonl",
+            &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+
+        // A bound the file overflows: 40 of 50, and it says so.
+        let bounded = read_agent_transcript_entries_tail_limited(&path, 40).unwrap();
+        assert_eq!(bounded.entries.len(), 40);
+        assert_eq!(bounded.entries[0].lines, vec!["turn 10".to_string()]);
+        assert!(bounded.older_available);
+
+        // Grown past the file's own length, the read reaches the first entry —
+        // and THAT is when it stops claiming there is more.
+        let whole = read_agent_transcript_entries_tail_limited(&path, 500).unwrap();
+        assert_eq!(whole.entries.len(), 50);
+        assert_eq!(whole.entries[0].lines, vec!["turn 0".to_string()]);
+        assert!(
+            !whole.older_available,
+            "a read that consumed the file must not offer a page that does not exist"
+        );
+
+        // Exactly-at-the-bound is the off-by-one that would show a phantom
+        // page: 50 asked, 50 returned, nothing older.
+        let exact = read_agent_transcript_entries_tail_limited(&path, 50).unwrap();
+        assert_eq!(exact.entries.len(), 50);
+        assert!(!exact.older_available);
+
         let _ = fs::remove_dir_all(root.parent().unwrap());
     }
 

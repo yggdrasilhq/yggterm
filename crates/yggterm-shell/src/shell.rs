@@ -210,7 +210,7 @@ use yggterm_server::{
     open_remote_session_with_view, open_stored_session, open_stored_session_with_view,
     persist_remote_generated_copy, ping, prepare_client_close, prepare_update_restart,
     reachable_versioned_daemon_statuses, refresh_local_managed_cli_now, refresh_managed_cli,
-    refresh_preview, refresh_remote_machine, remove_session, remove_ssh_target,
+    refresh_preview_with_history, refresh_remote_machine, remove_session, remove_ssh_target,
     request_terminal_launch, request_terminal_launch_for_path,
     set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, snapshot_session_view_for_ui,
@@ -15353,6 +15353,12 @@ struct ShellState {
     reveal_log: VecDeque<RevealLogEntry>,
     remote_preview_sync_after_ms: HashMap<String, u64>,
     remote_preview_failures: HashMap<String, PreviewSyncFailure>,
+    /// The row whose transcript is currently fetching a page of older turns.
+    ///
+    /// One at a time, and named rather than counted: the control has to be able
+    /// to say WHICH surface is busy, and a second click while a page is in
+    /// flight would ask the daemon to widen the window twice for one gesture.
+    preview_history_expanding: Option<String>,
     remote_preview_dirty_epoch: HashMap<String, u64>,
     remote_machine_refresh_requests: HashSet<String>,
     remote_machine_refresh_completed: HashMap<String, u64>,
@@ -16432,6 +16438,11 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
                 SNAPSHOT_PREVIEW_BLOCK_LIMIT,
                 SNAPSHOT_PREVIEW_BLOCK_LINE_LIMIT,
             ),
+            // Carried unchanged: `older_available` describes the transcript,
+            // not this capped copy. See `SessionPreview::older_available` — the
+            // version that added this copy's own clipping put a "Load earlier
+            // turns" control on a conversation with nothing behind it.
+            older_available: session.preview.older_available,
         },
         metadata: session.metadata.clone(),
         terminal_process_id: session.terminal_process_id,
@@ -17391,6 +17402,7 @@ impl ShellState {
             reveal_log: VecDeque::new(),
             remote_preview_sync_after_ms: HashMap::new(),
             remote_preview_failures: HashMap::new(),
+            preview_history_expanding: None,
             remote_preview_dirty_epoch: HashMap::new(),
             remote_machine_refresh_requests: HashSet::new(),
             remote_machine_refresh_completed: HashMap::new(),
@@ -40625,6 +40637,41 @@ fn spawn_remote_preview_payload_sync(
     session_path: String,
     reason: &'static str,
 ) {
+    spawn_preview_payload_sync(state, session_path, reason, false);
+}
+/// Ask this row's owner for one more page of older turns.
+///
+/// The daemon owns the blocks and the window; this only asks. A second ask
+/// while one is in flight is dropped rather than queued — one gesture, one
+/// page, or a reader who double-clicks jumps back two.
+fn expand_preview_history(state: Signal<ShellState>, session_path: String) {
+    let accepted = safe_shell_mut(state, "preview_history_expand", |shell| {
+        if shell.preview_history_expanding.is_some() {
+            return false;
+        }
+        shell.preview_history_expanding = Some(session_path.clone());
+        true
+    })
+    .unwrap_or(false);
+    if !accepted {
+        return;
+    }
+    spawn_preview_payload_sync(state, session_path, "preview_history_expand", true);
+}
+/// Re-hydrate a row's transcript, optionally widening its window by one page
+/// first.
+///
+/// Reading further back rides the SAME request as an ordinary refresh: the
+/// daemon owns the blocks, so the client never stitches a page onto a list it
+/// half-owns. It asks for a wider window and receives the whole tail — which
+/// is also why there is no page cursor here to drift out of step with what is
+/// on screen.
+fn spawn_preview_payload_sync(
+    state: Signal<ShellState>,
+    session_path: String,
+    reason: &'static str,
+    expand_history: bool,
+) {
     let request_meta = YggRequestMeta::background(
         format!("remote-preview-sync-{}-{}", session_path, current_millis()),
         "remote_preview_sync",
@@ -40650,11 +40697,20 @@ fn spawn_remote_preview_payload_sync(
         let outcome = run_dedicated_interactive_request_io(
             "remote_preview_sync",
             trace_home.as_path(),
-            move || refresh_preview(&endpoint, &path_for_task, true),
+            move || {
+                refresh_preview_with_history(&endpoint, &path_for_task, true, expand_history)
+            },
         )
         .await;
         let retry_session_path = session_path.clone();
-        let _ = safe_shell_mut(state, "remote_preview_sync_finish", |shell| match outcome {
+        let _ = safe_shell_mut(state, "remote_preview_sync_finish", |shell| {
+            // Released on BOTH arms and before the early returns below: a busy
+            // flag that only clears on success is a control that is dead for
+            // the rest of the session the first time an ssh hop times out.
+            if shell.preview_history_expanding.as_deref() == Some(session_path.as_str()) {
+                shell.preview_history_expanding = None;
+            }
+            match outcome {
             Ok(result) => {
                 if !shell.surface_request_is_current(&request_id) {
                     return;
@@ -40702,6 +40758,7 @@ fn spawn_remote_preview_payload_sync(
                         backoff_ms,
                     );
                 }
+            }
             }
         });
     });
@@ -86275,6 +86332,9 @@ fn MainSurface(
     let preview_latest_pin_pending = preview_latest_pin_request
         .as_ref()
         .is_some_and(|(_, pin_key, _)| *preview_latest_pin_key.read() != *pin_key);
+    // Named per session rather than a bare bool: two surfaces can be mounted
+    // and only the one that asked should read as busy.
+    let preview_history_expanding_path = state.read().preview_history_expanding.clone();
     use_effect(move || {
         let Some((session_path, pin_key, initial_scroll_top)) = preview_latest_pin_request.clone()
         else {
@@ -86822,10 +86882,16 @@ fn MainSurface(
                                         grouped_runs: grouped_runs.clone(),
                                         pin_latest_on_mount: preview_latest_pin_pending,
                                         latest_anchor_key: preview_latest_anchor_key.clone(),
+                                        preview_history_expanding: preview_history_expanding_path.as_deref()
+                                            == Some(session.session_path.as_str()),
                                         palette: snapshot.palette,
                                         on_toggle_block: move |ix| on_toggle_preview_block.call(ix),
                                         on_copy_block: move |text: String| {
                                             copy_preview_block_text(state, text);
+                                        },
+                                        on_load_older: {
+                                            let session_path = session.session_path.clone();
+                                            move |_| expand_preview_history(state, session_path.clone())
                                         },
                                     }
                                 } else {
@@ -87168,9 +87234,11 @@ fn ConversationWebView(
     grouped_runs: Vec<PreviewRun>,
     pin_latest_on_mount: bool,
     latest_anchor_key: String,
+    preview_history_expanding: bool,
     palette: Palette,
     on_toggle_block: EventHandler<usize>,
     on_copy_block: EventHandler<String>,
+    on_load_older: EventHandler<()>,
 ) -> Element {
     // ⛔ There is ONE reader of "what did this session say", and it is not
     // here. The shell used to ALSO parse the JSONL off disk itself and draw a
@@ -87235,6 +87303,36 @@ fn ConversationWebView(
                     palette,
                     message,
                 }
+            }
+            // The BEGINNING of what has been fetched. Both are here, above the
+            // top spacer, so they sit at the true start of the document rather
+            // than at the top of whatever the virtual window happens to hold.
+            if session.preview.older_available {
+                PreviewHistoryControl {
+                    session_path: session.session_path.clone(),
+                    palette,
+                    busy: preview_history_expanding,
+                    on_load_older: move |_| on_load_older.call(()),
+                }
+            }
+            // Restores the reader's place after a page lands. Keyed on the
+            // block count so it remounts exactly when the transcript grows, and
+            // a no-op unless the control armed it — one shot, armed by a click,
+            // cleared by the restore, so it can never re-arm itself on a live
+            // transcript the way a content-keyed flag would.
+            div {
+                key: "history-anchor-{visible_block_count}",
+                "data-preview-history-anchor-probe": "1",
+                style: "height:0; width:100%; pointer-events:none;",
+                onmounted: {
+                    let session_path = session.session_path.clone();
+                    move |_| {
+                        let script = preview_history_restore_script(&session_path);
+                        async move {
+                            let _ = document::eval(&script);
+                        }
+                    }
+                },
             }
             if preview_window.top_spacer_px > 0.0 {
                 div {
@@ -89038,6 +89136,118 @@ fn trigger_preview_scroll_control(session_path: String, action: TerminalScrollCo
     spawn(async move {
         let _ = document::eval(&preview_scroll_control_script(&session_path, action));
     });
+}
+/// The JS that finds THIS surface's scroller. Shared by the two history
+/// scripts so they can never disagree about which element they are holding.
+fn preview_scroller_lookup_js(session_path: &str) -> String {
+    let session_path_literal =
+        serde_json::to_string(session_path).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"  const path = {session_path_literal};
+  const all = Array.from(document.querySelectorAll('[data-preview-scroll="1"]'))
+    .filter((node) => node.isConnected);
+  const mine = all.filter((node) => node.getAttribute('data-preview-session-path') === path);
+  const scroller = (mine.length ? mine : all).pop();
+  if (!scroller) return;"#
+    )
+}
+/// Remember where the reader is, as a distance from the BOTTOM of the
+/// document.
+///
+/// Distance-from-bottom rather than `scrollTop`, because a page of history is
+/// prepended: it adds height ABOVE everything on screen and leaves everything
+/// below it untouched. Anchoring to the bottom therefore needs no idea of how
+/// tall the arriving page is — which matters because the only number the client
+/// has for that is `estimate_preview_block_height`, an ESTIMATE, and anchoring
+/// to an estimate would slide the reader by however wrong it was.
+fn preview_history_arm_script(session_path: &str) -> String {
+    let lookup = preview_scroller_lookup_js(session_path);
+    format!(
+        r#"(function() {{
+{lookup}
+  scroller.setAttribute(
+    'data-preview-history-anchor',
+    String(scroller.scrollHeight - scroller.scrollTop),
+  );
+}})();"#
+    )
+}
+/// Put the reader back after a page of history lands.
+///
+/// A no-op unless a click armed it. The attribute is removed BEFORE the scroll
+/// is applied, so a re-render that remounts the probe cannot replay it — the
+/// bug shape that cost three attempts on the open-at-latest pin was exactly a
+/// flag that kept re-arming itself as a live transcript grew.
+fn preview_history_restore_script(session_path: &str) -> String {
+    let lookup = preview_scroller_lookup_js(session_path);
+    format!(
+        r#"(function() {{
+{lookup}
+  const raw = scroller.getAttribute('data-preview-history-anchor');
+  if (raw === null) return;
+  scroller.removeAttribute('data-preview-history-anchor');
+  const anchor = Number(raw);
+  if (!Number.isFinite(anchor)) return;
+  scroller.scrollTop = Math.max(0, scroller.scrollHeight - anchor);
+}})();"#
+    )
+}
+/// The control at the top of a transcript that has more behind it.
+///
+/// A control the reader presses, not a scroll position that fires on its own.
+/// Two reasons, and both were paid for: an automatic fetch on a LIVE remote row
+/// pulls the transcript over ssh again every time someone scrolls up, and a
+/// scroll-driven trigger is precisely the thing that re-arms on remount. The
+/// defect being fixed is that the reader could not learn the rest of the
+/// conversation existed — a visible control fixes that; a hidden one does not.
+#[component]
+fn PreviewHistoryControl(
+    session_path: String,
+    palette: Palette,
+    busy: bool,
+    on_load_older: EventHandler<()>,
+) -> Element {
+    let label = if busy {
+        "Loading earlier turns…"
+    } else {
+        "Load earlier turns"
+    };
+    rsx! {
+        div {
+            "data-preview-history-control": "1",
+            "data-preview-history-busy": "{busy}",
+            style: "display:flex; justify-content:center; width:100%; padding:2px 0 10px 0;",
+            button {
+                r#type: "button",
+                disabled: busy,
+                style: format!(
+                    "display:inline-flex; align-items:center; gap:7px; padding:6px 14px; \
+                     border:1px solid {}; border-radius:999px; background:transparent; \
+                     color:{}; font-size:11.5px; font-weight:700; letter-spacing:0.02em; \
+                     cursor:{};",
+                    palette.border,
+                    palette.muted,
+                    if busy { "default" } else { "pointer" },
+                ),
+                onclick: {
+                    let session_path = session_path.clone();
+                    move |_| {
+                        if busy {
+                            return;
+                        }
+                        // Arm the anchor BEFORE the request, while the reader's
+                        // position is still the one they are looking at.
+                        let arm = preview_history_arm_script(&session_path);
+                        spawn(async move {
+                            let _ = document::eval(&arm);
+                        });
+                        on_load_older.call(());
+                    }
+                },
+                "{label}"
+            }
+        }
+    }
 }
 #[component]
 fn PreviewScrollController(session_path: String, palette: Palette) -> Element {
@@ -140514,6 +140724,100 @@ mod tests {
         }
     }
 
+    /// ★★ THE READER KEEPS THEIR PLACE WHEN A PAGE OF HISTORY LANDS.
+    ///
+    /// A page is PREPENDED, so it adds height above everything on screen. The
+    /// anchor is therefore a distance from the BOTTOM of the document, not a
+    /// `scrollTop` and not a block index: `scrollTop` moves by exactly the
+    /// height of the arriving page, and every index shifts by exactly its
+    /// length, while the distance from the bottom is invariant under a prepend.
+    ///
+    /// It also has to be a ONE-SHOT. The open-at-latest pin took three attempts
+    /// because each fix left something that could re-arm — `.is_some()` on a
+    /// steady state, then a key on content that a live transcript kept
+    /// changing. So the restore removes the attribute BEFORE it scrolls, and
+    /// only a click ever writes it.
+    #[test]
+    fn a_page_of_history_restores_the_reader_by_distance_from_the_bottom() {
+        let arm = preview_history_arm_script("remote-cc://dev/abc");
+        assert!(
+            arm.contains("scroller.scrollHeight - scroller.scrollTop"),
+            "the anchor must be measured from the bottom: {arm}"
+        );
+
+        let restore = preview_history_restore_script("remote-cc://dev/abc");
+        let removed_at = restore
+            .find("removeAttribute('data-preview-history-anchor')")
+            .expect("the restore must consume the anchor");
+        let scrolled_at = restore
+            .find("scroller.scrollTop =")
+            .expect("the restore must move the scroller");
+        assert!(
+            removed_at < scrolled_at,
+            "the anchor is cleared BEFORE the scroll, or a remount replays it:\n{restore}"
+        );
+        assert!(
+            restore.contains("scroller.scrollHeight - anchor"),
+            "restoring must re-derive the top from the NEW height: {restore}"
+        );
+
+        // Both scripts address the same scroller through the same lookup, so
+        // one can never anchor a surface the other does not move.
+        let lookup = preview_scroller_lookup_js("remote-cc://dev/abc");
+        assert!(arm.contains(&lookup));
+        assert!(restore.contains(&lookup));
+    }
+
+    /// ★★ THE FLAG DESCRIBES THE TRANSCRIPT, NOT THE PAYLOAD CARRYING IT.
+    ///
+    /// `older_available` answers exactly one question — "would asking for more
+    /// return more?" — because exactly one thing reads it: the control that
+    /// offers to ask. A capped copy of a preview therefore carries it
+    /// UNCHANGED.
+    ///
+    /// The opposite is the tempting move, and it shipped for one build: make a
+    /// clipped copy report `true` for its OWN clipping, on the reasoning that a
+    /// payload should never vouch for content it did not send
+    /// (`bug-class-metadata-vouches-for-clipped-content`). That instinct is
+    /// right about metadata and wrong here, because it gives one field two
+    /// meanings — and the GUI, which reassembles the full block list, kept the
+    /// capped copy's answer and drew "Load earlier turns" above a 298-block
+    /// conversation with nothing behind it. How much a copy dropped is a real
+    /// question; it is answered by the block count sitting next to it.
+    #[test]
+    fn a_capped_copy_reports_the_transcript_not_its_own_clipping() {
+        let block = |ix: usize| {
+            SessionPreviewBlock::message(
+                "ASSISTANT",
+                format!("2026-08-03T00:00:{ix:02}Z"),
+                PreviewTone::Assistant,
+                vec![format!("line {ix}")],
+            )
+        };
+        let session_with = |count: usize, older: bool| {
+            let mut session = test_managed_conversation_session(SessionKind::ClaudeCode);
+            session.preview.blocks = (0..count).map(block).collect();
+            session.preview.older_available = older;
+            snapshot_retained_terminal_session_view(&session)
+        };
+
+        // The reader consumed the file: no control, however much this copy drops.
+        let clipped_but_complete = session_with(SNAPSHOT_PREVIEW_BLOCK_LIMIT + 40, false);
+        assert_eq!(
+            clipped_but_complete.preview.blocks.len(),
+            SNAPSHOT_PREVIEW_BLOCK_LIMIT
+        );
+        assert!(
+            !clipped_but_complete.preview.older_available,
+            "a copy's own clipping must not offer a page the daemon cannot fetch"
+        );
+
+        // The reader stopped at its budget: the control belongs, and the flag
+        // survives the copy.
+        let truncated = session_with(1, true);
+        assert!(truncated.preview.older_available);
+    }
+
     /// The transcript inherits its body copy; the document reader owns its own.
     ///
     /// This is the live defect, in one assertion: the reading surface sits
@@ -150058,6 +150362,7 @@ mod tests {
                 terminal_lines: Vec::new(),
                 rendered_sections: Vec::new(),
                 preview: yggterm_server::SessionPreview {
+                    older_available: false,
                     summary: Vec::new(),
                     blocks: Vec::new(),
                 },
@@ -150125,6 +150430,7 @@ mod tests {
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -150306,6 +150612,7 @@ mod tests {
                 terminal_lines: vec![],
                 rendered_sections: vec![],
                 preview: yggterm_server::SessionPreview {
+                    older_available: false,
                     summary: vec![],
                     blocks: vec![],
                 },
@@ -150420,6 +150727,7 @@ mod tests {
                 terminal_lines: vec![],
                 rendered_sections: vec![],
                 preview: yggterm_server::SessionPreview {
+                    older_available: false,
                     summary: vec![],
                     blocks: vec![],
                 },
@@ -150502,6 +150810,7 @@ mod tests {
                 terminal_lines: vec!["› Example".to_string()],
                 rendered_sections: vec![],
                 preview: yggterm_server::SessionPreview {
+                    older_available: false,
                     summary: vec![],
                     blocks: vec![],
                 },
@@ -150624,6 +150933,7 @@ mod tests {
                 terminal_lines: vec![],
                 rendered_sections: vec![],
                 preview: yggterm_server::SessionPreview {
+                    older_available: false,
                     summary: vec![],
                     blocks: vec![],
                 },
@@ -150696,6 +151006,7 @@ mod tests {
                 terminal_lines: vec![],
                 rendered_sections: vec![],
                 preview: yggterm_server::SessionPreview {
+                    older_available: false,
                     summary: vec![],
                     blocks: vec![],
                 },
@@ -150800,6 +151111,7 @@ mod tests {
                 terminal_lines: vec![],
                 rendered_sections: vec![],
                 preview: yggterm_server::SessionPreview {
+                    older_available: false,
                     summary: vec![],
                     blocks: vec![],
                 },
@@ -151278,6 +151590,7 @@ mod tests {
                 terminal_lines: vec![],
                 rendered_sections: vec![],
                 preview: yggterm_server::SessionPreview {
+                    older_available: false,
                     summary: vec![],
                     blocks: vec![SessionPreviewBlock {
                         timestamp: "Mar 24, 2026 10:00 AM UTC+0530".to_string(),
@@ -151387,6 +151700,7 @@ mod tests {
             terminal_lines: vec![],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![],
                 blocks: vec![],
             },
@@ -151785,6 +152099,7 @@ mod tests {
             terminal_lines: vec![],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![],
                 blocks: vec![],
             },
@@ -151831,6 +152146,7 @@ mod tests {
             terminal_lines: vec![],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![],
                 blocks: vec![],
             },
@@ -151872,6 +152188,7 @@ mod tests {
             terminal_lines: vec![],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![],
                 blocks: vec![],
             },
@@ -151910,6 +152227,7 @@ mod tests {
             terminal_lines: vec![],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![],
                 blocks: vec![],
             },
@@ -151975,6 +152293,7 @@ mod tests {
             terminal_lines: vec![],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![],
                 blocks: vec![],
             },
@@ -152045,6 +152364,7 @@ mod tests {
             terminal_lines: vec![],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
                     value: "Local shell rooted at /home/user.".to_string(),
@@ -152122,6 +152442,7 @@ mod tests {
             terminal_lines: vec![],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
                     value: "Fix the live terminal mismatch.".to_string(),
@@ -152324,6 +152645,7 @@ mod tests {
             terminal_lines: vec![],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![],
                 blocks: vec![],
             },
@@ -152389,6 +152711,7 @@ mod tests {
             terminal_lines: vec![],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![],
                 blocks: vec![],
             },
@@ -152458,6 +152781,7 @@ mod tests {
             terminal_lines: vec![],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![],
                 blocks: vec![],
             },
@@ -152524,6 +152848,7 @@ mod tests {
             terminal_lines: vec![],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![],
                 blocks: vec![],
             },
@@ -152598,6 +152923,7 @@ mod tests {
                 terminal_lines: vec![],
                 rendered_sections: vec![],
                 preview: yggterm_server::SessionPreview {
+                    older_available: false,
                     summary: vec![],
                     blocks: vec![],
                 },
@@ -152672,6 +152998,7 @@ mod tests {
                 terminal_lines: vec![],
                 rendered_sections: vec![],
                 preview: yggterm_server::SessionPreview {
+                    older_available: false,
                     summary: vec![],
                     blocks: vec![],
                 },
@@ -152732,6 +153059,7 @@ mod tests {
                 terminal_lines: vec![],
                 rendered_sections: vec![],
                 preview: yggterm_server::SessionPreview {
+                    older_available: false,
                     summary: vec![],
                     blocks: vec![],
                 },
@@ -155144,6 +155472,7 @@ mod tests {
             ],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![],
                 blocks: vec![],
             },
@@ -155182,6 +155511,7 @@ mod tests {
             terminal_lines: vec!["sudo apt install wezterm".to_string()],
             rendered_sections: vec![],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![],
                 blocks: vec![],
             },
@@ -155267,6 +155597,7 @@ mod tests {
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -155320,6 +155651,7 @@ mod tests {
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
                     value: "Timezone fix is complete and both hosts now report Asia/Kolkata."
@@ -155375,6 +155707,7 @@ mod tests {
             terminal_lines: vec!["timezone migration".to_string()],
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: vec![yggterm_server::SessionPreviewBlock {
                     role: "assistant",
@@ -155719,6 +156052,7 @@ mod tests {
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: vec![yggterm_server::SessionPreviewBlock {
                     role: "assistant",
@@ -155772,6 +156106,7 @@ mod tests {
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: vec![yggterm_server::SessionPreviewBlock {
                     role: "assistant",
@@ -155822,6 +156157,7 @@ mod tests {
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: vec![
                     yggterm_server::SessionPreviewBlock {
@@ -155886,6 +156222,7 @@ mod tests {
                 lines: vec!["Document the Traccar workflow.".to_string()],
             }],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: vec![
                     yggterm_server::SessionPreviewBlock {
@@ -155948,6 +156285,7 @@ mod tests {
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: vec![
                     yggterm_server::SessionPreviewBlock {
@@ -156018,6 +156356,7 @@ mod tests {
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: vec![yggterm_server::SessionPreviewBlock {
                     role: "ASSISTANT",
@@ -156076,6 +156415,7 @@ mod tests {
                 lines: vec!["Launch command prepared".to_string()],
             }],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -163652,6 +163992,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["› active".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -163689,6 +164030,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~$".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -164491,6 +164833,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -164618,6 +164961,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["test shell ready".to_string()],
             rendered_sections: Vec::new(),
             preview: yggterm_server::SnapshotPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -164866,6 +165210,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -165811,6 +166156,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -165876,6 +166222,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -165922,6 +166269,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~/gh/yggterm$ sleep 8".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -166091,6 +166439,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -166718,6 +167067,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["› Continue".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -166799,6 +167149,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -167420,6 +167771,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~/gh/yggterm$ sleep 10".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -167454,6 +167806,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -167644,6 +167997,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -167834,6 +168188,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -168027,6 +168382,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 lines: vec!["Launch command prepared: exec '/bin/bash' -i".to_string()],
             }],
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -168224,6 +168580,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -168413,6 +168770,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~/gh/yggterm$ sleep 10".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -168602,6 +168960,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["sleep 10".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -168791,6 +169150,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@guihost:~$".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -168825,6 +169185,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -169017,6 +169378,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -169207,6 +169569,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -169241,6 +169604,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -169833,6 +170197,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -171347,6 +171712,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -171568,6 +171934,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -172294,6 +172661,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -172331,6 +172699,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["• wezterm is installed and available".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -172535,6 +172904,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -172593,6 +172963,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -172719,6 +173090,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
             preview: SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -172799,6 +173171,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 lines: heavy_rendered_lines.clone(),
             }],
             preview: SessionPreview {
+                older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
                     value: "Active summary".to_string(),
@@ -172850,6 +173223,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 lines: heavy_rendered_lines.clone(),
             }],
             preview: SessionPreview {
+                older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
                     value: "Inactive summary".to_string(),
@@ -174309,6 +174683,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -174349,6 +174724,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: vec![yggterm_server::SessionPreviewBlock {
                     role: "assistant",
@@ -174400,6 +174776,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![yggterm_server::SessionMetadataEntry {
                     label: "Summary",
                     value: "Local Codex terminal rooted at /home/user.".to_string(),
@@ -174447,6 +174824,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
                 ],
             }],
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![yggterm_server::SessionMetadataEntry {
                     label: "Summary",
                     value: "SSH terminal on guihost rooted at /home/user.".to_string(),
@@ -174495,6 +174873,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: vec![yggterm_server::SessionMetadataEntry {
                     label: "Summary",
                     value: "Local Codex terminal.".to_string(),
@@ -174579,6 +174958,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -174669,6 +175049,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ],
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
@@ -174755,6 +175136,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ],
             rendered_sections: Vec::new(),
             preview: yggterm_server::SessionPreview {
+                older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
             },
