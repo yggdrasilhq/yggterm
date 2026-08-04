@@ -368,11 +368,31 @@ work.
   daemon (a newer one is scanning the same corpus into the same store). The chore
   TICK is untouched — the CC title sync is the SSOT for CC titles.
 
-⚠ Neither is deployed. The code is on `main`; every daemon on the live host is
-still running the old loops, and the "after" figures above are an offline replay
-plus a gate that provably does not call the walk — not a live delta. Confirm
-after the next daemon bump by re-reading the same per-thread `rchar` and by
-`local_tree_scanned:false` on the `daemon/background_copy_chore` perf span.
+✅ **BOTH ARE NOW DEPLOYED AND THE OWED LIVE DELTA IS MEASURED (2026-08-04).**
+The confirmation this section asked for, run the way it asked — the same
+per-thread `rchar` read, on a daemon carrying the fix (dev pid 1107745, 3.0.24):
+
+| thread | before (per 90 s) | after (per 45 s) | after, scaled to 90 s |
+|---|---|---|---|
+| `yggterm-perf-incident-monitor` | **334.7 MB** | **9 MB** | ~18 MB |
+| background copy chore | 908.1 MB | **0 MB** | **0 MB** |
+
+⇒ the monitor is **~18x** cheaper and the chore's tree walk is GONE, not merely
+smaller — the gate refuses it, so the thread reads nothing at all.
+
+⚠ **And the attribution above ("100% of their cost was two GLOBAL loops") is now
+STALE — do not carry it forward.** With the I/O fixed, the same daemon still
+burns **17-23% of a core** continuously, and a per-thread CPU sample accounts
+for only **40 of 445 ticks** over 20 s. The remaining ~90% is NOT in any thread
+alive long enough to be sampled: a 10 Hz poll saw **38 distinct TIDs against a
+steady state of 11**, i.e. 27 threads born and dead inside 10 s. So the cost
+moved from file reads to thread churn, and the per-thread `rchar` instrument
+this section is built on is blind to it by construction.
+
+⛔ **The trap that nearly wrote the wrong number here:** the first CPU reading
+was taken while a `cargo build` was running on the same box and looked
+identical, so "the daemons are burning ~20%" was briefly indistinguishable from
+build noise. Re-measure with the box quiet before attributing any daemon CPU.
 
 ⚠ **This is also why `perf` events now carry a `pid`.** They did not, so
 "`daemon/background_copy_chore` ran 12,829 times" in §3b could not be split
