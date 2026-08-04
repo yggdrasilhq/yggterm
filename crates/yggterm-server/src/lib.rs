@@ -18985,6 +18985,33 @@ pub fn run_app_control_set_search(
     Ok(())
 }
 
+/// Press something in a contributed app pane, exactly as a click does.
+///
+/// The gap this fills was found live on 2026-08-04: an agent could OPEN the
+/// vault pane, screenshot it, and had no way to press a row in it — pointer
+/// injection does not map to screen pixels on this Wayland desktop, so the one
+/// affordance that had just shipped was the one thing that could not be
+/// exercised. Everything else in the app was already drivable from here.
+pub fn run_app_control_app_pane_action(
+    pane: String,
+    action: String,
+    value: Option<String>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::AppPaneAction {
+            pane,
+            action,
+            value,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_set_right_panel_mode(
     mode: AppControlRightPanelMode,
     timeout_ms: u64,

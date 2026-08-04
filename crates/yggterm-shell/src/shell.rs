@@ -72471,6 +72471,58 @@ async fn process_pending_app_control_requests(
                 error: None,
             }
         }
+        // ⛔ THE SAME OWNER A CLICK USES, and that is the whole value of it.
+        // `app_pane_run_action` posts the action, folds the reply's toast/eval/
+        // schema back in and re-renders; routing this verb anywhere else would
+        // make an agent's press a different event from a human's, which is
+        // exactly the kind of second path this codebase spends its tests
+        // forbidding.
+        AppControlCommand::AppPaneAction {
+            pane,
+            action,
+            value,
+        } => {
+            app_pane_run_action(
+                state,
+                desktop.clone(),
+                pane.clone(),
+                action.clone(),
+                value.clone(),
+            )
+            .await;
+            // What the pane BECAME, read after the action settled — an agent's
+            // next move depends on it, and asking for a second round trip to
+            // find out would race the re-render.
+            let (pane_id, schema_title, widget_count, footer_count) = {
+                let shell = state.read();
+                match shell.app_pane_schema.as_ref() {
+                    Some(schema) => (
+                        Some(schema.pane_id.clone()),
+                        schema.schema.title.clone(),
+                        schema.schema.widgets.len(),
+                        schema.schema.footer.len(),
+                    ),
+                    None => (None, String::new(), 0, 0),
+                }
+            };
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "command": "app_pane_action",
+                    "pane": pane,
+                    "action": action,
+                    "value": value,
+                    "rendered_pane": pane_id,
+                    "schema_title": schema_title,
+                    "widget_count": widget_count,
+                    "footer_count": footer_count,
+                })),
+                error: None,
+            }
+        }
         AppControlCommand::SetRightPanelMode { mode } => {
             // An app pane needs its schema fetched, not just its mode set —
             // otherwise the rail renders "Loading…" forever. Same path the
