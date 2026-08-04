@@ -49,6 +49,7 @@ mod profile_write_lock;
 // module itself is not gated — terminal.rs holds the type unconditionally and
 // gating here would force a second encoding of the same concept.
 mod pty_adoption;
+mod pty_handoff_wire;
 mod protocol;
 mod remote_cli;
 mod remote_runtime;
