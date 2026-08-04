@@ -3142,7 +3142,38 @@ fn main() -> Result<()> {
     if args.as_slice() == ["server", "status"] {
         let endpoint = cli_server_endpoint(store.home_dir());
         match status(&endpoint) {
-            Ok(runtime) => println!("{}", serde_json::to_string_pretty(&runtime)?),
+            Ok(runtime) => {
+                // A CLI answers about the daemon matching its OWN version, which
+                // is not necessarily the one the user's window is attached to.
+                // Say so in the answer rather than leaving it to be discovered.
+                let peers: Vec<yggterm_server::PeerDaemonSummary> =
+                    yggterm_server::reachable_versioned_daemon_statuses(store.home_dir())
+                        .into_iter()
+                        .map(|(_endpoint, peer)| yggterm_server::PeerDaemonSummary {
+                            pid: peer.server_pid,
+                            version: peer.server_version.clone(),
+                            owned_terminal_session_count: peer.owned_terminal_session_count,
+                        })
+                        .collect();
+                let warning = yggterm_server::stale_daemon_answer_warning(
+                    runtime.server_pid,
+                    runtime.owned_terminal_session_count,
+                    &peers,
+                );
+                let mut value = serde_json::to_value(&runtime)?;
+                if let Some(object) = value.as_object_mut() {
+                    if let Some(warning) = warning {
+                        object.insert(
+                            "stale_daemon_warning".to_string(),
+                            serde_json::Value::String(warning),
+                        );
+                    }
+                    if peers.len() > 1 {
+                        object.insert("peer_daemons".to_string(), serde_json::to_value(&peers)?);
+                    }
+                }
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            }
             Err(error) => println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
