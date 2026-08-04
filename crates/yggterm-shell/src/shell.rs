@@ -24480,16 +24480,25 @@ impl ShellState {
                 format!("{cli} finished working in “{label}”.")
             };
             // Toast (+ OS notification / chime when those settings are on).
-            self.push_notification(NotificationTone::Success, "Session finished", message);
-            // The user explicitly wants AUDIO on completion (2026-06-26), but the
-            // global notification_sound defaults off. There is no dedicated
-            // completion-audio setting, so tie the completion chime to the toast
-            // being shown: if in-app notifications are on we always chime once.
-            // When notification_sound is ALSO on, push_notification already
-            // chimed, so guard against a double chime.
-            if self.settings.in_app_notifications && !self.settings.notification_sound {
-                emit_notification_chime(NotificationTone::Success);
-            }
+            //
+            // ⛔ AND THAT IS THE WHOLE OF IT. There is deliberately no second
+            // chime here.
+            //
+            // There used to be: `in_app_notifications && !notification_sound`
+            // fired a chime PRECISELY WHEN THE SOUND SETTING WAS OFF, reasoning
+            // (2026-06-26) that the user wanted audio on completion while the
+            // global default was off. The reasoning aged into a bug. Measured on
+            // the GUI host 2026-08-04 — `notification_sound: false`,
+            // `in_app_notifications: true` — and the user's report was exactly
+            // what the code says it does: *"in spite of turning off audio
+            // notifications, I can hear chimes."*
+            //
+            // A setting that does not mean what it says is worse than a missing
+            // setting: the one control offered for "stop making noise" was the
+            // one branch that guaranteed noise. `notification_sound` is the
+            // authority, `push_notification` is its one enforcement point, and
+            // wanting completion audio is what turning it ON is for. Locked by
+            // `a_finished_session_chimes_only_when_the_sound_setting_says_so`.
         }
     }
     fn fail_terminal_open_attempt_for_request(&mut self, request_id: &str, reason: String) {
@@ -92749,44 +92758,29 @@ fn TerminalCanvas(
                         match decision {
                         ScreenReconcileDecision::Write => {
                             screen_reconcile_unwritable_retries = 0;
-                            // A daemon screen WIDER than this viewer is not a
-                            // cosmetic overflow — it is the frame-corruption
-                            // class. Each over-long row wraps, every row below
-                            // it shifts, and the payload's later absolute
-                            // `CSI r;cH` jumps then land on that spill, where
-                            // its `CSI nC` blank-runs leave the spilled
-                            // characters showing through: text merged out of two
-                            // frames, which is exactly what the user reports on
-                            // busy CC sessions. Nothing beyond this viewer's
-                            // width can be legitimate — the CLI cannot paint
-                            // wider than the PTY it was handed — so the cells
-                            // out there are ghosts from when the grid was wider.
-                            // Drop them. See
+                            // ⛔ THE CLIP IS THE DAEMON'S, AND THIS SIDE MUST NOT
+                            // SECOND-GUESS IT (`screen_reconcile_chunk`).
+                            //
+                            // A daemon screen wider than this viewer really is
+                            // the frame-corruption class — each over-long row
+                            // wraps, every row below it shifts, and the
+                            // payload's later absolute `CSI r;cH` jumps land on
+                            // that spill. The clip for it used to live HERE, and
+                            // that was the bug: this side knows only its own
+                            // width, and a wrapped line carries no break, so
+                            // measuring against the viewer reads the rest of a
+                            // sentence as a ghost and deletes it. Measured on
+                            // the GUI host 2026-08-04 — 504 clips against a
+                            // 170-column PTY reporting a "334-column" screen
+                            // that was two wrapped lines.
+                            //
+                            // Only the daemon holds both numbers (the model the
+                            // text was formatted against, and the PTY the CLI
+                            // was handed), and only their difference is a ghost.
+                            // So it arrives already clipped and is written as
+                            // it came. See
                             // docs/xterm-bugs.md#screen-model-wider-than-viewer.
-                            let screen_max_column =
-                                yggterm_server::formatted_screen_max_column(&screen_text);
-                            let screen_text = if current_terminal_cols > 0
-                                && screen_max_column > current_terminal_cols
-                            {
-                                append_trace_event(
-                                    &trace_home,
-                                    "ui",
-                                    "terminal_mount",
-                                    "screen_reconcile_clipped_to_viewer_width",
-                                    json!({
-                                        "session_path": session_path.clone(),
-                                        "reason": reconcile_reason,
-                                        "screen_max_column": screen_max_column,
-                                        "viewer_cols": current_terminal_cols,
-                                    }),
-                                );
-                                yggterm_server::clip_formatted_screen_to_width(
-                                    &screen_text,
-                                    current_terminal_cols,
-                                )
-                            } else {
-                                screen_text.clone()
-                            };
+                            let screen_text = screen_text.clone();
                             let _ = eval.send(TerminalJsCommand::Write {
                                 data: screen_text.clone(),
                             });
@@ -184910,6 +184904,48 @@ mod media_capture_locks {
         assert!(
             !body.contains("options.silent ||") && !body.contains("|| options.silent"),
             "`silent` has become a way to FORCE the chime; it may only suppress it",
+        );
+    }
+
+    /// ★ THE SOUND SETTING IS THE AUTHORITY, AND THE FAN-OUT IS ITS ONLY GATE.
+    ///
+    /// This lock is the one the fan-out test above thought it was making, and
+    /// did not: it checked what `push_notification_with` does, never that the
+    /// fan-out is the ONLY thing that chimes. It was not. The finished-session
+    /// path called the emitter directly under
+    /// `in_app_notifications && !notification_sound` — a branch that fires
+    /// precisely when the user has turned sound OFF. Measured on the GUI host
+    /// 2026-08-04 (`notification_sound: false`, `in_app_notifications: true`);
+    /// the user's report was *"in spite of turning off audio notifications, I
+    /// can hear chimes."*
+    ///
+    /// So the count is checked, not the reasoning. One call site, inside the fan
+    /// out, behind the setting.
+    #[test]
+    fn a_finished_session_chimes_only_when_the_sound_setting_says_so() {
+        let product = product_source();
+        let calls = product
+            .iter()
+            .filter(|line| line.contains("emit_notification_chime("))
+            .count();
+        // One definition, one call. Anything more is a second delivery path,
+        // which is exactly how the setting came to mean nothing.
+        assert_eq!(
+            calls, 2,
+            "there must be exactly ONE caller of the chime emitter (plus its own \
+             definition); a second one is how a 'sound off' setting stops meaning \
+             anything — found {calls} occurrences"
+        );
+        let fan_out = function_body(&product, "fn push_notification_with(");
+        assert!(
+            fan_out.contains("emit_notification_chime(tone);"),
+            "the one caller must be the fan-out itself"
+        );
+        // …and the finished-session path must not have grown its own again.
+        let finished = function_body(&product, "fn notify_finished_working_sessions(");
+        assert!(
+            !finished.contains("emit_notification_chime"),
+            "the completion path chimes through the fan-out or not at all:\n{finished}"
         );
     }
 
