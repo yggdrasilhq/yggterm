@@ -13,6 +13,54 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ★★★ A DAEMON OWNING A PLAIN SHELL CAN NEVER BE RETIRED — increment 2, steps 2-3
+
+**Status:** OPEN
+
+Step 1 of 3 is shipped and tested; steps 2-3 are the open work.
+
+This is the CONSTITUTION's *"the user must never have to know which daemon owns
+what"*, and it is the reason the session rail reads **"daemon is on 3.0.22 ·
+older than this client"** on the user's own GUI while a 3.0.26 daemon serves
+beside it.
+
+**What the user sees.** They press **Hot-restart daemon** in the rail. It
+answers success. Nothing changes. Measured 2026-08-04: five jojo daemons each
+returned `hot update handoff started: preserving N live terminal runtime(s)`
+with `spawn_ok: true` / `successor_already_live: true`, and afterwards the
+predecessor still held **all 14** of its PTYs and the successor held **none**.
+Three of those attempts were the user's own button presses.
+
+**Why.** The drain (`spawn_progressive_session_migration`) converges by
+RELEASING a session so a newer daemon re-resumes it, and
+`session_kind_is_migratable_agent` admits only Codex/CC — correctly, since an
+agent's state is in its own JSONL. **A plain shell has no such persistence, so
+it is never released, and there is no other way for a PTY to leave its daemon.**
+The owner therefore lingers on its old version for as long as that shell lives,
+which for a keep-alive shell is forever. jojo's preserved set was 8 `local://`
+shells to 2 `remote-cc://` rows, so this is the common case, not the corner.
+
+**Step 1 is done** (`0767a868`): `pty_handoff_wire` moves a master fd between
+daemons over `SCM_RIGHTS` with `MSG_CMSG_CLOEXEC`, four tests including the
+spike's negative control. Until today `PtyChildHandle::Adopted` was constructed
+nowhere and no `SCM_RIGHTS` call existed in the tree.
+
+**What is left, and the order is not negotiable:**
+
+1. **Receive side FIRST** — a handoff listener that takes the transcript line,
+   then the fd, builds `ReceivedMasterPty`, installs a runtime with
+   `PtyChildHandle::Adopted { pid, start_time }` and seeds the scrollback.
+2. **Send side SECOND, gated off until (1) is proven live.**
+
+⛔ **Do not build the send side first.** `sendmsg` success is the commit point
+(settled in `settled-calls.md`), so a send whose receiver cannot install the
+runtime **destroys the user's live shell** with no way back. That failure mode
+is worse than the bug.
+
+Inherited and not to be re-litigated: transcript travels BEFORE the fd; the
+child re-parents to init; identity is `(pid, start_time)`, never the pid alone.
+
+
 ## ★★★ A CLIENT ONLY EVER GETS THE FULL RECORD FOR THE *DAEMON'S* ACTIVE SESSION
 
 **Status:** OPEN
