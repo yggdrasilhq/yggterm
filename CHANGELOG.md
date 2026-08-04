@@ -6,6 +6,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## 3.0.24
 
+- **A contributed pane can be driven from the control plane**
+  (`server app pane <pane-id> <action> [value]`). Every other surface in the app
+  was already agent-drivable — a session opened, a terminal typed into, a web
+  page clicked — and a contributed pane could only be *opened*: its rows and
+  buttons were reachable by pointer alone, on a desktop where absolute pointer
+  injection does not map to screen pixels. So the affordances an agent had just
+  shipped were the ones it could not exercise. It routes through the same owner
+  a click uses, and answers with what the pane became.
+
 - **A wrapped line is no longer deleted from a screen replay.** The daemon's
   screen-width guard — written in July to drop ghost cells from a vt100 model
   that had drifted wider than its PTY — measured columns without knowing that a

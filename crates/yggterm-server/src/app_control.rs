@@ -600,6 +600,29 @@ pub enum AppControlCommand {
     SetRightPanelMode {
         mode: AppControlRightPanelMode,
     },
+    /// Press something in a contributed app pane, exactly as a click does.
+    ///
+    /// **Why this exists.** Every OTHER surface in this app could be driven from
+    /// here — a session opened, a terminal typed into, a web page clicked — and a
+    /// contributed pane could only be OPENED. Its rows and buttons were reachable
+    /// by pointer alone, on a Wayland desktop where absolute pointer injection
+    /// does not map to screen pixels, which means an agent could not exercise the
+    /// affordances it had just shipped. That is a hole in the agent-first design,
+    /// found on 2026-08-04 trying to live-prove the vault pane's row click; the
+    /// screenshot could show the pane and nothing could press it.
+    ///
+    /// It routes through `app_pane_run_action` — THE one owner a click uses — so
+    /// this cannot become a second path with its own behaviour. `value` is what
+    /// the widget would have carried: a row's id for a `row_action`, a tab's id
+    /// for `tabs`, `None` for a plain button.
+    AppPaneAction {
+        /// The pane's id, as the app declared it (`vault`, `notes`, `tabs`).
+        pane: String,
+        /// The action string the widget declares.
+        action: String,
+        #[serde(default)]
+        value: Option<String>,
+    },
     SetUiTheme {
         theme: UiTheme,
     },
@@ -1416,6 +1439,7 @@ impl AppControlCommand {
             Self::SetMainZoom { .. } => "set_main_zoom",
             Self::SetSearch { .. } => "set_search",
             Self::SetRightPanelMode { .. } => "set_right_panel_mode",
+            Self::AppPaneAction { .. } => "app_pane_action",
             Self::SetUiTheme { .. } => "set_ui_theme",
             Self::SetThemeEditorOpen { .. } => "set_theme_editor_open",
             Self::ResetThemeEditor => "reset_theme_editor",
