@@ -96,6 +96,57 @@ Read it:
 LIVE_HOST=$(cat .agents/config/live-host)
 ```
 
+## ★★★★ WHY THE SHADOW SESSION EXISTS — it is a DEVELOPMENT SURFACE, not just a probe
+
+**User-stated intent, 2026-08-04, written down because an agent kept missing it:**
+
+> *"terminal shadow/cobrowse sessions (attached/detached from GUI sessions) were made [so] you
+> agents [can] co-develop TUI/terminal UX with agents having a first class human life surface
+> control idea and can automatically iterate without the human interfering."*
+
+The shadow client is usually reached for as a **read** instrument — take a screenshot, check a row,
+confirm a session is alive. That is the smallest thing it does. Its actual purpose is to give an
+agent **the same surface a human sits in front of**, so the agent can develop *against the human
+experience* instead of against an API, and **iterate to a fix without the human in the loop**.
+
+**Three distinct uses. Reach for all three, not just the first:**
+
+| use | what it means | why an API can't do it |
+|---|---|---|
+| **Observe** | screenshot, `app state`, row order | (the familiar one) |
+| **★ Co-develop TUI/terminal UX** | change a keybinding, a status line, a paint path — then *sit in the surface* and use it as a human would, at human cadence, and iterate | Terminal UX is emergent: cursor placement, repaint flicker, what the eye lands on. No state dump tells you a layout is unpleasant to use |
+| **★ Drive a third-party TUI to extract what it knows** | launch someone else's full-screen CLI in a PTY, type into it, read its screen | The tool has no API. **The screen IS the API** |
+
+**The third use solved a real problem the same day this was written.** Every agy quota claim in the
+orbitstore campaign had been *inferred* from where runs stopped — a mysterious "5.79-day wall"
+nobody could predict. agy publishes the numbers itself behind an interactive `/usage` screen, and
+nothing was reading them because nothing thought to **drive the TUI**. One PTY + `/usage` +
+read-the-buffer immediately overturned two standing beliefs (there are TWO limits, weekly and
+5-hourly; a whole model pool sat 100% unused). ⇒ **When a CLI "won't tell you" something, ask
+whether it tells a human. If it does, drive it.** (`~/data/orbitstore/bin/cg_agy_usage.py` is the
+worked pattern: `pty.fork()` + `TERM` + `TIOCSWINSZ` + inject + strip ANSI + parse, raw kept.)
+
+★★ **THIS INCLUDES CLAUDE CODE ITSELF — an agent CAN read its own account's quota.** The reflex
+is to say *"`/usage` is a client-side command inside my own process, so I can't call it; ask the
+human."* **That reasoning is wrong and was corrected by the user within minutes of being written
+here.** You do not drive *your own* process — you **spawn a second one**: PTY a fresh `claude` in
+a scratch dir, inject `/usage`, read the status line, exit. Same recipe as any other TUI.
+
+    You've used 95% of your weekly limit · resets Aug 6, 10:30am (Asia/Kolkata)
+
+The same read also yields the CLI version, the active model, the effort level, the plan, and the
+org — none of which the agent's own context reliably carries. ⚠ It costs no model call (a slash
+command is local), so the "don't burn quota to measure quota" worry is unfounded.
+⇒ **THE GENERAL LESSON, worth more than the recipe: "I am inside it, therefore I cannot observe
+it" is a false constraint.** A second instance is an outside vantage point. Before declaring any
+surface unreachable, ask whether a *fresh* instance of it would answer.
+
+★ **DREAM AND IMPLEMENT AS YOU GO (user directive, 2026-08-04).** The same standing instruction
+that governs ychrome applies here: while working a task on this surface, **propose and build the
+verb you wished existed** rather than routing around its absence. Most of the verbs that make this
+skill useful were added exactly that way, mid-task. A missing affordance is a work item, not an
+excuse to hand the task back.
+
 ## ⛔ THE SHADOW-PROBE LAW (user-directed 2026-07-23) — probe through the shadow client, never the user's GUI
 
 Any probe that changes what the viewport shows — `app open`, view switches,
