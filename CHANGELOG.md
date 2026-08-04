@@ -4,6 +4,27 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.23
+
+- **A contributed pane's icons are the shell's own marks now, not emoji.** A
+  `list-row`, a row verb and a footer button may name a mark with `icon:<name>`
+  (`icon:copy`, `icon:eye`, `icon:archive`, …), which yggterm draws from the
+  named stroked set the context menus already use — `ShellIcon`, renamed from
+  `MenuIcon` because it is no longer only a menu's. ychrome's vault rail wore
+  `⧉ ⏱ ✎ 👁 🗑` at 11px in whatever face the platform had; the user's report was
+  that they "look illegible". A label the shell does not recognise is still
+  drawn as the character the app sent.
+- **Rows answer the pointer.** Every session-style row — the cwd tree, the
+  WebTabs rail, every contributed pane — takes a hover tint from one rule, so a
+  contributed list and the tree beside it cannot disagree about what hovering
+  looks like. A row's trailing verbs are an 18px target with room between them,
+  and light up in the accent under the pointer.
+- **A pane's action bar can hold a destructive button and an icon-only one.**
+  `danger` wears the product's one red; a button whose whole label is an icon
+  token is drawn as a square and floats to the bar's trailing edge, which is how
+  the vault's View pane gets Bitwarden's "Edit … archive delete" shape without a
+  second alignment field to disagree with the labels.
+
 ## 3.0.22
 
 - **Anything yggterm copies can now be pasted into other applications.** Every
