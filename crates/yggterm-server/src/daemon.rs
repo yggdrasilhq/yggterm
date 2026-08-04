@@ -12573,6 +12573,56 @@ fn daemon_version_is_newer_successor(peer_version: &str) -> bool {
 /// handoff is not converging and lingering is strictly better than churning.
 const MAX_MIGRATION_RELEASES_PER_KEY: u32 = 2;
 
+/// The release ledger belongs to the DAEMON, not to one drain thread.
+///
+/// It used to be a `HashMap` declared inside the thread
+/// [`spawn_progressive_session_migration`] spawns, which made
+/// [`MAX_MIGRATION_RELEASES_PER_KEY`] an allowance per DRAIN rather than per
+/// daemon. Every `HotRestart` RPC answered with `HotUpdateHandoff` starts a new
+/// drain (`start_migration_drain: true`), so each deploy handed every key a
+/// fresh allowance and the "lingering beats churning" rule silently reset — the
+/// one rule that exists to stop a non-converging handoff from re-resuming the
+/// user's live agent sessions forever.
+///
+/// Measured on the live desktop host 2026-08-04, on a daemon that had been sent
+/// several hot-restarts: `progressive_migration_session_returned` followed by
+/// `progressive_migration_session_released` for the SAME keys, over and over,
+/// including the remote-cc row the user was actively talking to an agent
+/// through. That is precisely the churn the comment at
+/// `session_kind_is_migratable_agent`'s call site says cost a user ~3s of
+/// swallowed keystrokes every ~50s, and it had come back because the counter
+/// that prevents it does not outlive the thread that owns it.
+static MIGRATION_RELEASE_ATTEMPTS: LazyLock<Mutex<HashMap<String, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// One drain per daemon, ever.
+///
+/// The same "a new drain per RPC" shape also let SEVERAL drains run at once,
+/// each releasing one session per 5 s tick against its own private counter, so
+/// N deploys meant N concurrent release loops on one daemon. The cap is
+/// meaningless while a second thread is doing the same work beside it.
+static MIGRATION_DRAIN_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// A copy of the release ledger, taken without holding its lock afterwards.
+fn migration_release_attempts_snapshot() -> HashMap<String, u32> {
+    MIGRATION_RELEASE_ATTEMPTS
+        .lock()
+        .map(|ledger| ledger.clone())
+        .unwrap_or_default()
+}
+
+/// Count one release of `runtime_key` and return the new total for it.
+fn record_migration_release_attempt(runtime_key: &str) -> u32 {
+    let Ok(mut ledger) = MIGRATION_RELEASE_ATTEMPTS.lock() else {
+        // A poisoned ledger must not become an UNLIMITED allowance: report the
+        // cap so the caller treats this key as spent rather than releasable.
+        return MAX_MIGRATION_RELEASES_PER_KEY;
+    };
+    let counter = ledger.entry(runtime_key.to_string()).or_insert(0);
+    *counter += 1;
+    *counter
+}
+
 /// One owned session's migration inputs for a single tick.
 struct MigrationCandidateRow {
     runtime_key: String,
@@ -12605,12 +12655,27 @@ fn spawn_progressive_session_migration(
     if !progressive_migration_enabled() {
         return;
     }
+    // One drain per daemon. A deploy sends `HotRestart` and every handoff answer
+    // asks for a drain, so without this a second deploy stacks a second release
+    // loop on top of the first — see MIGRATION_DRAIN_RUNNING.
+    if MIGRATION_DRAIN_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        append_trace_event(
+            &home_dir,
+            "daemon",
+            "lifecycle",
+            "progressive_migration_drain_already_running",
+            serde_json::json!({ "current_pid": std::process::id() }),
+        );
+        return;
+    }
     std::thread::spawn(move || {
         // Paced cadence: one release per tick, oldest-idle first.
         const POLL_INTERVAL_MS: u64 = 5_000;
-        // Releases attempted per runtime key. A key that keeps coming back is a
-        // handoff that is NOT converging — see MAX_MIGRATION_RELEASES_PER_KEY.
-        let mut release_attempts = HashMap::<String, u32>::new();
+        // Releases attempted per runtime key, held on the DAEMON so the
+        // allowance survives this thread — see MIGRATION_RELEASE_ATTEMPTS.
         loop {
             std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
             let owned = {
@@ -12671,6 +12736,10 @@ fn spawn_progressive_session_migration(
             if !successor_reachable {
                 continue;
             }
+            // Snapshot the ledger and release its lock BEFORE taking the daemon
+            // runtime lock: two locks held in one order here and the other order
+            // anywhere else is a deadlock, and this one is cheap to copy.
+            let release_attempts = migration_release_attempts_snapshot();
             let candidate = {
                 let rt = lock_daemon_runtime(&runtime, "progressive_migration_select");
                 let rows = owned
@@ -12696,11 +12765,8 @@ fn spawn_progressive_session_migration(
                 // Nothing safe to migrate this tick; keep lingering and re-check.
                 continue;
             };
-            let attempts = release_attempts
-                .entry(runtime_key.clone())
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-            if *attempts > 1 {
+            let attempts = record_migration_release_attempt(&runtime_key);
+            if attempts > 1 {
                 // Loud, not silent: a key we already released is back in our
                 // hands, so the successor did not adopt it. Say so — a churn
                 // loop that leaves no trace reads as "healthy" while the user
@@ -12712,7 +12778,7 @@ fn spawn_progressive_session_migration(
                     "progressive_migration_session_returned",
                     serde_json::json!({
                         "runtime_key": runtime_key,
-                        "release_attempt": *attempts,
+                        "release_attempt": attempts,
                         "max_attempts": MAX_MIGRATION_RELEASES_PER_KEY,
                         "current_pid": std::process::id(),
                     }),
@@ -16150,6 +16216,61 @@ mod tests {
             "a key that keeps coming back must stop being released — lingering \
              beats churning the user's live session"
         );
+    }
+
+    /// The allowance is per DAEMON, not per drain thread.
+    ///
+    /// The test above proves the filter works *given* a ledger; it could not
+    /// see that the ledger was declared inside the spawned drain and died with
+    /// it. Every `HotRestart` RPC answered with `HotUpdateHandoff` starts a new
+    /// drain, so each deploy used to hand every key a fresh allowance — which
+    /// is how a churn loop that this cap exists to stop was observed live on
+    /// 2026-08-04, re-resuming agent rows the user was actively working in.
+    #[test]
+    fn the_release_allowance_survives_a_new_drain_thread() {
+        let key = "remote-cc://dev/survives-a-new-drain";
+
+        // Drain #1 spends the whole allowance.
+        for _ in 0..super::MAX_MIGRATION_RELEASES_PER_KEY {
+            super::record_migration_release_attempt(key);
+        }
+
+        // Drain #2 starts here — a different thread, and under the old shape a
+        // brand-new empty map.
+        let seen_by_a_new_drain = std::thread::spawn(super::migration_release_attempts_snapshot)
+            .join()
+            .expect("snapshot thread");
+
+        assert!(
+            seen_by_a_new_drain.get(key).copied().unwrap_or(0)
+                >= super::MAX_MIGRATION_RELEASES_PER_KEY,
+            "a key that spent its allowance must still be spent in the next \
+             drain, or every deploy re-arms the churn loop"
+        );
+    }
+
+    /// Only one drain may hold the claim at a time. Without this, each deploy
+    /// stacked another release loop on the same daemon, and a per-key cap means
+    /// nothing while a second thread releases beside it.
+    #[test]
+    fn a_second_drain_cannot_claim_the_daemon_while_one_is_running() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // The guard's exact shape, exercised on a local flag so the test cannot
+        // disturb a real drain claim in the same process.
+        let running = AtomicBool::new(false);
+        let claim = |flag: &AtomicBool| {
+            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        };
+
+        assert!(claim(&running), "the first drain must start");
+        assert!(
+            !claim(&running),
+            "a second drain must be refused while one is running, or N deploys \
+             mean N concurrent release loops"
+        );
+        running.store(false, Ordering::SeqCst);
+        assert!(claim(&running), "a drain may start again once released");
     }
 
     use super::{
