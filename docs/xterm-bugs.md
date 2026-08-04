@@ -53,7 +53,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [detached-term-element-blank-viewport](#detached-term-element-blank-viewport) | Viewport entirely blank while every health field reports healthy: `term.element` is detached from its host and an empty `.xterm` husk (viewport only, no screen) occupies it, defeating all three repair guards | SPECIES A FIXED 2026-07-22 — provenance root-caused: the husk is born in a PArecordsAL `term.open()` (root appended first, screen fragment last), pinned by `tools/xterm-harness/husk_is_born_in_a_partial_open.test.js`; mount now retries after discarding the husk and the surface owner rebuilds rather than moves one. SPECIES B ALSO FIXED 2026-07-22 — and it was never a second species: `_coreBrowserService` arms the guard MID-open, six services before the screen reaches the root, so a late throw yields the same husk with the guard armed. The owner now disarms it (`term._core.element = undefined`) and re-opens, reported as `rebuilt_from_husk_disarmed`; pinned by `tools/xterm-harness/husk_species_b_is_a_late_partial_open.test.js` and proven in live WebKit |
 | [input-dead-after-window-refocus](#input-dead-after-window-refocus) | Viewport blinks and swallows keystrokes for ~3s, repeatedly; first reported as "cannot type after coming back from another window" | ROOT-CAUSED + FIXED 2026-07-23 (2.12.4) — progressive migration treated ANY reachable daemon as a successor and released the live daemon's own agent PTYs once a tick, re-resuming the CLI under the user's fingers. Successor now means strictly-newer + a returning key stops being released. Contributing: agent sessions born non-keep-alive (hence restart-unprotected), and the passive focus watchdog gated on the Wayland-lying `document.hasFocus()`. Probes kept: `ui/window_focus/transition`, `ui/input_policy/applied`, `input_dead_ms`, `passive_focus_recovery_state` |
 | [blank-viewport-client-snapshot-poison](#blank-viewport-client-snapshot-poison) | On reveal/switch-back of a cursor-addressed (codex) session, the viewport is clipped from the middle / blank above the bottom rows: the client restores a sparse cached xterm_session_snapshot instead of reconciling the daemon's authoritative screen frame; trips "viewport beyond scrollback base" → blink/reseed/restart | CAPTURE+RESTORE GUARDS SHIPPED (66d765c3); CODEX RECONCILE FIX 2026-06-06 (Bug 1) — reveal reconciles from daemon screen frame before the client snapshot; NEEDS LIVE VERIFY |
-| [screen-model-wider-than-viewer](#screen-model-wider-than-viewer) | Words on a busy CC/codex session render merged out of two different frames (`of exam manipulation` → `uof examrnmanipulation`), with a gutter of unrelated fragments down the left of the top rows | ROOT-CAUSED + FIXED 2026-07-25 — the daemon's vt100 model had drifted WIDER than its own PTY (204 vs 168) and served the ghost cells past the edge; three fixes, one per layer |
+| [screen-model-wider-than-viewer](#screen-model-wider-than-viewer) | Words on a busy CC/codex session render merged out of two different frames (`of exam manipulation` → `uof examrnmanipulation`), with a gutter of unrelated fragments down the left of the top rows | ROOT-CAUSED + FIXED 2026-07-25 — the daemon's vt100 model had drifted WIDER than its own PTY (204 vs 168) and served the ghost cells past the edge. ⚠ **The 2026-07-25 fix was itself deleting content until 2026-08-04**: the column walker could not see a line WRAP, so a wrapped line measured wider than the grid and the clip ate its continuation (504 firings on the live host). Fixed by giving the walker the grid it was formatted against; the client-side layer is gone, since it can never have both numbers |
 
 ---
 
@@ -2100,11 +2100,52 @@ Three layers, each independently sufficient for the case it covers:
 2. **Daemon, drift:** the `resize` fast path now compares the SCREEN MODEL too,
    and repairs it in place (`resize_screen_model_repaired`) instead of returning
    `resize_noop`.
-3. **Client, defence:** the reveal/post-resize reconcile measures the payload
-   before writing it and clips to its own grid, tracing
-   `screen_reconcile_clipped_to_viewer_width`. This is what protects a viewer
-   attached to an OLDER daemon — which is the live case, since a session
-   stranded on a preserved owner is served by whatever daemon still holds it.
+3. ~~**Client, defence:** the reveal/post-resize reconcile measures the payload
+   before writing it and clips to its own grid.~~ **REMOVED 2026-08-04 — it was
+   destroying content. See the section below.**
+
+### ⛔ THE WALKER COULD NOT SEE A LINE WRAP, AND THE CLIP ATE THE REST OF THE SENTENCE (2026-08-04)
+
+**The three layers above were right about the mechanism and wrong about the
+measurement**, and the wrong measurement made two of them destructive.
+
+A vt100 formatter emits a WRAPPED row as one continuous run with **no break
+between its parts** — deliberately, because that is what makes the receiving
+terminal re-wrap it at its own width instead of hard-breaking it at ours.
+`walk_formatted_screen` had no width to wrap at, so it counted columns straight
+through: a 400-character line on a 170-column grid measured as **column 400**.
+
+Then the clip fired on that reading and **deleted every cell past 170** — the
+second and third visual row of the line. Not a ghost: the rest of the sentence.
+
+**Found by reading the trace rather than by a report.** On the GUI host,
+2026-08-04: **504 `screen_snapshot_clipped_to_pty_width` events** across two
+plain shells, every one `pty_cols: 170` against a `screen_max_column` of 334 and
+260 — and CONSTANT, because nothing was changing. It was the same wrapped lines
+being mis-measured on every snapshot. A screen model that had genuinely drifted
+would not report the same width forever.
+
+**The fix, and what it costs.**
+
+- `walk_formatted_screen` takes the width of the grid the text was FORMATTED
+  against and wraps at it, exactly as the terminal will. `formatted_screen_max_column`
+  and `clip_formatted_screen_to_width` both require it; there is no default,
+  because there is no safe guess.
+- The real check survives: a stale model wider than the PTY wraps at its OWN
+  wider width, so its ghost cells still land past the PTY's edge and are still
+  found. Two tests hold both directions
+  (`a_wrapped_line_measures_to_the_grid_and_is_never_clipped`,
+  `a_model_wider_than_the_pty_is_still_caught`).
+- **Layer 3 is gone, and could never have been right.** The GUI holds only its
+  own width, and a wrapped line carries no break — so it cannot tell a ghost
+  from a continuation, whatever it measures. The reconcile payload is now
+  clipped by the DAEMON (`screen_reconcile_chunk`), which is the one place that
+  holds both numbers. One owner, with the information, instead of two with one
+  of them guessing.
+- The anomaly event gained the field that separates its own two causes:
+  `screen_model_cols`. Without it, 504 firings could not distinguish "the model
+  is stale and wide" from "the walker cannot see a wrap" — an anomaly event that
+  cannot tell its causes apart is a lead that costs a session.
 
 ### Live proof of layer 3 (2026-07-25 evening, jojo, before the 2.12.13 deploy)
 
@@ -2145,7 +2186,10 @@ cells), and compare the widest column reached against `pty_cols` from
   walker, so the measurement and the rewrite cannot disagree),
   `TerminalScreenState::size`, `TerminalSession::resize`,
   `TerminalSession::screen_snapshot`
-- `crates/yggterm-shell/src/shell.rs` — the `ScreenReconcileDecision::Write` arm
+- `crates/yggterm-server/src/terminal.rs` — `TerminalSession::screen_reconcile_chunk`
+  (the reconcile payload's clip, since 2026-08-04)
+- `crates/yggterm-shell/src/shell.rs` — the `ScreenReconcileDecision::Write` arm,
+  which now writes what it was given and explains why it must not re-clip
 
 ### Tests
 
@@ -2153,7 +2197,9 @@ cells), and compare the widest column reached against `pty_cols` from
 are counted as cells (not bytes), a screen that fits is byte-identical, clipping
 drops only the cells past the edge, colour state survives the clip, a wide glyph
 straddling the edge is dropped whole, and an OSC title string does not move the
-cursor.
+cursor. Plus the two that hold the 2026-08-04 contract in both directions: a
+wrapped line measures to the grid and is never clipped, and a model wider than
+the PTY is still caught.
 
 ### Telemetry
 

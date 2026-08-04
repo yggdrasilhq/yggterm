@@ -4,6 +4,34 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 3.0.24
+
+- **A wrapped line is no longer deleted from a screen replay.** The daemon's
+  screen-width guard — written in July to drop ghost cells from a vt100 model
+  that had drifted wider than its PTY — measured columns without knowing that a
+  vt100 formatter emits a WRAPPED row as one continuous run with no break in it.
+  So a 400-character line on a 170-column grid measured as "column 400", the
+  guard fired, and the clip removed the line's second and third visual rows.
+  Found in the trace, not in a report: 504 firings on the GUI host across two
+  plain shells, all reporting the same impossible width forever.
+
+  The walker now wraps at the width the text was formatted against, so the
+  measurement means "which column of the grid" — and the check it was written
+  for still works, because a stale wide model wraps at its own wider width and
+  its ghosts still land past the PTY's edge.
+- **The reconcile payload is clipped by the daemon, not by the GUI.** Only the
+  daemon holds both widths (the model the text was formatted against, and the
+  PTY the CLI was handed), and only their difference is a ghost. The client-side
+  copy of that decision could never have been right: it has one number, and a
+  wrapped line carries no break for it to find.
+- The clip's trace event carries `screen_model_cols`, the field that separates
+  its own two causes.
+- **The completion chime obeys the sound setting.** A session finishing work
+  chimed under `in_app_notifications && !notification_sound` — that is, precisely
+  when the user had turned notification sound OFF. The setting is the authority
+  now, and a test holds the chime to exactly one call site inside the
+  notification fan-out.
+
 ## 3.0.23
 
 - **A contributed pane's icons are the shell's own marks now, not emoji.** A

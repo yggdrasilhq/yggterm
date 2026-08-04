@@ -1200,7 +1200,40 @@ enum FormattedScreenStep<'a> {
 /// Shared by [`formatted_screen_max_column`] and
 /// [`clip_formatted_screen_to_width`] so the measurement and the rewrite can
 /// never disagree about where a character lands.
-fn walk_formatted_screen(screen_text: &str, mut step: impl FnMut(FormattedScreenStep<'_>)) {
+/// Walk a formatted screen, tracking the column each printed cell lands in.
+///
+/// ⛔ `grid_cols` IS THE GRID THE PAYLOAD WAS FORMATTED AGAINST, and passing the
+/// wrong one silently destroys content.
+///
+/// A vt100 formatter emits a WRAPPED row as one continuous run with no line
+/// break between its parts — deliberately, because that is what makes the
+/// receiving terminal re-wrap it at its own width instead of hard-breaking it at
+/// ours. So a 400-character line on a 170-column grid arrives as 400 printable
+/// bytes in a row, and a walker that counts columns monotonically reads its last
+/// cell as **column 400 on a 170-column screen**.
+///
+/// That is not a hypothesis. Measured on the GUI host 2026-08-04: 504
+/// `screen_snapshot_clipped_to_pty_width` events across two shells, every one of
+/// them reporting `pty_cols: 170` against a `screen_max_column` of 334 and 260 —
+/// constant, because the content was not changing; it was the same wrapped lines
+/// being mis-measured on every snapshot. The clip that fires on that reading
+/// then DELETES every wrapped continuation, so a re-attaching client gets a
+/// screen with the second and third visual row of every long line missing.
+///
+/// Wrapping here at the grid's own width is what makes the measurement mean
+/// "which column of the grid", which is the only thing the callers ever wanted.
+/// It also keeps the check that this code was written for honest: a STALE model
+/// wider than the PTY wraps at its own wider width, so its ghost cells still
+/// land past the PTY's edge and are still found.
+///
+/// `grid_cols == 0` means "unknown" and disables wrapping — the pre-2026-08-04
+/// behaviour, kept only so a caller with genuinely no width is explicit about
+/// it rather than passing a guess.
+fn walk_formatted_screen(
+    screen_text: &str,
+    grid_cols: u16,
+    mut step: impl FnMut(FormattedScreenStep<'_>),
+) {
     let bytes = screen_text.as_bytes();
     let mut col: u16 = 1;
     let mut i = 0usize;
@@ -1267,6 +1300,12 @@ fn walk_formatted_screen(screen_text: &str, mut step: impl FnMut(FormattedScreen
             }
             _ => {
                 let width = formatted_screen_cell_width(ch);
+                // THE WRAP, before the cell is placed: a terminal that cannot
+                // fit this cell in the current row starts the next one, and the
+                // cell lands in column 1 there.
+                if grid_cols > 0 && col.saturating_add(width).saturating_sub(1) > grid_cols {
+                    col = 1;
+                }
                 step(FormattedScreenStep::Print {
                     text: &screen_text[i..i + len],
                     col,
@@ -1319,9 +1358,15 @@ struct ScreenSnapshotKey {
 /// where `CSI nC` (blank runs) leaves the spilled characters showing through.
 /// The result is text merged out of two different frames. Measured live on jojo
 /// 2026-07-25: a screen reaching column 204 painted into a 168-column viewer.
-pub fn formatted_screen_max_column(screen_text: &str) -> u16 {
+///
+/// ⚠ `grid_cols` is the width of the GRID THIS TEXT WAS FORMATTED AGAINST — the
+/// daemon's vt100 model, not the viewer. Read [`walk_formatted_screen`] before
+/// passing anything else: a wrapped line has no break in it, so a walker given
+/// the wrong width reports a 400-column screen for a 170-column grid and every
+/// caller downstream acts on a number that describes nothing.
+pub fn formatted_screen_max_column(screen_text: &str, grid_cols: u16) -> u16 {
     let mut max_col = 0u16;
-    walk_formatted_screen(screen_text, |step| {
+    walk_formatted_screen(screen_text, grid_cols, |step| {
         if let FormattedScreenStep::Print { col, width, .. } = step {
             max_col = max_col.max(col.saturating_add(width).saturating_sub(1));
         }
@@ -1335,12 +1380,18 @@ pub fn formatted_screen_max_column(screen_text: &str) -> u16 {
 /// only the printable cells past the edge are dropped. Nothing legitimate lives
 /// there: the CLI cannot paint wider than the PTY it was handed, so a cell
 /// beyond the viewer's width is a ghost from when the grid was wider.
-pub fn clip_formatted_screen_to_width(screen_text: &str, cols: u16) -> String {
+///
+/// ⛔ THAT LAST SENTENCE IS ONLY TRUE WHEN `grid_cols` IS RIGHT. Given the
+/// viewer's width where the model's belonged, this deletes the continuation of
+/// every wrapped line — the cells are not ghosts, they are the rest of the
+/// sentence. Both arguments are required for that reason: there is no default
+/// that is safe to guess.
+pub fn clip_formatted_screen_to_width(screen_text: &str, grid_cols: u16, cols: u16) -> String {
     if cols == 0 {
         return screen_text.to_string();
     }
     let mut out = String::with_capacity(screen_text.len());
-    walk_formatted_screen(screen_text, |step| match step {
+    walk_formatted_screen(screen_text, grid_cols, |step| match step {
         FormattedScreenStep::Control(text) => out.push_str(text),
         FormattedScreenStep::Print { text, col, width } => {
             if col.saturating_add(width).saturating_sub(1) <= cols {
@@ -2099,14 +2150,23 @@ impl PtySessionRuntime {
     }
 
     fn render_screen_snapshot(&self, pty_cols: u16) -> String {
-        let formatted = self
-            .screen_state
-            .lock()
-            .expect("pty screen state lock poisoned")
-            .formatted
-            .trim_matches('\0')
-            .to_string();
-        if pty_cols == 0 || formatted_screen_max_column(&formatted) <= pty_cols {
+        // BOTH WIDTHS, read under one lock. The model's is what the text was
+        // formatted against (so it is where a wrapped line breaks); the PTY's is
+        // what the CLI was told it had (so it is where a legitimate cell must
+        // stop). Only their DIFFERENCE is a ghost. Reading one and guessing the
+        // other is exactly the mistake that made this clip destructive.
+        let (formatted, model_cols) = {
+            let screen_state = self
+                .screen_state
+                .lock()
+                .expect("pty screen state lock poisoned");
+            (
+                screen_state.formatted.trim_matches('\0').to_string(),
+                screen_state.size().1,
+            )
+        };
+        let max_column = formatted_screen_max_column(&formatted, model_cols);
+        if pty_cols == 0 || max_column <= pty_cols {
             return formatted;
         }
         trace_terminal_event(
@@ -2114,10 +2174,16 @@ impl PtySessionRuntime {
             serde_json::json!({
                 "path": self.key,
                 "pty_cols": pty_cols,
-                "screen_max_column": formatted_screen_max_column(&formatted),
+                "screen_max_column": max_column,
+                // THE DISCRIMINATOR THIS EVENT WAS MISSING. Without it, 504
+                // firings on the live host could not distinguish "the model is
+                // stale and wide" (the bug this clip is for) from "the walker
+                // cannot see a line wrap" (what it actually was). An anomaly
+                // event that cannot separate its own two causes costs a session.
+                "screen_model_cols": model_cols,
             }),
         );
-        clip_formatted_screen_to_width(&formatted, pty_cols)
+        clip_formatted_screen_to_width(&formatted, model_cols, pty_cols)
     }
 
     /// The daemon's CLEAN scrolled-off history rows (vt100 scrollback ring),
@@ -2158,12 +2224,43 @@ impl PtySessionRuntime {
         })
     }
 
+    /// The destructive full-screen replay a desynced client asks for.
+    ///
+    /// ⛔ IT IS CLIPPED HERE, AND ONLY HERE. The GUI used to clip this payload
+    /// itself, against the VIEWER's width — the only number it has — which
+    /// deletes the continuation of every wrapped line, because a wrapped line
+    /// carries no break for a walker to find. The daemon is the one place that
+    /// holds BOTH widths (the model the text was formatted against, and the PTY
+    /// the CLI was handed), so it is the only place that can tell a ghost cell
+    /// from the rest of a sentence. One owner, with the information — not two,
+    /// one of them guessing.
     fn screen_reconcile_chunk(&self, next_cursor: u64) -> Option<TerminalChunk> {
-        let screen_state = self
-            .screen_state
-            .lock()
-            .expect("pty screen state lock poisoned");
-        let payload = screen_state.viewport_reconcile_replay()?;
+        let (payload, model_cols) = {
+            let screen_state = self
+                .screen_state
+                .lock()
+                .expect("pty screen state lock poisoned");
+            (
+                screen_state.viewport_reconcile_replay()?,
+                screen_state.size().1,
+            )
+        };
+        let pty_cols = self.current_cols.load(Ordering::SeqCst);
+        let max_column = formatted_screen_max_column(&payload, model_cols);
+        let payload = if pty_cols > 0 && max_column > pty_cols {
+            trace_terminal_event(
+                "screen_reconcile_clipped_to_pty_width",
+                serde_json::json!({
+                    "path": self.key,
+                    "pty_cols": pty_cols,
+                    "screen_max_column": max_column,
+                    "screen_model_cols": model_cols,
+                }),
+            );
+            clip_formatted_screen_to_width(&payload, model_cols, pty_cols)
+        } else {
+            payload
+        };
         Some(TerminalChunk {
             seq: next_cursor.saturating_add(1),
             data: payload,
@@ -3653,27 +3750,31 @@ mod screen_width_tests {
     /// that reach past the viewer's right edge.
     const WIDE_SCREEN: &str = "\u{1b}[H\u{1b}[J\u{1b}[1;1Habc\u{1b}[Cdef\u{1b}[2;1Hxy";
 
+    /// The grid WIDE_SCREEN was formatted against. Wide enough that nothing in
+    /// it wraps, so these cases test the measurement and not the wrap.
+    const GRID: u16 = 80;
+
     #[test]
     fn max_column_counts_blank_runs_not_bytes() {
         // "abc" + one skipped cell + "def" = column 7. Byte length says 30-odd,
         // which is exactly why `screen_text.len()` could never have caught this.
-        assert_eq!(formatted_screen_max_column(WIDE_SCREEN), 7);
+        assert_eq!(formatted_screen_max_column(WIDE_SCREEN, GRID), 7);
         assert!(WIDE_SCREEN.len() > 20);
     }
 
     #[test]
     fn a_screen_that_fits_is_returned_unchanged() {
-        assert_eq!(clip_formatted_screen_to_width(WIDE_SCREEN, 7), WIDE_SCREEN);
-        assert_eq!(clip_formatted_screen_to_width(WIDE_SCREEN, 80), WIDE_SCREEN);
+        assert_eq!(clip_formatted_screen_to_width(WIDE_SCREEN, GRID, 7), WIDE_SCREEN);
+        assert_eq!(clip_formatted_screen_to_width(WIDE_SCREEN, GRID, 80), WIDE_SCREEN);
     }
 
     /// The fix: cells past the viewer's width are dropped, and every control
     /// sequence survives — colour/attribute state must not be lost with them.
     #[test]
     fn clipping_drops_only_the_cells_past_the_edge() {
-        let clipped = clip_formatted_screen_to_width(WIDE_SCREEN, 5);
+        let clipped = clip_formatted_screen_to_width(WIDE_SCREEN, GRID, 5);
         assert_eq!(clipped, "\u{1b}[H\u{1b}[J\u{1b}[1;1Habc\u{1b}[Cd\u{1b}[2;1Hxy");
-        assert_eq!(formatted_screen_max_column(&clipped), 5);
+        assert_eq!(formatted_screen_max_column(&clipped, GRID), 5);
         // The row that already fit is untouched.
         assert!(clipped.contains("\u{1b}[2;1Hxy"));
     }
@@ -3681,7 +3782,7 @@ mod screen_width_tests {
     #[test]
     fn colour_state_survives_the_clip() {
         let text = "\u{1b}[1;1H\u{1b}[31mred\u{1b}[32mgreen\u{1b}[m";
-        let clipped = clip_formatted_screen_to_width(text, 3);
+        let clipped = clip_formatted_screen_to_width(text, GRID, 3);
         assert_eq!(clipped, "\u{1b}[1;1H\u{1b}[31mred\u{1b}[32m\u{1b}[m");
     }
 
@@ -3690,8 +3791,8 @@ mod screen_width_tests {
         // A fullwidth character straddling the edge is dropped whole, never
         // half-painted.
         let text = "\u{1b}[1;1Ha\u{4e00}b";
-        assert_eq!(formatted_screen_max_column(text), 4);
-        assert_eq!(clip_formatted_screen_to_width(text, 2), "\u{1b}[1;1Ha");
+        assert_eq!(formatted_screen_max_column(text, GRID), 4);
+        assert_eq!(clip_formatted_screen_to_width(text, GRID, 2), "\u{1b}[1;1Ha");
     }
 
     /// The measurement must survive a payload it does not fully understand:
@@ -3699,7 +3800,64 @@ mod screen_width_tests {
     #[test]
     fn osc_sequences_do_not_move_the_cursor() {
         let text = "\u{1b}[1;1H\u{1b}]0;a window title\u{7}ok";
-        assert_eq!(formatted_screen_max_column(text), 2);
+        assert_eq!(formatted_screen_max_column(text, GRID), 2);
+    }
+
+    /// ★★★ A WRAPPED LINE IS NOT A WIDE SCREEN, AND THE CLIP MUST NOT EAT IT.
+    ///
+    /// This is the 2026-08-04 bug, in the smallest form that shows it. A vt100
+    /// formatter emits a wrapped row as ONE continuous run with no break — that
+    /// is what makes the receiving terminal re-wrap it at its own width instead
+    /// of hard-breaking it at ours — so a walker counting columns straight
+    /// through reads the last cell of a 400-character line on a 170-column grid
+    /// as "column 400", and the clip then deletes everything past 170: the
+    /// second and third visual row of the line.
+    ///
+    /// On the live host that read as 504 `screen_snapshot_clipped_to_pty_width`
+    /// events across two shells, `pty_cols: 170` against "screen_max_column"
+    /// 334 and 260 — CONSTANT, because nothing was changing; it was the same
+    /// wrapped lines being mis-measured on every single snapshot.
+    #[test]
+    fn a_wrapped_line_measures_to_the_grid_and_is_never_clipped() {
+        let long: String = std::iter::repeat('x').take(400).collect();
+        let wrapped = format!("\x1b[1;1H{long}");
+        // The whole point: 400 printable cells on a 170-column grid are 170
+        // columns wide, not 400.
+        assert_eq!(formatted_screen_max_column(&wrapped, 170), 170);
+        // …so nothing is dropped when the model and the PTY agree, which is
+        // every healthy session.
+        assert_eq!(clip_formatted_screen_to_width(&wrapped, 170, 170), wrapped);
+    }
+
+    /// …and the check this code was WRITTEN for still works. A stale model
+    /// wider than the PTY wraps at its own wider width, so its cells really do
+    /// land past the PTY's edge and are still found and dropped.
+    #[test]
+    fn a_model_wider_than_the_pty_is_still_caught() {
+        // 200 cells on a 200-column model: no wrap, so they occupy columns
+        // 1..200 — of which everything past 170 is a ghost the CLI could never
+        // have painted.
+        let row: String = std::iter::repeat('y').take(200).collect();
+        let stale = format!("\x1b[1;1H{row}");
+        assert_eq!(formatted_screen_max_column(&stale, 200), 200);
+        let clipped = clip_formatted_screen_to_width(&stale, 200, 170);
+        assert_eq!(
+            clipped.chars().filter(|c| *c == 'y').count(),
+            170,
+            "the ghost cells past the PTY edge must go, and only those"
+        );
+    }
+
+    /// A wrap must not survive a cursor jump: `CSI r;cH` re-seats the column,
+    /// and the row it lands on starts counting again.
+    #[test]
+    fn an_absolute_jump_reseats_the_column_after_a_wrap() {
+        let long: String = std::iter::repeat('z').take(30).collect();
+        let text = format!("\x1b[1;1H{long}\x1b[3;5Hq");
+        // 30 cells on a 10-column grid wrap to three rows; the jump then puts
+        // `q` at column 5, which is where the measurement must end up.
+        assert_eq!(formatted_screen_max_column(&text, 10), 10);
+        assert_eq!(clip_formatted_screen_to_width(&text, 10, 10), text);
     }
 }
 
@@ -4108,10 +4266,13 @@ PY"#;
             !drifted.contains("GHOSTCOL"),
             "the served screen must be clipped to the PTY width, not the model's"
         );
+        // Measured against the CLIPPED text's own grid, which is now the PTY's:
+        // once the ghosts past column 120 are gone, nothing in it wraps at 120
+        // either, so this reads the same number a viewer would.
         assert!(
-            formatted_screen_max_column(&drifted) <= 120,
+            formatted_screen_max_column(&drifted, 120) <= 120,
             "clipped screen still paints past the pty: {}",
-            formatted_screen_max_column(&drifted)
+            formatted_screen_max_column(&drifted, 120)
         );
 
         // --- the repair branch never touches resize_seq. ---
@@ -6062,3 +6223,4 @@ line-two on the real screen\r\n\
         );
     }
 }
+
