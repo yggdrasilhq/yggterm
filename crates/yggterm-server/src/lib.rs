@@ -112,6 +112,7 @@ pub use daemon::{
     focus_live_with_view, hot_restart, hot_restart_detailed, open_remote_session,
     open_remote_session_with_view, open_stored_session, open_stored_session_with_view, ping, working_flags,
     prepare_client_close, prepare_update_restart, raise_external_window,
+    PeerDaemonSummary, stale_daemon_answer_warning,
     reachable_versioned_daemon_statuses, refresh_managed_cli, refresh_preview,
     refresh_preview_with_history,
     refresh_remote_machine, remove_session, remove_ssh_target, reorder_live_sessions,
