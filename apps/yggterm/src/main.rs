@@ -56,7 +56,8 @@ use yggterm_server::{
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
     run_app_control_set_force_foreground, run_app_control_set_fullscreen,
     run_app_control_set_main_zoom, run_app_control_set_maximized,
-    run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
+    run_app_control_app_pane_action, run_app_control_set_preview_layout,
+    run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded, run_app_control_set_search,
     run_app_control_set_session_keep_alive, run_app_control_set_theme_editor_open,
     run_app_control_set_theme_editor_values, run_app_control_set_tree_selection,
@@ -868,6 +869,11 @@ fn print_server_app_help() {
     refusal and the surviving pids in live_processes
   yggterm server app session rename <session-path> <title> [--pid <pid>]
   yggterm server app start-page [--pid <pid>]
+  yggterm server app pane <pane-id> <action> [value]
+    press something in a contributed pane, exactly as a click does —
+    `panel pane:<id>` opens one, this is what can act on it. value is
+    what the widget would carry: a row id for a row_action, a tab id
+    for tabs, absent for a plain button
   yggterm server app terminal <new|send|focus|scroll|probe-type|probe-scroll|probe-select|probe-context-menu> ...
   yggterm server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|codex|claude-code>] [--title <title>] [--purpose <what-for>] [--no-activate]
     with no --title the row is named for the driving agent and its purpose
@@ -2318,6 +2324,28 @@ fn main() -> Result<()> {
                     ),
                 };
                 run_app_control_set_right_panel_mode(mode, timeout_ms)
+            }
+            // Press something IN a contributed pane. `panel pane:<id>` opens
+            // one; this is the verb that could then do nothing to it.
+            "pane" => {
+                let positional = cli_positional_args(&args, 3);
+                let mut positional = positional.into_iter();
+                let pane = positional
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "usage: server app pane <pane-id> <action> [value]"
+                    ))?
+                    .to_string();
+                let action = positional
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "usage: server app pane <pane-id> <action> [value]"
+                    ))?
+                    .to_string();
+                // The value a widget would have carried: a row's id for a
+                // `row_action`, a tab's id for `tabs`, absent for a button.
+                let value = positional.next().map(str::to_string);
+                run_app_control_app_pane_action(pane, action, value, timeout_ms)
             }
             "theme" => {
                 let theme = cli_positional_args(&args, 3)
