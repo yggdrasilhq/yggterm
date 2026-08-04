@@ -10573,6 +10573,56 @@ fn versioned_server_status_probe_paths_excluding_endpoint(
         .collect()
 }
 
+/// Another daemon alive on this host, as `server status` reports it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerDaemonSummary {
+    pub pid: u32,
+    pub version: String,
+    pub owned_terminal_session_count: usize,
+}
+
+/// Why `server status` may NEVER be read as "the daemon behind the user's
+/// window".
+///
+/// A CLI connects to the socket named for **its own** compiled version
+/// (`server-<version>.sock`). So the moment a new binary is deployed, the CLI
+/// starts answering about a daemon it just caused to exist — while the GUI
+/// stays attached to the daemon that owns its live sessions, on whatever
+/// version that daemon has always been.
+///
+/// This cost a whole session on 2026-08-04. The user's rail read *"daemon is on
+/// 3.0.22 · older than this client"*; `server status` was asked, answered
+/// **3.0.26**, and that answer was reported back to them as if the problem were
+/// solved. Both numbers were true and they were about different processes. The
+/// user had to point at the screenshot twice before the discrepancy was chased,
+/// and the deploys made to "fix" it added two more empty daemons beside the
+/// busy one.
+///
+/// The tell is ownership, not version: a daemon answering for zero PTYs while
+/// a peer holds twenty is not the daemon anyone is using. Returns the sentence
+/// to print beside the status, or `None` when this daemon is the busiest.
+pub fn stale_daemon_answer_warning(
+    answering_pid: u32,
+    answering_owned: usize,
+    peers: &[PeerDaemonSummary],
+) -> Option<String> {
+    let busiest = peers
+        .iter()
+        .filter(|peer| peer.pid != answering_pid)
+        .max_by_key(|peer| peer.owned_terminal_session_count)?;
+    if busiest.owned_terminal_session_count <= answering_owned {
+        return None;
+    }
+    Some(format!(
+        "this status is for pid {answering_pid}, which owns {answering_owned} terminal \
+         session(s) — but pid {} (version {}) owns {}. A CLI answers about the daemon \
+         matching ITS OWN version, so this is probably NOT the daemon behind the user's \
+         window. Check the GUI's own report (`server app state` -> daemon_update_state) \
+         before concluding anything about what the user sees.",
+        busiest.pid, busiest.version, busiest.owned_terminal_session_count,
+    ))
+}
+
 #[cfg(unix)]
 pub fn reachable_versioned_daemon_statuses(
     home_dir: &Path,
@@ -16216,6 +16266,57 @@ mod tests {
             "a key that keeps coming back must stop being released — lingering \
              beats churning the user's live session"
         );
+    }
+
+    /// Tonight's exact reading, turned into a lock.
+    ///
+    /// jojo, 2026-08-04: `server status` answered for the daemon matching the
+    /// CLI's own freshly-deployed version — pid 3737016, 3.0.26, **0 PTYs** —
+    /// while the user's GUI sat on pid 2458623, 3.0.22, holding **20**. That
+    /// answer was reported to them as though it described their window.
+    #[test]
+    fn a_status_for_an_empty_daemon_beside_a_busy_one_warns_that_it_is_the_wrong_daemon() {
+        let peers = vec![
+            super::PeerDaemonSummary {
+                pid: 3737016,
+                version: "3.0.26".to_string(),
+                owned_terminal_session_count: 0,
+            },
+            super::PeerDaemonSummary {
+                pid: 2458623,
+                version: "3.0.22".to_string(),
+                owned_terminal_session_count: 20,
+            },
+        ];
+
+        let warning = super::stale_daemon_answer_warning(3737016, 0, &peers)
+            .expect("an empty daemon beside a busy one MUST warn");
+        assert!(warning.contains("2458623"), "it must name the busy daemon");
+        assert!(warning.contains("3.0.22"), "and the version the user sees");
+    }
+
+    /// ...and it must stay quiet when this really is the daemon in use, or the
+    /// warning becomes noise that gets ignored on the day it matters.
+    #[test]
+    fn the_busiest_daemon_does_not_warn_about_itself() {
+        let peers = vec![
+            super::PeerDaemonSummary {
+                pid: 2458623,
+                version: "3.0.22".to_string(),
+                owned_terminal_session_count: 20,
+            },
+            super::PeerDaemonSummary {
+                pid: 3737016,
+                version: "3.0.26".to_string(),
+                owned_terminal_session_count: 0,
+            },
+        ];
+        assert!(
+            super::stale_daemon_answer_warning(2458623, 20, &peers).is_none(),
+            "the daemon holding the sessions is the right one to be answering"
+        );
+        // A lone daemon has nothing to be confused with.
+        assert!(super::stale_daemon_answer_warning(1, 0, &[]).is_none());
     }
 
     /// The allowance is per DAEMON, not per drain thread.
