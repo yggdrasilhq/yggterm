@@ -1095,43 +1095,60 @@ mod tests {
         );
     }
 
-    /// Task item 3: existing behaviour unchanged. Every construction site in the
-    /// terminal manager must still be `Owned` — increment 1 adds the ability to
-    /// express adoption, it does not adopt anything.
+    /// ⚠ **REWRITTEN for increment 2 (2026-08-04).** This used to assert that
+    /// `terminal.rs` mentioned no adoption at all — the correct guard while
+    /// increment 1 was only a type split, and a guard that had to CHANGE the
+    /// moment the handoff was really wired. It is rewritten rather than
+    /// deleted, because the invariant underneath it never went away: adoption
+    /// must arrive on purpose, in one place, and must never leak into the
+    /// ordinary spawn path.
     ///
-    /// **Honest limitation: this is a source-text scan, and its blind spot has
-    /// been measured, not guessed.** It matches the literal constructor names,
-    /// so it catches the accident it exists for — increment 2's wiring arriving
-    /// early by copy-paste — and nothing subtler. Mutating the construction
-    /// site to `child.process_id().and_then(PtyChildHandle::adopt)` really does
-    /// adopt, and this test really does stay GREEN, because the function is
-    /// named without its parenthesis and the `owned` fallback keeps the first
-    /// assertion true. A rename or a re-export would slip past the same way.
-    /// It is a tripwire, not a proof of absence; the proof that production
-    /// still owns its children is [`killing_an_owned_child_actually_ends_it`]
-    /// and the behavioural locks beside it.
+    /// What it locks now:
+    ///
+    /// 1. The spawn path still builds an **Owned** child. A PTY we opened is
+    ///    ours, `waitpid` works, and nothing about the handoff may change that.
+    /// 2. Adoption is constructed through **exactly one** door
+    ///    (`master.child_handle()` inside `PtySessionRuntime::adopt`). Scattered
+    ///    adoption sites are how "identity is (pid, start_time)" gets quietly
+    ///    downgraded to a bare pid at the third call site.
+    ///
+    /// **Same honest limitation as before: this is a source-text scan.** It is
+    /// a tripwire against copy-paste, not a proof. The behavioural proof that
+    /// an adopted PTY really works is
+    /// `terminal::tests::an_adopted_shell_still_answers_after_its_fd_crosses_a_socket`,
+    /// which drives a real bash through a real `SCM_RIGHTS` transfer and was
+    /// mutation-checked to fail when the command is never sent.
     #[test]
-    fn the_terminal_manager_still_only_constructs_owned_children() {
+    fn adoption_arrives_through_exactly_one_door_and_spawn_still_owns() {
         let terminal_src = include_str!("terminal.rs");
         assert!(
             terminal_src.contains("PtyChildHandle::owned(child)"),
-            "the PTY construction site must build an OWNED handle",
+            "the ordinary spawn path must still build an OWNED handle",
         );
+
+        // The one legitimate door. Counted, not merely present: a second call
+        // site is the regression this guards.
+        let doors = terminal_src.matches("master.child_handle()").count();
+        assert_eq!(
+            doors, 1,
+            "adoption must be constructed in exactly one place (found {doors}); \
+             a second site is where (pid, start_time) identity gets downgraded \
+             to a bare pid",
+        );
+
+        // The raw constructors stay out of terminal.rs entirely — an adopted
+        // handle comes from the master that carries the identity, never from a
+        // pid someone had lying around.
         for forbidden in [
             "PtyChildHandle::adopt(",
             "PtyChildHandle::adopt_with_start_time(",
         ] {
             assert!(
                 !terminal_src.contains(forbidden),
-                "terminal.rs constructs an ADOPTED child via {forbidden} — increment 1 is the \
-                 type split only. Wiring a real handoff is increment 2 and is \
-                 integrator-gated; it must not arrive by accident",
+                "terminal.rs builds an adopted child via {forbidden} instead of through \
+                 the master that carries its identity",
             );
         }
-        assert!(
-            !terminal_src.contains("ReceivedMasterPty"),
-            "terminal.rs uses ReceivedMasterPty — that is increment 2's wiring",
-        );
     }
 
     // -----------------------------------------------------------------------
