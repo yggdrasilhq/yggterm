@@ -950,7 +950,22 @@ fn status_dot_blink_opacity_css(working: bool) -> String {
 ///
 /// It stays a FUNCTION of the palette because the reveal is one owner for
 /// every row family — see [`the_row_reveal_rule_has_one_owner_and_reaches_every_surface`].
-fn session_row_hover_css(_palette: Palette) -> String {
+fn session_row_hover_css(palette: Palette) -> String {
+    format!(
+        "{}{}",
+        session_row_reveal_css(),
+        session_row_tint_css(palette)
+    )
+}
+
+/// The REVEAL half: which triggers show a row's trailing verbs.
+///
+/// ⛔ PALETTE-FREE, AND THAT IS THE CONTRACT. With no wash behind the verbs
+/// there is nothing for a theme to tint, so both palettes must produce this
+/// byte-for-byte — which is what makes "the frosted chip cannot come back
+/// quietly" checkable rather than aspirational. See
+/// [`the_row_verbs_are_in_flow_and_wear_no_chip`].
+fn session_row_reveal_css() -> String {
     // EVERY state names the SAME properties. Dioxus applies inline styles
     // property-by-property, and while this particular rule is a stylesheet
     // (not an inline style) the discipline is kept so a later move to inline
@@ -965,6 +980,40 @@ fn session_row_hover_css(_palette: Palette) -> String {
      [data-session-row][data-session-row-selected=\"true\"] [data-session-row-actions] *,\
      [data-session-row]:focus-within [data-session-row-actions] *{pointer-events:auto;}"
         .to_string()
+}
+
+/// The TINT half: the row answers the pointer, and so does a verb under it.
+///
+/// A row that does not light up under the pointer reads as a picture of a list
+/// — the same complaint the text fields drew before they got a hover fill
+/// ("lifeless with dullness everywhere"). The user asked for it on ychrome's
+/// vault rail *"exactly like the cwdtree"*, and the honest way to make two
+/// surfaces match exactly is for both to inherit ONE rule; so this lands on
+/// `[data-session-row]`, which the cwdtree, the WebTabs rail and every
+/// contributed pane already wear.
+///
+/// ⚠ THE `!important` IS REQUIRED, not sloppiness. A row's background is an
+/// INLINE style (`session_row_container_style` writes `background:transparent`
+/// in every unselected state, deliberately — the dropped-key rule), and an
+/// inline declaration out-specifies any stylesheet selector. Without it the
+/// fill simply never paints.
+///
+/// Scoped to `selected="false"` so it can never fight the selection tint, which
+/// is the one background a row is allowed to keep.
+///
+/// ⛔ This is NOT the frosted chip returning. The chip was a wash behind the
+/// VERBS, which put the row's own title underneath it; this is the ROW's own
+/// surface, under everything, which is what every file tree in the world does.
+fn session_row_tint_css(palette: Palette) -> String {
+    format!(
+        " [data-session-row][data-session-row-selected=\"false\"]:hover\
+         {{background:color-mix(in srgb, {accent} 10%, transparent) !important;}} \
+         [data-session-row] [data-session-row-actions] button:hover{{opacity:1; color:{accent};}}",
+        // The row tint and a field's are the SAME idea at the same strength —
+        // DESIGN.md ▸ Inputs ▸ Hover fill is `accent 9-12%`. A row is a bigger
+        // area than a 29px box, so it takes the quieter end of that range.
+        accent = palette.accent,
+    )
 }
 // ===== THE TEXT FIELD =======================================================
 //
@@ -3332,6 +3381,19 @@ enum AppPaneWidget {
         action: String,
         #[serde(default)]
         primary: bool,
+        /// This button DESTROYS something. It wears the product's one
+        /// destructive red (DESIGN.md ▸ Context menus: "the destructive group is
+        /// last, always") instead of the accent, wherever it is drawn.
+        ///
+        /// It is a TONE, not a confirmation: whether a press needs confirming is
+        /// the app's to decide and the app's to spell, because only the app
+        /// knows what is about to be lost.
+        #[serde(default)]
+        danger: bool,
+        /// The tooltip. Required in practice for an ICON-ONLY button (a `label`
+        /// of `icon:<name>` and nothing else), which has no words to read.
+        #[serde(default)]
+        title: String,
     },
     /// A row of the app's own data, with optional trailing action buttons.
     /// `row_action` makes the ROW BODY clickable (fires with the row id as
@@ -4289,21 +4351,39 @@ mod app_pane_reorder_tests {
         // rest: `display:none` costs no width, so a row with nothing revealed
         // still gives the title everything. Revealed, it becomes a flex item
         // and the title ellipsizes around it.
-        let css = session_row_hover_css(palette(UiTheme::ZedLight));
+        // ⚠ ASSERTED ON THE REVEAL HALF, and that split is the point. The ROW
+        // gained a hover tint on 2026-08-04 (`session_row_tint_css`), which is
+        // a palette-derived `color-mix` — so testing the whole stylesheet for
+        // "no color-mix anywhere" would now fail for a reason that has nothing
+        // to do with the chip. The prohibition was always about a wash behind
+        // the VERBS, which put the row's own title underneath it; it survives
+        // here, narrowed to exactly the rules it was ever about.
+        let css = session_row_reveal_css();
         assert!(css.contains("display:none;"), "at rest the verbs cost NO width: {css}");
         assert!(css.contains("display:inline-flex;"), "revealed they take space: {css}");
-        for banned in ["backdrop-filter", "linear-gradient", "color-mix"] {
+        for banned in ["backdrop-filter", "linear-gradient", "color-mix", "background"] {
             assert!(
                 !css.contains(banned),
                 "`{banned}` is the frosted chip coming back: {css}"
             );
         }
-        // …and the theme no longer changes the answer, because there is no
-        // wash to tint. Both palettes must produce the identical rule.
+        // …and the theme cannot change the reveal, because there is no wash to
+        // tint. A palette-dependent reveal is the chip's first symptom.
         assert_eq!(
             css,
-            session_row_hover_css(palette(UiTheme::ZedDark)),
-            "with no background, the reveal cannot depend on the palette"
+            session_row_reveal_css(),
+            "with no background, the reveal cannot depend on anything"
+        );
+        // The tint half touches the ROW and the BUTTON, never the actions
+        // container — a background on that container IS the chip.
+        let tint = session_row_tint_css(palette(UiTheme::ZedLight));
+        assert!(
+            tint.contains("[data-session-row][data-session-row-selected=\"false\"]:hover"),
+            "the row answers the pointer: {tint}"
+        );
+        assert!(
+            !tint.contains("[data-session-row-actions]{"),
+            "the verbs' container must never take a fill: {tint}"
         );
         // The title must actually be allowed to shrink, or it would push the
         // verbs off the row instead of truncating.
@@ -84862,14 +84942,30 @@ fn session_row_actions_style(_bleed_v_px: u32, _bleed_h_px: u32) -> String {
     // `display` is owned by the reveal rule (none -> inline-flex); everything
     // here is the in-flow box it becomes. No background, no mask, no bleed —
     // the row's own surface shows through, which is the whole point.
-    "align-items:center; justify-content:flex-end; gap:2px; margin-left:4px;".to_string()
+    // 4px between verbs, not 2: two 18px marks a hair apart read as one smudged
+    // control, which is half of what "the icons look illegible" meant.
+    "align-items:center; justify-content:flex-end; gap:4px; margin-left:6px;".to_string()
 }
 
-/// The tiny trailing verbs (✕, rename, …) every row family shares.
+/// A row's trailing verb button.
+///
+/// The metrics are a TOUCH TARGET, not a text box: an 18px square with the mark
+/// centred in it, so two verbs on one row cannot collide and each is big enough
+/// to hit. It used to be `padding:2px 4px` around whatever character the caller
+/// passed, which put ychrome's `⧉ ⏱ ✎` shoulder to shoulder at 11px — the user's
+/// report was that the vault rail's icons "look illegible" and want "a bit of
+/// padding between them" (2026-08-04). The gap itself is the container's
+/// ([`session_row_actions_style`]).
+///
+/// ⛔ Still NO BACKGROUND at rest (DESIGN.md ▸ Session-style rows: the frosted
+/// chip is a settled prohibition). The square is invisible until the pointer is
+/// on it — `session_row_hover_css` lights it.
 fn session_row_action_button_style(color: &str) -> String {
     format!(
-        "border:none; background:transparent; color:{color}; cursor:pointer; font-size:11px; \
-         line-height:1; padding:2px 4px; border-radius:5px; flex:0 0 auto; opacity:0.7;"
+        "display:inline-flex; align-items:center; justify-content:center; \
+         width:18px; height:18px; border:none; background:transparent; color:{color}; \
+         cursor:pointer; font-size:11px; line-height:1; padding:0; border-radius:5px; \
+         flex:0 0 auto; opacity:0.72;"
     )
 }
 
@@ -85179,12 +85275,9 @@ fn FileBadgeIcon(ext: String) -> Element {
 fn app_pane_row_icon(icon: &str) -> Element {
     match icon.strip_prefix("file:") {
         Some(ext) => rsx! { FileBadgeIcon { ext: ext.to_string() } },
-        None => rsx! {
-            span {
-                style: "font-size:12px; line-height:1;",
-                "{icon}"
-            }
-        },
+        // `icon:<name>` reaches the shell's own stroked set; anything else is
+        // still drawn as the character the app sent.
+        None => shell_glyph(icon, 13),
     }
 }
 
@@ -121280,17 +121373,18 @@ fn DocumentSurfaceBody(
                                         "{label}"
                                     }
                                 },
-                                AppPaneWidget::Button { id, label, action, primary } => rsx! {
+                                AppPaneWidget::Button { id, label, action, primary, title, .. } => rsx! {
                                     button {
                                         key: "{widget_key}",
                                         "data-document-button": "{id}",
+                                        title: "{title}",
                                         style: if *primary { bar_button_primary_style.clone() } else { bar_button_style.clone() },
                                         onclick: {
                                             let run_action = run_action.clone();
                                             let action = action.clone();
                                             move |_| run_action(action.clone(), None)
                                         },
-                                        "{label}"
+                                        {shell_glyph(label, 13)}
                                     }
                                 },
                                 // A SEARCH BOX IS A TEXT INPUT HERE, and it has to
@@ -121794,6 +121888,17 @@ fn AppPaneRailBody(
         palette.text,
         standard_transition(&["background-color", "border-color"])
     );
+    // A DESTRUCTIVE button wears the product's one red, filled when it is the
+    // primary act and outlined when it sits beside one. Same metrics as the
+    // pair above, so an action bar does not change height when one of its
+    // buttons happens to destroy something.
+    let danger_button_style = format!(
+        "align-self:flex-start; padding:8px 15px; border:1px solid color-mix(in srgb, {red} 42%, transparent); \
+         border-radius:10px; background:color-mix(in srgb, {red} 12%, transparent); color:{red}; \
+         font-size:11.5px; font-weight:700; cursor:pointer; transition:{};",
+        standard_transition(&["background-color", "border-color"]),
+        red = DESTRUCTIVE_RED,
+    );
     let pane_state = snapshot
         .app_pane_schema
         .as_ref()
@@ -122146,17 +122251,25 @@ fn AppPaneRailBody(
                                     }
                                 }
                             },
-                            AppPaneWidget::Button { id, label, action, primary } => rsx! {
+                            AppPaneWidget::Button { id, label, action, primary, danger, title } => rsx! {
                                 button {
                                     key: "{widget_key}",
                                     "data-app-pane-button": "{id}",
-                                    style: if primary { primary_button_style.clone() } else { plain_button_style.clone() },
+                                    "data-app-pane-button-danger": if danger { "true" } else { "false" },
+                                    title: "{title}",
+                                    style: if danger {
+                                        danger_button_style.clone()
+                                    } else if primary {
+                                        primary_button_style.clone()
+                                    } else {
+                                        plain_button_style.clone()
+                                    },
                                     onclick: {
                                         let (pane_id, action) = (pane_id.clone(), action.clone());
                                         let on_app_pane_action = on_app_pane_action.clone();
                                         move |_| on_app_pane_action.call((pane_id.clone(), action.clone(), None))
                                     },
-                                    "{label}"
+                                    {shell_glyph(&label, 13)}
                                 }
                             },
                             AppPaneWidget::ListRow { id, title, subtitle, icon, status, selected, row_action, actions, menu, rename, reorder_action, depth, expanded, expand_action } => {
@@ -122616,6 +122729,7 @@ fn AppPaneRailBody(
                                             for row_action in actions.iter().cloned() {
                                                 button {
                                                     key: "{row_action.action}",
+                                                    "data-app-pane-row-action": "{row_action.action}",
                                                     style: session_row_action_button_style(palette.muted),
                                                     title: "{row_action.title}",
                                                     // Pressing a row's ✕ must not
@@ -122636,7 +122750,10 @@ fn AppPaneRailBody(
                                                             ))
                                                         }
                                                     },
-                                                    "{row_action.label}"
+                                                    // `icon:<name>` draws the shell's own stroked
+                                                    // mark; anything else is still the character
+                                                    // the app sent.
+                                                    {shell_glyph(&row_action.label, 13)}
                                                 }
                                             }
                                         },
@@ -122674,6 +122791,9 @@ fn AppPaneRailBody(
         // the app's status-bar data (schema `footer`). Subset vocabulary —
         // label / toggle / button — documented in the libyggterm-surfaces skill.
         if !footer_widgets.is_empty() {
+            {
+            let first_footer_icon_button = app_pane_first_icon_button(&footer_widgets);
+            rsx! {
             div {
                 "data-app-pane-footer": "{pane_id}",
                 style: format!(
@@ -122685,6 +122805,14 @@ fn AppPaneRailBody(
                 for (index, widget) in footer_widgets.iter().cloned().enumerate() {
                     {
                     let widget_key = widget.key(index, &value_epochs);
+                    // WHERE THE TRAILING CLUSTER STARTS. Bitwarden's View Login
+                    // bar is the shape: the named verb (Edit) at the leading
+                    // edge, the icon-only ones (archive, delete) pushed to the
+                    // trailing edge. An icon-only button is one whose whole
+                    // label is an `icon:` token, so the app expresses the layout
+                    // by choosing an icon — there is no second "align" field to
+                    // disagree with it.
+                    let starts_trailing_cluster = index == first_footer_icon_button;
                     match widget {
                         AppPaneWidget::Label { text, .. } => rsx! {
                             span {
@@ -122724,25 +122852,26 @@ fn AppPaneRailBody(
                         // the scroll area, always reachable. `primary` reaches it
                         // for the same reason it reaches the body — a form whose
                         // Save scrolls away is a form with no Save.
-                        AppPaneWidget::Button { id, label, action, primary } => rsx! {
+                        AppPaneWidget::Button { id, label, action, primary, danger, title } => rsx! {
                             button {
                                 key: "{widget_key}",
                                 "data-app-pane-footer-button": "{id}",
                                 "data-app-pane-footer-button-primary": if primary { "true" } else { "false" },
-                                style: format!(
-                                    "padding:6px 13px; border:{}; border-radius:9px; \
-                                     background:{}; color:{}; font-size:11px; font-weight:{}; cursor:pointer;",
-                                    if primary { "0".to_string() } else { format!("1px solid color-mix(in srgb, {} 30%, rgba(127,127,127,0.34))", palette.accent) },
-                                    if primary { palette.accent } else { "transparent" },
-                                    if primary { "#fff" } else { palette.text },
-                                    if primary { "700" } else { "600" },
+                                "data-app-pane-footer-button-danger": if danger { "true" } else { "false" },
+                                title: "{title}",
+                                style: app_pane_footer_button_style(
+                                    palette,
+                                    primary,
+                                    danger,
+                                    ShellIcon::from_token(&label).is_some(),
+                                    starts_trailing_cluster,
                                 ),
                                 onclick: {
                                     let action = action.clone();
                                     let pane_id = pane_id.clone();
                                     move |_| on_app_pane_action.call((pane_id.clone(), action.clone(), None))
                                 },
-                                "{label}"
+                                {shell_glyph(&label, 15)}
                             }
                         },
                         // Anything else in a footer is a schema mistake; render
@@ -122752,8 +122881,81 @@ fn AppPaneRailBody(
                     }
                 }
             }
+            }
+            }
         }
     }
+}
+
+/// Where a footer's TRAILING cluster begins: the index of its first icon-only
+/// button, or `usize::MAX` when it has none (every button keeps the leading
+/// edge, exactly as before this existed).
+fn app_pane_first_icon_button(footer: &[AppPaneWidget]) -> usize {
+    footer
+        .iter()
+        .position(|widget| {
+            matches!(widget, AppPaneWidget::Button { label, .. }
+                if ShellIcon::from_token(label).is_some())
+        })
+        .unwrap_or(usize::MAX)
+}
+
+/// A pinned action-bar button.
+///
+/// FOUR shapes from ONE owner, because a bar that mixes hand-written styles ends
+/// up with buttons of different heights sitting next to each other:
+///
+/// * `primary` — filled in the accent. The act the bar exists for (Save, Edit).
+/// * `danger` — the product's one red ([`DESTRUCTIVE_RED`]), outlined, filled
+///   faintly. Never also primary: a destructive act is not the default one.
+/// * icon-only — a square, so the mark is centred rather than sitting in a
+///   text box that is wider than it is tall.
+/// * plain — outlined in the accent at low strength.
+fn app_pane_footer_button_style(
+    palette: Palette,
+    primary: bool,
+    danger: bool,
+    icon_only: bool,
+    starts_trailing_cluster: bool,
+) -> String {
+    let (border, background, color, weight) = if danger {
+        (
+            format!("1px solid color-mix(in srgb, {DESTRUCTIVE_RED} 38%, transparent)"),
+            format!("color-mix(in srgb, {DESTRUCTIVE_RED} 10%, transparent)"),
+            DESTRUCTIVE_RED.to_string(),
+            "700",
+        )
+    } else if primary {
+        (
+            "0".to_string(),
+            palette.accent.to_string(),
+            "#fff".to_string(),
+            "700",
+        )
+    } else {
+        (
+            format!(
+                "1px solid color-mix(in srgb, {} 30%, rgba(127,127,127,0.34))",
+                palette.accent
+            ),
+            "transparent".to_string(),
+            palette.text.to_string(),
+            "600",
+        )
+    };
+    format!(
+        "display:inline-flex; align-items:center; justify-content:center; \
+         {sizing} border:{border}; border-radius:9px; background:{background}; \
+         color:{color}; font-size:11px; font-weight:{weight}; cursor:pointer; \
+         margin-left:{margin};",
+        // A square for a mark, a pill for words.
+        sizing = if icon_only {
+            "width:30px; height:30px; padding:0;"
+        } else {
+            "min-height:30px; padding:6px 13px;"
+        },
+        margin = if starts_trailing_cluster { "auto" } else { "0" },
+    )
 }
 
 #[component]
@@ -123594,7 +123796,8 @@ fn ConnectRailBody(
 /// [`build_keytip_scopes`] declares it. So a chord can never name an item the menu
 /// does not show, an item can never appear without an accelerator (the §12 audit),
 /// and adding an item wires the mouse and the keyboard in one edit.
-/// A menu entry's leading mark.
+/// THE SHELL'S ONE ICON SET — a menu entry's leading mark, a contributed row's
+/// verb, a pane footer's archive and delete.
 ///
 /// DESIGN.md ▸ Context menus asks for "modern Microsoft app menus", and those
 /// have an icon column; DESIGN.md ▸ Tree behavior and ▸ Brand and mascot ask for
@@ -123608,8 +123811,17 @@ fn ConnectRailBody(
 /// A NAMED SET, not free-form path data at the call site: an icon vocabulary
 /// that anyone can extend inline is how a menu ends up with three different
 /// close marks.
+///
+/// ⛔ IT SERVES CONTRIBUTED PANES TOO, and that is why it stopped being called
+/// `MenuIcon` on 2026-08-04. A contributed app names a mark with the
+/// `icon:<name>` token ([`ShellIcon::from_token`]) wherever the schema takes a
+/// glyph — a `list-row`'s `icon`, a row action's `label`, a footer button's
+/// `label`. Before that, an app could only send a CHARACTER, so ychrome's vault
+/// rail wore `⧉ ⏱ ✎ 👁 🗑` — emoji at 11px, in whatever face the platform
+/// happened to have, which is exactly what this set exists to prevent. The user
+/// saw the result and said the icons "look illegible".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MenuIcon {
+enum ShellIcon {
     Plus,
     Reopen,
     Reload,
@@ -123623,30 +123835,169 @@ enum MenuIcon {
     Back,
     Close,
     Trash,
+    /// Reveal a stored value — the vault's eye.
+    Eye,
+    /// Hide it again.
+    EyeOff,
+    /// A time-based code (TOTP).
+    Clock,
+    /// Put this into the page — the vault's fill verb.
+    Fill,
+    /// A payment card.
+    Card,
+    /// A passkey / authenticator secret.
+    Key,
+    /// Archive: put it away without destroying it.
+    Archive,
+    /// Open this elsewhere (a URI).
+    External,
+    /// A site / web address.
+    Globe,
+    /// Roll a new value — the password generator.
+    Dice,
+    /// Past values, in order.
+    History,
+    /// An affirmative mark.
+    Check,
 }
 
-impl MenuIcon {
+impl ShellIcon {
+    /// The `icon:<name>` token a CONTRIBUTED pane may send instead of a glyph.
+    ///
+    /// ONE spelling, resolved in ONE place, for every slot a schema can put a
+    /// mark in. Anything unknown returns `None` and the caller falls back to
+    /// drawing the text it was given — an app that names an icon this shell
+    /// does not have gets its literal string, never a blank.
+    fn from_token(token: &str) -> Option<Self> {
+        Some(match token.strip_prefix("icon:")? {
+            "plus" => ShellIcon::Plus,
+            "reopen" => ShellIcon::Reopen,
+            "reload" => ShellIcon::Reload,
+            "copy" => ShellIcon::Copy,
+            "duplicate" => ShellIcon::Duplicate,
+            "split" => ShellIcon::Split,
+            "folder" => ShellIcon::Folder,
+            "rename" | "edit" | "pencil" => ShellIcon::Rename,
+            "collapse" => ShellIcon::Collapse,
+            "expand" => ShellIcon::Expand,
+            "back" => ShellIcon::Back,
+            "close" => ShellIcon::Close,
+            "trash" | "delete" => ShellIcon::Trash,
+            "eye" | "reveal" => ShellIcon::Eye,
+            "eye-off" | "hide" => ShellIcon::EyeOff,
+            "clock" | "totp" => ShellIcon::Clock,
+            "fill" => ShellIcon::Fill,
+            "card" => ShellIcon::Card,
+            "key" | "passkey" => ShellIcon::Key,
+            "archive" => ShellIcon::Archive,
+            "external" | "open" => ShellIcon::External,
+            "globe" | "site" => ShellIcon::Globe,
+            "dice" | "generate" => ShellIcon::Dice,
+            "history" => ShellIcon::History,
+            "check" => ShellIcon::Check,
+            _ => return None,
+        })
+    }
+
     /// The stroked paths that draw this mark, on a `0 0 14 14` box.
     fn paths(self) -> &'static [&'static str] {
         match self {
-            MenuIcon::Plus => &["M7 3.2v7.6", "M3.2 7h7.6"],
-            MenuIcon::Reopen => &["M3.6 7.4a3.9 3.9 0 1 1 1.4 3.3", "M2.6 4.6v3h3"],
-            MenuIcon::Reload => &["M10.4 6.6a3.9 3.9 0 1 0 .3 2.2", "M11.4 3.6v3h-3"],
-            MenuIcon::Copy => &["M5.4 5.4h5.2v5.2H5.4z", "M3.4 8.6V3.4h5.2"],
-            MenuIcon::Duplicate => &["M3.2 3.2h5v5h-5z", "M5.8 10.8h5v-5"],
-            MenuIcon::Split => &["M2.6 3.4h8.8v7.2H2.6z", "M7 3.4v7.2"],
-            MenuIcon::Folder => &["M2.4 4.3a1 1 0 0 1 1-1h2l1.2 1.4h4.1a1 1 0 0 1 1 1v4.1a1 1 0 0 1-1 1H3.4a1 1 0 0 1-1-1V4.3Z"],
-            MenuIcon::Rename => &["M3 11l1.4-.35 6-6-1.05-1.05-6 6L3 11z"],
-            MenuIcon::Collapse => &["M3.8 5.4L7 8.6l3.2-3.2"],
-            MenuIcon::Expand => &["M5.4 3.8L8.6 7l-3.2 3.2"],
-            MenuIcon::Back => &["M8.6 3.8L5.4 7l3.2 3.2"],
-            MenuIcon::Close => &["M4.2 4.2l5.6 5.6", "M9.8 4.2l-5.6 5.6"],
-            MenuIcon::Trash => &[
+            ShellIcon::Plus => &["M7 3.2v7.6", "M3.2 7h7.6"],
+            ShellIcon::Reopen => &["M3.6 7.4a3.9 3.9 0 1 1 1.4 3.3", "M2.6 4.6v3h3"],
+            ShellIcon::Reload => &["M10.4 6.6a3.9 3.9 0 1 0 .3 2.2", "M11.4 3.6v3h-3"],
+            ShellIcon::Copy => &["M5.4 5.4h5.2v5.2H5.4z", "M3.4 8.6V3.4h5.2"],
+            ShellIcon::Duplicate => &["M3.2 3.2h5v5h-5z", "M5.8 10.8h5v-5"],
+            ShellIcon::Split => &["M2.6 3.4h8.8v7.2H2.6z", "M7 3.4v7.2"],
+            ShellIcon::Folder => &["M2.4 4.3a1 1 0 0 1 1-1h2l1.2 1.4h4.1a1 1 0 0 1 1 1v4.1a1 1 0 0 1-1 1H3.4a1 1 0 0 1-1-1V4.3Z"],
+            ShellIcon::Rename => &["M3 11l1.4-.35 6-6-1.05-1.05-6 6L3 11z"],
+            ShellIcon::Collapse => &["M3.8 5.4L7 8.6l3.2-3.2"],
+            ShellIcon::Expand => &["M5.4 3.8L8.6 7l-3.2 3.2"],
+            ShellIcon::Back => &["M8.6 3.8L5.4 7l3.2 3.2"],
+            ShellIcon::Close => &["M4.2 4.2l5.6 5.6", "M9.8 4.2l-5.6 5.6"],
+            ShellIcon::Trash => &[
                 "M3.2 4.4h7.6",
                 "M5.6 4.4V2.9h2.8v1.5",
                 "M4.4 4.4l.45 6.3h4.3l.45-6.3",
             ],
+            ShellIcon::Eye => &[
+                "M1.6 7s2.1-3.4 5.4-3.4S12.4 7 12.4 7s-2.1 3.4-5.4 3.4S1.6 7 1.6 7Z",
+                "M7 8.6a1.6 1.6 0 1 0 0-3.2 1.6 1.6 0 0 0 0 3.2Z",
+            ],
+            ShellIcon::EyeOff => &[
+                "M2.6 4.6C1.9 5.4 1.6 7 1.6 7s2.1 3.4 5.4 3.4c1 0 1.9-.3 2.6-.7",
+                "M11.5 8.7c.6-.7.9-1.7.9-1.7S10.3 3.6 7 3.6c-.5 0-1 .1-1.4.2",
+                "M2.6 2.6l8.8 8.8",
+            ],
+            ShellIcon::Clock => &["M7 2.6a4.4 4.4 0 1 0 0 8.8 4.4 4.4 0 0 0 0-8.8Z", "M7 4.6V7l1.7 1"],
+            // An arrow travelling INTO a box: "put this value in the page".
+            ShellIcon::Fill => &[
+                "M11.4 4.2V2.9H2.6v8.2h8.8V9.8",
+                "M6 7h5.8",
+                "M9.9 5.2 11.9 7l-2 1.8",
+            ],
+            ShellIcon::Card => &["M1.9 3.9h10.2v6.2H1.9z", "M1.9 6.1h10.2", "M4 8.4h2.4"],
+            ShellIcon::Key => &[
+                "M9.2 3.2a2.6 2.6 0 1 1-2.1 4.1L3 11.4H1.9V9.9l.9-.9h1.3V7.7h1.3l1-1a2.6 2.6 0 0 1 2.8-3.5Z",
+                "M9.7 5.1h.01",
+            ],
+            // A lidded box: the archive tray, Bitwarden's own mark.
+            ShellIcon::Archive => &[
+                "M1.9 3.1h10.2v2.2H1.9z",
+                "M2.9 5.3v5.6h8.2V5.3",
+                "M5.6 7.5h2.8",
+            ],
+            ShellIcon::External => &["M7.6 2.9h3.5v3.5", "M11.1 2.9 6.4 7.6", "M9.6 8.4v2.7H2.9V4.4h2.7"],
+            ShellIcon::Globe => &[
+                "M7 2.1a4.9 4.9 0 1 0 0 9.8 4.9 4.9 0 0 0 0-9.8Z",
+                "M2.1 7h9.8",
+                "M7 2.1c1.3 1.4 2 3.1 2 4.9s-.7 3.5-2 4.9c-1.3-1.4-2-3.1-2-4.9s.7-3.5 2-4.9Z",
+            ],
+            ShellIcon::Dice => &["M2.4 2.4h9.2v9.2H2.4z", "M5 5h.01", "M9 9h.01", "M7 7h.01"],
+            ShellIcon::History => &[
+                "M2.5 7a4.5 4.5 0 1 0 1.4-3.3",
+                "M1.7 2.6v2.9h2.9",
+                "M7 4.6V7l1.9 1.1",
+            ],
+            ShellIcon::Check => &["M3 7.3 5.8 10 11 4.2"],
         }
+    }
+}
+
+/// Draw a named mark at `size` px. ONE emitter — the menu's icon column, a
+/// contributed row's verb and a footer's icon button all draw the same stroke
+/// weight, so a mark cannot read as two different products in two places.
+#[component]
+fn ShellIconMark(icon: ShellIcon, size: u32) -> Element {
+    rsx! {
+        svg {
+            width: "{size}",
+            height: "{size}",
+            view_box: "0 0 14 14",
+            fill: "none",
+            style: "flex:0 0 auto; display:block;",
+            for d in icon.paths() {
+                path {
+                    key: "{d}",
+                    d: "{d}",
+                    stroke: "currentColor",
+                    stroke_width: "1.25",
+                    stroke_linecap: "round",
+                    stroke_linejoin: "round",
+                }
+            }
+        }
+    }
+}
+
+/// A schema-declared glyph, drawn as SHARP VECTOR when it names one of the
+/// shell's marks and as the literal text otherwise.
+///
+/// The fallback is deliberate: an app that sends `"3"` or `"€"` still gets what
+/// it asked for. Only `icon:<name>` reaches the vector set.
+fn shell_glyph(label: &str, size: u32) -> Element {
+    match ShellIcon::from_token(label) {
+        Some(icon) => rsx! { ShellIconMark { icon, size } },
+        None => rsx! { span { style: "font-size:{size}px; line-height:1;", "{label}" } },
     }
 }
 
@@ -123687,7 +124038,7 @@ struct RowMenuItem {
     /// the list it was handed carries an icon, so a menu that opts out is drawn
     /// exactly as it was before the column existed. Within a menu that opts in,
     /// every row reserves the slot — a half-indented list reads worse than none.
-    icon: Option<MenuIcon>,
+    icon: Option<ShellIcon>,
 }
 impl RowMenuItem {
     fn new(id: impl Into<String>, label: impl Into<String>, hint: char) -> Self {
@@ -123716,7 +124067,7 @@ impl RowMenuItem {
             reason: None,
         }
     }
-    fn icon(mut self, icon: MenuIcon) -> Self {
+    fn icon(mut self, icon: ShellIcon) -> Self {
         self.icon = Some(icon);
         self
     }
@@ -123991,21 +124342,21 @@ fn web_tab_menu_items(
             }
             // ---- create -----------------------------------------------------
             items.push(
-                RowMenuItem::new("webtab-new", "New tab", 't').icon(MenuIcon::Plus),
+                RowMenuItem::new("webtab-new", "New tab", 't').icon(ShellIcon::Plus),
             );
             // Meaningful only because placement has an owner: "below this one"
             // is a real destination now, and the tab it opens joins this tab's
             // opener group so the next one cascades after it.
             items.push(
                 RowMenuItem::new("webtab-new-below", "New tab below this one", 'b')
-                    .icon(MenuIcon::Plus),
+                    .icon(ShellIcon::Plus),
             );
             let reopen = RowMenuItem::new(
                 "webtab-reopen",
                 format!("Reopen {}", web_tab_count_phrase(reopen_count.max(1), "closed tab")),
                 'e',
             )
-            .icon(MenuIcon::Reopen);
+            .icon(ShellIcon::Reopen);
             items.push(if reopen_count == 0 {
                 reopen.disabled("nothing has been closed here yet")
             } else {
@@ -124013,14 +124364,14 @@ fn web_tab_menu_items(
             });
             items.push(RowMenuItem::divider());
             // ---- this page --------------------------------------------------
-            let reload = RowMenuItem::new("webtab-reload", "Reload", 'r').icon(MenuIcon::Reload);
+            let reload = RowMenuItem::new("webtab-reload", "Reload", 'r').icon(ShellIcon::Reload);
             items.push(if tab.effective_url.trim().is_empty() {
                 reload.disabled("this tab has not gone anywhere yet")
             } else {
                 reload
             });
             let copy_url =
-                RowMenuItem::new("webtab-copy-url", "Copy URL", 'u').icon(MenuIcon::Copy);
+                RowMenuItem::new("webtab-copy-url", "Copy URL", 'u').icon(ShellIcon::Copy);
             items.push(if tab.effective_url.trim().is_empty() {
                 copy_url.disabled("this tab has no address to copy")
             } else {
@@ -124042,14 +124393,14 @@ fn web_tab_menu_items(
             // keep this", which is the very rule the old comment was appealing
             // to. Nothing new is encoded here.
             let duplicate = RowMenuItem::new("webtab-duplicate", "Duplicate tab", 'd')
-                .icon(MenuIcon::Duplicate);
+                .icon(ShellIcon::Duplicate);
             items.push(if tab.holds_saved_page {
                 duplicate
             } else {
                 duplicate.disabled("this tab is showing the app itself, not a page to copy")
             });
             let split = RowMenuItem::new("webtab-split", "Split with active tab", 's')
-                .icon(MenuIcon::Split);
+                .icon(ShellIcon::Split);
             items.push(if tab_id == active_tab_id {
                 split.disabled("this IS the active tab")
             } else {
@@ -124063,14 +124414,14 @@ fn web_tab_menu_items(
             // could only be renamed by a gesture nobody announces is a
             // half-shipped affordance.
             let rename = RowMenuItem::new("webtab-rename", "Rename tab", 'n')
-                .icon(MenuIcon::Rename);
+                .icon(ShellIcon::Rename);
             items.push(if tab.is_app_tab {
                 rename.disabled("the app's tab is named by the app")
             } else {
                 rename
             });
             let move_to = RowMenuItem::new("webtab-move", "Move to folder ▸", 'm')
-                .icon(MenuIcon::Folder);
+                .icon(ShellIcon::Folder);
             items.push(if tab.is_app_tab {
                 move_to.disabled("the app's tab belongs to the app, not to the tree")
             } else {
@@ -124079,7 +124430,7 @@ fn web_tab_menu_items(
             items.push(RowMenuItem::divider());
             // ---- destroy, last ----------------------------------------------
             let close = RowMenuItem::new("webtab-close", "Close tab", 'c')
-                .icon(MenuIcon::Close)
+                .icon(ShellIcon::Close)
                 .destructive();
             items.push(if tab.is_app_tab {
                 close.disabled("this is the app's own tab; quitting the app closes it")
@@ -124092,7 +124443,7 @@ fn web_tab_menu_items(
                 format!("Close {}", web_tab_count_phrase(others.len(), "other tab")),
                 'o',
             )
-            .icon(MenuIcon::Close)
+            .icon(ShellIcon::Close)
             .destructive();
             items.push(if others.is_empty() {
                 close_others.disabled(if tab.folder.is_some() {
@@ -124109,7 +124460,7 @@ fn web_tab_menu_items(
                 format!("Close {} below", web_tab_count_phrase(below.len(), "tab")),
                 'w',
             )
-            .icon(MenuIcon::Close)
+            .icon(ShellIcon::Close)
             .destructive();
             items.push(if below.is_empty() {
                 close_below.disabled("nothing is below this one here")
@@ -124124,11 +124475,11 @@ fn web_tab_menu_items(
             // Same intent grouping as a tab's menu: create, arrange, destroy.
             items.push(
                 RowMenuItem::new("webfolder-new-tab", "New tab in this folder", 't')
-                    .icon(MenuIcon::Plus),
+                    .icon(ShellIcon::Plus),
             );
             items.push(RowMenuItem::divider());
             items.push(
-                RowMenuItem::new("webfolder-rename", "Rename", 'r').icon(MenuIcon::Rename),
+                RowMenuItem::new("webfolder-rename", "Rename", 'r').icon(ShellIcon::Rename),
             );
             items.push(
                 RowMenuItem::new(
@@ -124141,9 +124492,9 @@ fn web_tab_menu_items(
                     'e',
                 )
                 .icon(if folder.collapsed {
-                    MenuIcon::Expand
+                    ShellIcon::Expand
                 } else {
-                    MenuIcon::Collapse
+                    ShellIcon::Collapse
                 }),
             );
             items.push(RowMenuItem::divider());
@@ -124153,7 +124504,7 @@ fn web_tab_menu_items(
                 format!("Close {}", web_tab_count_phrase(filed.len(), "tab")),
                 'c',
             )
-            .icon(MenuIcon::Close)
+            .icon(ShellIcon::Close)
             .destructive();
             items.push(if filed.is_empty() {
                 close.disabled("this folder is empty")
@@ -124166,7 +124517,7 @@ fn web_tab_menu_items(
             // say so in a name four times too wide for the box.
             items.push(
                 RowMenuItem::new("webfolder-delete", "Delete folder", 'd')
-                    .icon(MenuIcon::Trash)
+                    .icon(ShellIcon::Trash)
                     .destructive()
                     .note("its tabs return to the root"),
             );
@@ -124187,10 +124538,10 @@ fn web_tab_move_page_items(
     folders: &[WebTabFolder],
 ) -> Vec<RowMenuItem> {
     let mut items = vec![
-        RowMenuItem::new("webtab-move-back", "Back", 'b').icon(MenuIcon::Back),
+        RowMenuItem::new("webtab-move-back", "Back", 'b').icon(ShellIcon::Back),
         RowMenuItem::divider(),
     ];
-    let root = RowMenuItem::new("webtab-move-root", "Root", 'r').icon(MenuIcon::Folder);
+    let root = RowMenuItem::new("webtab-move-root", "Root", 'r').icon(ShellIcon::Folder);
     items.push(if tab.folder.is_none() {
         root.disabled("already here")
     } else {
@@ -124202,7 +124553,7 @@ fn web_tab_move_page_items(
             folder.name.clone(),
             folder.name.chars().next(),
         )
-        .icon(MenuIcon::Folder);
+        .icon(ShellIcon::Folder);
         items.push(if tab.folder.as_deref() == Some(folder.id.as_str()) {
             item.disabled("already here")
         } else {
@@ -124211,7 +124562,7 @@ fn web_tab_move_page_items(
     }
     items.push(RowMenuItem::divider());
     items.push(
-        RowMenuItem::new("webtab-move-new-folder", "New folder…", 'n').icon(MenuIcon::Plus),
+        RowMenuItem::new("webtab-move-new-folder", "New folder…", 'n').icon(ShellIcon::Plus),
     );
     items
 }
@@ -130129,6 +130480,13 @@ enum MenuItemTone {
     /// that cannot be clicked is a lie about the affordance.
     Inert,
 }
+
+/// THE product's one destructive red — a menu's "Delete", a pane footer's trash.
+///
+/// Named because it now has a second consumer: an app-pane button that declares
+/// `danger`. Two surfaces spelling the same intent with two hex values is how a
+/// product ends up with a delete that is a different red in every menu.
+const DESTRUCTIVE_RED: &str = "#c23f4d";
 fn shared_menu_item_style(
     palette: Palette,
     tone: MenuItemTone,
@@ -130158,7 +130516,7 @@ fn shared_menu_item_style(
         }
     };
     let base_color = match tone {
-        MenuItemTone::Destructive => "#c23f4d",
+        MenuItemTone::Destructive => DESTRUCTIVE_RED,
         MenuItemTone::Emphasized => palette.accent,
         MenuItemTone::Inert => {
             if dark {
@@ -145035,6 +145393,8 @@ mod tests {
                 label: "New".into(),
                 action: "new".into(),
                 primary: false,
+                danger: false,
+                title: String::new(),
             },
             reorderable("a"),
             row("fixed"),
@@ -179255,19 +179615,19 @@ mod webtabs_menu_switcher_locks {
         // construction, because the paths carry no colour at all (DESIGN.md ▸
         // Tree behavior: restrained and mostly grayscale).
         for icon in [
-            MenuIcon::Plus,
-            MenuIcon::Reopen,
-            MenuIcon::Reload,
-            MenuIcon::Copy,
-            MenuIcon::Duplicate,
-            MenuIcon::Split,
-            MenuIcon::Folder,
-            MenuIcon::Rename,
-            MenuIcon::Collapse,
-            MenuIcon::Expand,
-            MenuIcon::Back,
-            MenuIcon::Close,
-            MenuIcon::Trash,
+            ShellIcon::Plus,
+            ShellIcon::Reopen,
+            ShellIcon::Reload,
+            ShellIcon::Copy,
+            ShellIcon::Duplicate,
+            ShellIcon::Split,
+            ShellIcon::Folder,
+            ShellIcon::Rename,
+            ShellIcon::Collapse,
+            ShellIcon::Expand,
+            ShellIcon::Back,
+            ShellIcon::Close,
+            ShellIcon::Trash,
         ] {
             assert!(!icon.paths().is_empty(), "{icon:?} draws nothing");
             for d in icon.paths() {
