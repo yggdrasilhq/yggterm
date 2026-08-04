@@ -40,17 +40,31 @@ The owner therefore lingers on its old version for as long as that shell lives,
 which for a keep-alive shell is forever. jojo's preserved set was 8 `local://`
 shells to 2 `remote-cc://` rows, so this is the common case, not the corner.
 
-**Step 1 is done** (`0767a868`): `pty_handoff_wire` moves a master fd between
-daemons over `SCM_RIGHTS` with `MSG_CMSG_CLOEXEC`, four tests including the
-spike's negative control. Until today `PtyChildHandle::Adopted` was constructed
-nowhere and no `SCM_RIGHTS` call existed in the tree.
+**Steps 1 and 2 are done.**
 
-**What is left, and the order is not negotiable:**
+- **Step 1** (`0767a868`) — `pty_handoff_wire` moves a master fd between daemons
+  over `SCM_RIGHTS` with `MSG_CMSG_CLOEXEC`, four tests including the spike's
+  negative control.
+- **Step 2** (`d39bdb53`) — `TerminalManager::adopt_session` installs a runtime
+  around a received fd: `PtySessionRuntime::spawn` split at its seam so `spawn`
+  and `adopt` share one assembly, carried screen replayed before the reader
+  thread starts, and refusals rather than guesses for a live runtime already
+  under the key or a `(pid, start_time)` that cannot be confirmed alive.
+  Acceptance: a real bash, a real `SCM_RIGHTS` transfer, predecessor's master
+  dropped, and the shell still EVALUATES — mutation-checked to fail in 10 s
+  when the command is never sent.
 
-1. **Receive side FIRST** — a handoff listener that takes the transcript line,
-   then the fd, builds `ReceivedMasterPty`, installs a runtime with
-   `PtyChildHandle::Adopted { pid, start_time }` and seeds the scrollback.
-2. **Send side SECOND, gated off until (1) is proven live.**
+**What is left:**
+
+3. **The send side.** A `HotUpdateHandoff` that owns un-migratable runtimes
+   should, per runtime: write the transcript line, `sendmsg` the master fd,
+   then drop its runtime **without killing the child** so it re-parents to init,
+   and retire once its hands are empty.
+
+⚠ **The send side is where a bug destroys data, and it has one hazard the
+receive side does not:** dropping the predecessor's `PtySessionRuntime` must not
+run the ordinary shutdown path, which kills the child. Dropping the master alone
+only `SIGHUP`s the foreground group.
 
 ⛔ **Do not build the send side first.** `sendmsg` success is the commit point
 (settled in `settled-calls.md`), so a send whose receiver cannot install the
