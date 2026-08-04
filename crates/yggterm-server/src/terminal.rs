@@ -582,6 +582,52 @@ impl TerminalManager {
         Ok(())
     }
 
+    /// Install a session whose PTY was received from another daemon.
+    ///
+    /// Refuses to displace a RUNNING runtime under the same key: the whole
+    /// point of the handoff is that the successor did not already have this
+    /// session, and silently replacing a live one would kill a PTY to install
+    /// another. An exited husk under the key is replaced, exactly as
+    /// [`Self::ensure_session_with_size`] does.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn adopt_session(
+        &mut self,
+        key: &str,
+        launch_command: &str,
+        cwd: Option<&str>,
+        cols: u16,
+        rows: u16,
+        fd: std::os::fd::OwnedFd,
+        shell_pid: u32,
+        shell_start_time: u64,
+        seed: Option<&str>,
+    ) -> Result<()> {
+        if self
+            .sessions
+            .get(key)
+            .is_some_and(|session| session.is_running())
+        {
+            bail!("refusing to adopt {key}: this daemon already runs a live PTY for it");
+        }
+        if let Some(runtime) = self.sessions.remove(key) {
+            let _ = runtime.shutdown(None);
+        }
+        let runtime = PtySessionRuntime::adopt(
+            key,
+            launch_command,
+            cwd,
+            cols,
+            rows,
+            fd,
+            shell_pid,
+            shell_start_time,
+            seed,
+        )?;
+        self.sessions.insert(key.to_string(), runtime);
+        Ok(())
+    }
+
     /// Suspend/wake recovery: kill and immediately respawn every RUNNING
     /// ssh-carried session (remote resume/attach bridges, ssh shells). After a
     /// laptop suspend the bridges' TCP connections are dead but ssh hangs
@@ -1738,11 +1784,44 @@ impl PtySessionRuntime {
             .spawn_command(command)
             .with_context(|| format!("spawning terminal session {key}"))?;
 
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .context("cloning pty reader")?;
-        let writer = pair.master.take_writer().context("taking pty writer")?;
+        Self::assemble(
+            key,
+            launch_command,
+            cwd,
+            initial_cols,
+            initial_rows,
+            pair.master,
+            PtyChildHandle::owned(child),
+            None,
+        )
+    }
+
+    /// Build the runtime around a master this daemon ALREADY holds.
+    ///
+    /// Extracted from [`PtySessionRuntime::spawn`] so that adopting a PTY
+    /// received from another daemon is a wiring change rather than a second
+    /// copy of the reader/writer/ring machinery. Everything below the point
+    /// where a master and a child handle exist is identical whether we opened
+    /// the pty ourselves or were handed it — and the one rule this crate does
+    /// not bend is that a concept may not have two encodings.
+    ///
+    /// `seed` is the predecessor's screen, replayed into the parser and the
+    /// ring before the reader thread starts. The fd alone hands over a live
+    /// terminal with an EMPTY transcript; without this the user gets a working
+    /// shell that has forgotten everything it just said.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        key: &str,
+        launch_command: &str,
+        cwd: Option<&str>,
+        initial_cols: u16,
+        initial_rows: u16,
+        master: Box<dyn MasterPty + Send>,
+        child: PtyChildHandle,
+        seed: Option<&str>,
+    ) -> Result<Self> {
+        let mut reader = master.try_clone_reader().context("cloning pty reader")?;
+        let writer = master.take_writer().context("taking pty writer")?;
         let chunks = Arc::new(Mutex::new(VecDeque::new()));
         let retained_bytes = Arc::new(AtomicUsize::new(0));
         let seq = Arc::new(AtomicU64::new(0));
@@ -1760,6 +1839,21 @@ impl PtySessionRuntime {
             initial_rows,
             initial_cols,
         )));
+        // Replay the predecessor's screen BEFORE the reader thread starts, so
+        // the first live byte lands after the carried history rather than
+        // racing it. Seeding after the thread is spawned would interleave.
+        if let Some(seed) = seed.filter(|seed| !seed.is_empty()) {
+            if let Ok(mut screen) = screen_state.lock() {
+                screen.process(seed.as_bytes());
+            }
+            let seq_value = seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut seeded = chunks.lock().expect("pty chunk lock poisoned");
+            seeded.push_back(TerminalChunk {
+                seq: seq_value,
+                data: seed.to_string(),
+            });
+            retained_bytes.store(seed.len(), Ordering::SeqCst);
+        }
         let reader_chunks = Arc::clone(&chunks);
         let reader_retained_bytes = Arc::clone(&retained_bytes);
         let reader_seq = Arc::clone(&seq);
@@ -1971,9 +2065,9 @@ impl PtySessionRuntime {
         Ok(Self {
             key: key.to_string(),
             spawn_id: next_runtime_spawn_id(started_at_ms),
-            master: Arc::new(Mutex::new(pair.master)),
+            master: Arc::new(Mutex::new(master)),
             writer_tx,
-            child: Arc::new(Mutex::new(PtyChildHandle::owned(child))),
+            child: Arc::new(Mutex::new(child)),
             chunks,
             retained_bytes,
             seq,
@@ -1993,6 +2087,65 @@ impl PtySessionRuntime {
             launch_command: launch_command.to_string(),
             cwd: cwd.map(|value| value.to_string()),
         })
+    }
+
+    /// Take ownership of a PTY whose master fd arrived from another daemon.
+    ///
+    /// This is the receiving half of level (b): the predecessor sends its
+    /// screen, then the master fd, then drops its runtime without killing the
+    /// child, which re-parents to init. We drive the fd from here on and track
+    /// the process by `(pid, start_time)` — `waitpid` is gone forever for this
+    /// session, which is exactly why [`PtyChildHandle`] is an enum.
+    ///
+    /// Refuses rather than guesses when the process cannot be pinned: adopting
+    /// a pid with no confirmable identity is how a later `kill` lands on a
+    /// stranger after pid reuse.
+    #[cfg(target_os = "linux")]
+    fn adopt(
+        key: &str,
+        launch_command: &str,
+        cwd: Option<&str>,
+        cols: u16,
+        rows: u16,
+        fd: std::os::fd::OwnedFd,
+        shell_pid: u32,
+        shell_start_time: u64,
+        seed: Option<&str>,
+    ) -> Result<Self> {
+        if cols == 0 || rows == 0 {
+            bail!("adopted terminal size must be greater than zero");
+        }
+        let master = crate::pty_adoption::ReceivedMasterPty::new(fd, shell_pid, shell_start_time);
+        let mut child = master.child_handle();
+        // Identity, not optimism: an unconfirmable pid must refuse the adoption
+        // rather than install a runtime that will later signal a stranger.
+        if !child.is_running().unwrap_or(false) {
+            bail!(
+                "refusing to adopt {key}: pid {shell_pid} is not alive with start time \
+                 {shell_start_time} — the process died in transit or the identity is stale"
+            );
+        }
+        trace_terminal_event(
+            "adopt",
+            serde_json::json!({
+                "path": key,
+                "shell_pid": shell_pid,
+                "shell_start_time": shell_start_time,
+                "cols": cols,
+                "rows": rows,
+                "seed_bytes": seed.map(|seed| seed.len()).unwrap_or(0),
+            }),
+        );
+        Self::assemble(
+            key,
+            launch_command,
+            cwd,
+            cols,
+            rows,
+            Box::new(master),
+            child,
+            seed,
+        )
     }
 
     /// The declares this session's app currently stands behind.
@@ -6222,5 +6375,109 @@ line-two on the real screen\r\n\
             "a hit after the window counts again"
         );
     }
-}
 
+    /// THE ACCEPTANCE TEST for the receiving half of level (b): a shell spawned
+    /// by one owner keeps working after its master fd crosses a socket and a
+    /// different owner adopts it.
+    ///
+    /// This is the in-tree version of the spike's headline result. It uses the
+    /// real wire (`pty_handoff_wire`), a real `bash`, and the real
+    /// `TerminalManager::adopt_session` — nothing about the fd is faked, which
+    /// is the only way this proves the send side will be safe to build.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_adopted_shell_still_answers_after_its_fd_crosses_a_socket() {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        // The predecessor's side: open a pty and put a shell on it.
+        let pair = native_pty_system()
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.arg("--norc");
+        cmd.arg("-i");
+        cmd.env("PS1", "");
+        let child = pair.slave.spawn_command(cmd).expect("spawn bash");
+        let shell_pid = child.process_id().expect("bash pid");
+        let start_time =
+            crate::pty_adoption::process_start_time(shell_pid).expect("bash start time");
+
+        // Move the master fd across a real socket, exactly as a handoff would.
+        let (send, recv) = UnixStream::pair().expect("socketpair");
+        let raw = pair.master.as_raw_fd().expect("master raw fd");
+        crate::pty_handoff_wire::send_master_fd(
+            &send,
+            raw,
+            format!("pid={shell_pid} start={start_time}").as_bytes(),
+        )
+        .expect("send_master_fd");
+        let (received, token) =
+            crate::pty_handoff_wire::recv_master_fd(&recv).expect("recv_master_fd");
+        assert!(String::from_utf8_lossy(&token).contains(&format!("pid={shell_pid}")));
+
+        // The predecessor drops its master. The shell must NOT die: the
+        // successor now holds the only master, which is the whole premise.
+        drop(pair);
+
+        // The successor adopts it, carrying the predecessor's screen.
+        let mut manager = TerminalManager::new();
+        let key = "local://adopted-in-test";
+        manager
+            .adopt_session(
+                key,
+                "bash",
+                None,
+                80,
+                24,
+                received,
+                shell_pid,
+                start_time,
+                Some("CARRIED-HISTORY"),
+            )
+            .expect("adopt_session");
+
+        // The carried transcript is there before a single live byte arrives.
+        let seeded = manager.read(key, 0).expect("read adopted session");
+        assert!(
+            seeded
+                .chunks
+                .iter()
+                .any(|chunk| chunk.data.contains("CARRIED-HISTORY")),
+            "the predecessor's screen must survive the handoff, got: {:?}",
+            seeded.chunks
+        );
+
+        // And the shell still ANSWERS through the adopted master.
+        // The expected text must NOT be a substring of what we type: a PTY
+        // echoes input, so asserting on a literal marker passes even if the
+        // shell never ran. Arithmetic the shell must EVALUATE closes that hole
+        // — "MARK42END" cannot appear unless bash executed the line.
+        manager
+            .write(key, "printf 'RESULT-%s\\n' $((6*7))\n")
+            .expect("write to adopted pty");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut transcript = String::new();
+        while std::time::Instant::now() < deadline {
+            if let Ok(result) = manager.read(key, 0) {
+                transcript = result
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.data.as_str())
+                    .collect::<String>();
+            }
+            if transcript.contains("RESULT-42") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            transcript.contains("RESULT-42"),
+            "the adopted shell must still EVALUATE and answer, not merely echo; \
+             transcript: {transcript}"
+        );
+
+        let _ = manager.shutdown_all(|_key| None::<String>);
+    }
+}
