@@ -3413,6 +3413,68 @@ impl DaemonRuntime {
             .collect()
     }
 
+    /// Working flags for every live row, INCLUDING the ones this daemon only
+    /// proxies.
+    ///
+    /// ⛔ [`Self::working_flags`] reads `self.terminals`, which holds nothing
+    /// for a row this daemon does not own — so `?` dropped every proxied row
+    /// from the answer entirely. Not `Some(false)`: ABSENT. The GUI polls one
+    /// endpoint (`spawn_working_flags_poll_loop` → `working_flags(endpoint)`),
+    /// applies what comes back, and leaves `working` as `None` for everything
+    /// else, so those rows' indicators can never blink.
+    ///
+    /// Reported by the user 2026-08-05 — *"this session's working indicator is
+    /// not blinking"* — on a GUI whose daemon owned **1 of 9** rows. Every
+    /// restart spawns a daemon matching the new client version and ownership
+    /// does not follow it, so the serving daemon holding almost none of its
+    /// rows is the NORMAL state, not an edge case.
+    ///
+    /// One request per distinct OWNER, not per row, and an owner that fails is
+    /// marked unreachable so a dead peer cannot slow the 2.5 s poll for the
+    /// rest of its cache window.
+    fn working_flags_including_proxied(&mut self) -> Vec<(String, bool)> {
+        let mut flags = self.working_flags();
+        let mut answered: HashSet<String> =
+            flags.iter().map(|(path, _)| path.clone()).collect();
+
+        let unanswered: Vec<String> = self
+            .server
+            .live_sessions()
+            .iter()
+            .map(|session| session.session_path.clone())
+            .filter(|path| !answered.contains(path))
+            .collect();
+        if unanswered.is_empty() {
+            return flags;
+        }
+
+        let mut owners: Vec<ServerEndpoint> = Vec::new();
+        for path in &unanswered {
+            let runtime_key = self.terminal_runtime_key_for_path(path);
+            let Some(owner) = self.preserved_owner_endpoint_for_request(&runtime_key) else {
+                continue;
+            };
+            let label = owner_endpoint_label(&owner);
+            if !owners
+                .iter()
+                .any(|seen| owner_endpoint_label(seen) == label)
+            {
+                owners.push(owner);
+            }
+        }
+
+        let wanted: HashSet<String> = unanswered.into_iter().collect();
+        for owner in owners {
+            match working_flags(&owner) {
+                Ok(owner_flags) => {
+                    merge_proxied_working_flags(&mut flags, &mut answered, &wanted, owner_flags)
+                }
+                Err(_) => self.mark_preserved_owner_unreachable(&owner),
+            }
+        }
+        flags
+    }
+
     fn status(&self) -> ServerRuntimeStatus {
         let terminal_stats = self.terminals.stats();
         let payload_stats = self.server.payload_stats();
@@ -6478,7 +6540,7 @@ impl DaemonRuntime {
             ServerRequest::Ping => ServerResponse::Pong,
             ServerRequest::Status => ServerResponse::Status(self.status()),
             ServerRequest::WorkingFlags => ServerResponse::WorkingFlags {
-                flags: self.working_flags(),
+                flags: self.working_flags_including_proxied(),
             },
             ServerRequest::Snapshot => self.snapshot_response(None),
             ServerRequest::PrepareUpdateRestart => {
@@ -10571,6 +10633,33 @@ fn versioned_server_status_probe_paths_excluding_endpoint(
                 != excluded_identity.as_path()
         })
         .collect()
+}
+
+/// Fold one owner's working flags into the answer being assembled.
+///
+/// Split out of [`DaemonRuntime::working_flags_including_proxied`] so the merge
+/// rules are testable without two live daemons. Three rules, and each of them
+/// is a way this could go wrong:
+///
+/// - **A local flag always wins.** This daemon RUNS that row; an owner's stale
+///   copy must never overwrite the truth we measured ourselves.
+/// - **Only rows we actually lack are taken.** An owner answers about every row
+///   IT holds, including ones we never asked about, and admitting those would
+///   resurrect rows that are not in this daemon's live order.
+/// - **First owner wins.** Two preserved owners can both still claim a runtime
+///   mid-handover; taking the first keeps the answer stable instead of flipping
+///   the indicator with whichever peer replied last.
+fn merge_proxied_working_flags(
+    flags: &mut Vec<(String, bool)>,
+    answered: &mut HashSet<String>,
+    wanted: &HashSet<String>,
+    owner_flags: Vec<(String, bool)>,
+) {
+    for (path, working) in owner_flags {
+        if wanted.contains(&path) && answered.insert(path.clone()) {
+            flags.push((path, working));
+        }
+    }
 }
 
 /// Another daemon alive on this host, as `server status` reports it.
@@ -16265,6 +16354,89 @@ mod tests {
             !candidate_survives(&attempts),
             "a key that keeps coming back must stop being released — lingering \
              beats churning the user's live session"
+        );
+    }
+
+    /// The working indicator on a PROXIED row.
+    ///
+    /// The user reported "this session's working indicator is not blinking" on
+    /// a GUI whose daemon owned 1 of 9 rows. `working_flags` reads local
+    /// runtimes only, so a proxied row was not reported as `false` — it was
+    /// ABSENT, and the GUI leaves `working` as `None` for anything the poll
+    /// does not mention.
+    #[test]
+    fn a_proxied_rows_working_flag_is_taken_from_its_owner() {
+        use std::collections::HashSet;
+        let mut flags = vec![("local://mine".to_string(), true)];
+        let mut answered: HashSet<String> =
+            flags.iter().map(|(p, _)| p.clone()).collect();
+        let wanted: HashSet<String> = ["remote-cc://dev/theirs".to_string()]
+            .into_iter()
+            .collect();
+
+        super::merge_proxied_working_flags(
+            &mut flags,
+            &mut answered,
+            &wanted,
+            vec![("remote-cc://dev/theirs".to_string(), true)],
+        );
+
+        assert!(
+            flags.contains(&("remote-cc://dev/theirs".to_string(), true)),
+            "a row this daemon only proxies must still get a flag, or its dot \
+             can never blink; got {flags:?}"
+        );
+    }
+
+    /// A local flag always wins: this daemon RUNS that row, and an owner's
+    /// stale copy must not overwrite what we measured ourselves.
+    #[test]
+    fn an_owners_copy_never_overwrites_a_flag_this_daemon_measured() {
+        use std::collections::HashSet;
+        let mut flags = vec![("local://mine".to_string(), true)];
+        let mut answered: HashSet<String> =
+            flags.iter().map(|(p, _)| p.clone()).collect();
+        let wanted: HashSet<String> = HashSet::new();
+
+        super::merge_proxied_working_flags(
+            &mut flags,
+            &mut answered,
+            &wanted,
+            vec![("local://mine".to_string(), false)],
+        );
+
+        assert_eq!(
+            flags,
+            vec![("local://mine".to_string(), true)],
+            "the owner's stale copy must not replace the truth we measured"
+        );
+    }
+
+    /// An owner answers about every row IT holds. Admitting rows we never asked
+    /// about would resurrect sessions that are not in this daemon's live order.
+    #[test]
+    fn an_owner_cannot_add_rows_this_daemon_does_not_list() {
+        use std::collections::HashSet;
+        let mut flags = Vec::new();
+        let mut answered: HashSet<String> = HashSet::new();
+        let wanted: HashSet<String> = ["remote-cc://dev/asked".to_string()]
+            .into_iter()
+            .collect();
+
+        super::merge_proxied_working_flags(
+            &mut flags,
+            &mut answered,
+            &wanted,
+            vec![
+                ("remote-cc://dev/asked".to_string(), true),
+                ("local://never-heard-of-it".to_string(), true),
+            ],
+        );
+
+        assert_eq!(
+            flags,
+            vec![("remote-cc://dev/asked".to_string(), true)],
+            "only rows this daemon lists may be filled in"
         );
     }
 
