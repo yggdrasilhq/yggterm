@@ -603,6 +603,18 @@ pub struct RowTenantReport {
     pub created_by: Option<CreatorStamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral: Option<EphemeralDeclaration>,
+    /// Seconds since this row's PTY last produced output.
+    ///
+    /// ⛔ IT TRAVELS WITH THE MEASUREMENT, and it has to: only the daemon that
+    /// OWNS a PTY holds its idle clock, and the daemon answering this verb
+    /// routinely owns none of the rows it is asked about. Computing the idle
+    /// age at the answering end produced `null` for all 27 rows on the live
+    /// host — every plate unclearable, the policy inert, and nothing saying
+    /// why. Carrying it on the report means a proxied answer brings the owner's
+    /// reading home with the rest of its measurement.
+    /// [[finding-daemon-side-fix-inert-under-proxy]]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
     /// Whose plate this is and whether it is empty — the ONE verdict a sweep,
     /// a surface or a person may act on. Filled by the daemon assembling the
     /// report, where the stamps and the PTY idle clock are both in hand.
@@ -632,6 +644,7 @@ impl RowTenantReport {
             tenants_listed_of: None,
             created_by: None,
             ephemeral: None,
+            idle_secs: None,
             hygiene: None,
         }
     }
@@ -712,9 +725,10 @@ impl RowHygieneVerdict {
     }
 }
 
-/// Classify one measured row. `idle_secs` is the PTY output silence the daemon
-/// already tracks for the ephemeral reaper; pass `None` when it cannot say.
-pub fn row_hygiene_verdict(report: &RowTenantReport, idle_secs: Option<u64>) -> RowHygieneVerdict {
+/// Classify one measured row, from the report alone — including its
+/// `idle_secs`, so the verdict can never be computed against an idle clock
+/// that did not come home with the measurement.
+pub fn row_hygiene_verdict(report: &RowTenantReport) -> RowHygieneVerdict {
     // Unmeasurable FIRST — before the creator check — because a remote agent
     // row carries no local stamp either, and reading that absence as "the user
     // made it" would be right by accident and wrong for the reason that
@@ -740,7 +754,9 @@ pub fn row_hygiene_verdict(report: &RowTenantReport, idle_secs: Option<u64>) -> 
             oldest_tenant_command: report.oldest_tenant_command.clone(),
         };
     }
-    RowHygieneVerdict::EmptyPlate { idle_secs }
+    RowHygieneVerdict::EmptyPlate {
+        idle_secs: report.idle_secs,
+    }
 }
 
 /// Walk one row's process tree out of an already-taken `/proc` snapshot.
@@ -812,6 +828,7 @@ pub fn row_tenant_report(
         tenants_listed_of,
         created_by: None,
         ephemeral: None,
+        idle_secs: None,
         hygiene: None,
     }
 }
@@ -1066,10 +1083,16 @@ mod tests {
         report
     }
 
+    fn stamped_empty_report_idle(idle_secs: Option<u64>) -> RowTenantReport {
+        let mut report = stamped_empty_report();
+        report.idle_secs = idle_secs;
+        report
+    }
+
     #[test]
     fn only_an_agents_own_empty_row_is_ever_a_clearable_plate() {
         // The clearable case, and the age gate on it.
-        let plate = row_hygiene_verdict(&stamped_empty_report(), Some(7 * 3_600));
+        let plate = row_hygiene_verdict(&stamped_empty_report_idle(Some(7 * 3_600)));
         assert_eq!(
             plate,
             RowHygieneVerdict::EmptyPlate {
@@ -1082,28 +1105,27 @@ mod tests {
         // ⛔ A plate whose idle age is unknown is NOT clearable. An unknown age
         // must never read as "idle forever" — the failure this whole module
         // exists to prevent, in its most expensive form.
-        let ageless = row_hygiene_verdict(&stamped_empty_report(), None);
+        let ageless = row_hygiene_verdict(&stamped_empty_report_idle(None));
         assert_eq!(ageless, RowHygieneVerdict::EmptyPlate { idle_secs: None });
         assert!(!ageless.is_clearable(0));
 
         // The user's own row is never a plate, at any age.
-        let mut user_row = stamped_empty_report();
+        let mut user_row = stamped_empty_report_idle(Some(400 * 24 * 3_600));
         user_row.created_by = None;
-        let verdict = row_hygiene_verdict(&user_row, Some(400 * 24 * 3_600));
+        let verdict = row_hygiene_verdict(&user_row);
         assert_eq!(verdict, RowHygieneVerdict::UserRow);
         assert!(!verdict.is_clearable(0));
 
         // ⛔ A row this host cannot measure is never a plate — the remote agent
         // row the user is talking THROUGH would otherwise be the first swept,
         // because its work is on the other machine and nothing is local to see.
-        let unmeasurable = row_hygiene_verdict(
-            &RowTenantReport::unavailable(
-                "remote-cc://dev/x",
-                "remote-cc://dev/x",
-                TenantReportGap::NoLocalRuntime,
-            ),
-            Some(400 * 24 * 3_600),
+        let mut remote = RowTenantReport::unavailable(
+            "remote-cc://dev/x",
+            "remote-cc://dev/x",
+            TenantReportGap::NoLocalRuntime,
         );
+        remote.idle_secs = Some(400 * 24 * 3_600);
+        let unmeasurable = row_hygiene_verdict(&remote);
         assert_eq!(
             unmeasurable,
             RowHygieneVerdict::Unmeasurable {
@@ -1113,11 +1135,11 @@ mod tests {
         assert!(!unmeasurable.is_clearable(0));
 
         // Something alive in an agent's row: reported, never clearable.
-        let mut occupied = stamped_empty_report();
+        let mut occupied = stamped_empty_report_idle(Some(400 * 24 * 3_600));
         occupied.tenant_count = Some(1);
         occupied.oldest_tenant_age_secs = Some(257_485);
         occupied.oldest_tenant_command = Some("ychrome".to_string());
-        let verdict = row_hygiene_verdict(&occupied, Some(400 * 24 * 3_600));
+        let verdict = row_hygiene_verdict(&occupied);
         assert_eq!(
             verdict,
             RowHygieneVerdict::Occupied {
@@ -1129,10 +1151,10 @@ mod tests {
         assert!(!verdict.is_clearable(0));
 
         // A stamped, measured row with no count at all is a gap, not a plate.
-        let mut countless = stamped_empty_report();
+        let mut countless = stamped_empty_report_idle(Some(999_999));
         countless.tenant_count = None;
         assert!(matches!(
-            row_hygiene_verdict(&countless, Some(999_999)),
+            row_hygiene_verdict(&countless),
             RowHygieneVerdict::Unmeasurable { .. }
         ));
     }
@@ -1150,7 +1172,7 @@ mod tests {
         );
         assert!(report.created_by.is_none());
         assert_eq!(
-            row_hygiene_verdict(&report, None),
+            row_hygiene_verdict(&report),
             RowHygieneVerdict::Unmeasurable {
                 reason: "runtime_unreachable".to_string()
             }
