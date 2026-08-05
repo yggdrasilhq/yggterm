@@ -5281,6 +5281,23 @@ impl DaemonRuntime {
                     .server
                     .live_session_ephemeral_declaration(&path)
                     .or(report.ephemeral);
+                // The hygiene verdict is computed HERE, once, next to the two
+                // stamps it depends on — a caller that re-derives "is this row
+                // safe to clear" from the raw fields will eventually disagree
+                // with this one, and the disagreement costs a row the user
+                // wanted. `docs/agent-row-hygiene.md` owns the policy.
+                //
+                // Idle is the PTY's own silence, read from the same source the
+                // ephemeral reaper uses; a row this daemon does not own answers
+                // `None`, and an unknown age is never clearable.
+                let runtime_key = self.server.terminal_runtime_key_for_path(&path);
+                let idle_secs = self
+                    .terminals
+                    .session_idle_for_ms(&runtime_key)
+                    .map(|idle_ms| idle_ms / 1_000);
+                report.hygiene = Some(crate::session_tenancy::row_hygiene_verdict(
+                    &report, idle_secs,
+                ));
                 report
             })
             .collect();
