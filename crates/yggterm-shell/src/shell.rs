@@ -95952,6 +95952,14 @@ fn TerminalCanvas(
                                 // the reason lands beside `selection_copy_accepted` and
                                 // the two can be counted against each other. Privacy:
                                 // the length, never the text.
+                                //
+                                // ⚠ BOTH sinks, exactly as the accept path does. The
+                                // telemetry recorder only writes `ui_telemetry` and the
+                                // gated terminal_io stream; the `terminal_clipboard`
+                                // category — the one a reader greps, and the one the
+                                // accepts live in — comes from this second call. An
+                                // instrument filed somewhere other than where its
+                                // counterpart lives is not an instrument.
                                 let _ = safe_shell_mut(
                                     state,
                                     "terminal_clipboard_suppressed_telemetry",
@@ -95971,6 +95979,20 @@ fn TerminalCanvas(
                                             }),
                                         );
                                     },
+                                );
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_clipboard",
+                                    "selection_copy_suppressed",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "host_id": host_id.clone(),
+                                        "action": action,
+                                        "reason": reason,
+                                        "chars": chars,
+                                        "gesture_age_ms": gesture_age_ms,
+                                    }),
                                 );
                             }
                             Ok(TerminalJsEvent::Debug { message }) => {
