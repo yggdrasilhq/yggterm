@@ -48,7 +48,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [persisted-scroll-restore-fights-follow](#persisted-scroll-restore-fights-follow) | After GUI restart, every click/keystroke flickers between a saved scroll offset and the live bottom | FIXED 2026-06-02 |
 | [xterm-host-registry-leak](#xterm-host-registry-leak) | Switching/restarting sessions accumulates orphaned xterm.js instances (cleanup keyed to mount epoch that changes on remount) → growing latency on selection/paste/switch | FIXED 2026-06-02 |
 | [chunk-ring-trim-drops-mid-stream](#chunk-ring-trim-drops-mid-stream) | Middle chunks of TUI output silently missing: yggterm-server chunk ring trims oldest while a client's read-cursor is behind the trim, and read(cursor) returns only surviving chunks with no gap signal | LAYER 2b SHIPPED 2026-07-23 (read() appends the viewport reconcile after the tail on a detected gap — the busiest-CC interleave-corruption fix; layers 1/2a 2026-06-04) |
-| [reconcile-swaps-the-base-an-in-place-cli-diffs-against](#reconcile-swaps-the-base-an-in-place-cli-diffs-against) | Broken bottom right after SWITCHING to an agent session: the words are right and every SPACE between them holds a character from an older frame ("2 background shell" → "2rbackground shells…") | FIXED 2026-08-05 (v3.0.28) — a reveal reconcile now asks an in-place CLI to redraw; live-proven on the GUI host |
+| [reconcile-swaps-the-base-an-in-place-cli-diffs-against](#reconcile-swaps-the-base-an-in-place-cli-diffs-against) | Broken bottom right after SWITCHING to an agent session: the words are right and every SPACE between them holds a character from an older frame ("2 background shell" → "2rbackground shells…") | **OPEN** — root cause identified and confirmed; the first remedy (a resize nudge, v3.0.28) was WRONG and is reverted at v3.0.29 |
 | [squish-and-bottom-paint-on-reresume](#squish-and-bottom-paint-on-reresume) | After an update re-resumes a session, codex renders narrow (squish) + composer bg-split (bottom paint) | FIXED 2026-06-05 (v2.8.25) — daemon resizes PTY to client grid on re-attach; deterministic test |
 | [seed-connection-state-in-terminal](#seed-connection-state-in-terminal) | yggterm's own launch/connection seed boilerplate ("Launching live … session", "Terminal surface: embedded xterm.js", "Runtime owner: yggterm daemon") is written into the xterm buffer as prefill before the PTY paints | FIXED 2026-06-06 (D4) — local prefill source + render gate reject the daemon launch seed; deterministic fail-then-pass test |
 | [detached-term-element-blank-viewport](#detached-term-element-blank-viewport) | Viewport entirely blank while every health field reports healthy: `term.element` is detached from its host and an empty `.xterm` husk (viewport only, no screen) occupies it, defeating all three repair guards | SPECIES A FIXED 2026-07-22 — provenance root-caused: the husk is born in a PArecordsAL `term.open()` (root appended first, screen fragment last), pinned by `tools/xterm-harness/husk_is_born_in_a_partial_open.test.js`; mount now retries after discarding the husk and the surface owner rebuilds rather than moves one. SPECIES B ALSO FIXED 2026-07-22 — and it was never a second species: `_coreBrowserService` arms the guard MID-open, six services before the screen reaches the root, so a late throw yields the same husk with the guard armed. The owner now disarms it (`term._core.element = undefined`) and re-opens, reported as `rebuilt_from_husk_disarmed`; pinned by `tools/xterm-harness/husk_species_b_is_a_late_partial_open.test.js` and proven in live WebKit |
@@ -2255,8 +2255,12 @@ Event names + when they fire.
 
 ## reconcile-swaps-the-base-an-in-place-cli-diffs-against
 
-STATUS: FIXED 2026-08-05 (v3.0.28). Reported by the user as "fix the bottom
-rendering", live on the GUI host.
+STATUS: **OPEN.** Root cause below is identified and confirmed. The first
+remedy shipped as v3.0.28 and was WRONG — reverted at v3.0.29 the same hour,
+after the user's own screenshot showed it had made their surface worse. Read
+§"The remedy that failed" before proposing another.
+
+Reported by the user as "fix the bottom rendering", live on the GUI host.
 
 ### Symptom
 Immediately after **switching to** an agent-CLI session, the bottom of the
@@ -2299,19 +2303,27 @@ is never told, so every later frame paints words over cells it thinks are blank.
 **The divergence is permanent, because a differential renderer never goes back**
 — and more reconciles cannot repair it, since each one re-installs the base.
 
-### Fix
-The reconcile now follows its write with a resize nudge, which is the portable
-"redraw everything" request: SIGWINCH makes an in-place TUI re-author the whole
-screen instead of trusting its model. Two call sites already used the nudge for
-the same underlying reason (stale prompt gap, remote resume); this is the third
-and the one that pairs with the repaint that caused the divergence.
+### ⛔ THE REMEDY THAT FAILED — do not re-propose it
+**A resize nudge after the reconcile (v3.0.28, reverted at v3.0.29).** The
+reasoning looked sound: SIGWINCH is the portable "redraw everything" request, so
+ask the CLI to re-author the screen after we replaced its base. It was gated on
+`agent_cli_session`, rate-limited, and its trace event fired exactly as designed.
 
-Gated on `agent_cli_session` — the predicate for "repaints in place", which
-**includes Claude Code**. `codex_like_session` does not, and that omission was
-the 2026-07-27 bug; this was reported on a CC session, so the wrong predicate
-would have shipped a fix that never ran. Rate-limited to one nudge per 3 s
-(`RECONCILE_REPAINT_NUDGE_MIN_INTERVAL_MS`) so a re-arming reconcile cannot
-resize an agent's terminal in a loop.
+**It made the surface worse, and the failure is instructive.** SIGWINCH does not
+make an in-place CLI redraw *the screen* — it makes it redraw **the region it
+still owns**, which is only the live frame. Everything the reconcile had just
+painted above that frame was cleared and not replaced, so the interleaved bottom
+was traded for a BLANK transcript with a few spinner fragments floating in it.
+On a mid-turn surface it also tears, which is precisely what the existing
+`DeferWorking` guard beside it exists to prevent.
+
+⇒ **The transcript above the live frame is NOT the CLI's to repaint.** Any
+remedy that asks the CLI to redraw is asking for something it cannot give, and
+will empty the scrollback to prove it. The fix has to make the reconciled base
+MATCH what the CLI believes it drew — not ask the CLI to re-author it.
+
+Caught only because the user screenshotted their own screen after the deploy.
+The trace said the fix was working; the pixel said the surface was empty.
 
 ### Ruled out first, each with its instrument
 Recorded so they are not re-run:
