@@ -46581,12 +46581,67 @@ fn terminal_clipboard_owner_loop(
     }
 }
 
+/// How long two byte-identical writes from the same surface count as ONE act.
+/// Long enough to absorb a double dispatch (measured at the same millisecond on
+/// the live host), far short of any human re-copying the same text on purpose.
+const TERMINAL_CLIPBOARD_WRITE_COALESCE_MS: u64 = 400;
+/// The last write this door served, as a FINGERPRINT and a time — never the
+/// text. A `Secret` copy (a vault TOTP code) must not be left sitting in a
+/// static for the sake of a duplicate check.
+static LAST_TERMINAL_CLIPBOARD_WRITE_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
+static LAST_TERMINAL_CLIPBOARD_WRITE_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// What a terminal clipboard write actually did. A caller that cannot tell
+/// "served" from "already served" chimes twice for one copy, which is how the
+/// double copy notification survived so long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardWriteOutcome {
+    /// Queued to the owner thread; names the method for telemetry.
+    Served(&'static str),
+    /// A byte-identical write for the same surface and action inside the
+    /// coalescing window — ONE user act that reached this door twice.
+    Coalesced,
+}
+
+impl ClipboardWriteOutcome {
+    fn served_method(self) -> Option<&'static str> {
+        match self {
+            Self::Served(method) => Some(method),
+            Self::Coalesced => None,
+        }
+    }
+}
+
+/// Whether this write repeats the previous one closely enough to be the same
+/// user act. Pure so the window can be tested without the process statics.
+fn terminal_clipboard_write_is_repeat(
+    previous: Option<(u64, u64)>,
+    fingerprint: u64,
+    now_ms: u64,
+) -> bool {
+    let Some((last_fingerprint, last_at_ms)) = previous else {
+        return false;
+    };
+    last_fingerprint == fingerprint
+        && now_ms >= last_at_ms
+        && now_ms - last_at_ms < TERMINAL_CLIPBOARD_WRITE_COALESCE_MS
+}
+
+fn terminal_clipboard_write_fingerprint(session_path: &str, action: &str, text: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    session_path.hash(&mut hasher);
+    action.hash(&mut hasher);
+    text.hash(&mut hasher);
+    // A zero fingerprint would be indistinguishable from "nothing written yet".
+    hasher.finish() | 1
+}
+
 fn copy_terminal_selection_to_clipboard(
     session_path: &str,
     action: &str,
     text: String,
     trace_home: PathBuf,
-) -> Result<&'static str> {
+) -> Result<ClipboardWriteOutcome> {
     copy_terminal_text_to_clipboard(
         session_path,
         action,
@@ -46601,7 +46656,7 @@ fn copy_terminal_text_to_clipboard(
     text: String,
     trace_home: PathBuf,
     sensitivity: ClipboardSensitivity,
-) -> Result<&'static str> {
+) -> Result<ClipboardWriteOutcome> {
     if text.is_empty() {
         return Err(anyhow!(
             "Select terminal text before using the clipboard shortcut."
@@ -46614,6 +46669,42 @@ fn copy_terminal_text_to_clipboard(
             byte_count
         ));
     }
+    // ⛔ ONE COPY GESTURE, ONE WRITE. Measured on the live host: the viewport
+    // Copy action reached this door TWICE at the same millisecond with identical
+    // text, and each call set the selection again. On Wayland the clipboard is
+    // served on demand by whoever owns the selection, so a second set_text
+    // re-offers mid-handshake and the requester can be answered by the previous
+    // owner instead — a copy that reports success and pastes as the OLD content.
+    // Coalescing here rather than at the dispatcher is deliberate: the clipboard
+    // is one resource with one owner, so the invariant belongs at its door and
+    // holds for every caller (selection copy, OSC 52, cut) instead of once per
+    // route. The duplicate is still traced — swallowing it silently would hide
+    // the double dispatch that produced it.
+    let fingerprint = terminal_clipboard_write_fingerprint(session_path, action, &text);
+    let now_ms = current_millis();
+    let previous = (
+        LAST_TERMINAL_CLIPBOARD_WRITE_FINGERPRINT.load(Ordering::Relaxed),
+        LAST_TERMINAL_CLIPBOARD_WRITE_AT_MS.load(Ordering::Relaxed),
+    );
+    let previous = (previous.0 != 0).then_some(previous);
+    if terminal_clipboard_write_is_repeat(previous, fingerprint, now_ms) {
+        LAST_TERMINAL_CLIPBOARD_WRITE_AT_MS.store(now_ms, Ordering::Relaxed);
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "terminal_clipboard",
+            "selection_copy_coalesced",
+            json!({
+                "session_path": session_path,
+                "action": action,
+                "bytes": byte_count,
+                "since_previous_ms": now_ms.saturating_sub(previous.map(|(_, at)| at).unwrap_or(now_ms)),
+            }),
+        );
+        return Ok(ClipboardWriteOutcome::Coalesced);
+    }
+    LAST_TERMINAL_CLIPBOARD_WRITE_FINGERPRINT.store(fingerprint, Ordering::Relaxed);
+    LAST_TERMINAL_CLIPBOARD_WRITE_AT_MS.store(now_ms, Ordering::Relaxed);
     let sender = terminal_clipboard_owner_sender()?;
     sender
         .send(TerminalClipboardOwnerRequest {
@@ -46637,7 +46728,7 @@ fn copy_terminal_text_to_clipboard(
             "method": "native_owner_thread",
         }),
     );
-    Ok("native_owner_thread")
+    Ok(ClipboardWriteOutcome::Served("native_owner_thread"))
 }
 
 /// Read the clipboard on a BLOCKING thread with a FRESH connection — never on
@@ -69896,6 +69987,8 @@ async fn web_surface_totp_for(
             ClipboardSensitivity::Secret,
         )
         .is_ok()
+        // A coalesced write still leaves the code on the clipboard — the caller
+        // asked "is it there", not "did this call put it there".
     } else {
         false
     };
@@ -95544,7 +95637,12 @@ fn TerminalCanvas(
                                     selection,
                                     trace_home.clone(),
                                 ) {
-                                    Ok(method) => {
+                                    // A coalesced write is the SAME copy arriving
+                                    // twice: it is already on the clipboard, so
+                                    // there is nothing to announce and a second
+                                    // chime would only report our own duplicate.
+                                    Ok(ClipboardWriteOutcome::Coalesced) => {}
+                                    Ok(ClipboardWriteOutcome::Served(method)) => {
                                         let (title, message) = if action == "cut" {
                                             (
                                                 "Cut to Clipboard",
@@ -95838,6 +95936,42 @@ fn TerminalCanvas(
                                         ),
                                     );
                                 }
+                            }
+                            Ok(TerminalJsEvent::ClipboardSuppressed {
+                                action,
+                                reason,
+                                chars,
+                                gesture_age_ms,
+                            }) => {
+                                // Deliberately trace-only: no toast. A suppression is
+                                // usually correct (replayed history re-emitting an old
+                                // copy), and a toast for every correct refusal would
+                                // train the user to ignore the one that matters. But it
+                                // must not be INVISIBLE either — a silent drop is what
+                                // made "select-copy is inconsistent" unanswerable, so
+                                // the reason lands beside `selection_copy_accepted` and
+                                // the two can be counted against each other. Privacy:
+                                // the length, never the text.
+                                let _ = safe_shell_mut(
+                                    state,
+                                    "terminal_clipboard_suppressed_telemetry",
+                                    |shell| {
+                                        shell.record_terminal_io_telemetry(
+                                            "clipboard_copy",
+                                            "warn",
+                                            &session_path,
+                                            "selection_copy_suppressed",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "host_id": host_id.clone(),
+                                                "action": action.clone(),
+                                                "reason": reason.clone(),
+                                                "chars": chars,
+                                                "gesture_age_ms": gesture_age_ms,
+                                            }),
+                                        );
+                                    },
+                                );
                             }
                             Ok(TerminalJsEvent::Debug { message }) => {
                                 // Throttle the synchronous trace WRITE only; the
@@ -106177,6 +106311,21 @@ fn terminal_eval_script_with_canvas_renderer(
         // the SAME clipboard event the selection copy uses. Queries (`?`)
         // ask the terminal to REPLY with clipboard contents — consumed and
         // ignored (never leak the clipboard back to the PTY).
+        // THE one door that arms an OSC 52 replay-suppression window, keyed by the
+        // host whose stream is being replayed. Installed on `window` because the
+        // arming sites live in three different generated scripts (mount, replay,
+        // write bridge) while the handler that reads it is registered by the mount
+        // script — but the WINDOW is not the unit of suppression and never was.
+        // Arming globally meant a session catching up on its scrollback silently
+        // ate a copy the user had just made in a different terminal.
+        window.__yggtermArmOsc52Suppress = (armHostId, windowMs) => {{
+            try {{
+                const armKey = String(armHostId || '');
+                if (!armKey) {{ return; }}
+                window.__yggtermOsc52Suppress = window.__yggtermOsc52Suppress || {{}};
+                window.__yggtermOsc52Suppress[armKey] = Date.now() + windowMs;
+            }} catch (_osc52ArmError) {{}}
+        }};
         const osc52ClipboardDisposable = (() => {{
             try {{
                 if (!term || !term.parser || typeof term.parser.registerOscHandler !== 'function') {{
@@ -106198,7 +106347,7 @@ fn terminal_eval_script_with_canvas_renderer(
                         //    THIS same parser. That re-parse must NOT re-copy + re-chime and
                         //    clobber whatever the user just copied in another buffer (the
                         //    "impossible to copy buffer-to-buffer" bug). The replay/restore
-                        //    writes bump window.__yggtermOsc52SuppressUntilMs just before they run.
+                        //    writes arm this host's window via __yggtermArmOsc52Suppress first.
                         // 2) c+p DEDUPE — CC select-copy emits OSC 52 to both the clipboard
                         //    and primary selections (two sequences); ring + write ONCE.
                         // Window/global state survives scope boundaries across the mount script.
@@ -106215,22 +106364,49 @@ fn terminal_eval_script_with_canvas_renderer(
                         //    missed (the re-emit arrives as a small live chunk, not a bulk replay)
                         //    WITHOUT dropping keyboard-initiated copies (finding-osc52: the
                         //    pointer-only stamp silently ate the FIRST `c`-copy on every login).
+                        // ⛔ ALL THREE GATES ARE PER-HOST. They were window-globals, so a
+                        //    replay in ANY terminal ate a genuine copy in EVERY other one and
+                        //    the dedupe compared text across unrelated sessions — cross-talk
+                        //    that grows with the session count and reads to the user as
+                        //    "copying works sometimes".
                         const osc52Host = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
                             ? window.__yggtermXtermHosts[hostId] : null;
                         const osc52GestureAtMs = osc52Host ? Number(osc52Host.lastUserGestureAtMs || 0) : 0;
+                        // A dropped copy used to be SILENT, and that is why "select-copy is
+                        // inconsistent" had no diagnosis: three gates could eat it and none of
+                        // them left a mark, so a gate that fired was indistinguishable from a
+                        // CLI that never emitted. Every drop now names itself and carries the
+                        // gesture age the gate judged it on.
+                        const suppressOsc52 = (reason) => {{
+                            try {{
+                                sendTerminalEvent({{
+                                    kind: 'clipboard_suppressed',
+                                    action: 'osc52',
+                                    reason,
+                                    chars: text.length,
+                                    gesture_age_ms: osc52GestureAtMs > 0
+                                        ? Math.round(osc52NowMs - osc52GestureAtMs)
+                                        : -1,
+                                }});
+                            }} catch (_osc52SuppressReportError) {{}}
+                            return true;
+                        }};
                         if (osc52NowMs - osc52GestureAtMs > 3000) {{
-                            return true;
+                            return suppressOsc52('no_user_gesture');
                         }}
-                        if (osc52NowMs < (window.__yggtermOsc52SuppressUntilMs || 0)) {{
-                            return true;
+                        const osc52SuppressUntilMs = window.__yggtermOsc52Suppress
+                            ? Number(window.__yggtermOsc52Suppress[hostId] || 0) : 0;
+                        if (osc52NowMs < osc52SuppressUntilMs) {{
+                            return suppressOsc52('replay_window');
                         }}
-                        if (text === window.__yggtermOsc52LastCopyText
-                            && (osc52NowMs - (window.__yggtermOsc52LastCopyAtMs || 0)) < 1200) {{
-                            window.__yggtermOsc52LastCopyAtMs = osc52NowMs;
-                            return true;
+                        window.__yggtermOsc52LastCopy = window.__yggtermOsc52LastCopy || {{}};
+                        const osc52LastCopy = window.__yggtermOsc52LastCopy[hostId] || null;
+                        if (osc52LastCopy && text === osc52LastCopy.text
+                            && (osc52NowMs - Number(osc52LastCopy.atMs || 0)) < 1200) {{
+                            osc52LastCopy.atMs = osc52NowMs;
+                            return suppressOsc52('duplicate_c_and_p');
                         }}
-                        window.__yggtermOsc52LastCopyText = text;
-                        window.__yggtermOsc52LastCopyAtMs = osc52NowMs;
+                        window.__yggtermOsc52LastCopy[hostId] = {{ text, atMs: osc52NowMs }};
                         if (text.length > 0) {{
                             sendTerminalEvent({{
                                 kind: 'clipboard',
@@ -106265,9 +106441,37 @@ fn terminal_eval_script_with_canvas_renderer(
                 const gestureEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
                 if (gestureEntry) {{ gestureEntry.lastUserGestureAtMs = Date.now(); }}
             }};
+            // The PRESS is as much a copy gesture as the release, and it is the
+            // only half guaranteed to land on this terminal: a drag that starts
+            // here can end anywhere.
+            let osc52DragStartedHere = false;
+            const startOsc52Drag = () => {{
+                osc52DragStartedHere = true;
+                stampOsc52Gesture();
+            }};
+            host.addEventListener('pointerdown', startOsc52Drag, true);
+            host.addEventListener('mousedown', startOsc52Drag, true);
             host.addEventListener('pointerup', stampOsc52Gesture, true);
             host.addEventListener('mouseup', stampOsc52Gesture, true);
             host.addEventListener('keydown', stampOsc52Gesture, true);
+            // ⛔ A SELECTION DRAG OFTEN ENDS OUTSIDE THE TERMINAL — sweep past the
+            // bottom edge to take the last line, past the right edge to take the
+            // end of a wrapped one — and the release then fires on the DOCUMENT,
+            // never on the host. With the stamp bound to the host alone that copy
+            // reached the gesture gate with nothing stamped, looked exactly like a
+            // switch-in re-emit, and was dropped. Which release the gate saw
+            // depended on where the mouse came up: the copy worked or vanished
+            // with no visible difference to the user. That is the "it copies
+            // sometimes" report. Claim the release only when the press was ours,
+            // so another surface's drag never counts as a gesture on this one.
+            const releaseOsc52Drag = () => {{
+                if (!osc52DragStartedHere) {{ return; }}
+                osc52DragStartedHere = false;
+                stampOsc52Gesture();
+            }};
+            window.addEventListener('pointerup', releaseOsc52Drag, true);
+            window.addEventListener('mouseup', releaseOsc52Drag, true);
+            window.addEventListener('pointercancel', releaseOsc52Drag, true);
         }} catch (_osc52GestureError) {{}}
         let webglAddonAvailable = Boolean(window.WebglAddon && window.WebglAddon.WebglAddon);
         let rendererDecisionError = '';
@@ -110234,7 +110438,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     try {{
                         if (typeof term.reset === "function") {{ term.reset(); }}
                         // Replayed scrollback must not re-fire OSC 52 copy (see the OSC 52 handler).
-                        window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;
+                        window.__yggtermArmOsc52Suppress(hostId, 400);
                         if (ws) {{ ws("\x1bc\x1b[H"); ws(restoredText); }}
                         else if (typeof term.write === "function") {{ term.write(`\x1bc\x1b[H${{restoredText}}`); }}
                         const tentry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
@@ -114552,12 +114756,27 @@ fn terminal_eval_script_with_canvas_renderer(
             // daemon re-streams a session's BUFFERED output when the viewer attaches,
             // and that bulk catch-up carries any OSC 52 the CLI emitted earlier (CC's
             // select-copy). Replayed history must not re-fire the clipboard copy + chime.
-            // Arm the suppression window ONLY when a bulk/retained-scrollback payload
-            // actually contains an OSC 52 — a genuine live copy is a small incremental
-            // chunk that sets neither bulk flag, so it still fires normally.
-            if ((retainedScrollbackReplay || expectedScrollbackPayload)
-                && payload.indexOf('\x1b]52;') !== -1) {{
-                window.__yggtermOsc52SuppressUntilMs = Date.now() + 2000;
+            //
+            // ⛔ THE ARM MUST NAME REPLAYED HISTORY, NOT MERELY A BIG PAYLOAD. It used
+            // to fire on `expectedScrollbackPayload` alone — "more lines than the grid
+            // is tall, in the normal buffer" — which is not a property of a replay at
+            // all. It is what an agent CLI printing a long tool result looks like, and
+            // Claude Code lives in the normal buffer. So a copy made WHILE such a block
+            // was streaming rode in on the very payload that armed the window (the arm
+            // runs before the parse) and suppressed ITSELF. Whether a copy survived
+            // depended on how the daemon happened to chunk the output around it: the
+            // "it works sometimes" the user reported. The catch-up this guards is
+            // bounded in time by the attach that causes it, so ask for THAT — a
+            // retained-scrollback replay, or a bulk payload landing inside the
+            // switch-in window — instead of asking whether the payload was large.
+            const osc52ReplayLike =
+                retainedScrollbackReplay
+                || (entry && Date.now() - Number(entry.lastActivationAtMs || 0) < 8000);
+            if (osc52ReplayLike
+                && (retainedScrollbackReplay || expectedScrollbackPayload)
+                && payload.indexOf('\x1b]52;') !== -1
+                && window.__yggtermArmOsc52Suppress) {{
+                window.__yggtermArmOsc52Suppress(hostId, 2000);
             }}
             if (!retainedScrollbackReplay) {{
                 payload = coalesceHighVolumeTerminalPayload(payload);
@@ -115525,7 +115744,7 @@ fn terminal_eval_script_with_canvas_renderer(
                             ? term._core.writeSync.bind(term._core)
                             : (term && term._core && term._core._writeBuffer && typeof term._core._writeBuffer.writeSync === "function"
                                 ? term._core._writeBuffer.writeSync.bind(term._core._writeBuffer) : null);
-                        window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;
+                        window.__yggtermArmOsc52Suppress(hostId, 400);
                         if (wsReapply) {{ wsReapply("\x1bc\x1b[H"); wsReapply(pendingPostResetTranscript.text); }}
                         else if (typeof term.write === "function") {{ term.write(`\x1bc\x1b[H${{pendingPostResetTranscript.text}}`); }}
                         if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
@@ -117207,7 +117426,9 @@ fn terminal_replay_retained_data_script_for_session(
                 : null;
             try {{
               // Replayed scrollback must not re-fire OSC 52 copy (see the OSC 52 handler).
-              window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;
+              if (window.__yggtermArmOsc52Suppress) {{
+                window.__yggtermArmOsc52Suppress(String(entry.hostId || ''), 400);
+              }}
               // XTERM-BUG: cold-reveal-bulk-write-freeze — raise the bulk-write
               // in-flight signal so the per-line onScroll heavy tail is skipped
               // during this replay parse (same skip as bridge write flushes).
@@ -117457,7 +117678,9 @@ fn terminal_replay_retained_data_script_for_session(
                 ? "\x1bc\x1b[H"
                 : "\x1bc\x1b[2J\x1b[3J\x1b[H";
               // Replayed scrollback must not re-fire OSC 52 copy (see the OSC 52 handler).
-              window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;
+              if (window.__yggtermArmOsc52Suppress) {{
+                window.__yggtermArmOsc52Suppress(String(entry.hostId || ''), 400);
+              }}
               // XTERM-BUG: cold-reveal-bulk-write-freeze — raise the bulk-write
               // in-flight signal so the per-line onScroll heavy tail is skipped
               // during this replay parse (same skip as bridge write flushes).
@@ -117582,6 +117805,13 @@ fn terminal_set_input_policy_script_for_active_session(
               const now = Date.now();
               const hostId = String(entry.hostId || "");
               const mountedAt = String(entry.mountedAt || "");
+              // When this host was switched INTO — stamped before the repaint
+              // dedupe below, because it dates the ATTACH, not the repaint. The
+              // write bridge asks it to tell the daemon's catch-up burst (which
+              // may replay an old OSC 52) from ordinary live output, so a
+              // stamp skipped as a "duplicate repaint" would leave a real
+              // catch-up looking live.
+              entry.lastActivationAtMs = now;
               const repaintKey = `${{activeSessionPath}}:${{hostId}}:${{mountedAt}}:${{reason}}`;
               if (
                 entry.lastActivationRepaintKey === repaintKey
@@ -125423,7 +125653,7 @@ fn dispatch_viewport_menu_action(mut state: Signal<ShellState>, action: String) 
                 }
                 let chars = text.chars().count();
                 if copy_terminal_selection_to_clipboard(&session_path, "copy", text, trace_home)
-                    .is_ok()
+                    .is_ok_and(|outcome| outcome.served_method().is_some())
                 {
                     safe_push_notification(
                         state,
@@ -143926,9 +144156,20 @@ mod tests {
         // c+p double-emit to one chime.
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
-        // The handler honours the suppression window and the same-text dedupe.
-        assert!(script.contains("if (osc52NowMs < (window.__yggtermOsc52SuppressUntilMs || 0)) {"));
-        assert!(script.contains("text === window.__yggtermOsc52LastCopyText"));
+        // ⛔ EVERY GATE IS KEYED BY HOST. As window globals these ate copies across
+        // unrelated terminals: one session catching up on its scrollback opened a
+        // suppression window that swallowed a copy made in another, and the dedupe
+        // compared text between sessions that share nothing.
+        assert!(script.contains("Number(window.__yggtermOsc52Suppress[hostId] || 0)"));
+        assert!(script.contains("window.__yggtermOsc52LastCopy[hostId] = { text, atMs: osc52NowMs };"));
+        assert!(
+            !script.contains("window.__yggtermOsc52SuppressUntilMs"),
+            "the window-global suppression window is cross-talk between terminals and must stay gone"
+        );
+        assert!(
+            !script.contains("window.__yggtermOsc52LastCopyText"),
+            "the copy dedupe must not compare text across unrelated sessions"
+        );
         // The user-gesture gate: an OSC 52 with no recent gesture on this host is a re-emit
         // on switch-in (CC re-sending its selection / daemon catch-up), not a copy. Both a
         // mouse-release AND a keydown count as a copy gesture — a keyboard `c`-copy (CC login)
@@ -143937,23 +144178,62 @@ mod tests {
         assert!(script.contains("gestureEntry.lastUserGestureAtMs = Date.now();"));
         assert!(script.contains("host.addEventListener('mouseup', stampOsc52Gesture, true);"));
         assert!(script.contains("host.addEventListener('keydown', stampOsc52Gesture, true);"));
+        // A selection drag that leaves the terminal releases on the DOCUMENT, so the
+        // press must count and the release must be claimed from the window — otherwise
+        // whether a copy survives depends on where the mouse came up.
+        assert!(script.contains("host.addEventListener('pointerdown', startOsc52Drag, true);"));
+        assert!(script.contains("window.addEventListener('pointerup', releaseOsc52Drag, true);"));
+        assert!(script.contains("window.addEventListener('mouseup', releaseOsc52Drag, true);"));
+        assert!(
+            script.contains("if (!osc52DragStartedHere) { return; }"),
+            "a drag that began on another surface must not stamp a gesture on this terminal"
+        );
+        // Every drop names itself. A silent gate is indistinguishable from a CLI that
+        // never emitted, which is why "select-copy is inconsistent" had no diagnosis.
+        for reason in [
+            "return suppressOsc52('no_user_gesture');",
+            "return suppressOsc52('replay_window');",
+            "return suppressOsc52('duplicate_c_and_p');",
+        ] {
+            assert!(script.contains(reason), "every OSC 52 drop must report its reason: {reason}");
+        }
+        assert!(script.contains("kind: 'clipboard_suppressed',"));
+        assert!(script.contains("gesture_age_ms: osc52GestureAtMs > 0"));
         // The mount script's two buffer-restore writes (construct-time localStorage
         // restore + reapply-after-reset) each arm the suppression window first; the
         // live-data write (term.write(payload, ...)) must NOT, or copy breaks entirely.
         assert_eq!(
-            script.matches("window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;").count(),
+            script.matches("window.__yggtermArmOsc52Suppress(hostId, 400);").count(),
             2,
             "both mount-script buffer-restore writes must arm OSC 52 suppression (and only those)"
         );
-        // The live daemon-PTY write path arms suppression when a BULK retained/scrollback
-        // payload carries an OSC 52 — this is the daemon's catch-up re-stream on attach
-        // ("switching recopies"), the path the client-side replay arms above do NOT cover.
+        // ⛔ The live daemon-PTY write path arms suppression for the daemon's catch-up
+        // re-stream on attach — and ONLY then. Arming on payload SIZE alone made a
+        // genuine copy suppress itself whenever it rode in on a chunk of ordinary CLI
+        // output, because the arm runs before that same payload is parsed.
         assert!(script.contains("(retainedScrollbackReplay || expectedScrollbackPayload)"));
         assert!(script.contains("]52;') !== -1"));
-        assert!(script.contains("window.__yggtermOsc52SuppressUntilMs = Date.now() + 2000;"));
+        assert!(script.contains("window.__yggtermArmOsc52Suppress(hostId, 2000);"));
+        assert!(
+            script.contains(
+                "|| (entry && Date.now() - Number(entry.lastActivationAtMs || 0) < 8000);"
+            ),
+            "the bulk arm must name replayed history (a replay, or the switch-in catch-up window)"
+        );
+        assert!(
+            script.contains("const osc52ReplayLike =")
+                && script.contains("if (osc52ReplayLike\n"),
+            "the bulk arm must be gated on the replay-like test, not merely reference it"
+        );
+        // ...and the switch-in stamp it reads is written on EVERY activation, before the
+        // repaint dedupe — that stamp dates the attach, not the repaint.
+        let switch_script =
+            terminal_set_input_policy_script_for_active_session("local://osc52-test", true, true, false);
+        assert!(switch_script.contains("entry.lastActivationAtMs = now;"));
         // The reattach retained-replay script — the switch-back path that re-feeds the
         // buffered scrollback into the already-mounted terminal (which carries the OSC 52
-        // handler; the window global bridges the two scripts) — arms it on both its writes.
+        // handler; the window-installed arming door bridges the two scripts) — arms it on
+        // both its writes, against the host being replayed.
         let replay = terminal_replay_retained_data_script_for_session(
             "local://osc52-test",
             "hello\x1b]52;c;aGk=\x07world",
@@ -143961,9 +144241,60 @@ mod tests {
             0,
         );
         assert_eq!(
-            replay.matches("window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;").count(),
+            replay
+                .matches("window.__yggtermArmOsc52Suppress(String(entry.hostId || ''), 400);")
+                .count(),
             2,
-            "both retained-replay writes must arm OSC 52 suppression"
+            "both retained-replay writes must arm OSC 52 suppression for their own host"
+        );
+    }
+
+    #[test]
+    fn one_copy_gesture_writes_the_clipboard_once() {
+        // Live trace, guihost 3.0.30, 21:01:00.976: the viewport Copy action reached
+        // the clipboard door TWICE in the same millisecond with identical text and
+        // produced two owner updates. On Wayland the second set_text re-offers the
+        // selection mid-handshake, which is how a copy reports success and pastes
+        // as the OLD content.
+        let fingerprint = terminal_clipboard_write_fingerprint("local://a", "copy", "hello");
+        assert!(!terminal_clipboard_write_is_repeat(None, fingerprint, 1_000));
+        assert!(terminal_clipboard_write_is_repeat(
+            Some((fingerprint, 1_000)),
+            fingerprint,
+            1_000
+        ));
+        assert!(terminal_clipboard_write_is_repeat(
+            Some((fingerprint, 1_000)),
+            fingerprint,
+            1_000 + TERMINAL_CLIPBOARD_WRITE_COALESCE_MS - 1
+        ));
+        // Past the window a genuine re-copy of the same text must still be served.
+        assert!(!terminal_clipboard_write_is_repeat(
+            Some((fingerprint, 1_000)),
+            fingerprint,
+            1_000 + TERMINAL_CLIPBOARD_WRITE_COALESCE_MS
+        ));
+        // Different text, different action and different surface are different acts.
+        for other in [
+            terminal_clipboard_write_fingerprint("local://a", "copy", "goodbye"),
+            terminal_clipboard_write_fingerprint("local://a", "cut", "hello"),
+            terminal_clipboard_write_fingerprint("local://b", "copy", "hello"),
+        ] {
+            assert_ne!(other, fingerprint);
+            assert!(!terminal_clipboard_write_is_repeat(
+                Some((fingerprint, 1_000)),
+                other,
+                1_001
+            ));
+        }
+        // A fingerprint is never 0, which is the "nothing written yet" reading.
+        assert_ne!(fingerprint, 0);
+        // And a coalesced write announces nothing: the chime belongs to the write
+        // that actually happened.
+        assert_eq!(ClipboardWriteOutcome::Coalesced.served_method(), None);
+        assert_eq!(
+            ClipboardWriteOutcome::Served("native_owner_thread").served_method(),
+            Some("native_owner_thread")
         );
     }
 

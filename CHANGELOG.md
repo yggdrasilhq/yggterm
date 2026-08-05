@@ -4,6 +4,40 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Select-to-copy in an agent CLI works wherever the mouse comes up.** A
+  selection drag that leaves the terminal — sweeping past the bottom edge to
+  take the last line is the ordinary way to do it — releases on the document,
+  not on the terminal. The copy gate reads "was there a user gesture on this
+  terminal", it saw nothing, concluded the CLI was replaying an old clipboard
+  write, and dropped the copy. Nothing said so, so the copy worked or vanished
+  with no visible difference. The press now counts as much as the release, and a
+  release anywhere is claimed by the terminal the drag started in.
+- **A big block of output no longer swallows a copy made while it printed.** The
+  write path suppressed clipboard writes carried by any payload with more lines
+  than the grid is tall — which is not a property of replayed history, it is
+  what an agent CLI printing a long tool result looks like. The copy rode in on
+  the very payload that armed the suppression and cancelled itself, so whether
+  it survived depended on how the daemon happened to chunk the output around it.
+  Suppression is now armed for replayed history: a scrollback replay, or the
+  catch-up burst that follows switching into a session.
+- **One terminal's replay no longer eats another terminal's copy.** The three
+  gates on the CLI clipboard path kept their state on the window, so a session
+  catching up on its scrollback opened a suppression window that applied to
+  every open terminal, and the duplicate check compared text between sessions
+  that share nothing. All three are now keyed by the terminal they judge.
+- **A refused clipboard write says why** (`selection_copy_suppressed`, beside
+  the existing `selection_copy_accepted`, carrying the reason, the length and
+  the gesture age it was judged on). Three gates could drop a copy in silence,
+  which made a gate that fired indistinguishable from a CLI that never emitted —
+  and "copying is inconsistent" impossible to answer.
+- **One copy gesture writes the clipboard once.** The viewport Copy action was
+  reaching the clipboard twice in the same millisecond with identical text, and
+  each write re-offered the selection. On Wayland the clipboard is served on
+  demand by whoever owns it, so a re-offer mid-handshake can be answered by the
+  previous owner — a copy that reports success and pastes as the old content.
+  Byte-identical writes from the same surface now coalesce, and the duplicate is
+  traced rather than swallowed.
+
 ## 3.0.24
 
 - **A contributed pane can be driven from the control plane**
