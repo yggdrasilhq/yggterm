@@ -124,6 +124,23 @@ pub(crate) enum TerminalJsEvent {
         action: String,
         message: String,
     },
+    /// A clipboard write from the PTY that the host DECLINED to perform, and
+    /// why. Three gates guard the OSC 52 path (a copy needs a recent user
+    /// gesture on its own terminal, must not fall inside a replay window, and
+    /// must not repeat the sequence a CLI sends twice for `c` and `p`). Each
+    /// used to drop the copy in silence, which is exactly why "copying is
+    /// inconsistent" was undiagnosable: nothing distinguished a gate that fired
+    /// from a CLI that never emitted. A refusal that says nothing is
+    /// indistinguishable from an absence.
+    ClipboardSuppressed {
+        action: String,
+        reason: String,
+        chars: usize,
+        /// Milliseconds since the last user gesture on THAT terminal, or -1
+        /// when there has never been one. The gesture gate's own input, so a
+        /// reading of `no_user_gesture` can be checked instead of believed.
+        gesture_age_ms: i64,
+    },
     Debug {
         message: String,
     },
@@ -303,6 +320,13 @@ impl PanePlacement {
     }
 }
 
+/// "There has never been a user gesture on this terminal." A missing field
+/// must not read as `0`, which would mean the epoch and compute an age of
+/// fifty-odd years — a number a reader would quietly believe.
+fn unknown_gesture_age_ms() -> i64 {
+    -1
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum TerminalJsEventWire {
@@ -366,6 +390,14 @@ enum TerminalJsEventWire {
     ClipboardError {
         action: String,
         message: String,
+    },
+    ClipboardSuppressed {
+        action: String,
+        reason: String,
+        #[serde(default)]
+        chars: usize,
+        #[serde(default = "unknown_gesture_age_ms")]
+        gesture_age_ms: i64,
     },
     Debug {
         message: String,
@@ -553,6 +585,17 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
             TerminalJsEventWire::ClipboardError { action, message } => {
                 TerminalJsEvent::ClipboardError { action, message }
             }
+            TerminalJsEventWire::ClipboardSuppressed {
+                action,
+                reason,
+                chars,
+                gesture_age_ms,
+            } => TerminalJsEvent::ClipboardSuppressed {
+                action,
+                reason,
+                chars,
+                gesture_age_ms,
+            },
             TerminalJsEventWire::Debug { message } => TerminalJsEvent::Debug { message },
             TerminalJsEventWire::OpenUrl { url } => TerminalJsEvent::OpenUrl { url },
             TerminalJsEventWire::Notify {
