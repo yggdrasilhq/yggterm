@@ -531,6 +531,35 @@ pub struct TerminalManager {
     sessions: HashMap<String, PtySessionRuntime>,
 }
 
+/// One live session's handoff inputs, gathered while this daemon still owns it.
+///
+/// ⛔ **`master_fd` is BORROWED.** It is the runtime's own descriptor, valid
+/// only while that runtime is still in the map. It is deliberately not an
+/// `OwnedFd`: the sender must not close it, because `sendmsg` duplicates it
+/// into the receiver and the predecessor then releases it by EXITING, which is
+/// the ownership decision the spike settled.
+///
+/// ⛔ **Do not "tidy" this by dropping the runtime after a successful send.**
+/// A `PtySessionRuntime`'s reader thread holds its OWN cloned master, so
+/// dropping the runtime leaves that thread alive, still holding the pty open
+/// and still consuming bytes that now belong to the successor — two daemons
+/// reading one PTY, and the shell never seeing EOF. The predecessor hands off
+/// everything and then retires as a process; that is what releases the
+/// descriptors, and it is why the handoff is all-or-nothing rather than
+/// per-session.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct HandoffTakeout {
+    pub master_fd: std::os::fd::RawFd,
+    pub shell_pid: u32,
+    pub shell_start_time: u64,
+    pub cols: u16,
+    pub rows: u16,
+    pub screen: String,
+    pub launch_command: String,
+    pub cwd: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalShutdownSummary {
     pub stopped: usize,
@@ -626,6 +655,31 @@ impl TerminalManager {
         )?;
         self.sessions.insert(key.to_string(), runtime);
         Ok(())
+    }
+
+    /// Everything a handoff needs about one live session, gathered while we
+    /// still own it.
+    ///
+    /// `master_fd` is BORROWED, not owned: it stays valid only while this
+    /// runtime is still in the map. That is deliberate — see
+    /// [`Self::handoff_takeout`].
+    #[cfg(target_os = "linux")]
+    pub fn handoff_takeout(&self, key: &str) -> Option<HandoffTakeout> {
+        let runtime = self.sessions.get(key)?;
+        let shell_pid = runtime.process_id()?;
+        let shell_start_time = crate::pty_adoption::process_start_time(shell_pid)?;
+        let cols = runtime.current_cols.load(Ordering::SeqCst);
+        let rows = runtime.current_rows.load(Ordering::SeqCst);
+        Some(HandoffTakeout {
+            master_fd: runtime.master.lock().ok()?.as_raw_fd()?,
+            shell_pid,
+            shell_start_time,
+            cols,
+            rows,
+            screen: runtime.screen_snapshot(),
+            launch_command: runtime.launch_command.clone(),
+            cwd: runtime.cwd.clone(),
+        })
     }
 
     /// Suspend/wake recovery: kill and immediately respawn every RUNNING
