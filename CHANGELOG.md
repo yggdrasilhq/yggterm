@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A live row can say whose plate it is and whether it is empty.** Agent rows
+  accumulate on the Live Sessions table and clearing them by hand is only
+  annoying because of the second question: is this one finished, or is an agent
+  still working in it? Getting that wrong kills live work, so the safe move is
+  to clear nothing. Every row now carries one verdict — the user's own row, an
+  agent's row with something alive in it, an agent's row holding nothing but its
+  own shell, or a row this machine cannot see into — served by
+  `server terminal tenants`. Only the third is ever clearable, and a row whose
+  idle age is unknown is not. The policy is `docs/agent-row-hygiene.md`; the
+  verdict on the row itself, a bulk clear and the staged sweep are named there
+  and not yet built.
+
 - **Select-to-copy in an agent CLI works wherever the mouse comes up.** A
   selection drag that leaves the terminal — sweeping past the bottom edge to
   take the last line is the ordinary way to do it — releases on the document,
