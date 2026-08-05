@@ -5290,14 +5290,7 @@ impl DaemonRuntime {
                 // Idle is the PTY's own silence, read from the same source the
                 // ephemeral reaper uses; a row this daemon does not own answers
                 // `None`, and an unknown age is never clearable.
-                let runtime_key = self.server.terminal_runtime_key_for_path(&path);
-                let idle_secs = self
-                    .terminals
-                    .session_idle_for_ms(&runtime_key)
-                    .map(|idle_ms| idle_ms / 1_000);
-                report.hygiene = Some(crate::session_tenancy::row_hygiene_verdict(
-                    &report, idle_secs,
-                ));
+                report.hygiene = Some(crate::session_tenancy::row_hygiene_verdict(&report));
                 report
             })
             .collect();
@@ -5396,14 +5389,24 @@ impl DaemonRuntime {
                 TenantReportGap::RootPidUnavailable,
             );
         };
-        crate::session_tenancy::row_tenant_report(
+        // The idle clock belongs to whoever owns the PTY, so it is read HERE —
+        // in the branch that owns it — and carried on the report. A proxied
+        // answer then brings the owner's reading home with its measurement,
+        // instead of the answering daemon computing an idle age it cannot see.
+        let idle_secs = self
+            .terminals
+            .session_idle_for_ms(&runtime_key)
+            .map(|idle_ms| idle_ms / 1_000);
+        let mut measured = crate::session_tenancy::row_tenant_report(
             snapshot,
             path,
             &runtime_key,
             root_pid,
             self.terminals
                 .session_foreground_process_group_leader(&runtime_key),
-        )
+        );
+        measured.idle_secs = idle_secs;
+        measured
     }
 
     fn preserved_owner_endpoint_for_request(
