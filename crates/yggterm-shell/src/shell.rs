@@ -88733,6 +88733,25 @@ pub(crate) fn codex_like_session(kind: SessionKind) -> bool {
 pub(crate) fn agent_cli_session(kind: SessionKind) -> bool {
     kind.is_agent()
 }
+/// The smallest gap between two post-reconcile repaint nudges.
+///
+/// A nudge costs the session two PTY resizes, and a reveal reconcile can re-arm
+/// on a busy surface, so an ungated nudge would resize an agent's terminal in a
+/// loop. One per this window is enough: the nudge exists to re-sync the CLI
+/// after we replaced its base, and replacing it twice inside a second is the
+/// same event.
+pub(crate) const RECONCILE_REPAINT_NUDGE_MIN_INTERVAL_MS: u64 = 3_000;
+/// May a post-reconcile repaint nudge fire now?
+///
+/// Pure so the rate limit is testable without a terminal. `last == 0` means
+/// "never nudged", which must ALWAYS be allowed — the first reconcile after a
+/// reveal is precisely the one that replaced the base.
+pub(crate) fn reconcile_repaint_nudge_due(now_ms: u64, last_nudge_ms: u64) -> bool {
+    if last_nudge_ms == 0 {
+        return true;
+    }
+    now_ms.saturating_sub(last_nudge_ms) >= RECONCILE_REPAINT_NUDGE_MIN_INTERVAL_MS
+}
 /// Whether THIS mount takes the remote-resume readiness path.
 ///
 /// The DECISION `TerminalCanvas` makes once per mount and threads into ~8
@@ -89906,6 +89925,11 @@ fn TerminalCanvas(
         ),
     );
     let is_remote_resume_session = terminal_mount_takes_remote_resume_readiness(&session);
+    // Does this session's CLI repaint IN PLACE (differential frames + absolute
+    // column jumps) rather than re-emitting what it drew? If so, a reconcile
+    // that replaces its base must be followed by a redraw request — see the
+    // `reconcile_repaint_nudge` site.
+    let session_repaints_in_place = agent_cli_session(session.kind);
     let session_keep_alive = live_session_keep_alive(&session);
     let session_temporary_update_restore = live_session_temporary_update_restore(&session);
     let session_restart_protected = session_keep_alive || session_temporary_update_restore;
@@ -92419,6 +92443,10 @@ fn TerminalCanvas(
             let mut last_sent_terminal_resize_cols = 0_u16;
             let mut last_sent_terminal_resize_rows = 0_u16;
             let mut startup_resize_repair_scheduled = false;
+            // A screen reconcile REPLACES the base an in-place CLI is diffing
+            // against, so it must be followed by a full-repaint request. See
+            // `reconcile_repaint_nudge_due` below for why, and the rate limit.
+            let mut last_reconcile_repaint_nudge_ms = 0_u64;
             // RE-RESUME / REFLOW-BG FIX: when the COLUMN count changes, xterm.js
             // reflows and drops the background attribute of existing cells; a
             // delta-rendering TUI (codex) never repaints the unchanged text, so its
@@ -92846,6 +92874,92 @@ fn TerminalCanvas(
                                     "bytes": screen_text.len(),
                                 }),
                             );
+                            // ⛔ THE RECONCILE REPLACED THE BASE THE CLI IS
+                            // DIFFING AGAINST — ASK IT TO REDRAW, OR WE HAVE
+                            // JUST CAUSED THE CORRUPTION WE CAME TO REPAIR.
+                            //
+                            // An agent CLI repaints IN PLACE: it writes only the
+                            // cells that changed and jumps over the rest with
+                            // absolute column moves, because it knows what it
+                            // last drew. It never rewrites a cell it believes is
+                            // already correct.
+                            //
+                            // This write clears the grid and repaints it from the
+                            // DAEMON's screen. That frame is the daemon's
+                            // rendering of its vt100 model — not a byte-exact
+                            // replica of the CLI's own model — so afterwards the
+                            // two disagree, and the CLI is never told. Every
+                            // later frame then paints words over cells it thinks
+                            // are blank, and the divergence is PERMANENT because
+                            // a differential renderer never goes back.
+                            //
+                            // Reported 2026-08-04 as "fix the bottom rendering",
+                            // and the fingerprint is what identifies it: the
+                            // words are right and every SPACE BETWEEN THEM holds
+                            // a character from an older frame —
+                            //   "2 background shell command task(s) from the"
+                            //   -> "2rbackground shellscommandhtask(s)afromdthe"
+                            // — because the gaps are exactly what the CLI skips.
+                            // It showed up immediately after switching TO a
+                            // session, which is when the reveal reconcile fires.
+                            //
+                            // A resize nudge is the portable "redraw everything"
+                            // request: SIGWINCH makes an in-place TUI re-author
+                            // the whole screen instead of trusting its model. Two
+                            // existing call sites already use it for the same
+                            // underlying reason (stale prompt gap, remote resume);
+                            // this is the third and it is the one that pairs with
+                            // the repaint that caused the divergence.
+                            //
+                            // Gated on the CLI, not the locality: `agent_cli_session`
+                            // is the predicate for "repaints in place" and it
+                            // includes Claude Code (`codex_like_session` does not,
+                            // which is the bug that cost 2026-07-27). A plain
+                            // shell re-emits its prompt and needs nothing.
+                            let nudge_now_ms = current_millis();
+                            if session_repaints_in_place
+                                && reconcile_repaint_nudge_due(
+                                    nudge_now_ms,
+                                    last_reconcile_repaint_nudge_ms,
+                                )
+                                && terminal_geometry_is_usable(
+                                    current_terminal_cols,
+                                    current_terminal_rows,
+                                )
+                            {
+                                last_reconcile_repaint_nudge_ms = nudge_now_ms;
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "reconcile_repaint_nudge",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "reason": reconcile_reason,
+                                        "cols": current_terminal_cols,
+                                        "rows": current_terminal_rows,
+                                    }),
+                                );
+                                if let Err(error) = terminal_resize_nudge_async(
+                                    endpoint.clone(),
+                                    runtime_session_path.clone(),
+                                    current_terminal_cols,
+                                    current_terminal_rows,
+                                )
+                                .await
+                                {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "reconcile_repaint_nudge_error",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "error": error.to_string(),
+                                        }),
+                                    );
+                                }
+                            }
                         }
                         ScreenReconcileDecision::DeferWorking => {
                             // RE-ARM, don't drop: a vacuumed/stale reveal frame
@@ -174716,6 +174830,65 @@ Caused by:
         // Byte-faithful: prose that merely mentions the phrase is kept, and its real
         // trailing newline is forwarded verbatim (the old `.lines().join()` withheld it).
         assert_eq!(combined.as_deref(), Some(data));
+    }
+
+    #[test]
+    /// A reconcile REPLACES the base an in-place CLI diffs against, so the
+    /// nudge that asks it to redraw must be allowed on the FIRST one. That is
+    /// the reveal reconcile — the one the user hits by switching to a session,
+    /// and the one that produced the reported corruption.
+    #[test]
+    fn the_first_reconcile_after_a_reveal_may_always_ask_the_cli_to_redraw() {
+        assert!(
+            super::reconcile_repaint_nudge_due(1_000, 0),
+            "never-nudged must be allowed: the first reconcile is the one that \
+             swapped the CLI's base"
+        );
+    }
+
+    /// ...but it may not resize the user's terminal in a loop. A reveal
+    /// reconcile re-arms on a busy surface, and each nudge costs two PTY
+    /// resizes.
+    #[test]
+    fn repaint_nudges_are_rate_limited_so_a_rearming_reconcile_cannot_loop() {
+        let last = 10_000_u64;
+        assert!(
+            !super::reconcile_repaint_nudge_due(last + 1, last),
+            "a second nudge one millisecond later is the same event"
+        );
+        assert!(
+            !super::reconcile_repaint_nudge_due(
+                last + super::RECONCILE_REPAINT_NUDGE_MIN_INTERVAL_MS - 1,
+                last
+            ),
+            "still inside the window"
+        );
+        assert!(
+            super::reconcile_repaint_nudge_due(
+                last + super::RECONCILE_REPAINT_NUDGE_MIN_INTERVAL_MS,
+                last
+            ),
+            "at the window boundary a genuinely new reconcile may nudge again"
+        );
+    }
+
+    /// The gate is the CLI, not the locality — and it must include Claude Code.
+    ///
+    /// `codex_like_session` excludes CC, and using it here was the 2026-07-27
+    /// bug that left CC sessions on their own sparse snapshot. The corruption
+    /// this fix addresses was reported on a Claude Code session, so a predicate
+    /// that answers `false` for CC would ship a fix that never runs.
+    #[test]
+    fn the_redraw_gate_covers_claude_code_not_just_codex() {
+        assert!(
+            super::agent_cli_session(SessionKind::ClaudeCode),
+            "Claude Code repaints in place and MUST be nudged after a reconcile"
+        );
+        assert!(super::agent_cli_session(SessionKind::Codex));
+        assert!(
+            !super::agent_cli_session(SessionKind::Shell),
+            "a plain shell re-emits its prompt and needs no redraw request"
+        );
     }
 
     #[test]
