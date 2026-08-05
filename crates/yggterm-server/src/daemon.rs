@@ -3413,6 +3413,54 @@ impl DaemonRuntime {
             .collect()
     }
 
+    /// Hand every live PTY this daemon owns to `successor_version`.
+    ///
+    /// All-or-nothing on purpose: the caller may only release its descriptors
+    /// (by exiting) when EVERY runtime moved, because exiting closes the
+    /// masters of any runtime it still holds and their reader threads are the
+    /// only thing keeping those PTYs open. Stops at the first failure rather
+    /// than pressing on, so a broken successor costs one session's worth of
+    /// risk instead of all of them.
+    #[cfg(target_os = "linux")]
+    fn hand_off_all_runtimes(&mut self, successor_version: &str) -> HandoffSweep {
+        let keys = self.terminals.session_keys();
+        let total = keys.len();
+        if total == 0 {
+            return HandoffSweep::NoneMoved {
+                reason: "this daemon owns no live PTYs".to_string(),
+            };
+        }
+        let socket =
+            crate::pty_handoff::handoff_socket_path(self.store.home_dir(), successor_version);
+        let mut moved = 0usize;
+        let mut first_failure = None::<String>;
+        for key in keys {
+            let Some(takeout) = self.terminals.handoff_takeout(&key) else {
+                first_failure = Some(format!("{key}: no live runtime to take"));
+                break;
+            };
+            let metadata = crate::pty_handoff::HandoffMetadata {
+                version: crate::pty_handoff::HANDOFF_WIRE_VERSION,
+                runtime_key: key.clone(),
+                launch_command: takeout.launch_command,
+                cwd: takeout.cwd,
+                cols: takeout.cols,
+                rows: takeout.rows,
+                shell_pid: takeout.shell_pid,
+                shell_start_time: takeout.shell_start_time,
+                screen: takeout.screen,
+            };
+            match crate::pty_handoff::send_session(&socket, &metadata, takeout.master_fd) {
+                Ok(()) => moved += 1,
+                Err(error) => {
+                    first_failure = Some(format!("{key}: {error}"));
+                    break;
+                }
+            }
+        }
+        classify_handoff_sweep(total, moved, first_failure)
+    }
+
     /// Working flags for every live row, INCLUDING the ones this daemon only
     /// proxies.
     ///
@@ -6913,6 +6961,46 @@ impl DaemonRuntime {
                         }),
                     );
                     spawn_result?;
+                    // ★ LEVEL (b): try the LOSSLESS route before lingering.
+                    //
+                    // Opt-in for now (`YGGTERM_ENABLE_PTY_FD_HANDOFF`) because a
+                    // failure past the commit point destroys a live shell. When
+                    // it is off, or when nothing moves, behaviour is exactly the
+                    // lingering-preserved-owner path this replaces.
+                    #[cfg(target_os = "linux")]
+                    if pty_fd_handoff_enabled()
+                        && let Some(successor) = live_successor_version.as_deref()
+                    {
+                        let sweep = self.hand_off_all_runtimes(successor);
+                        append_trace_event(
+                            self.store.home_dir(),
+                            "daemon",
+                            "lifecycle",
+                            "pty_fd_handoff_sweep",
+                            serde_json::json!({
+                                "successor_version": successor,
+                                "outcome": format!("{sweep:?}"),
+                                "pid": std::process::id(),
+                            }),
+                        );
+                        if let HandoffSweep::AllMoved { .. } = sweep {
+                            // The successor holds every descriptor now. The ONLY
+                            // safe way to release ours is to EXIT: dropping
+                            // runtimes individually leaves their reader threads
+                            // holding cloned masters, and two daemons reading one
+                            // PTY means the shell never sees EOF. Exiting does not
+                            // signal the children — they re-parent to init, which
+                            // is what the spike proved.
+                            //
+                            // Delayed so this request's response still reaches the
+                            // caller; the descriptors are already gone, so nothing
+                            // is racing for them.
+                            std::thread::spawn(|| {
+                                std::thread::sleep(std::time::Duration::from_millis(250));
+                                std::process::exit(0);
+                            });
+                        }
+                    }
                     return Ok(ServerResponse::HotUpdateHandoff {
                         message: Some(format!(
                             "hot update handoff started: preserving {} live terminal runtime(s) on {}",
@@ -10635,6 +10723,170 @@ fn versioned_server_status_probe_paths_excluding_endpoint(
         .collect()
 }
 
+/// Is the lossless PTY fd handoff armed on this daemon?
+///
+/// **Opt-in for its first release**, the same integrator gate increment 1 used.
+/// The failure it guards against is not cosmetic: a handoff that goes wrong
+/// after the commit point destroys a live shell. Default OFF until it has run
+/// in a sandbox against two real daemons.
+#[cfg(target_os = "linux")]
+fn pty_fd_handoff_enabled() -> bool {
+    matches!(
+        std::env::var("YGGTERM_ENABLE_PTY_FD_HANDOFF")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// What a whole-daemon handoff attempt concluded.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HandoffSweep {
+    /// Every runtime moved. The predecessor may now release its descriptors,
+    /// and the ONLY safe way to do that is to exit the process.
+    AllMoved { moved: usize },
+    /// Nothing moved and nothing was lost — keep the PTYs and linger exactly as
+    /// before. This is the safe failure and it must stay indistinguishable from
+    /// "handoff not available".
+    NoneMoved { reason: String },
+    /// Some moved and then one failed. The daemon is now split across two
+    /// owners and MUST NOT exit — exiting would close the descriptors of the
+    /// runtimes it still holds while their reader threads are the only thing
+    /// keeping them alive.
+    Partial { moved: usize, reason: String },
+}
+
+/// Decide what a sweep concluded from its per-session results.
+///
+/// Split out and pure because the three outcomes drive completely different
+/// behaviour and the dangerous one — `Partial` — is the state a live test is
+/// least likely to produce on demand.
+#[cfg(target_os = "linux")]
+pub(crate) fn classify_handoff_sweep(
+    total: usize,
+    moved: usize,
+    first_failure: Option<String>,
+) -> HandoffSweep {
+    match first_failure {
+        None if moved == total => HandoffSweep::AllMoved { moved },
+        None => HandoffSweep::Partial {
+            moved,
+            reason: format!("{moved} of {total} moved with no error reported"),
+        },
+        Some(reason) if moved == 0 => HandoffSweep::NoneMoved { reason },
+        Some(reason) => HandoffSweep::Partial { moved, reason },
+    }
+}
+
+/// Accept PTY handoffs from predecessor daemons.
+///
+/// Level (b), increment 2 — the successor half. A predecessor that is retiring
+/// sends us its live PTYs one connection at a time; we seat each one and answer with
+/// an ack so it knows whether it may let go.
+///
+/// **Bound at daemon start, before any predecessor could look for us.** The
+/// address is derived from this daemon's version
+/// ([`crate::pty_handoff::handoff_socket_path`]), which is what lets a
+/// predecessor find it knowing only `live_successor_version`.
+///
+/// ⚠ A failure to bind is NOT fatal. Without a listener this daemon simply
+/// cannot accept handoffs, and a predecessor's `send_session` fails BEFORE its
+/// commit point — so its PTY stays where it is and the old lingering behaviour
+/// applies. Degrading to "no handoff" must never take the daemon down with it.
+#[cfg(target_os = "linux")]
+fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntime>>) {
+    use std::os::unix::net::UnixListener;
+
+    let path = crate::pty_handoff::handoff_socket_path(&home_dir, SERVER_PROTOCOL_VERSION);
+    // A stale socket file from a dead daemon of this version would refuse the
+    // bind forever. Removing it is safe: a LIVE daemon of our version would
+    // already own our request socket and we would not be starting.
+    let _ = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            append_trace_event(
+                &home_dir,
+                "daemon",
+                "lifecycle",
+                "pty_handoff_listener_bind_failed",
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "error": error.to_string(),
+                }),
+            );
+            return;
+        }
+    };
+    append_trace_event(
+        &home_dir,
+        "daemon",
+        "lifecycle",
+        "pty_handoff_listener_bound",
+        serde_json::json!({ "path": path.display().to_string() }),
+    );
+
+    std::thread::Builder::new()
+        .name("yggterm-pty-handoff".to_string())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let outcome = crate::pty_handoff::receive_session(&stream);
+                let (adopted, error) = match outcome {
+                    Ok((metadata, fd)) => {
+                        let mut rt = lock_daemon_runtime(&runtime, "pty_handoff_adopt");
+                        match rt.terminals.adopt_session(
+                            &metadata.runtime_key,
+                            &metadata.launch_command,
+                            metadata.cwd.as_deref(),
+                            metadata.cols,
+                            metadata.rows,
+                            fd,
+                            metadata.shell_pid,
+                            metadata.shell_start_time,
+                            Some(metadata.screen.as_str()),
+                        ) {
+                            Ok(()) => {
+                                append_trace_event(
+                                    &home_dir,
+                                    "daemon",
+                                    "lifecycle",
+                                    "pty_handoff_adopted",
+                                    serde_json::json!({
+                                        "runtime_key": metadata.runtime_key,
+                                        "shell_pid": metadata.shell_pid,
+                                        "cols": metadata.cols,
+                                        "rows": metadata.rows,
+                                        "screen_bytes": metadata.screen.len(),
+                                    }),
+                                );
+                                (true, None)
+                            }
+                            Err(error) => (false, Some(format!("{error:#}"))),
+                        }
+                    }
+                    Err(error) => (false, Some(format!("{error:#}"))),
+                };
+                if let Some(reason) = error.as_deref() {
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "lifecycle",
+                        "pty_handoff_refused",
+                        serde_json::json!({ "error": reason }),
+                    );
+                }
+                let _ = crate::pty_handoff::send_ack(
+                    &stream,
+                    &crate::pty_handoff::HandoffAck { adopted, error },
+                );
+            }
+        })
+        .ok();
+}
+
 /// Fold one owner's working flags into the answer being assembled.
 ///
 /// Split out of [`DaemonRuntime::working_flags_including_proxied`] so the merge
@@ -13243,6 +13495,10 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             "endpoint": format!("{endpoint:?}"),
         }),
     );
+    // Accept PTY handoffs before anything else could look for us: a predecessor
+    // derives our address from our VERSION, so it can knock the moment we exist.
+    #[cfg(target_os = "linux")]
+    spawn_pty_handoff_listener(home_dir.clone(), Arc::clone(&runtime));
     {
         // Perf incident monitor: catch the RANDOM "fan gets angry" flares the user
         // can't predict. Every 30s, summarize the last 60s of perf telemetry and, if
@@ -16354,6 +16610,77 @@ mod tests {
             !candidate_survives(&attempts),
             "a key that keeps coming back must stop being released — lingering \
              beats churning the user's live session"
+        );
+    }
+
+    /// Every runtime moved ⇒ the predecessor may release its descriptors, and
+    /// the only safe release is exiting.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sweep_that_moved_everything_lets_the_predecessor_exit() {
+        assert_eq!(
+            super::classify_handoff_sweep(3, 3, None),
+            super::HandoffSweep::AllMoved { moved: 3 }
+        );
+    }
+
+    /// Nothing moved ⇒ the safe failure. It must be indistinguishable from
+    /// "handoff unavailable", because both mean: keep the PTYs, linger, behave
+    /// exactly as before.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sweep_that_moved_nothing_is_the_safe_failure() {
+        assert_eq!(
+            super::classify_handoff_sweep(3, 0, Some("connect refused".to_string())),
+            super::HandoffSweep::NoneMoved {
+                reason: "connect refused".to_string()
+            }
+        );
+    }
+
+    /// ⛔ THE DANGEROUS ONE. Some moved, then one failed: the daemon is split
+    /// across two owners and MUST NOT exit — exiting closes the masters of the
+    /// runtimes it still holds, whose reader threads are the only thing keeping
+    /// those PTYs open. This is also the outcome a live test is least likely to
+    /// produce on demand, which is why it is pinned here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_partial_sweep_must_never_be_mistaken_for_success() {
+        let sweep = super::classify_handoff_sweep(3, 2, Some("peer died".to_string()));
+        assert_eq!(
+            sweep,
+            super::HandoffSweep::Partial {
+                moved: 2,
+                reason: "peer died".to_string()
+            }
+        );
+        assert!(
+            !matches!(sweep, super::HandoffSweep::AllMoved { .. }),
+            "a partial sweep must never authorise the exit"
+        );
+    }
+
+    /// A count that does not add up is also Partial, not success. Trusting
+    /// "no error reported" over the arithmetic is how a silent loss ships.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_short_count_with_no_error_is_still_not_success() {
+        assert!(matches!(
+            super::classify_handoff_sweep(3, 2, None),
+            super::HandoffSweep::Partial { moved: 2, .. }
+        ));
+    }
+
+    /// The gate is OFF unless explicitly armed — the first release of something
+    /// whose failure destroys a live shell does not default to on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_fd_handoff_is_opt_in() {
+        // Reads the process environment, which no test sets, so this asserts
+        // the DEFAULT rather than a parse.
+        assert!(
+            !super::pty_fd_handoff_enabled(),
+            "YGGTERM_ENABLE_PTY_FD_HANDOFF must be opt-in"
         );
     }
 
