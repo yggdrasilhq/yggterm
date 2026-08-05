@@ -2336,8 +2336,44 @@ Recorded so they are not re-run:
 | wcwidth disagreement on `●` U+25CF | CHA probe: `●●●●●\033[13GMARK` vs `xxxxx\033[13GMARK` | identical landing ⇒ width 1 on the daemon |
 | the reconcile never running | `screen_reconcile_forced_deadline` | fired **3×**; it runs and cannot help |
 
+### ★★★ THE DEEPER CAUSE, FOUND AFTER THE FAILED REMEDY (2026-08-05)
+**The GUI's daemon does not own the rows it displays, and a proxied row carries
+no screen — only its launch scaffold.** Measured on the live host:
+
+```
+rail                   : 0 owned · 9 total · 9 preserved
+daemon active_session  : terminal_lines = 3
+                         'Queue remote Claude Code resume c5c57fff-…'
+                         'Target host: dev'
+                         'Workspace: /home/user/gh/yggterm'
+ssh proxy for that row : pid 84932, PPID 4162027   <- the PREVIOUS daemon
+server status answers  : pid 169710 v3.0.29, owns 1 of 9
+```
+
+Every GUI restart spawns a daemon that matches the new client version, and
+ownership does not follow it. The serving daemon therefore answers about rows it
+has never run, and all it holds for them is the bootstrap seed.
+
+This explains **two** reported symptoms with one cause:
+
+1. **The rail reads `Status: bootstrapping` on a session that is actively
+   working** — it is reporting the launch scaffold, because that is the whole
+   screen this daemon has.
+2. **A diverged surface can never be repaired**, because the reconcile has no
+   authoritative frame to repair it FROM. `SkipUnwritable` correctly refuses to
+   paint a 3-line launch seed over a live transcript, so the corruption simply
+   stays.
+
+⇒ The bottom-rendering bug is not primarily a renderer bug. It is a symptom of
+ownership not migrating — the same gap the `SCM_RIGHTS` PTY handoff exists to
+close (see `pending-bugs.md`, "A DAEMON OWNING A PLAIN SHELL CAN NEVER BE
+RETIRED"). Fixing the renderer without fixing ownership treats the symptom.
+
+⚠ And restarts make it worse, which is worth knowing before reaching for one:
+each GUI relaunch during this session added a daemon and left the rows behind.
+
 ### Code locations
-- `shell.rs` — `reconcile_repaint_nudge` site, inside `ScreenReconcileDecision::Write`
+- `shell.rs` — `ScreenReconcileDecision::Write` / `SkipUnwritable`
 - `shell.rs::reconcile_repaint_nudge_due` — pure rate limit
 - `shell.rs::terminal_resize_nudge_async` — the redraw request
 
