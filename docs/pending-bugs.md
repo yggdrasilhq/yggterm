@@ -13,6 +13,32 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## `~/.yggterm` keeps one dead socket per version ever run — 700 of them
+
+**Status:** OPEN
+
+Counted on the GUI host 2026-08-05: **~700 `server-<version>.sock` files** in
+`~/.yggterm`, going back to `server-2-1-2.sock`. Seven daemons are alive; every
+other socket is a file no process will ever bind again. Nothing has ever swept
+them, and each deploy adds one more.
+
+Harmless today — the enumeration probe in `server status` reads existing
+sockets and never spawns, so a dead one costs a `connect` that fails — but it
+is the same shape as the clipboard staging dir before `clipboard_sweep.rs`
+(182 MB, growing, nobody's job), and the same shape the user named for live
+session rows: *nobody's plate, nobody's table.*
+
+**The sweep has an obvious safe rule** and it is the one the socket layer
+already needs: a socket nothing is listening on, whose version is not a live
+daemon's, is garbage. Take the rule from `clipboard_sweep.rs` — per-host, own
+`$YGGTERM_HOME` only, fail-safe on any read it cannot complete.
+
+⚠ Do NOT unlink a socket merely because `connect` fails. A daemon mid-restart
+has a moment with no listener, and deleting its address there turns a hiccup
+into a lost daemon. Bind-test or match against the live daemon set.
+
+Related: `docs/agent-row-hygiene.md` (the same class of accumulation, for rows).
+
 ## ★★★ A DAEMON OWNING A PLAIN SHELL CAN NEVER BE RETIRED — increment 2, steps 2-3
 
 **Status:** OPEN
