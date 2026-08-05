@@ -48,6 +48,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [persisted-scroll-restore-fights-follow](#persisted-scroll-restore-fights-follow) | After GUI restart, every click/keystroke flickers between a saved scroll offset and the live bottom | FIXED 2026-06-02 |
 | [xterm-host-registry-leak](#xterm-host-registry-leak) | Switching/restarting sessions accumulates orphaned xterm.js instances (cleanup keyed to mount epoch that changes on remount) → growing latency on selection/paste/switch | FIXED 2026-06-02 |
 | [chunk-ring-trim-drops-mid-stream](#chunk-ring-trim-drops-mid-stream) | Middle chunks of TUI output silently missing: yggterm-server chunk ring trims oldest while a client's read-cursor is behind the trim, and read(cursor) returns only surviving chunks with no gap signal | LAYER 2b SHIPPED 2026-07-23 (read() appends the viewport reconcile after the tail on a detected gap — the busiest-CC interleave-corruption fix; layers 1/2a 2026-06-04) |
+| [reconcile-swaps-the-base-an-in-place-cli-diffs-against](#reconcile-swaps-the-base-an-in-place-cli-diffs-against) | Broken bottom right after SWITCHING to an agent session: the words are right and every SPACE between them holds a character from an older frame ("2 background shell" → "2rbackground shells…") | FIXED 2026-08-05 (v3.0.28) — a reveal reconcile now asks an in-place CLI to redraw; live-proven on the GUI host |
 | [squish-and-bottom-paint-on-reresume](#squish-and-bottom-paint-on-reresume) | After an update re-resumes a session, codex renders narrow (squish) + composer bg-split (bottom paint) | FIXED 2026-06-05 (v2.8.25) — daemon resizes PTY to client grid on re-attach; deterministic test |
 | [seed-connection-state-in-terminal](#seed-connection-state-in-terminal) | yggterm's own launch/connection seed boilerplate ("Launching live … session", "Terminal surface: embedded xterm.js", "Runtime owner: yggterm daemon") is written into the xterm buffer as prefill before the PTY paints | FIXED 2026-06-06 (D4) — local prefill source + render gate reject the daemon launch seed; deterministic fail-then-pass test |
 | [detached-term-element-blank-viewport](#detached-term-element-blank-viewport) | Viewport entirely blank while every health field reports healthy: `term.element` is detached from its host and an empty `.xterm` husk (viewport only, no screen) occupies it, defeating all three repair guards | SPECIES A FIXED 2026-07-22 — provenance root-caused: the husk is born in a PArecordsAL `term.open()` (root appended first, screen fragment last), pinned by `tools/xterm-harness/husk_is_born_in_a_partial_open.test.js`; mount now retries after discarding the husk and the surface owner rebuilds rather than moves one. SPECIES B ALSO FIXED 2026-07-22 — and it was never a second species: `_coreBrowserService` arms the guard MID-open, six services before the screen reaches the root, so a late throw yields the same husk with the guard armed. The owner now disarms it (`term._core.element = undefined`) and re-opens, reported as `rebuilt_from_husk_disarmed`; pinned by `tools/xterm-harness/husk_species_b_is_a_late_partial_open.test.js` and proven in live WebKit |
@@ -2251,3 +2252,93 @@ Event names + when they fire.
 ### Related memory
 `[[memory-name]]` links to any related memories.
 ```
+
+## reconcile-swaps-the-base-an-in-place-cli-diffs-against
+
+STATUS: FIXED 2026-08-05 (v3.0.28). Reported by the user as "fix the bottom
+rendering", live on the GUI host.
+
+### Symptom
+Immediately after **switching to** an agent-CLI session, the bottom of the
+viewport is wrong: the composer border renders as a broken/dotted line, the
+`bypass permissions` footer is missing, and a line of prose reads like this —
+
+```
+2rbackground shellscommandhtask(s)afromdthenprevious1sessionahaveinoicompletion record.
+```
+
+### The fingerprint, which is what identifies it
+**Every word is correct and every SPACE BETWEEN THEM holds a character from an
+older frame.**
+
+```
+"2 background shell command task(s) from the previous session have no completion record."
+"2rbackground shellscommandhtask(s)afromdthenprevious1sessionahaveinoicompletion record."
+     ^              ^         ^         ^     ^   ^         ^       ^    ^  ^
+```
+
+That is not generic corruption. It is the negative image of what the CLI chose
+not to write.
+
+### Root cause
+An agent CLI repaints **in place**. Captured from the live stream:
+
+```
+failed all\x1b[45Gree cl\x1b[52Guses \x1b[60Gonce
+```
+
+It writes only the cells that changed and jumps over the rest with absolute
+column moves (CSI `G`), because it knows what it last drew. It never rewrites a
+cell it believes is already correct — so the gaps are exactly where a divergence
+becomes visible.
+
+The reveal reconcile clears the grid and repaints it from the **daemon's**
+screen. That frame is the daemon's rendering of its vt100 model, not a
+byte-exact replica of the CLI's model. Afterwards the two disagree and the CLI
+is never told, so every later frame paints words over cells it thinks are blank.
+**The divergence is permanent, because a differential renderer never goes back**
+— and more reconciles cannot repair it, since each one re-installs the base.
+
+### Fix
+The reconcile now follows its write with a resize nudge, which is the portable
+"redraw everything" request: SIGWINCH makes an in-place TUI re-author the whole
+screen instead of trusting its model. Two call sites already used the nudge for
+the same underlying reason (stale prompt gap, remote resume); this is the third
+and the one that pairs with the repaint that caused the divergence.
+
+Gated on `agent_cli_session` — the predicate for "repaints in place", which
+**includes Claude Code**. `codex_like_session` does not, and that omission was
+the 2026-07-27 bug; this was reported on a CC session, so the wrong predicate
+would have shipped a fix that never ran. Rate-limited to one nudge per 3 s
+(`RECONCILE_REPAINT_NUDGE_MIN_INTERVAL_MS`) so a re-arming reconcile cannot
+resize an agent's terminal in a loop.
+
+### Ruled out first, each with its instrument
+Recorded so they are not re-run:
+
+| hypothesis | instrument | result |
+|---|---|---|
+| the chunk-ring interleave bug | `terminal_stream_resync_required` | **zero** events |
+| client/PTY grid mismatch | `/proc/<pid>/fd` TIOCGWINSZ vs host `cols`/`rows` | both **170×65** — the "84" came from a DIFFERENT session |
+| the wrap-clip guard eating rows | `screen_snapshot_clipped_to_pty_width` | **zero** events |
+| wcwidth disagreement on `●` U+25CF | CHA probe: `●●●●●\033[13GMARK` vs `xxxxx\033[13GMARK` | identical landing ⇒ width 1 on the daemon |
+| the reconcile never running | `screen_reconcile_forced_deadline` | fired **3×**; it runs and cannot help |
+
+### Code locations
+- `shell.rs` — `reconcile_repaint_nudge` site, inside `ScreenReconcileDecision::Write`
+- `shell.rs::reconcile_repaint_nudge_due` — pure rate limit
+- `shell.rs::terminal_resize_nudge_async` — the redraw request
+
+### Telemetry
+`ui/terminal_mount/reconcile_repaint_nudge` — carries `reason`, `cols`, `rows`.
+Live on the GUI host after the fix:
+
+```
+reveal_screen_reconcile      {}
+reconcile_repaint_nudge      {reason: reveal_screen_reconcile, cols: 170, rows: 65}
+```
+
+### Tests
+`the_first_reconcile_after_a_reveal_may_always_ask_the_cli_to_redraw` ·
+`repaint_nudges_are_rate_limited_so_a_rearming_reconcile_cannot_loop` ·
+`the_redraw_gate_covers_claude_code_not_just_codex`
