@@ -97,6 +97,51 @@ Two more measured facts for whoever takes this:
   appeared after each kill. A retry with no ceiling is its own defect and it
   hides the first one.
 
+## ⛔ `session rename` TELLS THE GUI IT FAILED AND THE CALLER IT SUCCEEDED
+
+**Status:** OPEN
+
+lumenstore row, 2026-08-06, while executing rule 1 of
+[`agent-row-hygiene.md`](agent-row-hygiene.md) §The outline contract:
+
+```
+server app session rename 'remote-cc://dev/does-not-exist' 'probe'
+  → {"accepted": true, "reason": null, "session_path": "…/does-not-exist"}
+```
+
+**The daemon is not confused — the check works.** `server app state` carries the
+notification it raised at the same millisecond:
+
+```
+{"title": "Rename Failed", "message": "paper not found: remote-cc://dev/does-not-exist",
+ "tone": "Error", "id": 38, "persistent": false}
+```
+
+⛔ **The two channels disagree, and they are pointed at the wrong parties.** The
+refusal goes to the GUI as a toast — to the human, who did not issue the call
+and cannot act on it — while the **caller that can** retry, correct its path, or
+stop claiming the rule is done is handed `accepted: true`. The response even has
+the slot: `reason` is `null` on a call the daemon had a named reason to reject.
+
+No row is created (`server app rows` holds 35 before and after), so this is a
+silent no-op rather than corruption. That is also what makes it expensive to
+catch: the only way an agent learns the truth today is to re-read the table.
+
+⚖ **Same family as the neighbouring `session remove` entry, one layer up.**
+There the lesson was *`accepted` is the request being understood, not the work
+being done*, and `remove` grew a `verified` field for it. `rename` has no such
+field — and unlike `remove`, its failure is already computed and simply not
+returned.
+
+**Fix:** fill `accepted: false` + `reason: "paper_not_found"` from the same
+branch that raises the toast. The GUI notification is fine to keep; it is the
+CLI's silence that is the bug.
+
+⚠ **Found alongside:** an agent can *raise* a notification (`server app notify`)
+but there is **no verb to dismiss one**, so a probe's own error toast sits on the
+user's screen until it ages out. Worth a `notify --dismiss <id>` for exactly the
+agent-cleans-its-own-plate reason the hygiene contract is built on.
+
 ## `server sessions reorder` WITH NO FILE REPORTS ITSELF AS NONEXISTENT
 
 **Status:** OPEN
