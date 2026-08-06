@@ -13,6 +13,98 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ★★★ A DRAG-SELECT OVER A STREAMING SESSION SELECTS THE WHOLE STREAM
+
+**Status:** OPEN — half fixed (the viewport pin), the runaway selection is not
+
+User-reported 2026-08-05: *"CC paste is working but selection makes the Ux lag
+and sometimes jojo angry."* Their guess — frame writes — is the right
+neighbourhood; the amplifier is the selection SIZE.
+
+**Measured on a shadow client, identical drag geometry, same session, mid-screen
+so xterm's drag-scroll never arms:**
+
+| terminal | chars selected | `onSelectionChange` fired | viewport intent |
+|---|---|---|---|
+| idle | **608** | 2 | `UserScrollback/selection_active` |
+| streaming | **902,649** | **0** | was `PromptFollow/focus` |
+
+A 2.4 s drag selected **909,143 chars over 10,036 lines**, and each
+`term.getSelection()` on a selection that size costs **18-23 ms** on the same
+webview thread as the xterm write pump — more than a frame budget, on every
+flush. That is the felt lag, and the user also silently gets ~300x more text
+than they dragged over.
+
+**Root cause, in two layers.**
+
+1. ⛔ **THE QUIET-GATE LAW again.** The "a selection pins the viewport" guard
+   hung only off `term.onSelectionChange`, and that event **does not arrive**
+   while an agent CLI streams — zero firings across a drag that selected 902,649
+   chars. So the pin never armed. **FIXED**: both arm and release now hang off
+   the pointer gesture (`applySelectionScrollbackIntent`, one owner, called by
+   pointer-down, pointer-up and the selection-change path). A second defect at
+   the release site is fixed with it — the reached-bottom escape dropped ANY
+   `UserScrollback` pin the instant the viewport sat at base, which during a
+   stream is continuously true; traced live, the pin died **116 ms** after it
+   armed. It now survives via `selectionOwnsScrollbackPin`.
+2. ⏳ **STILL OPEN — the pin is not sufficient.** It governs only *our* scrolls.
+   xterm follows the tail itself whenever `ydisp === ybase`, and a drag's end
+   anchor is `(pointer viewport row + ydisp)`, so the same screen position keeps
+   resolving to a larger buffer row and the selection swallows every line
+   emitted during the gesture. Verified after the fix: intent now correctly
+   reads `UserScrollback/selection_active` for the whole drag and the selection
+   is **still 902,649 chars**.
+
+⛔ **DO NOT "fix" it by freezing the viewport during the drag — that was tried
+and it OVERCORRECTS TO NOTHING.** Forcing `ydisp` back to the drag-start row on
+each write made the streaming drag select **0 characters**: the forced scroll
+perturbs the same anchors the drag is building. A drag that selects nothing is
+worse for the user than one that selects too much, so it was reverted rather
+than shipped. The next attempt should constrain the SELECTION END (clamp it to
+the row the pointer is actually over, in content terms) rather than move the
+viewport under a live gesture.
+
+**The instrument that settles any future attempt** — a shadow, an ephemeral row,
+a `while :; do echo …; done`, and a synthetic drag. ⚠ Two instrument traps, both
+of which produced a confident wrong reading first: xterm's `handleMouseDown`
+requires **`detail: 1`** on the synthetic `MouseEvent` (`1===e.detail` selects
+the single-click branch) or no selection is ever made and the arm reads as "no
+cost"; and the handler is bound to **`mousedown`**, not `pointerdown`. Verify the
+counter is bound to the CURRENT `term` object — a remount silently orphans it.
+
+## ★★ YCHROME PLAYS A YOUTUBE VIDEO TWICE, AND THE SECOND ONE CANNOT BE STOPPED
+
+**Status:** OPEN
+
+User-reported 2026-08-06: *"ychrome plays double youtube video with the next
+same video unpausable or mutable. I have to close ychrome to kill this phantom
+youtube tab."*
+
+**What the symptom already tells us, before any probe.** A page's own pause and
+mute controls act on the DOM they can reach. A video that ignores them is
+therefore **not in the tab being looked at** — it is a second surface. That it
+survives everything short of killing ychrome says it has no row to close.
+
+**So this is very likely an already-filed defect wearing a new symptom** — see
+*A LIVE, LEASED WEB SURFACE CAN EXIST WITH NO ROW* and *A SECOND VIEWER STILL
+BUILDS ITS OWN WEBVIEWS* in this file. Check those before opening a new lane.
+
+**Is it the cause of the YouTube judder?** ⚠ Plausible, unproven, and worth
+taking seriously rather than assuming. The judder entry in the render batch
+below already **falsified the decode explanation** — stats-for-nerds reports
+almost no dropped frames, so the decoder is keeping up and the fault is in
+PRESENTATION. Two simultaneous presentations of the same video is exactly a
+presentation-layer cause, and "overlaps" is what a second presenter would look
+like. It would also explain why the judder never correlated with anything in the
+decode pipeline.
+
+⛔ Not observable on demand yet: `server app state → web_surfaces` read **0**
+while ychrome held 4 anchored sessions, because a surface only registers once
+its session is activated. **Reproduce first, then measure** — with the double
+play live, count webviews for that profile, and read stats-for-nerds on the
+VISIBLE player with and without the phantom. If judder is present only when a
+phantom exists, that closes both this and the judder entry at once.
+
 ## `~/.yggterm` keeps one dead socket per version ever run — 700 of them
 
 **Status:** OPEN
