@@ -74990,6 +74990,106 @@ async fn process_pending_app_control_requests(
                 }
             }
         }
+        AppControlCommand::ReorderSessions { ordered_paths } => {
+            // The order the USER sees lives here, in the GUI's own copy. Apply
+            // it through the same owner the server path uses, then read the
+            // RENDERED order back and report that — so `changed` means the
+            // sidebar moved, not that a field somewhere changed. The server
+            // path's `changed:true` over an unmoved sidebar cost the owner two
+            // reports and the orchestrator four round-trips.
+            // ⛔ Forward to the daemon THIS GUI is bound to — do not write the
+            // GUI's own copy. `live_session_order` is the daemon's SSOT and the
+            // GUI's copy is a MIRROR of it, replaced by the next poll: writing
+            // locally reported `changed:true` and was gone a second later
+            // (measured, 2026-08-07, while building this very verb).
+            //
+            // That is also the whole defect. `server sessions reorder` reaches
+            // whichever daemon the CALLING binary resolves — a 3.0.44 CLI landed
+            // on a 3.0.44 daemon owning zero sessions while the GUI mirrored a
+            // 3.0.41 one, both binaries answering 3.0.44. Routing through the
+            // GUI's own endpoint makes "which daemon" un-guessable by
+            // construction: it is the one whose rows are on screen.
+            let endpoint = state.read().bootstrap.server_endpoint.clone();
+            let paths = ordered_paths.clone();
+            // The order the user is looking at, BEFORE — so `changed` can be a
+            // fact about the sidebar rather than a parse of the daemon's reply.
+            let rendered_before = state.with(|shell| {
+                shell
+                    .snapshot()
+                    .rows
+                    .iter()
+                    .filter(|row| row.kind == BrowserRowKind::Session)
+                    .map(|row| row.full_path.clone())
+                    .collect::<Vec<_>>()
+            });
+            let outcome = task::spawn_blocking(move || {
+                yggterm_server::reorder_live_sessions(&endpoint, &paths)
+            })
+            .await
+            .map_err(|error| anyhow!("joining reorder task: {error}"))
+            .and_then(|inner| inner);
+            match outcome {
+                Ok((_snapshot, message)) => {
+                    // ⛔ `changed` is measured against the RENDERED list, before
+                    // and after — never parsed out of the daemon's reply. The
+                    // whole reason this verb exists is that
+                    // `server sessions reorder` answered `changed:true` four
+                    // times over a sidebar that never moved, so a reply that
+                    // describes a daemon field is exactly what must not be
+                    // reported here.
+                    let rendered_after = state.with(|shell| {
+                        shell
+                            .snapshot()
+                            .rows
+                            .iter()
+                            .filter(|row| row.kind == BrowserRowKind::Session)
+                            .map(|row| row.full_path.clone())
+                            .collect::<Vec<_>>()
+                    });
+                    let requested_present: Vec<&String> = ordered_paths
+                        .iter()
+                        .filter(|path| rendered_after.contains(path))
+                        .collect();
+                    let rendered_subset: Vec<&String> = rendered_after
+                        .iter()
+                        .filter(|path| ordered_paths.contains(path))
+                        .collect();
+                    let matches_request = rendered_subset == requested_present;
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            // Did the USER'S list move?
+                            "changed": rendered_after != rendered_before,
+                            "requested": ordered_paths.len(),
+                            "rendered_order": rendered_after,
+                            "matches_request": matches_request,
+                            // ⚠ Known gap, kept visible rather than hidden: a
+                            // RUNNING GUI does not re-read the daemon's live
+                            // order, so this reports false until the mirror
+                            // learns to adopt it (filed). The daemon's own reply
+                            // rides along so the two can be compared.
+                            "daemon_message": message,
+                        })),
+                        error: None,
+                    }
+                }
+                Err(error) => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "changed": false,
+                        "requested": ordered_paths.len(),
+                        "matches_request": false,
+                    })),
+                    error: Some(format!("{error:#}")),
+                },
+            }
+        }
         AppControlCommand::SendTerminalInput {
             session_path,
             data,

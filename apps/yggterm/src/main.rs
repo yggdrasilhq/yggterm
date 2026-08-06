@@ -36,6 +36,7 @@ use yggterm_server::{
     resolve_client_daemon_endpoint, row_order_ledger_report, run_app_control_background_window,
     run_app_control_close_window, run_app_control_close_window_preserving_sessions,
     run_app_control_create_terminal_with_tenancy, run_app_control_describe_rows,
+    run_app_control_reorder_sessions,
     run_app_control_describe_state,
     run_app_control_desktop_identity, run_app_control_dom_eval, run_app_control_drag,
     run_app_control_dump_state, run_app_control_focus_window,
@@ -876,6 +877,10 @@ fn print_server_app_help() {
   yggterm server app launch [--wait-visible] [--wait-settled] [--allow-multi-window]
   yggterm server app state [--pid <pid>]
   yggterm server app rows [--pid <pid>]
+  yggterm server app sessions reorder <order.json>
+    sets the order on the GUI — the process that RENDERS it — and answers with
+    the resulting `rendered_order`. `server sessions reorder` writes to whichever
+    daemon the CLI resolved, which is not always the one the GUI reads.
   yggterm server app update <check|restart> [--force]
     restart REFUSES while an agent web-surface lease is live (agent_lease_active);
     pre-flight with `server app state | jq .agent_leases`
@@ -2155,6 +2160,25 @@ fn main() -> Result<()> {
                 run_app_control_dump_state(output_path, timeout_ms)
             }
             "rows" => run_app_control_describe_rows(timeout_ms),
+            "sessions" if args.get(3).map(String::as_str) == Some("reorder") => {
+                // `server app sessions reorder <order.json>` — the APP-path twin
+                // of `server sessions reorder`. Same file format; the difference
+                // is which process it reaches, and only this one reaches the
+                // list the user is looking at.
+                let order_path = args
+                    .get(4)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "usage: server app sessions reorder <order.json>"
+                    ))?;
+                let raw = std::fs::read_to_string(order_path)
+                    .with_context(|| format!("reading order file {order_path}"))?;
+                let ordered_paths: Vec<String> = serde_json::from_str(&raw)
+                    .with_context(|| format!("{order_path} must be a JSON array of session paths"))?;
+                if ordered_paths.is_empty() {
+                    anyhow::bail!("{order_path} is empty; refusing to clear the row order");
+                }
+                run_app_control_reorder_sessions(ordered_paths, timeout_ms)
+            }
             "preview" | "web-view" | "webview" => {
                 let action = args.get(3).map(String::as_str).unwrap_or("scroll");
                 match action {

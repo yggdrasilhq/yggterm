@@ -823,6 +823,22 @@ pub enum AppControlCommand {
         #[serde(default)]
         launch_options: Option<AgentLaunchOptions>,
     },
+    /// Set the Live-region row order **on the process that renders it**.
+    ///
+    /// ⛔ Why this exists beside `server sessions reorder`. That verb goes down
+    /// the SERVER path and reaches whichever daemon the calling binary resolved
+    /// — which on 2026-08-07 was a 3.0.44 daemon owning zero sessions, while the
+    /// GUI was bound to a 3.0.41 one. Both binaries answered 3.0.44, so the
+    /// version told nobody anything. Four reorders answered `changed: true` and
+    /// the owner's sidebar never moved, twice reported.
+    ///
+    /// The rendered order is the GUI's own in-process list, so the verb that
+    /// sets it has to reach the GUI. Same owner underneath
+    /// (`replace_live_session_order`) — this is a second TRANSPORT, never a
+    /// second implementation.
+    ReorderSessions {
+        ordered_paths: Vec<String>,
+    },
     SendTerminalInput {
         session_path: String,
         data: String,
@@ -1501,6 +1517,7 @@ impl AppControlCommand {
             Self::Drag { .. } => "drag",
             Self::ShowStartPage => "show_start_page",
             Self::StartAction { .. } => "start_action",
+            Self::ReorderSessions { .. } => "reorder_sessions",
             Self::CreateTerminal { .. } => "create_terminal",
             Self::SendTerminalInput { .. } => "send_terminal_input",
             Self::SubmitTerminalPrompt { .. } => "submit_terminal_prompt",
@@ -2750,6 +2767,15 @@ mod tests {
                 session_path: "x".into(),
                 data: "y".into(),
                 allow_multiline: false,
+            }
+            .is_read_only()
+        );
+        // Reordering the rendered list is a mutation — it must re-render, or the
+        // verb changes the model and the user still sees the old order, which is
+        // the whole defect this transport exists to fix.
+        assert!(
+            !AppControlCommand::ReorderSessions {
+                ordered_paths: vec!["local://a".into()],
             }
             .is_read_only()
         );
