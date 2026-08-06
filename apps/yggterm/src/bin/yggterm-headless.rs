@@ -1996,6 +1996,7 @@ fn main() -> Result<()> {
                     args.iter().any(|a| a == "--persistent"),
                     args.iter().any(|a| a == "--silent"),
                     delay_ms,
+                    cli_flag_value(&args, "--session").as_deref(),
                     timeout_ms,
                 )
             }

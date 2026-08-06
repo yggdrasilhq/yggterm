@@ -15823,12 +15823,23 @@ fn tone_wire_word(tone: NotificationTone) -> &'static str {
 
 /// Per-notification overrides for the one fan-out. Defaults reproduce exactly what
 /// every existing caller got before the control plane could raise one.
-#[derive(Clone, Copy, Default)]
+///
+/// ⚠ NOT `Copy` — `source` owns a String. It was `Copy` before, and the 120
+/// call sites that construct it inline are unaffected; only a caller that
+/// reused one options value twice would notice.
+#[derive(Clone, Default)]
 struct NotificationOptions {
     /// Suppress the chime for this notification only. Never forces it on.
     silent: bool,
     /// Stay until dismissed rather than auto-expiring.
     persistent: bool,
+    /// The session this notification is ABOUT, if the raiser knows one.
+    ///
+    /// Clicking the card body takes the reader there. `None` leaves the card
+    /// inert and pointer-less — a notification that cannot take you anywhere
+    /// must not look like it can, so this is never guessed from "whatever is
+    /// active", which would send the reader somewhere unrelated.
+    source: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -17747,6 +17758,8 @@ impl ShellState {
                     "Sessions will settle in a moment. The terminal is paused so the update stays cheap.",
                     None,
                     false,
+                    // Not about one session — every row is settling.
+                    None,
                 );
             }
             HandoverPaintTransition::ResumedAdopted | HandoverPaintTransition::ResumedTimedOut => {
@@ -24428,6 +24441,9 @@ impl ShellState {
             ),
             None,
             false,
+            // The message literally says "the row in the sidebar" — so the
+            // card should BE the way there.
+            Some(session_path.to_string()),
         );
     }
     /// Advance a session's confirmed-working streak for one poll and, on the
@@ -29555,6 +29571,7 @@ impl ShellState {
                     job_key: None,
                     progress: None,
                     persistent: options.persistent,
+                    source: options.source.clone(),
                 });
                 self.next_notification_id += 1;
             }
@@ -29570,6 +29587,9 @@ impl ShellState {
             self.notifications.drain(0..overflow);
         }
     }
+    /// `source` is the session this job is ABOUT — clicking the card body takes
+    /// the reader there. `None` leaves the card inert rather than guessing from
+    /// whatever happens to be active, which would send them somewhere unrelated.
     fn upsert_job_notification(
         &mut self,
         job_key: impl Into<String>,
@@ -29578,6 +29598,7 @@ impl ShellState {
         message: impl Into<String>,
         progress: Option<f32>,
         emit_system: bool,
+        source: Option<String>,
     ) {
         let job_key = job_key.into();
         let title = title.into();
@@ -29601,6 +29622,12 @@ impl ShellState {
                 existing.message = message.clone();
                 existing.progress = next_progress;
                 existing.persistent = true;
+                // A job that learns its session on a later tick must become
+                // clickable then, not stay inert because the first call did
+                // not know it. Never CLEARS a known source with a None.
+                if source.is_some() {
+                    existing.source = source.clone();
+                }
                 if changed {
                     existing.created_at_ms = now;
                 }
@@ -29614,6 +29641,7 @@ impl ShellState {
                     job_key: Some(job_key.clone()),
                     progress: progress.map(|value| value.clamp(0.0, 1.0)),
                     persistent: true,
+                    source: source.clone(),
                 });
                 self.next_notification_id += 1;
                 created = true;
@@ -29708,6 +29736,8 @@ fn spawn_loading_notice(
                 message.clone(),
                 None,
                 false,
+                // A surface request, not a session row.
+                None,
             );
         });
     });
@@ -29720,6 +29750,7 @@ fn safe_upsert_job_notification(
     message: impl Into<String>,
     progress: Option<f32>,
     emit_system: bool,
+    source: Option<String>,
 ) {
     let job_key = job_key.into();
     let title = title.into();
@@ -29735,6 +29766,7 @@ fn safe_upsert_job_notification(
             message_for_write,
             progress,
             emit_system,
+            source,
         );
     }) {
         warn!(
@@ -30727,6 +30759,7 @@ fn upsert_terminal_resume_notification(
             message_for_write,
             None,
             false,
+            Some(session_path.clone()),
         );
     });
 }
@@ -31103,6 +31136,9 @@ fn spawn_title_generation_for_target(
             job_message,
             None,
             true,
+            // Every one of these jobs is ABOUT this session — the card is
+            // the way back to the row it names.
+            Some(session_path.to_string()),
         );
     }
     if announce {
@@ -31398,6 +31434,9 @@ fn spawn_precis_generation_for_target(
             },
             None,
             true,
+            // Every one of these jobs is ABOUT this session — the card is
+            // the way back to the row it names.
+            Some(session_path.to_string()),
         );
     }
     spawn(async move {
@@ -31637,6 +31676,9 @@ fn spawn_summary_generation_for_target(
             },
             None,
             true,
+            // Every one of these jobs is ABOUT this session — the card is
+            // the way back to the row it names.
+            Some(session_path.to_string()),
         );
     }
     spawn(async move {
@@ -33895,6 +33937,8 @@ fn apply_update_install_progress(
         format!("{} · {}%", progress.detail, progress.percent),
         Some(progress.percent as f32 / 100.0),
         false,
+        // App-wide, not a session.
+        None,
     );
 }
 
@@ -37739,6 +37783,22 @@ fn spawn_open_session_row_with_mode_retry_inner(
         }
         maybe_spawn_missing_remote_machine_refreshes(state);
     });
+}
+/// A notification's card was pressed: go to the session it is about.
+///
+/// ⛔ Routed through `resolve_app_control_row` + `spawn_open_session_row`, the
+/// SAME pair a sidebar click and the app-control `open` verb use. A second way
+/// to activate a row is how two paths drift into disagreeing about what
+/// "opening" means. A path that no longer resolves (the row was closed while
+/// the notification sat there) does nothing rather than inventing a row.
+fn spawn_open_session_from_notification(state: Signal<ShellState>, session_path: String) {
+    let row = safe_shell_read(state, "notification_activate", |shell| {
+        resolve_app_control_row(shell, &session_path)
+    })
+    .flatten();
+    if let Some(row) = row {
+        spawn_open_session_row(state, row);
+    }
 }
 fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<BrowserRow> {
     let snapshot = shell.snapshot();
@@ -72896,6 +72956,7 @@ async fn process_pending_app_control_requests(
             persistent,
             silent,
             delay_ms,
+            session: notify_session,
         } => {
             // ⛔ An unknown tone is REFUSED, never defaulted. A typo that quietly
             // downgraded an `error` to `info` would make the one notification that
@@ -72922,7 +72983,11 @@ async fn process_pending_app_control_requests(
                     "reason": "empty_title",
                 }),
                 (Some(tone), false) => {
-                    let options = NotificationOptions { silent, persistent };
+                    let options = NotificationOptions {
+                        silent,
+                        persistent,
+                        source: notify_session.clone(),
+                    };
                     let job_reported = job.clone();
                     let progress = progress.map(|p| (p / 100.0).clamp(0.0, 1.0));
                     let delay = delay_ms.unwrap_or(0);
@@ -72937,6 +73002,7 @@ async fn process_pending_app_control_requests(
                                 message.clone(),
                                 progress,
                                 shell.settings.system_notifications,
+                                notify_session.clone(),
                             ),
                             None => shell.push_notification_with(
                                 tone,
@@ -82193,6 +82259,9 @@ fn app() -> Element {
                         max_visible: TOAST_VIEWPORT_MAX_VISIBLE,
                         now_ms: current_millis(),
                         on_clear: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
+                        on_activate: move |session_path: String| {
+                            spawn_open_session_from_notification(state, session_path)
+                        },
                     }
                 }
                 if !snapshot.drag_paths.is_empty() {
@@ -119503,6 +119572,9 @@ fn RightRail(
                     snapshot: snapshot.clone(),
                     on_clear_notification,
                     on_clear_notifications,
+                    on_activate_notification: move |session_path: String| {
+                        spawn_open_session_from_notification(state, session_path)
+                    },
                 }
             } else if rendered_mode == RightPanelMode::WebTabs {
                 WebTabsRailBody { snapshot: snapshot.clone(), state }
@@ -124034,6 +124106,7 @@ fn NotificationsRailBody(
     snapshot: SharedSnapshot,
     on_clear_notification: EventHandler<u64>,
     on_clear_notifications: EventHandler<MouseEvent>,
+    on_activate_notification: EventHandler<String>,
 ) -> Element {
     rsx! {
         RailHeader { title: "Notifications".to_string(), color: snapshot.palette.text.to_string() }
@@ -124065,6 +124138,9 @@ fn NotificationsRailBody(
                             is_dark: palette_is_dark(snapshot.palette),
                         },
                         on_clear: move |_| on_clear_notification.call(notification.id),
+                        on_activate: move |session_path: String| {
+                            on_activate_notification.call(session_path)
+                        },
                     }
                 }
             }
@@ -163551,6 +163627,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             job_key: Some(resume_job_key.clone()),
             progress: None,
             persistent: true,
+            source: None,
         });
         assert!(
             !shell.terminal_session_ready_for_daemon_retained_replay(active_session_path),
@@ -164212,6 +164289,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "stuck",
             None,
             false,
+            None,
         );
         assert!(
             shell
@@ -172754,6 +172832,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "The live terminal on localhost failed during restore: reading daemon response",
             None,
             false,
+            None,
         );
         shell.observe_terminal_open_attempt_from_viewport(&json!({
             "active_session_path": session_path,
@@ -172802,6 +172881,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "This stale notice should be pruned.",
             None,
             true,
+            None,
         );
         shell.clear_terminal_resume_notifications_except(Some(session_path));
 
@@ -172844,6 +172924,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "This stale notice should be pruned.",
             None,
             true,
+            None,
         );
 
         assert!(shell.terminal_session_should_suppress_initial_resume_notice(session_path));
@@ -172875,6 +172956,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "Resuming the live terminal on dev.",
             None,
             true,
+            None,
         );
 
         shell.observe_terminal_open_attempt_from_viewport(&json!({
@@ -172929,6 +173011,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "Resuming the live terminal on dev.",
             None,
             true,
+            None,
         );
         shell.observe_terminal_open_attempt_from_viewport(&json!({
             "active_session_path": session_path,
@@ -173017,6 +173100,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "The live terminal on dev did not become interactive in time.",
             None,
             false,
+            None,
         );
 
         shell.observe_terminal_open_attempt_from_viewport(&json!({
@@ -185423,6 +185507,37 @@ mod media_capture_locks {
             grants, 1,
             "the capture dialog offers {grants} ways to grant a device; there must \
              be exactly one, on the button labelled Allow",
+        );
+    }
+
+    /// A notification that says "go here" must use the SAME door a click uses.
+    ///
+    /// The user asked for the card body to take them to the issuing row. That
+    /// is a second entry point into "activate a session", and a second entry
+    /// point is how two paths drift into disagreeing about what opening means
+    /// (which mode, which pane, which retry budget). So the handler resolves
+    /// through `resolve_app_control_row` and hands off to
+    /// `spawn_open_session_row` — the pair the sidebar and the app-control
+    /// `open` verb already share — rather than reaching into ShellState itself.
+    #[test]
+    fn a_notification_opens_its_row_through_the_one_activation_path() {
+        let product = product_source();
+        let body = function_body(
+            &product,
+            "fn spawn_open_session_from_notification(state: Signal<ShellState>, session_path: String) {",
+        );
+        assert!(
+            body.contains("resolve_app_control_row(shell, &session_path)"),
+            "the row must be RESOLVED by the shared resolver, not looked up a second way"
+        );
+        assert!(
+            body.contains("spawn_open_session_row(state, row)"),
+            "and opened by the shared opener, or a notification click opens rows \
+             differently from every other way of opening one"
+        );
+        assert!(
+            !body.contains("active_session_path ="),
+            "it must not set the active path itself — that is the drift this lock exists to stop"
         );
     }
 

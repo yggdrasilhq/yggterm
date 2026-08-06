@@ -673,6 +673,16 @@ pub enum AppControlCommand {
         /// turned sound off does not get overridden by a caller.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         silent: bool,
+        /// The session this notification is ABOUT. Clicking the card body takes
+        /// the reader there; the close button never does.
+        ///
+        /// An agent raising a notification from inside a row should pass its own
+        /// session path — the message is otherwise a report about a place the
+        /// reader then has to go and find, which on a fleet-sized session list
+        /// is most of what the message costs them. Omitted, the card is inert
+        /// and says so by not offering a pointer.
+        #[serde(default)]
+        session: Option<String>,
         /// Deliver after this many milliseconds instead of now. This is the alarm
         /// clock, and it is honest about its limit: the timer lives in the running
         /// GUI, so a GUI restart forgets it.

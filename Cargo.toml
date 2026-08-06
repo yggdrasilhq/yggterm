@@ -22,7 +22,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "3.0.33"
+version = "3.0.34"
 edition = "2024"
 authors = ["Yggdrasil HQ"]
 # One owner for the licence. Members inherit with `license.workspace = true`;
@@ -39,13 +39,13 @@ license = "GPL-3.0-or-later"
 # ⛔ ONE libyggterm version, never two. Every crate below moves to the same tag
 # in the same edit: two tags would resolve to two copies of `yggui-contract`,
 # and the types an app and its host exchange would stop being the same types.
-yggui = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.9.0" }
-yggui-contract = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.9.0" }
+yggui = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.10.1" }
+yggui-contract = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.10.1" }
 # emd (extended markdown) — the document model + parser. Left this tree for
 # libyggterm on 2026-08-02 and is MPL-2.0 there: it is the document engine of
 # the app pipeline (yedit, ztlkasten, breezed, charts-webapp), and a library apps
 # must LINK is MPL by the licence-by-role rule. Spec lives with the crate.
-emd-renderer = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.9.0" }
+emd-renderer = { git = "https://github.com/yggdrasilhq/libyggterm", tag = "v0.10.1" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
