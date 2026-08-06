@@ -237,7 +237,10 @@ fn print_server_app_help() {
   yggterm-headless server app terminal send <session> (--data <data>|--stdin)
   yggterm-headless server app terminal new [--kind <shell|codex|claude-code>] [--cwd <dir>] [--title <t>]
       [--machine-key <k>] [--no-activate] [--purpose <text>]
+      [--model <id>] [--permission-mode <default|plan|accept-edits|bypass>]
+      [--prompt <text>|--prompt-stdin]
       [--ephemeral (--ephemeral-owner-pid <pid> | --ephemeral-idle-ttl-secs <n>)]
+{delegate_usage}
   yggterm-headless server app keytips <audit [--json]|show|hide>
   yggterm-headless server app media answer <allow|deny-once|block-site> [--request <id>]
     answers the camera/microphone prompt `server app state` reports under
@@ -268,7 +271,10 @@ targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
         // Rendered by the web plane's OWNER, the same call the GUI binary's
         // help makes: an agent reading THIS binary's --help sees exactly the
         // verbs it can run, because the same code answers both questions.
-        web_usage = yggterm_server::web_usage_block("yggterm-headless")
+        web_usage = yggterm_server::web_usage_block("yggterm-headless"),
+        // Same rule for the delegate-launch flags: one owner renders
+        // them, both binaries print them under their own name.
+        delegate_usage = yggterm_server::delegate_launch_usage_block("yggterm-headless")
     );
 }
 
@@ -1356,6 +1362,28 @@ fn main() -> Result<()> {
             yggterm_server::row_sanity::plan_sweep(&rows, &records, now_ms, is_degraded);
         yggterm_server::print_row_sanity_report(&rows, &decisions, is_degraded, apply);
         if apply {
+            // ⛔ SECOND LINE OF DEFENCE. The classifier refuses a row whose work
+            // runs on another host, but that fix is in the DAEMON and an older
+            // one answers for its own rows without the field. A single layer
+            // between --apply and a live agent session is not enough: on
+            // 2026-08-06 this system offered to close a versestore delegate that
+            // was five hours into its task.
+            let unvouched = yggterm_server::row_sanity::unvouched_rows(&rows, &decisions);
+            if !unvouched.is_empty() {
+                eprintln!(
+                    "\nREFUSING --apply: {} row(s) would be acted on that this daemon \
+                     cannot vouch for as local work.",
+                    unvouched.len()
+                );
+                for path in unvouched.iter().take(10) {
+                    eprintln!("  {path}");
+                }
+                eprintln!(
+                    "A row whose agent runs on another host looks empty from here — that is \
+                     an ssh bridge, not an idle plate. Run the sweep ON that host."
+                );
+                anyhow::bail!("row sanity refused to act on rows it cannot vouch for");
+            }
             yggterm_server::save_sweep_records(store.home_dir(), &next_records);
         }
         return Ok(());
@@ -2516,6 +2544,12 @@ fn main() -> Result<()> {
                             }
                         });
                         let activate = !args.iter().any(|arg| arg == "--no-activate");
+                        // Per-launch model / permission mode + the initial
+                        // prompt, all through the SHARED readers — a flag must
+                        // mean the same thing typed at either binary.
+                        let launch = yggterm_core::agent_launch_options_from_args(&args)
+                            .map_err(|message| anyhow::anyhow!(message))?;
+                        let prompt = yggterm_server::read_prompt(&args)?;
                         run_app_control_create_terminal_with_tenancy(
                             machine_key,
                             cwd,
@@ -2528,6 +2562,8 @@ fn main() -> Result<()> {
                             Some(yggterm_server::session_tenancy::agent_cli_create_terminal_tenancy(
                                 &args,
                             )?),
+                            &launch,
+                            prompt.as_deref(),
                             timeout_ms,
                         )
                     }
