@@ -1848,6 +1848,29 @@ entry only after a live passkey ceremony on an agent-created surface.
 keeps it open. (The count used to ride on the status line itself, which broke
 `check-docs-ssot.sh` — one entry, exactly one status word.)
 
+## The headless engine cannot pay by card — `ctl fill-card` does not exist
+
+**Status:** OPEN
+
+Field report: **[`docs/agent-cobrowse-gaps-2026-08-07.md`](agent-cobrowse-gaps-2026-08-07.md)**.
+Raised by the operator on 2026-08-07 after an India Post booking driven end to end on
+`ychrome ctl` had to be handed to a second agent **on his own laptop** purely to pay Rs 23.
+
+⚠ **First, the non-issue, because it was the operator's suspicion and it is worth closing:**
+the fleet IS uniform. `ychrome-vault card` works on dev, and dev and jojo run a **byte-identical**
+yggterm binary with an **identical `web` verb set including `fill-card`**. Nothing is missing from
+dev's install.
+
+1. ⭐ **`ychrome ctl fill-card` → `unknown engine verb` (404).** `server app web fill-card` exists;
+   the engine has no equivalent. Since a yggterm web surface needs a registered GUI client (dev has
+   0, jojo has 1), **every card payment is forced onto the operator's working machine — the exact
+   thing `ctl` was built to avoid.** Ask: mirror the verb on the engine over the same vault agent
+   `card-secret` op, answering a length and never a value. The PAN boundary is unchanged.
+2. **`ychrome ctl fill` works but is absent from the usage banner**, so agents conclude the engine
+   has no credential support at all and re-derive that belief.
+3. **`fill-card` answers `matched:false` on fills that landed perfectly** — wrong in the
+   pessimistic direction, which invites a retry on a payment page.
+
 Field report from filing a CPC-ITR grievance end to end on the services-desk portal
 (succeeded — ack 26390914 — but cost ~3 h and two failed attempts):
 **[`docs/agent-cobrowse-gaps-2026-08-06.md`](agent-cobrowse-gaps-2026-08-06.md)**.
