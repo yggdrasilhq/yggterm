@@ -21146,6 +21146,26 @@ fn parse_app_control_session_kind(kind: &str) -> anyhow::Result<SessionKind> {
     }
 }
 
+/// `server app sessions reorder <order.json>` — set the order on the GUI.
+///
+/// The SERVER-path twin (`server sessions reorder`) reaches whichever daemon the
+/// calling binary resolved, which is not necessarily the one the GUI reads; see
+/// [`AppControlCommand::ReorderSessions`]. This one answers with the order that
+/// is actually drawn.
+pub fn run_app_control_reorder_sessions(
+    ordered_paths: Vec<String>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::ReorderSessions { ordered_paths },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_send_terminal_input(
     session_path: &str,
     data: &str,
