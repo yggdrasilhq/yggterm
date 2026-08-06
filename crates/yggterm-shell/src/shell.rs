@@ -16678,6 +16678,7 @@ fn snapshot_live_sidebar_session_view(session: &ManagedSessionView) -> ManagedSe
         // title. Dropping it here would make every sidebar copy read
         // "derived" and re-open the door this flag closes.
         title_is_explicit: session.title_is_explicit,
+        outline_prefix: session.outline_prefix.clone(),
         kind: session.kind,
         host_label: session.host_label.clone(),
         source: session.source,
@@ -16721,6 +16722,7 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
         session_path: session.session_path.clone(),
         title: session.title.clone(),
         title_is_explicit: session.title_is_explicit,
+        outline_prefix: session.outline_prefix.clone(),
         kind: session.kind,
         host_label: session.host_label.clone(),
         source: session.source,
@@ -48638,6 +48640,36 @@ fn inject_cc_sessions_into_stored_rows(
 // `ManagedSessionView` in-memory state, not from a JSONL file scan.
 
 fn live_session_label_with_index(
+    remote_session_index: &RemoteSessionIndex,
+    session: &ManagedSessionView,
+    short_ids: &HashMap<String, String>,
+) -> String {
+    compose_outline_prefix(
+        session.outline_prefix.as_deref(),
+        &live_session_derived_label(remote_session_index, session, short_ids),
+    )
+}
+
+/// `prefix + " " + label`, and the ONE place the two are joined.
+///
+/// The outline number and the title are separate facts with separate owners:
+/// the CLI rewrites the title whenever it likes, the prefix says where the row
+/// sits. Composing them here means a CLI rename can never destroy a number,
+/// which is what made the user's sidebar outline decay on every session.
+fn compose_outline_prefix(prefix: Option<&str>, label: &str) -> String {
+    let prefix = prefix.map(str::trim).filter(|value| !value.is_empty());
+    match prefix {
+        // Idempotent: re-composing a label that already carries its prefix
+        // must not stutter (`2. versestore: 2. versestore: …`), because a row is
+        // relabelled on every snapshot.
+        Some(prefix) if !label.trim_start().starts_with(prefix) => {
+            format!("{prefix} {}", label.trim_start())
+        }
+        _ => label.to_string(),
+    }
+}
+
+fn live_session_derived_label(
     remote_session_index: &RemoteSessionIndex,
     session: &ManagedSessionView,
     short_ids: &HashMap<String, String>,
@@ -148053,6 +148085,33 @@ mod tests {
     /// record spelled `local://<id>`, the daemon is never told, and the rename
     /// dies at the next restart with nothing reporting an error. There is no
     /// observable to assert on — only the absence of the comparison.
+    /// The outline decayed on the owner's sidebar because Claude Code renames
+    /// its own session: `2. versestore: panels + research` became "Initialize
+    /// versestore panels research lobe", on every session, forever. Composing
+    /// instead of overwriting is what makes re-asserting it by hand
+    /// unnecessary — so these are the properties that delete that chore.
+    #[test]
+    fn an_outline_prefix_survives_the_cli_retitling_its_own_session() {
+        // The CLI's title changes underneath; the number does not move.
+        assert_eq!(
+            compose_outline_prefix(Some("2. versestore:"), "panels + research"),
+            "2. versestore: panels + research"
+        );
+        assert_eq!(
+            compose_outline_prefix(Some("2. versestore:"), "Initialize versestore panels research lobe"),
+            "2. versestore: Initialize versestore panels research lobe"
+        );
+
+        // Idempotent — a row is relabelled on every snapshot, so composing a
+        // label that already carries its prefix must not stutter.
+        let once = compose_outline_prefix(Some("2. versestore:"), "panels");
+        assert_eq!(compose_outline_prefix(Some("2. versestore:"), &once), once);
+
+        // No prefix set is the untouched case: the label is the CLI's, whole.
+        assert_eq!(compose_outline_prefix(None, "Some CC Title"), "Some CC Title");
+        assert_eq!(compose_outline_prefix(Some("   "), "Some CC Title"), "Some CC Title");
+    }
+
     #[test]
     fn the_rename_persist_gate_compares_normalized_session_paths() {
         let source = include_str!("shell.rs");
@@ -152543,6 +152602,7 @@ mod tests {
                 working: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             }],
             &expanded_paths,
         );
@@ -152613,6 +152673,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let rows = merged_sidebar_rows(&[], &[], &[], &[session.clone()], &expanded_paths);
         let live_row = rows
@@ -152810,6 +152871,7 @@ mod tests {
                 working: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -152917,6 +152979,7 @@ mod tests {
                 working: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -153002,6 +153065,7 @@ mod tests {
                 working: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             }],
             &HashSet::from([
                 "__live_sessions__".to_string(),
@@ -153127,6 +153191,7 @@ mod tests {
                 working: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -153202,6 +153267,7 @@ mod tests {
                 working: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -153309,6 +153375,7 @@ mod tests {
                 working: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -153808,6 +153875,7 @@ mod tests {
                 working: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -153902,6 +153970,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let label = live_session_label(&remote_machines, &session, &HashMap::new());
         assert_eq!(label, "Stabilize daemon resume path");
@@ -154303,6 +154372,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert_eq!(
             resolved_session_title(&shell, &session).as_deref(),
@@ -154352,6 +154422,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert!(supports_generated_session_copy(&session));
     }
@@ -154393,6 +154464,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert!(!supports_generated_session_copy(&session));
     }
@@ -154434,6 +154506,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Document,
@@ -154505,6 +154578,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -154587,6 +154661,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -154661,6 +154736,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -154863,6 +154939,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -154931,6 +155008,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -155003,6 +155081,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -155072,6 +155151,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -155146,6 +155226,7 @@ mod tests {
                 working: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             }],
             &HashSet::from(["__live_sessions__".to_string()]),
         );
@@ -155223,6 +155304,7 @@ mod tests {
                 working: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             }],
             &HashSet::from([
                 "__live_sessions__".to_string(),
@@ -155286,6 +155368,7 @@ mod tests {
                 working: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             }],
             &HashSet::from(["__live_sessions__".to_string()]),
         );
@@ -157701,6 +157784,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert!(session_is_idle_for_sidebar_icon(&session));
     }
@@ -157742,6 +157826,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert!(!session_is_idle_for_sidebar_icon(&session));
     }
@@ -157830,6 +157915,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }];
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -157900,6 +157986,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let hits = search_content_hits(Some(&session), WorkspaceViewMode::Rendered, "Asia/Kolkata");
         assert_eq!(hits.len(), 1);
@@ -157952,6 +158039,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert!(content_search_query("/preview").is_none());
         assert!(
@@ -158305,6 +158393,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert!(visible_preview_blocks(&session).is_empty());
         assert!(!preview_summary_text(&session).contains("Launch command prepared"));
@@ -158358,6 +158447,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert!(remote_preview_needs_refresh(&session));
         assert!(remote_preview_should_auto_sync(&session));
@@ -158422,6 +158512,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert!(remote_preview_needs_refresh(&session));
         assert!(remote_preview_should_auto_sync(&session));
@@ -158489,6 +158580,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert!(remote_preview_needs_refresh(&session));
         assert!(!remote_preview_should_auto_sync(&session));
@@ -158554,6 +158646,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
 
         assert!(!preview_should_hide_stale_placeholder_content(&session));
@@ -158613,6 +158706,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
 
         assert!(!preview_should_hide_stale_placeholder_content(&session));
@@ -158666,6 +158760,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
 
         assert!(preview_should_hide_stale_placeholder_content(&session));
@@ -166251,6 +166346,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let inactive_session = ManagedSessionView {
             id: "inactive-session".to_string(),
@@ -166291,6 +166387,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -167093,6 +167190,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }
     }
 
@@ -167231,6 +167329,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }
     }
 
@@ -167477,6 +167576,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }
     }
     #[test]
@@ -168425,6 +168525,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let mut snapshot = ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -168493,6 +168594,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -168542,6 +168644,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let mut snapshot = ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -168714,6 +168817,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -169344,6 +169448,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -169425,6 +169530,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -170049,6 +170155,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let active_session = ManagedSessionView {
             id: "active".to_string(),
@@ -170086,6 +170193,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let row = test_sidebar_row("local://stale");
         let snapshot = RenderSnapshot {
@@ -170279,6 +170387,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -170472,6 +170581,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -170668,6 +170778,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -170868,6 +170979,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -171060,6 +171172,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
@@ -171252,6 +171365,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
@@ -171444,6 +171558,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let active_session = ManagedSessionView {
             id: "active".to_string(),
@@ -171481,6 +171596,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let row = test_sidebar_row("remote-session://guihost/idle");
         let snapshot = RenderSnapshot {
@@ -171676,6 +171792,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
@@ -171869,6 +171986,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let live_session = ManagedSessionView {
             id: "active-live".to_string(),
@@ -171906,6 +172024,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -172504,6 +172623,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -174027,6 +174147,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -174251,6 +174372,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -174980,6 +175102,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let codex_session = ManagedSessionView {
             id: "stored-live-codex".to_string(),
@@ -175020,6 +175143,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             apps: Vec::new(),
@@ -175227,6 +175351,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -175288,6 +175413,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -175417,6 +175543,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -175511,6 +175638,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let inactive_session = ManagedSessionView {
             id: "inactive".to_string(),
@@ -175565,6 +175693,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             apps: Vec::new(),
@@ -177013,6 +177142,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert!(is_remote_resume_agent_session(&session));
         session.source = SessionSource::Stored;
@@ -177066,6 +177196,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert_eq!(
             remote_resume_overlay_excerpt(&session).as_deref(),
@@ -177113,6 +177244,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert_eq!(remote_resume_overlay_excerpt(&session), None);
     }
@@ -177163,6 +177295,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert_eq!(
             remote_resume_overlay_seed_excerpt(&session).as_deref(),
@@ -177227,6 +177360,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert_eq!(remote_terminal_prefill_text(&session), None);
         assert_eq!(
@@ -177301,6 +177435,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let sessions: Vec<&ManagedSessionView> = vec![&session];
         let index = RemoteSessionIndex::default();
@@ -177391,6 +177526,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert_eq!(
             local_terminal_prefill_text(&session).as_deref(),
@@ -177480,6 +177616,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         // Primary fix: the local prefill source refuses the seed outright.
         assert_eq!(
