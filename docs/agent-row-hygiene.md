@@ -115,17 +115,42 @@ computed from, so the verdict can be checked rather than believed.
 ## What is built, and what is not
 
 **Built:** the tenant walk, the creator stamp, the pre-declared ephemeral
-reaper, and the verdict — the classification every other piece needs.
+reaper, the verdict — and, as of 2026-08-06, **the sanity system that acts on
+it**: `crates/yggterm-server/src/row_sanity.rs` plus `server terminal sanity`.
+
+```bash
+yggterm-headless server terminal sanity           # the table, and what would happen
+yggterm-headless server terminal sanity --apply   # actually record / close
+```
+
+The four rules above are BRANCHES in that module, each with a test, rather than
+prose a caller has to remember. Thresholds: an empty plate must be idle
+**30 min** before stage one looks at it (an agent composing its next command has
+an idle PTY), and must still be empty **1 h** later before stage two closes it.
+Records live in `$YGGTERM_HOME/row-sweep-records.json`.
+
+⭐ **The idle clock works now, and that is what un-blocked all of this.** The
+field shipped on 2026-08-05 read `null` on every row because ownership had not
+migrated to a daemon carrying it, which left the policy inert. Measured on the
+live table 2026-08-06: 39 rows, 19 measurable, idle values 0 / 870 / 5532 / 6542
+— real numbers, so the verdict finally discriminates.
+
+**Live-proven lifecycle** (jojo, 39 rows): dry run named two rows it would
+record; `--apply` recorded them and the table was **39 rows before and 39
+after**, because stage one kills nothing; the next run read them as *waiting out
+the grace* instead of re-recording. The occupied half is sorted by tenancy age
+and led with a ychrome that had been squatting **3.8 days**.
 
 **Not built, in the order it should be taken:**
 
-1. **The verdict on the row itself.** The user reads the sidebar, not a CLI. An
-   agent's row should say so, and an empty plate should say how long it has been
-   empty. Until this lands, the policy answers a question the user cannot ask.
-2. **A bulk clear.** One verb that closes exactly the rows the verdict names as
-   clearable, dry-run by default, so a table can be cleared in one act instead
-   of one click per row.
-3. **The two-stage sweep** on the daemon's existing chore tick, per rule 3.
-4. **The occupied half.** Nothing currently tells the user that a `ychrome` has
-   been squatting in a row for three days. It is not clearable — but it is the
-   other half of what they are looking at, and it is invisible.
+1. **The verdict on the ROW itself.** Still the biggest gap: the user reads the
+   sidebar, and today the answer lives in a CLI. `RowHygieneVerdict` is confined
+   to `yggterm-server` with nothing carrying it to the GUI, so this needs a wire
+   field before it needs any pixels.
+2. **The sweep on the daemon's chore tick.** `sanity --apply` is the manual
+   form; nothing runs it on a schedule yet, so the table only stays sane if
+   somebody asks. The decision function is already pure and the record store is
+   already durable, so this is wiring rather than design.
+3. **Acting on the occupied half.** It is now VISIBLE and sorted by age, which
+   was the missing half — but a three-day ychrome tenant still needs a person to
+   decide, and nothing offers them the choice in one place.
