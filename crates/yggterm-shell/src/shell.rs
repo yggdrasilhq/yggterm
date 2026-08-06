@@ -247,6 +247,9 @@ use yggui::dpad::{DPAD_CSS, DpadAction, DpadPalette, DpadPlacement, ScrollDpad};
 // The floating bar that replaced the docked header — find, the match stepper
 // and the light switch, costing no layout.
 use yggui::pill_toolbar::{PILL_TOOLBAR_CSS, PillStep, PillToolbar, PillToolbarPalette};
+use yggui::split_button::{
+    SPLIT_BUTTON_CSS, SplitButton, SplitButtonItem, SplitButtonPalette,
+};
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
     HoveredChromeControl as HoveredControl, MOTION_EMPHASIZED_DECELERATE, MOTION_ENTER_DURATION_MS,
@@ -15312,6 +15315,12 @@ struct ShellState {
     titlebar_new_menu_ignore_toggle_until_ms: u64,
     titlebar_session_menu_open: bool,
     titlebar_overflow_menu_open: bool,
+    /// Whether each start page split button is showing its menu. Held HERE and
+    /// not inside `yggui::SplitButton` so the global overlay closers can reach
+    /// them — a menu owning its own flag survives an Escape and hangs over a
+    /// surface that has moved on.
+    start_page_session_menu_open: bool,
+    start_page_app_menu_open: bool,
     titlebar_drag_request_count: u64,
     titlebar_drag_request_at_ms: u64,
     titlebar_maximize_toggle_request_count: u64,
@@ -16232,6 +16241,12 @@ struct RenderSnapshot {
     titlebar_new_menu_open: bool,
     titlebar_session_menu_open: bool,
     titlebar_overflow_menu_open: bool,
+    start_page_session_menu_open: bool,
+    start_page_app_menu_open: bool,
+    /// The sticky face of each start page split button, carried into the
+    /// snapshot so the control paints the right word on the first frame.
+    start_page_session_choice: String,
+    start_page_app_choice: String,
     alt_overlay_active: bool,
     alt_overlay_sequence: String,
     /// The modal scope the layer has descended into (§4), by kind — it rides the
@@ -17622,6 +17637,8 @@ impl ShellState {
             titlebar_new_menu_ignore_toggle_until_ms: 0,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            start_page_session_menu_open: false,
+            start_page_app_menu_open: false,
             titlebar_drag_request_count: 0,
             titlebar_drag_request_at_ms: 0,
             titlebar_maximize_toggle_request_count: 0,
@@ -18648,6 +18665,18 @@ impl ShellState {
             titlebar_new_menu_open: self.titlebar_new_menu_open,
             titlebar_session_menu_open: self.titlebar_session_menu_open,
             titlebar_overflow_menu_open: self.titlebar_overflow_menu_open,
+            start_page_session_menu_open: self.start_page_session_menu_open,
+            start_page_app_menu_open: self.start_page_app_menu_open,
+            start_page_session_choice: self
+                .settings
+                .start_page_session_choice
+                .clone()
+                .unwrap_or_default(),
+            start_page_app_choice: self
+                .settings
+                .start_page_app_choice
+                .clone()
+                .unwrap_or_default(),
             alt_overlay_active: self.alt_overlay_active,
             alt_overlay_sequence: self.alt_overlay_sequence.clone(),
             alt_overlay_modal_scope: self.alt_overlay_modal_scope.clone(),
@@ -21201,6 +21230,37 @@ impl ShellState {
         if tab_menu_is_strip_anchored {
             self.close_web_tab_context_menu();
         }
+        self.close_start_page_menus();
+    }
+
+    /// Shut both start page split-button menus.
+    ///
+    /// This is the reason the open flag is host-owned rather than held inside
+    /// `yggui::SplitButton`: a widget that kept its own flag could not be
+    /// reached from here, and its menu would outlive the surface underneath it.
+    fn close_start_page_menus(&mut self) {
+        self.start_page_session_menu_open = false;
+        self.start_page_app_menu_open = false;
+    }
+
+    /// Record which member of a start page family was last run, and persist it.
+    ///
+    /// Called on BOTH the primary press and a menu pick, from one handler, so
+    /// the face can never disagree with what actually ran last.
+    fn remember_start_page_choice(&mut self, family: StartPageFamily, id: &str) {
+        let id = id.trim();
+        if id.is_empty() {
+            return;
+        }
+        let slot = match family {
+            StartPageFamily::Session => &mut self.settings.start_page_session_choice,
+            StartPageFamily::App => &mut self.settings.start_page_app_choice,
+        };
+        if slot.as_deref() == Some(id) {
+            return;
+        }
+        *slot = Some(id.to_string());
+        self.persist_settings();
     }
     fn confirm_classic_tabs_switch(&mut self) {
         self.pending_classic_tabs_switch = false;
@@ -119257,6 +119317,145 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
     candidates.into_iter().map(|(row, ..)| row).collect()
 }
 
+/// The two start page split-button families.
+///
+/// Sessions and apps are separate controls rather than one long list because
+/// they are separate decisions: "what am I about to work in" versus "what tool
+/// am I opening". Collapsing both into a single menu would put Yggdrasil Maker
+/// one row below Claude Code and make the frequent choice hunt for itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StartPageFamily {
+    Session,
+    App,
+}
+
+/// The SESSION family, in menu order.
+///
+/// Order is deliberate and not frequency-sorted: a menu that reorders itself
+/// under the user destroys the muscle memory the sticky face is there to build.
+/// The face moves; the list does not.
+fn start_page_session_items(accent: &str) -> Vec<SplitButtonItem> {
+    vec![
+        SplitButtonItem::new("codex", "Codex Session")
+            .detail("Start Codex in the selected scope")
+            .accent(session_kind_primary_bg(SessionKind::Codex, accent)),
+        SplitButtonItem::new("claude-code", "Claude Code Session")
+            .detail("Start Claude Code in the selected scope")
+            .accent(session_kind_primary_bg(SessionKind::ClaudeCode, accent)),
+        // No accent: a plain shell is not one of the branded agent CLIs, and
+        // giving it one would imply a kinship it does not have.
+        SplitButtonItem::new("terminal", "Terminal").detail("Plain shell in the selected scope"),
+    ]
+}
+
+/// The id an app verb answers to, and the key its stickiness is stored under.
+fn start_page_app_item_id(app_name: &str, verb_id: &str) -> String {
+    format!("app:{app_name}:{verb_id}")
+}
+
+/// The APPS family, read from the SAME launcher registry the titlebar `+` menu
+/// and the cwd-tree context menu use — one list, three surfaces.
+fn start_page_app_items(apps: &[AppManifest]) -> Vec<SplitButtonItem> {
+    app_launcher_entries(apps)
+        .into_iter()
+        .map(|(app, verb)| {
+            let label = if app.icon.trim().is_empty() {
+                verb.label.clone()
+            } else {
+                format!("{} {}", app.icon.trim(), verb.label)
+            };
+            SplitButtonItem::new(start_page_app_item_id(&app.name, &verb.id), label)
+        })
+        .collect()
+}
+
+/// Dress the shared split button in yggterm's own palette.
+///
+/// One adapter, so both families cannot drift apart, and so the component keeps
+/// owning material while `DESIGN.md` keeps owning colour. Every value here is
+/// already what the buttons this control replaced were using — the shape
+/// changed, the palette did not.
+fn start_page_split_palette(palette: &Palette) -> SplitButtonPalette {
+    SplitButtonPalette::new(
+        palette.text.clone(),
+        palette.muted.clone(),
+        palette.panel_alt.clone(),
+        "rgba(120,142,166,0.16)",
+        palette.panel.clone(),
+        palette.accent.clone(),
+        "#ffffff",
+    )
+}
+
+/// Run one member of the SESSION family and make it the sticky face.
+///
+/// The phantom-start guard is preserved per member: the start page can be
+/// out from under a queued click, and starting a session the user did not ask
+/// for is worse than dropping the click.
+fn start_page_run_session_choice(
+    mut state: Signal<ShellState>,
+    id: &str,
+    row: Option<BrowserRow>,
+) {
+    let (trace_name, id_owned) = match id {
+        "codex" => ("start_page_new_codex", id.to_string()),
+        "claude-code" => ("start_page_new_claude_code", id.to_string()),
+        "terminal" => ("start_page_new_terminal", id.to_string()),
+        _ => return,
+    };
+    if !start_page_is_current_surface(&state) {
+        suppress_phantom_start_action(
+            trace_name,
+            json!({ "row": row.as_ref().map(|row| row.full_path.clone()) }),
+        );
+        return;
+    }
+    // Remembered BEFORE the spawn, so the face is right even if the launch
+    // itself fails — the button records what you chose, not what succeeded.
+    state.with_mut(|shell| {
+        shell.remember_start_page_choice(StartPageFamily::Session, &id_owned);
+    });
+    match id {
+        "codex" => spawn_start_preferred_agent_session_for_row(state, row),
+        "claude-code" => spawn_start_claude_code_session_for_row(state, row),
+        "terminal" => spawn_start_terminal_session_for_row(state, row),
+        _ => {}
+    }
+}
+
+/// Run one member of the APPS family and make it the sticky face.
+///
+/// The id is resolved back through the launcher registry rather than parsed,
+/// so an id naming an app that is no longer installed simply finds nothing and
+/// does nothing.
+fn start_page_run_app_choice(
+    mut state: Signal<ShellState>,
+    id: &str,
+    apps: &[AppManifest],
+    row: Option<BrowserRow>,
+) {
+    let Some((app, verb)) = app_launcher_entries(apps)
+        .into_iter()
+        .find(|(app, verb)| start_page_app_item_id(&app.name, &verb.id) == id)
+    else {
+        return;
+    };
+    if !start_page_is_current_surface(&state) {
+        suppress_phantom_start_action(
+            "start_page_launch_app_verb",
+            json!({ "app": app.name, "verb": verb.id }),
+        );
+        return;
+    }
+    let id_owned = id.to_string();
+    state.with_mut(|shell| {
+        shell.remember_start_page_choice(StartPageFamily::App, &id_owned);
+    });
+    let insert_after = row.as_ref().map(|row| row.full_path.clone());
+    let launch_context = launch_context_for_optional_row(state, row);
+    spawn_launch_app_verb(state, app, verb, launch_context, insert_after);
+}
+
 /// The identity a start-page row is deduped by: one SESSION, one card.
 ///
 /// A live row and the stored transcript row for the same session are the same
@@ -119516,9 +119715,9 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
     let recent_count = recent_rows.len();
     let selected_action_row = snapshot.selected_row.clone();
     let selected_agent_action_row = selected_action_row.clone();
-    let selected_claude_code_action_row = selected_action_row.clone();
-    let selected_terminal_action_row = selected_action_row.clone();
     let selected_app_action_row = selected_action_row.clone();
+    let session_items = start_page_session_items(&palette.accent);
+    let app_items = start_page_app_items(&snapshot.apps);
     let can_create_folder_in_selected = selected_action_row
         .as_ref()
         .is_some_and(|row| row.full_path == "local" || is_workspace_row(row));
@@ -119528,19 +119727,10 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
          font-size:12px; font-weight:700; box-shadow:inset 0 0 0 1px rgba(120,142,166,0.16);",
         palette.panel_alt, palette.text
     );
-    let claude_code_button_style = format!(
-        "display:inline-flex; align-items:center; justify-content:center; gap:8px; min-height:34px; \
-         padding:0 13px; border:none; border-radius:8px; background:{}; color:white; \
-         font-size:12px; font-weight:800; box-shadow:0 8px 20px rgba(217,119,6,0.22);",
-        session_kind_primary_bg(SessionKind::ClaudeCode, &palette.accent)
-    );
-    let primary_button_style = format!(
-        "display:inline-flex; align-items:center; justify-content:center; gap:8px; min-height:34px; \
-         padding:0 13px; border:none; border-radius:8px; background:{}; color:white; \
-         font-size:12px; font-weight:800; box-shadow:0 8px 20px rgba(37,99,235,0.14);",
-        session_kind_primary_bg(SessionKind::Codex, &palette.accent)
-    );
+    // `quick_button_style` survives for "New Folder", which is NOT a family
+    // member: it is conditional on the selection and belongs to no menu.
     rsx! {
+        style { {SPLIT_BUTTON_CSS} }
         div {
             "data-yggterm-start-page": "1",
             "data-yggterm-start-page-recent-count": "{recent_count}",
@@ -119564,130 +119754,56 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                 }
                 div {
                     style: "display:flex; flex-wrap:wrap; gap:10px;",
-                    button {
-                        r#type: "button",
-                        "data-yggterm-start-action": "agent",
-                        style: "{primary_button_style}",
-                        onmousedown: |evt| {
-                            evt.prevent_default();
-                            evt.stop_propagation();
+                    // TWO controls, not one per startable thing. This row had
+                    // grown to seven buttons, which the owner called ugly and
+                    // which also lied about frequency — seven equal buttons
+                    // imply the seventh is as likely as the first. Each family
+                    // collapses to one split button whose face is the member
+                    // last run. See `yggui::split_button`.
+                    SplitButton {
+                        palette: start_page_split_palette(&palette),
+                        items: session_items.clone(),
+                        selected_id: snapshot.start_page_session_choice.clone(),
+                        open: snapshot.start_page_session_menu_open,
+                        prefix: "New".to_string(),
+                        on_open_change: move |open: bool| {
+                            state.with_mut(|shell| {
+                                shell.close_start_page_menus();
+                                shell.start_page_session_menu_open = open;
+                            });
                         },
-                        onclick: move |evt| {
-                            evt.prevent_default();
-                            evt.stop_propagation();
-                            if !start_page_is_current_surface(&state) {
-                                suppress_phantom_start_action(
-                                    "start_page_new_codex",
-                                    json!({
-                                        "row": selected_agent_action_row
-                                            .as_ref()
-                                            .map(|row| row.full_path.clone()),
-                                    }),
-                                );
-                                return;
+                        on_activate: {
+                            let row = selected_agent_action_row.clone();
+                            move |id: String| {
+                                start_page_run_session_choice(state, &id, row.clone());
                             }
-                            spawn_start_preferred_agent_session_for_row(
-                                state,
-                                selected_agent_action_row.clone(),
-                            );
                         },
-                        "New Codex Session"
-                    }
-                    button {
-                        r#type: "button",
-                        "data-yggterm-start-action": "claude-code",
-                        style: "{claude_code_button_style}",
-                        onmousedown: |evt| {
-                            evt.prevent_default();
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.prevent_default();
-                            evt.stop_propagation();
-                            if !start_page_is_current_surface(&state) {
-                                suppress_phantom_start_action(
-                                    "start_page_new_claude_code",
-                                    json!({
-                                        "row": selected_claude_code_action_row
-                                            .as_ref()
-                                            .map(|row| row.full_path.clone()),
-                                    }),
-                                );
-                                return;
-                            }
-                            spawn_start_claude_code_session_for_row(
-                                state,
-                                selected_claude_code_action_row.clone(),
-                            );
-                        },
-                        "New Claude Code Session"
-                    }
-                    button {
-                        r#type: "button",
-                        "data-yggterm-start-action": "terminal",
-                        style: "{quick_button_style}",
-                        onmousedown: |evt| {
-                            evt.prevent_default();
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.prevent_default();
-                            evt.stop_propagation();
-                            if !start_page_is_current_surface(&state) {
-                                suppress_phantom_start_action(
-                                    "start_page_new_terminal",
-                                    json!({
-                                        "row": selected_terminal_action_row
-                                            .as_ref()
-                                            .map(|row| row.full_path.clone()),
-                                    }),
-                                );
-                                return;
-                            }
-                            spawn_start_terminal_session_for_row(
-                                state,
-                                selected_terminal_action_row.clone(),
-                            );
-                        },
-                        "New Terminal"
                     }
                     // Contributed by the libyggterm apps installed on this host.
                     // Same registry the titlebar `+` menu and the cwd-tree
                     // context menu read — one list, three surfaces.
-                    for (app, verb) in app_launcher_entries(&snapshot.apps) {
-                        button {
-                            key: "start-app-{app.name}-{verb.id}",
-                            r#type: "button",
-                            "data-yggterm-start-action": "app:{app.name}:{verb.id}",
-                            style: "{quick_button_style}",
-                            onmousedown: |evt| {
-                                evt.prevent_default();
-                                evt.stop_propagation();
-                            },
-                            onclick: {
-                                let entry = (app.clone(), verb.clone());
-                                let row = selected_app_action_row.clone();
-                                move |evt: MouseEvent| {
-                                    evt.prevent_default();
-                                    evt.stop_propagation();
-                                    if !start_page_is_current_surface(&state) {
-                                        suppress_phantom_start_action(
-                                            "start_page_launch_app_verb",
-                                            json!({ "app": entry.0.name, "verb": entry.1.id }),
-                                        );
-                                        return;
-                                    }
-                                    let insert_after = row.as_ref().map(|r| r.full_path.clone());
-                                    let launch_context = launch_context_for_optional_row(state, row.clone());
-                                    let (app, verb) = entry.clone();
-                                    spawn_launch_app_verb(state, app, verb, launch_context, insert_after);
-                                }
-                            },
-                            if !app.icon.is_empty() {
-                                span { "{app.icon}" }
+                    SplitButton {
+                        palette: start_page_split_palette(&palette),
+                        items: app_items.clone(),
+                        selected_id: snapshot.start_page_app_choice.clone(),
+                        open: snapshot.start_page_app_menu_open,
+                        // No prefix here. App verbs name themselves already
+                        // ("New Ychrome", "Open Yggdrasil Maker"), so a prefix
+                        // stutters into "Open New Ychrome". The session family
+                        // takes one because its members are nouns.
+                        on_open_change: move |open: bool| {
+                            state.with_mut(|shell| {
+                                shell.close_start_page_menus();
+                                shell.start_page_app_menu_open = open;
+                            });
+                        },
+                        on_activate: {
+                            let row = selected_app_action_row.clone();
+                            let apps = snapshot.apps.clone();
+                            move |id: String| {
+                                start_page_run_app_choice(state, &id, &apps, row.clone());
                             }
-                            "{verb.label}"
-                        }
+                        },
                     }
                     if can_create_folder_in_selected {
                         if let Some(row) = selected_action_row.clone() {
@@ -169758,6 +169874,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            start_page_session_menu_open: false,
+            start_page_app_menu_open: false,
+            start_page_session_choice: String::new(),
+            start_page_app_choice: String::new(),
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             alt_overlay_modal_scope: None,
@@ -170421,6 +170541,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            start_page_session_menu_open: false,
+            start_page_app_menu_open: false,
+            start_page_session_choice: String::new(),
+            start_page_app_choice: String::new(),
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             alt_overlay_modal_scope: None,
@@ -170615,6 +170739,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            start_page_session_menu_open: false,
+            start_page_app_menu_open: false,
+            start_page_session_choice: String::new(),
+            start_page_app_choice: String::new(),
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             alt_overlay_modal_scope: None,
@@ -170809,6 +170937,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            start_page_session_menu_open: false,
+            start_page_app_menu_open: false,
+            start_page_session_choice: String::new(),
+            start_page_app_choice: String::new(),
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             alt_overlay_modal_scope: None,
@@ -171006,6 +171138,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            start_page_session_menu_open: false,
+            start_page_app_menu_open: false,
+            start_page_session_choice: String::new(),
+            start_page_app_choice: String::new(),
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             alt_overlay_modal_scope: None,
@@ -171207,6 +171343,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            start_page_session_menu_open: false,
+            start_page_app_menu_open: false,
+            start_page_session_choice: String::new(),
+            start_page_app_choice: String::new(),
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             alt_overlay_modal_scope: None,
@@ -171400,6 +171540,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            start_page_session_menu_open: false,
+            start_page_app_menu_open: false,
+            start_page_session_choice: String::new(),
+            start_page_app_choice: String::new(),
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             alt_overlay_modal_scope: None,
@@ -171593,6 +171737,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            start_page_session_menu_open: false,
+            start_page_app_menu_open: false,
+            start_page_session_choice: String::new(),
+            start_page_app_choice: String::new(),
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             alt_overlay_modal_scope: None,
@@ -171824,6 +171972,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            start_page_session_menu_open: false,
+            start_page_app_menu_open: false,
+            start_page_session_choice: String::new(),
+            start_page_app_choice: String::new(),
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             alt_overlay_modal_scope: None,
@@ -172020,6 +172172,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            start_page_session_menu_open: false,
+            start_page_app_menu_open: false,
+            start_page_session_choice: String::new(),
+            start_page_app_choice: String::new(),
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             alt_overlay_modal_scope: None,
@@ -172252,6 +172408,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            start_page_session_menu_open: false,
+            start_page_app_menu_open: false,
+            start_page_session_choice: String::new(),
+            start_page_app_choice: String::new(),
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             alt_overlay_modal_scope: None,
@@ -172653,6 +172813,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            start_page_session_menu_open: false,
+            start_page_app_menu_open: false,
+            start_page_session_choice: String::new(),
+            start_page_app_choice: String::new(),
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             alt_overlay_modal_scope: None,
@@ -173084,6 +173248,96 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "/home/user/.codex/sessions/local-child.jsonl",
                 "/home/user/.codex/sessions/local-old.jsonl",
             ]
+        );
+    }
+
+    /// The face must be the member last RUN, and it must survive a restart.
+    ///
+    /// The owner's requirement, verbatim: "The button names are sticky. Maning
+    /// if I last press it to open claude code it will stay there." A choice
+    /// that resets on relaunch is a default, not a sticky face, so the
+    /// assertion that matters is the one about `AppSettings` — the persisted
+    /// record, which is what the first frame after a restart reads.
+    #[test]
+    fn the_start_page_split_button_face_is_the_member_last_run_and_persists() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_start_page());
+        assert_eq!(shell.settings.start_page_session_choice, None);
+        assert_eq!(shell.settings.start_page_app_choice, None);
+
+        shell.remember_start_page_choice(StartPageFamily::Session, "claude-code");
+        assert_eq!(
+            shell.settings.start_page_session_choice.as_deref(),
+            Some("claude-code"),
+            "pressing Claude Code must move the face to Claude Code"
+        );
+
+        // The two families are independent: choosing an app must not disturb
+        // the session face, or opening a browser would silently re-aim the
+        // button the user starts work with.
+        shell.remember_start_page_choice(StartPageFamily::App, "app:ychrome:open");
+        assert_eq!(
+            shell.settings.start_page_session_choice.as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(
+            shell.settings.start_page_app_choice.as_deref(),
+            Some("app:ychrome:open")
+        );
+
+        // The persisted settings ARE the sticky record — this is the value a
+        // fresh process reads to paint the first frame.
+        let restored: AppSettings =
+            serde_json::from_str(&serde_json::to_string(&shell.settings).expect("encode"))
+                .expect("decode");
+        assert_eq!(
+            restored.start_page_session_choice.as_deref(),
+            Some("claude-code"),
+            "the choice must survive a serialize/restore round trip"
+        );
+        assert_eq!(
+            restored.start_page_app_choice.as_deref(),
+            Some("app:ychrome:open")
+        );
+
+        // An empty id is not a choice and must not blank the face.
+        shell.remember_start_page_choice(StartPageFamily::Session, "   ");
+        assert_eq!(
+            shell.settings.start_page_session_choice.as_deref(),
+            Some("claude-code")
+        );
+    }
+
+    /// Seven buttons became two controls, and every action the row offered is
+    /// still reachable — a tidier row that dropped a verb would be a
+    /// regression wearing a redesign.
+    #[test]
+    fn both_start_page_families_still_offer_every_action_the_old_row_had() {
+        let session = start_page_session_items("#2563eb");
+        let ids = session.iter().map(|i| i.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids, ["codex", "claude-code", "terminal"]);
+        // Codex and Claude Code keep their brand fills; a plain shell is
+        // deliberately neutral.
+        assert!(!session[0].accent.trim().is_empty());
+        assert!(!session[1].accent.trim().is_empty());
+        assert!(session[2].accent.trim().is_empty());
+
+        let apps = vec![AppManifest {
+            name: "ychrome".to_string(),
+            icon: "🌐".to_string(),
+            verbs: vec![AppVerb {
+                id: "open".to_string(),
+                label: "New Ychrome".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let app_items = start_page_app_items(&apps);
+        assert_eq!(app_items.len(), 1);
+        assert_eq!(app_items[0].id, "app:ychrome:open");
+        assert!(
+            app_items[0].label.contains("New Ychrome"),
+            "the verb label carries through; got {:?}",
+            app_items[0].label
         );
     }
 
