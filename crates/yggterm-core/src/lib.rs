@@ -489,6 +489,20 @@ pub struct AppSettings {
     /// so a built workspace reopens as an intentional artifact; members resume
     /// via the normal per-pane handoff on restore.
     pub split_groups: Vec<SplitGroup>,
+    /// Which member of the start page's SESSION family the split button last
+    /// ran (`codex` · `claude-code` · `terminal`).
+    ///
+    /// Persisted, not merely remembered, because the whole point of the sticky
+    /// face is that it is already correct on the FIRST frame after a restart —
+    /// a choice that resets on relaunch is not sticky, it is a default. The
+    /// widget deliberately owns none of this (see `yggui::split_button`), which
+    /// is why the fact lives here.
+    pub start_page_session_choice: Option<String>,
+    /// The same for the start page's APPS family, keyed `app:<name>:<verb>` to
+    /// match the launcher registry's own identity. An id whose app is no longer
+    /// installed falls back to the first entry rather than rendering a dead
+    /// control.
+    pub start_page_app_choice: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -527,6 +541,8 @@ impl Default for AppSettings {
             expanded_browser_paths: Vec::new(),
             collapsed_synthetic_paths: Vec::new(),
             split_groups: Vec::new(),
+            start_page_session_choice: None,
+            start_page_app_choice: None,
         }
     }
 }
