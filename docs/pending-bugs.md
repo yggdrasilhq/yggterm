@@ -13,6 +13,36 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## THE TERMINAL'S RIGHT EDGE CLIPS THE LAST GLYPH — the hitbox is a column short
+
+**Status:** OPEN
+
+User-reported 2026-08-06, with a screenshot: *"See the right side of the
+terminal, sometimes words clip out beyond. The 'hitbox' needs a slight tweak."*
+
+**Visible in their frame and not subtle once you know to look** — a word running
+to the right edge loses its final character, not to wrapping but to clipping:
+`the fingrap|` for "the lumenstore", `the 2019 shap|` for "shape". The text is
+present in the buffer; the last column is simply not painted.
+
+That is a GEOMETRY defect, not a renderer one: the grid the daemon sizes and the
+box the client paints into disagree by about one column, so the rightmost cell
+falls outside the visible area. Suspect the same family as
+`screen_snapshot_clipped_to_pty_width` — a width computed in one place and
+consumed in another — but the direction is opposite (there the model was WIDER
+than the viewer; here the viewer is narrower than the grid it was told to draw).
+
+**Where to start, and what NOT to do.** ⛔ Do not "fix" it by shrinking the
+reported column count — that trades a clipped glyph for a wasted column and the
+CLI will re-wrap its own output to the number we report. Compare, on one live
+session: the daemon's `cols`, the xterm instance's `cols`, and the measured
+pixel width of the `.xterm-screen` element against `cols × cell_width`. The one
+that disagrees is the bug. A fractional cell width that floors somewhere is the
+most likely mechanism, since the symptom is intermittent ("sometimes") rather
+than on every line.
+
+⚠ Filed from the user's own screenshot; not yet reproduced under measurement.
+
 ## ★★★ A DRAG-SELECT OVER A STREAMING SESSION SELECTS THE WHOLE STREAM
 
 **Status:** OPEN
