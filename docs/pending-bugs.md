@@ -381,6 +381,13 @@ So the chain *daemon order → `live_session_order` → sidebar* is intact, and 
 epoch would guard a door that is already open. ⇒ **The divergence is UPSTREAM:
 the snapshot the GUI polls does not carry the reorder.**
 
+✅ **THE REPLY IS NOW HONEST, live-proven on jojo 2026-08-07** with a
+deliberately reversed control: `changed:false`, `matches_request:false`, and
+`rendered_order` returning the ACTUAL rendered list (head `29b04124…`) rather
+than the request. Before this, the same control answered ok/applied with
+`rendered_order` equal to the request. ⇒ **the verb still does not move the
+sidebar, and now says so** — which is the whole point of the response-layer rule.
+
 ⭐ **The surviving hypothesis, and the next probe.** jojo runs four daemons and
 rows are owned across them, so the serving daemon **aggregates** rows it does not
 own. If that aggregation rebuilds order from its own adoption sequence, it
