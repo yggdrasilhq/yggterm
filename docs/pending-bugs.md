@@ -13,6 +13,93 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ★★★ A STALE INSTALL STATE `exec`ed EVERY CLI VERB INTO A 2.11.0 BINARY — and `--version` could not see it
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**The observation owed:** on jojo carrying 3.0.44+, `~/.yggterm/bin/yggterm-headless
+server app terminal new --kind shell --ephemeral --title x` must answer
+`Error: --ephemeral needs a rule this daemon can honestly check…` **without**
+`YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF=1` in the environment. Today it creates a row.
+
+Found 2026-08-07 while creating an ordinary hygiene-compliant probe row. Three
+flags `docs/agent-row-hygiene.md` REQUIRES of every agent-created row came back
+dead in one reply:
+
+```
+server app terminal new --kind shell --no-activate --purpose "…" \
+    --ephemeral --ephemeral-idle-ttl-secs 900 --title "6.probe: flagcheck"
+→ {"activated": true, "purpose": null, …}          # and no `tenancy` key at all
+```
+
+`--purpose` null, `--no-activate` ignored (the probe row **took the user's
+viewport**), `--ephemeral` neither honoured nor refused. So an agent following
+the hygiene contract believes it made a detached, self-describing, self-reaping
+row and actually made an attached, anonymous, permanent one.
+
+**Root cause, and it is one line of state.**
+
+```
+jojo ~/.yggterm/install-state.json   "active_version":    "2.11.0"
+                                     "active_executable": ~/.yggterm/versions/2.11.0/yggterm
+```
+
+`maybe_handoff_to_preferred_headless_executable` `exec`s every non-builtin verb
+into the sibling of that path — a **2.11.0 binary from 2026-07-22**. Every deploy
+since has been a direct copy into `~/.local/bin` + `~/.yggterm/bin`, and **that
+path writes no install state**, so the file is sixteen minors stale and wins.
+The handoff compared PATHS and never versions, so nothing noticed.
+
+**Discriminator that settles it in one command** (bare `--ephemeral` is refused
+by name by the current parser and unknown to 2.11.0):
+
+```
+ssh jojo '~/.yggterm/bin/yggterm-headless server app terminal new --kind shell --ephemeral --title x'
+  → creates a row                                    # ran 2.11.0
+ssh jojo 'YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF=1 …same…'
+  → Error: --ephemeral needs a rule …                # ran 3.0.43
+```
+
+Same binary by md5 on dev refuses correctly, so this is host state, not a build.
+
+⚠ **THE BLAST RADIUS IS NARROW AND THAT IS WHY IT SURVIVED.**
+`find_direct_install_state` walks the EXECUTABLE's ancestors, so only a binary
+living under `~/.yggterm/` ever finds that state file:
+
+| invocation | diverted? |
+|---|---|
+| jojo `~/.yggterm/bin/yggterm-headless` | **yes → 2.11.0** |
+| jojo `~/.local/bin/yggterm-headless` (what the daemons run) | no — genuinely 3.0.43 |
+| dev / oc, any path | no — neither host has an `install-state.json` |
+
+So the daemons were never wrong, and every `~/.local/bin/…` recipe in
+`.agents/skills/yggui-app-control/SKILL.md` was fine. The poisoned intersection
+is exactly *the `~/.yggterm/bin` binary, on the GUI host* — which is what an
+agent is told to prefer when the PATH copy on dev/oc lags, and the only host
+where live proof is taken.
+
+⛔ **AND THE INSTRUMENT IS BLIND TO IT BY CONSTRUCTION.** `--version` is a *pure
+builtin*, exempted from the handoff (`builtin_cli_command_is_pure`), so it
+reports the binary you TYPED while every other verb runs a different one. The
+session-start `fleet-daemon-audit` hook reads `--version` and called the host
+current. ⇒ **on this fleet, "I checked the version" is not evidence that the
+code you are testing is the code that ran.** Prove a build by a BEHAVIOURAL
+discriminator — a flag or refusal that exists only in the build you mean.
+
+**Fixed** by `yggterm_core::handoff_target_is_not_a_downgrade`, read by both
+binaries' handoff sites: a handoff exists to route an OLD invocation into the
+ACTIVE newer install, never a new one into an older binary; an unparseable
+version refuses rather than guesses.
+
+⏳ **Still open underneath, and it is the real single-source-of-truth defect:**
+`install-state.json` claims to answer "which executable is active" while the
+deploy path everyone uses never writes it. The downgrade guard makes the stale
+answer harmless; it does not make the file true. Either the direct-deploy path
+must write it, or the file must stop claiming to answer that question. ⚠ Until
+one of those, `InstallContext::current_version` also still reports the RECORDED
+version (2.11.0 on jojo) rather than `CARGO_PKG_VERSION` — a second lie in the
+same struct, and anything reading it for "what am I" is wrong.
+
 ## UNIT TESTS WRITE TRACE EVENTS INTO THE DEVELOPER'S REAL `~/.yggterm`
 
 **Status:** OPEN
@@ -74,6 +161,26 @@ AUDIT trail, not a handle."* A grep for `parent_session` / `spawned_by` /
    fact about who spawned whom and re-derives after any restart, instead of
    being someone's typing.
 4. Optionally `sessions reorder --outline` to sort by the derived numbers.
+
+⛔ **A TRAP FOUND BEFORE IT WAS SPRUNG, 2026-08-07 — do not stamp a GUI launch
+as an agent creation.** The obvious implementation of step 1 is to have
+`spawn_launch_app_verb` declare a tenancy on the row it just made, since it
+ALREADY holds the parent: `insert_after` is the anchor row's `full_path`, passed
+through `launch_anchor_row` → `start_local_session_placed` / `start_ssh_session_placed`.
+So the parent link needs no new plumbing on that path at all.
+
+But `RowHygieneVerdict` reads *"no creator stamp ⇒ a human or the GUI opened
+this — NEVER a plate, at any age"* (`session_tenancy.rs`). Hanging parentage off
+`CreatorStamp` therefore turns **every ychrome the user opened by right-clicking
+a row** into an agent-created row the sweep may consider. That is a regression
+the sanity system would deliver quietly, on the user's own table.
+
+⇒ **Parentage and provenance are two questions and want two fields.** "Who
+spawned this row" is orthogonal to "did an agent make it", and the hygiene
+classifier keying off the presence of a stamp is the proof that they must not
+share one. Give the parent its own metadata label rather than widening
+`CreatorStamp`'s meaning — the field predecessor A added there stays for the
+CLI-create path, which genuinely is an agent creation.
 
 ⚖ **It also fixes the sanity system's cross-host problem from a better angle.**
 That was patched on 2026-08-06 by asking the session's `source`/`host_label`,

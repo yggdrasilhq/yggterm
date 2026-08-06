@@ -139,6 +139,80 @@ pub fn current_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// Whether a binary may hand its command off to the install state's recorded
+/// active executable.
+///
+/// ⛔ **A handoff exists to route an OLD invocation into the ACTIVE newer
+/// install. It must never route a NEW one into an older binary** — and until
+/// 2026-08-07 nothing stopped it, because the handoff compared PATHS and never
+/// versions.
+///
+/// **What that cost, measured on the live host.**
+/// `~/.yggterm/install-state.json` there still named `2.11.0` (written
+/// 2026-07-22, the last MANAGED install), while every deploy since has been a
+/// direct copy into `~/.local/bin` and `~/.yggterm/bin` — a path that writes no
+/// install state. So a 3.0.43 binary `exec`ed a **2.11.0** one for every verb,
+/// and three flags the row-hygiene contract mandates were silently dropped:
+/// `--purpose` came back null, `--no-activate` still stole the user's viewport,
+/// and `--ephemeral` was neither honoured nor refused by a parser that postdates
+/// 2.11.0 and therefore was not there.
+///
+/// ⚠ **And the instrument could not see it.** `--version` is a pure builtin,
+/// exempt from the handoff, so it reports the binary you TYPED while every other
+/// verb runs a different one. The fleet audit reads `--version` and called the
+/// host current. That is why this is decided from a version compare rather than
+/// from anything a probe can be pointed at.
+///
+/// **Unparseable is a refusal, deliberately.** Running our own binary is always
+/// safe; running an unidentifiable other one is not, so a malformed state file
+/// keeps the command in-process instead of guessing.
+pub fn handoff_target_is_not_a_downgrade(running_version: &str, recorded_version: &str) -> bool {
+    let (Ok(running), Ok(recorded)) = (
+        semver::Version::parse(running_version.trim()),
+        semver::Version::parse(recorded_version.trim()),
+    ) else {
+        return false;
+    };
+    recorded >= running
+}
+
+#[cfg(test)]
+mod handoff_version_tests {
+    use super::handoff_target_is_not_a_downgrade;
+
+    // The live failure, as a test: jojo ran 3.0.43 and its install state named
+    // 2.11.0, and the handoff sent every command sixteen minors backwards.
+    #[test]
+    fn a_newer_binary_never_hands_off_to_an_older_recorded_install() {
+        assert!(!handoff_target_is_not_a_downgrade("3.0.43", "2.11.0"));
+        assert!(!handoff_target_is_not_a_downgrade("3.0.44", "3.0.43"));
+    }
+
+    // The case the handoff exists FOR must keep working: an old binary on PATH
+    // routing into the managed active install.
+    #[test]
+    fn an_older_binary_still_hands_off_to_the_active_install() {
+        assert!(handoff_target_is_not_a_downgrade("3.0.40", "3.0.43"));
+        assert!(handoff_target_is_not_a_downgrade("2.11.0", "3.0.43"));
+    }
+
+    // Equal is a handoff: the paths differ but the build does not, and the
+    // existing path-identity check upstream already skips the true no-op.
+    #[test]
+    fn the_same_version_is_not_a_downgrade() {
+        assert!(handoff_target_is_not_a_downgrade("3.0.43", "3.0.43"));
+    }
+
+    // A state file we cannot read a version out of must not send the command
+    // into an unidentified binary.
+    #[test]
+    fn an_unparseable_version_refuses_rather_than_guesses() {
+        assert!(!handoff_target_is_not_a_downgrade("3.0.43", ""));
+        assert!(!handoff_target_is_not_a_downgrade("3.0.43", "nightly"));
+        assert!(!handoff_target_is_not_a_downgrade("", "3.0.43"));
+    }
+}
+
 pub fn current_asset_label() -> Result<String> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;

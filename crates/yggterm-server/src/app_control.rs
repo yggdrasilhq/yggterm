@@ -826,6 +826,19 @@ pub enum AppControlCommand {
     SendTerminalInput {
         session_path: String,
         data: String,
+        /// Send a payload with interior line breaks into an AGENT CLI row
+        /// anyway, knowing each line becomes its own submit.
+        ///
+        /// Default `false` refuses it by name: measured live 2026-08-07, a
+        /// three-line send into a Claude Code TUI submitted line 1 alone and
+        /// left lines 2-3 as queued messages, while the reply still said
+        /// `accepted: true`. See [`yggterm_core::terminal_input`]. A SHELL row
+        /// is unaffected — there N lines are N commands, which is correct.
+        ///
+        /// `#[serde(default)]` so a newer CLI and an older GUI coexist: the
+        /// field simply reads false, which is the safe arm.
+        #[serde(default)]
+        allow_multiline: bool,
     },
     /// Readiness-gated prompt insertion: wait until the session is at an idle
     /// interactive prompt (up to `timeout_ms`), then send `data`. If it never
@@ -2736,6 +2749,7 @@ mod tests {
             !AppControlCommand::SendTerminalInput {
                 session_path: "x".into(),
                 data: "y".into(),
+                allow_multiline: false,
             }
             .is_read_only()
         );

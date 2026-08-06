@@ -21136,6 +21136,7 @@ fn parse_app_control_session_kind(kind: &str) -> anyhow::Result<SessionKind> {
 pub fn run_app_control_send_terminal_input(
     session_path: &str,
     data: &str,
+    allow_multiline: bool,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
@@ -21144,6 +21145,7 @@ pub fn run_app_control_send_terminal_input(
         AppControlCommand::SendTerminalInput {
             session_path: session_path.to_string(),
             data: data.to_string(),
+            allow_multiline,
         },
         timeout_ms,
     )?;

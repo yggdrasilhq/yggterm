@@ -908,7 +908,12 @@ fn print_server_app_help() {
     with no --title the row is named for the driving agent and its purpose
   yggterm server app terminal scroll <session> --to <top|bottom|±N>
   yggterm server app terminal read-buffer <session> [--mode screen|full|cells]
-  yggterm server app terminal send <session> (--data <data>|--stdin)
+  yggterm server app terminal send <session> (--data <data>|--stdin) [--allow-multiline]
+    a payload with interior line breaks is REFUSED for an agent CLI row: its
+    composer reads every \r as Enter, so line 1 submits alone and the rest
+    become queued messages. Use `terminal submit` for a brief, or
+    --allow-multiline to fire N separate submits deliberately. Shell rows are
+    unaffected — there N lines are N commands.
   yggterm server app terminal new [--kind <shell|codex|claude-code>] [--cwd <dir>] [--title <t>]
       [--machine-key <k>] [--no-activate] [--purpose <text>]
       [--model <id>] [--permission-mode <default|plan|accept-edits|bypass>]
@@ -2921,7 +2926,14 @@ fn main() -> Result<()> {
                                 .context("missing --data or --stdin for server app terminal send")?
                                 .to_string()
                         };
-                        run_app_control_send_terminal_input(session_path, &data, timeout_ms)
+                        let allow_multiline =
+                            args.iter().any(|arg| arg == "--allow-multiline");
+                        run_app_control_send_terminal_input(
+                            session_path,
+                            &data,
+                            allow_multiline,
+                            timeout_ms,
+                        )
                     }
                     "submit" => {
                         // Readiness-gated prompt insertion (waits for an idle prompt
@@ -4944,6 +4956,15 @@ fn maybe_handoff_to_preferred_executable(
         return Ok(());
     }
     if std::env::var_os(ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF).is_some() {
+        return Ok(());
+    }
+    // ⛔ Same guard as the headless binary's: a stale install state must not send
+    // a newer build down to an older one. The GUI half of the 2026-08-07 live
+    // finding — jojo's state named 2.11.0 while 3.0.43 was deployed.
+    if !yggterm_core::handoff_target_is_not_a_downgrade(
+        env!("CARGO_PKG_VERSION"),
+        &install_context.current_version,
+    ) {
         return Ok(());
     }
     let Some(preferred) = install_context.preferred_executable.as_ref() else {
