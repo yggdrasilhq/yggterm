@@ -12612,6 +12612,54 @@ async fn web_surface_native_reconcile_loop(
                             // opens on, else the global.
                             let open_zoom = surface_zoom_factor(&session_path, &effective_url);
                             desktop.set_web_surface_zoom(native_id, open_zoom);
+                            // ⛔ ONE CLIENT OWNS THE SPEAKERS.
+                            //
+                            // Webviews are per-CLIENT, so a shadow viewer
+                            // mirroring a session that holds a video opens that
+                            // video AGAIN in its own WebKit process and plays
+                            // it. The user's pause, their mute button and their
+                            // media keys all act on the first client's webview,
+                            // because that is the one holding the media
+                            // session — so the second stream is unreachable by
+                            // every control a person has. Stashing does not
+                            // help: stash is a paint decision and is explicitly
+                            // never a mute, so the copy goes INVISIBLE and stays
+                            // AUDIBLE, which is exactly the phantom the user
+                            // reported on 2026-08-06 and could only kill by
+                            // closing the ychrome row.
+                            //
+                            // Muted at CREATE, not at stash: a shadow's surface
+                            // is unseen by construction, and muting at birth
+                            // leaves no window in which audio can escape.
+                            //
+                            // ⚠ This is OUR OWN DOCTRINE'S bill. The standing
+                            // rule is that an agent probes through a shadow
+                            // client rather than the user's GUI, so any agent
+                            // taking a screenshot while the user watches a video
+                            // reproduces this. The fix belongs here, at the one
+                            // place a viewer's surface is born.
+                            if client_is_shadow_viewer() {
+                                let muted = desktop.mute_web_surface(native_id, true);
+                                // Traced because the whole defect was INAUDIBLE
+                                // in every instrument we had: the phantom showed
+                                // up as an ordinary `native_open` on a second
+                                // pid, identical to a legitimate one. This event
+                                // is what separates "a viewer opened a copy" from
+                                // "a viewer opened a copy AND it can be heard".
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "web_surface",
+                                    "native_open_muted_for_shadow_viewer",
+                                    json!({
+                                        "session_path": session_path,
+                                        "tab_id": tab_id,
+                                        "native_id": native_id,
+                                        "applied": muted.is_ok(),
+                                        "error": muted.err(),
+                                    }),
+                                );
+                            }
                             // A surface is born mid-navigation: light the tab's
                             // loading dot now. Written ONCE, here — the poll below
                             // only writes state on a CHANGE, so the light cannot
