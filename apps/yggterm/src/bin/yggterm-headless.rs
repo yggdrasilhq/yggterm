@@ -1069,6 +1069,18 @@ fn gui_companion_executable_from_headless(current_exe: &Path) -> Option<std::pat
     )
 }
 
+/// Which GUI `server app launch` should start.
+///
+/// ⛔ **The install state's recorded executable is preferred ONLY when it is not
+/// a downgrade** — the same rule as the exec handoff, and it belongs here for
+/// the same reason. On the live host `preferred_executable` was
+/// `~/.yggterm/versions/2.11.0/yggterm`, and it EXISTS, so an agent relaunching
+/// the GUI through app control would have started a 2.11.0 window against a
+/// 3.0.44 daemon — the loudest possible version skew, arrived at silently.
+/// Found 2026-08-07 while reaching for this verb to prove another fix.
+///
+/// When the record is a downgrade we fall through to the companion sitting
+/// beside THIS binary, which is by construction the build the caller deployed.
 fn preferred_gui_executable_from_headless(
     current_exe: &Path,
     install_context: &InstallContext,
@@ -1077,6 +1089,13 @@ fn preferred_gui_executable_from_headless(
         .preferred_executable
         .clone()
         .filter(|path| path.is_file())
+        .filter(|recorded| {
+            yggterm_core::handoff_target_is_usable(
+                env!("CARGO_PKG_VERSION"),
+                &install_context.current_version,
+                recorded,
+            )
+        })
         .or_else(|| {
             gui_companion_executable_from_headless(current_exe).filter(|path| path.is_file())
         })
@@ -1150,19 +1169,22 @@ fn maybe_handoff_to_preferred_headless_executable(
     if command_reads_local_state_in_process(args) {
         return Ok(());
     }
-    // ⛔ Never hand a NEWER binary down to an older recorded install. The live
-    // host ran 3.0.43 with an install state still naming 2.11.0, so every verb
-    // was exec'd sixteen minors backwards and the flags that postdate 2.11.0
-    // were silently dropped. See `handoff_target_is_not_a_downgrade`.
-    if !yggterm_core::handoff_target_is_not_a_downgrade(
-        env!("CARGO_PKG_VERSION"),
-        &install_context.current_version,
-    ) {
-        return Ok(());
-    }
     let Some(preferred) = preferred_headless_executable(install_context) else {
         return Ok(());
     };
+    // ⛔ Never hand a NEWER binary down to an older install. The live host ran
+    // 3.0.43 with a record naming 2.11.0, so every verb was exec'd sixteen
+    // minors backwards and the flags that postdate 2.11.0 were silently dropped
+    // — and the record then bumped its VERSION without moving its PATH, which
+    // defeats a version-only check. `handoff_target_is_usable` reads the target
+    // path too, because a path cannot be bumped without a move.
+    if !yggterm_core::handoff_target_is_usable(
+        env!("CARGO_PKG_VERSION"),
+        &install_context.current_version,
+        &preferred,
+    ) {
+        return Ok(());
+    }
     let current = current_exe
         .canonicalize()
         .unwrap_or_else(|_| current_exe.to_path_buf());
@@ -3505,6 +3527,64 @@ mod tests {
             preferred,
             PathBuf::from("/direct/versions/2.1.52").join(expected_name)
         );
+    }
+
+    // ⛔ `server app launch` must not start an OLDER GUI just because a stale
+    // install record names one. On the live host the recorded executable was a
+    // real, present `2.11.0/yggterm` while 3.0.44 was deployed, so this verb
+    // would have put a 2.11.0 window in front of a 3.0.44 daemon.
+    #[test]
+    fn app_launch_refuses_a_downgrade_gui_and_falls_back_to_its_own_companion() {
+        let stale = InstallContext {
+            channel: InstallChannel::Direct,
+            update_policy: UpdatePolicy::Auto,
+            repo: "test/repo".to_string(),
+            asset_label: "linux-x86_64".to_string(),
+            // What the record CLAIMS is active — older than this build.
+            current_version: "2.11.0".to_string(),
+            executable_path: PathBuf::from("/home/u/.yggterm/bin/yggterm-headless"),
+            preferred_executable: Some(PathBuf::from("/home/u/.yggterm/versions/2.11.0/yggterm")),
+            managed_root: Some(PathBuf::from("/home/u/.yggterm")),
+            manager_hint: Some("Direct install".to_string()),
+        };
+        // Both candidates are absent on disk here, so the function can only
+        // answer None — but the point is WHICH branch it took: with the guard
+        // removed it would return the 2.11.0 path whenever that file exists.
+        let recorded = stale.preferred_executable.clone().expect("a recorded path");
+        assert!(
+            !yggterm_core::handoff_target_is_usable(
+                env!("CARGO_PKG_VERSION"),
+                &stale.current_version,
+                &recorded,
+            ),
+            "this build must consider a 2.11.0 record a downgrade, or the guard \
+             above is inert and the verb starts the old GUI"
+        );
+
+        // ⛔ AND the shape that defeated the first guard: the record's VERSION
+        // bumped to ours while its PATH stayed on 2.11.0. Live on jojo within an
+        // hour of shipping the version-only check.
+        let lying = InstallContext {
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            ..stale.clone()
+        };
+        assert!(
+            !yggterm_core::handoff_target_is_usable(
+                env!("CARGO_PKG_VERSION"),
+                &lying.current_version,
+                &recorded,
+            ),
+            "a record whose version contradicts its own path must be refused, \
+             not reconciled — there is no way to know which half is true"
+        );
+
+        // The case the preference exists for is untouched: a consistent record
+        // AHEAD of this build still wins.
+        assert!(yggterm_core::handoff_target_is_usable(
+            env!("CARGO_PKG_VERSION"),
+            "999.0.0",
+            std::path::Path::new("/home/u/.yggterm/versions/999.0.0/yggterm"),
+        ));
     }
 
     #[test]

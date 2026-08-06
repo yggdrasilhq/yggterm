@@ -4958,18 +4958,20 @@ fn maybe_handoff_to_preferred_executable(
     if std::env::var_os(ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF).is_some() {
         return Ok(());
     }
-    // ⛔ Same guard as the headless binary's: a stale install state must not send
-    // a newer build down to an older one. The GUI half of the 2026-08-07 live
-    // finding — jojo's state named 2.11.0 while 3.0.43 was deployed.
-    if !yggterm_core::handoff_target_is_not_a_downgrade(
-        env!("CARGO_PKG_VERSION"),
-        &install_context.current_version,
-    ) {
-        return Ok(());
-    }
     let Some(preferred) = install_context.preferred_executable.as_ref() else {
         return Ok(());
     };
+    // ⛔ Same guard as the headless binary's: a stale — or self-contradictory —
+    // install record must not send a newer build down to an older one. The GUI
+    // half of the 2026-08-07 live finding; see `handoff_target_is_usable` for
+    // why the TARGET PATH and not the recorded version is what decides.
+    if !yggterm_core::handoff_target_is_usable(
+        env!("CARGO_PKG_VERSION"),
+        &install_context.current_version,
+        preferred,
+    ) {
+        return Ok(());
+    }
     let current = current_exe
         .canonicalize()
         .unwrap_or_else(|_| current_exe.to_path_buf());

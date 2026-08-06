@@ -86,19 +86,62 @@ current. ⇒ **on this fleet, "I checked the version" is not evidence that the
 code you are testing is the code that ran.** Prove a build by a BEHAVIOURAL
 discriminator — a flag or refusal that exists only in the build you mean.
 
-**Fixed** by `yggterm_core::handoff_target_is_not_a_downgrade`, read by both
-binaries' handoff sites: a handoff exists to route an OLD invocation into the
-ACTIVE newer install, never a new one into an older binary; an unparseable
-version refuses rather than guesses.
+**Fixed** by `yggterm_core::handoff_target_is_not_a_downgrade`, read by **three**
+sites: both binaries' exec-handoff, and `server app launch`'s GUI resolution. A
+handoff exists to route an OLD invocation into the ACTIVE newer install, never a
+new one into an older binary; an unparseable version refuses rather than guesses.
+
+⚠ **The third site was found by reaching for the verb, not by reading.**
+`preferred_gui_executable_from_headless` prefers the recorded executable, and
+`~/.yggterm/versions/2.11.0/yggterm` EXISTS on jojo — so an agent relaunching the
+GUI through app control would have put a **2.11.0 window in front of a 3.0.44
+daemon**. Nothing in the first two fixes would have caught it: same stale fact,
+third consumer. If a fourth consumer of `preferred_executable` appears, it needs
+the same guard.
+
+### ⛔⛔ THE VERSION-ONLY GUARD WAS DEFEATED WITHIN THE HOUR — the record LIES, it is not merely stale
+
+The first fix compared `CARGO_PKG_VERSION` against the record's
+`active_version`. Deployed, live-proven, and then broken by the very next GUI
+restart. Measured on jojo at 01:55:
+
+```text
+"active_version":    "3.0.44"                                    <- bumped
+"active_executable": "/home/user/.yggterm/versions/2.11.0/yggterm" <- NOT moved
+```
+
+The GUI's daemon had already re-exec'd into `versions/2.11.0/yggterm-headless`
+(the original bug), and the hot-update then promoted `expected_version` 3.0.44
+against **that** path — `promote_direct_install_active_version` writes both
+fields from its `target_executable`, so a handoff that landed on the old path
+stamps the new version onto it. ⇒ **the corruption is self-perpetuating**: every
+promote re-bumps the version and leaves the path, and a guard reading the
+version waves it straight through forever.
+
+⇒ **Trust the PATH, which cannot be bumped without a move.** The managed layout
+is `versions/<v>/<binary>`, so the directory name is the layout's own statement
+about what lives there. `handoff_target_is_usable` refuses when the target's
+declared version is older than ours, and refuses outright when the record's
+version and its own path disagree — a self-contradictory record is unusable, and
+there is no way to know which half is true.
+
+⚠ **Live mitigation applied to jojo** (`install-state.json.bak-2026-08-07` holds
+the corrupt copy): `active_executable` repointed to `~/.yggterm/bin/yggterm`, the
+GUI that is really running. Verified: `~/.yggterm/bin/yggterm-headless server app
+terminal new --kind shell --ephemeral` refuses by name again, with no skip env.
 
 ⏳ **Still open underneath, and it is the real single-source-of-truth defect:**
 `install-state.json` claims to answer "which executable is active" while the
-deploy path everyone uses never writes it. The downgrade guard makes the stale
-answer harmless; it does not make the file true. Either the direct-deploy path
-must write it, or the file must stop claiming to answer that question. ⚠ Until
-one of those, `InstallContext::current_version` also still reports the RECORDED
-version (2.11.0 on jojo) rather than `CARGO_PKG_VERSION` — a second lie in the
-same struct, and anything reading it for "what am I" is wrong.
+deploy path everyone uses never writes it — and the hot-update path writes it
+from wherever the handoff happened to land. Either the direct-deploy path must
+write it, or the file must stop claiming to answer that question. ⚠ Until one of
+those, `InstallContext::current_version` also still reports the RECORDED version
+rather than `CARGO_PKG_VERSION` — a second lie in the same struct, and anything
+reading it for "what am I" is wrong.
+
+⚠ **`promote_direct_install_active_version` deserves its own look**: it will
+happily write a `(new version, old path)` pair, which is the corruption itself.
+It should refuse to promote a version onto a path that declares a different one.
 
 ## UNIT TESTS WRITE TRACE EVENTS INTO THE DEVELOPER'S REAL `~/.yggterm`
 

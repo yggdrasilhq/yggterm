@@ -176,6 +176,126 @@ pub fn handoff_target_is_not_a_downgrade(running_version: &str, recorded_version
     recorded >= running
 }
 
+/// The version a managed-install PATH declares about itself.
+///
+/// The managed layout is `<root>/versions/<version>/<binary>`, so the directory
+/// name is the layout's own statement about what lives there — and unlike the
+/// record's `active_version` field, nothing can bump it without moving the
+/// binary. Returns `None` for a path outside that layout (a raw `~/.local/bin`
+/// copy), which is not a refusal on its own: such a path makes no claim.
+pub fn install_path_declared_version(executable: &Path) -> Option<String> {
+    let dir = executable.parent()?;
+    let name = dir.file_name()?.to_str()?;
+    if dir.parent()?.file_name()?.to_str()? != "versions" {
+        return None;
+    }
+    semver::Version::parse(name).ok().map(|_| name.to_string())
+}
+
+/// Whether this build may hand its work to `target`, given what the install
+/// record claims and what the target's own path declares.
+///
+/// ⛔ **A version-only check is not enough, and the live host proved it within
+/// the hour.** After the first guard shipped, the record on jojo read:
+///
+/// ```text
+/// "active_version":    "3.0.44"                                    <- bumped
+/// "active_executable": "/home/user/.yggterm/versions/2.11.0/yggterm" <- NOT moved
+/// ```
+///
+/// A hot-update promoted the new version against a path a previous handoff had
+/// already pointed at 2.11.0, so the record now CONTRADICTS ITSELF — and a guard
+/// reading `active_version` waves it straight through. The corruption is
+/// self-perpetuating: each promote re-bumps the version and leaves the path.
+///
+/// ⇒ **Trust the path, which cannot be bumped without a move.** When the target
+/// sits in the managed `versions/<v>/` layout, `<v>` decides; a record whose
+/// version disagrees with its own path is refused outright rather than
+/// reconciled, because there is no way to know which half is true.
+pub fn handoff_target_is_usable(
+    running_version: &str,
+    recorded_version: &str,
+    target: &Path,
+) -> bool {
+    if !handoff_target_is_not_a_downgrade(running_version, recorded_version) {
+        return false;
+    }
+    match install_path_declared_version(target) {
+        // The path makes no claim (a raw copy) — the record's word is all there
+        // is, and it already passed.
+        None => true,
+        Some(declared) => {
+            handoff_target_is_not_a_downgrade(running_version, &declared)
+                && declared.trim() == recorded_version.trim()
+        }
+    }
+}
+
+#[cfg(test)]
+mod handoff_target_tests {
+    use super::{handoff_target_is_usable, install_path_declared_version};
+    use std::path::Path;
+
+    #[test]
+    fn a_managed_path_declares_its_own_version() {
+        assert_eq!(
+            install_path_declared_version(Path::new("/h/.yggterm/versions/2.11.0/yggterm"))
+                .as_deref(),
+            Some("2.11.0")
+        );
+        // Outside the layout, and therefore making no claim.
+        assert_eq!(
+            install_path_declared_version(Path::new("/h/.local/bin/yggterm")),
+            None
+        );
+        assert_eq!(
+            install_path_declared_version(Path::new("/h/.yggterm/bin/yggterm")),
+            None
+        );
+        // `versions/<not-a-version>/` is not a claim either.
+        assert_eq!(
+            install_path_declared_version(Path::new("/h/.yggterm/versions/nightly/yggterm")),
+            None
+        );
+    }
+
+    // THE live case, 2026-08-07: the record said 3.0.44 and pointed at the
+    // 2.11.0 tree. The version-only guard passed it; this one must not.
+    #[test]
+    fn a_record_whose_version_contradicts_its_own_path_is_refused() {
+        assert!(!handoff_target_is_usable(
+            "3.0.44",
+            "3.0.44",
+            Path::new("/h/.yggterm/versions/2.11.0/yggterm-headless"),
+        ));
+    }
+
+    #[test]
+    fn a_consistent_newer_managed_target_is_still_usable() {
+        assert!(handoff_target_is_usable(
+            "3.0.40",
+            "3.0.44",
+            Path::new("/h/.yggterm/versions/3.0.44/yggterm-headless"),
+        ));
+    }
+
+    // A raw copy outside the layout makes no claim, so the record decides — and
+    // this is the ordinary jojo/dev shape after the mitigation.
+    #[test]
+    fn an_unversioned_path_falls_back_to_the_record() {
+        assert!(handoff_target_is_usable(
+            "3.0.44",
+            "3.0.44",
+            Path::new("/h/.yggterm/bin/yggterm-headless"),
+        ));
+        assert!(!handoff_target_is_usable(
+            "3.0.44",
+            "2.11.0",
+            Path::new("/h/.yggterm/bin/yggterm-headless"),
+        ));
+    }
+}
+
 #[cfg(test)]
 mod handoff_version_tests {
     use super::handoff_target_is_not_a_downgrade;

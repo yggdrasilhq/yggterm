@@ -100,8 +100,8 @@ pub use install::{
     ReleaseUpdate,
     ReleaseUpdateInstallProgress, ReleaseUpdateInstallStage, UpdatePolicy, YGGTERM_DESKTOP_APP_ID,
     check_for_update, current_asset_label, current_version, detect_install_context,
-    direct_install_root, handoff_target_is_not_a_downgrade, install_mode_summary,
-    install_release_update,
+    direct_install_root, handoff_target_is_not_a_downgrade, handoff_target_is_usable,
+    install_mode_summary, install_path_declared_version, install_release_update,
     install_release_update_with_progress, promote_direct_install_active_version,
     refresh_desktop_integration, update_command_hint, write_direct_install_state,
 };
