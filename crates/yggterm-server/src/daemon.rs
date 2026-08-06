@@ -39,9 +39,10 @@ use std::time::SystemTime;
 use time::OffsetDateTime;
 use tracing::{info, warn};
 use yggterm_core::{
-    AppSettings, LIVE_SUMMARY_REFRESH_HORIZON, PerfSpan, SessionNode, SessionNodeKind,
-    SessionStore, append_bounded_jsonl_record, append_trace_event, local_cc_session_jsonl_path,
-    looks_like_generated_fallback_title, read_cc_session_title, resolve_yggterm_home,
+    AgentLaunchOptions, AppSettings, LIVE_SUMMARY_REFRESH_HORIZON, PerfSpan, SessionNode,
+    SessionNodeKind, SessionStore, append_bounded_jsonl_record, append_trace_event,
+    local_cc_session_jsonl_path, looks_like_generated_fallback_title, read_cc_session_title,
+    resolve_yggterm_home,
 };
 use yggui_contract::UiTheme;
 
@@ -1521,6 +1522,10 @@ fn persisted_live_session_from_preserved_owner_snapshot(
             session,
             crate::session_tenancy::EPHEMERAL_METADATA_LABEL,
         ),
+        // The row's per-launch model / permission mode crosses the daemon
+        // boundary with it: a delegate adopted during a version handover must
+        // relaunch on the tier it was created with, not the user's default.
+        agent_launch_options: session.agent_launch_options.clone(),
     })
 }
 
@@ -2002,6 +2007,10 @@ pub enum ServerRequest {
         terminal_appearance: Option<String>,
         #[serde(default)]
         insert_after: Option<String>,
+        /// Per-launch model / permission mode; composed into the
+        /// `YGGTERM_CC_EXTRA_ARGS` export this lane already forwards.
+        #[serde(default)]
+        launch_options: Option<AgentLaunchOptions>,
     },
     OpenRemoteSession {
         machine_key: String,
@@ -2094,6 +2103,16 @@ pub enum ServerRequest {
         terminal_appearance: Option<String>,
         #[serde(default)]
         insert_after: Option<String>,
+        /// Per-launch model / permission mode for an agent CLI kind.
+        ///
+        /// ⚠ **Version-coexisting daemons:** a daemon older than this field
+        /// ignores it (serde skips unknown fields), so the row would be born on
+        /// the user's default model with nobody the wiser. That is why the
+        /// create REPLY reports the launch command the row was actually born
+        /// with rather than echoing back what was asked for — an old owner
+        /// shows up as a visible mismatch, not silence.
+        #[serde(default)]
+        launch_options: Option<AgentLaunchOptions>,
     },
     SwitchAgentSessionMode {
         path: String,
@@ -5293,6 +5312,15 @@ impl DaemonRuntime {
                 // Idle is the PTY's own silence, read from the same source the
                 // ephemeral reaper uses; a row this daemon does not own answers
                 // `None`, and an unknown age is never clearable.
+                // ⛔ WHERE THE WORK RUNS, asked BEFORE the verdict. A LiveSsh
+                // row's PTY is an ssh bridge and its agent lives on the far
+                // end, so a local "nothing is running" describes the bridge.
+                // Without this the walk called a working delegate an empty
+                // plate (2026-08-06, near miss on the versestore lobe).
+                report.work_runs_on = self.server.live_session_remote_work_host(&path);
+                // This daemon ASKED. A report without this flag came from one
+                // that could not, and must never be swept on trust.
+                report.locality_checked = true;
                 report.hygiene = Some(crate::session_tenancy::row_hygiene_verdict(&report));
                 report
             })
@@ -7268,13 +7296,15 @@ impl DaemonRuntime {
                 title_hint,
                 terminal_appearance,
                 insert_after,
+                launch_options,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
-                let key = self.server.start_remote_claude_session(
+                let key = self.server.start_remote_claude_session_with_launch_options(
                     &target,
                     prefix.as_deref(),
                     cwd.as_deref(),
                     title_hint.as_deref(),
+                    &launch_options.unwrap_or_default(),
                 )?;
                 self.server
                     .place_live_session_after(&key, insert_after.as_deref());
@@ -7703,6 +7733,7 @@ impl DaemonRuntime {
                 title_hint,
                 terminal_appearance,
                 insert_after,
+                launch_options,
             } => {
                 // Phantom-spawn investigation: record that this birth was
                 // GUI/IPC-initiated (vs an internal server-side creation) —
@@ -7718,14 +7749,16 @@ impl DaemonRuntime {
                             "cwd": cwd,
                             "title_hint": title_hint,
                             "insert_after": insert_after,
+                            "launch_options": launch_options,
                         }),
                     );
                 }
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
-                let key = self.server.start_local_session(
+                let key = self.server.start_local_session_with_launch_options(
                     session_kind,
                     cwd.as_deref(),
                     title_hint.as_deref(),
+                    &launch_options.unwrap_or_default(),
                 );
                 self.server
                     .place_live_session_after(&key, insert_after.as_deref());
@@ -10226,14 +10259,79 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
     }
 }
 
+/// The path this daemon was launched from, with a replaced binary resolved back
+/// to its real path.
+///
+/// ⛔ THE ROGUE-DAEMON ROOT CAUSE, found on dev 2026-08-06. A deploy overwrites
+/// the binary in place, which leaves `/proc/self/exe` pointing at a deleted
+/// inode — and Linux renders that as `"<path> (deleted)"`. `current_exe()`
+/// hands back that decorated string verbatim, `metadata()` on it fails, and the
+/// build id falls to 0.
+///
+/// The build-id comparison then treats 0 as "unreadable, so do not guess", and
+/// reports NO pending update. So the one condition under which the check goes
+/// blind is *precisely* the condition that means a deploy happened: **the
+/// deploy destroys the instrument that detects the deploy.** dev's daemon sat
+/// on 2.12.19 for a week owning 12 of the owner's sessions, with
+/// `hot_restart_pending = false` and ZERO blockers — it was never deferring, it
+/// could not see that 3.0.38 was on disk.
+///
+/// The PATH is still correct after a replacement; only the inode is gone. So
+/// strip the suffix and stat the path, which is the file the successor would
+/// actually be launched from.
+fn daemon_binary_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let raw = exe.to_string_lossy().to_string();
+    match raw.strip_suffix(" (deleted)") {
+        Some(stripped) if !stripped.is_empty() => Some(std::path::PathBuf::from(stripped)),
+        _ => Some(exe),
+    }
+}
+
 fn current_build_id() -> u64 {
-    std::env::current_exe()
-        .ok()
+    daemon_binary_path()
         .and_then(|path| fs::metadata(path).ok())
         .and_then(|meta| meta.modified().ok())
         .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|dur| dur.as_secs())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod rogue_daemon_root_cause_tests {
+    /// ⛔ THE ROGUE DAEMON, 2026-08-06. dev's daemon owned 12 of the owner's
+    /// sessions on 2.12.19 for a week while 3.0.38 sat on disk, reporting
+    /// `hot_restart_pending = false` with ZERO blockers. It was not deferring
+    /// on the idle gate; it could not SEE the update.
+    ///
+    /// A deploy overwrites the binary in place, `/proc/self/exe` then points at
+    /// a deleted inode, and Linux renders that path as `"<path> (deleted)"`.
+    /// `metadata()` on that string fails, the build id falls to 0, and the
+    /// comparison treats 0 as "unreadable, do not guess". So the deploy
+    /// destroys the instrument that detects the deploy.
+    ///
+    /// This locks the suffix strip. If it goes, every daemon on the fleet goes
+    /// silently un-upgradable again the moment its binary is replaced.
+    #[test]
+    fn a_replaced_binary_still_resolves_to_the_path_it_was_launched_from() {
+        // The exact string the kernel produces for a replaced binary.
+        let deleted = "/home/user/.yggterm/bin/yggterm-headless (deleted)";
+        let stripped = deleted.strip_suffix(" (deleted)");
+        assert_eq!(
+            stripped,
+            Some("/home/user/.yggterm/bin/yggterm-headless"),
+            "the PATH survives a replacement — only the inode is gone, and that \
+             path is the file a successor would actually be launched from"
+        );
+
+        // A path that merely CONTAINS the word must not be mangled.
+        let honest = "/home/user/bin/my (deleted) tool";
+        assert_eq!(
+            honest.strip_suffix(" (deleted)"),
+            None,
+            "only a trailing marker is the kernel's; anything else is a real name"
+        );
+    }
 }
 
 /// Epoch-ms at which THIS daemon process started. Forced during `run_daemon` so it is
@@ -11277,6 +11375,31 @@ pub fn start_remote_claude_session_placed(
             title_hint: title_hint.map(ToOwned::to_owned),
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             insert_after: insert_after.map(ToOwned::to_owned),
+            launch_options: None,
+        },
+    )?)
+}
+
+/// A remote Claude Code start carrying ONE launch's model / permission mode.
+pub fn start_remote_claude_session_with_launch_options(
+    endpoint: &ServerEndpoint,
+    target: &str,
+    prefix: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    terminal_appearance: Option<&str>,
+    launch: &AgentLaunchOptions,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::StartRemoteClaudeSession {
+            target: target.to_string(),
+            prefix: prefix.map(ToOwned::to_owned),
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+            terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            insert_after: None,
+            launch_options: (!launch.is_empty()).then(|| launch.clone()),
         },
     )?)
 }
@@ -11554,6 +11677,29 @@ pub fn start_local_session_at_with_terminal_appearance(
     start_local_session_placed(endpoint, kind, cwd, title_hint, terminal_appearance, None)
 }
 
+/// A local start carrying ONE launch's model / permission mode — the delegate
+/// launch path (`terminal new --kind claude-code --model … --permission-mode …`).
+pub fn start_local_session_with_launch_options(
+    endpoint: &ServerEndpoint,
+    kind: SessionKind,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    terminal_appearance: Option<&str>,
+    launch: &AgentLaunchOptions,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::StartLocalSession {
+            session_kind: kind,
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+            terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            insert_after: None,
+            launch_options: (!launch.is_empty()).then(|| launch.clone()),
+        },
+    )?)
+}
+
 pub fn start_local_session_placed(
     endpoint: &ServerEndpoint,
     kind: SessionKind,
@@ -11570,6 +11716,7 @@ pub fn start_local_session_placed(
             title_hint: title_hint.map(ToOwned::to_owned),
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             insert_after: insert_after.map(ToOwned::to_owned),
+            launch_options: None,
         },
     )?)
 }
@@ -15804,6 +15951,7 @@ mod tests {
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         }
     }
 
@@ -18916,6 +19064,7 @@ mod tests {
             pty_cols: None,
             pty_rows: None,
             working: None,
+            agent_launch_options: Default::default(),
         }
     }
 
@@ -21046,6 +21195,7 @@ mod tests {
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         let unkept_update_runtime = remote_scanned_session_path("dev", "temporary-update");
         server.restore_live_session(PersistedLiveSession {
@@ -21062,6 +21212,7 @@ mod tests {
             restore_reason: Some("update-restart".to_string()),
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
         let all_registry_keys = owner_registry_keys.clone();
@@ -21182,6 +21333,7 @@ mod tests {
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         let terminals = TerminalManager::new();
 
@@ -21220,6 +21372,7 @@ mod tests {
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         let terminals = TerminalManager::new();
 
@@ -21259,6 +21412,7 @@ mod tests {
                 restore_reason: None,
                 created_by: None,
                 ephemeral: None,
+                agent_launch_options: Default::default(),
             });
         }
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
@@ -21306,6 +21460,7 @@ mod tests {
                 restore_reason: None,
                 created_by: None,
                 ephemeral: None,
+                agent_launch_options: Default::default(),
             });
         }
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
@@ -22244,6 +22399,7 @@ mod tests {
                 restore_reason: None,
                 created_by: None,
                 ephemeral: None,
+                agent_launch_options: Default::default(),
             }],
             session_pty_grids: Vec::new(),
         };
@@ -23074,11 +23230,11 @@ mod tests {
     /// wire divergence is the lost-PTY latch storm of 2026-07-17.
     #[test]
     fn protocol_shape_stamp_forces_version_bump() {
-        // Re-stamped for 2.12.18: `ServerRequest`/`ServerResponse` gained `Wpe`
-        // (one proxied verb on the Lane-A agent plane) and `WpeAgent`
-        // (supervision of the agent process), the wire half of increment 3.
-        const STAMPED_AT_VERSION: &str = "3.0.13";
-        const STAMPED_SHAPE_HASH: u64 = 0x3de56568f3710879;
+        // Re-stamped for 3.0.37: `StartLocalSession` and
+        // `StartRemoteClaudeSession` gained `launch_options`, the wire half of
+        // the integrated delegate launch (per-launch model + permission mode).
+        const STAMPED_AT_VERSION: &str = "3.0.37";
+        const STAMPED_SHAPE_HASH: u64 = 0x390c28af82c8e5b4;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

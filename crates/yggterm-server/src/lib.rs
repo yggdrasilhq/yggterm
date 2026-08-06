@@ -12,7 +12,9 @@ mod automation_cli;
 // The OS timer files an automation GENERATES. Separate from `automation` so the
 // record cannot grow a dependency on how any one platform spells a schedule.
 pub mod automation_units;
-pub use automation_cli::{automation_usage_block, run_automation_cli};
+pub use automation_cli::{
+    automation_usage_block, delegate_launch_usage_block, read_prompt, run_automation_cli,
+};
 // THE `collection …` / `snapshot now` verb plane, owned once for BOTH binaries.
 // Spec: ychrome/docs/collections.md (I3). The store and every decision it makes
 // live in yggterm-core; this is argv and a clock.
@@ -131,8 +133,9 @@ pub use daemon::{
     set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode, shutdown, snapshot,
     start_command_session, start_command_session_with_terminal_appearance, start_local_session,
     start_local_session_at, start_local_session_at_with_terminal_appearance,
-    start_local_session_placed, start_remote_claude_session_at_with_terminal_appearance,
-    start_remote_claude_session_placed, start_remote_codex_session_at,
+    start_local_session_placed, start_local_session_with_launch_options,
+    start_remote_claude_session_at_with_terminal_appearance, start_remote_claude_session_placed,
+    start_remote_claude_session_with_launch_options, start_remote_codex_session_at,
     start_remote_codex_session_at_with_terminal_appearance, start_remote_codex_session_placed,
     start_remote_runtime_codex_session, start_ssh_session_at,
     start_ssh_session_at_with_terminal_appearance, start_ssh_session_placed, status,
@@ -167,7 +170,8 @@ use anyhow::Context;
 use codex_cli::{
     ManagedCliAction, ManagedCliRefreshReport, best_effort_cwd_shell_prefix,
     ensure_local_managed_cli, ensure_local_managed_cli_for_focus, managed_cli_shell_command,
-    managed_cli_shell_command_with_terminal_appearance, refresh_local_managed_cli,
+    managed_cli_shell_command_full, managed_cli_shell_command_with_terminal_appearance,
+    refresh_local_managed_cli,
     summarize_managed_cli_report, sync_terminal_identity_env,
     terminal_identity_appearance_from_environment, terminal_identity_shell_exports_for_remote,
 };
@@ -191,8 +195,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use yggterm_core::AppManifest;
 use yggterm_core::{
-    PerfSpan, SessionNode, SessionStore, SessionTitleStore, TranscriptRole, WorkspaceDocument,
-    WorkspaceDocumentKind, YGGTERM_DESKTOP_APP_ID, append_trace_event, detect_install_context,
+    AgentLaunchOptions, PerfSpan, SessionNode, SessionStore, SessionTitleStore, TranscriptRole,
+    WorkspaceDocument, WorkspaceDocumentKind, YGGTERM_DESKTOP_APP_ID, append_trace_event, detect_install_context,
     event_trace_path, follow_trace_lines, generation_context_from_messages,
     looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
     read_cc_session_context, read_cc_session_identity_fields, read_cc_session_title,
@@ -928,6 +932,7 @@ fn persisted_live_session_from_managed(
         restore_reason,
         created_by: session_metadata_value(session, CREATED_BY_METADATA_LABEL),
         ephemeral: session_metadata_value(session, EPHEMERAL_METADATA_LABEL),
+        agent_launch_options: session.agent_launch_options.clone(),
     })
 }
 
@@ -2503,6 +2508,15 @@ pub struct SnapshotSessionView {
     // serde(default) keeps back-compat with older snapshots.
     #[serde(default)]
     pub working: Option<bool>,
+    /// The row's per-launch model / permission mode.
+    ///
+    /// On the SNAPSHOT because a snapshot is how a row's facts cross a daemon
+    /// boundary: a row adopted off a preserved owner during a version handover
+    /// is rebuilt from this view, and an option that did not travel would be an
+    /// option the row silently loses at the next deploy. serde(default) keeps
+    /// back-compat with older snapshots.
+    #[serde(default, skip_serializing_if = "AgentLaunchOptions::is_empty")]
+    pub agent_launch_options: AgentLaunchOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2782,6 +2796,12 @@ pub struct PersistedLiveSession {
     /// handover would silently make the row immortal again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral: Option<String>,
+    /// The row's per-launch model / permission mode. Persisted because a
+    /// delegate row outlives daemons: the command is re-derived on relaunch,
+    /// and a model lost at a handover would silently drop the row back onto the
+    /// user's default (expensive) tier — the exact trap this feature closes.
+    #[serde(default, skip_serializing_if = "AgentLaunchOptions::is_empty")]
+    pub agent_launch_options: AgentLaunchOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2841,6 +2861,20 @@ pub struct ManagedSessionView {
     /// Daemon-authoritative working state — see [`SnapshotSessionView::working`].
     /// `Some(true)` working, `Some(false)` confirmed idle, `None` unknown.
     pub working: Option<bool>,
+    /// What this row's launch asked of its agent CLI: `--model`,
+    /// `--permission-mode`.
+    ///
+    /// **Held on the SESSION, not merely baked into `launch_command`, because
+    /// the command is a point-in-time artifact and this row rebuilds it.**
+    /// `refresh_local_cc_relaunch_launch_command` re-derives a local CC row's
+    /// command from on-disk truth before every relaunch — and it fired 1 ms
+    /// after birth on the first live delegate row, replacing
+    /// `claude --model claude-opus-5 …` with a command that had never heard of
+    /// the model (jojo, 2026-08-06, trace `local_cc_relaunch_command_rebuilt`).
+    /// A launch option that survives only inside a string the daemon rewrites is
+    /// not a launch option. Keeping it here means every rebuild, relaunch and
+    /// restore re-applies the same answer.
+    pub agent_launch_options: AgentLaunchOptions,
 }
 
 /// The one place that decides whether a polled working flag differs from what a
@@ -3741,8 +3775,16 @@ impl YggtermServer {
         }
         let current_id = local_cc_current_session_id(&candidates);
         let cwd = session_metadata_value(session, "Cwd").unwrap_or_else(local_default_cwd);
-        let launch_command =
-            stored_session_launch_command(SessionKind::ClaudeCode, &cwd, &current_id);
+        // The row's per-launch options ride the rebuild. Without this the
+        // rebuild — which fires ~1 ms after a delegate row is born, before its
+        // first launch — silently drops `--model`/`--permission-mode` and the
+        // row runs on the user's default tier (jojo, 2026-08-06).
+        let launch_command = stored_session_launch_command_with_options(
+            SessionKind::ClaudeCode,
+            &cwd,
+            &current_id,
+            &session.agent_launch_options,
+        );
         let changed = session.launch_command != launch_command || session.id != current_id;
         if !changed {
             return false;
@@ -4065,6 +4107,33 @@ impl YggtermServer {
             ephemeral.map(EphemeralDeclaration::encode).as_deref(),
         );
         Ok(true)
+    }
+
+    /// The host a row's WORK runs on, when that is not this one.
+    ///
+    /// ⛔ SAFETY-CRITICAL. A `LiveSsh` row's local PTY is an ssh bridge; the
+    /// agent it was made for runs on the far end. A local tenant walk therefore
+    /// sees an empty PTY and would call it a clearable plate — which on
+    /// 2026-08-06 offered to close a versestore delegate that was five hours into
+    /// its task. Only the host that can SEE the work may judge it, so this is
+    /// what the hygiene verdict consults before anything else.
+    ///
+    /// `None` means local, or means this daemon holds no view of the session at
+    /// all — and an unknown answer keeps the row (rule 4), so both resolve to
+    /// safe.
+    pub fn live_session_remote_work_host(&self, path: &str) -> Option<String> {
+        let (_key, session) = self.resolve_live_session_entry(path)?;
+        match session.source {
+            SessionSource::LiveSsh => {
+                let host = session.host_label.trim();
+                Some(if host.is_empty() {
+                    "another host".to_string()
+                } else {
+                    host.to_string()
+                })
+            }
+            SessionSource::Stored | SessionSource::LiveLocal => None,
+        }
     }
 
     pub fn live_session_creator_stamp(&self, path: &str) -> Option<CreatorStamp> {
@@ -5762,6 +5831,23 @@ impl YggtermServer {
         cwd: Option<&str>,
         title_hint: Option<&str>,
     ) -> anyhow::Result<String> {
+        self.start_remote_claude_session_with_launch_options(
+            target,
+            prefix,
+            cwd,
+            title_hint,
+            &AgentLaunchOptions::default(),
+        )
+    }
+
+    pub fn start_remote_claude_session_with_launch_options(
+        &mut self,
+        target: &str,
+        prefix: Option<&str>,
+        cwd: Option<&str>,
+        title_hint: Option<&str>,
+        launch: &AgentLaunchOptions,
+    ) -> anyhow::Result<String> {
         let ssh_target = canonicalize_ssh_target_alias(target);
         if ssh_target.is_empty() {
             anyhow::bail!("enter an SSH target such as dev, pi@raspberry, or user@ip");
@@ -5828,7 +5914,7 @@ impl YggtermServer {
             prefix.as_deref(),
             &remote_binary,
             &["server", "remote", "start-cc", &uuid, &cwd_display],
-            &claude_extra_args_remote_exports(),
+            &claude_extra_args_remote_exports_with_launch(launch),
         );
         let title = title_hint
             .map(str::trim)
@@ -6834,6 +6920,23 @@ impl YggtermServer {
         cwd: Option<&str>,
         title_hint: Option<&str>,
     ) -> String {
+        self.start_local_session_with_launch_options(
+            kind,
+            cwd,
+            title_hint,
+            &AgentLaunchOptions::default(),
+        )
+    }
+
+    /// Start a local session, pinning the model / permission mode this ONE
+    /// launch asked for (`terminal new --model … --permission-mode …`).
+    pub fn start_local_session_with_launch_options(
+        &mut self,
+        kind: SessionKind,
+        cwd: Option<&str>,
+        title_hint: Option<&str>,
+        launch: &AgentLaunchOptions,
+    ) -> String {
         let uuid = Uuid::new_v4().to_string();
         let key = match kind {
             SessionKind::Codex
@@ -6847,7 +6950,16 @@ impl YggtermServer {
         let title = title_hint.map(ToOwned::to_owned).unwrap_or_else(|| {
             live_session_default_title(kind, target.cwd.as_deref(), &target.label)
         });
-        self.insert_live_session(&key, &uuid, kind, &target, Some(title));
+        self.insert_live_session_with_launch_options(
+            &key,
+            &uuid,
+            kind,
+            &target,
+            Some(title),
+            true,
+            true,
+            launch,
+        );
         key
     }
 
@@ -7375,6 +7487,7 @@ impl YggtermServer {
             restore_reason,
             created_by,
             ephemeral,
+            agent_launch_options,
         } = live;
         let storage_path =
             storage_path.or_else(|| is_local_codex_storage_session_path(&key).then(|| key.clone()));
@@ -7540,6 +7653,10 @@ impl YggtermServer {
                         UPDATE_RESTART_RESTORE_REASON.to_string(),
                     );
                 }
+                // The row's per-launch model / permission mode is restore
+                // truth too: a delegate row outlives daemons, and a model
+                // dropped at a handover puts it back on the default tier.
+                session.agent_launch_options = agent_launch_options.clone();
                 self.sessions.insert(normalized_live_key.clone(), session);
                 self.append_restored_live_session_order(normalized_live_key);
                 return;
@@ -7578,7 +7695,7 @@ impl YggtermServer {
                             .unwrap_or(RemoteDeployState::Planned),
                     )
                 });
-            self.insert_live_session_with_launch(
+            self.insert_live_session_with_launch_options(
                 normalized_live_key,
                 restored_codex_session_id.as_str(),
                 normalized_kind,
@@ -7586,6 +7703,7 @@ impl YggtermServer {
                 Some(resolved_title.clone()),
                 false,
                 false,
+                &agent_launch_options,
             );
             self.append_restored_live_session_order(normalized_live_key);
             if let Some(session) = self.sessions.get_mut(normalized_live_key) {
@@ -7661,7 +7779,7 @@ impl YggtermServer {
             }
             return;
         }
-        self.insert_live_session_with_launch(
+        self.insert_live_session_with_launch_options(
             &key,
             &id,
             normalized_kind,
@@ -7669,6 +7787,7 @@ impl YggtermServer {
             Some(title),
             false,
             false,
+            &agent_launch_options,
         );
         self.append_restored_live_session_order(&key);
         // remote-cc:// twin of the remote_scanned arm above (the scanned-key
@@ -8481,18 +8600,47 @@ impl YggtermServer {
         launch_now: bool,
         activate: bool,
     ) {
-        let mut session = build_live_session(
+        self.insert_live_session_with_launch_options(
+            key,
+            session_id,
+            kind,
+            target,
+            title_override,
+            launch_now,
+            activate,
+            &AgentLaunchOptions::default(),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_live_session_with_launch_options(
+        &mut self,
+        key: &str,
+        session_id: &str,
+        kind: SessionKind,
+        target: &SshConnectTarget,
+        title_override: Option<String>,
+        launch_now: bool,
+        activate: bool,
+        launch: &AgentLaunchOptions,
+    ) {
+        let mut session = build_live_session_with_launch_options(
             session_id,
             kind,
             target,
             self.backend,
             self.theme,
             self.ghostty_host.bridge_enabled,
+            launch,
         );
         if let Some(title_override) = title_override {
             session.title = title_override;
         }
         session.session_path = key.to_string();
+        // Carried on the row, not just in the command string it was born with:
+        // a local CC row re-derives its command before every relaunch, so an
+        // option held only in the string is erased by the first rebuild.
+        session.agent_launch_options = launch.clone();
         // AGENT CLI SESSIONS ARE KEEP-ALIVE AT BIRTH (user decision 2026-07-23).
         // CLAUDE.md's contract: agent CLI sessions are FIRST-CLASS and "persist
         // by default"; a plain shell is second-class and survives only if the
@@ -10782,19 +10930,47 @@ fn remote_ssh_launch_command_with_extra_exports(
 /// Export carrying the CLIENT's configured claude extra args into the remote
 /// resume-cc/start-cc wrapper env (forwarded onward to the host daemon).
 fn claude_extra_args_remote_exports() -> Vec<String> {
+    claude_extra_args_remote_exports_with_launch(&AgentLaunchOptions::default())
+}
+
+/// The same export, composed with ONE launch's model / permission mode.
+///
+/// **Why the remote lane rides this variable instead of a new wire field.** The
+/// remote host's `configured_cli_extra_args` already prefers
+/// `YGGTERM_CC_EXTRA_ARGS` over its own settings when the variable is set, so a
+/// per-launch option composed HERE reaches the remote `claude` invocation
+/// through a path that has been shipping for months — no second launch
+/// encoding, and no dependency on the remote binary being new enough to know
+/// about `--model`. Composition (strip-then-append) happens client-side because
+/// this is the only side that can see both the configured args and the request.
+fn claude_extra_args_remote_exports_with_launch(launch: &AgentLaunchOptions) -> Vec<String> {
     let raw = SessionStore::open_or_init()
         .and_then(|store| store.load_settings())
         .ok()
         .map(|settings| settings.claude_code_extra_args)
         .unwrap_or_default();
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    let configured = codex_cli::split_extra_args(&raw);
+    let tokens = if launch.is_empty() {
+        configured
+    } else {
+        let mut tokens = launch.strip_overridden(SessionKind::ClaudeCode, &configured);
+        // A refusal cannot reach here: `create_terminal_with_tenancy` validates
+        // the options against the kind before the request is sent, and this
+        // lane is Claude Code by construction.
+        tokens.extend(
+            launch
+                .launch_tokens(SessionKind::ClaudeCode)
+                .unwrap_or_default(),
+        );
+        tokens
+    };
+    if tokens.is_empty() {
         return Vec::new();
     }
     vec![format!(
         "export {}={}",
         codex_cli::ENV_YGGTERM_CC_EXTRA_ARGS,
-        shell_single_quote(trimmed)
+        shell_single_quote(&shlex::try_join(tokens.iter().map(String::as_str)).unwrap_or_default())
     )]
 }
 
@@ -20352,10 +20528,13 @@ pub fn run_app_control_create_terminal(
         kind,
         activate,
         None,
+        &AgentLaunchOptions::default(),
+        None,
         timeout_ms,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_app_control_create_terminal_with_tenancy(
     machine_key: Option<&str>,
     cwd: Option<&str>,
@@ -20364,9 +20543,11 @@ pub fn run_app_control_create_terminal_with_tenancy(
     kind: Option<&str>,
     activate: bool,
     tenancy: Option<CreateTerminalTenancy>,
+    launch: &AgentLaunchOptions,
+    prompt: Option<&str>,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
-    let payload = create_terminal_with_tenancy(
+    let mut payload = create_terminal_with_tenancy_and_launch(
         machine_key,
         cwd,
         title_hint,
@@ -20374,10 +20555,77 @@ pub fn run_app_control_create_terminal_with_tenancy(
         kind,
         activate,
         tenancy,
+        launch,
         timeout_ms,
     )?;
+    if let Some(prompt) = prompt {
+        let outcome = deliver_created_terminal_prompt(&payload, prompt, timeout_ms);
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("prompt".to_string(), outcome);
+        }
+    }
     write_stdout_payload(&serde_json::to_string_pretty(&payload)?)?;
     Ok(())
+}
+
+/// How long a freshly spawned agent CLI gets to reach an idle prompt before the
+/// create gives up on delivering `--prompt`.
+///
+/// Matches the automations layer's budget (`PROMPT_READY_TIMEOUT_MS`) because it
+/// is the same wait for the same reason: `claude` and `codex` both do
+/// non-trivial startup work, and a delegate launch has no user watching it.
+const CREATE_PROMPT_READY_TIMEOUT_MS: u64 = 120_000;
+
+/// Deliver the initial prompt into the row the create just made.
+///
+/// ⛔ **No second encoding.** This calls [`submit_terminal_prompt`] — the exact
+/// function `automation run` injects through, which waits for the CLI to
+/// ECHO-CONFIRM it is consuming input and then types the text and the Enter as
+/// two DISTINCT writes. A single write with a trailing `\r` is paste-buffered by
+/// the Claude Code TUI: the text lands in the composer and the newline never
+/// counts as a submit, which is how four steering messages sat unsubmitted on
+/// 2026-08-06 while the sender read `accepted:true`.
+fn deliver_created_terminal_prompt(payload: &Value, prompt: &str, timeout_ms: u64) -> Value {
+    let Some(session_path) = payload
+        .get("data")
+        .and_then(|data| data.get("session_path"))
+        .and_then(Value::as_str)
+    else {
+        return json!({
+            "delivered": false,
+            "error": "the create returned no session path to deliver a prompt to",
+        });
+    };
+    match submit_terminal_prompt(
+        session_path,
+        prompt,
+        CREATE_PROMPT_READY_TIMEOUT_MS,
+        timeout_ms,
+    ) {
+        Ok(response) => {
+            // `submitted:false` is a REAL answer, not an error: the row exists,
+            // the CLI never became ready, and the caller must be able to tell
+            // those apart to decide whether to retry or drive the row by hand.
+            let submitted = response
+                .data
+                .as_ref()
+                .and_then(|data| data.get("submitted"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            json!({
+                "delivered": submitted,
+                "session_path": session_path,
+                "chars": prompt.chars().count(),
+                "detail": response.data,
+                "error": response.error,
+            })
+        }
+        Err(error) => json!({
+            "delivered": false,
+            "session_path": session_path,
+            "error": format!("{error:#}"),
+        }),
+    }
 }
 
 /// The create, RETURNING its payload instead of printing it.
@@ -20397,6 +20645,76 @@ pub fn create_terminal_with_tenancy(
     tenancy: Option<CreateTerminalTenancy>,
     timeout_ms: u64,
 ) -> anyhow::Result<Value> {
+    create_terminal_with_tenancy_and_launch(
+        machine_key,
+        cwd,
+        title_hint,
+        purpose,
+        kind,
+        activate,
+        tenancy,
+        &AgentLaunchOptions::default(),
+        timeout_ms,
+    )
+}
+
+/// **The single validation site for a launch's model / permission mode**, run
+/// before anything is resolved or sent. Answers the parsed session kind.
+///
+/// It refuses rather than letting a request through that the far side would
+/// silently drop the flag from — a create that reported success while the row
+/// ran on the user's default tier is the whole defect this feature closes.
+/// Deliberately BEFORE `resolve_yggterm_home()`: a mistyped flag deserves the
+/// same answer on a machine whose home is broken, and a pure check is one a test
+/// can drive without a daemon.
+fn validate_create_terminal_launch(
+    kind: Option<&str>,
+    machine_key: Option<&str>,
+    launch: &AgentLaunchOptions,
+) -> anyhow::Result<Option<SessionKind>> {
+    let session_kind = kind.map(parse_app_control_session_kind).transpose()?;
+    // An unnamed `--kind` is a shell, which is exactly the case `--model` must
+    // be refused on — so the default is resolved BEFORE the check, not after.
+    let effective_kind = session_kind.unwrap_or(SessionKind::Shell);
+    launch
+        .launch_tokens(effective_kind)
+        .map_err(|message| anyhow::anyhow!(message))?;
+    // ⛔ The one lane that cannot carry these yet, refused BY NAME rather than
+    // dropped. A remote Claude Code start forwards its extra args over ssh in
+    // `YGGTERM_CC_EXTRA_ARGS`, which the remote host already reads; the remote
+    // CODEX start has no equivalent export, so the options would reach the
+    // wire, reach the daemon, and then quietly evaporate at the ssh boundary —
+    // the exact silence this feature exists to end.
+    if !launch.is_empty()
+        && machine_key.is_some_and(|key| !key.trim().is_empty())
+        && matches!(effective_kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
+    {
+        anyhow::bail!(
+            "a REMOTE codex session cannot carry --model / --permission-mode yet: that lane has \
+             no extra-args forwarding to the remote host (claude-code does, via \
+             YGGTERM_CC_EXTRA_ARGS). Launch it locally on that machine, or use \
+             --kind claude-code."
+        );
+    }
+    Ok(session_kind)
+}
+
+/// The create, carrying ONE launch's model / permission mode. Validated by
+/// [`validate_create_terminal_launch`]; both binaries and the automation
+/// executor reach the wire through here, so the refusal cannot be routed around.
+#[allow(clippy::too_many_arguments)]
+pub fn create_terminal_with_tenancy_and_launch(
+    machine_key: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    purpose: Option<&str>,
+    kind: Option<&str>,
+    activate: bool,
+    tenancy: Option<CreateTerminalTenancy>,
+    launch: &AgentLaunchOptions,
+    timeout_ms: u64,
+) -> anyhow::Result<Value> {
+    let session_kind = validate_create_terminal_launch(kind, machine_key, launch)?;
     let home = resolve_yggterm_home()?;
     let response = request_app_control(
         &home,
@@ -20405,8 +20723,9 @@ pub fn create_terminal_with_tenancy(
             cwd: cwd.map(ToOwned::to_owned),
             title_hint: title_hint.map(ToOwned::to_owned),
             purpose: purpose.map(ToOwned::to_owned),
-            session_kind: kind.map(parse_app_control_session_kind).transpose()?,
+            session_kind,
             activate: Some(activate),
+            launch_options: (!launch.is_empty()).then(|| launch.clone()),
         },
         timeout_ms,
     )?;
@@ -23203,6 +23522,7 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
         pty_cols: None,
         pty_rows: None,
         working: session.working,
+        agent_launch_options: session.agent_launch_options,
     }
 }
 
@@ -23315,6 +23635,7 @@ fn snapshot_live_session_view(session: &ManagedSessionView) -> SnapshotSessionVi
         pty_cols: None,
         pty_rows: None,
         working: session.working,
+        agent_launch_options: session.agent_launch_options.clone(),
     }
 }
 
@@ -23507,6 +23828,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
         ssh_prefix: session.ssh_prefix,
         stored_preview_hydrated: true,
         working: session.working,
+        agent_launch_options: session.agent_launch_options,
     }
 }
 
@@ -23880,6 +24202,7 @@ terminal_window_id: None,
         ssh_prefix: None,
         stored_preview_hydrated: should_hydrate_stored_preview,
         working: None,
+        agent_launch_options: AgentLaunchOptions::default(),
     }
 }
 
@@ -23890,6 +24213,33 @@ fn build_live_session(
     backend: TerminalBackend,
     theme: UiTheme,
     ghostty_bridge_enabled: bool,
+) -> ManagedSessionView {
+    build_live_session_with_launch_options(
+        uuid,
+        kind,
+        target,
+        backend,
+        theme,
+        ghostty_bridge_enabled,
+        &AgentLaunchOptions::default(),
+    )
+}
+
+/// [`build_live_session`] with the per-launch model / permission mode this ONE
+/// session asked for.
+///
+/// This is where a delegate's `--model` / `--permission-mode` become real: the
+/// command string built here is the session's `launch_command`, which is what
+/// the PTY runs and what a later restart re-runs. Empty options ⇒ byte-identical
+/// to the pre-flag command, so every human door is unaffected.
+fn build_live_session_with_launch_options(
+    uuid: &str,
+    kind: SessionKind,
+    target: &SshConnectTarget,
+    backend: TerminalBackend,
+    theme: UiTheme,
+    ghostty_bridge_enabled: bool,
+    launch: &AgentLaunchOptions,
 ) -> ManagedSessionView {
     let started_at = format_display_datetime(OffsetDateTime::now_utc());
     let shell_program = local_interactive_shell_program();
@@ -23905,7 +24255,12 @@ fn build_live_session(
                 RemoteDeployState::NotRequired,
             ),
             SessionKind::Codex => (
-                agent_launch_command(SessionKind::Codex, Some(&default_cwd), None),
+                agent_launch_command_with_options(
+                    SessionKind::Codex,
+                    Some(&default_cwd),
+                    None,
+                    launch,
+                ),
                 local_live_runtime_key(uuid),
                 "local-codex".to_string(),
                 default_cwd.clone(),
@@ -23913,7 +24268,12 @@ fn build_live_session(
                 RemoteDeployState::NotRequired,
             ),
             SessionKind::CodexLiteLlm => (
-                agent_launch_command(SessionKind::CodexLiteLlm, Some(&default_cwd), None),
+                agent_launch_command_with_options(
+                    SessionKind::CodexLiteLlm,
+                    Some(&default_cwd),
+                    None,
+                    launch,
+                ),
                 local_live_runtime_key(uuid),
                 "local-codex-litellm".to_string(),
                 default_cwd.clone(),
@@ -23921,7 +24281,7 @@ fn build_live_session(
                 RemoteDeployState::NotRequired,
             ),
             SessionKind::ClaudeCode => (
-                claude_code_fresh_launch_command(Some(&default_cwd), uuid),
+                claude_code_fresh_launch_command_with_options(Some(&default_cwd), uuid, launch),
                 local_live_runtime_key(uuid),
                 "local-claude-code".to_string(),
                 default_cwd.clone(),
@@ -24161,6 +24521,7 @@ fn build_live_session(
         ssh_prefix: target.prefix.clone(),
         stored_preview_hydrated: true,
         working: None,
+        agent_launch_options: AgentLaunchOptions::default(),
     }
 }
 
@@ -24742,15 +25103,31 @@ fn shell_join_extra_args(raw: &str) -> String {
 }
 
 fn agent_launch_command(kind: SessionKind, cwd: Option<&str>, session_id: Option<&str>) -> String {
-    let action = session_id.map(|session_id| ManagedCliAction::Resume {
-        session_id,
-        persistent: false,
+    agent_launch_command_with_options(kind, cwd, session_id, &AgentLaunchOptions::default())
+}
+
+/// [`agent_launch_command`] carrying ONE launch's model / permission mode.
+///
+/// ⚠ The legacy fallback deliberately does NOT carry the options: it exists for
+/// a host where the managed-CLI layout cannot be resolved at all, and a command
+/// that silently ran on the wrong model would be worse than one that visibly
+/// lacks the flags. In practice the fallback is unreachable on a provisioned
+/// host, and `composed_cli_extra_args` refuses (rather than drops) a bad option
+/// before we ever get here.
+fn agent_launch_command_with_options(
+    kind: SessionKind,
+    cwd: Option<&str>,
+    session_id: Option<&str>,
+    launch: &AgentLaunchOptions,
+) -> String {
+    let action = session_id.map_or(ManagedCliAction::Launch, |session_id| {
+        ManagedCliAction::Resume {
+            session_id,
+            persistent: false,
+        }
     });
-    let managed = match action {
-        Some(action) => managed_cli_shell_command(kind, cwd, action),
-        None => managed_cli_shell_command(kind, cwd, ManagedCliAction::Launch),
-    };
-    managed.unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, session_id))
+    managed_cli_shell_command_full(kind, cwd, action, None, launch)
+        .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, session_id))
 }
 
 /// A FRESH Claude Code session must be BORN with its identity: launch
@@ -24765,9 +25142,17 @@ fn agent_launch_command(kind: SessionKind, cwd: Option<&str>, session_id: Option
 /// flag and the minimum needed for handoff identity, so it satisfies the
 /// wrapper-vs-manual parity rule.
 fn claude_code_fresh_launch_command(cwd: Option<&str>, session_id: &str) -> String {
+    claude_code_fresh_launch_command_with_options(cwd, session_id, &AgentLaunchOptions::default())
+}
+
+fn claude_code_fresh_launch_command_with_options(
+    cwd: Option<&str>,
+    session_id: &str,
+    launch: &AgentLaunchOptions,
+) -> String {
     format!(
         "{} --session-id {}",
-        agent_launch_command(SessionKind::ClaudeCode, cwd, None),
+        agent_launch_command_with_options(SessionKind::ClaudeCode, cwd, None, launch),
         shell_single_quote(session_id)
     )
 }
@@ -24870,22 +25255,45 @@ fn stored_session_launch_command_for_locality(
     session_id: &str,
     is_local: bool,
 ) -> String {
+    stored_session_launch_command_for_locality_with_options(
+        kind,
+        cwd,
+        session_id,
+        is_local,
+        &AgentLaunchOptions::default(),
+    )
+}
+
+/// [`stored_session_launch_command_for_locality`] carrying the ROW's per-launch
+/// options, so a re-derived command says what the row was launched with.
+fn stored_session_launch_command_for_locality_with_options(
+    kind: SessionKind,
+    cwd: &str,
+    session_id: &str,
+    is_local: bool,
+    launch: &AgentLaunchOptions,
+) -> String {
     match kind {
         SessionKind::Codex | SessionKind::CodexLiteLlm => {
-            agent_launch_command(kind, Some(cwd), Some(session_id))
+            agent_launch_command_with_options(kind, Some(cwd), Some(session_id), launch)
         }
         SessionKind::ClaudeCode if is_local => match local_cc_resume_cwd(session_id) {
             // Resume in the cwd the TRANSCRIPT records, never the row's cwd: CC keys its
             // project dir on the process cwd, and a relaunch path can hand us a row whose
             // cwd has been defaulted to $HOME — which makes CC search the wrong project
             // dir and refuse a session that is sitting right there.
-            Some(transcript_cwd) => {
-                agent_launch_command(kind, Some(&transcript_cwd), Some(session_id))
-            }
+            Some(transcript_cwd) => agent_launch_command_with_options(
+                kind,
+                Some(&transcript_cwd),
+                Some(session_id),
+                launch,
+            ),
             // No transcript: nothing to resume. Re-birth the row with its own id.
-            None => claude_code_fresh_launch_command(Some(cwd), session_id),
+            None => claude_code_fresh_launch_command_with_options(Some(cwd), session_id, launch),
         },
-        SessionKind::ClaudeCode => agent_launch_command(kind, Some(cwd), Some(session_id)),
+        SessionKind::ClaudeCode => {
+            agent_launch_command_with_options(kind, Some(cwd), Some(session_id), launch)
+        }
         SessionKind::Document => "document web view".to_string(),
         SessionKind::Shell | SessionKind::SshShell => format!(
             "cd {} && codex resume {}",
@@ -24893,6 +25301,16 @@ fn stored_session_launch_command_for_locality(
             session_id
         ),
     }
+}
+
+/// [`stored_session_launch_command`] carrying the row's per-launch options.
+fn stored_session_launch_command_with_options(
+    kind: SessionKind,
+    cwd: &str,
+    session_id: &str,
+    launch: &AgentLaunchOptions,
+) -> String {
+    stored_session_launch_command_for_locality_with_options(kind, cwd, session_id, true, launch)
 }
 
 /// Launch command for a stored session whose row lives on THIS machine.
@@ -25294,6 +25712,7 @@ mod recipe_tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: AgentLaunchOptions::default(),
         }
     }
 
@@ -25825,6 +26244,7 @@ mod tests {
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         };
         assert!(
             super::persisted_live_session_is_recoverable(&cc),
@@ -25894,7 +26314,7 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
-    use yggterm_core::{SessionNodeKind, SessionTitleStore, TranscriptRole};
+    use yggterm_core::{AgentLaunchOptions, SessionNodeKind, SessionTitleStore, TranscriptRole};
 
     static CODEX_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -25905,6 +26325,156 @@ mod tests {
     // what made `agent_arm_matrix::locality_does_not_fork_the_invocation` report
     // a locality fork that did not exist.
     use crate::codex_cli::env_test_guard as terminal_identity_test_guard;
+
+    // ---- delegate launch: the create-side refusals ------------------------
+    //
+    // These run BEFORE any home/daemon resolution by construction, so they are
+    // a pure statement about the contract rather than about this machine.
+
+    fn opus() -> AgentLaunchOptions {
+        AgentLaunchOptions {
+            model: Some("claude-opus-5".to_string()),
+            permission_mode: Some(yggterm_core::AgentPermissionMode::Bypass),
+        }
+    }
+
+    /// ⛔ THE REGRESSION THIS FEATURE ALREADY HAD ONCE, live on jojo
+    /// 2026-08-06: the first delegate row launched with
+    /// `--model claude-opus-5 --permission-mode bypass` ran on the user's
+    /// DEFAULT model. The wire was fine — the daemon's own
+    /// `start_local_session_request` trace shows both options arriving — but
+    /// `refresh_local_cc_relaunch_launch_command` re-derived the command from
+    /// on-disk truth 1 ms after birth (trace `local_cc_relaunch_command_rebuilt`)
+    /// and rebuilt it through an options-free builder.
+    ///
+    /// The lesson is structural, so the lock is: a launch option held only
+    /// inside `launch_command` is not held at all, because this row REBUILDS
+    /// that string. The option lives on the session and every rebuild must
+    /// consult it. Scanned over the product half of the file so this test's own
+    /// text cannot satisfy it (field guide §7.1).
+    #[test]
+    fn a_local_cc_relaunch_rebuild_carries_the_rows_launch_options() {
+        let source = yggterm_core::agent_cli::product_lines(include_str!("lib.rs"))
+            .into_iter()
+            .map(|(_index, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rebuild = source
+            .split("pub fn refresh_local_cc_relaunch_launch_command(")
+            .nth(1)
+            .expect("the relaunch rebuild")
+            .split("\n    /// ")
+            .next()
+            .expect("the end of the rebuild");
+        assert!(
+            rebuild.contains("session.agent_launch_options"),
+            "the rebuild must read the ROW's launch options; without them it \
+             silently downgrades a delegate to the user's default model"
+        );
+        assert!(
+            !rebuild.contains("stored_session_launch_command(SessionKind::ClaudeCode"),
+            "the options-free builder is what dropped --model in the first place"
+        );
+    }
+
+    /// The row is where the options live, so they must survive the two
+    /// boundaries a delegate row actually crosses: a persist/restore cycle, and
+    /// an adoption off a preserved owner during a version handover. Both are
+    /// how a deploy would otherwise put the row back on the default tier.
+    #[test]
+    fn a_rows_launch_options_survive_persist_and_snapshot() {
+        let options = AgentLaunchOptions {
+            model: Some("claude-opus-5".to_string()),
+            permission_mode: Some(yggterm_core::AgentPermissionMode::Bypass),
+        };
+        let persisted = crate::PersistedLiveSession {
+            key: "local://abc".to_string(),
+            id: "abc".to_string(),
+            title: "delegate".to_string(),
+            kind: SessionKind::ClaudeCode,
+            keep_alive: true,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/home/user/gh/yggterm".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: None,
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: options.clone(),
+        };
+        let round_tripped: crate::PersistedLiveSession =
+            serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
+        assert_eq!(round_tripped.agent_launch_options, options);
+
+        // An older daemon's state file has no such field, and must still load.
+        let legacy: crate::PersistedLiveSession = serde_json::from_str(
+            r#"{"key":"local://abc","id":"abc","title":"t","kind":"claude_code",
+                "ssh_target":"localhost","prefix":null,"cwd":null}"#,
+        )
+        .expect("a state file from before this field must still restore");
+        assert!(legacy.agent_launch_options.is_empty());
+    }
+
+    #[test]
+    fn a_create_refuses_a_model_on_a_shell_kind() {
+        let error = crate::validate_create_terminal_launch(Some("shell"), None, &opus())
+            .expect_err("--model on --kind shell must refuse");
+        assert!(format!("{error:#}").contains("--model"), "{error:#}");
+    }
+
+    // The DEFAULT kind is a shell, so an omitted --kind must refuse too — this
+    // is the arm a caller hits by forgetting --kind, and it must not silently
+    // open a shell that quietly ignored the model it was given.
+    #[test]
+    fn a_create_refuses_a_model_when_no_kind_was_named() {
+        let error = crate::validate_create_terminal_launch(None, None, &opus())
+            .expect_err("an omitted --kind defaults to shell and must refuse");
+        assert!(format!("{error:#}").contains("--model"), "{error:#}");
+    }
+
+    #[test]
+    fn a_create_accepts_the_options_on_agent_kinds() {
+        for kind in ["claude-code", "codex"] {
+            crate::validate_create_terminal_launch(
+                Some(kind),
+                None,
+                &AgentLaunchOptions {
+                    model: Some("claude-opus-5".to_string()),
+                    permission_mode: Some(yggterm_core::AgentPermissionMode::Bypass),
+                },
+            )
+            .unwrap_or_else(|error| panic!("{kind} must accept a delegate launch: {error:#}"));
+        }
+    }
+
+    // Every kind must still create with NO options — the flags are additive and
+    // must not have narrowed what `terminal new` could already do.
+    #[test]
+    fn a_create_with_no_options_is_unchanged_on_every_kind() {
+        for kind in [None, Some("shell"), Some("codex"), Some("claude-code")] {
+            crate::validate_create_terminal_launch(kind, Some("dev"), &AgentLaunchOptions::default())
+                .unwrap_or_else(|error| panic!("{kind:?} must still create: {error:#}"));
+        }
+    }
+
+    // ⛔ The lane with no forwarding refuses BY NAME. Silently dropping it here
+    // would be the same defect one layer down: the flag reaches the daemon and
+    // evaporates at the ssh boundary.
+    #[test]
+    fn a_remote_codex_create_refuses_the_options_it_cannot_carry() {
+        let error = crate::validate_create_terminal_launch(Some("codex"), Some("dev"), &opus())
+            .expect_err("remote codex has no extra-args forwarding");
+        let error = format!("{error:#}");
+        assert!(error.contains("REMOTE codex"), "{error}");
+        assert!(
+            error.contains("claude-code"),
+            "the refusal must name the lane that DOES work: {error}"
+        );
+        // …and the same options on the lane that CAN carry them are accepted.
+        crate::validate_create_terminal_launch(Some("claude-code"), Some("dev"), &opus())
+            .expect("remote claude-code forwards via YGGTERM_CC_EXTRA_ARGS");
+    }
 
     #[test]
     fn default_screenshot_post_process_is_a_noop() {
@@ -26804,6 +27374,7 @@ mod tests {
             pty_cols: None,
             pty_rows: None,
             working: None,
+            agent_launch_options: AgentLaunchOptions::default(),
         }
     }
 
@@ -29041,6 +29612,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                agent_launch_options: AgentLaunchOptions::default(),
             },
         );
 
@@ -29144,6 +29716,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: AgentLaunchOptions::default(),
         };
         let inactive = ManagedSessionView {
             id: "inactive".to_string(),
@@ -29196,6 +29769,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: AgentLaunchOptions::default(),
         };
         server.active_session_path = Some(active.session_path.clone());
         server.live_session_order =
@@ -29997,6 +30571,7 @@ terminal_window_id: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: AgentLaunchOptions::default(),
         };
 
         let wrong_runtime = b"https://llm.example.com/v1/chat/completions with auth Bearer sk-1234.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\xe2\x80\xba Improve documentation in @filename\n\n  gpt-5.4 high fast \xc2\xb7 100% left \xc2\xb7 ~\n";
@@ -32596,6 +33171,7 @@ terminal_window_id: None,
             pty_cols: None,
             pty_rows: None,
             working: None,
+            agent_launch_options: AgentLaunchOptions::default(),
         });
 
         assert_eq!(
@@ -32908,6 +33484,7 @@ terminal_window_id: None,
                     restore_reason: None,
                     created_by: None,
                     ephemeral: None,
+                    agent_launch_options: Default::default(),
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -32969,6 +33546,7 @@ terminal_window_id: None,
                     restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
                     created_by: None,
                     ephemeral: None,
+                    agent_launch_options: Default::default(),
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -33058,6 +33636,7 @@ terminal_window_id: None,
                     restore_reason: None,
                     created_by: None,
                     ephemeral: None,
+                    agent_launch_options: Default::default(),
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -33151,6 +33730,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         let local_shell = server.start_local_session(
             SessionKind::Shell,
@@ -33319,6 +33899,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         assert!(server.represents_terminal_runtime_key(&kept_remote));
         assert!(
@@ -33408,6 +33989,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         };
 
         // Our own rows, in the user's arrangement.
@@ -33477,6 +34059,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         };
         server.restore_live_session(row("mine"));
 
@@ -33818,6 +34401,7 @@ terminal_window_id: None,
             restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         let session = server
@@ -33944,6 +34528,7 @@ terminal_window_id: None,
                     restore_reason: None,
                     created_by: None,
                     ephemeral: None,
+                    agent_launch_options: Default::default(),
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -33995,6 +34580,7 @@ terminal_window_id: None,
                     restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
                     created_by: None,
                     ephemeral: None,
+                    agent_launch_options: Default::default(),
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -34054,6 +34640,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         };
 
         assert!(
@@ -34165,6 +34752,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         server.open_or_focus_session(
             SessionKind::ClaudeCode,
@@ -34376,6 +34964,13 @@ terminal_window_id: None,
     /// rather than re-deriving it. Deleting either arm because "the shape
     /// changed" would retire the lock, which is the one thing a contract change
     /// may never do.
+    ///
+    /// ⚠ REWRITTEN AGAIN, same rule, when the delegate-launch options
+    /// (`--model` / `--permission-mode`) needed a create that carries them: the
+    /// core's BODY moved to `create_terminal_with_tenancy_and_launch` and the
+    /// old name became a defaults-only delegator. So the scan follows the body
+    /// to its new home rather than retiring; every assertion below is the one
+    /// that was there before.
     #[test]
     fn the_create_runner_stamps_the_row_and_reports_the_row_either_way() {
         let source = yggterm_core::agent_cli::product_lines(include_str!("lib.rs"))
@@ -34384,7 +34979,7 @@ terminal_window_id: None,
             .collect::<Vec<_>>()
             .join("\n");
         let core = source
-            .split("pub fn create_terminal_with_tenancy(")
+            .split("pub fn create_terminal_with_tenancy_and_launch(")
             .nth(1)
             .expect("the create core")
             .split("\n/// ")
@@ -34420,7 +35015,7 @@ terminal_window_id: None,
             .next()
             .expect("the end of the runner");
         assert!(
-            wrapper.contains("create_terminal_with_tenancy("),
+            wrapper.contains("create_terminal_with_tenancy_and_launch("),
             "the printing wrapper must delegate to the one create, never re-implement it"
         );
         assert!(
@@ -34504,6 +35099,7 @@ terminal_window_id: None,
                         restore_reason: None,
                         created_by: None,
                         ephemeral: None,
+                        agent_launch_options: Default::default(),
                     },
                     PersistedLiveSession {
                         key: "local://update-shell".to_string(),
@@ -34519,6 +35115,7 @@ terminal_window_id: None,
                         restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
                         created_by: None,
                         ephemeral: None,
+                        agent_launch_options: Default::default(),
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -34580,6 +35177,7 @@ terminal_window_id: None,
                         restore_reason: None,
                         created_by: None,
                         ephemeral: None,
+                        agent_launch_options: Default::default(),
                     },
                     PersistedLiveSession {
                         key: "codex-runtime://dead-codex".to_string(),
@@ -34595,6 +35193,7 @@ terminal_window_id: None,
                         restore_reason: None,
                         created_by: None,
                         ephemeral: None,
+                        agent_launch_options: Default::default(),
                     },
                     PersistedLiveSession {
                         key: "document::dead-doc".to_string(),
@@ -34610,6 +35209,7 @@ terminal_window_id: None,
                         restore_reason: None,
                         created_by: None,
                         ephemeral: None,
+                        agent_launch_options: Default::default(),
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -34683,6 +35283,7 @@ terminal_window_id: None,
                         restore_reason: None,
                         created_by: None,
                         ephemeral: None,
+                        agent_launch_options: Default::default(),
                     },
                     PersistedLiveSession {
                         key: "local::second-shell".to_string(),
@@ -34698,6 +35299,7 @@ terminal_window_id: None,
                         restore_reason: None,
                         created_by: None,
                         ephemeral: None,
+                        agent_launch_options: Default::default(),
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -34825,6 +35427,7 @@ terminal_window_id: None,
                         restore_reason: None,
                         created_by: None,
                         ephemeral: None,
+                        agent_launch_options: Default::default(),
                     },
                     PersistedLiveSession {
                         key: second_path.clone(),
@@ -34840,6 +35443,7 @@ terminal_window_id: None,
                         restore_reason: None,
                         created_by: None,
                         ephemeral: None,
+                        agent_launch_options: Default::default(),
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -34992,6 +35596,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         assert!(!server.sessions.contains_key(storage_path));
@@ -35046,6 +35651,7 @@ terminal_window_id: None,
             restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         let live = server
@@ -35114,6 +35720,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         let session = server.sessions.get(key).expect("restored remote cc row");
@@ -35176,6 +35783,7 @@ terminal_window_id: None,
             restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         server.request_terminal_launch_for_path(runtime_key);
 
@@ -35280,6 +35888,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         server.request_terminal_launch_for_path(&runtime_key);
 
@@ -35404,6 +36013,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         assert!(server.apply_codex_runtime_identity_to_live_session(
@@ -35565,6 +36175,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         assert!(server.apply_codex_runtime_identity_to_live_session(
             &runtime_key,
@@ -35645,6 +36256,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         assert!(
@@ -35749,6 +36361,7 @@ terminal_window_id: None,
             restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         server.request_terminal_launch_for_path(runtime_key);
 
@@ -35898,6 +36511,7 @@ terminal_window_id: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: false,
                 working: None,
+                agent_launch_options: AgentLaunchOptions::default(),
             },
         );
         server.live_session_order = vec![stale_path.to_string()];
@@ -35997,6 +36611,7 @@ terminal_window_id: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: AgentLaunchOptions::default(),
         };
 
         // The producers the daemon actually uses, for the very same session.
@@ -36113,6 +36728,7 @@ terminal_window_id: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: AgentLaunchOptions::default(),
         };
 
         let tree = SessionNode {
@@ -36488,6 +37104,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         let session = server
@@ -36559,6 +37176,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         let session = server
@@ -36856,6 +37474,7 @@ terminal_window_id: None,
                 restore_reason: None,
                 created_by: None,
                 ephemeral: None,
+                agent_launch_options: Default::default(),
             });
 
             let session = server
@@ -36959,6 +37578,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         let session = server
@@ -37051,6 +37671,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         let session = server
@@ -37178,6 +37799,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         server.active_session_path = Some("remote-session://dev/fresh-codex".to_string());
         server.active_view_mode = WorkspaceViewMode::Terminal;
@@ -37249,6 +37871,7 @@ terminal_window_id: None,
             restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         server.active_session_path = Some("remote-session://dev/synthetic-runtime".to_string());
         server.active_view_mode = WorkspaceViewMode::Terminal;
@@ -37331,6 +37954,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         assert_eq!(
@@ -37417,6 +38041,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         server.restore_live_session(PersistedLiveSession {
             key: "remote-session://jojo/live-2".to_string(),
@@ -37432,6 +38057,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         let targets = server.remote_shutdown_targets();
@@ -37507,6 +38133,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         let (machine, session_id) = server
@@ -37876,6 +38503,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         let result = server.refresh_session_preview_from_source("remote-session://dev/abc123");
@@ -37917,6 +38545,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         server.active_session_path = Some(path.to_string());
@@ -37962,6 +38591,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
         server.restore_live_session(PersistedLiveSession {
             key: "local://shell".to_string(),
@@ -37977,6 +38607,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         // No session with an interactive prompt may be stopped by typing into
@@ -38020,6 +38651,7 @@ terminal_window_id: None,
             restore_reason: None,
             created_by: None,
             ephemeral: None,
+            agent_launch_options: Default::default(),
         });
 
         assert!(

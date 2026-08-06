@@ -255,7 +255,72 @@ mod tests {
         report.unavailable_reason = None;
         report.unavailable_detail = None;
         report.hygiene = Some(hygiene);
+        // Fixtures represent a daemon that DID check, unless a test says
+        // otherwise — the unvouched case is exercised explicitly.
+        report.locality_checked = true;
         report
+    }
+
+    /// ⛔⛔ THE NEAR MISS, 2026-08-06. The first real user ran this on jojo and
+    /// it offered to CLOSE `live::c8a19e07` — a versestore lobe delegate five
+    /// hours into its task, whose transcript had been written sixty seconds
+    /// earlier. The row was created with `--machine-key dev`: registered on
+    /// jojo, but the `claude` child lives on dev, so the local walk saw a PTY
+    /// with no children and called it an empty plate.
+    ///
+    /// Rule 2 already forbade this. The rule was right; the classifier never
+    /// asked where the work runs. It asks now, and an empty-looking bridge is
+    /// UNMEASURABLE rather than clearable.
+    #[test]
+    fn a_row_whose_agent_runs_on_another_host_is_never_clearable() {
+        let mut bridge = report(
+            "live::c8a19e07",
+            RowHygieneVerdict::EmptyPlate {
+                idle_secs: Some(11_160),
+            },
+        );
+        bridge.work_runs_on = Some("dev".to_string());
+        // The verdict itself must refuse it...
+        let verdict = crate::session_tenancy::row_hygiene_verdict(&bridge);
+        assert!(
+            matches!(verdict, RowHygieneVerdict::Unmeasurable { .. }),
+            "a LiveSsh row's empty PTY is an ssh bridge, not an idle plate: {verdict:?}"
+        );
+
+        // ...and the sweep must refuse to act even if a stale record exists.
+        bridge.hygiene = Some(verdict);
+        let banked = SweepRecord {
+            session_path: "live::c8a19e07".to_string(),
+            first_seen_clearable_ms: NOW - STAGE_TWO_GRACE_SECS * 5 * 1_000,
+        };
+        let (decisions, next) = plan_sweep(&[bridge], &[banked], NOW, false);
+        assert_eq!(
+            decisions[0].action,
+            SweepAction::Keep,
+            "this is the decision that would have killed a working delegate"
+        );
+        assert!(next.is_empty(), "and its banked grace must be dropped");
+    }
+
+    /// The second line of defence, because the classifier fix lives in the
+    /// DAEMON and an older one answers for its own rows without the field.
+    #[test]
+    fn apply_refuses_a_row_whose_locality_was_never_established() {
+        // An old daemon's answer: measurable-looking, no locality field.
+        let mut legacy = report(
+            "live::from-an-old-daemon",
+            RowHygieneVerdict::EmptyPlate {
+                idle_secs: Some(9_000),
+            },
+        );
+        legacy.locality_checked = false;
+        let (decisions, _) = plan_sweep(&[legacy.clone()], &[], NOW, false);
+        assert_eq!(decisions[0].action, SweepAction::Record);
+        assert_eq!(
+            unvouched_rows(&[legacy], &decisions).len(),
+            1,
+            "a row nobody vouched for must block --apply, not be swept on trust"
+        );
     }
 
     /// RULE 1. The user's rows are not this policy's business, at any age.
@@ -449,6 +514,29 @@ pub fn save_sweep_records(home_dir: &std::path::Path, records: &[SweepRecord]) {
     } else {
         let _ = std::fs::remove_file(&temp);
     }
+}
+
+/// Rows that would be acted on but whose locality this daemon could not
+/// establish — the second line of defence behind the classifier.
+///
+/// ⛔ The classifier now refuses a row whose work runs elsewhere, but that fix
+/// lives in the DAEMON, and on a version-coexisting fleet an older daemon
+/// answers for its own rows without the field. Trusting a single layer here
+/// costs a live agent session, so `--apply` refuses outright rather than acting
+/// on a table it cannot fully vouch for.
+pub fn unvouched_rows(reports: &[RowTenantReport], decisions: &[RowSweepDecision]) -> Vec<String> {
+    decisions
+        .iter()
+        .filter(|decision| matches!(decision.action, SweepAction::Record | SweepAction::Close))
+        .filter(|decision| {
+            reports
+                .iter()
+                .find(|report| report.session_path == decision.session_path)
+                .map(|report| !report.locality_checked || report.work_runs_on.is_some())
+                .unwrap_or(true)
+        })
+        .map(|decision| decision.session_path.clone())
+        .collect()
 }
 
 /// Print the table the way a person asks about it.

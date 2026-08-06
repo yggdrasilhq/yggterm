@@ -621,6 +621,32 @@ pub struct RowTenantReport {
     /// `None` only in a report nobody classified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hygiene: Option<RowHygieneVerdict>,
+    /// The host the row's WORK actually runs on, when that is not this one.
+    ///
+    /// ⛔ SAFETY-CRITICAL, and the reason is a near miss on 2026-08-06. A row
+    /// created with `terminal new --machine-key dev` is registered HERE, but
+    /// its local PTY is only an ssh bridge — the `claude` child lives on dev.
+    /// The local walk therefore sees a PTY with no children and calls it an
+    /// EMPTY PLATE, which is how the sanity report offered to close a working
+    /// versestore delegate that had written its transcript sixty seconds earlier.
+    ///
+    /// Rule 2 of `docs/agent-row-hygiene.md` already forbade exactly this
+    /// ("locally a remote row is an ssh bridge, so nothing-is-running is
+    /// meaningless") — the rule was right and the classifier simply never
+    /// asked. It asks now, and `None` means "this daemon could not establish
+    /// where the work runs", which per rule 4 keeps the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_runs_on: Option<String>,
+    /// Did the daemon that produced this report ASK where the work runs?
+    ///
+    /// ⛔ `work_runs_on: None` is ambiguous on its own — it means "local" from a
+    /// daemon that checked, and "nobody looked" from one that predates the
+    /// check. On a version-coexisting fleet both arrive in the same table, and
+    /// treating the second as the first is precisely how a live delegate gets
+    /// swept. Defaults to FALSE so an older daemon's answer is never mistaken
+    /// for a vouched one.
+    #[serde(default)]
+    pub locality_checked: bool,
 }
 
 impl RowTenantReport {
@@ -646,6 +672,8 @@ impl RowTenantReport {
             ephemeral: None,
             idle_secs: None,
             hygiene: None,
+            work_runs_on: None,
+            locality_checked: false,
         }
     }
 }
@@ -736,6 +764,15 @@ pub fn row_hygiene_verdict(report: &RowTenantReport) -> RowHygieneVerdict {
     if let Some(reason) = report.unavailable_reason.as_deref() {
         return RowHygieneVerdict::Unmeasurable {
             reason: reason.to_string(),
+        };
+    }
+    // ⛔ BEFORE anything else that could call this row empty: if the work runs
+    // on another host, a local reading of "nothing is running" describes an ssh
+    // bridge, not the agent. This is rule 2, and its absence nearly closed a
+    // live delegate mid-task.
+    if let Some(host) = report.work_runs_on.as_deref() {
+        return RowHygieneVerdict::Unmeasurable {
+            reason: format!("work runs on {host} — only that host may judge it"),
         };
     }
     if report.created_by.is_none() {
@@ -830,6 +867,8 @@ pub fn row_tenant_report(
         ephemeral: None,
         idle_secs: None,
         hygiene: None,
+        work_runs_on: None,
+        locality_checked: false,
     }
 }
 
