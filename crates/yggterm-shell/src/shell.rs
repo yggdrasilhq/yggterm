@@ -15821,6 +15821,12 @@ fn tone_wire_word(tone: NotificationTone) -> &'static str {
     }
 }
 
+/// How many notifications the panel keeps before the oldest fall off.
+///
+/// User-set 2026-08-06 (raised from 1000): the panel is the history of what the
+/// fleet did, and a complex multi-agent run reports itself through it.
+const NOTIFICATION_HISTORY_LIMIT: usize = 2000;
+
 /// Per-notification overrides for the one fan-out. Defaults reproduce exactly what
 /// every existing caller got before the control plane could raise one.
 ///
@@ -28452,9 +28458,27 @@ impl ShellState {
         }
         rows
     }
+    /// Forget a notification entirely. This is what the PANEL's X means.
     fn clear_notification(&mut self, id: u64) {
         self.notifications
             .retain(|notification| notification.id != id);
+    }
+    /// Stop showing a notification's floating toast. It STAYS in the panel.
+    ///
+    /// ⛔ This is not `clear_notification`, and the difference is the whole
+    /// point. The X on a toast means "stop covering my screen"; the X in the
+    /// panel means "forget this happened". They were the same call until
+    /// 2026-08-06, when the user dismissed an agent's completion popup and lost
+    /// the report with it — on a multi-agent setup, notifications ARE the
+    /// reporting channel, so a dismissal that deletes is data loss.
+    fn dismiss_toast(&mut self, id: u64) {
+        if let Some(notification) = self
+            .notifications
+            .iter_mut()
+            .find(|notification| notification.id == id)
+        {
+            notification.toast_dismissed = true;
+        }
     }
     fn clear_job_notification(&mut self, job_key: &str) {
         self.notifications
@@ -29572,6 +29596,7 @@ impl ShellState {
                     progress: None,
                     persistent: options.persistent,
                     source: options.source.clone(),
+                    toast_dismissed: false,
                 });
                 self.next_notification_id += 1;
             }
@@ -29582,8 +29607,11 @@ impl ShellState {
         if self.settings.notification_sound && !options.silent {
             emit_notification_chime(tone);
         }
-        if self.notifications.len() > 1000 {
-            let overflow = self.notifications.len() - 1000;
+        // 2000, user-set 2026-08-06. The panel is a HISTORY now, not a
+        // spillway: notifications are how a multi-agent run reports itself, and
+        // a run can easily be a few hundred.
+        if self.notifications.len() > NOTIFICATION_HISTORY_LIMIT {
+            let overflow = self.notifications.len() - NOTIFICATION_HISTORY_LIMIT;
             self.notifications.drain(0..overflow);
         }
     }
@@ -29642,6 +29670,10 @@ impl ShellState {
                     progress: progress.map(|value| value.clamp(0.0, 1.0)),
                     persistent: true,
                     source: source.clone(),
+                    // A job that reports again after its toast was dismissed
+                    // stays dismissed — the upsert below never resurrects the
+                    // popup, it updates the record the panel holds.
+                    toast_dismissed: false,
                 });
                 self.next_notification_id += 1;
                 created = true;
@@ -29650,8 +29682,11 @@ impl ShellState {
         if emit_system && created && self.settings.system_notifications {
             emit_system_notification(&title, &message);
         }
-        if self.notifications.len() > 1000 {
-            let overflow = self.notifications.len() - 1000;
+        // 2000, user-set 2026-08-06. The panel is a HISTORY now, not a
+        // spillway: notifications are how a multi-agent run reports itself, and
+        // a run can easily be a few hundred.
+        if self.notifications.len() > NOTIFICATION_HISTORY_LIMIT {
+            let overflow = self.notifications.len() - NOTIFICATION_HISTORY_LIMIT;
             self.notifications.drain(0..overflow);
         }
     }
@@ -37784,6 +37819,40 @@ fn spawn_open_session_row_with_mode_retry_inner(
         maybe_spawn_missing_remote_machine_refreshes(state);
     });
 }
+/// How a notification's source session should be SPELLED in the panel footer.
+///
+/// Resolved at render time from the live rows, never stored on the notification
+/// — a row's title changes (a generated one routinely does), and a name copied
+/// when the notification was raised would then disagree with the row its click
+/// takes you to. The path is the identity; this is only today's spelling.
+///
+/// A path with no row left (the session was closed while the notification sat
+/// in history) yields `None` rather than a stale name or a raw UUID: the card
+/// still says WHEN, and stays honest about no longer knowing WHERE.
+fn session_display_label(snapshot: &SharedSnapshot, session_path: &str) -> Option<String> {
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.full_path == session_path)?;
+    let title = row
+        .session_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| row.label.trim());
+    if title.is_empty() {
+        return None;
+    }
+    // The host earns its space only when there is more than one machine in
+    // play; on a single-host row it is noise in a 10px line.
+    let host = row.host_label.trim();
+    if host.is_empty() {
+        Some(title.to_string())
+    } else {
+        Some(format!("{host} · {title}"))
+    }
+}
+
 /// A notification's card was pressed: go to the session it is about.
 ///
 /// ⛔ Routed through `resolve_app_control_row` + `spawn_open_session_row`, the
@@ -82258,7 +82327,11 @@ fn app() -> Element {
                         max_age_ms: TOAST_VIEWPORT_MAX_AGE_MS,
                         max_visible: TOAST_VIEWPORT_MAX_VISIBLE,
                         now_ms: current_millis(),
-                        on_clear: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
+                        // ⛔ DISMISS, not clear. The X on a toast means "stop
+                        // covering my screen"; the panel keeps the record. These
+                        // were the same call until the user lost an agent's
+                        // completion notice by closing its popup.
+                        on_clear: move |id: u64| state.with_mut(|shell| shell.dismiss_toast(id)),
                         on_activate: move |session_path: String| {
                             spawn_open_session_from_notification(state, session_path)
                         },
@@ -124141,6 +124214,16 @@ fn NotificationsRailBody(
                         on_activate: move |session_path: String| {
                             on_activate_notification.call(session_path)
                         },
+                        // The panel is where notifications are KEPT and read
+                        // later, so this is where "when" and "which session"
+                        // earn their space. The floating toast gets neither: it
+                        // is its own timestamp.
+                        meta: true,
+                        now_ms: current_millis(),
+                        source_label: notification
+                            .source
+                            .as_deref()
+                            .and_then(|path| session_display_label(&snapshot, path)),
                     }
                 }
             }
@@ -163628,6 +163711,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             progress: None,
             persistent: true,
             source: None,
+            toast_dismissed: false,
         });
         assert!(
             !shell.terminal_session_ready_for_daemon_retained_replay(active_session_path),

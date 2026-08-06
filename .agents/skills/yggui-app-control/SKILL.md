@@ -49,19 +49,57 @@ This skill is an agent's "human eye + keyboard/mouse" for a **Dioxus desktop UX*
 - **Web UX is OUT of scope.** Driving a web app (e.g. samplers / samplenotes-webapp running in Chrome) is the job of the **separate agent-browser CLI skill**, not this one. Clear lanes: this skill = Dioxus desktop; browser skill = web.
 - **Today this drives yggterm.** It generalizes to any Dioxus desktop app only once app-control is extracted into a reusable crate (`finding-yggui-app-control-not-reusable` in memory) — relevant when samplers / samplenotes-webapp ship desktop builds, not now (they're webapp + Android in the current prototyping phase).
 
-## Notifications and audio alerts — `server app notify` (WIRED 2026-08-03)
+## Notifications and audio alerts — `server app notify` (WIRED 2026-08-03 · `--session` + honest bars 2026-08-06)
 
-**The one way anything reaches the human.** An agent, a `/loop` waking up, a cron job,
-or any libyggterm app raises a notification the same way, so a toast from a background
-agent and one from the app itself are the same object.
+**The one door anything uses to reach the human.** An agent, a `/loop` waking up, a
+cron job, a delegate session, or any libyggterm app raises a notification the same way,
+so a toast from a background agent and one from the app itself are the same object and
+the human cannot be made to care which sent it.
+
+### ⛔⛔ FIRST: an untargeted notify lands on the USER'S SCREEN (burned 2026-08-06)
+
+`notify` is a **mutating** verb, and the router's rule for mutating verbs with several
+live workers is *prefer the ACTIVE-role client* — which is his GUI. That preference is
+deliberate (`choose_app_control_pid`: shadows exist so agent probes stay off his seat,
+and the symmetric guarantee is that his own untargeted verbs keep reaching his own
+screen). The consequence for us is blunt: **an agent testing notifications without a
+target is not testing anything, it is posting to the seat the human is sitting at.**
+That happened today and left stray cards on his panel for him to dismiss by hand.
 
 ```bash
-yggterm-headless server app notify "<title>" "<message>" [--tone info|success|warning|error]
-    [--job <key> --progress 0..100]   # upserts ONE row instead of stacking N toasts
-    [--persistent]                    # stays until dismissed
-    [--silent]                        # suppress the chime for this one
-    [--in 90s|10m|2h] [--at 07:30]    # the alarm clock
+# ⛔ WRONG — this is a toast on his desktop, not a test
+yggterm-headless server app notify "probe" "does the bar draw?"
+# ✅ RIGHT — your own shadow, his screen untouched
+yggterm-headless server app notify "probe" "does the bar draw?" --client agent-1
 ```
+
+**Rule: every notify you raise to verify your own work carries `--client <shadow>` or
+`--pid <shadow-pid>`. Only a notification genuinely FOR him goes untargeted.** And if
+the shadow is the only registered client, an untargeted notify routes there instead —
+so "it worked once without a flag" proves nothing about the next run. Name the target.
+
+### The flags
+
+```bash
+yggterm-headless server app notify "<title>" "<message>"
+    [--tone info|success|warning|error]  # unknown word REFUSED, never defaulted
+    [--session <session-path>]           # clicking the card body goes THERE
+    [--job <key>] [--progress 0..100]    # upserts ONE row instead of stacking N toasts
+    [--persistent]                       # stays until dismissed
+    [--silent]                           # suppress the chime for this one
+    [--in 90s|10m|2h] | [--at 07:30]     # the alarm clock
+    [--client <name> | --pid <pid>]      # WHOSE screen. Read the trap above
+```
+
+- Title and message are positional as shown, or `--title`/`--message`; the positional
+  form wins when both are given. **An empty title is refused** (`empty_title`) — a toast
+  with no title is a rectangle that says nothing.
+- `--tone warn` is accepted as an alias for `warning`; no tone at all means `info`.
+- **`--in` beats `--at`** when both are passed. A bare `--in 90` is **seconds**;
+  `--at 07:30` is local-clock and resolves to the NEXT occurrence, so 07:30 typed at
+  23:00 means tomorrow morning.
+- Both binaries (`yggterm` and `yggterm-headless`) parse this with the same reader and
+  route through one owner, so the two cannot grow two spellings of "warning".
 
 It fans out three ways at once, each gated by the user's own setting: an in-app toast,
 a real desktop notification, and a synthesized chime. **⛔ `--silent` may only SUPPRESS.
@@ -71,16 +109,100 @@ There is deliberately no way to force sound on for a user who turned it off.**
 notification verb that silently does nothing is indistinguishable from a human who
 missed the toast. An unknown tone is refused rather than defaulted: a typo that quietly
 downgraded an `error` to `info` would make the one notification that mattered look like
-the ones that did not.
+the ones that did not. ⚠ Tone is checked BEFORE the title, so a call that is wrong in
+both ways reports `unknown_tone` and you fix the title on the second run.
 
-**Use it for:** a long job that needs his attention, a `/loop` reporting that it woke
-and found something, a delegate session that has hit a question, an alarm. **Do not use
-it for** chatter: every notification spends his attention, which is the scarcest input
-on this fleet.
+### Recipe 1 — "I finished, here is the result", pointing at your own row
 
-⚠ **`--in`/`--at` timers live in the running GUI process, so a GUI restart forgets
-them.** The reply says so in its own `note` field. For anything that must survive a
-restart, use a cron entry that calls this verb rather than a long `--in`.
+⛔ **A notification with no `--session` is a dead end for the reader.** On a 42-row
+sidebar, "the crawl finished" without a pointer is a report about a place he then has
+to go and find, which is most of what the message costs him. Clicking the card body
+opens the row (routed through the same pair a sidebar click uses); the X dismisses and
+never navigates; a card with no source stays inert and shows no pointer rather than
+promising a journey it cannot make.
+
+⚠ **`$YGGTERM_SESSION_ID` is NOT the row path — do not paste it.** Inside a row the
+daemon exports its OWN key (`cc-runtime://8ae74690-…`), while the GUI on another
+machine knows that same session as `remote-cc://dev/8ae74690-…`. Same UUID, different
+scheme, plus a machine segment. Resolve it against the rows the GUI actually has:
+
+```bash
+UUID=${YGGTERM_SESSION_ID##*/}                      # works for cc-runtime:// and local://
+ROW=$(ssh "$LIVE_HOST" '~/.local/bin/yggterm server app rows' \
+      | python3 -c "import json,sys;print(next(r['full_path'] for r in
+          json.load(sys.stdin)['data']['rows'] if r['full_path'].endswith('$UUID')))")
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app notify 'Crawl finished' \
+    '412 rows, 3 refused — details in this session' --tone success --session '$ROW'"
+```
+
+A session spawned by `terminal new` hands you the right string directly: use the
+response's `data.session_path`, which is the row path by construction.
+
+### Recipe 2 — a long job reporting progress through ONE row
+
+`--job <key>` UPSERTS: call it as often as you like and the same card is rewritten
+instead of N cards stacking up and burying everything else.
+
+```bash
+for pct in 0 25 50 75; do
+  yggterm-headless server app notify "Reindexing versestore" "$pct% — labs shard" \
+      --job versestore-reindex --progress "$pct" --session "$ROW"
+  ... work ...
+done
+yggterm-headless server app notify "Reindexing versestore" "done — 8,412 docs" \
+    --job versestore-reindex --progress 100 --tone success --session "$ROW"
+```
+
+What the code does that the flags do not say:
+
+- **A `--job` card is ALWAYS persistent**, whether or not you pass `--persistent`. It
+  stays until dismissed, which is what a progress row has to do.
+- **A `--job` card never chimes**, and it raises a system notification only on the
+  FIRST tick. So `--silent` is redundant here — a job is already quiet by construction.
+- **`--session` on a job never clears.** Omit it on a later tick and the card keeps the
+  session it learned earlier; pass it once you know it and the card becomes clickable
+  from then on.
+- **Finish the job** with a last call at `--progress 100` (and `--tone success`), or the
+  card sits at whatever fraction it last saw and reads as wedged.
+
+### Recipe 3 — `--progress` is now the ONLY thing that draws a bar
+
+Fixed 2026-08-06 (`174f404b`). The bar used to be drawn for `persistent ||
+progress.is_some()`, and with no value the component rendered a **static 44% fill** —
+so nearly every bar the user had ever seen in yggterm was that fake one, frozen just
+short of half and indistinguishable from a stuck job. The component now takes an `f32`,
+"no value" is not a state it can be asked to draw, and **a bar means what it says**.
+
+⇒ **`--progress` without `--job` is silently dropped** — it is only read on the job
+path, so a one-shot with a percentage neither coalesces nor draws a bar. If you want a
+bar, you want a `--job`.
+
+### Recipe 4 — `--silent`, and when it earns its place
+
+`--silent` suppresses the chime for one notification and cannot ever force one on. Use
+it for **frequent or low-value** traffic that should be visible but not audible: a
+`/loop` posting "woke, nothing changed", per-file results in a batch, a heartbeat you
+want on screen for later reading. Anything he must act on keeps its chime.
+
+### Recipe 5 — the alarm clock, and its honest limit
+
+```bash
+yggterm-headless server app notify "Stand up" "" --in 45m
+yggterm-headless server app notify "Call the bank" "before they close" --at 15:30
+```
+
+⚠ **The timer lives in the running GUI process, so a GUI restart forgets it.** The
+reply says so itself (`scheduled:true` + a `note` field, and `delivered:false` — a
+scheduled call is not a delivered one, so do not assert on `delivered`). Anything that
+must survive a restart belongs in a cron entry that calls this verb, not in a long
+`--in`.
+
+### Use it for / not for
+
+**For:** a long job that needs his attention, a `/loop` reporting that it woke and found
+something, a delegate session that hit a question, a finished piece of work with a
+pointer to its row, an alarm. **Not for** chatter: every notification spends his
+attention, which is the scarcest input on this fleet.
 
 ⚠ It is a NOTIFICATION, not a dialog: it informs and cannot ask. Anything needing an
 answer belongs in a modal the shell owns.
@@ -196,6 +318,12 @@ ssh "$LIVE_HOST" 'cd ~/gh/yggterm && ./scripts/shadow-client.sh stop --name agen
   pre-fix builds an untargeted read answers from the newest worker (the
   shadow), which looks exactly like the shadow yanking the user's session
   (instrument-lie, live-caught 2026-07-23).
+  - ⛔⛔ **THIS INCLUDES `server app notify`, and it is the one that BITES**,
+    because a mis-aimed screenshot only wastes your time while a mis-aimed
+    toast lands on his desktop, chimes, and waits for him to dismiss it. It
+    happened 2026-08-06 and left stray cards on his panel. **Every test
+    notification carries `--client <shadow>` / `--pid <shadow-pid>`.** See
+    §Notifications above for the full verb.
 - A Shadow is read-only for geometry/ownership by daemon role gate: it cannot
   `terminal new`/resize/focus. For SPAWNING probe sessions, use the user's
   worker with `terminal new --no-activate` (their view never moves), then
