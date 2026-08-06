@@ -237,11 +237,31 @@ invisible. **That intermittency is the whole "version dance" the owner reported*
 and it is why it looks like a deploy-window behaviour: a deploy restarts the GUI,
 which re-reads its daemon's order at startup.
 
-**Fix, and the shape matters.** The order the user sees is owned by the GUI, so
-the verb that sets it must reach the GUI — an APP-path `reorder` beside
-`server app rows`, which has no order verb at all today (`server app --help`
-contains zero occurrences of `reorder`). Then `changed:true` can mean the
-sidebar moved.
+**Half shipped, and the remaining half is now isolated.**
+`server app sessions reorder <order.json>` exists (3.0.44): it forwards to the
+daemon **this GUI is bound to**, so "which daemon" stops being a guess, and it
+reports `changed` by comparing the RENDERED row list before and after rather
+than by parsing the daemon's reply.
+
+⛔ **But the sidebar still does not move, and that isolates the real defect: a
+RUNNING GUI never re-reads the daemon's live order.** Measured 2026-08-07 with
+the forwarding verb, on the GUI's own daemon, no restart: daemon updated, sidebar
+unchanged. A GUI **restart** does adopt it (observed immediately after — the
+sidebar came up in the orchestrator's outline).
+
+⇒ **The fix is in the snapshot-apply path**: the GUI's copy of
+`live_session_order` is a mirror that is deliberately not overwritten while the
+GUI runs — almost certainly to protect a user's drag from being stomped by a
+poll. So the rule needed is *"adopt the daemon's order when the daemon's order
+CHANGED, keep mine when only my local arrangement did"*, which needs a
+generation/epoch on the order rather than a value comparison. ⚠ Do not simply
+overwrite on every snapshot: that re-introduces the bug the mirror exists to
+prevent, and drags are the one row interaction the user does by hand.
+
+⚠ **An earlier claim in this entry was wrong and is retracted**: I reported a
+02:47 case where a running GUI DID adopt a reorder without restarting. It does
+not survive re-measurement, and the forwarding test above contradicts it. The
+orchestrator's model stands.
 
 ⚖ **Third verb in this family**, and worth one fix at the response layer rather
 than three: `session remove` grew `verified` for exactly this, `session rename`
