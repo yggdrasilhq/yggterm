@@ -67,6 +67,25 @@ than shipped. The next attempt should constrain the SELECTION END (clamp it to
 the row the pointer is actually over, in content terms) rather than move the
 viewport under a live gesture.
 
+**The arithmetic that names the right fix.** The selection grows by EXACTLY the
+number of lines the viewport scrolled during the drag: the end anchor is
+`(pointer screen row + ydisp)` and `ydisp` advances with the stream, while the
+start anchor is a fixed absolute buffer coordinate. Re-anchoring the start by the
+same delta would hold the selection constant — but xterm's public API is only
+`select(col,row,len)` and `selectLines(a,b)`, neither of which can express an
+arbitrary `(col,row)→(col,row)` range, so the model cannot be corrected from
+outside.
+
+⭐ **Therefore the likely answer is to hold the WRITES, not the viewport:** while
+the pointer is down, queue PTY output instead of writing it into xterm, and
+flush on pointer-up. Nothing is written, so `ydisp` cannot move, so the end
+anchor cannot advance, and the user selects exactly what they dragged over. A
+drag is a second or two and the user is demonstrably not reading new output
+during it. ⚠ This must carry a DEADLINE and a byte cap that flush anyway —
+§THE QUIET-GATE LAW forbids gating on an absence, but this gate is legal
+because its release is a positive signal (pointer-up) with a bounded fallback.
+Not attempted yet; it touches the write pump and deserves its own careful pass.
+
 **The instrument that settles any future attempt** — a shadow, an ephemeral row,
 a `while :; do echo …; done`, and a synthetic drag. ⚠ Two instrument traps, both
 of which produced a confident wrong reading first: xterm's `handleMouseDown`
