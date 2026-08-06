@@ -4,6 +4,26 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Opening an agent session from the command line can finally say which model,
+  which permissions, and what to work on.** `server app terminal new --kind
+  claude-code|codex` takes `--model`, `--permission-mode`
+  (`default|plan|accept-edits|bypass`) and `--prompt`/`--prompt-stdin`. Before
+  this, a session opened this way inherited whatever model was set as the
+  default — including the most expensive one — and the only way to ask for
+  skipped permission prompts was to edit the global setting that every other
+  session reads. Both are per-launch now: the mode never touches that setting,
+  and where the two disagree the one you typed wins. The opening prompt is
+  delivered the way a person types it — the text, then Enter as a separate
+  keystroke — because a newline sent along with the text lands in the composer
+  as a paste and never submits.
+
+  What you asked for is reported back from the row that was actually created,
+  not echoed: the reply says which model and mode the session was born with,
+  the real command behind it, and whether the prompt was submitted. A flag that
+  cannot be honoured is refused by name — `--model` on a plain shell, a
+  permission mode a CLI does not have, a remote codex session whose settings
+  cannot cross the ssh boundary — rather than accepted and quietly ignored.
+
 - **A live row can say whose plate it is and whether it is empty.** Agent rows
   accumulate on the Live Sessions table and clearing them by hand is only
   annoying because of the second question: is this one finished, or is an agent

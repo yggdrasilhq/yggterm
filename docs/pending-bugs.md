@@ -984,14 +984,20 @@ on yggui automations"*.
 
 The delegate-session pattern (a guiding agent launches an interactive
 CC/codex session in a yggterm row for the user to answer) is now the standing
-work pattern, and every step of it is hand-rolled: `--kind claude-code`
-cannot pin model/permission-mode (and inherits the user's default model — a
-live cost trap), a pending AskUserQuestion is invisible off-screen (JSONL
-gets it only when answered; client read-buffer is blank for never-activated
-rows), row order is only a debug field, and `terminal send`'s `accepted:true`
-cannot see whether the old child still owns the PTY. Eight ranked, costed
-feature asks: **[`docs/agent-bg-sessions-dream-2026-08-02.md`](agent-bg-sessions-dream-2026-08-02.md)**.
+work pattern, and most steps of it are still hand-rolled: a pending
+AskUserQuestion is invisible off-screen (JSONL gets it only when answered;
+client read-buffer is blank for never-activated rows), row order is only a
+debug field, and `terminal send`'s `accepted:true` cannot see whether the old
+child still owns the PTY. Ranked, costed feature asks:
+**[`docs/agent-bg-sessions-dream-2026-08-02.md`](agent-bg-sessions-dream-2026-08-02.md)**.
 Interim recipe + traps: data-fabric skill §THE BG-SESSION PLANE.
+
+✅ **Ask #1 CLOSED 2026-08-06** — the LAUNCH itself is first-class now:
+`terminal new --kind claude-code|codex` takes `--model`,
+`--permission-mode` (per-launch, never the global setting) and `--prompt`,
+so a delegate no longer inherits the user's default model and no longer needs
+the `--kind shell` + printf workaround. The remaining asks above are the
+OBSERVE and STEER halves, which is why this entry stays open.
 
 ## ⚠ TOOLING: `app open --view preview` never settles, so a Web View change cannot be verified through the documented instrument
 
