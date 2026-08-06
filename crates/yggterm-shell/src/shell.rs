@@ -15150,6 +15150,11 @@ struct ShellState {
     always_on_top: bool,
     notifications: Vec<ToastNotification>,
     next_notification_id: u64,
+    /// When the history was last written, and whether a throttled write is
+    /// still owed. The pair lets a fast-ticking progress job avoid putting the
+    /// disk in the render loop without silently dropping its last update.
+    notifications_persisted_at_ms: u64,
+    notifications_persist_pending: bool,
     // Last DEFINITE daemon-authoritative working verdict per agent session
     // (`true` = was working, `false` = was idle), the edge detector for the
     // working→done notification. Only updated on `Some(_)` snapshots — a `None`
@@ -15820,6 +15825,115 @@ fn tone_wire_word(tone: NotificationTone) -> &'static str {
         NotificationTone::Error => "error",
     }
 }
+
+/// A notification as it is written to disk.
+///
+/// ⛔ A LOCAL MIRROR of `ToastItem`, deliberately. The on-disk shape is the
+/// shell's concern, not the UI component's: making the component serialisable
+/// would let a rendering change silently become a format change, and every
+/// field here has to survive a version bump. `#[serde(default)]` throughout so
+/// a file written by an older build loads instead of being discarded — losing
+/// the history to a schema change is the same failure as losing it to a
+/// restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedNotification {
+    #[serde(default)]
+    tone: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    created_at_ms: u64,
+    #[serde(default)]
+    job_key: Option<String>,
+    #[serde(default)]
+    progress: Option<f32>,
+    #[serde(default)]
+    persistent: bool,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// Has a job reported itself DONE?
+///
+/// One owner, because both the create and the upsert path ask it and a job that
+/// dissolved on one and not the other would be the same class of bug as the two
+/// X's. `None` is not finished — a job with nothing measuring it has not
+/// claimed completion, it has only declined to say.
+fn notification_progress_is_finished(progress: Option<f32>) -> bool {
+    progress.is_some_and(|value| value >= 1.0)
+}
+
+fn notification_tone_wire(tone: NotificationTone) -> &'static str {
+    match tone {
+        NotificationTone::Info => "info",
+        NotificationTone::Success => "success",
+        NotificationTone::Warning => "warning",
+        NotificationTone::Error => "error",
+    }
+}
+
+fn notification_tone_from_wire(word: &str) -> NotificationTone {
+    match word {
+        "success" => NotificationTone::Success,
+        "warning" => NotificationTone::Warning,
+        "error" => NotificationTone::Error,
+        _ => NotificationTone::Info,
+    }
+}
+
+fn notifications_store_path() -> Option<PathBuf> {
+    yggterm_core::resolve_yggterm_home()
+        .ok()
+        .map(|home| home.join("notifications.json"))
+}
+
+/// Read the notification history back after a restart.
+///
+/// A missing or unreadable file is an EMPTY history, never an error the user
+/// sees: a corrupt store must cost the old notifications, not the ability to
+/// raise new ones.
+fn load_persisted_notifications() -> Vec<ToastNotification> {
+    let Some(path) = notifications_store_path() else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(stored) = serde_json::from_str::<Vec<PersistedNotification>>(&raw) else {
+        return Vec::new();
+    };
+    stored
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| ToastNotification {
+            // Ids are re-minted: they are handles for THIS process's clear
+            // buttons, never identity that has to survive.
+            id: index as u64 + 1,
+            tone: notification_tone_from_wire(&item.tone),
+            title: item.title,
+            message: item.message,
+            created_at_ms: item.created_at_ms,
+            job_key: item.job_key,
+            progress: item.progress,
+            persistent: item.persistent,
+            source: item.source,
+            // ⛔ A restored notification's toast is ALREADY dismissed. The user
+            // has seen these; replaying a screenful of popups on every GUI
+            // start would make the restart worse than the data loss it fixes.
+            toast_dismissed: true,
+        })
+        .collect()
+}
+
+/// Minimum gap between writes of the history file.
+///
+/// A progress job ticks fast, and rewriting 2000 entries per tick would put the
+/// disk in the render loop. The flush is throttled and the tail of a burst is
+/// caught by the periodic flush, so at worst a crash loses the last couple of
+/// seconds rather than the whole history.
+const NOTIFICATION_PERSIST_MIN_INTERVAL_MS: u64 = 2_000;
 
 /// How many notifications the panel keeps before the oldest fall off.
 ///
@@ -17360,6 +17474,8 @@ impl ShellState {
         let terminal_appearance = terminal_identity_appearance_for_settings(&settings);
         yggterm_server::sync_terminal_identity_appearance(terminal_appearance);
         let initial_window_maximized = settings.window_maximized;
+        let restored_notifications = load_persisted_notifications();
+        let restored_next_notification_id = restored_notifications.len() as u64 + 1;
         let pending_update_restart = bootstrap.pending_update_restart.clone();
         let right_panel_mode = if settings.show_settings {
             RightPanelMode::Settings
@@ -17460,8 +17576,12 @@ impl ShellState {
             fullscreen: false,
             page_fullscreen: false,
             always_on_top: false,
-            notifications: Vec::new(),
-            next_notification_id: 1,
+            // ⭐ The history SURVIVES a restart. It is how a multi-agent run
+            // reports itself, and a routine deploy used to erase it.
+            notifications: restored_notifications,
+            next_notification_id: restored_next_notification_id,
+            notifications_persisted_at_ms: 0,
+            notifications_persist_pending: false,
             session_working_prev: HashMap::new(),
             session_working_confirm_streak: HashMap::new(),
             web_surfaces: HashMap::new(),
@@ -28458,10 +28578,57 @@ impl ShellState {
         }
         rows
     }
+    /// Write the history to disk, at most every
+    /// `NOTIFICATION_PERSIST_MIN_INTERVAL_MS` unless `force`.
+    ///
+    /// Atomic: a temp file then a rename, because a half-written history that
+    /// fails to parse is indistinguishable from no history at all — and the
+    /// whole point of this file is to be there after an unclean exit.
+    fn persist_notifications(&mut self, force: bool) {
+        let now = current_millis();
+        if !force
+            && now.saturating_sub(self.notifications_persisted_at_ms)
+                < NOTIFICATION_PERSIST_MIN_INTERVAL_MS
+        {
+            self.notifications_persist_pending = true;
+            return;
+        }
+        let Some(path) = notifications_store_path() else {
+            return;
+        };
+        let stored = self
+            .notifications
+            .iter()
+            .map(|notification| PersistedNotification {
+                tone: notification_tone_wire(notification.tone).to_string(),
+                title: notification.title.clone(),
+                message: notification.message.clone(),
+                created_at_ms: notification.created_at_ms,
+                job_key: notification.job_key.clone(),
+                progress: notification.progress,
+                persistent: notification.persistent,
+                source: notification.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        let Ok(encoded) = serde_json::to_string(&stored) else {
+            return;
+        };
+        let temp = path.with_extension("json.tmp");
+        if std::fs::write(&temp, encoded).is_ok() && std::fs::rename(&temp, &path).is_ok() {
+            self.notifications_persisted_at_ms = now;
+            self.notifications_persist_pending = false;
+        } else {
+            // A failed write must not pretend it succeeded — leave the pending
+            // flag up so the next tick tries again.
+            let _ = std::fs::remove_file(&temp);
+        }
+    }
+
     /// Forget a notification entirely. This is what the PANEL's X means.
     fn clear_notification(&mut self, id: u64) {
         self.notifications
             .retain(|notification| notification.id != id);
+        self.persist_notifications(true);
     }
     /// Stop showing a notification's floating toast. It STAYS in the panel.
     ///
@@ -28486,6 +28653,7 @@ impl ShellState {
     }
     fn clear_notifications(&mut self) {
         self.notifications.clear();
+        self.persist_notifications(true);
     }
     fn select_tree_row(&mut self, row: &BrowserRow, mode: TreeSelectionMode) {
         if mode == TreeSelectionMode::ExtendRange && is_tree_multiselect_row(row) {
@@ -29610,6 +29778,8 @@ impl ShellState {
         // 2000, user-set 2026-08-06. The panel is a HISTORY now, not a
         // spillway: notifications are how a multi-agent run reports itself, and
         // a run can easily be a few hundred.
+        // See the note on the job path: new record => write now.
+        self.persist_notifications(true);
         if self.notifications.len() > NOTIFICATION_HISTORY_LIMIT {
             let overflow = self.notifications.len() - NOTIFICATION_HISTORY_LIMIT;
             self.notifications.drain(0..overflow);
@@ -29649,7 +29819,17 @@ impl ShellState {
                 existing.title = title.clone();
                 existing.message = message.clone();
                 existing.progress = next_progress;
-                existing.persistent = true;
+                // ⭐ A FINISHED JOB DISSOLVES. `--job` pins a toast persistent
+                // so a running job cannot be aged off the glass mid-flight —
+                // but once it reaches 100% it is not running any more, and a
+                // completed card sitting on the viewport forever is the user's
+                // report: *"notifications when finished should dissolve"*. It
+                // stops being persistent, so the ordinary age filter takes the
+                // TOAST; the panel keeps the record either way.
+                existing.persistent = !notification_progress_is_finished(next_progress);
+                // Bump the clock so the dissolve is a full grace period from
+                // COMPLETION, not from whenever the job first spoke.
+                existing.created_at_ms = now;
                 // A job that learns its session on a later tick must become
                 // clickable then, not stay inert because the first call did
                 // not know it. Never CLEARS a known source with a None.
@@ -29668,7 +29848,9 @@ impl ShellState {
                     created_at_ms: now,
                     job_key: Some(job_key.clone()),
                     progress: progress.map(|value| value.clamp(0.0, 1.0)),
-                    persistent: true,
+                    persistent: !notification_progress_is_finished(
+                        progress.map(|value| value.clamp(0.0, 1.0)),
+                    ),
                     source: source.clone(),
                     // A job that reports again after its toast was dismissed
                     // stays dismissed — the upsert below never resurrects the
@@ -29685,6 +29867,12 @@ impl ShellState {
         // 2000, user-set 2026-08-06. The panel is a HISTORY now, not a
         // spillway: notifications are how a multi-agent run reports itself, and
         // a run can easily be a few hundred.
+        // A NEW notification is written immediately; a mere progress tick is
+        // throttled. That keeps the disk out of a fast-ticking job's loop while
+        // guaranteeing the thing that actually matters for a history — that the
+        // notification EXISTS on disk — is never owed to a later flush that a
+        // crash might eat.
+        self.persist_notifications(created);
         if self.notifications.len() > NOTIFICATION_HISTORY_LIMIT {
             let overflow = self.notifications.len() - NOTIFICATION_HISTORY_LIMIT;
             self.notifications.drain(0..overflow);
@@ -185591,6 +185779,57 @@ mod media_capture_locks {
             grants, 1,
             "the capture dialog offers {grants} ways to grant a device; there must \
              be exactly one, on the button labelled Allow",
+        );
+    }
+
+    /// ⭐ A FINISHED JOB DISSOLVES; a running one does not.
+    ///
+    /// `--job` pins a toast persistent so a long job cannot be aged off the
+    /// glass while it is still working. At 100% it is not working any more, and
+    /// a completed card that sits on the viewport forever was the user's report
+    /// ("notifications when finished should dissolve"). Persistence is what
+    /// defeats the age filter, so completion simply drops it.
+    #[test]
+    fn a_job_stops_being_persistent_once_it_reports_a_hundred_percent() {
+        assert!(
+            !notification_progress_is_finished(None),
+            "nothing measuring it has not claimed completion, only declined to say"
+        );
+        assert!(!notification_progress_is_finished(Some(0.0)));
+        assert!(!notification_progress_is_finished(Some(0.99)));
+        assert!(notification_progress_is_finished(Some(1.0)));
+        assert!(
+            notification_progress_is_finished(Some(1.5)),
+            "an over-reported fraction is still finished, never un-finished"
+        );
+    }
+
+    /// The history has to survive the process, or the 2000-entry limit is a
+    /// promise about a Vec rather than about a record. The tone word is the
+    /// part most likely to rot silently — it is the only field that is not
+    /// already a primitive.
+    #[test]
+    fn every_notification_tone_round_trips_through_its_stored_word() {
+        for tone in [
+            NotificationTone::Info,
+            NotificationTone::Success,
+            NotificationTone::Warning,
+            NotificationTone::Error,
+        ] {
+            let word = notification_tone_wire(tone);
+            assert_eq!(
+                notification_tone_from_wire(word),
+                tone,
+                "`{word}` does not survive the round trip, so a restored panel \
+                 would quietly re-tone an error as info"
+            );
+        }
+        // An unknown word from an older or newer build must LOAD, not discard
+        // the entry — losing the history to a schema change is the same failure
+        // as losing it to a restart.
+        assert_eq!(
+            notification_tone_from_wire("something-new"),
+            NotificationTone::Info
         );
     }
 
