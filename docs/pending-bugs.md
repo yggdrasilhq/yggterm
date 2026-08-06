@@ -13,6 +13,35 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## THE NOTIFICATION HISTORY DIES WITH THE GUI
+
+**Status:** OPEN
+
+Found 2026-08-06 while deploying 3.0.35, and it matters because the user has
+just asked for a **2000-entry** history: `ShellState::notifications` is an
+in-memory `Vec`, so **a GUI restart empties the panel**. Measured — the restart
+for this deploy wiped a full panel to zero.
+
+That is a real gap between what was asked for and what shipped. "Store 2000 such
+notifications, history limit" reads as a durable record, and on a multi-agent
+setup it is the record of what the fleet did while the user was away. Today an
+agent can report faithfully into a panel that a routine deploy then erases, and
+nothing warns anyone.
+
+⚠ It is also the SECOND half of the dismissal bug that was just fixed. Closing a
+toast no longer destroys the record — but a GUI restart still does, so the
+guarantee is only as good as the process lifetime.
+
+**The shape of the fix.** A JSONL append beside the other per-host state in
+`$YGGTERM_HOME`, loaded at startup and trimmed to `NOTIFICATION_HISTORY_LIMIT`,
+following `clipboard_sweep.rs`'s per-host discipline. Two things to get right:
+- ⛔ **Notifications carry message text an agent wrote.** The store is per-host
+  and inherits the same no-secrets rule the journal has; do not persist a
+  notification body anywhere a different user could read.
+- The `source` session path must survive, so a restored notification still
+  clicks through — that is exactly the case where a click MATTERS, since the
+  user is coming back to something they were away from.
+
 ## THE TERMINAL'S RIGHT EDGE CLIPS THE LAST GLYPH — the hitbox is a column short
 
 **Status:** OPEN
