@@ -342,6 +342,110 @@ fn probe_tools(
         .collect::<Vec<_>>()
 }
 
+/// What the LOGIN SHELL resolves for `binary_name`, which is the only thing a
+/// session will actually execute.
+///
+/// Remote launches go through `login_shell_wrap` (`exec bash -lc '<cmd>'`), so
+/// this reproduces the resolution a real launch performs, deliberately WITHOUT
+/// the managed prefix forced onto PATH.
+fn login_shell_resolved_cli(binary_name: &str) -> Option<(String, Option<String>)> {
+    let script =
+        format!("command -v {binary_name} || exit 1; {binary_name} --version 2>/dev/null | head -1");
+    let output = Command::new("bash")
+        .arg("-lc")
+        .arg(script)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let path = lines.next()?.to_string();
+    let version = lines
+        .next()
+        .and_then(extract_semver_like_version)
+        .map(|version| version.to_string());
+    Some((path, version))
+}
+
+/// Pull the `1.2.3` out of a `--version` line. Both CLIs decorate it
+/// (`2.1.223 (Claude Code)`, `codex-cli 0.144.6`), so a whole-line comparison
+/// against a bare managed version would report a false divergence every time.
+fn extract_semver_like_version(line: &str) -> Option<&str> {
+    line.split_whitespace().find(|token| {
+        let mut parts = token.split('.');
+        let ok = parts.clone().count() >= 3;
+        ok && parts.all(|part| {
+            !part.is_empty() && part.chars().next().is_some_and(|c| c.is_ascii_digit())
+        })
+    })
+}
+
+/// Report when the binary yggterm MAINTAINS is not the binary a session RUNS.
+///
+/// ⛔ The failure this exists to catch, measured across the fleet 2026-08-06:
+/// the refresh had `~/.yggterm/npm/bin/claude` at 2.1.223 on all three machines
+/// and recorded a successful refresh — while `~/.yggterm/npm/bin` was not on the
+/// login PATH at all on jojo or oc, so every session there ran a SEPARATE
+/// `~/.local/bin/claude` stuck at 2.1.220. The refresh was verifying its own
+/// copy, so it could not see this, and reported success for a month.
+///
+/// [[spec-cli-binary-auto-provisioning]] already names login-shell resolution as
+/// the SSOT for "what will actually run"; this is that clause enforced, and the
+/// owner's ask (2026-08-06) that a machine which cannot keep its CLIs current
+/// SAY SO in telemetry rather than go quietly stale.
+fn report_managed_cli_effective_version_drift(
+    home: &Path,
+    probes: &[(ManagedCliTool, ToolProbe)],
+) {
+    for (tool, probe) in probes {
+        let binary_name = tool.binary_name();
+        let managed_version = match (&probe.version, probe.source) {
+            (Some(version), Some(ManagedCliBinarySource::Managed)) => version.clone(),
+            _ => continue,
+        };
+        let Some((resolved_path, resolved_version)) = login_shell_resolved_cli(binary_name) else {
+            append_trace_event(
+                home,
+                "server",
+                "managed_cli",
+                "effective_cli_unresolvable",
+                serde_json::json!({
+                    "tool": binary_name,
+                    "managed_version": managed_version,
+                    "detail": "the login shell resolves no such binary, so a session \
+                               cannot launch this CLI on this machine",
+                }),
+            );
+            continue;
+        };
+        let drifted = resolved_version
+            .as_deref()
+            .map(|resolved| resolved != managed_version)
+            .unwrap_or(true);
+        if !drifted {
+            continue;
+        }
+        append_trace_event(
+            home,
+            "server",
+            "managed_cli",
+            "effective_cli_version_drift",
+            serde_json::json!({
+                "tool": binary_name,
+                "managed_version": managed_version,
+                "effective_version": resolved_version,
+                "effective_path": resolved_path,
+                "detail": "the refresh updated the managed copy, but the login shell \
+                           resolves a DIFFERENT install — sessions on this machine run \
+                           the version reported as effective_version, not managed_version",
+            }),
+        );
+    }
+}
+
 fn record_managed_cli_probe_span(
     home: &Path,
     name: &str,
@@ -1259,6 +1363,33 @@ mod tests {
     }
 
     // The focus/attach path's cheap probe must recognize a present managed binary
+    /// The drift check compares a bare managed version against a decorated
+    /// `--version` line, so the extractor is the whole correctness of it: too
+    /// greedy and every machine reports permanent false drift, too strict and
+    /// the real drift (2.1.223 managed vs 2.1.220 effective, measured on jojo
+    /// and oc 2026-08-06) reads as agreement.
+    #[test]
+    fn effective_version_is_extracted_from_each_clis_decorated_version_line() {
+        assert_eq!(
+            extract_semver_like_version("2.1.223 (Claude Code)"),
+            Some("2.1.223")
+        );
+        assert_eq!(
+            extract_semver_like_version("codex-cli 0.144.6"),
+            Some("0.144.6")
+        );
+        // The package name must not be mistaken for a version just because it
+        // contains dots.
+        assert_eq!(
+            extract_semver_like_version("@anthropic-ai/claude-code 2.1.223"),
+            Some("2.1.223")
+        );
+        assert_eq!(extract_semver_like_version("no version here"), None);
+        assert_eq!(extract_semver_like_version(""), None);
+        // Two-component versions are not semver-like enough to compare against.
+        assert_eq!(extract_semver_like_version("tool 1.2"), None);
+    }
+
     // WITHOUT running a `<cli> --version` subprocess — that subprocess (claude up to
     // 910ms) plus the npm install it can trigger is the cold-switch latency we removed.
     // version==None is the proof that no subprocess ran.
@@ -2381,6 +2512,10 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
                 serde_json::json!({ "error": error.to_string() }),
             );
         }
+        // A refresh is only as true as the binary a session will actually run.
+        // Checked HERE, after a refresh we believe succeeded, because that is
+        // precisely when the silent form of this failure looks like success.
+        report_managed_cli_effective_version_drift(&paths.home, &after);
     }
 
     let statuses = before
