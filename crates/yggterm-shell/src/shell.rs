@@ -34208,8 +34208,22 @@ fn update_available_suffix_for_context(context: &InstallContext) -> String {
 
 fn pending_restart_from_active_install_state(current_exe: &Path) -> Option<PendingUpdateRestart> {
     let context = detect_install_context(current_exe).ok()?;
-    let preferred = context.preferred_executable?;
+    let preferred = context.preferred_executable.clone()?;
     if !preferred.is_file() {
+        return None;
+    }
+    // ⛔ An "update" that goes BACKWARDS is not an update, and this is the one
+    // consumer of the install record the USER presses. It compared paths only,
+    // so on the live host it offered "Restart now to update" into
+    // `versions/2.11.0/yggterm` while 3.0.44 was running — a downgrade wearing
+    // an update's label, under a panel that also displayed the wrong version.
+    // Same owner as the exec handoff: the target's own path decides, because a
+    // record can bump its version without moving its binary.
+    if !yggterm_core::handoff_target_is_usable(
+        &current_version(),
+        &context.current_version,
+        &preferred,
+    ) {
         return None;
     }
     let current = current_exe
@@ -124647,7 +124661,20 @@ fn SettingsRailBody(
             style { "{UPDATE_CTA_CSS}" }
             InstallUpdateRow {
                 update_call_to_action: snapshot.update_call_to_action.clone(),
-                version: snapshot.install_context.current_version.clone(),
+                // ⛔ The RUNNING build, not the install record's claim about it.
+                // This read `install_context.current_version`, which is the
+                // record's `active_version` — and the record is a claim about a
+                // PATH, kept by whatever last wrote it. On the live host it said
+                // **2.11.0** while the process rendering this panel was 3.0.44,
+                // under a button offering to "restart now to update" to the
+                // build already running. The user read the panel and asked why.
+                //
+                // Two encodings of "what version am I" existed side by side:
+                // `daemon_update_state.current_gui_version` was correct all
+                // along because it uses `current_version()`. This is now the
+                // same one owner. See `handoff_target_is_usable` for the other
+                // half of the same record's dishonesty.
+                version: yggterm_core::current_version(),
                 palette: snapshot.palette,
                 on_trigger_update,
             }
@@ -174714,8 +174741,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "yggterm-active-install-restart-{}",
             current_millis()
         ));
-        let old_dir = root.join("versions").join("2.1.93");
-        let next_dir = root.join("versions").join("2.1.94");
+        // ⚠ The recorded target must be AHEAD of this build, or it is not an
+        // update. This test used to write 2.1.94 — older than any current
+        // release — and passed only because the check was path-identity alone.
+        let old_dir = root.join("versions").join("998.0.0");
+        let next_dir = root.join("versions").join("999.0.0");
         let old_exe = old_dir.join("yggterm");
         let next_exe = next_dir.join("yggterm");
         fs::create_dir_all(&old_dir).expect("create old version dir");
@@ -174726,16 +174756,48 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             &root,
             "yggdrasilhq/yggterm",
             "linux-x86_64",
-            "2.1.94",
+            "999.0.0",
             &next_exe,
         )
         .expect("write direct install state");
 
         let pending = pending_restart_from_active_install_state(&old_exe)
-            .expect("active direct install should be restartable");
+            .expect("a NEWER active direct install should be restartable");
 
-        assert_eq!(pending.version, "2.1.94");
+        assert_eq!(pending.version, "999.0.0");
         assert_eq!(pending.executable, next_exe);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ⛔ The live failure, 2026-08-07: the panel offered "Restart now to update"
+    // into `versions/2.11.0/yggterm` while 3.0.44 was running. A downgrade
+    // wearing an update's label, on the one control the USER presses.
+    #[test]
+    fn pending_restart_never_offers_a_downgrade_as_an_update() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-active-install-downgrade-{}",
+            current_millis()
+        ));
+        let old_dir = root.join("versions").join("2.11.0");
+        let old_exe = old_dir.join("yggterm");
+        let running = root.join("bin").join("yggterm");
+        fs::create_dir_all(&old_dir).expect("create old version dir");
+        fs::create_dir_all(root.join("bin")).expect("create bin dir");
+        fs::write(&old_exe, b"old").expect("write old executable marker");
+        fs::write(&running, b"running").expect("write running executable marker");
+        yggterm_core::write_direct_install_state(
+            &root,
+            "yggdrasilhq/yggterm",
+            "linux-x86_64",
+            "2.11.0",
+            &old_exe,
+        )
+        .expect("write direct install state");
+
+        assert!(
+            pending_restart_from_active_install_state(&running).is_none(),
+            "an older recorded build must not be offered as an update"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
