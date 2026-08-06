@@ -69,6 +69,36 @@ pub struct CreatorStamp {
     pub host: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
+    /// The ROW that spawned this one, if it was spawned from inside one.
+    ///
+    /// Unlike [`Self::pid`] this is a HANDLE, not an audit note: the row it
+    /// names outlives the process that made the request, so it can still be
+    /// resolved, swept, and drawn as an outline long afterwards. It is what
+    /// makes a nested ychrome/yRDP surface attributable instead of a top-level
+    /// orphan, and it is the routing table a surface uses to reach its owning
+    /// session.
+    ///
+    /// ⚠ It is the value the creator SAW, not a claim we verified. A row can
+    /// name a parent that has since gone; consumers resolve it and tolerate a
+    /// miss rather than assuming it still exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_path: Option<String>,
+}
+
+/// The row this process is running INSIDE, from the environment yggterm
+/// already gives every PTY it owns.
+///
+/// ⭐ This is why nesting can record itself with no caller changes: a delegate
+/// that launches ychrome does not have to know it is nested, and historically
+/// would not have said so. `YGGTERM_SESSION_ID` is stripped by sshd, so the
+/// `LC_` mirror is what actually survives a remote hop — read both, in that
+/// order, exactly as the terminal side sets them.
+pub fn parent_session_path_from_env() -> Option<String> {
+    ["YGGTERM_SESSION_ID", "LC_YGGTERM_SESSION_ID"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|value| sanitize_path_token(&value))
+        .filter(|value| !value.is_empty())
 }
 
 impl CreatorStamp {
@@ -77,13 +107,29 @@ impl CreatorStamp {
             pid,
             host: sanitize_token(host),
             purpose: purpose.map(sanitize_free_text).filter(|p| !p.is_empty()),
+            parent_session_path: None,
         }
     }
 
-    /// `pid=<n> host=<h>[ purpose=<free text>]`. `purpose` is always last
-    /// because it is the only field allowed to contain spaces.
+    /// Name the spawning row. Blank clears it, so a caller that means "I have
+    /// no parent" can say so without the env default reasserting one.
+    pub fn with_parent_session_path(mut self, parent: Option<&str>) -> Self {
+        // ⛔ NOT `sanitize_token`: that substitutes `unknown-host` for a blank,
+        // which is right for a host and would turn "I have no parent" into a
+        // row parented to a machine that does not exist.
+        self.parent_session_path = parent.map(sanitize_path_token).filter(|v| !v.is_empty());
+        self
+    }
+
+    /// `pid=<n> host=<h>[ parent=<path>][ purpose=<free text>]`. `purpose` is
+    /// always last because it is the only field allowed to contain spaces; a
+    /// session path has none, so `parent` is safe in the head.
     pub fn encode(&self) -> String {
         let mut encoded = format!("pid={} host={}", self.pid, self.host);
+        if let Some(parent) = self.parent_session_path.as_deref() {
+            encoded.push_str(" parent=");
+            encoded.push_str(parent);
+        }
         if let Some(purpose) = self.purpose.as_deref() {
             encoded.push_str(" purpose=");
             encoded.push_str(purpose);
@@ -95,17 +141,21 @@ impl CreatorStamp {
         let (head, purpose) = split_trailing_free_text(value, "purpose=");
         let mut pid = None;
         let mut host = None;
+        let mut parent_session_path = None;
         for token in head.split_whitespace() {
             if let Some(rest) = token.strip_prefix("pid=") {
                 pid = rest.parse::<u32>().ok();
             } else if let Some(rest) = token.strip_prefix("host=") {
                 host = Some(rest.to_string());
+            } else if let Some(rest) = token.strip_prefix("parent=") {
+                parent_session_path = (!rest.is_empty()).then(|| rest.to_string());
             }
         }
         Some(Self {
             pid: pid?,
             host: host?,
             purpose,
+            parent_session_path,
         })
     }
 }
@@ -275,8 +325,20 @@ pub fn create_terminal_tenancy_from_args(
     {
         return Err(EPHEMERAL_NEEDS_AN_EXPLICIT_RULE.to_string());
     }
+    // Parentage: `--parent-session <path>` wins, `--parent-session none`
+    // declares "no parent", and otherwise we take the row this process is
+    // running inside. The default is what makes the outline real — a nested
+    // surface records its owner without its launcher knowing the feature
+    // exists — and the explicit spellings exist because a caller that means
+    // "top level" must be able to say it rather than inherit by accident.
+    let parent_session_path = match cli_flag_value(args, "--parent-session") {
+        Some("none") | Some("") => None,
+        Some(explicit) => Some(explicit.to_string()),
+        None => parent_session_path_from_env(),
+    };
     Ok(CreateTerminalTenancy {
-        created_by: CreatorStamp::new(creator_pid, host, cli_flag_value(args, "--purpose")),
+        created_by: CreatorStamp::new(creator_pid, host, cli_flag_value(args, "--purpose"))
+            .with_parent_session_path(parent_session_path.as_deref()),
         ephemeral,
     })
 }
@@ -1053,6 +1115,17 @@ fn sanitize_token(value: &str) -> String {
     }
 }
 
+/// A session path for the encoded stamp: whitespace-free (it lives in the
+/// space-separated head) and empty when there is nothing to say, so absence
+/// stays representable.
+fn sanitize_path_token(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
+}
+
 fn sanitize_free_text(value: &str) -> String {
     let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed.chars().take(MAX_PURPOSE_CHARS).collect()
@@ -1099,6 +1172,35 @@ mod tests {
 
         let bare = CreatorStamp::new(7, "host-b", None);
         assert_eq!(CreatorStamp::parse(&bare.encode()), Some(bare));
+    }
+
+    /// Parentage rides the SAME encoded string as the rest of the stamp, so a
+    /// row that outlives its daemon keeps its parent. `purpose` must stay last
+    /// even when a parent is present, because it is the only field that may
+    /// contain spaces — get that order wrong and the purpose eats the parent.
+    #[test]
+    fn creator_stamp_round_trips_a_parent_alongside_a_spaced_purpose() {
+        let stamp = CreatorStamp::new(4242, "host-a", Some("drive the browser"))
+            .with_parent_session_path(Some("remote-cc://dev/1410e4f2-62f9-4b04"));
+        assert_eq!(
+            stamp.parent_session_path.as_deref(),
+            Some("remote-cc://dev/1410e4f2-62f9-4b04")
+        );
+        assert_eq!(
+            stamp.encode(),
+            "pid=4242 host=host-a parent=remote-cc://dev/1410e4f2-62f9-4b04 purpose=drive the browser"
+        );
+        assert_eq!(CreatorStamp::parse(&stamp.encode()), Some(stamp));
+
+        // An older stamp has no `parent=` and must still parse, as a row with
+        // no known parent rather than a parse failure.
+        let legacy = CreatorStamp::parse("pid=9 host=host-b purpose=old row").expect("legacy");
+        assert_eq!(legacy.parent_session_path, None);
+
+        // "no parent" is sayable, and does not re-inherit.
+        let orphan = CreatorStamp::new(1, "host-c", None).with_parent_session_path(Some("  "));
+        assert_eq!(orphan.parent_session_path, None);
+        assert_eq!(orphan.encode(), "pid=1 host=host-c");
     }
 
     #[test]

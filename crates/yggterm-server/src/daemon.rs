@@ -1503,6 +1503,7 @@ fn persisted_live_session_from_preserved_owner_snapshot(
         key: session.session_path.clone(),
         id: session.id.clone(),
         title: session.title.clone(),
+        title_is_explicit: session.title_is_explicit,
         kind: session.kind,
         keep_alive: snapshot_session_keep_alive(session),
         ssh_target,
@@ -2048,6 +2049,14 @@ pub enum ServerRequest {
         title: Option<String>,
         precis: Option<String>,
         summary: Option<String>,
+        /// Whether `title` is a name a HUMAN chose (`session rename`) rather
+        /// than one we generated. Without it the daemon cannot tell a rename
+        /// from the background copy chore, and had to treat both as derived —
+        /// which is how a generated title overwrote the owner's renamed row.
+        /// `#[serde(default)]` = `false` = derived, so an older client's
+        /// request keeps its old meaning exactly.
+        #[serde(default)]
+        title_is_explicit: bool,
     },
     RemoveSshTarget {
         machine_key: String,
@@ -7405,10 +7414,15 @@ impl DaemonRuntime {
                 title,
                 precis,
                 summary,
+                title_is_explicit,
             } => {
                 let remote_copy_target = self.server.remote_copy_target_for_session_path(&path);
                 if let Some(title) = title.as_deref() {
-                    self.server.set_session_title_hint(&path, title);
+                    if title_is_explicit {
+                        self.server.set_session_title_explicit(&path, title);
+                    } else {
+                        self.server.set_session_title_hint(&path, title);
+                    }
                 }
                 if let Some(precis) = precis.as_deref() {
                     self.server.set_session_precis_hint(&path, precis);
@@ -11458,12 +11472,16 @@ pub fn refresh_preview_with_history(
     )?)
 }
 
+/// Persist generated copy for a row. `title_is_explicit` marks a title the USER
+/// chose (a rename) so the daemon can protect it from every derived writer; the
+/// generated title/summary chores pass `false`.
 pub fn update_session_copy(
     endpoint: &ServerEndpoint,
     path: &str,
     title: Option<&str>,
     precis: Option<&str>,
     summary: Option<&str>,
+    title_is_explicit: bool,
 ) -> Result<Option<String>> {
     expect_ack(send_request(
         endpoint,
@@ -11472,6 +11490,7 @@ pub fn update_session_copy(
             title: title.map(ToOwned::to_owned),
             precis: precis.map(ToOwned::to_owned),
             summary: summary.map(ToOwned::to_owned),
+            title_is_explicit,
         },
     )?)
 }
@@ -15952,6 +15971,7 @@ mod tests {
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         }
     }
 
@@ -19065,6 +19085,7 @@ mod tests {
             pty_rows: None,
             working: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         }
     }
 
@@ -21196,6 +21217,7 @@ mod tests {
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         let unkept_update_runtime = remote_scanned_session_path("dev", "temporary-update");
         server.restore_live_session(PersistedLiveSession {
@@ -21213,6 +21235,7 @@ mod tests {
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
         let all_registry_keys = owner_registry_keys.clone();
@@ -21334,6 +21357,7 @@ mod tests {
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         let terminals = TerminalManager::new();
 
@@ -21373,6 +21397,7 @@ mod tests {
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         let terminals = TerminalManager::new();
 
@@ -21413,6 +21438,7 @@ mod tests {
                 created_by: None,
                 ephemeral: None,
                 agent_launch_options: Default::default(),
+                title_is_explicit: false,
             });
         }
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
@@ -21461,6 +21487,7 @@ mod tests {
                 created_by: None,
                 ephemeral: None,
                 agent_launch_options: Default::default(),
+                title_is_explicit: false,
             });
         }
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
@@ -22400,6 +22427,7 @@ mod tests {
                 created_by: None,
                 ephemeral: None,
                 agent_launch_options: Default::default(),
+                title_is_explicit: false,
             }],
             session_pty_grids: Vec::new(),
         };
@@ -23233,8 +23261,8 @@ mod tests {
         // Re-stamped for 3.0.37: `StartLocalSession` and
         // `StartRemoteClaudeSession` gained `launch_options`, the wire half of
         // the integrated delegate launch (per-launch model + permission mode).
-        const STAMPED_AT_VERSION: &str = "3.0.37";
-        const STAMPED_SHAPE_HASH: u64 = 0x390c28af82c8e5b4;
+        const STAMPED_AT_VERSION: &str = "3.0.40";
+        const STAMPED_SHAPE_HASH: u64 = 0x28b18f9f7e2e7670;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
