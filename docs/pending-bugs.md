@@ -129,7 +129,10 @@ phantom exists, that closes both this and the judder entry at once.
 
 ## `~/.yggterm`'s 700 sockets are ALIASES, not corpses — the real growth is `client-instances`
 
-**Status:** AWAITING A DECISION (the user's — it is a behaviour change)
+**Status:** AWAITING A DECISION
+
+*(The user decides. Pruning the alias source is a behaviour change, not a
+cleanup — see the decision paragraph below.)*
 
 ⛔ **THE ORIGINAL PREMISE OF THIS ENTRY WAS WRONG AND IS CORRECTED HERE.** It
 said "~700 `server-<version>.sock` files … every other socket is a file no
