@@ -15,7 +15,10 @@ Closed narratives from before 2026-08-02 are in
 
 ## ★★★ A DRAG-SELECT OVER A STREAMING SESSION SELECTS THE WHOLE STREAM
 
-**Status:** OPEN — half fixed (the viewport pin), the runaway selection is not
+**Status:** OPEN
+
+*(Half of it shipped: the viewport pin. The runaway selection itself is what
+remains open, and it is the half the user feels.)*
 
 User-reported 2026-08-05: *"CC paste is working but selection makes the Ux lag
 and sometimes jojo angry."* Their guess — frame writes — is the right
