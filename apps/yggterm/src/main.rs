@@ -495,53 +495,22 @@ fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     yggterm_core::cli_flag_value(args, flag)
 }
 
-/// Refuse a `server app` payload that is really a flag.
+/// A `server app` verb's free-form payload, read position-independently.
 ///
-/// The belt to [`app_control_payload_arg`]'s braces: `cli_positional_args`
-/// already skips `--flag` tokens, so a resolved value can only look like this
-/// if that rule ever loosens. The guard stays because the cost of being wrong
-/// is not a wrong answer, it is the LIE-OF-SUCCESS shape — `dom-eval` printing
-/// `{"result": …}` for an evaluation of the string `--client`, which reads to
-/// the caller exactly like their script having run. Naming the token is honest;
-/// acting on it is not.
-fn refuse_flag_shaped_payload<'a>(value: &'a str, what: &str) -> Result<&'a str> {
-    if value.starts_with("--") {
-        anyhow::bail!(
-            "refusing to use {value:?} as the {what}: that is a flag, not a value. \
-             --client/--pid/--timeout-ms may sit on either side of the value, but \
-             the value itself must not look like a flag"
-        );
-    }
-    Ok(value)
+/// ⛔ The RULE lives in [`yggterm_core::cli_payload_arg`], beside the positional
+/// reader it is built on, because `bin/yggterm-headless.rs` has the same arms
+/// and a second copy of an argv rule is exactly how the two binaries drift.
+/// This is only the `anyhow` adapter.
+fn app_control_payload_arg<'a>(args: &'a [String], start: usize, what: &str) -> Result<&'a str> {
+    yggterm_core::cli_payload_arg(args, start, what).map_err(|error| anyhow::anyhow!(error))
 }
 
-/// THE reader for a `server app` verb's free-form payload — `dom-eval`'s
-/// script, `command invoke`'s id, `media answer`'s answer.
-///
-/// Position-INDEPENDENT, because the flags it shares an argv with are:
-/// [`yggterm_server::apply_app_control_target_overrides`] scans the whole argv
-/// for `--client`/`--pid`, so a payload read straight out of `args[start]`
-/// disagrees with the very flags it was typed beside. That disagreement is what
-/// made `dom-eval --client shadow '<script>'` evaluate the STRING `--client`
-/// and report success.
-///
-/// ⚠ The twin arms in `bin/yggterm-headless.rs` still read their payload at a
-/// fixed index. One owner means this rule belongs beside `cli_positional_args`
-/// in `yggterm_core::cli_args` where BOTH binaries can call it — moving it
-/// there is the finish of this fix, not a separate idea.
-fn app_control_payload_arg<'a>(args: &'a [String], start: usize, what: &str) -> Result<&'a str> {
-    match cli_positional_args(args, start).into_iter().next() {
-        Some(value) => refuse_flag_shaped_payload(value, what),
-        // No positional anywhere. When a flag sits where the payload was meant
-        // to go, name THAT token — it is the one the old fixed-index reader
-        // would have acted on — rather than the vaguer "missing".
-        None => match args.get(start).map(String::as_str) {
-            Some(flagged) if flagged.starts_with("--") => {
-                refuse_flag_shaped_payload(flagged, what)
-            }
-            _ => anyhow::bail!("missing {what}"),
-        },
-    }
+/// Refuse a payload that is really a flag. Adapter over
+/// [`yggterm_core::refuse_flag_shaped_payload`]; see there for why the guard
+/// exists at all (the LIE-OF-SUCCESS shape, not a wrong answer).
+#[cfg(test)]
+fn refuse_flag_shaped_payload<'a>(value: &'a str, what: &str) -> Result<&'a str> {
+    yggterm_core::refuse_flag_shaped_payload(value, what).map_err(|error| anyhow::anyhow!(error))
 }
 
 /// Parse the agent-oriented screenshot post-process flags:

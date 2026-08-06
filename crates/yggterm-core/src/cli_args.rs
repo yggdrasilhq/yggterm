@@ -61,9 +61,78 @@ pub fn cli_positional_args(args: &[String], start: usize) -> Vec<&str> {
     positional
 }
 
+/// Refuse a payload that still looks like a flag after resolution.
+///
+/// Naming the token is honest; acting on it is not. The failure this prevents
+/// is silent: a CLI that evaluates the string `--client` answers confidently
+/// about the wrong thing and reports success.
+pub fn refuse_flag_shaped_payload<'a>(value: &'a str, what: &str) -> Result<&'a str, String> {
+    if value.starts_with("--") {
+        return Err(format!(
+            "refusing to use {value:?} as the {what}: that is a flag, not a value. \
+             --client/--pid/--timeout-ms may sit on either side of the value, but \
+             the value itself must not look like a flag"
+        ));
+    }
+    Ok(value)
+}
+
+/// THE reader for a CLI verb's free-form payload — `dom-eval`'s script,
+/// `command invoke`'s id, `media answer`'s answer.
+///
+/// Position-INDEPENDENT, because the flags it shares an argv with are:
+/// `apply_app_control_target_overrides` scans the whole argv for
+/// `--client`/`--pid`, so a payload read straight out of `args[start]`
+/// disagrees with the very flags it was typed beside. That disagreement is what
+/// made `dom-eval --client shadow '<script>'` evaluate the STRING `--client`
+/// and report success.
+///
+/// ⛔ It lives HERE, beside [`cli_positional_args`], for the reason this
+/// module's own header gives: a second copy of an argv rule is how
+/// `--ephemeral-owner-pid=4242` was silently discarded by one parser while the
+/// spaced form worked in another. Both binaries call this one.
+pub fn cli_payload_arg<'a>(args: &'a [String], start: usize, what: &str) -> Result<&'a str, String> {
+    match cli_positional_args(args, start).into_iter().next() {
+        Some(value) => refuse_flag_shaped_payload(value, what),
+        // No positional anywhere. When a flag sits where the payload was meant
+        // to go, name THAT token — it is the one a fixed-index reader would have
+        // acted on — rather than the vaguer "missing".
+        None => match args.get(start).map(String::as_str) {
+            Some(flagged) if flagged.starts_with("--") => {
+                refuse_flag_shaped_payload(flagged, what)
+            }
+            _ => Err(format!("missing {what}")),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_payload_reads_the_same_with_the_flags_on_either_side() {
+        let before = argv(&["server", "app", "dom-eval", "--client", "shadow", "return 1+1"]);
+        let after = argv(&["server", "app", "dom-eval", "return 1+1", "--client", "shadow"]);
+        assert_eq!(
+            cli_payload_arg(&before, 3, "script").unwrap(),
+            cli_payload_arg(&after, 3, "script").unwrap(),
+            "the flags were never position-sensitive; the payload must not be either"
+        );
+        assert_eq!(cli_flag_value(&before, "--client"), Some("shadow"));
+        assert_eq!(cli_flag_value(&after, "--client"), Some("shadow"));
+    }
+
+    #[test]
+    fn a_flag_shaped_payload_is_refused_by_name_not_acted_on() {
+        let args = argv(&["server", "app", "dom-eval", "--client"]);
+        let error = cli_payload_arg(&args, 3, "script").unwrap_err();
+        assert!(
+            error.contains("--client"),
+            "the refusal must NAME the token, or the reader goes hunting: {error}"
+        );
+        assert!(!error.contains("missing"), "it is present and wrong, not absent: {error}");
+    }
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
