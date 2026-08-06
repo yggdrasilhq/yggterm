@@ -19326,6 +19326,7 @@ pub fn run_app_control_notify(
     persistent: bool,
     silent: bool,
     delay_ms: Option<u64>,
+    session: Option<&str>,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
@@ -19340,6 +19341,7 @@ pub fn run_app_control_notify(
             persistent,
             silent,
             delay_ms,
+            session: session.map(str::to_string),
         },
         timeout_ms,
     )?;
