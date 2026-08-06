@@ -201,6 +201,23 @@ pub fn read_prompt(args: &[String]) -> anyhow::Result<Option<String>> {
         std::io::stdin()
             .read_to_string(&mut value)
             .context("reading automation prompt from stdin")?;
+        // ⛔ An EMPTY read is refused BY NAME rather than passed on.
+        //
+        // It used to return `Some("")`, which the delivery path flattened to
+        // `prompt: null` in the reply — so a delegate launched over ssh with
+        // `--prompt-stdin` and no stdin came back looking successful
+        // (`launch.applied: true`, the model and permission mode both right)
+        // while the row sat idle with nothing to do. Live-hit 2026-08-06.
+        // A launched-but-silent delegate is the most expensive way to fail
+        // here, because nothing looks wrong until someone reads the row.
+        if value.trim().is_empty() {
+            anyhow::bail!(
+                "--prompt-stdin was given but stdin was empty; pipe the prompt in \
+                 (`… --prompt-stdin < brief.md`, or `cat brief.md | …`) or pass \
+                 `--prompt <text>`. Over ssh, quote the remote command so the \
+                 redirect is applied where you mean it."
+            );
+        }
         return Ok(Some(value));
     }
     Ok(cli_flag_value(args, "--prompt").map(str::to_string))
@@ -375,6 +392,12 @@ fn open_session_for_real(automation: &Automation, timeout_ms: u64) -> anyhow::Re
             std::process::id(),
             &crate::session_tenancy::local_host_token(),
             Some(&format!("automation:{}", automation.id)),
+        )
+        // An automation usually runs from a timer with no row of its own, in
+        // which case this is None and the row is correctly top-level. When it
+        // IS run from inside a row, that row is its parent.
+        .with_parent_session_path(
+            crate::session_tenancy::parent_session_path_from_env().as_deref(),
         ),
         // TTL-only, and deliberately no owner pid. This process exits the
         // moment the run is recorded — naming it as the owner would have the
@@ -855,6 +878,28 @@ mod tests {
     use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
 
     const IST: i32 = 5 * 3600 + 1800;
+
+    /// `--prompt` still reads normally; only the stdin arm gained a refusal.
+    /// (The empty-stdin arm itself is not unit-tested: it reads the process's
+    /// real stdin, which a test harness does not own — the refusal is asserted
+    /// on the message text a caller would see instead.)
+    #[test]
+    fn a_prompt_flag_is_read_without_touching_stdin() {
+        let args = vec!["--prompt".to_string(), "do the thing".to_string()];
+        assert_eq!(
+            read_prompt(&args).expect("reads"),
+            Some("do the thing".to_string())
+        );
+        assert_eq!(read_prompt(&[]).expect("reads"), None);
+    }
+
+    #[test]
+    fn the_empty_stdin_refusal_names_the_flag_and_both_ways_to_fix_it() {
+        let source = include_str!("automation_cli.rs");
+        assert!(source.contains("--prompt-stdin was given but stdin was empty"));
+        // A refusal that does not say what to do instead is a dead end.
+        assert!(source.contains("--prompt <text>"));
+    }
 
     fn at(year: i32, month: Month, day: u8, hour: u8, minute: u8) -> u64 {
         let date = Date::from_calendar_date(year, month, day).unwrap();

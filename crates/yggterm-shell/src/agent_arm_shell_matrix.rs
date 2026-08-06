@@ -332,6 +332,7 @@ impl ShellArm {
             stored_preview_hydrated: true,
             working: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         }
     }
 
