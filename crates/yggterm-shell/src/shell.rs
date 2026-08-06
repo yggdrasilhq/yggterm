@@ -49252,6 +49252,9 @@ fn remote_scanned_session_from_live(
         cached_precis: None,
         cached_summary: None,
         live_runtime: false,
+        // Derived from a live row, not chosen by a human: provenance is stamped
+        // by `set_session_title_explicit`, never by a projection.
+        title_is_explicit: false,
         storage_path,
     }
 }
@@ -152702,6 +152705,7 @@ mod tests {
                     cached_precis: None,
                     cached_summary: None,
                     live_runtime: false,
+                    title_is_explicit: false,
                     storage_path: "/home/user/.codex/sessions/a.jsonl".to_string(),
                 }],
             }],
@@ -152754,6 +152758,7 @@ mod tests {
                         cached_precis: None,
                         cached_summary: None,
                         live_runtime: false,
+                        title_is_explicit: false,
                         storage_path: "/home/user/.codex/sessions/a.jsonl".to_string(),
                     },
                     RemoteScannedSession {
@@ -152770,6 +152775,7 @@ mod tests {
                         cached_precis: None,
                         cached_summary: None,
                         live_runtime: false,
+                        title_is_explicit: false,
                         storage_path: "/home/user/.codex/sessions/b.jsonl".to_string(),
                     },
                 ],
@@ -152819,6 +152825,7 @@ mod tests {
                         cached_precis: None,
                         cached_summary: None,
                         live_runtime: false,
+                        title_is_explicit: false,
                         storage_path: "older".to_string(),
                     },
                     RemoteScannedSession {
@@ -152835,6 +152842,7 @@ mod tests {
                         cached_precis: None,
                         cached_summary: None,
                         live_runtime: false,
+                        title_is_explicit: false,
                         storage_path: "newer".to_string(),
                     },
                 ],
@@ -152878,6 +152886,7 @@ mod tests {
                     cached_precis: None,
                     cached_summary: None,
                     live_runtime: false,
+                    title_is_explicit: false,
                     storage_path: "/home/user/.codex/sessions/a.jsonl".to_string(),
                 }],
             }],
@@ -153231,6 +153240,7 @@ mod tests {
                         cached_precis: None,
                         cached_summary: None,
                         live_runtime: false,
+                        title_is_explicit: false,
                         storage_path: "a".to_string(),
                     },
                     RemoteScannedSession {
@@ -153247,6 +153257,7 @@ mod tests {
                         cached_precis: None,
                         cached_summary: None,
                         live_runtime: false,
+                        title_is_explicit: false,
                         storage_path: "b".to_string(),
                     },
                 ],
@@ -153292,6 +153303,7 @@ mod tests {
                     cached_precis: None,
                     cached_summary: None,
                     live_runtime: false,
+                    title_is_explicit: false,
                     storage_path: "a".to_string(),
                 }],
             }],
@@ -153838,6 +153850,7 @@ mod tests {
                     cached_precis: None,
                     cached_summary: None,
                     live_runtime: false,
+                    title_is_explicit: false,
                     storage_path: "/home/user/.codex/sessions/foo.jsonl".to_string(),
                 }],
             }],
@@ -154238,6 +154251,7 @@ mod tests {
                 cached_precis: Some(format!("metadata candidate {ix}")),
                 cached_summary: None,
                 live_runtime: true,
+                title_is_explicit: false,
                 storage_path: format!("/home/user/.codex/sessions/runtime-{ix}.jsonl"),
             })
             .collect::<Vec<_>>();
@@ -154319,6 +154333,7 @@ mod tests {
                     cached_precis: None,
                     cached_summary: None,
                     live_runtime: false,
+                    title_is_explicit: false,
                     storage_path: "/home/user/.codex/sessions/foo.jsonl".to_string(),
                 }],
             }],
@@ -154434,6 +154449,7 @@ mod tests {
                 cached_precis: None,
                 cached_summary: None,
                 live_runtime: false,
+                title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/foo.jsonl".to_string(),
             }],
         }];
@@ -154496,6 +154512,7 @@ mod tests {
             cached_precis: None,
             cached_summary: cached_summary.map(ToOwned::to_owned),
             live_runtime: false,
+            title_is_explicit: false,
             storage_path: format!("/home/user/.codex/sessions/{id}.jsonl"),
         };
         RemoteMachineSnapshot {
@@ -155316,6 +155333,7 @@ mod tests {
                 cached_precis: None,
                 cached_summary: Some("Typing latency proof is present.".to_string()),
                 live_runtime: false,
+                title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/example.jsonl".to_string(),
             }],
         }];
@@ -155352,6 +155370,7 @@ mod tests {
                     .to_string(),
             ),
             live_runtime: false,
+            title_is_explicit: false,
             storage_path: "/home/user/.codex/sessions/example.jsonl".to_string(),
         };
 
@@ -155395,6 +155414,7 @@ mod tests {
             cached_precis: None,
             cached_summary: None,
             live_runtime: false,
+            title_is_explicit: false,
             storage_path: "/home/user/.codex/sessions/example.jsonl".to_string(),
         };
         let short_ids = HashMap::from([(session.session_path.clone(), "019dfc5a".to_string())]);
@@ -155770,6 +155790,7 @@ mod tests {
                     cached_precis: None,
                     cached_summary: None,
                     live_runtime: false,
+                    title_is_explicit: false,
                     storage_path: "a".to_string(),
                 }],
             }],
@@ -155921,6 +155942,7 @@ mod tests {
                         cached_precis: None,
                         cached_summary: None,
                         live_runtime: false,
+                        title_is_explicit: false,
                         storage_path: "a".to_string(),
                     },
                     RemoteScannedSession {
@@ -155937,6 +155959,7 @@ mod tests {
                         cached_precis: None,
                         cached_summary: None,
                         live_runtime: false,
+                        title_is_explicit: false,
                         storage_path: "b".to_string(),
                     },
                 ],
@@ -155984,6 +156007,7 @@ mod tests {
                 cached_precis: None,
                 cached_summary: None,
                 live_runtime: false,
+                title_is_explicit: false,
                 storage_path: "a".to_string(),
             }],
         };
@@ -156042,6 +156066,7 @@ mod tests {
                     cached_precis: None,
                     cached_summary: None,
                     live_runtime: false,
+                    title_is_explicit: false,
                     storage_path: "practice.jsonl".to_string(),
                 }],
             }],
@@ -156144,6 +156169,7 @@ mod tests {
                     cached_precis: None,
                     cached_summary: None,
                     live_runtime: false,
+                    title_is_explicit: false,
                     storage_path: "practice.jsonl".to_string(),
                 }],
             }],
@@ -156276,6 +156302,7 @@ mod tests {
                     cached_precis: None,
                     cached_summary: None,
                     live_runtime: false,
+                    title_is_explicit: false,
                     storage_path: "a".to_string(),
                 }],
             }],
@@ -157134,6 +157161,7 @@ mod tests {
                     cached_precis: None,
                     cached_summary: None,
                     live_runtime: false,
+                    title_is_explicit: false,
                     storage_path: "/home/user/.codex/sessions/proof.jsonl".to_string(),
                 }],
             }],
@@ -157231,6 +157259,7 @@ mod tests {
                 cached_precis: None,
                 cached_summary: None,
                 live_runtime: false,
+                title_is_explicit: false,
                 storage_path: "a".to_string(),
             }],
         }];
@@ -158611,6 +158640,7 @@ mod tests {
                 cached_precis: None,
                 cached_summary: None,
                 live_runtime: false,
+                title_is_explicit: false,
                 storage_path: "/tmp/remote-dev-123.jsonl".to_string(),
             }],
         }];
@@ -168917,6 +168947,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                         cached_precis: None,
                         cached_summary: None,
                         live_runtime: false,
+                        title_is_explicit: false,
                         storage_path: "/home/user/.codex/sessions/a.jsonl".to_string(),
                     },
                     RemoteScannedSession {
@@ -168933,6 +168964,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                         cached_precis: None,
                         cached_summary: None,
                         live_runtime: false,
+                        title_is_explicit: false,
                         storage_path: "/home/user/.codex/sessions/b.jsonl".to_string(),
                     },
                 ],
@@ -173283,6 +173315,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 cached_precis: None,
                 cached_summary: None,
                 live_runtime: false,
+                title_is_explicit: false,
                 storage_path: format!("/home/user/.codex/sessions/{name}.jsonl"),
             };
         shell.server.apply_snapshot(ServerUiSnapshot {
@@ -173360,6 +173393,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 cached_precis: None,
                 cached_summary: None,
                 live_runtime: false,
+                title_is_explicit: false,
                 storage_path: format!("/home/user/.codex/sessions/{name}.jsonl"),
             };
         shell.server.apply_snapshot(ServerUiSnapshot {
@@ -173456,6 +173490,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 cached_precis: None,
                 cached_summary: None,
                 live_runtime: false,
+                title_is_explicit: false,
                 storage_path: format!("/home/user/.codex/sessions/{name}.jsonl"),
             };
         shell.server.apply_snapshot(ServerUiSnapshot {
@@ -173884,6 +173919,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cached_precis: None,
             cached_summary: None,
             live_runtime: false,
+            title_is_explicit: false,
             storage_path: format!("/home/user/.codex/sessions/{name}.jsonl"),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
@@ -175338,6 +175374,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             cached_precis: None,
             cached_summary: None,
             live_runtime: false,
+            title_is_explicit: false,
             storage_path: "/home/user/.codex/sessions/rollout-6d8cdd5.jsonl".to_string(),
         };
         let short_ids = HashMap::from([(session.session_path.clone(), "6d8cdd5".to_string())]);

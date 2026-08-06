@@ -196,6 +196,79 @@ quick one.
 **Falsifier:** `ls -l --time-style=full-iso ~/.yggterm/event-trace.*.jsonl`
 before and after `cargo test -p yggterm-shell`; if no mtime moves, this is wrong.
 
+## ★★★ FIVE VERBS REPORT THE REQUEST, NOT THE EFFECT — one rule, not five patches
+
+**Status:** AWAITING A DECISION
+
+*(The shape of the fix is the decision: a response-layer rule, or five separate
+patches. Owner-directed framing, 2026-08-07.)*
+
+Owner, watching the tool calls scroll past: *"for common tasks that we are
+failing again and again like row org, we should have yggui automation supplied
+tooling shortcuts for doing these common chores so that no mistakes do not
+happen."* He is not asking for better agent discipline — he watched an agent
+hand-assemble one chore out of five primitives, get it wrong, and retry.
+
+**Every failure on the night of 2026-08-07 was an agent believing a success
+field, and the owner finding the truth by looking at his screen:**
+
+| verb | field | what it actually meant |
+|---|---|---|
+| `session remove` | `verified` | answered `false / remote_runtime_survived` with `live_processes: []` in the SAME reply, 3 of 3 |
+| `session rename` | `accepted: true` | on a call the daemon had a named reason to reject |
+| `server sessions reorder` | `changed: true` | a daemon field moved; the sidebar did not, 4 times |
+| `terminal new --prompt-stdin` | `delivered: true` | `submitted:true, waited_ms:19802` — and the transcript never gained a user row, twice in one minute |
+| `terminal send` | `accepted: true` | bytes written; into an agent row that is one Enter PER LINE |
+
+⇒ **The candidate rule: a mutating verb answers against RE-READ state, or it
+answers with a named refusal.** Never against the request it just made. The
+app-path reorder shipped in 3.0.44 is the first verb built this way — `changed`
+is a before/after comparison of the rendered list — and it is the pattern to
+copy or to generalise.
+
+⚖ **And the reason the owner wants these as VERBS rather than agent habits:**
+*"an agent's discipline resets every session, but a verb does not."* Anything an
+agent must remember to do in the right order is a defect waiting for a tired
+session. Same argument as the row-hygiene work: **the janitorial work must
+become tooling.** The named dreams, each with a measured cost from that night:
+`spawn-delegate` (one verb, delivery PROVEN not reported) · `outline --apply`
+(must move the GUI) · a `rename` that cannot lose the self-title race ·
+`send --file` · a row state distinguishing **WAITING-ON-INPUT from idle**
+(a monitor stayed silent through the state that mattered) · an honest `reap` ·
+binary/daemon resolution that never fails silently.
+
+## ⚠ AN EXPLICIT TITLE CAN STILL BE OVERWRITTEN ON A ROW WHOSE AGENT HAS EXITED
+
+**Status:** OPEN
+
+Measured by the orchestrator 2026-08-07: two rows renamed at 00:55 reverted
+~2.5 h later to CLI-generated titles. ⭐ **The discriminator rules out the
+obvious cause — the reverted row had ZERO live claude processes**, so this was
+not the CLI re-titling itself; a generated title overwrote a human-set one on a
+session with no agent running.
+
+**Root cause, partly located.** `session_title_is_explicit` reads
+`self.sessions` — the LIVE row. Once an agent exits, the only surviving copy is
+the scanned mirror (`RemoteScannedSession`), and it carried **no provenance at
+all**, exactly as the predecessor's own doc comment said (*"the scanned mirror
+carries no provenance of its own"*). So every downstream guard was reduced to
+`looks_like_generated_fallback_title` — the shape heuristic that provably cannot
+separate `6. yggterm: campaign` from a real conversation title like
+`Ping from orchestrator`.
+
+**Shipped: the missing precondition.** `RemoteScannedSession::title_is_explicit`
+(`#[serde(default)]`), stamped by `set_session_title_explicit`, and consumed by
+the merge in `promote_remote_codex_live_session_to_scanned`.
+
+⛔ **NOT PROVEN FIXED, and do not close it on this.** I did not reproduce the
+observed revert, and the merge I guarded is a live→scanned promotion, not
+necessarily the site that fired. The remaining work is to find which path
+consumes the mirror on a machine rescan / state restore
+(`load_remote_machine_sessions_from_mirror`, `overlay_mirrored_remote_sessions`
+around `lib.rs:5628` are the unexamined candidates) and make it read the flag.
+**Falsifier that would close it:** rename a `remote-cc://` row whose agent has
+exited, force a machine rescan, and read the title back from `server app rows`.
+
 ## ★★★ `server reorder` WRITES WHERE THE GUI DOES NOT READ — same version, different DAEMON
 
 **Status:** OPEN
