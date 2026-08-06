@@ -35,6 +35,12 @@ pub use browser_import_cli::{browser_import_usage_block, run_browser_import_cli}
 pub mod app_declare;
 mod attach;
 mod clipboard_sweep;
+// The clipboard sweeper's sibling: autoclean for `$YGGTERM_HOME/server-*.sock`
+// (docs/pending-bugs.md: ~700 of them on the GUI host). Unix-only because the
+// socket names are; the liveness proof is the kernel's own table, never a
+// failed connect.
+#[cfg(unix)]
+mod socket_sweep;
 mod codex_cli;
 mod daemon;
 pub mod grid_overlay;
