@@ -1,5 +1,5 @@
 use crate::{SessionKind, shell_single_quote};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use yggterm_core::{
-    ENV_YGGTERM_HOME, PerfSpan, SessionStore, append_trace_event, resolve_yggterm_home,
+    AgentLaunchOptions, ENV_YGGTERM_HOME, PerfSpan, SessionStore, append_trace_event,
+    resolve_yggterm_home,
 };
 use yggui_contract::UiTheme;
 
@@ -1476,6 +1477,39 @@ mod tests {
             " '--message' 'Avikalpa'\\''s laptop'"
         );
     }
+
+    // The delegate-launch composition, at the layer that builds the command.
+    // `composed_cli_extra_args` reads the user's SETTINGS, so these drive the
+    // pure half — strip + append + quote — through the same code path with the
+    // configured side supplied explicitly.
+    #[test]
+    fn a_per_launch_option_appends_after_stripping_what_it_overrides() {
+        let configured = split_extra_args("--model claude-fable-5 --verbose");
+        let launch = AgentLaunchOptions {
+            model: Some("claude-opus-5".to_string()),
+            permission_mode: Some(yggterm_core::AgentPermissionMode::Bypass),
+        };
+        let mut tokens = launch.strip_overridden(SessionKind::ClaudeCode, &configured);
+        tokens.extend(launch.launch_tokens(SessionKind::ClaudeCode).unwrap());
+        assert_eq!(
+            shell_join_tokens(&tokens),
+            " '--verbose' '--model' 'claude-opus-5' '--dangerously-skip-permissions'",
+            "the configured model must be GONE, not merely outranked"
+        );
+    }
+
+    // An empty launch must leave the command byte-identical to the pre-flag
+    // path, or every human door (titlebar +, KeyTips, start page) changes shape
+    // for a feature none of them asked for.
+    #[test]
+    fn an_empty_launch_composes_to_the_configured_args_verbatim() {
+        let configured = split_extra_args("-s danger-full-access --profile 'field test'");
+        let launch = AgentLaunchOptions::default();
+        assert_eq!(
+            shell_join_tokens(&launch.strip_overridden(SessionKind::Codex, &configured)),
+            shell_join_extra_args("-s danger-full-access --profile 'field test'")
+        );
+    }
 }
 
 fn run_version_command(binary_path: &Path) -> Option<String> {
@@ -1672,6 +1706,22 @@ pub(crate) fn managed_cli_shell_command_with_terminal_appearance(
     action: ManagedCliAction<'_>,
     terminal_appearance: Option<&str>,
 ) -> Result<String> {
+    managed_cli_shell_command_full(
+        kind,
+        cwd,
+        action,
+        terminal_appearance,
+        &AgentLaunchOptions::default(),
+    )
+}
+
+pub(crate) fn managed_cli_shell_command_full(
+    kind: SessionKind,
+    cwd: Option<&str>,
+    action: ManagedCliAction<'_>,
+    terminal_appearance: Option<&str>,
+    launch: &AgentLaunchOptions,
+) -> Result<String> {
     let Some(tool) = ManagedCliTool::from_session_kind(kind) else {
         anyhow::bail!("session kind does not use a managed Codex CLI");
     };
@@ -1682,7 +1732,7 @@ pub(crate) fn managed_cli_shell_command_with_terminal_appearance(
         parts.push(preamble);
     }
     parts.push(paths.shell_exports_with_terminal_appearance(tool, terminal_appearance));
-    let extra_args = configured_cli_extra_args(kind);
+    let extra_args = composed_cli_extra_args(kind, launch)?;
     // Invocation SHAPE is descriptor data now (harness spec §3, phase 1): which
     // CLI takes `--resume <id>` vs `resume <id>`, and which re-roots with
     // `-C "$PWD"`, is answered once in `yggterm_core::agent_cli` instead of by
@@ -1743,16 +1793,54 @@ fn join_invocation_tokens(tokens: &[String]) -> String {
         .collect::<String>()
 }
 
+/// The CLI's extra args for ONE launch: the user's configured args, with the
+/// flags this launch overrides removed, plus the launch's own tokens.
+///
+/// **Per-launch wins, and "wins" means the configured flag is gone.** Leaving
+/// both on the command line would make the CLI's own precedence rule the source
+/// of truth for which model runs — a second encoding of a question yggterm
+/// already answers.
+///
+/// ⛔ The launch options are NEVER written back to settings. A delegate asking
+/// for bypass must not mutate `claude_code_extra_args`, which the user owns;
+/// that requirement is what made the pre-flag workaround unacceptable.
+pub(crate) fn composed_cli_extra_args(
+    kind: SessionKind,
+    launch: &AgentLaunchOptions,
+) -> Result<String> {
+    let configured = configured_cli_extra_arg_tokens(kind);
+    if launch.is_empty() {
+        // Byte-identical to the pre-flag path for every human door.
+        return Ok(shell_join_tokens(&configured));
+    }
+    let mut tokens = launch.strip_overridden(kind, &configured);
+    tokens.extend(launch.launch_tokens(kind).map_err(|message| anyhow!(message))?);
+    Ok(shell_join_tokens(&tokens))
+}
+
 fn configured_cli_extra_args(kind: SessionKind) -> String {
+    shell_join_tokens(&configured_cli_extra_arg_tokens(kind))
+}
+
+/// The user's configured extra args for `kind`, as TOKENS.
+///
+/// Split out from the joined form because "per-launch wins" is a token-level
+/// operation: you cannot remove `--model opus` from a shell-quoted string
+/// without re-parsing it, and re-parsing it in a second place is how the two
+/// spellings drift.
+fn configured_cli_extra_arg_tokens(kind: SessionKind) -> Vec<String> {
     // Remote CC daemon-runtime lane: the CLIENT machine's configured claude
     // extra args (e.g. --dangerously-skip-permissions) travel to this host
     // via YGGTERM_CC_EXTRA_ARGS (ssh export → wrapper → daemon request env),
     // because the remote machine's own settings store does not have them.
+    // The per-launch options of a REMOTE delegate ride this same variable,
+    // already composed by the client (see `claude_extra_args_remote_exports`),
+    // which is why this arm returns early and never re-reads local settings.
     if kind == SessionKind::ClaudeCode
         && let Ok(forwarded) = env::var(ENV_YGGTERM_CC_EXTRA_ARGS)
         && !forwarded.trim().is_empty()
     {
-        return shell_join_extra_args(&forwarded);
+        return split_extra_args(&forwarded);
     }
     let settings = SessionStore::open_or_init()
         .and_then(|store| store.load_settings())
@@ -1765,20 +1853,31 @@ fn configured_cli_extra_args(kind: SessionKind) -> String {
         _ => None,
     }
     .unwrap_or_default();
-    shell_join_extra_args(&raw)
+    split_extra_args(&raw)
 }
 
+/// Parse a configured extra-args STRING and shell-quote it back onto a command.
+/// Kept as the one-shot spelling for callers that never override anything.
 fn shell_join_extra_args(raw: &str) -> String {
+    shell_join_tokens(&split_extra_args(raw))
+}
+
+pub(crate) fn split_extra_args(raw: &str) -> Vec<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return String::new();
+        return Vec::new();
     }
-    let tokens = shlex::split(trimmed).unwrap_or_else(|| {
+    shlex::split(trimmed).unwrap_or_else(|| {
         trimmed
             .split_whitespace()
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>()
-    });
+    })
+}
+
+/// Shell-quote tokens onto a command, space-prefixed. Empty ⇒ empty string, so
+/// a launch with no extra args stays byte-identical to the pre-flag command.
+pub(crate) fn shell_join_tokens(tokens: &[String]) -> String {
     if tokens.is_empty() {
         String::new()
     } else {

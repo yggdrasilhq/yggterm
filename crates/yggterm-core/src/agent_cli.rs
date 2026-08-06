@@ -40,6 +40,315 @@ pub enum ResumeSelector {
     Subcommand(&'static str),
 }
 
+/// Whether a CLI flag swallows the next token as its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagArity {
+    /// `--dangerously-skip-permissions` — the flag IS the whole statement.
+    Standalone,
+    /// `--model opus` — the following token belongs to it.
+    TakesValue,
+}
+
+/// Which per-launch option supersedes a configured flag.
+///
+/// Declared per flag rather than inferred from the emit table: `--sandbox` is a
+/// permission flag codex accepts but yggterm never emits, and inferring its
+/// category from "is it in the emit list" would put it in the wrong bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverriddenBy {
+    Model,
+    PermissionMode,
+}
+
+/// A permission posture a delegate launch can ask for, in ONE vocabulary
+/// across every agent CLI.
+///
+/// **Why yggterm names these rather than passing the CLI's own spelling
+/// through.** A caller launching a delegate row should not have to know that
+/// Claude Code says `acceptEdits` while codex says `--sandbox workspace-write`,
+/// any more than it has to know that one resumes with `--resume <id>` and the
+/// other with `resume <id>`. Per-CLI spelling is DATA on the descriptor
+/// ([`AgentCliDescriptor::permission_modes`]), exactly like [`ResumeSelector`].
+///
+/// ⛔ **A mode absent from a CLI's table is REFUSED BY NAME, never
+/// approximated.** A permission mode is a security boundary; a mapping that
+/// reads `accept-edits` but means "never ask, sandboxed to the workspace" is a
+/// second encoding of that boundary which can silently diverge from what the
+/// caller believed it asked for. Codex has no plan mode and no edits-only
+/// approval, so it declares neither and says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPermissionMode {
+    /// Whatever the CLI itself defaults to — emits NO tokens.
+    ///
+    /// Deliberately empty rather than spelling the CLI's default value: Claude
+    /// Code's `--permission-mode` choices have already been renamed once
+    /// (`default` → `manual`/`auto`, seen on 2.1.223), and a value we do not
+    /// need to send is a value that cannot rot.
+    Default,
+    Plan,
+    AcceptEdits,
+    /// Skip permission prompts entirely — what an unattended delegate needs.
+    Bypass,
+}
+
+/// The spellings [`AgentPermissionMode::parse`] accepts, in the order a refusal
+/// lists them.
+pub const AGENT_PERMISSION_MODE_NAMES: &[(&str, AgentPermissionMode)] = &[
+    ("default", AgentPermissionMode::Default),
+    ("plan", AgentPermissionMode::Plan),
+    ("accept-edits", AgentPermissionMode::AcceptEdits),
+    ("bypass", AgentPermissionMode::Bypass),
+];
+
+impl AgentPermissionMode {
+    /// Parse the flag value. One spelling per mode: an alias table is a second
+    /// vocabulary to keep in sync with the docs, and there is no user demand
+    /// for one.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        AGENT_PERMISSION_MODE_NAMES
+            .iter()
+            .find(|(name, _)| *name == trimmed)
+            .map(|(_, mode)| *mode)
+            .ok_or_else(|| {
+                format!(
+                    "--permission-mode {raw:?} is not a mode yggterm knows. Try one of: {}",
+                    AGENT_PERMISSION_MODE_NAMES
+                        .iter()
+                        .map(|(name, _)| *name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+
+    /// The spelling a caller types, and the one a reply reports back.
+    pub fn name(&self) -> &'static str {
+        AGENT_PERMISSION_MODE_NAMES
+            .iter()
+            .find(|(_, mode)| mode == self)
+            .map(|(name, _)| *name)
+            .unwrap_or("default")
+    }
+}
+
+/// What ONE launch asks of an agent CLI, over and above the user's configured
+/// defaults: which model, and which permission posture.
+///
+/// **The trap this closes.** `terminal new --kind claude-code` used to be
+/// unusable for a delegate row because model and permission mode came ONLY from
+/// global settings: the row inherited whatever the user had set as their default
+/// model — the exact tier a delegate exists to avoid — and bypass could be asked
+/// for only by mutating `claude_code_extra_args`, a setting the user owns and an
+/// agent has no business writing. Both are now per-launch, and neither reads or
+/// writes the global setting.
+///
+/// Empty is the norm: a launch that asks for nothing composes to byte-identical
+/// behaviour with the pre-flag path, which is what keeps every human door
+/// (titlebar +, KeyTips, start page) unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct AgentLaunchOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<AgentPermissionMode>,
+}
+
+impl AgentLaunchOptions {
+    /// Nothing asked for ⇒ every path stays exactly as it was.
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none() && self.permission_mode.is_none()
+    }
+
+    /// The tokens this launch adds, or a refusal naming what went wrong.
+    ///
+    /// ⛔ **Refuses rather than ignores.** A silently dropped `--model` is
+    /// precisely how the inheritance trap survived unnoticed for so long: the
+    /// launch reported success and the row quietly ran on the wrong tier. So a
+    /// non-agent kind, an empty value, or a mode this CLI cannot express is an
+    /// ERROR the caller reads, never a no-op.
+    pub fn launch_tokens(&self, kind: SessionKind) -> Result<Vec<String>, String> {
+        let Some(descriptor) = agent_cli_descriptor(kind) else {
+            if self.is_empty() {
+                return Ok(Vec::new());
+            }
+            let asked = self.asked_flag_names().join(" and ");
+            return Err(format!(
+                "{asked} applies to an agent CLI session, and --kind {} has no CLI to pass it to. \
+                 Launch with --kind claude-code or --kind codex.",
+                session_kind_flag_name(kind)
+            ));
+        };
+        let mut tokens = Vec::new();
+        if let Some(model) = &self.model {
+            if model.trim().is_empty() {
+                return Err(
+                    "--model needs a model id; an empty one would silently inherit the default"
+                        .to_string(),
+                );
+            }
+            tokens.push(descriptor.model_flag.to_string());
+            tokens.push(model.trim().to_string());
+        }
+        if let Some(mode) = self.permission_mode {
+            let allowed = descriptor
+                .permission_modes
+                .iter()
+                .find(|(candidate, _)| *candidate == mode)
+                .map(|(_, tokens)| *tokens)
+                .ok_or_else(|| {
+                    format!(
+                        "{} has no {} mode. It offers: {}.",
+                        descriptor.display_name,
+                        mode.name(),
+                        descriptor
+                            .permission_modes
+                            .iter()
+                            .map(|(candidate, _)| candidate.name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+            tokens.extend(allowed.iter().map(|token| (*token).to_string()));
+        }
+        Ok(tokens)
+    }
+
+    /// The configured extra args with every flag this launch overrides removed,
+    /// so "per-launch wins" is settled HERE rather than by whichever CLI happens
+    /// to prefer its last occurrence.
+    ///
+    /// Only the flags actually asked for are stripped: a launch that pins a
+    /// model leaves the user's configured permission flags alone.
+    pub fn strip_overridden(&self, kind: SessionKind, configured: &[String]) -> Vec<String> {
+        let Some(descriptor) = agent_cli_descriptor(kind) else {
+            return configured.to_vec();
+        };
+        let strip: Vec<(&str, FlagArity)> = descriptor
+            .overridden_flags
+            .iter()
+            .filter(|(_, _, overridden_by)| match overridden_by {
+                OverriddenBy::Model => self.model.is_some(),
+                OverriddenBy::PermissionMode => self.permission_mode.is_some(),
+            })
+            .map(|(flag, arity, _)| (*flag, *arity))
+            .collect();
+        if strip.is_empty() {
+            return configured.to_vec();
+        }
+        let mut kept = Vec::new();
+        let mut index = 0;
+        while index < configured.len() {
+            let token = configured[index].as_str();
+            // `--model=opus` is one token; `--model opus` is two.
+            let (head, inline_value) = match token.split_once('=') {
+                Some((head, _)) => (head, true),
+                None => (token, false),
+            };
+            match strip.iter().find(|(flag, _)| *flag == head) {
+                Some((_, FlagArity::TakesValue)) if !inline_value => index += 2,
+                Some(_) => index += 1,
+                None => {
+                    kept.push(configured[index].clone());
+                    index += 1;
+                }
+            }
+        }
+        kept
+    }
+
+    /// The flag names this launch asked for, for a refusal message.
+    fn asked_flag_names(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.model.is_some() {
+            names.push("--model");
+        }
+        if self.permission_mode.is_some() {
+            names.push("--permission-mode");
+        }
+        names
+    }
+}
+
+/// Read `--model` / `--permission-mode` out of a command line.
+///
+/// ONE reader for both binaries, the same rule the tenancy flags already follow:
+/// a flag must mean the same thing whether it was typed at `yggterm` or at
+/// `yggterm-headless`, so neither carries a copy of this parser.
+///
+/// Value-shaped refusals happen here (present-but-empty, unknown mode); the
+/// KIND-shaped refusal cannot, because the caller has not resolved the kind yet
+/// — [`AgentLaunchOptions::launch_tokens`] owns that one.
+pub fn agent_launch_options_from_args(args: &[String]) -> Result<AgentLaunchOptions, String> {
+    let model = match flag_present(args, "--model") {
+        false => None,
+        // Deliberately NOT `cli_flag_value`, which treats a missing value and a
+        // `--`-prefixed next token alike as "absent". A caller who typed
+        // `--model` and meant it deserves an error, not a silent fallback to
+        // the default tier — that silence IS the bug this feature closes.
+        true => Some(
+            crate::cli_flag_value(args, "--model")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "--model needs a model id (e.g. --model claude-opus-5); it was given none"
+                        .to_string()
+                })?
+                .to_string(),
+        ),
+    };
+    let permission_mode = match flag_present(args, "--permission-mode") {
+        false => None,
+        true => Some(AgentPermissionMode::parse(
+            crate::cli_flag_value(args, "--permission-mode")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "--permission-mode needs a mode: {}",
+                        AGENT_PERMISSION_MODE_NAMES
+                            .iter()
+                            .map(|(name, _)| *name)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?,
+        )?),
+    };
+    Ok(AgentLaunchOptions {
+        model,
+        permission_mode,
+    })
+}
+
+/// Whether `flag` appears at all, in either `--flag value` or `--flag=value`
+/// spelling. The question `cli_flag_value` cannot answer, because it collapses
+/// "absent" and "present with no usable value".
+fn flag_present(args: &[String], flag: &str) -> bool {
+    let inline_prefix = format!("{flag}=");
+    args.iter()
+        .any(|arg| arg == flag || arg.starts_with(&inline_prefix))
+}
+
+/// The `--kind` spelling for a session kind, for refusal messages.
+fn session_kind_flag_name(kind: SessionKind) -> &'static str {
+    match agent_cli_descriptor(kind) {
+        Some(descriptor) => match descriptor.kind {
+            SessionKind::ClaudeCode => "claude-code",
+            SessionKind::CodexLiteLlm => "codex-litellm",
+            _ => "codex",
+        },
+        None => match kind {
+            SessionKind::SshShell => "ssh",
+            SessionKind::Document => "document",
+            _ => "shell",
+        },
+    }
+}
+
 /// One session, as read out of a CLI's OWN store (spec §3 `read_store_entry`).
 ///
 /// Deliberately the *material* a scanner needs, not a finished row: the tree
@@ -84,6 +393,43 @@ pub struct AgentCliDescriptor {
     /// process cwd. This is a real per-CLI divergence, so it is data — it used
     /// to be an `is_claude`/`has_cwd` branch pair in the builder.
     pub resume_re_roots_with_cwd: bool,
+    /// The flag this CLI takes a model id on, e.g. `--model`.
+    ///
+    /// Data, not a branch, for the same reason [`ResumeSelector`] is: the next
+    /// CLI to arrive spells it in its own row instead of in an `is_claude`.
+    pub model_flag: &'static str,
+    /// The glyph this CLI draws at the head of its input composer — codex `›`,
+    /// Claude Code `❯`.
+    ///
+    /// Data because "is this session sitting at a prompt I can type into?" was
+    /// answered by a hardcoded `›`, which is codex's glyph alone. A Claude Code
+    /// row therefore read as never-ready forever, and the readiness-gated
+    /// prompt delivery silently refused to send to it (live, jojo 2026-08-06).
+    pub composer_marker: char,
+    /// Lowercase fragments of the chrome this CLI legitimately draws BELOW its
+    /// composer — codex's model/shortcut hints, Claude Code's permission-mode
+    /// footer.
+    ///
+    /// The readiness gate needs this to tell a CURRENT composer from an OLD
+    /// prompt line with real output scrolled beneath it. Which lines count as
+    /// chrome is per-CLI vocabulary, so it is per-CLI data; a shared hardcoded
+    /// list is what made Claude Code's `⏵⏵ bypass permissions on` read as
+    /// model output.
+    pub composer_footer_hints: &'static [&'static str],
+    /// Which permission postures this CLI can express, and the tokens for each.
+    /// A mode absent from this table is refused by name — see
+    /// [`AgentPermissionMode`].
+    pub permission_modes: &'static [(AgentPermissionMode, &'static [&'static str])],
+    /// Every flag that SETS a model or permission posture for this CLI —
+    /// including spellings yggterm never emits (codex's `-m`, `--sandbox`).
+    ///
+    /// This is the strip list, not the emit list: when a per-launch option wins
+    /// over the user's configured extra args, "wins" has to mean the configured
+    /// flag is REMOVED, not that both are on the command line arguing about it
+    /// and the CLI's own last-wins rule decides. Each entry says whether it
+    /// consumes the following token as its value, and which per-launch option
+    /// supersedes it.
+    pub overridden_flags: &'static [(&'static str, FlagArity, OverriddenBy)],
     /// True when the CLI re-derives full content from its own store on resume
     /// (all shipped CLIs do). Drives replay policy §5.4: re-derivable ⇒ the PTY
     /// is disposable and rows ride every persist.
@@ -387,6 +733,45 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // re-rooted; the cwd tree's whole promise is that a row opens where the
         // tree says it lives.
         resume_re_roots_with_cwd: true,
+        model_flag: "--model",
+        composer_marker: '\u{203a}',
+        composer_footer_hints: &["gpt-", "claude", "tab to ", "ctrl", "esc"],
+        // Read off `codex --help` on codex-cli 0.144.6 (2026-08-06), not from
+        // memory. Codex has NO plan mode and no edits-only approval — its
+        // vocabulary is `--ask-for-approval {untrusted,on-request,never}` plus
+        // `--sandbox {read-only,workspace-write,danger-full-access}`, which is a
+        // different axis from Claude Code's. Approximating `accept-edits` as
+        // "never ask, sandboxed to the workspace" would be yggterm inventing a
+        // security posture the caller never asked for, so those two modes are
+        // absent here and refused by name.
+        permission_modes: &[
+            (AgentPermissionMode::Default, &[]),
+            (
+                AgentPermissionMode::Bypass,
+                &["--dangerously-bypass-approvals-and-sandbox"],
+            ),
+        ],
+        overridden_flags: &[
+            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
+            ("-m", FlagArity::TakesValue, OverriddenBy::Model),
+            (
+                "--ask-for-approval",
+                FlagArity::TakesValue,
+                OverriddenBy::PermissionMode,
+            ),
+            ("-a", FlagArity::TakesValue, OverriddenBy::PermissionMode),
+            (
+                "--sandbox",
+                FlagArity::TakesValue,
+                OverriddenBy::PermissionMode,
+            ),
+            ("-s", FlagArity::TakesValue, OverriddenBy::PermissionMode),
+            (
+                "--dangerously-bypass-approvals-and-sandbox",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
+        ],
         content_rederives_on_resume: true,
         // Codex files sessions by date: `~/.codex/sessions/2026/07/25/
         // rollout-2026-07-25T…-<uuid>.jsonl`, so the depth is not fixed.
@@ -407,6 +792,38 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // here would be a silent behavior change riding a "no wire changes"
         // phase. Recorded for phase 2's four-arm matrix to settle.
         resume_re_roots_with_cwd: false,
+        // Same binary family as codex, so the same flag vocabulary.
+        model_flag: "--model",
+        composer_marker: '\u{203a}',
+        composer_footer_hints: &["gpt-", "claude", "tab to ", "ctrl", "esc"],
+        permission_modes: &[
+            (AgentPermissionMode::Default, &[]),
+            (
+                AgentPermissionMode::Bypass,
+                &["--dangerously-bypass-approvals-and-sandbox"],
+            ),
+        ],
+        overridden_flags: &[
+            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
+            ("-m", FlagArity::TakesValue, OverriddenBy::Model),
+            (
+                "--ask-for-approval",
+                FlagArity::TakesValue,
+                OverriddenBy::PermissionMode,
+            ),
+            ("-a", FlagArity::TakesValue, OverriddenBy::PermissionMode),
+            (
+                "--sandbox",
+                FlagArity::TakesValue,
+                OverriddenBy::PermissionMode,
+            ),
+            ("-s", FlagArity::TakesValue, OverriddenBy::PermissionMode),
+            (
+                "--dangerously-bypass-approvals-and-sandbox",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
+        ],
         content_rederives_on_resume: true,
         session_store_globs: &[".codex-litellm/sessions/**/rollout-*.jsonl"],
         store_excluded_name_fragments: &[".bak."],
@@ -421,6 +838,46 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         binary_name: "claude",
         resume_selector: ResumeSelector::Flag("--resume"),
         resume_re_roots_with_cwd: false,
+        model_flag: "--model",
+        composer_marker: '\u{276f}',
+        composer_footer_hints: &["claude", "permissions", "shift+tab", "for agents", "ctrl", "esc"],
+        // Read off `claude --help` on Claude Code 2.1.223 (2026-08-06). Its
+        // `--permission-mode` choices are acceptEdits, auto, bypassPermissions,
+        // manual, dontAsk, plan — note there is no longer a `default` value,
+        // which is exactly why `Default` emits NOTHING instead of naming one.
+        // Bypass goes through `--dangerously-skip-permissions` rather than
+        // `--permission-mode bypassPermissions` because the standalone flag has
+        // been stable across every CC version the fleet has run.
+        permission_modes: &[
+            (AgentPermissionMode::Default, &[]),
+            (AgentPermissionMode::Plan, &["--permission-mode", "plan"]),
+            (
+                AgentPermissionMode::AcceptEdits,
+                &["--permission-mode", "acceptEdits"],
+            ),
+            (
+                AgentPermissionMode::Bypass,
+                &["--dangerously-skip-permissions"],
+            ),
+        ],
+        overridden_flags: &[
+            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
+            (
+                "--permission-mode",
+                FlagArity::TakesValue,
+                OverriddenBy::PermissionMode,
+            ),
+            (
+                "--dangerously-skip-permissions",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
+            (
+                "--allow-dangerously-skip-permissions",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
+        ],
         content_rederives_on_resume: true,
         // CC files one flat dir per cwd, the dir name being the cwd with every
         // character outside [A-Za-z0-9-] replaced: `~/.claude/projects/
@@ -765,6 +1222,272 @@ mod tests {
                 agent_cli_descriptor(kind).is_some(),
                 kind.is_agent(),
                 "{kind:?}: descriptor presence must equal is_agent()"
+            );
+        }
+    }
+
+    fn args(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    // ---- per-launch model + permission mode (delegate launch) -------------
+
+    #[test]
+    fn a_model_becomes_the_cli_s_own_model_flag() {
+        let options = AgentLaunchOptions {
+            model: Some("claude-opus-5".to_string()),
+            permission_mode: None,
+        };
+        assert_eq!(
+            options.launch_tokens(SessionKind::ClaudeCode).unwrap(),
+            vec!["--model".to_string(), "claude-opus-5".to_string()]
+        );
+        assert_eq!(
+            options.launch_tokens(SessionKind::Codex).unwrap(),
+            vec!["--model".to_string(), "claude-opus-5".to_string()]
+        );
+    }
+
+    #[test]
+    fn bypass_maps_to_each_cli_s_own_skip_flag() {
+        let options = AgentLaunchOptions {
+            model: None,
+            permission_mode: Some(AgentPermissionMode::Bypass),
+        };
+        assert_eq!(
+            options.launch_tokens(SessionKind::ClaudeCode).unwrap(),
+            vec!["--dangerously-skip-permissions".to_string()]
+        );
+        assert_eq!(
+            options.launch_tokens(SessionKind::Codex).unwrap(),
+            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
+        );
+    }
+
+    // `default` means "do not send one", NOT "send the value named default" —
+    // CC has already renamed that value out from under us once.
+    #[test]
+    fn the_default_mode_emits_nothing() {
+        let options = AgentLaunchOptions {
+            model: None,
+            permission_mode: Some(AgentPermissionMode::Default),
+        };
+        assert!(
+            options
+                .launch_tokens(SessionKind::ClaudeCode)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(options.launch_tokens(SessionKind::Codex).unwrap().is_empty());
+    }
+
+    // ⛔ THE REFUSALS. A silently ignored flag is how the model-inheritance
+    // trap survived: the launch reported success while the row ran on the
+    // user's default tier.
+    #[test]
+    fn a_model_on_a_shell_kind_is_refused_by_name() {
+        let options = AgentLaunchOptions {
+            model: Some("claude-opus-5".to_string()),
+            permission_mode: None,
+        };
+        let error = options
+            .launch_tokens(SessionKind::Shell)
+            .expect_err("--model on a shell must refuse, never no-op");
+        assert!(error.contains("--model"), "{error}");
+        assert!(error.contains("--kind shell"), "{error}");
+        assert!(error.contains("claude-code"), "{error}");
+    }
+
+    #[test]
+    fn a_permission_mode_on_a_shell_kind_is_refused_by_name() {
+        let options = AgentLaunchOptions {
+            model: None,
+            permission_mode: Some(AgentPermissionMode::Bypass),
+        };
+        let error = options
+            .launch_tokens(SessionKind::Shell)
+            .expect_err("--permission-mode on a shell must refuse");
+        assert!(error.contains("--permission-mode"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_launch_on_a_shell_kind_is_fine() {
+        assert!(
+            AgentLaunchOptions::default()
+                .launch_tokens(SessionKind::Shell)
+                .unwrap()
+                .is_empty(),
+            "asking for nothing must stay byte-identical on every kind"
+        );
+    }
+
+    #[test]
+    fn an_empty_model_is_refused_rather_than_inherited() {
+        let error = AgentLaunchOptions {
+            model: Some("   ".to_string()),
+            permission_mode: None,
+        }
+        .launch_tokens(SessionKind::ClaudeCode)
+        .expect_err("an empty --model must refuse");
+        assert!(error.contains("--model"), "{error}");
+
+        let error = agent_launch_options_from_args(&args(&["--model"]))
+            .expect_err("--model with no value must refuse");
+        assert!(error.contains("--model"), "{error}");
+        // The trap shape: `cli_flag_value` reads a `--`-prefixed next token as
+        // "absent", which would have silently dropped the model.
+        let error = agent_launch_options_from_args(&args(&["--model", "--no-activate"]))
+            .expect_err("--model swallowed by the next flag must refuse");
+        assert!(error.contains("--model"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_permission_mode_is_refused_with_the_list() {
+        let error = agent_launch_options_from_args(&args(&["--permission-mode", "yolo"]))
+            .expect_err("an unknown mode must refuse");
+        assert!(error.contains("yolo"), "{error}");
+        for (name, _) in AGENT_PERMISSION_MODE_NAMES {
+            assert!(error.contains(name), "refusal must list {name}: {error}");
+        }
+    }
+
+    // Codex genuinely has neither mode (verified against codex-cli 0.144.6), so
+    // it says so instead of approximating a security posture.
+    #[test]
+    fn a_mode_the_cli_cannot_express_is_refused_not_approximated() {
+        for mode in [AgentPermissionMode::Plan, AgentPermissionMode::AcceptEdits] {
+            let error = AgentLaunchOptions {
+                model: None,
+                permission_mode: Some(mode),
+            }
+            .launch_tokens(SessionKind::Codex)
+            .expect_err("codex has no plan/accept-edits mode");
+            assert!(error.contains(mode.name()), "{error}");
+            assert!(error.contains("Codex"), "{error}");
+            assert!(error.contains("bypass"), "the refusal must name what it DOES have: {error}");
+        }
+    }
+
+    #[test]
+    fn the_arg_reader_is_the_same_for_both_binaries() {
+        let parsed = agent_launch_options_from_args(&args(&[
+            "--kind",
+            "claude-code",
+            "--model",
+            "claude-opus-5",
+            "--permission-mode",
+            "bypass",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(parsed.permission_mode, Some(AgentPermissionMode::Bypass));
+        // Inline spelling reads the same.
+        let inline = agent_launch_options_from_args(&args(&[
+            "--model=claude-opus-5",
+            "--permission-mode=bypass",
+        ]))
+        .unwrap();
+        assert_eq!(inline, parsed);
+        assert!(
+            agent_launch_options_from_args(&args(&["--kind", "shell"]))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // "Per-launch wins" has to mean the configured flag is REMOVED. Leaving
+    // both on the command line makes the CLI's own precedence rule the source
+    // of truth, which is a second encoding by definition.
+    #[test]
+    fn a_per_launch_option_strips_the_configured_flag_it_overrides() {
+        let configured = args(&[
+            "--model",
+            "claude-fable-5",
+            "--dangerously-skip-permissions",
+            "--verbose",
+        ]);
+        let model_only = AgentLaunchOptions {
+            model: Some("claude-opus-5".to_string()),
+            permission_mode: None,
+        };
+        assert_eq!(
+            model_only.strip_overridden(SessionKind::ClaudeCode, &configured),
+            args(&["--dangerously-skip-permissions", "--verbose"]),
+            "a pinned model strips the configured model and leaves the rest alone"
+        );
+        let mode_only = AgentLaunchOptions {
+            model: None,
+            permission_mode: Some(AgentPermissionMode::Plan),
+        };
+        assert_eq!(
+            mode_only.strip_overridden(SessionKind::ClaudeCode, &configured),
+            args(&["--model", "claude-fable-5", "--verbose"]),
+            "a pinned mode strips the configured permission flags only"
+        );
+        assert_eq!(
+            AgentLaunchOptions::default().strip_overridden(SessionKind::ClaudeCode, &configured),
+            configured,
+            "asking for nothing must not touch the user's configured args"
+        );
+    }
+
+    #[test]
+    fn stripping_handles_inline_values_and_short_flags() {
+        let configured = args(&["--model=gpt-x", "-m", "gpt-y", "--sandbox", "read-only", "-C", "/tmp"]);
+        let options = AgentLaunchOptions {
+            model: Some("claude-opus-5".to_string()),
+            permission_mode: Some(AgentPermissionMode::Bypass),
+        };
+        assert_eq!(
+            options.strip_overridden(SessionKind::Codex, &configured),
+            args(&["-C", "/tmp"]),
+            "both spellings of the model flag and the sandbox flag must go"
+        );
+    }
+
+    // Every flag we EMIT must also be one we STRIP, or a second launch could
+    // stack two of them.
+    #[test]
+    fn every_emitted_flag_is_also_an_overridden_flag() {
+        for descriptor in AGENT_CLIS {
+            let strippable: Vec<&str> = descriptor
+                .overridden_flags
+                .iter()
+                .map(|(flag, _, _)| *flag)
+                .collect();
+            assert!(
+                strippable.contains(&descriptor.model_flag),
+                "{}: model_flag {} is not in overridden_flags",
+                descriptor.display_name,
+                descriptor.model_flag
+            );
+            for (mode, tokens) in descriptor.permission_modes {
+                if let Some(flag) = tokens.first() {
+                    assert!(
+                        strippable.contains(flag),
+                        "{}: {} emits {flag}, which is not in overridden_flags",
+                        descriptor.display_name,
+                        mode.name()
+                    );
+                }
+            }
+        }
+    }
+
+    // Every CLI must be able to express "leave it alone", or a caller has no
+    // way to ask for the user's own defaults explicitly.
+    #[test]
+    fn every_agent_cli_supports_the_default_mode() {
+        for descriptor in AGENT_CLIS {
+            let default = descriptor
+                .permission_modes
+                .iter()
+                .find(|(mode, _)| *mode == AgentPermissionMode::Default)
+                .unwrap_or_else(|| panic!("{} has no default mode", descriptor.display_name));
+            assert!(
+                default.1.is_empty(),
+                "{}: the default mode must emit no tokens",
+                descriptor.display_name
             );
         }
     }

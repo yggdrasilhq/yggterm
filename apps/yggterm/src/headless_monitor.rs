@@ -12,6 +12,7 @@ use yggterm_server::{
     HotRestartResult, ServerEndpoint, SessionKind, YGG_LOADING_NOTIFICATION_AFTER_MS,
     YggEventEnvelope, YggEventKind, YggProgress, YggRequestMeta, YggSurface, YggTarget,
     default_endpoint, ensure_local_daemon_running, hot_restart_detailed,
+    resolve_client_daemon_endpoint,
     local_headless_companion_executable_from_current, ping, prepare_update_restart,
     reachable_versioned_daemon_statuses, refresh_managed_cli, refresh_remote_machine,
     request_terminal_launch, retire_daemon, shutdown, snapshot, start_local_session_at, status,
@@ -131,7 +132,20 @@ struct Config {
 pub fn run(args: Vec<String>) -> Result<()> {
     let cfg = parse_args(args)?;
     let home_dir = resolve_yggterm_home()?;
-    let endpoint = default_endpoint(&home_dir);
+    // ⛔ NOT `default_endpoint`. The monitor is a CLIENT, and the deploy it
+    // exists to drive is by definition a NEWER binary talking to an OLDER
+    // daemon: `--scenario hot-restart` is how a version bump ships, and the new
+    // version's socket does not exist until the restart it is trying to
+    // perform has already happened. Dialling the own-version socket therefore
+    // failed with `connecting to …/server-3-0-37.sock` on every version bump —
+    // the deploy path could only ever restart a daemon of its own version.
+    //
+    // `resolve_client_daemon_endpoint` is the SSOT for "which daemon does a
+    // client talk to", and its newer-client-older-daemon fallback is written
+    // for exactly this shape; the GUI has used it since
+    // [[finding-gui-only-deploy-version-socket-mismatch]]. Same-version and
+    // no-daemon cases resolve identically to before.
+    let endpoint = resolve_client_daemon_endpoint(&home_dir).endpoint;
 
     for iteration in 0..cfg.iterations {
         run_scenario(&cfg, &endpoint, iteration)?;

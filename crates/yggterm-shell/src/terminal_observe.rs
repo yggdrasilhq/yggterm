@@ -3502,9 +3502,53 @@ pub(crate) fn terminal_chunk_is_claude_prompt_surface(data: &str) -> bool {
     idle_footer || permission_prompt
 }
 
-pub(crate) fn terminal_chunk_has_current_codex_input_row(data: &str) -> bool {
+/// Whether the screen shows ANY registered agent CLI sitting at its input
+/// composer, ready to be typed into.
+///
+/// **Why this exists next to the codex-shaped predicate below.** They answer
+/// different questions. [`terminal_chunk_has_current_codex_input_row`] asks "is
+/// this codex's input row", and roughly ten surface-health call sites are tuned
+/// against that meaning; widening it would quietly change all of them. This one
+/// asks "may I submit a prompt here", which is the readiness gate for
+/// `SubmitTerminalPrompt`, and the honest answer depends on WHICH CLI the row is
+/// running: codex draws `›`, Claude Code draws `❯`.
+///
+/// The glyph is [`AgentCliDescriptor::composer_marker`] — data, so the next CLI
+/// declares its own instead of being invisible here. The defect this closes:
+/// with only codex's glyph, a `--kind claude-code` row was never ready, so a
+/// readiness-gated prompt was correctly-but-uselessly never sent (live, jojo
+/// 2026-08-06 — the row sat at a clean `❯` composer while the gate timed out).
+pub(crate) fn terminal_chunk_has_agent_composer_row(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
-    let lines = stripped
+    let lines = normalized_composer_lines(&stripped);
+    yggterm_core::AGENT_CLIS.iter().any(|descriptor| {
+        let Some(prompt_index) = lines
+            .iter()
+            .rposition(|line| line.starts_with(descriptor.composer_marker))
+        else {
+            return false;
+        };
+        // Either the wrapped-input shape codex draws, or nothing below the
+        // composer except this CLI's own footer chrome. Anything else means the
+        // marker is an OLD prompt with real output beneath it, and firing a
+        // prompt at that surface is what the gate exists to prevent.
+        terminal_chunk_has_wrapped_codex_input_region(&lines, prompt_index)
+            || lines[prompt_index + 1..].iter().all(|line| {
+                let lower = line.to_ascii_lowercase();
+                descriptor
+                    .composer_footer_hints
+                    .iter()
+                    .any(|hint| lower.contains(hint))
+            })
+    })
+}
+
+/// Screen text as the composer predicates read it: control sequences stripped,
+/// blank lines dropped, box-drawing chrome trimmed. Shared so the codex-shaped
+/// predicate and the any-agent gate cannot normalize differently and disagree
+/// about the same screen.
+fn normalized_composer_lines(stripped: &str) -> Vec<&str> {
+    stripped
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -3512,8 +3556,13 @@ pub(crate) fn terminal_chunk_has_current_codex_input_row(data: &str) -> bool {
             line.trim_matches(|ch: char| matches!(ch, '╭' | '╮' | '╰' | '╯' | '─' | '│' | ' '))
         })
         .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    let Some(prompt_index) = lines.iter().rposition(|line| line.starts_with('›')) else {
+        .collect::<Vec<_>>()
+}
+
+pub(crate) fn terminal_chunk_has_current_codex_input_row(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let lines = normalized_composer_lines(&stripped);
+    let Some(prompt_index) = lines.iter().rposition(|line| line.starts_with('\u{203a}')) else {
         return false;
     };
     if lines.len().saturating_sub(prompt_index) > 5 {
@@ -4101,7 +4150,8 @@ mod tests {
         WorkspaceViewMode, parse_meminfo, parse_pressure_avg60_bp,
         describe_terminal_open_attempt, describe_viewport_snapshot,
         summarize_terminal_surface_for_app_control, terminal_bootstrap_activation_epoch,
-        terminal_chunk_has_codex_prompt_output, terminal_chunk_has_current_codex_input_row,
+        terminal_chunk_has_agent_composer_row, terminal_chunk_has_codex_prompt_output,
+        terminal_chunk_has_current_codex_input_row,
         terminal_chunk_has_meaningful_output, terminal_chunk_is_claude_prompt_surface,
         terminal_chunk_is_codex_interactive_setup_prompt,
         terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_codex_session_not_on_remote,
@@ -5863,6 +5913,52 @@ Best thing to improve in the meantime:
 ╰────────────────────────────────────────────────────────╯"
         ));
         assert!(!terminal_chunk_has_codex_prompt_output("$ echo hi"));
+    }
+
+    #[test]
+    /// ⛔ A Claude Code row sitting at a clean composer was never "ready", so a
+    /// readiness-gated prompt was never delivered to it — the gate only knew
+    /// codex's `›`. Live on jojo 2026-08-06: the delegate row showed
+    /// `Opus 5 · Claude Pro`, `⏵⏵ bypass permissions on`, and an empty `❯`
+    /// composer, while `terminal new --prompt` timed out waiting for readiness.
+    #[test]
+    fn the_composer_gate_recognizes_every_registered_agent_cli() {
+        // Verbatim shape of the live Claude Code screen (control sequences
+        // already stripped by the caller's normalization).
+        let claude_code = "Claude Code v2.1.223\nOpus 5 with xhigh effort · Claude Pro\n~/gh/yggterm\n❯\n⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(
+            terminal_chunk_has_agent_composer_row(claude_code),
+            "a claude-code row at its composer must be submit-ready"
+        );
+        assert!(
+            !terminal_chunk_has_current_codex_input_row(claude_code),
+            "the codex-shaped predicate keeps its own meaning; ~10 surface-health \
+             call sites are tuned against it and must not silently change"
+        );
+        // Codex still passes both, unchanged.
+        let codex = "Status rows\n\n› /status\n\n  gpt-5.5 xhigh · ~/gh/yggterm";
+        assert!(terminal_chunk_has_agent_composer_row(codex));
+        assert!(terminal_chunk_has_current_codex_input_row(codex));
+        // Neither fires on a screen with no composer at all.
+        assert!(!terminal_chunk_has_agent_composer_row(
+            "Do you want to proceed?\n1. Yes\n2. No"
+        ));
+    }
+
+    /// Every registered CLI must declare a composer glyph, and they must be
+    /// distinct — a shared glyph would make the readiness gate unable to say
+    /// which CLI it is looking at.
+    #[test]
+    fn every_agent_cli_declares_a_distinct_composer_marker() {
+        let mut markers: Vec<char> = yggterm_core::AGENT_CLIS
+            .iter()
+            .map(|descriptor| descriptor.composer_marker)
+            .collect();
+        assert!(markers.iter().all(|marker| !marker.is_whitespace()));
+        markers.sort_unstable();
+        markers.dedup();
+        // Codex and Codex-LiteLLM are the same binary family and share `›`.
+        assert_eq!(markers.len(), 2, "codex family + claude code");
     }
 
     #[test]

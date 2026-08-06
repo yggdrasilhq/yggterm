@@ -25,7 +25,48 @@ data-fabric skill §THE BG-SESSION PLANE. Precedent format:
 
 ## Ranked feature asks
 
-### 1. First-class delegate launch on `terminal new` (or an automations verb)
+### 1. ✅ SHIPPED 2026-08-06 — First-class delegate launch on `terminal new`
+
+**What shipped**, on `server app terminal new --kind claude-code|codex`:
+`--model <id>`, `--permission-mode <default|plan|accept-edits|bypass>`, and
+`--prompt <text>` / `--prompt-stdin`. The reply gains a `launch` block —
+`model`, `permission_mode`, `applied`, `launch_command` — READ BACK off the
+created row rather than echoed, so a create routed to an older daemon reads
+`applied:false` instead of lying, and a `prompt` block saying whether the
+prompt was actually submitted.
+
+**Per-launch means per-launch:** the permission mode neither reads nor writes
+the global `claude_code_extra_args`, and it WINS over it — the configured flag
+is stripped rather than left on the command line to argue. `--model` is
+refused BY NAME on `--kind shell`, on an empty value, and on the one lane that
+cannot carry it (a REMOTE codex start has no extra-args forwarding; remote
+Claude Code does, via `YGGTERM_CC_EXTRA_ARGS`). Agent CLI kinds were already
+born keep-alive; verified on a real `--no-activate` row
+(`Runtime Persistence: keep-alive`), so no `--keep-alive` flag was added.
+
+**Live proof** (jojo, 3.0.39): the running process was
+`claude --model claude-opus-5 --dangerously-skip-permissions --session-id …`;
+Claude Code's own banner read `Opus 5 with xhigh effort` with
+`⏵⏵ bypass permissions on`; and the prompt produced a real turn whose
+transcript records `model: claude-opus-5`.
+
+**Two bugs found by that live proof, both fixed here** — each one had made the
+feature look shipped while doing nothing:
+1. **A launch option held only in `launch_command` is not held at all.**
+   `refresh_local_cc_relaunch_launch_command` re-derives a local CC row's
+   command from on-disk truth and fired 1 ms after the row was born, replacing
+   the composed command with one that had never heard of `--model`. The options
+   now live ON the session (`agent_launch_options`), persist, and cross a daemon
+   handover, so every rebuild re-applies them.
+2. **The prompt-readiness gate only knew codex's `›` composer.** A Claude Code
+   row draws `❯`, so it was never "ready" and the readiness-gated prompt was
+   correctly-but-uselessly never sent. The composer glyph and the footer chrome
+   that may sit under it are per-CLI descriptor data now.
+
+Still open here: ask #2 (a session BRIEF as first-class metadata) would remove
+the last hand-rolled step, since the prompt still has to carry the brief's path.
+
+### 1b. The original ask, kept for the costs it records
 
 **What:** `terminal new --kind claude-code|codex --model <id>
 --permission-mode bypass --prompt-file <f> [--brief-file <f>]` — or the
@@ -139,6 +180,16 @@ hasTrustDialogAccepted) for the target cwd, or a `--trust-cwd` flag on
 the trust dialog until a human clicks it; the arg prompt resumes only after.
 **Cost paid:** 3 of 5 wave-1 delegates sat at trust dialogs invisible
 off-screen until the user noticed and clicked each by hand.
+
+⏸ **Considered and deliberately NOT taken while shipping ask #1 (2026-08-06).**
+It is not cheap in the sense that word was meant: `~/.claude.json` is the user's
+own Claude Code config, not yggterm state, and the entry in question records
+that a human answered a SECURITY question about a directory. yggterm writing it
+on their behalf answers that question for them, silently, from a flag — and it
+would do so in a file we do not own and cannot migrate when its schema moves.
+The honest version of this ask is a yggterm-side allowlist of cwds the FLEET
+owns, checked before launch and surfaced in the row, which is a real feature
+rather than a config poke. Left open at its full size.
 
 ## For the skills (data-fabric / yggui-app-control)
 

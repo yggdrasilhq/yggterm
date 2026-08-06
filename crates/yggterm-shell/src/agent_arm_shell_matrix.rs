@@ -331,6 +331,7 @@ impl ShellArm {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         }
     }
 
