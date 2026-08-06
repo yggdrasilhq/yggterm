@@ -1410,6 +1410,32 @@ covered on the agent path; item 3 (silent `about:blank` reset) and item 4
 entry only after a live passkey ceremony on an agent-created surface.
 
 
+## ★★ CO-BROWSE: NO FILE-UPLOAD VERB, AND TWO SILENT OTP-READER FAULTS (2026-08-06)
+
+**Status:** OPEN (2 of 5 defects FIXED in-run)
+
+Field report from filing a CPC-ITR grievance end to end on the services-desk portal
+(succeeded — ack 26390914 — but cost ~3 h and two failed attempts):
+**[`docs/agent-cobrowse-gaps-2026-08-06.md`](agent-cobrowse-gaps-2026-08-06.md)**.
+The headline four:
+
+1. ⭐ **There is no file-upload verb** (`web do` is click/type only), so an agent
+   cannot attach a document on any portal that asks for one. The grievance went
+   in **without its s.154 order PDF**, which was staged and ready.
+2. ⛔ **`termux-sms.py watch --code-only` returned the MATCH STRING, not the
+   code** — so `itr-portal.sh` typed `OTP for Aadhaar` one char per OTP box and
+   **no unattended login could ever have completed.** FIXED in-run.
+3. ⛔ **One dropped ssh poll aborted an entire `watch` in ~5 s**, printing
+   exactly what "nothing arrived" prints (`fetch()` raises `SystemExit`,
+   uncaught). **This retires every "no OTP arrived within N s" ever recorded by
+   that path as evidence** — and it manufactured a false "UIDAI stopped
+   delivering" finding that two sessions then built theory on. FIXED in-run.
+   ⇒ *A watcher that cannot distinguish "I waited and saw nothing" from "I never
+   looked" will be believed, and its silence blamed on whatever was suspected.*
+4. ⛔ **`~/.claude/skills/data-fabric/scripts/*` is in no git repo on any host**,
+   so these fixes had to be `scp`'d to jojo and oc by hand; until then `oc` ran
+   a broken reader while the skill text claimed the path worked.
+
 ## ★★ AGENT CO-BROWSE CANNOT COMPLETE AN OTP LOGIN
 
 **Status:** OPEN
