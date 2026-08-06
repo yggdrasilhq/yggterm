@@ -869,6 +869,27 @@ fn apply_session_tenancy_metadata(
     }
 }
 
+/// Apply the born-keep-alive rule to a row being created, from the row's OWN
+/// kind.
+///
+/// **One owner, because the rule had at least three birth sites and only one of
+/// them applied it.** `insert_live_session_with_launch_options` did;
+/// `start_remote_claude_session_*` and the other hand-built inserts did not, so
+/// `--kind claude-code` was born keep-alive LOCALLY and born unprotected on a
+/// `--machine-key <host>` row — while the CLI help and a code comment both
+/// stated flatly that agent CLI kinds are born keep-alive. Two agents measured
+/// the two lanes and reported opposite "facts"; both were right.
+///
+/// It reads `session.kind` rather than taking it as an argument so a caller
+/// cannot pass a kind the row does not have, and it is a no-op for the kinds
+/// that are second-class by design — which is why it is safe to call at EVERY
+/// birth site rather than at the ones someone remembered.
+fn apply_birth_keep_alive(session: &mut ManagedSessionView) {
+    if session_kind_persists_by_default(session.kind) {
+        set_session_keep_alive_metadata(session, true);
+    }
+}
+
 fn set_session_keep_alive_metadata(session: &mut ManagedSessionView, keep_alive: bool) {
     if keep_alive {
         upsert_session_metadata(
@@ -933,12 +954,30 @@ fn persisted_live_session_from_managed(
         created_by: session_metadata_value(session, CREATED_BY_METADATA_LABEL),
         ephemeral: session_metadata_value(session, EPHEMERAL_METADATA_LABEL),
         agent_launch_options: session.agent_launch_options.clone(),
+        title_is_explicit: session.title_is_explicit,
     })
 }
 
-fn passive_title_hint_can_update(current_title: &str, title_hint: &str, was_missing: bool) -> bool {
+/// Whether a DERIVED title may replace what a row currently shows.
+///
+/// `current_is_explicit` is the stored fact (see
+/// [`ManagedSessionView::title_is_explicit`]) and it is checked FIRST, before
+/// every heuristic, because it is the only input here that is knowledge rather
+/// than inference. The rest of this function guesses provenance from the
+/// string's shape; `was_missing` does not even do that — it reports whether the
+/// row was in this daemon's map, which is true of every row on a daemon that
+/// just started, and is why a rename died at each restart.
+fn passive_title_hint_can_update(
+    current_title: &str,
+    title_hint: &str,
+    was_missing: bool,
+    current_is_explicit: bool,
+) -> bool {
     let hint = title_hint.trim();
     if hint.is_empty() || looks_like_generated_fallback_title(hint) {
+        return false;
+    }
+    if current_is_explicit && !current_title.trim().is_empty() {
         return false;
     }
     let current = current_title.trim();
@@ -2517,6 +2556,15 @@ pub struct SnapshotSessionView {
     /// back-compat with older snapshots.
     #[serde(default, skip_serializing_if = "AgentLaunchOptions::is_empty")]
     pub agent_launch_options: AgentLaunchOptions,
+    /// Whether [`Self::title`] was set by a human.
+    ///
+    /// On the SNAPSHOT for the same reason as `agent_launch_options` above: a
+    /// row adopted off a preserved owner during a version handover is rebuilt
+    /// from this view, and a provenance bit that did not travel would silently
+    /// demote the owner's renamed row back to a derived title at the next
+    /// deploy — the very failure this flag exists to end.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub title_is_explicit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2802,6 +2850,14 @@ pub struct PersistedLiveSession {
     /// user's default (expensive) tier — the exact trap this feature closes.
     #[serde(default, skip_serializing_if = "AgentLaunchOptions::is_empty")]
     pub agent_launch_options: AgentLaunchOptions,
+    /// Whether [`Self::title`] was set by a human. Persisted because the whole
+    /// point of the flag is to survive the daemon that learned it — a row
+    /// outlives many daemons, and a rename that does not survive a restart is
+    /// the bug this closes. `#[serde(default)]` so an older state file (and an
+    /// older daemon reading this one) simply reads `false`, i.e. "derived",
+    /// which is the pre-existing behaviour rather than a new guess.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub title_is_explicit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2875,6 +2931,27 @@ pub struct ManagedSessionView {
     /// not a launch option. Keeping it here means every rebuild, relaunch and
     /// restore re-applies the same answer.
     pub agent_launch_options: AgentLaunchOptions,
+    /// Whether [`Self::title`] was set by a HUMAN (`terminal new --title`, or
+    /// `session rename`) rather than derived from the transcript.
+    ///
+    /// **This is a stored FACT about the title's provenance, and it exists
+    /// because nothing else could answer the question.** Every writer used to
+    /// guess: `passive_title_hint_can_update` inferred provenance from the
+    /// title's SHAPE (does it look auto-generated?), which cannot separate
+    /// `6. yggterm: campaign` from `Continue atlasstore campaign`, and the
+    /// insert paths used `was_missing` — whether the row was in THIS daemon's
+    /// map — which is a fact about daemon lifecycle, not about the title.
+    ///
+    /// So a renamed row lost its name three ways: the background copy chore
+    /// overwrote it unconditionally with a generated title, and both insert
+    /// paths overwrote it on any fresh daemon because the row was "missing".
+    /// That is why the owner's `0 / 1 / 1.1 / 2 …` sidebar outline evaporated
+    /// on every restart while `reorder` survived — order was a stored fact and
+    /// the title was a guess.
+    ///
+    /// ⇒ an explicit title OUTRANKS every derived source; a derived title is a
+    /// FALLBACK consulted only when no explicit title was ever set.
+    pub title_is_explicit: bool,
 }
 
 /// The one place that decides whether a polled working flag differs from what a
@@ -3138,7 +3215,12 @@ impl YggtermServer {
             });
         }
         if let Some(title_hint) = title_hint
-            && passive_title_hint_can_update(&entry.title, title_hint, was_missing)
+            && passive_title_hint_can_update(
+                &entry.title,
+                title_hint,
+                was_missing,
+                entry.title_is_explicit,
+            )
         {
             entry.title = title_hint.to_string();
         }
@@ -4222,9 +4304,52 @@ impl YggtermServer {
             .collect()
     }
 
+    /// Apply a DERIVED title (the background copy chore's generated title, a
+    /// scanner's `title_hint`).
+    ///
+    /// ⛔ It refuses a row whose title a human set. This used to be
+    /// unconditional, which is how a generated conversation title replaced the
+    /// `--title` a delegate was launched with, seconds after birth.
     pub fn set_session_title_hint(&mut self, session_path: &str, title: &str) {
+        if self.session_title_is_explicit(session_path) {
+            return;
+        }
         if let Some(session) = self.sessions.get_mut(session_path) {
             session.title = title.to_string();
+        }
+        for machine in &mut self.remote_machines {
+            for scanned in &mut machine.sessions {
+                if scanned.session_path == session_path {
+                    scanned.title_hint = title.to_string();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Whether this row's title was set by a human. The scanned mirror carries
+    /// no provenance of its own, so the live row is the one owner of the
+    /// answer — asking it here keeps the two copies from disagreeing.
+    pub fn session_title_is_explicit(&self, session_path: &str) -> bool {
+        self.sessions
+            .get(session_path)
+            .is_some_and(|session| session.title_is_explicit && !session.title.trim().is_empty())
+    }
+
+    /// Set a title a HUMAN chose — `terminal new --title`, `session rename`.
+    ///
+    /// This is the ONE door for an explicit title, and it is what makes the
+    /// title a stored fact instead of a string every derived writer is free to
+    /// re-guess. The scanned mirror is updated with it too, so a row whose
+    /// display reads through the scan cannot show a stale derived name.
+    pub fn set_session_title_explicit(&mut self, session_path: &str, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            return;
+        }
+        if let Some(session) = self.sessions.get_mut(session_path) {
+            session.title = title.to_string();
+            session.title_is_explicit = true;
         }
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
@@ -4272,8 +4397,15 @@ impl YggtermServer {
 
     pub fn set_session_title_hint_passive(&mut self, session_path: &str, title: &str) -> bool {
         let mut applied = false;
+        // Read the row's provenance once, up front: the scanned mirror below
+        // has none of its own, and letting it answer separately is how the two
+        // copies of "the row's title" started disagreeing in the first place.
+        let explicit = self.session_title_is_explicit(session_path);
+        if explicit {
+            return false;
+        }
         if let Some(session) = self.sessions.get_mut(session_path)
-            && passive_title_hint_can_update(&session.title, title, false)
+            && passive_title_hint_can_update(&session.title, title, false, false)
         {
             session.title = title.to_string();
             applied = true;
@@ -4281,7 +4413,7 @@ impl YggtermServer {
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
                 if scanned.session_path == session_path {
-                    if passive_title_hint_can_update(&scanned.title_hint, title, false) {
+                    if passive_title_hint_can_update(&scanned.title_hint, title, false, false) {
                         scanned.title_hint = title.to_string();
                         applied = true;
                     }
@@ -4542,7 +4674,12 @@ impl YggtermServer {
             });
         }
         if let Some(title_hint) = session.title_hint.as_deref() {
-            if passive_title_hint_can_update(&entry.title, title_hint, was_missing) {
+            if passive_title_hint_can_update(
+                &entry.title,
+                title_hint,
+                was_missing,
+                entry.title_is_explicit,
+            ) {
                 entry.title = title_hint.to_string();
             }
         }
@@ -5805,6 +5942,7 @@ impl YggtermServer {
             target.cwd.as_deref(),
             self.theme,
         );
+        apply_birth_keep_alive(&mut session);
         self.sessions.insert(key.clone(), session);
         self.live_session_order.retain(|existing| existing != &key);
         self.live_session_order.insert(0, key.clone());
@@ -5969,6 +6107,7 @@ impl YggtermServer {
             format!("ssh {ssh_target} 'yggterm server remote resume-cc {uuid} --require-existing'"),
         );
 
+        apply_birth_keep_alive(&mut session);
         self.sessions.insert(session_path.clone(), session);
         self.live_session_order
             .retain(|existing| existing != &session_path);
@@ -6466,6 +6605,7 @@ impl YggtermServer {
                     mark_session_preview_loading(&mut session);
                     applied_head_preview =
                         try_apply_remote_preview_head_payload(&mut session, &target, scanned);
+                    apply_birth_keep_alive(&mut session);
                     self.sessions.insert(session_path.clone(), session);
                     self.live_session_order
                         .retain(|existing| existing != &session_path);
@@ -6669,6 +6809,7 @@ impl YggtermServer {
         if view_mode == WorkspaceViewMode::Rendered {
             clear_session_preview_for_loading(&mut staged);
         }
+        apply_birth_keep_alive(&mut staged);
         self.sessions.insert(session_path.clone(), staged);
         if view_mode == WorkspaceViewMode::Terminal {
             if !self
@@ -6729,6 +6870,7 @@ impl YggtermServer {
                 "scan".to_string(),
             );
         }
+        apply_birth_keep_alive(&mut staged);
         self.sessions.insert(session_path.clone(), staged);
         if view_mode == WorkspaceViewMode::Terminal {
             if !self
@@ -6796,6 +6938,7 @@ impl YggtermServer {
         session.source = SessionSource::LiveLocal;
         upsert_session_metadata(&mut session.metadata, "Storage", storage_path.to_string());
         upsert_session_metadata(&mut session.metadata, "UUID", session_id.clone());
+        apply_birth_keep_alive(&mut session);
         self.sessions.insert(live_key.clone(), session);
         self.live_session_order.retain(|p| p != &live_key);
         self.live_session_order.insert(0, live_key.clone());
@@ -6872,6 +7015,7 @@ impl YggtermServer {
             session.title = resolved_title.clone();
             upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
             upsert_session_metadata(&mut session.metadata, "Host", ssh_target.to_string());
+            apply_birth_keep_alive(&mut session);
             self.sessions.insert(session_path.clone(), session);
         }
         if let Some(session) = self.sessions.get_mut(&session_path) {
@@ -7488,6 +7632,7 @@ impl YggtermServer {
             created_by,
             ephemeral,
             agent_launch_options,
+            title_is_explicit,
         } = live;
         let storage_path =
             storage_path.or_else(|| is_local_codex_storage_session_path(&key).then(|| key.clone()));
@@ -7585,7 +7730,13 @@ impl YggtermServer {
                     // `live_runtime=false`, so treating that bit as a veto drops kept
                     // terminals during restart before the remote runtime can reattach.
                     scanned.live_runtime = true;
-                    if !title.trim().is_empty() && !looks_like_generated_fallback_title(&title) {
+                    // An EXPLICIT title is restored whatever it looks like: the
+                    // shape heuristic exists to recognise titles we generated,
+                    // and it has no business overruling a name a human typed
+                    // just because that name resembles one.
+                    if !title.trim().is_empty()
+                        && (title_is_explicit || !looks_like_generated_fallback_title(&title))
+                    {
                         scanned.title_hint = title.clone();
                     }
                 }
@@ -7598,8 +7749,11 @@ impl YggtermServer {
                     self.theme,
                     self.ghostty_host.bridge_enabled,
                 );
-                if !title.trim().is_empty() && !looks_like_generated_fallback_title(&title) {
+                if !title.trim().is_empty()
+                    && (title_is_explicit || !looks_like_generated_fallback_title(&title))
+                {
                     session.title = title.clone();
+                    session.title_is_explicit = title_is_explicit;
                 }
                 if has_saved_codex_identity {
                     session.id = restored_codex_session_id.clone();
@@ -7667,12 +7821,13 @@ impl YggtermServer {
             ) {
                 return;
             }
-            let resolved_title =
-                if !title.trim().is_empty() && !looks_like_generated_fallback_title(&title) {
-                    title.clone()
-                } else {
-                    short_session_id(session_id)
-                };
+            let resolved_title = if !title.trim().is_empty()
+                && (title_is_explicit || !looks_like_generated_fallback_title(&title))
+            {
+                title.clone()
+            } else {
+                short_session_id(session_id)
+            };
             let cached_machine = self
                 .remote_machines
                 .iter()
@@ -7707,6 +7862,7 @@ impl YggtermServer {
             );
             self.append_restored_live_session_order(normalized_live_key);
             if let Some(session) = self.sessions.get_mut(normalized_live_key) {
+                session.title_is_explicit = title_is_explicit;
                 if starts_new_codex {
                     configure_remote_new_codex_live_session(
                         session,
@@ -7790,6 +7946,13 @@ impl YggtermServer {
             &agent_launch_options,
         );
         self.append_restored_live_session_order(&key);
+        // The row's title provenance travels with the row. Without this a
+        // LOCAL row restored on a fresh daemon came back with the user's name
+        // but marked "derived", so the first generated title reclaimed it —
+        // the rename would have survived exactly one restart.
+        if let Some(session) = self.sessions.get_mut(&key) {
+            session.title_is_explicit = title_is_explicit;
+        }
         // remote-cc:// twin of the remote_scanned arm above (the scanned-key
         // parse only matches remote-session://): build_live_session's
         // ClaudeCode arm produces a LOCAL launch, so without this rewrite a
@@ -11848,7 +12011,12 @@ fn apply_remote_scanned_session_preview(
         .map(|entry| entry.value.as_str())
         .is_some_and(|value| matches!(value, "tail" | "head" | "full"))
         && (!session.preview.blocks.is_empty() || !session.rendered_sections.is_empty());
-    if passive_title_hint_can_update(&session.title, &scanned.title_hint, false) {
+    if passive_title_hint_can_update(
+        &session.title,
+        &scanned.title_hint,
+        false,
+        session.title_is_explicit,
+    ) {
         session.title = scanned.title_hint.clone();
     }
     let (primary_goals, preview_blocks, rendered_sections) =
@@ -12233,7 +12401,9 @@ const REMOTE_PREVIEW_TAIL_BLOCK_LIMIT: usize = 600;
 fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: RemotePreviewPayload) {
     if let Some(title_hint) = payload
         .title_hint
-        .filter(|value| passive_title_hint_can_update(&session.title, value, false))
+        .filter(|value| {
+            passive_title_hint_can_update(&session.title, value, false, session.title_is_explicit)
+        })
     {
         session.title = title_hint;
     }
@@ -23523,6 +23693,7 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
         pty_rows: None,
         working: session.working,
         agent_launch_options: session.agent_launch_options,
+        title_is_explicit: session.title_is_explicit,
     }
 }
 
@@ -23636,6 +23807,7 @@ fn snapshot_live_session_view(session: &ManagedSessionView) -> SnapshotSessionVi
         pty_rows: None,
         working: session.working,
         agent_launch_options: session.agent_launch_options.clone(),
+        title_is_explicit: session.title_is_explicit,
     }
 }
 
@@ -23772,6 +23944,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
         id: session.id,
         session_path: session.session_path,
         title: session.title,
+        title_is_explicit: session.title_is_explicit,
         kind: session.kind,
         host_label: session.host_label,
         source,
@@ -24118,6 +24291,10 @@ fn build_session(
         id: session_id.clone(),
         session_path: path.to_string(),
         title: title.clone(),
+        // A hint, by construction: this builder is only ever handed a DERIVED
+        // title. An explicit one is applied by `set_session_title_explicit`
+        // after the row exists, so there is one door for provenance.
+        title_is_explicit: false,
         kind,
         host_label: host_label.clone(),
         source: SessionSource::Stored,
@@ -24362,6 +24539,9 @@ fn build_live_session_with_launch_options(
         id: uuid.to_string(),
         session_path,
         title: uuid.to_string(),
+        // Same rule as `build_session`: birth is always derived, and an
+        // explicit `--title` is applied through the one door afterwards.
+        title_is_explicit: false,
         kind,
         host_label: target.label.clone(),
         source,
@@ -25713,6 +25893,7 @@ mod recipe_tests {
             stored_preview_hydrated: true,
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
+            title_is_explicit: false,
         }
     }
 
@@ -26245,6 +26426,7 @@ mod tests {
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         };
         assert!(
             super::persisted_live_session_is_recoverable(&cc),
@@ -26402,6 +26584,7 @@ mod tests {
             created_by: None,
             ephemeral: None,
             agent_launch_options: options.clone(),
+            title_is_explicit: false,
         };
         let round_tripped: crate::PersistedLiveSession =
             serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
@@ -27375,6 +27558,7 @@ mod tests {
             pty_rows: None,
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
+            title_is_explicit: false,
         }
     }
 
@@ -29613,6 +29797,7 @@ mod tests {
                 stored_preview_hydrated: true,
                 working: None,
                 agent_launch_options: AgentLaunchOptions::default(),
+                title_is_explicit: false,
             },
         );
 
@@ -29717,6 +29902,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
+            title_is_explicit: false,
         };
         let inactive = ManagedSessionView {
             id: "inactive".to_string(),
@@ -29770,6 +29956,7 @@ mod tests {
             stored_preview_hydrated: true,
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
+            title_is_explicit: false,
         };
         server.active_session_path = Some(active.session_path.clone());
         server.live_session_order =
@@ -30572,6 +30759,7 @@ terminal_window_id: None,
             stored_preview_hydrated: true,
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
+            title_is_explicit: false,
         };
 
         let wrong_runtime = b"https://llm.example.com/v1/chat/completions with auth Bearer sk-1234.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\xe2\x80\xba Improve documentation in @filename\n\n  gpt-5.4 high fast \xc2\xb7 100% left \xc2\xb7 ~\n";
@@ -32584,6 +32772,261 @@ terminal_window_id: None,
         );
     }
 
+    /// The owner's sidebar outline (`0` / `1` / `1.1` / …) is his session
+    /// management system, and it evaporated at every daemon restart while the
+    /// applied ORDER survived. Order was a stored fact; the title was re-derived.
+    #[test]
+    fn an_explicitly_renamed_row_keeps_its_name_across_a_daemon_restart() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = server.start_local_session(
+            SessionKind::ClaudeCode,
+            Some("/home/user/gh/yggterm"),
+            Some("Local Claude Code"),
+        );
+        server
+            .set_live_session_keep_alive(&path, true)
+            .expect("keep the row");
+        server.set_session_title_explicit(&path, "6. yggterm: campaign");
+
+        // The rename must be a PERSISTED fact, not only an in-memory one.
+        let persisted = server.persisted_state();
+        let record = persisted
+            .live_sessions
+            .iter()
+            .find(|live| live.key == path)
+            .expect("renamed row persists");
+        assert_eq!(record.title, "6. yggterm: campaign");
+        assert!(
+            record.title_is_explicit,
+            "the rename's provenance must persist too, or the next daemon re-derives the title"
+        );
+
+        // A NEW daemon restores the row and knows nothing about it; then the
+        // CC transcript scan offers the conversation's own generated title.
+        let mut next = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        next.restore_persisted_state(persisted, None);
+        let restored = next.sessions.get(&path).expect("restored row");
+        assert_eq!(restored.title, "6. yggterm: campaign");
+        assert!(
+            restored.title_is_explicit,
+            "provenance must survive the restore, not just the title"
+        );
+
+        next.open_or_focus_session(
+            SessionKind::ClaudeCode,
+            &path,
+            Some("session-id"),
+            Some("/home/user/gh/yggterm"),
+            Some("Launch integrated yggterm campaign session"),
+            None,
+        );
+        assert_eq!(
+            next.sessions.get(&path).expect("restored row").title,
+            "6. yggterm: campaign",
+            "a derived title must never displace a name the user set"
+        );
+    }
+
+    /// `terminal new --help` and a code comment BOTH state that agent CLI kinds
+    /// are born keep-alive. That was true only on the local lane: a
+    /// `--machine-key <host> --kind claude-code` row was born unprotected,
+    /// measured on jojo 3.0.39 (`live_keep_alive: false`). Whichever way that
+    /// disagreement is settled, the two claims and the running system have to
+    /// agree — so this test is the thing that keeps them honest.
+    #[test]
+    fn an_agent_row_is_born_keep_alive_on_every_lane_not_just_the_local_one() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+
+        // The lane that already worked.
+        let local = server.start_local_session(
+            SessionKind::ClaudeCode,
+            Some("/home/user/gh/yggterm"),
+            Some("local delegate"),
+        );
+        assert!(
+            server.live_session_keep_alive(&local),
+            "a local agent row was already born keep-alive; do not regress it"
+        );
+
+        // The lane that did not, and is the one a delegate actually uses.
+        let remote = server
+            .start_remote_claude_session_with_launch_options(
+                "dev",
+                None,
+                Some("/home/user/gh/yggterm"),
+                Some("remote delegate"),
+                &Default::default(),
+            )
+            .expect("remote cc row");
+        assert!(
+            server.live_session_keep_alive(&remote),
+            "a remote agent row must be born keep-alive too, or the help text lies"
+        );
+
+        // And the rule stays kind-driven: a shell is second-class BY DESIGN and
+        // must not be swept up by a fix aimed at agent rows.
+        let shell = server.start_local_session(SessionKind::Shell, Some("/home/user"), Some("sh"));
+        assert!(
+            !server.live_session_keep_alive(&shell),
+            "a plain shell is deliberately NOT born keep-alive"
+        );
+    }
+
+    /// The `was_missing` arm, tested directly because it is the one that made
+    /// the bug survive every restart: a row absent from THIS daemon's map used
+    /// to accept any derived title unconditionally, and every row is absent on
+    /// a daemon that just started. Map occupancy is a fact about the daemon,
+    /// never about the title.
+    #[test]
+    fn a_row_new_to_this_daemon_still_refuses_a_derived_title_over_an_explicit_one() {
+        assert!(
+            !crate::passive_title_hint_can_update(
+                "6. yggterm: campaign",
+                "Launch integrated yggterm campaign session",
+                true,
+                true,
+            ),
+            "was_missing must not override the user's own name"
+        );
+        // Everything else about the old behaviour is unchanged.
+        assert!(crate::passive_title_hint_can_update(
+            "local shell",
+            "Continue atlasstore campaign",
+            false,
+            false,
+        ));
+        assert!(crate::passive_title_hint_can_update("", "A Generated Title", true, false));
+        assert!(!crate::passive_title_hint_can_update(
+            "A Real Derived Title",
+            "Another Derived Title",
+            false,
+            false,
+        ));
+    }
+
+    /// The second half of the same defect, and the one the owner hit first: a
+    /// delegate launched with `--title` came back wearing the CLI's own
+    /// auto-generated conversation title.
+    #[test]
+    fn a_generated_title_never_displaces_an_explicit_one() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = server.start_local_session(
+            SessionKind::ClaudeCode,
+            Some("/home/user/gh/yggterm"),
+            Some("Local Claude Code"),
+        );
+        server.set_session_title_explicit(&path, "6. yggterm: campaign");
+
+        // The background copy chore: this used to be UNCONDITIONAL.
+        server.set_session_title_hint(&path, "Launch integrated yggterm campaign session");
+        assert_eq!(
+            server.sessions.get(&path).expect("row").title,
+            "6. yggterm: campaign"
+        );
+
+        // And the passive path, which guessed provenance from the string's
+        // shape and so could not tell these two apart at all.
+        assert!(!server.set_session_title_hint_passive(&path, "Some Generated Title"));
+        assert_eq!(
+            server.sessions.get(&path).expect("row").title,
+            "6. yggterm: campaign"
+        );
+
+        // A LATER explicit rename still wins — the flag protects the user's
+        // name from derivation, never from the user.
+        server.set_session_title_explicit(&path, "6. yggterm: campaign (renamed)");
+        assert_eq!(
+            server.sessions.get(&path).expect("row").title,
+            "6. yggterm: campaign (renamed)"
+        );
+    }
+
+    /// A row nobody named must still pick up a generated title, or the fix
+    /// would trade one bug for a worse one: rows stuck on `local shell`.
+    #[test]
+    fn a_derived_title_still_lands_on_a_row_the_user_never_named() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = server.start_local_session(SessionKind::ClaudeCode, Some("/home/user"), None);
+        server.set_session_title_hint(&path, "Continue atlasstore campaign");
+        assert_eq!(
+            server.sessions.get(&path).expect("row").title,
+            "Continue atlasstore campaign"
+        );
+    }
+
     #[test]
     fn passive_title_hint_can_still_replace_placeholder_titles() {
         let tree = SessionNode {
@@ -33172,6 +33615,7 @@ terminal_window_id: None,
             pty_rows: None,
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
+            title_is_explicit: false,
         });
 
         assert_eq!(
@@ -33485,6 +33929,7 @@ terminal_window_id: None,
                     created_by: None,
                     ephemeral: None,
                     agent_launch_options: Default::default(),
+                    title_is_explicit: false,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -33547,6 +33992,7 @@ terminal_window_id: None,
                     created_by: None,
                     ephemeral: None,
                     agent_launch_options: Default::default(),
+                    title_is_explicit: false,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -33637,6 +34083,7 @@ terminal_window_id: None,
                     created_by: None,
                     ephemeral: None,
                     agent_launch_options: Default::default(),
+                    title_is_explicit: false,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -33731,6 +34178,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         let local_shell = server.start_local_session(
             SessionKind::Shell,
@@ -33900,6 +34348,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         assert!(server.represents_terminal_runtime_key(&kept_remote));
         assert!(
@@ -33990,6 +34439,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         };
 
         // Our own rows, in the user's arrangement.
@@ -34060,6 +34510,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         };
         server.restore_live_session(row("mine"));
 
@@ -34402,6 +34853,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         let session = server
@@ -34529,6 +34981,7 @@ terminal_window_id: None,
                     created_by: None,
                     ephemeral: None,
                     agent_launch_options: Default::default(),
+                    title_is_explicit: false,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -34581,6 +35034,7 @@ terminal_window_id: None,
                     created_by: None,
                     ephemeral: None,
                     agent_launch_options: Default::default(),
+                    title_is_explicit: false,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -34641,6 +35095,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         };
 
         assert!(
@@ -34753,6 +35208,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         server.open_or_focus_session(
             SessionKind::ClaudeCode,
@@ -35100,6 +35556,7 @@ terminal_window_id: None,
                         created_by: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
+                        title_is_explicit: false,
                     },
                     PersistedLiveSession {
                         key: "local://update-shell".to_string(),
@@ -35116,6 +35573,7 @@ terminal_window_id: None,
                         created_by: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
+                        title_is_explicit: false,
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -35178,6 +35636,7 @@ terminal_window_id: None,
                         created_by: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
+                        title_is_explicit: false,
                     },
                     PersistedLiveSession {
                         key: "codex-runtime://dead-codex".to_string(),
@@ -35194,6 +35653,7 @@ terminal_window_id: None,
                         created_by: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
+                        title_is_explicit: false,
                     },
                     PersistedLiveSession {
                         key: "document::dead-doc".to_string(),
@@ -35210,6 +35670,7 @@ terminal_window_id: None,
                         created_by: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
+                        title_is_explicit: false,
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -35284,6 +35745,7 @@ terminal_window_id: None,
                         created_by: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
+                        title_is_explicit: false,
                     },
                     PersistedLiveSession {
                         key: "local::second-shell".to_string(),
@@ -35300,6 +35762,7 @@ terminal_window_id: None,
                         created_by: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
+                        title_is_explicit: false,
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -35428,6 +35891,7 @@ terminal_window_id: None,
                         created_by: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
+                        title_is_explicit: false,
                     },
                     PersistedLiveSession {
                         key: second_path.clone(),
@@ -35444,6 +35908,7 @@ terminal_window_id: None,
                         created_by: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
+                        title_is_explicit: false,
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -35597,6 +36062,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         assert!(!server.sessions.contains_key(storage_path));
@@ -35652,6 +36118,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         let live = server
@@ -35721,6 +36188,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         let session = server.sessions.get(key).expect("restored remote cc row");
@@ -35784,6 +36252,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         server.request_terminal_launch_for_path(runtime_key);
 
@@ -35889,6 +36358,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         server.request_terminal_launch_for_path(&runtime_key);
 
@@ -36014,6 +36484,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         assert!(server.apply_codex_runtime_identity_to_live_session(
@@ -36176,6 +36647,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         assert!(server.apply_codex_runtime_identity_to_live_session(
             &runtime_key,
@@ -36257,6 +36729,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         assert!(
@@ -36362,6 +36835,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         server.request_terminal_launch_for_path(runtime_key);
 
@@ -36512,6 +36986,7 @@ terminal_window_id: None,
                 stored_preview_hydrated: false,
                 working: None,
                 agent_launch_options: AgentLaunchOptions::default(),
+                title_is_explicit: false,
             },
         );
         server.live_session_order = vec![stale_path.to_string()];
@@ -36612,6 +37087,7 @@ terminal_window_id: None,
             stored_preview_hydrated: true,
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
+            title_is_explicit: false,
         };
 
         // The producers the daemon actually uses, for the very same session.
@@ -36729,6 +37205,7 @@ terminal_window_id: None,
             stored_preview_hydrated: false,
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
+            title_is_explicit: false,
         };
 
         let tree = SessionNode {
@@ -37105,6 +37582,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         let session = server
@@ -37177,6 +37655,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         let session = server
@@ -37475,6 +37954,7 @@ terminal_window_id: None,
                 created_by: None,
                 ephemeral: None,
                 agent_launch_options: Default::default(),
+                title_is_explicit: false,
             });
 
             let session = server
@@ -37579,6 +38059,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         let session = server
@@ -37672,6 +38153,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         let session = server
@@ -37800,6 +38282,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         server.active_session_path = Some("remote-session://dev/fresh-codex".to_string());
         server.active_view_mode = WorkspaceViewMode::Terminal;
@@ -37872,6 +38355,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         server.active_session_path = Some("remote-session://dev/synthetic-runtime".to_string());
         server.active_view_mode = WorkspaceViewMode::Terminal;
@@ -37955,6 +38439,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         assert_eq!(
@@ -38042,6 +38527,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         server.restore_live_session(PersistedLiveSession {
             key: "remote-session://jojo/live-2".to_string(),
@@ -38058,6 +38544,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         let targets = server.remote_shutdown_targets();
@@ -38134,6 +38621,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         let (machine, session_id) = server
@@ -38504,6 +38992,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         let result = server.refresh_session_preview_from_source("remote-session://dev/abc123");
@@ -38546,6 +39035,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         server.active_session_path = Some(path.to_string());
@@ -38592,6 +39082,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
         server.restore_live_session(PersistedLiveSession {
             key: "local://shell".to_string(),
@@ -38608,6 +39099,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         // No session with an interactive prompt may be stopped by typing into
@@ -38652,6 +39144,7 @@ terminal_window_id: None,
             created_by: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
+            title_is_explicit: false,
         });
 
         assert!(
