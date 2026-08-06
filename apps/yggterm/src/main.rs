@@ -495,6 +495,55 @@ fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     yggterm_core::cli_flag_value(args, flag)
 }
 
+/// Refuse a `server app` payload that is really a flag.
+///
+/// The belt to [`app_control_payload_arg`]'s braces: `cli_positional_args`
+/// already skips `--flag` tokens, so a resolved value can only look like this
+/// if that rule ever loosens. The guard stays because the cost of being wrong
+/// is not a wrong answer, it is the LIE-OF-SUCCESS shape — `dom-eval` printing
+/// `{"result": …}` for an evaluation of the string `--client`, which reads to
+/// the caller exactly like their script having run. Naming the token is honest;
+/// acting on it is not.
+fn refuse_flag_shaped_payload<'a>(value: &'a str, what: &str) -> Result<&'a str> {
+    if value.starts_with("--") {
+        anyhow::bail!(
+            "refusing to use {value:?} as the {what}: that is a flag, not a value. \
+             --client/--pid/--timeout-ms may sit on either side of the value, but \
+             the value itself must not look like a flag"
+        );
+    }
+    Ok(value)
+}
+
+/// THE reader for a `server app` verb's free-form payload — `dom-eval`'s
+/// script, `command invoke`'s id, `media answer`'s answer.
+///
+/// Position-INDEPENDENT, because the flags it shares an argv with are:
+/// [`yggterm_server::apply_app_control_target_overrides`] scans the whole argv
+/// for `--client`/`--pid`, so a payload read straight out of `args[start]`
+/// disagrees with the very flags it was typed beside. That disagreement is what
+/// made `dom-eval --client shadow '<script>'` evaluate the STRING `--client`
+/// and report success.
+///
+/// ⚠ The twin arms in `bin/yggterm-headless.rs` still read their payload at a
+/// fixed index. One owner means this rule belongs beside `cli_positional_args`
+/// in `yggterm_core::cli_args` where BOTH binaries can call it — moving it
+/// there is the finish of this fix, not a separate idea.
+fn app_control_payload_arg<'a>(args: &'a [String], start: usize, what: &str) -> Result<&'a str> {
+    match cli_positional_args(args, start).into_iter().next() {
+        Some(value) => refuse_flag_shaped_payload(value, what),
+        // No positional anywhere. When a flag sits where the payload was meant
+        // to go, name THAT token — it is the one the old fixed-index reader
+        // would have acted on — rather than the vaguer "missing".
+        None => match args.get(start).map(String::as_str) {
+            Some(flagged) if flagged.starts_with("--") => {
+                refuse_flag_shaped_payload(flagged, what)
+            }
+            _ => anyhow::bail!("missing {what}"),
+        },
+    }
+}
+
 /// Parse the agent-oriented screenshot post-process flags:
 ///   --region <terminal|full>   crop to the active terminal viewport
 ///   --crop <x,y,w,h>           explicit pixel crop
@@ -888,6 +937,10 @@ fn print_server_app_help() {
     answers the camera/microphone prompt `server app state` reports under
     pending_media_capture; non-zero exit + a named reason when it was NOT applied
   yggterm server app command <list|invoke <id>>
+  yggterm server app dom-eval <script>
+    evaluates the script in the GUI's OWN dom (the app chrome; a page inside a
+    web surface is `web eval`). The body is spliced into an async function, so
+    `return` whatever you want back
 {web_usage}
 row tenancy (server app terminal new): these flags are parsed by the SAME reader
   as the headless binary's, so they mean one thing on either. Every create from
@@ -905,7 +958,10 @@ row tenancy (server app terminal new): these flags are parsed by the SAME reader
 targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
   worker handles the verb; --client names a client by its --client-id (a shadow
   view client, slice 4.3) — see `server app clients`. --pid wins if both given;
-  with one GUI and no target it routes there automatically.",
+  with one GUI and no target it routes there automatically. These flags may be
+  written BEFORE or AFTER a verb's value: `dom-eval --client shadow '<js>'` and
+  `dom-eval '<js>' --client shadow` are the same command, and a value that
+  itself looks like a flag is refused rather than acted on.",
         // The web usage block is rendered by the plane's OWNER, so this help
         // and the headless binary's cannot document different verb sets.
         web_usage = yggterm_server::web_usage_block("yggterm")
@@ -2656,10 +2712,12 @@ fn main() -> Result<()> {
                 )
             }
             "dom-eval" => {
-                let script = args
-                    .get(3)
-                    .map(String::as_str)
-                    .context("missing script for server app dom-eval")?;
+                // The script is a POSITIONAL among global flags, not `args[3]`:
+                // `dom-eval --client shadow '<script>'` must mean the same as
+                // `dom-eval '<script>' --client shadow`, because the `--client`
+                // that picks the GUI worker is already read wherever it sits.
+                let script =
+                    app_control_payload_arg(&args, 3, "script for server app dom-eval")?;
                 run_app_control_dom_eval(script, timeout_ms)
             }
             "keytips" => {
@@ -2689,14 +2747,13 @@ fn main() -> Result<()> {
                 let action = args.get(3).map(String::as_str).unwrap_or("answer");
                 match action {
                     "answer" => {
-                        let answer = args
-                            .get(4)
-                            .filter(|arg| !arg.starts_with("--"))
-                            .map(String::to_string)
-                            .context(
-                                "missing answer for server app media answer \
-                                 (allow | deny-once | block-site)",
-                            )?;
+                        let answer = app_control_payload_arg(
+                            &args,
+                            4,
+                            "answer for server app media answer \
+                             (allow | deny-once | block-site)",
+                        )?
+                        .to_string();
                         let request_id = cli_flag_value(&args, "--request")
                             .map(|value| value.parse::<u64>())
                             .transpose()
@@ -2722,10 +2779,11 @@ fn main() -> Result<()> {
                 match action {
                     "list" => yggterm_server::run_app_control_list_commands(timeout_ms),
                     "invoke" => {
-                        let id = args
-                            .get(4)
-                            .map(String::as_str)
-                            .context("missing command id for server app command invoke")?;
+                        let id = app_control_payload_arg(
+                            &args,
+                            4,
+                            "command id for server app command invoke",
+                        )?;
                         yggterm_server::run_app_control_invoke_command(id.to_string(), timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app command action: {other}"),
@@ -6290,6 +6348,150 @@ mod tests {
         assert!(source.contains("server app open <session-path>"));
         assert!(source.contains("\"open\" =>"));
         assert!(source.contains("run_app_control_open_path(session_path, view_mode, timeout_ms)"));
+    }
+
+    fn payload_argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    /// ⛔ THE LIE-OF-SUCCESS SHAPE. `server app dom-eval --client shadow
+    /// '<script>'` read its script at `args[3]`, which is the token `--client`
+    /// — so it evaluated the STRING "--client" in the GUI and printed a result
+    /// for it, indistinguishable to the caller from their script having run.
+    /// The targeting flags were never position-sensitive (they are scanned out
+    /// of the whole argv), so it was the payload that had to catch up: both
+    /// spellings are ONE command, same script and same target.
+    #[test]
+    fn a_server_app_payload_is_the_same_with_the_flags_on_either_side() {
+        let script = "return document.title";
+        let spellings = [
+            payload_argv(&["server", "app", "dom-eval", "--client", "shadow", script]),
+            payload_argv(&["server", "app", "dom-eval", script, "--client", "shadow"]),
+            payload_argv(&[
+                "server", "app", "dom-eval", "--pid", "4242", script, "--client", "shadow",
+            ]),
+            payload_argv(&[
+                "server", "app", "dom-eval", "--client", "shadow", "--pid", "4242", script,
+            ]),
+        ];
+        for args in &spellings {
+            assert_eq!(
+                super::app_control_payload_arg(args, 3, "script for server app dom-eval")
+                    .expect("the script resolves wherever the flags sit"),
+                script,
+                "{args:?} must resolve the same script as its sibling spellings"
+            );
+            // The other half of "same command": the target the script rides
+            // with. `app_control_client_flag`/`app_control_pid_flag` read the
+            // whole argv under this same rule, so the two halves can no longer
+            // disagree about which GUI worker a positional was typed for.
+            assert_eq!(
+                super::cli_flag_value(args, "--client"),
+                Some("shadow"),
+                "{args:?} names the same client whichever side the script sits"
+            );
+        }
+        assert_eq!(super::cli_flag_value(&spellings[2], "--pid"), Some("4242"));
+        assert_eq!(super::cli_flag_value(&spellings[3], "--pid"), Some("4242"));
+        // The same reader, the same rule, for the other free-form payloads in
+        // the family — `media answer` at index 4 and `command invoke`'s id.
+        for (start, args, expected) in [
+            (
+                4,
+                payload_argv(&["server", "app", "media", "answer", "--request", "7", "allow"]),
+                "allow",
+            ),
+            (
+                4,
+                payload_argv(&["server", "app", "media", "answer", "allow", "--request", "7"]),
+                "allow",
+            ),
+            (
+                4,
+                payload_argv(&["server", "app", "command", "invoke", "--pid", "42", "help.open"]),
+                "help.open",
+            ),
+            (
+                4,
+                payload_argv(&["server", "app", "command", "invoke", "help.open", "--pid", "42"]),
+                "help.open",
+            ),
+        ] {
+            assert_eq!(
+                super::app_control_payload_arg(&args, start, "value")
+                    .expect("the payload resolves wherever the flags sit"),
+                expected,
+                "{args:?} must resolve the same payload as its sibling spelling"
+            );
+        }
+    }
+
+    /// Belt and braces: a value that looks like a flag is REFUSED, never acted
+    /// on. A refusal names the problem; evaluating `--client` as a script is
+    /// the defect this whole reader exists to close.
+    #[test]
+    fn a_server_app_payload_that_looks_like_a_flag_is_refused_not_acted_on() {
+        let error =
+            super::refuse_flag_shaped_payload("--client", "script for server app dom-eval")
+                .expect_err("a flag is not a script");
+        let message = format!("{error}");
+        assert!(
+            message.contains("--client") && message.contains("refusing"),
+            "the refusal must name the token it refused: {message}"
+        );
+        // And through argv, with the script left out entirely: the arm must
+        // still refuse rather than reach for whatever sits at the fixed index.
+        let args = payload_argv(&["server", "app", "dom-eval", "--client", "shadow"]);
+        let error = super::app_control_payload_arg(&args, 3, "script for server app dom-eval")
+            .expect_err("a bare flag is not a script");
+        let message = format!("{error}");
+        assert!(
+            message.contains("--client"),
+            "the refusal must name the token it refused: {message}"
+        );
+        // A genuinely missing payload still says so plainly.
+        let bare = payload_argv(&["server", "app", "dom-eval"]);
+        assert!(
+            format!(
+                "{}",
+                super::app_control_payload_arg(&bare, 3, "script for server app dom-eval")
+                    .expect_err("no script at all")
+            )
+            .contains("missing script for server app dom-eval")
+        );
+    }
+
+    /// The arms must ROUTE the shared reader. A lock on the helper alone stays
+    /// green if a call site quietly goes back to `args.get(3)`, which is
+    /// exactly how this bug shipped.
+    #[test]
+    fn every_free_form_app_payload_arm_reads_through_the_one_positional_reader() {
+        let source = include_str!("main.rs");
+        let product = source
+            .split("mod tests {")
+            .next()
+            .expect("main.rs has a product half above its tests");
+        for (marker, close, index) in [
+            ("\"dom-eval\" => {", "\n            }", "3"),
+            ("\"answer\" => {", "\n                    }", "4"),
+            ("\"invoke\" => {", "\n                    }", "4"),
+        ] {
+            let rest = product
+                .split(marker)
+                .nth(1)
+                .unwrap_or_else(|| panic!("the {marker} arm moved — move this lock with it"));
+            let arm = &rest[..rest
+                .find(close)
+                .unwrap_or_else(|| panic!("the {marker} arm has no close brace"))];
+            assert!(
+                arm.contains("app_control_payload_arg("),
+                "{marker} does not read its payload through the one reader:\n{arm}"
+            );
+            assert!(
+                !arm.contains(&format!(".get({index})")),
+                "{marker} still reads a payload at a fixed index:\n{arm}"
+            );
+        }
     }
 
     #[test]
