@@ -389,6 +389,20 @@ by `window_focused` and by `daemon_request/terminal_read` rate. `gpu_ms` zero in
 
 ### 7.4 Instruments that lie about their own subject
 
+- **⛔ `/proc/<pid>/fd` CANNOT link a `claude` process to its transcript.**
+  Claude Code APPENDS AND CLOSES, so the JSONL is not held open and the fd
+  table shows nothing — an empty result is the NORMAL case, not evidence that
+  the process has no transcript. This is the opposite of Codex, whose open
+  transcript fd is exactly how `AGENTS.md` says to recover its session identity,
+  which is why the technique gets retried on CC and silently returns nothing.
+  Link by EVIDENCE instead: the session id in argv (`--session-id <uuid>`),
+  else a known path matched inside the transcript body. Measured 2026-08-06.
+- **A row leaving the table is NOT its runtime dying.** `session remove` answers
+  with `verified` and, on failure, `verified_refusal` (e.g.
+  `remote_runtime_survived`). The ROW LIST updates first, so reading it instead
+  of `verified` reports a clean reap over a live orphan — it has already
+  produced one. ⚠ `live_processes: []` has been observed in the SAME reply as
+  `remote_runtime_survived`; when they disagree, believe the refusal.
 - **`set_var`/`remove_var` do NOT change `/proc/<pid>/environ`.** glibc
   reallocates the environ array on the heap; the kernel keeps exposing the
   exec-time stack page. Anything the process set AFTER exec is invisible there,
