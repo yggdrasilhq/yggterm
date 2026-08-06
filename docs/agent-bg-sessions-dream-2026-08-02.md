@@ -117,6 +117,29 @@ user's seat.
 by the user personally after I published a brief to a scratchpad path; my
 steer messages arrive looking like the user typed them.
 
+## Addendum 2026-08-06 (graph-router wave 1)
+
+**7. `terminal send --enter` — submit semantics for TUI targets.**
+**What:** a flag (or first-class two-write idiom) that makes a send SUBMIT into a
+full-screen TUI: write the text, settle ~1 s, then write a discrete `\r`. A single
+write with an inline trailing `\r` is paste-buffered by the Claude Code TUI — the
+text lands in the input box and the newline never counts as Enter.
+**Why:** guide-to-delegate steering silently no-ops today; the verb answers
+`accepted:true` while nothing was submitted.
+**Cost paid:** four steering messages (2026-08-06) sat unsubmitted across four
+delegate rows; the orchestrator reasoned wrongly about which delegates were
+running from the false "delivered" assumption, and only the user's own eyes on
+the rows caught it.
+
+**8. Trust pre-acceptance for fresh cwds.**
+**What:** the launch path pre-seeding `~/.claude.json` (projects entry,
+hasTrustDialogAccepted) for the target cwd, or a `--trust-cwd` flag on
+`terminal new`.
+**Why:** a delegate launched into a cwd Claude Code has never opened stalls at
+the trust dialog until a human clicks it; the arg prompt resumes only after.
+**Cost paid:** 3 of 5 wave-1 delegates sat at trust dialogs invisible
+off-screen until the user noticed and clicked each by hand.
+
 ## For the skills (data-fabric / yggui-app-control)
 
 - data-fabric §THE BG-SESSION PLANE added 2026-08-02 (recipe + five traps) —
