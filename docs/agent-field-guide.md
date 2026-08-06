@@ -389,6 +389,16 @@ by `window_focused` and by `daemon_request/terminal_read` rate. `gpu_ms` zero in
 
 ### 7.4 Instruments that lie about their own subject
 
+- **⛔ `pgrep -f "<pattern>"` MATCHES YOUR OWN WRAPPER.** A shell running
+  `until ! pgrep -f "cargo build --release"; do sleep 10; done` has that exact
+  string in its OWN `/proc/<pid>/cmdline`, so the check matches itself and the
+  loop never exits — reporting "still building" forever after the build
+  finished. Cost an hour of a session on 2026-08-06, waiting on a build that
+  had completed 90 minutes earlier. Use `pgrep -x cargo` (exact NAME, not the
+  command line), check the artifact's mtime, or exclude yourself with
+  `pgrep -f pat | grep -v $$`. ⚠ Same shape as a structural test whose own
+  assertion string satisfies the search it performs — **if a probe's text can
+  appear in the thing it probes, it is measuring itself.**
 - **⛔ `/proc/<pid>/fd` CANNOT link a `claude` process to its transcript.**
   Claude Code APPENDS AND CLOSES, so the JSONL is not held open and the fd
   table shows nothing — an empty result is the NORMAL case, not evidence that
