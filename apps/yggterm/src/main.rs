@@ -887,6 +887,17 @@ fn print_server_app_help() {
     refusal and the surviving pids in live_processes
   yggterm server app session rename <session-path> <title> [--pid <pid>]
   yggterm server app start-page [--pid <pid>]
+  yggterm server app notify <title> [message] [--tone info|success|warning|error]
+      [--job <key>] [--progress 0..100] [--session <session-path>]
+      [--persistent] [--silent] [--in <dur>|--at <clock>] [--pid <pid>]
+    THE door for an agent, a cron job or a libyggterm app to reach the user.
+    ⛔ It targets the ACTIVE GUI by default — an agent testing one MUST pass
+    --pid/--client or its toast lands on the user's own screen.
+    --job upserts one row (that is how a long job reports progress without
+    burying everything else) and --progress draws the bar; --progress without
+    --job is DROPPED. --session makes the card clickable through to that row.
+    ⚠ $YGGTERM_SESSION_ID is NOT a row path — match its UUID against
+    `server app rows` first, or the card is inert.
   yggterm server app pane <pane-id> <action> [value]
     press something in a contributed pane, exactly as a click does —
     `panel pane:<id>` opens one, this is what can act on it. value is
