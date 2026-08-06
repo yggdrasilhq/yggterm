@@ -5401,8 +5401,10 @@ impl WebSurfaceHost {
     /// soft stash), but it must not be killed while the user is listening to it.
     /// A missing surface reads `false` — there is nothing left to protect.
     ///
-    /// Deliberately NOT paired with `set_is_muted`. Muting a page to save CPU
-    /// would be the exact failure this exists to prevent.
+    /// Deliberately NOT paired with `set_is_muted` **for the throttling
+    /// question**. Muting a page to save CPU would be the exact failure this
+    /// exists to prevent. See `set_muted` below, which answers a different
+    /// question and is not a reversal of this one.
     pub fn is_playing_audio(&self, id: u64) -> bool {
         use webkit2gtk::WebViewExt as _;
         use wry::WebViewExtUnix as _;
@@ -5410,6 +5412,37 @@ impl WebSurfaceHost {
             .borrow()
             .get(&id)
             .is_some_and(|s| s.webview.webview().is_playing_audio())
+    }
+
+    /// Mute or unmute surface `id`.
+    ///
+    /// # WHO OWNS THE SPEAKERS — not "may an unseen page make noise"
+    ///
+    /// `is_playing_audio` above refuses to mute for THROTTLING, and that refusal
+    /// stands: a backgrounded page the user is listening to must keep playing.
+    /// This answers a different question. Webviews are per CLIENT, and a second
+    /// viewer builds its own set, so a co-browsing or shadow client that mirrors
+    /// a session containing a video **opens that video again in its own WebKit
+    /// process and plays it**. Two audio streams, and the page-level pause, the
+    /// mute button and the media keys all act on the FIRST client's webview
+    /// because that is the one holding the media session.
+    ///
+    /// Reported by the user 2026-08-06 as a phantom YouTube tab that no control
+    /// could stop and only closing the ychrome row would kill. Confirmed in the
+    /// trace: the user's GUI opened the tab, a shadow client opened its own copy
+    /// of the same video ~100 s later, stashed it 16 s after that — `stash` is a
+    /// paint decision and explicitly never a mute — and it stayed audible until
+    /// the cross-client tombstone sweep reaped it a second after the user closed
+    /// the row.
+    ///
+    /// So: exactly one client owns the speakers, and every additional viewer is
+    /// silent. A missing surface is not an error — there is nothing to mute.
+    pub fn set_muted(&self, id: u64, muted: bool) {
+        use webkit2gtk::WebViewExt as _;
+        use wry::WebViewExtUnix as _;
+        if let Some(surface) = self.surfaces.borrow().get(&id) {
+            surface.webview.webview().set_is_muted(muted);
+        }
     }
 
     /// Destroy surface `id`.
