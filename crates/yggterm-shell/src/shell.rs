@@ -108866,6 +108866,18 @@ fn terminal_eval_script_with_canvas_renderer(
         let forcedRefreshSkippedCount = 0;
         let scrollbackLocked = false;
         let scrollbackIntent = 'PromptFollow';
+        // Does a SELECTION currently own the viewport pin?
+        // ⛔ Read by the reached-bottom release below, which otherwise drops ANY
+        // UserScrollback pin the instant the viewport sits at the base — a
+        // condition that is CONTINUOUSLY true while an agent CLI streams. Traced
+        // on a shadow during a drag over a streaming session: the pin armed on
+        // mouse-down (`UserScrollback/selection_active`) and was gone 116 ms
+        // later (`PromptFollow/focus`, then `write_flush_reached_bottom`), after
+        // which the viewport resumed following the stream and dragged the
+        // selection's end anchor through the buffer with it — 902,650 chars from
+        // a 2.4 s drag. Declared HERE, beside the intent it guards, so the
+        // release site can read it with no temporal-dead-zone risk.
+        let selectionOwnsScrollbackPin = false;
         // Working-session-cluster follow fix (finding-working-state-row-overlap):
         // `programmaticScrollInProgress` is set synchronously around every
         // forceXtermViewportY move so the onScroll it fires is not mistaken for a
@@ -109602,7 +109614,14 @@ fn terminal_eval_script_with_canvas_renderer(
                             entry.lastScrollbackVisualMismatchAtBottomReason = String(reason || '');
                         }}
                     }}
-                    if (!scrollbackLocked && scrollbackIntent === 'UserScrollback') {{
+                    // ⛔ `!selectionOwnsScrollbackPin`: "the viewport reached the
+                    // bottom" is the documented escape from a WHEEL pin, and it
+                    // is right for one. For a SELECTION pin it is fatal — during
+                    // a drag at the tail of a streaming session the viewport is
+                    // at the bottom on every write flush, so this line used to
+                    // un-pin mid-gesture and let the selection chase the stream.
+                    if (!scrollbackLocked && scrollbackIntent === 'UserScrollback'
+                        && !selectionOwnsScrollbackPin) {{
                         setScrollbackIntent('PromptFollow', reason ? `${{reason}}_reached_bottom` : 'reached_bottom');
                 }} else if (
                     userScrolledUp
@@ -112730,6 +112749,82 @@ fn terminal_eval_script_with_canvas_renderer(
                     window.setTimeout(flushScheduledPrimarySelectionSync, 16);
             }}
         }};
+        // A selection that is gone can no longer hold the pin, whether or not
+        // the release then fires (it deliberately does not fire for someone who
+        // scrolled up first). Returns true so it can sit at the head of that
+        // condition and drop the claim exactly once.
+        const releaseSelectionPinClaim = () => {{
+            selectionOwnsScrollbackPin = false;
+            return true;
+        }};
+        // SELECTION ⇒ VIEWPORT PIN, one owner for both directions.
+        // ⛔ THE QUIET-GATE LAW (see the campaign): this decision used to hang
+        // ONLY off term.onSelectionChange, and that event does not arrive when
+        // the workload is an agent CLI streaming output. Measured on a shadow,
+        // same drag geometry, same session:
+        //   idle      →   967 chars, 2 selection-change events, pin ARMED
+        //   streaming → 902,649 chars, 0 selection-change events, pin NEVER ARMED
+        // With the pin unarmed the viewport keeps auto-following the stream, so
+        // the drag's end anchor chases it through the buffer and the selection
+        // accumulates every line the agent emits while the mouse is down — a
+        // 2.4 s drag selected 909,143 chars over 10,036 lines, and each
+        // serialization of that selection costs 18-23 ms on the same thread as
+        // the xterm write pump. That is the felt lag, and the runaway size is
+        // also why the user gets far more text than they dragged over.
+        // The RELEASE had the same defect from the other side: a click during a
+        // stream armed the pin and the release event never came, which is the
+        // filed "stuck viewport after a copy — '2 new messages ↓' that never
+        // follows" symptom. Both directions now hang off the POINTER GESTURE,
+        // which is a positive signal the workload cannot starve; the
+        // selection-change path stays wired as a second caller of this same
+        // owner, so the two can never disagree.
+        const applySelectionScrollbackIntent = (selecting) => {{
+            try {{
+                if (selecting) {{
+                    if (scrollbackIntent !== 'UserScrollback') {{
+                        setScrollbackIntent('UserScrollback', 'selection_active');
+                    }}
+                    // Claim the pin ONLY when this selection is what set it. A
+                    // user who scrolled up first keeps their own pin and its
+                    // own reason, and the reached-bottom escape still applies
+                    // to that one — which is correct, it is a wheel pin.
+                    if (lastScrollbackIntentReason === 'selection_active') {{
+                        selectionOwnsScrollbackPin = true;
+                    }}
+                }} else if (
+                    releaseSelectionPinClaim()
+                    && scrollbackIntent === 'UserScrollback'
+                    && lastScrollbackIntentReason === 'selection_active'
+                ) {{
+                    // The release stays deliberately narrow — someone who
+                    // scrolled UP to read and then selected keeps their place.
+                    const buf = term && term.buffer ? term.buffer.active : null;
+                    if (buf) {{
+                        // The SAME effective-viewport reading the follow
+                        // executor and the settle watchdog use — raw
+                        // buf.viewportY can sit permanently below base under
+                        // the visual-beyond-base clamp.
+                        const vy = Math.max(0, Number(
+                            (typeof effectiveXtermViewportY === 'function'
+                                ? effectiveXtermViewportY(buf)
+                                : buf.viewportY) || 0
+                        ));
+                        const by = Math.max(0, Number(buf.baseY || 0));
+                        // 2 = scroll_mode::PIN_THRESHOLD_LINES; output jitter of
+                        // a row or two is not "the user left".
+                        if (by - vy < 2) {{
+                            setScrollbackIntent(
+                                'PromptFollow',
+                                'selection_cleared_at_bottom'
+                            );
+                        }}
+                    }}
+                }}
+            }} catch (_selectionIntentError) {{}}
+        }};
+        const terminalHasSelection = () => Boolean(
+            term && typeof term.hasSelection === 'function' && term.hasSelection()
+        );
         // A left-press starts a NEW selection: xterm clears the current one
         // before any trailing-edge sync could run. This capture-phase listener
         // runs BEFORE xterm's element handlers, so the COMPLETED selection is
@@ -112742,6 +112837,10 @@ fn terminal_eval_script_with_canvas_renderer(
             primarySelectionPointerDragActive = true;
             dragSelectionChangeCount = 0;
             dragBeganAtMs = Date.now();
+            // ⭐ ARM THE PIN HERE, not on the first selection-change. This runs
+            // in the capture phase, so the viewport has stopped following
+            // before xterm has even begun the selection this press starts.
+            applySelectionScrollbackIntent(true);
         }};
         // Drag end: make the FINAL selection durable NOW, not at the next
         // animation frame — a middle-click (possibly on another host) must
@@ -112753,6 +112852,10 @@ fn terminal_eval_script_with_canvas_renderer(
             primarySelectionPointerDragActive = false;
             const flushBeganAtMs = Date.now();
             flushPrimarySelectionSync('selection_flush_pointer_up');
+            // ⭐ AND RELEASE HERE. A press that selected nothing (a plain click)
+            // must not leave the viewport pinned waiting for a selection-change
+            // event that a streaming session never delivers.
+            applySelectionScrollbackIntent(terminalHasSelection());
             if (wasDragging) {{
                 // DRAG LIFECYCLE INSTRUMENT (2026-07-31). The terminal
                 // selection path emitted ONE event per copy and nothing during
@@ -114981,41 +115084,14 @@ fn terminal_eval_script_with_canvas_renderer(
                 // (`selection_active`, not a wheel or a key), and the viewport
                 // is within the pin threshold of the base. Someone who scrolled
                 // up and then selected keeps their place.
-                try {{
-                    const selecting = Boolean(
-                        term && typeof term.hasSelection === 'function' && term.hasSelection()
-                    );
-                    if (selecting && scrollbackIntent !== 'UserScrollback') {{
-                        setScrollbackIntent('UserScrollback', 'selection_active');
-                    }} else if (
-                        !selecting
-                        && scrollbackIntent === 'UserScrollback'
-                        && lastScrollbackIntentReason === 'selection_active'
-                    ) {{
-                        const buf = term && term.buffer ? term.buffer.active : null;
-                        if (buf) {{
-                            // The SAME effective-viewport reading the follow
-                            // executor and the settle watchdog use — raw
-                            // buf.viewportY can sit permanently below base under
-                            // the visual-beyond-base clamp.
-                            const vy = Math.max(0, Number(
-                                (typeof effectiveXtermViewportY === 'function'
-                                    ? effectiveXtermViewportY(buf)
-                                    : buf.viewportY) || 0
-                            ));
-                            const by = Math.max(0, Number(buf.baseY || 0));
-                            // 2 = scroll_mode::PIN_THRESHOLD_LINES, the same
-                            // literal the settle watchdog above uses; output
-                            // jitter of a row or two is not "the user left".
-                            if (by - vy < 2) {{
-                                setScrollbackIntent(
-                                    'PromptFollow',
-                                    'selection_cleared_at_bottom'
-                                );
-                            }}
-                        }}
-                    }}
-                }} catch (_selectionIntentError) {{}}
+                // ⛔ ONE OWNER: applySelectionScrollbackIntent, which the
+                // pointer handlers also call. This path is the one that does
+                // NOT arrive under streaming load (measured: 0 firings across a
+                // drag that selected 902,649 chars), so it may never be the
+                // only caller — but it is still correct when it does arrive
+                // (a keyboard/API selection change reaches nothing else), and
+                // routing it here is what keeps the two from disagreeing.
+                applySelectionScrollbackIntent(terminalHasSelection());
                 // CC-DRAG-STALL: everything else (the O(selected-cells)
                 // selection serialization, host-entry sync, canvas-layer pass,
                 // health telemetry) is deferred to the coalesced trailing
@@ -140924,33 +141000,90 @@ mod tests {
     fn a_selection_cleared_at_the_bottom_releases_its_own_pin() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
-        let handler = script
-            .split("term.onSelectionChange(() => {")
+        let owner = script
+            .split("const applySelectionScrollbackIntent = (selecting) => {")
             .nth(1)
-            .and_then(|rest| rest.split("schedulePrimarySelectionSync();").next())
-            .expect("the selection handler");
+            .and_then(|rest| rest.split("const terminalHasSelection").next())
+            .expect("the one owner of the selection viewport pin");
         assert!(
-            handler.contains("setScrollbackIntent('UserScrollback', 'selection_active')"),
+            owner.contains("setScrollbackIntent('UserScrollback', 'selection_active')"),
             "the pin itself must survive — it is what stops output yanking a live drag"
         );
         assert!(
-            handler.contains("selection_cleared_at_bottom"),
+            owner.contains("selection_cleared_at_bottom"),
             "and it must be able to release, or the viewport is stuck until a remount"
         );
         // All three guards, or the release is wrong in one of the two
         // directions that matter.
         assert!(
-            handler.contains("lastScrollbackIntentReason === 'selection_active'"),
+            owner.contains("lastScrollbackIntentReason === 'selection_active'"),
             "a wheel/key pin must NOT be released by a selection clearing"
         );
         assert!(
-            handler.contains("by - vy < 2"),
+            owner.contains("by - vy < 2"),
             "a user who scrolled UP and then selected must keep their place"
         );
         assert!(
-            handler.contains("effectiveXtermViewportY"),
+            owner.contains("effectiveXtermViewportY"),
             "must use the SAME effective-viewport reading as the follow executor \
              and the settle watchdog, not raw buf.viewportY"
+        );
+    }
+
+    /// ⛔ THE QUIET-GATE LAW, applied to the viewport pin.
+    ///
+    /// The pin used to arm ONLY from `term.onSelectionChange`. That event does
+    /// not arrive while an agent CLI streams: measured on a shadow client with
+    /// the same drag geometry and the same session, an idle terminal fired 2
+    /// selection-change events and armed the pin (967 chars selected), while a
+    /// streaming one fired **zero** and never armed it — and the selection ran
+    /// to **902,649 chars** because the unpinned viewport kept following the
+    /// stream and dragged the selection's end anchor through the buffer with
+    /// it. Serializing a selection that size costs 18-23 ms on the same thread
+    /// as the xterm write pump, which is the lag the user feels.
+    ///
+    /// So both directions must hang off the POINTER GESTURE, which the workload
+    /// cannot starve. If this test fails, the pin has been re-attached to an
+    /// absence and the runaway selection is back.
+    #[test]
+    fn the_viewport_pin_arms_and_releases_on_the_pointer_gesture_not_on_an_event() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+
+        let down = script
+            .split("const handlePrimarySelectionSyncPointerDown = (_event) => {")
+            .nth(1)
+            .and_then(|rest| rest.split("};").next())
+            .expect("the pointer-down handler");
+        assert!(
+            down.contains("applySelectionScrollbackIntent(true)"),
+            "the pin must ARM on pointer-down — waiting for a selection-change \
+             event is waiting for something a streaming session never sends, \
+             and the selection then grows without bound"
+        );
+
+        let up = script
+            .split("const handlePrimarySelectionSyncPointerUp = (_event) => {")
+            .nth(1)
+            .and_then(|rest| rest.split("};").next())
+            .expect("the pointer-up handler");
+        assert!(
+            up.contains("applySelectionScrollbackIntent(terminalHasSelection())"),
+            "and it must RELEASE on pointer-up — a plain click during a stream \
+             otherwise pins the viewport forever, which is the reported \
+             'N new messages ↓ that never follows'"
+        );
+
+        // One owner, or the gesture path and the event path drift apart.
+        assert_eq!(
+            script.matches("setScrollbackIntent('UserScrollback', 'selection_active')").count(),
+            1,
+            "exactly ONE site may arm the selection pin"
+        );
+        assert_eq!(
+            script.matches("'selection_cleared_at_bottom'").count(),
+            1,
+            "exactly ONE site may release the selection pin"
         );
     }
 
@@ -148218,8 +148351,12 @@ mod tests {
             "the per-event health emit must be deferred to the trailing edge"
         );
         assert!(
-            handler.contains("setScrollbackIntent('UserScrollback', 'selection_active');"),
-            "the scroll pin must stay IMMEDIATE — it keeps streaming output from yanking the viewport mid-drag"
+            handler.contains("applySelectionScrollbackIntent(terminalHasSelection());"),
+            "the scroll pin must stay IMMEDIATE — it keeps streaming output from \
+             yanking the viewport mid-drag. It is now decided by one shared owner \
+             that the POINTER handlers also call, because this event does not \
+             arrive at all under streaming load; this path must still delegate to \
+             it, or the gesture path and the event path can disagree"
         );
         assert!(
             handler.contains("schedulePrimarySelectionSync();"),
