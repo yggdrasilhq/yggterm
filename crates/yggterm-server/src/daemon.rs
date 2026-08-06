@@ -360,8 +360,11 @@ fn server_version_is_strictly_newer(candidate: &str, mine: &str) -> bool {
     }
 }
 
+/// THE owner of the versioned socket name format. `socket_sweep` borrows it
+/// rather than re-encoding `server-<x>-<y>-<z>.sock`, so a sweep can never
+/// disagree with the binder about which files belong to this layer.
 #[cfg(unix)]
-fn parse_versioned_server_socket_name(path: &Path) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_versioned_server_socket_name(path: &Path) -> Option<(u64, u64, u64)> {
     let file_name = path.file_name()?.to_str()?;
     let version = file_name.strip_prefix("server-")?.strip_suffix(".sock")?;
     let mut parts = version.split('-');
@@ -13319,39 +13322,83 @@ fn attempt_self_retire_preserving_handoff(
     }
 }
 
-/// Socket-litter cleanup (run #19): unlink versioned `server-*.sock` files
-/// with no listener behind them. ~600 dead sockets had accumulated in
-/// ~/.yggterm, and every cross-daemon walk (GUI startup candidate scan,
-/// dedup prune, takeover, retire CLI) probed each one. Unlinking a dead
-/// socket is safe — a daemon that starts later removes/rebinds its own path.
+/// Socket-litter cleanup: unlink versioned `server-*.sock` files that no
+/// process is listening on and no live daemon's version claims.
+///
+/// **The predicate lives in `crate::socket_sweep`, not here.** Run #19 shipped
+/// it inline as "one `status()` per socket, unlink on failure", which is the
+/// exact move docs/pending-bugs.md later forbade: a daemon mid-restart is dark
+/// for a moment, and unlinking its address in that window turns a hiccup into a
+/// lost daemon. The replacement proves liveness POSITIVELY from the kernel's
+/// unix-socket table (one read for all ~700 paths, zero connects) and unlinks
+/// only what a previous round already saw dead a day earlier.
 #[cfg(unix)]
 fn cleanup_dead_versioned_server_sockets(home_dir: &Path, excluded: &ServerEndpoint) -> usize {
-    let mut removed = 0_usize;
-    for path in versioned_server_status_probe_paths_excluding_endpoint(home_dir, excluded) {
-        let endpoint = ServerEndpoint::UnixSocket(path.clone());
-        if status(&endpoint).is_ok() {
-            continue;
-        }
-        if fs::remove_file(&path).is_ok() {
-            removed += 1;
-        }
-    }
-    if removed > 0 {
+    let own_socket = match excluded {
+        ServerEndpoint::UnixSocket(path) => Some(path.clone()),
+        ServerEndpoint::Tcp { .. } => None,
+    };
+    let census = crate::socket_sweep::LiveDaemonCensus::gather(home_dir);
+    let outcome = crate::socket_sweep::run_socket_sweep(
+        home_dir,
+        own_socket.as_deref(),
+        &census,
+        crate::current_millis_u64(),
+    );
+    if outcome.did_anything() {
         append_trace_event(
             home_dir,
             "daemon",
             "lifecycle",
             "dead_server_sockets_removed",
-            serde_json::json!({ "removed": removed }),
+            serde_json::json!({
+                "removed": outcome.removed,
+                "awaiting_confirmation": outcome.awaiting_confirmation,
+                "kept_live": outcome.kept_live,
+                "degraded": outcome.degraded,
+                "live_sockets": census.live_socket_count(),
+            }),
         );
     }
-    removed
+    outcome.removed
 }
 
 #[cfg(not(unix))]
 fn cleanup_dead_versioned_server_sockets(_home_dir: &Path, _excluded: &ServerEndpoint) -> usize {
     0
 }
+
+/// The chore-tick half of the socket sweep. The startup pass alone can never
+/// finish the job: a socket is unlinked only on a LATER round that re-proves it
+/// dead, so a long-lived daemon has to look again on its own clock.
+/// Interval-gated inside, exactly like the clipboard sweep beside it.
+#[cfg(unix)]
+fn run_socket_sweep_chore_if_due(home_dir: &Path, now_ms: u64) {
+    let own_socket = match default_endpoint(home_dir) {
+        ServerEndpoint::UnixSocket(path) => Some(path),
+        ServerEndpoint::Tcp { .. } => None,
+    };
+    if let Some(outcome) =
+        crate::socket_sweep::run_socket_sweep_if_due(home_dir, own_socket.as_deref(), now_ms)
+        && outcome.did_anything()
+    {
+        append_trace_event(
+            home_dir,
+            "daemon",
+            "chore",
+            "socket_sweep",
+            serde_json::json!({
+                "removed": outcome.removed,
+                "awaiting_confirmation": outcome.awaiting_confirmation,
+                "kept_live": outcome.kept_live,
+                "degraded": outcome.degraded,
+            }),
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn run_socket_sweep_chore_if_due(_home_dir: &Path, _now_ms: u64) {}
 
 /// GATE #8 startup hook: run the superseded-daemon takeover once, off the
 /// accept path, under the runtime lock (see
@@ -13700,6 +13747,9 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                         }),
                     );
                 }
+                // Versioned-socket autoclean, same shape and same tick: own
+                // $YGGTERM_HOME only, interval-gated inside, no runtime lock.
+                run_socket_sweep_chore_if_due(&chore_home_dir, crate::current_millis_u64());
                 match run_background_copy_chore(
                     &runtime,
                     generation_enabled,
