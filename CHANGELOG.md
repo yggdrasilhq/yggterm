@@ -15,12 +15,15 @@ This file tracks user-visible changes in `yggterm`.
   unchanged — there several lines are several commands, which was always right.
 
 - **Commands stopped being handed to a months-old copy of the app.** If the
-  install record still named an older version than the one you are running, every
-  command was quietly re-run by that older binary, so newer options were dropped
+  install record pointed at an older version than the one you are running, every
+  command was quietly re-run by that older copy, so newer options were dropped
   without a word — a session opened with "don't switch to it" switched to it
   anyway, and one asked to clean itself up never did. `--version` could not show
-  this, because it is one of the few things the old copy never got to answer. A
-  newer build now refuses to hand its work down to an older one.
+  this, because it is one of the few things the old copy never got to answer.
+  Relaunching the app could hit it too, starting an old window against a current
+  daemon. A newer build now refuses to hand its work down to an older one, and it
+  decides from where the target actually lives rather than from what the record
+  claims — the record had been recording a new version against an old location.
 
 - **The start page's two buttons actually remember now.** They kept your last
   choice while the app was open and forgot it on the next launch, so the face you
