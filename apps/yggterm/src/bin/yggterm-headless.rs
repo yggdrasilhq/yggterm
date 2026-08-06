@@ -1337,6 +1337,29 @@ fn main() -> Result<()> {
     if args.len() >= 2 && args[0] == "server" && args[1] == "web-import" {
         return yggterm_server::run_browser_import_cli(&args[1..]);
     }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "terminal" && args[2] == "sanity" {
+        // THE TABLE, in the words a person uses about it: what is on it, what
+        // is squatting, and what may go. Read-only unless --apply is passed —
+        // a sweep that acts by default is a sweep nobody can safely run once to
+        // see what it would do.
+        let endpoint = cli_server_endpoint(store.home_dir());
+        let (rows, degraded) = yggterm_server::terminal_tenants(&endpoint, None)?;
+        let apply = args.iter().any(|arg| arg == "--apply");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_millis() as u64)
+            .unwrap_or(0);
+        let records = yggterm_server::load_sweep_records(store.home_dir());
+        // `degraded` is a REASON, not a flag — its presence is the degradation.
+        let is_degraded = degraded.is_some();
+        let (decisions, next_records) =
+            yggterm_server::row_sanity::plan_sweep(&rows, &records, now_ms, is_degraded);
+        yggterm_server::print_row_sanity_report(&rows, &decisions, is_degraded, apply);
+        if apply {
+            yggterm_server::save_sweep_records(store.home_dir(), &next_records);
+        }
+        return Ok(());
+    }
     if args.len() >= 3 && args[0] == "server" && args[1] == "terminal" && args[2] == "tenants" {
         // Per-row tenant accounting (docs/pending-bugs.md, the immortal tenant
         // class). Read-only and ON DEMAND — nothing polls, so asking costs one
