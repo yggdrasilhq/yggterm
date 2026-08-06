@@ -13,28 +13,30 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
-## FIVE yggterm-shell TESTS FAIL ON A CLEAN main
+## UNIT TESTS WRITE TRACE EVENTS INTO THE DEVELOPER'S REAL `~/.yggterm`
 
 **Status:** OPEN
 
-Measured 2026-08-06 by stashing all local work and running
-`cargo test --release -p yggterm-shell --lib` on an otherwise clean tree, then
-re-running each name alone. They fail both in the suite and in isolation, so
-this is not cross-test pollution:
+Found 2026-08-07 while root-causing the five notification tests that failed on a
+clean `main`. Those failed because `ShellState::new` restored the developer's
+REAL notification backlog — `resolve_yggterm_home()` falls back to `~/.yggterm`
+when `YGGTERM_HOME` is unset, as it is under `cargo test`. That read is fixed at
+the seam (`load_persisted_notifications` returns empty under `cfg!(test)`).
 
-- `a_failed_startup_sync_does_not_spend_the_handover_baseline`
-- `a_toast_command_drains_once_and_shows_a_notification` (9 notifications, 1 expected)
-- `daemon_handover_tells_the_user_and_stops_the_terminal_paint_path`
-- `fast_reveal_does_not_notify_even_under_swap_pressure`
-- `healthy_recovering_surface_does_not_fire_dead_session_toast`
+The WRITES are not fixed. `append_trace_event` resolves the same home from a
+dozen call sites in `shell.rs`, so running the suite appends trace events to the
+user's live `~/.yggterm/event-trace.*.jsonl`. It corrupts no test — nothing
+asserts on those files — but it means the suite mutates the user's real state,
+and a future test that DOES read a trace would fail the same drifting way.
 
-Four of the five are notification-count assertions, which suggests one cause:
-something now emits notifications that previously did not, and the toast drain
-sees a backlog. Not yet root-caused — filed so the red suite is not mistaken for
-noise by the next session, and so nobody re-measures the baseline from scratch.
+**The fix is not another `cfg!(test)` gate**: it is to give the test binary an
+isolated `YGGTERM_HOME`. Note `std::env::set_var` is unsafe under edition 2024
+and the suite is multi-threaded, so a `Once` in a bootstrap helper races with
+concurrent `resolve_yggterm_home()` readers — this needs a real answer, not a
+quick one.
 
-**Falsifier:** run the five names on a clean checkout; if they pass, this entry
-is wrong and the failure belongs to whatever was in the tree.
+**Falsifier:** `ls -l --time-style=full-iso ~/.yggterm/event-trace.*.jsonl`
+before and after `cargo test -p yggterm-shell`; if no mtime moves, this is wrong.
 
 ## ★★★ ROW PARENTAGE: NOTHING RECORDS WHO SPAWNED A ROW
 

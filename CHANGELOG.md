@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Typing in the rename box no longer throws the caret to the end.** Renaming a
+  row, or editing an SSH connect field, put the cursor at the end of the line
+  after every single keystroke — so putting a `1.` in front of a name was
+  impossible without retyping the whole thing. The text those fields showed came
+  from the snapshot, a copy rebuilt a beat behind what you had typed, and the
+  field re-asserted that stale copy on every repaint. The field you are typing
+  in now owns its own text until you commit it. A test locks the rule so the
+  same mistake cannot return in a new field.
+
 - **The start page is two buttons now, not seven, and they remember.** The row
   had grown one button per startable thing — New Codex Session, New Claude Code
   Session, New Terminal, New Ychrome, New Ychrome (Incognito), New Yedit, Open
