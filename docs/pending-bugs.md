@@ -1286,42 +1286,6 @@ behaviour is unchanged and the deploy happens separately.
 the production call site yourself.**
 
 
-## Agent engine: ctl fill is documented but has no route
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-**The observation owed:** `ychrome ctl fill page_id=<p> entry=<item>` answering
-`{"filled":"filled"}` against a real login form, with the page-side field
-length read back afterwards. It cannot be observed yet: the dev daemon is
-still serving pre-fix code and **refuses to retire under 4 live surfaces, one
-of them the operator's linked WhatsApp Web session** (a restart costs a phone
-QR re-scan). ychrome's contract makes that handover the operator's call, so
-the binary is installed and waiting at `~/.local/bin/ychrome`; the verb goes
-live on the next `ychrome daemon restart`.
-
-**What shipped** (ychrome `95b116a`, plus the doc correction): `/engine/fill`
-takes `{page_id, entry, user?}` and answers
-`{ok, entry, filled: "filled"|"user-only"|"no-fields"}`, with a locked vault
-answering `502 vault: …` so it cannot be mistaken for a page error. The
-secret goes agent → eval script → dropped, exactly as the sidebar's own fill
-action does; the reply names fields, never values. Two tests hold it: `fill`
-is in `DRIVES_A_PAGE` (else the governor could park the page between `open`
-and `fill` and the fill would land on nothing while answering 200), and the
-route is asserted never to mention a password field.
-
-⚠ **The fix landed inside a commit whose message is about something else.**
-Another agent's `git add` swept these files up mid-edit, so `95b116a` reads
-as a stale-port docs commit and contains the engine route. It was already
-pushed, and rewriting shared history in THIS repo is the trap that cost the
-relicence pass, so it stays. **Do not go looking for a `feat(engine)` commit
-— there isn't one.** The general lesson: on a fleet where agents share a
-checkout, `git add -A` is not a safe habit; stage explicit paths.
-
-*(original report, 2026-08-01, found while an agent filed a GitHub support
-ticket headlessly: `agent-engine.md` §4 documented `ychrome ctl fill` but the
-daemon exposed no `/engine/fill`, so the agent had to post raw input events
-to the daemon socket with the secret in a 0600 file to keep it off the
-command line.)*
 >
 > Earlier rounds closed: the tab rail becoming the cwdtree with folder icons,
 > nesting, the drag gesture and the density pass; Cloudflare challenges;
@@ -1861,15 +1825,33 @@ the fleet IS uniform. `ychrome-vault card` works on dev, and dev and jojo run a 
 yggterm binary with an **identical `web` verb set including `fill-card`**. Nothing is missing from
 dev's install.
 
-1. ⭐ **`ychrome ctl fill-card` → `unknown engine verb` (404).** `server app web fill-card` exists;
-   the engine has no equivalent. Since a yggterm web surface needs a registered GUI client (dev has
-   0, jojo has 1), **every card payment is forced onto the operator's working machine — the exact
-   thing `ctl` was built to avoid.** Ask: mirror the verb on the engine over the same vault agent
-   `card-secret` op, answering a length and never a value. The PAN boundary is unchanged.
-2. **`ychrome ctl fill` works but is absent from the usage banner**, so agents conclude the engine
-   has no credential support at all and re-derive that belief.
-3. **`fill-card` answers `matched:false` on fills that landed perfectly** — wrong in the
-   pessimistic direction, which invites a retry on a payment page.
+⚖ **TRIAGED 2026-08-07 — two owners, and only one of them is this queue.**
+
+- **Asks 1 and 2 are ychrome's** (`ctl fill-card`; `ctl fill` missing from the engine's usage
+  banner). Both are engine verbs, so they live in `ychrome/docs/pending-bugs.md`, the one answer to
+  what is open for ychrome. Cross-referenced, never duplicated.
+- **Ask 3 stays here:** `server app web fill-card` is a yggterm verb.
+
+⭐ **AND THE REPORT CLOSED AN OPEN ENTRY IN THIS FILE.** *"Agent engine: ctl fill is documented but
+has no route"* sat at **FIXED IN CODE — LIVE PROOF OWED**, blocked on exactly one observation:
+`ychrome ctl fill page_id=<p> entry=<item>` answering `{"filled":"filled"}` against a real login
+form. The report delivers it verbatim — `{"entry":"…","filled":"filled","ok":true}`, on a real
+login, today — so the ychrome daemon restart it was waiting on evidently happened. Entry deleted.
+⇒ **a field report from another lobe IS live proof; read an incoming report against your own OWED
+list before filing anything new from it.**
+
+**What remains here:**
+
+1. **`server app web fill-card` answers `matched:false` on fills that landed perfectly** (measured
+   on the IDFC 3DS page, RUN 6, 2026-08-07 00:15 IST — the field held the full value and the
+   payment succeeded). Either fix the matcher or say plainly that `matched` is not an observation.
+   ⚠ **Wrong in the PESSIMISTIC direction is the expensive one**: it invites a retry of a fill that
+   already worked, on a payment page.
+
+   ⇒ **Same verb family as the `web fill-vault` interleave entry below**, which already records
+   that `"matched": false` "says nothing about the damage" — the second report that this field is
+   uninformative, and the two want one fix. Neither ask touches the PAN boundary, which is right
+   as it stands.
 
 Field report from filing a CPC-ITR grievance end to end on the services-desk portal
 (succeeded — ack 26390914 — but cost ~3 h and two failed attempts):
