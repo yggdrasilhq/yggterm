@@ -315,6 +315,56 @@ around `lib.rs:5628` are the unexamined candidates) and make it read the flag.
 **Falsifier that would close it:** rename a `remote-cc://` row whose agent has
 exited, force a machine rescan, and read the title back from `server app rows`.
 
+## ★★★ A NEW ROW ALWAYS LANDS AT THE HEAD — ten front-insert sites, one missing owner
+
+**Status:** OPEN
+
+Owner-directed build order 2026-08-07: *"sorts are cheap and never break, and spawnee sessions are
+grouped as a collapseable tree with the session as the parent element."*
+
+**Reproduced under measurement**, jojo 3.0.44, one ephemeral spawn:
+
+```
+BEFORE: 0  1  1.1  2  4  5.1  5.2  6  7.1  7.2
+AFTER : ZZ 0  1    1.1 2  4    5.1  5.2  6   7.1        <- new row at the HEAD
+```
+
+⇒ **`grep -n "live_session_order.insert(0" crates/yggterm-server/src/lib.rs` returns TEN sites.**
+Every birth path independently answers "where does a new row go?" with "the front". That is the
+single-source-of-truth defect stated plainly: ten copies of one decision, and the outline has no
+say in any of them.
+
+**The fix shape.** ONE owner — `seat_new_live_session(key)` — called by all ten, which places by
+outline position and falls back to the front when the row has no outline (so today's behaviour is
+preserved exactly for unnumbered rows). ⚠ **Sort key trap:** compare dotted segments as INTEGERS,
+never lexicographically — `"10" < "2"` is correct string order and wrong outline order, and it will
+look right until the tenth lobe exists. Unnumbered rows sort last, **stably**.
+
+⛔ **AND A CORRECTION, because two of us have now acted on it.** It was reported that a single
+spawn *re-scrambles the whole live order* (`0 1 2 4 5.1` → `5.1 4 2 1 0`). **The reproduction above
+falsifies that**: every unrelated row kept its relative position. The observed reversal is almost
+certainly a **reversed-order control I applied myself at ~03:30** while testing the reorder verb,
+rendered later at a GUI restart — the reversal matches that input exactly, and only a restart
+renders a stored order. ⇒ **the insertion path prepends; it does not rewrite.** Fixing the wrong
+one of those would have cost a day.
+
+⚖ **This is one lane with the parentage entry below, not two tickets.** `parent_session_path` gives
+placement at spawn, the sort key, the collapse bucket and sweep-my-children — four features, one
+field. And the tree vocabulary already exists: `server app rows` returns `depth`, `child_count`,
+`expanded` and `group_kind`, the Live Sessions group already collapses, and **every live row is
+`depth: 1`** — that flatness is the entire gap. A collapsed bucket also already has its
+work-aggregation signal: `busy_reason: "group_descendant_working"`, so work cannot hide inside one.
+
+⚠ Two durability bars, both learned tonight: **collapse state must survive a GUI restart** (the
+same bar `outline_prefix` needed, which was persisted-then-dropped on restore), and a collapsed
+parent must still be clickable through to its child — the constitution's *"click it and co-browse
+it"* applies to a nested row too.
+
+⏳ **Blocked on nothing but sequencing**, and `outline_prefix` is the near-term unlock: it exists
+and survives a restart, but is **not exposed on `server app rows`** and still has **no setter**, so
+the outline number today lives only inside the title string — a structured fact encoded in prose,
+destroyed by the title clobbers recorded above.
+
 ## ★★★ `server reorder` WRITES WHERE THE GUI DOES NOT READ — same version, different DAEMON
 
 **Status:** OPEN
