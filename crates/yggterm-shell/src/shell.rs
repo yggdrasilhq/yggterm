@@ -15907,6 +15907,25 @@ fn notifications_store_path() -> Option<PathBuf> {
 /// sees: a corrupt store must cost the old notifications, not the ability to
 /// raise new ones.
 fn load_persisted_notifications() -> Vec<ToastNotification> {
+    // ⛔ A unit test must start from an empty notification list.
+    //
+    // `notifications_store_path()` resolves through `resolve_yggterm_home()`,
+    // which falls back to the developer's REAL `~/.yggterm` when `YGGTERM_HOME`
+    // is unset — as it is under `cargo test`. So every `ShellState::new` in the
+    // suite inherited whatever notifications the developer's own GUI happened
+    // to be holding, and five tests that assert on notification counts failed
+    // on a clean checkout, in the suite AND in isolation. The count tracked the
+    // developer's backlog: it read 9 one hour and 10 the next, which is what
+    // finally gave it away — a genuine logic bug does not drift upward while
+    // you use the app.
+    //
+    // Gating on `cfg!(test)` rather than isolating the home because this is the
+    // one read that leaks USER STATE into an assertion. (Trace writes from tests
+    // still land in the real home; that is filed separately, it corrupts no
+    // test.)
+    if cfg!(test) {
+        return Vec::new();
+    }
     let Some(path) = notifications_store_path() else {
         return Vec::new();
     };
@@ -86258,7 +86277,12 @@ fn SidebarRow(
                                  color:{}; font-size:12px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
                                 palette.text
                             ),
-                            value: rename_value,
+                            // ⛔ `initial_value`, NEVER `value`. See the twin at
+                            // the other branch and `docs/agent-field-guide.md`:
+                            // `value` is VOLATILE, `rename_value` arrives from the
+                            // lagging snapshot, and the stale re-assert yanked the
+                            // caret to the end after every keystroke.
+                            initial_value: rename_value,
                             onmounted: move |evt| async move {
                                 let _ = evt.set_focus(true).await;
                             },
@@ -86588,7 +86612,9 @@ fn SidebarRow(
                                      color:{}; font-size:12px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
                                     palette.text
                                 ),
-                                value: rename_value,
+                                // ⛔ `initial_value`, NEVER `value` — twin of the
+                                // branch above; same volatile/stale-snapshot trap.
+                                initial_value: rename_value,
                                 onmounted: move |evt| async move {
                                     let _ = evt.set_focus(true).await;
                                 },
@@ -124893,7 +124919,10 @@ fn ConnectRailBody(
                 }
                 input {
                     r#type: "text",
-                    value: "{snapshot.ssh_connect_target}",
+                    // ⛔ `initial_value`: this text comes from the lagging
+                    // snapshot, and volatile `value` re-asserts the stale
+                    // copy mid-edit, throwing the caret to the end.
+                    initial_value: "{snapshot.ssh_connect_target}",
                     placeholder: "dev or pi@raspberry or user@192.0.2.15",
                     style: format!(
                         "height:36px; padding:0 12px; border:1px solid {}; border-radius:10px; background:{}; color:{}; \
@@ -124918,7 +124947,10 @@ fn ConnectRailBody(
                 }
                 input {
                     r#type: "text",
-                    value: "{snapshot.ssh_connect_prefix}",
+                    // ⛔ `initial_value`: this text comes from the lagging
+                    // snapshot, and volatile `value` re-asserts the stale
+                    // copy mid-edit, throwing the caret to the end.
+                    initial_value: "{snapshot.ssh_connect_prefix}",
                     placeholder: "Optional prefix, e.g. sudo machinectl shell prod",
                     style: format!(
                         "height:36px; padding:0 12px; border:1px solid {}; border-radius:10px; background:{}; color:{}; \
@@ -173248,6 +173280,66 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "/home/user/.codex/sessions/local-child.jsonl",
                 "/home/user/.codex/sessions/local-old.jsonl",
             ]
+        );
+    }
+
+    /// ⛔ A text input fed from the SNAPSHOT must never use volatile `value:`.
+    ///
+    /// This is a source-level lock on the bug the owner hit on 2026-08-06:
+    /// typing one character into the session rename box threw the caret to the
+    /// end of the line. `value` is declared `volatile` in dioxus-html, so it is
+    /// re-applied to the DOM on every render; `rename_value` arrives from
+    /// `snapshot.tree_rename_value`, a projection rebuilt asynchronously. So
+    /// between the keystroke and the next snapshot rebuild, a render re-asserted
+    /// the STALE text, the interpreter saw `node.value !== value` and rewrote
+    /// the node — which resets the caret. Two owners for one string while the
+    /// user is typing, which is the repo's single-source-of-truth rule broken in
+    /// the one place where the DOM is the authority.
+    ///
+    /// `initial_value` seeds the field once and then leaves it alone; `oninput`
+    /// keeps the host in step for the commit. Every other text field in this
+    /// file already did it that way — the rename box was the outlier.
+    ///
+    /// The lock scans the source rather than the rendered DOM because there is
+    /// no headless way to observe a caret, and because the failure is invisible
+    /// until a human types in the MIDDLE of a word.
+    #[test]
+    fn no_snapshot_fed_text_input_uses_the_volatile_value_attribute() {
+        let source = include_str!("shell.rs");
+        let lines = source.lines().collect::<Vec<_>>();
+        let mut offenders = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            // Only RAW elements. A `value:` on a component is an ordinary prop
+            // name and carries none of this meaning.
+            if trimmed != "input {" && trimmed != "textarea {" {
+                continue;
+            }
+            let mut depth = 1_i32;
+            let mut cursor = index + 1;
+            while cursor < lines.len() && depth > 0 {
+                let body = lines[cursor];
+                depth += body.matches('{').count() as i32;
+                depth -= body.matches('}').count() as i32;
+                if depth > 0 {
+                    let body = body.trim_start();
+                    if let Some(rest) = body.strip_prefix("value:") {
+                        // Only the snapshot-fed ones. A slider or colour well
+                        // genuinely wants the host to drive it, and has no
+                        // caret to lose.
+                        if rest.contains("snapshot.") || rest.contains("rename_value") {
+                            offenders.push(format!("line {}: {}", cursor + 1, body));
+                        }
+                    }
+                }
+                cursor += 1;
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these inputs re-assert a lagging snapshot value on every render and \
+             will throw the caret to the end mid-typing — use `initial_value:`:\n{}",
+            offenders.join("\n")
         );
     }
 
