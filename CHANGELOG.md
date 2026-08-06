@@ -25,6 +25,15 @@ This file tracks user-visible changes in `yggterm`.
   decides from where the target actually lives rather than from what the record
   claims — the record had been recording a new version against an old location.
 
+- **Settings showed the wrong version, and offered to "update" you backwards.**
+  The version in Settings came from the install record rather than from the app
+  actually running, so it could read months out of date — and the button beside
+  it offered to restart into whatever that record pointed at, with no check that
+  it was newer. On one machine that meant a panel reading `2.11.0` under a
+  "Restart now to update" button that would have replaced a current build with a
+  July one. Settings now reports the running build, and a restart is only offered
+  for a build that is genuinely ahead.
+
 - **The start page's two buttons actually remember now.** They kept your last
   choice while the app was open and forgot it on the next launch, so the face you
   saw on the first frame was always the default rather than what you use. Both

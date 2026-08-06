@@ -143,6 +143,34 @@ reading it for "what am I" is wrong.
 happily write a `(new version, old path)` pair, which is the corruption itself.
 It should refuse to promote a version onto a path that declares a different one.
 
+### ⚠ FOUND BY THE USER'S EYES: the Settings panel is a FIFTH consumer, and it offered a DOWNGRADE
+
+Reported 2026-08-07 from the screen — *"GUI version shows 2.11.0"* — while the
+process rendering that panel was 3.0.44, under a button reading **"Restart now
+to update · The updated build is installed and waiting to replace this
+process."**
+
+Two separate defects, both fixed:
+
+1. **The displayed version was the RECORD, not the build.** `InstallUpdateRow`
+   read `snapshot.install_context.current_version`. Meanwhile
+   `daemon_update_state.current_gui_version` had been correct all along because
+   it uses `current_version()` — **two encodings of "what version am I", one
+   right and one wrong, rendered in the same window.**
+2. ⛔ **`pending_restart_from_active_install_state` compared PATHS ONLY** — no
+   version check at all — so it offered a restart into
+   `versions/2.11.0/yggterm`. **A downgrade wearing an update's label, on the
+   one control the user presses.** Now guarded by `handoff_target_is_usable`.
+
+⚖ **This is the lesson of the whole lane.** Five consumers read one dishonest
+record — two exec handoffs, `server app launch`, the version display, and the
+update button — and each was found by a different accident: a probe, a verb I
+reached for, and finally the user looking at the screen. **When a fact is wrong,
+enumerate its readers**; fixing the ones you tripped over is not fixing the
+fact. ⚠ A sixth reader would still be wrong today: `InstallContext::current_version`
+still reports the record rather than `CARGO_PKG_VERSION`, so the struct itself
+remains the trap.
+
 ## UNIT TESTS WRITE TRACE EVENTS INTO THE DEVELOPER'S REAL `~/.yggterm`
 
 **Status:** OPEN
