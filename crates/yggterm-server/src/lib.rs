@@ -18241,7 +18241,26 @@ fn ensure_live_app_control_pid(
             Err(error) => return Err(error),
         }
         if std::time::Instant::now() >= deadline {
-            anyhow::bail!("no live Yggterm GUI client is registered for app control");
+            // ⛔ A refusal that does not name the fix teaches the caller to
+            // route around the feature. Measured 2026-08-07: a delegate on dev
+            // tried to message a sibling row, got the old flat sentence, and
+            // invented a `crossings/` directory to pass files instead — sensible
+            // improvisation, and it means the row plane was silently unreachable
+            // for EVERY delegate on the fleet, because app control is served by
+            // the GUI PROCESS and every delegate runs where there is no GUI.
+            //
+            // Nothing was wrong except that nobody was told where to stand.
+            anyhow::bail!(
+                "no live Yggterm GUI client is registered for app control on this host ({}).\n\
+                 App control is served by the yggterm GUI PROCESS, not by the daemon, so it \
+                 only answers on the host where the GUI is running — a headless host has a \
+                 daemon and sessions but no client to drive.\n\
+                 Fix: run this verb on the GUI host (`ssh <gui-host> \
+                 '~/.yggterm/bin/yggterm-headless server app …'`). `server app clients` lists \
+                 the registered clients on whichever host you run it, so it answers \
+                 \"is the GUI here?\" directly.",
+                crate::session_tenancy::local_host_token()
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(40));
     }
@@ -33065,6 +33084,73 @@ terminal_window_id: None,
         assert!(!crate::looks_like_generated_fallback_title("Ping from orchestrator"));
     }
 
+    /// ⛔ A reorder must be observable in what the sidebar renders FROM, not in
+    /// the reply. This is the "pass a known-different order, read it BACK,
+    /// assert it changed" lock — it fails if the apply is a no-op.
+    ///
+    /// Owner-reported 2026-08-07, third time in one night: the app-path verb
+    /// answered `ok/applied` with `rendered_order` **equal to the request**, and
+    /// the sidebar did not move; the SAME list reversed produced byte-different
+    /// input and identical output, which is the signature of a reply composed
+    /// from the request rather than re-read. The Live region renders from
+    /// `live_sessions()` (via the pass-through `merge_hot_sidebar_sessions`), so
+    /// that projection — never the reply — is what a test must assert on.
+    #[test]
+    fn a_reversed_order_changes_what_the_sidebar_renders_from() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let paths: Vec<String> = (0..4)
+            .map(|ix| {
+                server.start_local_session(
+                    SessionKind::Shell,
+                    Some("/home/user"),
+                    Some(&format!("row {ix}")),
+                )
+            })
+            .collect();
+        let rendered = |server: &YggtermServer| -> Vec<String> {
+            server
+                .live_sessions()
+                .iter()
+                .map(|session| session.session_path.clone())
+                .collect()
+        };
+        let before = rendered(&server);
+        assert_eq!(before.len(), 4, "four live rows to reorder");
+
+        let reversed: Vec<String> = before.iter().rev().cloned().collect();
+        let update = server.replace_live_session_order(&reversed);
+        assert!(update.changed, "a reversed order is a real change");
+
+        let after = rendered(&server);
+        assert_ne!(
+            after, before,
+            "the projection the sidebar renders from must MOVE — an apply that \
+             leaves it identical is the no-op this lock exists to catch"
+        );
+        assert_eq!(
+            after, reversed,
+            "and it must land in exactly the requested order"
+        );
+        assert_eq!(paths.len(), 4);
+    }
+
     /// The outline prefix is the OTHER half of the owner's numbering, and it was
     /// persisted and then dropped on the way back — the restore destructured
     /// `outline_prefix` and never applied it, which the compiler had been
@@ -40451,6 +40537,39 @@ terminal_window_id: None,
         let message = error.to_string();
         assert!(message.contains("no live Yggterm GUI client with --client"));
         assert!(message.contains("shadow-a"), "lists the available clients");
+    }
+
+    /// ⛔ The no-client refusal must TEACH, because the caller that hits it is
+    /// on the wrong host and cannot tell.
+    ///
+    /// Measured 2026-08-07: a delegate on dev tried to message a sibling row,
+    /// received the old flat sentence, and invented a `crossings/` file channel
+    /// instead. App control is served by the GUI PROCESS, so it only answers
+    /// where the GUI runs — every delegate on the fleet runs somewhere else, and
+    /// nothing said so. The refusal is the only place that can.
+    #[test]
+    fn the_no_client_refusal_names_the_host_problem_and_the_way_out() {
+        // Built at the raise site; assert on the shape the caller needs rather
+        // than on prose, so rewording stays free but dropping the guidance does
+        // not. The needle is assembled from halves so this assertion cannot
+        // match its own source text (field guide §7.4).
+        let source = include_str!("lib.rs");
+        let raise = source
+            .split("no live Yggterm GUI client is registered for app control")
+            .nth(1)
+            .expect("the no-client refusal");
+        let refusal = &raise[..raise.len().min(900)];
+        for needle in [
+            concat!("GUI ", "PROCESS"),
+            concat!("server app ", "clients"),
+            "ssh <gui-host>",
+        ] {
+            assert!(
+                refusal.contains(needle),
+                "the refusal must still tell the caller {needle:?} — a flat refusal \
+                 taught a delegate to route around the row plane entirely"
+            );
+        }
     }
 
     #[test]
