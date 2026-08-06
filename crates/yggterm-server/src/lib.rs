@@ -2098,6 +2098,7 @@ fn remote_scanned_session_from_live_codex(
         cached_summary: summary_metadata_value(&session.preview.summary, "Summary")
             .or_else(|| session_metadata_value(session, "Summary")),
         live_runtime,
+        title_is_explicit: false,
         storage_path,
     })
 }
@@ -2363,6 +2364,21 @@ pub struct RemoteScannedSession {
     pub cached_summary: Option<String>,
     #[serde(default)]
     pub live_runtime: bool,
+    /// Whether `title_hint` is a name a HUMAN chose.
+    ///
+    /// ⛔ The mirror needs its own provenance because it OUTLIVES the live row.
+    /// `session_title_is_explicit` reads `self.sessions`, so a row with no live
+    /// session — an agent that has exited, which is the ordinary resting state —
+    /// had no provenance anywhere, and the next machine rescan overwrote the
+    /// user's name with the CLI's self-composed one. Measured 2026-08-07: two
+    /// rows renamed at 00:55 reverted ~2.5 h later, and the discriminator that
+    /// names this site is that the reverted row had **zero live claude
+    /// processes**.
+    ///
+    /// `#[serde(default)]` so an older scan payload simply reads false, which is
+    /// the pre-existing behaviour.
+    #[serde(default)]
+    pub title_is_explicit: bool,
     pub storage_path: String,
 }
 
@@ -4126,7 +4142,14 @@ impl YggtermServer {
             if !scanned.cwd.trim().is_empty() {
                 existing.cwd = scanned.cwd;
             }
-            if !scanned.title_hint.trim().is_empty()
+            // ⛔ A name the user chose outranks anything a scan re-derives, and
+            // the shape heuristic below cannot tell them apart — it could never
+            // separate `6. yggterm: campaign` from `Continue atlasstore
+            // campaign`, which is why provenance became a stored fact. Without
+            // this line the mirror's own explicit title was overwritten on the
+            // next rescan for any row whose live session had exited.
+            if !existing.title_is_explicit
+                && !scanned.title_hint.trim().is_empty()
                 && !looks_like_generated_fallback_title(&scanned.title_hint)
             {
                 existing.title_hint = scanned.title_hint;
@@ -4397,6 +4420,10 @@ impl YggtermServer {
             for scanned in &mut machine.sessions {
                 if scanned.session_path == session_path {
                     scanned.title_hint = title.to_string();
+                    // The mirror carries the provenance too, because it is the
+                    // copy that survives the live row exiting — and that is
+                    // exactly when the rescan used to win.
+                    scanned.title_is_explicit = true;
                     return;
                 }
             }
@@ -13480,6 +13507,7 @@ fn load_remote_machine_sessions_from_mirror(
             cached_precis: row.get(9)?,
             cached_summary: row.get(10)?,
             live_runtime: false,
+            title_is_explicit: false,
             storage_path: row.get(11)?,
         })
     })?;
@@ -15107,6 +15135,7 @@ fn scan_remote_machine_sessions(
                 .cached_summary
                 .filter(|value| !value.trim().is_empty()),
             live_runtime: summary.live_runtime,
+            title_is_explicit: false,
             storage_path: summary.rollout_path,
         });
     }
@@ -15172,6 +15201,7 @@ fn scan_remote_machine_sessions(
                             cached_precis: None,
                             cached_summary: None,
                             live_runtime: false,
+                            title_is_explicit: false,
                             storage_path: summary.path,
                         });
 
@@ -26106,6 +26136,7 @@ mod tests {
             cached_precis: None,
             cached_summary: None,
             live_runtime: true,
+            title_is_explicit: false,
             storage_path: "/home/user/.claude/projects/x/abc.jsonl".to_string(),
         }
     }
@@ -27784,6 +27815,7 @@ mod tests {
                 cached_precis: Some("precis".to_string()),
                 cached_summary: Some("summary".to_string()),
                 live_runtime,
+                title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/test.jsonl".to_string(),
             }],
         }
@@ -31266,6 +31298,7 @@ terminal_window_id: None,
             cached_precis: Some("Short precis".to_string()),
             cached_summary: Some("Longer summary text".to_string()),
             live_runtime: false,
+            title_is_explicit: false,
             storage_path: "/home/user/.codex/sessions/test.jsonl".to_string(),
         }];
         mirror_remote_machine_sessions("jojo", &sessions)?;
@@ -31843,6 +31876,7 @@ terminal_window_id: None,
                 cached_precis: Some("precis".to_string()),
                 cached_summary: Some("summary".to_string()),
                 live_runtime: false,
+                title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/preview.jsonl".to_string(),
             }],
         });
@@ -31908,6 +31942,7 @@ terminal_window_id: None,
                 cached_precis: Some("cached precis".to_string()),
                 cached_summary: Some("cached summary".to_string()),
                 live_runtime: true,
+                title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/preview.jsonl".to_string(),
             }],
         });
@@ -32414,6 +32449,7 @@ terminal_window_id: None,
                 cached_precis: Some("Short precis".to_string()),
                 cached_summary: Some("Longer summary text".to_string()),
                 live_runtime: false,
+                title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/test.jsonl".to_string(),
             }],
         });
@@ -32940,6 +32976,95 @@ terminal_window_id: None,
         );
     }
 
+    /// The scanned mirror carries the PROVENANCE of a human-set title, not just
+    /// its text.
+    ///
+    /// ⚠ This is a precondition, not a proven end-to-end fix — read the filing
+    /// before believing the revert is closed. What is established: the
+    /// orchestrator measured two rows renamed at 00:55 reverting ~2.5 h later to
+    /// CLI-generated titles, with the discriminator that the reverted row had
+    /// **zero live claude processes**. `session_title_is_explicit` reads
+    /// `self.sessions` — the LIVE row — so once an agent exits, the only
+    /// surviving copy is this mirror, and it carried no provenance at all. Every
+    /// guard downstream was therefore reduced to
+    /// `looks_like_generated_fallback_title`, the shape heuristic that provably
+    /// cannot separate `6. yggterm: campaign` from a real conversation title
+    /// like `Ping from orchestrator`.
+    ///
+    /// So: no provenance on the mirror ⇒ no guard can be written at all. This
+    /// test locks the fact into place; which merge site consumes it is the open
+    /// half.
+    #[test]
+    fn an_explicit_rename_stamps_provenance_on_the_mirror_that_outlives_the_live_row() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = remote_scanned_session_path("dev", "abc");
+        server.remote_machines.push(RemoteMachineSnapshot {
+            apps: Vec::new(),
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            remote_binary_expr: None,
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![RemoteScannedSession {
+                session_path: path.clone(),
+                session_id: "abc".to_string(),
+                cwd: "/home/user/gh/yggterm".to_string(),
+                started_at: "2026-08-07T00:00:00Z".to_string(),
+                modified_epoch: 1,
+                event_count: 10,
+                user_message_count: 5,
+                assistant_message_count: 5,
+                title_hint: "Continue atlasstore campaign".to_string(),
+                recent_context: String::new(),
+                cached_precis: None,
+                cached_summary: None,
+                live_runtime: false,
+                title_is_explicit: false,
+                storage_path: "/home/user/.claude/projects/x/abc.jsonl".to_string(),
+            }],
+        });
+
+        // A human names the row. There is deliberately NO live session for it —
+        // the agent has exited, which is the ordinary resting state and the
+        // condition under which the revert was measured.
+        server.set_session_title_explicit(&path, "1.1 atlasstore: records");
+        assert!(
+            !server.session_title_is_explicit(&path),
+            "precondition: with no live row there is no provenance in `sessions` — \
+             which is exactly why the mirror has to carry its own"
+        );
+
+        let held = &server.remote_machines[0].sessions[0];
+        assert_eq!(held.title_hint, "1.1 atlasstore: records");
+        assert!(
+            held.title_is_explicit,
+            "the mirror must record that a HUMAN chose this name, or no merge \
+             site downstream can tell it from a re-derived one"
+        );
+        // And the shape heuristic genuinely cannot help here, which is why the
+        // stored fact is the only workable guard.
+        assert!(!crate::looks_like_generated_fallback_title("Ping from orchestrator"));
+    }
+
     /// The outline prefix is the OTHER half of the owner's numbering, and it was
     /// persisted and then dropped on the way back — the restore destructured
     /// `outline_prefix` and never applied it, which the compiler had been
@@ -33437,6 +33562,7 @@ terminal_window_id: None,
             cached_precis: None,
             cached_summary: None,
             live_runtime: false,
+            title_is_explicit: false,
             storage_path: "/tmp/abc123.jsonl".to_string(),
         };
 
@@ -33491,6 +33617,7 @@ terminal_window_id: None,
             cached_precis: None,
             cached_summary: None,
             live_runtime: false,
+            title_is_explicit: false,
             storage_path: "/tmp/tail123.jsonl".to_string(),
         };
 
@@ -33535,6 +33662,7 @@ terminal_window_id: None,
             cached_precis: None,
             cached_summary: None,
             live_runtime: true,
+            title_is_explicit: false,
             storage_path: "/home/user/.codex/sessions/demo.jsonl".to_string(),
         };
 
@@ -33583,6 +33711,7 @@ terminal_window_id: None,
             cached_precis: None,
             cached_summary: None,
             live_runtime: true,
+            title_is_explicit: false,
             storage_path: "/home/user/.codex/sessions/2026/05/samplenotes.jsonl".to_string(),
         };
 
@@ -33619,6 +33748,7 @@ terminal_window_id: None,
             cached_precis: None,
             cached_summary: None,
             live_runtime: true,
+            title_is_explicit: false,
             storage_path: "/home/user/.codex/sessions/2026/05/samplenotes.jsonl".to_string(),
         };
 
@@ -33815,6 +33945,7 @@ terminal_window_id: None,
                 cached_precis: None,
                 cached_summary: None,
                 live_runtime: false,
+                title_is_explicit: false,
                 storage_path: "/one.jsonl".to_string(),
             },
             RemoteScannedSession {
@@ -33831,6 +33962,7 @@ terminal_window_id: None,
                 cached_precis: Some("precis".to_string()),
                 cached_summary: Some("summary".to_string()),
                 live_runtime: false,
+                title_is_explicit: false,
                 storage_path: "/two.jsonl".to_string(),
             },
         ];
@@ -33952,6 +34084,7 @@ terminal_window_id: None,
                         cached_precis: Some("precis".to_string()),
                         cached_summary: Some("summary".to_string()),
                         live_runtime: true,
+                        title_is_explicit: false,
                         storage_path: "/home/user/.codex/sessions/abc123.jsonl".to_string(),
                     }],
                 }],
@@ -34028,6 +34161,7 @@ terminal_window_id: None,
                     cached_precis: Some("precis".to_string()),
                     cached_summary: Some("summary".to_string()),
                     live_runtime: true,
+                    title_is_explicit: false,
                     storage_path: "/home/user/.codex/sessions/abc123.jsonl".to_string(),
                 }],
             }],
@@ -34331,6 +34465,7 @@ terminal_window_id: None,
                 cached_precis: Some("precis".to_string()),
                 cached_summary: Some("summary".to_string()),
                 live_runtime: true,
+                title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/abc123.jsonl".to_string(),
             }],
         });
@@ -36041,6 +36176,7 @@ terminal_window_id: None,
                             cached_precis: Some("first precis".to_string()),
                             cached_summary: Some("first summary".to_string()),
                             live_runtime: true,
+                            title_is_explicit: false,
                             storage_path: "/home/user/.codex/sessions/abc123.jsonl".to_string(),
                         },
                         RemoteScannedSession {
@@ -36057,6 +36193,7 @@ terminal_window_id: None,
                             cached_precis: Some("second precis".to_string()),
                             cached_summary: Some("second summary".to_string()),
                             live_runtime: true,
+                            title_is_explicit: false,
                             storage_path: "/home/user/.codex/sessions/def456.jsonl".to_string(),
                         },
                     ],
@@ -37838,6 +37975,7 @@ terminal_window_id: None,
                 cached_precis: None,
                 cached_summary: None,
                 live_runtime: true,
+                title_is_explicit: false,
                 storage_path: "/tmp/abc123.jsonl".to_string(),
             }],
         });
@@ -38469,6 +38607,7 @@ terminal_window_id: None,
                 cached_precis: None,
                 cached_summary: None,
                 live_runtime: true,
+                title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/fresh-codex.jsonl".to_string(),
             }],
         });
@@ -38701,6 +38840,7 @@ terminal_window_id: None,
                     cached_precis: Some("precis".to_string()),
                     cached_summary: Some("summary".to_string()),
                     live_runtime: true,
+                    title_is_explicit: false,
                     storage_path: "/home/user/.codex/sessions/live-1.jsonl".to_string(),
                 },
                 RemoteScannedSession {
@@ -38717,6 +38857,7 @@ terminal_window_id: None,
                     cached_precis: Some("precis".to_string()),
                     cached_summary: Some("summary".to_string()),
                     live_runtime: true,
+                    title_is_explicit: false,
                     storage_path: "/home/user/.codex/sessions/live-2.jsonl".to_string(),
                 },
             ],
@@ -38814,6 +38955,7 @@ terminal_window_id: None,
                 cached_precis: Some("precis".to_string()),
                 cached_summary: Some("summary".to_string()),
                 live_runtime: false,
+                title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/cached-1.jsonl".to_string(),
             }],
         });
@@ -39808,6 +39950,7 @@ terminal_window_id: None,
             cached_precis: None,
             cached_summary: None,
             live_runtime: false,
+            title_is_explicit: false,
             storage_path: "/home/user/.codex/sessions/example.jsonl".to_string(),
         };
 

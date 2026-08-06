@@ -19384,6 +19384,7 @@ mod tests {
                         cached_precis: None,
                         cached_summary: None,
                         live_runtime: true,
+                        title_is_explicit: false,
                         storage_path: format!("/home/user/.codex/sessions/runtime-{ix}.jsonl"),
                     })
                     .collect(),
@@ -19802,6 +19803,7 @@ mod tests {
                 cached_precis: Some("preview only".to_string()),
                 cached_summary: None,
                 live_runtime: true,
+                title_is_explicit: false,
                 storage_path: "/home/user/.codex/sessions/missing-runtime.jsonl".to_string(),
             }],
         };
@@ -22737,6 +22739,7 @@ mod tests {
                     cached_precis: None,
                     cached_summary: None,
                     live_runtime: false,
+                    title_is_explicit: false,
                     storage_path: "/home/user/.codex/sessions/one.jsonl".to_string(),
                 },
                 RemoteScannedSession {
@@ -22753,6 +22756,7 @@ mod tests {
                     cached_precis: Some("precis".to_string()),
                     cached_summary: Some("summary".to_string()),
                     live_runtime: false,
+                    title_is_explicit: false,
                     storage_path: "/home/user/.codex/sessions/two.jsonl".to_string(),
                 },
             ],
@@ -22803,6 +22807,7 @@ mod tests {
                         cached_precis: None,
                         cached_summary: None,
                         live_runtime: false,
+                        title_is_explicit: false,
                         storage_path: "/home/user/.codex/sessions/one.jsonl".to_string(),
                     },
                     RemoteScannedSession {
@@ -22819,6 +22824,7 @@ mod tests {
                         cached_precis: None,
                         cached_summary: None,
                         live_runtime: false,
+                        title_is_explicit: false,
                         storage_path: "/home/user/.codex/sessions/two.jsonl".to_string(),
                     },
                 ],
@@ -22846,6 +22852,7 @@ mod tests {
                     cached_precis: None,
                     cached_summary: None,
                     live_runtime: false,
+                    title_is_explicit: false,
                     storage_path: "/root/.codex/sessions/three.jsonl".to_string(),
                 }],
             },
