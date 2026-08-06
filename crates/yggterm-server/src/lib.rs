@@ -7798,6 +7798,14 @@ impl YggtermServer {
                     session.title = title.clone();
                     session.title_is_explicit = title_is_explicit;
                 }
+                // ⛔ The outline prefix travels too, and UNCONDITIONALLY — it is
+                // not part of the title and must not ride the title's gate. It
+                // was persisted and then dropped here, so the owner's `1.`/`2.`
+                // numbering died at every daemon handover: exactly the failure
+                // the comment on `title_is_explicit` below describes, one field
+                // over. The compiler had been reporting it as an unused
+                // binding.
+                session.outline_prefix = outline_prefix.clone();
                 if has_saved_codex_identity {
                     session.id = restored_codex_session_id.clone();
                     session.session_path = normalized_live_key.clone();
@@ -7906,6 +7914,7 @@ impl YggtermServer {
             self.append_restored_live_session_order(normalized_live_key);
             if let Some(session) = self.sessions.get_mut(normalized_live_key) {
                 session.title_is_explicit = title_is_explicit;
+                session.outline_prefix = outline_prefix.clone();
                 if starts_new_codex {
                     configure_remote_new_codex_live_session(
                         session,
@@ -7995,6 +8004,10 @@ impl YggtermServer {
         // the rename would have survived exactly one restart.
         if let Some(session) = self.sessions.get_mut(&key) {
             session.title_is_explicit = title_is_explicit;
+            // Same reasoning, same restart: the outline prefix is a fact about
+            // where the row SITS, and it has to survive the handover or the
+            // numbering is re-typed by hand every time.
+            session.outline_prefix = outline_prefix.clone();
         }
         // remote-cc:// twin of the remote_scanned arm above (the scanned-key
         // parse only matches remote-session://): build_live_session's
@@ -32904,6 +32917,82 @@ terminal_window_id: None,
             next.sessions.get(&path).expect("restored row").title,
             "6. yggterm: campaign",
             "a derived title must never displace a name the user set"
+        );
+    }
+
+    /// The outline prefix is the OTHER half of the owner's numbering, and it was
+    /// persisted and then dropped on the way back — the restore destructured
+    /// `outline_prefix` and never applied it, which the compiler had been
+    /// reporting as an unused binding the whole time. So `1.` / `2.` / `4.1`
+    /// died at every daemon handover and had to be re-typed by hand, which is
+    /// precisely what composing a prefix instead of overwriting the title was
+    /// built to stop.
+    ///
+    /// ⚠ Note it is asserted INDEPENDENTLY of the title: the prefix is a fact
+    /// about where the row SITS, so it must not ride the title's restore gate
+    /// (the branch that carries it is guarded by a non-empty, non-generated
+    /// title — a row whose CLI had self-titled would have lost its number).
+    #[test]
+    fn an_outline_prefix_survives_a_daemon_restart_the_way_an_explicit_title_does() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = server.start_local_session(
+            SessionKind::ClaudeCode,
+            Some("/home/user/gh/yggterm"),
+            Some("Local Claude Code"),
+        );
+        server
+            .set_live_session_keep_alive(&path, true)
+            .expect("keep the row");
+        assert!(
+            server.set_session_outline_prefix(&path, "4.1"),
+            "the row takes a prefix"
+        );
+
+        let persisted = server.persisted_state();
+        let record = persisted
+            .live_sessions
+            .iter()
+            .find(|live| live.key == path)
+            .expect("row persists");
+        assert_eq!(
+            record.outline_prefix.as_deref(),
+            Some("4.1"),
+            "the prefix must reach persistence"
+        );
+
+        let mut next = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        next.restore_persisted_state(persisted, None);
+        assert_eq!(
+            next.sessions
+                .get(&path)
+                .expect("restored row")
+                .outline_prefix
+                .as_deref(),
+            Some("4.1"),
+            "the prefix must survive the restore too — persisting it and dropping \
+             it on the way back is the same as never storing it"
         );
     }
 

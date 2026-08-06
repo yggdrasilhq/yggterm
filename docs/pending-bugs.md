@@ -196,6 +196,68 @@ quick one.
 **Falsifier:** `ls -l --time-style=full-iso ~/.yggterm/event-trace.*.jsonl`
 before and after `cargo test -p yggterm-shell`; if no mtime moves, this is wrong.
 
+## ★★★ `server reorder` WRITES WHERE THE GUI DOES NOT READ — same version, different DAEMON
+
+**Status:** OPEN
+
+Owner, twice: *"the rows are not placed in the correct order in the Live session
+area. This error needs to be corrected for future too."* Root-caused by the
+orchestrator (four reorder round-trips, all answering `changed:true`), corrected
+here on one measurement.
+
+**The orchestrator's falsification was measured on the wrong pair.** They ruled
+out [[finding-version-string-as-rendezvous-key]] because both binaries answer
+3.0.44 — which is true and which is not the question:
+
+```
+GUI  3.0.44  ->  daemon 3417351 @ 3.0.41     <- what the user sees
+CLI  3.0.44  ->  daemon 3755280 @ 3.0.44, owns 0 sessions
+```
+
+⇒ **Two binaries of the SAME version resolved to two DIFFERENT daemons.** The
+CLI's reorder lands on a daemon that owns nothing and that the GUI never reads,
+so `changed:true` is honest about a field nobody renders. Same rendezvous defect,
+one level down: **binary version parity does not imply daemon parity, and the
+version is not the thing to compare — the resolved `server_pid` is.**
+
+**The rendered order is the GUI's own in-process list, and `server app rows`
+reports it faithfully.** Measured against a faithful screenshot with the two
+copies deliberately divergent: sidebar and `server app rows` both read
+`3.1, 3.2, 0., 1., 2., 4., 6.` (new rows PREPENDED at the head) while the daemon
+held `0., 7.1, 7.2, 1., 2., 3.1, 3.2`. ⚠ So `server app rows` is NOT a second
+encoding to distrust here — it is the accurate report, and `server snapshot` is
+the misleading one, because the snapshot answers from whichever daemon the CLI
+resolved.
+
+⚠ **A running GUI CAN pick up a daemon reorder — when it is bound to the same
+daemon.** At 02:47 a `server sessions reorder` moved the sidebar with no restart
+(screenshot-proven), because GUI and CLI were both on the 3.0.44 daemon then. A
+later GUI restart bound it to the 3.0.41 daemon, and every reorder since has been
+invisible. **That intermittency is the whole "version dance" the owner reported**,
+and it is why it looks like a deploy-window behaviour: a deploy restarts the GUI,
+which re-reads its daemon's order at startup.
+
+**Fix, and the shape matters.** The order the user sees is owned by the GUI, so
+the verb that sets it must reach the GUI — an APP-path `reorder` beside
+`server app rows`, which has no order verb at all today (`server app --help`
+contains zero occurrences of `reorder`). Then `changed:true` can mean the
+sidebar moved.
+
+⚖ **Third verb in this family**, and worth one fix at the response layer rather
+than three: `session remove` grew `verified` for exactly this, `session rename`
+still answers `accepted:true` on failures, and `reorder` reports a daemon field.
+**All three report the REQUEST, not the EFFECT.**
+
+⇒ **And it is the argument for DERIVING the outline** (the parentage entry
+below): a stored order exists in two copies that drift, is re-typed after every
+launch, and gets prepended to by every new row. A derived order re-derives after
+any restart and cannot diverge, because there is no second copy.
+
+⚠ Enabling condition, not cause: jojo runs four daemons (3.0.29, 3.0.32, 3.0.41,
+3.0.44) because *a daemon owning a plain `local://` shell can never be retired* —
+see that entry. With N daemons each holding an order, "which copy does a restart
+restore from" is ambiguous, which is what makes this unreproducible day to day.
+
 ## ★★★ ROW PARENTAGE: NOTHING RECORDS WHO SPAWNED A ROW
 
 **Status:** OPEN
