@@ -1217,10 +1217,59 @@ the STRANDING half is fixed, see below).** Webviews are per CLIENT, so a
 shadow — or a second GUI — showing a 10-tab surface builds a second full set
 (J8a: 11 more processes). That is what makes co-browsing work at all on the
 current per-client surface model, and both sets are governed by the same
-reclaim lane, so this is a cost rather than a defect. It is recorded only
-because the memory arithmetic is easy to forget: a second viewer of a heavy
-session roughly doubles the GUI-side web-process bill for as long as both are
-shown. The half that WAS a defect — `session remove` answering `verified:true`
+reclaim lane. It is also recorded because the memory arithmetic is easy to
+forget: a second viewer of a heavy session roughly doubles the GUI-side
+web-process bill for as long as both are shown.
+
+### ⛔⛔ "A COST RATHER THAN A DEFECT" WAS WRONG, AND THE USER PAID FOR IT
+
+This entry used to dispose of the duplicate set as a mere cost. **It is a
+defect, and the disposition is corrected here rather than in a new entry.** The
+second viewer does not just spend RAM — **it opens the page's video again in its
+own WebKit process and plays it into the user's speakers**, where nothing they
+can press will stop it. The page's pause, the mute button and the media keys all
+act on the FIRST client's webview, because that is the one holding the media
+session.
+
+**User-reported 2026-08-06:** *"ychrome plays double youtube video with the next
+same video unpausable or mutable… I had tried media keys, etc. many ways to stop
+that bg video. There is no way to stop it unless I close the session row."*
+
+Confirmed in the trace, twice, and **we caused it ourselves**:
+
+```
+1785964054633  pid 1510425 (the user's GUI)  native_open  y.gour.top/watch?v=j1Vk6Y-23CY
+1785964154970  pid 1690716 (an AGENT shadow) native_open  youtube.com/watch?v=j1Vk6Y-23CY   ← the phantom, +100.3 s
+1785964425582  pid 1699947 (another shadow)  native_open  youtube.com/watch?v=j1Vk6Y-23CY   ← again
+```
+
+⚠ **There is no ~60s timer** — the user's "after ~1min" is the agent's own shadow
+launch cadence (100.3 s and 110.6 s measured), not a reclaim constant. Do not go
+looking for one. `WEB_SURFACE_DEFAULT_BACKGROUND_HOLD_SECS` (600) and the
+pressured/thrash constants are not involved.
+
+⚠ **Stashing does not help and must not be mistaken for a fix:** the shadow
+stashed its copy 16 s in, and stash is a paint decision that is explicitly never
+a mute — so the copy went INVISIBLE and stayed AUDIBLE. Only the cross-client
+tombstone sweep reaped it, one second after the user closed the row, which is
+why closing the row was the only thing that worked.
+
+⛔ **THIS IS OUR OWN DOCTRINE'S BILL.** `feedback-agentic-surface-is-the-default`
+tells every agent to probe through a shadow client instead of the user's GUI. So
+**any agent taking a screenshot while the user watches a video reproduces this.**
+Until the fix below is live-proven, an agent should not hold a shadow open on a
+session the user is watching media in.
+
+**FIX WRITTEN, NOT YET LIVE-PROVEN** (`set_muted` in the vendored web-surface
+host, a `mute_web_surface` passthrough, and a mute at CREATE — not at stash —
+for any `client_is_shadow_viewer()`, traced as
+`native_open_muted_for_shadow_viewer`). One client owns the speakers; every
+additional viewer is silent. ⏳ **Two things still owed:** a live proof that the
+path fires (a shadow must be made to build a surface on demand, which did not
+reproduce in the window available), and a check that WebKitGTK's `set_is_muted`
+silences an ALREADY-PLAYING `<video>` rather than only new sources.
+
+**The half that WAS already known to be a defect** — `session remove` answering `verified:true`
 while the other client kept its set alive forever, with no row anywhere —
 is fixed on 2026-08-01 (lane `lane/dev/webview-leaks`): every client now
 sweeps the sessions it holds webviews for against the tombstone plane, in the

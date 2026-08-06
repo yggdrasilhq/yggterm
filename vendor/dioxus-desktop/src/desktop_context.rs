@@ -1080,6 +1080,39 @@ impl DesktopService {
         }
     }
 
+    /// Mute or unmute a web surface. One client owns the speakers; every
+    /// additional viewer of the same session is silent, because webviews are
+    /// per-client and a second viewer plays the page's video again in its own
+    /// process where no page control or media key can reach it. See
+    /// `WebSurfaceHost::set_muted` — this is NOT the throttling question.
+    pub fn mute_web_surface(&self, id: u64, muted: bool) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => {
+                    host.set_muted(id, muted);
+                    Ok(())
+                }
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, muted);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
     /// Re-attach a stashed web surface at the given bounds and show it.
     pub fn unstash_web_surface(
         &self,
