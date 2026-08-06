@@ -75058,14 +75058,25 @@ async fn process_pending_app_control_requests(
                         .filter(|path| ordered_paths.contains(path))
                         .collect();
                     let matches_request = rendered_subset == requested_present;
+                    // ⚠ `changed` compares the REQUESTED rows' relative order,
+                    // not the whole list. Comparing whole lists reported
+                    // `changed:true` over a sidebar that had not moved a row —
+                    // rows are created and closed by other agents between the
+                    // two reads, so any full-list diff is mostly noise. That is
+                    // the same lie this verb exists to stop, committed by this
+                    // verb, caught on its first live run.
+                    let subset_before: Vec<&String> = rendered_before
+                        .iter()
+                        .filter(|path| ordered_paths.contains(path))
+                        .collect();
                     AppControlResponse {
                         request_id: request.request_id.clone(),
                         handled_by_pid: std::process::id(),
                         completed_at_ms: current_millis() as u128,
                         output_path: None,
                         data: Some(json!({
-                            // Did the USER'S list move?
-                            "changed": rendered_after != rendered_before,
+                            // Did the rows the caller named actually move?
+                            "changed": rendered_subset != subset_before,
                             "requested": ordered_paths.len(),
                             "rendered_order": rendered_after,
                             "matches_request": matches_request,
@@ -172872,6 +172883,45 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             &generic_error
         ));
     }
+    #[test]
+    fn the_reorder_reply_is_re_read_from_the_gui_and_never_composed_from_the_request() {
+        // ⛔ STRUCTURAL, because "remember to re-read" is exactly the discipline
+        // that failed. The verb shipped composing `rendered_order` from the
+        // daemon's post-apply snapshot — which EQUALS the request whenever the
+        // daemon accepted it — so a reversed control produced byte-different
+        // input and identical output, and the owner watched an unmoved sidebar
+        // for the third time in one night.
+        //
+        // ⚠ Needles are assembled from halves so this assertion cannot match
+        // its own source text (field guide §7.4).
+        let source = include_str!("shell.rs");
+        let arm = source
+            .split(concat!("AppControlCommand::ReorderSessions ", "{"))
+            .nth(1)
+            .expect("the reorder handler");
+        let arm = &arm[..arm.len().min(9000)];
+
+        assert!(
+            arm.contains("rendered_after"),
+            "the reply must be built from a re-read taken AFTER the apply"
+        );
+        assert!(
+            arm.contains(concat!("\"rendered_order\": ", "rendered_after")),
+            "`rendered_order` must BE the re-read"
+        );
+        assert!(
+            !arm.contains(concat!("\"rendered_order\": ", "ordered_paths")),
+            "`rendered_order` must never be the request echoed back — that is the \
+             whole defect this verb was built to end, committed by this verb"
+        );
+        // And the re-read must come from the rows the sidebar draws, not from
+        // the server model the daemon just overwrote.
+        assert!(
+            arm.contains(concat!(".snapshot", "()")) && arm.contains(concat!(".", "rows")),
+            "re-read the RENDERED rows; the daemon's own snapshot is what lied"
+        );
+    }
+
     // ⛔ The refusal, and its three negative controls — each of which, if it
     // flipped, would break something that WORKS today.
     //
