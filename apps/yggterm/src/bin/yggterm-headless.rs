@@ -234,7 +234,12 @@ fn print_server_app_help() {
   yggterm-headless server app terminal <new|send|focus|probe-type|probe-scroll|probe-select|probe-context-menu> ...
   yggterm-headless server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|codex|claude-code>] [--title <title>] [--purpose <what-for>] [--no-activate]
     with no --title the row is named for the driving agent and its purpose
-  yggterm-headless server app terminal send <session> (--data <data>|--stdin)
+  yggterm-headless server app terminal send <session> (--data <data>|--stdin) [--allow-multiline]
+    a payload with interior line breaks is REFUSED for an agent CLI row: its
+    composer reads every \r as Enter, so line 1 submits alone and the rest
+    become queued messages. Use `terminal submit` for a brief, or
+    --allow-multiline to fire N separate submits deliberately. Shell rows are
+    unaffected — there N lines are N commands.
   yggterm-headless server app terminal new [--kind <shell|codex|claude-code>] [--cwd <dir>] [--title <t>]
       [--machine-key <k>] [--no-activate] [--purpose <text>]
       [--model <id>] [--permission-mode <default|plan|accept-edits|bypass>]
@@ -1143,6 +1148,16 @@ fn maybe_handoff_to_preferred_headless_executable(
         return Ok(());
     }
     if command_reads_local_state_in_process(args) {
+        return Ok(());
+    }
+    // ⛔ Never hand a NEWER binary down to an older recorded install. The live
+    // host ran 3.0.43 with an install state still naming 2.11.0, so every verb
+    // was exec'd sixteen minors backwards and the flags that postdate 2.11.0
+    // were silently dropped. See `handoff_target_is_not_a_downgrade`.
+    if !yggterm_core::handoff_target_is_not_a_downgrade(
+        env!("CARGO_PKG_VERSION"),
+        &install_context.current_version,
+    ) {
         return Ok(());
     }
     let Some(preferred) = preferred_headless_executable(install_context) else {
@@ -2596,7 +2611,14 @@ fn main() -> Result<()> {
                                 })?
                                 .to_string()
                         };
-                        run_app_control_send_terminal_input(session_path, &data, timeout_ms)
+                        let allow_multiline =
+                            args.iter().any(|arg| arg == "--allow-multiline");
+                        run_app_control_send_terminal_input(
+                            session_path,
+                            &data,
+                            allow_multiline,
+                            timeout_ms,
+                        )
                     }
                     "submit" => {
                         // Readiness-gated prompt insertion: waits for the session to

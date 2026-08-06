@@ -50,6 +50,9 @@ mod retention;
 pub mod session_bus;
 mod session_kind;
 mod telemetry;
+/// How a text payload reaches a terminal composer — and why an agent CLI needs
+/// bracketed paste where a shell does not.
+pub mod terminal_input;
 mod titles;
 mod trace;
 mod transcript;
@@ -97,7 +100,8 @@ pub use install::{
     ReleaseUpdate,
     ReleaseUpdateInstallProgress, ReleaseUpdateInstallStage, UpdatePolicy, YGGTERM_DESKTOP_APP_ID,
     check_for_update, current_asset_label, current_version, detect_install_context,
-    direct_install_root, install_mode_summary, install_release_update,
+    direct_install_root, handoff_target_is_not_a_downgrade, install_mode_summary,
+    install_release_update,
     install_release_update_with_progress, promote_direct_install_active_version,
     refresh_desktop_integration, update_command_hint, write_direct_install_state,
 };
@@ -1292,6 +1296,14 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.web_surface_restore_tabs = serde_json::from_value(value.clone())
             .context("failed to parse web_surface_restore_tabs")?;
     }
+    if let Some(value) = object.get("start_page_session_choice") {
+        settings.start_page_session_choice = serde_json::from_value(value.clone())
+            .context("failed to parse start_page_session_choice")?;
+    }
+    if let Some(value) = object.get("start_page_app_choice") {
+        settings.start_page_app_choice = serde_json::from_value(value.clone())
+            .context("failed to parse start_page_app_choice")?;
+    }
     Ok(settings)
 }
 
@@ -1327,6 +1339,13 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "expanded_browser_paths": settings.expanded_browser_paths,
         "collapsed_synthetic_paths": settings.collapsed_synthetic_paths,
         "split_groups": settings.split_groups,
+        // The start page's two sticky split buttons. Their own doc comments say
+        // "persisted, not merely remembered … a choice that resets on relaunch is
+        // not sticky, it is a default" — and until this line they were exactly
+        // that: remembered in memory, gone on restart. Third time a field reached
+        // the struct and not the writer, which is what the test below exists for.
+        "start_page_session_choice": settings.start_page_session_choice,
+        "start_page_app_choice": settings.start_page_app_choice,
         // The web-surface prefs. They were absent here, so NONE of them survived a
         // restart — including the global zoom, which had shipped as "persisted"
         // for weeks. A hand-written serializer beside a hand-written parser is two
@@ -2821,6 +2840,29 @@ mod tests {
         assert_eq!(parsed.web_surface_zoom_percent, 125.0);
         assert!(parsed.web_surface_vertical_tabs);
         assert!(parsed.web_surface_restore_tabs);
+    }
+
+    // ⚠ The structural test above checks the WRITER only, so the PARSER is the
+    // half that can still rot silently — and it did here. Both sticky start-page
+    // choices reached `AppSettings` in 4cc6118f and neither the writer nor the
+    // reader learned them, so the buttons remembered your last choice until the
+    // next restart. Their own doc comments say a choice that resets on relaunch
+    // "is not sticky, it is a default", which is exactly what shipped.
+    #[test]
+    fn the_start_pages_sticky_choices_survive_a_settings_round_trip() {
+        let mut settings = AppSettings::default();
+        settings.start_page_session_choice = Some("claude-code".to_string());
+        settings.start_page_app_choice = Some("app:ychrome:new".to_string());
+        let parsed =
+            parse_settings_value(&serialize_settings_value(&settings)).expect("round trip");
+        assert_eq!(
+            parsed.start_page_session_choice.as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(
+            parsed.start_page_app_choice.as_deref(),
+            Some("app:ychrome:new")
+        );
     }
 
     #[test]
