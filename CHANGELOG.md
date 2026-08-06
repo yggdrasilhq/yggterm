@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The start page is two buttons now, not seven, and they remember.** The row
+  had grown one button per startable thing — New Codex Session, New Claude Code
+  Session, New Terminal, New Ychrome, New Ychrome (Incognito), New Yedit, Open
+  Yggdrasil Maker — which was cluttered and also misreported frequency, since
+  seven equal buttons imply the seventh is as likely as the first. There is now
+  one **New** button for sessions and one **Open** button for apps; each shows
+  the member you last ran, with a caret for the rest. The choice is persisted,
+  so the face is already right on the first frame after a restart, and the two
+  families are independent — opening a browser does not re-aim the button you
+  start work with. Nothing was dropped: every action the old row offered is in
+  one of the two menus, and the menus keep a fixed order so the sticky face
+  never moves the list under your hand.
+
 - **Your sessions no longer vanish because a binary was one version behind.**
   Every yggterm client looked for a daemon socket named after its own version,
   and refused any daemon whose version string was not byte-identical — including
