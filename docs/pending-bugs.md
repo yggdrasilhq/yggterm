@@ -127,29 +127,46 @@ play live, count webviews for that profile, and read stats-for-nerds on the
 VISIBLE player with and without the phantom. If judder is present only when a
 phantom exists, that closes both this and the judder entry at once.
 
-## `~/.yggterm` keeps one dead socket per version ever run — 700 of them
+## `~/.yggterm`'s 700 sockets are ALIASES, not corpses — the real growth is `client-instances`
 
-**Status:** OPEN
+**Status:** AWAITING A DECISION (the user's — it is a behaviour change)
 
-Counted on the GUI host 2026-08-05: **~700 `server-<version>.sock` files** in
-`~/.yggterm`, going back to `server-2-1-2.sock`. Seven daemons are alive; every
-other socket is a file no process will ever bind again. Nothing has ever swept
-them, and each deploy adds one more.
+⛔ **THE ORIGINAL PREMISE OF THIS ENTRY WAS WRONG AND IS CORRECTED HERE.** It
+said "~700 `server-<version>.sock` files … every other socket is a file no
+process will ever bind again", and prescribed a sweep. Measured on jojo
+2026-08-06:
 
-Harmless today — the enumeration probe in `server status` reads existing
-sockets and never spawns, so a dead one costs a `connect` that fails — but it
-is the same shape as the clipboard staging dir before `clipboard_sweep.rs`
-(182 MB, growing, nobody's job), and the same shape the user named for live
-session rows: *nobody's plate, nobody's table.*
+```
+server-*.sock total=674   symlinks=670   real sockets=4
+listening yggterm unix sockets: 7
+client-instances scope dirs: 675   of which EMPTY: 628
+```
 
-**The sweep has an obvious safe rule** and it is the one the socket layer
-already needs: a socket nothing is listening on, whose version is not a live
-daemon's, is garbage. Take the rule from `clipboard_sweep.rs` — per-host, own
-`$YGGTERM_HOME` only, fail-safe on any read it cannot complete.
+**670 of the 674 are SYMLINK ALIASES resolving to the LIVE daemon, and all four
+real sockets are listening. Zero are dead.** So the sweep the entry asked for is
+correct and collects nothing — the right verdict for all 674 is KEEP.
 
-⚠ Do NOT unlink a socket merely because `connect` fails. A daemon mid-restart
-has a moment with no listener, and deleting its address there turns a hiccup
-into a lost daemon. Bind-test or match against the live daemon set.
+**Where the growth actually comes from:** `refresh_legacy_server_socket_aliases`
+regenerates one alias per version on **every daemon bind**, seeded from the 675
+scope directories under `$YGGTERM_HOME/client-instances/` — **628 of them
+empty**. Deleting alias files alone is futile; they are recreated on the next
+bind. The count only comes down by pruning the `client-instances` registry.
+
+⚠ **THE DECISION, and it is the user's** — retiring a live-pointing alias is a
+behaviour change, not a cleanup: an older client that loses its alias **falls
+back to spawning its own daemon**, which is precisely the daemon-proliferation
+the fleet already suffers from. So "prune the empty scope dirs" needs a rule for
+what an empty scope dir MEANS (a client that never registered? one that exited
+cleanly? one from a version no longer installed?) before anything is unlinked.
+
+**SHIPPED IN THE MEANTIME, and it fixed a live hazard rather than the cosmetics:**
+`socket_sweep.rs`, which **replaces** `cleanup_dead_versioned_server_sockets` —
+a function that ran on every daemon start and unlinked a socket **whenever
+`status()` failed**, i.e. exactly the thing this entry's own warning forbade. A
+daemon mid-restart has a moment with no listener, and the old code would delete
+its address there. The new predicate issues **no `connect` at all**: liveness is
+proved positively from one read of `/proc/net/unix`, a path must be dead in two
+rounds ≥24 h apart, and an unreadable census keeps everything.
 
 Related: `docs/agent-row-hygiene.md` (the same class of accumulation, for rows).
 
