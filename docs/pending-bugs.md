@@ -220,6 +220,52 @@ field, and the owner finding the truth by looking at his screen:**
 | `terminal new --prompt-stdin` | `delivered: true` | `submitted:true, waited_ms:19802` — and the transcript never gained a user row, twice in one minute |
 | `terminal send` | `accepted: true` | bytes written; into an agent row that is one Enter PER LINE |
 
+### ⛔ THE ROW PLANE WAS UNREACHABLE FROM EVERY NON-GUI HOST, AND THE REFUSAL DID NOT SAY SO
+
+Measured by a delegate, 2026-08-07: row 5.1 (on dev) tried to message row 5.2
+and got `no live Yggterm GUI client is registered for app control`. It concluded
+*"the row plane is still unreachable from here, so files remain the channel"*,
+invented a `crossings/` directory, and passed a structured file to its sibling.
+
+**Sensible improvisation, and a total feature loss.** App control is served by
+the **GUI process**, not the daemon, so it only answers on the host where the GUI
+runs — and every delegate on this fleet runs on dev while the GUI is on jojo. So
+the cross-row messaging contract every delegate is briefed with was **impossible
+for all of them**, and the refusal never mentioned the word "host".
+
+⇒ **Nothing was broken except that nobody was told where to stand.** The refusal
+now names the host it is on, states that app control follows the GUI process,
+and points at `ssh <gui-host>` plus `server app clients` (which answers "is the
+GUI here?" directly). Locked by
+`the_no_client_refusal_names_the_host_problem_and_the_way_out`.
+
+⏳ **Still open, and the better fix:** cross-row messaging should RESOLVE the GUI
+host from any fleet host rather than refuse. The daemon already holds
+`remote_machines` with ssh targets; what it does not record is which of them runs
+a GUI. ⚠ Same family as the binary/daemon resolution item — **resolution fails
+silently and the caller invents a workaround** — and the workaround is the
+expensive part, because a file channel nobody designed becomes load-bearing.
+
+### ⭐ A LAW THAT LIVES ONLY IN A MEMORY FILE IS RE-BROKEN BY EVERY SESSION THAT HAS NOT READ IT
+
+Added 2026-08-07: row 1 (atlasstore) took a **fourth** cyber demotion
+(`claude-fable-5` → `claude-opus-5`, `dir=retry`, unpaired with any 529) minutes
+after being handed a portal errand. The standing law is that **that lobe launches
+on Opus 5 ALWAYS, precisely because it demotes** — and the row was on Fable,
+because nothing enforced the law at launch.
+
+⇒ **`spawn-delegate` should refuse to be born on a model its lobe is known to
+refuse**, reading a per-lobe model policy rather than trusting the launcher to
+remember. This is the sharpest instance of the whole pattern: the cost of
+"remember to pass `--model`" is paid once per session that forgets, forever, and
+it is invisible until someone reads a demotion counter.
+
+⚠ Design note before anyone builds it: the policy has to key on something the
+launch verb can actually see. The lobe is not a yggterm concept — the row's
+`--purpose`, its `cwd` (`~/data/<lobe>`), or an explicit `--lobe` are the
+candidates, and `cwd` is the one that cannot be forgotten because the delegate
+needs it anyway.
+
 ⇒ **The candidate rule: a mutating verb answers against RE-READ state, or it
 answers with a named refusal.** Never against the request it just made. The
 app-path reorder shipped in 3.0.44 is the first verb built this way — `changed`
@@ -296,8 +342,8 @@ version is not the thing to compare — the resolved `server_pid` is.**
 **The rendered order is the GUI's own in-process list, and `server app rows`
 reports it faithfully.** Measured against a faithful screenshot with the two
 copies deliberately divergent: sidebar and `server app rows` both read
-`3.1, 3.2, 0., 1., 2., 4., 6.` (new rows PREPENDED at the head) while the daemon
-held `0., 7.1, 7.2, 1., 2., 3.1, 3.2`. ⚠ So `server app rows` is NOT a second
+`5.1, 5.2, 0., 1., 2., 4., 6.` (new rows PREPENDED at the head) while the daemon
+held `0., 7.1, 7.2, 1., 2., 5.1, 5.2`. ⚠ So `server app rows` is NOT a second
 encoding to distrust here — it is the accurate report, and `server snapshot` is
 the misleading one, because the snapshot answers from whichever daemon the CLI
 resolved.
@@ -322,14 +368,33 @@ the forwarding verb, on the GUI's own daemon, no restart: daemon updated, sideba
 unchanged. A GUI **restart** does adopt it (observed immediately after — the
 sidebar came up in the orchestrator's outline).
 
-⇒ **The fix is in the snapshot-apply path**: the GUI's copy of
-`live_session_order` is a mirror that is deliberately not overwritten while the
-GUI runs — almost certainly to protect a user's drag from being stomped by a
-poll. So the rule needed is *"adopt the daemon's order when the daemon's order
-CHANGED, keep mine when only my local arrangement did"*, which needs a
-generation/epoch on the order rather than a value comparison. ⚠ Do not simply
-overwrite on every snapshot: that re-introduces the bug the mirror exists to
-prevent, and drags are the one row interaction the user does by hand.
+⛔ **AND THE "GUI REFUSES TO ADOPT" THEORY IS FALSIFIED — read this before
+building an epoch.** The obvious fix is a generation counter so the GUI adopts
+"when the DAEMON's order changed". **The code already adopts unconditionally**:
+
+- `apply_snapshot` (`lib.rs:5295`) sets `self.live_session_order` from
+  `snapshot.live_sessions` on **every** snapshot — no guard, no epoch.
+- `merge_hot_sidebar_sessions` (`shell.rs:39888`) is a pass-through
+  (`live_sessions.to_vec()`), and the Live region renders from that.
+
+So the chain *daemon order → `live_session_order` → sidebar* is intact, and an
+epoch would guard a door that is already open. ⇒ **The divergence is UPSTREAM:
+the snapshot the GUI polls does not carry the reorder.**
+
+⭐ **The surviving hypothesis, and the next probe.** jojo runs four daemons and
+rows are owned across them, so the serving daemon **aggregates** rows it does not
+own. If that aggregation rebuilds order from its own adoption sequence, it
+overwrites `live_session_order` on every poll — which explains all of it: the
+reorder lands, the next aggregation discards it, a **restart** reads the
+persisted order once before aggregation takes over, and new rows arrive at the
+head because that is where adoption appends them.
+**Probe:** reorder, then compare `live_session_order` against the order of
+`snapshot.live_sessions` on the serving daemon across two consecutive polls —
+if the field holds and the projection does not, the aggregation is the writer.
+Start at `append_restored_live_session_order` and the peer-adoption path.
+
+⚠ Do not simply pin the order in the GUI either: drags are the one row
+interaction the user performs by hand, and a pin would strand them.
 
 ⚠ **An earlier claim in this entry was wrong and is retracted**: I reported a
 02:47 case where a running GUI DID adopt a reorder without restarting. It does
