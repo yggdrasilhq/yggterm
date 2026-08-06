@@ -13,6 +13,29 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## FIVE yggterm-shell TESTS FAIL ON A CLEAN main
+
+**Status:** OPEN
+
+Measured 2026-08-06 by stashing all local work and running
+`cargo test --release -p yggterm-shell --lib` on an otherwise clean tree, then
+re-running each name alone. They fail both in the suite and in isolation, so
+this is not cross-test pollution:
+
+- `a_failed_startup_sync_does_not_spend_the_handover_baseline`
+- `a_toast_command_drains_once_and_shows_a_notification` (9 notifications, 1 expected)
+- `daemon_handover_tells_the_user_and_stops_the_terminal_paint_path`
+- `fast_reveal_does_not_notify_even_under_swap_pressure`
+- `healthy_recovering_surface_does_not_fire_dead_session_toast`
+
+Four of the five are notification-count assertions, which suggests one cause:
+something now emits notifications that previously did not, and the toast drain
+sees a backlog. Not yet root-caused — filed so the red suite is not mistaken for
+noise by the next session, and so nobody re-measures the baseline from scratch.
+
+**Falsifier:** run the five names on a clean checkout; if they pass, this entry
+is wrong and the failure belongs to whatever was in the tree.
+
 ## ★★★ ROW PARENTAGE: NOTHING RECORDS WHO SPAWNED A ROW
 
 **Status:** OPEN
@@ -1412,7 +1435,11 @@ entry only after a live passkey ceremony on an agent-created surface.
 
 ## ★★ CO-BROWSE: NO FILE-UPLOAD VERB, AND TWO SILENT OTP-READER FAULTS (2026-08-06)
 
-**Status:** OPEN (2 of 5 defects FIXED in-run)
+**Status:** OPEN
+
+2 of the 5 defects in this entry were fixed in-run; the 3 named below are what
+keeps it open. (The count used to ride on the status line itself, which broke
+`check-docs-ssot.sh` — one entry, exactly one status word.)
 
 Field report from filing a CPC-ITR grievance end to end on the services-desk portal
 (succeeded — ack 26390914 — but cost ~3 h and two failed attempts):

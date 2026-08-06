@@ -4,6 +4,24 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Your sessions no longer vanish because a binary was one version behind.**
+  Every yggterm client looked for a daemon socket named after its own version,
+  and refused any daemon whose version string was not byte-identical — including
+  a daemon NEWER than itself, which it logged as "stale". So a machine running
+  a 3.0.39 client and a live 3.0.40 daemon rejected the daemon it could see,
+  fell back to a socket no daemon had ever bound, and every row died with
+  "socket connection failed". Restarting the GUI did not help, because the
+  restart did not change either version. Reachability is now a serve-capability
+  question — a daemon at or ahead of a client can serve it — while version
+  equality goes on answering the deploy question it was written for.
+
+- **A running session keeps its card on the start page, and opening it switches
+  to the session instead of starting a second one.** Launching a session used to
+  delete its own start page entry, so the page claimed the session did not
+  exist while it was running a few pixels away. Live sessions now sort above
+  stored ones, and a session's live row and its stored transcript collapse to a
+  single card.
+
 - **A session name you chose now survives everything.** Renaming a row, or
   opening one with `--title`, used to be undone: the name held until the next
   daemon restart, or until the agent CLI generated its own title for the

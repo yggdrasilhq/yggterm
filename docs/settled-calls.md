@@ -9,6 +9,35 @@ and referenced from here.
 says the answer changed.
 
 
+## ★★★ A RUNNING SESSION KEEPS ITS START-PAGE CARD (2026-08-06) — REVERSES A 2026-05-26 CALL
+
+**Settled by the user, verbatim:** *"when I launch a session that entry drops
+from the startpage. This is buggy behavior. If the session is open it should
+switch to that not LIE about sessions present."*
+
+This **reverses** the 2026-05-26 call that live sessions are deliberately absent
+from start-page recents. That call is not being re-litigated by argument — the
+user changed the answer, which is the only thing that may reopen one.
+
+Worth recording *why* the old call stopped holding, because the reasoning was
+sound when it was made. Its stated premise was that live sessions are "already
+surfaced in the Live Sessions sidebar group", so the start page did not need to
+be a third presence. On 2026-08-06 a daemon-reachability bug emptied that
+sidebar group, and the strip turned one broken surface into total invisibility:
+the sessions were running, and no surface in the product admitted they existed.
+A rule that is only correct while another surface is healthy is a rule with a
+hidden dependency.
+
+- **A live session keeps its start-page card**, and it sorts ABOVE stored ones —
+  running-now outranks a file mtime, and live rows frequently carry no mtime.
+- **Opening that card SWITCHES to the running session**; it never starts a
+  second copy.
+- **One session, one card.** A live row and its stored transcript row collapse,
+  deduped on session id rather than path, because no path normalization relates
+  `local://<id>` to `~/.codex/sessions/<id>.jsonl`.
+- Unchanged: the 2026-05-25 dual-presence claim (Live Sessions group + cwd tree)
+  and start-page recency ordering below the live block.
+
 ## ★★★ 3.0.0 IS THE libyggterm SEPARATION RELEASE (2026-08-02)
 
 **Settled by the user, verbatim:** *"I previously reserved v3 for all platform
