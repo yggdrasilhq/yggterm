@@ -13,6 +13,46 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ★★★ `session rename` DOES NOT SURVIVE A DAEMON RESTART — BUT `reorder` DOES
+
+**Status:** OPEN
+
+Found by the orchestrator, 2026-08-06, and it is why the owner's sidebar
+numbering keeps evaporating.
+
+**The measurement, and the asymmetry IS the evidence.** After renaming rows to
+an outline (0 / 0.1 / 1 / 1.1 / …) and applying `sessions reorder`, a daemon
+restart left:
+
+- the applied **ORDER intact**, exactly as requested;
+- every renamed row **reverted to its creation-time title**.
+
+So one of the two is persisted and re-applied on restore and the other is not.
+Order survives; the title is re-derived.
+
+**Why it is an SSOT defect and not a missing `fsync`.** There are two encodings
+of "this row's title": the name the user set, and a title DERIVED at restore
+from the session record (`live_session_default_title`, `lib.rs:421`, called from
+at least three restore paths at `:5678`, `:5775`, `:5924`). On restore the
+derived one wins and overwrites the set one. That is the exact shape CLAUDE.md
+forbids — *"if two places could answer the same question, collapse them"* — and
+the rename is the one that loses.
+
+⇒ **A rename must be a stored FACT about the row, and the derived title must be
+a FALLBACK consulted only when no set title exists**, never a value that
+re-asserts itself over one. The reorder path already gets this right and is
+worth reading as the precedent.
+
+⚠ Not reproduced under instrumentation here — filed from the orchestrator's
+direct observation, with the code path named but not yet proven to be the
+clobber. The cheap discriminator: rename a row, restart the daemon, and check
+whether the stored session record still carries the set title (persisted but
+overwritten on read) or lost it (never persisted). Those are different bugs with
+the same symptom, and the fix differs.
+
+**It compounds ROW PARENTAGE below**: an outline that cannot survive a restart
+cannot be maintained by hand *or* by derivation until this is fixed.
+
 ## ★★★ ROW PARENTAGE: NOTHING RECORDS WHO SPAWNED A ROW
 
 **Status:** OPEN
