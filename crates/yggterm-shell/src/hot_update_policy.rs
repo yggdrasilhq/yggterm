@@ -271,6 +271,54 @@ pub(crate) fn runtime_status_matches_current_app(runtime_status: &ServerRuntimeS
     runtime_status_is_current_app_version(runtime_status)
 }
 
+/// Whether this client can be SERVED by the daemon behind `runtime_status`.
+///
+/// ⛔ This is NOT [`runtime_status_matches_current_app`], and the difference is
+/// the whole point. Version equality answers a DEPLOY question — "is the daemon
+/// the build I am supposed to be running?" — and is the right predicate for the
+/// startup hot-swap decision. It is the WRONG predicate for "can I talk to this
+/// daemon at all", and using it there is what stranded the user's rows on
+/// 2026-08-06:
+///
+/// The GUI's recovery walk pinged every `server-*.sock` alias, found the LIVE
+/// 3.0.40 daemon behind each one, and rejected all of them as
+/// `skip_stale_versioned_socket_candidate` for the sole reason that the client
+/// was 3.0.39. With every candidate refused it fell back to
+/// `server-3-0-39.sock` — a socket no daemon had ever bound, because 3.0.39 had
+/// never run a daemon on that host — and every row died with
+/// "connecting to /home/user/.yggterm/server-3-0-39.sock". A newer daemon is not
+/// a stale one; calling it stale is how a working daemon became unreachable.
+///
+/// The rule: a daemon at or AHEAD of this client can serve it, because the wire
+/// is additive and the newer side is the one that knows about both shapes. A
+/// daemon BEHIND this client is deliberately excluded here — that case already
+/// has its own path (`resolve_client_daemon_endpoint` falls back to it and
+/// reports `version_mismatch` loudly so the stale daemon gets deployed over),
+/// and silently accepting it would hide the deploy the user still owes.
+pub(crate) fn runtime_status_can_serve_current_app(runtime_status: &ServerRuntimeStatus) -> bool {
+    if runtime_status_is_current_app_version(runtime_status) {
+        return true;
+    }
+    let Some(runtime) = parse_version_triple(runtime_status.server_version.as_str()) else {
+        return false;
+    };
+    let Some(current) = parse_version_triple(current_version().as_str()) else {
+        return false;
+    };
+    runtime >= current
+}
+
+fn parse_version_triple(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.trim().split('.');
+    let major = parts.next()?.trim().parse::<u64>().ok()?;
+    let minor = parts.next()?.trim().parse::<u64>().ok()?;
+    let patch = parts.next()?.trim().parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
 pub(crate) fn startup_daemon_hot_update_pending_reason(
     runtime_status: &ServerRuntimeStatus,
     expected_version: &str,

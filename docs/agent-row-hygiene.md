@@ -102,6 +102,51 @@ Provenance is not optional and neither is cleanup. Agents create rows through
   The sweep is a backstop for what an agent forgot, not a substitute for
   clearing your own plate.
 
+## The outline contract — every session names and numbers itself (owner-directed 2026-08-06)
+
+The user runs ~19 sessions he reads, and the sidebar is a working instrument, not a log. He
+organises it **like a book**, and the numbering also declares *which rows are under
+orchestration* — an unnumbered row is his alone. **Every session does this for itself.** The
+orchestrator is not the janitor: it runs on the expensive tier, the sessions run on the cheap
+one, and janitorial work belongs where it is cheapest and best-informed.
+
+**1. Name your OWN row — but compose with your CLI, do not fight it.**
+Claude Code **renames its own session** once it has a title, which silently destroys any name
+set at creation. Codex does not, but most agent CLIs behave like CC, so this is the rule:
+
+> **Wait for your CLI to auto-title, then RENAME to `N. <lobe>: <the CLI's own title>`.**
+
+The CLI's title is genuinely informative — it says what the session is doing — so prefixing it
+keeps both facts. Re-assert the prefix after any restart, and after any point where you notice
+your row has lost it.
+
+```bash
+yggterm server app session rename '<your row path>' '2. versestore: <CC title>'
+yggterm-headless server app terminal keep '<your row path>'   # sessions are keep-alive…
+```
+
+**2. Number and name every row you SPAWN, as your child.** A row you create is `N.M`, where `N`
+is your own number: `4. harborstore` spawning a ychrome surface for an ITR portal makes
+`4.1 ychrome: itr-<label>`. Place it directly beneath yourself. An unnumbered spawn is an
+orphan the user cannot attribute, and attributing it by hand is exactly the work this rule
+exists to delete.
+
+**3. Keep-alive SESSIONS, never their spawns.** The numbered agent sessions are keep-alive so he
+can identify them at a glance; a transient surface (a ychrome page, a probe) is not.
+⚠ `terminal new --help` claims agent CLI kinds are *born* keep-alive — measured false on 3.0.39,
+so set it explicitly until that is fixed.
+
+**4. When your task ends, REMOVE the rows you spawned — yourself.** Read `verified`, not
+`accepted`: a `verified:false` names a refusal and lists surviving pids in `live_processes`,
+**which you must then reap yourself**. ⚠ `session remove` has been measured TIMING OUT on
+removals that fully succeeded, so re-read the table before retrying — and never conclude
+"gone" from the row list alone, which is how a live agent was once orphaned with no row.
+
+**⇒ The goal is that tooling does 99% of this.** Every rule above that a human or an agent has
+to *remember* is a defect in the product: the parent chain should supply the number, a session's
+children should be sweepable as a unit, and an explicit title should outrank the CLI's derived
+one. Until then, the contract is manual and each session owns its own plate.
+
 ## Reading the table today
 
 ```bash

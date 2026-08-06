@@ -8,8 +8,9 @@ use crate::handover_gate::{
     HandoverPaintGate, HandoverPaintTransition, handover_observation_from_parts,
 };
 use crate::hot_update_policy::{
-    daemon_update_state_json, runtime_status_handoff_active, runtime_status_is_current_app_version,
-    runtime_status_matches_current_app, startup_authorized_hot_update_runtime_keys_from_sources,
+    daemon_update_state_json, runtime_status_can_serve_current_app, runtime_status_handoff_active,
+    runtime_status_is_current_app_version, runtime_status_matches_current_app,
+    startup_authorized_hot_update_runtime_keys_from_sources,
     startup_daemon_hot_swap_reason_with_authorized_keys,
     startup_daemon_should_preserve_stale_runtime,
     startup_stale_daemon_hot_swap_target_with_authorized_keys,
@@ -34912,7 +34913,10 @@ fn reconcile_stale_daemon_on_startup(endpoint: &ServerEndpoint, current_exe: &Pa
 
 fn current_daemon_is_reachable(endpoint: &ServerEndpoint, stage: &'static str) -> bool {
     match status(endpoint) {
-        Ok(runtime_status) if runtime_status_matches_current_app(&runtime_status) => true,
+        // "Reachable" is a connectivity question, so it takes the
+        // serve-capability predicate: a daemon at or ahead of this client can
+        // answer us. Equality here declared a live newer daemon unreachable.
+        Ok(runtime_status) if runtime_status_can_serve_current_app(&runtime_status) => true,
         Ok(runtime_status)
             if startup_daemon_should_preserve_stale_runtime(
                 &runtime_status,
@@ -35141,7 +35145,12 @@ fn maybe_alias_current_endpoint_to_reachable_versioned_socket(
         let Ok(candidate_status) = status(&candidate_endpoint) else {
             continue;
         };
-        if !runtime_status_matches_current_app(&candidate_status) {
+        // Serve-capability, NOT version equality. This walk is looking for a
+        // daemon that can answer at all; a daemon AHEAD of us qualifies. The
+        // equality form rejected every live candidate and left the client
+        // pointing at a socket nobody had ever bound (see
+        // `runtime_status_can_serve_current_app`).
+        if !runtime_status_can_serve_current_app(&candidate_status) {
             trace_daemon_step(
                 endpoint,
                 "skip_stale_versioned_socket_candidate",
@@ -119121,28 +119130,82 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
     mut browser_row_modified_epoch: impl FnMut(&BrowserRow) -> i64,
 ) -> Vec<BrowserRow> {
     let mut seen = HashSet::<String>::new();
-    let active_path = snapshot.active_session_path.as_deref();
+    let active_path = snapshot
+        .active_session_path
+        .as_deref()
+        .map(normalize_live_session_path);
     let scope = start_page_recent_scope(snapshot);
     let live_projection_paths = start_page_live_projection_paths(snapshot);
-    let mut candidates = Vec::<(BrowserRow, i64, String, usize)>::new();
+    let live_paths_for_rank = &live_projection_paths;
+    let mut candidates = Vec::<(BrowserRow, bool, i64, String, usize)>::new();
+    // Dedup on SESSION IDENTITY, not on the path string. A running session and
+    // its stored JSONL row are one session under two spellings — `local://<id>`
+    // and `~/.codex/sessions/<...>.jsonl` — which no path normalization relates,
+    // so a path key would put the same session on the page twice now that the
+    // live row is no longer filtered out. The session id is the one thing both
+    // spellings agree on; the normalized path is the fallback for rows that
+    // carry no id (documents, recipes).
     let mut push_candidate = |row: BrowserRow, modified_epoch: i64, started_at: String| {
-        if active_path.is_some_and(|active| active == row.full_path) {
+        let key = start_page_recent_identity_key(&row);
+        if active_path
+            .as_deref()
+            .is_some_and(|active| active == normalize_live_session_path(&row.full_path))
+        {
             return;
         }
-        if seen.insert(row.full_path.clone()) {
+        if seen.insert(key) {
             let ix = candidates.len();
-            candidates.push((row, modified_epoch, started_at, ix));
+            // A running session is the most current thing on the page, and a
+            // stored transcript's mtime cannot express that — a live row often
+            // carries no epoch at all and would sort BELOW week-old files.
+            let is_live =
+                live_paths_for_rank.contains(&normalize_live_session_path(&row.full_path));
+            candidates.push((row, is_live, modified_epoch, started_at, ix));
         }
     };
 
-    // SPEC: start page is a LAUNCHING PAD for sessions you want to open or
-    // resume. Live sessions are already running — they're surfaced in the
-    // "Live Sessions" sidebar group and the cwd tree (see
-    // [[spec-active-sessions-dual-presence]] for the canonical two-place
-    // claim; the start page is explicitly NOT a third presence).
-    // The `live_projection_paths` filter at the browser_rows loop below
-    // strips any browser_row whose path matches a live session, so we
-    // don't double-count via that path either.
+    // SPEC (user directive 2026-08-06, REVERSING the 2026-05-26 call recorded
+    // in [[spec-active-sessions-dual-presence]]): a running session KEEPS its
+    // start-page row, and opening it SWITCHES to the running session instead of
+    // starting a second one.
+    //
+    // The old rule stripped every row whose path matched a live session, so the
+    // act of launching a session made its row vanish from the start page. That
+    // was defensible only under the old rule's own assumption — "live sessions
+    // are already surfaced in the Live Sessions sidebar group" — and when the
+    // daemon-reachability bug broke that assumption, the strip turned a sidebar
+    // outage into total invisibility: the sessions were running, and there was
+    // nowhere left in the UI that admitted they existed. The user's words: "If
+    // the session is open it should switch to that not LIE about sessions
+    // present."
+    //
+    // So live rows are no longer filtered out; they are PREFERRED. The live row
+    // is pushed before the stored row for the same session, and the normalized
+    // dedup in `push_candidate` collapses the pair to one row — the live one,
+    // which `spawn_open_session_row` routes to a focus rather than a launch.
+    // Live rows go in FIRST so that when the same session also has a scanned
+    // remote row or a stored JSONL row, the normalized dedup keeps the LIVE
+    // one. Order here is the whole mechanism: push a stored row first and the
+    // start page would offer "resume" for a session that is already running.
+    let mut live_first = browser_rows
+        .iter()
+        .filter(|row| matches!(row.kind, BrowserRowKind::Session))
+        .filter(|row| live_projection_paths.contains(&normalize_live_session_path(&row.full_path)))
+        .filter(|row| start_page_recent_scope_allows_browser_row(&scope, row))
+        .collect::<Vec<_>>();
+    // Same recency order the page sorts by, so that when two live spellings of
+    // one session both qualify the winner is deterministic rather than
+    // dependent on sidebar assembly order.
+    live_first.sort_by(|left, right| {
+        browser_row_modified_epoch(right)
+            .cmp(&browser_row_modified_epoch(left))
+            .then_with(|| left.full_path.cmp(&right.full_path))
+    });
+    for row in live_first {
+        let modified_epoch = browser_row_modified_epoch(row);
+        push_candidate(row.clone(), modified_epoch, String::new());
+    }
+
     for machine in &snapshot.remote_machines {
         let remote_short_ids = unique_session_short_ids_for_pairs(
             &machine
@@ -119173,21 +119236,38 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
             row.kind == BrowserRowKind::Session
                 || row.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe)
         })
-        .filter(|row| !live_projection_paths.contains(&normalize_live_session_path(&row.full_path)))
         .filter(|row| start_page_recent_scope_allows_browser_row(&scope, row))
     {
         let modified_epoch = browser_row_modified_epoch(row);
         push_candidate(row.clone(), modified_epoch, String::new());
     }
 
+    // Running sessions first, then recency. Ordering "by recency" was the
+    // 2026-05-25 spec and still governs everything below the live block; live
+    // rows sit above it because "running right now" outranks any file mtime,
+    // and because a live row's epoch is frequently 0.
     candidates.sort_by(|left, right| {
         right
             .1
             .cmp(&left.1)
             .then_with(|| right.2.cmp(&left.2))
-            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| right.3.cmp(&left.3))
+            .then_with(|| left.4.cmp(&right.4))
     });
-    candidates.into_iter().map(|(row, _, _, _)| row).collect()
+    candidates.into_iter().map(|(row, ..)| row).collect()
+}
+
+/// The identity a start-page row is deduped by: one SESSION, one card.
+///
+/// A live row and the stored transcript row for the same session are the same
+/// thing wearing two paths, and only the session id relates them. Rows without
+/// an id fall back to the normalized path, which is what documents and terminal
+/// recipes are keyed by.
+fn start_page_recent_identity_key(row: &BrowserRow) -> String {
+    match row.session_id.as_deref().map(str::trim) {
+        Some(session_id) if !session_id.is_empty() => format!("session-id:{session_id}"),
+        _ => format!("path:{}", normalize_live_session_path(&row.full_path)),
+    }
 }
 
 fn start_page_live_projection_paths(snapshot: &RenderSnapshot) -> HashSet<String> {
@@ -138440,6 +138520,63 @@ mod tests {
             "managed_session_count": 0,
         }))
         .expect("test runtime status")
+    }
+
+    /// A daemon AHEAD of this client is reachable, not "stale".
+    ///
+    /// The regression this pins: on 2026-08-06 the GUI's recovery walk pinged
+    /// every versioned socket, found the live 3.0.40 daemon behind each alias,
+    /// and refused all of them because the client was 3.0.39 — then fell back to
+    /// `server-3-0-39.sock`, which no daemon had ever bound, and every row died
+    /// with "socket connection failed". Version equality is a DEPLOY predicate;
+    /// using it to answer "can I talk to this daemon" is what broke it.
+    #[test]
+    fn a_daemon_ahead_of_this_client_can_still_serve_it() {
+        let (major, minor, patch) = {
+            let version = current_version();
+            let mut parts = version.split('.');
+            let major: u64 = parts.next().unwrap().parse().unwrap();
+            let minor: u64 = parts.next().unwrap().parse().unwrap();
+            let patch: u64 = parts.next().unwrap().parse().unwrap();
+            (major, minor, patch)
+        };
+
+        let same = runtime_status_for_test(&current_version(), 0, 1);
+        assert!(
+            runtime_status_can_serve_current_app(&same),
+            "own version must serve"
+        );
+
+        let newer = runtime_status_for_test(&format!("{major}.{minor}.{}", patch + 1), 0, 2);
+        assert!(
+            runtime_status_can_serve_current_app(&newer),
+            "a NEWER daemon must be reachable — refusing it is the bug that \
+             stranded every row behind a socket nobody had bound"
+        );
+        assert!(
+            !runtime_status_matches_current_app(&newer),
+            "but it is still not a version MATCH, so the deploy decision is unchanged"
+        );
+
+        let much_newer = runtime_status_for_test(&format!("{major}.{}.0", minor + 1), 0, 3);
+        assert!(runtime_status_can_serve_current_app(&much_newer));
+
+        // Older daemons are deliberately excluded here: that case has its own
+        // fallback path which reports the mismatch loudly so the stale daemon
+        // still gets deployed over.
+        if patch > 0 {
+            let older = runtime_status_for_test(&format!("{major}.{minor}.{}", patch - 1), 0, 4);
+            assert!(
+                !runtime_status_can_serve_current_app(&older),
+                "an OLDER daemon must not silently satisfy this predicate"
+            );
+        }
+
+        let garbage = runtime_status_for_test("not-a-version", 0, 5);
+        assert!(
+            !runtime_status_can_serve_current_app(&garbage),
+            "an unparseable version must fail closed"
+        );
     }
 
     #[test]
@@ -172951,12 +173088,19 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
-    fn start_page_recent_rows_excludes_live_terminal_projections() {
-        // SPEC: live sessions do NOT appear in start page recents. They are
-        // dual-present in Live Sessions group + cwd tree only. The start page
-        // is a launching pad for sessions to open/resume; live ones are
-        // already running and accessible from the sidebar Live Sessions group.
-        // See [[spec-active-sessions-dual-presence]] (out-of-scope: start page).
+    fn start_page_recent_rows_keep_live_sessions_so_the_page_cannot_lie() {
+        // SPEC (user directive 2026-08-06): a running session KEEPS its start
+        // page row. This test previously asserted the OPPOSITE — that the live
+        // row is stripped — under the 2026-05-26 call recorded in
+        // [[spec-active-sessions-dual-presence]], whose stated premise was that
+        // live sessions are "already accessible from the sidebar Live Sessions
+        // group". When a daemon-reachability bug emptied that group, the strip
+        // meant the running sessions appeared NOWHERE, and launching a session
+        // made its own card disappear. The user's words: "If the session is
+        // open it should switch to that not LIE about sessions present."
+        //
+        // The old assertion is kept below, inverted, so the reversal is legible
+        // rather than looking like a deleted test.
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
         let live_terminal_path = "live::remote-shell";
         let mut live_terminal = test_live_shell_session(live_terminal_path);
@@ -173022,10 +173166,75 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .map(|row| row.full_path)
             .collect::<Vec<_>>();
 
-        // The browser_row representation of live::remote-shell is stripped by
-        // the live_projection_paths filter, and no separate live-session
-        // candidate is pushed. Only the durable scanned session remains.
-        assert_eq!(paths, ["remote-session://samplenotes-webapp/durable"]);
+        // The live row now SURVIVES, and it sorts ahead of the durable scanned
+        // row because live rows are pushed first. Before the 2026-08-06 fix
+        // this asserted `["remote-session://samplenotes-webapp/durable"]` — the
+        // live session had been silently dropped off the page.
+        assert!(
+            paths.contains(&live_terminal_path.to_string()),
+            "a running session must keep its start page row; got {paths:?}"
+        );
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| path.as_str() == live_terminal_path)
+                .count(),
+            1,
+            "and it must appear exactly ONCE — one session, one card"
+        );
+        assert!(
+            paths.contains(&"remote-session://samplenotes-webapp/durable".to_string()),
+            "the durable scanned session is unaffected; got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_live_session_and_its_stored_transcript_collapse_to_the_live_row() {
+        // One session wearing two paths — `local://<id>` while running and a
+        // stored transcript row from the scan — must be ONE card, and the card
+        // must be the live one so that opening it focuses the running session
+        // instead of starting a second copy of it.
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
+        let live_path = "local://shared-session-id";
+        let mut live = test_live_shell_session(live_path);
+        live.id = "shared-session-id".to_string();
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Rendered,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live)],
+            apps: Vec::new(),
+        });
+        let mut snapshot = shell.snapshot();
+        // No selected row → unscoped recents, so this test measures the dedup
+        // and nothing else.
+        snapshot.selected_row = None;
+        snapshot.active_session_path = None;
+
+        let mut live_row =
+            test_browser_session_row(live_path, "Shared", "local", Some("/home/user"));
+        live_row.session_id = Some("shared-session-id".to_string());
+        let mut stored_row = test_browser_session_row(
+            "/home/user/.codex/sessions/shared-session-id.jsonl",
+            "Shared",
+            "local",
+            Some("/home/user"),
+        );
+        stored_row.session_id = Some("shared-session-id".to_string());
+        snapshot.rows = vec![stored_row, live_row];
+
+        let paths = start_page_recent_rows_from_browser_rows(&snapshot, &snapshot.rows)
+            .into_iter()
+            .map(|row| row.full_path)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            [live_path],
+            "the pair must collapse to the LIVE row, not the stored transcript"
+        );
     }
 
     #[test]
@@ -173127,14 +173336,15 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .into_iter()
             .map(|row| row.full_path)
             .collect::<Vec<_>>();
-        // SPEC: live sessions are NOT in the start page recents — they're
-        // dual-present in Live Sessions group + cwd tree only. The folder
-        // selection scopes recents to durable sessions in this folder.
-        // active_path's live session is verified above by the live_sessions
-        // assert; it must not also appear here.
+        // SPEC (user directive 2026-08-06, reversing the 2026-05-26 call): the
+        // retained live session in this folder KEEPS its card, and sorts above
+        // the durable ones because running-now outranks a file mtime. The
+        // folder selection still scopes recents to this folder — `newer-other`
+        // is in /home/user/gh/other and stays out.
         assert_eq!(
             recent_paths,
             vec![
+                "remote-session://dev/live-active".to_string(),
                 "remote-session://dev/newest-yggterm".to_string(),
                 "remote-session://dev/older-yggterm".to_string(),
             ]
