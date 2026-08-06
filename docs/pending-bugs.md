@@ -13,34 +13,41 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
-## THE NOTIFICATION HISTORY DIES WITH THE GUI
+## ★★ THE RENDER PIPELINE STILL INTERLEAVES CHARACTERS FROM AN OLDER FRAME
 
 **Status:** OPEN
 
-Found 2026-08-06 while deploying 3.0.35, and it matters because the user has
-just asked for a **2000-entry** history: `ShellState::notifications` is an
-in-memory `Vec`, so **a GUI restart empties the panel**. Measured — the restart
-for this deploy wiped a full panel to zero.
+User-reported 2026-08-06 with a faithful screenshot, after a GUI restart and a
+long scroll: *"Rendering pipeline still needs work."*
 
-That is a real gap between what was asked for and what shipped. "Store 2000 such
-notifications, history limit" reads as a durable record, and on a multi-agent
-setup it is the record of what the fleet did while the user was away. Today an
-agent can report faithfully into a panel that a routine deploy then erases, and
-nothing warns anyone.
+**The fingerprint, and it is unmistakable once seen** — words from two different
+frames fused character by character, spaces eaten:
 
-⚠ It is also the SECOND half of the dismissal bug that was just fixed. Closing a
-toast no longer destroys the record — but a GUI restart still does, so the
-guarantee is only as good as the process lifetime.
+```
+BothsX'spcalledthefsameedelete,aso "stop covering my screen"tando"forget this happened"
+Itsalsoecaughtttthato--job forcestpersistentoandinever chimesi(so0--silentdisia no-op there)
+The history dies with the GUI.nIt'srannin-memoryiVec, southisrveryedeployeemptied,yourcpanel.
+```
 
-**The shape of the fix.** A JSONL append beside the other per-host state in
-`$YGGTERM_HOME`, loaded at startup and trimmed to `NOTIFICATION_HISTORY_LIMIT`,
-following `clipboard_sweep.rs`'s per-host discipline. Two things to get right:
-- ⛔ **Notifications carry message text an agent wrote.** The store is per-host
-  and inherits the same no-secrets rule the journal has; do not persist a
-  notification body anywhere a different user could read.
-- The `source` session path must survive, so a restored notification still
-  clicks through — that is exactly the case where a click MATTERS, since the
-  user is coming back to something they were away from.
+Read it as `Both X's called the same delete` overwritten INTO the previous
+frame's text, one cell at a time. Every SPACE holds a character from an older
+frame — the same fingerprint already recorded for the bottom-rendering bug in
+`docs/xterm-bugs.md`, so this is that family, not a new one.
+
+**What is new and worth carrying:** it appeared on a FRESH GUI (3.0.35, minutes
+old) on a session that had just been re-resumed after a restart, while a long
+answer streamed. That is the same window the field guide already warns about —
+*a daemon swap re-resumes the CLI on a fresh PTY, and that re-resume window IS
+the corruption* — which makes this a strong, cheap repro rather than a mystery:
+**restart the GUI, then stream a long answer into a re-resumed row.**
+
+⛔ Do NOT reach for `reconcile` on a session showing this — it is a destructive
+full reset+re-seed and has blanked a live viewport before. And do not repeat the
+3.0.28 remedy (a resize nudge after the reconcile): SIGWINCH makes an in-place
+CLI redraw only the region it still owns, which turned the interleaved bottom
+into a BLANK transcript and was reverted at 3.0.29. The atlas/full-refresh path
+is the suspect, not the daemon's screen — the daemon's copy is correct, the
+CLIENT paints less than it holds.
 
 ## THE TERMINAL'S RIGHT EDGE CLIPS THE LAST GLYPH — the hitbox is a column short
 
