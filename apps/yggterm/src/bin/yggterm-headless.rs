@@ -2368,10 +2368,18 @@ fn main() -> Result<()> {
                 )
             }
             "dom-eval" => {
-                let script = args
-                    .get(3)
-                    .map(String::as_str)
-                    .context("missing script for server app dom-eval")?;
+                // ⛔ NOT `args.get(3)`. `--client`/`--pid` are scanned out of the
+                // WHOLE argv, so a fixed-index read disagrees with the very
+                // flags it was typed beside: `dom-eval --client shadow '<js>'`
+                // used to evaluate the STRING "--client" and report success.
+                // One owner for the rule, in yggterm_core, because this binary
+                // and `yggterm` both have this arm.
+                let script = yggterm_core::cli_payload_arg(
+                    &args,
+                    3,
+                    "script for server app dom-eval",
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
                 run_app_control_dom_eval(script, timeout_ms)
             }
             "start-action" | "start" => {
