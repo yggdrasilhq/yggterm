@@ -13,6 +13,64 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ★★★ ROW PARENTAGE: NOTHING RECORDS WHO SPAWNED A ROW
+
+**Status:** OPEN
+
+Owner, 2026-08-06, looking at the sidebar: *"We need the 0, 1, 1.1, 2, … top to
+bottom for the agent rows sanitization and somehow to track who further spawns
+nested rows of ychrome, yRDP, etc. and organize like this."*
+
+**Half of it works today and needs nothing:** `server sessions reorder` applied a
+hand-built outline on jojo (37 rows, `matches_request: true`, none skipped). The
+verb is right.
+
+⛔ **The half that cannot be faked: there is no parent link, anywhere.**
+`CreatorStamp` (`session_tenancy.rs:65`) records pid + host + purpose, and its
+own doc says the pid is *"dead by the time anyone reads this — the value is the
+AUDIT trail, not a handle."* A grep for `parent_session` / `spawned_by` /
+`parent_row` across `crates/` returns nothing. So:
+
+- the outline numbers are **hand-typed**, and the next orchestrator has no way
+  to know `6.1` belongs under `6`;
+- a ychrome or yRDP surface opened BY a delegate arrives as a **top-level
+  orphan** — four were on the table unattributable (2× "Agent unnamed shell"
+  badged `tenant-sample`, 2× "New Ychrome" badged `sample-a`/`sample-b`);
+- any restart re-scrambles it.
+
+**Cheapest-first, and the order matters:**
+
+1. `parent_session_path` on `CreatorStamp` — the spawning ROW, not its pid,
+   written at create time. ⚠ Critically by the **surface-creation paths**
+   (ychrome, yRDP), not just `terminal new`, because that is where nesting
+   actually comes from.
+2. Expose it on `server app rows` beside `session_id`.
+3. **Derive** the outline from the parent chain, depth-first — so `6.1` is a
+   fact about who spawned whom and re-derives after any restart, instead of
+   being someone's typing.
+4. Optionally `sessions reorder --outline` to sort by the derived numbers.
+
+⚖ **It also fixes the sanity system's cross-host problem from a better angle.**
+That was patched on 2026-08-06 by asking the session's `source`/`host_label`,
+which works — but a row that knows its PARENT knows which host its child runs on
+by construction, and the same stamp is what would let a delegate be swept
+*together with everything it spawned*.
+
+## ⚠ `server app session remove` REPORTS A TIMEOUT ON WORK IT COMPLETED
+
+**Status:** OPEN
+
+Found 2026-08-06 clearing rows on jojo: the verb exited 1 with
+`timed out waiting for app control response … after 15000 ms` on rows it had in
+fact **already removed** — the table went 42 → 37, exactly as asked.
+
+A timeout that reads as failure on completed work is the inverse of the
+lie-of-success shape and costs just as much: **a caller that retries on it
+chases ghosts**, and an agent scripting a bulk clear will either double-remove
+or report a failure the user then investigates. The verb should confirm against
+the resulting row set before reporting a timeout, or say plainly that the
+request outlived its response window without asserting the work failed.
+
 ## ★★ THE RENDER PIPELINE STILL INTERLEAVES CHARACTERS FROM AN OLDER FRAME
 
 **Status:** OPEN
