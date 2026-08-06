@@ -137,9 +137,19 @@ returned.
 branch that raises the toast. The GUI notification is fine to keep; it is the
 CLI's silence that is the bug.
 
-⚠ **Found alongside:** an agent can *raise* a notification (`server app notify`)
-but there is **no verb to dismiss one**, so a probe's own error toast sits on the
-user's screen until it ages out. Worth a `notify --dismiss <id>` for exactly the
+⚠ **My probe was untargeted, and that is on me, not on the daemon.** The
+`data-fabric` skill already carries the law — *"an agent testing notifications
+with no target is not testing anything; it is posting to the seat he is sitting
+at"* — and `session rename` takes `--pid`, so the probe should have been aimed
+at a shadow client. It was not, and the `Rename Failed` card landed on the
+user's own panel. **The rule generalises past `notify`: any probe of a verb that
+can raise a toast needs the same targeting**, which is not obvious from
+`rename`'s signature.
+
+⚠ **Still a real gap underneath it:** an agent can *raise* a notification but
+there is **no verb to dismiss one** (checked against `server app --help`, which
+is generated from the dispatcher). So even a correctly-targeted probe cannot
+clear its own card. Worth a `notify --dismiss <id>` for the same
 agent-cleans-its-own-plate reason the hygiene contract is built on.
 
 ## `server sessions reorder` WITH NO FILE REPORTS ITSELF AS NONEXISTENT
