@@ -4,6 +4,27 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A session name you chose now survives everything.** Renaming a row, or
+  opening one with `--title`, used to be undone: the name held until the next
+  daemon restart, or until the agent CLI generated its own title for the
+  conversation, and then the row quietly went back to something derived. If you
+  number your sessions to keep track of them, the numbering evaporated at the
+  worst moment — on the restart you were using it to survive. The row now
+  records that a name was CHOSEN rather than derived, and a chosen name outranks
+  every generated one, across restarts and daemon handovers. Nothing changes for
+  a row you never named: it still picks up a generated title as before.
+
+- **Agent sessions opened on another machine are kept alive like local ones.**
+  `--kind claude-code` on a remote machine was born without the keep-alive that
+  the same command gives a local session — so a session that should have
+  outlived a restart did not, while the help text said otherwise. All lanes now
+  follow the same rule. Plain shells are unchanged: they are still deliberately
+  not kept alive unless you ask.
+
+- **`--prompt-stdin` with nothing piped in now says so.** It used to open the
+  session, report success, and leave it sitting there with no prompt — the row
+  looked healthy and was doing nothing.
+
 - **Opening an agent session from the command line can finally say which model,
   which permissions, and what to work on.** `server app terminal new --kind
   claude-code|codex` takes `--model`, `--permission-mode`

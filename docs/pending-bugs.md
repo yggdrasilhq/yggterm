@@ -13,46 +13,6 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
-## ★★★ `session rename` DOES NOT SURVIVE A DAEMON RESTART — BUT `reorder` DOES
-
-**Status:** OPEN
-
-Found by the orchestrator, 2026-08-06, and it is why the owner's sidebar
-numbering keeps evaporating.
-
-**The measurement, and the asymmetry IS the evidence.** After renaming rows to
-an outline (0 / 0.1 / 1 / 1.1 / …) and applying `sessions reorder`, a daemon
-restart left:
-
-- the applied **ORDER intact**, exactly as requested;
-- every renamed row **reverted to its creation-time title**.
-
-So one of the two is persisted and re-applied on restore and the other is not.
-Order survives; the title is re-derived.
-
-**Why it is an SSOT defect and not a missing `fsync`.** There are two encodings
-of "this row's title": the name the user set, and a title DERIVED at restore
-from the session record (`live_session_default_title`, `lib.rs:421`, called from
-at least three restore paths at `:5678`, `:5775`, `:5924`). On restore the
-derived one wins and overwrites the set one. That is the exact shape CLAUDE.md
-forbids — *"if two places could answer the same question, collapse them"* — and
-the rename is the one that loses.
-
-⇒ **A rename must be a stored FACT about the row, and the derived title must be
-a FALLBACK consulted only when no set title exists**, never a value that
-re-asserts itself over one. The reorder path already gets this right and is
-worth reading as the precedent.
-
-⚠ Not reproduced under instrumentation here — filed from the orchestrator's
-direct observation, with the code path named but not yet proven to be the
-clobber. The cheap discriminator: rename a row, restart the daemon, and check
-whether the stored session record still carries the set title (persisted but
-overwritten on read) or lost it (never persisted). Those are different bugs with
-the same symptom, and the fix differs.
-
-**It compounds ROW PARENTAGE below**: an outline that cannot survive a restart
-cannot be maintained by hand *or* by derivation until this is fixed.
-
 ## ★★★ ROW PARENTAGE: NOTHING RECORDS WHO SPAWNED A ROW
 
 **Status:** OPEN
@@ -110,6 +70,94 @@ chases ghosts**, and an agent scripting a bulk clear will either double-remove
 or report a failure the user then investigates. The verb should confirm against
 the resulting row set before reporting a timeout, or say plainly that the
 request outlived its response window without asserting the work failed.
+
+### ⚠ IT HAS NOW COST A LIVE ORPHAN — reproduced twice more, 2026-08-06 night
+
+The orchestrator hit it on **all four** of four lobe removals: 15 s timeout
+reported, every row really gone, every pid really dead. **The damage was not the
+timeout — it was what the timeout taught the caller to do.** Reading "row gone"
+off the row list instead of the reply's own `verified` field let row 6.1's
+`claude` survive its removal as an **orphan**: alive, no row, invisible to the
+owner, until it was hunted by hand.
+
+⇒ **`verified` is the field, not the row list.** Reproduced deliberately while
+clearing a probe row: the reply said `verified: false` with
+`verified_refusal: "remote_runtime_survived"`, and the remote `claude` was
+indeed still running on the other host. **The instrument is honest and the row
+list is not** — a row leaves the table before its runtime is confirmed dead.
+
+Two more measured facts for whoever takes this:
+
+- `live_processes: []` was reported **in the same reply** as
+  `verified_refusal: "remote_runtime_survived"`. Those two cannot both be
+  right; the empty list is the one that lies, and a caller trusting it would
+  conclude the reap was clean.
+- The daemon then **respawns `server remote terminate-cc <uuid>` in a loop**
+  against a runtime that will not die — several were alive at once and new ones
+  appeared after each kill. A retry with no ceiling is its own defect and it
+  hides the first one.
+
+## `server sessions reorder` WITH NO FILE REPORTS ITSELF AS NONEXISTENT
+
+**Status:** OPEN
+
+Orchestrator, 2026-08-06: `server sessions reorder` with no file argument answers
+**`unsupported server sessions action: reorder`** — because the branch requires
+`argc >= 4`, so an arity miss falls through to the unknown-action arm and a verb
+that exists denies existing.
+
+That is a discovery cost paid by every future caller: the honest answer is a
+usage error naming the missing argument. ⚠ Same shape as any parser that treats
+"wrong number of arguments" as "no such thing" — worth a scan for siblings while
+fixing it.
+
+## ★★ WHO OWNS "IS THIS ROW WORKING?" — three tools, three answers
+
+**Status:** OPEN
+
+Orchestrator, 2026-08-06, after telling the owner that delegates were working
+when **3 of ~33 processes** were actually mid-turn, and being corrected by him.
+
+**The failure is a granularity mismatch, and it is partly ours.** `row-health.py`
+(data-fabric) verdicts are **per-cwd**, so `WORKING <cwd>` only means *some*
+transcript under that directory moved — and in the orchestrator's own cwd it
+reported the orchestrator back to itself as evidence of delegate progress.
+
+Their replacement (`~/.claude/skills/data-fabric/scripts/row-work.py`) links
+pid → transcript by EVIDENCE (session id from argv, else the runbook path
+matched inside the transcript) and judges by **turn state**: walk back past
+system rows; assistant text = turn ended = IDLE; `tool_use` / user
+`tool_result` = mid-turn.
+
+⇒ **yggterm should own this verdict, not a skill script.** The row model already
+holds the pid, the host and the session id; `server app rows` already carries a
+`working` field. One honest answer there replaces three tools that disagree, and
+it is the same field the working-indicator already wants
+([[spec-title-summary-working-indicator]]).
+
+⚠ **Do not import their STUCK verdicts as-is.** `--resume` can fork a
+transcript, so the reported ages (4-15 days) are most likely MISLINKS rather
+than wedged sessions. Settle the fork case before any reaper trusts STUCK —
+this is the same family as
+[[finding-agent-session-liveness-is-invisible-to-os-signals]], where an
+absence was mistaken for a state.
+
+## ⚠ ~9 RAW `session_path == row.full_path` COMPARISONS ARE UNAUDITED
+
+**Status:** OPEN
+
+Found while fixing the rename persist gate, 2026-08-06. A sidebar row can spell
+a session `local::<id>` while the live record spells it `local://<id>` — that is
+the entire reason `normalize_live_session_path` exists. The rename gate compared
+them RAW and therefore read false for those rows, silently never telling the
+daemon about the rename. **That one is fixed** (`live_session_matches_row_path`
+is now the one comparison owner).
+
+⛔ **The other ~9 sites in `shell.rs` are NOT fixed and NOT audited**, and this
+entry exists so nobody assumes the class was swept. Each needs its own reading:
+some compare a row against a live record (suspect), some may legitimately want
+identity on one spelling. `grep -n "session.session_path == row.full_path"`.
+A blanket normalize would be its own bug — the point is that no one has looked.
 
 ## ★★ THE RENDER PIPELINE STILL INTERLEAVES CHARACTERS FROM AN OLDER FRAME
 
