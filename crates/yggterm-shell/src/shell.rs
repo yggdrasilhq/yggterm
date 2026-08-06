@@ -40,7 +40,8 @@ use crate::terminal_observe::{
     terminal_chunk_has_generic_codex_idle_footer, terminal_chunk_has_meaningful_output,
     terminal_chunk_has_prompt_output, terminal_chunk_has_visible_output,
     terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
-    terminal_chunk_is_codex_resume_instruction, terminal_chunk_has_current_codex_input_row,
+    terminal_chunk_is_codex_resume_instruction, terminal_chunk_has_agent_composer_row,
+    terminal_chunk_has_current_codex_input_row,
     terminal_chunk_is_generic_codex_idle,
     terminal_chunk_is_loading_placeholder, terminal_chunk_is_local_codex_scaffold,
     terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
@@ -161,8 +162,8 @@ use yggterm_core::agent_presence::{AGENT_CURSOR_TTL_MS, AgentPointer, AgentPrese
 use yggterm_core::agent_scheme;
 use yggterm_core::notification_audio;
 use yggterm_core::{
-    AgentSessionProfile, AppManifest, AppSettings, AppVerb, BrowserRow, BrowserRowKind,
-    InstallContext, PerfSpan,
+    AgentLaunchOptions, AgentSessionProfile, AppManifest, AppSettings, AppVerb, BrowserRow,
+    BrowserRowKind, InstallContext, PerfSpan,
     ReleaseUpdateInstallProgress, ReleaseUpdateInstallStage, SessionBrowserState, SessionNode,
     SessionStore, SessionSummaryTimelineEntry, SessionTitleResolver, SplitAxis, SplitGroup,
     SplitMember,
@@ -216,7 +217,8 @@ use yggterm_server::{
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, snapshot_session_view_for_ui,
     stage_remote_clipboard_png, start_command_session_with_terminal_appearance,
     start_local_session_at_with_terminal_appearance, start_local_session_placed,
-    start_remote_claude_session_at_with_terminal_appearance, start_remote_claude_session_placed,
+    start_local_session_with_launch_options, start_remote_claude_session_placed,
+    start_remote_claude_session_with_launch_options,
     start_remote_codex_session_at_with_terminal_appearance, start_remote_codex_session_placed,
     start_ssh_session_at_with_terminal_appearance, start_ssh_session_placed, status,
     take_next_app_control_request,
@@ -16705,6 +16707,7 @@ fn snapshot_live_sidebar_session_view(session: &ManagedSessionView) -> ManagedSe
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
         working: session.working,
+        agent_launch_options: Default::default(),
     }
 }
 
@@ -16758,6 +16761,7 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
         working: session.working,
+        agent_launch_options: Default::default(),
     }
 }
 
@@ -52824,6 +52828,55 @@ fn public_live_session_path_from_started_key(key: &str) -> Option<String> {
     }
     Some(trimmed.to_string())
 }
+/// What the created row was ACTUALLY born with, read back off its launch
+/// command — never an echo of what the request asked for.
+///
+/// **Why read-back rather than echo.** Daemons coexist across versions by
+/// design (CLAUDE.md's constitution), and serde drops unknown fields silently,
+/// so a create routed to a daemon older than `launch_options` would answer
+/// "model: claude-opus-5" while the row ran on the user's default tier. An echo
+/// cannot tell those apart; the launch command can, because it is produced where
+/// the row LIVES. `applied:false` with the real command attached is the honest
+/// answer, and it saves the caller a `pgrep`.
+fn app_control_created_launch_report(
+    snapshot: &ServerUiSnapshot,
+    created_path: Option<&str>,
+    requested: &AgentLaunchOptions,
+) -> Value {
+    let launch_command = created_path.and_then(|path| {
+        snapshot
+            .live_sessions
+            .iter()
+            .chain(snapshot.active_session.iter())
+            .find(|session| session.session_path == path)
+            .map(|session| session.launch_command.clone())
+    });
+    let expected = created_path
+        .and_then(|path| {
+            snapshot
+                .live_sessions
+                .iter()
+                .chain(snapshot.active_session.iter())
+                .find(|session| session.session_path == path)
+        })
+        .map(|session| requested.launch_tokens(session.kind).unwrap_or_default())
+        .unwrap_or_default();
+    // Every requested token must be present in the command the row carries.
+    // Quoting is the launch builder's business, so compare on the unquoted
+    // token — `--model` and `'--model'` are the same statement.
+    let applied = launch_command.as_ref().map(|command| {
+        expected
+            .iter()
+            .all(|token| command.contains(token.as_str()))
+    });
+    json!({
+        "model": requested.model,
+        "permission_mode": requested.permission_mode.map(|mode| mode.name()),
+        "applied": applied,
+        "launch_command": launch_command,
+    })
+}
+
 fn app_control_created_session_path(
     snapshot: &ServerUiSnapshot,
     message: Option<&str>,
@@ -74466,7 +74519,9 @@ async fn process_pending_app_control_requests(
             purpose,
             session_kind,
             activate,
+            launch_options,
         } => {
+            let launch_options = launch_options.unwrap_or_default();
             let endpoint = state.read().bootstrap.server_endpoint.clone();
             let requested_kind = session_kind.unwrap_or(SessionKind::Shell);
             // Creation through THIS plane is agent creation: every human door
@@ -74532,6 +74587,7 @@ async fn process_pending_app_control_requests(
                     let title_hint_for_task = title_hint.clone();
                     let requested_kind_for_task = requested_kind;
                     let terminal_appearance_for_task = terminal_appearance.clone();
+                    let launch_for_task = launch_options.clone();
                     let prewarm_endpoint = endpoint.clone();
                     let outcome = run_dedicated_interactive_request_io(
                         "app_control_create_terminal_remote",
@@ -74548,13 +74604,14 @@ async fn process_pending_app_control_requests(
                                     Some(&terminal_appearance_for_task),
                                 )
                             } else if requested_kind_for_task == SessionKind::ClaudeCode {
-                                start_remote_claude_session_at_with_terminal_appearance(
+                                start_remote_claude_session_with_launch_options(
                                     &endpoint,
                                     &machine.ssh_target,
                                     machine.prefix.as_deref(),
                                     cwd_for_task.as_deref(),
                                     title_hint_for_task.as_deref(),
                                     Some(&terminal_appearance_for_task),
+                                    &launch_for_task,
                                 )
                             } else {
                                 start_ssh_session_at_with_terminal_appearance(
@@ -74573,6 +74630,11 @@ async fn process_pending_app_control_requests(
                         Ok((snapshot, message)) => {
                             let created_path =
                                 app_control_created_session_path(&snapshot, message.as_deref());
+                            let launch_report = app_control_created_launch_report(
+                                &snapshot,
+                                created_path.as_deref(),
+                                &launch_options,
+                            );
                             state.with_mut(|shell| {
                                 shell.apply_created_terminal_snapshot(
                                     Ok((snapshot, message.clone())),
@@ -74601,6 +74663,7 @@ async fn process_pending_app_control_requests(
                                     "purpose": purpose,
                                     "agent_title": synthesized_title,
                                     "session_kind": requested_kind,
+                                    "launch": launch_report,
                                     "activated": activate != Some(false),
                                     "active_session_path": app_control_create_active_session_path(
                                         activate,
@@ -74627,17 +74690,19 @@ async fn process_pending_app_control_requests(
                     let cwd_for_task = cwd.clone();
                     let title_hint_for_task = title_hint.clone();
                     let terminal_appearance_for_task = terminal_appearance.clone();
+                    let launch_for_task = launch_options.clone();
                     let outcome = run_dedicated_interactive_request_io(
                         "app_control_create_terminal_local",
                         &home,
                         move || {
                             ensure_daemon_running(&endpoint)?;
-                            start_local_session_at_with_terminal_appearance(
+                            start_local_session_with_launch_options(
                                 &endpoint,
                                 requested_kind,
                                 cwd_for_task.as_deref(),
                                 title_hint_for_task.as_deref(),
                                 Some(&terminal_appearance_for_task),
+                                &launch_for_task,
                             )
                         },
                     )
@@ -74646,6 +74711,11 @@ async fn process_pending_app_control_requests(
                         Ok((snapshot, message)) => {
                             let created_path =
                                 app_control_created_session_path(&snapshot, message.as_deref());
+                            let launch_report = app_control_created_launch_report(
+                                &snapshot,
+                                created_path.as_deref(),
+                                &launch_options,
+                            );
                             state.with_mut(|shell| {
                                 shell.apply_created_terminal_snapshot(
                                     Ok((snapshot, message.clone())),
@@ -74665,6 +74735,7 @@ async fn process_pending_app_control_requests(
                                     "purpose": purpose,
                                     "agent_title": synthesized_title,
                                     "session_kind": requested_kind,
+                                    "launch": launch_report,
                                     "activated": activate != Some(false),
                                     "active_session_path": app_control_create_active_session_path(
                                         activate,
@@ -74779,8 +74850,10 @@ async fn process_pending_app_control_requests(
             // row (idle interactive prompt), then send. If it never becomes ready
             // within the timeout, send NOTHING and report not-ready so the caller
             // retries later or skips — never fire a prompt into a menu/busy/update
-            // surface. Readiness policy = terminal_chunk_has_current_codex_input_row
-            // (the same recognizer the surface-health uses), kept as SSOT here.
+            // surface. Readiness policy = terminal_chunk_has_agent_composer_row,
+            // which recognizes EVERY registered agent CLI's composer glyph (codex
+            // `›`, Claude Code `❯`). With only codex's, a claude-code row was never
+            // ready and its prompt was never sent (live, guihost 2026-08-06).
             let (endpoint, runtime_session_path, trace_home) = state.with(|shell| {
                 (
                     shell.bootstrap.server_endpoint.clone(),
@@ -74817,7 +74890,7 @@ async fn process_pending_app_control_requests(
                     trace_home.as_path(),
                 )
                 .await
-                    && terminal_chunk_has_current_codex_input_row(&screen)
+                    && terminal_chunk_has_agent_composer_row(&screen)
                 {
                     prompt_shown = true;
                     break;
@@ -152337,6 +152410,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                agent_launch_options: Default::default(),
             }],
             &expanded_paths,
         );
@@ -152405,6 +152479,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let rows = merged_sidebar_rows(&[], &[], &[], &[session.clone()], &expanded_paths);
         let live_row = rows
@@ -152600,6 +152675,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                agent_launch_options: Default::default(),
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -152705,6 +152781,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                agent_launch_options: Default::default(),
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -152788,6 +152865,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                agent_launch_options: Default::default(),
             }],
             &HashSet::from([
                 "__live_sessions__".to_string(),
@@ -152911,6 +152989,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                agent_launch_options: Default::default(),
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -152984,6 +153063,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                agent_launch_options: Default::default(),
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -153089,6 +153169,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                agent_launch_options: Default::default(),
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -153586,6 +153667,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                agent_launch_options: Default::default(),
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -153678,6 +153760,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let label = live_session_label(&remote_machines, &session, &HashMap::new());
         assert_eq!(label, "Stabilize daemon resume path");
@@ -154077,6 +154160,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert_eq!(
             resolved_session_title(&shell, &session).as_deref(),
@@ -154124,6 +154208,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert!(supports_generated_session_copy(&session));
     }
@@ -154163,6 +154248,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert!(!supports_generated_session_copy(&session));
     }
@@ -154202,6 +154288,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Document,
@@ -154271,6 +154358,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -154351,6 +154439,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -154423,6 +154512,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -154623,6 +154713,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -154689,6 +154780,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -154759,6 +154851,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -154826,6 +154919,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -154898,6 +154992,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                agent_launch_options: Default::default(),
             }],
             &HashSet::from(["__live_sessions__".to_string()]),
         );
@@ -154973,6 +155068,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                agent_launch_options: Default::default(),
             }],
             &HashSet::from([
                 "__live_sessions__".to_string(),
@@ -155034,6 +155130,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                agent_launch_options: Default::default(),
             }],
             &HashSet::from(["__live_sessions__".to_string()]),
         );
@@ -157447,6 +157544,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert!(session_is_idle_for_sidebar_icon(&session));
     }
@@ -157486,6 +157584,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert!(!session_is_idle_for_sidebar_icon(&session));
     }
@@ -157572,6 +157671,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         }];
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -157640,6 +157740,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let hits = search_content_hits(Some(&session), WorkspaceViewMode::Rendered, "Asia/Kolkata");
         assert_eq!(hits.len(), 1);
@@ -157690,6 +157791,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert!(content_search_query("/preview").is_none());
         assert!(
@@ -158041,6 +158143,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert!(visible_preview_blocks(&session).is_empty());
         assert!(!preview_summary_text(&session).contains("Launch command prepared"));
@@ -158092,6 +158195,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert!(remote_preview_needs_refresh(&session));
         assert!(remote_preview_should_auto_sync(&session));
@@ -158154,6 +158258,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert!(remote_preview_needs_refresh(&session));
         assert!(remote_preview_should_auto_sync(&session));
@@ -158219,6 +158324,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert!(remote_preview_needs_refresh(&session));
         assert!(!remote_preview_should_auto_sync(&session));
@@ -158282,6 +158388,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
 
         assert!(!preview_should_hide_stale_placeholder_content(&session));
@@ -158339,6 +158446,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
 
         assert!(!preview_should_hide_stale_placeholder_content(&session));
@@ -158390,6 +158498,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
 
         assert!(preview_should_hide_stale_placeholder_content(&session));
@@ -165973,6 +166082,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let inactive_session = ManagedSessionView {
             id: "inactive-session".to_string(),
@@ -166011,6 +166121,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -166811,6 +166922,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         }
     }
 
@@ -166947,6 +167059,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             pty_cols: None,
             pty_rows: None,
             working: None,
+            agent_launch_options: Default::default(),
         }
     }
 
@@ -167191,6 +167304,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         }
     }
     #[test]
@@ -168137,6 +168251,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let mut snapshot = ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -168203,6 +168318,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -168250,6 +168366,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let mut snapshot = ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -168420,6 +168537,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -169048,6 +169166,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -169127,6 +169246,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -169749,6 +169869,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let active_session = ManagedSessionView {
             id: "active".to_string(),
@@ -169784,6 +169905,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let row = test_sidebar_row("local://stale");
         let snapshot = RenderSnapshot {
@@ -169975,6 +170097,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -170166,6 +170289,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -170360,6 +170484,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -170558,6 +170683,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -170748,6 +170874,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
@@ -170938,6 +171065,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
@@ -171128,6 +171256,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let active_session = ManagedSessionView {
             id: "active".to_string(),
@@ -171163,6 +171292,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let row = test_sidebar_row("remote-session://guihost/idle");
         let snapshot = RenderSnapshot {
@@ -171356,6 +171486,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
@@ -171547,6 +171678,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let live_session = ManagedSessionView {
             id: "active-live".to_string(),
@@ -171582,6 +171714,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -172178,6 +172311,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -173699,6 +173833,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -173921,6 +174056,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -174648,6 +174784,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let codex_session = ManagedSessionView {
             id: "stored-live-codex".to_string(),
@@ -174686,6 +174823,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             apps: Vec::new(),
@@ -174891,6 +175029,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -174950,6 +175089,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -175077,6 +175217,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -175169,6 +175310,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let inactive_session = ManagedSessionView {
             id: "inactive".to_string(),
@@ -175221,6 +175363,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             apps: Vec::new(),
@@ -176667,6 +176810,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert!(is_remote_resume_agent_session(&session));
         session.source = SessionSource::Stored;
@@ -176718,6 +176862,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert_eq!(
             remote_resume_overlay_excerpt(&session).as_deref(),
@@ -176763,6 +176908,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert_eq!(remote_resume_overlay_excerpt(&session), None);
     }
@@ -176811,6 +176957,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert_eq!(
             remote_resume_overlay_seed_excerpt(&session).as_deref(),
@@ -176873,6 +177020,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert_eq!(remote_terminal_prefill_text(&session), None);
         assert_eq!(
@@ -176945,6 +177093,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         let sessions: Vec<&ManagedSessionView> = vec![&session];
         let index = RemoteSessionIndex::default();
@@ -177033,6 +177182,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         assert_eq!(
             local_terminal_prefill_text(&session).as_deref(),
@@ -177120,6 +177270,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            agent_launch_options: Default::default(),
         };
         // Primary fix: the local prefill source refuses the seed outright.
         assert_eq!(

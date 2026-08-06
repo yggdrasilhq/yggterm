@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-use yggterm_core::UiTheme;
+use yggterm_core::{AgentLaunchOptions, UiTheme};
 use yggui_contract::YgguiClipboardContents;
 
 use crate::SessionKind;
@@ -813,6 +813,15 @@ pub enum AppControlCommand {
         /// existing activate-on-create behavior.
         #[serde(default)]
         activate: Option<bool>,
+        /// What THIS launch asks of the agent CLI: `--model`,
+        /// `--permission-mode`. Per-launch only — it neither reads nor writes
+        /// the global `claude_code_extra_args` setting, because a delegate
+        /// asking for bypass must not mutate a setting the user owns.
+        ///
+        /// Refused rather than ignored on a non-agent kind; see
+        /// [`yggterm_core::AgentLaunchOptions::launch_tokens`].
+        #[serde(default)]
+        launch_options: Option<AgentLaunchOptions>,
     },
     SendTerminalInput {
         session_path: String,
@@ -3176,6 +3185,7 @@ mod tests {
                 purpose: None,
                 session_kind: Some(SessionKind::Shell),
                 activate: None,
+                launch_options: None,
             }
         );
 
@@ -3186,9 +3196,36 @@ mod tests {
             purpose: Some("reap leftovers".to_string()),
             session_kind: Some(SessionKind::Shell),
             activate: Some(false),
+            launch_options: None,
         };
         let round_tripped: AppControlCommand =
             serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(round_tripped, with);
+    }
+
+    /// Same cross-version duty for the delegate-launch options: an older build's
+    /// request must still parse, and a request that carries them must survive
+    /// the round trip rather than being silently dropped on the way to the row.
+    #[test]
+    fn a_create_terminal_request_round_trips_its_launch_options() {
+        let with = AppControlCommand::CreateTerminal {
+            machine_key: None,
+            cwd: Some("/tmp".to_string()),
+            title_hint: None,
+            purpose: Some("delegate".to_string()),
+            session_kind: Some(SessionKind::ClaudeCode),
+            activate: Some(false),
+            launch_options: Some(yggterm_core::AgentLaunchOptions {
+                model: Some("claude-opus-5".to_string()),
+                permission_mode: Some(yggterm_core::AgentPermissionMode::Bypass),
+            }),
+        };
+        let encoded = serde_json::to_string(&with).unwrap();
+        assert!(
+            encoded.contains("claude-opus-5") && encoded.contains("bypass"),
+            "the wire must carry the model and mode verbatim: {encoded}"
+        );
+        let round_tripped: AppControlCommand = serde_json::from_str(&encoded).unwrap();
         assert_eq!(round_tripped, with);
     }
 

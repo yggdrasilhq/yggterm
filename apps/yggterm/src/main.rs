@@ -911,7 +911,10 @@ fn print_server_app_help() {
   yggterm server app terminal send <session> (--data <data>|--stdin)
   yggterm server app terminal new [--kind <shell|codex|claude-code>] [--cwd <dir>] [--title <t>]
       [--machine-key <k>] [--no-activate] [--purpose <text>]
+      [--model <id>] [--permission-mode <default|plan|accept-edits|bypass>]
+      [--prompt <text>|--prompt-stdin]
       [--ephemeral (--ephemeral-owner-pid <pid> | --ephemeral-idle-ttl-secs <n>)]
+{delegate_usage}
   yggterm server app keytips <audit [--json]|show|hide>
   yggterm server app media answer <allow|deny-once|block-site> [--request <id>]
     answers the camera/microphone prompt `server app state` reports under
@@ -944,7 +947,10 @@ targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
   itself looks like a flag is refused rather than acted on.",
         // The web usage block is rendered by the plane's OWNER, so this help
         // and the headless binary's cannot document different verb sets.
-        web_usage = yggterm_server::web_usage_block("yggterm")
+        web_usage = yggterm_server::web_usage_block("yggterm"),
+        // Same rule for the delegate-launch flags: one owner renders
+        // them, both binaries print them under their own name.
+        delegate_usage = yggterm_server::delegate_launch_usage_block("yggterm")
     );
 }
 
@@ -2869,6 +2875,12 @@ fn main() -> Result<()> {
                             }
                         });
                         let activate = !args.iter().any(|arg| arg == "--no-activate");
+                        // Per-launch model / permission mode + the initial
+                        // prompt, all through the SHARED readers — a flag must
+                        // mean the same thing typed at either binary.
+                        let launch = yggterm_core::agent_launch_options_from_args(&args)
+                            .map_err(|message| anyhow::anyhow!(message))?;
+                        let prompt = yggterm_server::read_prompt(&args)?;
                         run_app_control_create_terminal_with_tenancy(
                             machine_key,
                             cwd,
@@ -2881,6 +2893,8 @@ fn main() -> Result<()> {
                             Some(yggterm_server::session_tenancy::agent_cli_create_terminal_tenancy(
                                 &args,
                             )?),
+                            &launch,
+                            prompt.as_deref(),
                             timeout_ms,
                         )
                     }

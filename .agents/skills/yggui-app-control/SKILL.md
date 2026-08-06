@@ -1136,6 +1136,44 @@ full-bleed and is blind to both panes (trap 11) and to native webviews
 `[data-ws-pinned-session]`/`[data-ws-pinned-tab]` placeholder rect against
 `[data-ws-page]`.
 
+## ★★★ Launching a DELEGATE session (integrated kinds — 3.0.39+)
+
+**⛔ Use the INTEGRATED kind, never `--kind shell` + a printf'd `claude …`**
+(owner directive 2026-08-06). `--kind claude-code`/`codex` rows carry the
+metadata that makes a row usable — title, purpose, machine, PID, session id,
+working state, resume — and are **born keep-alive**. The shell workaround throws
+all of that away, and every reason it used to exist is now closed:
+
+```bash
+LIVE_HOST=$(cat .agents/config/live-host)
+ssh "$LIVE_HOST" "~/.local/bin/yggterm-headless server app terminal new \
+  --kind claude-code --cwd /home/user/gh/yggterm --no-activate \
+  --purpose 'what this row is for' --title 'delegate-<job>' \
+  --model claude-opus-5 --permission-mode bypass \
+  --prompt-stdin < brief.md" 
+```
+
+| Flag | What it does |
+|---|---|
+| `--model <id>` | Pins THIS launch's model instead of inheriting the user's default. **REFUSED by name on `--kind shell`** and on an empty value. |
+| `--permission-mode` | `default\|plan\|accept-edits\|bypass`. Per-launch ONLY — never reads or writes the global `claude_code_extra_args`, and WINS over it. codex has no plan/accept-edits and says so rather than approximating. |
+| `--prompt` / `--prompt-stdin` | The opening prompt. Delivered once the CLI **echo-confirms** it is consuming input, as two writes (text, then a discrete Enter) — a single write with a trailing newline is paste-buffered by the CC TUI and never submits. |
+
+**Read the reply, do not assume.** `data.launch` reports `model`,
+`permission_mode`, `applied` and the real `launch_command`, **read back off the
+created row** — so a create that landed on an older daemon reads
+`applied:false` rather than lying. `prompt.delivered` says whether the prompt
+actually submitted; `submitted:false` is a real answer (the row exists, the CLI
+never became ready), not an error.
+
+- **No `--keep-alive` flag exists and none is needed** — agent CLI kinds are
+  born keep-alive. Verify on the row with `Runtime Persistence: keep-alive`.
+- **Remote works for claude-code** (`--machine-key <host>`; the options ride the
+  `YGGTERM_CC_EXTRA_ARGS` export). **Remote codex REFUSES** the options by
+  name — that lane has no forwarding, so it says so instead of dropping them.
+- Still declare tenancy for a probe row: `--ephemeral --ephemeral-idle-ttl-secs
+  <n>`, and `server app session remove <path>` when done (`docs/agent-row-hygiene.md`).
+
 ## Terminal Probe (type text into live terminal)
 
 ```bash

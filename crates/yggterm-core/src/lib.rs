@@ -71,11 +71,12 @@ pub use yggui_contract::{
 };
 
 pub use agent_cli::{
-    AGENT_CLIS, AgentCliDescriptor, AgentStoreEntry, CODEX_FAMILY, RecordedStoreLiteral,
-    ResumeSelector, agent_cli_descriptor, agent_cli_for_store_path,
-    agent_cli_for_store_session_file, all_agent_cli_store_path_fragments,
-    store_home_dir_name_is_any, store_literal_scan_coverage, store_path_is_under_any,
-    unregistered_store_literals,
+    AGENT_CLIS, AGENT_PERMISSION_MODE_NAMES, AgentCliDescriptor, AgentLaunchOptions,
+    AgentPermissionMode, AgentStoreEntry, CODEX_FAMILY, FlagArity, OverriddenBy,
+    RecordedStoreLiteral, ResumeSelector, agent_cli_descriptor, agent_cli_for_store_path,
+    agent_cli_for_store_session_file, agent_launch_options_from_args,
+    all_agent_cli_store_path_fragments, store_home_dir_name_is_any, store_literal_scan_coverage,
+    store_path_is_under_any, unregistered_store_literals,
 };
 pub use app_registry::{
     APP_REGISTRY_DIRNAME, AppManifest, AppVerb, app_registry_dir, scan_app_registry,

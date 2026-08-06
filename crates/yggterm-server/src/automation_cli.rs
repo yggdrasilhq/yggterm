@@ -51,6 +51,43 @@ use crate::session_tenancy::{CreateTerminalTenancy, CreatorStamp, EphemeralDecla
 /// non-trivial startup work, and an automation has all night.
 const PROMPT_READY_TIMEOUT_MS: u64 = 120_000;
 
+/// The delegate-launch flags on `server app terminal new`, owned ONCE so both
+/// binaries print the same text under their own name.
+///
+/// An agent that reads `--help` and does not see a verb concludes the build
+/// lacks it — the misdiagnosis that kept `--kind claude-code` unused for weeks
+/// while agents hand-rolled `--kind shell` workarounds instead.
+pub fn delegate_launch_usage_block(binary: &str) -> String {
+    format!(
+        "delegate launch (server app terminal new, agent CLI kinds only):
+  {binary} server app terminal new --kind claude-code --cwd <dir> --no-activate
+      --purpose <what-for> --model <id> --permission-mode bypass --prompt <text>
+
+  --model <id>              pins THIS launch's model instead of inheriting the
+                            user's default (which is the expensive tier a
+                            delegate exists to avoid). REFUSED on --kind shell.
+  --permission-mode <mode>  default | plan | accept-edits | bypass. bypass ⇒
+                            claude --dangerously-skip-permissions, codex
+                            --dangerously-bypass-approvals-and-sandbox. codex
+                            has no plan/accept-edits and says so. PER-LAUNCH:
+                            it never reads or writes the global
+                            claude_code_extra_args setting, and it wins over
+                            whatever that setting holds.
+  --prompt <text>           the opening prompt, delivered once the CLI
+                            ECHO-CONFIRMS it is consuming input, as two writes
+                            (text, then a discrete Enter). A single write with a
+                            trailing newline is paste-buffered by the CC TUI and
+                            never submits — that is why there is a verb for this.
+  --prompt-stdin            read it from stdin instead (no quoting to get wrong)
+
+  Agent CLI kinds are BORN keep-alive, so no --keep-alive flag is needed.
+  The reply's `launch` block reports what the ROW was born with — model,
+  permission_mode, applied, and the real launch_command — read back from the
+  created row rather than echoed, so a create that landed on an older daemon
+  reads applied:false instead of lying.\n"
+    )
+}
+
 pub fn automation_usage_block(binary: &str) -> String {
     format!(
         "automations (scheduled agent-CLI sessions — see docs/automations.md):
@@ -151,7 +188,14 @@ fn flag_u64(args: &[String], flag: &str) -> anyhow::Result<Option<u64>> {
         .transpose()
 }
 
-fn read_prompt(args: &[String]) -> anyhow::Result<Option<String>> {
+/// Read `--prompt <text>` / `--prompt-stdin`.
+///
+/// Public because `server app terminal new --prompt` reads the SAME two flags
+/// with the same stdin behaviour. Two readers would be two chances to disagree
+/// about which flag wins, and the delegate-launch path is the one place where a
+/// silently empty prompt means an agent session that starts and is asked
+/// nothing.
+pub fn read_prompt(args: &[String]) -> anyhow::Result<Option<String>> {
     if args.iter().any(|arg| arg == "--prompt-stdin") {
         let mut value = String::new();
         std::io::stdin()
