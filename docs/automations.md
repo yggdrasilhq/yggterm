@@ -31,8 +31,16 @@ sessions the way an automation needs to:
 server app terminal new --kind claude-code --cwd <dir> --machine-key <host> \
     --no-activate --purpose "automation:<id>" \
     --ephemeral --ephemeral-idle-ttl-secs <n>
-server app terminal send <session> --data <prompt>
+server app terminal submit <session> --stdin < brief.md
 ```
+
+⛔ **Not `terminal send` for the prompt.** An agent CLI's composer reads every
+`\r` as Enter, so a multi-line brief sent raw submits line 1 alone and leaves the
+rest as queued messages — measured live 2026-08-07, and `send` now refuses it by
+name for an agent row. `submit` waits for the composer to echo-confirm it is
+reading, wraps a multi-line prompt in bracketed paste, and submits the whole
+block as ONE message. `terminal new --prompt <text>` routes through the same
+code and is the one-call form.
 
 `--no-activate` IS detached. `--purpose` IS the tenancy record. `--ephemeral
 --ephemeral-idle-ttl-secs` IS the reaper, already running on an existing daemon

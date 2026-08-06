@@ -4,6 +4,29 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A multi-line brief now arrives as one message, not as line 1 plus a queue.**
+  Sending several lines to a Codex or Claude Code row wrote them as one Enter per
+  line: the first line was submitted on its own, the agent started working on
+  that fragment, and the rest piled up as queued messages it would pick up later
+  as unrelated follow-ups. `terminal send` now refuses a multi-line payload for
+  an agent row and names the verb that works, and `terminal submit` (and
+  `terminal new --prompt`, which is the delegate-launch path) wraps the text so
+  the whole block lands in the composer and submits together. Plain shells are
+  unchanged — there several lines are several commands, which was always right.
+
+- **Commands stopped being handed to a months-old copy of the app.** If the
+  install record still named an older version than the one you are running, every
+  command was quietly re-run by that older binary, so newer options were dropped
+  without a word — a session opened with "don't switch to it" switched to it
+  anyway, and one asked to clean itself up never did. `--version` could not show
+  this, because it is one of the few things the old copy never got to answer. A
+  newer build now refuses to hand its work down to an older one.
+
+- **The start page's two buttons actually remember now.** They kept your last
+  choice while the app was open and forgot it on the next launch, so the face you
+  saw on the first frame was always the default rather than what you use. Both
+  choices are written to the settings file and read back.
+
 - **Typing in the rename box no longer throws the caret to the end.** Renaming a
   row, or editing an SSH connect field, put the cursor at the end of the line
   after every single keystroke — so putting a `1.` in front of a name was

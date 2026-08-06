@@ -1222,6 +1222,15 @@ ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal focus '$S'"
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal send '$S' --data \$'continue\r'"
 ```
 
+⛔ **`send` REFUSES a multi-line payload into an agent CLI row**, by name:
+`{accepted:false, reason:"multiline_send_into_agent_cli"}`. An agent composer
+reads every `\r` as Enter, so a three-line brief submitted line 1 alone and left
+lines 2-3 as "Press up to edit queued messages" — measured live 2026-08-07 — while
+the old reply still said `accepted:true`. **Use `terminal submit` for anything with
+newlines**: it wraps the block in bracketed paste and submits it as ONE message.
+`--allow-multiline` restores the old N-separate-submits behaviour when that is
+genuinely what you want. A SHELL row is unaffected: there N lines are N commands.
+
 ### Arrow keys / menu navigation
 `send --data` is raw PTY bytes, so send escape sequences directly with bash `$'...'`.
 Down-arrow is `\x1b[B` (normal cursor mode) or `\x1bOB` (application cursor mode — check

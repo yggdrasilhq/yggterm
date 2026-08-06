@@ -74976,14 +74976,52 @@ async fn process_pending_app_control_requests(
                 }
             }
         }
-        AppControlCommand::SendTerminalInput { session_path, data } => {
-            let (endpoint, runtime_session_path, trace_home) = state.with(|shell| {
-                (
-                    shell.bootstrap.server_endpoint.clone(),
-                    app_control_terminal_input_write_path(shell, &session_path),
-                    perf_home_dir(&shell.bootstrap.settings_path),
-                )
-            });
+        AppControlCommand::SendTerminalInput {
+            session_path,
+            data,
+            allow_multiline,
+        } => {
+            let (endpoint, runtime_session_path, trace_home, target_is_agent_cli) =
+                state.with(|shell| {
+                    (
+                        shell.bootstrap.server_endpoint.clone(),
+                        app_control_terminal_input_write_path(shell, &session_path),
+                        perf_home_dir(&shell.bootstrap.settings_path),
+                        live_session_kind_for_path(shell, &session_path)
+                            .is_some_and(SessionKind::is_agent),
+                    )
+                });
+            // ⛔ The refusal. A payload with interior line breaks reaches an agent
+            // CLI's composer as one Enter PER LINE — measured live on guihost
+            // 2026-08-07: a three-line send submitted line 1 alone and left lines
+            // 2-3 as queued messages, while this very reply said `accepted: true`
+            // with a `chunk_count` of 3. Silently acting on a one-line fragment of
+            // a brief is the worst available behaviour, so it is refused BY NAME
+            // here rather than reported as success.
+            //
+            // A SHELL row is deliberately untouched: there N lines are N commands
+            // and that is correct (proven in the same measurement). The kind is
+            // what separates the two, which is why this is not a payload-only rule.
+            if app_control_send_refuses_multiline(target_is_agent_cli, allow_multiline, &data) {
+                AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "accepted": false,
+                        "session_path": session_path,
+                        "reason": yggterm_core::terminal_input::MULTILINE_SEND_REFUSAL_REASON,
+                        "detail": yggterm_core::terminal_input::MULTILINE_SEND_REFUSAL_DETAIL,
+                        "line_count": data
+                            .trim_end_matches(['\r', '\n'])
+                            .split(['\r', '\n'])
+                            .count(),
+                        "bytes": data.len(),
+                    })),
+                    error: None,
+                }
+            } else {
             let read_nudge_reason = app_control_terminal_input_read_nudge_reason(&data);
             match terminal_write_app_control_input_async(
                 endpoint,
@@ -75054,6 +75092,7 @@ async fn process_pending_app_control_requests(
                     })),
                     error: Some(error.to_string()),
                 },
+            }
             }
         }
         AppControlCommand::SubmitTerminalPrompt {
@@ -75158,7 +75197,21 @@ async fn process_pending_app_control_requests(
                 // Type the text first, then submit with a DISTINCT Enter — codex treats
                 // a \r concatenated with the text in one write as a pasted newline
                 // (composer content), not a submit (verified live 2026-06-04).
+                //
+                // ⛔ And a MULTI-LINE prompt must be wrapped in bracketed paste, or
+                // its interior newlines are Enters too: trimming only the TRAILING
+                // ones left every delegate brief arriving as line 1 submitted alone
+                // plus N-1 queued messages. Measured on guihost 2026-08-07, and the
+                // remedy measured in the same session — the composer held all three
+                // lines unsubmitted, then the discrete Enter below submitted them as
+                // ONE message. `--prompt` on `terminal new` routes here too, so this
+                // is the fix for the delegate-launch path, not just for `submit`.
                 let text = data.trim_end_matches(['\r', '\n']).to_string();
+                let text = if yggterm_core::terminal_input::payload_has_interior_line_break(&text) {
+                    yggterm_core::terminal_input::wrap_as_bracketed_paste(&text)
+                } else {
+                    text
+                };
                 if !text.is_empty() {
                     let _ = terminal_write_app_control_input_async(
                         endpoint.clone(),
@@ -101859,6 +101912,39 @@ pub(crate) fn remote_session_starts_new_agent(session: &ManagedSessionView) -> b
     let action = metadata_value(session, "Remote Launch Action");
     yggterm_server::agent_start_subcommand_is_registered(&action)
 }
+/// The kind of the LIVE session a caller named, through the one path-comparison
+/// owner.
+///
+/// ⚠ Raw `==` would be wrong here: a caller can spell a session `local::<id>`
+/// while the live record spells it `local://<id>`, which is the entire reason
+/// [`normalize_live_session_path`] exists. Comparing raw read false for exactly
+/// those rows once already (the rename persist gate, 2026-08-06), and here a
+/// false read would let a multi-line brief through into an agent composer.
+fn live_session_kind_for_path(shell: &ShellState, session_path: &str) -> Option<SessionKind> {
+    let wanted = normalize_live_session_path(session_path);
+    shell
+        .server
+        .live_sessions()
+        .iter()
+        .find(|session| normalize_live_session_path(&session.session_path) == wanted)
+        .map(|session| session.kind)
+}
+
+/// Whether `terminal send` must refuse this payload rather than fire N Enters.
+///
+/// Split out so the rule can be tested without a running GUI: the three inputs
+/// are exactly what the decision is made from, and the negative arms (a shell
+/// row, an opted-in caller, a single line) are as load-bearing as the positive.
+fn app_control_send_refuses_multiline(
+    target_is_agent_cli: bool,
+    allow_multiline: bool,
+    data: &str,
+) -> bool {
+    target_is_agent_cli
+        && !allow_multiline
+        && yggterm_core::terminal_input::payload_has_interior_line_break(data)
+}
+
 fn app_control_terminal_input_write_path(shell: &ShellState, session_path: &str) -> String {
     terminal_input_write_path_for_runtime(
         session_path,
@@ -102934,6 +103020,14 @@ fn app_control_terminal_input_read_nudge_reason(data: &str) -> &'static str {
 
 fn app_control_terminal_input_write_chunks(data: &str) -> Vec<String> {
     let data = app_control_terminal_input_payload_for_pty(data);
+    // A bracketed-paste block is ONE chunk. The per-line split exists to pace
+    // Enters, and there are no Enters inside a paste — the receiver is in paste
+    // mode, so every `\r` between the markers is a soft newline in its composer.
+    // Splitting one would also strand the markers in separate writes for no
+    // gain, and a settle delay mid-paste is latency with nothing to settle.
+    if yggterm_core::terminal_input::is_bracketed_paste_block(&data) {
+        return vec![data];
+    }
     let mut chunks = Vec::new();
     let mut start_ix = 0usize;
     for (ix, ch) in data.char_indices() {
@@ -172619,6 +172713,40 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             &generic_error
         ));
     }
+    // ⛔ The refusal, and its three negative controls — each of which, if it
+    // flipped, would break something that WORKS today.
+    //
+    // Measured live on guihost 2026-08-07 against a real Claude Code TUI: a
+    // three-line `terminal send` submitted line 1 alone and left lines 2-3 as
+    // "Press up to edit queued messages", while the reply reported
+    // `accepted: true` with `chunk_count: 3`. The same payload into a plain bash
+    // row ran all three commands correctly — which is why the SESSION KIND, not
+    // the payload alone, decides.
+    #[test]
+    fn a_multiline_send_is_refused_for_an_agent_cli_and_allowed_for_a_shell() {
+        let brief = "1. read the doors\n2. take item one\n3. report back\n";
+
+        assert!(
+            app_control_send_refuses_multiline(true, false, brief),
+            "a brief into an agent composer is one Enter per line — refuse it by name"
+        );
+
+        // NEGATIVE 1 — a shell row. N lines are N commands and that is correct.
+        assert!(
+            !app_control_send_refuses_multiline(false, false, brief),
+            "a shell row must keep accepting multi-line sends; heredocs and \
+             command batches depend on it"
+        );
+        // NEGATIVE 2 — the caller opted in, knowing it fires N submits.
+        assert!(!app_control_send_refuses_multiline(true, true, brief));
+        // NEGATIVE 3 — the ordinary single-line drive, with and without Enter.
+        assert!(!app_control_send_refuses_multiline(true, false, "/status\r"));
+        assert!(!app_control_send_refuses_multiline(true, false, "/status"));
+        assert!(!app_control_send_refuses_multiline(true, false, "\r"));
+        // A bare interrupt carries no line break and must still reach a busy agent.
+        assert!(!app_control_send_refuses_multiline(true, false, "\u{3}"));
+    }
+
     #[test]
     fn app_control_terminal_input_splits_interrupt_from_following_bytes() {
         assert_eq!(
@@ -172654,6 +172782,23 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "PY\r".to_string()
             ],
             "multiline app-control pastes must be paced as line writes with terminal-enter semantics, so background heredocs cannot block the PTY echo path before the terminator line"
+        );
+        // A bracketed-paste block stays ONE write. Splitting it would put a 25 ms
+        // settle in the middle of a paste — and the whole reason the block exists
+        // is that there is no Enter inside it to pace.
+        let pasted = format!(
+            "{}line one\nline two\nline three{}",
+            yggterm_core::terminal_input::BRACKETED_PASTE_BEGIN,
+            yggterm_core::terminal_input::BRACKETED_PASTE_END
+        );
+        assert_eq!(
+            app_control_terminal_input_write_chunks(&pasted),
+            vec![format!(
+                "{}line one\rline two\rline three{}",
+                yggterm_core::terminal_input::BRACKETED_PASTE_BEGIN,
+                yggterm_core::terminal_input::BRACKETED_PASTE_END
+            )],
+            "a bracketed-paste block is one write; its interior \\r are soft newlines in the composer, not Enters"
         );
         assert_eq!(
             app_control_terminal_input_read_nudge_reason("echo ok\r"),
