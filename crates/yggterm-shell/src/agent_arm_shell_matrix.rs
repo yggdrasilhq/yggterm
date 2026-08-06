@@ -333,6 +333,7 @@ impl ShellArm {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }
     }
 

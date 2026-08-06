@@ -955,6 +955,7 @@ fn persisted_live_session_from_managed(
         ephemeral: session_metadata_value(session, EPHEMERAL_METADATA_LABEL),
         agent_launch_options: session.agent_launch_options.clone(),
         title_is_explicit: session.title_is_explicit,
+        outline_prefix: session.outline_prefix.clone(),
     })
 }
 
@@ -2565,6 +2566,10 @@ pub struct SnapshotSessionView {
     /// deploy — the very failure this flag exists to end.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub title_is_explicit: bool,
+    /// On the SNAPSHOT so the outline survives a daemon handover, exactly like
+    /// the launch options and the title's provenance beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outline_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2858,6 +2863,11 @@ pub struct PersistedLiveSession {
     /// which is the pre-existing behaviour rather than a new guess.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub title_is_explicit: bool,
+    /// The row's sidebar outline position. Persisted for the same reason the
+    /// title's provenance is: a row outlives many daemons, and an outline that
+    /// cannot survive a restart is not an outline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outline_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2952,6 +2962,25 @@ pub struct ManagedSessionView {
     /// ⇒ an explicit title OUTRANKS every derived source; a derived title is a
     /// FALLBACK consulted only when no explicit title was ever set.
     pub title_is_explicit: bool,
+    /// The row's position in the user's sidebar outline (`2. versestore:`),
+    /// stored SEPARATELY from the title and composed with it at render time.
+    ///
+    /// **Separate because the two facts have different owners and different
+    /// lifetimes.** The title says what the session is DOING and the agent CLI
+    /// rewrites it whenever it likes — Claude Code re-titles its own session
+    /// once it has one, which silently destroyed every outline number the
+    /// orchestrator set (`2. versestore: panels + research` became "Initialize
+    /// versestore panels research lobe", measured on the owner's sidebar
+    /// 2026-08-06). The prefix says WHERE THE ROW SITS, which only the user and
+    /// the spawn hierarchy know.
+    ///
+    /// ⭐ Composing instead of overwriting keeps both facts and makes the
+    /// outline undecayable: a CLI rename can no longer destroy a number,
+    /// because it never touches this field. That deletes the standing
+    /// instruction for every session to notice its row was renamed and
+    /// re-assert its prefix by hand — janitorial work the product should not
+    /// be asking anyone to remember.
+    pub outline_prefix: Option<String>,
 }
 
 /// The one place that decides whether a polled working flag differs from what a
@@ -4334,6 +4363,19 @@ impl YggtermServer {
         self.sessions
             .get(session_path)
             .is_some_and(|session| session.title_is_explicit && !session.title.trim().is_empty())
+    }
+
+    /// Set (or clear, with an empty value) the row's outline position.
+    ///
+    /// Deliberately NOT part of the title: a session sets this ONCE and never
+    /// thinks about it again, however many times its CLI re-titles itself.
+    pub fn set_session_outline_prefix(&mut self, session_path: &str, prefix: &str) -> bool {
+        let prefix = prefix.trim();
+        let Some(session) = self.sessions.get_mut(session_path) else {
+            return false;
+        };
+        session.outline_prefix = (!prefix.is_empty()).then(|| prefix.to_string());
+        true
     }
 
     /// Set a title a HUMAN chose — `terminal new --title`, `session rename`.
@@ -7633,6 +7675,7 @@ impl YggtermServer {
             ephemeral,
             agent_launch_options,
             title_is_explicit,
+            outline_prefix,
         } = live;
         let storage_path =
             storage_path.or_else(|| is_local_codex_storage_session_path(&key).then(|| key.clone()));
@@ -23694,6 +23737,7 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
         working: session.working,
         agent_launch_options: session.agent_launch_options,
         title_is_explicit: session.title_is_explicit,
+        outline_prefix: session.outline_prefix.clone(),
     }
 }
 
@@ -23808,6 +23852,7 @@ fn snapshot_live_session_view(session: &ManagedSessionView) -> SnapshotSessionVi
         working: session.working,
         agent_launch_options: session.agent_launch_options.clone(),
         title_is_explicit: session.title_is_explicit,
+        outline_prefix: session.outline_prefix.clone(),
     }
 }
 
@@ -23945,6 +23990,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
         session_path: session.session_path,
         title: session.title,
         title_is_explicit: session.title_is_explicit,
+        outline_prefix: session.outline_prefix.clone(),
         kind: session.kind,
         host_label: session.host_label,
         source,
@@ -24295,6 +24341,7 @@ fn build_session(
         // title. An explicit one is applied by `set_session_title_explicit`
         // after the row exists, so there is one door for provenance.
         title_is_explicit: false,
+        outline_prefix: None,
         kind,
         host_label: host_label.clone(),
         source: SessionSource::Stored,
@@ -24542,6 +24589,7 @@ fn build_live_session_with_launch_options(
         // Same rule as `build_session`: birth is always derived, and an
         // explicit `--title` is applied through the one door afterwards.
         title_is_explicit: false,
+        outline_prefix: None,
         kind,
         host_label: target.label.clone(),
         source,
@@ -25894,6 +25942,7 @@ mod recipe_tests {
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }
     }
 
@@ -26427,6 +26476,7 @@ mod tests {
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         assert!(
             super::persisted_live_session_is_recoverable(&cc),
@@ -26585,6 +26635,7 @@ mod tests {
             ephemeral: None,
             agent_launch_options: options.clone(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let round_tripped: crate::PersistedLiveSession =
             serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
@@ -27559,6 +27610,7 @@ mod tests {
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }
     }
 
@@ -29798,6 +29850,7 @@ mod tests {
                 working: None,
                 agent_launch_options: AgentLaunchOptions::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             },
         );
 
@@ -29903,6 +29956,7 @@ mod tests {
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         let inactive = ManagedSessionView {
             id: "inactive".to_string(),
@@ -29957,6 +30011,7 @@ mod tests {
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         server.active_session_path = Some(active.session_path.clone());
         server.live_session_order =
@@ -30760,6 +30815,7 @@ terminal_window_id: None,
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
 
         let wrong_runtime = b"https://llm.example.com/v1/chat/completions with auth Bearer sk-1234.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\xe2\x80\xba Improve documentation in @filename\n\n  gpt-5.4 high fast \xc2\xb7 100% left \xc2\xb7 ~\n";
@@ -33616,6 +33672,7 @@ terminal_window_id: None,
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         assert_eq!(
@@ -33930,6 +33987,7 @@ terminal_window_id: None,
                     ephemeral: None,
                     agent_launch_options: Default::default(),
                     title_is_explicit: false,
+                    outline_prefix: None,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -33993,6 +34051,7 @@ terminal_window_id: None,
                     ephemeral: None,
                     agent_launch_options: Default::default(),
                     title_is_explicit: false,
+                    outline_prefix: None,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -34084,6 +34143,7 @@ terminal_window_id: None,
                     ephemeral: None,
                     agent_launch_options: Default::default(),
                     title_is_explicit: false,
+                    outline_prefix: None,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -34179,6 +34239,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         let local_shell = server.start_local_session(
             SessionKind::Shell,
@@ -34349,6 +34410,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         assert!(server.represents_terminal_runtime_key(&kept_remote));
         assert!(
@@ -34440,6 +34502,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
 
         // Our own rows, in the user's arrangement.
@@ -34511,6 +34574,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
         server.restore_live_session(row("mine"));
 
@@ -34854,6 +34918,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         let session = server
@@ -34982,6 +35047,7 @@ terminal_window_id: None,
                     ephemeral: None,
                     agent_launch_options: Default::default(),
                     title_is_explicit: false,
+                    outline_prefix: None,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -35035,6 +35101,7 @@ terminal_window_id: None,
                     ephemeral: None,
                     agent_launch_options: Default::default(),
                     title_is_explicit: false,
+                    outline_prefix: None,
                 }],
                 session_pty_grids: Vec::new(),
             },
@@ -35096,6 +35163,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
 
         assert!(
@@ -35209,6 +35277,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         server.open_or_focus_session(
             SessionKind::ClaudeCode,
@@ -35557,6 +35626,7 @@ terminal_window_id: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
+                        outline_prefix: None,
                     },
                     PersistedLiveSession {
                         key: "local://update-shell".to_string(),
@@ -35574,6 +35644,7 @@ terminal_window_id: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
+                        outline_prefix: None,
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -35637,6 +35708,7 @@ terminal_window_id: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
+                        outline_prefix: None,
                     },
                     PersistedLiveSession {
                         key: "codex-runtime://dead-codex".to_string(),
@@ -35654,6 +35726,7 @@ terminal_window_id: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
+                        outline_prefix: None,
                     },
                     PersistedLiveSession {
                         key: "document::dead-doc".to_string(),
@@ -35671,6 +35744,7 @@ terminal_window_id: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
+                        outline_prefix: None,
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -35746,6 +35820,7 @@ terminal_window_id: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
+                        outline_prefix: None,
                     },
                     PersistedLiveSession {
                         key: "local::second-shell".to_string(),
@@ -35763,6 +35838,7 @@ terminal_window_id: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
+                        outline_prefix: None,
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -35892,6 +35968,7 @@ terminal_window_id: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
+                        outline_prefix: None,
                     },
                     PersistedLiveSession {
                         key: second_path.clone(),
@@ -35909,6 +35986,7 @@ terminal_window_id: None,
                         ephemeral: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
+                        outline_prefix: None,
                     },
                 ],
                 session_pty_grids: Vec::new(),
@@ -36063,6 +36141,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         assert!(!server.sessions.contains_key(storage_path));
@@ -36119,6 +36198,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         let live = server
@@ -36189,6 +36269,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         let session = server.sessions.get(key).expect("restored remote cc row");
@@ -36253,6 +36334,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         server.request_terminal_launch_for_path(runtime_key);
 
@@ -36359,6 +36441,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         server.request_terminal_launch_for_path(&runtime_key);
 
@@ -36485,6 +36568,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         assert!(server.apply_codex_runtime_identity_to_live_session(
@@ -36648,6 +36732,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         assert!(server.apply_codex_runtime_identity_to_live_session(
             &runtime_key,
@@ -36730,6 +36815,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         assert!(
@@ -36836,6 +36922,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         server.request_terminal_launch_for_path(runtime_key);
 
@@ -36987,6 +37074,7 @@ terminal_window_id: None,
                 working: None,
                 agent_launch_options: AgentLaunchOptions::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             },
         );
         server.live_session_order = vec![stale_path.to_string()];
@@ -37088,6 +37176,7 @@ terminal_window_id: None,
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
 
         // The producers the daemon actually uses, for the very same session.
@@ -37206,6 +37295,7 @@ terminal_window_id: None,
             working: None,
             agent_launch_options: AgentLaunchOptions::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         };
 
         let tree = SessionNode {
@@ -37583,6 +37673,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         let session = server
@@ -37656,6 +37747,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         let session = server
@@ -37955,6 +38047,7 @@ terminal_window_id: None,
                 ephemeral: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             });
 
             let session = server
@@ -38060,6 +38153,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         let session = server
@@ -38154,6 +38248,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         let session = server
@@ -38283,6 +38378,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         server.active_session_path = Some("remote-session://dev/fresh-codex".to_string());
         server.active_view_mode = WorkspaceViewMode::Terminal;
@@ -38356,6 +38452,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         server.active_session_path = Some("remote-session://dev/synthetic-runtime".to_string());
         server.active_view_mode = WorkspaceViewMode::Terminal;
@@ -38440,6 +38537,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         assert_eq!(
@@ -38528,6 +38626,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         server.restore_live_session(PersistedLiveSession {
             key: "remote-session://jojo/live-2".to_string(),
@@ -38545,6 +38644,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         let targets = server.remote_shutdown_targets();
@@ -38622,6 +38722,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         let (machine, session_id) = server
@@ -38993,6 +39094,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         let result = server.refresh_session_preview_from_source("remote-session://dev/abc123");
@@ -39036,6 +39138,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         server.active_session_path = Some(path.to_string());
@@ -39083,6 +39186,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         server.restore_live_session(PersistedLiveSession {
             key: "local://shell".to_string(),
@@ -39100,6 +39204,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         // No session with an interactive prompt may be stopped by typing into
@@ -39145,6 +39250,7 @@ terminal_window_id: None,
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
 
         assert!(

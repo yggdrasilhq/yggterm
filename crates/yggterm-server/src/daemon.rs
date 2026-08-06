@@ -1504,6 +1504,7 @@ fn persisted_live_session_from_preserved_owner_snapshot(
         id: session.id.clone(),
         title: session.title.clone(),
         title_is_explicit: session.title_is_explicit,
+        outline_prefix: session.outline_prefix.clone(),
         kind: session.kind,
         keep_alive: snapshot_session_keep_alive(session),
         ssh_target,
@@ -15972,6 +15973,7 @@ mod tests {
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }
     }
 
@@ -19086,6 +19088,7 @@ mod tests {
             working: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         }
     }
 
@@ -21218,6 +21221,7 @@ mod tests {
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         let unkept_update_runtime = remote_scanned_session_path("dev", "temporary-update");
         server.restore_live_session(PersistedLiveSession {
@@ -21236,6 +21240,7 @@ mod tests {
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
         let all_registry_keys = owner_registry_keys.clone();
@@ -21358,6 +21363,7 @@ mod tests {
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         let terminals = TerminalManager::new();
 
@@ -21398,6 +21404,7 @@ mod tests {
             ephemeral: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
+            outline_prefix: None,
         });
         let terminals = TerminalManager::new();
 
@@ -21439,6 +21446,7 @@ mod tests {
                 ephemeral: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             });
         }
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
@@ -21488,6 +21496,7 @@ mod tests {
                 ephemeral: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             });
         }
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
@@ -22428,6 +22437,7 @@ mod tests {
                 ephemeral: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
+                outline_prefix: None,
             }],
             session_pty_grids: Vec::new(),
         };
