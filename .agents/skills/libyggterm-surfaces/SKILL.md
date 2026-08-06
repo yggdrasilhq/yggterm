@@ -153,6 +153,25 @@ That is a whole viewport-surface app. A heavyweight app adds a sidebar
 contribution (below), cwd-tree documents, and a chooser — each via the same OSC
 channel plus a loopback control endpoint for actions.
 
+### Reaching the human is a VERB, not a fifth surface
+
+An app that wants to tell the user something calls
+`$YGGTERM_BIN server app notify "<title>" "<message>" [--tone …] [--session <row-path>]
+[--job <key> --progress 0..100]`. It is the same door an agent, a
+cron job and yggterm's own events use, so an app's toast and the shell's are the same
+object and the human cannot be made to care which raised it. **Do not invent an OSC for
+notifications and do not draw your own banner in a pane** — one fan-out owns in-app
+toast + system notification + chime, and each is gated by the user's own setting. ⛔ It
+informs and cannot ask; anything needing an answer is a modal the shell owns (the
+`fido2` dialog is the worked example of that split).
+
+⚠ `--session` wants the GUI's **row path**, and `$YGGTERM_SESSION_ID` is the owning
+daemon's key — the same session reads `cc-runtime://<uuid>` inside the row and
+`remote-cc://<machine>/<uuid>` in a GUI on another host. Match by UUID against
+`server app rows` rather than pasting the env var. Full flag table, the recipes, and
+the ⛔ "an untargeted notify lands on the user's screen" rule:
+`.agents/skills/yggui-app-control/SKILL.md` §Notifications.
+
 ## Sidebar-contribution surface — SHIPPED 2026-07-09, live-proven
 
 Built and live-proven on jojo (yggterm `010b9957`, ychrome `8452654`). ychrome's
@@ -941,3 +960,5 @@ retirement): [[campaign-native-vault-client]] and ychrome's `docs/password-manag
   extraction-not-construction.
 - A secret in a sidebar schema or an OSC payload. → the app performs the action;
   only non-secret metadata crosses the wire.
+- An app-drawn banner, or a new OSC, to tell the user something. →
+  `server app notify` (one fan-out, one set of user settings, one object).
