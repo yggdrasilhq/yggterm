@@ -54,6 +54,27 @@ copies.
 
 ## Third parties only he can chase
 
+- **Google Play identity verification is his, and it gates every listing** — the
+  developer account exists and is paid (ID `7834754661078735260`), but Google
+  locks *Create app* until three checks pass: government ID, access to an Android
+  device, and the contact phone. Only he can present a document. Decided
+  2026-08-08: **passport, not Aadhaar** (Aadhaar is not Google's to hold, and the
+  passport survives the US move) — with one thing to check first, that the
+  passport's NAME matches the payments profile, since Google verifies against
+  documents. → `~/data/fingraph/owner-window/fingraph-playstore.md`.
+  *Meanwhile:* nothing in either repo waits on it; the campaign has no Play work
+  that verification unblocks.
+
+- **The fake `Anthony Gestapo` US payments profile wants closing, in a NORMAL
+  browser** — profile `3778-9171-5739`, made years ago, holds no payment methods
+  and gates nothing, but it is a false identity record on the account that is
+  about to be identity-verified. `Close payments profile` exists in its Settings
+  and raises a Google re-auth that never opens the close flow on an agent
+  surface. → `~/data/fingraph/owner-window/fingraph-playstore.md`.
+  *Meanwhile:* it blocks nothing, so the relay simply does not touch it.
+
+
+
 - **GitHub Support ticket 4622345** — the privacy force-push shrank the
   discoverable surface and revoked nothing; pre-rewrite SHAs were still fetchable
   after the push. Only the ticket closes it. → campaign memory
