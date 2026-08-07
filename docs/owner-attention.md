@@ -74,7 +74,7 @@ copies.
 ## Nothing is waiting on him for these, and they are the relay's actual queue
 
 Said explicitly because the tab is easier to read when it is short: everything
-else open in either repo is unattended work — the daemon reaper, the cross-origin
+else open in either repo is unattended work — the cross-origin
 frame, the view-swap stall, the passkey shim's scope, the stranded control port,
 the flaky `daemon_staleness` pair, the yedit document-surface regression, the
 Android `#[cfg]` gate, the WebKit popup blocker. The relay takes those in
