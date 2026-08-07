@@ -92,6 +92,78 @@ Field context: `~/data/atlasStore/graph/notes/indiapost-rti-a-booking-run-2026-0
 site-lore `app.indiapost.gov.in` slug `drop-off-booked-and-paid-surcharge-and-input-rungs`.
 
 
+## ⛔⛔ REGRESSION: A YEDIT ROW SHOWS ITS TERMINAL WHERE ITS DOCUMENT SHOULD BE — and the titlebar says Document
+
+**Status:** OPEN
+
+Owner-reported 2026-08-07 with a screenshot, called an emergency: *"yedit switching
+views does not work. The edit view is not working. This is a regression."*
+
+**What he sees.** The `New Yedit` row is open. The titlebar switch reads
+`Document | Terminal` with **Document selected**. The Yedit RAIL renders correctly
+on the right (Markdown|Split|Text slider, the FILES list). The main viewport shows
+**the bash prompt**, with `yedit: document surface opened` printed twice — he ran
+the command again trying to get his editor back.
+
+### The measurements, live on jojo at 3.0.48
+
+| probe | answer |
+|---|---|
+| yedit daemon | alive, `GET /ping` → `{"ok":true,"app_name":"Yedit","document_version":"53:false"}`, with and without a query string |
+| the declare | `terminal_runtime app_declare_ingested … verb:"sidebar"` fires on EVERY `yedit` run (14:58:20, 14:58:51, 15:17:25) |
+| the contribution | ALIVE — the rail is on screen, and the right-rail element measures 278×1200 |
+| `[data-document-surface]` | ⛔ **absent from the DOM entirely** |
+| the terminal host's `data-document-surface-owns-viewport` | ⛔ **`"true"`** |
+| `split_view` | `{"active_group_id": null, "groups": []}` — no split, so the split branch is not eating it |
+| `server app state` `active_session_path` | the yedit row |
+
+### ⭐ THE CONTRADICTION IS THE BUG, AND IT IS ONE LINE APART
+
+Two derivations of *"is the document surface showing"*, both documented as sharing
+one owner, disagreeing at the same instant on the same session:
+
+- `data-document-surface-owns-viewport` (`shell.rs` ~91339) reads the LIVE state —
+  `state.read().document_surface_visible_for(&host_session_path)` → **true**. It is
+  true enough that the terminal host is put on `pointer-events:none` because of it,
+  which is why the viewport also feels dead to the mouse.
+- The mount gate (`shell.rs` ~88519) reads the SNAPSHOT —
+  `snapshot.document_surfaces.get(path).is_some_and(|s| s.pane.visible)` → **false**,
+  so `DocumentSurfaceBody` never mounts.
+
+`toast_anchor` (`shell.rs` ~17095) reads the snapshot too and independently agrees
+it is false. So the snapshot's `document_surfaces` map genuinely lacks a visible
+entry for a session whose live derivation says it has one. Both are built from
+`document_surface_visible_for`; the snapshot builds its map only for `co_visible`
+= the active session + split members (`shell.rs` ~18615). **Start there: something
+makes the snapshot skip the row it is actively rendering.**
+
+⇒ The user-visible shape of the defect: the chrome, the pointer policy and the
+titlebar all behave as if the document surface owns the viewport, and no document
+surface exists. The terminal is not "showing through" — it is what was always
+there, now unclickable.
+
+### ⛔ THREE REMEDIES TRIED, ALL FALSIFIED — do not re-derive them
+- **`yedit --close` then `yedit`** (a fresh declare from a clean slate): no change.
+- **Switching to another row and back** (forces a fresh snapshot, so this rules out
+  simple snapshot staleness): no change.
+- **Re-running `yedit`** repeatedly: the daemon ingests each declare; the GUI never
+  creates a second contribution because it still holds the first.
+
+### ⚠ WHAT I COULD NOT SEPARATE, AND SAY SO
+Three GUI restarts (3.0.46 → 3.0.47 → 3.0.48) happened before he reported this, so
+**this session may have caused it**. Against that: the rail survives those restarts
+and rebuilds correctly, and nothing in the three changes touches the document
+surface. Not settled either way — reproduce on a GUI that has not been bumped
+before believing either story.
+
+### ⚠ AND AN INSTRUMENT GAP THAT COST TIME HERE
+`server app state` exposes **no** `sidebar_contributions` and **no**
+`document_surfaces`, so the two disagreeing derivations can only be compared by
+dom-eval on a `data-` attribute plus inference. Both maps belong in the state dump;
+without them, this class is diagnosed by guessing selectors. ⚠ And `data-app-pane-id`
+does NOT exist — the real hooks are `data-app-pane-toolbar` / `-tab` / `-input`; a
+probe built on the invented name reports an empty rail over a rail that is on screen.
+
 ## ⭐ OPERATOR-REPORTED, LIVES IN ychrome: a vault CARD item is unreadable and uneditable in the sidebar
 
 **Status:** OPEN

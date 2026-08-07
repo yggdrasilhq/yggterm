@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A notification no longer sits flush against the titlebar.** With the titlebar
+  pinned rather than auto-hidden, a top-centre toast was positioned from the
+  window edge and landed against the chrome with no breathing room. It now
+  clears the titlebar and keeps the same gap it has always had against a bare
+  edge. The auto-hidden layout is unchanged.
+
 - **You can now ask a session whether it is actually listening.** An agent
   session sometimes stops reading its input after a turn ends: the process is
   still alive, the prompt is still drawn, and the row looks exactly like one
