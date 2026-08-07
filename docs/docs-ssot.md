@@ -17,6 +17,7 @@ never copy the answer.
 | The question | The one owner | Everyone else |
 |---|---|---|
 | What is OPEN right now? | `docs/pending-bugs.md` (this repo; ychrome has its own) | link to it |
+| What is waiting on the OWNER? | `docs/owner-attention.md` | link to it |
 | What shipped, and when? | git history + `CHANGELOG.md` | link to it |
 | Which instruments lie? What traps cost time? | `docs/agent-field-guide.md` | link to it |
 | How is the product SUPPOSED to behave? | the spec docs + `DESIGN.md` | link to it |
