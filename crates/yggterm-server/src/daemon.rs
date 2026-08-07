@@ -1989,6 +1989,12 @@ pub enum ServerRequest {
         /// Live-order anchor: place the new session directly below this row.
         #[serde(default)]
         insert_after: Option<String>,
+        /// The DURABLE seat: the row's outline number (`6.1`), stored on the
+        /// row so its position survives a restart, a re-title and a daemon
+        /// handover. Outranks `insert_after` when both are given; see
+        /// [`crate::YggtermServer::seat_created_live_session`].
+        #[serde(default)]
+        outline_prefix: Option<String>,
     },
     StartRemoteCodexSession {
         target: String,
@@ -1999,6 +2005,9 @@ pub enum ServerRequest {
         terminal_appearance: Option<String>,
         #[serde(default)]
         insert_after: Option<String>,
+        /// See [`Self::StartSshSession::outline_prefix`].
+        #[serde(default)]
+        outline_prefix: Option<String>,
     },
     StartRemoteClaudeSession {
         target: String,
@@ -2009,6 +2018,9 @@ pub enum ServerRequest {
         terminal_appearance: Option<String>,
         #[serde(default)]
         insert_after: Option<String>,
+        /// See [`Self::StartSshSession::outline_prefix`].
+        #[serde(default)]
+        outline_prefix: Option<String>,
         /// Per-launch model / permission mode; composed into the
         /// `YGGTERM_CC_EXTRA_ARGS` export this lane already forwards.
         #[serde(default)]
@@ -2113,6 +2125,9 @@ pub enum ServerRequest {
         terminal_appearance: Option<String>,
         #[serde(default)]
         insert_after: Option<String>,
+        /// See [`Self::StartSshSession::outline_prefix`].
+        #[serde(default)]
+        outline_prefix: Option<String>,
         /// Per-launch model / permission mode for an agent CLI kind.
         ///
         /// ⚠ **Version-coexisting daemons:** a daemon older than this field
@@ -7260,6 +7275,7 @@ impl DaemonRuntime {
                 title_hint,
                 terminal_appearance,
                 insert_after,
+                outline_prefix,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_ssh_session(
@@ -7268,8 +7284,11 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     title_hint.as_deref(),
                 )?;
-                self.server
-                    .place_live_session_after(&key, insert_after.as_deref());
+                self.server.seat_created_live_session(
+                    &key,
+                    outline_prefix.as_deref(),
+                    insert_after.as_deref(),
+                );
                 if self.server.active_session_supports_terminal() {
                     self.ensure_terminal_for_active()?;
                 }
@@ -7283,6 +7302,7 @@ impl DaemonRuntime {
                 title_hint,
                 terminal_appearance,
                 insert_after,
+                outline_prefix,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_remote_codex_session(
@@ -7291,8 +7311,11 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     title_hint.as_deref(),
                 )?;
-                self.server
-                    .place_live_session_after(&key, insert_after.as_deref());
+                self.server.seat_created_live_session(
+                    &key,
+                    outline_prefix.as_deref(),
+                    insert_after.as_deref(),
+                );
                 if self.server.active_session_supports_terminal() {
                     self.ensure_terminal_for_active()?;
                 }
@@ -7306,6 +7329,7 @@ impl DaemonRuntime {
                 title_hint,
                 terminal_appearance,
                 insert_after,
+                outline_prefix,
                 launch_options,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
@@ -7316,8 +7340,11 @@ impl DaemonRuntime {
                     title_hint.as_deref(),
                     &launch_options.unwrap_or_default(),
                 )?;
-                self.server
-                    .place_live_session_after(&key, insert_after.as_deref());
+                self.server.seat_created_live_session(
+                    &key,
+                    outline_prefix.as_deref(),
+                    insert_after.as_deref(),
+                );
                 if self.server.active_session_supports_terminal() {
                     self.ensure_terminal_for_active()?;
                 }
@@ -7748,6 +7775,7 @@ impl DaemonRuntime {
                 title_hint,
                 terminal_appearance,
                 insert_after,
+                outline_prefix,
                 launch_options,
             } => {
                 // Phantom-spawn investigation: record that this birth was
@@ -7775,8 +7803,11 @@ impl DaemonRuntime {
                     title_hint.as_deref(),
                     &launch_options.unwrap_or_default(),
                 );
-                self.server
-                    .place_live_session_after(&key, insert_after.as_deref());
+                self.server.seat_created_live_session(
+                    &key,
+                    outline_prefix.as_deref(),
+                    insert_after.as_deref(),
+                );
                 if self.server.active_session_supports_terminal() {
                     self.ensure_terminal_for_active()?;
                 }
@@ -11296,6 +11327,31 @@ pub fn start_ssh_session_placed(
             title_hint: title_hint.map(ToOwned::to_owned),
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             insert_after: insert_after.map(ToOwned::to_owned),
+            outline_prefix: None,
+        },
+    )?)
+}
+
+/// An SSH shell start that lands at a REQUESTED seat.
+pub fn start_ssh_session_seated(
+    endpoint: &ServerEndpoint,
+    target: &str,
+    prefix: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    terminal_appearance: Option<&str>,
+    seat: &crate::RowSeatRequest,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::StartSshSession {
+            target: target.to_string(),
+            prefix: prefix.map(ToOwned::to_owned),
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+            terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            insert_after: seat.insert_after.clone(),
+            outline_prefix: seat.outline_prefix.clone(),
         },
     )?)
 }
@@ -11349,6 +11405,31 @@ pub fn start_remote_codex_session_placed(
             title_hint: title_hint.map(ToOwned::to_owned),
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             insert_after: insert_after.map(ToOwned::to_owned),
+            outline_prefix: None,
+        },
+    )?)
+}
+
+/// A remote Codex start that lands at a REQUESTED seat.
+pub fn start_remote_codex_session_seated(
+    endpoint: &ServerEndpoint,
+    target: &str,
+    prefix: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    terminal_appearance: Option<&str>,
+    seat: &crate::RowSeatRequest,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::StartRemoteCodexSession {
+            target: target.to_string(),
+            prefix: prefix.map(ToOwned::to_owned),
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+            terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            insert_after: seat.insert_after.clone(),
+            outline_prefix: seat.outline_prefix.clone(),
         },
     )?)
 }
@@ -11390,6 +11471,7 @@ pub fn start_remote_claude_session_placed(
             title_hint: title_hint.map(ToOwned::to_owned),
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             insert_after: insert_after.map(ToOwned::to_owned),
+            outline_prefix: None,
             launch_options: None,
         },
     )?)
@@ -11414,6 +11496,36 @@ pub fn start_remote_claude_session_with_launch_options(
             title_hint: title_hint.map(ToOwned::to_owned),
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             insert_after: None,
+            outline_prefix: None,
+            launch_options: (!launch.is_empty()).then(|| launch.clone()),
+        },
+    )?)
+}
+
+/// A remote Claude Code start that lands at a REQUESTED seat.
+///
+/// The remote twin of [`start_local_session_seated`]; see that function for why
+/// the seat rides WITH the create rather than following it.
+pub fn start_remote_claude_session_seated(
+    endpoint: &ServerEndpoint,
+    target: &str,
+    prefix: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    terminal_appearance: Option<&str>,
+    launch: &AgentLaunchOptions,
+    seat: &crate::RowSeatRequest,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::StartRemoteClaudeSession {
+            target: target.to_string(),
+            prefix: prefix.map(ToOwned::to_owned),
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+            terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            insert_after: seat.insert_after.clone(),
+            outline_prefix: seat.outline_prefix.clone(),
             launch_options: (!launch.is_empty()).then(|| launch.clone()),
         },
     )?)
@@ -11715,6 +11827,39 @@ pub fn start_local_session_with_launch_options(
             title_hint: title_hint.map(ToOwned::to_owned),
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             insert_after: None,
+            outline_prefix: None,
+            launch_options: (!launch.is_empty()).then(|| launch.clone()),
+        },
+    )?)
+}
+
+/// A local start that lands at a REQUESTED seat, in the SAME request.
+///
+/// The agent-plane create path (`server app terminal new --outline 6.1`) goes
+/// through here. Its predecessor,
+/// [`start_local_session_with_launch_options`], hardcoded `insert_after: None`
+/// — so the one door agents actually use could not place a row at all, even
+/// though the wire had carried that field since the context menu needed it.
+/// **That is why every agent-spawned row landed at the head**, and why the
+/// owner ended up dragging one back into position by hand.
+pub fn start_local_session_seated(
+    endpoint: &ServerEndpoint,
+    kind: SessionKind,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    terminal_appearance: Option<&str>,
+    launch: &AgentLaunchOptions,
+    seat: &crate::RowSeatRequest,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::StartLocalSession {
+            session_kind: kind,
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+            terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            insert_after: seat.insert_after.clone(),
+            outline_prefix: seat.outline_prefix.clone(),
             launch_options: (!launch.is_empty()).then(|| launch.clone()),
         },
     )?)
@@ -11736,6 +11881,7 @@ pub fn start_local_session_placed(
             title_hint: title_hint.map(ToOwned::to_owned),
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             insert_after: insert_after.map(ToOwned::to_owned),
+            outline_prefix: None,
             launch_options: None,
         },
     )?)
@@ -20267,6 +20413,7 @@ mod tests {
                 title_hint: Some("Debug".to_string()),
                 terminal_appearance: None,
                 insert_after: None,
+                outline_prefix: None,
             }),
             super::DAEMON_LONG_REQUEST_IO_TIMEOUT_MS
         );
@@ -20278,6 +20425,7 @@ mod tests {
                 title_hint: None,
                 terminal_appearance: None,
                 insert_after: None,
+                outline_prefix: None,
             }),
             super::DAEMON_LONG_REQUEST_IO_TIMEOUT_MS
         );
@@ -23275,11 +23423,14 @@ mod tests {
     /// wire divergence is the lost-PTY latch storm of 2026-07-17.
     #[test]
     fn protocol_shape_stamp_forces_version_bump() {
-        // Re-stamped for 3.0.37: `StartLocalSession` and
-        // `StartRemoteClaudeSession` gained `launch_options`, the wire half of
-        // the integrated delegate launch (per-launch model + permission mode).
-        const STAMPED_AT_VERSION: &str = "3.0.40";
-        const STAMPED_SHAPE_HASH: u64 = 0x28b18f9f7e2e7670;
+        // Re-stamped for 3.0.45: the four `Start*Session` requests gained
+        // `outline_prefix`, so a create can say WHERE its row lands and the
+        // daemon seats it inside the same request. An older daemon ignores the
+        // field (serde skips unknowns) and the row keeps its birth position —
+        // which is why the create reply reports the seat it RE-READ rather
+        // than the one it asked for.
+        const STAMPED_AT_VERSION: &str = "3.0.45";
+        const STAMPED_SHAPE_HASH: u64 = 0x3e91ec635194c8f5;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
