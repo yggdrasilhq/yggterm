@@ -577,6 +577,14 @@ created, so nothing is ever half-placed.
   the rows' numbers. Idempotent: an already-sorted list reports `changed: false`, which is the
   success case, not a no-op to chase.
 
+⚠ **A small render defect found while reading the compose rule, not yet reproduced.**
+`compose_outline_prefix` suppresses the prefix when `label.trim_start().starts_with(prefix)` —
+correct and necessary for idempotence (a row is relabelled on every snapshot, and `2. versestore: 2.
+versestore:` was the bug it closes), but it is a PREFIX match on a bare string. So a row numbered `2`
+whose CLI titles it *"2026 audit"* renders with no visible number while carrying one, and a row
+numbered `1` titled *"12 things"* does the same. The fix is to require a separator after the match
+(`2.`/`2 `), not to drop the idempotence guard.
+
 ⏳ **Still open in this lane:**
 
 1. **The collapse buckets.** The tree vocabulary already exists: `server app rows` returns `depth`,
