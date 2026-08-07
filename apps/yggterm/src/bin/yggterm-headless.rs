@@ -2611,6 +2611,9 @@ fn main() -> Result<()> {
                         let launch = yggterm_core::agent_launch_options_from_args(&args)
                             .map_err(|message| anyhow::anyhow!(message))?;
                         let prompt = yggterm_server::read_prompt(&args)?;
+                        // WHERE the row lands, applied INSIDE the create. Same
+                        // shared reader at both binaries.
+                        let seat = yggterm_server::read_row_seat(&args);
                         run_app_control_create_terminal_with_tenancy(
                             machine_key,
                             cwd,
@@ -2624,6 +2627,7 @@ fn main() -> Result<()> {
                                 &args,
                             )?),
                             &launch,
+                            &seat,
                             prompt.as_deref(),
                             timeout_ms,
                         )

@@ -822,6 +822,19 @@ pub enum AppControlCommand {
         /// [`yggterm_core::AgentLaunchOptions::launch_tokens`].
         #[serde(default)]
         launch_options: Option<AgentLaunchOptions>,
+        /// WHERE this row lands, applied inside the create rather than after
+        /// it — `--outline 6.1` (durable) or `--insert-after <path>`
+        /// (positional). See [`crate::RowSeatRequest`].
+        ///
+        /// ⛔ This plane could not place a row at all before 3.0.45, so every
+        /// agent-spawned session arrived at the head of Live Sessions and the
+        /// owner re-sorted his sidebar by hand. `#[serde(default)]` keeps a
+        /// newer CLI talking to an older GUI: the fields simply read `None`,
+        /// which is the pre-existing behaviour rather than a new guess.
+        #[serde(default)]
+        outline_prefix: Option<String>,
+        #[serde(default)]
+        insert_after: Option<String>,
     },
     /// Set the Live-region row order **on the process that renders it**.
     ///
@@ -3226,6 +3239,8 @@ mod tests {
                 session_kind: Some(SessionKind::Shell),
                 activate: None,
                 launch_options: None,
+                outline_prefix: None,
+                insert_after: None,
             }
         );
 
@@ -3237,6 +3252,8 @@ mod tests {
             session_kind: Some(SessionKind::Shell),
             activate: Some(false),
             launch_options: None,
+            outline_prefix: None,
+            insert_after: None,
         };
         let round_tripped: AppControlCommand =
             serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
@@ -3259,6 +3276,8 @@ mod tests {
                 model: Some("claude-opus-5".to_string()),
                 permission_mode: Some(yggterm_core::AgentPermissionMode::Bypass),
             }),
+            outline_prefix: Some("6.1".to_string()),
+            insert_after: None,
         };
         let encoded = serde_json::to_string(&with).unwrap();
         assert!(

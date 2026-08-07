@@ -13,7 +13,8 @@ mod automation_cli;
 // record cannot grow a dependency on how any one platform spells a schedule.
 pub mod automation_units;
 pub use automation_cli::{
-    automation_usage_block, delegate_launch_usage_block, read_prompt, run_automation_cli,
+    automation_usage_block, delegate_launch_usage_block, read_prompt, read_row_seat,
+    run_automation_cli,
 };
 // THE `collection …` / `snapshot now` verb plane, owned once for BOTH binaries.
 // Spec: ychrome/docs/collections.md (I3). The store and every decision it makes
@@ -133,7 +134,9 @@ pub use daemon::{
     set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode, shutdown, snapshot,
     start_command_session, start_command_session_with_terminal_appearance, start_local_session,
     start_local_session_at, start_local_session_at_with_terminal_appearance,
-    start_local_session_placed, start_local_session_with_launch_options,
+    start_local_session_placed, start_local_session_seated,
+    start_local_session_with_launch_options, start_remote_claude_session_seated,
+    start_remote_codex_session_seated, start_ssh_session_seated,
     start_remote_claude_session_at_with_terminal_appearance, start_remote_claude_session_placed,
     start_remote_claude_session_with_launch_options, start_remote_codex_session_at,
     start_remote_codex_session_at_with_terminal_appearance, start_remote_codex_session_placed,
@@ -204,6 +207,7 @@ use yggterm_core::{
     read_codex_transcript_messages_limited, read_codex_transcript_messages_tail_limited,
     read_trace_tail, resolve_yggterm_home,
 };
+use yggterm_core::session_outline::{OutlineKey, normalize_outline_prefix, parse_outline_key};
 use session_tenancy::{
     CREATED_BY_METADATA_LABEL, CreatorStamp, EPHEMERAL_METADATA_LABEL, EphemeralDeclaration,
 };
@@ -2177,6 +2181,67 @@ pub struct SkippedLiveSessionOrderRow {
     pub path: String,
     /// One of [`SKIPPED_NOT_A_LIVE_ROW`] / [`SKIPPED_DUPLICATE_ROW`].
     pub reason: String,
+}
+
+/// Where a create asks its row to land, carried WITH the create.
+///
+/// ⚖ **Seating is a property of creation, not a follow-up** — the owner's
+/// instruction after he dragged a mis-seated row back into place by hand at
+/// 05:30: *"From now on, we need to spawn session at the exact row we want."*
+/// A create-then-reorder sequence is not acceptable even when both halves
+/// succeed, because the wrong order is on screen in between, and because the
+/// second half is precisely the step that has been failing. So the instruction
+/// rides in the same request that makes the row, and the daemon applies it
+/// before it answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RowSeatRequest {
+    /// The durable form: this row's outline number.
+    pub outline_prefix: Option<String>,
+    /// The positional form: land directly below this row.
+    pub insert_after: Option<String>,
+}
+
+impl RowSeatRequest {
+    pub fn is_empty(&self) -> bool {
+        self.outline_prefix.is_none() && self.insert_after.is_none()
+    }
+}
+
+/// What actually happened to a newly created row's position.
+///
+/// Returned by [`YggtermServer::seat_created_live_session`] and reported
+/// verbatim in the create reply, because "where did my row land" is exactly the
+/// kind of question this project has repeatedly answered with the request
+/// rather than the effect. `rule` names the branch that fired, so a caller can
+/// tell an honoured outline from an ignored one without re-reading the table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveSeatOutcome {
+    /// `outline` · `after_anchor` · `front` (no instruction given) · `refused`.
+    pub rule: &'static str,
+    /// The prefix as STORED, after normalisation (`"2."` → `"2"`), so the
+    /// caller sees the value the sort will actually compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outline_prefix: Option<String>,
+    /// Why the requested seat was not honoured. `None` on every success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+}
+
+impl LiveSeatOutcome {
+    /// No placement was asked for: the row keeps the position its birth site
+    /// gave it, which is the front. Not a refusal — nothing was requested.
+    pub fn unplaced() -> Self {
+        Self {
+            rule: "front",
+            outline_prefix: None,
+            refusal: None,
+        }
+    }
+
+    /// Whether the caller asked for a seat and did not get it.
+    pub fn was_refused(&self) -> bool {
+        self.refusal.is_some()
+    }
 }
 
 /// The honest result of [`YggtermServer::replace_live_session_order`].
@@ -4855,6 +4920,170 @@ impl YggtermServer {
         }
     }
 
+    /// THE one answer to "where does this row go in the Live order?".
+    ///
+    /// **It exists because there were ten of them.** `live_session_order
+    /// .insert(0, …)` appeared at ten independent birth sites, every one
+    /// answering *the front*, and none of them consulting the outline. That is
+    /// the single-source-of-truth defect stated plainly: ten copies of one
+    /// decision. The owner paid for it directly — a session spawned for him at
+    /// 05:30 landed at the head, his sidebar read wrong, and he dragged it back
+    /// into place by hand. His instruction afterwards is the contract this
+    /// function implements: *"From now on, we need to spawn session at the
+    /// exact row we want."*
+    ///
+    /// ⚖ **Seating is a property of CREATION, not a follow-up.** A
+    /// create-then-reorder sequence is not acceptable even when both halves
+    /// work: the wrong order is visible in between, and the second half is
+    /// exactly what fails today. So this runs inside the same request that
+    /// makes the row.
+    ///
+    /// The rule, in precedence order:
+    ///
+    /// 1. **The row's own `outline_prefix`**, if it has one — seated among its
+    ///    numbered peers, ahead of every unnumbered row. This is the durable
+    ///    form: the number is a stored fact, so the seat survives a restart and
+    ///    a re-title.
+    /// 2. **Otherwise the front**, which is byte-for-byte what all ten sites
+    ///    did. ⇒ **until a row carries a prefix, nothing about today's
+    ///    behaviour changes**, which is what makes this safe to land under a
+    ///    sidebar full of live agent work.
+    ///
+    /// Returns the rule that fired, so a verb reporting a seat can name the
+    /// reason instead of asserting a success it did not verify.
+    pub fn seat_new_live_session(&mut self, key: &str) -> &'static str {
+        self.live_session_order.retain(|existing| existing != key);
+        match self.outline_seat_for(key) {
+            Some(index) => {
+                self.live_session_order.insert(index, key.to_string());
+                "outline"
+            }
+            None => {
+                self.live_session_order.insert(0, key.to_string());
+                "front"
+            }
+        }
+    }
+
+    /// The index `key`'s outline number entitles it to, or `None` when the row
+    /// carries no readable number and therefore has no outline claim.
+    ///
+    /// ⚖ **The scan considers NUMBERED rows only, and that is the whole
+    /// subtlety.** The numbered rows form an ordered subsequence of the live
+    /// list; unnumbered rows are wherever their own births left them and are
+    /// not evidence about anything. Seating relative to "the first row that
+    /// sorts after me" — counting unnumbered rows, which sort last — put `1`
+    /// at the head of `[unnumbered, 2]` and left the unnumbered row wedged
+    /// between `1` and `2`. Seating relative to the numbered rows alone gives
+    /// `[unnumbered, 1, 2]`: the outline is in order, and a row nobody
+    /// numbered is not shoved around to make the arithmetic work.
+    ///
+    /// An equal prefix counts as "before", so a duplicate number lands after
+    /// the row already holding it — stable, like every other tie here.
+    fn outline_seat_for(&self, key: &str) -> Option<usize> {
+        let prefix = self.sessions.get(key)?.outline_prefix.clone()?;
+        let seat_key = parse_outline_key(Some(&prefix));
+        if seat_key == OutlineKey::Unnumbered {
+            return None;
+        }
+        let mut first_after = None;
+        let mut last_before = None;
+        for (index, existing) in self.live_session_order.iter().enumerate() {
+            let existing_key = parse_outline_key(
+                self.sessions
+                    .get(existing)
+                    .and_then(|session| session.outline_prefix.as_deref()),
+            );
+            if existing_key == OutlineKey::Unnumbered {
+                continue;
+            }
+            if existing_key > seat_key {
+                first_after = Some(index);
+                break;
+            }
+            last_before = Some(index);
+        }
+        Some(match (first_after, last_before) {
+            (Some(index), _) => index,
+            (None, Some(index)) => index + 1,
+            // No numbered row to anchor against: the front, which is where a
+            // brand-new row has always gone.
+            (None, None) => 0,
+        })
+    }
+
+    /// Seat a row the caller asked to place, INSIDE the request that made it.
+    ///
+    /// The one door for "spawn this session at the exact row I want", and the
+    /// only place the two ways of saying that are reconciled:
+    ///
+    /// - `outline_prefix` is the DURABLE form. The number is stored on the row,
+    ///   so the seat survives a restart, a re-title and a daemon handover — and
+    ///   a later spawn seats itself relative to it without anyone re-typing an
+    ///   order.
+    /// - `insert_after` is the POSITIONAL form, unchanged from the context
+    ///   menu's "open new terminal here": land directly below this row, with no
+    ///   claim about where the row belongs tomorrow.
+    ///
+    /// They are not two encodings of one fact, so both may be honoured; when
+    /// both are given the outline wins, because a stored number outranks a
+    /// one-shot position. ⛔ **Every refusal is NAMED, never silent** — a bad
+    /// prefix or an anchor that does not resolve comes back in
+    /// [`LiveSeatOutcome::refusal`] rather than leaving the caller believing a
+    /// seat it did not get. That is the whole lesson of the verbs that reported
+    /// the request instead of the effect.
+    pub fn seat_created_live_session(
+        &mut self,
+        key: &str,
+        outline_prefix: Option<&str>,
+        insert_after: Option<&str>,
+    ) -> LiveSeatOutcome {
+        let requested_prefix = outline_prefix
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(prefix) = requested_prefix {
+            return match normalize_outline_prefix(prefix) {
+                Ok(Some(normalized)) => {
+                    self.set_session_outline_prefix(key, &normalized);
+                    let rule = self.seat_new_live_session(key);
+                    LiveSeatOutcome {
+                        rule,
+                        outline_prefix: Some(normalized),
+                        refusal: None,
+                    }
+                }
+                // An empty prefix is filtered above, so `Ok(None)` is
+                // unreachable here; treat it as the no-instruction case rather
+                // than inventing a refusal for it.
+                Ok(None) => LiveSeatOutcome::unplaced(),
+                Err(refusal) => LiveSeatOutcome {
+                    rule: "refused",
+                    outline_prefix: None,
+                    refusal: Some(refusal),
+                },
+            };
+        }
+        let Some(anchor) = insert_after.map(str::trim).filter(|value| !value.is_empty()) else {
+            return LiveSeatOutcome::unplaced();
+        };
+        if self.place_live_session_after(key, Some(anchor)) {
+            LiveSeatOutcome {
+                rule: "after_anchor",
+                outline_prefix: None,
+                refusal: None,
+            }
+        } else {
+            LiveSeatOutcome {
+                rule: "refused",
+                outline_prefix: None,
+                refusal: Some(format!(
+                    "insert-after anchor {anchor:?} is not a row in this daemon's live order, \
+                     so the new row kept its birth position"
+                )),
+            }
+        }
+    }
+
     /// Place a (newly started) live session directly below an anchor row in
     /// the Live Sessions order. The context-menu "Open new terminal/CC/codex
     /// here" actions thread the right-clicked row through as the anchor so
@@ -6013,8 +6242,7 @@ impl YggtermServer {
         );
         apply_birth_keep_alive(&mut session);
         self.sessions.insert(key.clone(), session);
-        self.live_session_order.retain(|existing| existing != &key);
-        self.live_session_order.insert(0, key.clone());
+        self.seat_new_live_session(&key);
         self.active_session_path = Some(key.clone());
         self.active_view_mode = WorkspaceViewMode::Terminal;
         self.request_terminal_launch_for_active();
@@ -6178,9 +6406,7 @@ impl YggtermServer {
 
         apply_birth_keep_alive(&mut session);
         self.sessions.insert(session_path.clone(), session);
-        self.live_session_order
-            .retain(|existing| existing != &session_path);
-        self.live_session_order.insert(0, session_path.clone());
+        self.seat_new_live_session(&session_path);
         self.active_session_path = Some(session_path.clone());
         self.active_view_mode = WorkspaceViewMode::Terminal;
         Ok(session_path)
@@ -6773,9 +6999,7 @@ impl YggtermServer {
                 );
             }
             if launch_terminal {
-                self.live_session_order
-                    .retain(|existing| existing != &session_path);
-                self.live_session_order.insert(0, session_path.clone());
+                self.seat_new_live_session(&session_path);
                 self.focus_live_session(&session_path);
             } else {
                 self.active_session_path = Some(session_path.clone());
@@ -6886,7 +7110,7 @@ impl YggtermServer {
                 .iter()
                 .any(|existing| existing == &session_path)
             {
-                self.live_session_order.insert(0, session_path.clone());
+                self.seat_new_live_session(&session_path);
             }
         } else {
             self.live_session_order
@@ -6947,7 +7171,7 @@ impl YggtermServer {
                 .iter()
                 .any(|existing| existing == &session_path)
             {
-                self.live_session_order.insert(0, session_path.clone());
+                self.seat_new_live_session(&session_path);
             }
         } else {
             self.live_session_order
@@ -6964,8 +7188,7 @@ impl YggtermServer {
             .resolve_live_terminal_key_for_storage_path(storage_path)
             .map(str::to_string)
         {
-            self.live_session_order.retain(|p| p != &existing_key);
-            self.live_session_order.insert(0, existing_key.clone());
+            self.seat_new_live_session(&existing_key);
             self.active_session_path = Some(existing_key.clone());
             self.active_view_mode = WorkspaceViewMode::Terminal;
             return Some(existing_key);
@@ -7009,8 +7232,7 @@ impl YggtermServer {
         upsert_session_metadata(&mut session.metadata, "UUID", session_id.clone());
         apply_birth_keep_alive(&mut session);
         self.sessions.insert(live_key.clone(), session);
-        self.live_session_order.retain(|p| p != &live_key);
-        self.live_session_order.insert(0, live_key.clone());
+        self.seat_new_live_session(&live_key);
         self.active_session_path = Some(live_key.clone());
         self.active_view_mode = WorkspaceViewMode::Terminal;
         Some(live_key)
@@ -7120,7 +7342,7 @@ impl YggtermServer {
             );
         }
         if !self.live_session_order.iter().any(|p| p == &session_path) {
-            self.live_session_order.insert(0, session_path.clone());
+            self.seat_new_live_session(&session_path);
         }
         self.active_session_path = Some(session_path.clone());
         self.active_view_mode = WorkspaceViewMode::Terminal;
@@ -8170,9 +8392,7 @@ impl YggtermServer {
             .resolve_live_terminal_key_for_storage_path(storage_path)
             .map(str::to_string)
         {
-            self.live_session_order
-                .retain(|existing| existing != &existing_key);
-            self.live_session_order.insert(0, existing_key.clone());
+            self.seat_new_live_session(&existing_key);
             self.active_session_path = Some(existing_key.clone());
             self.active_view_mode = WorkspaceViewMode::Terminal;
             return Some(existing_key);
@@ -8258,8 +8478,7 @@ impl YggtermServer {
         live.launch_phase = TerminalLaunchPhase::Running;
 
         self.sessions.insert(key.clone(), live);
-        self.live_session_order.retain(|existing| existing != &key);
-        self.live_session_order.insert(0, key.clone());
+        self.seat_new_live_session(&key);
         self.active_session_path = Some(key.clone());
         self.active_view_mode = WorkspaceViewMode::Terminal;
         Some(key)
@@ -8781,8 +9000,7 @@ impl YggtermServer {
             }
         }
         if promote_active_stored_session {
-            self.live_session_order.retain(|existing| existing != &path);
-            self.live_session_order.insert(0, path.clone());
+            self.seat_new_live_session(&path);
         }
         if let Some((ssh_target, ssh_prefix, remote_binary_expr, remote_deploy_state)) =
             promote_active_remote_launch
@@ -8925,8 +9143,7 @@ impl YggtermServer {
             );
         }
         self.sessions.insert(key.to_string(), session);
-        self.live_session_order.retain(|existing| existing != key);
-        self.live_session_order.insert(0, key.to_string());
+        self.seat_new_live_session(key);
         // TWO DECISIONS, NOT ONE. `launch_now` means "start this session's PTY
         // now"; `activate` means "and take over the user's viewport". They were
         // the same flag, and that conflation is a focus-steal the user feels
@@ -20804,6 +21021,7 @@ pub fn run_app_control_create_terminal(
         activate,
         None,
         &AgentLaunchOptions::default(),
+        &RowSeatRequest::default(),
         None,
         timeout_ms,
     )
@@ -20819,6 +21037,7 @@ pub fn run_app_control_create_terminal_with_tenancy(
     activate: bool,
     tenancy: Option<CreateTerminalTenancy>,
     launch: &AgentLaunchOptions,
+    seat: &RowSeatRequest,
     prompt: Option<&str>,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
@@ -20831,6 +21050,7 @@ pub fn run_app_control_create_terminal_with_tenancy(
         activate,
         tenancy,
         launch,
+        seat,
         timeout_ms,
     )?;
     if let Some(prompt) = prompt {
@@ -20929,6 +21149,7 @@ pub fn create_terminal_with_tenancy(
         activate,
         tenancy,
         &AgentLaunchOptions::default(),
+        &RowSeatRequest::default(),
         timeout_ms,
     )
 }
@@ -20974,6 +21195,49 @@ fn validate_create_terminal_launch(
     Ok(session_kind)
 }
 
+/// **The single validation site for a requested seat**, run before the request
+/// is sent. Answers the seat as it will travel, with the prefix normalised.
+///
+/// Two refusals, both BY NAME, because a seat that is silently ignored is the
+/// failure this whole lane exists to end:
+///
+/// 1. **A prefix the sort cannot read.** `--outline lobe-2` would be stored,
+///    compared as unnumbered, and land the row at the bottom while the reply
+///    said the outline was applied.
+/// 2. ⛔ **Both forms at once.** `--outline` and `--insert-after` are two
+///    different answers to one question, and rather than pick a winner behind
+///    the caller's back — the exact move that produces "I asked for X and got
+///    Y" — the create refuses and says which to drop.
+fn validate_create_terminal_seat(seat: &RowSeatRequest) -> anyhow::Result<RowSeatRequest> {
+    let outline = seat
+        .outline_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let anchor = seat
+        .insert_after
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if outline.is_some() && anchor.is_some() {
+        anyhow::bail!(
+            "--outline and --insert-after are two different ways to say where this row goes; \
+             pass one. --outline stores a durable number that survives a restart and a \
+             re-title, --insert-after only places the row once."
+        );
+    }
+    let outline_prefix = match outline {
+        Some(prefix) => normalize_outline_prefix(prefix).map_err(|message| {
+            anyhow::anyhow!("{message}; the row was NOT created, so nothing is half-placed")
+        })?,
+        None => None,
+    };
+    Ok(RowSeatRequest {
+        outline_prefix,
+        insert_after: anchor.map(ToOwned::to_owned),
+    })
+}
+
 /// The create, carrying ONE launch's model / permission mode. Validated by
 /// [`validate_create_terminal_launch`]; both binaries and the automation
 /// executor reach the wire through here, so the refusal cannot be routed around.
@@ -20987,9 +21251,11 @@ pub fn create_terminal_with_tenancy_and_launch(
     activate: bool,
     tenancy: Option<CreateTerminalTenancy>,
     launch: &AgentLaunchOptions,
+    seat: &RowSeatRequest,
     timeout_ms: u64,
 ) -> anyhow::Result<Value> {
     let session_kind = validate_create_terminal_launch(kind, machine_key, launch)?;
+    let seat = validate_create_terminal_seat(seat)?;
     let home = resolve_yggterm_home()?;
     let response = request_app_control(
         &home,
@@ -21001,6 +21267,8 @@ pub fn create_terminal_with_tenancy_and_launch(
             session_kind,
             activate: Some(activate),
             launch_options: (!launch.is_empty()).then(|| launch.clone()),
+            outline_prefix: seat.outline_prefix.clone(),
+            insert_after: seat.insert_after.clone(),
         },
         timeout_ms,
     )?;
@@ -32916,6 +33184,170 @@ terminal_window_id: None,
             server.sessions.get(path).expect("session").title,
             "Install Yggterm Works"
         );
+    }
+
+    fn outline_test_server() -> YggtermServer {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        )
+    }
+
+    fn outline_titles(server: &YggtermServer) -> Vec<String> {
+        server
+            .live_session_order
+            .iter()
+            .map(|key| {
+                server
+                    .sessions
+                    .get(key)
+                    .and_then(|session| session.outline_prefix.clone())
+                    .unwrap_or_else(|| "-".to_string())
+            })
+            .collect()
+    }
+
+    /// ⛔ THE DEFECT, LOCKED: a new row used to land at the HEAD from ten
+    /// independent birth sites, so a session spawned into a numbered sidebar
+    /// arrived above rows that outrank it. The owner dragged one back into
+    /// place by hand at 05:30 and then said what he wanted:
+    /// *"From now on, we need to spawn session at the exact row we want."*
+    ///
+    /// This fails on the old code, where `insert(0, …)` put `6.1` ahead of `1`.
+    #[test]
+    fn a_numbered_row_is_seated_at_its_outline_position_not_at_the_head() {
+        let mut server = outline_test_server();
+        let mut seat = |prefix: &str| {
+            let path = server.start_local_session(SessionKind::Shell, Some("/tmp"), Some(prefix));
+            server.seat_created_live_session(&path, Some(prefix), None);
+            path
+        };
+        seat("1");
+        seat("5.2");
+        seat("2");
+        seat("5.1");
+        seat("10");
+        seat("6.1");
+        assert_eq!(
+            outline_titles(&server),
+            vec!["1", "2", "5.1", "5.2", "6.1", "10"],
+            "each spawn must land at its own outline seat, and 10 sorts LAST"
+        );
+    }
+
+    /// TOTALITY: a row with no number keeps the pre-existing behaviour exactly
+    /// — it goes to the front — so this change is inert on a sidebar that has
+    /// not adopted the outline yet.
+    #[test]
+    fn an_unnumbered_row_still_lands_at_the_front_and_never_displaces_a_number() {
+        let mut server = outline_test_server();
+        let numbered =
+            server.start_local_session(SessionKind::Shell, Some("/tmp"), Some("numbered"));
+        server.seat_created_live_session(&numbered, Some("2"), None);
+        let plain = server.start_local_session(SessionKind::Shell, Some("/tmp"), Some("plain"));
+        server.seat_created_live_session(&plain, None, None);
+        assert_eq!(
+            outline_titles(&server),
+            vec!["-", "2"],
+            "no instruction means the front, which is what all ten birth sites did"
+        );
+        // …and a number seated afterwards takes its place among the NUMBERS,
+        // without dragging the unnumbered row around to make room. `1` lands
+        // directly above `2`; the row nobody numbered stays where its own birth
+        // put it.
+        let first = server.start_local_session(SessionKind::Shell, Some("/tmp"), Some("first"));
+        server.seat_created_live_session(&first, Some("1"), None);
+        assert_eq!(outline_titles(&server), vec!["-", "1", "2"]);
+    }
+
+    /// IDEMPOTENCE — the owner's word was *"never break"*, and a seat re-applied
+    /// to a row already sitting there must be the identity, not a shuffle.
+    #[test]
+    fn re_seating_a_row_that_is_already_in_place_changes_nothing() {
+        let mut server = outline_test_server();
+        for prefix in ["1", "2", "3"] {
+            let path = server.start_local_session(SessionKind::Shell, Some("/tmp"), Some(prefix));
+            server.seat_created_live_session(&path, Some(prefix), None);
+        }
+        let before = server.live_session_order.clone();
+        let key = before[1].clone();
+        server.seat_new_live_session(&key);
+        assert_eq!(server.live_session_order, before);
+    }
+
+    /// ⛔ NO SILENT FAILURE. A prefix the sort cannot read, and an anchor that
+    /// is not a row, both come back NAMED — never as a success over a row that
+    /// stayed at the head.
+    #[test]
+    fn a_seat_that_cannot_be_honoured_is_refused_by_name() {
+        let mut server = outline_test_server();
+        let path = server.start_local_session(SessionKind::Shell, Some("/tmp"), Some("row"));
+
+        let bad_prefix = server.seat_created_live_session(&path, Some("lobe-2"), None);
+        assert_eq!(bad_prefix.rule, "refused");
+        assert!(
+            bad_prefix
+                .refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("lobe-2")),
+            "{bad_prefix:?}"
+        );
+
+        let bad_anchor = server.seat_created_live_session(&path, None, Some("local://nope"));
+        assert_eq!(bad_anchor.rule, "refused");
+        assert!(bad_anchor.was_refused(), "{bad_anchor:?}");
+
+        // And the honest success reports the prefix as STORED, normalised.
+        let ok = server.seat_created_live_session(&path, Some(" 2. "), None);
+        assert_eq!(ok.rule, "outline");
+        assert_eq!(ok.outline_prefix.as_deref(), Some("2"));
+        assert!(ok.refusal.is_none());
+    }
+
+    /// ⛔ Both forms at once is refused rather than silently resolved, so a
+    /// caller never gets a seat it did not ask for.
+    #[test]
+    fn asking_for_an_outline_and_an_anchor_at_once_refuses_before_creating_anything() {
+        let error = crate::validate_create_terminal_seat(&crate::RowSeatRequest {
+            outline_prefix: Some("6.1".to_string()),
+            insert_after: Some("local://abc".to_string()),
+        })
+        .expect_err("two answers to one question must not be resolved behind the caller's back");
+        let message = error.to_string();
+        assert!(message.contains("--outline"), "{message}");
+        assert!(message.contains("--insert-after"), "{message}");
+    }
+
+    /// A mistyped number refuses BEFORE the create, so nothing is half-placed.
+    #[test]
+    fn a_malformed_outline_is_refused_before_the_row_exists() {
+        let error = crate::validate_create_terminal_seat(&crate::RowSeatRequest {
+            outline_prefix: Some("six-point-one".to_string()),
+            insert_after: None,
+        })
+        .expect_err("a prefix the sort cannot read must not be stored");
+        assert!(error.to_string().contains("NOT created"), "{error}");
+
+        let clean = crate::validate_create_terminal_seat(&crate::RowSeatRequest {
+            outline_prefix: Some("6.1.".to_string()),
+            insert_after: None,
+        })
+        .expect("a trailing dot is the position the owner typed");
+        assert_eq!(clean.outline_prefix.as_deref(), Some("6.1"));
     }
 
     /// The owner's sidebar outline (`0` / `1` / `1.1` / …) is his session

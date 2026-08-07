@@ -15,7 +15,9 @@ Closed narratives from before 2026-08-02 are in
 
 ## ★★ WEBKIT'S OWN POPUP BLOCKER EATS `window.open` BEFORE OUR POPUP PIPELINE SEES IT — and no agent can tell
 
-**Status:** OPEN. **Operator-reported 2026-08-07**, twice in one session, both halves in his words:
+**Status:** OPEN
+
+**Operator-reported 2026-08-07**, twice in one session, both halves in his words:
 > *"I tried clicking the receipt and label from the webapp and the webapp complains popup is
 > getting blocked. So ychrome also needs a pipeline to direct popups to new tabs."*
 > *"Also agents need to know that popup has fired, like you said you cannot tell anything."*
@@ -92,7 +94,9 @@ site-lore `app.indiapost.gov.in` slug `drop-off-booked-and-paid-surcharge-and-in
 
 ## ⭐ OPERATOR-REPORTED, LIVES IN ychrome: a vault CARD item is unreadable and uneditable in the sidebar
 
-**Status:** OPEN — **the fix belongs in `ychrome`**, filed there with the measurements:
+**Status:** OPEN
+
+⚖ **The fix belongs in `ychrome`**, filed there with the measurements:
 `~/gh/ychrome/docs/pending-bugs.md` § *A CARD ITEM IS UNREADABLE AND UNEDITABLE IN THE SIDEBAR*.
 Listed here only so the yggterm dev agent sees it, because the operator meets it through **this**
 GUI's sidebar and will report it against yggterm.
@@ -417,10 +421,20 @@ exited, force a machine rescan, and read the title back from `server app rows`.
 
 ## ★★★ A NEW ROW ALWAYS LANDS AT THE HEAD — ten front-insert sites, one missing owner
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*(The seating half shipped in 3.0.45. The sort verb, the `outline_prefix` setter and the collapse
+buckets are still OPEN and listed at the bottom of this entry — one lane, one ticket.)*
+
+**The observation owed:** on jojo carrying 3.0.45+, `server app terminal new --kind shell
+--outline 6.9 --purpose … --ephemeral …` must answer `"seat": {"honoured": true,
+"outline_prefix": "6.9", …}` **and** the row must be visible between `6.` and `7.1` in a faithful
+screenshot. Today the verb does not exist below 3.0.45.
 
 Owner-directed build order 2026-08-07: *"sorts are cheap and never break, and spawnee sessions are
-grouped as a collapseable tree with the session as the parent element."*
+grouped as a collapseable tree with the session as the parent element."* Hardened the same night
+after he dragged a mis-seated row back into place by hand at 05:30: *"From now on, we need to spawn
+session at the exact row we want. The second 6 session looked odd. I manually dragged it."*
 
 **Reproduced under measurement**, jojo 3.0.44, one ephemeral spawn:
 
@@ -429,41 +443,70 @@ BEFORE: 0  1  1.1  2  4  5.1  5.2  6  7.1  7.2
 AFTER : ZZ 0  1    1.1 2  4    5.1  5.2  6   7.1        <- new row at the HEAD
 ```
 
-⇒ **`grep -n "live_session_order.insert(0" crates/yggterm-server/src/lib.rs` returns TEN sites.**
-Every birth path independently answers "where does a new row go?" with "the front". That is the
-single-source-of-truth defect stated plainly: ten copies of one decision, and the outline has no
+⇒ **`grep -n "live_session_order.insert(0" crates/yggterm-server/src/lib.rs` returned TEN sites.**
+Every birth path independently answered "where does a new row go?" with "the front". That is the
+single-source-of-truth defect stated plainly: ten copies of one decision, and the outline had no
 say in any of them.
 
-**The fix shape.** ONE owner — `seat_new_live_session(key)` — called by all ten, which places by
-outline position and falls back to the front when the row has no outline (so today's behaviour is
-preserved exactly for unnumbered rows). ⚠ **Sort key trap:** compare dotted segments as INTEGERS,
-never lexicographically — `"10" < "2"` is correct string order and wrong outline order, and it will
-look right until the tenth lobe exists. Unnumbered rows sort last, **stably**.
+**SHIPPED — `seat_new_live_session` is the one owner**, called by all ten former sites. It seats a
+row by its `outline_prefix` and falls back to the front when the row has no number, so **behaviour
+is unchanged on any sidebar that has not adopted the outline** — the safest possible rollout under
+live agent work. The sort key
+(`yggterm_core::session_outline`) compares dotted segments as **integers**; the ten-lobe trap
+(`"10" < "2"` is correct string order and wrong outline order) is locked by
+`a_tenth_lobe_does_not_sort_before_the_second`.
+
+⚖ **SEATING IS A PROPERTY OF CREATION**, per the owner: a create-then-reorder sequence is refused
+as a design even when both halves work, because the wrong order is on screen in between and the
+second half is the half that fails. So `terminal new` grew `--outline <prefix>` and
+`--insert-after <path>`, carried in the create request itself (`RowSeatRequest`) and applied by the
+daemon before it answers. The reply's `seat` block is **RE-READ from the order the GUI holds**,
+never composed from the request.
+
+⛔ **Every refusal is named.** A prefix the sort cannot read, an anchor that is not a row, and
+`--outline` + `--insert-after` together are all refused BY NAME — the last one *before* the row is
+created, so nothing is ever half-placed.
+
+⏳ **Still open in this lane, and they are the rest of the owner's ask:**
+
+1. **The `sort` verb** — his *"sort verb as a shortcut in yggui automation layer"*. Seating fixes
+   new rows; nothing yet re-derives the whole order when reality has drifted.
+2. **`outline_prefix` is still absent from `server app rows` and still has no setter verb**, so a
+   row can only get its number at birth. An existing row cannot be numbered at all.
+3. **The collapse buckets.** The tree vocabulary already exists: `server app rows` returns `depth`,
+   `child_count`, `expanded` and `group_kind`, the Live Sessions group already collapses, and
+   **every live row is `depth: 1`** — that flatness is the entire gap. A collapsed bucket also
+   already has its work-aggregation signal, `busy_reason: "group_descendant_working"`, so work
+   cannot hide inside one. ⚠ Two durability bars: **collapse state must survive a GUI restart**
+   (the same bar `outline_prefix` needed, which was persisted-then-dropped on restore), and a
+   collapsed parent must stay clickable through to its child — the constitution's *"click it and
+   co-browse it"* applies to a nested row too.
+
+⭐ **THE DRAG IS THE PROVEN WRITE PATH, and the verbs should travel it.** Owner, 2026-08-07:
+manual drag is the only row-ordering affordance that worked end to end while `server reorder`
+needed a GUI restart and `server app sessions reorder` was a no-op. Reading
+`queue_drop_current_drag_target` (`shell.rs`) shows why, and it is a **two-step route no verb
+takes**: (1) an optimistic `replace_live_session_order` on the GUI's OWN copy, so the sidebar moves
+immediately; (2) `reorder_live_sessions_scoped(endpoint, paths, Some(gui_row_order_scope()))` —
+**scoped to this GUI's ledger** — followed by `apply_snapshot`. The app-control verb calls the
+UNSCOPED `reorder_live_sessions` and deliberately skips step 1. ⇒ the row-order ledger
+(`row_order_ledger.rs`, `reconcile_order_with_remembered`) restores from the GUI's scope on the
+next rebuild and reverts anything written outside it. **That is the likeliest reason the reorder
+verb is invisible while the drag sticks**, and it is a much cheaper explanation than the
+aggregation hypothesis below. ⚠ Not yet measured — the falsifier is to call the app verb WITH the
+gui scope and see whether it survives a rebuild.
 
 ⛔ **AND A CORRECTION, because two of us have now acted on it.** It was reported that a single
 spawn *re-scrambles the whole live order* (`0 1 2 4 5.1` → `5.1 4 2 1 0`). **The reproduction above
 falsifies that**: every unrelated row kept its relative position. The observed reversal is almost
-certainly a **reversed-order control I applied myself at ~03:30** while testing the reorder verb,
-rendered later at a GUI restart — the reversal matches that input exactly, and only a restart
-renders a stored order. ⇒ **the insertion path prepends; it does not rewrite.** Fixing the wrong
-one of those would have cost a day.
+certainly a **reversed-order control applied by the orchestrator at ~03:30** while testing the
+reorder verb, rendered later at a GUI restart — the reversal matches that input exactly, and only a
+restart renders a stored order. ⇒ **the insertion path prepended; it did not rewrite.** Fixing the
+wrong one of those would have cost a day.
 
 ⚖ **This is one lane with the parentage entry below, not two tickets.** `parent_session_path` gives
 placement at spawn, the sort key, the collapse bucket and sweep-my-children — four features, one
-field. And the tree vocabulary already exists: `server app rows` returns `depth`, `child_count`,
-`expanded` and `group_kind`, the Live Sessions group already collapses, and **every live row is
-`depth: 1`** — that flatness is the entire gap. A collapsed bucket also already has its
-work-aggregation signal: `busy_reason: "group_descendant_working"`, so work cannot hide inside one.
-
-⚠ Two durability bars, both learned tonight: **collapse state must survive a GUI restart** (the
-same bar `outline_prefix` needed, which was persisted-then-dropped on restore), and a collapsed
-parent must still be clickable through to its child — the constitution's *"click it and co-browse
-it"* applies to a nested row too.
-
-⏳ **Blocked on nothing but sequencing**, and `outline_prefix` is the near-term unlock: it exists
-and survives a restart, but is **not exposed on `server app rows`** and still has **no setter**, so
-the outline number today lives only inside the title string — a structured fact encoded in prose,
-destroyed by the title clobbers recorded above.
+field.
 
 ## ★★★ `server reorder` WRITES WHERE THE GUI DOES NOT READ — same version, different DAEMON
 
