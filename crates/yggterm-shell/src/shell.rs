@@ -42,7 +42,7 @@ use crate::terminal_observe::{
     terminal_chunk_has_prompt_output, terminal_chunk_has_visible_output,
     terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
     terminal_chunk_is_codex_resume_instruction, terminal_chunk_has_agent_composer_row,
-    terminal_chunk_has_current_codex_input_row,
+    terminal_chunk_has_current_codex_input_row, terminal_composer_row_holds_draft,
     terminal_chunk_is_generic_codex_idle,
     terminal_chunk_is_loading_placeholder, terminal_chunk_is_local_codex_scaffold,
     terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
@@ -75583,65 +75583,26 @@ async fn process_pending_app_control_requests(
             let started = Instant::now();
             // A displayed prompt does NOT mean codex is reading input — a just-resumed
             // codex draws its composer before its input loop is live and silently drops
-            // keystrokes (root cause, see finding-fresh-restarted-codex-no-input). So:
-            // PHASE 1 — wait for the composer to be DISPLAYED (avoid probing a menu /
-            // mid-output surface); PHASE 2 — ECHO-VERIFY codex is actually CONSUMING
-            // input by writing a probe and confirming it echoes, then clear it (Ctrl+U)
-            // and submit. The real prompt is written ONLY after the echo is confirmed.
-            const ECHO_PROBE: &str = "yggterm_ready_probe";
-            const CLEAR_LINE: &str = "\u{15}"; // Ctrl+U
-            let probe_write = |payload: &str| {
-                terminal_write_app_control_input_async(
-                    endpoint.clone(),
-                    runtime_session_path.clone(),
-                    session_path.clone(),
-                    payload.to_string(),
-                    "submit_probe",
-                    trace_home.as_path(),
-                )
-            };
-            let mut prompt_shown = false;
-            while started.elapsed() < timeout {
-                if let Ok((screen, ..)) = terminal_snapshot_async(
-                    endpoint.clone(),
-                    session_path.clone(),
-                    trace_home.as_path(),
-                )
-                .await
-                    && terminal_chunk_has_agent_composer_row(&screen)
-                {
-                    prompt_shown = true;
-                    break;
-                }
-                sleep(Duration::from_millis(150)).await;
-            }
-            let mut ready = false;
-            if prompt_shown {
-                while started.elapsed() < timeout {
-                    let _ = probe_write(ECHO_PROBE).await;
-                    sleep(Duration::from_millis(180)).await;
-                    let echoed = matches!(
-                        terminal_snapshot_async(
-                            endpoint.clone(),
-                            session_path.clone(),
-                            trace_home.as_path(),
-                        )
-                        .await,
-                        Ok((ref screen, ..)) if screen.contains(ECHO_PROBE)
-                    );
-                    // Clear the probe whether it echoed (consumed) or was buffered while
-                    // codex wasn't reading yet — keeps the composer clean either way.
-                    let _ = probe_write(CLEAR_LINE).await;
-                    if echoed {
-                        sleep(Duration::from_millis(60)).await;
-                        ready = true;
-                        break;
-                    }
-                    sleep(Duration::from_millis(120)).await;
-                }
-            }
-            let waited_ms = started.elapsed().as_millis() as u64;
-            if !ready {
+            // keystrokes (root cause, see finding-fresh-restarted-codex-no-input), and a
+            // WEDGED row draws one forever while reading nothing. `probe_terminal_input_
+            // consumption` owns that two-phase proof; the real prompt is written ONLY
+            // after it confirms the echo. It is the SAME function `CheckTerminalInput`
+            // calls, so "is this row reading input" has one answer, not two.
+            //
+            // The draft guard is OFF here on purpose: this caller has been told to send
+            // that text, so clearing the composer line is part of doing what was asked.
+            // A bare check turns it on.
+            let verdict = probe_terminal_input_consumption(
+                endpoint.clone(),
+                runtime_session_path.clone(),
+                session_path.clone(),
+                trace_home.as_path(),
+                timeout,
+                false,
+            )
+            .await;
+            let waited_ms = verdict.waited_ms;
+            if !verdict.consuming_input {
                 AppControlResponse {
                     request_id: request.request_id.clone(),
                     handled_by_pid: std::process::id(),
@@ -75650,7 +75611,8 @@ async fn process_pending_app_control_requests(
                     data: Some(json!({
                         "submitted": false,
                         "session_path": session_path,
-                        "reason": "session never echo-confirmed it was consuming input within the timeout (prompt may be displayed but codex not yet reading)",
+                        "reason": verdict.reason,
+                        "composer_shown": verdict.composer_shown,
                         "waited_ms": waited_ms,
                     })),
                     error: None,
@@ -75744,6 +75706,63 @@ async fn process_pending_app_control_requests(
                         error: Some(error.to_string()),
                     },
                 }
+            }
+        }
+        AppControlCommand::CheckTerminalInput {
+            session_path,
+            timeout_ms,
+        } => {
+            // The wedge detector. A row that has stopped consuming input after a
+            // turn ends is ALIVE, its turn has ENDED, and it looks exactly like a
+            // healthy idle row — `send` answers `error: null` and delivers nothing
+            // into it. This asks the one question that separates them, and submits
+            // NOTHING, so it is safe to point at a row the owner is using.
+            let (endpoint, runtime_session_path, trace_home) = state.with(|shell| {
+                (
+                    shell.bootstrap.server_endpoint.clone(),
+                    app_control_terminal_input_write_path(shell, &session_path),
+                    perf_home_dir(&shell.bootstrap.settings_path),
+                )
+            });
+            // Short by default: a healthy row echoes in a few hundred ms, so a
+            // 30 s wait would only ever be spent confirming bad news slowly.
+            let timeout = Duration::from_millis(if timeout_ms == 0 { 6_000 } else { timeout_ms });
+            let verdict = probe_terminal_input_consumption(
+                endpoint,
+                runtime_session_path,
+                session_path.clone(),
+                trace_home.as_path(),
+                timeout,
+                true,
+            )
+            .await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "session_path": session_path,
+                    "consuming_input": verdict.consuming_input,
+                    // WEDGED is a positive claim and needs BOTH halves: the
+                    // composer is displayed AND the row did not echo. Without the
+                    // first half a busy row mid-output would be called wedged,
+                    // which is the false positive that would justify a reaper
+                    // killing live work.
+                    "wedged": !verdict.consuming_input
+                        && verdict.composer_shown
+                        && !verdict.composer_held_draft,
+                    "composer_shown": verdict.composer_shown,
+                    "composer_held_draft": verdict.composer_held_draft,
+                    "waited_ms": verdict.waited_ms,
+                    "reason": verdict.reason,
+                    "remedy": if !verdict.consuming_input && verdict.composer_shown && !verdict.composer_held_draft {
+                        Some("server terminal restart '<session>' clears the wedge with the transcript intact")
+                    } else {
+                        None
+                    },
+                })),
+                error: None,
             }
         }
         AppControlCommand::ReclaimTerminalFocus { session_path } => {
@@ -103374,6 +103393,141 @@ async fn terminal_read_async(
     })
     .await
 }
+/// The probe marker typed into a composer to prove the CLI is reading it, and
+/// the Ctrl+U that removes it again. ONE definition — `SubmitTerminalPrompt`
+/// and `CheckTerminalInput` are the same question asked for two purposes, and a
+/// second copy of this marker is how they would drift into disagreeing about
+/// whether a row is alive.
+const TERMINAL_INPUT_ECHO_PROBE: &str = "yggterm_ready_probe";
+const TERMINAL_INPUT_CLEAR_LINE: &str = "\u{15}"; // Ctrl+U — clears the composer line
+/// Named verdicts. A wedged row is ALIVE and looks IDLE, so the reason string is
+/// the only thing that separates it from a healthy row waiting for work — it
+/// must say which of the three things happened, never just "not ready".
+const TERMINAL_INPUT_CONSUMING_REASON: &str =
+    "the session echo-confirmed it is consuming input";
+const TERMINAL_INPUT_WEDGED_REASON: &str =
+    "session never echo-confirmed it was consuming input within the timeout (composer is displayed, so the row is WEDGED: alive, idle-looking, and not reading its PTY)";
+const TERMINAL_INPUT_NO_COMPOSER_REASON: &str =
+    "no agent composer row appeared within the timeout — the row is mid-output, in a menu, or is not an agent CLI, so input readiness is unanswerable rather than false";
+const TERMINAL_INPUT_DRAFT_REASON: &str =
+    "the composer holds an unsent draft — refusing to probe, because the probe types a marker and clears the line with Ctrl+U and would destroy it";
+
+/// One verdict on one question: **is this row consuming input right now?**
+#[derive(Debug, Clone)]
+struct TerminalInputProbeVerdict {
+    consuming_input: bool,
+    composer_shown: bool,
+    composer_held_draft: bool,
+    waited_ms: u64,
+    reason: &'static str,
+}
+
+/// Prove — or fail to prove — that a session is reading its PTY, WITHOUT
+/// submitting anything.
+///
+/// Phase 1 waits for the composer to be displayed, so the probe is never fired
+/// into a menu or mid-output surface. Phase 2 types the probe marker and
+/// confirms it ECHOES back onto the daemon's screen, then clears it. A displayed
+/// composer is NOT evidence on its own: a just-resumed CLI draws its composer
+/// seconds before its input loop is live (see
+/// [[finding-fresh-restarted-codex-no-input]]), and a WEDGED row draws one
+/// forever while reading nothing.
+///
+/// `guard_draft` makes the probe refuse instead of running when the composer
+/// already holds typed text. `SubmitTerminalPrompt` leaves it off — its caller
+/// has asked for that text to be sent and the Ctrl+U is part of doing so — while
+/// a bare check must never cost the human a sentence for the sake of an answer.
+async fn probe_terminal_input_consumption(
+    endpoint: ServerEndpoint,
+    runtime_session_path: String,
+    session_path: String,
+    trace_home: &Path,
+    timeout: Duration,
+    guard_draft: bool,
+) -> TerminalInputProbeVerdict {
+    let started = Instant::now();
+    let mut composer_shown = false;
+    let mut composer_held_draft = false;
+    while started.elapsed() < timeout {
+        if let Ok((screen, ..)) = terminal_snapshot_async(
+            endpoint.clone(),
+            session_path.clone(),
+            trace_home,
+        )
+        .await
+            && terminal_chunk_has_agent_composer_row(&screen)
+        {
+            composer_shown = true;
+            composer_held_draft = terminal_composer_row_holds_draft(&screen);
+            break;
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+    if !composer_shown {
+        return TerminalInputProbeVerdict {
+            consuming_input: false,
+            composer_shown: false,
+            composer_held_draft: false,
+            waited_ms: started.elapsed().as_millis() as u64,
+            reason: TERMINAL_INPUT_NO_COMPOSER_REASON,
+        };
+    }
+    if guard_draft && composer_held_draft {
+        return TerminalInputProbeVerdict {
+            consuming_input: false,
+            composer_shown: true,
+            composer_held_draft: true,
+            waited_ms: started.elapsed().as_millis() as u64,
+            reason: TERMINAL_INPUT_DRAFT_REASON,
+        };
+    }
+    while started.elapsed() < timeout {
+        let _ = terminal_write_app_control_input_async(
+            endpoint.clone(),
+            runtime_session_path.clone(),
+            session_path.clone(),
+            TERMINAL_INPUT_ECHO_PROBE.to_string(),
+            "submit_probe",
+            trace_home,
+        )
+        .await;
+        sleep(Duration::from_millis(180)).await;
+        let echoed = matches!(
+            terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home).await,
+            Ok((ref screen, ..)) if screen.contains(TERMINAL_INPUT_ECHO_PROBE)
+        );
+        // Clear the probe whether it echoed (consumed) or was buffered while the
+        // CLI wasn't reading yet — the composer is left clean either way.
+        let _ = terminal_write_app_control_input_async(
+            endpoint.clone(),
+            runtime_session_path.clone(),
+            session_path.clone(),
+            TERMINAL_INPUT_CLEAR_LINE.to_string(),
+            "submit_probe",
+            trace_home,
+        )
+        .await;
+        if echoed {
+            sleep(Duration::from_millis(60)).await;
+            return TerminalInputProbeVerdict {
+                consuming_input: true,
+                composer_shown: true,
+                composer_held_draft,
+                waited_ms: started.elapsed().as_millis() as u64,
+                reason: TERMINAL_INPUT_CONSUMING_REASON,
+            };
+        }
+        sleep(Duration::from_millis(120)).await;
+    }
+    TerminalInputProbeVerdict {
+        consuming_input: false,
+        composer_shown: true,
+        composer_held_draft,
+        waited_ms: started.elapsed().as_millis() as u64,
+        reason: TERMINAL_INPUT_WEDGED_REASON,
+    }
+}
+
 async fn terminal_snapshot_async(
     endpoint: ServerEndpoint,
     session_path: String,

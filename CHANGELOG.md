@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **You can now ask a session whether it is actually listening.** An agent
+  session sometimes stops reading its input after a turn ends: the process is
+  still alive, the prompt is still drawn, and the row looks exactly like one
+  waiting for work — but everything typed or sent into it disappears, and the
+  tools that send it report success. `server app terminal input-check <session>`
+  asks the one question that separates the two, and sends nothing while asking,
+  so it is safe to point at a session you are using. It answers that the session
+  is listening, that it is wedged (with the command that clears it), or that the
+  question cannot be answered yet because the session is mid-output — never a
+  bare "not ready". If the prompt is holding something you typed and have not
+  sent, it declines to check rather than clearing your line to find out.
+
 - **The last character on a line is no longer cut off at the right edge of the
   terminal.** The terminal reserves a narrow strip on the right so the scrollbar
   stays grabbable, and that strip clips whatever is drawn under it — but the
