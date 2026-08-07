@@ -40,6 +40,57 @@ pub enum ResumeSelector {
     Subcommand(&'static str),
 }
 
+/// Who decides a session's title.
+///
+/// Data, because the answer used to be `matches!(self, SessionKind::ClaudeCode)`
+/// on [`SessionKind::self_generates_copy`] — a hand-list that a second
+/// store-authoritative CLI silently falls out of, and then yggterm generates a
+/// title for a CLI that already wrote its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleAuthority {
+    /// The CLI writes its own title into its own store; yggterm READS it and
+    /// only writes back on an explicit user rename (`spec-codex-cc-title-summary`).
+    Store,
+    /// The CLI records no title of its own; yggterm's LLM chore generates one.
+    Generated,
+}
+
+/// How yggterm provisions this CLI on a machine it touches
+/// (`spec-cli-binary-auto-provisioning`).
+///
+/// ⛔ User-local installs only — never `sudo`, never a `/usr/local` copy that
+/// the CLI's own updater cannot write to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliInstall {
+    /// `npm i -g <package>` under the yggterm-owned npm prefix.
+    Npm(&'static str),
+    /// `uv tool install <package>` — a Python CLI.
+    Uv(&'static str),
+    /// A vendor installer that writes into `~/.local/bin`. The str is the URL a
+    /// human would pipe to a shell; yggterm records it so the provisioner can
+    /// name what is missing, and does NOT run it unattended.
+    VendorScript(&'static str),
+    /// Closed-source or licence-gated: yggterm can detect it and refuse cleanly,
+    /// but must never try to install it.
+    Manual,
+}
+
+/// One phrase that means "a turn is in flight", as read off this CLI's SCREEN.
+///
+/// Distinct from [`AgentCliDescriptor::working_footer_hints`], which is scanned
+/// only BELOW the composer for the agent-row plane. This one is the whole-screen
+/// matcher behind the sidebar dot and the hot-update idle gate — the two
+/// consumers that must never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenWorkingPhrase {
+    /// Lowercase fragment the line must contain.
+    pub needle: &'static str,
+    /// When non-empty, the line must ALSO contain one of these. Codex's
+    /// `working (` is only a work signal beside `/stop to close` or
+    /// `background terminal running`; alone it is prose.
+    pub also_any: &'static [&'static str],
+}
+
 /// Whether a CLI flag swallows the next token as its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlagArity {
@@ -382,8 +433,70 @@ pub struct AgentCliDescriptor {
     pub kind: SessionKind,
     /// Human name for UI ("Codex", "Claude Code", …).
     pub display_name: &'static str,
+    /// The ONE lowercase wire name for this CLI: the `--kind` flag value, the
+    /// `session_kind_label` string, and the `icon_kind` the row JSON reports.
+    ///
+    /// ⚠ It is deliberately NOT the same field as [`Self::wrapper_slug`] or the
+    /// scheme strings: the three shipped CLIs carry historical spellings
+    /// (`remote-session://` for codex, `resume-cc` for Claude Code) that are on
+    /// disk and on the wire and may not be renamed. New CLIs derive everything
+    /// from this one slug, which is what makes them free of that debt.
+    pub slug: &'static str,
     /// The executable, as invoked on the session's host.
     pub binary_name: &'static str,
+    /// How yggterm provisions the binary when a machine lacks it.
+    pub install: CliInstall,
+    /// The boxed-glyph mark drawn in the sidebar, start page and row JSON —
+    /// codex `>_`, Claude Code `*_`, a shell `$_`.
+    ///
+    /// Data because "which icon?" had THREE answers in the shell (a kind string,
+    /// a glyph, and a bespoke component), kept in agreement only by two tests.
+    /// The mark is the CLI's identity, so the CLI declares it once.
+    ///
+    /// Two characters render pixel-identical to the shipped three; three still
+    /// fit the rect but are drawn a point smaller (see `TreeIcon`).
+    pub icon_glyph: &'static str,
+    /// The letter this CLI's "New … Session Here" menu entry WANTS. A
+    /// preference, never a guarantee — the KeyTip ladder may deny it.
+    pub menu_hint: char,
+    /// Who owns this CLI's session title.
+    pub title_authority: TitleAuthority,
+    /// Whether the CLI accepts a caller-supplied session id at birth (Claude
+    /// Code's `--session-id <uuid>`).
+    ///
+    /// `true` ⇒ the row id IS the transcript id from birth and the remote
+    /// identity poll is unnecessary BY DESIGN. `false` ⇒ the CLI mints its own
+    /// id and yggterm rebinds `local://<synth>` once it appears (spec §7.5).
+    /// This one bit is what decides whether the poll runs — it used to be a
+    /// per-CLI code fork.
+    pub id_assigned_at_birth: bool,
+    /// The token the remote wrapper subcommands are built from:
+    /// `resume-<slug>`, `start-<slug>`, `terminate-<slug>`,
+    /// `<slug>-session-exists`.
+    ///
+    /// `None` ⇒ this CLI is LOCAL-ONLY and has no remote arm at all
+    /// (`CodexLiteLlm`). Declaring it is what lets the arm matrices stop
+    /// hardcoding `matches!(kind, CodexLiteLlm)`.
+    pub wrapper_slug: Option<&'static str>,
+    /// The scheme this CLI's REMOTE rows are identified by, including its `://`.
+    /// `None` for a local-only CLI. Codex's is `remote-session://` for
+    /// historical reasons; every new CLI's is `remote-<slug>://`.
+    pub remote_row_scheme: Option<&'static str>,
+    /// The scheme this CLI's daemon-owned runtime keys use, including its `://`.
+    /// `None` for a local-only CLI. New CLIs get `<slug>-runtime://`.
+    pub runtime_key_scheme: Option<&'static str>,
+    /// Whole-SCREEN phrases meaning a turn is in flight — the sidebar dot and
+    /// the hot-update idle gate read these. See [`ScreenWorkingPhrase`].
+    ///
+    /// ⛔ EMPTY means UNMEASURED, exactly as for `working_footer_hints`: the row
+    /// then reports `false` for working because nothing was observed, and that
+    /// gap belongs in the descriptor where the next session can see it — not in
+    /// a matcher in another crate that nobody thinks to update.
+    pub working_screen_phrases: &'static [ScreenWorkingPhrase],
+    /// Lines that LOOK like a work signal and are not — codex's completion
+    /// summary `Worked for 12s` contains `worked for `, and matched the naive
+    /// `working` needle.
+    pub working_screen_negations: &'static [&'static str],
     /// How an existing session id is named on resume.
     pub resume_selector: ResumeSelector,
     /// Whether resuming into a known cwd passes it explicitly.
@@ -460,6 +573,16 @@ pub struct AgentCliDescriptor {
     /// A glob cannot express "not containing", and codex writes `.bak.` copies
     /// beside real transcripts.
     pub store_excluded_name_fragments: &'static [&'static str],
+    /// WHY this CLI's past sessions are not listed in the cwd tree, when
+    /// [`Self::session_store_globs`] is empty.
+    ///
+    /// `None` ⇒ the store IS scanned. `Some(reason)` ⇒ the gap is DECLARED, and
+    /// the reason names the specific obstacle so the next session can close it
+    /// instead of rediscovering it. A CLI may be first-class for launch and
+    /// resume — which is the product's core promise — while its historical
+    /// sessions are not yet enumerable; what is forbidden is being silent about
+    /// which of the two is true.
+    pub store_scan_gap: Option<&'static str>,
     /// Environment variable that relocates this CLI's home — the directory
     /// ABOVE the store root — when set. `None` ⇒ the store is always under
     /// `$HOME`.
@@ -495,6 +618,76 @@ impl AgentCliDescriptor {
         }
         tokens.push(session_id_quoted.to_string());
         tokens
+    }
+
+    /// Whether this CLI has a remote arm at all. Derived from
+    /// [`Self::wrapper_slug`] so "local-only" is declared once instead of being
+    /// a `matches!(kind, CodexLiteLlm)` in the scheme lock, the arm matrices and
+    /// the wrapper tables.
+    pub fn has_remote_arm(&self) -> bool {
+        self.wrapper_slug.is_some()
+    }
+
+    /// The remote wrapper subcommand that RESUMES an existing session
+    /// (`resume-codex`, `resume-cc`, `resume-kimi`). `None` when local-only.
+    pub fn resume_subcommand(&self) -> Option<String> {
+        self.wrapper_slug.map(|slug| format!("resume-{slug}"))
+    }
+
+    /// The remote wrapper subcommand that STARTS a fresh session.
+    pub fn start_subcommand(&self) -> Option<String> {
+        self.wrapper_slug.map(|slug| format!("start-{slug}"))
+    }
+
+    /// The remote wrapper subcommand that CLOSES a session across the ssh hop.
+    ///
+    /// ⚠ Its absence is a real, user-visible bug shape: a close that never
+    /// crosses the hop leaves the remote CLI running with no row to reach it by.
+    pub fn terminate_subcommand(&self) -> Option<String> {
+        self.wrapper_slug.map(|slug| format!("terminate-{slug}"))
+    }
+
+    /// The remote wrapper subcommand that asks whether a saved session exists.
+    pub fn session_exists_subcommand(&self) -> Option<String> {
+        self.wrapper_slug.map(|slug| format!("{slug}-session-exists"))
+    }
+
+    /// The label the "New … Session" menu entries carry, derived from
+    /// [`Self::display_name`] so the menu and the metadata rail cannot disagree
+    /// about what this CLI is called.
+    pub fn new_session_label(&self) -> String {
+        format!("New {} Session", self.display_name)
+    }
+
+    /// Whether this CLI's own store is authoritative for the session title.
+    pub fn title_is_store_authoritative(&self) -> bool {
+        matches!(self.title_authority, TitleAuthority::Store)
+    }
+
+    /// Whether this CLI's SCREEN says a turn is in flight.
+    ///
+    /// Window and folding match the matcher this replaced exactly: the last ten
+    /// non-empty lines, ASCII-lowercased, negations checked first.
+    pub fn screen_shows_working(&self, sample: &str) -> bool {
+        sample.lines().rev().take(10).any(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return false;
+            }
+            let lower = line.to_ascii_lowercase();
+            if self
+                .working_screen_negations
+                .iter()
+                .any(|deny| lower.contains(deny))
+            {
+                return false;
+            }
+            self.working_screen_phrases.iter().any(|phrase| {
+                lower.contains(phrase.needle)
+                    && (phrase.also_any.is_empty()
+                        || phrase.also_any.iter().any(|also| lower.contains(also)))
+            })
+        })
     }
 
     /// Tokens for the CLI's own resume PICKER (no session id).
@@ -741,7 +934,37 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     AgentCliDescriptor {
         kind: SessionKind::Codex,
         display_name: "Codex",
+        slug: "codex",
         binary_name: "codex",
+        install: CliInstall::Npm("@openai/codex"),
+        icon_glyph: ">_",
+        menu_hint: 'c',
+        // Codex records no title of its own; yggterm's LLM chore writes one.
+        title_authority: TitleAuthority::Generated,
+        // Codex launches bare and discovers its ULID later, so the synthesized
+        // `local://<uuid4>` has to be rebound once the transcript appears.
+        id_assigned_at_birth: false,
+        wrapper_slug: Some("codex"),
+        // ⚠ HISTORICAL, and deliberately not `remote-codex://`: this string is
+        // in every persisted state file on the fleet. The slug drives new CLIs;
+        // it may not retroactively rename a shipped one.
+        remote_row_scheme: Some("remote-session://"),
+        runtime_key_scheme: Some("codex-runtime://"),
+        // Codex prints no `esc to interrupt` on a plain turn; the two shapes
+        // below are its BACKGROUND-task indicators, and both need their partner
+        // phrase or they match ordinary prose.
+        working_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "esc to interrupt",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "working (",
+                also_any: &["/stop to close", "background terminal running"],
+            },
+        ],
+        // `Worked for 12s` is codex's COMPLETION summary, not active work.
+        working_screen_negations: &["worked for "],
         resume_selector: ResumeSelector::Subcommand("resume"),
         // `codex resume <id>` reopens the session's ORIGINAL cwd unless
         // re-rooted; the cwd tree's whole promise is that a row opens where the
@@ -796,13 +1019,38 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // rollout-2026-07-25T…-<uuid>.jsonl`, so the depth is not fixed.
         session_store_globs: &[".codex/sessions/**/rollout-*.jsonl"],
         store_excluded_name_fragments: &[".bak."],
+        store_scan_gap: None,
         store_home_env_override: Some(crate::ENV_YGGTERM_CODEX_HOME),
         read_store_entry: read_codex_store_entry,
     },
     AgentCliDescriptor {
         kind: SessionKind::CodexLiteLlm,
         display_name: "Codex-LiteLLM",
+        slug: "codex-litellm",
         binary_name: "codex-litellm",
+        // A local fork the user builds; yggterm never installs it.
+        install: CliInstall::Manual,
+        icon_glyph: ">_",
+        menu_hint: 'z',
+        title_authority: TitleAuthority::Generated,
+        id_assigned_at_birth: false,
+        // ⛔ LOCAL-ONLY, and this is the declaration that says so. It replaces
+        // the `matches!(kind, CodexLiteLlm)` that the scheme lock, both arm
+        // matrices and the wrapper tables each carried their own copy of.
+        wrapper_slug: None,
+        remote_row_scheme: None,
+        runtime_key_scheme: None,
+        working_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "esc to interrupt",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "working (",
+                also_any: &["/stop to close", "background terminal running"],
+            },
+        ],
+        working_screen_negations: &["worked for "],
         resume_selector: ResumeSelector::Subcommand("resume"),
         // ⚠ Deliberately FALSE, preserving shipped behavior exactly: the
         // pre-descriptor builder gated `-C "$PWD"` on `SessionKind::Codex`
@@ -851,6 +1099,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         content_rederives_on_resume: true,
         session_store_globs: &[".codex-litellm/sessions/**/rollout-*.jsonl"],
         store_excluded_name_fragments: &[".bak."],
+        store_scan_gap: None,
         // No override: only `resolve_codex_home` consults an env var, and it
         // relocates `.codex` alone. Preserving that exactly.
         store_home_env_override: None,
@@ -859,7 +1108,30 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     AgentCliDescriptor {
         kind: SessionKind::ClaudeCode,
         display_name: "Claude Code",
+        slug: "claude-code",
         binary_name: "claude",
+        install: CliInstall::Npm("@anthropic-ai/claude-code"),
+        icon_glyph: "*_",
+        menu_hint: 'l',
+        // CC does the hard work of titling its own sessions and yggterm must
+        // RESPECT that, writing back only on an explicit user rename
+        // (`spec-codex-cc-title-summary`, user decision 2026-06-06).
+        title_authority: TitleAuthority::Store,
+        // CC launches with `--session-id <uuid>`, so the row id IS the
+        // transcript id from birth and no rebind poll is needed.
+        id_assigned_at_birth: true,
+        // ⚠ HISTORICAL `cc`, not `claude-code`: `resume-cc` / `start-cc` are in
+        // the Connect strings the metadata rail shows the user and in scripts.
+        wrapper_slug: Some("cc"),
+        remote_row_scheme: Some("remote-cc://"),
+        runtime_key_scheme: Some("cc-runtime://"),
+        // Measured on jojo 2026-08-07 — see `working_footer_hints` below for the
+        // three-row comparison this came from.
+        working_screen_phrases: &[ScreenWorkingPhrase {
+            needle: "esc to interrupt",
+            also_any: &[],
+        }],
+        working_screen_negations: &[],
         resume_selector: ResumeSelector::Flag("--resume"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
@@ -915,8 +1187,341 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // -home-user-gh-yggterm/<session-uuid>.jsonl`. Exactly one level.
         session_store_globs: &[".claude/projects/*/*.jsonl"],
         store_excluded_name_fragments: &[],
+        store_scan_gap: None,
         store_home_env_override: None,
         read_store_entry: read_claude_code_store_entry,
+    },
+    // ── The 2026-08-08 intake. Every field below was read off the CLI's own
+    // source or its installed binary on this date, never from memory; the
+    // provenance is on each row. See `docs/spec-adding-an-agent-cli.md`.
+    AgentCliDescriptor {
+        kind: SessionKind::Pi,
+        display_name: "Pi",
+        slug: "pi",
+        binary_name: "pi",
+        install: CliInstall::Npm("@earendil-works/pi-coding-agent"),
+        // The mathematical constant is pi's own mark.
+        icon_glyph: "\u{3c0}_",
+        menu_hint: 'p',
+        // No auto-title anywhere in the source; `/name` and `--name` are the
+        // only writers, so an untitled pi session has nothing for yggterm to
+        // respect and the LLM chore owns it.
+        title_authority: TitleAuthority::Generated,
+        // `pi --session-id <id>` creates the session if it is missing
+        // (`src/main.ts`), the closest analogue to Claude Code's birth id.
+        id_assigned_at_birth: true,
+        wrapper_slug: Some("pi"),
+        remote_row_scheme: Some("remote-pi://"),
+        runtime_key_scheme: Some("pi-runtime://"),
+        // `Working... (escape to interrupt)` — the message is composed from
+        // `defaultWorkingMessage` plus the resolved interrupt binding, so match
+        // the stable half. `Thinking...` is the hidden-reasoning variant.
+        working_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "working...",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "thinking...",
+                also_any: &[],
+            },
+        ],
+        working_screen_negations: &[],
+        resume_selector: ResumeSelector::Flag("--session"),
+        // `pi` takes `process.cwd()`; there is no `--cwd`, and `--session-dir`
+        // relocates STORAGE, not the working directory.
+        resume_re_roots_with_cwd: false,
+        model_flag: "--model",
+        composer_marker: '\u{203a}',
+        composer_footer_hints: &["esc", "ctrl", "/help", "tab"],
+        working_footer_hints: &["to interrupt"],
+        // Not yet read off `pi --help` on an installed copy; declaring a mode
+        // yggterm has not verified would be inventing a security posture.
+        permission_modes: &[(AgentPermissionMode::Default, &[])],
+        overridden_flags: &[("--model", FlagArity::TakesValue, OverriddenBy::Model)],
+        content_rederives_on_resume: true,
+        // `~/.pi/agent/sessions/--<cwd-with-separators-hyphenated>--/
+        // <timestamp>_<uuid>.jsonl`; line 1 is the session header carrying
+        // `id`, `cwd` and `timestamp`.
+        session_store_globs: &[".pi/agent/sessions/*/*.jsonl"],
+        store_excluded_name_fragments: &[],
+        // None of the 2026-08-08 intake relocates its home with an env var.
+        store_home_env_override: None,
+        store_scan_gap: None,
+        read_store_entry: read_pi_store_entry,
+    },
+    AgentCliDescriptor {
+        kind: SessionKind::OpenCode,
+        display_name: "OpenCode",
+        slug: "opencode",
+        binary_name: "opencode",
+        // The npm package is `opencode-ai`; the binary it installs is
+        // `opencode`. Naming the wrong one is how provisioning silently
+        // installs nothing.
+        install: CliInstall::Npm("opencode-ai"),
+        icon_glyph: "OC_",
+        menu_hint: 'o',
+        // A title agent EXISTS in the tree but is not wired into the v2 runner
+        // (an explicit TODO there), and creation writes the placeholder
+        // `New session - <iso>`. So the store is not authoritative today.
+        title_authority: TitleAuthority::Generated,
+        // ⛔ The CLI REFUSES an unknown `--session <id>` outright; a caller
+        // must mint the session over opencode's own RPC first. So yggterm may
+        // not assume a birth id.
+        id_assigned_at_birth: false,
+        wrapper_slug: Some("opencode"),
+        remote_row_scheme: Some("remote-opencode://"),
+        runtime_key_scheme: Some("opencode-runtime://"),
+        working_screen_phrases: &[ScreenWorkingPhrase {
+            needle: "esc interrupt",
+            also_any: &[],
+        }],
+        working_screen_negations: &[],
+        resume_selector: ResumeSelector::Flag("--session"),
+        resume_re_roots_with_cwd: false,
+        model_flag: "--model",
+        composer_marker: '\u{276f}',
+        composer_footer_hints: &["esc", "interrupt", "ctrl", "tab"],
+        working_footer_hints: &["esc interrupt", "again to interrupt"],
+        permission_modes: &[(AgentPermissionMode::Default, &[])],
+        overridden_flags: &[("--model", FlagArity::TakesValue, OverriddenBy::Model)],
+        // ⚠ The default TUI owns the screen and repaints via opentui; there is
+        // no scrollback transcript to re-derive. `--mini` is the streaming
+        // variant that does replay.
+        content_rederives_on_resume: false,
+        session_store_globs: &[],
+        store_excluded_name_fragments: &[],
+        // None of the 2026-08-08 intake relocates its home with an env var.
+        store_home_env_override: None,
+        store_scan_gap: Some(
+            "opencode keeps every session in ONE SQLite database \
+             (~/.local/share/opencode/opencode.db, table `session`, columns \
+             id/directory/title), not a file per session, so the glob+read_store_entry \
+             shape cannot express it. rusqlite is already a yggterm-core dependency; \
+             closing this needs a scanner-shaped hook that yields MANY entries from \
+             ONE path, plus WAL-safe read-only opening.",
+        ),
+        read_store_entry: read_no_store_entry,
+    },
+    AgentCliDescriptor {
+        kind: SessionKind::QwenCode,
+        display_name: "Qwen Code",
+        slug: "qwen-code",
+        binary_name: "qwen",
+        install: CliInstall::Npm("@qwen-code/qwen-code"),
+        icon_glyph: "Q_",
+        menu_hint: 'q',
+        // Qwen generates and PERSISTS its own title as a `custom_title` record
+        // and re-appends it near EOF as the file grows, so a tail scan finds
+        // it. yggterm must respect that.
+        title_authority: TitleAuthority::Store,
+        // `qwen --session-id <uuid>` — but a collision is FATAL, so the caller
+        // must mint a fresh uuid, never reuse a row id it already used.
+        id_assigned_at_birth: true,
+        wrapper_slug: Some("qwen"),
+        remote_row_scheme: Some("remote-qwen://"),
+        runtime_key_scheme: Some("qwen-runtime://"),
+        // ⚠ i18n'd through `t()`, so a non-English locale changes it. The
+        // store and the runtime sidecar are the reliable signals; this is the
+        // screen fallback.
+        working_screen_phrases: &[ScreenWorkingPhrase {
+            needle: "esc to cancel",
+            also_any: &[],
+        }],
+        working_screen_negations: &[],
+        resume_selector: ResumeSelector::Flag("--resume"),
+        resume_re_roots_with_cwd: false,
+        model_flag: "--model",
+        composer_marker: '\u{276f}',
+        composer_footer_hints: &["esc", "ctrl", "qwen", "tab"],
+        working_footer_hints: &["esc to cancel"],
+        permission_modes: &[(AgentPermissionMode::Default, &[])],
+        overridden_flags: &[("--model", FlagArity::TakesValue, OverriddenBy::Model)],
+        content_rederives_on_resume: true,
+        // `~/.qwen/projects/<cwd-with-non-alnum-hyphenated>/chats/<uuid>.jsonl`.
+        // ⚠ The service's own comment says `~/.qwen/tmp/<id>/chats` — that
+        // comment is STALE; the code calls `getProjectDir()`, not
+        // `getProjectTempDir()`. Read the code, not the comment.
+        session_store_globs: &[".qwen/projects/*/chats/*.jsonl"],
+        // `<sessionId>.runtime.json` sits beside the transcript in the same
+        // directory and is not a transcript.
+        store_excluded_name_fragments: &[".runtime."],
+        store_home_env_override: None,
+        store_scan_gap: None,
+        read_store_entry: read_qwen_store_entry,
+    },
+    AgentCliDescriptor {
+        kind: SessionKind::Kimi,
+        display_name: "Kimi",
+        slug: "kimi",
+        binary_name: "kimi",
+        // A Python CLI; `uv tool install` is what its own getting-started says.
+        install: CliInstall::Uv("kimi-cli"),
+        icon_glyph: "K_",
+        menu_hint: 'k',
+        // `state.json` carries `custom_title` with a `title_generated` flag and
+        // a 3-attempt cap — the CLI owns it.
+        title_authority: TitleAuthority::Store,
+        // `kimi -r <unknown-id>` CREATES that session rather than failing, so a
+        // caller-supplied id at birth is honoured. Its id is a directory name
+        // verbatim, with no format validation.
+        id_assigned_at_birth: true,
+        wrapper_slug: Some("kimi"),
+        remote_row_scheme: Some("remote-kimi://"),
+        runtime_key_scheme: Some("kimi-runtime://"),
+        // ⚠ Kimi's main turn spinner draws a moon frame with EMPTY text, and
+        // its interrupt is Ctrl-C, not esc — there is no "esc to interrupt"
+        // affordance to match. These are the per-block spinners.
+        working_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "composing...",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "thinking...",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "compacting...",
+                also_any: &[],
+            },
+        ],
+        // `Thought for 12s` is the COMPLETION trace, and it contains `thought`,
+        // not `thinking...` — kept explicit so a future needle widening cannot
+        // silently swallow it.
+        working_screen_negations: &["thought for "],
+        resume_selector: ResumeSelector::Flag("--resume"),
+        // `kimi -w <dir>` is how a new session is rooted; resume takes the id
+        // and re-derives the work dir from its own metadata.
+        resume_re_roots_with_cwd: false,
+        model_flag: "--model",
+        composer_marker: '\u{276f}',
+        composer_footer_hints: &["ctrl", "kimi", "/help", "tab"],
+        working_footer_hints: &["composing...", "thinking..."],
+        permission_modes: &[(AgentPermissionMode::Default, &[])],
+        overridden_flags: &[("--model", FlagArity::TakesValue, OverriddenBy::Model)],
+        // Resume replays only the last 5 turns to the screen; the full history
+        // stays on disk, so the PTY is NOT a faithful re-derivation.
+        content_rederives_on_resume: false,
+        session_store_globs: &[],
+        store_excluded_name_fragments: &[],
+        // None of the 2026-08-08 intake relocates its home with an env var.
+        store_home_env_override: None,
+        store_scan_gap: Some(
+            "kimi buckets sessions under an MD5 OF THE WORKING DIRECTORY \
+             (~/.kimi/sessions/<md5(cwd)>/<session-id>/context.jsonl), so the cwd \
+             cannot be recovered from the path and the cwd tree has nowhere to hang \
+             the row. The reverse map exists — ~/.kimi/kimi.json `work_dirs[]` carries \
+             `path` — but matching it to a bucket needs an MD5 of each candidate path, \
+             and yggterm-core has sha2 and no md5. Closing this means either adding \
+             md-5 (and its licence notice) or indexing kimi.json directly. Deferred \
+             also because upstream says kimi-cli is being wound down in favour of \
+             MoonshotAI/kimi-code.",
+        ),
+        read_store_entry: read_no_store_entry,
+    },
+    AgentCliDescriptor {
+        kind: SessionKind::Muse,
+        display_name: "Muse Code",
+        slug: "muse",
+        binary_name: "muse",
+        // The vendor installer writes a launcher to ~/.local/bin/muse which
+        // then fetches `muse-bin-<version>` beside it — user-local, which is
+        // what `spec-cli-binary-auto-provisioning` requires. Credentials land
+        // in ~/.config/muse/auth.json.
+        install: CliInstall::VendorScript("https://dev.meta.ai/install.sh"),
+        icon_glyph: "M_",
+        menu_hint: 'm',
+        title_authority: TitleAuthority::Generated,
+        id_assigned_at_birth: false,
+        wrapper_slug: Some("muse"),
+        remote_row_scheme: Some("remote-muse://"),
+        runtime_key_scheme: Some("muse-runtime://"),
+        // ⛔ UNMEASURED — no copy of Muse Code is installed on the fleet, and a
+        // phrase invented from a press release is exactly the guess that turns
+        // "paused" into "grinding". Fill this from a screen.
+        working_screen_phrases: &[],
+        working_screen_negations: &[],
+        resume_selector: ResumeSelector::Flag("--resume"),
+        resume_re_roots_with_cwd: false,
+        model_flag: "--model",
+        composer_footer_hints: &[],
+        composer_marker: '\u{276f}',
+        working_footer_hints: &[],
+        permission_modes: &[(AgentPermissionMode::Default, &[])],
+        overridden_flags: &[],
+        content_rederives_on_resume: true,
+        session_store_globs: &[],
+        store_excluded_name_fragments: &[],
+        // None of the 2026-08-08 intake relocates its home with an env var.
+        store_home_env_override: None,
+        store_scan_gap: Some(
+            "Muse Code is closed source and NOT INSTALLED on any fleet host, so its \
+             store layout, resume flag and working phrase are all UNOBSERVED. What is \
+             known came from reading the public installer without running it: the \
+             binary is `muse`, it installs user-local into ~/.local/bin, and it keeps \
+             credentials at ~/.config/muse/auth.json. `resume_selector`, \
+             `composer_marker` and the phrase lists here are PLACEHOLDERS to be \
+             replaced from a real `muse --help` and a real screen — they are not \
+             measurements. Installing it needs a Meta login, which only the owner has: \
+             tracked in docs/owner-attention.md.",
+        ),
+        read_store_entry: read_no_store_entry,
+    },
+    AgentCliDescriptor {
+        kind: SessionKind::Antigravity,
+        display_name: "Antigravity",
+        slug: "antigravity",
+        binary_name: "agy",
+        install: CliInstall::Manual,
+        icon_glyph: "A_",
+        menu_hint: 'a',
+        // The conversation file carries a `name` field, which is the CLI's own
+        // title; on a fresh conversation it is still the cwd.
+        title_authority: TitleAuthority::Store,
+        id_assigned_at_birth: false,
+        wrapper_slug: Some("agy"),
+        remote_row_scheme: Some("remote-agy://"),
+        runtime_key_scheme: Some("agy-runtime://"),
+        // ⛔ UNMEASURED. `agy` is installed on jojo and oc, but no working
+        // screen has been captured — `agy --help` documents flags, not the TUI.
+        working_screen_phrases: &[],
+        working_screen_negations: &[],
+        // Read off `agy --help`, v1.0.5 on jojo (2026-08-08): resume is
+        // `--conversation <ID>`, and `-c`/`--continue` takes the most recent.
+        resume_selector: ResumeSelector::Flag("--conversation"),
+        resume_re_roots_with_cwd: false,
+        model_flag: "--model",
+        composer_marker: '\u{276f}',
+        composer_footer_hints: &["esc", "ctrl"],
+        working_footer_hints: &[],
+        // `--dangerously-skip-permissions` is documented in `agy --help` as
+        // "Auto-approve all tool permission requests without prompting".
+        permission_modes: &[
+            (AgentPermissionMode::Default, &[]),
+            (
+                AgentPermissionMode::Bypass,
+                &["--dangerously-skip-permissions"],
+            ),
+        ],
+        overridden_flags: &[
+            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
+            (
+                "--dangerously-skip-permissions",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
+        ],
+        content_rederives_on_resume: true,
+        // `~/.antigravitycli/<uuid>.json`, one flat file per conversation,
+        // carrying `id`, `name` and `projectResources.resources[].gitFolder
+        // .folderUri` as a `file://` URI. Verified on jojo 2026-08-08.
+        session_store_globs: &[".antigravitycli/*.json"],
+        store_excluded_name_fragments: &[],
+        // None of the 2026-08-08 intake relocates its home with an env var.
+        store_home_env_override: None,
+        store_scan_gap: None,
+        read_store_entry: read_antigravity_store_entry,
     },
 ];
 
@@ -941,6 +1546,127 @@ fn read_codex_store_entry(path: &Path) -> Option<AgentStoreEntry> {
         cwd,
         modified_epoch_ms: modified_epoch_ms_of(path),
         title: None,
+        detail: None,
+    })
+}
+
+/// The reader for a CLI whose store yggterm cannot enumerate yet.
+///
+/// It is wired to a descriptor whose `session_store_globs` is EMPTY, so nothing
+/// ever calls it — but a descriptor field may not be left unset, and a function
+/// that says why in one line beats a `None` that says nothing. The reason lives
+/// on the descriptor's `store_scan_gap`.
+fn read_no_store_entry(_path: &Path) -> Option<AgentStoreEntry> {
+    None
+}
+
+/// Read the FIRST line of a JSONL file as JSON.
+///
+/// Bounded: a session transcript's first line is its header for every CLI that
+/// writes one, and a store scan must never pull a multi-megabyte transcript into
+/// memory to learn a uuid.
+fn read_first_jsonl_object(path: &Path) -> Option<serde_json::Value> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    let mut line = String::new();
+    let mut reader = BufReader::new(file);
+    // A header line longer than this is not a header.
+    for _ in 0..8 {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        return serde_json::from_str(line.trim()).ok();
+    }
+    None
+}
+
+/// `pi` — line 1 is the session header: `{"type":"session","id":…,"cwd":…}`.
+///
+/// The title is NOT in the header: it arrives later as a `session_info` entry
+/// carrying `name`. Scanning the whole file for the newest one would make the
+/// cwd-tree scan O(transcript), so the store contributes identity only and the
+/// title chore owns the copy — which is what `TitleAuthority::Generated` says.
+fn read_pi_store_entry(path: &Path) -> Option<AgentStoreEntry> {
+    let header = read_first_jsonl_object(path)?;
+    if header.get("type").and_then(|value| value.as_str()) != Some("session") {
+        return None;
+    }
+    let session_id = header.get("id")?.as_str()?.to_string();
+    let cwd = header.get("cwd")?.as_str()?.to_string();
+    if session_id.is_empty() || cwd.is_empty() {
+        return None;
+    }
+    Some(AgentStoreEntry {
+        session_id,
+        cwd,
+        modified_epoch_ms: modified_epoch_ms_of(path),
+        title: None,
+        detail: None,
+    })
+}
+
+/// `qwen` — every record carries `sessionId` and `cwd`, so the first one
+/// answers identity without walking the file.
+fn read_qwen_store_entry(path: &Path) -> Option<AgentStoreEntry> {
+    let first = read_first_jsonl_object(path)?;
+    let session_id = first.get("sessionId")?.as_str()?.to_string();
+    let cwd = first.get("cwd")?.as_str()?.to_string();
+    if session_id.is_empty() || cwd.is_empty() {
+        return None;
+    }
+    Some(AgentStoreEntry {
+        session_id,
+        cwd,
+        modified_epoch_ms: modified_epoch_ms_of(path),
+        // Qwen's title is a `custom_title` record appended LATER (and
+        // re-appended near EOF as the file grows). Reading it is a tail scan,
+        // which the identity pass deliberately is not; the title sync owns it.
+        title: None,
+        detail: None,
+    })
+}
+
+/// `agy` — one flat JSON object per conversation.
+///
+/// `name` is the CLI's own title, and on a conversation that has not been named
+/// yet it is still the working directory. Handing that back as a title would
+/// make every fresh row read `/home/pi`, so a name equal to the cwd is treated
+/// as absent — the same judgement the cwd-derived placeholder gets elsewhere.
+fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let session_id = value.get("id")?.as_str()?.to_string();
+    let cwd = value
+        .get("projectResources")?
+        .get("resources")?
+        .as_array()?
+        .iter()
+        .find_map(|resource| {
+            resource
+                .get("gitFolder")?
+                .get("folderUri")?
+                .as_str()?
+                .strip_prefix("file://")
+                .map(|path| path.to_string())
+        })?;
+    if session_id.is_empty() || cwd.is_empty() {
+        return None;
+    }
+    let title = value
+        .get("name")
+        .and_then(|name| name.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && *name != cwd)
+        .map(|name| name.to_string());
+    Some(AgentStoreEntry {
+        session_id,
+        cwd,
+        modified_epoch_ms: modified_epoch_ms_of(path),
+        title,
         detail: None,
     })
 }

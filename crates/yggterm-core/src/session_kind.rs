@@ -6,6 +6,18 @@ pub enum SessionKind {
     Codex,
     CodexLiteLlm,
     ClaudeCode,
+    /// `pi` — earendil-works/pi, MIT.
+    Pi,
+    /// `opencode` — sst/opencode, MIT.
+    OpenCode,
+    /// `qwen` — QwenLM/qwen-code, Apache-2.0.
+    QwenCode,
+    /// `kimi` — MoonshotAI/kimi-cli, Apache-2.0.
+    Kimi,
+    /// `muse` — Meta's Muse Code, closed source.
+    Muse,
+    /// `agy` — Google Antigravity's CLI, closed source.
+    Antigravity,
     Shell,
     SshShell,
     Document,
@@ -24,8 +36,17 @@ impl SessionKind {
             .any(|descriptor| descriptor.kind == self)
     }
 
+    /// Whether this kind writes its own session title, so yggterm must RESPECT
+    /// it rather than generate one.
+    ///
+    /// DERIVED from the descriptor's `title_authority`. It used to be
+    /// `matches!(self, SessionKind::ClaudeCode)` — a hand-list that a second
+    /// store-authoritative CLI falls silently out of, after which yggterm
+    /// generates a title for a CLI that already wrote one and the two disagree
+    /// forever.
     pub fn self_generates_copy(self) -> bool {
-        matches!(self, SessionKind::ClaudeCode)
+        crate::agent_cli::agent_cli_descriptor(self)
+            .is_some_and(|descriptor| descriptor.title_is_store_authoritative())
     }
 
     /// Whether a session of this kind has a RENDERED (non-terminal) view of its

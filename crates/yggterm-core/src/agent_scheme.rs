@@ -114,6 +114,119 @@ pub const SESSION_PATH_SCHEMES: &[SchemeDescriptor] = &[
         legacy: false,
         example: "cc-runtime://00000000-0000-4000-8000-000000000005",
     },
+    // ── The 2026-08-08 intake. Every row here is DERIVED from its
+    // `AgentCliDescriptor` (`remote_row_scheme` / `runtime_key_scheme`) and the
+    // lock `every_agent_descriptor_scheme_is_registered_and_vice_versa` fails the
+    // build if the two ever disagree — a new CLI cannot land a scheme in one
+    // place and forget the other.
+    SchemeDescriptor {
+        prefix: "remote-pi://",
+        role: SchemeRole::RowIdentity,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::Pi),
+        agent: true,
+        legacy: false,
+        example: "remote-pi://devhost/00000000-0000-4000-8000-000000000006",
+    },
+    SchemeDescriptor {
+        prefix: "pi-runtime://",
+        role: SchemeRole::RuntimeKey,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::Pi),
+        agent: true,
+        legacy: false,
+        example: "pi-runtime://00000000-0000-4000-8000-000000000026",
+    },
+    SchemeDescriptor {
+        prefix: "remote-opencode://",
+        role: SchemeRole::RowIdentity,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::OpenCode),
+        agent: true,
+        legacy: false,
+        example: "remote-opencode://devhost/00000000-0000-4000-8000-000000000007",
+    },
+    SchemeDescriptor {
+        prefix: "opencode-runtime://",
+        role: SchemeRole::RuntimeKey,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::OpenCode),
+        agent: true,
+        legacy: false,
+        example: "opencode-runtime://00000000-0000-4000-8000-000000000027",
+    },
+    SchemeDescriptor {
+        prefix: "remote-qwen://",
+        role: SchemeRole::RowIdentity,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::QwenCode),
+        agent: true,
+        legacy: false,
+        example: "remote-qwen://devhost/00000000-0000-4000-8000-000000000008",
+    },
+    SchemeDescriptor {
+        prefix: "qwen-runtime://",
+        role: SchemeRole::RuntimeKey,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::QwenCode),
+        agent: true,
+        legacy: false,
+        example: "qwen-runtime://00000000-0000-4000-8000-000000000028",
+    },
+    SchemeDescriptor {
+        prefix: "remote-kimi://",
+        role: SchemeRole::RowIdentity,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::Kimi),
+        agent: true,
+        legacy: false,
+        example: "remote-kimi://devhost/00000000-0000-4000-8000-000000000009",
+    },
+    SchemeDescriptor {
+        prefix: "kimi-runtime://",
+        role: SchemeRole::RuntimeKey,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::Kimi),
+        agent: true,
+        legacy: false,
+        example: "kimi-runtime://00000000-0000-4000-8000-000000000029",
+    },
+    SchemeDescriptor {
+        prefix: "remote-muse://",
+        role: SchemeRole::RowIdentity,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::Muse),
+        agent: true,
+        legacy: false,
+        example: "remote-muse://devhost/00000000-0000-4000-8000-000000000010",
+    },
+    SchemeDescriptor {
+        prefix: "muse-runtime://",
+        role: SchemeRole::RuntimeKey,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::Muse),
+        agent: true,
+        legacy: false,
+        example: "muse-runtime://00000000-0000-4000-8000-000000000030",
+    },
+    SchemeDescriptor {
+        prefix: "remote-agy://",
+        role: SchemeRole::RowIdentity,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::Antigravity),
+        agent: true,
+        legacy: false,
+        example: "remote-agy://devhost/00000000-0000-4000-8000-000000000011",
+    },
+    SchemeDescriptor {
+        prefix: "agy-runtime://",
+        role: SchemeRole::RuntimeKey,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::Antigravity),
+        agent: true,
+        legacy: false,
+        example: "agy-runtime://00000000-0000-4000-8000-000000000031",
+    },
     // ── Non-agent (registered so shared predicates can be locked too) ──────
     SchemeDescriptor {
         prefix: "live::",
@@ -394,27 +507,130 @@ mod tests {
 
     #[test]
     fn every_agent_kind_has_a_current_remote_identity_or_is_local_only() {
-        // Codex and ClaudeCode both have remote row schemes; CodexLiteLlm is
-        // local-only today (its legacy aliases are parse-only). This test is
-        // the place a NEW CLI's scheme coverage becomes a conscious decision:
-        // adding a kind to SessionKind::is_agent without deciding its remote
-        // story fails here.
-        for kind in [
-            SessionKind::Codex,
-            SessionKind::CodexLiteLlm,
-            SessionKind::ClaudeCode,
-        ] {
+        // ⚠ The kind list and the local-only answer are both DERIVED now. They
+        // used to be hand-written here (`[Codex, CodexLiteLlm, ClaudeCode]` and
+        // `matches!(kind, CodexLiteLlm)`), which is a lock that silently stops
+        // covering the thing it guards the moment a CLI is added — the exact
+        // stale-green shape the burn-down contract exists to forbid.
+        for descriptor in crate::agent_cli::AGENT_CLIS {
+            let kind = descriptor.kind;
             let has_remote_row = SESSION_PATH_SCHEMES.iter().any(|scheme| {
                 scheme.kind == Some(kind)
                     && !scheme.legacy
                     && scheme.locality == SchemeLocality::Remote
                     && matches!(scheme.role, SchemeRole::RowIdentity)
             });
-            let local_only = matches!(kind, SessionKind::CodexLiteLlm);
-            assert!(
-                has_remote_row || local_only,
-                "{kind:?} has no remote row scheme and is not declared local-only"
+            assert_eq!(
+                has_remote_row,
+                descriptor.has_remote_arm(),
+                "{kind:?}: the scheme table and the descriptor disagree about \
+                 whether this CLI has a remote arm"
             );
+        }
+    }
+
+    /// BOTH DIRECTIONS between the descriptor registry and the scheme table.
+    ///
+    /// A CLI that declares `remote_row_scheme`/`runtime_key_scheme` and forgets
+    /// the table row fails here; so does a table row for a CLI whose descriptor
+    /// never named it. Without this, the two are a copy of each other and the
+    /// copy is what rots — which is how `cc-runtime://` came to be missing from
+    /// seven predicates at once.
+    #[test]
+    fn every_agent_descriptor_scheme_is_registered_and_vice_versa() {
+        for descriptor in crate::agent_cli::AGENT_CLIS {
+            for (declared, role, what) in [
+                (
+                    descriptor.remote_row_scheme,
+                    SchemeRole::RowIdentity,
+                    "remote_row_scheme",
+                ),
+                (
+                    descriptor.runtime_key_scheme,
+                    SchemeRole::RuntimeKey,
+                    "runtime_key_scheme",
+                ),
+            ] {
+                let Some(prefix) = declared else {
+                    continue;
+                };
+                let registered = scheme_for_prefix(prefix).unwrap_or_else(|| {
+                    panic!(
+                        "{:?} declares {what} {prefix:?} but no row in \
+                         SESSION_PATH_SCHEMES carries that prefix",
+                        descriptor.kind
+                    )
+                });
+                assert_eq!(registered.kind, Some(descriptor.kind), "{prefix}: kind");
+                assert_eq!(registered.role, role, "{prefix}: role");
+                assert!(registered.agent && !registered.legacy, "{prefix}");
+                assert_eq!(
+                    registered.locality,
+                    SchemeLocality::Remote,
+                    "{prefix}: a wrapper-slug scheme is a remote scheme"
+                );
+            }
+        }
+
+        for scheme in SESSION_PATH_SCHEMES {
+            if !scheme.agent || scheme.legacy || scheme.locality != SchemeLocality::Remote {
+                continue;
+            }
+            let Some(kind) = scheme.kind else { continue };
+            let descriptor = crate::agent_cli::agent_cli_descriptor(kind)
+                .unwrap_or_else(|| panic!("{:?} has no descriptor", kind));
+            let declared = match scheme.role {
+                SchemeRole::RowIdentity => descriptor.remote_row_scheme,
+                SchemeRole::RuntimeKey => descriptor.runtime_key_scheme,
+                SchemeRole::RowAndRuntimeKey => continue,
+            };
+            assert_eq!(
+                declared,
+                Some(scheme.prefix),
+                "{} is registered for {:?} but its descriptor names {:?}",
+                scheme.prefix,
+                kind,
+                declared
+            );
+        }
+    }
+
+    /// The wrapper subcommands are DERIVED, and no two CLIs may collide on one.
+    ///
+    /// `resume-codex` and `resume-cc` are historical spellings kept on their
+    /// descriptors; every new CLI's verb falls out of its `wrapper_slug`. A
+    /// collision would route one CLI's resume into another's handler across the
+    /// ssh hop, which is silent and unrecoverable.
+    #[test]
+    fn wrapper_subcommands_are_derived_and_unique() {
+        let mut seen: Vec<String> = Vec::new();
+        for descriptor in crate::agent_cli::AGENT_CLIS {
+            let Some(slug) = descriptor.wrapper_slug else {
+                assert!(
+                    descriptor.remote_row_scheme.is_none()
+                        && descriptor.runtime_key_scheme.is_none(),
+                    "{:?} is local-only but declares a remote scheme",
+                    descriptor.kind
+                );
+                continue;
+            };
+            assert!(
+                !slug.is_empty() && slug.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+                "{:?}: wrapper slug {slug:?} must be lowercase ascii",
+                descriptor.kind
+            );
+            for verb in [
+                descriptor.resume_subcommand(),
+                descriptor.start_subcommand(),
+                descriptor.terminate_subcommand(),
+                descriptor.session_exists_subcommand(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(!seen.contains(&verb), "two CLIs both claim {verb:?}");
+                seen.push(verb);
+            }
         }
     }
 
