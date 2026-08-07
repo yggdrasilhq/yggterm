@@ -53137,10 +53137,19 @@ fn reorder_response(
             // rows between the two reads, so any full-list diff is mostly
             // noise. That is the same lie this verb exists to stop, committed
             // by this verb, caught on its first live run.
+            // ⚠ DEDUPED, and that is not a nicety. A live session has DUAL
+            // PRESENCE — one row in Live Sessions and one in its cwd folder,
+            // both carrying the same `full_path` — so the rendered list holds
+            // each of these paths twice. Comparing with duplicates makes
+            // `matches_request` false for every request that names a live row,
+            // forever, no matter how correctly the sidebar moved. First
+            // occurrence wins, which is the Live-region one.
             let subset = |order: &[String]| -> Vec<String> {
+                let mut seen = std::collections::HashSet::new();
                 order
                     .iter()
                     .filter(|path| requested.contains(path))
+                    .filter(|path| seen.insert((*path).clone()))
                     .cloned()
                     .collect()
             };
