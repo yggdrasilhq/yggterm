@@ -39,13 +39,15 @@ copies.
 
 ## Credentials and real-money actions (the vault and the card rails)
 
-- **An unlocked vault, for ten minutes.** Two card entries can be *written* blind
-  but cannot be *proven* without one: the sidebar's card view/edit gap, and the
-  engine's missing `ctl fill-card`. → ychrome `docs/pending-bugs.md` § *A CARD
-  ITEM IS UNREADABLE AND UNEDITABLE IN THE SIDEBAR* and § *THE ENGINE CANNOT PAY
-  BY CARD*.
-  *Meanwhile:* the relay builds both against a synthetic fixture vault and leaves
-  the live proof owed, named, in the queue entry.
+- ~~**An unlocked vault, for ten minutes.**~~ **NOT A GATE — disproven
+  2026-08-08 and removed.** The vault agent on dev is already unlocked
+  (`ychrome-vault status` → `agent: true`, `state: unlocked`, 1125 items), so
+  both card entries are provable without him. `ctl fill-card` was then built and
+  measured live on the harness the same session. ⇒ **an owner gate is a claim
+  like any other and this file must not hold an unfalsified one**: nobody had
+  run the one-line status probe that answers it, and the line sat here parking
+  work that was never blocked. What remains of that lane — the sidebar's card
+  view/edit gap — is ordinary queue work, not something waiting on him.
 - **Any card payment is his, per action, every time** — fingraph's standing law,
   and it is not a thing an unattended session may ever take. A card fix is
   written and tested here; it is never exercised against a live gateway.
