@@ -2465,6 +2465,28 @@ login, today — so the ychrome daemon restart it was waiting on evidently happe
 ⇒ **a field report from another lobe IS live proof; read an incoming report against your own OWED
 list before filing anything new from it.**
 
+> ### ⚠ REOPENED IN PART, 2026-08-07 — the OWED observation was the wrong observation
+>
+> **The closure above stands for what it actually proved, and the deleted entry stays deleted:**
+> the entry was *"documented but has no route"*, and the response does prove a route exists.
+>
+> ⛔ **But `{"filled":"filled","ok":true}` is NOT evidence the fill was correct**, and it was
+> being read that way. lumenstore row 5.2 observed the identical response on a **wrong write** —
+> a 31-character value into a field whose vault secret is 20 characters, with the confirm field
+> left **empty** — caught only by a hand-written page-side readback. Filed as
+> `ctl fill REPORTS SUCCESS ON A WRONG WRITE` at the top of `ychrome/docs/pending-bugs.md`.
+>
+> ⭐ **The lesson is about the OWED list, not about ychrome.** "Live proof owed" named a
+> *response string* as the falsifier. A response string can only ever prove the route; it cannot
+> prove the effect. ⇒ **when writing a LIVE PROOF OWED line, name an observation of the EFFECT
+> (a readback, a resulting state), never an observation of the ANSWER.** Every remaining OWED
+> entry in this file is worth re-reading against that distinction.
+>
+> ⇒ And it sharpens item 1 below rather than contradicting it: `web fill-card` reporting
+> `matched:false` on a good fill and `ctl fill` reporting success on a bad one are **the same
+> defect with opposite signs** — a status field with no readback behind it. The optimistic
+> direction is the dangerous one, because nothing prompts a retry.
+
 **What remains here:**
 
 1. **`server app web fill-card` answers `matched:false` on fills that landed perfectly** (measured
