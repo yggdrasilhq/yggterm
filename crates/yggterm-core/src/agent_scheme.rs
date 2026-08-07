@@ -659,15 +659,26 @@ mod tests {
         assert!(runtimes.contains(&"codex-runtime://"));
         assert!(runtimes.contains(&"cc-runtime://"));
         assert!(!runtimes.contains(&"remote-session://"));
+        // ⚠ DERIVED, not transcribed. This assertion used to hold a copy of the
+        // four shipped prefixes, so it stopped describing the registry the
+        // moment a CLI was added — and a lock that passes while covering less
+        // than it claims is worse than no lock.
         let remotes: Vec<_> = remote_agent_schemes().map(|s| s.prefix).collect();
-        assert_eq!(
-            remotes,
-            vec![
-                "remote-session://",
-                "remote-cc://",
-                "codex-runtime://",
-                "cc-runtime://"
-            ]
-        );
+        let expected: Vec<&str> = crate::agent_cli::AGENT_CLIS
+            .iter()
+            .filter_map(|d| d.remote_row_scheme)
+            .chain(
+                crate::agent_cli::AGENT_CLIS
+                    .iter()
+                    .filter_map(|d| d.runtime_key_scheme),
+            )
+            .collect();
+        let mut sorted_remotes = remotes.clone();
+        sorted_remotes.sort_unstable();
+        let mut sorted_expected = expected.clone();
+        sorted_expected.sort_unstable();
+        assert_eq!(sorted_remotes, sorted_expected);
+        assert!(remotes.contains(&"remote-session://"));
+        assert!(remotes.contains(&"cc-runtime://"));
     }
 }
