@@ -86670,10 +86670,29 @@ fn FileBadgeIcon(ext: String) -> Element {
 /// badge; anything else (an emoji glyph) renders as text.
 fn app_pane_row_icon(icon: &str) -> Element {
     match icon.strip_prefix("file:") {
+        // A file badge draws its OWN shape and carries its own ground; putting
+        // a second disc behind it would be a badge inside a badge.
         Some(ext) => rsx! { FileBadgeIcon { ext: ext.to_string() } },
         // `icon:<name>` reaches the shell's own stroked set; anything else is
         // still drawn as the character the app sent.
-        None => shell_glyph(icon, 13),
+        //
+        // THE DISC IS ACCESSIBILITY, not decoration. A bare 13px stroke on the
+        // page ground is a low-contrast hairline that has to be hunted for in a
+        // list of forty rows. A filled disc gives the mark a consistent target
+        // and a consistent contrast floor whatever the row is sitting on, and
+        // the extra two pixels are what make a 1.25 stroke read as a shape
+        // rather than a smudge. `geometricPrecision` stops the rasteriser
+        // snapping those strokes to the pixel grid, which is what made curves
+        // look faceted at this size.
+        None => rsx! {
+            span {
+                style: "display:inline-flex; align-items:center; justify-content:center; \
+                        width:26px; height:26px; flex:0 0 26px; border-radius:50%; \
+                        background:rgba(127,127,127,0.16); \
+                        shape-rendering:geometricPrecision;",
+                {shell_glyph(icon, 15)}
+            }
+        },
     }
 }
 
