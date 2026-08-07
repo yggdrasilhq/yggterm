@@ -881,6 +881,15 @@ fn print_server_app_help() {
     sets the order on the GUI — the process that RENDERS it — and answers with
     the resulting `rendered_order`. `server sessions reorder` writes to whichever
     daemon the CLI resolved, which is not always the one the GUI reads.
+  yggterm server app sessions sort [--dry-run]
+    re-derives the Live order from the rows' outline numbers and applies it.
+    Segments compare as INTEGERS (1 · 1.1 · 2 · 10), unnumbered rows sort last
+    and stably, and sorting a sorted list reports changed:false — which is the
+    success case, not a no-op to chase.
+  yggterm server app session outline <session-path> <prefix>
+    numbers a row that already exists and RE-SEATS it (an empty prefix clears
+    it). The number is stored apart from the title and composed at render time,
+    so a CLI re-titling itself can no longer destroy a position.
   yggterm server app update <check|restart> [--force]
     restart REFUSES while an agent web-surface lease is live (agent_lease_active);
     pre-flight with `server app state | jq .agent_leases`
@@ -910,7 +919,14 @@ fn print_server_app_help() {
     for tabs, absent for a plain button
   yggterm server app terminal <new|send|focus|scroll|probe-type|probe-scroll|probe-select|probe-context-menu> ...
   yggterm server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|codex|claude-code>] [--title <title>] [--purpose <what-for>] [--no-activate]
-    with no --title the row is named for the driving agent and its purpose
+      [--outline <prefix> | --insert-after <session-path>]
+    with no --title the row is named for the driving agent and its purpose.
+    --outline seats the row at a stored number that survives restarts and
+    re-titles; --insert-after places it below an anchor row this once. The seat
+    is applied INSIDE the create, and the reply's `seat.honoured` is RE-READ
+    from the rendered order rather than echoed from the request. Passing both,
+    or a prefix that is not a dotted number, is refused BY NAME before the row
+    is created.
   yggterm server app terminal scroll <session> --to <top|bottom|±N>
   yggterm server app terminal read-buffer <session> [--mode screen|full|cells]
   yggterm server app terminal send <session> (--data <data>|--stdin) [--allow-multiline]
