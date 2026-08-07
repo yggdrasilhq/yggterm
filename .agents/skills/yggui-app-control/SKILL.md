@@ -138,6 +138,41 @@ ssh "$LIVE_HOST" "~/.local/bin/yggterm server app notify 'Crawl finished' \
 A session spawned by `terminal new` hands you the right string directly: use the
 response's `data.session_path`, which is the row path by construction.
 
+### ⭐ SEAT THE ROW AT CREATION — never create-then-reorder (3.0.45)
+
+The owner's standing requirement, after he dragged a mis-seated row into place by
+hand: *"From now on, we need to spawn session at the exact row we want."*
+
+```bash
+# The DURABLE form: a number stored on the row. Survives a restart and every
+# re-title, and later spawns seat themselves relative to it.
+yggterm-headless server app terminal new --kind claude-code --outline 6.1 \
+    --purpose "…" --no-activate --title "6.1 yggterm: probe"
+
+# The POSITIONAL form: land directly below this row, no claim about tomorrow.
+yggterm-headless server app terminal new --kind shell --insert-after "$ROW"
+```
+
+⛔ **Read `data.seat.honoured` in the reply.** It is RE-READ from the order the
+GUI holds, not echoed from your request, so `false` means the row is not where
+you asked — check `seat.live_index` and `seat.seated_after`.
+
+⛔ **`--outline` and `--insert-after` together are refused BY NAME**, before the
+row is created, and so is a prefix the sort cannot read (`--outline lobe-2`).
+Nothing is ever half-placed.
+
+**Numbering a row that already exists**, and re-sorting when reality drifted:
+
+```bash
+yggterm-headless server app session outline "$ROW" 6.1   # empty prefix clears it
+yggterm-headless server app sessions sort --dry-run      # show the order it would apply
+yggterm-headless server app sessions sort                # apply it
+```
+
+The sort compares dotted segments as **integers** (`1 · 1.1 · 2 · 10`, never
+`10 < 2`), places unnumbered rows last and stably, and is idempotent — sorting a
+sorted list reports `changed: false`, which is a success, not a no-op to chase.
+
 ### Recipe 2 — a long job reporting progress through ONE row
 
 `--job <key>` UPSERTS: call it as often as you like and the same card is rewritten

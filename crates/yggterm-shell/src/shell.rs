@@ -53045,6 +53045,134 @@ fn public_live_session_path_from_started_key(key: &str) -> Option<String> {
 /// cannot tell those apart; the launch command can, because it is produced where
 /// the row LIVES. `applied:false` with the real command attached is the honest
 /// answer, and it saves the caller a `pgrep`.
+/// The Live-region order as it is drawn right now.
+fn rendered_live_order(shell: &ShellState) -> Vec<String> {
+    shell
+        .snapshot()
+        .rows
+        .iter()
+        .filter(|row| row.kind == BrowserRowKind::Session)
+        .map(|row| row.full_path.clone())
+        .collect()
+}
+
+/// Apply a Live-region order the way a DRAG does — **the only row-ordering path
+/// measured working end to end.**
+///
+/// ⭐ The owner settled this by using it: he re-sorted his sidebar by hand while
+/// `server sessions reorder` needed a GUI restart to show and `server app
+/// sessions reorder` was a measured no-op. So the drag's route is the reference
+/// implementation, and reading it (`queue_drop_current_drag_target`) shows the
+/// verb was skipping two of its three steps:
+///
+/// 1. **Write the GUI's own copy first.** The sidebar moves immediately rather
+///    than waiting for a poll. The verb deliberately skipped this on the theory
+///    that a local write is overwritten by the next snapshot — true in
+///    isolation, and not true when step 2 follows, because the daemon then
+///    hands back the same order.
+/// 2. **Persist SCOPED to this GUI's ledger** (`gui_row_order_scope()`). The
+///    verb called the UNSCOPED twin. ⇒ `row_order_ledger`'s
+///    `reconcile_order_with_remembered` restores this GUI's remembered
+///    arrangement on the next rebuild and **reverts anything written outside
+///    that scope** — the most economical explanation yet for "the daemon
+///    updated and the sidebar did not", and much cheaper than the
+///    peer-aggregation theory.
+/// 3. **Adopt the returned snapshot**, so the mirror and the daemon agree
+///    before anything reads either.
+///
+/// Returns `(rendered_before, rendered_after, daemon_message)` so the caller
+/// reports an effect it RE-READ rather than the request it made.
+async fn apply_live_order_the_way_a_drag_does(
+    mut state: Signal<ShellState>,
+    ordered_paths: Vec<String>,
+) -> anyhow::Result<(Vec<String>, Vec<String>, Option<String>)> {
+    let rendered_before = state.with(rendered_live_order);
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    // Step 1 — the optimistic local apply, through the same one owner the
+    // daemon uses. Same function, same honesty.
+    state.with_mut(|shell| {
+        shell.server.replace_live_session_order(&ordered_paths);
+    });
+    let paths_for_task = ordered_paths.clone();
+    let (snapshot, message) = task::spawn_blocking(move || {
+        // Step 2 — scoped, exactly as the drag persists it.
+        yggterm_server::reorder_live_sessions_scoped(
+            &endpoint,
+            &paths_for_task,
+            Some(gui_row_order_scope().as_str()),
+        )
+    })
+    .await
+    .map_err(|error| anyhow!("joining reorder task: {error}"))??;
+    // Step 3.
+    state.with_mut(|shell| {
+        shell.server.apply_snapshot(snapshot);
+        shell.needs_initial_server_sync = false;
+        shell.refresh_tree_debug("app_control_live_session_reorder");
+    });
+    let rendered_after = state.with(rendered_live_order);
+    Ok((rendered_before, rendered_after, message))
+}
+
+/// The one reply shape for every verb that moves rows, built from the RE-READ
+/// order and never from the request.
+fn reorder_response(
+    request: &yggterm_server::AppControlRequest,
+    requested: &[String],
+    outcome: anyhow::Result<(Vec<String>, Vec<String>, Option<String>)>,
+) -> AppControlResponse {
+    let base = AppControlResponse {
+        request_id: request.request_id.clone(),
+        handled_by_pid: std::process::id(),
+        completed_at_ms: current_millis() as u128,
+        output_path: None,
+        data: None,
+        error: None,
+    };
+    match outcome {
+        Ok((before, after, message)) => {
+            // ⚠ `changed` compares the REQUESTED rows' relative order, not the
+            // whole list. Comparing whole lists reported `changed:true` over a
+            // sidebar that had not moved a row — other agents create and close
+            // rows between the two reads, so any full-list diff is mostly
+            // noise. That is the same lie this verb exists to stop, committed
+            // by this verb, caught on its first live run.
+            let subset = |order: &[String]| -> Vec<String> {
+                order
+                    .iter()
+                    .filter(|path| requested.contains(path))
+                    .cloned()
+                    .collect()
+            };
+            let requested_present: Vec<String> = requested
+                .iter()
+                .filter(|path| after.contains(path))
+                .cloned()
+                .collect();
+            let after_subset = subset(&after);
+            AppControlResponse {
+                data: Some(json!({
+                    "changed": after_subset != subset(&before),
+                    "requested": requested.len(),
+                    "rendered_order": after,
+                    "matches_request": after_subset == requested_present,
+                    "daemon_message": message,
+                })),
+                ..base
+            }
+        }
+        Err(error) => AppControlResponse {
+            data: Some(json!({
+                "changed": false,
+                "requested": requested.len(),
+                "matches_request": false,
+            })),
+            error: Some(format!("{error:#}")),
+            ..base
+        },
+    }
+}
+
 /// Where the created row ACTUALLY landed, read back from the order the GUI now
 /// holds — never composed from the request.
 ///
@@ -54312,6 +54440,16 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "selected": shell.selected_tree_paths.contains(&row.full_path),
                 "session_id": row.session_id,
                 "session_cwd": row.session_cwd,
+                // WHERE the row sits, as a structured fact beside its identity.
+                // It was stored and survived a restart but was invisible here,
+                // so the outline number lived only inside the title string — a
+                // structured fact encoded in prose, destroyed by every CLI
+                // re-title. Read from the live record, which is its one owner.
+                "outline_prefix": snapshot.live_sessions.iter().find(|session| {
+                    normalize_live_session_path(&session.session_path)
+                        == normalize_live_session_path(&row.full_path)
+                        || session.session_path == row.full_path
+                }).and_then(|session| session.outline_prefix.clone()),
                 "child_count": row.descendant_sessions,
                 "busy": busy,
                 "busy_reason": busy_state.reason,
@@ -75102,97 +75240,61 @@ async fn process_pending_app_control_requests(
             }
         }
         AppControlCommand::ReorderSessions { ordered_paths } => {
-            // The order the USER sees lives here, in the GUI's own copy. Apply
-            // it through the same owner the server path uses, then read the
-            // RENDERED order back and report that — so `changed` means the
-            // sidebar moved, not that a field somewhere changed. The server
-            // path's `changed:true` over an unmoved sidebar cost the owner two
-            // reports and the orchestrator four round-trips.
-            // ⛔ Forward to the daemon THIS GUI is bound to — do not write the
-            // GUI's own copy. `live_session_order` is the daemon's SSOT and the
-            // GUI's copy is a MIRROR of it, replaced by the next poll: writing
-            // locally reported `changed:true` and was gone a second later
-            // (measured, 2026-08-07, while building this very verb).
-            //
-            // That is also the whole defect. `server sessions reorder` reaches
-            // whichever daemon the CALLING binary resolves — a 3.0.44 CLI landed
-            // on a 3.0.44 daemon owning zero sessions while the GUI mirrored a
-            // 3.0.41 one, both binaries answering 3.0.44. Routing through the
-            // GUI's own endpoint makes "which daemon" un-guessable by
-            // construction: it is the one whose rows are on screen.
+            let outcome =
+                apply_live_order_the_way_a_drag_does(state, ordered_paths.clone()).await;
+            reorder_response(&request, &ordered_paths, outcome)
+        }
+        AppControlCommand::SetSessionOutline {
+            session_path,
+            prefix,
+        } => {
+            // Forward to the daemon THIS GUI is bound to — "which daemon" is
+            // then un-guessable by construction: it is the one whose rows are
+            // on screen. A CLI that resolves its own daemon has already landed
+            // a reorder on one owning zero sessions while the GUI mirrored
+            // another, both binaries answering the same version.
             let endpoint = state.read().bootstrap.server_endpoint.clone();
-            let paths = ordered_paths.clone();
-            // The order the user is looking at, BEFORE — so `changed` can be a
-            // fact about the sidebar rather than a parse of the daemon's reply.
-            let rendered_before = state.with(|shell| {
-                shell
-                    .snapshot()
-                    .rows
-                    .iter()
-                    .filter(|row| row.kind == BrowserRowKind::Session)
-                    .map(|row| row.full_path.clone())
-                    .collect::<Vec<_>>()
-            });
+            let path_for_task = session_path.clone();
+            let prefix_for_task = prefix.clone();
             let outcome = task::spawn_blocking(move || {
-                yggterm_server::reorder_live_sessions(&endpoint, &paths)
+                yggterm_server::set_session_outline_prefix(
+                    &endpoint,
+                    &path_for_task,
+                    &prefix_for_task,
+                )
             })
             .await
-            .map_err(|error| anyhow!("joining reorder task: {error}"))
+            .map_err(|error| anyhow!("joining outline task: {error}"))
             .and_then(|inner| inner);
             match outcome {
-                Ok((_snapshot, message)) => {
-                    // ⛔ `changed` is measured against the RENDERED list, before
-                    // and after — never parsed out of the daemon's reply. The
-                    // whole reason this verb exists is that
-                    // `server sessions reorder` answered `changed:true` four
-                    // times over a sidebar that never moved, so a reply that
-                    // describes a daemon field is exactly what must not be
-                    // reported here.
-                    let rendered_after = state.with(|shell| {
+                Ok((snapshot, message)) => {
+                    state.with_mut(|shell| {
+                        shell.server.apply_snapshot(snapshot);
+                        shell.needs_initial_server_sync = false;
+                    });
+                    // ⛔ RE-READ. `applied` is the value now on the row, not the
+                    // value we asked for — `session rename` answers
+                    // `accepted:true` on a path the daemon never heard of, and
+                    // this verb must not join that family.
+                    let stored = state.with(|shell| {
                         shell
                             .snapshot()
-                            .rows
+                            .live_sessions
                             .iter()
-                            .filter(|row| row.kind == BrowserRowKind::Session)
-                            .map(|row| row.full_path.clone())
-                            .collect::<Vec<_>>()
+                            .find(|session| session.session_path == session_path)
+                            .and_then(|session| session.outline_prefix.clone())
                     });
-                    let requested_present: Vec<&String> = ordered_paths
-                        .iter()
-                        .filter(|path| rendered_after.contains(path))
-                        .collect();
-                    let rendered_subset: Vec<&String> = rendered_after
-                        .iter()
-                        .filter(|path| ordered_paths.contains(path))
-                        .collect();
-                    let matches_request = rendered_subset == requested_present;
-                    // ⚠ `changed` compares the REQUESTED rows' relative order,
-                    // not the whole list. Comparing whole lists reported
-                    // `changed:true` over a sidebar that had not moved a row —
-                    // rows are created and closed by other agents between the
-                    // two reads, so any full-list diff is mostly noise. That is
-                    // the same lie this verb exists to stop, committed by this
-                    // verb, caught on its first live run.
-                    let subset_before: Vec<&String> = rendered_before
-                        .iter()
-                        .filter(|path| ordered_paths.contains(path))
-                        .collect();
+                    let wanted = (!prefix.trim().is_empty()).then(|| prefix.trim().to_string());
                     AppControlResponse {
                         request_id: request.request_id.clone(),
                         handled_by_pid: std::process::id(),
                         completed_at_ms: current_millis() as u128,
                         output_path: None,
                         data: Some(json!({
-                            // Did the rows the caller named actually move?
-                            "changed": rendered_subset != subset_before,
-                            "requested": ordered_paths.len(),
-                            "rendered_order": rendered_after,
-                            "matches_request": matches_request,
-                            // ⚠ Known gap, kept visible rather than hidden: a
-                            // RUNNING GUI does not re-read the daemon's live
-                            // order, so this reports false until the mirror
-                            // learns to adopt it (filed). The daemon's own reply
-                            // rides along so the two can be compared.
+                            "session_path": session_path,
+                            "requested": wanted,
+                            "outline_prefix": stored,
+                            "applied": stored == wanted,
                             "daemon_message": message,
                         })),
                         error: None,
@@ -75204,12 +75306,73 @@ async fn process_pending_app_control_requests(
                     completed_at_ms: current_millis() as u128,
                     output_path: None,
                     data: Some(json!({
-                        "changed": false,
-                        "requested": ordered_paths.len(),
-                        "matches_request": false,
+                        "session_path": session_path,
+                        "applied": false,
                     })),
                     error: Some(format!("{error:#}")),
                 },
+            }
+        }
+        AppControlCommand::SortSessions { dry_run } => {
+            // The order the outline NAMES, derived from the rows themselves.
+            // A pure function of stored state, so it is idempotent by
+            // construction and there is no second copy to drift.
+            let (current, desired) = state.with(|shell| {
+                let snapshot = shell.snapshot();
+                let current: Vec<String> = snapshot
+                    .live_sessions
+                    .iter()
+                    .map(|session| session.session_path.clone())
+                    .collect();
+                let mut desired: Vec<(String, Option<String>)> = snapshot
+                    .live_sessions
+                    .iter()
+                    .map(|session| {
+                        (session.session_path.clone(), session.outline_prefix.clone())
+                    })
+                    .collect();
+                yggterm_core::session_outline::sort_by_outline(&mut desired, |(_, prefix)| {
+                    prefix.clone()
+                });
+                (
+                    current,
+                    desired.into_iter().map(|(path, _)| path).collect::<Vec<_>>(),
+                )
+            });
+            let numbered = state.with(|shell| {
+                shell
+                    .snapshot()
+                    .live_sessions
+                    .iter()
+                    .filter(|session| session.outline_prefix.is_some())
+                    .count()
+            });
+            if dry_run || desired == current {
+                AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "dry_run": dry_run,
+                        // Already sorted is a SUCCESS, not a no-op to explain:
+                        // "sorting a sorted list changes nothing" is the
+                        // idempotence the owner asked for by name.
+                        "changed": false,
+                        "rows": current.len(),
+                        "numbered_rows": numbered,
+                        "rendered_order": if dry_run { desired } else { current },
+                    })),
+                    error: None,
+                }
+            } else {
+                let outcome =
+                    apply_live_order_the_way_a_drag_does(state, desired.clone()).await;
+                let mut response = reorder_response(&request, &desired, outcome);
+                if let Some(object) = response.data.as_mut().and_then(Value::as_object_mut) {
+                    object.insert("numbered_rows".to_string(), json!(numbered));
+                }
+                response
             }
         }
         AppControlCommand::SendTerminalInput {
