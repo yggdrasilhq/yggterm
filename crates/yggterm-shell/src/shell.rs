@@ -106768,6 +106768,29 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
             }}
         }} catch (_reapError) {{}}
+        // XTERM-BUG: right-edge-glyph-clipped — ONE owner for the right gutter.
+        //
+        // `.xterm-screen` is deliberately narrower than the host by the
+        // scrollbar width (XTERM-BUG: scrollbar-not-draggable, below) and it
+        // clips: `overflow: hidden`. The grid proposal used to divide the FULL
+        // host width by the cell width, so it handed the terminal one more
+        // column than the paint box can show and the last column was clipped to
+        // a sliver — measured live on guihost at 3.0.45: cols 170 x 8px = 1360px of
+        // canvas inside a 1353px screen, i.e. 1 of the final column's 8 pixels
+        // visible. The user's symptom was exactly that: "sometimes a letter is
+        // missing on the rightmost edge, and widening the window brings it back"
+        // (widening changes the remainder, so whether the loss is visible on a
+        // given line depends on where the text ends).
+        //
+        // ⛔ Do NOT widen the screen back to 100% — that re-breaks the
+        // scrollbar hitbox. The gutter is a real reservation, so the honest fix
+        // is to compute the grid against the box that actually paints it. Every
+        // consumer of that 8px reads it from here, so the paint box and the grid
+        // can never drift apart again.
+        const terminalScrollbarGutterPx = () => Math.max(
+            0,
+            Number(window.__yggtermXtermScrollbarGutterPx || 8)
+        );
         const hostMetrics = () => {{
             const rect = host.getBoundingClientRect();
             const computed = window.getComputedStyle(host);
@@ -107928,7 +107951,12 @@ fn terminal_eval_script_with_canvas_renderer(
             const cellWidth = Math.max(1, terminalCssCellWidth());
             const cellHeight = Math.max(1, terminalCssCellHeight());
             const bottomGuardPx = Math.max(0, Number(window.__yggtermXtermFitBottomGuardPx || 2));
-            const availableWidth = Math.max(0, Number(content.width || 0));
+            // XTERM-BUG: right-edge-glyph-clipped — the grid must be proposed
+            // against the width `.xterm-screen` actually paints into, which is
+            // the host MINUS the reserved scrollbar gutter. Dividing the full
+            // host width here handed out a column that lands under the clip.
+            const rightGutterPx = terminalScrollbarGutterPx();
+            const availableWidth = Math.max(0, Number(content.width || 0) - rightGutterPx);
             const availableHeight = Math.max(0, Number(content.height || 0) - bottomGuardPx);
             const pinned = shadowPinnedGrid();
             if (pinned) {{
@@ -107938,6 +107966,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     pinned: true,
                     available_width_px: Number(availableWidth.toFixed(2)),
                     available_height_px: Number(availableHeight.toFixed(2)),
+                    right_gutter_px: rightGutterPx,
                     cell_width_px: Number(cellWidth.toFixed(3)),
                     cell_height_px: Number(cellHeight.toFixed(3)),
                 }};
@@ -107947,6 +107976,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 rows: Math.max(1, Math.floor(availableHeight / cellHeight)),
                 available_width_px: Number(availableWidth.toFixed(2)),
                 available_height_px: Number(availableHeight.toFixed(2)),
+                right_gutter_px: rightGutterPx,
                 cell_width_px: Number(cellWidth.toFixed(3)),
                 cell_height_px: Number(cellHeight.toFixed(3)),
             }};
@@ -108967,8 +108997,10 @@ fn terminal_eval_script_with_canvas_renderer(
                        mouse clicks before they reach the native
                        scrollbar. Reserve the scrollbar width on the
                        right so the scrollbar is hit-testable. Matches
-                       the ::-webkit-scrollbar width: 8px rule below. */
-                    width: calc(100% - 8px) !important;
+                       the ::-webkit-scrollbar width rule below, and the
+                       SAME number the grid proposal subtracts — see
+                       XTERM-BUG: right-edge-glyph-clipped. */
+                    width: calc(100% - ${{terminalScrollbarGutterPx()}}px) !important;
                 }}
                 /* XTERM-BUG: scrollable-element-zero-height (xterm.js 6)
                    xterm.js 6 moved .xterm-screen INSIDE a new VS Code-derived
@@ -109109,7 +109141,7 @@ fn terminal_eval_script_with_canvas_renderer(
                    highlight on rest-to-active transition. Color is the
                    only thing that changes; transition keeps it smooth. */
                 #${{hostId}} .xterm-viewport::-webkit-scrollbar {{
-                    width: 8px !important;
+                    width: ${{terminalScrollbarGutterPx()}}px !important;
                     height: 0 !important;
                     background: transparent !important;
                 }}
@@ -110987,7 +111019,7 @@ fn terminal_eval_script_with_canvas_renderer(
             // than the host by the scrollbar width so the right-edge
             // scrollbar slot is hit-testable by the native browser drag.
             if (screen) {{
-                screen.style.width = 'calc(100% - 8px)';
+                screen.style.width = `calc(100% - ${{terminalScrollbarGutterPx()}}px)`;
                 screen.style.height = '100%';
                 screen.style.position = 'relative';
                 screen.style.overflow = 'hidden';
@@ -149374,6 +149406,50 @@ mod tests {
         assert!(
             XTERM_FIT_JS.contains("typeof renderService.clear === \"function\""),
             "the fit addon must not throw before terminal.resize when xterm changes private render-service shape"
+        );
+    }
+
+    #[test]
+    fn the_grid_is_proposed_against_the_box_that_paints_it() {
+        // XTERM-BUG: right-edge-glyph-clipped. `.xterm-screen` is narrowed by
+        // the scrollbar gutter and clips (`overflow: hidden`), so a grid sized
+        // against the FULL host width buys a column the user can never read.
+        // Measured live on guihost at 3.0.45 before the fix: cols 170 x 8px = 1360px
+        // of canvas inside a 1353px screen. The lock is that ONE expression owns
+        // that number and BOTH the paint box and the grid read it.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("const terminalScrollbarGutterPx = () => Math.max("),
+            "the right gutter needs exactly one owner in the mount script"
+        );
+        assert!(
+            script.contains("Number(content.width || 0) - rightGutterPx"),
+            "the grid proposal must subtract the reserved right gutter, or the last column lands under the clip"
+        );
+        assert!(
+            script.contains("const rightGutterPx = terminalScrollbarGutterPx();"),
+            "the grid proposal must read the gutter from its owner, not a second literal"
+        );
+        assert!(
+            script.contains("width: calc(100% - ${terminalScrollbarGutterPx()}px) !important;"),
+            "the .xterm-screen paint box must read the gutter from the same owner as the grid"
+        );
+        assert!(
+            script.contains("screen.style.width = `calc(100% - ${terminalScrollbarGutterPx()}px)`;"),
+            "the runtime restretch must read the gutter from the same owner too"
+        );
+        // The literal is what let the two drift apart in the first place: the
+        // paint box said 8px and the fit said nothing at all. If a hardcoded
+        // `calc(100% - Npx)` returns to this script, so does the clipped glyph.
+        let literal_gutter = format!("calc(100% - {}px)", 8);
+        assert!(
+            !script.contains(literal_gutter.as_str()),
+            "a hardcoded screen-width gutter is how the paint box and the grid diverged"
+        );
+        assert!(
+            XTERM_FIT_JS.contains("__yggtermXtermScrollbarGutterPx || 8"),
+            "the fit-addon fallback must reserve the same gutter as the primary sizing path"
         );
     }
 

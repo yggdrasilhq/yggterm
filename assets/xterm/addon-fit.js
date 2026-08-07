@@ -68,9 +68,15 @@
       if (dimensions.css.cell.width === 0 || dimensions.css.cell.height === 0) {
         return undefined;
       }
+      // XTERM-BUG: right-edge-glyph-clipped — yggterm narrows `.xterm-screen`
+      // by a fixed gutter so the right-edge scrollbar stays hit-testable, and
+      // that box CLIPS. This addon is only the exception fallback for
+      // `proposedTerminalFitDimensions`, so it must reserve the SAME gutter or
+      // the two sizing paths disagree by a column. Upstream's overview-ruler
+      // guess (14) is not the number yggterm actually reserves.
       const scrollbarWidth = this._terminal.options.scrollback === 0
         ? 0
-        : this._terminal.options.overviewRuler?.width || 14;
+        : Math.max(0, Number(root.__yggtermXtermScrollbarGutterPx || 8));
       const parentStyle = window.getComputedStyle(parent);
       const elementStyle = window.getComputedStyle(element);
       const parentHeight = elementSize(parent, parentStyle, "height");
