@@ -2374,6 +2374,27 @@ SessionStart hook's `DELETED` count is this bug's accumulator, not cosmetic.
 `running: false`. §5 of the report has a one-command `strace` test that proves or kills the
 diagnosis.
 
+⛔⛔ **RECURRED WITHIN THE HOUR — see the ADDENDUM (§8-9).** Same row, 15:27-16:22, another 55
+minutes. The CLI walked **3.0.45 -> 3.0.48 -> 3.0.49 -> 3.0.50 in about three hours** while the row
+stayed pinned to 3.0.45 throughout. At this update cadence every long-running row is orphaned
+roughly hourly; this is not a race anyone has to wait for.
+
+⚠ **The second symptom was WORSE and must not be folded in:** occurrence 1 was unreachable but
+WORKING; occurrence 2 was unreachable **and NOT PROGRESSING** (533 transcript rows at 15:27, 533 at
+16:22). The socket split explains unaddressability, **not** non-progress. Capture
+`/proc/<pid>/wchan`, `/stack` and `fd/1` BEFORE restarting a stalled row — the restart destroys the
+evidence.
+
+⭐ **FOUR LIVENESS INSTRUMENTS DISAGREED, and it is the deeper finding.** (i) **transcript mtime is
+not progress** — a file can be touched without gaining rows, so any stall check must compare ROW
+COUNT; (ii) `row-health.py` derives `WORKING` from mtime **while already computing the row count
+and not using it**, and its own docstring names the fallacy (*"pgrep proves a LAUNCH, never
+PROGRESS"*); (iii) `row-health.py` resolves **per-CWD, not per-session** — newest `.jsonl` in the
+project dir, any `claude` pid sharing the cwd (13 share `/home/user/gh/yggterm`), so a dead row
+inherits a sibling's liveness; (iv) `pgrep` counts the querying shell. **Same shape as the socket
+split every time: asked about one thing, answered about another.** Only `terminal submit`'s
+`unanswerable` currently keeps the law.
+
 ## The headless engine cannot pay by card — `ctl fill-card` does not exist
 
 **Status:** OPEN
