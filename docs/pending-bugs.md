@@ -1075,35 +1075,70 @@ into a BLANK transcript and was reverted at 3.0.29. The atlas/full-refresh path
 is the suspect, not the daemon's screen — the daemon's copy is correct, the
 CLIENT paints less than it holds.
 
-## THE TERMINAL'S RIGHT EDGE CLIPS THE LAST GLYPH — the hitbox is a column short
+### ⭐⭐ 2026-08-07 — THE TRIGGER IS A LAPTOP SUSPEND, AND THAT NAMES THE WINDOW
 
-**Status:** OPEN
+Re-reported by the owner with a faithful frame, same fingerprint, on the
+orchestrator row `remote-cc://dev/1275246b-…`: *"I saw this on the orchestrator
+session when I woke up laptop after myself waking up from sleep."*
 
-User-reported 2026-08-06, with a screenshot: *"See the right side of the
-terminal, sometimes words clip out beyond. The 'hitbox' needs a slight tweak."*
+**The trace settles what happens, and it is not a mystery any more.** jojo's
+event trace has three wall-clock holes this morning — 09:01:39→10:42:45,
+10:43:45→11:52:58, 11:53:58→12:46:16 — and each wake is followed within seconds
+by the SAME chain on the affected row:
 
-**Visible in their frame and not subtle once you know to look** — a word running
-to the right edge loses its final character, not to wrapping but to clipping:
-`the fingrap|` for "the lumenstore", `the 2019 shap|` for "shape". The text is
-present in the buffer; the last column is simply not painted.
+```
+10:42:45 suspend_wake      bridges_respawned          {suspend_ms: 6058164}
+10:42:45 terminal_runtime  suspend_wake_bridge_respawn {path: …1275246b…, cols:170, rows:65}
+10:42:45 terminal_runtime  spawn / replace_exited_runtime          <- a NEW PTY
+10:42:52 terminal_mount    terminal_stream_cursor_rewound
+                            {previous_cursor: 10106, next_cursor: 1, chunk_count: 1}
+10:42:52 terminal_mount    bootstrap_reset {mount_epoch: 2}        <- client re-mounts
+```
 
-That is a GEOMETRY defect, not a renderer one: the grid the daemon sizes and the
-box the client paints into disagree by about one column, so the rightmost cell
-falls outside the visible area. Suspect the same family as
-`screen_snapshot_clipped_to_pty_width` — a width computed in one place and
-consumed in another — but the direction is opposite (there the model was WIDER
-than the viewer; here the viewer is narrower than the grid it was told to draw).
+⇒ **a suspend is a daemon-swap-equivalent.** `respawn_ssh_carried_sessions`
+deliberately kills and respawns every ssh-carried bridge on wake (the TCP
+connections are dead and ssh would take ~45 s of ServerAlive to notice), so the
+CLI is RE-RESUMED on a fresh PTY — and the field guide already says the
+re-resume window IS this corruption. The value of the finding is that the window
+is now **named, dated and reproducible on demand: suspend the laptop, wake it,
+look at a busy agent row.** No more waiting for it to happen.
 
-**Where to start, and what NOT to do.** ⛔ Do not "fix" it by shrinking the
-reported column count — that trades a clipped glyph for a wasted column and the
-CLI will re-wrap its own output to the number we report. Compare, on one live
-session: the daemon's `cols`, the xterm instance's `cols`, and the measured
-pixel width of the `.xterm-screen` element against `cols × cell_width`. The one
-that disagrees is the bug. A fractional cell width that floors somewhere is the
-most likely mechanism, since the symptom is intermittent ("sometimes") rather
-than on every line.
+**Two suspects FALSIFIED today, cheaply — do not re-derive them:**
 
-⚠ Filed from the user's own screenshot; not yet reproduced under measurement.
+- **The `batch_terminal_chunks` excision is NOT doing this.**
+  `terminal_forward_divergence` has fired **zero** times across every retained
+  trace file on jojo. The 679-byte whole-line excision measured in 2026-07-11 is
+  real but is not the mechanism here, so the parity rework is not the gate on
+  this particular report.
+- **The idle trim is NOT doing this either.** A suspend does make every session
+  read as idle at once (`trim_idle_buffer` compares WALL clock against
+  `last_activity_ms`, and 101 minutes of sleep clears any threshold), and
+  `terminal_buffers/idle_trim` did fire at the wake instant — but
+  `trim_idle_buffer` skips `launch_command_looks_like_remote_resume_attach`
+  sessions, so the agent rows are already exempt (`trimmed_sessions: 1`, and not
+  this one).
+
+**Surviving hypothesis, stated so it can be attacked:** the re-mounted host is
+seeded from the RETAINED surface (the previous transcript), and the re-resumed
+CLI then paints a diff-style frame over that base rather than a full clear.
+Every cell the new frame does not rewrite keeps the retained character — which
+is exactly "every space holds a character from an older frame". The repair that
+exists for this is the screen reconcile, and the trace shows it being held off
+constantly: `screen_reconcile_deferred_recent_output` 738,
+`screen_reconcile_skipped_working_surface` 664,
+`screen_reconcile_skipped_unwritable` 297 — against
+`screen_reconcile_forced_deadline` 551. That is §THE QUIET-GATE LAW again, and
+the deadline is the only reason it ever runs at all on an agent row.
+
+⚠ One neighbouring defect fell out of the same trace and is worth fixing on its
+own: `respawn_ssh_carried_sessions` re-creates each bridge at the dying
+runtime's `current_cols/current_rows`, and one row came back at the DEFAULT
+**120×36** (`{path: …1f4a3c27…, cols:120, rows:36}`) while its siblings came
+back at 170×65 — because a row whose PTY was never resized still carries the
+default. A CLI re-resumed into a 120-column PTY re-wraps its whole transcript at
+120 and paints it into a 170-column client grid. That is not what the owner
+photographed (his row respawned at 170×65) but it is a second, independent way
+to get text at the wrong columns after a wake.
 
 ## ★★★ A DRAG-SELECT OVER A STREAMING SESSION SELECTS THE WHOLE STREAM
 

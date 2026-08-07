@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The last character on a line is no longer cut off at the right edge of the
+  terminal.** The terminal reserves a narrow strip on the right so the scrollbar
+  stays grabbable, and that strip clips whatever is drawn under it — but the
+  number of columns was still worked out from the full width of the window, so
+  the terminal was always handed one column more than it could show. On a live
+  session that was 1360 pixels of text inside a 1353-pixel window: seven of the
+  final column's eight pixels were behind the strip, which is why a word ending
+  near the right edge lost its last letter and why widening the window brought
+  the letter back. The columns are now measured against the area that is
+  actually painted, and the strip's width has a single owner that both the
+  layout and the sizing read.
+
 - **A new session lands where you asked, not at the top of the list.** Every way
   of starting a session put its row at the head of Live Sessions, so a session
   spawned into a numbered sidebar arrived above rows that outrank it and the
