@@ -525,10 +525,40 @@ exited, force a machine rescan, and read the title back from `server app rows`.
 *(The seating half shipped in 3.0.45. The sort verb, the `outline_prefix` setter and the collapse
 buckets are still OPEN and listed at the bottom of this entry — one lane, one ticket.)*
 
-**The observation owed:** on jojo carrying 3.0.45+, `server app terminal new --kind shell
---outline 6.9 --purpose … --ephemeral …` must answer `"seat": {"honoured": true,
-"outline_prefix": "6.9", …}` **and** the row must be visible between `6.` and `7.1` in a faithful
-screenshot. Today the verb does not exist below 3.0.45.
+✅ **LIVE-PROVEN on jojo 3.0.45, 2026-08-07 06:4x**, with two ephemeral probe rows created in the
+order `6.9` then `6.8`:
+
+```
+seat A → {"honoured": true, "outline_prefix": "6.9", "live_index": 0}
+seat B → {"outline_prefix": "6.8", "live_index": 1}
+rendered → 0: 5.3 lumenstore (unnumbered)   1: '6.8' probe B   2: '6.9' probe A
+```
+
+⇒ **the later row seated ABOVE the earlier one**, which is the whole feature, and the unnumbered
+row above them was not disturbed. `outline_prefix` is present on `server app rows`. Both probes
+removed afterwards, `verified: true`, `live_processes: []`.
+
+⛔ **The proof also caught two defects of its own, both now fixed and locked:**
+
+1. **`seat.honoured` was a FALSE NEGATIVE.** It required that no row above sort after this one —
+   counting UNNUMBERED rows, which sort last — so a correctly seated `6.8` reported
+   `honoured: false` merely because an unnumbered row sat above it. That contradicted
+   `outline_seat_for`, which deliberately does not move unnumbered rows out of a numbered row's
+   way. ⚖ **A verb whose success field disagrees with the behaviour it reports on is this lane's
+   own defect, committed by this lane** — the predicate must model the rule, not a stricter one.
+2. ⛔ **THE NUMBER WAS INVISIBLE IN THE SIDEBAR.** Probe A rendered as *"Local Shell Script
+   Debugging"* — no number — one minute after creation, while still carrying
+   `outline_prefix: "6.9"`. `compose_outline_prefix` runs when the row is BUILT, and
+   `enrich_sidebar_rows_with_live_titles` then overwrites `label` with the generated title. **So
+   the outline decayed on exactly the event it was built to survive: a CLI re-titling itself.**
+   Fixed with one re-compose pass at the END of enrichment (the last writer of the label) rather
+   than a call at each of its branches, because a future branch would drop it again silently.
+   Locked by `enrichment_re_composes_the_outline_number_it_would_otherwise_overwrite`.
+
+⚠ **Two instrument notes for the next session**, both of which cost time here: the app-control
+default timeout is **15 s and a create needs more** — `--timeout-ms 90000` is the difference
+between a clean `seat` reply and `Error: timed out …` over a row that was in fact created; and
+piping `ssh … 2>&1` into a JSON parser corrupts the payload with stderr, so use `2>/dev/null`.
 
 Owner-directed build order 2026-08-07: *"sorts are cheap and never break, and spawnee sessions are
 grouped as a collapseable tree with the session as the parent element."* Hardened the same night
