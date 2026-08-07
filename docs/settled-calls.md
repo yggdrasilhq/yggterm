@@ -9,6 +9,44 @@ and referenced from here.
 says the answer changed.
 
 
+## ★★★ NO REPO MAY CARRY TWO LICENCE CLAIMS, AND LUMENSTORE GATES GOING PUBLIC (2026-08-07)
+
+**Settled by the user, verbatim:** *"Such duplicity of licenses must be force
+push delete cleaned and only then proceeded. In case on any new projects
+entering the public space always lumenstore should analyze what the license
+should be and then we proceed."*
+
+Two rules, and they answer different questions.
+
+1. **Duplicity is cleaned by rewriting history, not by fixing forward.** A repo
+   whose `LICENSE` says one thing and whose `README`/`AGENTS.md` says another is
+   not "mostly right" — it is two answers to one question, and the permissive
+   one is the one a reader relies on. The fix is a history rewrite plus a force
+   push, so no commit anywhere in the lineage carries the contradiction.
+2. **Nothing of his goes public until lumenstore has decided its licence**, and
+   the answer is a row in `~/git/gour.top/docs/venture/ip-register.md` (§THE
+   LAUNCH GATE, Step 0). Steer phrase: *"continue the lumenstore campaign"*.
+
+⚖ **This overrode a verdict an agent had written the same day** — *"fix forward
++ a dated NOTICE erratum; never a rewrite, never a public statement."* That
+verdict is still correct about what a rewrite achieves **legally**: relicensing
+retracts no grant already made, and a rewrite only shrinks the discoverable
+surface. It was answering "can we take the offer back", and the answer is still
+no. The user is answering a different question — "may the repo keep contradicting
+itself" — and the answer is no. Both hold, and the honest record of each
+exposure window lives in the register, which is private.
+
+⛔ **Do not add a public erratum when cleaning duplicity.** An erratum
+re-publishes the claim it corrects, which is the opposite of the instruction.
+The record goes in the register.
+
+**Executed the same day:** yedit rewritten across all 13 commits and
+force-pushed (tip `fbf1540`); cellulose and paper **deleted** at his direction
+(*"far far superceded in concept"*, cellulose's name reserved for a fresh repo
+later); charts's `app/` carved out of its root Apache grant; the orphaned Apache
+`yggdrasil-build-main` tree deleted. Full detail in the register's §THE LICENCE
+SWEEP.
+
 ## ★★★ A RUNNING SESSION KEEPS ITS START-PAGE CARD (2026-08-06) — REVERSES A 2026-05-26 CALL
 
 **Settled by the user, verbatim:** *"when I launch a session that entry drops
