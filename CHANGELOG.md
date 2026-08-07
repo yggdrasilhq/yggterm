@@ -19,7 +19,7 @@ This file tracks user-visible changes in `yggterm`.
   sort against, and the order had to be repaired afterwards. A row without a
   stored number now falls back to the one its title still shows, so the new row
   is inserted directly where it belongs and nothing moves. The parse is narrow
-  on purpose: `5.1 lumenstore` and `0. Aug 7 2026` claim a place, `2026 audit` and
+  on purpose: `5.1 gadgets` and `0. Aug 7 2026` claim a place, `2026 audit` and
   `3 notes to file` do not.
 
 - **A notification no longer sits flush against the titlebar.** With the titlebar

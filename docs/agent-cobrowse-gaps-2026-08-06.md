@@ -7,7 +7,7 @@ sub-failure below is either a defect or a missing verb rather than a site proble
 
 Site mechanics went to lore instead: `eportal.incometax.gov.in` slug `cpc-itr-grievance-filing`.
 
-Reporter: harborstore lobe row (`4. harborstore`), claude-opus-5.
+Reporter: levers lobe row (`4. levers`), claude-opus-5.
 
 ---
 

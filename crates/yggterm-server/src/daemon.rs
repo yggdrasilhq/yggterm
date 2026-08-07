@@ -5356,7 +5356,7 @@ impl DaemonRuntime {
                 // row's PTY is an ssh bridge and its agent lives on the far
                 // end, so a local "nothing is running" describes the bridge.
                 // Without this the walk called a working delegate an empty
-                // plate (2026-08-06, near miss on the versestore lobe).
+                // plate (2026-08-06, near miss on the cogs lobe).
                 report.work_runs_on = self.server.live_session_remote_work_host(&path);
                 // This daemon ASKED. A report without this flag came from one
                 // that could not, and must never be swept on trust.

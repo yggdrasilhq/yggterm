@@ -690,7 +690,7 @@ pub struct RowTenantReport {
     /// its local PTY is only an ssh bridge — the `claude` child lives on dev.
     /// The local walk therefore sees a PTY with no children and calls it an
     /// EMPTY PLATE, which is how the sanity report offered to close a working
-    /// versestore delegate that had written its transcript sixty seconds earlier.
+    /// cogs delegate that had written its transcript sixty seconds earlier.
     ///
     /// Rule 2 of `docs/agent-row-hygiene.md` already forbade exactly this
     /// ("locally a remote row is an ssh bridge, so nothing-is-running is

@@ -48766,7 +48766,7 @@ fn compose_outline_prefix(prefix: Option<&str>, label: &str) -> String {
     let prefix = prefix.map(str::trim).filter(|value| !value.is_empty());
     match prefix {
         // Idempotent: re-composing a label that already carries its prefix
-        // must not stutter (`2. versestore: 2. versestore: …`), because a row is
+        // must not stutter (`2. cogs: 2. cogs: …`), because a row is
         // relabelled on every snapshot.
         Some(prefix) if !label.trim_start().starts_with(prefix) => {
             format!("{prefix} {}", label.trim_start())
@@ -143647,7 +143647,7 @@ mod tests {
         // scaffold carries perfectly readable scan text.
         let starved = row(
             vec![
-                scan_block("Continue atlasstore and lookup-app work"),
+                scan_block("Continue widgets and lookup-app work"),
                 scan_block("running · idle"),
             ],
             "tail",
@@ -143674,7 +143674,7 @@ mod tests {
                 vec![format!("turn {ix}")],
             ));
         }
-        blocks.push(scan_block("Continue atlasstore and lookup-app work"));
+        blocks.push(scan_block("Continue widgets and lookup-app work"));
         let hydrated = row(blocks, "tail");
         assert!(!remote_preview_hydration_claim_is_unbacked(&hydrated));
         assert!(!remote_preview_should_auto_sync(&hydrated));
@@ -149178,26 +149178,26 @@ mod tests {
     /// dies at the next restart with nothing reporting an error. There is no
     /// observable to assert on — only the absence of the comparison.
     /// The outline decayed on the owner's sidebar because Claude Code renames
-    /// its own session: `2. versestore: panels + research` became "Initialize
-    /// versestore panels research lobe", on every session, forever. Composing
+    /// its own session: `2. cogs: panels + research` became "Initialize
+    /// cogs panels research lobe", on every session, forever. Composing
     /// instead of overwriting is what makes re-asserting it by hand
     /// unnecessary — so these are the properties that delete that chore.
     #[test]
     fn an_outline_prefix_survives_the_cli_retitling_its_own_session() {
         // The CLI's title changes underneath; the number does not move.
         assert_eq!(
-            compose_outline_prefix(Some("2. versestore:"), "panels + research"),
-            "2. versestore: panels + research"
+            compose_outline_prefix(Some("2. cogs:"), "panels + research"),
+            "2. cogs: panels + research"
         );
         assert_eq!(
-            compose_outline_prefix(Some("2. versestore:"), "Initialize versestore panels research lobe"),
-            "2. versestore: Initialize versestore panels research lobe"
+            compose_outline_prefix(Some("2. cogs:"), "Initialize cogs panels research lobe"),
+            "2. cogs: Initialize cogs panels research lobe"
         );
 
         // Idempotent — a row is relabelled on every snapshot, so composing a
         // label that already carries its prefix must not stutter.
-        let once = compose_outline_prefix(Some("2. versestore:"), "panels");
-        assert_eq!(compose_outline_prefix(Some("2. versestore:"), &once), once);
+        let once = compose_outline_prefix(Some("2. cogs:"), "panels");
+        assert_eq!(compose_outline_prefix(Some("2. cogs:"), &once), once);
 
         // No prefix set is the untouched case: the label is the CLI's, whole.
         assert_eq!(compose_outline_prefix(None, "Some CC Title"), "Some CC Title");

@@ -115,7 +115,7 @@ popup or who opened it; there is no `web popups` verb and no `web wait --until p
 only instrument today is patching `window.open` in the page itself.
 
 **The cost, measured:** the agent that booked and paid the India Post article recorded in the
-atlasStore run note that *"the Receipt / Label buttons produce nothing — no `window.open`, no
+widgets run note that *"the Receipt / Label buttons produce nothing — no `window.open`, no
 dialog, no download"* and filed it as an unsolved site quirk. **That finding was WRONG**, and it was
 wrong in the direction that poisons the next run: the popup was blocked, the site is fine, and a
 site-lore entry now had to be corrected. **A blocked popup and a dead button are indistinguishable
@@ -134,7 +134,7 @@ from the agent side, and the agent will always guess "dead button".**
 ⇒ Same law as everywhere on this plane: **an operation's own success field is an assumption; the
 observable is the state.** A popup currently has no observable at all.
 
-Field context: `~/data/atlasStore/graph/notes/indiapost-rti-a-booking-run-2026-08-07.md`;
+Field context: `~/data/widgets/graph/notes/indiapost-rti-a-booking-run-2026-08-07.md`;
 site-lore `app.indiapost.gov.in` slug `drop-off-booked-and-paid-surcharge-and-input-rungs`.
 
 
@@ -231,7 +231,7 @@ Two halves, neither of which is a secrets-policy question:
 2. **`ychrome-vault edit` has no card options whatsoever** — only rename/user/uri/totp/notes/
    custom-field — so a card item can never be updated by this client, and every card expires.
 
-Context: `~/data/atlasStore/graph/notes/indiapost-rti-a-booking-run-2026-08-07.md`.
+Context: `~/data/widgets/graph/notes/indiapost-rti-a-booking-run-2026-08-07.md`.
 ⚠ Do not fix half of it: seeing an expiry you cannot change moves the dead end one screen later.
 
 
@@ -466,7 +466,7 @@ built on the row plane is unreliable in a way nothing reports.
 
 | row | symptom | cleared by |
 |---|---|---|
-| harborstore row 4 | ~30 min frozen | — |
+| levers row 4 | ~30 min frozen | — |
 | yggterm row 6 (this session) | alive, turn ended, not reading input | `server terminal restart` |
 
 **What is true of the wedged row, and it is the hard part:** the process is ALIVE, the turn has
@@ -653,7 +653,7 @@ expensive part, because a file channel nobody designed becomes load-bearing.
 
 ### ⭐ A LAW THAT LIVES ONLY IN A MEMORY FILE IS RE-BROKEN BY EVERY SESSION THAT HAS NOT READ IT
 
-Added 2026-08-07: row 1 (atlasstore) took a **fourth** cyber demotion
+Added 2026-08-07: row 1 (widgets) took a **fourth** cyber demotion
 (`claude-fable-5` → `claude-opus-5`, `dir=retry`, unpaired with any 529) minutes
 after being handed a portal errand. The standing law is that **that lobe launches
 on Opus 5 ALWAYS, precisely because it demotes** — and the row was on Fable,
@@ -733,7 +733,7 @@ order `6.9` then `6.8`:
 ```
 seat A → {"honoured": true, "outline_prefix": "6.9", "live_index": 0}
 seat B → {"outline_prefix": "6.8", "live_index": 1}
-rendered → 0: 5.3 lumenstore (unnumbered)   1: '6.8' probe B   2: '6.9' probe A
+rendered → 0: 5.3 gadgets (unnumbered)   1: '6.8' probe B   2: '6.9' probe A
 ```
 
 ⇒ **the later row seated ABOVE the earlier one**, which is the whole feature, and the unnumbered
@@ -811,8 +811,8 @@ created, so nothing is ever half-placed.
 
 ⚠ **A small render defect found while reading the compose rule, not yet reproduced.**
 `compose_outline_prefix` suppresses the prefix when `label.trim_start().starts_with(prefix)` —
-correct and necessary for idempotence (a row is relabelled on every snapshot, and `2. versestore: 2.
-versestore:` was the bug it closes), but it is a PREFIX match on a bare string. So a row numbered `2`
+correct and necessary for idempotence (a row is relabelled on every snapshot, and `2. cogs: 2.
+cogs:` was the bug it closes), but it is a PREFIX match on a bare string. So a row numbered `2`
 whose CLI titles it *"2026 audit"* renders with no visible number while carrying one, and a row
 numbered `1` titled *"12 things"* does the same. The fix is to require a separator after the match
 (`2.`/`2 `), not to drop the idempotence guard.
@@ -1076,7 +1076,7 @@ Two more measured facts for whoever takes this:
 
 **Status:** OPEN
 
-lumenstore row, 2026-08-06, while executing rule 1 of
+gadgets row, 2026-08-06, while executing rule 1 of
 [`agent-row-hygiene.md`](agent-row-hygiene.md) §The outline contract:
 
 ```
@@ -2439,7 +2439,7 @@ keeps it open. (The count used to ride on the status line itself, which broke
 **Status:** OPEN
 
 Field report: **[`docs/agent-row-unreachable-versioned-socket-split-2026-08-07.md`](agent-row-unreachable-versioned-socket-split-2026-08-07.md)**.
-Raised by the atlasStore lobe delegate on 2026-08-07 after **53 minutes** of a perfectly healthy
+Raised by the widgets lobe delegate on 2026-08-07 after **53 minutes** of a perfectly healthy
 agent being treated as dead.
 
 **The socket is versioned and superseded ones are not forwarded.** The CLI follows the new version
@@ -2517,7 +2517,7 @@ list before filing anything new from it.**
 > the entry was *"documented but has no route"*, and the response does prove a route exists.
 >
 > ⛔ **But `{"filled":"filled","ok":true}` is NOT evidence the fill was correct**, and it was
-> being read that way. lumenstore row 5.2 observed the identical response on a **wrong write** —
+> being read that way. gadgets row 5.2 observed the identical response on a **wrong write** —
 > a 31-character value into a field whose vault secret is 20 characters, with the confirm field
 > left **empty** — caught only by a hand-written page-side readback. Filed as
 > `ctl fill REPORTS SUCCESS ON A WRONG WRITE` at the top of `ychrome/docs/pending-bugs.md`.

@@ -1432,7 +1432,7 @@ fn main() -> Result<()> {
             // runs on another host, but that fix is in the DAEMON and an older
             // one answers for its own rows without the field. A single layer
             // between --apply and a live agent session is not enough: on
-            // 2026-08-06 this system offered to close a versestore delegate that
+            // 2026-08-06 this system offered to close a cogs delegate that
             // was five hours into its task.
             let unvouched = yggterm_server::row_sanity::unvouched_rows(&rows, &decisions);
             if !unvouched.is_empty() {
