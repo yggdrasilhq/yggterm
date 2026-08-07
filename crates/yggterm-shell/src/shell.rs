@@ -3612,6 +3612,10 @@ impl AppPaneContextMenu {
                 // …and for the same reason it invents no reason: the tooltip
                 // falls back to the label, which the app authored.
                 reason: None,
+                // A contributed action is a leaf. An app that wants nesting
+                // contributes it through the surface protocol, not by the shell
+                // guessing a hierarchy out of its verb names.
+                submenu: Vec::new(),
             })
             .collect()
     }
@@ -15384,6 +15388,9 @@ struct ShellState {
     /// [`ShellState::context_menu_anchor_is_resolvable`] answers both halves.
     context_menu_anchor_tracked: bool,
     context_menu_context_row: Option<BrowserRow>,
+    /// Which page the row menu is showing — `None` is the root list, `Some(id)`
+    /// is that opener's children. See [`row_menu_page_items`].
+    row_menu_page: RowMenuPage,
     context_menu_position: Option<(f64, f64)>,
     /// When the open context menu belongs to a VIEWPORT surface rather than a
     /// sidebar row, which surface — so the menu shows Copy/Paste for that
@@ -16296,6 +16303,8 @@ struct RenderSnapshot {
     /// The row menu's contents for `context_menu_row` (empty when closed) — the
     /// SSOT the mouse menu draws and the `rowmenu` KeyTip scope declares.
     row_menu_items: Vec<RowMenuItem>,
+    /// Both levels, unflattened — what the KeyTip layer and the dispatcher read.
+    row_menu_tree: Vec<RowMenuItem>,
     row_menu_title: String,
     /// The "here" row (`ALT,E`'s target): the selected sidebar row, else the active
     /// session. The row-menu KeyTip badge paints on THIS row.
@@ -17374,22 +17383,42 @@ fn conversation_provider_model_for_session(
             ConversationProviderModel::read_only("samplenotes-webapp-api", "SAMPLENOTES Webapp", "SAMPLENOTES API")
         };
     }
+    // An agent CLI's transcript reader is named from its descriptor. The three
+    // shipped ids stay byte-for-byte what they were — they are the reader
+    // identity the web view persists against — and a new CLI's falls out of its
+    // slug, which is what stops a tenth CLI needing an arm here.
+    if let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(session.kind) {
+        let (id, title, format) = match session.kind {
+            SessionKind::Codex => ("codex-transcript", "Codex transcript", "Codex JSONL"),
+            SessionKind::CodexLiteLlm => (
+                "codex-litellm-transcript",
+                "Codex LiteLLM transcript",
+                "Codex JSONL",
+            ),
+            SessionKind::ClaudeCode => (
+                "claude-code-transcript",
+                "Claude Code transcript",
+                "Claude conversation",
+            ),
+            _ => {
+                // `&'static str` because the descriptor is `'static` and the
+                // slug is a compile-time literal; the format! output is not, so
+                // it is leaked ONCE per CLI at first use. Nine strings for the
+                // life of the process, against threading a lifetime through the
+                // provider model for the same nine.
+                let id: &'static str =
+                    Box::leak(format!("{}-transcript", descriptor.slug).into_boxed_str());
+                let title: &'static str =
+                    Box::leak(format!("{} transcript", descriptor.display_name).into_boxed_str());
+                let format: &'static str = Box::leak(
+                    format!("{} session store", descriptor.display_name).into_boxed_str(),
+                );
+                return ConversationProviderModel::read_only(id, title, format);
+            }
+        };
+        return ConversationProviderModel::read_only(id, title, format);
+    }
     match session.kind {
-        SessionKind::Codex => ConversationProviderModel::read_only(
-            "codex-transcript",
-            "Codex transcript",
-            "Codex JSONL",
-        ),
-        SessionKind::CodexLiteLlm => ConversationProviderModel::read_only(
-            "codex-litellm-transcript",
-            "Codex LiteLLM transcript",
-            "Codex JSONL",
-        ),
-        SessionKind::ClaudeCode => ConversationProviderModel::read_only(
-            "claude-code-transcript",
-            "Claude Code transcript",
-            "Claude conversation",
-        ),
         // A plain shell has NO conversation. It used to get a "Terminal
         // transcript / Saved terminal output" reader, which is how opening a
         // yedit session (a shell hosting a document app) showed a terminal
@@ -17404,6 +17433,8 @@ fn conversation_provider_model_for_session(
         SessionKind::Document => {
             ConversationProviderModel::read_only("document", "Document", "Yggterm document")
         }
+        // Unreachable: every agent kind returned above.
+        _ => ConversationProviderModel::read_only("none", "", ""),
     }
 }
 fn conversation_provider_send_enabled(session: &ManagedSessionView) -> bool {
@@ -17596,6 +17627,7 @@ impl ShellState {
         let mut state = Self {
             settings,
             bootstrap,
+            row_menu_page: None,
             browser,
             server,
             search_query: String::new(),
@@ -18490,8 +18522,15 @@ impl ShellState {
             selected_row.as_ref(),
             active_session_path.as_deref(),
         );
+        // ⚖ THE SPLIT that makes `ALT,E,S,L` work: the KeyTip tree is built from
+        // the WHOLE menu tree (both levels, every frame), while the overlay is
+        // handed only the page the mouse is looking at. A page turn therefore
+        // changes what is DRAWN and nothing about what is REACHABLE, so the
+        // chord resolves in one go without the submenu ever having been opened.
+        let row_menu_tree = row_menu_items;
+        let row_menu_items = row_menu_page_items(&row_menu_tree, &self.row_menu_page);
         let keytip_tree =
-            build_keytip_tree(&self.keytip_config, &launch_anchor_apps, &row_menu_items);
+            build_keytip_tree(&self.keytip_config, &launch_anchor_apps, &row_menu_tree);
         // The WebTabs rail's row menu, resolved against THIS frame's tab tree so
         // "Close 12 other tabs" is a promise the frame can keep.
         let (web_tab_menu_items, web_tab_menu_title) = self.web_tab_menu_view();
@@ -18719,6 +18758,7 @@ impl ShellState {
             keymap_editor_error: self.keymap_editor_error.clone(),
             selected_tree_paths,
             row_menu_items,
+            row_menu_tree,
             row_menu_title,
             here_row_path,
             context_menu_row,
@@ -24753,10 +24793,13 @@ impl ShellState {
         self.session_working_confirm_streak
             .retain(|path, _| live_paths.contains(path));
         for (title, kind) in finished {
-            let cli = match kind {
-                SessionKind::ClaudeCode => "Claude Code",
-                SessionKind::Codex | SessionKind::CodexLiteLlm => "Codex",
-                _ => "Agent",
+            // The CLI's own name, from its descriptor. `_ => "Agent"` told the
+            // user "Agent finished" for anything that was not one of two hand-
+            // listed kinds — a notification that names nothing is one the user
+            // has to go and look up.
+            let cli = match yggterm_core::agent_cli::agent_cli_descriptor(kind) {
+                Some(descriptor) => descriptor.display_name,
+                None => "Agent",
             };
             let label = title.trim();
             let message = if label.is_empty() {
@@ -28465,6 +28508,10 @@ impl ShellState {
         self.context_menu_row = Some(row);
         self.context_menu_context_row = Some(context_row);
         self.context_menu_position = Some(position);
+        // A fresh menu always opens at the root list. A page that survived the
+        // last dismissal would reopen mid-submenu on a row that may not even
+        // have that opener.
+        self.row_menu_page = None;
         self.record_ui_telemetry(
             "context_menu_open",
             json!({
@@ -28512,7 +28559,17 @@ impl ShellState {
         self.context_menu_context_row = None;
         self.context_menu_position = None;
         self.context_menu_surface = None;
+        self.row_menu_page = None;
         self.refresh_tree_debug("close_context_menu");
+    }
+
+    /// Turn the row menu to `page` — the root list, or one opener's children.
+    ///
+    /// The twin of [`ShellState::turn_web_tab_menu_page`]; the two submenus in
+    /// this app work the same way on purpose.
+    fn turn_row_menu_page(&mut self, page: RowMenuPage) {
+        self.row_menu_page = page;
+        self.refresh_tree_debug("turn_row_menu_page");
     }
     /// Can the sidebar still point at this row?
     ///
@@ -39799,11 +39856,16 @@ fn spawn_start_terminal_session_for_row(
     spawn_start_session_for_row(state, SessionKind::Shell, explicit_row);
 }
 
-fn spawn_start_claude_code_session_for_row(
+/// Start a session of a NAMED agent CLI on the row the surface resolves.
+///
+/// Replaced `spawn_start_claude_code_session_for_row` — one function per CLI is
+/// the shape that made "add a CLI" mean "add a function", and there are nine.
+fn spawn_start_agent_session_for_row(
     state: Signal<ShellState>,
     explicit_row: Option<BrowserRow>,
+    kind: SessionKind,
 ) {
-    spawn_start_session_for_row(state, SessionKind::ClaudeCode, explicit_row);
+    spawn_start_session_for_row(state, kind, explicit_row);
 }
 /// Whether `path` is inside a given CLI's OWN session store.
 ///
@@ -39871,6 +39933,16 @@ fn session_kind_primary_bg<'a>(kind: SessionKind, accent: &'a str) -> &'a str {
 }
 
 fn is_hot_terminal_sidebar_path(path: &str) -> bool {
+    // Every REGISTERED agent scheme, plus the non-agent ones spelled below.
+    // A live remote row of ANY CLI must promote into the Live region, get dual
+    // presence, the keep-alive menu and a stable start-page entry; the
+    // hand-list gave that to codex first and Claude Code only after a bug.
+    if yggterm_core::agent_scheme::SESSION_PATH_SCHEMES
+        .iter()
+        .any(|scheme| scheme.agent && path.starts_with(scheme.prefix))
+    {
+        return true;
+    }
     path.starts_with("local://")
         || path.starts_with("ssh://")
         || path.starts_with("live::")
@@ -39905,11 +39977,14 @@ fn session_kind_for_row(row: &BrowserRow) -> SessionKind {
     }
 }
 fn session_kind_action_label(kind: SessionKind) -> &'static str {
+    if kind.is_agent() {
+        return "session";
+    }
     match kind {
-        SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode => "session",
         SessionKind::Shell => "terminal",
         SessionKind::SshShell => "ssh session",
         SessionKind::Document => "paper",
+        _ => "session",
     }
 }
 fn is_live_sidebar_row(row: &BrowserRow) -> bool {
@@ -43446,6 +43521,10 @@ fn sidebar_merge_cache_key(
         session.session_path.hash(&mut hasher);
         session.id.hash(&mut hasher);
         session.title.hash(&mut hasher);
+        // A CACHE KEY, so it only has to be injective. The shipped numbers are
+        // pinned (changing one invalidates every cached sidebar merge for no
+        // reason) and a new kind takes the next free value from its position in
+        // the registry — which is why the fallback is an offset, not a repeat.
         match session.kind {
             SessionKind::Codex => 1_u8,
             SessionKind::CodexLiteLlm => 2_u8,
@@ -43453,6 +43532,12 @@ fn sidebar_merge_cache_key(
             SessionKind::SshShell => 4_u8,
             SessionKind::Document => 5_u8,
             SessionKind::ClaudeCode => 6_u8,
+            other => 7_u8.saturating_add(
+                yggterm_core::agent_cli::AGENT_CLIS
+                    .iter()
+                    .position(|descriptor| descriptor.kind == other)
+                    .unwrap_or(u8::MAX as usize - 7) as u8,
+            ),
         }
         .hash(&mut hasher);
         session.host_label.hash(&mut hasher);
@@ -45484,6 +45569,13 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
                 shell.close_context_menu();
                 shell.close_titlebar_new_menu();
                 shell.alt_jump_path = None;
+            } else if shell.row_menu_page.is_some() {
+                // ⚠ A level that is not the last one still has a container to
+                // undo. Popping `ALT,E,S` back to `ALT,E` while the menu stayed
+                // on the submenu page left the layer showing the PARENT's
+                // letters over the CHILD's list — every badge pointing at
+                // something else on screen.
+                shell.turn_row_menu_page(None);
             }
         }),
         // Jump mode (`ALT,J`): walk the Live list, commit with Enter. Outside jump
@@ -45859,19 +45951,50 @@ fn build_keytip_scopes(
     // Filtering here rather than guarding `dispatch_keytip_node` is deliberate —
     // an undeclared node has no badge either, so the overlay cannot paint an
     // accelerator that would do nothing.
-    let rowmenu = row_menu
+    //
+    // ⚖ An item that OPENS a submenu declares `Target::Descend` into that
+    // submenu's own scope, and every child scope is declared on the SAME frame
+    // whether or not the submenu is drawn. That is what lets `ALT,E,S,L` run
+    // straight through: the chord resolver walks scopes, not pixels, so the
+    // keyboard never has to visit a page the mouse would have had to turn to.
+    let rowmenu: Vec<KeyTipDecl> = row_menu
         .iter()
         .filter(|item| !item.separator && !item.disabled)
         .map(|item| {
+            let target = if item.submenu.is_empty() {
+                Target::Run
+            } else {
+                Target::Descend(KtScope::RowMenuSub(item.id.clone()))
+            };
             KeyTipDecl::shell_optional(
                 row_menu_node_key(&item.id),
                 item.label.clone(),
                 item.hint,
-                Target::Run,
+                target,
             )
         })
         .collect();
-    vec![
+    let rowmenu_children: Vec<(KtScope, Vec<KeyTipDecl>)> = row_menu
+        .iter()
+        .filter(|item| !item.submenu.is_empty())
+        .map(|item| {
+            let decls = item
+                .submenu
+                .iter()
+                .filter(|child| !child.separator && !child.disabled)
+                .map(|child| {
+                    KeyTipDecl::shell_optional(
+                        row_menu_node_key(&child.id),
+                        child.label.clone(),
+                        child.hint,
+                        Target::Run,
+                    )
+                })
+                .collect();
+            (KtScope::RowMenuSub(item.id.clone()), decls)
+        })
+        .collect();
+    let mut scopes = vec![
         (KtScope::Root, root),
         (KtScope::Insert, insert),
         (KtScope::Settings, settings),
@@ -45881,7 +46004,9 @@ fn build_keytip_scopes(
         // arrow/PageUp/PageDown/Enter keys are handled by the bridge while it is
         // the open scope.
         (KtScope::SessionJump, Vec::new()),
-    ]
+    ];
+    scopes.extend(rowmenu_children);
+    scopes
 }
 /// Map a registry scope id (`descends_into`) to the resolver's scope. One place
 /// that knows the scope vocabulary.
@@ -45919,11 +46044,25 @@ fn keytip_node_id(node_key: &str) -> String {
             } else if node_key.starts_with("theme.") {
                 "settings"
             } else if node_key.starts_with("rowmenu:") {
+                // A submenu leaf's key is `rowmenu:<opener>/<leaf>`; its scope
+                // is the opener's, not the parent menu's, or the §12 audit
+                // reports both levels as one scope and the badge painter asks
+                // the wrong list for its letter.
+                //
+                // Returned as an owned String below; the borrow shape here only
+                // needs to distinguish the two cases.
                 "rowmenu"
             } else {
                 "root"
             }
         });
+    if scope == "rowmenu" {
+        if let Some(rest) = node_key.strip_prefix("rowmenu:") {
+            if let Some((opener, _leaf)) = rest.split_once('/') {
+                return format!("rowmenu.{opener}/{node_key}");
+            }
+        }
+    }
     format!("{scope}/{node_key}")
 }
 /// The `data-keytip-tip` value for a node: the assigned letter (or group number),
@@ -46266,6 +46405,17 @@ fn dispatch_keytip_open(mut state: Signal<ShellState>, key: &str) {
         "session.menu" => spawn_open_row_menu_here(state),
         // ALT,J — jump mode. The live list is walked, not badged (§8).
         "session.jump" => state.with_mut(|shell| shell.begin_session_jump()),
+        // ALT,E,<letter> onto a submenu opener — turn the drawn menu to that
+        // page so the mouse and the keyboard are looking at the same list.
+        //
+        // ⚠ The CHORD does not need this: the child scope is declared every
+        // frame, so `ALT,E,S,L` would resolve even if nothing turned. Turning
+        // is for the human who stops after `S` — without it they would see the
+        // parent list wearing the child's badges, which is the worst of both.
+        key if key.starts_with("rowmenu:") => {
+            let opener = key.trim_start_matches("rowmenu:").to_string();
+            state.with_mut(|shell| shell.turn_row_menu_page(Some(opener)));
+        }
         _ => {}
     }
 }
@@ -46295,7 +46445,7 @@ fn dispatch_keytip_node(mut state: Signal<ShellState>, key: &str) {
     }
     if key == "insert.claude" {
         // Clears the overlay + closes the menu itself.
-        spawn_start_claude_code_session_for_row(state, None);
+        spawn_start_agent_session_for_row(state, None, SessionKind::ClaudeCode);
         return;
     }
     if let Some(theme) = match key {
@@ -48898,19 +49048,27 @@ fn live_session_default_summary(session: &ManagedSessionView) -> Option<String> 
             Some(cwd) => format!("Local shell rooted at {cwd}."),
             None => "Local shell terminal.".to_string(),
         }),
-        SessionKind::Codex => Some(match cwd {
-            Some(cwd) => format!("Local Codex terminal rooted at {cwd}."),
-            None => "Local Codex terminal.".to_string(),
-        }),
-        SessionKind::CodexLiteLlm => Some(match cwd {
-            Some(cwd) => format!("Local Codex LiteLLM terminal rooted at {cwd}."),
-            None => "Local Codex LiteLLM terminal.".to_string(),
-        }),
-        SessionKind::ClaudeCode => Some(match cwd {
-            Some(cwd) => format!("Local Claude Code session rooted at {cwd}."),
-            None => "Local Claude Code session.".to_string(),
-        }),
         SessionKind::Document => Some("Document preview.".to_string()),
+        // Every agent CLI, named by its descriptor. The three shipped sentences
+        // are preserved word for word — `terminal` for the codex family and
+        // `session` for Claude Code, which is the vocabulary each already had —
+        // and a new CLI takes `session`.
+        kind => {
+            let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(kind)?;
+            let name = match kind {
+                SessionKind::CodexLiteLlm => "Codex LiteLLM",
+                _ => descriptor.display_name,
+            };
+            let noun = if yggterm_core::agent_cli::CODEX_FAMILY.contains(&kind) {
+                "terminal"
+            } else {
+                "session"
+            };
+            Some(match cwd {
+                Some(cwd) => format!("Local {name} {noun} rooted at {cwd}."),
+                None => format!("Local {name} {noun}."),
+            })
+        }
     }
 }
 #[cfg(test)]
@@ -48923,11 +49081,10 @@ fn live_session_label(
     live_session_label_with_index(&remote_session_index, session, short_ids)
 }
 fn is_local_tree_live_session(session: &ManagedSessionView) -> bool {
-    is_local_live_session_path(&session.session_path)
-        && matches!(
-            session.kind,
-            SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
-        )
+    // Every agent CLI, derived. The hand-listed triple silently answered
+    // `false` for a fourth, which drops its live row out of the local cwd tree
+    // altogether — the row exists and the tree does not show it.
+    is_local_live_session_path(&session.session_path) && session.kind.is_agent()
 }
 fn is_live_local_stored_codex_terminal_session(session: &ManagedSessionView) -> bool {
     session.source == SessionSource::LiveLocal
@@ -52374,13 +52531,17 @@ fn ensure_home_scoped_workspace_dir(path: &str) -> Result<bool> {
     Ok(true)
 }
 fn group_session_title_hint(row: &BrowserRow, kind: SessionKind) -> String {
-    let suffix = match kind {
-        SessionKind::Codex => "codex",
-        SessionKind::CodexLiteLlm => "codex-litellm",
-        SessionKind::ClaudeCode => "claude-code",
-        SessionKind::Shell => "shell",
-        SessionKind::SshShell => "ssh",
-        SessionKind::Document => "document",
+    // The CLI's slug — the same token `--kind` takes and `session_kind_label`
+    // reports, so a row's placeholder title names the CLI the same way every
+    // other surface does.
+    let suffix = match yggterm_core::agent_cli::agent_cli_descriptor(kind) {
+        Some(descriptor) => descriptor.slug,
+        None => match kind {
+            SessionKind::Shell => "shell",
+            SessionKind::SshShell => "ssh",
+            SessionKind::Document => "document",
+            _ => "shell",
+        },
     };
     format!("{} {}", row.label, suffix)
 }
@@ -75578,10 +75739,11 @@ async fn process_pending_app_control_requests(
             // which recognizes EVERY registered agent CLI's composer glyph (codex
             // `›`, Claude Code `❯`). With only codex's, a claude-code row was never
             // ready and its prompt was never sent (live, guihost 2026-08-06).
-            let (endpoint, runtime_session_path, trace_home) = state.with(|shell| {
+            let (endpoint, runtime_session_path, session_kind, trace_home) = state.with(|shell| {
                 (
                     shell.bootstrap.server_endpoint.clone(),
                     app_control_terminal_input_write_path(shell, &session_path),
+                    live_session_kind_for_path(shell, &session_path),
                     perf_home_dir(&shell.bootstrap.settings_path),
                 )
             });
@@ -75602,6 +75764,7 @@ async fn process_pending_app_control_requests(
                 endpoint.clone(),
                 runtime_session_path.clone(),
                 session_path.clone(),
+                session_kind,
                 trace_home.as_path(),
                 timeout,
                 false,
@@ -75723,10 +75886,11 @@ async fn process_pending_app_control_requests(
             // healthy idle row — `send` answers `error: null` and delivers nothing
             // into it. This asks the one question that separates them, and submits
             // NOTHING, so it is safe to point at a row the owner is using.
-            let (endpoint, runtime_session_path, trace_home) = state.with(|shell| {
+            let (endpoint, runtime_session_path, session_kind, trace_home) = state.with(|shell| {
                 (
                     shell.bootstrap.server_endpoint.clone(),
                     app_control_terminal_input_write_path(shell, &session_path),
+                    live_session_kind_for_path(shell, &session_path),
                     perf_home_dir(&shell.bootstrap.settings_path),
                 )
             });
@@ -75737,6 +75901,7 @@ async fn process_pending_app_control_requests(
                 endpoint,
                 runtime_session_path,
                 session_path.clone(),
+                session_kind,
                 trace_home.as_path(),
                 timeout,
                 true,
@@ -82477,7 +82642,7 @@ fn app() -> Element {
                                     );
                                     return;
                                 }
-                                spawn_start_claude_code_session_for_row(state, None);
+                                spawn_start_agent_session_for_row(state, None, SessionKind::ClaudeCode);
                             },
                             // The `+` menu launches at "here" — exactly like the row
                             // menu's "… Here" items, through the same anchored path
@@ -85867,11 +86032,29 @@ fn tree_icon_kind(row: &BrowserRow) -> &'static str {
             // branches below are fallback for synthesized rows.
             // See [[spec-unify-local-remote]].
             if let Some(kind) = row.session_kind {
+                // ⚠ The agent arm is DERIVED. It used to be a hand-written
+                // `Codex | CodexLiteLlm => "session"`, `ClaudeCode =>
+                // "claude-code"` pair, and a seventh CLI would have fallen into
+                // whichever arm someone remembered — silently wearing another
+                // CLI's mark in the sidebar, the row JSON and every smoke test
+                // that asserts on `icon_kind`.
+                //
+                // The two shipped strings are HISTORICAL and stay: `"session"`
+                // for the codex family (it predates there being a second CLI)
+                // and `"claude-code"`. Every new CLI reports its `slug`.
+                if let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(kind) {
+                    return match kind {
+                        SessionKind::Codex | SessionKind::CodexLiteLlm => "session",
+                        _ => descriptor.slug,
+                    };
+                }
                 return match kind {
-                    SessionKind::Codex | SessionKind::CodexLiteLlm => "session",
-                    SessionKind::ClaudeCode => "claude-code",
                     SessionKind::Shell | SessionKind::SshShell => "terminal",
                     SessionKind::Document => "paper",
+                    // Unreachable: every non-agent kind is named above and every
+                    // agent kind took the descriptor branch. A `match` that
+                    // cannot see the future is exactly what this arm replaces.
+                    _ => "terminal",
                 };
             }
             if row.full_path.starts_with("codex-litellm://")
@@ -85910,12 +86093,21 @@ fn tree_icon_glyph(row: &BrowserRow) -> Option<&'static str> {
         BrowserRowKind::Separator => Some("—"),
         BrowserRowKind::Session => {
             // SSOT for glyph: consult session_kind first. See [[spec-unify-local-remote]].
+            //
+            // ⚠ An agent CLI's mark is DESCRIPTOR DATA (`icon_glyph`) — the CLI
+            // declares its own identity once, beside its binary name and its
+            // store. It used to be a `match` here, a second `match` in
+            // `tree_icon_kind`, and a bespoke component reached by a THIRD
+            // string comparison at the call site; three answers to one question,
+            // kept in agreement only by two tests.
             if let Some(kind) = row.session_kind {
+                if let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(kind) {
+                    return Some(descriptor.icon_glyph);
+                }
                 return Some(match kind {
-                    SessionKind::ClaudeCode => "*_",
-                    SessionKind::Codex | SessionKind::CodexLiteLlm => ">_",
                     SessionKind::Shell | SessionKind::SshShell => "$_",
                     SessionKind::Document => "$_",
+                    _ => "$_",
                 });
             }
             if is_claude_code_session_path(&row.full_path) {
@@ -87607,12 +87799,33 @@ fn tree_icon_spec(row: &BrowserRow) -> TreeIconSpec {
     }
 }
 
+/// The `<text>` style for a boxed glyph, sized so the mark fits the SAME rect
+/// every session-kind icon draws.
+///
+/// The rect's inner width is 15.8 px and JetBrains Mono advances ≈0.6 em, so at
+/// 7 px a character costs ≈4.2 px: two characters (`>_`, `$_`, `K_`, `π_`) sit
+/// with ≈3.7 px of air each side, which is the shipped look. Three (`OC_`) would
+/// leave 1.6 px and read visibly cramped beside its neighbours, so it steps down
+/// a point instead.
+///
+/// ⛔ The answer is never "widen the rect": the rect is what makes every row's
+/// icon one family, and a wider one on a single CLI is the thing a user's eye
+/// catches immediately (`DESIGN.md` §sidebar iconography).
+fn boxed_glyph_text_style(glyph: &str) -> &'static str {
+    const SEVEN: &str = "font-family:'JetBrains Mono', ui-monospace, monospace; \
+                         font-size:7px; font-weight:800; letter-spacing:0;";
+    const SIX: &str = "font-family:'JetBrains Mono', ui-monospace, monospace; \
+                       font-size:6px; font-weight:800; letter-spacing:0;";
+    if glyph.chars().count() >= 3 { SIX } else { SEVEN }
+}
+
 #[component]
 fn TreeIcon(spec: TreeIconSpec) -> Element {
     if spec == TreeIconSpec::ClaudeCode {
         return rsx! { ClaudeCodeTreeIcon {} };
     }
     if let TreeIconSpec::BoxedGlyph(glyph) = spec {
+        let style = boxed_glyph_text_style(glyph);
         return rsx! {
             svg {
                 width: "19",
@@ -87626,7 +87839,7 @@ fn TreeIcon(spec: TreeIconSpec) -> Element {
                     y: "9.8",
                     text_anchor: "middle",
                     fill: "currentColor",
-                    style: "font-family:'JetBrains Mono', ui-monospace, monospace; font-size:7px; font-weight:800; letter-spacing:0;",
+                    style: "{style}",
                     "{glyph}"
                 }
             }
@@ -101929,18 +102142,30 @@ fn terminal_line_prefix_has_meaningful_replay_content(line: &str) -> bool {
 }
 fn terminal_line_internal_transport_error_index(line: &str) -> Option<usize> {
     let lower = line.to_ascii_lowercase();
-    [
-        "error: terminal session not found: local://",
-        "terminal session not found: local://",
-        "error: terminal session not found: remote-session://",
-        "terminal session not found: remote-session://",
-        "error: terminal session not found: codex-runtime://",
-        "terminal session not found: codex-runtime://",
-        "warn ignoring stale yggterm daemon for current app version",
-    ]
-    .iter()
-    .filter_map(|marker| lower.find(marker))
-    .min()
+    // ⚖ DERIVED from the scheme registry. This list used to name three schemes
+    // by hand, so a real `terminal session not found: cc-runtime://…` was NOT
+    // recognised as internal transport noise and was painted into the user's
+    // viewport as if the CLI had said it. Twelve more schemes landed on
+    // 2026-08-08; hand-listing them would have been the same bug nine times.
+    let scheme_markers: Vec<String> = yggterm_core::agent_scheme::SESSION_PATH_SCHEMES
+        .iter()
+        .filter(|scheme| scheme.prefix.ends_with("://") || scheme.prefix.ends_with("::"))
+        .flat_map(|scheme| {
+            let prefix = scheme.prefix.to_ascii_lowercase();
+            [
+                format!("error: terminal session not found: {prefix}"),
+                format!("terminal session not found: {prefix}"),
+            ]
+        })
+        .collect();
+    scheme_markers
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(
+            "warn ignoring stale yggterm daemon for current app version",
+        ))
+        .filter_map(|marker| lower.find(marker))
+        .min()
 }
 fn normalized_terminal_transport_line(line: &str) -> String {
     let stripped = strip_terminal_control_sequences(line);
@@ -103505,6 +103730,7 @@ async fn probe_terminal_input_consumption(
     endpoint: ServerEndpoint,
     runtime_session_path: String,
     session_path: String,
+    session_kind: Option<SessionKind>,
     trace_home: &Path,
     timeout: Duration,
     guard_draft: bool,
@@ -103524,7 +103750,9 @@ async fn probe_terminal_input_consumption(
         {
             composer_shown = true;
             composer_held_draft = terminal_composer_row_holds_draft(&screen);
-            activity = terminal_chunk_agent_activity(&screen);
+            // The session's own kind — never inferred from the composer glyph,
+            // which several CLIs share.
+            activity = terminal_chunk_agent_activity(session_kind, &screen);
             break;
         }
         sleep(Duration::from_millis(150)).await;
@@ -120174,17 +120402,27 @@ enum StartPageFamily {
 /// under the user destroys the muscle memory the sticky face is there to build.
 /// The face moves; the list does not.
 fn start_page_session_items(accent: &str) -> Vec<SplitButtonItem> {
-    vec![
-        SplitButtonItem::new("codex", "Codex Session")
-            .detail("Start Codex in the selected scope")
-            .accent(session_kind_primary_bg(SessionKind::Codex, accent)),
-        SplitButtonItem::new("claude-code", "Claude Code Session")
-            .detail("Start Claude Code in the selected scope")
-            .accent(session_kind_primary_bg(SessionKind::ClaudeCode, accent)),
-        // No accent: a plain shell is not one of the branded agent CLIs, and
-        // giving it one would imply a kinship it does not have.
+    // One member per REGISTERED agent CLI, in registry order — the same
+    // derivation the cwd-tree row menu uses, so the two surfaces cannot offer
+    // different CLIs. It used to be two hardcoded entries, which is one of the
+    // four places a new CLI had to be remembered by hand.
+    let mut items: Vec<SplitButtonItem> = yggterm_core::agent_cli::AGENT_CLIS
+        .iter()
+        .map(|descriptor| {
+            SplitButtonItem::new(descriptor.slug, format!("{} Session", descriptor.display_name))
+                .detail(format!(
+                    "Start {} in the selected scope",
+                    descriptor.display_name
+                ))
+                .accent(session_kind_primary_bg(descriptor.kind, accent))
+        })
+        .collect();
+    // No accent: a plain shell is not one of the branded agent CLIs, and
+    // giving it one would imply a kinship it does not have.
+    items.push(
         SplitButtonItem::new("terminal", "Terminal").detail("Plain shell in the selected scope"),
-    ]
+    );
+    items
 }
 
 /// The id an app verb answers to, and the key its stickiness is stored under.
@@ -120236,11 +120474,18 @@ fn start_page_run_session_choice(
     id: &str,
     row: Option<BrowserRow>,
 ) {
-    let (trace_name, id_owned) = match id {
-        "codex" => ("start_page_new_codex", id.to_string()),
-        "claude-code" => ("start_page_new_claude_code", id.to_string()),
-        "terminal" => ("start_page_new_terminal", id.to_string()),
-        _ => return,
+    let agent_kind = yggterm_core::agent_cli::AGENT_CLIS
+        .iter()
+        .find(|descriptor| descriptor.slug == id)
+        .map(|descriptor| descriptor.kind);
+    // The trace name is per-family, not per-CLI: a name minted from the slug
+    // would make every new CLI a new event nobody has a dashboard for, and the
+    // thing being traced is "the start page launched a session", which the
+    // payload already qualifies.
+    let (trace_name, id_owned) = match (agent_kind, id) {
+        (Some(_), _) => ("start_page_new_agent_session", id.to_string()),
+        (None, "terminal") => ("start_page_new_terminal", id.to_string()),
+        (None, _) => return,
     };
     if !start_page_is_current_surface(&state) {
         suppress_phantom_start_action(
@@ -120254,11 +120499,13 @@ fn start_page_run_session_choice(
     state.with_mut(|shell| {
         shell.remember_start_page_choice(StartPageFamily::Session, &id_owned);
     });
-    match id {
-        "codex" => spawn_start_preferred_agent_session_for_row(state, row),
-        "claude-code" => spawn_start_claude_code_session_for_row(state, row),
-        "terminal" => spawn_start_terminal_session_for_row(state, row),
-        _ => {}
+    match (agent_kind, id) {
+        // Codex means "whatever the user set as their default agent" — the
+        // `AgentSessionProfile` setting picks the fork, as it always has.
+        (Some(SessionKind::Codex), _) => spawn_start_preferred_agent_session_for_row(state, row),
+        (Some(kind), _) => spawn_start_agent_session_for_row(state, row, kind),
+        (None, "terminal") => spawn_start_terminal_session_for_row(state, row),
+        (None, _) => {}
     }
 }
 
@@ -125112,13 +125359,20 @@ fn DaemonMetadataGroup(
 /// Friendly, user-facing label for a session kind. The raw enum names
 /// (`ClaudeCode`, `CodexLiteLlm`) are an implementation detail.
 fn friendly_session_kind(kind: SessionKind) -> &'static str {
+    if let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(kind) {
+        // ⚠ `Codex · LiteLLM` keeps its middot: this string is the metadata
+        // rail's, and the rail reads as a sentence where the descriptor's
+        // hyphenated form reads as an identifier.
+        return match kind {
+            SessionKind::CodexLiteLlm => "Codex · LiteLLM",
+            _ => descriptor.display_name,
+        };
+    }
     match kind {
-        SessionKind::Codex => "Codex",
-        SessionKind::CodexLiteLlm => "Codex · LiteLLM",
-        SessionKind::ClaudeCode => "Claude Code",
         SessionKind::Shell => "Shell",
         SessionKind::SshShell => "SSH Shell",
         SessionKind::Document => "Document",
+        _ => "Shell",
     }
 }
 fn friendly_launch_phase(phase: TerminalLaunchPhase) -> &'static str {
@@ -126069,6 +126323,22 @@ struct RowMenuItem {
     /// exactly as it was before the column existed. Within a menu that opts in,
     /// every row reserves the slot — a half-indented list reads worse than none.
     icon: Option<ShellIcon>,
+    /// Non-empty ⇒ this item OPENS a child list instead of dispatching a verb.
+    ///
+    /// The child is drawn as a PAGE TURN in the same overlay, not a flyout:
+    /// [`ContextMenuOverlay`] is the one menu in this app and it draws a flat
+    /// list, so the submenu is the SAME box at the SAME anchor showing a
+    /// different list — the pattern "Move to folder ▸" already uses. A true
+    /// hover flyout would need per-item DOM geometry the shell deliberately does
+    /// not keep, plus hover-intent timing, for no gain the keyboard layer does
+    /// not already give.
+    ///
+    /// ⚖ The KeyTip layer does NOT page-turn with it: `build_keytip_scopes`
+    /// declares the parent AND every child scope from this tree on every frame,
+    /// so `ALT,E,S,L` resolves in one go without the submenu ever having been
+    /// drawn. That split — flatten for the mouse, whole tree for the chord — is
+    /// the entire trick.
+    submenu: Vec<RowMenuItem>,
 }
 impl RowMenuItem {
     fn new(id: impl Into<String>, label: impl Into<String>, hint: char) -> Self {
@@ -126082,6 +126352,7 @@ impl RowMenuItem {
             disabled: false,
             icon: None,
             reason: None,
+            submenu: Vec::new(),
         }
     }
     fn hinted(id: impl Into<String>, label: impl Into<String>, hint: Option<char>) -> Self {
@@ -126095,6 +126366,7 @@ impl RowMenuItem {
             disabled: false,
             icon: None,
             reason: None,
+            submenu: Vec::new(),
         }
     }
     fn icon(mut self, icon: ShellIcon) -> Self {
@@ -126154,6 +126426,33 @@ impl RowMenuItem {
             disabled: false,
             icon: None,
             reason: None,
+            submenu: Vec::new(),
+        }
+    }
+
+    /// Make this item a submenu opener. Child ids are NAMESPACED under the
+    /// opener (`open-session-here/new-agent:pi`) so a node key stays a unique
+    /// DOM identity and a unique dispatch target across both levels.
+    fn submenu(mut self, items: Vec<RowMenuItem>) -> Self {
+        self.submenu = items
+            .into_iter()
+            .map(|mut child| {
+                child.id = format!("{}/{}", self.id, child.id);
+                child
+            })
+            .collect();
+        self
+    }
+
+    /// The label as drawn, with the affordance that says this opens a list.
+    ///
+    /// `▸` is the mark "Move to folder ▸" already carries, so the two submenus
+    /// in the app read as one idea rather than two conventions.
+    fn display_label(&self) -> String {
+        if self.submenu.is_empty() {
+            self.label.clone()
+        } else {
+            format!("{} \u{25b8}", self.label)
         }
     }
 }
@@ -127032,6 +127331,121 @@ fn document_surface_edit_script(action: &str) -> String {
         command = command,
     )
 }
+/// The opener id of the agent-CLI submenu. `ALT, E, S` reaches it.
+const OPEN_SESSION_MENU_ID: &str = "open-session-here";
+/// The opener id of the libyggterm-app submenu.
+const OPEN_APP_MENU_ID: &str = "open-app-here";
+
+/// One entry per REGISTERED agent CLI, in registry order.
+///
+/// ⚖ Derived from `AGENT_CLIS`, never hand-listed. Before this there were two
+/// hardcoded pushes (`New Codex Session Here`, `New Claude Code Session Here`)
+/// in two branches of this function, plus a third copy in the start page and a
+/// fourth in the KeyTips scope — four places a new CLI had to be remembered, in
+/// a codebase whose whole harness spec exists because that shape keeps costing
+/// bugs. A CLI that registers a descriptor now appears here by construction.
+///
+/// `here` distinguishes the two callers: a SESSION row opens the new session in
+/// that session's cwd ("… Here"), a folder row opens it in the folder.
+fn agent_session_menu_items(here: bool) -> Vec<RowMenuItem> {
+    yggterm_core::agent_cli::AGENT_CLIS
+        .iter()
+        .map(|descriptor| {
+            let label = if here {
+                format!("{} Here", descriptor.new_session_label())
+            } else {
+                descriptor.new_session_label()
+            };
+            RowMenuItem::new(
+                format!("{NEW_AGENT_MENU_PREFIX}{}", descriptor.slug),
+                label,
+                descriptor.menu_hint,
+            )
+        })
+        .collect()
+}
+
+/// The id prefix carrying which CLI a "New … Session" entry means.
+///
+/// One shape for all nine, so the dispatcher is one descriptor lookup rather
+/// than an arm per CLI. It replaced `new-codex-here` / `new-claude-here` /
+/// `new-session` / `new-claude-code` — four ids for one verb.
+const NEW_AGENT_MENU_PREFIX: &str = "new-agent:";
+
+/// Verbs CONTRIBUTED by the libyggterm apps on this row's host.
+///
+/// Same registry as the titlebar `+` menu and the start page — a purged app
+/// leaves all three at once. The manifest's `keytip` is the requested letter
+/// (libyggterm-surfaces spec §10). yggterm contributes NO app-specific chrome
+/// of its own here; the list is whatever the host's `~/.yggterm/apps/*.json`
+/// manifests declare.
+fn libyggterm_app_menu_items(apps: &[AppManifest], here: bool) -> Vec<RowMenuItem> {
+    app_launcher_entries(apps)
+        .into_iter()
+        .map(|(app, verb)| {
+            let label = if here {
+                format!("{} Here", verb.label)
+            } else {
+                verb.label.clone()
+            };
+            RowMenuItem::hinted(
+                format!("app:{}:{}", app.name, verb.id),
+                label,
+                verb.keytip
+                    .chars()
+                    .next()
+                    .or_else(|| app.keytip.chars().next()),
+            )
+        })
+        .collect()
+}
+
+/// The page a row menu is showing: the root list, or one opener's children.
+///
+/// Mirrors [`WebTabMenuPage`] deliberately — one submenu idiom in the app, not
+/// two. `Some(opener_id)` is a page turn in the SAME overlay at the SAME anchor.
+type RowMenuPage = Option<String>;
+
+/// Flatten the row-menu TREE to the page the mouse is looking at.
+///
+/// The KeyTip layer never calls this: it is handed the whole tree, which is why
+/// `ALT,E,S,L` resolves without the submenu having been drawn.
+fn row_menu_page_items(items: &[RowMenuItem], page: &RowMenuPage) -> Vec<RowMenuItem> {
+    let Some(opener) = page.as_deref() else {
+        return items.to_vec();
+    };
+    let Some(parent) = items.iter().find(|item| item.id == opener) else {
+        // The opener vanished between frames (its app was purged, the row
+        // changed kind). Falling back to the root beats drawing an empty box.
+        return items.to_vec();
+    };
+    let mut page_items = vec![
+        RowMenuItem::new(row_menu_back_id(opener), "Back", 'b').icon(ShellIcon::Back),
+        RowMenuItem::divider(),
+    ];
+    page_items.extend(parent.submenu.iter().cloned());
+    page_items
+}
+
+/// The id that turns a submenu page back to the root.
+fn row_menu_back_id(opener: &str) -> String {
+    format!("{opener}/__back")
+}
+
+/// The page this id turns to, if it is a navigation id rather than a verb.
+///
+/// Resolved BEFORE the action router, exactly as `web_tab_menu_page_turn` is:
+/// these are the only ids that leave the menu OPEN.
+fn row_menu_page_turn(items: &[RowMenuItem], id: &str) -> Option<RowMenuPage> {
+    if id.ends_with("/__back") {
+        return Some(None);
+    }
+    items
+        .iter()
+        .find(|item| item.id == id && !item.submenu.is_empty())
+        .map(|item| Some(item.id.clone()))
+}
+
 /// Build the row menu for `row`. Pure: same inputs, same menu, in a stable order
 /// — which is what makes the KeyTip letters stable too (invariant 1).
 fn row_menu_items(
@@ -127116,26 +127530,16 @@ fn row_menu_items(
             );
         }
         items.push(RowMenuItem::new("add-folder", "Add Folder", 'f'));
-        items.push(RowMenuItem::new("new-session", "New Codex Session", 'c'));
-        items.push(RowMenuItem::new(
-            "new-claude-code",
-            "New Claude Code Session",
-            'l',
-        ));
         items.push(RowMenuItem::new("new-terminal", "New Terminal", 't'));
-        // Verbs CONTRIBUTED by the libyggterm apps on this row's host. Same
-        // registry as the titlebar `+` menu and the start page; a purged app
-        // leaves all three at once. The manifest's `keytip` is the requested
-        // letter (spec §10).
-        for (app, verb) in app_launcher_entries(apps) {
-            items.push(RowMenuItem::hinted(
-                format!("app:{}:{}", app.name, verb.id),
-                format!("{} Here", verb.label),
-                verb.keytip
-                    .chars()
-                    .next()
-                    .or_else(|| app.keytip.chars().next()),
-            ));
+        items.push(
+            RowMenuItem::new(OPEN_SESSION_MENU_ID, "Open Session", 's')
+                .submenu(agent_session_menu_items(false)),
+        );
+        if !app_launcher_entries(apps).is_empty() {
+            items.push(
+                RowMenuItem::new(OPEN_APP_MENU_ID, "Open libyggterm App", 'b')
+                    .submenu(libyggterm_app_menu_items(apps, false)),
+            );
         }
         items.push(RowMenuItem::divider());
         items.push(RowMenuItem::new("add-separator", "Add Separator", 'p'));
@@ -127165,25 +127569,19 @@ fn row_menu_items(
                 "Open Terminal Here",
                 't',
             ));
-            items.push(RowMenuItem::new(
-                "new-codex-here",
-                "New Codex Session Here",
-                'c',
-            ));
-            items.push(RowMenuItem::new(
-                "new-claude-here",
-                "New Claude Code Session Here",
-                'l',
-            ));
-            for (app, verb) in app_launcher_entries(apps) {
-                items.push(RowMenuItem::hinted(
-                    format!("app:{}:{}", app.name, verb.id),
-                    format!("{} Here", verb.label),
-                    verb.keytip
-                        .chars()
-                        .next()
-                        .or_else(|| app.keytip.chars().next()),
-                ));
+            // ⚖ TWO LAYERS, owner-directed 2026-08-08. Nine agent CLIs and four
+            // app verbs as siblings is a list nobody can read, and it grows
+            // every time a CLI ships. `Open Terminal Here` stays flat — it is
+            // the one entry that is not a choice between vendors.
+            items.push(
+                RowMenuItem::new(OPEN_SESSION_MENU_ID, "Open Session Here", 's')
+                    .submenu(agent_session_menu_items(true)),
+            );
+            if !app_launcher_entries(apps).is_empty() {
+                items.push(
+                    RowMenuItem::new(OPEN_APP_MENU_ID, "Open libyggterm App Here", 'b')
+                        .submenu(libyggterm_app_menu_items(apps, true)),
+                );
             }
         }
         items.push(RowMenuItem::new(
@@ -127191,7 +127589,12 @@ fn row_menu_items(
             "Regenerate Title/Summary",
             'g',
         ));
-        items.push(RowMenuItem::new("edit-summary", "Edit Summary", 's'));
+        // ⚠ Re-hinted off `s`, which the submenu above now takes. Left alone,
+        // the ladder would silently hand this item `i` (its hint denied, then
+        // the first free letter of its title) and `ALT,E,S` would quietly stop
+        // meaning "Edit Summary" — the exact "a chord never silently changes its
+        // target" invariant the KeyTips spec names.
+        items.push(RowMenuItem::new("edit-summary", "Edit Summary", 'y'));
         items.push(RowMenuItem::divider());
         items.push(
             RowMenuItem::new(
@@ -127660,6 +128063,26 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
         dispatch_viewport_menu_action(state, action.to_string());
         return;
     }
+    // ⚠ NAVIGATION FIRST, before the action router — these are the only ids
+    // that leave the menu OPEN. Without this the catch-all at the bottom would
+    // treat "Open Session Here ▸" as an unknown verb and close the box, which
+    // is a submenu that dismisses instead of opening.
+    {
+        let turn = state.with(|shell| {
+            let items = shell.snapshot().row_menu_tree;
+            row_menu_page_turn(&items, &id)
+        });
+        if let Some(page) = turn {
+            state.with_mut(|shell| shell.turn_row_menu_page(page));
+            return;
+        }
+    }
+    // A submenu leaf carries its opener's id as a prefix so node keys stay
+    // unique across both levels; the verb below it is what dispatches.
+    let id = match id.rsplit_once('/') {
+        Some((_, leaf)) => leaf.to_string(),
+        None => id,
+    };
     // The creation-context row (a folder for a paper, a session's own cwd) — the
     // same row `open_context_menu` resolved when the menu opened.
     let context_row = state.with(|shell| {
@@ -127676,6 +128099,37 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
             remove_split_pane(state, &group_id, &pane_path);
         }
         spawn_close_session_runtime(state, pane_path);
+        return;
+    }
+    // ONE arm for every registered agent CLI. The nine "New … Session" entries
+    // differ only in which descriptor they name, so they route through one
+    // lookup — the four hardcoded ids this replaced (`new-session`,
+    // `new-claude-code`, `new-codex-here`, `new-claude-here`) were four places
+    // a tenth CLI would have had to be remembered.
+    //
+    // A folder row creates in the folder (`context_row`); a session row creates
+    // in that session's own cwd (`row`), landing directly below it.
+    if let Some(slug) = id.strip_prefix(NEW_AGENT_MENU_PREFIX) {
+        let anchor = if row.kind == BrowserRowKind::Session {
+            row.clone()
+        } else {
+            context_row.clone()
+        };
+        let kind = yggterm_core::agent_cli::AGENT_CLIS
+            .iter()
+            .find(|descriptor| descriptor.slug == slug)
+            .map(|descriptor| descriptor.kind);
+        match kind {
+            // Codex means "whatever the user set as their default agent" — the
+            // `AgentSessionProfile` setting picks the fork, exactly as the old
+            // `new-session` arm did.
+            Some(SessionKind::Codex) => spawn_start_group_session(state, anchor, preferred_agent_kind),
+            Some(kind) => spawn_start_group_session(state, anchor, kind),
+            // An id naming a CLI that is not registered cannot have been drawn
+            // by this menu; closing is the honest response to a verb that does
+            // not exist.
+            None => state.with_mut(|shell| shell.close_context_menu()),
+        }
         return;
     }
     if id.starts_with("app:") {
@@ -127777,14 +128231,10 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
         }
         "add-folder" => queue_new_group_for_row(state, context_row),
         "add-separator" => queue_new_separator_for_row(state, row),
-        "new-session" => spawn_start_group_session(state, context_row, preferred_agent_kind),
-        "new-claude-code" => spawn_start_group_session(state, context_row, SessionKind::ClaudeCode),
         "new-terminal" => spawn_start_group_session(state, context_row, SessionKind::Shell),
         // The "… Here" items on a live-session row use the RAW row, so the new
         // session inherits THAT session's cwd and lands directly below it.
         "open-terminal-here" => spawn_start_group_session(state, row, SessionKind::Shell),
-        "new-codex-here" => spawn_start_group_session(state, row, preferred_agent_kind),
-        "new-claude-here" => spawn_start_group_session(state, row, SessionKind::ClaudeCode),
         "keep-alive" | "stop-keep-alive" => {
             let keep_alive = id == "keep-alive";
             // Re-derive from the same function that labelled the item, so the
@@ -128238,7 +128688,7 @@ fn ContextMenuOverlay(
                             }
                             span {
                                 style: "flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis;",
-                                "{item.label}"
+                                "{item.display_label()}"
                             }
                         }
                     }
@@ -139366,6 +139816,51 @@ mod tests {
         assert_eq!(tree_icon_spec(&shell), TreeIconSpec::BoxedGlyph("$_"));
         let sep = icon_test_row(BrowserRowKind::Separator, "sep");
         assert_eq!(tree_icon_spec(&sep), TreeIconSpec::BoxedGlyph("—"));
+
+        // ⭐ EVERY registered agent CLI draws the mark ITS DESCRIPTOR declares,
+        // and no two share one. A collision is not cosmetic: the sidebar is the
+        // instrument the owner reads to tell his rows apart, and two CLIs
+        // wearing one mark makes it lie.
+        let mut glyphs: Vec<&str> = Vec::new();
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            let mut row = icon_test_row(BrowserRowKind::Session, "local://agent");
+            row.session_kind = Some(descriptor.kind);
+            // Claude Code keeps its bespoke two-run component (the asterisk is
+            // drawn larger than the underscore); everyone else is a boxed glyph.
+            if descriptor.kind != SessionKind::ClaudeCode {
+                assert_eq!(
+                    tree_icon_spec(&row),
+                    TreeIconSpec::BoxedGlyph(descriptor.icon_glyph),
+                    "{:?} must draw its declared mark",
+                    descriptor.kind
+                );
+            }
+            assert!(
+                descriptor.icon_glyph.ends_with('_'),
+                "{:?}: the trailing underscore is the family resemblance",
+                descriptor.kind
+            );
+            assert!(
+                descriptor.icon_glyph.chars().count() <= 3,
+                "{:?}: a mark wider than three characters does not fit the rect, \
+                 and the answer is never to widen the rect",
+                descriptor.kind
+            );
+            // The codex family deliberately shares `>_` — one CLI in two builds.
+            if !yggterm_core::agent_cli::CODEX_FAMILY.contains(&descriptor.kind) {
+                assert!(
+                    !glyphs.contains(&descriptor.icon_glyph),
+                    "{:?} reuses the mark {}",
+                    descriptor.kind,
+                    descriptor.icon_glyph
+                );
+                glyphs.push(descriptor.icon_glyph);
+            }
+        }
+        // A three-character mark steps down a point so it still reads as one
+        // family with the two-character ones.
+        assert_ne!(boxed_glyph_text_style("OC_"), boxed_glyph_text_style("K_"));
+        assert_eq!(boxed_glyph_text_style(">_"), boxed_glyph_text_style("K_"));
 
         // Documents: generic paper vs terminal-recipe.
         let paper = icon_test_row(BrowserRowKind::Document, "doc://p");
@@ -153065,7 +153560,7 @@ mod tests {
         let resolved = resolve_creation_context_row(&[session.clone()], &session);
         assert_eq!(resolved.kind, BrowserRowKind::Group);
         assert_eq!(resolved.full_path, "/home/user");
-        assert_eq!(resolved.label, "pi");
+        assert_eq!(resolved.label, "user");
         assert_eq!(resolved.session_cwd.as_deref(), Some("/home/user"));
     }
     #[test]
@@ -155778,8 +156273,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
         );
-        assert_eq!(rows[0].label, "Pi Home Shell");
-        assert_eq!(rows[0].session_title.as_deref(), Some("Pi Home Shell"));
+        assert_eq!(rows[0].label, "User Home Shell");
+        assert_eq!(rows[0].session_title.as_deref(), Some("User Home Shell"));
         assert_eq!(
             rows[0].detail_label,
             "Local shell rooted at /home/user.".to_string()
@@ -157442,7 +157937,7 @@ mod tests {
             .map(|item| item.id.as_str())
             .collect();
         assert!(ids.contains(&"open-terminal-here"), "{ids:?}");
-        assert!(ids.contains(&"new-codex-here"), "{ids:?}");
+        assert!(ids.contains(&OPEN_SESSION_MENU_ID), "{ids:?}");
         assert!(ids.contains(&"keep-alive"), "{ids:?}");
         assert!(ids.contains(&"delete-session"), "{ids:?}");
 
@@ -157457,21 +157952,133 @@ mod tests {
         );
         // …and every non-separator item is reachable from it, with the tip the
         // badge paints (one assignment, two views).
+        //
+        // ⚖ A SUBMENU OPENER resolves to `Descend`, not `Run` — it is not a
+        // verb. Splitting the assertion by target is what keeps this lock
+        // honest about the two-level menu instead of quietly excusing the
+        // openers.
         for item in items.iter().filter(|item| !item.separator) {
             let node_key = row_menu_node_key(&item.id);
             let tip = tree
                 .tip_for("e", &node_key)
                 .unwrap_or_else(|| panic!("row menu item {} got no keytip", item.id));
-            assert_eq!(
-                tree.resolve(&format!("e{}", tip.to_lowercase())),
-                ChordResolution::Run(node_key.clone()),
-                "chord for {} must run it",
-                item.id
-            );
+            let chord = format!("e{}", tip.to_lowercase());
+            if item.submenu.is_empty() {
+                assert_eq!(
+                    tree.resolve(&chord),
+                    ChordResolution::Run(node_key.clone()),
+                    "chord for {} must run it",
+                    item.id
+                );
+            } else {
+                assert_eq!(
+                    tree.resolve(&chord),
+                    ChordResolution::Descend {
+                        key: node_key.clone(),
+                        scope: format!("rowmenu.{}", item.id),
+                    },
+                    "chord for {} must OPEN it",
+                    item.id
+                );
+                // Every child is reachable one level deeper, from the SAME
+                // frame — the submenu was never drawn.
+                for child in item.submenu.iter().filter(|child| !child.separator) {
+                    let child_key = row_menu_node_key(&child.id);
+                    let child_tip = tree
+                        .tip_for(&chord, &child_key)
+                        .unwrap_or_else(|| panic!("submenu item {} got no keytip", child.id));
+                    assert_eq!(
+                        tree.resolve(&format!("{chord}{}", child_tip.to_lowercase())),
+                        ChordResolution::Run(child_key.clone()),
+                        "chord for {} must run it",
+                        child.id
+                    );
+                }
+            }
         }
         // A separator is drawn, never badged, never dispatched.
         assert!(items.iter().any(|item| item.separator));
         assert!(tree.tip_for("e", "rowmenu:").is_none());
+    }
+
+    /// ⭐ THE CHORD THE OWNER TYPES. `ALT,E,L` opened Claude Code before the
+    /// submenu; `ALT,E,S,L` must open it after, and the whole point of building
+    /// the KeyTip tree from the TREE rather than the drawn page is that this
+    /// resolves without the submenu ever having been opened.
+    #[test]
+    fn alt_e_s_l_reaches_claude_code_through_the_open_session_submenu() {
+        let row = test_live_session_row("local://abc", "yggterm shell");
+        let items = row_menu_items(&row, &[], None, &[], 0, false, false);
+        let tree = build_keytip_tree(&KeymapConfig::default(), &[], &items);
+
+        assert_eq!(
+            tree.resolve("es"),
+            ChordResolution::Descend {
+                key: row_menu_node_key(OPEN_SESSION_MENU_ID),
+                scope: format!("rowmenu.{OPEN_SESSION_MENU_ID}"),
+            },
+            "S must open the session submenu"
+        );
+        let claude = row_menu_node_key(&format!(
+            "{OPEN_SESSION_MENU_ID}/{NEW_AGENT_MENU_PREFIX}claude-code"
+        ));
+        assert_eq!(
+            tree.resolve("esl"),
+            ChordResolution::Run(claude),
+            "ALT,E,S,L must start a Claude Code session"
+        );
+
+        // Every registered CLI is reachable in that submenu — the list is
+        // derived, so a tenth CLI joins this assertion by existing.
+        let submenu = items
+            .iter()
+            .find(|item| item.id == OPEN_SESSION_MENU_ID)
+            .expect("the session submenu");
+        assert_eq!(
+            submenu.submenu.len(),
+            yggterm_core::agent_cli::AGENT_CLIS.len(),
+            "one entry per registered agent CLI"
+        );
+
+        // ⚠ And the chord that MOVED says so out loud: `Edit Summary` was
+        // re-hinted off `s`, so `ALT,E,S` can never silently mean two things.
+        assert!(items.iter().any(|item| item.id == "edit-summary" && item.hint == Some('y')));
+    }
+
+    /// The mouse sees ONE page; the keyboard sees the whole tree.
+    #[test]
+    fn the_row_menu_draws_one_page_while_the_alt_layer_holds_both_levels() {
+        let row = test_live_session_row("local://abc", "yggterm shell");
+        let items = row_menu_items(&row, &[], None, &[], 0, false, false);
+
+        let root_page = row_menu_page_items(&items, &None);
+        assert!(root_page.iter().any(|item| item.id == OPEN_SESSION_MENU_ID));
+        assert!(
+            !root_page
+                .iter()
+                .any(|item| item.id.starts_with(&format!("{OPEN_SESSION_MENU_ID}/"))),
+            "the root page must not draw the children too"
+        );
+
+        let child_page = row_menu_page_items(&items, &Some(OPEN_SESSION_MENU_ID.to_string()));
+        assert!(
+            child_page.first().is_some_and(|item| item.label == "Back"),
+            "a submenu page leads with the way out"
+        );
+        assert!(child_page.iter().any(|item| item.id
+            == format!("{OPEN_SESSION_MENU_ID}/{NEW_AGENT_MENU_PREFIX}claude-code")));
+
+        // Back turns to the root; an opener turns to its page. Nothing else in
+        // the menu leaves it open.
+        assert_eq!(
+            row_menu_page_turn(&items, &row_menu_back_id(OPEN_SESSION_MENU_ID)),
+            Some(None)
+        );
+        assert_eq!(
+            row_menu_page_turn(&items, OPEN_SESSION_MENU_ID),
+            Some(Some(OPEN_SESSION_MENU_ID.to_string()))
+        );
+        assert_eq!(row_menu_page_turn(&items, "delete-session"), None);
     }
     #[test]
     fn row_menu_scope_is_empty_while_no_row_menu_is_open() {
@@ -157979,7 +158586,7 @@ mod tests {
                 session_kind: None,
             },
         ];
-        let matches = search_sidebar_matches(&rows, "home/pi/gh");
+        let matches = search_sidebar_matches(&rows, "home/user/gh");
         assert!(
             matches
                 .iter()
@@ -170923,6 +171530,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
+            row_menu_tree: Vec::new(),
             row_menu_title: String::new(),
             here_row_path: None,
             session_jump_status: None,
@@ -171590,6 +172198,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
+            row_menu_tree: Vec::new(),
             row_menu_title: String::new(),
             here_row_path: None,
             session_jump_status: None,
@@ -171788,6 +172397,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
+            row_menu_tree: Vec::new(),
             row_menu_title: String::new(),
             here_row_path: None,
             session_jump_status: None,
@@ -171986,6 +172596,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
+            row_menu_tree: Vec::new(),
             row_menu_title: String::new(),
             here_row_path: None,
             session_jump_status: None,
@@ -172187,6 +172798,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
+            row_menu_tree: Vec::new(),
             row_menu_title: String::new(),
             here_row_path: None,
             session_jump_status: None,
@@ -172392,6 +173004,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
+            row_menu_tree: Vec::new(),
             row_menu_title: String::new(),
             here_row_path: None,
             session_jump_status: None,
@@ -172589,6 +173202,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
+            row_menu_tree: Vec::new(),
             row_menu_title: String::new(),
             here_row_path: None,
             session_jump_status: None,
@@ -172786,6 +173400,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
+            row_menu_tree: Vec::new(),
             row_menu_title: String::new(),
             here_row_path: None,
             session_jump_status: None,
@@ -173021,6 +173636,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
+            row_menu_tree: Vec::new(),
             row_menu_title: String::new(),
             here_row_path: None,
             session_jump_status: None,
@@ -173221,6 +173837,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
+            row_menu_tree: Vec::new(),
             row_menu_title: String::new(),
             here_row_path: None,
             session_jump_status: None,
@@ -173457,6 +174074,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
+            row_menu_tree: Vec::new(),
             row_menu_title: String::new(),
             here_row_path: None,
             session_jump_status: None,
@@ -173976,6 +174594,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
+            row_menu_tree: Vec::new(),
             row_menu_title: String::new(),
             here_row_path: None,
             session_jump_status: None,
@@ -174529,12 +175148,31 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     fn both_start_page_families_still_offer_every_action_the_old_row_had() {
         let session = start_page_session_items("#2563eb");
         let ids = session.iter().map(|i| i.id.as_str()).collect::<Vec<_>>();
-        assert_eq!(ids, ["codex", "claude-code", "terminal"]);
-        // Codex and Claude Code keep their brand fills; a plain shell is
-        // deliberately neutral.
-        assert!(!session[0].accent.trim().is_empty());
-        assert!(!session[1].accent.trim().is_empty());
-        assert!(session[2].accent.trim().is_empty());
+        // DERIVED: one member per registered agent CLI, then the plain shell.
+        // Transcribing the three shipped ids here made the lock stop describing
+        // the family the moment a CLI was added.
+        let mut expected: Vec<&str> = yggterm_core::agent_cli::AGENT_CLIS
+            .iter()
+            .map(|descriptor| descriptor.slug)
+            .collect();
+        expected.push("terminal");
+        assert_eq!(ids, expected);
+        assert!(ids.contains(&"codex") && ids.contains(&"claude-code"));
+        // Every agent CLI carries an accent; the plain shell is deliberately
+        // neutral and is always LAST. Indexing by position `[2]` meant "the
+        // terminal" only while exactly two CLIs existed.
+        for item in &session[..session.len() - 1] {
+            assert!(
+                !item.accent.trim().is_empty(),
+                "{} is an agent CLI and must carry an accent",
+                item.id
+            );
+        }
+        assert!(
+            session
+                .last()
+                .is_some_and(|item| item.id == "terminal" && item.accent.trim().is_empty())
+        );
 
         let apps = vec![AppManifest {
             name: "ychrome".to_string(),
@@ -179942,7 +180580,7 @@ Updated at   Branch  Conversation\n\
         };
         assert_eq!(
             humanized_title_for_copy_target(&target).as_deref(),
-            Some("Pi Home Shell")
+            Some("User Home Shell")
         );
     }
     #[test]

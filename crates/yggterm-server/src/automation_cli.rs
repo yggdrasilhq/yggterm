@@ -451,13 +451,17 @@ fn open_session_for_real(automation: &Automation, timeout_ms: u64) -> anyhow::Re
         })
 }
 
+/// The `--kind` value the scheduler's create carries.
+///
+/// ⛔ `_ => "shell"` was the silent failure here: an automation configured for
+/// ANY CLI outside the hand-list launched a PLAIN SHELL on its schedule, and the
+/// create reported success — a scheduled agent run that quietly became a bash
+/// prompt with the prompt never delivered. Derived from `session_kind_label`,
+/// which is the same string `parse_app_control_session_kind` accepts, so the
+/// two ends of this flag cannot disagree. (It also stops mapping
+/// `CodexLiteLlm` → `codex`, which silently launched the wrong build.)
 fn session_kind_flag(automation: &Automation) -> &'static str {
-    use yggterm_core::SessionKind;
-    match automation.agent_kind {
-        SessionKind::ClaudeCode => "claude-code",
-        SessionKind::Codex | SessionKind::CodexLiteLlm => "codex",
-        _ => "shell",
-    }
+    crate::session_kind_label(automation.agent_kind)
 }
 
 // ---------------------------------------------------------------------------
@@ -649,16 +653,15 @@ pub fn run_automation_cli(args: &[String], timeout_ms: u64) -> anyhow::Result<()
             };
 
             if let Some(kind) = cli_flag_value(args, "--kind") {
+                // ONE parser for `--kind`, shared with the app-control create,
+                // so every registered CLI's slug works here the moment it is
+                // registered. The three-name list this replaced refused
+                // `--kind pi` at the scheduler even though the create it
+                // eventually calls accepts it.
                 automation.agent_kind = match kind {
-                    "claude-code" | "claude" | "cc" => yggterm_core::SessionKind::ClaudeCode,
-                    "codex" => yggterm_core::SessionKind::Codex,
-                    "shell" => yggterm_core::SessionKind::Shell,
-                    other => {
-                        return Err(anyhow!(
-                            "--kind {other:?} is not an agent CLI this scheduler can open. \
-                             Try shell, codex or claude-code."
-                        ));
-                    }
+                    // `cc` predates the slug and is in users' unit files.
+                    "cc" => yggterm_core::SessionKind::ClaudeCode,
+                    other => crate::parse_session_kind_flag(other)?,
                 };
             }
             if let Some(machine) = cli_flag_value(args, "--machine-key") {

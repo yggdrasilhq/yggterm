@@ -198,6 +198,7 @@ use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use yggterm_core::AppManifest;
+use yggterm_core::agent_cli::{AGENT_CLIS, agent_cli_descriptor};
 use yggterm_core::{
     AgentLaunchOptions, PerfSpan, SessionNode, SessionStore, SessionTitleStore, TranscriptRole,
     WorkspaceDocument, WorkspaceDocumentKind, YGGTERM_DESKTOP_APP_ID, append_trace_event, detect_install_context,
@@ -426,6 +427,12 @@ pub enum SessionSource {
 
 pub use yggterm_core::SessionKind;
 
+/// A row's title at birth, before the CLI or the LLM chore names it.
+///
+/// A SHELL is titled by its working directory, because that is all a shell is.
+/// Every agent CLI — and a document — keeps the caller's fallback, because its
+/// real title arrives shortly from its own store or the generation chore, and a
+/// cwd there would be overwritten within a turn.
 fn live_session_default_title(kind: SessionKind, cwd: Option<&str>, fallback: &str) -> String {
     match kind {
         SessionKind::Shell | SessionKind::SshShell => cwd
@@ -461,64 +468,72 @@ fn live_session_default_summary(kind: SessionKind, target: &SshConnectTarget) ->
                 "Interactive shell for command-line work while Yggterm keeps the PTY available across sidebar navigation.".to_string()
             }
         },
-        SessionKind::Codex => match cwd {
-            Some(cwd) => format!(
-                "Codex session rooted at {cwd}; the daemon owns the PTY so the conversation can survive sidebar navigation and GUI restarts."
-            ),
-            None => {
-                "Codex session with daemon-owned PTY state so the conversation can survive sidebar navigation and GUI restarts.".to_string()
-            }
-        },
-        SessionKind::CodexLiteLlm => match cwd {
-            Some(cwd) => format!(
-                "Codex LiteLLM session rooted at {cwd}; the daemon owns the PTY so the conversation can survive sidebar navigation and GUI restarts."
-            ),
-            None => {
-                "Codex LiteLLM session with daemon-owned PTY state so the conversation can survive sidebar navigation and GUI restarts.".to_string()
-            }
-        },
-        SessionKind::ClaudeCode => match cwd {
-            Some(cwd) => format!(
-                "Claude Code session rooted at {cwd}; the daemon owns the PTY so the conversation can survive sidebar navigation and GUI restarts."
-            ),
-            None => {
-                "Claude Code session with daemon-owned PTY state so the conversation can survive sidebar navigation and GUI restarts.".to_string()
-            }
-        },
         SessionKind::Document => "Document preview.".to_string(),
+        // Every agent CLI says the same sentence about itself, with its own
+        // display name in it — three copies of one string differing only by
+        // "Codex"/"Codex LiteLLM"/"Claude Code" is exactly the shape a fourth
+        // CLI falls out of, and a missing default summary is a row the
+        // titlebar/start page shows blank.
+        kind => {
+            let display = agent_cli_descriptor(kind)
+                .map(|descriptor| descriptor.display_name)
+                .unwrap_or("Agent");
+            match cwd {
+                Some(cwd) => format!(
+                    "{display} session rooted at {cwd}; the daemon owns the PTY so the conversation can survive sidebar navigation and GUI restarts."
+                ),
+                None => format!(
+                    "{display} session with daemon-owned PTY state so the conversation can survive sidebar navigation and GUI restarts."
+                ),
+            }
+        }
     }
 }
 
-fn live_local_source_metadata_value(kind: SessionKind) -> &'static str {
+/// The "Source" metadata stamp for a local row: `local-<slug>` for an agent CLI.
+///
+/// Derived, because the three hand-written `local-codex` / `local-codex-litellm`
+/// / `local-claude-code` strings were the slug with a prefix already — and a
+/// fourth CLI that fell out of the list got no stamp at all, which the restore
+/// path reads as "not a local agent row".
+fn live_local_source_metadata_value(kind: SessionKind) -> String {
+    if let Some(descriptor) = agent_cli_descriptor(kind) {
+        return format!("local-{}", descriptor.slug);
+    }
     match kind {
-        SessionKind::Shell => "local-shell",
-        SessionKind::Codex => "local-codex",
-        SessionKind::CodexLiteLlm => "local-codex-litellm",
-        SessionKind::ClaudeCode => "local-claude-code",
-        SessionKind::SshShell => "live-ssh",
-        SessionKind::Document => "document",
+        SessionKind::Shell => "local-shell".to_string(),
+        SessionKind::SshShell => "live-ssh".to_string(),
+        SessionKind::Document => "document".to_string(),
+        // Unreachable: every remaining kind has a descriptor.
+        _ => "local-shell".to_string(),
     }
 }
 
 fn live_local_target_metadata_value(kind: SessionKind, cwd: &str) -> String {
     match kind {
-        SessionKind::Shell
-        | SessionKind::Codex
-        | SessionKind::CodexLiteLlm
-        | SessionKind::ClaudeCode => cwd.to_string(),
+        // An ssh shell's target is the MACHINE; a document has none. Everything
+        // that actually runs in a working directory — plain shells and every
+        // agent CLI — is targeted at that directory.
         SessionKind::SshShell => "remote".to_string(),
         SessionKind::Document => "document".to_string(),
+        _ => cwd.to_string(),
     }
 }
 
+/// The "Prefix" stamp — the command word a row is launched under.
+///
+/// The agent half is the descriptor's `binary_name` (what a session actually
+/// execs), which is what the three literals here already were: `claude`, not
+/// the `claude-code` slug.
 fn live_local_prefix_metadata_value(kind: SessionKind) -> &'static str {
+    if let Some(descriptor) = agent_cli_descriptor(kind) {
+        return descriptor.binary_name;
+    }
     match kind {
         SessionKind::Shell => "shell",
-        SessionKind::Codex => "codex",
-        SessionKind::CodexLiteLlm => "codex-litellm",
-        SessionKind::ClaudeCode => "claude",
-        SessionKind::SshShell => "none",
-        SessionKind::Document => "none",
+        SessionKind::SshShell | SessionKind::Document => "none",
+        // Unreachable: every remaining kind has a descriptor.
+        _ => "none",
     }
 }
 
@@ -526,14 +541,14 @@ fn is_remote_scanned_live_session_path(path: &str) -> bool {
     path.starts_with("remote-session://")
 }
 
+/// A local row worth restoring after a daemon swap: a plain shell (its PTY may
+/// have survived) or ANY agent CLI (it re-derives from the CLI's own store).
+///
+/// `is_agent()` rather than the three-name `matches!` this replaced: the list
+/// was one a new CLI had to be remembered in, and forgetting it drops that CLI's
+/// live rows at every daemon swap — silently, because the filter skips by design.
 fn local_live_session_kind_is_recoverable(kind: SessionKind) -> bool {
-    matches!(
-        kind,
-        SessionKind::Shell
-            | SessionKind::Codex
-            | SessionKind::CodexLiteLlm
-            | SessionKind::ClaudeCode
-    )
+    kind == SessionKind::Shell || kind.is_agent()
 }
 
 fn persisted_live_session_is_recoverable(live: &PersistedLiveSession) -> bool {
@@ -597,11 +612,10 @@ pub(crate) fn session_path_is_remote_agent(path: &str) -> bool {
 /// wording (here and in `daemon::snapshot_session_is_agent_store_recoverable`),
 /// which is exactly the second encoding that can silently diverge.
 pub(crate) fn agent_store_recoverable_row(key: &str, kind: SessionKind, local_row: bool) -> bool {
-    let is_local_agent = (local_row || local_runtime_id_from_key(key).is_some())
-        && matches!(
-            kind,
-            SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
-        );
+    // `is_agent()` is registry-derived; the three-name `matches!` it replaced is
+    // the list a new CLI silently falls out of, and falling out here means its
+    // rows vanish at the next daemon swap.
+    let is_local_agent = (local_row || local_runtime_id_from_key(key).is_some()) && kind.is_agent();
     is_local_agent || session_path_is_remote_agent(key)
 }
 
@@ -845,10 +859,10 @@ fn session_keep_alive(session: &ManagedSessionView) -> bool {
 /// survive a GUI close only when the user explicitly marks them keep-alive.
 /// Remote agent rows resolve to the same agent kinds, so they are covered too.
 fn session_kind_persists_by_default(kind: SessionKind) -> bool {
-    match kind {
-        SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode => true,
-        SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => false,
-    }
+    // Registry-derived: first-class IS "is an agent CLI", so a CLI cannot be
+    // registered and then quietly born second-class because a hand-list here
+    // was not updated.
+    kind.is_agent()
 }
 
 /// The ONE writer of the tenancy metadata labels. Both the create-time
@@ -1535,11 +1549,19 @@ fn wait_for_external_agent_resume_to_clear(kind: SessionKind, home: &Path, sessi
 /// The wrapper verbs that BRIDGE a remote agent session's stdio, per kind. One
 /// table, never a fork — the codex-only version of this predicate is why a
 /// `remote-cc://` teardown left its `resume-cc` bridge behind.
-fn remote_agent_bridge_verbs(kind: SessionKind) -> &'static [&'static str] {
-    match kind {
-        SessionKind::ClaudeCode => &["resume-cc", "start-cc"],
-        _ => &["resume-codex", "start-codex"],
-    }
+fn remote_agent_bridge_verbs(kind: SessionKind) -> Vec<String> {
+    // Derived from the wrapper registry. The `_ => ["resume-codex",
+    // "start-codex"]` this replaced meant a bridge sweep for ANY non-CC kind
+    // hunted codex's verbs, so a new CLI's bridge process was never recognized
+    // as its own — the same shape that left a `remote-cc://` teardown's bridge
+    // behind.
+    [
+        remote_agent_resume_subcommand(kind),
+        remote_agent_start_subcommand(kind),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn remote_agent_bridge_args_match(args: &[String], session_id: &str, kind: SessionKind) -> bool {
@@ -1547,7 +1569,7 @@ fn remote_agent_bridge_args_match(args: &[String], session_id: &str, kind: Sessi
     args.windows(4).any(|window| {
         window[0] == "server"
             && window[1] == "remote"
-            && verbs.contains(&window[2].as_str())
+            && verbs.iter().any(|verb| verb == &window[2])
             && window[3] == session_id
     })
 }
@@ -2121,14 +2143,32 @@ fn session_path_is_remote(path: &str) -> bool {
         || path.starts_with("remote-runtime://")
 }
 
+/// The session id inside a LOCAL runtime key, whatever scheme spells it.
+///
+/// ⚖ WIDENED 2026-08-08 from a seven-prefix hand-list to the scheme registry.
+/// The hand-list did not know `cc-runtime://`, and its recorded consequence
+/// said exactly what that cost: *"cc-runtime keys unrecognized by
+/// recoverable/snapshot predicates + restore normalizers"* — i.e. a remote
+/// Claude Code runtime key was not recoverable and not snapshot-able, and had
+/// not been since the scheme was minted. Six more CLIs would have reproduced it
+/// six more times.
+///
+/// ⚠ **This is a behaviour change on existing rows, not only on new ones.** A
+/// `cc-runtime://` key now parses where it used to return `None`, so CC rows
+/// gain the recovery and snapshot paths codex rows always had. That is the fix
+/// the burn-down table was recording, but it is a live change and wants a live
+/// observation: after a daemon swap, a remote CC row should restore rather than
+/// vanish.
 fn local_runtime_id_from_key(key: &str) -> Option<&str> {
-    key.strip_prefix("local://")
-        .or_else(|| key.strip_prefix("local::"))
-        .or_else(|| key.strip_prefix("codex://"))
-        .or_else(|| key.strip_prefix("codex::"))
-        .or_else(|| key.strip_prefix("codex-runtime://"))
-        .or_else(|| key.strip_prefix("codex-litellm://"))
-        .or_else(|| key.strip_prefix("codex-litellm::"))
+    yggterm_core::agent_scheme::SESSION_PATH_SCHEMES
+        .iter()
+        .filter(|scheme| scheme.locality == yggterm_core::agent_scheme::SchemeLocality::Local
+            || matches!(
+                scheme.role,
+                yggterm_core::agent_scheme::SchemeRole::RuntimeKey
+                    | yggterm_core::agent_scheme::SchemeRole::RowAndRuntimeKey
+            ))
+        .find_map(|scheme| key.strip_prefix(scheme.prefix))
         .filter(|id| !id.trim().is_empty())
 }
 
@@ -2307,10 +2347,17 @@ impl LiveSessionOrderUpdate {
 
 fn managed_session_is_live_runtime_session(key: &str, session: &ManagedSessionView) -> bool {
     managed_session_is_promoted_live_session(key, session)
+        // ⚖ NARROWED ON PURPOSE, and it is not the Class-B hand-list: the
+        // second clause is guarded by `is_local_codex_storage_session_path`,
+        // which only ever answers true for a path under the CODEX FAMILY's
+        // store. Widening the kind test to `is_agent()` would admit kinds the
+        // path test can never pass, i.e. change nothing but the reader's
+        // expectations. The pairing is the codex family, declared once in
+        // `yggterm_core::agent_cli::CODEX_FAMILY`.
         || (matches!(
             session.source,
             SessionSource::LiveLocal | SessionSource::LiveSsh
-        ) && matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
+        ) && yggterm_core::agent_cli::CODEX_FAMILY.contains(&session.kind)
             && (is_local_codex_storage_session_path(key)
                 || is_local_codex_storage_session_path(&session.session_path)))
 }
@@ -2833,12 +2880,11 @@ pub fn validate_server_ui_snapshot(snapshot: &ServerUiSnapshot) -> Vec<String> {
 
 fn snapshot_session_supports_terminal_view(session: &SnapshotSessionView) -> bool {
     match session.kind {
+        // A document has no PTY of its own — only a terminal RECIPE can give it
+        // one. Every other kind (shells and every agent CLI) has a terminal
+        // exactly when it is live.
         SessionKind::Document => snapshot_document_has_terminal_recipe(session),
-        SessionKind::Codex
-        | SessionKind::CodexLiteLlm
-        | SessionKind::ClaudeCode
-        | SessionKind::Shell
-        | SessionKind::SshShell => matches!(
+        _ => matches!(
             session.source,
             SessionSource::LiveLocal | SessionSource::LiveSsh
         ),
@@ -2858,12 +2904,10 @@ fn snapshot_document_has_terminal_recipe(session: &SnapshotSessionView) -> bool 
 
 fn managed_session_supports_terminal_view(session: &ManagedSessionView) -> bool {
     match session.kind {
+        // Twin of `snapshot_session_supports_terminal_view` — same rule, other
+        // row shape.
         SessionKind::Document => recipe_terminal_spec(session).is_some(),
-        SessionKind::Codex
-        | SessionKind::CodexLiteLlm
-        | SessionKind::ClaudeCode
-        | SessionKind::Shell
-        | SessionKind::SshShell => matches!(
+        _ => matches!(
             session.source,
             SessionSource::LiveLocal | SessionSource::LiveSsh
         ),
@@ -7396,12 +7440,11 @@ impl YggtermServer {
     ) -> String {
         let uuid = Uuid::new_v4().to_string();
         let key = match kind {
-            SessionKind::Codex
-            | SessionKind::CodexLiteLlm
-            | SessionKind::ClaudeCode
-            | SessionKind::Shell => local_live_runtime_key(&uuid),
             SessionKind::SshShell => format!("live::{uuid}"),
             SessionKind::Document => format!("document::{uuid}"),
+            // `local://` is both row identity and runtime key for everything
+            // that runs on THIS machine — every agent CLI and the plain shell.
+            _ => local_live_runtime_key(&uuid),
         };
         let target = local_session_target(kind, cwd);
         let title = title_hint.map(ToOwned::to_owned).unwrap_or_else(|| {
@@ -7506,6 +7549,36 @@ impl YggtermServer {
             require_existing,
             terminal_appearance,
         )
+    }
+
+    /// The kind-parameterized entry the generic daemon request calls. The
+    /// codex/cc wrappers above are the same call with the kind baked in — one
+    /// lane, never a fork ([[spec-unify-local-remote]]).
+    pub fn ensure_remote_runtime_agent_session_public(
+        &mut self,
+        kind: SessionKind,
+        session_id: &str,
+        cwd: Option<&str>,
+        require_existing: bool,
+        terminal_appearance: Option<&str>,
+    ) -> anyhow::Result<String> {
+        self.ensure_remote_runtime_agent_session(
+            kind,
+            session_id,
+            cwd,
+            require_existing,
+            terminal_appearance,
+        )
+    }
+
+    pub fn start_remote_runtime_agent_session_public(
+        &mut self,
+        kind: SessionKind,
+        session_id: &str,
+        cwd: Option<&str>,
+        terminal_appearance: Option<&str>,
+    ) -> anyhow::Result<String> {
+        self.start_remote_runtime_agent_session(kind, session_id, cwd, terminal_appearance)
     }
 
     fn ensure_remote_runtime_agent_session(
@@ -7639,7 +7712,13 @@ impl YggtermServer {
                 "Restore",
                 format!(
                     "yggterm server remote {} {session_id} --require-existing",
-                    remote_agent_resume_subcommand(kind)
+                    // A kind that reached here has a runtime key, so its
+                    // descriptor has a wrapper slug — but the Restore hint is
+                    // the string a human retypes, so it names the kind rather
+                    // than printing `None` if that ever stops being true.
+                    remote_agent_resume_subcommand(kind).unwrap_or_else(|| {
+                        format!("resume-<{} has no remote arm>", session_kind_label(kind))
+                    })
                 ),
             );
             if let Some(cwd) = target.cwd.as_deref() {
@@ -7813,7 +7892,9 @@ impl YggtermServer {
                 "Restore",
                 format!(
                     "yggterm server remote {} {session_id}",
-                    remote_agent_start_subcommand(kind)
+                    remote_agent_start_subcommand(kind).unwrap_or_else(|| {
+                        format!("start-<{} has no remote arm>", session_kind_label(kind))
+                    })
                 ),
             );
             if let Some(cwd) = target.cwd.as_deref() {
@@ -8137,10 +8218,13 @@ impl YggtermServer {
                 self.append_restored_live_session_order(normalized_live_key);
                 return;
             }
-            if !matches!(
-                kind,
-                SessionKind::SshShell | SessionKind::Codex | SessionKind::CodexLiteLlm
-            ) {
+            // A REMOTE-SCANNED row: an ssh shell, or an agent CLI whose row
+            // lives on another machine. `is_agent()` rather than the two-name
+            // codex list, because the branch above has already handled every
+            // row with a live local runtime — what reaches here is a remote row,
+            // and a remote row of a CLI missing from the list was simply
+            // DROPPED at restore.
+            if !(kind == SessionKind::SshShell || kind.is_agent()) {
                 return;
             }
             let resolved_title = if !title.trim().is_empty()
@@ -8405,8 +8489,11 @@ impl YggtermServer {
         let stored = self.sessions.get(storage_path)?.clone();
         if stored.source != SessionSource::Stored
             || !local_live_session_kind_is_recoverable(stored.kind)
-            || !(is_local_codex_storage_session_path(storage_path)
-                || matches!(stored.kind, SessionKind::Codex | SessionKind::CodexLiteLlm))
+            // A stored row is focusable-as-live when it is an AGENT row (it
+            // re-derives from the CLI's own store) or its storage path is one.
+            // The two-name codex list refused to open a stored pi/qwen/agy row
+            // as a live session at all — the row was clickable and did nothing.
+            || !(is_local_codex_storage_session_path(storage_path) || stored.kind.is_agent())
         {
             return None;
         }
@@ -10021,35 +10108,111 @@ fn remote_direct_write_target_for_path(path: &str) -> Option<(&str, String)> {
 /// ([[spec-unify-local-remote]]: codex and Claude Code share ONE code path,
 /// parameterized — never forked). Returns None for kinds that have no
 /// daemon-runtime lane (shells, documents).
+/// The daemon-owned runtime key for `kind`, derived from the descriptor's
+/// `runtime_key_scheme`.
+///
+/// `None` means this kind has NO daemon runtime lane — a shell, a document, or
+/// a local-only CLI (`CodexLiteLlm`, whose `wrapper_slug` says so). The
+/// `_ => None` this replaced answered `None` for every CLI registered after
+/// Claude Code too, and `None` here means the caller cannot even build a key to
+/// ask the daemon about: no resume, no resize, no terminate.
 fn remote_runtime_agent_session_key(kind: SessionKind, session_id: &str) -> Option<String> {
-    match kind {
-        SessionKind::Codex | SessionKind::CodexLiteLlm => {
-            Some(remote_runtime_codex_session_key(session_id))
-        }
-        SessionKind::ClaudeCode => Some(remote_runtime_cc_session_key(session_id)),
-        _ => None,
-    }
+    agent_cli_descriptor(kind)
+        .and_then(|descriptor| descriptor.runtime_key_scheme)
+        .map(|scheme| format!("{scheme}{session_id}"))
 }
 
+/// Does THIS host's copy of `kind`'s own store hold `session_id`?
+///
+/// The `_ => remote_saved_codex_session_exists(...)` this replaced looked every
+/// non-CC session up in `~/.codex`, so a pi/qwen/agy session — which is not in
+/// `~/.codex` and never will be — answered `false`, and a `--require-existing`
+/// resume then reported the live session as "no longer available".
 fn remote_saved_agent_session_exists(kind: SessionKind, session_id: &str) -> anyhow::Result<bool> {
     match kind {
-        SessionKind::ClaudeCode => remote_saved_cc_session_exists(session_id),
-        _ => remote_saved_codex_session_exists(session_id),
+        SessionKind::ClaudeCode => return remote_saved_cc_session_exists(session_id),
+        // Codex keeps the measured reader: its file NAME carries a timestamp
+        // rather than the session id, so identity lives in a field INSIDE the
+        // rollout, and its store may be relocated by `CODEX_HOME`.
+        SessionKind::Codex | SessionKind::CodexLiteLlm => {
+            return remote_saved_codex_session_exists(session_id);
+        }
+        _ => {}
     }
+    let Some(descriptor) = agent_cli_descriptor(kind) else {
+        // Not an agent CLI — there is no store to look in, and saying "yes"
+        // would invent a session for a shell.
+        return Ok(false);
+    };
+    if descriptor.store_scan_gap.is_some() {
+        // ⛔ DECLARED-UNSCANNABLE store (opencode's single SQLite db, kimi's
+        // md5(cwd) buckets, Muse's unobserved layout). The honest answer is
+        // "unknown", and this predicate has only two values — so it answers the
+        // one that cannot destroy anything. `false` would FALSE-DEATH a live
+        // session under `--require-existing`, which is the failure this whole
+        // function exists to avoid; `true` merely lets the CLI itself, which is
+        // the real authority, refuse an id it does not have.
+        return Ok(true);
+    }
+    let Some(home) = dirs::home_dir() else {
+        return Ok(false);
+    };
+    Ok(descriptor
+        .store_roots_absolute(&home)
+        .iter()
+        .any(|root| agent_store_holds_session(descriptor, root, session_id)))
 }
 
+/// Walk one store root looking for `session_id`, classifying files with the
+/// descriptor's own glob and reading identity with its own reader.
+fn agent_store_holds_session(
+    descriptor: &'static yggterm_core::agent_cli::AgentCliDescriptor,
+    dir: &Path,
+    session_id: &str,
+) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if agent_store_holds_session(descriptor, &path, session_id) {
+                return true;
+            }
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !descriptor.store_file_name_is_session(name) {
+            continue;
+        }
+        if (descriptor.read_store_entry)(&path)
+            .is_some_and(|stored| stored.session_id == session_id)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// What a remote-runtime row calls its CLI in user-facing copy. `_ => "Codex"`
+/// named every future CLI's session after codex, in the title, the registry
+/// summary and the queue line.
 fn remote_runtime_agent_display(kind: SessionKind) -> &'static str {
-    match kind {
-        SessionKind::ClaudeCode => "Claude Code",
-        _ => "Codex",
-    }
+    agent_cli_descriptor(kind)
+        .map(|descriptor| descriptor.display_name)
+        .unwrap_or("Codex")
 }
 
-pub(crate) fn remote_agent_resume_subcommand(kind: SessionKind) -> &'static str {
-    match kind {
-        SessionKind::ClaudeCode => "resume-cc",
-        _ => "resume-codex",
-    }
+/// The wrapper verb that RESUMES this CLI across the ssh hop.
+///
+/// `None` ⇒ this kind has no remote arm at all (a shell, a document, or a
+/// local-only CLI). The `_ => "resume-codex"` this replaced sent `resume-codex`
+/// for every new CLI, which on the far side resumes a CODEX session id that
+/// does not exist.
+pub(crate) fn remote_agent_resume_subcommand(kind: SessionKind) -> Option<String> {
+    agent_cli_descriptor(kind).and_then(|descriptor| descriptor.resume_subcommand())
 }
 
 /// Whether `action` is a start subcommand this build emits for SOME agent CLI.
@@ -10062,22 +10225,36 @@ pub(crate) fn remote_agent_resume_subcommand(kind: SessionKind) -> &'static str 
 pub fn agent_start_subcommand_is_registered(action: &str) -> bool {
     let action = action.trim();
     !action.is_empty()
-        && yggterm_core::agent_cli::AGENT_CLIS
-            .iter()
-            .any(|descriptor| remote_agent_start_subcommand(descriptor.kind) == action)
+        && AGENT_CLIS.iter().any(|descriptor| {
+            remote_agent_start_subcommand(descriptor.kind).as_deref() == Some(action)
+        })
 }
 
-pub(crate) fn remote_agent_start_subcommand(kind: SessionKind) -> &'static str {
-    match kind {
-        SessionKind::ClaudeCode => "start-cc",
-        _ => "start-codex",
-    }
+/// The wrapper verb that STARTS a fresh session across the ssh hop. `None` on
+/// the same terms as [`remote_agent_resume_subcommand`].
+pub(crate) fn remote_agent_start_subcommand(kind: SessionKind) -> Option<String> {
+    agent_cli_descriptor(kind).and_then(|descriptor| descriptor.start_subcommand())
 }
 
+/// The label the remote-runtime registry files a session under.
+///
+/// Exhaustive on purpose — no `_` arm. `_ => RemoteRuntimeKind::Codex` filed
+/// every future CLI's runtime as codex, and this is the one table that has to
+/// change when a CLI is added, so it should FAIL THE BUILD rather than answer.
 fn remote_runtime_agent_registry_kind(kind: SessionKind) -> RemoteRuntimeKind {
     match kind {
+        // Two builds of ONE CLI share one registry label (`CODEX_FAMILY`).
+        SessionKind::Codex | SessionKind::CodexLiteLlm => RemoteRuntimeKind::Codex,
         SessionKind::ClaudeCode => RemoteRuntimeKind::ClaudeCode,
-        _ => RemoteRuntimeKind::Codex,
+        SessionKind::Pi => RemoteRuntimeKind::Pi,
+        SessionKind::OpenCode => RemoteRuntimeKind::OpenCode,
+        SessionKind::QwenCode => RemoteRuntimeKind::QwenCode,
+        SessionKind::Kimi => RemoteRuntimeKind::Kimi,
+        SessionKind::Muse => RemoteRuntimeKind::Muse,
+        SessionKind::Antigravity => RemoteRuntimeKind::Antigravity,
+        SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => {
+            RemoteRuntimeKind::Shell
+        }
     }
 }
 
@@ -11570,11 +11747,22 @@ fn refresh_remote_codex_terminal_identity_launch_command(
         .filter(|value| !value.is_empty())
         .unwrap_or_default();
     let starts_new_codex = remote_live_session_starts_new_codex(session);
+    // A kind with no remote arm cannot have its remote launch command refreshed
+    // — refusing here is what keeps a local-only CLI from being handed codex's
+    // wrapper verb, which is what the old `_ =>` fallback did.
+    let verb = if starts_new_codex {
+        remote_agent_start_subcommand(session.kind)
+    } else {
+        remote_agent_resume_subcommand(session.kind)
+    };
+    let Some(verb) = verb else {
+        return false;
+    };
     let args = if starts_new_codex {
         vec![
             "server",
             "remote",
-            remote_agent_start_subcommand(session.kind),
+            verb.as_str(),
             session_id.as_str(),
             cwd.as_str(),
         ]
@@ -11582,7 +11770,7 @@ fn refresh_remote_codex_terminal_identity_launch_command(
         vec![
             "server",
             "remote",
-            remote_agent_resume_subcommand(session.kind),
+            verb.as_str(),
             session_id.as_str(),
             cwd.as_str(),
             "--require-existing",
@@ -11657,16 +11845,24 @@ fn refresh_restored_remote_runtime_codex_launch_command(
     key: &str,
     session: &mut ManagedSessionView,
 ) -> bool {
-    // Codex AND its Claude Code twin: restored daemon-runtime rows of both
-    // kinds repair their resume launch the same way ([[spec-unify-local-remote]]).
-    if !matches!(session.kind, SessionKind::Codex | SessionKind::ClaudeCode) {
+    // EVERY agent CLI: restored daemon-runtime rows all repair their resume
+    // launch the same way ([[spec-unify-local-remote]]).
+    //
+    // ⚠ This hand-list was already WRONG before the intake — it named Codex and
+    // ClaudeCode and omitted `CodexLiteLlm`, so a restored codex-litellm runtime
+    // row never had its launch repaired at all.
+    let Some(descriptor) = agent_cli_descriptor(session.kind) else {
         return false;
-    }
-    let resume_needle = if session.kind == SessionKind::ClaudeCode {
-        "--resume"
-    } else {
-        " resume"
     };
+    // The needle is the CLI's OWN resume token, from the descriptor: a flag
+    // (`--resume`, `--session`, `--conversation`) or a subcommand (` resume`).
+    // Hardcoding codex's ` resume` for everything else would match any command
+    // that happens to contain the word.
+    let resume_needle = match descriptor.resume_selector {
+        yggterm_core::agent_cli::ResumeSelector::Flag(flag) => flag.to_string(),
+        yggterm_core::agent_cli::ResumeSelector::Subcommand(sub) => format!(" {sub}"),
+    };
+    let resume_needle = resume_needle.as_str();
     let Some(session_id) = restored_remote_runtime_codex_session_id(key, session) else {
         return false;
     };
@@ -15864,6 +16060,117 @@ pub fn run_remote_resume_cc(
     bridge_remote_runtime_session_stdio(&endpoint, &key)
 }
 
+/// The wrapper entry for every CLI registered AFTER the codex/cc pair —
+/// `yggterm server remote resume-<slug> <id> [cwd] [--require-existing]`,
+/// invoked BY the ssh launch line ON the session's own machine.
+///
+/// One kind-parameterized body instead of a `run_remote_resume_<cli>` per CLI:
+/// the codex and cc twins above are near-identical already, and the third copy
+/// is where they would start to diverge. Everything CLI-specific is read off
+/// the descriptor (the runtime key, the store lookup, the provisioning tool).
+pub fn run_remote_resume_agent(
+    kind: SessionKind,
+    session_id: &str,
+    cwd: Option<&str>,
+    require_existing: bool,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let initial_size = current_tty_size();
+    let terminal_appearance = terminal_identity_appearance_from_environment();
+    let runtime_key = remote_runtime_agent_session_key(kind, session_id)
+        .with_context(|| format!("session kind {kind:?} has no daemon runtime lane"))?;
+    // LIVE RUNTIME WINS OVER THE TRANSCRIPT GATE — the same rule as
+    // `run_remote_resume_cc`, and for the same reason: a session with a live
+    // PTY and no transcript yet must not be false-deathed by the
+    // `--require-existing` check.
+    if let Some((endpoint, runtime_key)) =
+        endpoint_with_live_remote_runtime_key_for_bridge_with_terminal_appearance(
+            &home,
+            &runtime_key,
+            Some(&terminal_appearance),
+        )?
+    {
+        sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
+        return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
+    }
+    let saved_session_exists = remote_saved_agent_session_exists(kind, session_id)?;
+    if remote_resume_requires_missing_saved_session_failure(require_existing, saved_session_exists)
+    {
+        anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
+    }
+    if saved_session_exists {
+        wait_for_external_agent_resume_to_clear(kind, &home, session_id);
+    }
+    if let Some(tool) = ManagedCliTool::from_session_kind(kind) {
+        let _ = ensure_local_managed_cli(tool)?;
+    }
+    let endpoint = default_endpoint(&home);
+    ensure_local_daemon_running(&endpoint)?;
+    sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
+    let key = daemon::ensure_remote_runtime_agent_session(
+        &endpoint,
+        kind,
+        session_id,
+        cwd,
+        require_existing,
+        initial_size,
+        Some(&terminal_appearance),
+    )?;
+    bridge_remote_runtime_session_stdio(&endpoint, &key)
+}
+
+/// Start twin of [`run_remote_resume_agent`].
+pub fn run_remote_start_agent(
+    kind: SessionKind,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(tool) = ManagedCliTool::from_session_kind(kind) {
+        let _ = ensure_local_managed_cli(tool)?;
+    }
+    let home = resolve_yggterm_home()?;
+    let runtime_key = remote_runtime_agent_session_key(kind, session_id)
+        .with_context(|| format!("session kind {kind:?} has no daemon runtime lane"))?;
+    let initial_size = current_tty_size();
+    let terminal_appearance = terminal_identity_appearance_from_environment();
+    if let Some((endpoint, runtime_key)) =
+        endpoint_with_live_remote_runtime_key_for_bridge_with_terminal_appearance(
+            &home,
+            &runtime_key,
+            Some(&terminal_appearance),
+        )?
+    {
+        sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
+        return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
+    }
+    let endpoint = default_endpoint(&home);
+    ensure_local_daemon_running(&endpoint)?;
+    sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
+    let key = daemon::start_remote_runtime_agent_session(
+        &endpoint,
+        kind,
+        session_id,
+        cwd,
+        initial_size,
+        Some(&terminal_appearance),
+    )?;
+    bridge_remote_runtime_session_stdio(&endpoint, &key)
+}
+
+/// `<slug>-session-exists` for every CLI — the descriptor-driven store lookup,
+/// answering in the same JSON shape the codex verb has always used.
+pub fn run_remote_saved_agent_session_exists(
+    kind: SessionKind,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let response = RemoteSavedCodexSessionExistsResponse {
+        session_id: session_id.to_string(),
+        exists: remote_saved_agent_session_exists(kind, session_id)?,
+    };
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
+}
+
 /// Claude Code twin of [`run_remote_start_codex`].
 pub fn run_remote_start_cc(session_id: &str, cwd: Option<&str>) -> anyhow::Result<()> {
     let perf_home = resolve_yggterm_home().ok();
@@ -17556,8 +17863,26 @@ fn bridge_initial_snapshot_text(snapshot: Option<&str>) -> Option<&str> {
         .filter(|text| terminal_bridge_snapshot_has_visible_text(text))
 }
 
+/// Whether a bridge's first snapshot is delivered as a raw stream.
+///
+/// ⚖ WIDENED 2026-08-08 from the literal `codex-runtime://` to every registered
+/// RUNTIME KEY. The behaviour is a property of "a daemon owns this PTY on
+/// another machine", which is what a runtime key means — it was never a
+/// property of codex.
 fn bridge_initial_snapshot_should_use_raw_stream(path: &str) -> bool {
-    path.starts_with("codex-runtime://")
+    // ⚠ REMOTE runtime keys only. `agent_runtime_key_schemes()` also yields
+    // `local://`, which is BOTH a row identity and a runtime key — and a local
+    // session has no bridge to stream through. Widening to it made a local row
+    // take the remote first-paint path, caught immediately by the lock that
+    // asserts `local://session` is not a raw-stream bridge.
+    yggterm_core::agent_scheme::remote_agent_schemes()
+        .filter(|scheme| {
+            matches!(
+                scheme.role,
+                yggterm_core::agent_scheme::SchemeRole::RuntimeKey
+            )
+        })
+        .any(|scheme| path.starts_with(scheme.prefix))
 }
 
 fn bridge_initial_snapshot_text_for_path<'a>(
@@ -17885,7 +18210,7 @@ pub fn run_remote_terminate_cc(session_id: &str) -> anyhow::Result<()> {
 /// an older daemon that a version bump left holding the PTY. Every other remote
 /// control op should resolve its endpoint the same way — see
 /// [`owning_daemon_endpoint_for_runtime_key`].
-fn run_remote_terminate_agent(session_id: &str, kind: SessionKind) -> anyhow::Result<()> {
+pub fn run_remote_terminate_agent(session_id: &str, kind: SessionKind) -> anyhow::Result<()> {
     let runtime_key = remote_runtime_agent_session_key(kind, session_id)
         .with_context(|| format!("no daemon runtime lane for session kind {kind:?}"))?;
     if let Ok(home) = resolve_yggterm_home() {
@@ -21242,15 +21567,25 @@ fn validate_create_terminal_launch(
     // CODEX start has no equivalent export, so the options would reach the
     // wire, reach the daemon, and then quietly evaporate at the ssh boundary —
     // the exact silence this feature exists to end.
+    //
+    // ⚖ NARROWED ON PURPOSE, so this is not the Class-B hand-list either: the
+    // exemption belongs to Claude Code ALONE, because `YGGTERM_CC_EXTRA_ARGS` is
+    // the one export the remote wrapper reads. Every other CLI — the codex
+    // family and the whole 2026-08-08 intake — has no such export, so the
+    // options would reach the wire and evaporate at the ssh boundary. Stated as
+    // "everything except CC" rather than a list, so a new CLI is refused
+    // loudly by default instead of being silently exempted.
     if !launch.is_empty()
         && machine_key.is_some_and(|key| !key.trim().is_empty())
-        && matches!(effective_kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
+        && effective_kind.is_agent()
+        && effective_kind != SessionKind::ClaudeCode
     {
         anyhow::bail!(
-            "a REMOTE codex session cannot carry --model / --permission-mode yet: that lane has \
+            "a REMOTE {} session cannot carry --model / --permission-mode yet: that lane has \
              no extra-args forwarding to the remote host (claude-code does, via \
              YGGTERM_CC_EXTRA_ARGS). Launch it locally on that machine, or use \
-             --kind claude-code."
+             --kind claude-code.",
+            session_kind_label(effective_kind)
         );
     }
     Ok(session_kind)
@@ -21512,15 +21847,51 @@ pub fn run_app_control_focus_split_pane(
     Ok(())
 }
 
+/// Resolve a `--kind` spelling to a session kind.
+///
+/// **Registry-first.** Every registered CLI's `slug` is accepted, so registering
+/// a CLI is the ONLY step needed to make `--kind <slug>` work. The hand-list
+/// this replaced refused `--kind pi` outright — the flag parser is the door
+/// every delegate launch, automation and app-control create comes through, so a
+/// CLI that cannot be named here cannot be launched at all.
+///
+/// The legacy spellings below are kept because they are what users, scripts and
+/// systemd units already type; they are aliases ON TOP of the slugs, never a
+/// replacement for them.
+pub(crate) fn parse_session_kind_flag(kind: &str) -> anyhow::Result<SessionKind> {
+    parse_app_control_session_kind(kind)
+}
+
 fn parse_app_control_session_kind(kind: &str) -> anyhow::Result<SessionKind> {
-    match kind.trim().to_ascii_lowercase().as_str() {
+    let normalized = kind.trim().to_ascii_lowercase();
+    if let Some(descriptor) = AGENT_CLIS
+        .iter()
+        .find(|descriptor| descriptor.slug == normalized)
+    {
+        return Ok(descriptor.kind);
+    }
+    match normalized.as_str() {
         "shell" | "terminal" | "plain" => Ok(SessionKind::Shell),
-        "codex" => Ok(SessionKind::Codex),
-        "codex-litellm" | "litellm" => Ok(SessionKind::CodexLiteLlm),
-        "claude" | "claude-code" | "claudecode" => Ok(SessionKind::ClaudeCode),
-        other => anyhow::bail!(
-            "unsupported app-control terminal kind {other:?}; expected shell, codex, codex-litellm, or claude"
-        ),
+        "litellm" => Ok(SessionKind::CodexLiteLlm),
+        "claude" | "claudecode" => Ok(SessionKind::ClaudeCode),
+        // The wrapper slug is what the remote verbs and the `agy` binary are
+        // spelled with, so a user who typed `agy`/`qwen`/`cc` meant the CLI.
+        other => AGENT_CLIS
+            .iter()
+            .find(|descriptor| {
+                descriptor.wrapper_slug == Some(other) || descriptor.binary_name == other
+            })
+            .map(|descriptor| descriptor.kind)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unsupported app-control terminal kind {other:?}; expected shell or one of: {}",
+                    AGENT_CLIS
+                        .iter()
+                        .map(|descriptor| descriptor.slug)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }),
     }
 }
 
@@ -23978,12 +24349,16 @@ pub fn terminate_remote_codex_session(
 
 /// The remote verb that closes an agent runtime on its OWNING host, per kind.
 /// One table, never a fork ([[spec-unify-local-remote]]).
-fn remote_terminate_agent_verb(kind: SessionKind) -> Option<&'static str> {
-    match kind {
-        SessionKind::Codex | SessionKind::CodexLiteLlm => Some("terminate-codex"),
-        SessionKind::ClaudeCode => Some("terminate-cc"),
-        _ => None,
-    }
+///
+/// ⛔ `None` is the value that costs a live process: with no verb, the close
+/// never crosses the ssh hop, the row disappears locally and the remote CLI
+/// keeps running with nothing pointing at it — while the teardown reports
+/// `verified:true` because every fact it checked was local. The `_ => None`
+/// this replaced handed exactly that to every CLI registered after Claude Code,
+/// so the verb is now the descriptor's (`terminate-<wrapper_slug>`) and `None`
+/// means only what it should: this kind has no remote arm at all.
+fn remote_terminate_agent_verb(kind: SessionKind) -> Option<String> {
+    agent_cli_descriptor(kind).and_then(|descriptor| descriptor.terminate_subcommand())
 }
 
 /// Ask the machine that OWNS a remote agent session to close its runtime.
@@ -24008,7 +24383,7 @@ pub fn terminate_remote_agent_session(
     run_remote_yggterm_command(
         &machine.ssh_target,
         machine.prefix.as_deref(),
-        &["server", "remote", verb, session_id],
+        &["server", "remote", verb.as_str(), session_id],
         None,
     )
     .map(|_| ())
@@ -24092,10 +24467,13 @@ pub fn resize_remote_agent_session_pty(
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<()> {
-    let runtime_key = match kind {
-        SessionKind::ClaudeCode => remote_runtime_cc_session_key(session_id),
-        _ => remote_runtime_codex_session_key(session_id),
-    };
+    // The runtime key comes from the descriptor's own `runtime_key_scheme`; the
+    // `_ => codex-runtime://` this replaced is the very bug the doc comment
+    // above describes, one CLI further along — it sent the remote daemon a key
+    // that does not exist for the session, the daemon answered `terminal
+    // session not found`, and the caller discarded that error.
+    let runtime_key = remote_runtime_agent_session_key(kind, session_id)
+        .with_context(|| format!("session kind {kind:?} has no daemon runtime lane to resize"))?;
     let cols = cols.to_string();
     let rows = rows.to_string();
     run_remote_yggterm_command(
@@ -24951,38 +25329,12 @@ fn build_live_session_with_launch_options(
                 shell_program.clone(),
                 RemoteDeployState::NotRequired,
             ),
-            SessionKind::Codex => (
-                agent_launch_command_with_options(
-                    SessionKind::Codex,
-                    Some(&default_cwd),
-                    None,
-                    launch,
-                ),
-                local_live_runtime_key(uuid),
-                "local-codex".to_string(),
-                default_cwd.clone(),
-                "codex".to_string(),
-                RemoteDeployState::NotRequired,
-            ),
-            SessionKind::CodexLiteLlm => (
-                agent_launch_command_with_options(
-                    SessionKind::CodexLiteLlm,
-                    Some(&default_cwd),
-                    None,
-                    launch,
-                ),
-                local_live_runtime_key(uuid),
-                "local-codex-litellm".to_string(),
-                default_cwd.clone(),
-                "codex-litellm".to_string(),
-                RemoteDeployState::NotRequired,
-            ),
             SessionKind::ClaudeCode => (
                 claude_code_fresh_launch_command_with_options(Some(&default_cwd), uuid, launch),
                 local_live_runtime_key(uuid),
-                "local-claude-code".to_string(),
+                live_local_source_metadata_value(SessionKind::ClaudeCode),
                 default_cwd.clone(),
-                "claude".to_string(),
+                live_local_prefix_metadata_value(SessionKind::ClaudeCode).to_string(),
                 RemoteDeployState::NotRequired,
             ),
             SessionKind::SshShell => (
@@ -25006,6 +25358,27 @@ fn build_live_session_with_launch_options(
                 "none".to_string(),
                 RemoteDeployState::NotRequired,
             ),
+            // Every OTHER agent CLI — every non-agent kind is named above, so
+            // this arm is the agent fallthrough. The three cells that used to be
+            // spelled per CLI are now the registry's answers (`local-<slug>`,
+            // the binary name), and the launch is the generic builder.
+            //
+            // ⚠ Claude Code keeps its own arm because it is BORN with its id
+            // (`--session-id <uuid>`), and that flag is measured for CC only.
+            // `id_assigned_at_birth` is true for pi, qwen and kimi as well, but
+            // the descriptor records the FACT and not the SPELLING (pi/qwen say
+            // `--session-id`, kimi says `-r`), so a birth id here would be an
+            // invented flag. Their rows rebind to the CLI's own id via the
+            // identity poll instead (spec §7.5) until the descriptor carries
+            // the flag.
+            _ => (
+                agent_launch_command_with_options(kind, Some(&default_cwd), None, launch),
+                local_live_runtime_key(uuid),
+                live_local_source_metadata_value(kind),
+                default_cwd.clone(),
+                live_local_prefix_metadata_value(kind).to_string(),
+                RemoteDeployState::NotRequired,
+            ),
         };
     let preview_intro = match kind {
         SessionKind::Shell => {
@@ -25024,6 +25397,17 @@ fn build_live_session_with_launch_options(
             "This session should land in the main viewport as an embedded xterm.js terminal.".to_string()
         }
         SessionKind::Document => "Documents stay in Web View only.".to_string(),
+        // The rest of the registry says the same thing about itself, named from
+        // its descriptor. The three arms above keep their shipped wording
+        // because each states a MEASURED per-CLI fact (LiteLLM's dedicated CLI
+        // path); a fourth CLI gets the true generic sentence rather than
+        // codex's.
+        kind => format!(
+            "This {} session stays attached to the daemon and opens inline in the main terminal viewport.",
+            agent_cli_descriptor(kind)
+                .map(|descriptor| descriptor.display_name)
+                .unwrap_or("agent")
+        ),
     };
     let preview_runtime = match kind {
         SessionKind::SshShell => {
@@ -25042,6 +25426,17 @@ fn build_live_session_with_launch_options(
             "Claude Code is launched locally and will receive /exit when the daemon shuts down.".to_string()
         }
         SessionKind::Document => "No terminal runtime is required.".to_string(),
+        // ⚠ The shipped arms name each CLI's SHUTDOWN word (`/quit` vs `/exit`)
+        // — a measured per-CLI fact that the descriptor does not carry. A new
+        // CLI therefore gets a sentence that stops SHORT of naming one, rather
+        // than inheriting codex's `/quit`: telling the user a CLI receives a
+        // command it has never heard of is worse than saying nothing about it.
+        kind => format!(
+            "{} is launched locally by the daemon.",
+            agent_cli_descriptor(kind)
+                .map(|descriptor| descriptor.display_name)
+                .unwrap_or("The agent CLI")
+        ),
     };
     let default_summary = live_session_default_summary(kind, target);
     let source = if kind == SessionKind::SshShell {
@@ -25646,10 +26041,11 @@ fn build_live_terminal_lines(session: &ManagedSessionView) -> Vec<String> {
         ),
         format!(
             "{}: {}",
-            if matches!(
-                session.kind,
-                SessionKind::Shell | SessionKind::Codex | SessionKind::CodexLiteLlm
-            ) {
+            // A session that runs HERE is labelled by its workspace; one that
+            // runs elsewhere is labelled by its target machine. The hand-list
+            // this replaced omitted Claude Code, so a local CC row's cwd was
+            // captioned "Target" — and every new CLI inherited that.
+            if session.kind == SessionKind::Shell || session.kind.is_agent() {
                 "Workspace"
             } else {
                 "Target"
@@ -25756,7 +26152,32 @@ fn legacy_agent_launch_command(
         (SessionKind::CodexLiteLlm, None) => {
             format!("{cwd_prefix}CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm{extra_args}")
         }
-        _ => String::new(),
+        // Every OTHER agent CLI, from the registry. The arms above are literal
+        // because each carries a measured extra (codex's `-C "$PWD"`
+        // re-rooting, LiteLLM's `CODEX_HOME`, the two configured extra-args
+        // settings); the rest have neither, so the descriptor's own resume
+        // tokens ARE the command.
+        //
+        // ⛔ `_ => String::new()` was the arm that made this a silent failure:
+        // an empty launch command is a PTY that runs nothing and a row that
+        // opens blank, with no error anywhere. This fallback only runs when the
+        // managed-CLI layout cannot be resolved at all.
+        (kind, session_id) => match agent_cli_descriptor(kind) {
+            None => String::new(),
+            Some(descriptor) => {
+                let binary = descriptor.binary_name;
+                match session_id {
+                    None => format!("{cwd_prefix}{binary}"),
+                    Some(session_id) => {
+                        let tokens = descriptor.resume_tokens(
+                            &shell_single_quote(session_id),
+                            !cwd_prefix.is_empty(),
+                        );
+                        format!("{cwd_prefix}{binary} {}", tokens.join(" "))
+                    }
+                }
+            }
+        },
     }
 }
 
@@ -25975,9 +26396,6 @@ fn stored_session_launch_command_for_locality_with_options(
     launch: &AgentLaunchOptions,
 ) -> String {
     match kind {
-        SessionKind::Codex | SessionKind::CodexLiteLlm => {
-            agent_launch_command_with_options(kind, Some(cwd), Some(session_id), launch)
-        }
         SessionKind::ClaudeCode if is_local => match local_cc_resume_cwd(session_id) {
             // Resume in the cwd the TRANSCRIPT records, never the row's cwd: CC keys its
             // project dir on the process cwd, and a relaunch path can hand us a row whose
@@ -25992,15 +26410,18 @@ fn stored_session_launch_command_for_locality_with_options(
             // No transcript: nothing to resume. Re-birth the row with its own id.
             None => claude_code_fresh_launch_command_with_options(Some(cwd), session_id, launch),
         },
-        SessionKind::ClaudeCode => {
-            agent_launch_command_with_options(kind, Some(cwd), Some(session_id), launch)
-        }
         SessionKind::Document => "document web view".to_string(),
         SessionKind::Shell | SessionKind::SshShell => format!(
             "cd {} && codex resume {}",
             shell_single_quote(cwd),
             session_id
         ),
+        // Every agent CLI resumes through the ONE builder, which reads the
+        // resume shape off the descriptor. Only Claude Code needs an arm of its
+        // own, above, and only for a LOCAL row: CC keys its project directory
+        // on the process cwd, so the transcript's cwd — not the row's — decides
+        // where the resume lands.
+        _ => agent_launch_command_with_options(kind, Some(cwd), Some(session_id), launch),
     }
 }
 
@@ -26027,60 +26448,49 @@ fn local_default_cwd() -> String {
 
 fn local_session_target(kind: SessionKind, cwd: Option<&str>) -> SshConnectTarget {
     let cwd = Some(cwd.map(ToOwned::to_owned).unwrap_or_else(local_default_cwd));
-    match kind {
-        SessionKind::Codex => SshConnectTarget {
-            label: "codex".to_string(),
-            kind,
-            ssh_target: "localhost".to_string(),
-            prefix: None,
-            cwd,
+    // The label WAS the kind's slug at every agent arm (`codex`,
+    // `codex-litellm`, `claude-code`) — six near-identical struct literals that
+    // differed in one string. Derived now, so a CLI cannot be registered and
+    // then labelled by whichever arm it happened to fall into.
+    let label = match kind {
+        SessionKind::Shell => "local-shell".to_string(),
+        SessionKind::SshShell => "ssh-shell".to_string(),
+        SessionKind::Document => "document".to_string(),
+        _ => session_kind_label(kind).to_string(),
+    };
+    SshConnectTarget {
+        label,
+        kind,
+        ssh_target: "localhost".to_string(),
+        // A document has no working directory: it IS the rendered thing.
+        cwd: if kind == SessionKind::Document {
+            None
+        } else {
+            cwd
         },
-        SessionKind::CodexLiteLlm => SshConnectTarget {
-            label: "codex-litellm".to_string(),
-            kind,
-            ssh_target: "localhost".to_string(),
-            prefix: None,
-            cwd,
-        },
-        SessionKind::ClaudeCode => SshConnectTarget {
-            label: "claude-code".to_string(),
-            kind,
-            ssh_target: "localhost".to_string(),
-            prefix: None,
-            cwd,
-        },
-        SessionKind::Shell => SshConnectTarget {
-            label: "local-shell".to_string(),
-            kind,
-            ssh_target: "localhost".to_string(),
-            prefix: None,
-            cwd,
-        },
-        SessionKind::SshShell => SshConnectTarget {
-            label: "ssh-shell".to_string(),
-            kind,
-            ssh_target: "localhost".to_string(),
-            prefix: None,
-            cwd,
-        },
-        SessionKind::Document => SshConnectTarget {
-            label: "document".to_string(),
-            kind,
-            ssh_target: "localhost".to_string(),
-            prefix: None,
-            cwd: None,
-        },
+        prefix: None,
     }
 }
 
-fn session_kind_label(kind: SessionKind) -> &'static str {
+/// The ONE lowercase wire name for a session kind — the `--kind` value, the
+/// `session_kind_label` string in telemetry, the row JSON's `icon_kind`.
+///
+/// The agent half is `descriptor.slug` rather than nine hand-written arms,
+/// because that slug is the same string the flag parser accepts: spelling them
+/// separately is how a kind could be LABELLED `pi` and yet be unparseable as
+/// `--kind pi`.
+pub(crate) fn session_kind_label(kind: SessionKind) -> &'static str {
+    if let Some(descriptor) = agent_cli_descriptor(kind) {
+        return descriptor.slug;
+    }
     match kind {
-        SessionKind::Codex => "codex",
-        SessionKind::CodexLiteLlm => "codex-litellm",
-        SessionKind::ClaudeCode => "claude-code",
         SessionKind::Shell => "shell",
+        // Historical spelling: `ssh`, not `ssh-shell`. It is on disk and on the
+        // wire, so it stays hand-written next to the kinds that have no slug.
         SessionKind::SshShell => "ssh",
         SessionKind::Document => "document",
+        // Unreachable: every remaining kind has a descriptor and returned above.
+        _ => "shell",
     }
 }
 
@@ -26793,6 +27203,59 @@ mod tests {
     // not cover fails UNLESS recorded in KNOWN_PREDICATE_HOLES; a recorded
     // hole that no longer reproduces fails until its row is deleted. The
     // burn-down list lives in yggterm-core::agent_scheme.
+
+    /// The flag parser and the label must be TWO ENDS OF ONE STRING.
+    ///
+    /// `session_kind_label` names a kind on the wire and in telemetry;
+    /// `parse_app_control_session_kind` turns a typed `--kind` back into one.
+    /// Before this, the label was a hand-written nine-arm match and the parser a
+    /// four-name list, so `--kind pi` was REFUSED for a CLI the rest of the
+    /// system was happily labelling `pi` — and `--kind` is the door every
+    /// delegate launch, automation and app-control create comes through.
+    #[test]
+    fn every_registered_cli_can_be_named_and_then_typed_back() {
+        use super::{parse_app_control_session_kind, session_kind_label};
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            let label = session_kind_label(descriptor.kind);
+            assert_eq!(
+                label, descriptor.slug,
+                "{:?}: the label and the registry slug must be one string",
+                descriptor.kind
+            );
+            assert_eq!(
+                parse_app_control_session_kind(label).unwrap_or_else(|error| panic!(
+                    "--kind {label} is refused for {:?}: {error}",
+                    descriptor.kind
+                )),
+                descriptor.kind,
+            );
+            // The wrapper slug is what the remote verbs and (for agy) the binary
+            // are spelled with, so a user who typed it meant this CLI.
+            if let Some(wrapper) = descriptor.wrapper_slug {
+                assert_eq!(
+                    parse_app_control_session_kind(wrapper).unwrap_or_else(|error| panic!(
+                        "--kind {wrapper} is refused for {:?}: {error}",
+                        descriptor.kind
+                    )),
+                    descriptor.kind,
+                );
+            }
+        }
+        // The legacy spellings that are in users' scripts and unit files.
+        for (typed, expected) in [
+            ("shell", SessionKind::Shell),
+            ("terminal", SessionKind::Shell),
+            ("claude", SessionKind::ClaudeCode),
+            ("claudecode", SessionKind::ClaudeCode),
+            ("litellm", SessionKind::CodexLiteLlm),
+        ] {
+            assert_eq!(
+                parse_app_control_session_kind(typed).expect("legacy spelling still parses"),
+                expected,
+                "legacy --kind {typed} stopped working",
+            );
+        }
+    }
 
     #[test]
     fn scheme_registry_lock_local_runtime_id_from_key() {
@@ -32704,12 +33167,18 @@ terminal_window_id: None,
             cwd: Some("/home/user/gh/yggterm".to_string()),
         };
 
-        for kind in [
-            SessionKind::Shell,
-            SessionKind::SshShell,
-            SessionKind::Codex,
-            SessionKind::CodexLiteLlm,
-        ] {
+        // Shells plus EVERY registered CLI, derived. The four-name array this
+        // replaced skipped Claude Code already, and would have skipped the whole
+        // 2026-08-08 intake — a lock that does not test the kind that was just
+        // added is the stale-green this file's other lists exist to prevent.
+        for kind in [SessionKind::Shell, SessionKind::SshShell]
+            .into_iter()
+            .chain(
+                yggterm_core::agent_cli::AGENT_CLIS
+                    .iter()
+                    .map(|descriptor| descriptor.kind),
+            )
+        {
             let summary = live_session_default_summary(kind, &target);
             assert!(
                 !looks_like_low_signal_generated_copy(&summary),
