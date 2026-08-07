@@ -1449,7 +1449,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         composer_marker: '\u{276f}',
         working_footer_hints: &[],
         permission_modes: &[(AgentPermissionMode::Default, &[])],
-        overridden_flags: &[],
+        overridden_flags: &[("--model", FlagArity::TakesValue, OverriddenBy::Model)],
         content_rederives_on_resume: true,
         session_store_globs: &[],
         store_excluded_name_fragments: &[],
@@ -1779,14 +1779,12 @@ pub struct StorePredicateHole {
     pub consequence: &'static str,
 }
 
-pub const KNOWN_STORE_PREDICATE_HOLES: &[StorePredicateHole] = &[StorePredicateHole {
-    predicate: "selected_path_should_expand_ancestors",
-    kind: SessionKind::ClaudeCode,
-    recorded: "2026-07-25",
-    consequence: "selecting a CC transcript expands its store dirs as if they were tree \
-                  folders; the codex arm has excluded exactly that since before CC rows \
-                  carried a real file_path",
-}];
+/// ✅ EMPTY since 2026-08-08 — `selected_path_should_expand_ancestors` was
+/// widened from the codex family to EVERY registered store, which closed the
+/// one row this table held. The both-directions contract is what forced the
+/// deletion in the same change: a recorded hole that no longer reproduces fails
+/// the build, so the table can never go stale-green.
+pub const KNOWN_STORE_PREDICATE_HOLES: &[StorePredicateHole] = &[];
 
 /// A source site that still spells a store path by hand, with the reason it is
 /// allowed to. Every entry is a place a fourth agent CLI would have to be
@@ -1938,6 +1936,13 @@ pub fn unregistered_store_literals(
 /// new hole, and a recorded hole that IS covered is a stale row to delete.
 pub fn assert_store_predicate_coverage(predicate_name: &str, probe: impl Fn(&str) -> bool) {
     for descriptor in AGENT_CLIS {
+        // A CLI with a declared `store_scan_gap` has no store PATH to probe —
+        // `example_store_path` degenerates to the bare home, and asserting a
+        // predicate against `/home/example/` measures nothing. The gap is
+        // already locked by `every_agent_cli_declares_a_store`.
+        if descriptor.session_store_globs.is_empty() {
+            continue;
+        }
         let example = descriptor.example_store_path("/home/example");
         let covered = probe(&example);
         let recorded = KNOWN_STORE_PREDICATE_HOLES
@@ -2479,9 +2484,29 @@ mod tests {
     #[test]
     fn every_agent_cli_declares_a_store() {
         for descriptor in AGENT_CLIS {
+            // A CLI may legitimately have no scannable store — opencode keeps
+            // one SQLite DB, kimi buckets by MD5 of the cwd, Muse is not
+            // installed anywhere yet. What is forbidden is SILENCE: the gap
+            // must be declared, with the specific obstacle, so the next session
+            // closes it instead of rediscovering it.
+            if descriptor.session_store_globs.is_empty() {
+                let gap = descriptor.store_scan_gap.unwrap_or_else(|| {
+                    panic!(
+                        "{:?} declares no store globs and no store_scan_gap — say \
+                         which it is",
+                        descriptor.kind
+                    )
+                });
+                assert!(
+                    gap.len() > 80,
+                    "{:?}: a store_scan_gap must name the obstacle, not wave at it",
+                    descriptor.kind
+                );
+                continue;
+            }
             assert!(
-                !descriptor.session_store_globs.is_empty(),
-                "{:?} must declare where it keeps its sessions",
+                descriptor.store_scan_gap.is_none(),
+                "{:?} declares BOTH store globs and a scan gap",
                 descriptor.kind
             );
             for glob in descriptor.session_store_globs {

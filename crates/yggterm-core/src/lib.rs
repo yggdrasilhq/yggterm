@@ -1363,37 +1363,30 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
 }
 
 /// Single source of truth for "is an agent CLI actively working right now",
-/// derived purely from the live screen text. CLI-agnostic: Codex renders
-/// `Working (Ns • esc to interrupt)`, Claude Code renders
-/// `✻ <gerund>… (Ns · esc to interrupt)` — the shared, unambiguous "I'm busy,
-/// press esc to stop" signal is `esc to interrupt`, which neither CLI shows
-/// when idle. Codex-only background-task indicators (`/stop to close`,
-/// `background terminal running`) are kept as a fallback.
+/// derived purely from the live screen text — when the CALLER DOES NOT KNOW
+/// which CLI is behind the PTY.
 ///
 /// Both the sidebar working-indicator (GUI) and the hot-update idle gate
-/// (daemon) MUST use this one function so the displayed "working" state and
+/// (daemon) MUST use this one derivation so the displayed "working" state and
 /// the "is it safe to hot-update" decision can never silently diverge.
 /// See [[finding-hot-update-interrupts-remote-sessions]].
+///
+/// ⚠ **The phrases are DESCRIPTOR DATA now** ([`agent_cli::ScreenWorkingPhrase`]),
+/// not a hardcoded list. They used to live here as a hand-written `esc to
+/// interrupt` plus two codex-only fragments, and a CLI whose spinner words it
+/// differently — kimi says `Composing...` and interrupts on Ctrl-C, with no
+/// `esc` affordance at all — reported IDLE forever while it ground. `idle` is
+/// the answer a caller reads as *"finished, safe to move on"*, so a guess there
+/// is the expensive kind.
+///
+/// This kind-agnostic form answers "is ANY registered CLI's phrase on this
+/// screen". Where the kind IS known — `working_flags`, which has the session in
+/// hand — call [`agent_cli::AgentCliDescriptor::screen_shows_working`] instead:
+/// it cannot mistake one CLI's completion trace for another's work signal.
 pub fn screen_text_shows_agent_working(sample: &str) -> bool {
-    sample.lines().rev().take(10).any(|line| {
-        let line = line.trim();
-        if line.is_empty() {
-            return false;
-        }
-        let lower = line.to_ascii_lowercase();
-        if lower.contains("worked for ") {
-            // Codex completion summary ("Worked for Ns"), not active work.
-            return false;
-        }
-        // Universal active-processing signal shown by both Codex and Claude Code.
-        if lower.contains("esc to interrupt") {
-            return true;
-        }
-        // Codex-only background-task indicators (no "esc to interrupt" line).
-        lower.contains("working (")
-            && (lower.contains("/stop to close")
-                || lower.contains("background terminal running"))
-    })
+    agent_cli::AGENT_CLIS
+        .iter()
+        .any(|descriptor| descriptor.screen_shows_working(sample))
 }
 
 /// Single source of truth for "does the current input line hold an unsent

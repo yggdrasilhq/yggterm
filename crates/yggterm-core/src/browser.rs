@@ -378,13 +378,22 @@ impl SessionBrowserState {
 /// user-visible change and belongs to a phase that can prove it live, not to
 /// this refactor.
 fn selected_path_should_expand_ancestors(path: &str) -> bool {
-    !path.contains("://") && !path.starts_with("__") && !codex_family_store_path(path)
+    // ⚠ Was `!codex_family_store_path(path)` — the codex forks only. A store
+    // path is not a place in the user's filesystem tree, it is where a CLI
+    // keeps its transcripts, so expanding its ancestors walks the sidebar into
+    // `~/.claude/projects/…` or `~/.qwen/projects/…`. Every registered store
+    // has that property; hand-listing two of them meant the third onwards was
+    // wrong, which is what `KNOWN_STORE_PREDICATE_HOLES` recorded for CC.
+    !path.contains("://") && !path.starts_with("__") && !agent_cli_store_path(path)
 }
 
-/// True when `path` is inside either codex fork's store.
-fn codex_family_store_path(path: &str) -> bool {
-    crate::agent_cli::store_path_is_under_any(crate::agent_cli::CODEX_FAMILY, path)
+/// True when `path` is inside ANY registered agent CLI's session store.
+fn agent_cli_store_path(path: &str) -> bool {
+    crate::agent_cli::AGENT_CLIS
+        .iter()
+        .any(|descriptor| descriptor.store_path_is_under_root(path))
 }
+
 
 fn default_level_one_expanded_paths(root: &SessionNode) -> HashSet<String> {
     let mut expanded_paths = HashSet::new();
@@ -766,18 +775,37 @@ mod tests {
     }
 
     // The shipped behavior the lock above is calibrated against — kept explicit
-    // so the hole is legible without running the generic lock.
+    // so it is legible without running the generic lock.
+    //
+    // ⚖ CHANGED 2026-08-08, and the change is the point: a CC transcript used
+    // to expand its ancestors while a codex one did not, which was the single
+    // row in `KNOWN_STORE_PREDICATE_HOLES`. A CLI's store is not a place in the
+    // user's tree for ANY CLI, so selecting a transcript must not walk the
+    // sidebar into `~/.claude/projects` any more than into `~/.codex/sessions`.
+    // The predicate now reads the registry, so the six CLIs added the same day
+    // are covered by construction and the hole table is empty.
     #[test]
-    fn codex_transcripts_do_not_expand_ancestors_but_cc_ones_still_do() {
+    fn no_agent_cli_transcript_expands_its_store_as_if_it_were_a_folder() {
         assert!(!selected_path_should_expand_ancestors(
             "/home/user/.codex/sessions/2026/07/25/rollout-abc.jsonl"
         ));
         assert!(!selected_path_should_expand_ancestors(
             "/home/user/.codex-litellm/sessions/2026/07/25/rollout-abc.jsonl"
         ));
-        assert!(selected_path_should_expand_ancestors(
+        assert!(!selected_path_should_expand_ancestors(
             "/home/user/.claude/projects/-home-user-gh-yggterm/abc.jsonl"
         ));
+        assert!(!selected_path_should_expand_ancestors(
+            "/home/user/.pi/agent/sessions/--home-user-gh-yggterm--/2026_abc.jsonl"
+        ));
+        assert!(!selected_path_should_expand_ancestors(
+            "/home/user/.qwen/projects/-home-user-gh-yggterm/chats/abc.jsonl"
+        ));
+        assert!(!selected_path_should_expand_ancestors(
+            "/home/user/.antigravitycli/abc.json"
+        ));
+        // A real directory still expands — the exclusion is stores, not
+        // dotfiles.
         assert!(selected_path_should_expand_ancestors("/home/user/gh/yggterm"));
     }
 

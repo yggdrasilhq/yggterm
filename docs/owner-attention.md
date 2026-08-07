@@ -39,9 +39,18 @@ copies.
 
 ## Credentials and real-money actions (the vault and the card rails)
 
-- **Any card payment is his, per action, every time** — fingraph's standing law,
-  and it is not a thing an unattended session may ever take. A card fix is
-  written and tested here; it is never exercised against a live gateway.
+- **Any card payment is his, per action, every time** — his standing rule for
+  money actions, and it is not a thing an unattended session may ever take. A
+  card fix is written and tested here; it is never exercised against a live
+  gateway.
+
+- **Muse Code needs his login before anything about it can be MEASURED** — the
+  CLI is closed source and installing it requires a vendor account only he holds.
+  Its descriptor ships with its resume flag, composer glyph and working phrase
+  marked as placeholders rather than measurements, and says so on the value. →
+  `docs/spec-adding-an-agent-cli.md` §6.
+  *Meanwhile:* the other eight CLIs are wired, and Muse's row is data — one
+  descriptor edit once a real `muse --help` and a real screen exist.
 
 ## Third parties only he can chase
 
@@ -54,8 +63,8 @@ copies.
 
 ## Gates he set that an agent must not walk through
 
-- **fingraph decides a licence before anything goes public** — step 0 of the
-  launch gate, owner-set 2026-08-07. → `docs/settled-calls.md`.
+- **He decides the licence before anything goes public** — step 0 of the launch
+  gate, owner-set 2026-08-07. → `docs/settled-calls.md`.
 - **Windows and macOS builds are 3.x milestones and are not to be opened
   unprompted** (user directive). Listed here only so a session that trips over a
   cross-platform failure knows it is parked on purpose rather than forgotten.
