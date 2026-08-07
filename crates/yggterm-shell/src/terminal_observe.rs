@@ -4103,21 +4103,25 @@ pub(crate) fn terminal_line_is_internal_transport_error(line: &str) -> bool {
         .trim_start_matches(|ch: char| matches!(ch, '›' | '>' | ' ' | '\t'))
         .trim()
         .to_ascii_lowercase();
-    normalized.starts_with("error: terminal session not found: local://")
-        || normalized.starts_with("terminal session not found: local://")
-        || normalized.starts_with("error: terminal session not found: remote-session://")
-        || normalized.starts_with("terminal session not found: remote-session://")
-        || normalized.starts_with("error: terminal session not found: codex-runtime://")
-        || normalized.starts_with("terminal session not found: codex-runtime://")
+    // ⚖ DERIVED from the scheme registry — the SSOT twin of
+    // `terminal_line_internal_transport_error_index` in shell.rs, and the same
+    // hole: three schemes by hand meant a genuine `cc-runtime://` transport
+    // error reached the user's viewport wearing the CLI's voice.
+    let scheme_noise = yggterm_core::agent_scheme::SESSION_PATH_SCHEMES.iter().any(|scheme| {
+        let prefix = scheme.prefix.to_ascii_lowercase();
+        let bare = format!("terminal session not found: {prefix}");
+        let errored = format!("error: {bare}");
+        normalized.starts_with(&bare)
+            || normalized.starts_with(&errored)
+            || normalized.contains(&errored)
+    });
+    scheme_noise
         || normalized.starts_with("error: hot update failed before bridging stale remote runtime")
         || normalized.starts_with("hot update failed before bridging stale remote runtime")
         || normalized.contains("hot update failed before bridging stale remote runtime")
         || normalized.starts_with("warn ignoring stale yggterm daemon for current app version")
         || normalized.contains("warn ignoring stale yggterm daemon for current app version")
         || normalized == "reading daemon response"
-        || normalized.contains("error: terminal session not found: local://")
-        || normalized.contains("error: terminal session not found: remote-session://")
-        || normalized.contains("error: terminal session not found: codex-runtime://")
 }
 
 pub(crate) fn terminal_tail_excerpt(data: &str, max_chars: usize) -> String {
@@ -6113,16 +6117,16 @@ Best thing to improve in the meantime:
         let working = "some output\n❯\n──── ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← 1 agent";
         let paused = "some output\n❯\u{a0}\u{1b}[2mapply the yedit and cellulose and paper fixes\n──── ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent";
         let idle = "some output\n❯\n──── ⏵⏵ bypass permissions on (shift+tab to cycle)";
-        assert_eq!(terminal_chunk_agent_activity(working), AgentRowActivity::Working);
+        assert_eq!(terminal_chunk_agent_activity(Some(yggterm_core::SessionKind::ClaudeCode), working), AgentRowActivity::Working);
         assert_eq!(
-            terminal_chunk_agent_activity(paused),
+            terminal_chunk_agent_activity(Some(yggterm_core::SessionKind::ClaudeCode), paused),
             AgentRowActivity::Idle,
             "the owner's paused row: a ghosted last message and NO interrupt hint"
         );
-        assert_eq!(terminal_chunk_agent_activity(idle), AgentRowActivity::Idle);
+        assert_eq!(terminal_chunk_agent_activity(Some(yggterm_core::SessionKind::ClaudeCode), idle), AgentRowActivity::Idle);
         // No composer at all — mid-output, a menu, or a plain shell.
         assert_eq!(
-            terminal_chunk_agent_activity("Do you want to proceed?\n1. Yes\n2. No"),
+            terminal_chunk_agent_activity(None, "Do you want to proceed?\n1. Yes\n2. No"),
             AgentRowActivity::Unknown
         );
     }
@@ -6134,7 +6138,7 @@ Best thing to improve in the meantime:
     fn an_unmeasured_cli_is_unknown_not_idle() {
         let codex_idle = "output\n› \n\n  gpt-5.5 xhigh · ~/gh/yggterm";
         assert_eq!(
-            terminal_chunk_agent_activity(codex_idle),
+            terminal_chunk_agent_activity(Some(yggterm_core::SessionKind::Codex), codex_idle),
             AgentRowActivity::Unknown,
             "codex declares no working_footer_hints, so its activity is unmeasured"
         );
@@ -6150,16 +6154,24 @@ Best thing to improve in the meantime:
     /// distinct — a shared glyph would make the readiness gate unable to say
     /// which CLI it is looking at.
     #[test]
-    fn every_agent_cli_declares_a_distinct_composer_marker() {
-        let mut markers: Vec<char> = yggterm_core::AGENT_CLIS
+    fn every_agent_cli_declares_a_composer_marker() {
+        // ⚠ RENAMED and WEAKENED on purpose, 2026-08-08. It used to assert the
+        // markers were DISTINCT (`markers.len() == 2`), which encoded a belief
+        // that the glyph identifies the CLI. It does not: `›` and `❯` are what
+        // most terminal agents pick, and six of the nine registered CLIs share
+        // one or the other. Keeping the assertion would have forced a FALSE
+        // glyph onto a descriptor to satisfy a test — a measurement bent to fit
+        // a lock, which is the worst thing a lock can cause.
+        //
+        // The real fix is upstream: `terminal_chunk_agent_activity` now takes
+        // the session's KIND, so it never has to infer the CLI from a glyph.
+        // What still must hold is that every CLI declares SOMETHING drawable.
+        let markers: Vec<char> = yggterm_core::AGENT_CLIS
             .iter()
             .map(|descriptor| descriptor.composer_marker)
             .collect();
+        assert_eq!(markers.len(), yggterm_core::AGENT_CLIS.len());
         assert!(markers.iter().all(|marker| !marker.is_whitespace()));
-        markers.sort_unstable();
-        markers.dedup();
-        // Codex and Codex-LiteLLM are the same binary family and share `›`.
-        assert_eq!(markers.len(), 2, "codex family + claude code");
     }
 
     #[test]
@@ -8758,11 +8770,36 @@ impl AgentRowActivity {
 /// so a CLI that words it differently declares its own instead of being
 /// silently reported as quiet. A CLI with an empty list yields
 /// [`AgentRowActivity::Unknown`] even when its composer is plainly on screen.
-pub(crate) fn terminal_chunk_agent_activity(data: &str) -> AgentRowActivity {
+/// ⚠ **A COMPOSER GLYPH IS NOT A DISCRIMINATOR, and treating it as one was a
+/// latent bug that the 2026-08-08 intake made unavoidable.**
+///
+/// The old signature took only the screen and searched `AGENT_CLIS` for the
+/// first descriptor whose `composer_marker` appeared, then used THAT
+/// descriptor's `working_footer_hints`. That worked while exactly two glyphs
+/// existed. It cannot: `›` and `❯` are the two glyphs most terminal agents
+/// choose, and six new CLIs collide on them — so the verdict would have been
+/// read off whichever CLI happened to be declared first, reporting one CLI's
+/// activity using another's vocabulary. Silently, and in the direction that
+/// says "idle".
+///
+/// The caller knows the session's kind. Ask it.
+///
+/// `kind` of `None` (or a non-agent kind) keeps the old best-effort search, for
+/// the one caller that genuinely has a screen and no session.
+pub(crate) fn terminal_chunk_agent_activity(
+    kind: Option<yggterm_core::SessionKind>,
+    data: &str,
+) -> AgentRowActivity {
     let stripped = strip_terminal_control_sequences(data);
     let lines = normalized_composer_lines(&stripped);
     let mut saw_composer_without_marker = false;
-    for descriptor in yggterm_core::AGENT_CLIS.iter() {
+    let candidates: Vec<&'static yggterm_core::agent_cli::AgentCliDescriptor> = match kind
+        .and_then(yggterm_core::agent_cli::agent_cli_descriptor)
+    {
+        Some(descriptor) => vec![descriptor],
+        None => yggterm_core::AGENT_CLIS.iter().collect(),
+    };
+    for descriptor in candidates {
         let Some(prompt_index) = lines
             .iter()
             .rposition(|line| line.starts_with(descriptor.composer_marker))

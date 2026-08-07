@@ -47,6 +47,14 @@ pub enum ScopeId {
     SettingsTheme,
     /// The row menu — the sidebar's right-click menu, opened on the "here" row.
     RowMenu,
+    /// A row-menu SUBMENU, keyed by its opener's item id
+    /// (`"open-session-here"`). This is the level that makes `ALT,E,S,L` mean
+    /// "row menu → Open Session Here → Claude Code".
+    ///
+    /// ⚖ Non-root, so the Excel-reserved-letter rule does not apply and a child
+    /// may freely reuse a letter its parent scope spent — the ladder cost of a
+    /// second level is zero.
+    RowMenuSub(String),
     /// Jump-to-session: a NAVIGATION scope (§8), declaration-free by design. The
     /// live-session list is walked with the arrows / PageUp / PageDown and
     /// committed with Enter; badging fifty rows would be unreadable.
@@ -64,6 +72,7 @@ impl ScopeId {
             ScopeId::Settings => "settings".to_string(),
             ScopeId::SettingsTheme => "settings.theme".to_string(),
             ScopeId::RowMenu => "rowmenu".to_string(),
+            ScopeId::RowMenuSub(id) => format!("rowmenu.{id}"),
             ScopeId::SessionJump => "session.jump".to_string(),
             ScopeId::App(id) => format!("app.{id}"),
         }

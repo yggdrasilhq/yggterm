@@ -20,14 +20,38 @@ pub enum RemoteRuntimeKind {
     Codex,
     Shell,
     ClaudeCode,
+    // The 2026-08-08 intake. Purely ADDITIVE on the wire and in the sqlite
+    // column: every value already written keeps its meaning, and only a session
+    // of a new CLI can produce a new one. Without these rows,
+    // `remote_runtime_agent_registry_kind` had nothing to answer with but
+    // `Codex`, and every pi/qwen/agy runtime would have been filed as a codex
+    // one — a registry that lies about which CLI owns a PTY.
+    Pi,
+    OpenCode,
+    QwenCode,
+    Kimi,
+    Muse,
+    Antigravity,
 }
 
 impl RemoteRuntimeKind {
+    /// The `runtime_kind` TEXT value.
+    ///
+    /// ⚠ `codex` and `claude_code` are HISTORICAL spellings already written into
+    /// every user's `remote-runtime.db`; they are not the CLI slug (`claude-code`)
+    /// and may not be renamed. New CLIs use their slug with `-` → `_`, which is
+    /// what this table's existing spellings would have been.
     fn as_db(&self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Shell => "shell",
             Self::ClaudeCode => "claude_code",
+            Self::Pi => "pi",
+            Self::OpenCode => "opencode",
+            Self::QwenCode => "qwen_code",
+            Self::Kimi => "kimi",
+            Self::Muse => "muse",
+            Self::Antigravity => "antigravity",
         }
     }
 
@@ -35,6 +59,15 @@ impl RemoteRuntimeKind {
         match value {
             "shell" => Self::Shell,
             "claude_code" => Self::ClaudeCode,
+            "pi" => Self::Pi,
+            "opencode" => Self::OpenCode,
+            "qwen_code" => Self::QwenCode,
+            "kimi" => Self::Kimi,
+            "muse" => Self::Muse,
+            "antigravity" => Self::Antigravity,
+            // Unrecognized values stay codex: a row written by a NEWER daemon
+            // than this one must still read back as *something*, and codex is
+            // the value this column held for its whole history.
             _ => Self::Codex,
         }
     }
