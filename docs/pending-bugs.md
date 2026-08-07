@@ -13,6 +13,29 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⭐ OPERATOR-REPORTED, LIVES IN ychrome: a vault CARD item is unreadable and uneditable in the sidebar
+
+**Status:** OPEN — **the fix belongs in `ychrome`**, filed there with the measurements:
+`~/gh/ychrome/docs/pending-bugs.md` § *A CARD ITEM IS UNREADABLE AND UNEDITABLE IN THE SIDEBAR*.
+Listed here only so the yggterm dev agent sees it, because the operator meets it through **this**
+GUI's sidebar and will report it against yggterm.
+
+His words, 2026-08-07, while paying an India Post booking by card:
+> *"ychrome-vault edit/or see details of card is broken and no detail other than note can be seen
+> in the GUI sidebar."*
+
+Two halves, neither of which is a secrets-policy question:
+1. **`view_tab_widgets` renders no card section at all** — brand, cardholder, expiry and **last4**
+   are invisible, though `ychrome-vault card <name>` already answers all five secret-free. With two
+   IDFC WOW cards in the vault (his and his sister's), **last4 is the only thing that tells them
+   apart**, so the pane withholds the one field that prevents charging the wrong person.
+2. **`ychrome-vault edit` has no card options whatsoever** — only rename/user/uri/totp/notes/
+   custom-field — so a card item can never be updated by this client, and every card expires.
+
+Context: `~/data/atlasStore/graph/notes/indiapost-rti-a-booking-run-2026-08-07.md`.
+⚠ Do not fix half of it: seeing an expiry you cannot change moves the dead end one screen later.
+
+
 ## ★★★ A STALE INSTALL STATE `exec`ed EVERY CLI VERB INTO A 2.11.0 BINARY — and `--version` could not see it
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
