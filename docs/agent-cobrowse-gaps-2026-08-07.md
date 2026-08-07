@@ -1,6 +1,6 @@
 # Agent co-browse gap — the headless engine cannot pay by card (2026-08-07)
 
-Filed from the atlasStore lobe after an India Post Speed Post booking was driven end to end on
+Filed from the widgets lobe after an India Post Speed Post booking was driven end to end on
 `ychrome ctl` and then had to be **handed to a second agent on the operator's own laptop purely to
 pay Rs 23**. Raised by the operator, who was right to challenge the claim that this was a fleet
 non-uniformity: **it is not.** The vault is uniform. The gap is one missing verb on one driver.

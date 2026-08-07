@@ -3033,7 +3033,7 @@ pub struct ManagedSessionView {
     /// because nothing else could answer the question.** Every writer used to
     /// guess: `passive_title_hint_can_update` inferred provenance from the
     /// title's SHAPE (does it look auto-generated?), which cannot separate
-    /// `6. yggterm: campaign` from `Continue atlasstore campaign`, and the
+    /// `6. yggterm: campaign` from `Continue widgets campaign`, and the
     /// insert paths used `was_missing` — whether the row was in THIS daemon's
     /// map — which is a fact about daemon lifecycle, not about the title.
     ///
@@ -3047,15 +3047,15 @@ pub struct ManagedSessionView {
     /// ⇒ an explicit title OUTRANKS every derived source; a derived title is a
     /// FALLBACK consulted only when no explicit title was ever set.
     pub title_is_explicit: bool,
-    /// The row's position in the user's sidebar outline (`2. versestore:`),
+    /// The row's position in the user's sidebar outline (`2. cogs:`),
     /// stored SEPARATELY from the title and composed with it at render time.
     ///
     /// **Separate because the two facts have different owners and different
     /// lifetimes.** The title says what the session is DOING and the agent CLI
     /// rewrites it whenever it likes — Claude Code re-titles its own session
     /// once it has one, which silently destroyed every outline number the
-    /// orchestrator set (`2. versestore: panels + research` became "Initialize
-    /// versestore panels research lobe", measured on the owner's sidebar
+    /// orchestrator set (`2. cogs: panels + research` became "Initialize
+    /// cogs panels research lobe", measured on the owner's sidebar
     /// 2026-08-06). The prefix says WHERE THE ROW SITS, which only the user and
     /// the spawn hierarchy know.
     ///
@@ -4213,7 +4213,7 @@ impl YggtermServer {
             }
             // ⛔ A name the user chose outranks anything a scan re-derives, and
             // the shape heuristic below cannot tell them apart — it could never
-            // separate `6. yggterm: campaign` from `Continue atlasstore
+            // separate `6. yggterm: campaign` from `Continue widgets
             // campaign`, which is why provenance became a stored fact. Without
             // this line the mirror's own explicit title was overwritten on the
             // next rescan for any row whose live session had exited.
@@ -4317,7 +4317,7 @@ impl YggtermServer {
     /// ⛔ SAFETY-CRITICAL. A `LiveSsh` row's local PTY is an ssh bridge; the
     /// agent it was made for runs on the far end. A local tenant walk therefore
     /// sees an empty PTY and would call it a clearable plate — which on
-    /// 2026-08-06 offered to close a versestore delegate that was five hours into
+    /// 2026-08-06 offered to close a cogs delegate that was five hours into
     /// its task. Only the host that can SEE the work may judge it, so this is
     /// what the hygiene verdict consults before anything else.
     ///
@@ -15049,7 +15049,7 @@ print(path)
 /// cwd it saw and read only the first 512 KB — so on a remote machine a
 /// `/cd`-moved session kept showing under its birth folder in the cwd tree
 /// forever. Live case, dev 2026-07-24: session `4a0a61e0` `/cd`'d from
-/// `/home/user/gh/yggterm` to `/home/user/data/orbitstore`, and the record proving
+/// `/home/user/gh/yggterm` to `/home/user/data/spindles`, and the record proving
 /// it sits at byte 942_954 of a 943_711-byte transcript — past the old head-only
 /// cap, so no latest-wins rule alone would have caught it either.
 const REMOTE_CC_SCAN_SCRIPT: &str = r#"
@@ -33687,7 +33687,7 @@ terminal_window_id: None,
                 event_count: 10,
                 user_message_count: 5,
                 assistant_message_count: 5,
-                title_hint: "Continue atlasstore campaign".to_string(),
+                title_hint: "Continue widgets campaign".to_string(),
                 recent_context: String::new(),
                 cached_precis: None,
                 cached_summary: None,
@@ -33700,7 +33700,7 @@ terminal_window_id: None,
         // A human names the row. There is deliberately NO live session for it —
         // the agent has exited, which is the ordinary resting state and the
         // condition under which the revert was measured.
-        server.set_session_title_explicit(&path, "1.1 atlasstore: records");
+        server.set_session_title_explicit(&path, "1.1 widgets: records");
         assert!(
             !server.session_title_is_explicit(&path),
             "precondition: with no live row there is no provenance in `sessions` — \
@@ -33708,7 +33708,7 @@ terminal_window_id: None,
         );
 
         let held = &server.remote_machines[0].sessions[0];
-        assert_eq!(held.title_hint, "1.1 atlasstore: records");
+        assert_eq!(held.title_hint, "1.1 widgets: records");
         assert!(
             held.title_is_explicit,
             "the mirror must record that a HUMAN chose this name, or no merge \
@@ -33943,7 +33943,7 @@ terminal_window_id: None,
         // Everything else about the old behaviour is unchanged.
         assert!(crate::passive_title_hint_can_update(
             "local shell",
-            "Continue atlasstore campaign",
+            "Continue widgets campaign",
             false,
             false,
         ));
@@ -34033,10 +34033,10 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         let path = server.start_local_session(SessionKind::ClaudeCode, Some("/home/user"), None);
-        server.set_session_title_hint(&path, "Continue atlasstore campaign");
+        server.set_session_title_hint(&path, "Continue widgets campaign");
         assert_eq!(
             server.sessions.get(&path).expect("row").title,
-            "Continue atlasstore campaign"
+            "Continue widgets campaign"
         );
     }
 
@@ -38100,7 +38100,7 @@ terminal_window_id: None,
         let hydrated = ManagedSessionView {
             id: "a033a728-69ff-439b-ba00-2459f6bc3fb3".to_string(),
             session_path: path.to_string(),
-            title: "Orbitstore Campaign Progress".to_string(),
+            title: "Spindles Campaign Progress".to_string(),
             kind: SessionKind::ClaudeCode,
             host_label: "dev".to_string(),
             source: SessionSource::LiveSsh,
@@ -38227,7 +38227,7 @@ terminal_window_id: None,
         let mut session = ManagedSessionView {
             id: "a033a728".to_string(),
             session_path: "remote-cc://dev/a033a728".to_string(),
-            title: "Orbitstore Campaign Progress".to_string(),
+            title: "Spindles Campaign Progress".to_string(),
             kind: SessionKind::ClaudeCode,
             host_label: "dev".to_string(),
             source: SessionSource::LiveSsh,
@@ -41574,15 +41574,15 @@ terminal_window_id: None,
         // (A) The user's bug: `/cd` re-homes the session. CC moved the
         //     transcript into the dir encoding the NEW cwd, so that cwd — not
         //     the birth cwd of record 1 — is where the session lives.
-        let a_dir = projects.join("-home-user-data-orbitstore");
+        let a_dir = projects.join("-home-user-data-spindles");
         std::fs::create_dir_all(&a_dir).unwrap();
         std::fs::write(
             a_dir.join("aaaaaaaa-0000-0000-0000-000000000001.jsonl"),
             cc_jsonl(&[
                 serde_json::json!({"type":"user","sessionId":"session-a","cwd":"/home/user/gh/yggterm",
-                    "message":{"role":"user","content":"continue the orbitstore campaign"}}),
+                    "message":{"role":"user","content":"continue the spindles campaign"}}),
                 serde_json::json!({"type":"assistant","cwd":"/home/user/gh/yggterm"}),
-                serde_json::json!({"type":"user","cwd":"/home/user/data/orbitstore",
+                serde_json::json!({"type":"user","cwd":"/home/user/data/spindles",
                     "message":{"role":"user","content":"now build the graph"}}),
             ]),
         )
@@ -41690,7 +41690,7 @@ terminal_window_id: None,
                 .unwrap_or_else(|| panic!("script dropped {id}; emitted {} rows", scanned.len()))
                 .clone()
         };
-        assert_eq!(by_id("session-a").cwd, "/home/user/data/orbitstore");
+        assert_eq!(by_id("session-a").cwd, "/home/user/data/spindles");
         assert_eq!(by_id("session-b").cwd, "/home/user/gh/yggterm");
         assert_eq!(by_id("session-c").cwd, "/home/user/git/recipes");
         assert_eq!(by_id("session-c").title, "Renamed Late");

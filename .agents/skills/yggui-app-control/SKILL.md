@@ -180,12 +180,12 @@ instead of N cards stacking up and burying everything else.
 
 ```bash
 for pct in 0 25 50 75; do
-  yggterm-headless server app notify "Reindexing versestore" "$pct% — labs shard" \
-      --job versestore-reindex --progress "$pct" --session "$ROW"
+  yggterm-headless server app notify "Reindexing cogs" "$pct% — labs shard" \
+      --job cogs-reindex --progress "$pct" --session "$ROW"
   ... work ...
 done
-yggterm-headless server app notify "Reindexing versestore" "done — 8,412 docs" \
-    --job versestore-reindex --progress 100 --tone success --session "$ROW"
+yggterm-headless server app notify "Reindexing cogs" "done — 8,412 docs" \
+    --job cogs-reindex --progress 100 --tone success --session "$ROW"
 ```
 
 What the code does that the flags do not say:
@@ -275,12 +275,12 @@ experience* instead of against an API, and **iterate to a fix without the human 
 | **★ Drive a third-party TUI to extract what it knows** | launch someone else's full-screen CLI in a PTY, type into it, read its screen | The tool has no API. **The screen IS the API** |
 
 **The third use solved a real problem the same day this was written.** Every agy quota claim in the
-orbitstore campaign had been *inferred* from where runs stopped — a mysterious "5.79-day wall"
+spindles campaign had been *inferred* from where runs stopped — a mysterious "5.79-day wall"
 nobody could predict. agy publishes the numbers itself behind an interactive `/usage` screen, and
 nothing was reading them because nothing thought to **drive the TUI**. One PTY + `/usage` +
 read-the-buffer immediately overturned two standing beliefs (there are TWO limits, weekly and
 5-hourly; a whole model pool sat 100% unused). ⇒ **When a CLI "won't tell you" something, ask
-whether it tells a human. If it does, drive it.** (`~/data/orbitstore/bin/cg_agy_usage.py` is the
+whether it tells a human. If it does, drive it.** (`~/data/spindles/bin/cg_agy_usage.py` is the
 worked pattern: `pty.fork()` + `TERM` + `TIOCSWINSZ` + inject + strip ANSI + parse, raw kept.)
 
 ★★ **THIS INCLUDES CLAUDE CODE ITSELF — an agent CAN read its own account's quota.** The reflex

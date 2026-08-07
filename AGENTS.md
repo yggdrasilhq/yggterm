@@ -48,11 +48,36 @@ Full mission rationale: see `~/.claude/projects/-home-user-gh-yggterm/memory/pro
   DELETED 2026-08-07 on the user's call (*"far far superceded in concept"*).
   **Paper's role is retired**; ztlkasten took the brain-organization work.
   **Cellulose's name is reserved** and it returns as a fresh repo later. Do not
-  recreate either from this file. When cellulose does return it takes the launch
-  gate at `~/git/gour.top/docs/venture/ip-register.md` §THE LAUNCH GATE **Step 0
-  first** — lumenstore decides the licence before anything of his goes public.
-  Cellulose as a *design target* is still live throughout `docs/alt-keytips.md`
-  and `docs/agent-control-plane.md`; that is the concept, not a checkout.
+  recreate either from this file. When cellulose does return, its licence is
+  decided **before** the repo is made public, not after — see the maintainer's
+  private IP register for that gate. Cellulose as a *design target* is still
+  live throughout `docs/alt-keytips.md` and `docs/agent-control-plane.md`; that
+  is the concept, not a checkout.
+
+## ⛔⛔ PRIVACY — this repo is PUBLIC, and the leak vector is not a secret
+
+**Run `scripts/check-privacy.sh` before any commit that adds fixtures, docs or
+war-story comments.** It is enforced by `tests/privacy.rs`.
+
+On 2026-08-07 an audit found the maintainer's private working structure in this
+repo's tracked test fixtures: numbered sidebar row titles naming his real
+projects, personal home paths, and comments citing live legal filings by date.
+None of it was a credential, so no secret scanner would ever have caught it.
+
+**The vector, stated so it cannot be misread: an agent writing a REAL example
+into a fixture because a real example was in front of it.** Every instance
+arrived that way.
+
+⇒ **INVENT every example.** A session title, a path, a project name, a portal, a
+filename — make one up (`"3. widgets: refactor"`, `/home/user/proj`,
+`example.test`). A test fixture is published source, and an invented example
+tests exactly as well.
+⇒ **A war-story comment cites the SYMPTOM, never the case.** "a batch fill of an
+async autocomplete drops the second value" — not which portal, which filing,
+which date.
+⇒ **Never commit build artifacts** (`__pycache__`, `*.pyc`, stray `*.db`): a
+`.pyc` embeds the absolute source path of the machine that built it, which is
+exactly how one leak survived a content rewrite.
 
 ## ⛔ THE PRESENTATION POLICY — you may not flip these flags
 

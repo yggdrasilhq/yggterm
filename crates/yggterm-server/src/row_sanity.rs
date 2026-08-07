@@ -262,7 +262,7 @@ mod tests {
     }
 
     /// ⛔⛔ THE NEAR MISS, 2026-08-06. The first real user ran this on jojo and
-    /// it offered to CLOSE `live::c8a19e07` — a versestore lobe delegate five
+    /// it offered to CLOSE `live::c8a19e07` — a cogs lobe delegate five
     /// hours into its task, whose transcript had been written sixty seconds
     /// earlier. The row was created with `--machine-key dev`: registered on
     /// jojo, but the `claude` child lives on dev, so the local walk saw a PTY
