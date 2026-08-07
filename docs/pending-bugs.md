@@ -371,11 +371,43 @@ no way to learn that its delegate never heard it.
 
 **What to build, in order:**
 
-1. **A row state that distinguishes WEDGED from IDLE.** Both look identical today. The discriminator
-   is exactly what `submit` already computes — does the session echo-confirm that it is consuming
-   input? — so the signal exists and is simply not surfaced as row state. This is the same field
-   the working-indicator wants ([[spec-title-summary-working-indicator]]) and the same one the
-   three-tools-three-answers entry below asks for. **One honest field closes all three.**
+1. ✅ **A WEDGED-vs-IDLE discriminator — SHIPPED 3.0.48 as `server app terminal input-check`**,
+   live-proven on jojo against a deliberately frozen CLI (`kill -STOP` on the remote `claude`:
+   alive, composer displayed, consuming nothing — the wedge's exact signature, reproducible on
+   demand for the first time). All four verdicts measured:
+
+   | row state | answer |
+   |---|---|
+   | healthy Claude Code row | `consuming_input:true` in **248 ms** |
+   | `kill -STOP`ped CLI | `wedged:true` + the named remedy |
+   | plain shell row | `composer_shown:false` — *unanswerable*, explicitly NOT wedged |
+   | composer holding typed text | refuses by name rather than probing |
+
+   ⚖ **`wedged` is a POSITIVE claim, deliberately**: composer displayed AND no echo AND no draft.
+   A busy row mid-output answers `composer_shown:false` instead of `wedged:true`, because the
+   false positive is what would justify a reaper killing live work (item 3).
+   ⭐ And the contrast was captured in one sitting, on one frozen row, seconds apart:
+   `input-check` said `wedged:true` while `send` said `error:null, accepted:true, bytes:14`.
+   The instrument table below is no longer anecdote.
+
+   ⛔ **Two live corrections it cost, both worth carrying:**
+   - **The draft guard must read the SGR, not the text.** The probe types a marker and clears with
+     Ctrl+U, so it must refuse on an unsent draft — but a blunt "any text after the glyph is a
+     draft" was measured WRONG on two of three real composers: Claude Code draws its placeholder
+     (`Try "write a test for shell.rs"`) and the ghost of the last sent message BOTH as text after
+     the glyph, `ESC[2m` faint. The blunt rule refused every real row, i.e. it made the wedge
+     undetectable in exactly the case the guard exists to protect. Faint = the CLI's chrome;
+     normal intensity = the human's words. Locked with the verbatim raw lines.
+   - **It cannot see a row owned by an OLDER daemon** — the snapshot goes to the GUI's endpoint,
+     and a row whose PTY lives on a preserved predecessor answers `composer_shown:false`.
+     [[finding-daemon-side-fix-inert-under-proxy]], fifth sighting. Not fixed; say so when reading
+     an "unanswerable" verdict.
+
+   ⏳ **Still owed from this item:** the verdict is on-demand only and is NOT cached as row state,
+   so the sidebar still cannot show a wedge and neither can the working-indicator
+   ([[spec-title-summary-working-indicator]]) or the three-tools-three-answers entry below. The
+   probe is intrusive (it types), so a background poll is NOT the way to get there — cache the
+   last verdict on the session and carry it on the snapshot instead.
 2. **`send` must not report success without delivery** (see below).
 3. **An automatic remedy, gated carefully.** `server terminal restart` clears it, but ⛔ a reaper
    that restarts a row it wrongly believes wedged would destroy live work — so this needs the

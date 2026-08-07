@@ -21618,6 +21618,34 @@ pub fn submit_terminal_prompt(
     )
 }
 
+/// Ask whether a row is CONSUMING INPUT, and change nothing.
+///
+/// The verb exists because a wedged agent row is invisible: it is alive, its
+/// turn has ended, it draws its composer, and `send` into it answers
+/// `error: null` while delivering nothing. Until now the only thing that could
+/// see the difference was `submit`'s echo-confirm, which cannot be used as a
+/// question because it puts words in the row's mouth.
+pub fn run_app_control_check_terminal_input(
+    session_path: &str,
+    check_timeout_ms: u64,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    // The GUI polls for up to `check_timeout_ms`; give the IPC round trip room
+    // beyond that so the client does not time out over a check that is working.
+    let request_timeout_ms = timeout_ms.max(check_timeout_ms.saturating_add(10_000));
+    let response = request_app_control(
+        &home,
+        AppControlCommand::CheckTerminalInput {
+            session_path: session_path.to_string(),
+            timeout_ms: check_timeout_ms,
+        },
+        request_timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_reclaim_terminal_focus(
     session_path: &str,
     timeout_ms: u64,

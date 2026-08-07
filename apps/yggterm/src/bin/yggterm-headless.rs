@@ -53,7 +53,7 @@ use yggterm_server::{
     run_app_control_set_theme_editor_values, run_app_control_set_tree_selection,
     run_app_control_set_window_chrome_hover, run_app_control_show_start_page,
     run_app_control_split_web_tab, run_app_control_start_action,
-    run_app_control_submit_terminal_prompt, run_app_control_trigger_update_check,
+    run_app_control_check_terminal_input, run_app_control_submit_terminal_prompt, run_app_control_trigger_update_check,
     run_app_control_ungroup_split_group, run_attach, run_daemon, run_screenrecord_capture,
     run_screenshot_capture, run_screenshot_capture_with_post_process, run_trace_bundle,
     run_trace_follow, run_trace_tail, run_trace_transitions,
@@ -245,7 +245,7 @@ fn print_server_app_help() {
     what the widget would carry: a row id for a row_action, a tab id
     for tabs, absent for a plain button
   yggterm-headless server app update <check|restart>
-  yggterm-headless server app terminal <new|send|focus|probe-type|probe-scroll|probe-select|probe-context-menu> ...
+  yggterm-headless server app terminal <new|send|input-check|focus|probe-type|probe-scroll|probe-select|probe-context-menu> ...
   yggterm-headless server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|codex|claude-code>] [--title <title>] [--purpose <what-for>] [--no-activate]
       [--outline <prefix> | --insert-after <session-path>]
     with no --title the row is named for the driving agent and its purpose.
@@ -255,6 +255,14 @@ fn print_server_app_help() {
     from the rendered order rather than echoed from the request. Passing both,
     or a prefix that is not a dotted number, is refused BY NAME before the row
     is created.
+  yggterm-headless server app terminal input-check <session> [--check-timeout-ms <ms>]
+    Is this row CONSUMING INPUT? Answers and submits NOTHING, so it is safe to
+    point at a row the owner is using. A wedged agent row is ALIVE, its turn has
+    ENDED and it draws its composer, so every other signal calls it healthy and
+    `send` into it answers `error: null` while delivering nothing. `wedged:true`
+    is a POSITIVE claim (composer displayed AND no echo), never merely quiet;
+    a busy row mid-output answers `composer_shown:false` instead. Refuses by
+    name when the composer holds an unsent draft — the probe clears the line.
   yggterm-headless server app terminal send <session> (--data <data>|--stdin) [--allow-multiline]
     a payload with interior line breaks is REFUSED for an agent CLI row: its
     composer reads every \r as Enter, so line 1 submits alone and the rest
@@ -2743,6 +2751,35 @@ fn main() -> Result<()> {
                             session_path,
                             &data,
                             ready_timeout_ms,
+                            timeout_ms,
+                        )
+                    }
+                    "input-check" => {
+                        // The wedge question, asked without submitting anything:
+                        // is this row consuming input? A wedged agent row is
+                        // alive, idle-looking and deaf, and `send` into it
+                        // reports success while delivering nothing.
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app terminal input-check"
+                                )
+                            })?;
+                        let check_timeout_ms = args
+                            .windows(2)
+                            .find_map(|window| {
+                                if window[0] == "--check-timeout-ms" {
+                                    window[1].parse::<u64>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(6_000);
+                        run_app_control_check_terminal_input(
+                            session_path,
+                            check_timeout_ms,
                             timeout_ms,
                         )
                     }

@@ -901,6 +901,24 @@ pub enum AppControlCommand {
         #[serde(default)]
         timeout_ms: u64,
     },
+    /// Answer ONE question and change nothing: is this row CONSUMING INPUT?
+    ///
+    /// A wedged agent row — alive, turn ended, not reading its PTY — is
+    /// indistinguishable from a healthy idle row by every OS signal and by every
+    /// other verb: `send` answers `error: null` and delivers nothing. The only
+    /// thing that can see it is the echo-confirm `SubmitTerminalPrompt` already
+    /// performs, and until now that discipline was only reachable by SUBMITTING
+    /// something. This exposes it on its own so a row can be interrogated
+    /// without putting words in its mouth.
+    ///
+    /// Refuses by name rather than probing when the composer holds an unsent
+    /// draft: the probe types a marker and clears the line with Ctrl+U, which
+    /// would eat a half-written message.
+    CheckTerminalInput {
+        session_path: String,
+        #[serde(default)]
+        timeout_ms: u64,
+    },
     ReclaimTerminalFocus {
         session_path: String,
     },
@@ -1558,6 +1576,7 @@ impl AppControlCommand {
             Self::CreateTerminal { .. } => "create_terminal",
             Self::SendTerminalInput { .. } => "send_terminal_input",
             Self::SubmitTerminalPrompt { .. } => "submit_terminal_prompt",
+            Self::CheckTerminalInput { .. } => "check_terminal_input",
             Self::ReclaimTerminalFocus { .. } => "reclaim_terminal_focus",
             Self::RedrawTerminal { .. } => "redraw_terminal",
             Self::ReconcileTerminalFromDaemon { .. } => "reconcile_terminal_from_daemon",

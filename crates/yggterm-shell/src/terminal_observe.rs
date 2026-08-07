@@ -3543,6 +3543,103 @@ pub(crate) fn terminal_chunk_has_agent_composer_row(data: &str) -> bool {
     })
 }
 
+/// Whether the composer row currently holds TYPED TEXT the human has not sent.
+///
+/// The echo probe that proves a row is consuming input works by typing a marker
+/// and clearing the line with Ctrl+U. On an empty composer that is invisible; on
+/// a composer holding a half-written message it DESTROYS that message. So any
+/// caller that probes must ask this first and refuse by name — a probe that can
+/// eat the owner's sentence is one nobody will dare run on a live row, which
+/// would make the wedge unobservable in exactly the case that matters.
+///
+/// ⚠ **The discriminator is the SGR, not the text**, and a blunt "any content
+/// after the glyph is a draft" rule was measured WRONG in the direction that
+/// makes the whole check useless. Three live Claude Code composers on jojo
+/// (2026-08-07), raw:
+///
+/// ```text
+/// \x1b[m❯\xa0\x1b[2mTry "write a test for shell.rs"   <- fresh row: PLACEHOLDER
+/// \x1b[m❯\xa0\x1b[2msent it                            <- settled row: the last
+///                                                        message, shown as a ghost
+/// \x1b[38;2;153;153;153m❯                              <- genuinely empty
+/// ```
+///
+/// Two of the three carry text and NEITHER is the human's unsent words. The
+/// blunt rule refused the probe on both, which would have left the wedge
+/// undetectable on every real row — the exact outcome the guard exists to avoid.
+/// What separates them is `ESC[2m` (faint): the CLI draws its own chrome dimmed
+/// and the human's typing at normal intensity. So this reads the SGR state the
+/// composer content OPENS in, on the raw line, and treats faint as chrome.
+///
+/// The asymmetry still decides the ambiguous case: anything not provably faint
+/// counts as a draft, because a needless refusal costs a retry and a wrong
+/// "it is empty" costs the human's sentence.
+pub(crate) fn terminal_composer_row_holds_draft(data: &str) -> bool {
+    yggterm_core::AGENT_CLIS.iter().any(|descriptor| {
+        let Some(raw_line) = data
+            .split('\n')
+            .filter(|line| {
+                strip_terminal_control_sequences(line)
+                    .trim()
+                    .trim_start_matches(|ch: char| matches!(ch, '│' | ' '))
+                    .starts_with(descriptor.composer_marker)
+            })
+            .next_back()
+        else {
+            return false;
+        };
+        let Some(after_marker) = raw_line.split_once(descriptor.composer_marker) else {
+            return false;
+        };
+        composer_content_is_human_typed(after_marker.1)
+    })
+}
+
+/// Walk the composer's raw tail, tracking whether SGR faint is in force, and
+/// decide at the FIRST printable character. Empty tail ⇒ no draft.
+fn composer_content_is_human_typed(tail: &str) -> bool {
+    let mut faint = false;
+    let mut rest = tail;
+    while !rest.is_empty() {
+        if let Some(body) = rest.strip_prefix('\u{1b}') {
+            // Only CSI ... m carries intensity; every other escape is skipped
+            // whole so its parameters can never be mistaken for text.
+            let Some(after_bracket) = body.strip_prefix('[') else {
+                let skip = body.chars().next().map_or(1, char::len_utf8);
+                rest = &body[skip..];
+                continue;
+            };
+            let Some(end) = after_bracket.find(|ch: char| ch.is_ascii_alphabetic()) else {
+                return false;
+            };
+            let (params, terminator) = after_bracket.split_at(end);
+            if terminator.starts_with('m') {
+                if params.is_empty() {
+                    // A bare `ESC[m` is `ESC[0m` — a full reset.
+                    faint = false;
+                }
+                for param in params.split(';') {
+                    match param {
+                        "2" => faint = true,
+                        "0" | "" | "22" => faint = false,
+                        _ => {}
+                    }
+                }
+            }
+            rest = &after_bracket[end + 1..];
+            continue;
+        }
+        let ch = rest.chars().next().expect("non-empty");
+        if ch.is_whitespace() || ch == '\u{200b}' {
+            rest = &rest[ch.len_utf8()..];
+            continue;
+        }
+        // First real glyph: faint means the CLI drew it, not the human.
+        return !faint;
+    }
+    false
+}
+
 /// Screen text as the composer predicates read it: control sequences stripped,
 /// blank lines dropped, box-drawing chrome trimmed. Shared so the codex-shaped
 /// predicate and the any-agent gate cannot normalize differently and disagree
@@ -4151,7 +4248,7 @@ mod tests {
         describe_terminal_open_attempt, describe_viewport_snapshot,
         summarize_terminal_surface_for_app_control, terminal_bootstrap_activation_epoch,
         terminal_chunk_has_agent_composer_row, terminal_chunk_has_codex_prompt_output,
-        terminal_chunk_has_current_codex_input_row,
+        terminal_chunk_has_current_codex_input_row, terminal_composer_row_holds_draft,
         terminal_chunk_has_meaningful_output, terminal_chunk_is_claude_prompt_surface,
         terminal_chunk_is_codex_interactive_setup_prompt,
         terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_codex_session_not_on_remote,
@@ -5941,6 +6038,65 @@ Best thing to improve in the meantime:
         assert!(terminal_chunk_has_current_codex_input_row(codex));
         // Neither fires on a screen with no composer at all.
         assert!(!terminal_chunk_has_agent_composer_row(
+            "Do you want to proceed?\n1. Yes\n2. No"
+        ));
+    }
+
+    /// The input-consumption probe types a marker and clears the line with
+    /// Ctrl+U. On an empty composer that is invisible; on a composer holding a
+    /// half-written message it DESTROYS the human's words. This is the guard
+    /// between those cases, and every sample below is a VERBATIM raw composer
+    /// line captured off jojo's daemon screen on 2026-08-07 — because the first
+    /// version of this guard was written from a stripped-text reading of the
+    /// same rows and was wrong about two of the three.
+    #[test]
+    fn the_draft_guard_reads_the_sgr_not_the_text() {
+        // A fresh Claude Code row. There IS text after the glyph and it is the
+        // CLI's placeholder, drawn faint. Calling this a draft made the wedge
+        // check refuse on every newly created row — measured live before this
+        // test existed.
+        let fresh_placeholder = "~/gh/yggterm\n\u{1b}[m❯\u{a0}\u{1b}[2mTry \"write a test for shell.rs\"\n\u{1b}[38;2;136;136;136;22m──── ⏵⏵ bypass permissions on";
+        assert!(
+            !terminal_composer_row_holds_draft(fresh_placeholder),
+            "a faint placeholder is the CLI's chrome, not the human's words"
+        );
+        // A settled row echoing the last sent message as a faint ghost — same
+        // shape, also not a draft.
+        let ghost_of_last_message = "✻ Cooked for 4m 34s\n\u{1b}[m❯\u{a0}\u{1b}[2msent it\n\u{1b}[38;2;136;136;136;22m──── ⏵⏵ bypass permissions on";
+        assert!(
+            !terminal_composer_row_holds_draft(ghost_of_last_message),
+            "the faint echo of an already-sent message is not an unsent draft"
+        );
+        // The orchestrator's genuinely empty composer.
+        let empty = "It's now rebuilding the six positions on NSE names\n\u{1b}[38;2;153;153;153m❯\n\u{1b}[38;2;136;136;136m──── ⏵⏵ bypass permissions on";
+        assert!(
+            !terminal_composer_row_holds_draft(empty),
+            "an empty composer must be probeable, or the wedge stays invisible"
+        );
+        // The case the guard exists for: the human has typed and not sent. Same
+        // NBSP separator, NO faint — that one byte difference is the whole
+        // discriminator, and losing it costs a sentence.
+        let human_draft = "✻ Cooked for 4m 34s\n\u{1b}[m❯\u{a0}the records reply arrived, log it\n\u{1b}[38;2;136;136;136;22m──── ⏵⏵ bypass permissions on";
+        assert!(
+            terminal_composer_row_holds_draft(human_draft),
+            "typed-but-unsent text must refuse the probe — the probe would Ctrl+U it away"
+        );
+        // A reset BEFORE the text cancels an earlier faint: chrome then typing
+        // on the same line must still read as a draft.
+        assert!(terminal_composer_row_holds_draft(
+            "\u{1b}[m❯\u{a0}\u{1b}[2m\u{1b}[22mtyped after the ghost cleared"
+        ));
+        // Codex's glyph is a different character and a different byte length;
+        // the guard must not be tuned to one CLI's marker.
+        assert!(terminal_composer_row_holds_draft(
+            "› write the brief\n\n  gpt-5.5 xhigh · ~/gh/yggterm"
+        ));
+        assert!(!terminal_composer_row_holds_draft(
+            "›\n\n  gpt-5.5 xhigh · ~/gh/yggterm"
+        ));
+        // No composer at all is not a draft — that row is mid-output or in a
+        // menu, and the probe refuses it for a DIFFERENT named reason.
+        assert!(!terminal_composer_row_holds_draft(
             "Do you want to proceed?\n1. Yes\n2. No"
         ));
     }
