@@ -2483,7 +2483,7 @@ inherits a sibling's liveness; (iv) `pgrep` counts the querying shell. **Same sh
 split every time: asked about one thing, answered about another.** Only `terminal submit`'s
 `unanswerable` currently keeps the law.
 
-## The headless engine cannot pay by card — `ctl fill-card` does not exist
+## `server app web fill-card` answers `matched:false` on fills that landed perfectly
 
 **Status:** OPEN
 
@@ -2498,10 +2498,13 @@ dev's install.
 
 ⚖ **TRIAGED 2026-08-07 — two owners, and only one of them is this queue.**
 
-- **Asks 1 and 2 are ychrome's** (`ctl fill-card`; `ctl fill` missing from the engine's usage
-  banner). Both are engine verbs, so they live in `ychrome/docs/pending-bugs.md`, the one answer to
-  what is open for ychrome. Cross-referenced, never duplicated.
-- **Ask 3 stays here:** `server app web fill-card` is a yggterm verb.
+- **Asks 1 and 2 were ychrome's** (`ctl fill-card`; `ctl fill` missing from the engine's usage
+  banner). Both are engine verbs, so they lived in `ychrome/docs/pending-bugs.md`, the one answer to
+  what is open for ychrome. Cross-referenced, never duplicated. **Both have SHIPPED** — see git
+  there; the entry that owned them is deleted, and this entry's title changed with them, because a
+  heading that still said *"the engine cannot pay by card"* would answer a status question this
+  file does not own.
+- **Ask 3 stays here:** `server app web fill-card` is a yggterm verb, and it is what remains below.
 
 ⭐ **AND THE REPORT CLOSED AN OPEN ENTRY IN THIS FILE.** *"Agent engine: ctl fill is documented but
 has no route"* sat at **FIXED IN CODE — LIVE PROOF OWED**, blocked on exactly one observation:
