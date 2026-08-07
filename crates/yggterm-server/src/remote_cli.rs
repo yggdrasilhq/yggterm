@@ -3,12 +3,17 @@ use crate::{
     run_remote_cc_rename, run_remote_local_codex_identities, run_remote_preview,
     run_remote_preview_head,
     run_remote_preview_tail, run_remote_protocol_version, run_remote_refresh_managed_cli,
-    run_remote_resume_cc, run_remote_resume_codex, run_remote_saved_codex_session_exists,
-    run_remote_scan, run_remote_stage_clipboard_png, run_remote_start_cc, run_remote_start_codex,
-    run_remote_agent_runtime_alive, run_remote_apps, run_remote_terminate_cc,
+    run_remote_resume_agent, run_remote_resume_cc, run_remote_resume_codex,
+    run_remote_saved_agent_session_exists, run_remote_saved_codex_session_exists,
+    run_remote_scan, run_remote_stage_clipboard_png, run_remote_start_agent, run_remote_start_cc,
+    run_remote_start_codex,
+    run_remote_agent_runtime_alive, run_remote_apps, run_remote_terminate_agent,
+    run_remote_terminate_cc,
     run_remote_terminate_codex, run_remote_upsert_generated_copy,
 };
 use anyhow::{Result, bail};
+use yggterm_core::SessionKind;
+use yggterm_core::agent_cli::AGENT_CLIS;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteServerCommand {
@@ -102,6 +107,78 @@ pub enum RemoteServerCommand {
     UpsertGeneratedCopy {
         session_id: String,
     },
+    /// The four wrapper verbs of every CLI registered AFTER the codex/cc pair
+    /// above, carried as ONE kind-bearing variant each.
+    ///
+    /// The pair above keeps its own variants so `resume-codex` / `resume-cc`
+    /// parse and dispatch byte-for-byte — those strings are on the wire between
+    /// machines that may be running different builds. Everything after them
+    /// derives its verbs from `wrapper_slug`, so registering a CLI is what makes
+    /// `resume-<slug>` work; there is no per-CLI literal to remember.
+    ResumeAgent {
+        kind: SessionKind,
+        session_id: String,
+        cwd: Option<String>,
+        require_existing: bool,
+    },
+    StartAgent {
+        kind: SessionKind,
+        session_id: String,
+        cwd: Option<String>,
+    },
+    TerminateAgent {
+        kind: SessionKind,
+        session_id: String,
+    },
+    SavedAgentSessionExists {
+        kind: SessionKind,
+        session_id: String,
+    },
+}
+
+/// Which registered CLI a wrapper verb belongs to, and which of the four verbs
+/// it is.
+///
+/// Derived from `wrapper_slug` — `resume-<slug>`, `start-<slug>`,
+/// `terminate-<slug>`, `<slug>-session-exists` — rather than 24 more literal
+/// match arms. The three shipped CLIs are matched here too and then routed to
+/// their own dedicated variants below, so this parser and the literals stay
+/// provably in agreement instead of being two spellings of one verb table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapperVerb {
+    Resume,
+    Start,
+    Terminate,
+    SessionExists,
+}
+
+fn parse_wrapper_verb(verb: &str) -> Option<(SessionKind, WrapperVerb)> {
+    AGENT_CLIS.iter().find_map(|descriptor| {
+        let which = if descriptor.resume_subcommand().as_deref() == Some(verb) {
+            WrapperVerb::Resume
+        } else if descriptor.start_subcommand().as_deref() == Some(verb) {
+            WrapperVerb::Start
+        } else if descriptor.terminate_subcommand().as_deref() == Some(verb) {
+            WrapperVerb::Terminate
+        } else if descriptor.session_exists_subcommand().as_deref() == Some(verb) {
+            WrapperVerb::SessionExists
+        } else {
+            return None;
+        };
+        Some((descriptor.kind, which))
+    })
+}
+
+/// The optional positional cwd that follows a session id: the first argument
+/// after it that is not a flag. Spelled once because all four verbs read it the
+/// same way, and the four hand-copied closures it replaced are where a fifth
+/// would have been copied slightly differently.
+fn positional_cwd(args: &[String]) -> Option<String> {
+    args.iter()
+        .skip(4)
+        .find(|value| !value.starts_with("--"))
+        .cloned()
+        .filter(|value| !value.is_empty())
 }
 
 pub fn try_run_remote_server_command(args: &[String]) -> Result<bool> {
@@ -207,7 +284,42 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
         "upsert-generated-copy" if args.len() == 4 => RemoteServerCommand::UpsertGeneratedCopy {
             session_id: args[3].clone(),
         },
-        _ => return Ok(None),
+        // Every OTHER registered CLI's four verbs, resolved against the wrapper
+        // registry. Reached only when none of the literals above matched, so
+        // the shipped spellings keep their exact arms and their exact arity
+        // rules; this arm is what makes `resume-pi` / `start-agy` /
+        // `qwen-session-exists` exist at all, and it cannot fall behind the
+        // registry because it IS the registry.
+        other => match parse_wrapper_verb(other) {
+            Some((kind, WrapperVerb::Resume)) if args.len() >= 4 => {
+                RemoteServerCommand::ResumeAgent {
+                    kind,
+                    session_id: args[3].clone(),
+                    cwd: positional_cwd(args),
+                    require_existing: args.iter().any(|value| value == "--require-existing"),
+                }
+            }
+            Some((kind, WrapperVerb::Start)) if args.len() >= 4 => {
+                RemoteServerCommand::StartAgent {
+                    kind,
+                    session_id: args[3].clone(),
+                    cwd: positional_cwd(args),
+                }
+            }
+            Some((kind, WrapperVerb::Terminate)) if args.len() == 4 => {
+                RemoteServerCommand::TerminateAgent {
+                    kind,
+                    session_id: args[3].clone(),
+                }
+            }
+            Some((kind, WrapperVerb::SessionExists)) if args.len() == 4 => {
+                RemoteServerCommand::SavedAgentSessionExists {
+                    kind,
+                    session_id: args[3].clone(),
+                }
+            }
+            _ => return Ok(None),
+        },
     };
     Ok(Some(command))
 }
@@ -265,10 +377,39 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
         RemoteServerCommand::UpsertGeneratedCopy { session_id } => {
             run_remote_upsert_generated_copy(&session_id)
         }
+        RemoteServerCommand::ResumeAgent {
+            kind,
+            session_id,
+            cwd,
+            require_existing,
+        } => run_remote_resume_agent(kind, &session_id, cwd.as_deref(), require_existing),
+        RemoteServerCommand::StartAgent {
+            kind,
+            session_id,
+            cwd,
+        } => run_remote_start_agent(kind, &session_id, cwd.as_deref()),
+        RemoteServerCommand::TerminateAgent { kind, session_id } => {
+            run_remote_terminate_agent(&session_id, kind)
+        }
+        RemoteServerCommand::SavedAgentSessionExists { kind, session_id } => {
+            run_remote_saved_agent_session_exists(kind, &session_id)
+        }
     }
 }
 
+/// Resolve `ensure-managed-cli <name>` to a provisioning key.
+///
+/// Registry-first, so every CLI's slug works the moment it is registered; the
+/// three literals below are legacy spellings already on the wire between
+/// machines (`claude` is the BINARY name, not the slug).
 fn parse_managed_cli_tool(value: &str) -> Result<ManagedCliTool> {
+    if let Some(descriptor) = AGENT_CLIS
+        .iter()
+        .find(|descriptor| descriptor.slug == value || descriptor.binary_name == value)
+        && let Some(tool) = ManagedCliTool::from_session_kind(descriptor.kind)
+    {
+        return Ok(tool);
+    }
     match value {
         "codex" => Ok(ManagedCliTool::Codex),
         "codex-litellm" => Ok(ManagedCliTool::CodexLiteLlm),
@@ -446,6 +587,101 @@ mod tests {
             parse_remote_server_command(&args)
                 .expect("parse command")
                 .is_none()
+        );
+    }
+
+    /// Every registered CLI's four wrapper verbs must PARSE. The bug this locks
+    /// out is not a wrong answer but a missing one: an unparsed verb falls
+    /// through to `Ok(None)`, the wrapper reports "unknown command" on the far
+    /// side of an ssh hop, and the row it was launching never appears.
+    ///
+    /// Byte-for-byte on the two shipped spellings is asserted separately above
+    /// (`parse_resume_cc_and_start_cc_mirror_codex`,
+    /// `parse_resume_codex_supports_require_existing_and_cwd`); this one proves
+    /// the SET is complete.
+    #[test]
+    fn every_registered_cli_has_all_four_wrapper_verbs_parsing() {
+        for descriptor in AGENT_CLIS {
+            let Some(wrapper) = descriptor.wrapper_slug else {
+                // ⛔ LOCAL-ONLY (codex-litellm). It has no remote arm at all, so
+                // it must contribute NO verbs — asserted, because a local-only
+                // CLI that quietly grew wrapper verbs would be reachable over
+                // ssh with no row scheme to name the result.
+                assert!(
+                    descriptor.resume_subcommand().is_none()
+                        && descriptor.start_subcommand().is_none()
+                        && descriptor.terminate_subcommand().is_none()
+                        && descriptor.session_exists_subcommand().is_none(),
+                    "{:?} is local-only yet names a wrapper verb",
+                    descriptor.kind
+                );
+                continue;
+            };
+            let verbs = [
+                (format!("resume-{wrapper}"), true),
+                (format!("start-{wrapper}"), true),
+                (format!("terminate-{wrapper}"), false),
+                (format!("{wrapper}-session-exists"), false),
+            ];
+            for (verb, takes_cwd) in verbs {
+                let mut args = vec![
+                    "server".to_string(),
+                    "remote".to_string(),
+                    verb.clone(),
+                    "00000000-0000-4000-8000-000000000001".to_string(),
+                ];
+                if takes_cwd {
+                    args.push("/home/user/gh/yggterm".to_string());
+                }
+                let parsed = parse_remote_server_command(&args)
+                    .unwrap_or_else(|error| panic!("{verb}: parse failed: {error}"));
+                assert!(
+                    parsed.is_some(),
+                    "{verb} does not parse — the wrapper would answer 'unknown command' \
+                     across the ssh hop and the session would never appear",
+                );
+            }
+        }
+    }
+
+    /// The generic parser must resolve a NEW CLI's verb to that CLI, not to
+    /// codex. `resume-pi` reaching `ResumeCodex` is the exact silent failure the
+    /// `_ =>` catch-alls produced everywhere else.
+    #[test]
+    fn a_new_clis_verb_resolves_to_that_cli() {
+        let command = parse_remote_server_command(&[
+            "server".to_string(),
+            "remote".to_string(),
+            "resume-pi".to_string(),
+            "abc-123".to_string(),
+            "/srv/ws".to_string(),
+            "--require-existing".to_string(),
+        ])
+        .expect("parse")
+        .expect("command");
+        assert_eq!(
+            command,
+            RemoteServerCommand::ResumeAgent {
+                kind: SessionKind::Pi,
+                session_id: "abc-123".to_string(),
+                cwd: Some("/srv/ws".to_string()),
+                require_existing: true,
+            }
+        );
+        let exists = parse_remote_server_command(&[
+            "server".to_string(),
+            "remote".to_string(),
+            "agy-session-exists".to_string(),
+            "abc-123".to_string(),
+        ])
+        .expect("parse")
+        .expect("command");
+        assert_eq!(
+            exists,
+            RemoteServerCommand::SavedAgentSessionExists {
+                kind: SessionKind::Antigravity,
+                session_id: "abc-123".to_string(),
+            }
         );
     }
 

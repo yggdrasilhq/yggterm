@@ -49,7 +49,7 @@ Nine questions, and the answer to each is a descriptor field:
 | 8 | What glyph heads its input composer? | its prompt component | `composer_marker`, `composer_footer_hints` |
 | 9 | What permission postures can it express? | `--help` on an installed copy | `permission_modes`, `overridden_flags` |
 
-**The shallow clones live at `/home/pi/gh/cli-reference/<name>`** — that is where
+**The shallow clones live at `~/gh/cli-reference/<name>`** — that is where
 the 2026-08-08 intake read its answers, and where the next one should.
 
 ### The three answers that are allowed to be "I don't know"

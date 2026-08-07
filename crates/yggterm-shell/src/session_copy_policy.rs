@@ -42,13 +42,25 @@ pub(crate) fn shell_title_case_words(value: &str) -> String {
 }
 
 pub(crate) fn terminal_kind_title_suffix(kind: SessionKind) -> &'static str {
+    // An agent CLI's human name is its own to declare — the descriptor's
+    // `display_name` is the same string the metadata rail, the menus and the
+    // start page use, so a row's title cannot call it something else.
+    if let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(kind) {
+        // ⚠ `Codex LiteLLM` with a space, not the descriptor's hyphenated
+        // `Codex-LiteLLM`: this string is title PROSE and lands in
+        // `looks_like_generated_fallback_title`'s word matching, which the
+        // hyphen would change.
+        return match kind {
+            SessionKind::CodexLiteLlm => "Codex LiteLLM",
+            _ => descriptor.display_name,
+        };
+    }
     match kind {
-        SessionKind::Codex => "Codex",
-        SessionKind::CodexLiteLlm => "Codex LiteLLM",
-        SessionKind::ClaudeCode => "Claude Code",
         SessionKind::Shell => "Shell",
         SessionKind::SshShell => "SSH Terminal",
         SessionKind::Document => "Document",
+        // Unreachable: every agent kind took the branch above.
+        _ => "Shell",
     }
 }
 
@@ -77,13 +89,14 @@ pub(crate) fn humanized_terminal_title(
         let title = format!("{} {suffix}", shell_title_case_words(host_label));
         return (!looks_like_generated_fallback_title(&title)).then_some(title);
     }
+    if kind.is_agent() {
+        return Some(format!("{suffix} Session"));
+    }
     Some(match kind {
-        SessionKind::Codex => "Codex Session".to_string(),
-        SessionKind::CodexLiteLlm => "Codex LiteLLM Session".to_string(),
-        SessionKind::ClaudeCode => "Claude Code Session".to_string(),
         SessionKind::Shell => "Local Terminal".to_string(),
         SessionKind::SshShell => "SSH Terminal".to_string(),
         SessionKind::Document => "Document".to_string(),
+        _ => "Local Terminal".to_string(),
     })
 }
 
@@ -214,7 +227,7 @@ mod tests {
         );
         assert_eq!(
             humanized_terminal_title(SessionKind::Codex, "/home/user", Some("dev")),
-            Some("Pi Home Codex".to_string())
+            Some("User Home Codex".to_string())
         );
     }
 }

@@ -9,6 +9,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+use yggterm_core::agent_cli::{AgentCliDescriptor, CliInstall, agent_cli_descriptor};
 use yggterm_core::{
     AgentLaunchOptions, ENV_YGGTERM_HOME, PerfSpan, SessionStore, append_trace_event,
     resolve_yggterm_home,
@@ -54,6 +55,16 @@ pub enum ManagedCliTool {
     Codex,
     CodexLiteLlm,
     ClaudeCode,
+    // The 2026-08-08 intake. Every registered CLI needs a row here or
+    // `managed_cli_tool_and_descriptor_agree_on_every_binary_name` fails: a CLI
+    // with no provisioning key is one yggterm can launch but never install, and
+    // "it is not installed" would surface as a launch that dies at the PTY.
+    Pi,
+    OpenCode,
+    QwenCode,
+    Kimi,
+    Muse,
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,42 +151,93 @@ pub(crate) enum ManagedCliAction<'a> {
 }
 
 impl ManagedCliTool {
+    /// The session kind this provisioning key serves.
+    ///
+    /// The ONE place the two enums are matched up. Everything else a tool knows
+    /// about itself — binary, package, display name — is read off the registry
+    /// descriptor from here, so the second hand-kept table those used to live in
+    /// cannot drift from the one the launcher reads.
+    fn session_kind(self) -> SessionKind {
+        match self {
+            Self::Codex => SessionKind::Codex,
+            Self::CodexLiteLlm => SessionKind::CodexLiteLlm,
+            Self::ClaudeCode => SessionKind::ClaudeCode,
+            Self::Pi => SessionKind::Pi,
+            Self::OpenCode => SessionKind::OpenCode,
+            Self::QwenCode => SessionKind::QwenCode,
+            Self::Kimi => SessionKind::Kimi,
+            Self::Muse => SessionKind::Muse,
+            Self::Antigravity => SessionKind::Antigravity,
+        }
+    }
+
+    fn descriptor(self) -> &'static AgentCliDescriptor {
+        agent_cli_descriptor(self.session_kind())
+            .expect("every managed CLI tool names a registered agent CLI")
+    }
+
     pub(crate) fn from_session_kind(kind: SessionKind) -> Option<Self> {
-        match kind {
-            SessionKind::Codex => Some(Self::Codex),
-            SessionKind::CodexLiteLlm => Some(Self::CodexLiteLlm),
+        Some(match kind {
+            SessionKind::Codex => Self::Codex,
+            SessionKind::CodexLiteLlm => Self::CodexLiteLlm,
             // Claude Code ships as @anthropic-ai/claude-code on npm and
             // releases near-daily; an unmanaged binary goes missing/stale and
             // the user pays an interactive `npm up -g` round-trip mid-flow.
             // Managing it gives CC the same self-provisioning + 6h refresh
             // the codex CLIs get ([[spec-cli-binary-auto-provisioning]]).
-            SessionKind::ClaudeCode => Some(Self::ClaudeCode),
-            SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => None,
-        }
+            SessionKind::ClaudeCode => Self::ClaudeCode,
+            SessionKind::Pi => Self::Pi,
+            SessionKind::OpenCode => Self::OpenCode,
+            SessionKind::QwenCode => Self::QwenCode,
+            SessionKind::Kimi => Self::Kimi,
+            SessionKind::Muse => Self::Muse,
+            SessionKind::Antigravity => Self::Antigravity,
+            SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => return None,
+        })
     }
 
     pub(crate) fn binary_name(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::CodexLiteLlm => "codex-litellm",
-            Self::ClaudeCode => "claude",
+        self.descriptor().binary_name
+    }
+
+    /// The npm package `npm i -g` may be handed for this tool, or `None` when
+    /// this CLI is not npm-provisionable AT ALL.
+    ///
+    /// ⛔ **`Uv`, `VendorScript` and `Manual` answer `None`, and the installer
+    /// refuses them BY NAME.** The old table answered every tool with a package
+    /// string, so a uv/vendor CLI reaching [`install_latest`] would have been
+    /// appended to one `npm install -g` line — and npm fails the WHOLE batch on
+    /// one unresolvable name, which would have taken codex and claude down with
+    /// it rather than skipping the one tool npm cannot serve.
+    pub(crate) fn npm_package(self) -> Option<&'static str> {
+        // ✅ The `CodexLiteLlm` override that stood here from 2026-08-08 is
+        // GONE, having done its job: it recorded that the filesystem said npm
+        // while the descriptor said Manual, and the descriptor was corrected to
+        // `CliInstall::Npm("@avikalpa/codex-litellm")` in the same day. The
+        // measurement outlived the workaround, which is the right order.
+        match self.descriptor().install {
+            CliInstall::Npm(package) => Some(package),
+            CliInstall::Uv(_) | CliInstall::VendorScript(_) | CliInstall::Manual => None,
         }
     }
 
+    /// What a status report NAMES as this tool's provisioning source. Not a
+    /// package to install — [`Self::npm_package`] is the only thing allowed to
+    /// answer that — but the thing a human reads to know where the binary comes
+    /// from, which for a uv/vendor/manual CLI is not an npm package at all.
     pub(crate) fn package_name(self) -> &'static str {
-        match self {
-            Self::Codex => "@openai/codex",
-            Self::CodexLiteLlm => "@avikalpa/codex-litellm",
-            Self::ClaudeCode => "@anthropic-ai/claude-code",
+        if let Some(package) = self.npm_package() {
+            return package;
+        }
+        match self.descriptor().install {
+            CliInstall::Npm(package) | CliInstall::Uv(package) => package,
+            CliInstall::VendorScript(url) => url,
+            CliInstall::Manual => "(installed by hand — yggterm never provisions it)",
         }
     }
 
     fn display_name(self) -> &'static str {
-        match self {
-            Self::Codex => "Codex",
-            Self::CodexLiteLlm => "Codex-LiteLLM",
-            Self::ClaudeCode => "Claude Code",
-        }
+        self.descriptor().display_name
     }
 }
 
@@ -329,6 +391,18 @@ fn save_managed_cli_refresh_state(home: &Path, state: &ManagedCliRefreshState) -
         }
     }
     Ok(())
+}
+
+/// Every registered agent CLI, as provisioning keys, in registry order.
+///
+/// The refresh sweep's roster. Derived so registering a CLI is the ONLY step
+/// needed to get it probed and version-reported; the hand-listed array this
+/// replaced is where a new CLI silently stayed invisible to provisioning.
+fn managed_cli_tools_for_refresh() -> Vec<ManagedCliTool> {
+    yggterm_core::agent_cli::AGENT_CLIS
+        .iter()
+        .filter_map(|descriptor| ManagedCliTool::from_session_kind(descriptor.kind))
+        .collect()
 }
 
 fn probe_tools(
@@ -1724,6 +1798,29 @@ fn install_latest(
     tools: &[ManagedCliTool],
     background: bool,
 ) -> Result<()> {
+    // ⛔ A tool whose descriptor does not say `CliInstall::Npm` is REFUSED BY
+    // NAME here, never appended to the npm line. npm fails a whole `install -g`
+    // batch on one unresolvable name, so a silent fallthrough would not install
+    // the wrong package — it would take every OTHER tool's refresh down with it
+    // and report the failure against all of them.
+    let (npm_tools, refused): (Vec<_>, Vec<_>) = tools
+        .iter()
+        .copied()
+        .partition(|tool| tool.npm_package().is_some());
+    if !refused.is_empty() {
+        let names = refused
+            .iter()
+            .map(|tool| format!("{} ({})", tool.display_name(), tool.package_name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "these CLIs are not npm-provisionable and must not be handed to `npm install -g`: \
+             {names}"
+        );
+    }
+    if npm_tools.is_empty() {
+        return Ok(());
+    }
     let npm = npm_binary().context("npm is required to manage Codex tools")?;
     paths.ensure_dirs()?;
     let mut command = Command::new(npm);
@@ -1740,8 +1837,11 @@ fn install_latest(
     if background {
         command.arg("--silent");
     }
-    for tool in tools {
-        command.arg(format!("{}@latest", tool.package_name()));
+    for tool in &npm_tools {
+        let package = tool
+            .npm_package()
+            .expect("partitioned above: only npm-provisionable tools reach here");
+        command.arg(format!("{package}@latest"));
     }
     let output = command
         .stdout(Stdio::null())
@@ -1976,12 +2076,27 @@ fn configured_cli_extra_arg_tokens(kind: SessionKind) -> Vec<String> {
     let settings = SessionStore::open_or_init()
         .and_then(|store| store.load_settings())
         .ok();
+    // ⚖ NOT descriptor-derivable, and the arms are spelled out rather than left
+    // to a `_` so that stays visible: the settings store has exactly TWO
+    // extra-args fields (`codex_extra_args`, `claude_code_extra_args`), and a
+    // CLI with no field of its own has no configured args — not codex's.
+    // Giving a new CLI codex's flags is how `--sandbox workspace-write` would
+    // reach a binary that has never heard of it and refuse to start.
     let raw = match kind {
         SessionKind::Codex | SessionKind::CodexLiteLlm => {
             settings.map(|settings| settings.codex_extra_args)
         }
         SessionKind::ClaudeCode => settings.map(|settings| settings.claude_code_extra_args),
-        _ => None,
+        // The 2026-08-08 intake owns no settings field yet. A DECLARED gap:
+        // per-launch `--model` / `--permission-mode` still work for them
+        // (those ride `AgentLaunchOptions`, not this).
+        SessionKind::Pi
+        | SessionKind::OpenCode
+        | SessionKind::QwenCode
+        | SessionKind::Kimi
+        | SessionKind::Muse
+        | SessionKind::Antigravity => None,
+        SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => None,
     }
     .unwrap_or_default();
     split_extra_args(&raw)
@@ -2242,7 +2357,11 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
     );
     let before = probe_tool(&paths, tool);
     let refresh_state = load_managed_cli_refresh_state(&paths.home);
-    let npm_available = npm_binary().is_some();
+    // A CLI yggterm does not install is one it may only DETECT. Gating the
+    // refresh on it here (rather than letting `install_latest` bail) keeps the
+    // ready/system_fallback answer for a uv- or vendor-installed CLI that is
+    // sitting on PATH — refusing to install must not read as "unavailable".
+    let npm_available = npm_binary().is_some() && tool.npm_package().is_some();
     if npm_available
         && managed_cli_explicit_refresh_needed(tool, &before, &refresh_state, now_ms, ttl_ms)
     {
@@ -2340,6 +2459,17 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
         return Ok(status);
     }
 
+    // Absent AND not ours to install. Refused BY NAME, with the source the
+    // descriptor declares, because "yggterm will fix this for you" is a promise
+    // it cannot keep for a uv/vendor/manual CLI and a silent npm attempt would
+    // install nothing under a name that looks right.
+    if tool.npm_package().is_none() {
+        anyhow::bail!(
+            "{} is not installed and yggterm does not provision it — install it yourself from {}",
+            tool.display_name(),
+            tool.package_name()
+        );
+    }
     install_latest(&paths, &[tool], false)?;
     let after = probe_tool(&paths, tool);
     if !after.available {
@@ -2403,11 +2533,11 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
         }),
     );
     let perf = PerfSpan::start(&paths.home, "cli", "refresh_managed_codex");
-    let tools = [
-        ManagedCliTool::Codex,
-        ManagedCliTool::CodexLiteLlm,
-        ManagedCliTool::ClaudeCode,
-    ];
+    // DERIVED from the CLI registry, not hand-listed: the three-name array this
+    // replaced is the shape where a newly registered CLI is launchable but
+    // never provisioned or version-reported, which surfaces to the user as a
+    // session that dies at the PTY with no telemetry saying why.
+    let tools = managed_cli_tools_for_refresh();
     let before = probe_tools(&paths, &tools);
     record_managed_cli_probe_span(
         &paths.home,
@@ -2481,7 +2611,16 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
     ) {
         install_attempted = true;
         let install_perf = PerfSpan::start(&paths.home, "cli", "refresh_managed_codex_install");
-        if let Err(error) = install_latest(&paths, &tools, background) {
+        // Only the npm half goes to npm. The uv/vendor/manual CLIs are still
+        // PROBED above (their version is reported like any other), they are just
+        // not this installer's to fetch — and handing them over would fail the
+        // whole batch, taking codex and claude's refresh with them.
+        let installable = tools
+            .iter()
+            .copied()
+            .filter(|tool| tool.npm_package().is_some())
+            .collect::<Vec<_>>();
+        if let Err(error) = install_latest(&paths, &installable, background) {
             install_error = Some(error.to_string());
         }
         install_perf.finish(serde_json::json!({

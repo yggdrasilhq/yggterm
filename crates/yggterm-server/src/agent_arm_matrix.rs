@@ -53,7 +53,17 @@ struct Arm {
     kind: SessionKind,
     locality: Locality,
     /// The scheme that names a ROW on this arm.
-    row_scheme: &'static str,
+    ///
+    /// `None` on a REMOTE arm means this CLI has no remote arm at all — it is
+    /// LOCAL-ONLY, which the descriptor declares by carrying no `wrapper_slug`
+    /// (`CodexLiteLlm`). The row still exists so [`every_registered_cli_has_both_arms`]
+    /// keeps its shape: "this CLI cannot go remote" is an ANSWER the matrix
+    /// records, not a row that may be left out.
+    ///
+    /// It used to be `remote-session://` for codex-litellm — codex's scheme,
+    /// borrowed — which is the same class of borrowing this whole module exists
+    /// to catch.
+    row_scheme: Option<&'static str>,
     /// The scheme that names the RUNTIME on this arm (`None` where the row
     /// scheme is also the runtime key — `local://` is both, which the scheme
     /// registry models rather than papers over).
@@ -83,7 +93,7 @@ const ARMS: &[Arm] = &[
     Arm {
         kind: SessionKind::Codex,
         locality: Locality::Local,
-        row_scheme: "local://",
+        row_scheme: Some("local://"),
         runtime_scheme: None,
         remote_resume_subcommand: None,
         remote_start_subcommand: None,
@@ -96,7 +106,7 @@ const ARMS: &[Arm] = &[
     Arm {
         kind: SessionKind::Codex,
         locality: Locality::Remote,
-        row_scheme: "remote-session://",
+        row_scheme: Some("remote-session://"),
         runtime_scheme: Some("codex-runtime://"),
         remote_resume_subcommand: Some("resume-codex"),
         remote_start_subcommand: Some("start-codex"),
@@ -109,7 +119,7 @@ const ARMS: &[Arm] = &[
     Arm {
         kind: SessionKind::CodexLiteLlm,
         locality: Locality::Local,
-        row_scheme: "local://",
+        row_scheme: Some("local://"),
         runtime_scheme: None,
         remote_resume_subcommand: None,
         remote_start_subcommand: None,
@@ -124,10 +134,15 @@ const ARMS: &[Arm] = &[
     Arm {
         kind: SessionKind::CodexLiteLlm,
         locality: Locality::Remote,
-        row_scheme: "remote-session://",
-        runtime_scheme: Some("codex-runtime://"),
-        remote_resume_subcommand: Some("resume-codex"),
-        remote_start_subcommand: Some("start-codex"),
+        // ⛔ NO REMOTE ARM. The descriptor says so (`wrapper_slug: None`), and
+        // every remote accessor now agrees: no row scheme, no runtime key, no
+        // wrapper verbs. This row used to claim codex's `remote-session://` +
+        // `resume-codex`, which meant a remote codex-litellm row would have
+        // been resumed as CODEX — the wrong binary against the wrong store.
+        row_scheme: None,
+        runtime_scheme: None,
+        remote_resume_subcommand: None,
+        remote_start_subcommand: None,
         write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
         binary: "codex-litellm",
         resume_selector_token: "resume",
@@ -137,7 +152,7 @@ const ARMS: &[Arm] = &[
     Arm {
         kind: SessionKind::ClaudeCode,
         locality: Locality::Local,
-        row_scheme: "local://",
+        row_scheme: Some("local://"),
         runtime_scheme: None,
         remote_resume_subcommand: None,
         remote_start_subcommand: None,
@@ -150,7 +165,7 @@ const ARMS: &[Arm] = &[
     Arm {
         kind: SessionKind::ClaudeCode,
         locality: Locality::Remote,
-        row_scheme: "remote-cc://",
+        row_scheme: Some("remote-cc://"),
         runtime_scheme: Some("cc-runtime://"),
         remote_resume_subcommand: Some("resume-cc"),
         remote_start_subcommand: Some("start-cc"),
@@ -159,6 +174,179 @@ const ARMS: &[Arm] = &[
         resume_selector_token: "--resume",
         re_roots_with_cwd: false,
         store_globs: &[".claude/projects/*/*.jsonl"],
+    },
+    // ── The 2026-08-08 intake. Each pair is TRANSCRIBED from the CLI's
+    // descriptor rather than read from it at runtime: a table that reads the
+    // registry would agree with the registry by construction and catch nothing.
+    // What the assertions below then check is that the PRODUCT's answers —
+    // built by `persistent_agent_resume_command`, `remote_runtime_agent_session_key`,
+    // `terminal_write_strategy_for_path` — match these cells too.
+    Arm {
+        kind: SessionKind::Pi,
+        locality: Locality::Local,
+        row_scheme: Some("local://"),
+        runtime_scheme: None,
+        remote_resume_subcommand: None,
+        remote_start_subcommand: None,
+        write_strategy_without_local_runtime: TerminalWriteStrategy::LocalRuntimeFallback,
+        binary: "pi",
+        resume_selector_token: "--session",
+        re_roots_with_cwd: false,
+        store_globs: &[".pi/agent/sessions/*/*.jsonl"],
+    },
+    Arm {
+        kind: SessionKind::Pi,
+        locality: Locality::Remote,
+        row_scheme: Some("remote-pi://"),
+        runtime_scheme: Some("pi-runtime://"),
+        remote_resume_subcommand: Some("resume-pi"),
+        remote_start_subcommand: Some("start-pi"),
+        write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
+        binary: "pi",
+        resume_selector_token: "--session",
+        re_roots_with_cwd: false,
+        store_globs: &[".pi/agent/sessions/*/*.jsonl"],
+    },
+    Arm {
+        kind: SessionKind::OpenCode,
+        locality: Locality::Local,
+        row_scheme: Some("local://"),
+        runtime_scheme: None,
+        remote_resume_subcommand: None,
+        remote_start_subcommand: None,
+        write_strategy_without_local_runtime: TerminalWriteStrategy::LocalRuntimeFallback,
+        binary: "opencode",
+        resume_selector_token: "--session",
+        re_roots_with_cwd: false,
+        // ⛔ EMPTY = a DECLARED store-scan gap (one SQLite db, not a file per
+        // session), not an oversight. The descriptor carries the reason.
+        store_globs: &[],
+    },
+    Arm {
+        kind: SessionKind::OpenCode,
+        locality: Locality::Remote,
+        row_scheme: Some("remote-opencode://"),
+        runtime_scheme: Some("opencode-runtime://"),
+        remote_resume_subcommand: Some("resume-opencode"),
+        remote_start_subcommand: Some("start-opencode"),
+        write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
+        binary: "opencode",
+        resume_selector_token: "--session",
+        re_roots_with_cwd: false,
+        store_globs: &[],
+    },
+    Arm {
+        kind: SessionKind::QwenCode,
+        locality: Locality::Local,
+        row_scheme: Some("local://"),
+        runtime_scheme: None,
+        remote_resume_subcommand: None,
+        remote_start_subcommand: None,
+        write_strategy_without_local_runtime: TerminalWriteStrategy::LocalRuntimeFallback,
+        binary: "qwen",
+        resume_selector_token: "--resume",
+        re_roots_with_cwd: false,
+        store_globs: &[".qwen/projects/*/chats/*.jsonl"],
+    },
+    Arm {
+        kind: SessionKind::QwenCode,
+        locality: Locality::Remote,
+        // ⚠ The wrapper slug is `qwen`, not the `qwen-code` --kind slug: the
+        // verbs and schemes are built from `wrapper_slug`, which is a separate
+        // field precisely so the two can differ.
+        row_scheme: Some("remote-qwen://"),
+        runtime_scheme: Some("qwen-runtime://"),
+        remote_resume_subcommand: Some("resume-qwen"),
+        remote_start_subcommand: Some("start-qwen"),
+        write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
+        binary: "qwen",
+        resume_selector_token: "--resume",
+        re_roots_with_cwd: false,
+        store_globs: &[".qwen/projects/*/chats/*.jsonl"],
+    },
+    Arm {
+        kind: SessionKind::Kimi,
+        locality: Locality::Local,
+        row_scheme: Some("local://"),
+        runtime_scheme: None,
+        remote_resume_subcommand: None,
+        remote_start_subcommand: None,
+        write_strategy_without_local_runtime: TerminalWriteStrategy::LocalRuntimeFallback,
+        binary: "kimi",
+        resume_selector_token: "--resume",
+        re_roots_with_cwd: false,
+        // ⛔ EMPTY = declared gap (md5(cwd) buckets), see the descriptor.
+        store_globs: &[],
+    },
+    Arm {
+        kind: SessionKind::Kimi,
+        locality: Locality::Remote,
+        row_scheme: Some("remote-kimi://"),
+        runtime_scheme: Some("kimi-runtime://"),
+        remote_resume_subcommand: Some("resume-kimi"),
+        remote_start_subcommand: Some("start-kimi"),
+        write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
+        binary: "kimi",
+        resume_selector_token: "--resume",
+        re_roots_with_cwd: false,
+        store_globs: &[],
+    },
+    Arm {
+        kind: SessionKind::Muse,
+        locality: Locality::Local,
+        row_scheme: Some("local://"),
+        runtime_scheme: None,
+        remote_resume_subcommand: None,
+        remote_start_subcommand: None,
+        write_strategy_without_local_runtime: TerminalWriteStrategy::LocalRuntimeFallback,
+        binary: "muse",
+        // ⛔ PLACEHOLDER, not a measurement: Muse Code is installed nowhere on
+        // the fleet, so `--resume` is what the descriptor records as unverified.
+        // This cell exists so the matrix stays the same shape; it is locked to
+        // the descriptor, and both move together when a real `muse --help` is read.
+        resume_selector_token: "--resume",
+        re_roots_with_cwd: false,
+        store_globs: &[],
+    },
+    Arm {
+        kind: SessionKind::Muse,
+        locality: Locality::Remote,
+        row_scheme: Some("remote-muse://"),
+        runtime_scheme: Some("muse-runtime://"),
+        remote_resume_subcommand: Some("resume-muse"),
+        remote_start_subcommand: Some("start-muse"),
+        write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
+        binary: "muse",
+        resume_selector_token: "--resume",
+        re_roots_with_cwd: false,
+        store_globs: &[],
+    },
+    Arm {
+        kind: SessionKind::Antigravity,
+        locality: Locality::Local,
+        row_scheme: Some("local://"),
+        runtime_scheme: None,
+        remote_resume_subcommand: None,
+        remote_start_subcommand: None,
+        write_strategy_without_local_runtime: TerminalWriteStrategy::LocalRuntimeFallback,
+        binary: "agy",
+        // Read off `agy --help`, v1.0.5 on jojo (2026-08-08).
+        resume_selector_token: "--conversation",
+        re_roots_with_cwd: false,
+        store_globs: &[".antigravitycli/*.json"],
+    },
+    Arm {
+        kind: SessionKind::Antigravity,
+        locality: Locality::Remote,
+        row_scheme: Some("remote-agy://"),
+        runtime_scheme: Some("agy-runtime://"),
+        remote_resume_subcommand: Some("resume-agy"),
+        remote_start_subcommand: Some("start-agy"),
+        write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
+        binary: "agy",
+        resume_selector_token: "--conversation",
+        re_roots_with_cwd: false,
+        store_globs: &[".antigravitycli/*.json"],
     },
 ];
 
@@ -199,16 +387,72 @@ impl Arm {
         format!("{:?}/{:?}", self.kind, self.locality)
     }
 
-    /// The row path this arm produces for the fixture session.
-    fn row_path(&self) -> String {
-        match (self.kind, self.locality) {
-            (_, Locality::Local) => local_live_runtime_key(ARM_SESSION_ID),
-            (SessionKind::ClaudeCode, Locality::Remote) => {
-                remote_cc_session_path(ARM_MACHINE, ARM_SESSION_ID)
+    /// The row path this arm produces for the fixture session, or `None` when
+    /// this CLI has no arm on this locality.
+    ///
+    /// ⚠ The remote half USED to be `(_, Locality::Remote) =>
+    /// remote_scanned_session_path(...)`, i.e. codex's `remote-session://` for
+    /// every CLI but Claude Code. That single catch-all would have let the whole
+    /// table pass while the product was wrong: every new CLI's remote row would
+    /// have been built, classified and written as a CODEX row, and the write
+    /// strategy / teardown / resize predicates that key on the scheme would all
+    /// have agreed with each other about the wrong CLI. It is now the
+    /// descriptor's `remote_row_scheme`, which is the same string the scheme
+    /// registry holds.
+    fn row_path(&self) -> Option<String> {
+        match self.locality {
+            Locality::Local => Some(local_live_runtime_key(ARM_SESSION_ID)),
+            Locality::Remote => {
+                let scheme = agent_cli_descriptor(self.kind)?.remote_row_scheme?;
+                Some(format!("{scheme}{ARM_MACHINE}/{ARM_SESSION_ID}"))
             }
-            (_, Locality::Remote) => remote_scanned_session_path(ARM_MACHINE, ARM_SESSION_ID),
         }
     }
+}
+
+/// The two shipped remote row builders, proved to agree with the scheme the
+/// descriptor declares — so `row_path`'s derivation above is not a THIRD
+/// spelling of the remote path, it is the same one.
+#[test]
+fn the_shipped_remote_row_builders_match_their_declared_schemes() {
+    assert_eq!(
+        remote_scanned_session_path(ARM_MACHINE, ARM_SESSION_ID),
+        Arm {
+            kind: SessionKind::Codex,
+            locality: Locality::Remote,
+            row_scheme: None,
+            runtime_scheme: None,
+            remote_resume_subcommand: None,
+            remote_start_subcommand: None,
+            write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
+            binary: "",
+            resume_selector_token: "",
+            re_roots_with_cwd: false,
+            store_globs: &[],
+        }
+        .row_path()
+        .expect("codex has a remote arm"),
+        "the codex remote row builder and its declared scheme disagree",
+    );
+    assert_eq!(
+        remote_cc_session_path(ARM_MACHINE, ARM_SESSION_ID),
+        Arm {
+            kind: SessionKind::ClaudeCode,
+            locality: Locality::Remote,
+            row_scheme: None,
+            runtime_scheme: None,
+            remote_resume_subcommand: None,
+            remote_start_subcommand: None,
+            write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
+            binary: "",
+            resume_selector_token: "",
+            re_roots_with_cwd: false,
+            store_globs: &[],
+        }
+        .row_path()
+        .expect("claude code has a remote arm"),
+        "the CC remote row builder and its declared scheme disagree",
+    );
 }
 
 #[test]
@@ -239,12 +483,41 @@ fn every_registered_cli_has_both_arms() {
 #[test]
 fn every_arm_names_its_row_and_runtime_with_the_registered_scheme() {
     for arm in ARMS {
-        let row_path = arm.row_path();
+        let descriptor = agent_cli_descriptor(arm.kind).expect("registered CLI");
+        // A REMOTE arm with no row scheme is a LOCAL-ONLY CLI, and the
+        // descriptor must say the same thing — both directions, so neither the
+        // table nor the registry can quietly grow (or lose) a remote arm alone.
+        if arm.locality == Locality::Remote {
+            assert_eq!(
+                arm.row_scheme.is_none(),
+                !descriptor.has_remote_arm(),
+                "{}: the matrix and the registry disagree about whether this CLI has a \
+                 remote arm at all",
+                arm.name(),
+            );
+        }
+        let Some(row_scheme) = arm.row_scheme else {
+            assert!(
+                arm.runtime_scheme.is_none()
+                    && arm.remote_resume_subcommand.is_none()
+                    && arm.remote_start_subcommand.is_none(),
+                "{}: a CLI with no remote row scheme must name no remote key or verb either",
+                arm.name(),
+            );
+            assert!(
+                remote_runtime_agent_session_key(arm.kind, ARM_SESSION_ID).is_none(),
+                "{}: local-only, yet the product still builds it a remote runtime key",
+                arm.name(),
+            );
+            continue;
+        };
+        let row_path = arm
+            .row_path()
+            .unwrap_or_else(|| panic!("{}: an arm with a row scheme has a row path", arm.name()));
         assert!(
-            row_path.starts_with(arm.row_scheme),
-            "{}: row path {row_path} does not use its declared scheme {}",
+            row_path.starts_with(row_scheme),
+            "{}: row path {row_path} does not use its declared scheme {row_scheme}",
             arm.name(),
-            arm.row_scheme,
         );
         match (arm.locality, arm.runtime_scheme) {
             (Locality::Remote, Some(scheme)) => {
@@ -494,13 +767,13 @@ fn every_remote_arm_names_its_wrapper_subcommands() {
         match arm.locality {
             Locality::Remote => {
                 assert_eq!(
-                    Some(remote_agent_resume_subcommand(arm.kind)),
+                    remote_agent_resume_subcommand(arm.kind).as_deref(),
                     arm.remote_resume_subcommand,
                     "{}: remote resume subcommand drifted",
                     arm.name(),
                 );
                 assert_eq!(
-                    Some(remote_agent_start_subcommand(arm.kind)),
+                    remote_agent_start_subcommand(arm.kind).as_deref(),
                     arm.remote_start_subcommand,
                     "{}: remote start subcommand drifted",
                     arm.name(),
@@ -521,7 +794,11 @@ fn every_remote_arm_names_its_wrapper_subcommands() {
 #[test]
 fn every_arm_routes_a_keystroke_the_same_way_as_its_locality_twin() {
     for arm in ARMS {
-        let row_path = arm.row_path();
+        // A local-only CLI has no remote row to aim a keystroke at; the
+        // scheme-agreement lock above already proved the absence is declared.
+        let Some(row_path) = arm.row_path() else {
+            continue;
+        };
         assert_eq!(
             terminal_write_strategy_for_path(&row_path, false),
             arm.write_strategy_without_local_runtime,

@@ -1028,8 +1028,14 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         display_name: "Codex-LiteLLM",
         slug: "codex-litellm",
         binary_name: "codex-litellm",
-        // A local fork the user builds; yggterm never installs it.
-        install: CliInstall::Manual,
+        // ⚠ CORRECTED 2026-08-08 from `CliInstall::Manual` / "yggterm never
+        // installs it", which was a GUESS and was false. MEASURED on this host:
+        // `~/.yggterm/npm/lib/node_modules/@avikalpa/codex-litellm` is under
+        // the yggterm-managed npm prefix and `~/.yggterm/npm/bin/codex-litellm`
+        // is the binary sessions actually run — the 6-hourly refresh has been
+        // provisioning it all along, in the same batch as codex and claude.
+        // The wrong value would have quietly stopped that.
+        install: CliInstall::Npm("@avikalpa/codex-litellm"),
         icon_glyph: ">_",
         menu_hint: 'z',
         title_authority: TitleAuthority::Generated,

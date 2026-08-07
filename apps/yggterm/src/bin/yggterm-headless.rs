@@ -3589,6 +3589,9 @@ mod tests {
             cached_summary: None,
             live_runtime: false,
             storage_path: "/home/user/.codex/sessions/session.jsonl".to_string(),
+            // A scanned row whose title the CLI never wrote: this fixture is
+            // exactly the case the cwd fallback exists for.
+            title_is_explicit: false,
         };
         assert_eq!(
             remote_session_title_fallback(&scanned, "").as_deref(),

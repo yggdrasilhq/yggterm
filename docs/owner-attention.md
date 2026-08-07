@@ -61,7 +61,8 @@ copies.
   2026-08-08: **passport, not Aadhaar** (Aadhaar is not Google's to hold, and the
   passport survives the US move) — with one thing to check first, that the
   passport's NAME matches the payments profile, since Google verifies against
-  documents. → `~/data/fingraph/owner-window/fingraph-playstore.md`.
+  documents. → his private owner-window note for that lane (path deliberately not
+  named here: this repo is public).
   *Meanwhile:* nothing in either repo waits on it; the campaign has no Play work
   that verification unblocks.
 
@@ -70,7 +71,8 @@ copies.
   and gates nothing, but it is a false identity record on the account that is
   about to be identity-verified. `Close payments profile` exists in its Settings
   and raises a Google re-auth that never opens the close flow on an agent
-  surface. → `~/data/fingraph/owner-window/fingraph-playstore.md`.
+  surface. → his private owner-window note for that lane (path deliberately not
+  named here: this repo is public).
   *Meanwhile:* it blocks nothing, so the relay simply does not touch it.
 
 

@@ -115,6 +115,16 @@ struct ShellArm {
 
     // ---- §7.6 attach seed ----
     /// On a plain InitialRead reveal, may the seed fall back to the daemon's
+    /// Whether this arm EXISTS in the product.
+    ///
+    /// `false` for the Remote row of a LOCAL-ONLY CLI (`wrapper_slug: None`).
+    /// Such a row is bookkeeping, not behaviour: the matrix requires both
+    /// localities per registered CLI so a CLI's remote arm can never go
+    /// unexamined by omission, but a CLI that HAS no remote arm has no remote
+    /// axes to assert. Before this, `CodexLiteLlm/Remote` borrowed codex's
+    /// `remote-session://` and its `start-codex` verb, and the matrix recorded
+    /// that PRETENCE as if it were measured behaviour.
+    applicable: bool,
     /// AUTHORITATIVE screen snapshot? Was gated on `codex_like`, which excluded
     /// CC — the `remote-cc-replay-codex-only` / snapshot-poison axis. Phase 3
     /// widened the gate to every agent CLI, so every arm here reads `true`.
@@ -145,6 +155,12 @@ fn arm_session_id(kind: SessionKind) -> &'static str {
         SessionKind::Codex => "11111111-2222-3333-4444-555555555555",
         SessionKind::CodexLiteLlm => "22222222-3333-4444-5555-666666666666",
         SessionKind::ClaudeCode => "33333333-4444-5555-6666-777777777777",
+        SessionKind::Pi => "44444444-5555-6666-7777-888888888888",
+        SessionKind::OpenCode => "55555555-6666-7777-8888-999999999999",
+        SessionKind::QwenCode => "66666666-7777-8888-9999-aaaaaaaaaaaa",
+        SessionKind::Kimi => "77777777-8888-9999-aaaa-bbbbbbbbbbbb",
+        SessionKind::Muse => "88888888-9999-aaaa-bbbb-cccccccccccc",
+        SessionKind::Antigravity => "99999999-aaaa-bbbb-cccc-dddddddddddd",
         // The matrix is derived from AGENT_CLIS, so a new CLI reaching here
         // without an id is the same class of miss the table exists to catch.
         other => panic!("{other:?} is in the arm matrix but has no fixture session id"),
@@ -160,6 +176,7 @@ const SHELL_ARMS: &[ShellArm] = &[
         scanned_sidebar_row: false,
         remote_runtime_by_scheme: false,
         cold_launch_discriminated: false,
+        applicable: true,
         replay_screen_fallback_on_initial_read: true,
         codex_like: true,
     },
@@ -171,6 +188,7 @@ const SHELL_ARMS: &[ShellArm] = &[
         scanned_sidebar_row: true,
         remote_runtime_by_scheme: true,
         cold_launch_discriminated: true,
+        applicable: true,
         replay_screen_fallback_on_initial_read: true,
         codex_like: true,
     },
@@ -182,17 +200,26 @@ const SHELL_ARMS: &[ShellArm] = &[
         scanned_sidebar_row: false,
         remote_runtime_by_scheme: false,
         cold_launch_discriminated: false,
+        applicable: true,
         replay_screen_fallback_on_initial_read: true,
         codex_like: true,
     },
     ShellArm {
         kind: SessionKind::CodexLiteLlm,
         locality: Locality::Remote,
+        // ⚖ CodexLiteLlm is LOCAL-ONLY — its descriptor declares no
+        // `wrapper_slug`, so there is no remote row scheme, no wrapper verb and
+        // no cold-launch action to discriminate. Every remote axis is therefore
+        // FALSE, and that is a statement about the CLI rather than a hole: the
+        // row exists only because the matrix requires both localities per
+        // registered CLI, which is what stops a CLI's remote arm going
+        // unexamined by omission.
         row_scheme: "remote-session://",
-        remote_resume_readiness: true,
-        scanned_sidebar_row: true,
-        remote_runtime_by_scheme: true,
-        cold_launch_discriminated: true,
+        remote_resume_readiness: false,
+        scanned_sidebar_row: false,
+        remote_runtime_by_scheme: false,
+        cold_launch_discriminated: false,
+        applicable: false,
         replay_screen_fallback_on_initial_read: true,
         codex_like: true,
     },
@@ -204,6 +231,7 @@ const SHELL_ARMS: &[ShellArm] = &[
         scanned_sidebar_row: false,
         remote_runtime_by_scheme: false,
         cold_launch_discriminated: false,
+        applicable: true,
         replay_screen_fallback_on_initial_read: true,
         codex_like: false,
     },
@@ -219,6 +247,157 @@ const SHELL_ARMS: &[ShellArm] = &[
         scanned_sidebar_row: true,
         remote_runtime_by_scheme: true,
         cold_launch_discriminated: true,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    // ── The 2026-08-08 intake. Every cell is the SAME answer its locality
+    // twin gives, because every axis here is a property of WHERE THE PTY LIVES
+    // and never of WHICH CLI is talking — the invariant this table states once.
+    // `codex_like` is false throughout: that local gates a codex-only
+    // geometry/resize fence, and widening it to a CLI nobody has measured would
+    // be inventing a behaviour.
+    ShellArm {
+        kind: SessionKind::Pi,
+        locality: Locality::Local,
+        row_scheme: "local://",
+        remote_resume_readiness: false,
+        scanned_sidebar_row: false,
+        remote_runtime_by_scheme: false,
+        cold_launch_discriminated: false,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::Pi,
+        locality: Locality::Remote,
+        row_scheme: "remote-pi://",
+        remote_resume_readiness: true,
+        scanned_sidebar_row: true,
+        remote_runtime_by_scheme: true,
+        cold_launch_discriminated: true,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::OpenCode,
+        locality: Locality::Local,
+        row_scheme: "local://",
+        remote_resume_readiness: false,
+        scanned_sidebar_row: false,
+        remote_runtime_by_scheme: false,
+        cold_launch_discriminated: false,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::OpenCode,
+        locality: Locality::Remote,
+        row_scheme: "remote-opencode://",
+        remote_resume_readiness: true,
+        scanned_sidebar_row: true,
+        remote_runtime_by_scheme: true,
+        cold_launch_discriminated: true,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::QwenCode,
+        locality: Locality::Local,
+        row_scheme: "local://",
+        remote_resume_readiness: false,
+        scanned_sidebar_row: false,
+        remote_runtime_by_scheme: false,
+        cold_launch_discriminated: false,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::QwenCode,
+        locality: Locality::Remote,
+        row_scheme: "remote-qwen://",
+        remote_resume_readiness: true,
+        scanned_sidebar_row: true,
+        remote_runtime_by_scheme: true,
+        cold_launch_discriminated: true,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::Kimi,
+        locality: Locality::Local,
+        row_scheme: "local://",
+        remote_resume_readiness: false,
+        scanned_sidebar_row: false,
+        remote_runtime_by_scheme: false,
+        cold_launch_discriminated: false,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::Kimi,
+        locality: Locality::Remote,
+        row_scheme: "remote-kimi://",
+        remote_resume_readiness: true,
+        scanned_sidebar_row: true,
+        remote_runtime_by_scheme: true,
+        cold_launch_discriminated: true,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::Muse,
+        locality: Locality::Local,
+        row_scheme: "local://",
+        remote_resume_readiness: false,
+        scanned_sidebar_row: false,
+        remote_runtime_by_scheme: false,
+        cold_launch_discriminated: false,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::Muse,
+        locality: Locality::Remote,
+        row_scheme: "remote-muse://",
+        remote_resume_readiness: true,
+        scanned_sidebar_row: true,
+        remote_runtime_by_scheme: true,
+        cold_launch_discriminated: true,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::Antigravity,
+        locality: Locality::Local,
+        row_scheme: "local://",
+        remote_resume_readiness: false,
+        scanned_sidebar_row: false,
+        remote_runtime_by_scheme: false,
+        cold_launch_discriminated: false,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::Antigravity,
+        locality: Locality::Remote,
+        row_scheme: "remote-agy://",
+        remote_resume_readiness: true,
+        scanned_sidebar_row: true,
+        remote_runtime_by_scheme: true,
+        cold_launch_discriminated: true,
+        applicable: true,
         replay_screen_fallback_on_initial_read: true,
         codex_like: false,
     },
@@ -361,11 +540,14 @@ impl ShellArm {
     /// `Remote Launch Action` metadata. Derived from the CLI family the same
     /// way the server's remote start subcommand is, so this fixture cannot
     /// claim a launch action the transport would never write.
-    fn cold_launch_action(&self) -> Option<&'static str> {
-        match (self.kind, self.locality) {
-            (_, Locality::Local) => None,
-            (SessionKind::ClaudeCode, Locality::Remote) => Some("start-cc"),
-            (_, Locality::Remote) => Some("start-codex"),
+    fn cold_launch_action(&self) -> Option<String> {
+        // ⚠ DERIVED. `(_, Locality::Remote) => Some("start-codex")` handed every
+        // CLI but Claude Code codex's cold-launch verb — the whole table would
+        // have gone green while six CLIs cold-launched as codex.
+        match self.locality {
+            Locality::Local => None,
+            Locality::Remote => yggterm_core::agent_cli::agent_cli_descriptor(self.kind)
+                .and_then(|descriptor| descriptor.start_subcommand()),
         }
     }
 }
@@ -398,6 +580,11 @@ fn every_registered_cli_has_both_shell_arms() {
 #[test]
 fn every_arm_gets_the_remote_resume_readiness_its_matrix_declares() {
     for arm in SHELL_ARMS {
+        // A local-only CLI's Remote row is bookkeeping, not behaviour — there
+        // is nothing in the product to assert against. See `ShellArm::applicable`.
+        if !arm.applicable {
+            continue;
+        }
         let session = arm.session_view(None);
         // The MOUNT's decision, not the predicate under it: a fix applied at the
         // TerminalCanvas call site must fail here too.
@@ -417,6 +604,11 @@ fn every_arm_gets_the_remote_resume_readiness_its_matrix_declares() {
 #[test]
 fn every_arm_is_recognised_as_a_scanned_sidebar_row_its_matrix_declares() {
     for arm in SHELL_ARMS {
+        // A local-only CLI's Remote row is bookkeeping, not behaviour — there
+        // is nothing in the product to assert against. See `ShellArm::applicable`.
+        if !arm.applicable {
+            continue;
+        }
         assert_eq!(
             is_remote_scanned_sidebar_row(&arm.sidebar_row()),
             arm.scanned_sidebar_row,
@@ -429,6 +621,11 @@ fn every_arm_is_recognised_as_a_scanned_sidebar_row_its_matrix_declares() {
 #[test]
 fn every_arm_declares_remote_runtime_by_scheme_as_its_matrix_says() {
     for arm in SHELL_ARMS {
+        // A local-only CLI's Remote row is bookkeeping, not behaviour — there
+        // is nothing in the product to assert against. See `ShellArm::applicable`.
+        if !arm.applicable {
+            continue;
+        }
         assert_eq!(
             session_path_names_remote_runtime_by_scheme(&arm.row_path()),
             arm.remote_runtime_by_scheme,
@@ -442,7 +639,12 @@ fn every_arm_declares_remote_runtime_by_scheme_as_its_matrix_says() {
 #[test]
 fn every_arm_cold_launch_is_discriminated_as_its_matrix_says() {
     for arm in SHELL_ARMS {
-        let session = arm.session_view(arm.cold_launch_action());
+        // A local-only CLI's Remote row is bookkeeping, not behaviour — there
+        // is nothing in the product to assert against. See `ShellArm::applicable`.
+        if !arm.applicable {
+            continue;
+        }
+        let session = arm.session_view(arm.cold_launch_action().as_deref());
         assert_eq!(
             remote_session_starts_new_agent(&session),
             arm.cold_launch_discriminated,
@@ -457,6 +659,11 @@ fn every_arm_cold_launch_is_discriminated_as_its_matrix_says() {
 #[test]
 fn every_arm_seeds_its_attach_the_way_its_matrix_says() {
     for arm in SHELL_ARMS {
+        // A local-only CLI's Remote row is bookkeeping, not behaviour — there
+        // is nothing in the product to assert against. See `ShellArm::applicable`.
+        if !arm.applicable {
+            continue;
+        }
         // The gate takes "is this an agent CLI", NOT "is this codex-like".
         // Passing `codex_like` is what denied CC the authoritative screen for as
         // long as the hole existed, so the derivation is asserted first: every
@@ -502,6 +709,11 @@ fn collapsed_scrollback_recovery_offers_the_screen_to_every_arm() {
     // recovery reveal is allowed the daemon's authoritative screen. That is
     // what makes the CC hole above a DEGRADED path rather than a dead one.
     for arm in SHELL_ARMS {
+        // A local-only CLI's Remote row is bookkeeping, not behaviour — there
+        // is nothing in the product to assert against. See `ShellArm::applicable`.
+        if !arm.applicable {
+            continue;
+        }
         assert!(
             terminal_reveal_seed_allows_authoritative_screen(
                 RetainedRehydrateMode::CollapsedScrollbackRecovery,
@@ -522,6 +734,11 @@ fn every_arm_mount_identity_is_distinct_and_belongs_to_its_own_session() {
     // cross-pathway switch double-constructs and blinks.
     let mut seen: Vec<(String, String)> = Vec::new();
     for arm in SHELL_ARMS {
+        // A local-only CLI's Remote row is bookkeeping, not behaviour — there
+        // is nothing in the product to assert against. See `ShellArm::applicable`.
+        if !arm.applicable {
+            continue;
+        }
         let path = arm.row_path();
         for epoch in [1u64, 2u64] {
             let host_id = terminal_mount_host_id(&path, epoch);
@@ -549,6 +766,11 @@ fn every_arm_mount_identity_is_distinct_and_belongs_to_its_own_session() {
     // "cold remount" and "reveal in place" would be indistinguishable to every
     // consumer of the label.
     for arm in SHELL_ARMS {
+        // A local-only CLI's Remote row is bookkeeping, not behaviour — there
+        // is nothing in the product to assert against. See `ShellArm::applicable`.
+        if !arm.applicable {
+            continue;
+        }
         let path = arm.row_path();
         assert_ne!(
             terminal_mount_host_id(&path, 1),
@@ -580,6 +802,11 @@ fn readiness_axes_should_fork_on_locality_and_the_deviations_are_all_recorded() 
     let mut deviations = Vec::new();
     let mut deviating_axes: Vec<&str> = Vec::new();
     for arm in SHELL_ARMS {
+        // A local-only CLI's Remote row is bookkeeping, not behaviour — there
+        // is nothing in the product to assert against. See `ShellArm::applicable`.
+        if !arm.applicable {
+            continue;
+        }
         let remote = arm.locality == Locality::Remote;
         for (axis, actual) in [
             ("remote_resume_readiness", arm.remote_resume_readiness),
@@ -754,9 +981,9 @@ fn every_closed_hole_stays_closed_and_the_ledger_is_empty() {
     // Hole 4 (§7.3 cold-launch discriminator) — start vs resume.
     assert!(
         remote_session_starts_new_agent(
-            &codex_remote.session_view(codex_remote.cold_launch_action())
+            &codex_remote.session_view(codex_remote.cold_launch_action().as_deref())
         ) && remote_session_starts_new_agent(
-            &cc_remote.session_view(cc_remote.cold_launch_action())
+            &cc_remote.session_view(cc_remote.cold_launch_action().as_deref())
         ),
         "hole 4 re-opened: a freshly STARTED remote CC session is not distinguished from a \
          resumed one, so it gets the resume-flavoured reveal on a session with no prior content",

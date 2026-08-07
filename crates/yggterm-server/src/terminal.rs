@@ -3356,7 +3356,10 @@ fn launch_command_looks_like_remote_resume_attach(launch_command: &str) -> bool 
             crate::remote_agent_resume_subcommand(descriptor.kind),
             crate::remote_agent_start_subcommand(descriptor.kind),
         ]
-        .iter()
+        .into_iter()
+        // A local-only CLI yields no verbs at all, which is the honest empty
+        // set — not codex's pair borrowed on its behalf.
+        .flatten()
         .any(|subcommand| {
             launch_command.contains(&format!(
                 "server'\\'' '\\''remote'\\'' '\\''{subcommand}"
@@ -4160,7 +4163,14 @@ PY"#;
             for subcommand in [
                 crate::remote_agent_resume_subcommand(kind),
                 crate::remote_agent_start_subcommand(kind),
-            ] {
+            ]
+            .into_iter()
+            // A registered remote ROW scheme implies a wrapper slug, so this
+            // flatten drops nothing today; it is here so a local-only CLI that
+            // ever grew a row scheme would be skipped rather than tested
+            // against codex's verbs.
+            .flatten()
+            {
                 let launch_command = format!(
                     "ssh -tt devhost -- sh -lc 'exec \"$HOME\"/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''{subcommand}'\\'' …'"
                 );

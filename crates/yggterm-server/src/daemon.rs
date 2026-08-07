@@ -837,8 +837,15 @@ fn daemon_logical_home_for_endpoint(endpoint: &ServerEndpoint) -> Option<PathBuf
     }
 }
 
+/// Whether this path names a terminal the RUNTIME owns rather than the client.
+///
+/// ⚖ WIDENED 2026-08-08 from codex's two literals to every registered remote
+/// agent scheme, row or runtime. Its recorded consequence was that "CC
+/// daemon-owned runtimes miss runtime-owned handling" — a hand-list that named
+/// one CLI while deciding a question about WHERE THE PTY LIVES.
 fn uses_runtime_owned_terminal_path(path: &str) -> bool {
-    path.starts_with("remote-session://") || path.starts_with("codex-runtime://")
+    yggterm_core::agent_scheme::remote_agent_schemes()
+        .any(|scheme| path.starts_with(scheme.prefix))
 }
 
 fn terminal_launch_command_for_path(
@@ -2216,6 +2223,42 @@ pub enum ServerRequest {
         #[serde(default)]
         claude_extra_args: Option<String>,
     },
+    /// The daemon-runtime lane for every CLI registered AFTER the codex/cc
+    /// pair above — ONE request carrying the kind, not a variant pair per CLI.
+    ///
+    /// The pair above stays byte-for-byte because it is on the wire between
+    /// daemons of different versions and may not be renamed. A CLI added after
+    /// the registry has no such debt, and the reason the pair was split — "an
+    /// OLD daemon fails LOUDLY on version skew instead of resuming the wrong
+    /// CLI" — is preserved here too: a daemon that predates this variant has
+    /// never heard of it either, so it errors rather than guessing.
+    /// ⚠ The field is `session_kind`, not `kind`: this enum is serde
+    /// internally-tagged on `kind`, so a payload field of that name collides
+    /// with the tag. `StartLocalSession` and `SwitchAgentSessionMode` already
+    /// spell it this way.
+    EnsureRemoteRuntimeAgentSession {
+        session_kind: SessionKind,
+        session_id: String,
+        cwd: Option<String>,
+        require_existing: bool,
+        #[serde(default)]
+        terminal_appearance: Option<String>,
+        #[serde(default)]
+        initial_cols: Option<u16>,
+        #[serde(default)]
+        initial_rows: Option<u16>,
+    },
+    StartRemoteRuntimeAgentSession {
+        session_kind: SessionKind,
+        session_id: String,
+        cwd: Option<String>,
+        #[serde(default)]
+        terminal_appearance: Option<String>,
+        #[serde(default)]
+        initial_cols: Option<u16>,
+        #[serde(default)]
+        initial_rows: Option<u16>,
+    },
     /// Daemon-owned resumable plain-shell session (tmux replacement for
     /// `server attach`). The host daemon owns/persists the shell PTY.
     EnsureShellSession {
@@ -2674,6 +2717,8 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::StartRemoteRuntimeCodexSession { .. }
         | ServerRequest::EnsureRemoteRuntimeCcSession { .. }
         | ServerRequest::StartRemoteRuntimeCcSession { .. }
+        | ServerRequest::EnsureRemoteRuntimeAgentSession { .. }
+        | ServerRequest::StartRemoteRuntimeAgentSession { .. }
         | ServerRequest::EnsureShellSession { .. }
         | ServerRequest::FocusLive { .. }
         | ServerRequest::SetViewMode { .. }
@@ -3458,17 +3503,23 @@ impl DaemonRuntime {
             .iter()
             .filter_map(|session| {
                 let runtime_path = self.terminal_runtime_key_for_path(&session.session_path);
-                let working = match session.kind {
-                    SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode => {
-                        self.terminals
-                            .session_screen_snapshot(&runtime_path)
-                            .as_deref()
-                            .map(yggterm_core::screen_text_shows_agent_working)
-                    }
-                    SessionKind::Shell => self
+                let working = match yggterm_core::agent_cli::agent_cli_descriptor(session.kind) {
+                    // PER-CLI matcher, not the kind-agnostic one. This has the
+                    // session's kind in hand, so it can ask THAT CLI's phrases
+                    // — and the kind-agnostic detector ORs across every
+                    // descriptor, which means one CLI's completion trace
+                    // (codex's `Worked for 12s`) can read as another's work
+                    // signal. The agnostic function still exists for callers
+                    // that genuinely have no kind (the hot-update idle gate).
+                    Some(descriptor) => self
+                        .terminals
+                        .session_screen_snapshot(&runtime_path)
+                        .as_deref()
+                        .map(|screen| descriptor.screen_shows_working(screen)),
+                    None if session.kind == SessionKind::Shell => self
                         .terminals
                         .session_foreground_process_active(&runtime_path),
-                    _ => None,
+                    None => None,
                 }?;
                 Some((session.session_path.clone(), working))
             })
@@ -3843,13 +3894,11 @@ impl DaemonRuntime {
             session.pty_cols = Some(cols);
             session.pty_rows = Some(rows);
         }
-        if matches!(
-            session.kind,
-            SessionKind::Shell
-                | SessionKind::Codex
-                | SessionKind::CodexLiteLlm
-                | SessionKind::ClaudeCode
-        ) {
+        // Every kind with a LOCAL screen worth scraping: a plain shell plus
+        // every agent CLI. Registry-derived, because the hand-list it replaced
+        // is the shape a new CLI silently drops out of — and dropping out here
+        // means no sidebar dot, no status line and no terminal lines for it.
+        if session.kind == SessionKind::Shell || session.kind.is_agent() {
             let screen_text = self.terminals.session_screen_snapshot(&runtime_path);
             // Daemon-authoritative working state (SSOT for the sidebar dot + the
             // working→done notification): for agent CLIs, derive it from the
@@ -3858,13 +3907,14 @@ impl DaemonRuntime {
             // screen (preserved/foreign-owned) so the GUI must NOT blink it.
             // This is what stops a session from blinking forever after its turn
             // ended but its last-captured frame froze on the working footer.
-            if matches!(
-                session.kind,
-                SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
-            ) {
+            if let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(session.kind) {
+                // THIS CLI's phrases, not the union over every CLI: the
+                // agnostic matcher can mistake one CLI's completion trace for
+                // another's work signal, and `working` is the value the GUI
+                // renders as a live dot.
                 session.working = screen_text
                     .as_deref()
-                    .map(yggterm_core::screen_text_shows_agent_working);
+                    .map(|screen| descriptor.screen_shows_working(screen));
             } else if session.kind == SessionKind::Shell {
                 // Issue #1 ("shell always working"): a plain shell has no agent
                 // footer to scrape — its working state is the OS fact "a
@@ -7874,16 +7924,13 @@ impl DaemonRuntime {
                     }
                 }
                 self.persist()?;
+                // `session_kind_label` is the one wire name for a kind — the
+                // same string `--kind` accepts. This match was a second copy of
+                // it, and a copy is a place a new CLI is named differently from
+                // the way it can be typed.
                 self.snapshot_response(Some(format!(
                     "switched to {}",
-                    match session_kind {
-                        SessionKind::Codex => "codex",
-                        SessionKind::CodexLiteLlm => "codex-litellm",
-                        SessionKind::ClaudeCode => "claude-code",
-                        SessionKind::Shell => "shell",
-                        SessionKind::SshShell => "ssh",
-                        SessionKind::Document => "document",
-                    }
+                    crate::session_kind_label(session_kind)
                 )))
             }
             ServerRequest::StartCommandSession {
@@ -7991,6 +8038,52 @@ impl DaemonRuntime {
                     terminal_appearance.as_deref(),
                 )?;
                 self.adopt_legacy_local_codex_runtime(&session_id, &key);
+                let _ = self.ensure_terminal_for_path_with_initial_size(
+                    &key,
+                    valid_initial_terminal_size(initial_cols, initial_rows),
+                )?;
+                self.persist()?;
+                ServerResponse::Ack { message: Some(key) }
+            }
+            ServerRequest::EnsureRemoteRuntimeAgentSession {
+                session_kind,
+                session_id,
+                cwd,
+                require_existing,
+                terminal_appearance,
+                initial_cols,
+                initial_rows,
+            } => {
+                sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
+                let key = self.server.ensure_remote_runtime_agent_session_public(
+                    session_kind,
+                    &session_id,
+                    cwd.as_deref(),
+                    require_existing,
+                    terminal_appearance.as_deref(),
+                )?;
+                let _ = self.ensure_terminal_for_path_with_initial_size(
+                    &key,
+                    valid_initial_terminal_size(initial_cols, initial_rows),
+                )?;
+                self.persist()?;
+                ServerResponse::Ack { message: Some(key) }
+            }
+            ServerRequest::StartRemoteRuntimeAgentSession {
+                session_kind,
+                session_id,
+                cwd,
+                terminal_appearance,
+                initial_cols,
+                initial_rows,
+            } => {
+                sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
+                let key = self.server.start_remote_runtime_agent_session_public(
+                    session_kind,
+                    &session_id,
+                    cwd.as_deref(),
+                    terminal_appearance.as_deref(),
+                )?;
                 let _ = self.ensure_terminal_for_path_with_initial_size(
                     &key,
                     valid_initial_terminal_size(initial_cols, initial_rows),
@@ -9175,8 +9268,13 @@ fn collect_live_copy_candidates(
             // updated. The rebind poll records the CLI's on-disk JSONL in the
             // "Storage" metadata; once it exists the session can be titled
             // from the real transcript.
-            let storage = if matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
-            {
+            // Every agent CLI whose title yggterm GENERATES. Deliberately NOT
+            // `is_agent()`: a store-authoritative CLI (Claude Code, Qwen, Kimi,
+            // Antigravity) writes its own title, and making it a generation
+            // candidate would have the chore invent a second title that
+            // disagrees with the one the CLI already wrote
+            // ([[spec-codex-cc-title-summary]]).
+            let storage = if session.kind.is_agent() && !session.kind.self_generates_copy() {
                 session
                     .metadata
                     .iter()
@@ -10321,6 +10419,10 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         }
         ServerRequest::EnsureRemoteRuntimeCcSession { .. } => "ensure_remote_runtime_cc_session",
         ServerRequest::StartRemoteRuntimeCcSession { .. } => "start_remote_runtime_cc_session",
+        ServerRequest::EnsureRemoteRuntimeAgentSession { .. } => {
+            "ensure_remote_runtime_agent_session"
+        }
+        ServerRequest::StartRemoteRuntimeAgentSession { .. } => "start_remote_runtime_agent_session",
         ServerRequest::EnsureShellSession { .. } => "ensure_shell_session",
         ServerRequest::FocusLive { .. } => "focus_live",
         ServerRequest::SetViewMode { .. } => "set_view_mode",
@@ -12021,6 +12123,53 @@ pub fn start_remote_runtime_codex_session(
     .with_context(|| format!("missing runtime session key for {session_id}"))
 }
 
+/// The kind-parameterized lane, for every CLI without a bespoke request pair.
+pub fn ensure_remote_runtime_agent_session(
+    endpoint: &ServerEndpoint,
+    kind: SessionKind,
+    session_id: &str,
+    cwd: Option<&str>,
+    require_existing: bool,
+    initial_size: Option<(u16, u16)>,
+    terminal_appearance: Option<&str>,
+) -> Result<String> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::EnsureRemoteRuntimeAgentSession {
+            session_kind: kind,
+            session_id: session_id.to_string(),
+            cwd: cwd.map(ToOwned::to_owned),
+            require_existing,
+            terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            initial_cols: initial_size.map(|(cols, _)| cols),
+            initial_rows: initial_size.map(|(_, rows)| rows),
+        },
+    )?)?
+    .with_context(|| format!("missing runtime session key for {session_id}"))
+}
+
+pub fn start_remote_runtime_agent_session(
+    endpoint: &ServerEndpoint,
+    kind: SessionKind,
+    session_id: &str,
+    cwd: Option<&str>,
+    initial_size: Option<(u16, u16)>,
+    terminal_appearance: Option<&str>,
+) -> Result<String> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::StartRemoteRuntimeAgentSession {
+            session_kind: kind,
+            session_id: session_id.to_string(),
+            cwd: cwd.map(ToOwned::to_owned),
+            terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            initial_cols: initial_size.map(|(cols, _)| cols),
+            initial_rows: initial_size.map(|(_, rows)| rows),
+        },
+    )?)?
+    .with_context(|| format!("missing runtime session key for {session_id}"))
+}
+
 pub fn ensure_remote_runtime_cc_session(
     endpoint: &ServerEndpoint,
     session_id: &str,
@@ -13325,10 +13474,18 @@ fn progressive_migration_enabled() -> bool {
 /// predicate. Widening this list to admit `Shell` would kill a live shell and
 /// hand back an empty one, which is not migration.
 fn session_kind_is_migratable_agent(kind: SessionKind) -> bool {
-    matches!(
-        kind,
-        SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
-    )
+    // Registry-derived. The hand-list this replaced is the shape where a new
+    // CLI is quietly non-migratable, so its PTY lingers with a dying daemon
+    // instead of converging onto the newest one.
+    //
+    // ⚠ `content_rederives_on_resume` is FALSE for opencode and kimi (their
+    // resume does not replay the full transcript to the screen), which is a
+    // real per-CLI fact this predicate could one day read. It is NOT read here
+    // yet: migration's losslessness argument is about the CLI's STORE, not its
+    // scrollback, and narrowing on a field whose consequence has not been
+    // measured live would be a guess. Recorded so the next session can settle
+    // it rather than rediscover it.
+    kind.is_agent()
 }
 
 /// Is this reachable peer a genuine migration SUCCESSOR — a daemon running a
@@ -16084,6 +16241,8 @@ fn daemon_request_io_timeout_ms(request: &ServerRequest) -> u64 {
         | ServerRequest::StartRemoteRuntimeCodexSession { .. }
         | ServerRequest::EnsureRemoteRuntimeCcSession { .. }
         | ServerRequest::StartRemoteRuntimeCcSession { .. }
+        | ServerRequest::EnsureRemoteRuntimeAgentSession { .. }
+        | ServerRequest::StartRemoteRuntimeAgentSession { .. }
         | ServerRequest::RemoveSession { .. }
         | ServerRequest::TerminalRestart {
             force_remote: true, ..
@@ -16130,17 +16289,25 @@ pub(crate) fn terminal_write_strategy_for_path(
     path: &str,
     local_runtime_running: bool,
 ) -> TerminalWriteStrategy {
-    // BOTH remote agent schemes, not just codex. This predicate used to match
-    // `remote-session://` only, so a `remote-cc://` session whose local bridge
-    // runtime was not running fell to LocalRuntimeFallback — keystrokes aimed
-    // at a runtime that does not exist, which then triggered the relaunch
-    // recovery (ensure) instead of delivering the byte to the remote host.
-    // That is the post-daemon-swap "active remote-cc un-inputable for minutes"
-    // window while the retiring predecessor still owns the runtime.
+    // EVERY remote agent ROW scheme, from the registry. This predicate used to
+    // match `remote-session://` only, so a `remote-cc://` session whose local
+    // bridge runtime was not running fell to LocalRuntimeFallback — keystrokes
+    // aimed at a runtime that does not exist, which then triggered the relaunch
+    // recovery (ensure) instead of delivering the byte to the remote host. That
+    // is the post-daemon-swap "active remote-cc un-inputable for minutes" window
+    // while the retiring predecessor still owns the runtime.
+    //
+    // Round 8 fixed it by naming the second scheme; naming schemes is what put
+    // the hole there in the first place, so the list is now DERIVED — a CLI
+    // registered with a remote row scheme is covered the moment it is
+    // registered, and `scheme_registry_lock_terminal_write_strategy_for_path`
+    // (which allows this predicate NO recorded holes) proves it.
     let trimmed = path.trim_start();
     if local_runtime_running {
         TerminalWriteStrategy::LocalRuntime
-    } else if trimmed.starts_with("remote-session://") || trimmed.starts_with("remote-cc://") {
+    } else if yggterm_core::agent_scheme::remote_agent_row_schemes()
+        .any(|scheme| trimmed.starts_with(scheme.prefix))
+    {
         TerminalWriteStrategy::RemoteDirectFallback
     } else {
         TerminalWriteStrategy::LocalRuntimeFallback
@@ -16222,11 +16389,14 @@ mod tests {
 
         // B4's whole premise: an agent row whose PTY exited is owned by NOBODY
         // and must STILL be adopted — it re-derives from the CLI's own store.
-        for kind in [
-            SessionKind::ClaudeCode,
-            SessionKind::Codex,
-            SessionKind::CodexLiteLlm,
-        ] {
+        //
+        // DERIVED from the registry, not the three names that used to be here:
+        // a hand-listed variant array in a LOCK is the worst kind, because it
+        // goes green while silently never testing the CLI that was added.
+        for kind in yggterm_core::agent_cli::AGENT_CLIS
+            .iter()
+            .map(|descriptor| descriptor.kind)
+        {
             assert!(
                 DaemonRuntime::peer_live_row_is_adoptable(
                     &peer_row("local://c7ea1ad8", kind),
@@ -23478,15 +23648,21 @@ mod tests {
     /// wire divergence is the lost-PTY latch storm of 2026-07-17.
     #[test]
     fn protocol_shape_stamp_forces_version_bump() {
-        // Re-stamped for 3.0.45: the four `Start*Session` requests gained
-        // `outline_prefix`, so a create can say WHERE its row lands and the
-        // daemon seats it inside the same request, and `SetSessionOutlinePrefix`
-        // arrived so a row that already exists can be numbered at all. An older daemon ignores the
-        // field (serde skips unknowns) and the row keeps its birth position —
-        // which is why the create reply reports the seat it RE-READ rather
-        // than the one it asked for.
-        const STAMPED_AT_VERSION: &str = "3.0.45";
-        const STAMPED_SHAPE_HASH: u64 = 0x404008d5f198e4da;
+        // Re-stamped for 3.0.52: `EnsureRemoteRuntimeAgentSession` /
+        // `StartRemoteRuntimeAgentSession` arrived — ONE kind-bearing pair
+        // serving every CLI registered after codex/cc, which keep their own
+        // variants byte-for-byte. A daemon older than this has never heard of
+        // the new variants and errors on them, which is the loud failure the
+        // codex/cc split was designed for, one CLI generation on.
+        //
+        // ✅ The workspace version was bumped 3.0.51 → 3.0.52 IN THE SAME
+        // COMMIT as the wire change, which is the whole point of this stamp: a
+        // wire change shipping under an unchanged version leaves the fleet's
+        // version-ordered compatibility gate looking at two builds of one
+        // version with different shapes — the lost-PTY latch storm of
+        // 2026-07-17.
+        const STAMPED_AT_VERSION: &str = "3.0.52";
+        const STAMPED_SHAPE_HASH: u64 = 0x5acb28d22cfd76a1;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

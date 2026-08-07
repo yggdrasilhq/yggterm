@@ -411,62 +411,20 @@ pub struct PredicateHole {
     pub consequence: &'static str,
 }
 
-pub const KNOWN_PREDICATE_HOLES: &[PredicateHole] = &[
-    PredicateHole {
-        predicate: "local_runtime_id_from_key",
-        scheme: "cc-runtime://",
-        recorded: "2026-07-23",
-        consequence: "cc-runtime keys unrecognized by recoverable/snapshot predicates + restore normalizers",
-    },
-    PredicateHole {
-        predicate: "uses_runtime_owned_terminal_path",
-        scheme: "remote-cc://",
-        recorded: "2026-07-23",
-        consequence: "CC daemon-owned runtimes miss runtime-owned handling",
-    },
-    PredicateHole {
-        predicate: "uses_runtime_owned_terminal_path",
-        scheme: "cc-runtime://",
-        recorded: "2026-07-23",
-        consequence: "CC daemon-owned runtimes miss runtime-owned handling",
-    },
-    PredicateHole {
-        predicate: "bridge_initial_snapshot_should_use_raw_stream",
-        scheme: "cc-runtime://",
-        recorded: "2026-07-23",
-        consequence: "codex bridges delay raw stream, CC bridges take a different path",
-    },
-    PredicateHole {
-        predicate: "terminal_line_internal_transport_error_index",
-        scheme: "cc-runtime://",
-        recorded: "2026-07-23",
-        consequence: "a real `…not found: cc-runtime://…` transport error is NOT excised",
-    },
-    PredicateHole {
-        predicate: "terminal_line_internal_transport_error_index",
-        scheme: "remote-cc://",
-        recorded: "2026-07-23",
-        consequence: "a real `…not found: remote-cc://…` transport error is NOT excised",
-    },
-    PredicateHole {
-        predicate: "terminal_line_is_internal_transport_error",
-        scheme: "cc-runtime://",
-        recorded: "2026-07-23",
-        consequence: "same hole as the shell twin, second copy (terminal_observe)",
-    },
-    PredicateHole {
-        predicate: "terminal_line_is_internal_transport_error",
-        scheme: "remote-cc://",
-        recorded: "2026-07-23",
-        consequence: "same hole as the shell twin, second copy (terminal_observe)",
-    },
-    PredicateHole {
-        predicate: "is_hot_terminal_sidebar_path",
-        scheme: "cc-runtime://",
-        recorded: "2026-07-23",
-        consequence: "includes remote-cc but not cc-runtime",
-    },
-];
+/// ✅ **EMPTY since 2026-08-08 — spec §6 A5 is met.**
+///
+/// All nine rows were `remote-cc://` / `cc-runtime://` shaped, and the six-CLI
+/// intake forced the question: record twenty-four more holes, or fix the nine
+/// predicates. They were fixed, and every one now derives from this registry —
+/// `local_runtime_id_from_key`, `uses_runtime_owned_terminal_path`,
+/// `bridge_initial_snapshot_should_use_raw_stream`,
+/// `terminal_line_internal_transport_error_index`, its `terminal_observe` twin,
+/// and `is_hot_terminal_sidebar_path`.
+///
+/// ⛔ The table stays, and the both-directions locks stay with it: the next hole
+/// is recorded here with its consequence, and deleted in the same commit as its
+/// fix. An empty table is a state, not a retirement.
+pub const KNOWN_PREDICATE_HOLES: &[PredicateHole] = &[];
 
 pub fn predicate_hole_allowed(predicate: &str, scheme: &str) -> bool {
     KNOWN_PREDICATE_HOLES

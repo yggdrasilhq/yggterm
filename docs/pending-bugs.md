@@ -13,27 +13,34 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
-## ⚠ FIVE `yggterm-shell` LIB TESTS FAIL ON A CLEAN TREE — session titles and cwd walking
+## THREE `yggterm-server` LIB TESTS FAIL ON A CLEAN TREE — two of them reach the NETWORK
 
-**Status:** OPEN, unowned. Found incidentally 2026-08-08 while verifying an unrelated
-pane change; **not caused by it** — confirmed by stashing the change and re-running, which
-fails identically.
+**Status:** OPEN
+
+Confirmed 2026-08-08 during the six-CLI intake, and confirmed NOT caused by it:
+`git diff` touches none of the three functions under test.
 
 ```
-session_copy_policy::tests::humanized_terminal_title_uses_cwd_before_host_label
-shell::tests::creation_context_for_session_uses_session_cwd_without_tree_walk
-shell::tests::enrich_sidebar_rows_with_live_titles_humanizes_short_local_shell_labels
-shell::tests::humanized_title_for_copy_target_uses_home_user_shell_title
-shell::tests::search_sidebar_matches_include_group_rows
+tests::start_remote_codex_session_uses_remote_start_codex_launch_contract
+tests::start_remote_claude_session_assigns_authoritative_session_id
+daemon::tests::daemon_binary_is_legacy_allows_deleted_current_install_path
 ```
 
-They cluster on ONE theme — how a session's title is humanized from its cwd/host — so this
-is likely a single behaviour change that landed without its tests, not five faults. Nobody
-has claimed them, and a red suite is a suite people stop reading: whoever next touches
-title/cwd derivation should either fix them or delete them with a reason.
+**The first two are environment-dependent, which is the real defect.**
+`normalize_remote_attach_cwd` SHELLS OUT over ssh to resolve the cwd. On a host
+that cannot reach the remote it fails closed and the assertion passes; on a host
+that CAN, the resolver walks up from a path that does not exist there and returns
+`/home`, so `contains("…/gh/yggterm")` fails. Verified by running the resolver
+script over ssh by hand. **A unit test whose verdict depends on whether the
+machine has network reach to another machine is not a unit test** — it passes for
+the wrong reason on the machine where it passes. Fix by injecting the resolver,
+not by making the assertion looser.
 
-⛔ Do not "fix" these by loosening the assertions until the intended behaviour is named.
+The third asserts `!daemon_binary_is_legacy(current, <current install path>,
+Some(<same path>))`; neither `daemon_binary_is_legacy` nor
+`daemon_expected_binary_paths` is in the diff.
 
+⛔ Do not silence these. The first two hide a test that measures the network.
 
 ## THE TITLEBAR `+` MENU IS THE LAST HAND-LISTED CLI SURFACE
 
