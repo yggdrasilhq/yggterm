@@ -4,6 +4,23 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A new session lands where you asked, not at the top of the list.** Every way
+  of starting a session put its row at the head of Live Sessions, so a session
+  spawned into a numbered sidebar arrived above rows that outrank it and the
+  order had to be repaired by hand. Sessions can now be given a position when
+  they are created — an outline number (`--outline 6.1`) that is stored on the
+  row and survives restarts and renames, or an anchor row to sit below
+  (`--insert-after`) — and the position is applied as part of creating the
+  session, so there is no moment where the list is briefly wrong.
+
+- **Rows can be numbered after the fact, and the list can be re-sorted.**
+  `session outline <row> <number>` numbers a row that already exists and moves it
+  to where that number belongs; `sessions sort` re-derives the whole order from
+  the numbers when things have drifted. Numbers are compared as numbers, so `10`
+  comes after `2` rather than before it, and rows without a number keep their
+  place at the end instead of being shuffled. Re-sorting an already-sorted list
+  changes nothing.
+
 - **A multi-line brief now arrives as one message, not as line 1 plus a queue.**
   Sending several lines to a Codex or Claude Code row wrote them as one Enter per
   line: the first line was submitted on its own, the agent started working on

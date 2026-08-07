@@ -2071,6 +2071,18 @@ pub enum ServerRequest {
         #[serde(default)]
         title_is_explicit: bool,
     },
+    /// Set (or clear, with an empty string) a row's outline number.
+    ///
+    /// Its OWN request rather than a field on `UpdateSessionCopy`, because the
+    /// two facts have different owners and different lifetimes: the title says
+    /// what the session is DOING and the agent CLI rewrites it whenever it
+    /// likes, while the number says WHERE THE ROW SITS and only the user and
+    /// the spawn hierarchy know it. Riding them on one request is how a copy
+    /// refresh would come to clobber a position.
+    SetSessionOutlinePrefix {
+        path: String,
+        prefix: String,
+    },
     RemoveSshTarget {
         machine_key: String,
     },
@@ -2647,6 +2659,9 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::RefreshRemoteMachine { .. }
         | ServerRequest::RefreshManagedCli { .. }
         | ServerRequest::UpdateSessionCopy { .. }
+        // A shared-view mutation: it moves a row in the order every client
+        // renders, so a shadow may not do it.
+        | ServerRequest::SetSessionOutlinePrefix { .. }
         | ServerRequest::RemoveSshTarget { .. }
         | ServerRequest::RemoveSession { .. }
         | ServerRequest::DropTerminalRuntime { .. }
@@ -7466,6 +7481,30 @@ impl DaemonRuntime {
                 }
                 ServerResponse::Ack { message: None }
             }
+            ServerRequest::SetSessionOutlinePrefix { path, prefix } => {
+                // The outline number is a STORED fact, deliberately not part of
+                // the title: a session sets it once and never thinks about it
+                // again, however many times its CLI re-titles itself. Composing
+                // the two at render time is what makes the outline undecayable
+                // — a CLI rename can no longer destroy a number, because it
+                // never touches this field.
+                let applied = self.server.set_session_outline_prefix(&path, &prefix);
+                if applied {
+                    // Re-seat, so setting a number MOVES the row rather than
+                    // labelling it and leaving it where it was. Cheap and
+                    // idempotent: a row already in its seat does not move.
+                    self.server.seat_new_live_session(&path);
+                    self.persist()?;
+                }
+                self.snapshot_response(Some(if applied {
+                    format!("outline {prefix:?} on {path}")
+                } else {
+                    // ⛔ Named, not silent. `session rename` answers
+                    // `accepted:true` on a path the daemon has never heard of,
+                    // and this must not repeat that.
+                    format!("no live session for {path}")
+                }))
+            }
             ServerRequest::RemoveSshTarget { machine_key } => {
                 let removed = self.server.remove_ssh_targets_for_machine(&machine_key);
                 self.persist()?;
@@ -10257,6 +10296,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::RefreshManagedCli { .. } => "refresh_managed_cli",
         ServerRequest::RefreshPreview { .. } => "refresh_preview",
         ServerRequest::UpdateSessionCopy { .. } => "update_session_copy",
+        ServerRequest::SetSessionOutlinePrefix { .. } => "set_session_outline_prefix",
         ServerRequest::RemoveSshTarget { .. } => "remove_ssh_target",
         ServerRequest::RemoveSession { .. } => "remove_session",
         ServerRequest::DropTerminalRuntime { .. } => "drop_terminal_runtime",
@@ -11665,6 +11705,21 @@ pub fn reorder_live_sessions(
     ordered_paths: &[String],
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
     reorder_live_sessions_scoped(endpoint, ordered_paths, None)
+}
+
+/// Set (or clear, with `""`) a row's outline number on the daemon that owns it.
+pub fn set_session_outline_prefix(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    prefix: &str,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::SetSessionOutlinePrefix {
+            path: path.to_string(),
+            prefix: prefix.to_string(),
+        },
+    )?)
 }
 
 /// Fetch the row-order ledger report (JSON string) — all scopes or one.
@@ -23425,12 +23480,13 @@ mod tests {
     fn protocol_shape_stamp_forces_version_bump() {
         // Re-stamped for 3.0.45: the four `Start*Session` requests gained
         // `outline_prefix`, so a create can say WHERE its row lands and the
-        // daemon seats it inside the same request. An older daemon ignores the
+        // daemon seats it inside the same request, and `SetSessionOutlinePrefix`
+        // arrived so a row that already exists can be numbered at all. An older daemon ignores the
         // field (serde skips unknowns) and the row keeps its birth position —
         // which is why the create reply reports the seat it RE-READ rather
         // than the one it asked for.
         const STAMPED_AT_VERSION: &str = "3.0.45";
-        const STAMPED_SHAPE_HASH: u64 = 0x3e91ec635194c8f5;
+        const STAMPED_SHAPE_HASH: u64 = 0x404008d5f198e4da;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

@@ -275,6 +275,105 @@ fact. ⚠ A sixth reader would still be wrong today: `InstallContext::current_ve
 still reports the record rather than `CARGO_PKG_VERSION`, so the struct itself
 remains the trap.
 
+## ⛔⛔ THE DEPLOY WRITES THREE COPIES AND MISSES THE ONE ON `PATH` — and it faked a second bug
+
+**Status:** OPEN
+
+Reported by the orchestrator 2026-08-07, **re-measured here the same hour** and worse than
+reported: it is on TWO hosts, not one.
+
+```
+dev   ~/.local/bin/yggterm            3.0.40   <- what `which yggterm` resolves
+      ~/.local/bin/yggterm-headless   3.0.44
+      ~/.yggterm/bin/yggterm          3.0.44
+      ~/.yggterm/bin/yggterm-headless 3.0.44
+oc    ~/.local/bin/yggterm            3.0.40   <- BOTH ~/.local copies stale
+      ~/.local/bin/yggterm-headless   3.0.40
+```
+
+Every delegate that types `yggterm` on dev runs **3.0.40** and binds a 3.0.40 socket among the
+daemons there. ⚖ **This is the mirror image of `edcc4927`** ("the refresh was updating a binary no
+session ever runs") — it now updates the binaries nothing *types* while missing the one it does.
+
+### ⭐ AND IT WAS WEARING A SECOND BUG'S CLOTHES — that half is CLOSED, do not build for it
+
+A delegate reported *"cannot reach the yggterm GUI, version says 3.0.40"* and the version was
+filed as the cause. It was not, and the proposed fix — *"`server app` verbs on a host with zero
+GUI clients should refuse BY NAME"* — **already shipped in 3.0.44** (`317755f8`). Measured here on
+dev, both binaries present, same host, same minute:
+
+```
+3.0.40  → Error: no live Yggterm GUI client is registered
+3.0.44  → Error: no live Yggterm GUI client is registered for app control on this host (dev).
+          App control is served by the yggterm GUI PROCESS, not by the daemon … run this verb
+          on the GUI host … `server app clients` answers "is the GUI here?" directly.
+```
+
+⇒ **The delegate saw the pre-3.0.44 sentence because it was running the pre-3.0.44 binary.** The
+two findings are one finding: **fixing the split install is what delivers the refusal fleet-wide.**
+⚠ Generalise the lesson rather than the fix — *a stale binary does not report itself as stale; it
+reports the WORLD as broken, in the vocabulary of whatever it was doing.* Any bug report that
+quotes an error string must be re-read on a binary proven current before the string is believed.
+
+**Shipped alongside:** the refusal now names candidate GUI hosts from the daemon's own ssh-target
+list instead of the placeholder `<gui-host>` (no ssh probing — a refusal that hangs is worse than
+a vague one), and the session-start `fleet-daemon-audit` hook was rewritten to **report
+DISAGREEMENT rather than a version**: it enumerates both binary names in both directories plus
+whatever `PATH` resolves, and leads with `⛔ <host> SPLIT INSTALL`. The old hook read
+`yggterm-headless` at two paths and **never read `yggterm` at all**, which is why it printed "all
+audited hosts on 3.0.44" over this. ⚠ While rewriting it, a second silent no-op surfaced: its
+running-daemon probe read `SERVER_VERSION` from `/proc/<pid>/environ`, **a variable that is not in
+a daemon's environment**, so that line had never printed once. It now groups daemons by
+`/proc/<pid>/exe`.
+
+⏳ **The actual fix is still open: the deploy path must write every copy, or stop writing some.**
+Until then `~/.local/bin/yggterm` on dev and both `~/.local` copies on oc are stale.
+
+### ⚠ 30 DAEMONS LIVE ON dev, TWO OF THEM FROM A BUILD TREE
+
+Confirmed by the rewritten audit: `2x ~/gh/yggterm/target/release/yggterm-headless`,
+`27x ~/.yggterm/bin/yggterm-headless`, all marked `(deleted)`. **A daemon running out of
+`target/release` can never be updated by any deploy**, because no deploy writes there. Same lane as
+the never-retire entry below (fd-handoff step 3).
+
+## ⭐⭐ `terminal send` IS SILENTLY LOSSY AND `terminal submit` IS NOT — change the runbook
+
+**Status:** OPEN
+
+Found by row 5.1 with a controlled pair, then paid for by the orchestrator on itself: **two long
+findings sent to row 6 with the two-write pattern returned `error: null` and never landed**, and
+were reported to the owner as sent. `terminal submit` to the same row answered
+`submitted: true, waited_ms: 308` and arrived.
+
+⇒ **`error: null` on `send` is not delivery. `submitted: true` is.**
+
+⚖ **This is the SEVENTH verb in the report-the-request-not-the-effect family, and `submit` is the
+first one that got it right** — so it is the reference implementation, not just the workaround.
+What it does that the other six do not: it **waits for the session to echo-confirm it is consuming
+input**, it carries a **deadline**, and on failure it reports a **named reason** rather than a
+falsy field (*"session never echo-confirmed it was consuming input, prompt may be displayed but
+codex not yet reading"*, `submitted:false` after 30,084 ms). Positive signal, bounded wait, named
+refusal — the three properties §THE QUIET-GATE LAW asks for.
+
+**The fix is not to document `send` away.** Either `send` grows the same confirmation, or it
+refuses by name on an agent-CLI row and points at `submit`. A verb whose success field means
+"bytes were written somewhere" is a trap for every future caller.
+
+⚠ **`submit` does not exist in the 3.0.40 CLI**, so the runbook fix cannot land fleet-wide until
+the split install above is fixed. The two entries are sequenced, not independent.
+
+## ⚠ `ygg-unwedge` CANNOT FIND THE GUI ON THE HOST THE GUI RUNS ON
+
+**Status:** OPEN
+
+Reported by row 5.1, untouched here. On **jojo**, `ygg-unwedge` answers *"no yggterm GUI supervisor
+running"* — with and without `DISPLAY=:1` — while `server app clients` on that same host lists a
+live client on display `:1`. **The remedy tool is blind on the one machine it exists to remedy.**
+
+Same family as the two entries above: a resolver fails, says nothing useful, and the caller is left
+to invent a theory. Start by comparing what `ygg-unwedge` looks for against what
+`client-instances` actually records.
+
 ## UNIT TESTS WRITE TRACE EVENTS INTO THE DEVELOPER'S REAL `~/.yggterm`
 
 **Status:** OPEN
@@ -467,13 +566,20 @@ never composed from the request.
 `--outline` + `--insert-after` together are all refused BY NAME — the last one *before* the row is
 created, so nothing is ever half-placed.
 
-⏳ **Still open in this lane, and they are the rest of the owner's ask:**
+**ALSO SHIPPED in 3.0.45, the rest of the numbering surface:**
 
-1. **The `sort` verb** — his *"sort verb as a shortcut in yggui automation layer"*. Seating fixes
-   new rows; nothing yet re-derives the whole order when reality has drifted.
-2. **`outline_prefix` is still absent from `server app rows` and still has no setter verb**, so a
-   row can only get its number at birth. An existing row cannot be numbered at all.
-3. **The collapse buckets.** The tree vocabulary already exists: `server app rows` returns `depth`,
+- `server app session outline <path> <prefix>` — number a row that already exists (empty clears
+  it), which **re-seats it** rather than labelling it in place. Until this, a row could only get
+  its number at birth.
+- `outline_prefix` is now on `server app rows`, beside `session_id`. It was stored and survived a
+  restart but was invisible, so the number lived only inside the title string.
+- `server app sessions sort [--dry-run]` — the owner's shortcut, re-deriving the Live order from
+  the rows' numbers. Idempotent: an already-sorted list reports `changed: false`, which is the
+  success case, not a no-op to chase.
+
+⏳ **Still open in this lane:**
+
+1. **The collapse buckets.** The tree vocabulary already exists: `server app rows` returns `depth`,
    `child_count`, `expanded` and `group_kind`, the Live Sessions group already collapses, and
    **every live row is `depth: 1`** — that flatness is the entire gap. A collapsed bucket also
    already has its work-aggregation signal, `busy_reason: "group_descendant_working"`, so work
@@ -482,19 +588,25 @@ created, so nothing is ever half-placed.
    collapsed parent must stay clickable through to its child — the constitution's *"click it and
    co-browse it"* applies to a nested row too.
 
-⭐ **THE DRAG IS THE PROVEN WRITE PATH, and the verbs should travel it.** Owner, 2026-08-07:
-manual drag is the only row-ordering affordance that worked end to end while `server reorder`
-needed a GUI restart and `server app sessions reorder` was a no-op. Reading
-`queue_drop_current_drag_target` (`shell.rs`) shows why, and it is a **two-step route no verb
-takes**: (1) an optimistic `replace_live_session_order` on the GUI's OWN copy, so the sidebar moves
-immediately; (2) `reorder_live_sessions_scoped(endpoint, paths, Some(gui_row_order_scope()))` —
-**scoped to this GUI's ledger** — followed by `apply_snapshot`. The app-control verb calls the
-UNSCOPED `reorder_live_sessions` and deliberately skips step 1. ⇒ the row-order ledger
-(`row_order_ledger.rs`, `reconcile_order_with_remembered`) restores from the GUI's scope on the
-next rebuild and reverts anything written outside it. **That is the likeliest reason the reorder
-verb is invisible while the drag sticks**, and it is a much cheaper explanation than the
-aggregation hypothesis below. ⚠ Not yet measured — the falsifier is to call the app verb WITH the
-gui scope and see whether it survives a rebuild.
+⭐ **THE DRAG WAS THE PROVEN WRITE PATH, AND THE VERBS NOW TRAVEL IT.** Owner, 2026-08-07: manual
+drag is the only row-ordering affordance that worked end to end while `server reorder` needed a GUI
+restart and `server app sessions reorder` was a no-op. Reading `queue_drop_current_drag_target`
+(`shell.rs`) showed why — the drag takes **three steps and the verb took one**:
+
+1. an optimistic `replace_live_session_order` on the GUI's OWN copy, so the sidebar moves
+   immediately;
+2. `reorder_live_sessions_scoped(endpoint, paths, Some(gui_row_order_scope()))` — **scoped to this
+   GUI's ledger**;
+3. `apply_snapshot` of what the daemon returns.
+
+The app-control verb called the **UNSCOPED** `reorder_live_sessions` and deliberately skipped step
+1. ⇒ `row_order_ledger`'s `reconcile_order_with_remembered` restores this GUI's remembered
+arrangement on the next rebuild and **reverts anything written outside that scope** — a far cheaper
+explanation than the peer-aggregation hypothesis below, and it explains the restart-only visibility
+exactly. **Shipped:** `apply_live_order_the_way_a_drag_does` is now the one route, used by both
+`sessions reorder` and the new `sessions sort`. ⚠ **Live proof owed** — this is a hypothesis with a
+mechanism, not yet a measurement; the falsifier is that the verb still fails to move the sidebar on
+jojo after 3.0.45.
 
 ⛔ **AND A CORRECTION, because two of us have now acted on it.** It was reported that a single
 spawn *re-scrambles the whole live order* (`0 1 2 4 5.1` → `5.1 4 2 1 0`). **The reproduction above

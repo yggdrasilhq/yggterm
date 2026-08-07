@@ -2179,6 +2179,15 @@ fn main() -> Result<()> {
                 }
                 run_app_control_reorder_sessions(ordered_paths, timeout_ms)
             }
+            // `server app sessions sort [--dry-run]` — the owner's shortcut:
+            // re-derive the Live order from the rows' outline numbers and apply
+            // it, through the same path a manual drag takes.
+            "sessions" if args.get(3).map(String::as_str) == Some("sort") => {
+                yggterm_server::run_app_control_sort_sessions(
+                    args.iter().any(|arg| arg == "--dry-run"),
+                    timeout_ms,
+                )
+            }
             "preview" | "web-view" | "webview" => {
                 let action = args.get(3).map(String::as_str).unwrap_or("scroll");
                 match action {
@@ -3217,6 +3226,26 @@ fn main() -> Result<()> {
                             .next()
                             .context("missing session path for server app session restart")?;
                         run_app_control_restart_session(session_path, timeout_ms)
+                    }
+                    // `server app session outline <path> <prefix>` — number a
+                    // row that already exists. The prefix is stored SEPARATELY
+                    // from the title and composed at render time, so a CLI
+                    // re-title can no longer destroy a position. An empty
+                    // prefix clears it.
+                    "outline" => {
+                        let positionals = cli_positional_args(&args, 4);
+                        let session_path = positionals.first().copied().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "usage: server app session outline <session-path> <prefix>  \
+                                 (an empty prefix clears it)"
+                            )
+                        })?;
+                        let prefix = positionals.get(1).copied().unwrap_or("");
+                        yggterm_server::run_app_control_set_session_outline(
+                            session_path,
+                            prefix,
+                            timeout_ms,
+                        )
                     }
                     other => anyhow::bail!("unsupported app session action: {other}"),
                 }

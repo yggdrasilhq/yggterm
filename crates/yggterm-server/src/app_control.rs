@@ -852,6 +852,28 @@ pub enum AppControlCommand {
     ReorderSessions {
         ordered_paths: Vec<String>,
     },
+    /// Set (or clear, with `""`) a row's outline number, then re-seat it.
+    ///
+    /// The number is where the sort gets its key, and until this existed it
+    /// could only be given at birth — an existing row could not be numbered at
+    /// all, which is why the owner's outline lived inside title strings and was
+    /// destroyed by every CLI re-title.
+    SetSessionOutline {
+        session_path: String,
+        prefix: String,
+    },
+    /// Re-derive the Live-region order from the rows' outline numbers and apply
+    /// it — the owner's *"sort verb as a shortcut in yggui automation layer
+    /// that autosorts and correctly aligns the spawnees"*.
+    ///
+    /// The seating owner keeps NEW rows in place; this is the escape hatch for
+    /// when reality has drifted anyway (rows created by an older daemon, rows
+    /// numbered after the fact, an order restored from a stale ledger).
+    SortSessions {
+        /// Report the order this WOULD apply and change nothing.
+        #[serde(default)]
+        dry_run: bool,
+    },
     SendTerminalInput {
         session_path: String,
         data: String,
@@ -1531,6 +1553,8 @@ impl AppControlCommand {
             Self::ShowStartPage => "show_start_page",
             Self::StartAction { .. } => "start_action",
             Self::ReorderSessions { .. } => "reorder_sessions",
+            Self::SetSessionOutline { .. } => "set_session_outline",
+            Self::SortSessions { .. } => "sort_sessions",
             Self::CreateTerminal { .. } => "create_terminal",
             Self::SendTerminalInput { .. } => "send_terminal_input",
             Self::SubmitTerminalPrompt { .. } => "submit_terminal_prompt",

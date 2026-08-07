@@ -131,7 +131,8 @@ pub use daemon::{
     reorder_live_sessions_scoped, row_order_ledger_report,
     request_terminal_launch, request_terminal_launch_for_path, retire_daemon,
     retire_stale_daemons, RetireStaleDaemonOutcome, RetireStaleDaemonsReport, run_daemon,
-    set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode, shutdown, snapshot,
+    set_all_preview_blocks_folded, set_session_keep_alive, set_session_outline_prefix,
+    set_view_mode, shutdown, snapshot,
     start_command_session, start_command_session_with_terminal_appearance, start_local_session,
     start_local_session_at, start_local_session_at_with_terminal_appearance,
     start_local_session_placed, start_local_session_seated,
@@ -207,7 +208,9 @@ use yggterm_core::{
     read_codex_transcript_messages_limited, read_codex_transcript_messages_tail_limited,
     read_trace_tail, resolve_yggterm_home,
 };
-use yggterm_core::session_outline::{OutlineKey, normalize_outline_prefix, parse_outline_key};
+use yggterm_core::session_outline::{
+    OutlineKey, normalize_outline_prefix, parse_outline_key, sort_by_outline,
+};
 use session_tenancy::{
     CREATED_BY_METADATA_LABEL, CreatorStamp, EPHEMERAL_METADATA_LABEL, EphemeralDeclaration,
 };
@@ -18472,15 +18475,54 @@ fn ensure_live_app_control_pid(
                  App control is served by the yggterm GUI PROCESS, not by the daemon, so it \
                  only answers on the host where the GUI is running — a headless host has a \
                  daemon and sessions but no client to drive.\n\
-                 Fix: run this verb on the GUI host (`ssh <gui-host> \
-                 '~/.yggterm/bin/yggterm-headless server app …'`). `server app clients` lists \
-                 the registered clients on whichever host you run it, so it answers \
+                 Fix: run this verb on the GUI host ({}). `server app clients` lists the \
+                 registered clients on whichever host you run it, so it answers \
                  \"is the GUI here?\" directly.",
-                crate::session_tenancy::local_host_token()
+                crate::session_tenancy::local_host_token(),
+                app_control_gui_host_hint(&endpoint)
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(40));
     }
+}
+
+/// Name the hosts worth trying, instead of the placeholder `<gui-host>`.
+///
+/// ⛔ **A refusal that cannot name a destination is why a delegate blamed the
+/// version.** Measured 2026-08-07: a delegate on dev could not reach the GUI,
+/// reported *"cannot reach the yggterm GUI, version says 3.0.40"*, and two
+/// unrelated facts — a stale binary and a host with no GUI at all — were merged
+/// into one theory. The refusal it saw was the pre-3.0.44 flat sentence; this
+/// one at least says WHERE to stand.
+///
+/// The daemon already holds the fleet's ssh targets; what it does not record is
+/// which of them runs a GUI, so these are CANDIDATES and are labelled as such
+/// rather than asserted. ⚠ Deliberately no ssh probing: this runs on a path
+/// that has already failed, and a refusal that hangs is worse than a vague one.
+fn app_control_gui_host_hint(endpoint: &ServerEndpoint) -> String {
+    let hosts: Vec<String> = crate::daemon::snapshot(endpoint)
+        .ok()
+        .map(|(snapshot, _message)| {
+            snapshot
+                .remote_machines
+                .iter()
+                .map(|machine| machine.ssh_target.clone())
+                .filter(|target| !target.trim().is_empty())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default();
+    if hosts.is_empty() {
+        return "`ssh <gui-host> '~/.yggterm/bin/yggterm-headless server app …'` — this daemon \
+                knows no remote machines, so it cannot name a candidate"
+            .to_string();
+    }
+    format!(
+        "candidates this daemon knows: {}. Try `ssh <host> \
+         '~/.yggterm/bin/yggterm-headless server app clients'` on each until one reports count > 0",
+        hosts.join(", ")
+    )
 }
 
 /// The GUI process tree a read like `server render-top` should measure when
@@ -21479,6 +21521,38 @@ pub fn run_app_control_reorder_sessions(
         AppControlCommand::ReorderSessions { ordered_paths },
         timeout_ms,
     )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// `server app session outline <path> <prefix>` — number a row that exists.
+pub fn run_app_control_set_session_outline(
+    session_path: &str,
+    prefix: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    // Refuse a prefix the sort cannot read HERE, before any round trip, for the
+    // same reason the create does: a stored value the sort ignores is a silent
+    // failure, and this verb's whole job is to make a position unambiguous.
+    let normalized = normalize_outline_prefix(prefix).map_err(|message| anyhow::anyhow!(message))?;
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetSessionOutline {
+            session_path: session_path.to_string(),
+            prefix: normalized.unwrap_or_default(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+/// `server app sessions sort [--dry-run]` — re-derive the order from the rows'
+/// outline numbers and apply it.
+pub fn run_app_control_sort_sessions(dry_run: bool, timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::SortSessions { dry_run }, timeout_ms)?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
@@ -33318,6 +33392,88 @@ terminal_window_id: None,
         assert!(ok.refusal.is_none());
     }
 
+    /// The SORT the owner asked for, over the model it actually sorts: rows in
+    /// integer outline order, unnumbered rows last and stable.
+    ///
+    /// Locks the two words in his acceptance criteria — *"cheap and never
+    /// break"* — as TOTALITY (every row gets a position) and IDEMPOTENCE
+    /// (sorting a sorted list is the identity).
+    #[test]
+    fn the_sort_orders_numbers_first_and_is_idempotent() {
+        let sort = |rows: Vec<(&str, Option<&str>)>| -> Vec<String> {
+            let mut rows: Vec<(String, Option<String>)> = rows
+                .into_iter()
+                .map(|(path, prefix)| (path.to_string(), prefix.map(ToOwned::to_owned)))
+                .collect();
+            crate::sort_by_outline(&mut rows, |(_, prefix): &(String, Option<String>)| {
+                prefix.clone()
+            });
+            rows.into_iter().map(|(path, _)| path).collect()
+        };
+        let rows = vec![
+            ("noise-a", None),
+            ("ten", Some("10")),
+            ("two", Some("2")),
+            ("one-one", Some("1.1")),
+            ("noise-b", None),
+            ("one", Some("1")),
+        ];
+        let once = sort(rows.clone());
+        assert_eq!(
+            once,
+            vec!["one", "one-one", "two", "ten", "noise-a", "noise-b"],
+            "10 sorts after 2, and unnumbered rows keep their arrival order at the end"
+        );
+        // Idempotent: the second pass is the identity, which is what makes it
+        // safe to run on every projection rather than as a batch job.
+        let twice = sort(
+            once.iter()
+                .map(|path| {
+                    let prefix = rows
+                        .iter()
+                        .find(|(candidate, _)| candidate == path)
+                        .and_then(|(_, prefix)| *prefix);
+                    (path.as_str(), prefix)
+                })
+                .collect(),
+        );
+        assert_eq!(twice, once);
+    }
+
+    /// Setting a number MOVES the row, rather than labelling it and leaving it
+    /// where it was — otherwise the outline is a decoration.
+    #[test]
+    fn numbering_an_existing_row_re_seats_it() {
+        let mut server = outline_test_server();
+        let mut paths = Vec::new();
+        for prefix in ["1", "2", "3"] {
+            let path = server.start_local_session(SessionKind::Shell, Some("/tmp"), Some(prefix));
+            server.seat_created_live_session(&path, Some(prefix), None);
+            paths.push(path);
+        }
+        let latecomer =
+            server.start_local_session(SessionKind::Shell, Some("/tmp"), Some("latecomer"));
+        assert_eq!(server.live_session_order.first(), Some(&latecomer));
+
+        assert!(server.set_session_outline_prefix(&latecomer, "2.1"));
+        server.seat_new_live_session(&latecomer);
+        assert_eq!(
+            outline_titles(&server),
+            vec!["1", "2", "2.1", "3"],
+            "a number given after the fact must move the row to where it belongs"
+        );
+
+        // Clearing it is the documented way back, and must not error.
+        assert!(server.set_session_outline_prefix(&latecomer, ""));
+        assert_eq!(
+            server
+                .sessions
+                .get(&latecomer)
+                .and_then(|session| session.outline_prefix.clone()),
+            None
+        );
+    }
+
     /// ⛔ Both forms at once is refused rather than silently resolved, so a
     /// caller never gets a seat it did not ask for.
     #[test]
@@ -40994,7 +41150,9 @@ terminal_window_id: None,
         for needle in [
             concat!("GUI ", "PROCESS"),
             concat!("server app ", "clients"),
-            "ssh <gui-host>",
+            // The destination is RESOLVED at runtime now rather than spelled as
+            // a placeholder, so the raise site must call the resolver.
+            concat!("app_control_gui_host", "_hint"),
         ] {
             assert!(
                 refusal.contains(needle),
@@ -41002,6 +41160,24 @@ terminal_window_id: None,
                  taught a delegate to route around the row plane entirely"
             );
         }
+    }
+
+    /// ⛔ The refusal must name a DESTINATION even when the daemon knows no
+    /// remote machines — the fallback is the old placeholder, never silence.
+    ///
+    /// Why it matters, measured 2026-08-07: a delegate on a host with no GUI
+    /// saw the pre-3.0.44 flat sentence, concluded its BINARY VERSION was the
+    /// problem, and reported a version bug. Two unrelated facts merged into one
+    /// theory because the refusal named nowhere to go.
+    #[test]
+    fn the_no_client_refusal_names_a_destination_even_with_no_machines_known() {
+        // An endpoint nothing is listening on: `snapshot` fails, and the hint
+        // must still be actionable rather than empty.
+        let hint = crate::app_control_gui_host_hint(&ServerEndpoint::UnixSocket(
+            std::path::PathBuf::from("/nonexistent/yggterm-no-such-daemon.sock"),
+        ));
+        assert!(hint.contains("ssh <gui-host>"), "{hint}");
+        assert!(hint.contains("cannot name a candidate"), "{hint}");
     }
 
     #[test]
