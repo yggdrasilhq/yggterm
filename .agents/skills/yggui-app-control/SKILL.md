@@ -1431,3 +1431,64 @@ probes go blind — verify via the file-based `~/.yggterm/event-trace.jsonl` and
 - Before reporting a UI change as done: verify visually with a live screenshot.
 - When diagnosing a discrepancy between sidebar and start page: take a screenshot and read app state together.
 - When debugging session layout, icons, or colors: always verify in the live app, not just from code review.
+
+---
+
+## ★★★ ORCHESTRATION LESSONS — six failures, one shape (2026-08-07)
+
+An orchestrator drove a fleet of delegate rows for a full day through these verbs. Everything
+below is a **measured** failure with the fix that survived it. They are listed together because
+they share one root, which is the most useful thing in this section.
+
+### ⛔ THE ONE-SHAPE LAW: *asked about one thing, answered about another*
+Every instrument failure that day had this shape — a probe that answers a question **adjacent** to
+the one you asked, and is therefore right often enough to be trusted.
+
+| probe | you asked | it actually answers |
+|---|---|---|
+| `pgrep -cf -- "--session-id <uuid>"` | is this agent alive? | does **any** process — *including the shell running this grep* — mention that uuid? |
+| transcript file **mtime** | is it progressing? | has the file been **touched**? (tooling may touch transcripts on a timer) |
+| **first observation** of a counter | did it change? | is this the **first time I looked**? |
+| a daemon of a **different version** | is this session running? | do **I** know this session? (a miss answered `running:false`) |
+
+**THE TEST, before trusting any probe:** write down the question you asked and the question the
+instrument answers. **If they differ by one word, it will lie to you eventually.**
+**THE FIXES, all one shape:** *identify, don't count* (read `/proc/<pid>/cmdline` and require the
+expected executable) · *seed, don't fire* (a first observation is not an event) · *read the effect,
+not the request* · **and a lookup that MISSES must say "I don't own that", never "it isn't running".**
+
+### ⛔ A MUTATING VERB'S SUCCESS FIELD IS NOT THE EFFECT
+Several verbs report that the **request** was understood, not that the **work** happened. Treat
+`accepted`/`error:null`/an echoed payload as "the message parsed" and **always read the state back**.
+- `terminal send` can return `error:null` for a message that never arrives.
+- **`terminal submit` is the reference implementation**: it echo-confirms and answers
+  `submitted:true|false` with a **named reason**, and it distinguishes *unanswerable* from *false*
+  rather than guessing. **Prefer it for every agent-CLI row.** That refusal string is also a
+  diagnostic: *"never echo-confirmed it was consuming input"* ≠ *"no composer row appeared"*.
+- For anything visual, verify with a **faithful screenshot**; a row table and the pixels can disagree.
+
+### ⛔ THREE DISTINCT "THE ROW WON'T TALK" FAILURES — tell them apart before acting
+| agent process | daemon screen | remedy |
+|---|---|---|
+| **absent** | — | **remove + re-spawn**; a terminal restart will not revive it |
+| alive, PTY attached | present | **`server terminal restart`** — clears a *wedged* row (alive, turn ended, not reading input) |
+| alive, on a real PTY | `running:false`, empty buffer | **`server terminal restart`** — re-attaches to the **existing** pty; the daemon had lost the runtime |
+
+### ⚠ SPAWNING AND NAMING
+- An agent CLI **composes its own title** when its first turn ends, clobbering a title set earlier —
+  **and it has no deadline**, so a fixed re-assert window is not enough. Set the title **after** the
+  first turn ends, verify by reading the row table back, and hold it for the row's life.
+- A newly created row may land at the **head** of the order rather than at its intended position.
+  Seat it as part of creation; a create-then-reorder sequence shows the wrong order in between.
+- **Prove a launch prompt arrived by reading the session transcript**, never by the launch reply.
+- **An interrupted spawn may already have created the row.** Check before retrying, or you get two
+  agents in one working tree — which happened, and one had to stand down.
+
+### ⚖ WATCHING DELEGATES
+- **A delegate's dominant failure is STOPPING, not crashing.** A watcher that only reports deaths
+  and errors stays silent through the state that matters. Make *turn ended + no new transcript rows
+  past a threshold* the primary signal, edge-triggered.
+- **Only alert where a decision is live.** A finished row going quiet is correct behaviour; alerting
+  on it teaches the reader to skim, which is how the one real alert gets missed.
+- **A watcher must not report its own bookkeeping as events**, and **a dry run must never share the
+  live watcher's state directory** — clearing test markers once produced a fleet-wide false signal.
