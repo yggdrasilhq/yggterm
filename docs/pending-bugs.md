@@ -13,6 +13,83 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ★★ WEBKIT'S OWN POPUP BLOCKER EATS `window.open` BEFORE OUR POPUP PIPELINE SEES IT — and no agent can tell
+
+**Status:** OPEN. **Operator-reported 2026-08-07**, twice in one session, both halves in his words:
+> *"I tried clicking the receipt and label from the webapp and the webapp complains popup is
+> getting blocked. So ychrome also needs a pipeline to direct popups to new tabs."*
+> *"Also agents need to know that popup has fired, like you said you cannot tell anything."*
+
+⚠ **The pipeline he is asking for ALREADY EXISTS and is good** — `surface_new_window_handler` →
+`build_popup_webview` → `take_web_surface_popups()` → `web_surface_adopt_popup_tab`, related-view
+so `window.opener` and `window.close()` are live, adopted rather than re-navigated so a POSTed
+OAuth callback is not replayed. **That is why this is worth fixing rather than building: the whole
+mechanism is one setting away from running.**
+
+### Half 1 — the setting. `create` never fires, so none of that code runs
+
+```
+$ grep -rn 'javascript_can_open' --include=*.rs vendor/ crates apps
+vendor/wry/src/webkitgtk/mod.rs:461:        settings.set_javascript_can_access_clipboard(true);
+   # …_can_access_clipboard. Nothing anywhere sets _can_open_windows_automatically.
+```
+
+`WebKitSettings:javascript-can-open-windows-automatically` **defaults to FALSE**, and with it false
+WebKit refuses any `window.open` that is not inside a **live user-activation window** — before
+emitting `create`. So:
+
+- the page receives **`null`** and prints its own *"popup blocked"* message (what the operator saw);
+- `connect_create` never fires, so `surface_new_window_handler` never runs, so nothing is ever
+  adopted as a tab, and **the trace event `web_surface.popup_adopted` cannot be emitted either**.
+
+⛔ **The blocked case is the NORMAL case for real apps, not an edge.** A modern SPA does
+`const r = await fetch(...); window.open(r.url)` — and the `await` spends the activation. Measured
+on `app.indiapost.gov.in` 2026-08-07: **the payment gateway popup was blocked** (a booking
+tab existed; no second tab appeared in `web_surface_tabs`), and the **Receipt and Label buttons in
+My Bookings are simply unreachable**. The gateway leg only completed because the agent
+monkey-patched `window.open` to steal the URL and relaunched it through the ychrome CLI.
+
+⚠ **ychrome's ENGINE already made this exact call and wrote down why** —
+`ychrome/src/engine/host.rs::arm_new_window`: *"That is the shape a bank-payment gateway takes — the
+merchant form targets a popup — so an agent driving a payment saw a successful click and a page that
+never moved."* ⇒ **the `ctl` engine can take a popup and the GUI surface cannot**, which inverts the
+usual asymmetry and strands the one plane that has the card rail.
+
+**Ask:** set `javascript_can_open_windows_automatically(true)` on the surface's `Settings` so
+`create` reaches the handler we already have. The blocking that matters is not WebKit's heuristic —
+it is ours, in `surface_new_window_handler`, which can already `Deny` with a reason and does.
+
+### Half 2 — an agent cannot observe a popup at all, and reads silence as "the button is dead"
+
+Even when adoption works, **nothing about it reaches the agent control plane.** `popup_adopted` goes
+to the trace file; `server app state | jq .web_surface_tabs` shows the new tab with no hint it was a
+popup or who opened it; there is no `web popups` verb and no `web wait --until popup`. An agent's
+only instrument today is patching `window.open` in the page itself.
+
+**The cost, measured:** the agent that booked and paid the India Post article recorded in the
+atlasStore run note that *"the Receipt / Label buttons produce nothing — no `window.open`, no
+dialog, no download"* and filed it as an unsolved site quirk. **That finding was WRONG**, and it was
+wrong in the direction that poisons the next run: the popup was blocked, the site is fine, and a
+site-lore entry now had to be corrected. **A blocked popup and a dead button are indistinguishable
+from the agent side, and the agent will always guess "dead button".**
+
+**Ask, smallest useful shape:**
+- `web popups --session <s>` → the recent popup decisions: `{opener_tab_id, url, outcome:
+  adopted|denied|blocked_by_engine, new_tab_id?, reason?, at}`. **`blocked_by_engine` must be
+  reportable even after half 1 lands**, because our own handler still denies (a dead opener, a
+  failed build) and those must not look like nothing happening either.
+- `web wait --until popup` / `popup:<url-substring>`, so a payment or OAuth hop is awaited rather
+  than polled.
+- `popup_of: <tab_id>` on the `web_surface_tabs` rows, so a listing answers "where did this tab come
+  from" without a trace file.
+
+⇒ Same law as everywhere on this plane: **an operation's own success field is an assumption; the
+observable is the state.** A popup currently has no observable at all.
+
+Field context: `~/data/atlasStore/graph/notes/indiapost-rti-a-booking-run-2026-08-07.md`;
+site-lore `app.indiapost.gov.in` slug `drop-off-booked-and-paid-surcharge-and-input-rungs`.
+
+
 ## ⭐ OPERATOR-REPORTED, LIVES IN ychrome: a vault CARD item is unreadable and uneditable in the sidebar
 
 **Status:** OPEN — **the fix belongs in `ychrome`**, filed there with the measurements:
