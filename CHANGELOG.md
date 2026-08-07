@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Asking whether a session is listening now also tells you whether it is
+  working.** The check proved that input reaches a session, and an idle session
+  answers that exactly as well as a busy one — so a paused session read as a
+  running one. The reply now carries what the session's own display says it is
+  doing: working, idle, or unknown when the tool in question has never been
+  observed mid-task. Unknown is deliberate and is never reported as idle, because
+  idle is what gets read as finished.
+
 - **A numbered session now lands in its place at birth, even in a sidebar that
   was numbered by hand.** Spawning a row with an outline number put it at the
   top of the list when none of the other rows carried a stored number — their

@@ -4247,8 +4247,9 @@ mod tests {
         WorkspaceViewMode, parse_meminfo, parse_pressure_avg60_bp,
         describe_terminal_open_attempt, describe_viewport_snapshot,
         summarize_terminal_surface_for_app_control, terminal_bootstrap_activation_epoch,
-        terminal_chunk_has_agent_composer_row, terminal_chunk_has_codex_prompt_output,
-        terminal_chunk_has_current_codex_input_row, terminal_composer_row_holds_draft,
+        AgentRowActivity, terminal_chunk_agent_activity, terminal_chunk_has_agent_composer_row,
+        terminal_chunk_has_codex_prompt_output, terminal_chunk_has_current_codex_input_row,
+        terminal_composer_row_holds_draft,
         terminal_chunk_has_meaningful_output, terminal_chunk_is_claude_prompt_surface,
         terminal_chunk_is_codex_interactive_setup_prompt,
         terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_codex_session_not_on_remote,
@@ -6099,6 +6100,50 @@ Best thing to improve in the meantime:
         assert!(!terminal_composer_row_holds_draft(
             "Do you want to proceed?\n1. Yes\n2. No"
         ));
+    }
+
+    /// ⛔ THE REGRESSION THIS LOCKS: a paused row reported as "grinding".
+    ///
+    /// All three footers are VERBATIM from one jojo snapshot on 2026-08-07 —
+    /// the owner's paused delegate, an idle probe row, and this session's own
+    /// row while it was mid-turn. The discriminator is one phrase, and it was
+    /// sitting in the screen the liveness probe already read.
+    #[test]
+    fn a_paused_row_and_a_working_row_are_told_apart_by_the_cli_chrome() {
+        let working = "some output\n❯\n──── ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← 1 agent";
+        let paused = "some output\n❯\u{a0}\u{1b}[2mapply the yedit and cellulose and paper fixes\n──── ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent";
+        let idle = "some output\n❯\n──── ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert_eq!(terminal_chunk_agent_activity(working), AgentRowActivity::Working);
+        assert_eq!(
+            terminal_chunk_agent_activity(paused),
+            AgentRowActivity::Idle,
+            "the owner's paused row: a ghosted last message and NO interrupt hint"
+        );
+        assert_eq!(terminal_chunk_agent_activity(idle), AgentRowActivity::Idle);
+        // No composer at all — mid-output, a menu, or a plain shell.
+        assert_eq!(
+            terminal_chunk_agent_activity("Do you want to proceed?\n1. Yes\n2. No"),
+            AgentRowActivity::Unknown
+        );
+    }
+
+    /// A CLI whose in-flight phrase nobody has measured must answer UNKNOWN
+    /// even with its composer plainly on screen. Guessing `Idle` there is how
+    /// "paused" becomes "done" for the next caller.
+    #[test]
+    fn an_unmeasured_cli_is_unknown_not_idle() {
+        let codex_idle = "output\n› \n\n  gpt-5.5 xhigh · ~/gh/yggterm";
+        assert_eq!(
+            terminal_chunk_agent_activity(codex_idle),
+            AgentRowActivity::Unknown,
+            "codex declares no working_footer_hints, so its activity is unmeasured"
+        );
+        assert!(
+            yggterm_core::AGENT_CLIS
+                .iter()
+                .any(|d| !d.working_footer_hints.is_empty()),
+            "at least one CLI must carry a measured in-flight phrase, or the verdict is always Unknown"
+        );
     }
 
     /// Every registered CLI must declare a composer glyph, and they must be
@@ -8674,4 +8719,73 @@ That sentence is part of the saved Codex transcript and is not a live transport 
             0
         );
     }
+}
+
+/// What a row is DOING, as far as its own chrome will say.
+///
+/// ⛔ **This exists because a liveness answer was read as a progress answer,
+/// and it cost the owner a wrong status report.** `input-check` proves a row is
+/// consuming input; a healthy IDLE row consumes input exactly as well as a
+/// working one, which is stated plainly in that verb's own docs — and the
+/// verdict `consuming_input: true` was still reported to him as *"grinding"*
+/// over a row he had paused. The signal that would have answered correctly was
+/// in the same daemon screen the probe already reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentRowActivity {
+    /// The CLI is drawing its in-flight marker: a turn is running.
+    Working,
+    /// The CLI's composer is displayed and its in-flight marker is absent.
+    Idle,
+    /// No composer, or a CLI whose in-flight phrase has never been measured.
+    /// ⛔ Deliberately NOT `Idle`: "idle" is what a caller reads as *finished,
+    /// safe to move on*, and guessing it is the whole defect being fixed.
+    Unknown,
+}
+
+impl AgentRowActivity {
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Read a row's activity off the agent CLI's own composer footer.
+///
+/// The in-flight phrase is [`AgentCliDescriptor::working_footer_hints`] — data,
+/// so a CLI that words it differently declares its own instead of being
+/// silently reported as quiet. A CLI with an empty list yields
+/// [`AgentRowActivity::Unknown`] even when its composer is plainly on screen.
+pub(crate) fn terminal_chunk_agent_activity(data: &str) -> AgentRowActivity {
+    let stripped = strip_terminal_control_sequences(data);
+    let lines = normalized_composer_lines(&stripped);
+    let mut saw_composer_without_marker = false;
+    for descriptor in yggterm_core::AGENT_CLIS.iter() {
+        let Some(prompt_index) = lines
+            .iter()
+            .rposition(|line| line.starts_with(descriptor.composer_marker))
+        else {
+            continue;
+        };
+        // Only the chrome BELOW the composer carries the in-flight marker;
+        // scanning the whole screen would match the CLI quoting its own footer
+        // in a transcript, which an agent working on this very repo does.
+        let footer = lines[prompt_index + 1..].join(" ").to_ascii_lowercase();
+        if descriptor.working_footer_hints.is_empty() {
+            saw_composer_without_marker = true;
+            continue;
+        }
+        if descriptor
+            .working_footer_hints
+            .iter()
+            .any(|hint| footer.contains(hint))
+        {
+            return AgentRowActivity::Working;
+        }
+        return AgentRowActivity::Idle;
+    }
+    let _ = saw_composer_without_marker;
+    AgentRowActivity::Unknown
 }

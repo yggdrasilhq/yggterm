@@ -1097,6 +1097,48 @@ fixing it.
 
 ## ★★ WHO OWNS "IS THIS ROW WORKING?" — three tools, three answers
 
+### ⛔ 2026-08-07 — I BECAME THE FOURTH TOOL, ON THE OWNER'S OWN ROW
+
+`terminal input-check` shipped this morning, and within the hour I reported his
+PAUSED delegate as *"grinding the licence audit"*. He caught it: *"first figure
+out why you mis-read the pause as grinding and fix the root cause, otherwise the
+same bug will bite us later."*
+
+**Root cause: a LIVENESS verb answered a PROGRESS question, and its reply
+invited that.** `consuming_input: true` is exactly what a healthy IDLE row
+reports — the verb's own docs say so — but the reply read
+`consuming_input: true, wedged: false, reason: "the session echo-confirmed it is
+consuming input"`, which is a green light to anyone holding a progress question.
+
+⭐ **The signal that would have answered correctly was in the same daemon screen
+the probe already reads.** Three live rows in one jojo snapshot:
+
+```
+idle       ⏵⏵ bypass permissions on (shift+tab to cycle)
+PAUSED     ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent
+WORKING    ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← 1 agent
+```
+
+Shipped in 3.0.51: `activity: working|idle|unknown` on the reply, read from
+`AgentCliDescriptor::working_footer_hints` — per-CLI DATA, so a CLI that words
+it differently declares its own instead of being silently reported quiet, and an
+UNMEASURED CLI answers `unknown`, never `idle`. Codex's phrase is unmeasured and
+its list is deliberately empty. The reply also carries an `answers` field naming
+what the verb does and does not settle.
+
+⚠ **Still open, and this entry stays open for it:** `activity` is a FOURTH
+answer to "is this row working", beside the working-indicator, `busy_reason` and
+the title/summary pipeline. It is the first one derived from what the CLI itself
+draws, so it is the best candidate to become the single owner — but until the
+other three are collapsed into it, this entry is not closed.
+
+⚠ **And a false start worth not repeating:** I first suspected my own draft
+guard (that a faint composer might be his unsent draft, so the probe's Ctrl+U
+would eat it). Falsified by controlled test — typing into a live composer
+renders at NORMAL intensity (`❯\u{a0}THIS_IS_AN_UNSENT_DRAFT`, no `ESC[2m`), so
+faint really is chrome and the guard is correct.
+
+
 **Status:** OPEN
 
 Orchestrator, 2026-08-06, after telling the owner that delegates were working

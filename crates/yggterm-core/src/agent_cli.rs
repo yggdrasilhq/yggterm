@@ -416,6 +416,20 @@ pub struct AgentCliDescriptor {
     /// list is what made Claude Code's `⏵⏵ bypass permissions on` read as
     /// model output.
     pub composer_footer_hints: &'static [&'static str],
+    /// Lowercase fragments this CLI draws in its composer footer **only while a
+    /// turn is in flight** — Claude Code's `esc to interrupt`.
+    ///
+    /// ⚖ This is the ONLY honest answer to "is this row working?" that the row
+    /// plane can give, and it is per-CLI vocabulary for the same reason
+    /// `composer_marker` is: a hardcoded phrase would silently answer `idle`
+    /// for every CLI that words it differently, and `idle` is the answer a
+    /// caller reads as *"finished, safe to move on"*.
+    ///
+    /// ⛔ **An EMPTY list means UNMEASURED, and the activity verdict is then
+    /// `Unknown` — never `Idle`.** A CLI whose working phrase nobody has
+    /// observed must not be reported as quiet; that is the guess that would
+    /// turn "paused" into "grinding" (or worse, "done") for the next caller.
+    pub working_footer_hints: &'static [&'static str],
     /// Which permission postures this CLI can express, and the tokens for each.
     /// A mode absent from this table is refused by name — see
     /// [`AgentPermissionMode`].
@@ -736,6 +750,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         model_flag: "--model",
         composer_marker: '\u{203a}',
         composer_footer_hints: &["gpt-", "claude", "tab to ", "ctrl", "esc"],
+        // ⛔ UNMEASURED. Codex's in-flight phrase has never been observed on a
+        // live working row, so this stays empty and the activity verdict for a
+        // codex row is `Unknown` rather than a guess. Fill it from a screen,
+        // not from memory.
+        working_footer_hints: &[],
         // Read off `codex --help` on codex-cli 0.144.6 (2026-08-06), not from
         // memory. Codex has NO plan mode and no edits-only approval — its
         // vocabulary is `--ask-for-approval {untrusted,on-request,never}` plus
@@ -796,6 +815,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         model_flag: "--model",
         composer_marker: '\u{203a}',
         composer_footer_hints: &["gpt-", "claude", "tab to ", "ctrl", "esc"],
+        // ⛔ UNMEASURED. Codex's in-flight phrase has never been observed on a
+        // live working row, so this stays empty and the activity verdict for a
+        // codex row is `Unknown` rather than a guess. Fill it from a screen,
+        // not from memory.
+        working_footer_hints: &[],
         permission_modes: &[
             (AgentPermissionMode::Default, &[]),
             (
@@ -841,6 +865,13 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         model_flag: "--model",
         composer_marker: '\u{276f}',
         composer_footer_hints: &["claude", "permissions", "shift+tab", "for agents", "ctrl", "esc"],
+        // Measured on jojo 2026-08-07 by comparing three live rows in one
+        // snapshot: a working row's footer reads
+        // `⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← 1 agent`,
+        // an idle row's the same WITHOUT `esc to interrupt`. The owner's paused
+        // row proved it: it carried `← 1 agent` and no interrupt hint, and I
+        // had called it "grinding" off a liveness probe.
+        working_footer_hints: &["esc to interrupt"],
         // Read off `claude --help` on Claude Code 2.1.223 (2026-08-06). Its
         // `--permission-mode` choices are acceptEdits, auto, bypassPermissions,
         // manual, dontAsk, plan — note there is no longer a `default` value,
