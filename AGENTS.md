@@ -199,6 +199,36 @@ When choosing whether to ship a feature, ask: "does this advance baseline parity
 
 ## Agent workflow expectations
 
+### ⛔ SHIP IT — never park a built fix behind "this would restart your GUI"
+
+**Owner directive, 2026-08-08, verbatim:** *"Answer is almost always yes because of our
+daemon architecture I lose a max of ~10sec worst case. Always restart."*
+
+A GUI restart is **not** a destructive act here and must never be treated as one. The
+daemon is host-resident and owns the sessions: PTYs keep running, scrollback and cursor
+position survive, and the window comes back with the rows still there. **The whole cost is
+about ten seconds.** Asking him to authorise that trades ten seconds of his time for an
+indefinite wait, and it leaves a verified fix sitting in a binary nobody is running — which
+is strictly worse than the bug, because now the repo and the running system disagree.
+
+So: **build it, install it, restart it, and say what you did.** Do not end a turn with
+"needs a restart, your call".
+
+Three things this does NOT license, and they are the actual risks:
+- ⛔ It is not permission to install a **stale or unbuilt** artefact — the version rules
+  further down this section still bind, and `update restart` still refuses while an agent
+  web-surface lease is live (`server app state | jq .agent_leases`).
+- ⛔ It is not permission to restart to *test a guess*. Restart to ship something you have
+  already built and tested, not to see what happens.
+- ⛔ It does not extend to the **vault agent** or to anything holding an unlocked secret;
+  those have their own handover path (`ychrome-vault handover`), which keeps the session
+  unlocked instead of dropping it.
+
+⚠ Note the sibling trap: **`ychrome` has its own daemon.** Reinstalling the ychrome binary
+changes nothing until `ychrome daemon restart` runs — a browser window closed and reopened
+routes straight back into the OLD daemon. That cost an hour on 2026-08-07: a passkey fix was
+deployed, the owner reopened the window as asked, and it still ran the old code.
+
 - Treat this as an integration-heavy systems project.
 - When adding code, include clear ownership boundaries between Rust app logic, PTY runtime, and any optional Ghostty FFI.
 - Prefer incremental, testable changes.
