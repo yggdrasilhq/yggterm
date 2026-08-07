@@ -13,6 +13,54 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⚠ FIVE `yggterm-shell` LIB TESTS FAIL ON A CLEAN TREE — session titles and cwd walking
+
+**Status:** OPEN, unowned. Found incidentally 2026-08-08 while verifying an unrelated
+pane change; **not caused by it** — confirmed by stashing the change and re-running, which
+fails identically.
+
+```
+session_copy_policy::tests::humanized_terminal_title_uses_cwd_before_host_label
+shell::tests::creation_context_for_session_uses_session_cwd_without_tree_walk
+shell::tests::enrich_sidebar_rows_with_live_titles_humanizes_short_local_shell_labels
+shell::tests::humanized_title_for_copy_target_uses_home_user_shell_title
+shell::tests::search_sidebar_matches_include_group_rows
+```
+
+They cluster on ONE theme — how a session's title is humanized from its cwd/host — so this
+is likely a single behaviour change that landed without its tests, not five faults. Nobody
+has claimed them, and a red suite is a suite people stop reading: whoever next touches
+title/cwd derivation should either fix them or delete them with a reason.
+
+⛔ Do not "fix" these by loosening the assertions until the intended behaviour is named.
+
+
+## THE TITLEBAR `+` MENU IS THE LAST HAND-LISTED CLI SURFACE
+
+**Status:** OPEN
+
+Found 2026-08-08 while landing the six-CLI intake (pi, opencode, qwen-code, kimi,
+muse, antigravity). Every other surface that offers "start a session with CLI X"
+is now derived from `AGENT_CLIS`: the cwd-tree row menu, its ALT submenu, the
+start page's session family, and the sidebar icon. The titlebar `+` menu is not.
+
+It is hand-rolled `rsx!` — one `button` and one `on_start_*` callback per entry —
+rather than a list of `RowMenuItem`, so it never joined the registry the way the
+other menus did. Its KeyTip node is the literal `"insert.claude"`
+(`build_keytip_scopes`, with the comment "not in the enum registry yet"), and its
+dispatch is `if key == "insert.claude"`.
+
+**What a user sees:** the six new CLIs appear in the row menu's `Open Session
+Here ▸` submenu and on the start page, and are absent from the `+` menu, which
+offers Codex, Claude Code and Terminal only. The `+` menu is therefore quietly
+telling the user that three CLIs exist.
+
+**The fix is not to add six more buttons** — that reproduces the shape at nine.
+The `+` menu should draw `RowMenuItem`s like the four other menus in the app, at
+which point `agent_session_menu_items()` feeds it and the KeyTip declarations
+fall out of the list exactly as the row menu's do. `docs/spec-adding-an-agent-cli.md`
+§2 step 7 names it as the remaining surface.
+
 ## ⛔⛔ THE VENDORED `dioxus-desktop` NO LONGER CROSS-COMPILES FOR ANDROID — drillkit-rs cannot cut an APK
 
 **Status:** OPEN

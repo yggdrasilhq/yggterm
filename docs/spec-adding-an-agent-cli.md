@@ -172,8 +172,16 @@ Almost all of this is now free. What is genuinely per-CLI:
 - **KeyTips** — nothing to do; the menu's declarations are generated from the
   menu itself. Just make sure your `menu_hint` is not already spent by a sibling
   (§4).
-- **Start page** — the session-family split button and the recent-session cards
-  still carry their own dispatch. Check them.
+- **Start page** — nothing to do for the session-family split button; it is one
+  member per registered CLI. The recent-session CARDS still carry their own
+  `open_button_label` / accent dispatch, and a new CLI gets the generic "Open"
+  and the unbranded accent until someone gives it one.
+- **Titlebar `+` menu** — ⚠ **STILL HAND-LISTED.** It is hand-rolled `rsx!` with
+  one callback per entry rather than `RowMenuItem`, so it did not inherit the
+  registry the way the row menu and the start page did, and its KeyTip node
+  `insert.claude` is a literal. A new CLI does NOT appear there. Recorded in
+  `pending-bugs.md`; the fix is to make that menu draw `RowMenuItem`s like every
+  other menu in the app.
 
 ### Step 8 — provisioning
 
