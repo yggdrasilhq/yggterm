@@ -258,3 +258,113 @@ mod tests {
         assert_eq!(derive_child_outline_prefix(Some("scratch"), []), None);
     }
 }
+
+/// The seat a row's TITLE claims, for rows that predate `outline_prefix`.
+///
+/// ⚖ **This does not weaken the law at the top of this module — read it
+/// carefully.** The stored prefix is still the only DURABLE owner, and this is
+/// never written back into one. It exists for exactly one job: comparing a
+/// brand-new numbered row against a sidebar whose rows were numbered by hand,
+/// in prose, before the field existed.
+///
+/// The defect it closes, reported by the owner on 2026-08-07 in the shape
+/// *"cant we inject the session row directly at the start in place instead of
+/// moving it"*: spawning `--outline 5.4` into a list of ten rows titled
+/// `0. …`, `1. …`, `5.3 …` seated it at the HEAD — correctly, by the rule as
+/// written, because every one of those rows read `Unnumbered` and a numbered
+/// row sorts ahead of every unnumbered one. The seat was right about a world in
+/// which nothing else had a number, and that world was a migration artefact,
+/// not the owner's sidebar. Ignoring evidence that is plainly on screen to
+/// protect a law about durability is the law serving itself.
+///
+/// ⛔ **The parse is deliberately TIGHT, because the loose one has already been
+/// paid for.** A bare leading integer is NOT enough: a CLI that re-titles a row
+/// `2026 audit` would otherwise claim outline `2026` and jump the queue — the
+/// same prose-collision that made `compose_outline_prefix`'s bare prefix-match
+/// hide a number it was holding. Two shapes only, both of which the owner
+/// actually types:
+///
+///   - a DOTTED number then whitespace — `5.1 lumenstore: crypto`
+///   - a bare number then a DOT and whitespace — `0. Aug 7 2026`
+///
+/// `2026 audit` matches neither. A re-title that destroys the number costs the
+/// hint and nothing else: the row falls back to `Unnumbered`, which is the
+/// behaviour it had before this function existed.
+pub fn outline_key_from_title(title: &str) -> OutlineKey {
+    let trimmed = title.trim_start();
+    let head: String = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect();
+    let Some(rest) = trimmed.get(head.len()..) else {
+        return OutlineKey::Unnumbered;
+    };
+    // The claim must END at a separator the owner writes, never mid-word.
+    let dotted = head.contains('.') && !head.ends_with('.');
+    let bare_with_dot = head.ends_with('.') && head.trim_end_matches('.').parse::<u64>().is_ok();
+    if !(dotted || bare_with_dot) {
+        return OutlineKey::Unnumbered;
+    }
+    if !rest.starts_with(char::is_whitespace) {
+        return OutlineKey::Unnumbered;
+    }
+    parse_outline_key(Some(&head))
+}
+
+#[cfg(test)]
+mod title_seat_hint_tests {
+    use super::*;
+
+    /// The owner's live sidebar on 2026-08-07, verbatim, plus the shapes that
+    /// must NOT be mistaken for an outline claim.
+    #[test]
+    fn a_title_claims_a_seat_only_in_the_shapes_he_types() {
+        for (title, expected) in [
+            ("0. Aug 7 2026", OutlineKey::Numbered(vec![0])),
+            ("1. atlasstore: records", OutlineKey::Numbered(vec![1])),
+            ("5.1 lumenstore: vendor research + pipeline", OutlineKey::Numbered(vec![5, 1])),
+            ("5.3 lumenstore: YGGTERM mark status", OutlineKey::Numbered(vec![5, 3])),
+            ("7.2 topicb: Continue side-quest", OutlineKey::Numbered(vec![7, 2])),
+        ] {
+            assert_eq!(outline_key_from_title(title), expected, "title: {title}");
+        }
+        // ⛔ The prose collisions. A year, a version and a bare count are not
+        // outline claims, and treating them as one would let a CLI's own
+        // re-title jump the queue.
+        for title in [
+            "2026 audit",
+            "3 notes to file",
+            "v2 parity work",
+            "Continue atlasstore campaign",
+            "",
+            "5.1lumenstore",
+        ] {
+            assert_eq!(
+                outline_key_from_title(title),
+                OutlineKey::Unnumbered,
+                "title must not claim a seat: {title}"
+            );
+        }
+    }
+
+    /// The hint must never outrank the stored fact — it only fills a hole.
+    #[test]
+    fn the_hint_orders_the_owners_sidebar_the_way_he_reads_it() {
+        let mut keys: Vec<OutlineKey> = ["6. yggterm", "0. Aug 7 2026", "5.3 lumenstore", "5.10 later", "5.2 lumenstore"]
+            .iter()
+            .map(|title| outline_key_from_title(title))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                OutlineKey::Numbered(vec![0]),
+                OutlineKey::Numbered(vec![5, 2]),
+                OutlineKey::Numbered(vec![5, 3]),
+                // 10 after 2, as integers — the trap this module was built for.
+                OutlineKey::Numbered(vec![5, 10]),
+                OutlineKey::Numbered(vec![6]),
+            ]
+        );
+    }
+}

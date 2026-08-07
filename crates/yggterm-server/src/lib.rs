@@ -209,7 +209,8 @@ use yggterm_core::{
     read_trace_tail, resolve_yggterm_home,
 };
 use yggterm_core::session_outline::{
-    OutlineKey, normalize_outline_prefix, parse_outline_key, sort_by_outline,
+    OutlineKey, normalize_outline_prefix, outline_key_from_title, parse_outline_key,
+    sort_by_outline,
 };
 use session_tenancy::{
     CREATED_BY_METADATA_LABEL, CreatorStamp, EPHEMERAL_METADATA_LABEL, EphemeralDeclaration,
@@ -4968,6 +4969,29 @@ impl YggtermServer {
         }
     }
 
+    /// The outline number a row is SEATED by: its stored prefix, else the one
+    /// its title still carries from before the field existed.
+    ///
+    /// ⚖ One reader for both sides of every comparison, deliberately — a seat
+    /// computed with the incoming row read one way and the sitting rows read
+    /// another is how a row lands somewhere neither rule asked for.
+    ///
+    /// The stored prefix WINS and is the only durable owner; the title is a
+    /// migration hint and is never written back (see
+    /// [`yggterm_core::session_outline::outline_key_from_title`] for why the
+    /// parse is tight). Without it, spawning `--outline 5.4` into a sidebar of
+    /// hand-numbered-in-prose rows seated the new row at the HEAD, because
+    /// every sitting row read `Unnumbered` — the owner's report of 2026-08-07.
+    fn outline_key_for_seating(&self, key: &str) -> OutlineKey {
+        let Some(session) = self.sessions.get(key) else {
+            return OutlineKey::Unnumbered;
+        };
+        match parse_outline_key(session.outline_prefix.as_deref()) {
+            OutlineKey::Unnumbered => outline_key_from_title(&session.title),
+            numbered => numbered,
+        }
+    }
+
     /// The index `key`'s outline number entitles it to, or `None` when the row
     /// carries no readable number and therefore has no outline claim.
     ///
@@ -4984,19 +5008,14 @@ impl YggtermServer {
     /// An equal prefix counts as "before", so a duplicate number lands after
     /// the row already holding it — stable, like every other tie here.
     fn outline_seat_for(&self, key: &str) -> Option<usize> {
-        let prefix = self.sessions.get(key)?.outline_prefix.clone()?;
-        let seat_key = parse_outline_key(Some(&prefix));
+        let seat_key = self.outline_key_for_seating(key);
         if seat_key == OutlineKey::Unnumbered {
             return None;
         }
         let mut first_after = None;
         let mut last_before = None;
         for (index, existing) in self.live_session_order.iter().enumerate() {
-            let existing_key = parse_outline_key(
-                self.sessions
-                    .get(existing)
-                    .and_then(|session| session.outline_prefix.as_deref()),
-            );
+            let existing_key = self.outline_key_for_seating(existing);
             if existing_key == OutlineKey::Unnumbered {
                 continue;
             }

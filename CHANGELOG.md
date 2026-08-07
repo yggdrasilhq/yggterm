@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A numbered session now lands in its place at birth, even in a sidebar that
+  was numbered by hand.** Spawning a row with an outline number put it at the
+  top of the list when none of the other rows carried a stored number — their
+  numbers lived only in their titles, so there was nothing for the new row to
+  sort against, and the order had to be repaired afterwards. A row without a
+  stored number now falls back to the one its title still shows, so the new row
+  is inserted directly where it belongs and nothing moves. The parse is narrow
+  on purpose: `5.1 lumenstore` and `0. Aug 7 2026` claim a place, `2026 audit` and
+  `3 notes to file` do not.
+
 - **A notification no longer sits flush against the titlebar.** With the titlebar
   pinned rather than auto-hidden, a top-centre toast was positioned from the
   window edge and landed against the chrome with no breathing room. It now
