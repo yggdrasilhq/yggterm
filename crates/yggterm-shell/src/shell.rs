@@ -124156,7 +124156,13 @@ fn AppPaneRailBody(
                                                             Some(field_id.clone()),
                                                         ))
                                                     },
-                                                    "{field_action.label}"
+                                                    // An in-field action names its mark the same
+                                                    // way a footer button does. Rendering the raw
+                                                    // label here printed `icon:copy` / `icon:eye` /
+                                                    // `icon:dice` as TEXT inside the box, on top of
+                                                    // the value — one slot that forgot the shared
+                                                    // resolver every other slot uses.
+                                                    {shell_glyph(&field_action.label, 14)}
                                                 }
                                             }
                                         }
