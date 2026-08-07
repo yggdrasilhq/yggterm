@@ -1212,6 +1212,11 @@ const TERMINAL_CODEX_ACTIVITY_HINT_MS: u64 = 6_000;
 const SIDEBAR_SAMPLE_MIN_WRITE_INTERVAL_MS: u64 = 750;
 const CODEX_COMPLETION_NOTIFICATION_MIN_BUSY_MS: u64 = 10_000;
 const TITLEBAR_HEIGHT_PX: f64 = 32.0;
+/// Where a top-centre toast sits when the titlebar is PINNED: below the chrome,
+/// plus the same 22px the library uses against a bare window edge. Derived from
+/// `TITLEBAR_HEIGHT_PX` rather than typed as a number, so moving the chrome
+/// moves the toast with it.
+const TOAST_TOP_CENTER_PINNED_OFFSET_PX: f64 = TITLEBAR_HEIGHT_PX + 22.0;
 const TITLEBAR_RESPONSIVE_CSS: &str = r#"
 [data-yggterm-titlebar-right] .yggterm-titlebar-overflow-trigger {
     display: none !important;
@@ -81819,6 +81824,22 @@ fn app() -> Element {
                 let _ = document::eval(&context_menu_policy_script());
             },
             style { "{TOAST_CSS}" }
+            // A top-centre toast clears the TITLEBAR instead of sitting on it.
+            //
+            // `ToastAnchor::TopCenter` is a flat `top:22px` from the window edge,
+            // which is right when the titlebar is auto-hidden (nothing is up
+            // there) and wrong when it is pinned: the chrome is
+            // TITLEBAR_HEIGHT_PX tall, so the card lands against it with no
+            // breathing room — the owner's report, 2026-08-07. The offset is
+            // yggterm's to know, not the library's: libyggterm has no titlebar
+            // and cannot answer "is chrome occupying the top edge".
+            //
+            // Scoped to the pinned case by the shell's own attribute, so the
+            // auto-hide arm keeps the library's 22px unchanged.
+            style {
+                "[data-yggterm-titlebar-pinned=\"true\"] [data-yggui-toast-anchor=\"top_center\"] {{ \
+                 top: {TOAST_TOP_CENTER_PINNED_OFFSET_PX}px !important; }}"
+            }
             // The session-style row's reveal rule, declared ONCE for the whole
             // window: the cwdtree sidebar, the ychrome tab rail and every
             // contributed app pane all draw `data-session-row`s, and a rule
@@ -83327,6 +83348,16 @@ fn app() -> Element {
                     }
                 }
                 if !snapshot.notifications.is_empty() {
+                    // The wrapper exists ONLY to give the toast an ancestor that
+                    // states whether the titlebar is pinned. The obvious
+                    // `[data-titlebar-auto-hide-enabled]` element is the workspace
+                    // ROW — a sibling of the toast layer, not an ancestor — so a
+                    // rule keyed on it silently matched nothing (measured: the
+                    // pinned arm left the card at top:22px, unchanged). A
+                    // descendant selector needs a real ancestor; this is it.
+                    div {
+                        "data-yggterm-titlebar-pinned": if titlebar_auto_hide_enabled { "false" } else { "true" },
+                        style: "display:contents;",
                         ToastViewport {
                             items: snapshot.notifications.clone(),
                             palette: ToastPalette {
@@ -83347,6 +83378,7 @@ fn app() -> Element {
                         on_activate: move |session_path: String| {
                             spawn_open_session_from_notification(state, session_path)
                         },
+                        }
                     }
                 }
                 if !snapshot.drag_paths.is_empty() {
