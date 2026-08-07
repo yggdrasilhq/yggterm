@@ -49006,7 +49006,7 @@ fn enrich_sidebar_rows_with_live_titles(
     for (session_path, summary) in remote_session_index.generated_summary_by_path {
         summary_by_path.entry(session_path).or_insert(summary);
     }
-    for row in rows {
+    for row in rows.iter_mut() {
         let live_backed = title_by_path.contains_key(&row.full_path)
             || summary_by_path.contains_key(&row.full_path);
         let authoritative_live = authoritative_live_paths.contains(&row.full_path);
@@ -49094,6 +49094,41 @@ fn enrich_sidebar_rows_with_live_titles(
             );
         } else if kept_alive_paths.contains(&row.full_path) {
             row.detail_label = live_session_detail_label(row.detail_label.clone(), true);
+        }
+    }
+    // ⛔ RE-COMPOSE THE OUTLINE LAST, because THIS function is the last writer
+    // of a row's label.
+    //
+    // The prefix is composed once when the row is built
+    // (`live_session_label_with_index`), and every branch above then overwrites
+    // `row.label` with an enriched or generated title — so the number vanished
+    // from the sidebar the moment a CLI re-titled its own session, which is
+    // exactly the decay that storing the prefix apart from the title exists to
+    // prevent. Caught on the live host: a probe row carrying `outline_prefix`
+    // "6.9" rendered as "Local Shell Script Debugging" with no number, one
+    // minute after it was created.
+    //
+    // One pass at the end rather than a call at each write site: there are
+    // several branches here and a future one would silently drop the number
+    // again. `compose_outline_prefix` is idempotent, so re-applying it to a
+    // label that already carries its prefix is a no-op.
+    let outline_by_path: HashMap<&str, &str> = live_sessions
+        .iter()
+        .filter_map(|session| {
+            session
+                .outline_prefix
+                .as_deref()
+                .map(|prefix| (session.session_path.as_str(), prefix))
+        })
+        .collect();
+    if !outline_by_path.is_empty() {
+        for row in rows.iter_mut() {
+            if let Some(prefix) = outline_by_path
+                .get(row.full_path.as_str())
+                .or_else(|| outline_by_path.get(normalize_live_session_path(&row.full_path).as_str()))
+            {
+                row.label = compose_outline_prefix(Some(prefix), &row.label);
+            }
         }
     }
 }
@@ -53233,18 +53268,38 @@ fn app_control_created_seat_report(
         .and_then(|session| session.outline_prefix.clone());
     let preceding = index.checked_sub(1).map(|before| order[before].to_string());
     let honoured = match (&requested.outline_prefix, &requested.insert_after) {
-        // The durable form: the row must carry the number, and no row ahead of
-        // it may sort after it. Checking the STORED number as well as the
-        // position is what separates "the seat happened to be right" from "the
-        // instruction was recorded", and only the second survives a restart.
+        // The durable form: the row must carry the number, and it must sit in
+        // the right place AMONG THE NUMBERED ROWS. Checking the STORED number as
+        // well as the position is what separates "the seat happened to be
+        // right" from "the instruction was recorded", and only the second
+        // survives a restart.
+        //
+        // ⛔ NUMBERED ROWS ONLY, and this was a live-caught false negative. The
+        // first version required that no row above sort after this one —
+        // counting unnumbered rows, which sort last — so a correctly seated
+        // `6.8` reported `honoured: false` merely because an unnumbered row sat
+        // above it. That contradicted the seating rule itself, which
+        // deliberately does NOT move unnumbered rows out of a numbered row's
+        // way (see `outline_seat_for`). A verb whose success field disagrees
+        // with the behaviour it reports on is the defect this whole lane is
+        // about, so it is worth stating plainly: the predicate must model the
+        // rule, not a stricter one.
         (Some(outline), _) => {
-            let expected = yggterm_core::session_outline::parse_outline_key(Some(outline));
+            use yggterm_core::session_outline::{OutlineKey, parse_outline_key};
+            let expected = parse_outline_key(Some(outline));
+            let numbered = |session: &SnapshotSessionView| {
+                let key = parse_outline_key(session.outline_prefix.as_deref());
+                (key != OutlineKey::Unnumbered).then_some(key)
+            };
             stored_prefix.as_deref() == Some(outline.as_str())
-                && snapshot.live_sessions[..index].iter().all(|session| {
-                    yggterm_core::session_outline::parse_outline_key(
-                        session.outline_prefix.as_deref(),
-                    ) <= expected
-                })
+                && snapshot.live_sessions[..index]
+                    .iter()
+                    .filter_map(numbered)
+                    .all(|key| key <= expected)
+                && snapshot.live_sessions[index + 1..]
+                    .iter()
+                    .filter_map(numbered)
+                    .all(|key| key >= expected)
         }
         // The positional form: the anchor must be the row immediately above.
         (None, Some(anchor)) => preceding.as_deref() == Some(anchor.as_str()),
@@ -155506,6 +155561,55 @@ mod tests {
         );
     }
 
+    /// The one live-session fixture the outline-enrichment tests share, so the
+    /// new test cannot drift from the one it was derived from.
+    fn live_sessions_fixture_for_outline_test() -> Vec<ManagedSessionView> {
+        vec![ManagedSessionView {
+            id: "019cf82b-196b-7152-b4d2-e053f7286318".to_string(),
+            session_path: "codex://019cf82b-196b-7152-b4d2-e053f7286318".to_string(),
+            title: "Investigate Why Terminal TUI Barebones".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "localhost".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                older_available: false,
+                summary: vec![SessionMetadataEntry {
+                    label: "Summary",
+                    value: "Fix the live terminal mismatch.".to_string(),
+                }],
+                blocks: vec![],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/user/gh/yggterm".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+            working: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        }]
+    }
+
     #[test]
     fn enrich_sidebar_rows_with_live_titles_overrides_generic_live_row_labels() {
         let live_sessions = vec![ManagedSessionView {
@@ -155581,6 +155685,58 @@ mod tests {
             Some("Investigate Why Terminal TUI Barebones")
         );
         assert_eq!(rows[0].detail_label, "Fix the live terminal mismatch.");
+    }
+
+    /// ⛔ THE OUTLINE NUMBER SURVIVES ENRICHMENT — live-caught, guihost 3.0.45.
+    ///
+    /// A probe row created with `--outline 6.9` was rendering as
+    /// "Local Shell Script Debugging" with no number, one minute after it was
+    /// created: the prefix is composed when the row is BUILT, and this function
+    /// then overwrote `label` with a generated title. So the number vanished
+    /// the moment a CLI re-titled its own session — precisely the decay that
+    /// storing the prefix apart from the title exists to prevent.
+    ///
+    /// Fails on the pre-fix code, where the label came back without "6.9".
+    #[test]
+    fn enrichment_re_composes_the_outline_number_it_would_otherwise_overwrite() {
+        let mut live_sessions = live_sessions_fixture_for_outline_test();
+        live_sessions[0].outline_prefix = Some("6.9".to_string());
+        let mut rows = vec![BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "codex://019cf82b-196b-7152-b4d2-e053f7286318".to_string(),
+            label: "6.9 Remote Codex 019cf82b".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 1,
+            host_label: "localhost".to_string(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: Some("019cf82b-196b-7152-b4d2-e053f7286318".to_string()),
+            session_cwd: Some("/home/user/gh/yggterm".to_string()),
+            session_kind: None,
+        }];
+        enrich_sidebar_rows_with_live_titles(
+            &mut rows,
+            &live_sessions,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            rows[0].label, "6.9 Investigate Why Terminal TUI Barebones",
+            "the generated title must arrive WITH the row's outline number"
+        );
+        // Idempotent: a second pass must not stutter the prefix.
+        enrich_sidebar_rows_with_live_titles(
+            &mut rows,
+            &live_sessions,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(rows[0].label, "6.9 Investigate Why Terminal TUI Barebones");
     }
     #[test]
     fn enrich_sidebar_rows_replaces_generic_yggterm_codex_with_remote_generated_title() {
