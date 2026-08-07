@@ -42,6 +42,32 @@ Some(<same path>))`; neither `daemon_binary_is_legacy` nor
 
 ⛔ Do not silence these. The first two hide a test that measures the network.
 
+## NO APP-CONTROL VERB RAISES THE SIDEBAR ROW MENU — its UI cannot be live-proven
+
+**Status:** OPEN
+
+Found 2026-08-08 while trying to satisfy `CLAUDE.md`'s own rule that a UI change
+is not done until a live screenshot confirms it. The row menu gained a second
+layer that day, and there is **no way for an agent to open it**.
+
+`server app` can screenshot, read rows, drive a contributed pane, click inside a
+web surface, show/hide the KeyTip overlay and audit the KeyTip tree. None of
+those raises `ContextMenuOverlay` on a cwd-tree row. The two paths that do are a
+mouse `oncontextmenu` on the row and the `ALT,E` chord, and the chord is caught
+by a window-level JS keydown listener that app-control cannot feed.
+
+**What this costs:** the row menu is one of the densest interaction surfaces in
+the product — five mounts, keytip badges, disabled-item tooltips, and now a page
+turn — and every claim about how it LOOKS is currently unfalsifiable from an
+agent session. `keytips audit` proves the tree; it does not prove a pixel.
+
+**The fix is a verb, not a workaround:** `server app row-menu open <row-path>
+[--page <opener-id>]` / `close`, driving the same `open_context_menu` the mouse
+does. It would also give the KeyTip badge painter its first end-to-end test.
+
+⚠ Do not close this by screenshotting after asking the owner to right-click. The
+point is that the campaign runs unattended.
+
 ## THE TITLEBAR `+` MENU IS THE LAST HAND-LISTED CLI SURFACE
 
 **Status:** OPEN
