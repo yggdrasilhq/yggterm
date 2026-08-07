@@ -16,6 +16,30 @@ for free.
 **ychrome is the pilot app** (a web browser). yedit, ytop, Paper, Cellulose are
 the next consumers. This skill is the contract they all share.
 
+## ⇢ READ THE TIER DECISION FIRST — it decides what this recipe IS
+
+This skill is the build recipe for ONE shape of app. Which shape you need is
+settled upstream, in **`libyggterm/docs/spec-app-architecture.md`**, and reading
+it first is not optional: it decides whether you are writing a headless daemon
+that emits widgets, an app that hosts a native content surface, or a Dioxus
+window that links `yggui` and never touches this protocol at all.
+
+The three answers, so you know whether you are in the right file:
+
+- **Tier A** — the host paints your content with widgets it already has. No UI
+  code in your app. This skill is your whole recipe.
+- **Tier C** — your content needs ONE new declarative widget kind. That is a
+  HOST change (the vocabulary is yggterm's), admitted on the spec's two rules;
+  after it lands you are a Tier A app.
+- **Tier B** — only a foreign engine can paint your content (a web engine, an
+  RDP client). You host a native surface AND use this skill for your chrome,
+  because **chrome is always the schema** — ychrome ships an entire web engine
+  and still declares its rail panes as widgets.
+
+⛔ Do not jump from A to B because a widget is missing. That serves one app and
+charges every app the native-surface tax — no faithful screenshot into the
+surface, no `dom-eval`, no inherited theme — forever.
+
 ## The one rule that governs everything
 
 **yggterm provides the surface INTERFACE. The app OWNS the surface content.**
