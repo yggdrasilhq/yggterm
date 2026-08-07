@@ -284,7 +284,7 @@ mod tests {
 /// hide a number it was holding. Two shapes only, both of which the owner
 /// actually types:
 ///
-///   - a DOTTED number then whitespace — `5.1 lumenstore: crypto`
+///   - a DOTTED number then whitespace — `5.1 gadgets: crypto`
 ///   - a bare number then a DOT and whitespace — `0. Aug 7 2026`
 ///
 /// `2026 audit` matches neither. A re-title that destroys the number costs the
@@ -321,10 +321,10 @@ mod title_seat_hint_tests {
     fn a_title_claims_a_seat_only_in_the_shapes_he_types() {
         for (title, expected) in [
             ("0. Aug 7 2026", OutlineKey::Numbered(vec![0])),
-            ("1. atlasstore: records", OutlineKey::Numbered(vec![1])),
-            ("5.1 lumenstore: vendor research + pipeline", OutlineKey::Numbered(vec![5, 1])),
-            ("5.3 lumenstore: YGGTERM mark status", OutlineKey::Numbered(vec![5, 3])),
-            ("7.2 topicb: Continue side-quest", OutlineKey::Numbered(vec![7, 2])),
+            ("1. widgets: intake", OutlineKey::Numbered(vec![1])),
+            ("5.1 gadgets: vendor research + pipeline", OutlineKey::Numbered(vec![5, 1])),
+            ("5.3 gadgets: mark status", OutlineKey::Numbered(vec![5, 3])),
+            ("7.2 sprockets: Continue the sweep", OutlineKey::Numbered(vec![7, 2])),
         ] {
             assert_eq!(outline_key_from_title(title), expected, "title: {title}");
         }
@@ -335,9 +335,9 @@ mod title_seat_hint_tests {
             "2026 audit",
             "3 notes to file",
             "v2 parity work",
-            "Continue atlasstore campaign",
+            "Continue widgets campaign",
             "",
-            "5.1lumenstore",
+            "5.1gadgets",
         ] {
             assert_eq!(
                 outline_key_from_title(title),
@@ -350,7 +350,7 @@ mod title_seat_hint_tests {
     /// The hint must never outrank the stored fact — it only fills a hole.
     #[test]
     fn the_hint_orders_the_owners_sidebar_the_way_he_reads_it() {
-        let mut keys: Vec<OutlineKey> = ["6. yggterm", "0. Aug 7 2026", "5.3 lumenstore", "5.10 later", "5.2 lumenstore"]
+        let mut keys: Vec<OutlineKey> = ["6. yggterm", "0. Aug 7 2026", "5.3 gadgets", "5.10 later", "5.2 gadgets"]
             .iter()
             .map(|title| outline_key_from_title(title))
             .collect();

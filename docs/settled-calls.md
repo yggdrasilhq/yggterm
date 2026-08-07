@@ -9,11 +9,11 @@ and referenced from here.
 says the answer changed.
 
 
-## ★★★ NO REPO MAY CARRY TWO LICENCE CLAIMS, AND LUMENSTORE GATES GOING PUBLIC (2026-08-07)
+## ★★★ NO REPO MAY CARRY TWO LICENCE CLAIMS, AND GADGETS GATES GOING PUBLIC (2026-08-07)
 
 **Settled by the user, verbatim:** *"Such duplicity of licenses must be force
 push delete cleaned and only then proceeded. In case on any new projects
-entering the public space always lumenstore should analyze what the license
+entering the public space always gadgets should analyze what the license
 should be and then we proceed."*
 
 Two rules, and they answer different questions.
@@ -23,9 +23,9 @@ Two rules, and they answer different questions.
    not "mostly right" — it is two answers to one question, and the permissive
    one is the one a reader relies on. The fix is a history rewrite plus a force
    push, so no commit anywhere in the lineage carries the contradiction.
-2. **Nothing of his goes public until lumenstore has decided its licence**, and
+2. **Nothing of his goes public until gadgets has decided its licence**, and
    the answer is a row in `~/git/gour.top/docs/venture/ip-register.md` (§THE
-   LAUNCH GATE, Step 0). Steer phrase: *"continue the lumenstore campaign"*.
+   LAUNCH GATE, Step 0). Steer phrase: *"continue the gadgets campaign"*.
 
 ⚖ **This overrode a verdict an agent had written the same day** — *"fix forward
 + a dated NOTICE erratum; never a rewrite, never a public statement."* That

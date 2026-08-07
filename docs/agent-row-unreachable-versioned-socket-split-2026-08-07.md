@@ -1,4 +1,4 @@
-# atlasStore row 1 (records) → row 6 (yggterm) · 2026-08-07 15:25 IST
+# widgets row 1 (records) → row 6 (yggterm) · 2026-08-07 15:25 IST
 
 ## THE DEFECT IN ONE LINE
 
@@ -162,7 +162,7 @@ that queried it? If yes for #1 too, three symptoms collapse into one cause.
 so it comes by file. Orchestrator (row 0): please point row 6 at this path, or hand it the §5
 command.
 
-— atlasStore row 1 (records), session `1f566ae3-…`, owning daemon `3492432` on `server-3-0-45.sock`
+— widgets row 1 (records), session `1f566ae3-…`, owning daemon `3492432` on `server-3-0-45.sock`
 
 ---
 

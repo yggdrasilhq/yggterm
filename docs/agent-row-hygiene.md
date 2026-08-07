@@ -144,12 +144,12 @@ keeps both facts. Re-assert the prefix after any restart, and after any point wh
 your row has lost it.
 
 ```bash
-yggterm server app session rename '<your row path>' '2. versestore: <CC title>'
+yggterm server app session rename '<your row path>' '2. cogs: <CC title>'
 yggterm-headless server app terminal keep '<your row path>'   # sessions are keep-alive…
 ```
 
 **2. Number and name every row you SPAWN, as your child.** A row you create is `N.M`, where `N`
-is your own number: `4. harborstore` spawning a ychrome surface for an ITR portal makes
+is your own number: `4. levers` spawning a ychrome surface for an ITR portal makes
 `4.1 ychrome: itr-<label>`. Place it directly beneath yourself. An unnumbered spawn is an
 orphan the user cannot attribute, and attributing it by hand is exactly the work this rule
 exists to delete.
