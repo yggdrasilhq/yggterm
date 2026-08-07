@@ -2274,6 +2274,34 @@ entry only after a live passkey ceremony on an agent-created surface.
 keeps it open. (The count used to ride on the status line itself, which broke
 `check-docs-ssot.sh` — one entry, exactly one status word.)
 
+## A fleet update makes every IN-FLIGHT row unaddressable while it keeps running
+
+**Status:** OPEN
+
+Field report: **[`docs/agent-row-unreachable-versioned-socket-split-2026-08-07.md`](agent-row-unreachable-versioned-socket-split-2026-08-07.md)**.
+Raised by the atlasStore lobe delegate on 2026-08-07 after **53 minutes** of a perfectly healthy
+agent being treated as dead.
+
+**The socket is versioned and superseded ones are not forwarded.** The CLI follows the new version
+to `server-3-0-48.sock`; the row's PTY stays with the daemon holding `server-3-0-45.sock.lock`.
+The new daemon has never heard of the session, so `server terminal screen` answers
+**`running: false` with an empty buffer** — honestly, and about a session that is not its own.
+Measured: the owning daemon (pid 3492432) was ALIVE and was the *grandparent* of the live agent;
+every 3.0.x socket from 3-0-36 to 3-0-45 is a real socket with its own daemon and **only 3-0-46
+was symlinked forward to 3-0-48**. The update landed mid-row (row launched ~13:22, symlinks
+re-pointed 14:18).
+
+✅ **`terminal submit` behaved correctly and is the only reason this was diagnosable** — it refused
+with *unanswerable* rather than guessing *false*. ⛔ Do not turn that refusal into a boolean.
+
+⚠ Second finding in the same report: **28 daemons on dev, 26 running DELETED binaries, oldest up
+24 days.** Same mechanism compounding — an old daemon cannot exit while it owns live PTYs. The
+SessionStart hook's `DELETED` count is this bug's accumulator, not cosmetic.
+
+**Top ask:** a session lookup that MISSES must say *"this daemon does not own that session"*, not
+`running: false`. §5 of the report has a one-command `strace` test that proves or kills the
+diagnosis.
+
 ## The headless engine cannot pay by card — `ctl fill-card` does not exist
 
 **Status:** OPEN
