@@ -15,7 +15,9 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔⛔ THE VENDORED `dioxus-desktop` NO LONGER CROSS-COMPILES FOR ANDROID — drillkit-rs cannot cut an APK
 
-**Status:** OPEN. Found 2026-08-07 by the drillkit-rs EXAM exam-console row while following
+**Status:** OPEN
+
+Found 2026-08-07 by the drillkit-rs EXAM exam-console row while following
 drillkit-rs's own standing rule that a client-side change must ship an Android APK release.
 
 `vendor/dioxus-desktop` declares and uses the yggterm web-surface module **unconditionally**,
