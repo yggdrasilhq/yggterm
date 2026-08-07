@@ -163,3 +163,104 @@ so it comes by file. Orchestrator (row 0): please point row 6 at this path, or h
 command.
 
 — atlasStore row 1 (records), session `1f566ae3-…`, owning daemon `3492432` on `server-3-0-45.sock`
+
+---
+
+# ADDENDUM — 2026-08-07 16:30 IST. **IT RECURRED WITHIN THE HOUR, AND FOUR LIVENESS INSTRUMENTS DISAGREE**
+
+## 8. RECURRENCE #2 on the SAME row, 55 minutes after #1 was written up
+
+| | occurrence 1 | occurrence 2 |
+|---|---|---|
+| row unreachable | ~14:2x → 15:1x | **15:27 → 16:22** |
+| duration | **53 min** | **55 min** |
+| owner's probe | `screen` `running:false`, empty buffer; `submit` `unanswerable` | same, **plus the transcript held 533 rows at 15:27 and still 533 at 16:22** |
+| recovery | `server terminal restart` re-attached to the existing pty | same |
+
+**A defect that repeats on the same row inside an hour is not a rare race.**
+
+### The version ladder underneath it, measured at 16:24
+
+```
+server-3-0-45.sock   06:32:18   REAL   ← daemon 3492432, owns my pty. STILL. Since ~13:22.
+server-3-0-48.sock   15:18:22   REAL   ← occurrence 1's migration
+server-3-0-49.sock   15:39:14   REAL   ← lands INSIDE occurrence 2's window
+CLI now reports      3.0.50
+```
+
+⇒ **The CLI walked 3.0.45 → 3.0.48 → 3.0.49 → 3.0.50 in about three hours while my row stayed
+pinned to 3.0.45 the entire time, across both incidents and across a restart.** Four version
+generations under one live row in an afternoon. This is not an edge case anyone has to wait for —
+**at this update cadence every long-running row is orphaned roughly hourly.**
+
+### ⚠ BUT THE SECOND SYMPTOM WAS DIFFERENT, AND WORSE — do not fold them into one story
+
+Occurrence 1: **unreachable but WORKING.** I was producing rows the whole time; only addressing
+was broken.
+Occurrence 2: **unreachable AND NOT PROGRESSING.** 533 transcript rows at 15:27, 533 at 16:22.
+Zero output for 55 minutes, process alive and `S (sleeping)`.
+
+**The versioned-socket split explains unaddressability. It does NOT by itself explain
+non-progress.** Something has to be stopping the process from producing output, not merely from
+being named.
+
+**Hypothesis, and it is only that:** if a PTY handoff between the old and new daemon
+half-completes, the agent blocks writing to a PTY whose reader is gone — alive, sleeping, no new
+rows, while the file's mtime still twitches on partial flushes. That matches every observation but
+is unproven. ⚠ Note `pty-handoff-3-0-49.sock` appeared at **16:24:33**, i.e. at my restart, and
+`3-0-49`'s server socket at 15:39:14 — **12 minutes AFTER the stall began at 15:27**, so the
+timing does not straightforwardly support "the socket migration froze it". Do not assume one cause.
+
+**Cheap test, next time a row is found stalled — capture BEFORE restarting, it is destroyed by the
+fix:** `cat /proc/<pid>/wchan; cat /proc/<pid>/stack; ls -l /proc/<pid>/fd/1 /proc/<pid>/fd/2`.
+A blocked PTY write shows up there and nowhere else.
+
+---
+
+## 9. ⭐ FOUR LIVENESS INSTRUMENTS, ALL DISAGREEING — this is the deeper finding
+
+The row was simultaneously reported alive by two instruments and dead by two others. **Every one
+of them was answering a slightly different question than the one asked.**
+
+**(i) TRANSCRIPT MTIME IS NOT PROGRESS.** (Owner's finding, and it is the generalisable one.)
+A file can be touched without gaining rows. **Any liveness or stall check must compare ROW COUNT,
+not mtime.** This is what reported me as active for 55 minutes while I produced nothing.
+⚠ Honest note: I sampled my own and another row 63 s apart at 16:25/16:26 and did **not** catch a
+divergence in that window (mine 548→555 rows with mtime moving; the other static on both). The
+owner observed the divergence directly over 55 minutes; I could not add a second instance. The
+generalisation stands on its own — mtime proves a WRITE, not a ROW.
+
+**(ii) `row-health.py` DERIVES ITS VERDICT FROM MTIME.** Provable from source:
+```python
+idle = time.time() - entry.stat().st_mtime
+...
+elif idle <= idle_secs:  row["verdict"] = "WORKING"
+```
+⭐ **And it already computes `stats["rows"]` two lines earlier and puts it in the output dict — the
+honest number is right there and simply is not used for the verdict.** Its own docstring says
+*"`pgrep` proves a LAUNCH, never PROGRESS"*, and then it uses mtime, which proves a WRITE, never
+progress. **The tool names the exact fallacy it commits.**
+⇒ Fix: keep a per-transcript row-count baseline; `WORKING` only when rows have INCREASED since the
+last check; first sighting answers `UNKNOWN (baseline recorded)` rather than guessing.
+
+**(iii) `row-health.py` MATCHES PER-CWD, NOT PER-SESSION.** `newest_transcript(project_dir)` takes
+the newest `.jsonl` **by mtime in the whole project directory**, and `alive_pids(cwd)` counts any
+`claude|codex` process whose cwd matches — **13 live claude processes share
+`/home/user/gh/yggterm`.** So a dead row in a busy directory inherits a *sibling's* liveness.
+⇒ **This is the same failure as the versioned socket: asked about one thing, answered about
+another.** Two independent instruments, one shape.
+
+**(iv) `pgrep` counts the querying shell** — already known, same family.
+
+⛔ **CORRECTION TO §7 OF THIS DOCUMENT.** It said *"row 6 reads WORKING on `row-health.py` at 15:24,
+so it is alive and this is deliverable."* **That was wrong.** Row 6 is dead — no `claude` process
+at `/proc` cmdline level, daemon `running:false`, transcript frozen since 13:07. I reported the
+instrument faithfully and the instrument was wrong, for reasons (ii) and (iii) above. **The
+crossings file could not have been delivered by messaging that row**, which is why it is filed here
+instead. My error was trusting a verdict I had not checked against the row's own transcript.
+
+⇒ ★ **THE RULE THAT FALLS OUT, and it is the same one `terminal submit` already obeys:** a
+liveness instrument must answer about *the thing it was asked about*, and must say **unanswerable**
+rather than substitute a neighbour — a neighbouring version's daemon, a neighbouring session's
+transcript, a neighbouring process's pid, or a write in place of a row. Four instruments, one law,
+and only `submit` currently keeps it.
