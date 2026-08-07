@@ -336,6 +336,58 @@ Confirmed by the rewritten audit: `2x ~/gh/yggterm/target/release/yggterm-headle
 `target/release` can never be updated by any deploy**, because no deploy writes there. Same lane as
 the never-retire entry below (fd-handoff step 3).
 
+## ⛔⛔ AN AGENT ROW STOPS CONSUMING INPUT AFTER A TURN ENDS — alive, idle-looking, and DEAF
+
+**Status:** OPEN
+
+⚖ **This outranks every other row-management item in this file**, on the owner's call and on the
+arithmetic: a wedged row **silently drops every instruction sent to it**, so any orchestration
+built on the row plane is unreliable in a way nothing reports.
+
+**TWICE in one night, 2026-08-07**, on two different rows, owner-observed both times:
+
+| row | symptom | cleared by |
+|---|---|---|
+| harborstore row 4 | ~30 min frozen | — |
+| yggterm row 6 (this session) | alive, turn ended, not reading input | `server terminal restart` |
+
+**What is true of the wedged row, and it is the hard part:** the process is ALIVE, the turn has
+ENDED, and the row looks IDLE — which is indistinguishable from a healthy row waiting for work.
+Every OS-level signal says fine. Same family as
+[[finding-agent-session-liveness-is-invisible-to-os-signals]].
+
+**The instrument table, measured:**
+
+| verb | on a wedged row | verdict |
+|---|---|---|
+| `terminal send` | `error: null` | ⛔ **LIES** — reports success, delivers nothing |
+| `terminal submit` | names it (no echo-confirm within the deadline) | ✅ the only honest one |
+| `server terminal restart` | clears the wedge, transcript intact | ✅ the remedy |
+
+⇒ **`submit`'s echo-confirm is the ONLY thing that can see this**, which is the strongest argument
+yet for the entry below: `send`'s `error: null` is not merely uninformative here, it actively
+conceals a dropped instruction. An orchestrator that sends with `send` and believes the reply has
+no way to learn that its delegate never heard it.
+
+**What to build, in order:**
+
+1. **A row state that distinguishes WEDGED from IDLE.** Both look identical today. The discriminator
+   is exactly what `submit` already computes — does the session echo-confirm that it is consuming
+   input? — so the signal exists and is simply not surfaced as row state. This is the same field
+   the working-indicator wants ([[spec-title-summary-working-indicator]]) and the same one the
+   three-tools-three-answers entry below asks for. **One honest field closes all three.**
+2. **`send` must not report success without delivery** (see below).
+3. **An automatic remedy, gated carefully.** `server terminal restart` clears it, but ⛔ a reaper
+   that restarts a row it wrongly believes wedged would destroy live work — so this needs the
+   positive-signal discipline of §THE QUIET-GATE LAW, never an absence-of-output timer.
+
+⚠ **Not yet root-caused, and do not assume the CLI.** Both wedges followed a turn ENDING, which is
+when the CLI returns to its read loop — so the suspect set includes our PTY read path and the
+handoff after a turn, not only the agent CLI. **The cheap first probe:** on a wedged row, compare
+the daemon's vt100 screen (`server terminal screen`) against what a `send` writes — if the bytes
+reach the PTY and the screen never changes, the CLI stopped reading; if the bytes never reach the
+PTY, it is ours.
+
 ## ⭐⭐ `terminal send` IS SILENTLY LOSSY AND `terminal submit` IS NOT — change the runbook
 
 **Status:** OPEN

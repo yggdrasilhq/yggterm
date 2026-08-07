@@ -173330,31 +173330,55 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         //
         // ⚠ Needles are assembled from halves so this assertion cannot match
         // its own source text (field guide §7.4).
+        //
+        // ⚠ Retargeted when the reply moved into ONE shared builder shared by
+        // `sessions reorder` and `sessions sort`. The guarantee did not move —
+        // it got stronger, because now BOTH verbs inherit it from one place
+        // instead of one verb hand-rolling it. Asserting on the old match arm
+        // would have failed while the property held, which is the "locks
+        // survive contract changes" trap: rewrite the lock to the new model,
+        // never delete the guarantee.
         let source = include_str!("shell.rs");
-        let arm = source
-            .split(concat!("AppControlCommand::ReorderSessions ", "{"))
+        let builder = source
+            .split(concat!("fn reorder_", "response("))
             .nth(1)
-            .expect("the reorder handler");
-        let arm = &arm[..arm.len().min(9000)];
+            .expect("the one reply builder for every verb that moves rows");
+        let builder = &builder[..builder.len().min(4000)];
 
         assert!(
-            arm.contains("rendered_after"),
-            "the reply must be built from a re-read taken AFTER the apply"
+            builder.contains(concat!("\"rendered_order\": ", "after")),
+            "`rendered_order` must BE the order re-read AFTER the apply"
         );
         assert!(
-            arm.contains(concat!("\"rendered_order\": ", "rendered_after")),
-            "`rendered_order` must BE the re-read"
-        );
-        assert!(
-            !arm.contains(concat!("\"rendered_order\": ", "ordered_paths")),
+            !builder.contains(concat!("\"rendered_order\": ", "requested")),
             "`rendered_order` must never be the request echoed back — that is the \
              whole defect this verb was built to end, committed by this verb"
         );
-        // And the re-read must come from the rows the sidebar draws, not from
-        // the server model the daemon just overwrote.
+        // `changed` must be a BEFORE/AFTER comparison, never a parse of the
+        // daemon's reply.
         assert!(
-            arm.contains(concat!(".snapshot", "()")) && arm.contains(concat!(".", "rows")),
+            builder.contains(concat!("\"changed\": ", "after_subset != subset(&before)")),
+            "`changed` must compare the re-read order against the one from before"
+        );
+
+        // And the re-read itself must come from the rows the sidebar draws, not
+        // from the server model the daemon just overwrote.
+        let reader = source
+            .split(concat!("fn rendered_live_", "order("))
+            .nth(1)
+            .expect("the one reader of the rendered order");
+        let reader = &reader[..reader.len().min(600)];
+        assert!(
+            reader.contains(concat!(".snapshot", "()")) && reader.contains(concat!(".", "rows")),
             "re-read the RENDERED rows; the daemon's own snapshot is what lied"
+        );
+
+        // Both row-moving verbs must go through the shared applier, so neither
+        // can grow a private route that skips the drag's proven three steps.
+        let applier = concat!("apply_live_order_the_way_a_", "drag_does(");
+        assert!(
+            source.matches(applier).count() >= 3,
+            "reorder and sort must both call the one applier (plus its definition)"
         );
     }
 
