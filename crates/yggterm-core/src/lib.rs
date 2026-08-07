@@ -49,6 +49,10 @@ mod retention;
 /// 2026-07-30.
 pub mod session_bus;
 mod session_kind;
+/// WHERE A ROW SITS — the owner's `0 / 1 / 1.1 / 2` sidebar outline, parsed and
+/// compared as integers per dotted segment. One owner for the sort key, so a
+/// verb can never report an order the sidebar does not draw.
+pub mod session_outline;
 mod telemetry;
 /// How a text payload reaches a terminal composer — and why an agent CLI needs
 /// bracketed paste where a shell does not.

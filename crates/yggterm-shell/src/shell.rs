@@ -218,10 +218,8 @@ use yggterm_server::{
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, snapshot_session_view_for_ui,
     stage_remote_clipboard_png, start_command_session_with_terminal_appearance,
     start_local_session_at_with_terminal_appearance, start_local_session_placed,
-    start_local_session_with_launch_options, start_remote_claude_session_placed,
-    start_remote_claude_session_with_launch_options,
-    start_remote_codex_session_at_with_terminal_appearance, start_remote_codex_session_placed,
-    start_ssh_session_at_with_terminal_appearance, start_ssh_session_placed, status,
+    start_remote_claude_session_placed, start_remote_codex_session_placed,
+    start_ssh_session_placed, status,
     take_next_app_control_request,
     terminal_ensure, terminal_read, terminal_resize, terminal_restart_with_size,
     terminal_retained_snapshot, terminal_snapshot, terminal_write,
@@ -53047,6 +53045,83 @@ fn public_live_session_path_from_started_key(key: &str) -> Option<String> {
 /// cannot tell those apart; the launch command can, because it is produced where
 /// the row LIVES. `applied:false` with the real command attached is the honest
 /// answer, and it saves the caller a `pgrep`.
+/// Where the created row ACTUALLY landed, read back from the order the GUI now
+/// holds — never composed from the request.
+///
+/// ⚖ **This is the one-rule pattern applied at birth.** Six verbs have now been
+/// measured reporting the request rather than the effect (`remove`.verified,
+/// `rename`.accepted, `reorder`.changed, `--prompt-stdin`.delivered,
+/// `send`.accepted, `sessions reorder`.rendered_order), and each cost the owner
+/// a discovery he made by looking at his own screen. A create that echoed back
+/// `"outline": "6.1"` while the row sat at the head would be the seventh.
+///
+/// So `honoured` is computed from `live_sessions` — the ordered model the Live
+/// region renders from (`merge_hot_sidebar_sessions` is a pass-through of it) —
+/// AFTER the create's snapshot has been applied.
+fn app_control_created_seat_report(
+    snapshot: &ServerUiSnapshot,
+    created_path: Option<&str>,
+    requested: &yggterm_server::RowSeatRequest,
+) -> Value {
+    if requested.is_empty() {
+        return Value::Null;
+    }
+    let requested_json = json!({
+        "outline": requested.outline_prefix,
+        "insert_after": requested.insert_after,
+    });
+    let Some(created_path) = created_path else {
+        return json!({
+            "requested": requested_json,
+            "honoured": false,
+            "refusal": "the create returned no session path, so the seat could not be checked",
+        });
+    };
+    let order: Vec<&str> = snapshot
+        .live_sessions
+        .iter()
+        .map(|session| session.session_path.as_str())
+        .collect();
+    let Some(index) = order.iter().position(|path| *path == created_path) else {
+        return json!({
+            "requested": requested_json,
+            "honoured": false,
+            "refusal": "the created row is not in the live order this GUI holds",
+        });
+    };
+    let stored_prefix = snapshot
+        .live_sessions
+        .iter()
+        .find(|session| session.session_path == created_path)
+        .and_then(|session| session.outline_prefix.clone());
+    let preceding = index.checked_sub(1).map(|before| order[before].to_string());
+    let honoured = match (&requested.outline_prefix, &requested.insert_after) {
+        // The durable form: the row must carry the number, and no row ahead of
+        // it may sort after it. Checking the STORED number as well as the
+        // position is what separates "the seat happened to be right" from "the
+        // instruction was recorded", and only the second survives a restart.
+        (Some(outline), _) => {
+            let expected = yggterm_core::session_outline::parse_outline_key(Some(outline));
+            stored_prefix.as_deref() == Some(outline.as_str())
+                && snapshot.live_sessions[..index].iter().all(|session| {
+                    yggterm_core::session_outline::parse_outline_key(
+                        session.outline_prefix.as_deref(),
+                    ) <= expected
+                })
+        }
+        // The positional form: the anchor must be the row immediately above.
+        (None, Some(anchor)) => preceding.as_deref() == Some(anchor.as_str()),
+        (None, None) => true,
+    };
+    json!({
+        "requested": requested_json,
+        "honoured": honoured,
+        "outline_prefix": stored_prefix,
+        "live_index": index,
+        "seated_after": preceding,
+    })
+}
+
 fn app_control_created_launch_report(
     snapshot: &ServerUiSnapshot,
     created_path: Option<&str>,
@@ -74729,8 +74804,19 @@ async fn process_pending_app_control_requests(
             session_kind,
             activate,
             launch_options,
+            outline_prefix,
+            insert_after,
         } => {
             let launch_options = launch_options.unwrap_or_default();
+            // WHERE the row lands, carried into the create request itself. A
+            // create-then-reorder sequence is not acceptable here even when
+            // both halves work: the wrong order is on screen in between, and
+            // the reorder is the half that has been failing. See
+            // [`yggterm_server::RowSeatRequest`].
+            let seat = yggterm_server::RowSeatRequest {
+                outline_prefix: outline_prefix.clone(),
+                insert_after: insert_after.clone(),
+            };
             let endpoint = state.read().bootstrap.server_endpoint.clone();
             let requested_kind = session_kind.unwrap_or(SessionKind::Shell);
             // Creation through THIS plane is agent creation: every human door
@@ -74807,6 +74893,7 @@ async fn process_pending_app_control_requests(
                     let requested_kind_for_task = requested_kind;
                     let terminal_appearance_for_task = terminal_appearance.clone();
                     let launch_for_task = launch_options.clone();
+                    let seat_for_task = seat.clone();
                     let prewarm_endpoint = endpoint.clone();
                     let outcome = run_dedicated_interactive_request_io(
                         "app_control_create_terminal_remote",
@@ -74814,16 +74901,17 @@ async fn process_pending_app_control_requests(
                         move || {
                             ensure_daemon_running(&endpoint)?;
                             if requested_kind_for_task == SessionKind::Codex {
-                                start_remote_codex_session_at_with_terminal_appearance(
+                                yggterm_server::start_remote_codex_session_seated(
                                     &endpoint,
                                     &machine.ssh_target,
                                     machine.prefix.as_deref(),
                                     cwd_for_task.as_deref(),
                                     title_hint_for_task.as_deref(),
                                     Some(&terminal_appearance_for_task),
+                                    &seat_for_task,
                                 )
                             } else if requested_kind_for_task == SessionKind::ClaudeCode {
-                                start_remote_claude_session_with_launch_options(
+                                yggterm_server::start_remote_claude_session_seated(
                                     &endpoint,
                                     &machine.ssh_target,
                                     machine.prefix.as_deref(),
@@ -74831,15 +74919,17 @@ async fn process_pending_app_control_requests(
                                     title_hint_for_task.as_deref(),
                                     Some(&terminal_appearance_for_task),
                                     &launch_for_task,
+                                    &seat_for_task,
                                 )
                             } else {
-                                start_ssh_session_at_with_terminal_appearance(
+                                yggterm_server::start_ssh_session_seated(
                                     &endpoint,
                                     &machine.ssh_target,
                                     machine.prefix.as_deref(),
                                     cwd_for_task.as_deref(),
                                     title_hint_for_task.as_deref(),
                                     Some(&terminal_appearance_for_task),
+                                    &seat_for_task,
                                 )
                             }
                         },
@@ -74853,6 +74943,11 @@ async fn process_pending_app_control_requests(
                                 &snapshot,
                                 created_path.as_deref(),
                                 &launch_options,
+                            );
+                            let seat_report = app_control_created_seat_report(
+                                &snapshot,
+                                created_path.as_deref(),
+                                &seat,
                             );
                             state.with_mut(|shell| {
                                 shell.apply_created_terminal_snapshot(
@@ -74890,6 +74985,9 @@ async fn process_pending_app_control_requests(
                                     "agent_title": synthesized_title,
                                     "session_kind": requested_kind,
                                     "launch": launch_report,
+                                    // WHERE it landed, re-read — never the
+                                    // request echoed back.
+                                    "seat": seat_report,
                                     "activated": activate != Some(false),
                                     "active_session_path": app_control_create_active_session_path(
                                         activate,
@@ -74917,18 +75015,20 @@ async fn process_pending_app_control_requests(
                     let title_hint_for_task = title_hint.clone();
                     let terminal_appearance_for_task = terminal_appearance.clone();
                     let launch_for_task = launch_options.clone();
+                    let seat_for_task = seat.clone();
                     let outcome = run_dedicated_interactive_request_io(
                         "app_control_create_terminal_local",
                         &home,
                         move || {
                             ensure_daemon_running(&endpoint)?;
-                            start_local_session_with_launch_options(
+                            yggterm_server::start_local_session_seated(
                                 &endpoint,
                                 requested_kind,
                                 cwd_for_task.as_deref(),
                                 title_hint_for_task.as_deref(),
                                 Some(&terminal_appearance_for_task),
                                 &launch_for_task,
+                                &seat_for_task,
                             )
                         },
                     )
@@ -74941,6 +75041,11 @@ async fn process_pending_app_control_requests(
                                 &snapshot,
                                 created_path.as_deref(),
                                 &launch_options,
+                            );
+                            let seat_report = app_control_created_seat_report(
+                                &snapshot,
+                                created_path.as_deref(),
+                                &seat,
                             );
                             state.with_mut(|shell| {
                                 shell.apply_created_terminal_snapshot(
@@ -74969,6 +75074,9 @@ async fn process_pending_app_control_requests(
                                     "agent_title": synthesized_title,
                                     "session_kind": requested_kind,
                                     "launch": launch_report,
+                                    // WHERE it landed, re-read — never the
+                                    // request echoed back.
+                                    "seat": seat_report,
                                     "activated": activate != Some(false),
                                     "active_session_path": app_control_create_active_session_path(
                                         activate,

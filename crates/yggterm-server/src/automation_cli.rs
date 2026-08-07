@@ -223,6 +223,24 @@ pub fn read_prompt(args: &[String]) -> anyhow::Result<Option<String>> {
     Ok(cli_flag_value(args, "--prompt").map(str::to_string))
 }
 
+/// Read `--outline <prefix>` / `--insert-after <session-path>` — WHERE a
+/// created row should land.
+///
+/// Public and shared for the same reason [`read_prompt`] is: `--outline 6.1`
+/// must mean the same thing typed at `yggterm` and at `yggterm-headless`, and a
+/// second reader is a second chance for them to disagree about a flag whose
+/// whole job is to make a position unambiguous.
+///
+/// The shape of the prefix is validated later, at the single create-validation
+/// site, so a mistyped number is refused with the row NOT created rather than
+/// half-placed.
+pub fn read_row_seat(args: &[String]) -> crate::RowSeatRequest {
+    crate::RowSeatRequest {
+        outline_prefix: cli_flag_value(args, "--outline").map(str::to_string),
+        insert_after: cli_flag_value(args, "--insert-after").map(str::to_string),
+    }
+}
+
 fn print(value: &Value) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
