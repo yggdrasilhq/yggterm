@@ -113,6 +113,15 @@ Open, user-confirmed bugs live in `docs/pending-bugs.md`. When the user says
 "finish the pending bugs" (or similar), that file is the work queue. Remove an
 entry in the same commit as its verified fix.
 
+**When something needs the user, it goes in `docs/owner-attention.md` and the
+work continues.** That file is the one answer to *"what is waiting on him?"* —
+one line per item, pointing at the entry that owns the detail, never copying it.
+It exists because the campaign runs unattended: an owner-gated step is parked
+there and the relay takes the next load-bearing subset, rather than stalling.
+⛔ Only genuine owner gates belong there — a decision only he makes, a credential
+only he holds, a real-money action, a third party only he can chase. Work that is
+merely hard is a queue item.
+
 ⛔ **`docs/docs-ssot.md` is the law for every status document, and it is
 enforced** (`scripts/check-docs-ssot.sh`, run by
 `docs_ssot::the_bug_file_lists_only_open_items`). One question, one owner: the
