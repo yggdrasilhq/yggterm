@@ -101,6 +101,29 @@ Provenance is not optional and neither is cleanup. Agents create rows through
   (`server app session remove <path>`), rather than leaving it for the policy.
   The sweep is a backstop for what an agent forgot, not a substitute for
   clearing your own plate.
+- ⛔⛔ **AN APP SESSION IS RUBBISH THE MOMENT ITS JOB IS DONE — owner-directed
+  2026-08-07**, after an India Post booking run left two ychrome rows behind on
+  a 38-row sidebar. His words: *"janitor work on the left our ychrome session
+  should be done … so these used app sessions do not dangle around and cause row
+  noise on the yggterm GUI UX."*
+  A ychrome/yRDP row is **scaffolding for ONE task, not a shared asset**: its
+  surface holds a finished page, its scrollback holds a spent URL, and it
+  explains nothing to the human whose sidebar it sits in. **Removing the row is
+  the last step of the task, not a courtesy afterwards.**
+  ⚠ **The ONE exception is a HANDOVER, and it must be named in the report with
+  its path**: a session deliberately left alive for the human to finish — a UPI
+  QR he must scan, a login only he can complete. A leftover is not a handover.
+  ⚠ **And "the row went" is not "the processes went".** Prove all three:
+  `server app rows` (your path absent) · `server app state | jq
+  .web_surface_tabs` (no row for your session) · `pgrep -af 'ychrome --profile
+  <yours>'` (empty). Read `verified`, never `accepted`.
+  ⛔ **Why this had to be said twice:** the rule above has been in this file
+  since 2026-08-06, but `~/.claude/skills/data-fabric/SKILL.md` — the door most
+  agents actually load — said the OPPOSITE ("LEAVE THE SESSION UP … visibility
+  beats tidiness") until 2026-08-07. **The stale line won, because an agent
+  obeys the doc it reads, not the doc that is right.** ⇒ when a rule here is
+  disobeyed, check whether some other doc is teaching the reverse before
+  concluding the agent was careless.
 
 ## The outline contract — every session names and numbers itself (owner-directed 2026-08-06)
 
