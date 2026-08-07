@@ -41,6 +41,7 @@ use crate::terminal_observe::{
     terminal_chunk_has_generic_codex_idle_footer, terminal_chunk_has_meaningful_output,
     terminal_chunk_has_prompt_output, terminal_chunk_has_visible_output,
     terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
+    AgentRowActivity, terminal_chunk_agent_activity,
     terminal_chunk_is_codex_resume_instruction, terminal_chunk_has_agent_composer_row,
     terminal_chunk_has_current_codex_input_row, terminal_composer_row_holds_draft,
     terminal_chunk_is_generic_codex_idle,
@@ -75760,6 +75761,13 @@ async fn process_pending_app_control_requests(
                     "composer_shown": verdict.composer_shown,
                     "composer_held_draft": verdict.composer_held_draft,
                     "waited_ms": verdict.waited_ms,
+                    // ⛔ LIVENESS IS NOT PROGRESS, and this field exists because
+                    // that was read the wrong way round on the owner's own row.
+                    // `consuming_input: true` is what a healthy IDLE row
+                    // reports; it says nothing about whether a turn is running.
+                    // `activity` answers the question a caller actually had.
+                    "activity": verdict.activity.wire_name(),
+                    "answers": "whether bytes reach this row, and what its CLI chrome says it is doing — NOT whether its work is finished or correct",
                     "reason": verdict.reason,
                     "remedy": if !verdict.consuming_input && verdict.composer_shown && !verdict.composer_held_draft {
                         Some("server terminal restart '<session>' clears the wedge with the transcript intact")
@@ -103450,6 +103458,11 @@ struct TerminalInputProbeVerdict {
     consuming_input: bool,
     composer_shown: bool,
     composer_held_draft: bool,
+    /// What the row is DOING, read off the CLI's own chrome. Carried beside
+    /// liveness rather than derived from it — a healthy IDLE row consumes input
+    /// exactly as well as a working one, and reporting only the first is how a
+    /// paused row got called "grinding".
+    activity: AgentRowActivity,
     waited_ms: u64,
     reason: &'static str,
 }
@@ -103480,6 +103493,7 @@ async fn probe_terminal_input_consumption(
     let started = Instant::now();
     let mut composer_shown = false;
     let mut composer_held_draft = false;
+    let mut activity = AgentRowActivity::Unknown;
     while started.elapsed() < timeout {
         if let Ok((screen, ..)) = terminal_snapshot_async(
             endpoint.clone(),
@@ -103491,6 +103505,7 @@ async fn probe_terminal_input_consumption(
         {
             composer_shown = true;
             composer_held_draft = terminal_composer_row_holds_draft(&screen);
+            activity = terminal_chunk_agent_activity(&screen);
             break;
         }
         sleep(Duration::from_millis(150)).await;
@@ -103500,6 +103515,7 @@ async fn probe_terminal_input_consumption(
             consuming_input: false,
             composer_shown: false,
             composer_held_draft: false,
+            activity,
             waited_ms: started.elapsed().as_millis() as u64,
             reason: TERMINAL_INPUT_NO_COMPOSER_REASON,
         };
@@ -103509,6 +103525,7 @@ async fn probe_terminal_input_consumption(
             consuming_input: false,
             composer_shown: true,
             composer_held_draft: true,
+            activity,
             waited_ms: started.elapsed().as_millis() as u64,
             reason: TERMINAL_INPUT_DRAFT_REASON,
         };
@@ -103545,6 +103562,7 @@ async fn probe_terminal_input_consumption(
                 consuming_input: true,
                 composer_shown: true,
                 composer_held_draft,
+                activity,
                 waited_ms: started.elapsed().as_millis() as u64,
                 reason: TERMINAL_INPUT_CONSUMING_REASON,
             };
@@ -103555,6 +103573,7 @@ async fn probe_terminal_input_consumption(
         consuming_input: false,
         composer_shown: true,
         composer_held_draft,
+        activity,
         waited_ms: started.elapsed().as_millis() as u64,
         reason: TERMINAL_INPUT_WEDGED_REASON,
     }
