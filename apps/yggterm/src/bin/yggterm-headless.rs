@@ -209,6 +209,15 @@ fn print_server_app_help() {
     sets the order on the GUI — the process that RENDERS it — and answers with
     the resulting `rendered_order`. `server sessions reorder` writes to whichever
     daemon the CLI resolved, which is not always the one the GUI reads.
+  yggterm-headless server app sessions sort [--dry-run]
+    re-derives the Live order from the rows' outline numbers and applies it.
+    Segments compare as INTEGERS (1 · 1.1 · 2 · 10), unnumbered rows sort last
+    and stably, and sorting a sorted list reports changed:false — which is the
+    success case, not a no-op to chase.
+  yggterm-headless server app session outline <session-path> <prefix>
+    numbers a row that already exists and RE-SEATS it (an empty prefix clears
+    it). The number is stored apart from the title and composed at render time,
+    so a CLI re-titling itself can no longer destroy a position.
   yggterm-headless server app screenshot [output] [--pid <pid>] [--region terminal|full] [--crop x,y,w,h] [--scale n] [--backend os]
   yggterm-headless server app open <session-path> [--view <terminal|preview>] [--pid <pid>]
   yggterm-headless server app resize-window --width <px> --height <px> [--pid <pid>]
@@ -238,7 +247,14 @@ fn print_server_app_help() {
   yggterm-headless server app update <check|restart>
   yggterm-headless server app terminal <new|send|focus|probe-type|probe-scroll|probe-select|probe-context-menu> ...
   yggterm-headless server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|codex|claude-code>] [--title <title>] [--purpose <what-for>] [--no-activate]
-    with no --title the row is named for the driving agent and its purpose
+      [--outline <prefix> | --insert-after <session-path>]
+    with no --title the row is named for the driving agent and its purpose.
+    --outline seats the row at a stored number that survives restarts and
+    re-titles; --insert-after places it below an anchor row this once. The seat
+    is applied INSIDE the create, and the reply's `seat.honoured` is RE-READ
+    from the rendered order rather than echoed from the request. Passing both,
+    or a prefix that is not a dotted number, is refused BY NAME before the row
+    is created.
   yggterm-headless server app terminal send <session> (--data <data>|--stdin) [--allow-multiline]
     a payload with interior line breaks is REFUSED for an agent CLI row: its
     composer reads every \r as Enter, so line 1 submits alone and the rest
