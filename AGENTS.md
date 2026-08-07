@@ -44,10 +44,15 @@ Full mission rationale: see `~/.claude/projects/-home-user-gh-yggterm/memory/pro
 - `../ghostty` contains legacy Ghostty integration code in Zig.
 - `../zed` is an optional visual/reference checkout for shell design study.
 - This repo (`yggterm`) is the integration layer and product surface.
-- `~/gh/paper` and `~/gh/cellulose` are the intended local checkouts for
-  standalone Paper and Cellulose apps. They should live under
-  `github.com/yggdrasilhq`, remain GPL-3.0-or-later licensed, and expose clean
-  integration boundaries that Yggterm can embed without absorbing the whole app.
+- ⛔ **`~/gh/paper` and `~/gh/cellulose` no longer exist** — both repos were
+  DELETED 2026-08-07 on the user's call (*"far far superceded in concept"*).
+  **Paper's role is retired**; ztlkasten took the brain-organization work.
+  **Cellulose's name is reserved** and it returns as a fresh repo later. Do not
+  recreate either from this file. When cellulose does return it takes the launch
+  gate at `~/git/gour.top/docs/venture/ip-register.md` §THE LAUNCH GATE **Step 0
+  first** — lumenstore decides the licence before anything of his goes public.
+  Cellulose as a *design target* is still live throughout `docs/alt-keytips.md`
+  and `docs/agent-control-plane.md`; that is the concept, not a checkout.
 
 ## ⛔ THE PRESENTATION POLICY — you may not flip these flags
 

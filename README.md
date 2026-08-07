@@ -195,8 +195,10 @@ Some Yggterm workspace surfaces are now intended to mature in their own reposito
 
 The current expected family is:
 
-- `paper`: a richer notion-like workspace and document surface
-- `cellulose`: an AI-first spreadsheet and analytical workspace
+- `ztlkasten`: the roam/obsidian-replacement usage layer, which took over the
+  brain-organization role once sketched as `paper`
+- `cellulose`: an AI-first spreadsheet and analytical workspace (planned; the
+  name is reserved and the repo is not yet cut)
 - Excalidraw integration: likely maintained as a fork or patch stack over the Obsidian Excalidraw plugin rather than reimplemented from zero
 
 The intent is:
