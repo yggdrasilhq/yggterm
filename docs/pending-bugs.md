@@ -13,6 +13,50 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⛔⛔ THE VENDORED `dioxus-desktop` NO LONGER CROSS-COMPILES FOR ANDROID — drillkit-rs cannot cut an APK
+
+**Status:** OPEN. Found 2026-08-07 by the drillkit-rs EXAM exam-console row while following
+drillkit-rs's own standing rule that a client-side change must ship an Android APK release.
+
+`vendor/dioxus-desktop` declares and uses the yggterm web-surface module **unconditionally**,
+but that module is Linux/WebKitGTK-only by construction — its own header says so ("This is the
+Linux/WebKitGTK path"), and it builds on `gtk::Overlay` / `build_gtk`. There is no GTK on
+`aarch64-linux-android`, so the module cannot compile there and every reference to it fails:
+
+```
+error[E0433]: cannot find `web_surface` in `crate`          x12
+error[E0609]: no field `web_surface_host` on type `&DesktopService`   x2
+error[E0282]: type annotations needed                        x1   (let web_surface_backdrop;)
+error: could not compile `dioxus-desktop` (lib) due to 15 previous errors
+```
+
+The three unconditional sites:
+
+- `vendor/dioxus-desktop/src/lib.rs:28` — `mod web_surface;` (and `:29`, `:37` `pub use web_surface::{...}`)
+- `vendor/dioxus-desktop/src/desktop_context.rs:82` — the `web_surface_host` field on `DesktopService`
+- `vendor/dioxus-desktop/src/desktop_context.rs:134,162` — `install_web_surface_host`, `SurfaceUserscript`
+
+**This is a REGRESSION, and it is datable.** drillkit-rs release `v0.1.0-beta.22` (16 Jun 2026)
+carries a working `drillkit-rs-android-arm64-dev.apk`; `vendor/dioxus-desktop/src/lib.rs` was last
+touched by `4cb67d00` (2026-08-01, "feat(web): the legacy browser keys, and a screenshot on the
+page menu"). So Android built before that work and does not now.
+
+⚠ **Not fixed here on purpose.** The fix is a `#[cfg]` pass over the module, the `DesktopService`
+field and its callers, and a wrong gate silently disables web surfaces on Linux — yggterm's own
+core feature. That belongs to whoever owns the web-surface plane, not to a consumer repo's exam
+row. **The falsifier is concrete:** `cd ~/git/drillkit-rs && ./scripts/build-android-armv8.sh`
+produces a signed `target/release/drillkit-rs-android-arm64-dev.apk`.
+
+⭐ **Worth knowing for anyone consuming this vendor dir:** the WEB target is unaffected
+(`dx build --web` was run and verified live the same day). Only Android is down, and it is down
+hard — no APK release is possible from any fleet host until this is gated.
+
+⚠ Second, smaller thing found in the same run, listed so it is not rediscovered: `oc` (the only
+host with the Android SDK/NDK) has **Java 17**, while `drillkit-rs/scripts/build-android-armv8.sh`
+defaults `JAVA_HOME` to `java-21-openjdk-amd64`. It honours an explicit `JAVA_HOME`, so
+`JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64` gets past the dependency check and Gradle is happy;
+the Rust compile above is what actually stops the build.
+
 ## ★★ WEBKIT'S OWN POPUP BLOCKER EATS `window.open` BEFORE OUR POPUP PIPELINE SEES IT — and no agent can tell
 
 **Status:** OPEN
