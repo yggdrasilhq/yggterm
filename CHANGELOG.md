@@ -4,6 +4,23 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The start page lists every session again — the scope now RANKS instead of
+  dropping.** RECENT WORK was filtered by a `{machine_key, cwd}` scope taken
+  from whichever row was selected, while the header said only "N shown". The
+  same page read three times with a different row selected answered 188, then
+  40, then 4 — so a row outside the scope looked exactly like a row that did not
+  exist, which is what happened when a removed delegate could not be found to
+  respawn it. In-scope work still leads the list (the page's own promise is
+  "create work in this scope", and that ordering is what makes it true) and
+  everything else follows instead of vanishing.
+
+- **A session no longer appears twice on the start page.** The de-duplication
+  matched on the session id when a row had one and on the path when it did not,
+  so the two sidebar spellings of one live session — the live row, which knows
+  its id, and the folder row, which does not — never met. It was invisible only
+  because the scope filter dropped the second copy first; taking that filter
+  away surfaced it, and both are fixed together.
+
 - **"New Terminal" is its own button on the start page, not an item inside the
   session menu.** Being in that menu meant being sticky: choose a plain shell
   once and it became the face of the button you reach for to start an agent, so
