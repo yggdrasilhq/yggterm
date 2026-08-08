@@ -4,6 +4,39 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **`server app state` now reports what the right rail is actually DRAWING, not
+  just what was asked for.** Chasing the report above, every instrument said the
+  rail was `hidden` while a fully painted rail sat beside the row — and both
+  readings were true, because **a rail that is not docked still renders a body**:
+  the hover-reveal card draws the reveal mode, so the requested mode says nothing
+  about what is on screen. The probe's new `shell.right_panel` block carries the
+  pair (`requested_mode` / `rendered_mode`), whether the rail is `docked`, the
+  pre-tenancy `raw_mode`, the `restore_mode` and `reveal_mode` behind it, the
+  contributed pane being rendered together with the session that DECLARED it, and
+  the session whose tab rail the body would draw. That last one is read off the
+  overlay's own stamp rather than inferred from the active session:
+  `WebSurfaceOverlayView` now carries the session it was looked up under, so
+  "whose tab rail is this" is a field, not a guess. The rail component and the
+  probe share ONE resolution (`rail_render_view`), so the pixels and the probe
+  cannot disagree about which body is up.
+
+- **An app row is now BORN with the app's command, so a restart brings the app
+  back instead of a bare prompt.** His live ychrome row returned from a daemon
+  swap as plain bash carrying `Runtime Restore Reason: update-restart`, which is
+  the honest explanation of *"ychrome launch launches plain terminal"* for a row
+  that has survived a deploy. The row was created as a plain shell and the app's
+  command was TYPED into its PTY afterwards, so its stored launch command was
+  `exec '/bin/bash' -i` and nothing on the wire said the row was ychrome — there
+  was nothing for a restart to re-run. A local app launch now goes through the
+  command-session door, which holds the command as the row's own launch command
+  and stamps `Source: app:<name>`. The command keeps an interactive shell after
+  the verb, deliberately: apps declare their surface and exit (`yedit` prints
+  `yedit: document surface opened` and returns), so a bare verb would end the PTY
+  seconds after the row was born. It also retires the guess the old path had to
+  make — the typed command went to whatever the daemon called the ACTIVE session,
+  not necessarily the row just created. Command sessions can now be seated under
+  an anchor row like every other "…Here" launcher.
+
 - **A contributed rail pane is now addressed by the session that DECLARED it, so
   one app's sidebar can no longer paint over another app's row.** Reported, with
   a screenshot: *"yedit launch opens blank viewport on libyggterm surface; I

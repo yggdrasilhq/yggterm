@@ -133,7 +133,8 @@ pub use daemon::{
     retire_stale_daemons, RetireStaleDaemonOutcome, RetireStaleDaemonsReport, run_daemon,
     set_all_preview_blocks_folded, set_session_keep_alive, set_session_outline_prefix,
     set_view_mode, shutdown, snapshot,
-    start_command_session, start_command_session_with_terminal_appearance, start_local_session,
+    start_command_session, start_command_session_placed,
+    start_command_session_with_terminal_appearance, start_local_session,
     start_local_session_at, start_local_session_at_with_terminal_appearance,
     start_local_session_placed, start_local_session_seated,
     start_local_session_with_launch_options, start_remote_claude_session_seated,
@@ -26215,6 +26216,39 @@ fn local_interactive_shell_launch_command(shell_program: &str) -> String {
     format!("exec {} -i", shell_single_quote(shell_program))
 }
 
+/// The launch command for a libyggterm APP row: run the app's verb, then hand
+/// the row the interactive shell an app row has always ended up at.
+///
+/// ⛔ THE DEFECT THIS CLOSES (owner-reported 2026-08-08): an app row used to be
+/// born as a plain shell with the app's command TYPED into its PTY afterwards,
+/// so the row's stored launch command was `exec '/bin/bash' -i` and **nothing on
+/// the wire said the row was ychrome**. A daemon swap re-ran that command and
+/// the app was gone permanently — his live ychrome row came back as bare bash
+/// with `Runtime Restore Reason: update-restart`. Holding the app's command AS
+/// the launch command is what makes the row survive a restart as itself.
+///
+/// ⚠ **The shell tail is not decoration.** Apps declare their surface and
+/// RETURN — `yedit` prints `yedit: document surface opened` and exits, which is
+/// exactly what the owner's screenshot shows. A launch command of the bare app
+/// verb would therefore end the PTY within a second of birth and the row would
+/// die on arrival. The tail preserves the behaviour the typed command always
+/// had, restart included.
+///
+/// ⚠ `"$SHELL"` is expanded by the DAEMON's shell at exec time, deliberately:
+/// the GUI composes this string but the daemon runs it, and the daemon's
+/// environment is the one that decides what a shell is here (a frozen daemon
+/// env has poisoned sessions before). It also keeps the string correct on an
+/// owner too old to know any of this, which is what version-coexisting daemons
+/// require.
+pub fn local_app_verb_launch_command(app_command: &str) -> String {
+    if cfg!(windows) {
+        // `cmd /C` chains with `&`, which runs the tail whatever the app
+        // returned — the `;` semantics wanted here, not `&&`.
+        return format!("{app_command} & %COMSPEC%");
+    }
+    format!("{app_command}; exec \"${{SHELL:-/bin/bash}}\" -i")
+}
+
 fn legacy_agent_launch_command(
     kind: SessionKind,
     cwd: Option<&str>,
@@ -27572,6 +27606,7 @@ mod tests {
         remote_scanned_session_path, remote_snapshot_looks_like_codex,
         remote_snapshot_looks_like_shell_prompt, remote_ssh_launch_command,
         remote_summary_for_path, sanitize_recent_context_payload,
+        local_app_verb_launch_command,
         session_metadata_value, should_fallback_to_python,
         session_path_is_remote, should_remove_local_daemon_socket_for_spawn_state,
         stored_session_launch_command, stored_session_launch_command_for_locality,
@@ -29392,6 +29427,66 @@ mod tests {
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         )
+    }
+
+    /// ⛔ OWNER-REPORTED 2026-08-08: his live ychrome row came back from a
+    /// daemon swap as a bare bash prompt, carrying `Runtime Restore Reason:
+    /// update-restart`. The cause was that an app row was born a plain shell
+    /// and the app's command was TYPED into its PTY afterwards, so the row's
+    /// stored launch command was `exec '/bin/bash' -i` — **nothing on the wire
+    /// said the row was ychrome**, and a restart had nothing to re-run.
+    ///
+    /// Both halves are locked, and the second is the non-obvious one: apps
+    /// declare their surface and RETURN (`yedit` prints `yedit: document
+    /// surface opened` and exits), so a launch command of the bare app verb
+    /// would end the PTY seconds after birth. The row must run the app AND
+    /// still be a terminal afterwards.
+    #[test]
+    fn an_app_row_holds_its_app_command_so_a_restart_brings_the_app_back() {
+        let mut server = test_server();
+        let app_command = "'/home/user/.local/bin/ychrome' 'new'";
+        let path = server.start_command_session(
+            Some("/home/user"),
+            Some("New Ychrome"),
+            &local_app_verb_launch_command(app_command),
+            Some("app:ychrome"),
+        );
+
+        let (launch_command, _cwd) = server
+            .terminal_spec(&path)
+            .expect("an app row must have a terminal spec to be restartable");
+        assert!(
+            launch_command.starts_with(app_command),
+            "the row must RE-RUN the app on restart, not a shell that once had \
+             it typed into it — got {launch_command}"
+        );
+        assert_ne!(
+            launch_command, app_command,
+            "…and it must not END there: an app declares its surface and exits, \
+             so a bare verb kills the PTY on arrival"
+        );
+        if cfg!(unix) {
+            assert!(
+                launch_command.ends_with("; exec \"${SHELL:-/bin/bash}\" -i"),
+                "the tail hands the row the interactive shell it always ended \
+                 up at, expanded by the DAEMON's shell — got {launch_command}"
+            );
+        }
+
+        let session = server
+            .sessions
+            .get(&path)
+            .expect("the row exists under its own key");
+        assert_eq!(
+            session
+                .metadata
+                .iter()
+                .find(|entry| entry.label == "Source")
+                .map(|entry| entry.value.as_str()),
+            Some("app:ychrome"),
+            "the Source stamp is where a row SAYS which app it is — the identity \
+             the old typed-command path never wrote anywhere"
+        );
     }
 
     #[test]

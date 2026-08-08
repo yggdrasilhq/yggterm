@@ -29,16 +29,20 @@ the two must land together and deploy once. Falsifier for the live proof: open
 the `New Yedit` row and read the rail; ychrome's omnibox/tabs/`tables` folder
 appearing there again means this did not close it.
 
-⚠ **STILL OPEN underneath it, and NOT what the fix above addresses:** the
-photographed rail also painted ychrome's chrome while `right_panel_mode`
-reported `hidden`. `WebTabsRailBody` draws `snapshot.active_web_surface_overlay`,
-which IS keyed on `active_session_path` — so either that overlay resolved to a
-non-active session's surface, or the collapsed-rail body
-(`rendered_mode = right_panel_reveal_mode` when `visible == false`) painted a
-tenant of a session that was no longer on screen. The instrument to separate
-those does not exist: `server app state` reports the rail's MODE but not its
-rendered pane id, its tenant session, or which session the overlay it is
-drawing belongs to. **Add that first; do not guess between the two.**
+⚠ **STILL OPEN underneath it: the second half is now MEASURABLE but not yet
+measured.** The photographed rail also painted ychrome's chrome while
+`right_panel_mode` reported `hidden`. **3.0.61 built the instrument that
+separates the two candidates** — `server app state` grew a `shell.right_panel`
+block reporting `requested_mode` / `rendered_mode` / `docked`, the rendered pane
+with the session that DECLARED it, and `web_tabs_overlay_session` read off the
+overlay's own stamp. It also settled the thing that made the old readings look
+contradictory: **a rail that is not docked STILL RENDERS A BODY** (the reveal
+card draws `reveal_mode`), so `hidden` beside a painted rail was never a
+contradiction, and the probe simply could not see which body was up.
+⛔ **What remains is the measurement**, on a deployed 3.0.61: reproduce, read
+`shell.right_panel`, and name the carrier. If it names the overlay, session-key
+`RightPanelMode::WebTabs` exactly as `AppPane` now is — **do not widen to it
+before that reading**.
 
 Owner-reported 2026-08-08, with a screenshot: *"Right click context menu ychrome
 launch launches plain terminal. yedit launch opens blank viewport on libyggterm
@@ -138,13 +142,18 @@ deliberate and documented — *"the same thing the user would do by hand"* — a
 row being a shell is NOT itself the bug. **The bug is that nothing on the wire
 says "this row is ychrome".** Three consequences, each live-proven:
 
-1. **A restart resurrects bare bash.** The row's stored launch command is
-   `exec '/bin/bash' -i`. His ychrome row carries exactly that, plus
-   `Runtime Restore Reason: update-restart` — so a daemon swap relaunched bash and
-   the app was gone permanently. ⇒ This is the honest explanation of *"ychrome
-   launch launches plain terminal"* for a row that has survived a deploy.
-   ⚠⚠ **It also means every GUI restart re-breaks his app rows**, so a deploy must
-   not be done casually while app rows are live.
+1. ⭐ **FIXED IN CODE (3.0.61) — LIVE PROOF OWED.** A local app launch now goes
+   through `start_command_session_placed`, so the row is BORN holding
+   `local_app_verb_launch_command(cmd)` as its own launch command with
+   `Source: app:<name>` stamped on it. The command keeps an interactive shell
+   after the verb — apps declare and EXIT, so a bare verb would end the PTY on
+   arrival. Lock: `an_app_row_holds_its_app_command_so_a_restart_brings_the_app_back`,
+   mutation-proven red three ways. **Falsifier:** launch an app row, restart the
+   GUI, and read the row — a bash prompt with no app means this did not close it.
+   ⚠ **NOT retroactive:** a row created before 3.0.61 still stores
+   `exec '/bin/bash' -i` and still comes back as bare bash.
+   ⚠ The REMOTE (ssh) arm still types the command out-of-band, deliberately —
+   untouched and unproven.
 2. **The missing-binary refusal shipped in 3.0.59 cannot speak for an app.**
    `local_managed_cli_tool_for` (`lib.rs` ~15555) returns `None` for a Shell, so
    the exact failure `ac624b85` fixed for CLIs — a binary that prints, exits, and
@@ -164,9 +173,10 @@ is fine; the missing piece is row-level app IDENTITY, not a new enum variant.
 - **`write_app_verb_command` types into whatever the daemon calls the ACTIVE
   session, not into the session it just created**, and returns silently when it
   can resolve neither. A row that never received its command line is a bare prompt
-  forever. ⚠ NOT confirmed to have fired in the live incident. The start reply
-  already knows which session it created — carry that path through and delete the
-  active-session inference.
+  forever. ⚠ NOT confirmed to have fired in the live incident.
+  ⭐ **Retired for the LOCAL arm in 3.0.61** — a create that carries its own
+  command has nothing left to infer. **Still live on the REMOTE (ssh) arm**,
+  which is the open half of this bullet.
 - **A bare `ychrome` takes the PROFILE-PICKER path, and the daemon's retention
   allow-list DISCARDS that declare** (`app_declare.rs` ~87), so a bare-ychrome row
   never gets a retained declare at all. Either the `new` verb stops being
@@ -3206,7 +3216,9 @@ split every time: asked about one thing, answered about another.** Only `termina
 
 ## A POPUP-based re-auth cannot be completed on a web surface — the parent never resumes
 
-**Status:** OPEN · raised 2026-08-08 · **operator-confirmed by doing it in Chromium instead**
+**Status:** OPEN
+
+Raised 2026-08-08 · **operator-confirmed by doing it in Chromium instead**.
 
 Field report: **[`docs/agent-cobrowse-gaps-2026-08-08.md`](agent-cobrowse-gaps-2026-08-08.md)**.
 Filed from fingraph row 5.5 after *"close the fake Google payments profile"* was driven to the
