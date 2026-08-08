@@ -37,6 +37,16 @@ copies.
   *Meanwhile:* the relay is fixing them one at a time in the pattern the rule
   would generalise, so either answer is cheaper afterwards, not dearer.
 
+- **How should a session whose CWD no longer exists render, and what should
+  clicking it do?** — the orphan repair recovered five lost sessions on the GUI
+  host (two of 11,006 records) and their workspaces are gone, so a click aims
+  `cd <cwd> && codex resume` at a directory that is not there. → yggterm
+  `docs/pending-bugs.md` § *A SESSION WHOSE CWD NO LONGER EXISTS…*
+  (`Status: AWAITING A DECISION`).
+  *Meanwhile:* they render and are reachable, which is the half he already ruled
+  on (*"They should show"*); only the click behaviour is parked. ⛔ Hiding them
+  is not an available answer — that is the exact mistake the repair undid.
+
 ## Credentials and real-money actions (the vault and the card rails)
 
 - **Any card payment is his, per action, every time** — his standing rule for
