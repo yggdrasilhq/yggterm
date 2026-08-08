@@ -4,6 +4,22 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **An exhausted policy fetch now re-arms after a minute, so an endpoint that
+  comes back on the SAME port is finally noticed.** The repair rule above can
+  only fire if a policy ever arrives, and after three failed fetches nothing
+  ever fetched again: the refetch flag was `policy_attempts <
+  MAX_POLICY_FETCH_ATTEMPTS` and only a CHANGED policy stamp reset the counter.
+  A daemon that re-binds its old port sends no stamp change and no new url, so
+  there was nothing for the ~4s heartbeat to notice — a boot race or a few
+  seconds of a busy host made the surface permanently unprotected. Exhaustion
+  now records WHEN it happened, and a pure `sidebar_policy_refetch_due` hands
+  the contribution a fresh budget once a minute: ~1 fetch/min against an
+  endpoint that is genuinely dead, and a transient refusal heals within a
+  minute instead of never. The old cap's reason survives intact — *"a
+  permanently broken endpoint must not mean one fetch every 4s for the life of
+  the session"* — and zoom, appearance and document, which are cosmetic and
+  gate nothing, keep the hard cap.
+
 - **A web surface that opened without ad-block is now REBUILT once the policy
   arrives, instead of running unprotected for its whole life.** Userscripts and
   the adblock ruleset ride `init_script`, which binds at webview CREATION — so

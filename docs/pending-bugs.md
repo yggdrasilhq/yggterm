@@ -13,54 +13,144 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
-## ★★ AN EXHAUSTED POLICY FETCH NEVER RE-ARMS, SO A SAME-PORT RECOVERY NEVER LANDS
+## ★★★ OWNER-REPORTED: A LEGACY BROWSER CHORD IS DEAD WHENEVER THE SIDEBAR HAS FOCUS
 
 **Status:** OPEN
 
-The repair half of the stranded-control-port bug SHIPPED in 3.0.55: a web
-surface built without the app's policy is rebuilt once the policy arrives
-(`web_surface_recreate_reason` → `policy_arrived`). It fires on the reported
-case, where a `ychrome daemon restart` moves the control port, the client
-re-declares the new url on its ~4s heartbeat, `sidebar_contribution_matches_
-declare` tears the contribution down, and the fresh one fetches with a clean
-budget.
+⭐ **Owner-reported 2026-08-08:** *"legacy shortcuts in ychrome like CTRL+T works
+when viewport is active but not when sidebar is active."*
 
-**It cannot fire when the endpoint comes back on the SAME url.** After
-`MAX_POLICY_FETCH_ATTEMPTS` (3) failures, `apply_sidebar_declare`'s refetch flag
-goes false and STAYS false for the life of the contribution:
+This is the THIRD face of the bug reported twice on 2026-08-01 (a revealed page
+with no keyboard; an omnibox focus that lasted a split second), and the first two
+fixes cannot reach it, because this one is not about which surface was revealed.
 
-```rust
-policy: !policy_version.is_empty()
-    && existing.policy.is_none()
-    && existing.policy_attempts < MAX_POLICY_FETCH_ATTEMPTS,
+`WEB_PAGE_CHORDS` is `page_only` to the last row, and the window claimer stands a
+`page_only` row down *"unless the focused widget is one of this host's VISIBLE
+surface webviews"* (`shell.rs`, the `WEB_PAGE_CHORDS` doc). Click the sidebar and
+the focused GTK widget is the **shell's own Dioxus webview**, so every browser
+chord stands down. That gate is not sloppy — it is the reason `Ctrl+R` is still
+readline's reverse-search in every terminal, and `assert_accels_pty_safe` plus
+`assert_no_legacy_chord_is_an_accel` hold the two layers disjoint by name.
+
+The gate is two lines, both in the vendored crate:
+`vendor/dioxus-desktop/src/web_surface.rs` — `claimed_chord`'s
+`(!entry.page_only || page_focused)`, and the `page_focused` it is handed, which
+matches `window.focused_widget()` against *"the surfaces this host owns — the
+shell's own webview is not among them"*.
+
+⛔ **The obvious fix is wrong.** "Also allow the chord when the toplevel webview
+has focus" hands `Ctrl+R`/`Ctrl+T`/`Ctrl+W` back to the terminal, because **the
+terminal canvas and the sidebar live in the SAME webview** — GTK cannot tell them
+apart, and that indistinguishability is precisely why the gate was written at the
+widget level. So the answer has to come DOWN from the shell into the vendored
+claimer, not be re-derived inside it.
+
+**So the gate needs a second, finer question that only the shell can answer:** is
+the shell's own DOM focus in a terminal or a text field right now? The find bar
+already owns a fact of that exact shape
+(`web_find::find_bar_blocks_terminal_input`), so the honest move is to name the
+DOM-focus fact ONCE and have both read it, not to add a second encoding. A chord
+would then serve when the active session's view is a web surface AND the shell's
+DOM focus is neither the terminal nor an input.
+
+**Acceptance:** with a ychrome session active and the sidebar clicked, `Ctrl+T`
+opens a tab; with a terminal session active and the sidebar clicked, `Ctrl+R`
+still reaches readline; and a rename field in the sidebar still eats its own
+`Ctrl+W`. ⚠ Live proof is a keystroke through app control, not a unit test — the
+whole bug lives in which widget GTK considers focused.
+
+## ★★ OWNER-REPORTED: THE FIRST TAB REFUSES CLOSE, DUPLICATE AND DRAG — the refusals are right, the AFFORDANCES are the bug
+
+**Status:** OPEN
+
+⭐ **Owner-reported 2026-08-08:** *"the first tab of ychrome session is a diva. It
+cannot be closed, duplicated, dragged around, etc."*
+
+Every one of those refusals is deliberate and has its own reason written at the
+callsite: `web_surface_close_tab` returns early on `index == 0` (closing the app
+is the overlay ✕, which sends a real Ctrl+C); `web_surface_duplicate_tab` refuses
+`WEB_TAB_APP_TAB_ID` because `persist_web_tabs` saves tabs[0] only as the MARKED
+app-tab row, so a copy would persist as a user tab and resurrect a stale start
+page on the next visit; the drag lands `DragDropPlacement::After` on it for the
+same reason. The ✕ on that row is a **go home**, not a close, and it lost and
+regained that meaning once already.
+
+**So the defect is not the policy — it is that the row LOOKS like every other
+tab and answers differently.** A user cannot see an invariant. Two candidate
+shapes, and the choice is a spec call rather than a patch:
+
+1. **Mark it.** Render the app tab as what it is — pinned, no drag handle, its ✕
+   labelled and shaped as *go home* — so nothing is offered that will be refused.
+2. **Free it, per app kind.** For a BROWSER the app tab is a start page and
+   nothing depends on it surviving; for yedit it is the editor and everything
+   does. `AgentCliDescriptor`-style per-app declaration could say which, and
+   ychrome would declare its first tab ordinary.
+
+⚠ Shape 2 is the one the report actually asks for, and it is the one that moves
+`persist_web_tabs`' marked-row invariant — do not start it without deciding what
+a ychrome session with NO app tab is.
+
+## ⭐ OWNER-REPORTED: LAUNCHING MUSE CODE LANDS IN A SHELL THAT SAYS `command not found`
+
+**Status:** OPEN
+
+⭐ **Owner-reported 2026-08-08:** *"All CLIs might not be installed. I tried
+launching Muse Code and the viewport reported CLI binary not found."*
+
+The measured half is already filed one entry down ("AUTO-PROVISIONING COVERS
+THREE OF THE SIX NEW CLIs"), and Muse is correctly parked in
+`owner-attention.md` — it is closed source and installed nowhere on the fleet, so
+no provisioner can fetch it. **That part is not a bug and must not be "fixed" by
+guessing at an installer.**
+
+What the report proves is the OTHER half, and it is now owner-confirmed rather
+than agent-measured: **a missing binary is not a launch failure anywhere in the
+product.** The exec falls through to `/bin/bash`, the row goes `healthy`, the
+shell outlives the CLI at a prompt, and the only instrument that can answer *"did
+my CLI start?"* is reading the screen text. Nine CLIs are first-class now and
+several are not installed on any given host, so this is the common case, not the
+edge.
+
+**Owed:** `AgentCliDescriptor` already names `binary_name` — check it on the
+launch path, and when it is absent fail the ROW with the CLI's name and its
+documented install method, instead of handing the user a shell. The descriptor
+for Muse already carries the sentence to show (`⛔ UNMEASURED … installs
+user-local into ~/.local/bin`).
+
+## ⛔⛔ SIX yggterm-shell RETENTION TESTS ARE RED AT HEAD — and the recorded baseline still says green
+
+**Status:** OPEN
+
+Measured on jojo at `a9773099`, deterministic, single-threaded, and **proven not
+to be the measuring session's own change**: stashing only `shell.rs` and
+rebuilding at HEAD reproduces all six.
+
+```
+inactive_retained_ready_session_keeps_bridge_mounted_but_pauses_reads
+prune_terminal_attach_in_flight_drops_background_retained_attach
+retained_background_session_trickles_reads_instead_of_pausing
+shell_snapshot_retains_live_local_stored_codex_sessions
+shell_snapshot_trims_inactive_live_payloads_for_sidebar_and_retention
+sync_live_terminal_retention_keeps_active_not_fresh_inactive_live_sessions
 ```
 
-So a transient refusal — a boot race, a daemon that re-binds its old port, a
-few seconds of a busy host — is permanent: no fetch is ever tried again, the
-policy never lands, and the surface the gate opened unblocked stays unblocked.
-`rearm_abandoned_sidebar_policy_fetch` exists for exactly this and is wired to
-the AGENT door (`web ensure`) only; a human's surfaces have no such door.
+They all say one thing: a session that was explicitly retained and marked
+resume-ready is **no longer in `snapshot().retained_terminal_sessions`** after
+`sync_live_terminal_retention()`.
 
-⚠ The comment guarding that line is right and must survive the fix: *"a
-permanently broken endpoint must not mean one fetch every 4s for the life of the
-session."* The answer is a COOLDOWN, not an uncapped retry — a fresh budget once
-per minute rather than never, which costs ~1 fetch/min against a dead endpoint
-and heals a transient one within a minute.
+**Where NOT to look:** the retention code itself. `git log -S` puts the last edit
+to `sync_live_terminal_retention` at 2.4.0 and to `retained_terminal_sessions` at
+2.10.8. **Start at the start-page scope work** (`e492cdff`, `a3ae8ed6`) — it
+changed what `snapshot()` puts in the live/recent lists, which is what these
+tests read.
 
-**Shape of the fix:** record WHEN the budget was exhausted
-(`policy_exhausted_at_ms`, set by `fail_sidebar_policy` on the call that returns
-true), and make the heartbeat's refetch flag a pure `sidebar_policy_refetch_due(
-attempts, exhausted_at_ms, now_ms)`. ⛔ `policy_attempts` is reset in five
-places (declare stamp change, insert, apply, invalidate, re-arm); the new field
-must move WITH it from ONE owner — a `reset_policy_fetch()` on the contribution
-— or the exhausted mark goes stale and the cooldown fires on a healthy session.
-
-**Acceptance:** a contribution whose fetch has failed 3 times against an
-unchanged control url is asked to fetch again after the cooldown and not before,
-and a surface built under `Abandoned` is then repaired by the rule that already
-exists. Mutation-prove the cooldown boundary, not just the happy path.
-
----
+⚠ **The reason this is filed at ⛔⛔ rather than as a chore:** the campaign's
+recorded baseline is *"1844 tests, 1843 pass + 1 ignored"*, so every brief tells
+the next agent the suite is green. It is not, and the first thing an agent does
+with an unexplained red is suspect its own diff. That cost this session a stash,
+a rebuild and a re-run to disprove. **A wrong baseline is worse than no
+baseline** — until this is fixed, the number to quote is 1840 pass + 6 fail + 1
+ignored.
 
 ## ★★★ THE EXTRA-ARGS SETTINGS ARE TWO TEXT BOXES AND THERE ARE NINE CLIs — build the modal
 
