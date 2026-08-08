@@ -4,6 +4,30 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **An app row now survives a DAEMON restart as itself, which is the half the
+  create-time fix could not reach.** Born holding the app's command was not
+  enough: the persisted form of a live row has never carried `launch_command` at
+  all — the restore RE-DERIVES it, and for a shell the derivation is
+  `exec '<shell>' -i`. So the row still came back as bare bash after a daemon
+  swap, carrying `Runtime Restore Reason: update-restart`, which is exactly what
+  he reported. The row now persists WHICH app verb it is, as the same
+  `app:<name>:<verb>` token every launcher menu already speaks (it is the row's
+  `Source` stamp, so there is no second field to drift), and the command is
+  re-derived from it against the registry as it is THEN — not the path stored
+  months ago. A row adopted off a peer daemon during a version handover carries
+  the token across too. An app since uninstalled resolves to nothing and the row
+  falls back to the plain shell it would otherwise have been, which is a visible
+  empty prompt rather than an exec of a path that has moved.
+
+- **An agent can now launch an app row.** `server app launch-app <app> [verb]`
+  routes through the same owner the titlebar `+`, the cwd-tree row menu and the
+  start page all use. Every other kind of row already had a headless door and an
+  APP row had none — the only way to create one was a pointer click on a menu,
+  on a Wayland desktop where absolute pointer injection does not map to screen
+  pixels. So the app-launch path could not be exercised by the agent changing
+  it, which is the same hole the contributed-pane action verb was added to close.
+  The reply reports what the row was actually born with, not what was asked for.
+
 - **`server app state` now reports what the right rail is actually DRAWING, not
   just what was asked for.** Chasing the report above, every instrument said the
   rail was `hidden` while a fully painted rail sat beside the row — and both
