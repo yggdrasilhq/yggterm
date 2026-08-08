@@ -375,10 +375,31 @@ Both halves of this were got wrong on 2026-08-08, in opposite directions:
 | **another agent** | `terminal submit <their row> --stdin` | agent-to-agent; costs the human nothing |
 | **your own bookkeeping** | `notify --pid/--client` | ⛔ otherwise it lands on *his* screen |
 
-⛔ And the identifier must be a **row path**. `$YGGTERM_SESSION_ID` is `cc-runtime://<uuid>` while
-the row is `remote-cc://<host>/<uuid>` — same uuid, different string, and the card renders, looks
-correct and **does nothing when clicked**. Resolve it against `server app rows` first;
-`ygg-babysit.py`'s `resolve_row_path()` does exactly this so the mistake cannot be made.
+⛔ And the identifier must be a **row path**, read back from `server app rows` — measured on both
+sides by the delegate that hit it:
+
+```
+$YGGTERM_SESSION_ID  =  cc-runtime://c00a69a6-…        <- INERT
+rows.full_path       =  remote-cc://dev/c00a69a6-…     <- the address
+```
+
+⭐ **They differ by SCHEME *and* by a HOST SEGMENT that only the row path carries.** So this cannot
+be repaired by swapping the scheme in a string — the host is information the environment variable
+does not contain, and an agent composing the address from what it knows about itself **cannot get
+there by reasoning.** It must look the row up. `ygg-babysit.py`'s `resolve_row_path()` does exactly
+this, so the mistake cannot be made rather than merely being warned about.
+
+⛔⛔ **AND THE HARDER HALF: YOU CAN VERIFY THE ADDRESS, NEVER THE DELIVERY.** `notify` answered
+`error: null` for the **misaddressed** send too — it reports that a card was accepted, not that it
+points anywhere useful, and certainly not that anyone can act on it. ⇒ *"row 5.2 notified"* was
+**true of the wire and false of the intent**. So:
+
+- **Read the address back from `rows` and claim only that.** "Card addressed to <row>, verified
+  against the rows API" is honest; "row X notified" is a claim about someone else's attention.
+- The only proof of delivery is downstream: the human acts on it, or the row shows the effect.
+
+This is the `§7` law — *verbs report the REQUEST, not the EFFECT* — arriving in the one place where
+the request and the effect are separated by a human being.
 
 ## 4. Correspondence — any session can reach any other
 
