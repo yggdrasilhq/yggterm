@@ -2169,6 +2169,16 @@ pub enum ServerRequest {
         source_label: Option<String>,
         #[serde(default)]
         terminal_appearance: Option<String>,
+        /// Seat the new row directly below this live-session path, exactly as
+        /// `StartLocalSession` does — so an app launched from a row lands under
+        /// it like "New Terminal Here" and not at the top of the tree.
+        ///
+        /// ⚠ **Version-coexisting daemons:** an owner older than this field
+        /// ignores it (serde skips unknown fields) and the row lands at the top.
+        /// That is placement only — the row still carries its launch command, so
+        /// nothing about its IDENTITY depends on the owner being current.
+        #[serde(default)]
+        insert_after: Option<String>,
     },
     EnsureRemoteRuntimeCodexSession {
         session_id: String,
@@ -7965,6 +7975,7 @@ impl DaemonRuntime {
                 launch_command,
                 source_label,
                 terminal_appearance,
+                insert_after,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_command_session(
@@ -7973,6 +7984,11 @@ impl DaemonRuntime {
                     &launch_command,
                     source_label.as_deref(),
                 );
+                // The SAME seating `StartLocalSession` does — one owner for
+                // "where does a newly created row go", so a command session and
+                // a plain terminal launched from the same anchor land together.
+                self.server
+                    .seat_created_live_session(&key, None, insert_after.as_deref());
                 if self.server.active_session_supports_terminal() {
                     self.ensure_terminal_for_active()?;
                 }
@@ -12095,6 +12111,28 @@ pub fn start_command_session_with_terminal_appearance(
     source_label: Option<&str>,
     terminal_appearance: Option<&str>,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
+    start_command_session_placed(
+        endpoint,
+        cwd,
+        title_hint,
+        launch_command,
+        source_label,
+        terminal_appearance,
+        None,
+    )
+}
+
+/// The placed form: the row is seated under `insert_after`, like every other
+/// "…Here" launcher. The two wrappers above are this with no anchor.
+pub fn start_command_session_placed(
+    endpoint: &ServerEndpoint,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    launch_command: &str,
+    source_label: Option<&str>,
+    terminal_appearance: Option<&str>,
+    insert_after: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::StartCommandSession {
@@ -12103,6 +12141,7 @@ pub fn start_command_session_with_terminal_appearance(
             launch_command: launch_command.to_string(),
             source_label: source_label.map(ToOwned::to_owned),
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            insert_after: insert_after.map(ToOwned::to_owned),
         },
     )?)
 }
@@ -23687,8 +23726,8 @@ mod tests {
         // version-ordered compatibility gate looking at two builds of one
         // version with different shapes — the lost-PTY latch storm of
         // 2026-07-17.
-        const STAMPED_AT_VERSION: &str = "3.0.52";
-        const STAMPED_SHAPE_HASH: u64 = 0x5acb28d22cfd76a1;
+        const STAMPED_AT_VERSION: &str = "3.0.61";
+        const STAMPED_SHAPE_HASH: u64 = 0x6d402f7c3075445c;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

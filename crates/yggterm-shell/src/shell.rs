@@ -209,7 +209,8 @@ use yggterm_server::{
     app_control_requests_pending_for_worker, cleanup_legacy_daemons,
     complete_app_control_request, connect_ssh_custom, enqueue_app_control_request,
     fetch_remote_generation_context, focus_live_with_view, hot_restart, hot_restart_detailed,
-    local_headless_companion_executable_from_current, managed_cli_refresh_ttl_ms,
+    local_app_verb_launch_command, local_headless_companion_executable_from_current,
+    managed_cli_refresh_ttl_ms,
     open_remote_session_with_view, open_stored_session, open_stored_session_with_view,
     persist_remote_generated_copy, ping, prepare_client_close, prepare_update_restart,
     reachable_versioned_daemon_statuses, refresh_local_managed_cli_now, refresh_managed_cli,
@@ -217,7 +218,8 @@ use yggterm_server::{
     request_terminal_launch, request_terminal_launch_for_path,
     set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, snapshot_session_view_for_ui,
-    stage_remote_clipboard_png, start_command_session_with_terminal_appearance,
+    stage_remote_clipboard_png, start_command_session_placed,
+    start_command_session_with_terminal_appearance,
     start_local_session_at_with_terminal_appearance, start_local_session_placed,
     start_remote_claude_session_placed, start_remote_codex_session_placed,
     start_ssh_session_placed, status,
@@ -5135,6 +5137,17 @@ fn web_surface_adblock_cache(rules: &str) -> Option<std::path::PathBuf> {
 /// per-tab iframes.
 #[derive(Debug, Clone, PartialEq)]
 struct WebSurfaceOverlayView {
+    /// The session this overlay BELONGS to, stamped by
+    /// [`ShellState::web_surface_overlay_for_session`] — the one place that
+    /// knows, because it is the key the surface was looked up under.
+    ///
+    /// Carried so "whose tab rail is this" is a field to READ rather than a
+    /// re-derivation. `RightPanelMode::WebTabs` has no session of its own (its
+    /// tenant is resolved through `active_web_surface_overlay`), so without
+    /// this the agent probe could only guess the owner from the active session
+    /// — the exact re-derivation that let another app's rail paint over a row
+    /// unnoticed in the `AppPane` case.
+    session: String,
     tabs: Vec<WebSurfaceOverlayTabView>,
     active_tab_id: u64,
     /// Address bar content: the active tab's in-progress draft, or its URL.
@@ -21278,6 +21291,7 @@ impl ShellState {
             .map(|query| web_surface_history_suggestions(&active.profile, query, 6))
             .unwrap_or_default();
         Some(WebSurfaceOverlayView {
+            session: session_path.to_string(),
             tabs,
             active_tab_id,
             // An internal page (history viewer) rides the tab as a multi-KB
@@ -37584,6 +37598,10 @@ fn spawn_launch_app_verb(
 ) {
     let command = app.command_for(&verb);
     let title_hint = verb.label.clone();
+    // The row's `Source` metadata — the one place a row says WHICH app it is.
+    // The registry key, not the display label: it is the name the manifest is
+    // filed under and the only stable identifier an app has.
+    let source_label = format!("app:{}", app.name);
     let pending = format!("starting {}", verb.label);
     let terminal_appearance =
         state.with(|shell| shell.effective_terminal_identity_appearance().to_string());
@@ -37599,16 +37617,24 @@ fn spawn_launch_app_verb(
                 // Here". The daemon fails open (top insert) when the anchor is
                 // not a live session (a cwd-tree folder, or the titlebar `+`
                 // which passes None) — so every launcher surface stays uniform.
-                let (snapshot, message) = start_local_session_placed(
+                // ⛔ The row is BORN with the app's command as its launch
+                // command, never handed the command afterwards. A row whose
+                // stored command is `exec '/bin/bash' -i` has no app identity
+                // at all: a daemon swap re-ran the bash and the owner's live
+                // ychrome row came back as a bare prompt, permanently
+                // (`Runtime Restore Reason: update-restart`, 2026-08-08). This
+                // also retires the write-into-the-ACTIVE-session inference
+                // `write_app_verb_command` had to make — a create that carries
+                // its own command has nothing left to guess.
+                start_command_session_placed(
                     &endpoint,
-                    SessionKind::Shell,
                     cwd.as_deref(),
                     Some(&title_hint),
+                    &local_app_verb_launch_command(&command),
+                    Some(&source_label),
                     Some(&terminal_appearance),
                     insert_after.as_deref(),
-                )?;
-                write_app_verb_command(&endpoint, &snapshot, message.as_deref(), &command);
-                Ok((snapshot, message))
+                )
             });
         }
         TerminalLaunchContext::Remote {
@@ -53810,6 +53836,12 @@ fn describe_app_state_snapshot(
     let agent_leases = live_agent_leases(&state.peek(), current_millis() as u64);
     let shell = state.read();
     let snapshot = shell.snapshot();
+    // The rail's rendered truth, resolved by the SAME call the component makes.
+    let rail_view = rail_render_view(&snapshot);
+    let rendered_app_pane = match &rail_view.rendered_mode {
+        RightPanelMode::AppPane(open_pane) => Some(open_pane),
+        _ => None,
+    };
     let search_sidebar_matches = snapshot
         .search_sidebar_matches
         .iter()
@@ -54306,6 +54338,42 @@ fn describe_app_state_snapshot(
             "rail_width": shell.rail_width,
             "rail_resizing": shell.rail_resize_drag.is_some(),
             "right_panel_mode": right_panel_mode_label(&snapshot.right_panel_mode),
+            // THE RAIL'S RENDERED TRUTH. `right_panel_mode` above answers "what
+            // did the shell ask for", which is NOT "what is on screen": a rail
+            // that is not docked still renders a body from `reveal_mode`, so an
+            // agent reading only the field above sees `hidden` while a fully
+            // painted rail sits beside the row. Resolved by `rail_render_view`,
+            // the SAME call the component makes, and carrying the OWNER of
+            // whichever body won — the two ways a foreign app's rail can appear
+            // over someone else's session.
+            "right_panel": {
+                // Same value as `right_panel_mode` above, repeated here only so
+                // requested-vs-rendered can be read as one pair; both are
+                // `snapshot.right_panel_mode`, so they cannot diverge.
+                "requested_mode": right_panel_mode_label(&rail_view.requested_mode),
+                "rendered_mode": right_panel_mode_label(&rail_view.rendered_mode),
+                // False = collapsed or hover-revealed. Still painting
+                // `rendered_mode`.
+                "docked": rail_view.docked,
+                // Pre-tenancy, before `displayed_right_panel_mode` resolved a
+                // dead app-pane tenant away. A gap between this and
+                // `requested_mode` means a tenancy stood down this frame.
+                "raw_mode": right_panel_mode_label(&shell.right_panel_mode),
+                "restore_mode": right_panel_mode_label(&snapshot.right_panel_restore_mode),
+                "reveal_mode": right_panel_mode_label(&snapshot.right_panel_reveal_mode),
+                // The contributed pane the body is built from, and the session
+                // that DECLARED it. `rendered_pane_session` differing from
+                // `active_session_path` is a tenancy leak, by definition.
+                "rendered_pane": rendered_app_pane.map(|open_pane| open_pane.pane.clone()),
+                "rendered_pane_session": rendered_app_pane.map(|open_pane| open_pane.session.clone()),
+                // Whose tab rail `WebTabsRailBody` would draw, read off the
+                // overlay's own stamp rather than re-derived from the active
+                // session. Null = it would draw "No web surface is open".
+                "web_tabs_overlay_session": snapshot
+                    .active_web_surface_overlay
+                    .as_ref()
+                    .map(|overlay| overlay.session.clone()),
+            },
             "preview_layout": preview_layout_mode_label(shell.preview_layout),
             "search_query": shell.search_query,
             "search_focused": shell.search_focused,
@@ -121715,6 +121783,74 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
         }
     }
 }
+/// What the side rail is actually RENDERING this frame.
+///
+/// ⚠ `requested_mode` and `rendered_mode` differ far more often than the name
+/// "hidden" suggests, and the gap is invisible from `right_panel_mode` alone:
+/// **a rail that is not docked still renders a body** (the hover-reveal card
+/// draws it), resolved from `right_panel_reveal_mode` rather than from what the
+/// shell asked for. A probe that reports only the requested mode therefore says
+/// `hidden` while a fully-painted rail is on screen — which is exactly how a
+/// foreign app's tab rail beside a yedit row survived two reproductions without
+/// the instruments naming what was drawing it (2026-08-08).
+///
+/// One owner for the question, read by [`RightRail`] and by the agent probe, so
+/// the pixels and `server app state` cannot disagree about which body is up.
+#[derive(Clone, Debug, PartialEq)]
+struct RailRenderView {
+    /// The mode the shell asked for: `RenderSnapshot::right_panel_mode`, whose
+    /// app-pane tenancy `displayed_right_panel_mode` has already resolved.
+    requested_mode: RightPanelMode,
+    /// The mode whose BODY is built — `requested_mode` when the rail is docked,
+    /// otherwise the reveal mode the collapsed card falls back to.
+    rendered_mode: RightPanelMode,
+    /// Is the rail docked in flow? False = collapsed or hover-revealed, both of
+    /// which still render `rendered_mode`.
+    docked: bool,
+}
+fn rail_render_view(snapshot: &RenderSnapshot) -> RailRenderView {
+    let requested_mode = snapshot.right_panel_mode.clone();
+    // The mode a HIDDEN rail reveals to is the shell's authoritative
+    // `right_panel_reveal_mode` — `right_panel_restore_mode` (the last mode it
+    // actually showed) RESOLVED through the same tenancy/liveness rules the
+    // docked rail gets, so the reveal can never surface a dead `WebTabs` rail
+    // ("No web surface is open") on a session that never had a surface, and a
+    // document app's own sidebar reveals instead (the yedit hidden-sidebar
+    // bug). The resize-grip un-hide uses the SAME value, so hover-reveal and
+    // drag-dock can never disagree. Replaces a component-local `retained_mode`
+    // signal that lagged and showed Metadata even after the user had switched
+    // to Settings (the "hardlocked to session metadata" report, 2026-07-21).
+    let restore_mode = snapshot.right_panel_reveal_mode.clone();
+    // A contributed pane lives and dies with its declaration: when the app stops
+    // declaring (exited, session switched, contribution swept) the pane
+    // collapses, and it re-reveals when the app is back.
+    // ⛔ BOTH halves, as everywhere else: the pane's OWNER must be the session
+    // on screen, and that owner must still declare it. `sidebar_panes` is the
+    // ACTIVE session's declaration list, so matching an id against it while
+    // ignoring the owner is how another app's rail earned the right to paint
+    // over this row (live-caught 2026-08-08).
+    let app_pane_available = |mode: &RightPanelMode| match mode {
+        RightPanelMode::AppPane(open_pane) => {
+            snapshot.active_session_path.as_deref() == Some(open_pane.session.as_str())
+                && snapshot
+                    .sidebar_panes
+                    .iter()
+                    .any(|pane| pane.id == open_pane.pane)
+        }
+        _ => true,
+    };
+    let docked = requested_mode != RightPanelMode::Hidden && app_pane_available(&requested_mode);
+    let rendered_mode = if docked {
+        requested_mode.clone()
+    } else {
+        restore_mode
+    };
+    RailRenderView {
+        requested_mode,
+        rendered_mode,
+        docked,
+    }
+}
 #[component]
 fn RightRail(
     snapshot: SharedSnapshot,
@@ -121773,42 +121909,14 @@ fn RightRail(
     /// these are yggterm's OWN tabs, not an app's contributed schema.
     state: Signal<ShellState>,
 ) -> Element {
-    let requested_mode = snapshot.right_panel_mode.clone();
-    // The mode a HIDDEN rail reveals to is the shell's authoritative
-    // `right_panel_reveal_mode` — `right_panel_restore_mode` (the last mode it
-    // actually showed) RESOLVED through the same tenancy/liveness rules the
-    // docked rail gets, so the reveal can never surface a dead `WebTabs` rail
-    // ("No web surface is open") on a session that never had a surface, and a
-    // document app's own sidebar reveals instead (the yedit hidden-sidebar
-    // bug). The resize-grip un-hide uses the SAME value, so hover-reveal and
-    // drag-dock can never disagree. Replaces a component-local `retained_mode`
-    // signal that lagged and showed Metadata even after the user had switched
-    // to Settings (the "hardlocked to session metadata" report, 2026-07-21).
-    let restore_mode = snapshot.right_panel_reveal_mode.clone();
-    // A contributed pane lives and dies with its declaration: when the app stops
-    // declaring (exited, session switched, contribution swept) the pane
-    // collapses, and it re-reveals when the app is back.
-    // ⛔ BOTH halves, as everywhere else: the pane's OWNER must be the session
-    // on screen, and that owner must still declare it. `sidebar_panes` is the
-    // ACTIVE session's declaration list, so matching an id against it while
-    // ignoring the owner is how another app's rail earned the right to paint
-    // over this row (live-caught 2026-08-08).
-    let app_pane_available = |mode: &RightPanelMode| match mode {
-        RightPanelMode::AppPane(open_pane) => {
-            snapshot.active_session_path.as_deref() == Some(open_pane.session.as_str())
-                && snapshot
-                    .sidebar_panes
-                    .iter()
-                    .any(|pane| pane.id == open_pane.pane)
-        }
-        _ => true,
-    };
-    let visible = requested_mode != RightPanelMode::Hidden && app_pane_available(&requested_mode);
-    let rendered_mode = if visible {
-        requested_mode.clone()
-    } else {
-        restore_mode.clone()
-    };
+    // ⛔ ONE owner for "what is the rail drawing" — [`rail_render_view`], which
+    // the agent probe reads too. A private copy here is how the pixels and
+    // `server app state` came to disagree.
+    let RailRenderView {
+        requested_mode: _,
+        rendered_mode,
+        docked: visible,
+    } = rail_render_view(&snapshot);
     // Extracted before the rsx! chain: an `if let` arm inside it defeats the
     // macro's branch-type inference.
     // Only the pane ID reaches the body: `rendered_mode` can be `AppPane` ONLY
@@ -135666,7 +135774,7 @@ mod tests {
     // would have filled the survivor with the WRONG app's schema.
     //
     // MUTATION PROOF: drop the session half of `active_session_offers_pane`
-    // (or of the rail component's `app_pane_available`) and this goes red.
+    // (or of `rail_render_view`'s `app_pane_available`) and this goes red.
     #[test]
     fn a_pane_is_a_tenant_of_the_session_that_declared_it_never_of_a_namesake() {
         // The real clock, because `displayed_right_panel_mode` reads it: a
@@ -135835,6 +135943,72 @@ mod tests {
         // A remembered Metadata rail is a valid user choice and is preserved.
         plain.right_panel_restore_mode = RightPanelMode::Metadata;
         assert_eq!(plain.revealed_right_panel_mode(1_000), RightPanelMode::Metadata);
+    }
+
+    /// ⛔ THE INSTRUMENT GAP that cost two full reproductions (2026-08-08): the
+    /// owner saw a fully painted rail beside a row whose `right_panel_mode` the
+    /// probe reported as `hidden`, and every field available said the rail was
+    /// not there. Both halves are locked here.
+    ///
+    /// 1. **A rail that is not docked still renders a body.** `hidden` is the
+    ///    REQUEST; the reveal card draws `reveal_mode` regardless. So a probe
+    ///    that reports only the requested mode is blind to what is on screen,
+    ///    and `rail_render_view` — the one call the component makes — must
+    ///    report the pair.
+    /// 2. **The tab rail's overlay carries its OWN session**, so "whose rail is
+    ///    this" is read, never inferred from the active session. A surface
+    ///    belonging to a background browser must stamp that browser, and must
+    ///    not reach `active_web_surface_overlay` at all.
+    #[test]
+    fn a_rail_that_is_not_docked_still_renders_a_body_and_the_overlay_names_its_owner() {
+        // yedit is active with a rail pane; the user has hidden the rail.
+        let mut shell = shell_with_rail_pane("local://yedit", "notes", 1_000);
+        shell.right_panel_mode = RightPanelMode::Hidden;
+        shell.right_panel_restore_mode = RightPanelMode::Hidden;
+        let view = rail_render_view(&shell.snapshot());
+        assert!(
+            !view.docked,
+            "a hidden rail is not docked — that half was never in doubt"
+        );
+        assert_eq!(view.requested_mode, RightPanelMode::Hidden);
+        assert_eq!(
+            view.rendered_mode,
+            RightPanelMode::AppPane(AppPaneRef::new("local://yedit", "notes")),
+            "…and it STILL builds a body, from the reveal mode. Collapse this to \
+             `requested_mode` and the probe goes blind exactly where the owner's \
+             screenshot showed a rail the instruments denied"
+        );
+
+        // A web surface owned by a DIFFERENT session than the active one: its
+        // overlay must name its own owner, and must not surface as the active
+        // session's tab rail.
+        shell.upsert_web_surface(
+            "local://ychrome",
+            "https://example.com/".to_string(),
+            None,
+            "https://example.com/".to_string(),
+            None,
+            None,
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
+            WebSurfaceOpenKind::Launch,
+            1_000,
+        );
+        assert_eq!(
+            shell
+                .web_surface_overlay_for_session("local://ychrome", 1_000)
+                .expect("the background surface has an overlay of its own")
+                .session,
+            "local://ychrome",
+            "the overlay is stamped with the session it was looked up under — \
+             stamp the ACTIVE session instead and a foreign tab rail can no \
+             longer be told from the row's own"
+        );
+        assert!(
+            shell.snapshot().active_web_surface_overlay.is_none(),
+            "and a background browser's surface must never reach the active \
+             session's tab rail"
+        );
     }
 
     // The rail stack, mutation half: changing the rail while the pane is
