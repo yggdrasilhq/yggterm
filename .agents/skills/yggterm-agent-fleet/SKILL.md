@@ -65,11 +65,32 @@ your own session, because a row can be sent input like any other:
 
 ```sh
 printf '/context' | yggterm server app terminal submit "$ROW" --stdin
+sleep 1
+printf 'continue' | yggterm server app terminal submit "$ROW" --stdin   # ⛔ not optional
 ```
 
 The readout arrives as your next turn. **Do this at natural checkpoints on any
 long run, not when you feel full** — by then the cheap remedy (write the
 handover now) may no longer fit.
+
+### ⛔ A SELF-DIRECTED SLASH COMMAND CAN STALL YOUR OWN LOOP
+
+**Chase every slash command you send to your OWN row with a plain `continue`, a
+second later.** A slash command is handled by the CLI's front end, not by the
+model loop, and whether the loop is re-entered afterwards is the CLI's choice —
+one none of them documents. When it is not, the readout sits on screen, the turn
+never resumes, and the row looks exactly like an agent thinking. Unattended that
+costs hours, and the follow-up prompt is the only control we hold from outside.
+
+Messaging ANOTHER row (§4) is a different case: that session's loop is already
+turning, and your message lands at its turn boundary.
+
+⭐ **Across CLIs, assume the market leader's spellings.** `/context`, `/cost`,
+`/status` are the right first guess in any of them, because they copy each
+other. The OUTPUT shapes differ, so parse loosely and never key on an exact
+line. ⚠ **Write each nuance back into this section as you find it** — a command
+that does not exist here, one that means something else there, a different stall
+behaviour. A nuance left in a transcript was never learned.
 
 ⚖ **Budget rule of thumb:** decide what you will still be able to finish, and
 write the handover BEFORE you spend the context on the work. A finished task

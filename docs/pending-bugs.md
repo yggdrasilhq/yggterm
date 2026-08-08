@@ -357,28 +357,45 @@ surfaces it binds.
 ⛔ `server app start-page` is a verb that OPENS the page and answers only
 `{accepted, selected_paths}` — it cannot be used to read what the page lists.
 
-### ✅ THE READ ALREADY EXISTS, AND IT MOVES THE QUESTION
+### ✅ ROOT-CAUSED 2026-08-08: IT IS A SILENT `{machine_key, cwd}` SCOPE
 
-Measured on jojo 2026-08-08 (3.0.53). `server app state` → `dom` already carries
-`start_page_recent_count`, `start_page_recent_sessions` (each with its own
-`session_path` and rect) and `start_page_text_sample`. So the page CAN be read
-from the CLI after `server app start-page`; the missing verb was never the
-blocker, and it read **190 shown** with the orchestrator row selected.
+**Measured on jojo (3.0.53), the same page read three times with a DIFFERENT ROW
+SELECTED each time.** Nothing else changed between readings:
 
-⚠ **Take the reading twice, with a DIFFERENT ROW SELECTED each time**, because
-the next suspect is a filter nothing on the page admits to:
-`start_page_recent_scope` (`shell.rs`) derives a `{machine_key, cwd}` scope
-**from `snapshot.selected_row`**, and `start_page_recent_scope_allows_browser_row`
-drops every candidate outside it. The header says "190 shown" and never says
-"…of N, scoped to this machine and cwd" — so a row that is filtered out looks
-exactly like a row that does not exist, which is the symptom as reported.
+| selected row's scope | header says | rows the DOM carried |
+|---|---|---|
+| `dev` · `/home/pi/gh/yggterm` | **188 shown** | 12 rendered |
+| `dev` · `/home/pi/git/jyas` | **40 shown** | 12 rendered |
+| `dev` · `/home/pi/data/dossierGraph/git/graph-manager` | **4 shown** | 4 rendered |
 
-Two other exclusions are already read from the source and are NOT the cause on
-their own, but must be held constant while testing the scope: the ACTIVE session
-is dropped by `push_candidate` on purpose, and the candidate list is built ONLY
-from `all_sidebar_rows_for_selection()` — so a session the sidebar does not hold
-cannot appear on the start page at all, whatever its JSONL still says.
+⇒ RECENT WORK is filtered by a scope derived from `snapshot.selected_row`, and
+**the header never says so.** `start_page_recent_scope` (`shell.rs`) builds
+`{machine_key, cwd}` from the selected row; the three `start_page_recent_scope_
+allows_*` predicates then DROP every candidate outside it. So a row that is
+filtered out looks exactly like a row that does not exist — which is the symptom
+as reported, and why the count "338" then "188" was never evidence of anything:
+it counts a scope, not the machine.
 
+⚠ The page half-admits it in prose it never connects to the number: the subtitle
+reads *"Open recent work, start a local terminal, or create work in this
+scope."* The scope is right for the CREATE buttons (a new session belongs in the
+cwd you are looking at). It is wrong for RECENT WORK, which
+`spec-active-sessions-dual-presence` binds to showing every session.
+
+⚠ `start_page_recent_sessions` reports only the RENDERED cards (12 with a
+viewport that deep), so it is not a second count of the list — compare
+`start_page_recent_count` across readings, never the array length.
+
+**The named fix, so it is not re-derived:** stop DROPPING out-of-scope
+candidates. Rank them — live first, then in-scope, then recency — so in-scope
+work still leads and nothing vanishes, and make the header count what it lists.
+Three `.filter(|row| start_page_recent_scope_allows_*)` calls in
+`start_page_recent_rows_from_browser_rows_with_modified_epochs` become an
+`in_scope` flag on the candidate tuple and one more `.then_with` in its sort.
+
+Held constant while testing, and NOT the cause: the ACTIVE session is dropped by
+`push_candidate` on purpose, and candidates come only from
+`all_sidebar_rows_for_selection()`.
 
 ## THREE `yggterm-server` LIB TESTS FAIL ON A CLEAN TREE — two of them reach the NETWORK
 
