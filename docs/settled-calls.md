@@ -9,6 +9,68 @@ and referenced from here.
 says the answer changed.
 
 
+## ⚖⚖ THE HOT-RESTART GATE IS RELAY-AWARE, DEADLINED, AND REPAIRS WHAT IT BREAKS (2026-08-08)
+
+**Settled by the owner, and it unblocks the CONSTITUTION's unmet guarantee.**
+Full design: [`spec-hot-restart-relay-gate.md`](spec-hot-restart-relay-gate.md).
+His ruling, in his own structure:
+
+1. **A relay must force or await the swap BEFORE handing off**, so no successor
+   is born onto a stale daemon. *"The mechanism should not stale the daemons."*
+2. **Queue and wait** when sessions are running, whether in relay mode or
+   standalone.
+3. **After 30 minutes, force the swap**, stalling the working sessions, **and
+   then inject `continue` into their prompts.**
+4. **A session stalled at a question is NOT working** and is freely restarted.
+5. **A session running sub-agents is waited for, without deadline** — *"the 30
+   min rule does not apply here."*
+
+⛔ **This SUPERSEDES the standing prohibition in the campaign memory** against
+putting a deadline on the idle gate. That review failed a design that was a bare
+timeout on an absence-gate. This one carries the two things that review was
+missing: a **positive** definition of "working" (not inferred from silence) and a
+**repair** for what it interrupts — plus a refusal to interrupt the one class
+where repair is impossible. Do not re-litigate it by citing the old ⛔.
+
+**Live evidence at the time of the ruling:** GUI 3.0.67, daemon 3.0.65,
+`hot_restart_pending: true` with `hot_restart_blockers: []` and
+`block_reason: null` — the gate reporting that nothing blocks it while not
+firing, **241 minutes after the last successful swap**.
+
+## ★★★ A LOST SESSION SHOWS; A NOISE SESSION IS DELETED (2026-08-08)
+
+**Two rulings, minutes apart, on what the sweep surfaced.** Verbatim: *"They
+should show."* and *"Noise sessions should be deleted."*
+
+**What they were about.** 125 `.bak.` copies on the GUI host had no live rollout
+at all — **67 distinct sessions that the 2026-03-14 codex migration LOST**: it
+wrote the backup and never produced the replacement. None has a row in codex's
+own `threads` table, so codex did not know about them either, and yggterm hid
+them because `store_excluded_name_fragments` rejects any name containing
+`.bak.`. Among them were two sessions of **11,006 records / 181 user turns**.
+
+**What the two rulings mean together, and it is a design principle, not a
+chore:** *visibility* and *retention* are different questions and were being
+answered by one mechanism — the filename. Hiding a session by name meant "we do
+not show backups" was silently also deciding "and you may never see this
+session again". The two now have two answers, both keyed on SUBSTANCE:
+
+- **Lost sessions are RESTORED** to their canonical `<base>.jsonl` name. This
+  was chosen over teaching the index to display `.bak.` files, because a rename
+  mints no second kind of session file: the orphan becomes an ordinary session,
+  visible to yggterm's existing scanner *and* to codex's own walk, with no code
+  change. Reversible, moves no bytes, manifest at
+  `~/.yggterm/bak-restore-manifest.jsonl`.
+- **Noise is DELETED** — but by the spec's own §9.2 deferred destroy (trash hop
+  with a `.trashed-<ms>` suffix), never `unlink`, because for these the copy was
+  the only one.
+
+**Executed on the GUI host 2026-08-08:** 5 sessions restored (623 live, up from
+618), 118 noise copies trashed, 0 orphans left, 787 KB recoverable.
+
+⛔ **The floor is RECORDS, not user turns**, and this corrected an error in
+`spec-sweep-policy.md` §4 — see that section.
+
 ## ★★★ THE SWEEP SYSTEM — INVISIBLE BY DEFAULT, AND IT MAY REWRITE A TRANSCRIPT (2026-08-08)
 
 **Settled by the owner, verbatim on the shape:** *"I mostly want the processes
