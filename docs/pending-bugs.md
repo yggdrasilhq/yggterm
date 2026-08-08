@@ -13,6 +13,134 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⛔⛔ `terminal new --prompt` DROPPED A DELEGATE'S ENTIRE BRIEF AND REPORTED A GOOD LAUNCH — 8 HOURS LOST
+
+**Status:** OPEN
+
+Measured 2026-08-07 21:15 IST, live, on the campaign relay itself. A successor session was spawned with a 192-line runbook on
+`--prompt-stdin`. **The runbook never arrived.** The delegate's first and only
+user message was:
+
+```
+yggterm_ready_probe\x15yggterm_ready_probe\x15yggterm_ready_probe\x15
+yggterm_ready_probe\x15yggterm_ready_probe\x15yggterm_ready_probe\x15
+```
+
+It answered `Ready.` and stopped. Nobody noticed for **eight hours**, which is
+the whole cost of this entry.
+
+### The probe is not side-effect-free, and that is the bug
+
+`submit_prompt_echo_verified` (`crates/yggterm-server/src/terminal.rs`) proves a
+CLI is consuming input by writing `yggterm_ready_probe`, checking it echoes to
+the daemon screen, then clearing with Ctrl+U. Its doc says the clear is
+"self-healing across retries".
+
+⭐ **It is not, because "not ready" does not mean "your bytes were discarded" —
+it means they are QUEUED.** A CLI that has not started reading still has a PTY
+behind it, and the PTY buffers. So the six probe+Ctrl+U pairs sat in the buffer,
+the echo never appeared (nothing was rendering yet), the gate correctly
+concluded not-consuming and correctly declined to write the real prompt — and
+then the buffer flushed the probes into the composer, where they were submitted
+as the delegate's opening message.
+
+**The gate's own instrument poisoned the row it had just refused to use.** Any
+readiness probe that WRITES cannot be non-destructive against a program that is
+not yet reading.
+
+⚠ Ctrl+U also did not clear Claude Code's composer here — six probes
+accumulated rather than replacing one another.
+
+### The second half: nothing in the reply said it failed
+
+`terminal new`'s reply carries a `launch` block — `applied`, `model`,
+`permission_mode`, `launch_command` — and its `--help` says it "reports what the
+ROW was born with". **It says nothing about whether the prompt was delivered.**
+So `launch.applied: true` is true and useless: the row was born exactly as
+asked, holding no brief.
+
+⚖ `shell.rs`'s own `app_control_created_seat_report` doc already lists
+**`--prompt-stdin`.delivered** as one of six verbs "measured reporting the
+request rather than the effect". The list was right; this path never got the fix.
+
+**Owed:** `terminal new --prompt*` must answer with a `prompt` block re-read
+from the row — `{submitted, waited_ms, reason}` — and a non-zero exit when
+`submitted:false`. A delegate launcher cannot verify what the launcher will not
+report.
+
+### ✅ THE WORKING SEQUENCE, PROVEN 2026-08-08 — use it until this is fixed
+
+`terminal submit` (which exists, reports honestly, and is **missing from
+`terminal`'s own verb list** in `--help` — a third, smaller defect):
+
+```sh
+# 1. create with NO --prompt
+P=$(… terminal new --kind claude-code --no-activate --model … --permission-mode bypass …)
+# 2. WAIT for the row to actually be reading. Measured: 5.9 s on a cold claude-code row.
+…terminal input-check "$P" --check-timeout-ms 20000     # want consuming_input:true
+# 3. submit, and READ `submitted`
+… | …terminal submit "$P" --stdin                        # answers submitted:true, waited_ms
+# 4. ⛔ VERIFY BY TRANSCRIPT CONTENT, never by the reply
+grep -q '<a distinctive token from your brief>' ~/.claude/projects/<cwd-slug>/<uuid>.jsonl
+```
+
+Step 4 is the one that would have caught this in 30 seconds. The failed launch
+DID produce a transcript file, 28 KB of it — **existence proved nothing.**
+
+⛔ Do not "fix" this by lengthening the readiness timeout. The gate was not too
+impatient; it was writing into a buffer it could not see and could not take back.
+
+
+## ⛔ THE START-PAGE SPLIT-BUTTON MENU IS TRANSPARENT — the page reads straight through it
+
+**Status:** OPEN
+
+Owner-reported with a screenshot 2026-08-08, against `981cc98f` (nine CLIs reach the menus). Every recent-work card behind the open
+"New Codex Session" menu is legible through its items, so the list of nine CLIs
+cannot be read at all.
+
+**Root cause, exactly:** `start_page_split_palette` (`shell.rs:120455`) passes
+`palette.panel_alt` as the split button's `surface`, and `panel_alt` is
+`rgba(255,255,255,0.18)` light / `rgba(255,255,255,0.05)` dark
+(`shell.rs:130858`, `:130876`). The menu paints `background:{palette.surface}`
+(`libyggterm crates/yggui/src/split_button.rs`), so a floating overlay is
+painted with an **18% white tint**.
+
+⭐ **The token is not wrong; it is doing two jobs with opposite requirements.**
+`SplitButtonPalette`'s `surface` is documented as "fill for a neutral button AND
+for the menu surface". A tint is correct for a button sitting on an opaque page
+— that is the glass look. It is never correct for a menu floating over content.
+
+**Owed, in libyggterm (component fix, not a yggterm override):** the menu needs
+an opaque surface of its own — a `menu_surface` slot, or compositing the tint
+over an opaque base inside the component. Then bump the pinned tag
+(`Cargo.toml`: `yggui = { … tag = "v0.12.0" }`).
+
+⚠ The owner named the reference behaviour: *"I like the right click context
+menu (simple works here)"* — match that surface treatment rather than inventing.
+
+
+## ⛔ THE START PAGE DOES NOT LIST EVERY SESSION — a closed row could not be found to respawn
+
+**Status:** OPEN
+
+NOT yet root-caused. Owner-reported 2026-08-08: he removed
+a delegate row, went to the start page to reopen it, and it was not in RECENT
+WORK. The header said "338 shown" and the dev node claimed 338.
+
+⚠ **What is NOT yet established:** whether the list is capped, filtered, or
+merely sorted so the row fell below the fold; and whether a row removed via
+`session remove` is deliberately excluded from recent work. Name which before
+changing anything — "shows all sessions" is a spec claim
+(`spec-active-sessions-dual-presence`) and the start page is one of the two
+surfaces it binds.
+
+⛔ `server app start-page` is a verb that OPENS the page and answers only
+`{accepted, selected_paths}` — it cannot be used to read what the page lists.
+That missing read is itself why this could not be settled from the CLI, and is
+probably the first thing to build.
+
+
 ## THREE `yggterm-server` LIB TESTS FAIL ON A CLEAN TREE — two of them reach the NETWORK
 
 **Status:** OPEN
