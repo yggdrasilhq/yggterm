@@ -889,6 +889,37 @@ Both halves are the same defect — the kind vocabulary has three encodings (fla
 token, enum debug name, help text) and no owner. Collapse them onto the
 descriptor's `slug`, which is already the SSOT the intake built.
 
+## A PANE-TENANCY TEST IS FLAKY UNDER PARALLEL EXECUTION — it passes alone and fails in the suite
+
+**Status:** OPEN
+
+`shell::tests::a_pane_is_a_tenant_of_the_session_that_declared_it_never_of_a_namesake`
+(`crates/yggterm-shell/src/shell.rs`).
+
+Measured 2026-08-08 across three runs with **`shell.rs` unchanged between
+them** (`git log` on the file shows nothing since `b3f96ec4`):
+
+| run | result |
+|---|---|
+| full suite, ~21:44 | **PASS** |
+| full suite, ~23:05 | **FAIL** — `displayed_right_panel_mode()` returned `Metadata`, expected `AppPane(local://yedit / notes)`, *"back on its own row the pane returns without a re-open"* |
+| that test ALONE, ~23:20 | **PASS** (`1 passed; 1855 filtered out`) |
+
+⇒ Not a regression and not load: **it is order- or shared-state-dependent
+under the harness's parallel threads.** The test binary runs the same tests
+either way, so what differs between the two full runs is thread interleaving.
+
+⛔ This is the project's own **"No non-determinism"** rule (`CLAUDE.md`) broken
+in a test rather than in the product, and it is the more expensive place for it:
+a flaky test in a suite that already carries documented reds is indistinguishable
+from a seventh documented red, so it will be inherited as "known" and never
+looked at. The fix is to find the shared state — a `static`, a global panel-mode
+cache, or a thread-local the pane lookup reads — and give the test its own.
+
+⚠ Do not "fix" it by asserting less. The assertion is the CONTRACT (a pane
+returns to its own row without a re-open); what is wrong is that something
+outside the test can change the answer.
+
 ## AUTO-PROVISIONING COVERS THREE OF THE SIX NEW CLIs — the other three land in a shell that stays
 
 **Status:** OPEN
