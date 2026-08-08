@@ -623,6 +623,36 @@ pub enum AppControlCommand {
         #[serde(default)]
         value: Option<String>,
     },
+    /// Launch a libyggterm app's verb, exactly as the titlebar `+` menu, the
+    /// cwd-tree context menu and the start page all do.
+    ///
+    /// **Why this exists.** Every other row an agent can create — a shell, a
+    /// codex, a claude-code — has a headless door, and an APP row had none: the
+    /// only ways to launch one were a pointer click on a menu, on a Wayland
+    /// desktop where absolute pointer injection does not map to screen pixels.
+    /// So an agent could not exercise the app-launch path it had just changed,
+    /// which is the same hole `AppPaneAction` was added to close on 2026-08-04.
+    /// Found on 2026-08-08 trying to live-prove that an app row is now born
+    /// holding its own launch command.
+    ///
+    /// It routes through `spawn_launch_app_verb` — THE one owner every launcher
+    /// surface already shares — so an agent's launch cannot become a second
+    /// path with its own behaviour.
+    LaunchApp {
+        /// The app's registry key (`ychrome`, `yedit`), as the manifest is filed.
+        app: String,
+        /// The verb's declared id. Omitted means the app's FIRST verb, which is
+        /// what a menu shows first.
+        #[serde(default)]
+        verb: Option<String>,
+        /// Working directory for the new row. `None` = the shell's own default,
+        /// exactly as the titlebar `+` gives.
+        #[serde(default)]
+        cwd: Option<String>,
+        /// Seat the row under this live-session path, like "…Here".
+        #[serde(default)]
+        insert_after: Option<String>,
+    },
     SetUiTheme {
         theme: UiTheme,
     },
@@ -1541,6 +1571,7 @@ impl AppControlCommand {
             Self::SetSearch { .. } => "set_search",
             Self::SetRightPanelMode { .. } => "set_right_panel_mode",
             Self::AppPaneAction { .. } => "app_pane_action",
+            Self::LaunchApp { .. } => "launch_app",
             Self::SetUiTheme { .. } => "set_ui_theme",
             Self::SetThemeEditorOpen { .. } => "set_theme_editor_open",
             Self::ResetThemeEditor => "reset_theme_editor",

@@ -42,7 +42,7 @@ use yggterm_server::{
     run_app_control_dump_state, run_app_control_focus_window,
     run_app_control_grid, run_app_control_key, run_app_control_list_clients,
     run_app_control_memory_profile,
-    run_app_control_move_window_by, run_app_control_open_path,
+    run_app_control_move_window_by, run_app_control_launch_app, run_app_control_open_path,
     run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
     run_app_control_pointer, run_app_control_probe_terminal_context_menu,
     run_app_control_probe_terminal_primary_selection_paste,
@@ -912,6 +912,12 @@ fn print_server_app_help() {
     --job is DROPPED. --session makes the card clickable through to that row.
     ⚠ $YGGTERM_SESSION_ID is NOT a row path — match its UUID against
     `server app rows` first, or the card is inert.
+  yggterm server app launch-app <app> [verb] [--cwd <dir>] [--insert-after <session-path>]
+    launch a libyggterm app's verb through the SAME owner the titlebar `+`,
+    the row menu and the start page use. <app> is the registry key
+    (`ychrome`, `yedit`); no verb given means the app's first, which is what
+    a menu shows first. The reply's `shell.launch_app` block reports what was
+    accepted and the real launch command the row was born with.
   yggterm server app pane <pane-id> <action> [value]
     press something in a contributed pane, exactly as a click does —
     `panel pane:<id>` opens one, this is what can act on it. value is
@@ -2387,6 +2393,20 @@ fn main() -> Result<()> {
                     "clear" => run_app_control_set_search("", Some(false), timeout_ms),
                     other => anyhow::bail!("unsupported app search action: {other}"),
                 }
+            }
+            "launch-app" | "app-launch" => {
+                let positional = cli_positional_args(&args, 3);
+                let mut positional = positional.into_iter();
+                let app = positional.next().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "usage: server app launch-app <app> [verb] [--cwd <dir>] [--insert-after <session-path>]"
+                    )
+                })?
+                .to_string();
+                let verb = positional.next().map(ToOwned::to_owned);
+                let cwd = cli_flag_value(&args, "--cwd").map(ToOwned::to_owned);
+                let insert_after = cli_flag_value(&args, "--insert-after").map(ToOwned::to_owned);
+                run_app_control_launch_app(app, verb, cwd, insert_after, timeout_ms)
             }
             "panel" | "right-panel" => {
                 let mode = cli_positional_args(&args, 3)

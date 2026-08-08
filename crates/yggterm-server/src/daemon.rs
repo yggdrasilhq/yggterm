@@ -1517,6 +1517,11 @@ fn persisted_live_session_from_preserved_owner_snapshot(
         ssh_target,
         prefix: session.ssh_prefix.clone(),
         cwd: snapshot_session_metadata_value(session, "Cwd"),
+        // WHICH app verb this row is, if it is one. A row adopted off a peer
+        // daemon that loses this comes back as bare bash — the same loss the
+        // field exists to close, arriving through the handover door instead.
+        app_launch: snapshot_session_metadata_value(session, "Source")
+            .filter(|source| crate::app_verb_token_parts(source).is_some()),
         remote_launch_action: snapshot_session_metadata_value(session, "Remote Launch Action"),
         storage_path: snapshot_session_metadata_value(session, "Storage"),
         restore_reason: Some(crate::UPDATE_RESTART_RESTORE_REASON.to_string()),
@@ -16389,6 +16394,7 @@ mod tests {
 
     fn peer_row(key: &str, kind: crate::SessionKind) -> crate::PersistedLiveSession {
         crate::PersistedLiveSession {
+            app_launch: None,
             key: key.to_string(),
             id: key.trim_start_matches("local://").to_string(),
             title: key.to_string(),
@@ -21646,6 +21652,7 @@ mod tests {
         );
         let kept_samplenotes = remote_scanned_session_path("dev", "kept-samplenotes");
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: kept_samplenotes.clone(),
             id: "kept-samplenotes".to_string(),
             title: "samplenotes".to_string(),
@@ -21665,6 +21672,7 @@ mod tests {
         });
         let unkept_update_runtime = remote_scanned_session_path("dev", "temporary-update");
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: unkept_update_runtime.clone(),
             id: "temporary-update".to_string(),
             title: "temporary update".to_string(),
@@ -21788,6 +21796,7 @@ mod tests {
         );
         let kept_runtime = remote_scanned_session_path("practice", "kept-runtime");
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: kept_runtime.clone(),
             id: "kept-runtime".to_string(),
             title: "samplers non-data".to_string(),
@@ -21829,6 +21838,7 @@ mod tests {
         );
         let plain_runtime = remote_scanned_session_path("practice", "plain-runtime");
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: plain_runtime.clone(),
             id: "plain-runtime".to_string(),
             title: "plain runtime".to_string(),
@@ -21871,6 +21881,7 @@ mod tests {
         let duplicate_erome = remote_scanned_session_path("dev", "kept-erome");
         for key in [&kept_samplenotes, &duplicate_erome] {
             server.restore_live_session(PersistedLiveSession {
+                app_launch: None,
                 key: key.clone(),
                 id: key.rsplit('/').next().unwrap_or("session").to_string(),
                 title: "remote".to_string(),
@@ -21921,6 +21932,7 @@ mod tests {
         let reassigned_erome = remote_scanned_session_path("dev", "kept-erome");
         for key in [&kept_samplenotes, &reassigned_erome] {
             server.restore_live_session(PersistedLiveSession {
+                app_launch: None,
                 key: key.clone(),
                 id: key.rsplit('/').next().unwrap_or("session").to_string(),
                 title: "remote".to_string(),
@@ -22862,6 +22874,7 @@ mod tests {
             remote_machines: Vec::new(),
             stored_sessions: Vec::new(),
             live_sessions: vec![PersistedLiveSession {
+                app_launch: None,
                 key: "remote-session://jojo/demo".to_string(),
                 id: "demo".to_string(),
                 title: "Demo".to_string(),

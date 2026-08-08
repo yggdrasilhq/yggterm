@@ -980,6 +980,10 @@ fn persisted_live_session_from_managed(
         agent_launch_options: session.agent_launch_options.clone(),
         title_is_explicit: session.title_is_explicit,
         outline_prefix: session.outline_prefix.clone(),
+        // ONE encoding: the `Source` stamp an app launch writes IS the
+        // `app:<name>:<verb>` token, so there is no second field to drift.
+        app_launch: session_metadata_value(session, "Source")
+            .filter(|source| app_verb_token_parts(source).is_some()),
     })
 }
 
@@ -3009,6 +3013,24 @@ pub struct PersistedLiveSession {
     /// cannot survive a restart is not an outline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outline_prefix: Option<String>,
+    /// WHICH libyggterm app verb this row is, as the canonical
+    /// `app:<name>:<verb>` token every launcher menu already speaks.
+    ///
+    /// ⛔ Persisted because THE COMMAND IS NOT. A live app row holds the app's
+    /// command in `launch_command`, but the persisted form has never carried
+    /// that field — `restore_live_session` RE-DERIVES it, and for a
+    /// `SessionKind::Shell` the derivation is the interactive shell. So an app
+    /// row created perfectly still came back from a daemon swap as bare bash
+    /// with `Runtime Restore Reason: update-restart` — the owner's report,
+    /// 2026-08-08, and the half a create-time fix alone cannot reach.
+    ///
+    /// The TOKEN, not the command: a manifest's binary path is a fact about the
+    /// machine, so the command is re-derived against the CURRENT registry on
+    /// restore, exactly as [`Self::agent_launch_options`] re-derives an agent's.
+    /// An app that has been uninstalled resolves to nothing and the row falls
+    /// back to the shell it would have been, rather than execing a stale path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_launch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -8084,6 +8106,7 @@ impl YggtermServer {
             agent_launch_options,
             title_is_explicit,
             outline_prefix,
+            app_launch,
         } = live;
         let storage_path =
             storage_path.or_else(|| is_local_codex_storage_session_path(&key).then(|| key.clone()));
@@ -8479,7 +8502,19 @@ impl YggtermServer {
                         session.kind == SessionKind::Codex && session_id == id.as_str()
                     })
                 {
-                    session.launch_command = stored_session_launch_command(session.kind, &cwd, &id);
+                    // ⛔ AN APP ROW IS NOT A PLAIN SHELL, and this line is where
+                    // it used to become one. `stored_session_launch_command`
+                    // answers `exec '<shell>' -i` for a `Shell`, which is the
+                    // correct derivation for a row that IS a shell and a total
+                    // loss for a row that is ychrome. Re-derive the app's own
+                    // command from the token the row persisted, against the
+                    // CURRENT registry (owner-reported, 2026-08-08).
+                    session.launch_command = app_launch
+                        .as_deref()
+                        .and_then(restored_app_verb_launch_command)
+                        .unwrap_or_else(|| {
+                            stored_session_launch_command(session.kind, &cwd, &id)
+                        });
                 }
                 upsert_session_metadata(
                     &mut session.metadata,
@@ -20184,6 +20219,28 @@ pub fn run_app_control_set_right_panel_mode(
     Ok(())
 }
 
+pub fn run_app_control_launch_app(
+    app: String,
+    verb: Option<String>,
+    cwd: Option<String>,
+    insert_after: Option<String>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::LaunchApp {
+            app,
+            verb,
+            cwd,
+            insert_after,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_set_ui_theme(theme: UiTheme, timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(&home, AppControlCommand::SetUiTheme { theme }, timeout_ms)?;
@@ -26216,6 +26273,34 @@ fn local_interactive_shell_launch_command(shell_program: &str) -> String {
     format!("exec {} -i", shell_single_quote(shell_program))
 }
 
+/// Split the canonical `app:<name>:<verb>` token every launcher menu speaks.
+///
+/// ONE parser, shared by the `Source` stamp's persistence filter and by the
+/// restore that re-derives an app row's command — a second reading of the same
+/// token is how a row would persist under one spelling and restore under
+/// another. A bare `app:<name>` (no verb) is NOT this token: it names an app
+/// without saying which verb the row is, and guessing the first verb on restore
+/// would silently change what the row runs.
+pub fn app_verb_token_parts(token: &str) -> Option<(&str, &str)> {
+    let rest = token.strip_prefix("app:")?;
+    let (app, verb) = rest.split_once(':')?;
+    (!app.trim().is_empty() && !verb.trim().is_empty()).then_some((app, verb))
+}
+
+/// Re-derive an app row's launch command from its persisted token, against the
+/// registry AS IT IS NOW.
+///
+/// `None` when the app or the verb is no longer installed — the caller then
+/// falls back to the plain shell the row would otherwise have been, which is a
+/// visible empty prompt rather than an exec of a path that has moved.
+fn restored_app_verb_launch_command(token: &str) -> Option<String> {
+    let (app_name, verb_id) = app_verb_token_parts(token)?;
+    let apps = cached_app_registry();
+    let app = apps.iter().find(|app| app.name == app_name)?;
+    let verb = app.verbs.iter().find(|verb| verb.id == verb_id)?;
+    Some(local_app_verb_launch_command(&app.command_for(verb)))
+}
+
 /// The launch command for a libyggterm APP row: run the app's verb, then hand
 /// the row the interactive shell an app row has always ended up at.
 ///
@@ -27539,6 +27624,7 @@ mod tests {
     #[test]
     fn remote_cc_keep_alive_sessions_are_recoverable_like_codex() {
         let cc = PersistedLiveSession {
+            app_launch: None,
             key: "remote-cc://practice/8247344a-6764-4c06-9cf5-d74757ee09d0".to_string(),
             id: "8247344a-6764-4c06-9cf5-d74757ee09d0".to_string(),
             title: "cc keep-alive".to_string(),
@@ -27606,7 +27692,8 @@ mod tests {
         remote_scanned_session_path, remote_snapshot_looks_like_codex,
         remote_snapshot_looks_like_shell_prompt, remote_ssh_launch_command,
         remote_summary_for_path, sanitize_recent_context_payload,
-        local_app_verb_launch_command,
+        app_verb_token_parts, local_app_verb_launch_command,
+        persisted_live_session_from_managed,
         session_metadata_value, should_fallback_to_python,
         session_path_is_remote, should_remove_local_daemon_socket_for_spawn_state,
         stored_session_launch_command, stored_session_launch_command_for_locality,
@@ -27699,6 +27786,7 @@ mod tests {
             permission_mode: Some(yggterm_core::AgentPermissionMode::Bypass),
         };
         let persisted = crate::PersistedLiveSession {
+            app_launch: None,
             key: "local://abc".to_string(),
             id: "abc".to_string(),
             title: "delegate".to_string(),
@@ -29449,7 +29537,7 @@ mod tests {
             Some("/home/user"),
             Some("New Ychrome"),
             &local_app_verb_launch_command(app_command),
-            Some("app:ychrome"),
+            Some("app:ychrome:new"),
         );
 
         let (launch_command, _cwd) = server
@@ -29483,10 +29571,41 @@ mod tests {
                 .iter()
                 .find(|entry| entry.label == "Source")
                 .map(|entry| entry.value.as_str()),
-            Some("app:ychrome"),
+            Some("app:ychrome:new"),
             "the Source stamp is where a row SAYS which app it is — the identity \
              the old typed-command path never wrote anywhere"
         );
+
+        // ⛔ THE HALF A CREATE-TIME FIX CANNOT REACH. `PersistedLiveSession`
+        // has never carried `launch_command`; `restore_live_session` RE-DERIVES
+        // it, and for a Shell the derivation is the interactive shell. So the
+        // row above would still have come back from a daemon swap as bare bash
+        // — which is the owner's report verbatim (`Runtime Restore Reason:
+        // update-restart`). The TOKEN has to survive, and the command is
+        // re-derived from it against the registry as it is THEN.
+        let persisted = persisted_live_session_from_managed(&path, session, false, None, false)
+            .expect("a local app row is persistable");
+        assert_eq!(
+            persisted.app_launch.as_deref(),
+            Some("app:ychrome:new"),
+            "the persisted row must carry WHICH app verb it is, or the restore \
+             has nothing to re-derive from"
+        );
+
+        // The verb is not optional in the token, and this is why: restoring
+        // `app:ychrome` would have to GUESS a verb, silently changing what the
+        // row runs. One parser for both directions.
+        assert_eq!(
+            app_verb_token_parts("app:ychrome:new"),
+            Some(("ychrome", "new"))
+        );
+        for not_a_token in ["app:ychrome", "app:", "app::new", "ychrome:new", "recipe-session"] {
+            assert_eq!(
+                app_verb_token_parts(not_a_token),
+                None,
+                "{not_a_token} does not name an app verb and must not be treated as one"
+            );
+        }
     }
 
     #[test]
@@ -35716,6 +35835,7 @@ terminal_window_id: None,
                 }],
                 stored_sessions: Vec::new(),
                 live_sessions: vec![PersistedLiveSession {
+                    app_launch: None,
                     key: stale_path.clone(),
                     id: "missing".to_string(),
                     title: "Stale Live".to_string(),
@@ -35780,6 +35900,7 @@ terminal_window_id: None,
                 )],
                 stored_sessions: Vec::new(),
                 live_sessions: vec![PersistedLiveSession {
+                    app_launch: None,
                     key: stale_path.clone(),
                     id: "missing-runtime".to_string(),
                     title: "Temporary Update Restore".to_string(),
@@ -35872,6 +35993,7 @@ terminal_window_id: None,
                 )],
                 stored_sessions: Vec::new(),
                 live_sessions: vec![PersistedLiveSession {
+                    app_launch: None,
                     key: kept_path.clone(),
                     id: "kept-runtime".to_string(),
                     title: "Kept Restore".to_string(),
@@ -35969,6 +36091,7 @@ terminal_window_id: None,
             }],
         });
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: remote_path.clone(),
             id: "abc123".to_string(),
             title: "Restore Live Remote".to_string(),
@@ -36140,6 +36263,7 @@ terminal_window_id: None,
 
         let kept_remote = remote_scanned_session_path("dev", "kept-samplenotes");
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: kept_remote.clone(),
             id: "kept-samplenotes".to_string(),
             title: "samplenotes".to_string(),
@@ -36232,6 +36356,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         let row = |id: &str| PersistedLiveSession {
+            app_launch: None,
             key: format!("local://{id}"),
             id: id.to_string(),
             title: id.to_string(),
@@ -36304,6 +36429,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         let row = |id: &str| PersistedLiveSession {
+            app_launch: None,
             key: format!("local://{id}"),
             id: id.to_string(),
             title: id.to_string(),
@@ -36648,6 +36774,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "local://update-shell".to_string(),
             id: "update-shell".to_string(),
             title: "Update Shell".to_string(),
@@ -36777,6 +36904,7 @@ terminal_window_id: None,
                 remote_machines: Vec::new(),
                 stored_sessions: Vec::new(),
                 live_sessions: vec![PersistedLiveSession {
+                    app_launch: None,
                     key: "local://old-shell".to_string(),
                     id: "old-shell".to_string(),
                     title: "Old unkept shell".to_string(),
@@ -36831,6 +36959,7 @@ terminal_window_id: None,
                 remote_machines: Vec::new(),
                 stored_sessions: Vec::new(),
                 live_sessions: vec![PersistedLiveSession {
+                    app_launch: None,
                     key: "local::old-shell".to_string(),
                     id: "old-shell".to_string(),
                     title: "Old unkept shell".to_string(),
@@ -36893,6 +37022,7 @@ terminal_window_id: None,
         );
         let key = crate::remote_cc_session_path("dev", "adopt-me");
         let row = |title: &str| PersistedLiveSession {
+            app_launch: None,
             key: key.clone(),
             id: "adopt-me".to_string(),
             title: title.to_string(),
@@ -37007,6 +37137,7 @@ terminal_window_id: None,
         // An unkept row stays unkept across a re-open (restore/user authority).
         let unkept = crate::remote_cc_session_path("dev", "user-unkept");
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: unkept.clone(),
             id: "user-unkept".to_string(),
             title: "unkept".to_string(),
@@ -37354,6 +37485,7 @@ terminal_window_id: None,
                 stored_sessions: Vec::new(),
                 live_sessions: vec![
                     PersistedLiveSession {
+                        app_launch: None,
                         key: remote_path.clone(),
                         id: "kept-remote".to_string(),
                         title: "Kept Remote".to_string(),
@@ -37374,6 +37506,7 @@ terminal_window_id: None,
                         outline_prefix: None,
                     },
                     PersistedLiveSession {
+                        app_launch: None,
                         key: "local://update-shell".to_string(),
                         id: "update-shell".to_string(),
                         title: "Update Shell".to_string(),
@@ -37438,6 +37571,7 @@ terminal_window_id: None,
                 stored_sessions: Vec::new(),
                 live_sessions: vec![
                     PersistedLiveSession {
+                        app_launch: None,
                         key: "local::dead-shell".to_string(),
                         id: "dead-shell".to_string(),
                         title: "Smoke Local Shell".to_string(),
@@ -37456,6 +37590,7 @@ terminal_window_id: None,
                         outline_prefix: None,
                     },
                     PersistedLiveSession {
+                        app_launch: None,
                         key: "codex-runtime://dead-codex".to_string(),
                         id: "dead-codex".to_string(),
                         title: "Remote Codex 019d1518".to_string(),
@@ -37474,6 +37609,7 @@ terminal_window_id: None,
                         outline_prefix: None,
                     },
                     PersistedLiveSession {
+                        app_launch: None,
                         key: "document::dead-doc".to_string(),
                         id: "dead-doc".to_string(),
                         title: "local::ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string(),
@@ -37550,6 +37686,7 @@ terminal_window_id: None,
                 stored_sessions: Vec::new(),
                 live_sessions: vec![
                     PersistedLiveSession {
+                        app_launch: None,
                         key: "local::first-shell".to_string(),
                         id: "first-shell".to_string(),
                         title: "First shell".to_string(),
@@ -37568,6 +37705,7 @@ terminal_window_id: None,
                         outline_prefix: None,
                     },
                     PersistedLiveSession {
+                        app_launch: None,
                         key: "local::second-shell".to_string(),
                         id: "second-shell".to_string(),
                         title: "Second shell".to_string(),
@@ -37700,6 +37838,7 @@ terminal_window_id: None,
                 stored_sessions: Vec::new(),
                 live_sessions: vec![
                     PersistedLiveSession {
+                        app_launch: None,
                         key: first_path.clone(),
                         id: "abc123".to_string(),
                         title: "First remote".to_string(),
@@ -37718,6 +37857,7 @@ terminal_window_id: None,
                         outline_prefix: None,
                     },
                     PersistedLiveSession {
+                        app_launch: None,
                         key: second_path.clone(),
                         id: "def456".to_string(),
                         title: "Second remote".to_string(),
@@ -37873,6 +38013,7 @@ terminal_window_id: None,
         let storage_path = "/home/user/.codex/sessions/2026/05/05/session.jsonl";
 
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: storage_path.to_string(),
             id: "stored-codex-id".to_string(),
             title: "Stored Codex".to_string(),
@@ -37930,6 +38071,7 @@ terminal_window_id: None,
         );
 
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "codex-runtime://runtime-session".to_string(),
             id: "runtime-session".to_string(),
             title: "Runtime Session".to_string(),
@@ -38001,6 +38143,7 @@ terminal_window_id: None,
 
         let key = "remote-cc://practice/53991819-a835-4bd2-b5c4-76a67631f33c";
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: key.to_string(),
             id: "53991819-a835-4bd2-b5c4-76a67631f33c".to_string(),
             title: "practice cc".to_string(),
@@ -38066,6 +38209,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: runtime_key.to_string(),
             id: "synthetic-runtime".to_string(),
             title: "Remote Codex synthetic".to_string(),
@@ -38173,6 +38317,7 @@ terminal_window_id: None,
         );
         server.remote_machines = vec![remote_machine_with_scanned_session("dev", real_id, true)];
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: runtime_key.clone(),
             id: synthetic_id.to_string(),
             title: "Kaustav work".to_string(),
@@ -38300,6 +38445,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: runtime_key.clone(),
             id: synthetic_id.to_string(),
             title: "Remote Codex 0dce9c47".to_string(),
@@ -38464,6 +38610,7 @@ terminal_window_id: None,
             sessions: Vec::new(),
         }];
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: runtime_key.clone(),
             id: synthetic_id.to_string(),
             title: "muhurta".to_string(),
@@ -38547,6 +38694,7 @@ terminal_window_id: None,
             sessions: Vec::new(),
         }];
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: runtime_key.clone(),
             id: synthetic_id.to_string(),
             title: "samplenotes webapp".to_string(),
@@ -38654,6 +38802,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: runtime_key.to_string(),
             id: "synthetic-runtime".to_string(),
             title: "Local Codex synthetic".to_string(),
@@ -39405,6 +39554,7 @@ terminal_window_id: None,
         });
 
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "remote-session://jojo/abc123".to_string(),
             id: "abc123".to_string(),
             title: "Example".to_string(),
@@ -39480,6 +39630,7 @@ terminal_window_id: None,
         });
 
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "remote-session://dev/abc123".to_string(),
             id: "abc123".to_string(),
             title: "Remote Session".to_string(),
@@ -39780,6 +39931,7 @@ terminal_window_id: None,
 
             crate::sync_terminal_identity_appearance("light");
             server.restore_live_session(PersistedLiveSession {
+                app_launch: None,
                 key: "remote-session://dev/abc123".to_string(),
                 id: "abc123".to_string(),
                 title: "Restored".to_string(),
@@ -39886,6 +40038,7 @@ terminal_window_id: None,
         let runtime_key = remote_runtime_codex_session_key("abc123");
 
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: runtime_key.clone(),
             id: "abc123".to_string(),
             title: "Restored Remote Codex".to_string(),
@@ -39981,6 +40134,7 @@ terminal_window_id: None,
         let runtime_key = remote_runtime_codex_session_key("fresh123");
 
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: runtime_key.clone(),
             id: "fresh123".to_string(),
             title: "Fresh Remote Codex".to_string(),
@@ -40112,6 +40266,7 @@ terminal_window_id: None,
         });
 
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "remote-session://dev/fresh-codex".to_string(),
             id: "fresh-codex".to_string(),
             title: "Yggterm".to_string(),
@@ -40186,6 +40341,7 @@ terminal_window_id: None,
         });
 
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "remote-session://dev/synthetic-runtime".to_string(),
             id: "synthetic-runtime".to_string(),
             title: "Update-restored Codex".to_string(),
@@ -40271,6 +40427,7 @@ terminal_window_id: None,
             sessions: Vec::new(),
         });
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "remote-session://dev/abc123".to_string(),
             id: "abc123".to_string(),
             title: "Remote session".to_string(),
@@ -40362,6 +40519,7 @@ terminal_window_id: None,
             ],
         });
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "remote-session://jojo/live-1".to_string(),
             id: "live-1".to_string(),
             title: "Live 1".to_string(),
@@ -40380,6 +40538,7 @@ terminal_window_id: None,
             outline_prefix: None,
         });
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "remote-session://jojo/live-2".to_string(),
             id: "live-2".to_string(),
             title: "Live 2".to_string(),
@@ -40459,6 +40618,7 @@ terminal_window_id: None,
             }],
         });
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "remote-session://jojo/live-2".to_string(),
             id: "live-2".to_string(),
             title: "Live 2".to_string(),
@@ -40831,6 +40991,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "remote-session://dev/abc123".to_string(),
             id: "abc123".to_string(),
             title: "Remote session".to_string(),
@@ -40875,6 +41036,7 @@ terminal_window_id: None,
         );
         let path = "remote-session://dev/abc123";
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: path.to_string(),
             id: "abc123".to_string(),
             title: "Remote session".to_string(),
@@ -40923,6 +41085,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "local://codex".to_string(),
             id: "codex".to_string(),
             title: "Codex".to_string(),
@@ -40941,6 +41104,7 @@ terminal_window_id: None,
             outline_prefix: None,
         });
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "local://shell".to_string(),
             id: "shell".to_string(),
             title: "Shell".to_string(),
@@ -40987,6 +41151,7 @@ terminal_window_id: None,
             UiTheme::ZedLight,
         );
         server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
             key: "codex-runtime://cleanup-me".to_string(),
             id: "cleanup-me".to_string(),
             title: "Cleanup Me".to_string(),
