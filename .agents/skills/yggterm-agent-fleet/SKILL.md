@@ -1,6 +1,6 @@
 ---
 name: yggterm-agent-fleet
-description: What an agent CLI gains by running inside yggterm — its own addressable row, the ability to spawn and verify delegate sessions, to message any other session, to read its own context budget, and a one-time bootstrap that wires a durable memory + campaign system. Read this before spawning any session, before handing work to another agent, or when starting a long campaign that must outlive one context window.
+description: What an agent CLI gains by running inside yggterm — its own addressable row, the ability to spawn and verify delegate sessions, to message any other session, to read its own context budget, and a one-time bootstrap that wires a durable memory + campaign system. Read this before spawning any session, before claiming a row at the start of a campaign, before SUCCEEDING a session that has gone cold (§6 — harvest its transcript, never prompt it), before handing work to another agent, and before trusting any row-management verb's own success field (§7).
 ---
 
 # You are running inside yggterm. Here is what that gives you.
@@ -54,6 +54,40 @@ its own position. Set the seat once; let the CLI name itself.
 yggterm server app session outline "$ROW" 4.2      # seats it; "" clears
 yggterm server app session rename  "$ROW" "topic: what I am actually doing"
 ```
+
+### ⛔ CLAIM YOUR ROW AS YOUR FIRST ACT ON A CAMPAIGN — do not wait to be asked
+
+**A session that starts long-lived work owns its own identity.** A row born with
+the title its CLI invented, sitting wherever the sidebar dropped it, is the one
+row a human cannot find later — and it is always the one running the work.
+
+```sh
+.agents/skills/yggterm-agent-fleet/ygg-claim.sh \
+    --title "<topic>: <what this session is for>" \
+    [--campaign <token>] [--replace <uuid-of-the-row-this-supersedes>]
+```
+
+It does the whole chore in one call — derive the seat number from existing rows,
+rename, **read the title back**, keep re-asserting it, and (with `--replace`)
+retire and reap the predecessor. Do this **at the start**, not at the end.
+
+**Why a verb and not a paragraph.** Every part of this has a trap that has
+actually fired, and a session's discipline resets every launch:
+
+- **A rename applied too early is LOST.** The CLI composes its own title when its
+  first turn ends and clobbers whatever was set before. One row ended up named
+  after a liveness ping, because the ping was the first message it ever received.
+  ⇒ the tool re-asserts the title for a while instead of writing it once.
+- **Numbering is a decision, not a constant.** Seats are derived: an explicit
+  `--number` wins; replacing a row inherits its seat; joining a campaign that
+  already has rows takes the next SUB-seat (`5.1`, `5.2`); a row that already has
+  a number **keeps it**, so re-running the claim is a no-op; only an unnumbered
+  row takes the next free top-level seat.
+- **A new row lands at the HEAD of the sidebar**, so every launch leaves the
+  outline wrong until someone repairs it. Repair it in the same breath as the
+  spawn — never "later", never leaving it for the human.
+- ⚠ **If a human has dragged a row themselves, that is THEIR placement.** Read
+  the order back and leave it alone; a manual drag outranks a stored outline.
 
 ---
 
@@ -246,7 +280,192 @@ by it. One session grinding at a time; the baton is explicit.
 
 ---
 
-## 6. Adapting this to your own setup
+## 6. ⛔ Succeed a session that has gone cold — HARVEST IT, never ask it
+
+**A long-running row drifts into the worst cell of a two-by-two: a COLD prompt
+cache holding a LARGE context.** Those costs multiply rather than add — every
+turn re-writes a huge input at full price instead of reading it cheaply — so one
+turn on such a row can cost more than the entire remaining job.
+
+The remedy is a **succession**: harvest what the session knows from artefacts that
+cost nothing to read, write it somewhere durable, and continue in a fresh, small,
+warm session. Both problems disappear at once.
+
+### ⛔⛔ The asking IS the expense
+
+**Never ask a cold, high-context session to write you a handover.** Requesting one
+is several of the most expensive turns that row will ever run — the precise cost
+the succession exists to avoid. And it is worse than it looks: **the moment you
+prompt a cold row it becomes warm**, so respawning it *afterwards* throws away
+the money you just spent.
+
+⇒ **A fork with no middle: either (a) touch nothing and succeed it from
+artefacts, or (b) having touched it, keep it. Never both.**
+
+⚖ **The exception, and check for it first:** asking is right when the respawn is
+**not** cost-motivated — a session that is context-*exhausted* rather than
+expensive-to-run can write an excellent handover, because it still has the cache
+you would otherwise pay to rebuild. **Ask yourself WHY you are respawning before
+you reach for the ask.**
+
+### Three outcomes, not two
+
+| the row is… | do this |
+|---|---|
+| **cold, with work still pending** | **succeed it** — harvest, distil, claim, retire |
+| **parked, and its repo is clean and pushed** | **let it go cold.** Its value is the written output, not its context — *read the files, not the row.* Warming is waste; succeeding it is worse |
+| **parked, but its repo is dirty or unpushed** | **harvest FIRST** — knowledge may be trapped in its head that exists nowhere else |
+
+⛔ **A dead row has no cache at all** — it can only be read or resumed from disk.
+Warming advice is meaningless for it; suppress it.
+
+### The harvest, cheapest instrument first
+
+A transcript is a plain JSONL file on disk. Reading its tail costs a file read;
+making the session produce the same summary costs a fortune. **Same information,
+two prices, orders of magnitude apart.**
+
+```sh
+J=~/.claude/projects/<cwd-slug>/<uuid>.jsonl
+
+# a. When did it ACTUALLY last work?  ⛔ NOT the file's mtime — see below.
+jq -r 'select(.timestamp) | .timestamp' "$J" | tail -1
+
+# b. What was it TOLD? Human turns are the highest-signal, cheapest read there is.
+jq -r 'select(.type=="user" and (.message.content|type=="string"))
+       | .timestamp + " | " + .message.content' "$J"
+
+# c. What did it CONCLUDE? A working row's last message is its own status report.
+jq -r 'select(.type=="assistant")
+       | (.message.content // [] | map(select(.type=="text").text) | join("\n"))' "$J" \
+  | tail -c 6000
+
+# d. ⭐ What did it WRITE? — the step that decides whether it is safe to retire.
+jq -r 'select(.type=="assistant") | (.message.content // [])[]
+       | select(.type=="tool_use" and (.name=="Write" or .name=="Edit"))
+       | .input.file_path' "$J" | sort -u
+```
+
+⭐ **(d) IS THE ONE THAT SETTLES IT**, and it answers a question no summary can:
+*is there anything in this session's head that is not already on disk?* **If every
+`Write`/`Edit` target is a file you can go and read, the transcript holds nothing
+unwritten and the row is safe to retire.** If a target is missing, uncommitted, or
+outside any repo, harvest **that specific thing** before you kill anything.
+
+⛔ **mtime is not progress.** A transcript's modification time moves for metadata
+— stored titles, mode, last-prompt — long after the last real turn. Measured: a
+row whose file read as *touched 22 minutes ago* had last actually worked **36
+hours** earlier. Read the last real timestamp out of the content, as in (a).
+
+Then widen only as needed: `git log`, the repo's state file or status command, and
+whatever queue file the campaign keeps.
+
+### Distil into DURABLE MEMORY, not into a bespoke brief
+
+⭐ **This is the real prize.** Write the distillate into the campaign's own memory
+or state file, and it becomes the **standing handover surface** — the next
+successor reads it like any other session and needs no brief written for it. A
+brief that duplicates campaign memory is a second copy that will go stale.
+
+- ✅ **Carry:** what is DONE and where it is written · what is OPEN and the exact
+  next step · decisions ALREADY MADE, so they are not relitigated · dead ends
+  **with the evidence that killed them**, so they are not re-walked · outstanding
+  approvals · traps already paid for.
+- ⛔ **Drop:** the narrative, the tool-by-tool path, superseded drafts, and
+  anything the repo already holds — **point at the repo instead. A pointer is
+  cheaper than a paste and cannot go stale.**
+
+**The test of a good succession: the successor never needs the predecessor's
+transcript.** Carry conclusions and state; drop the history that produced them.
+
+### Then take the seat, in this order
+
+1. **Claim your own row first** (§1) — rename, seat, read the title back.
+2. **Only then retire the predecessor** (§7 — and reap it yourself).
+
+⛔ Retiring first leaves a numbered gap in the sidebar and an unclaimed identity,
+which is exactly the state a human cannot navigate.
+⛔ **Announce a succession before you perform it.** The action is usually right;
+being surprised by it is not.
+
+### ⭐ Assume this — do not wait to be asked
+
+When you are told to continue work whose previous session has gone cold, **this
+whole sequence is the default**: harvest → distil → claim → retire → continue.
+Say what you did. Do not ask permission to read a file you already own, and do
+not offer to "ask the old session" as though it were the cheap option.
+
+---
+
+## 7. ⛔ Verbs report the REQUEST, not the EFFECT — read state back, every time
+
+The single most expensive pattern in fleet work: **you ask about one thing and the
+instrument answers about another.** Verbs across this surface return a success
+field describing what they *asked for*, not what *happened*.
+
+Documented cases, each of which cost real time before it was understood: a rename
+that reported success and reverted later; a reorder that returned
+`changed: true` three times while the sidebar never moved; a reorder verb that
+echoed the requested order back as though it were the rendered one; a send that
+returned `error: null` for messages that never arrived; and a remove that timed
+out on removals which had in fact succeeded.
+
+⇒ **THE TEST, before trusting any probe: write down the question you asked, and
+the question the instrument actually answers. If they differ by one word, it will
+lie to you eventually.**
+
+### Removing a row: two fields, two different questions
+
+```sh
+yggterm server app session remove "$ROW"
+```
+
+Measured: `row_still_listed: false` together with `verified: false` and
+`verified_refusal: "remote_runtime_survived"`. **Both are true and they are not
+contradictory** — the ROW was genuinely gone from the sidebar, while the agent
+PROCESS kept running on the remote host, because only the local transport had
+been reaped. Read both fields; they answer different questions.
+
+⇒ **Reap the runtime yourself, by `/proc`, requiring BOTH a plausible agent
+binary AND the session id:**
+
+```sh
+for p in $(pgrep -f -- "$UUID"); do
+  c=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+  case "$c" in *pgrep*) continue ;; esac        # your own query matches too
+  case "$c" in *claude*"$UUID"*|*codex*"$UUID"*) kill -TERM "$p" ;; esac
+done
+```
+
+⛔ **`pgrep -cf "<uuid>"` COUNTS THE QUERYING SHELL** and has reported a dead row
+alive. **Never use a count as proof of life or death** — identify each candidate
+and check its cmdline. `ygg-claim.sh --replace` does all of this for you.
+
+### A quiet row is not necessarily an idle row
+
+Three distinct failures all look like *"the row is idle"*, and each needs a
+different hand. Diagnose with the terminal screen plus a `/proc` check — never
+with a count:
+
+| # | agent process | what `submit` says | remedy |
+|---|---|---|---|
+| 1 | **absent** | never echo-confirms | **remove + re-spawn** — a restart will not revive it |
+| 2 | alive, PTY attached | *"never echo-confirmed it was consuming input"* | **`server terminal restart`** — clears the wedge in seconds |
+| 3 | alive on a real PTY, but the daemon shows no runtime | *input readiness is **unanswerable** rather than false* | **`server terminal restart`** — re-attaches to the existing pty, spawns no rival |
+
+**#2 is a WEDGE: alive, turn ended, sitting in its event loop, not reading
+input** — and it silently eats every message sent to it. It is a pattern, not a
+one-off. ⇒ **probe any row that goes quiet with `submit` BEFORE assuming it chose
+to be idle**, because `send` cannot see this at all: it returns `error: null` for
+messages that vanish.
+
+⭐ Note that #3's verb behaved *well*: it distinguished **unanswerable** from
+**false** instead of guessing. That refusal string is the discriminator between #2
+and #3 — read it, do not just check the boolean.
+
+---
+
+## 8. Adapting this to your own setup
 
 Everything above is generic. To make it yours:
 
