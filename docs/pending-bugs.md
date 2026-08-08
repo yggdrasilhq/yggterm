@@ -101,6 +101,63 @@ remote agent can reach. Worth closing when this area is next touched.
 ⇒ Still open, and the next capture will answer it: the rail watcher now freezes
 every `[data-yggui-toast*]` element's rect and text at break time.
 
+## `sessions regenerate-copy --budget 0` IGNORES THE BUDGET AND CALLS THE LLM
+
+**Status:** OPEN
+
+Found 2026-08-08 while looking for a safe way to force one local session scan.
+`server sessions regenerate-copy --budget 0 --skip-remote --json` began
+**requesting titles from litellm immediately**:
+
+    INFO resolving session title session_id="…" force=false file_path=…
+    INFO requesting title from litellm session_id="…" context_chars=7933
+
+A budget of zero should be the natural "scan, generate nothing" mode. Instead
+`--budget 0` behaves as unlimited or as the default — a classic zero-means-unset
+bug, and it is the second time in this repo that a flag reported an intent it
+did not carry.
+
+**Why it matters beyond the surprise:** the external LLM endpoint rate-limits
+with HTTP 429 under quick successive calls, and the daemon's own chore tick is
+deliberately capped at 3 generations per tick for exactly that reason. A verb
+that silently ignores its cap can burn that budget from the CLI side. It had to
+be killed by hand.
+
+⚠ **Also missing, and the reason the flag was reached for at all:** there is no
+cheap way to force a local tree scan. `local_tree_scan` is throttled behind
+`local_tree_scanned:false` / `superseded:true`, so an agent that changes the
+session store cannot ask the product to re-read it. A read-only
+`sessions rescan` would have made this entry unnecessary.
+
+## A SESSION WHOSE CWD NO LONGER EXISTS IS INDISTINGUISHABLE FROM A LIVE ONE
+
+**Status:** AWAITING A DECISION
+
+**Who decides:** the owner — how a session with a vanished workspace should
+render, and what clicking it should do.
+
+Created by the orphan repair (see the `.bak.` entry). Five sessions were restored
+on the GUI host and **all three of the inspected ones have a cwd that is gone**:
+`/home/pi/data/cases-debug-cli`, `/home/pi/data/cases-debug-movefix`, and an
+unmounted SMB path. Two of them are 11,006-record / 181-turn sessions, so these
+are not throwaways.
+
+`build_local_cwd_tree` groups by the cwd **string** and never calls `is_dir()`
+(`yggterm-core/src/lib.rs`), so they render as ordinary rows under ordinary
+folders. That is what made the repair work at all, and it is deliberate — but it
+means **clicking one runs the product's core promise (`ssh … && cd <cwd> &&
+codex resume <uuid>`) against a directory that is not there.**
+
+⛔ Do NOT "fix" this by hiding them: that is precisely the mistake the orphan
+repair just undid, where a session was invisible because of a naming rule. The
+question is how a still-valuable session with a vanished workspace should
+PRESENT and what clicking it should do — resume in the nearest surviving parent,
+resume read-only, or offer to re-point the cwd. That is a spec call, not a
+defect to patch at a callsite.
+
+⚠ The condition is general, not an artefact of the repair: any session outlives
+its directory eventually.
+
 ## ⚖⚖ THE HOT-RESTART GATE IS UNBUILT — THE DESIGN IS NOW SETTLED
 
 **Status:** OPEN
@@ -219,9 +276,8 @@ rename, selection), so grepping it for a session id is a BLIND instrument rather
 than a negative result; and the scan annotation is throttled behind
 `local_tree_scanned:false` / `superseded:true`, so a stale count reads exactly
 like a current one — **check `ts_ms` before believing it.**
-- ⚠ **`regenerate-copy --budget 0` does NOT mean "no generation"** — it began
-  requesting titles from litellm immediately. It is not a safe way to force a
-  scan.
+- ⚠ `regenerate-copy --budget 0` is not a safe way to force a scan — it has its
+  own entry above.
 
 ## THERE IS NO SESSION SWEEP, AND THE BUILD SWEEP RUNS TOO RARELY TO KEEP UP
 
