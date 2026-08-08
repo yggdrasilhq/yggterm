@@ -212,9 +212,9 @@ row — **a bash prompt with no app means it did not hold**. Check
 
 **Status:** OPEN
 
-`launch-app ychrome --cwd /home/pi/gh/yggterm` answered `accepted:true` with
-`launch_command: /home/pi/.local/bin/ychrome` and created a row whose
-`session_cwd` was **`/home/pi/data/taxgraph`** — the ACTIVE session's cwd, not the
+`launch-app ychrome --cwd /home/user/gh/yggterm` answered `accepted:true` with
+`launch_command: /home/user/.local/bin/ychrome` and created a row whose
+`session_cwd` was **`/home/user/data/otherlane`** — the ACTIVE session's cwd, not the
 one passed (measured 2026-08-08 on 3.0.63). The reply's `shell.launch_app` block
 does not carry the cwd at all, so it reports a good launch either way.
 
@@ -265,7 +265,7 @@ harmless — collapse still fires (`data-metadata-group-expanded` 1→0→1, liv
 
 **Status:** OPEN
 
-Measured by the taxgraph row, 2026-08-08, which wrote the bug and only caught it
+Measured by another campaign row, 2026-08-08, which wrote the bug and only caught it
 because it tested against a host it KNEW had a live GUI. `server app clients`
 answers with a top-level `{clients, count}`; every other app verb wraps its
 payload in `{data: {...}}`. So the obvious parser reads `data.clients`, finds
@@ -3607,7 +3607,7 @@ split every time: asked about one thing, answered about another.** Only `termina
 Raised 2026-08-08 · **operator-confirmed by doing it in Chromium instead**.
 
 Field report: **[`docs/agent-cobrowse-gaps-2026-08-08.md`](agent-cobrowse-gaps-2026-08-08.md)**.
-Filed from fingraph row 5.5 after *"close the fake Google payments profile"* was driven to the
+Filed from another campaign row after a third-party-portal task was driven to the
 last step four times and abandoned. His words: *"I manually removed the Anthony profile on a
 chromium browser. It was ychrome browser shortcoming."*
 

@@ -1,6 +1,6 @@
 # Agent co-browse gap — a POPUP-based re-auth cannot be completed on a web surface (2026-08-08)
 
-Filed from **fingraph row 5.5** (Google Play onboarding) after the task
+Filed from **another campaign row** (a third-party portal onboarding) after the task
 *"close the fake `Anthony Gestapo` US payments profile"* was driven to the last
 step on a `--no-activate` yggterm web surface, failed there four times, and was
 then **finished by the operator in Chromium in a couple of minutes**. His verdict,

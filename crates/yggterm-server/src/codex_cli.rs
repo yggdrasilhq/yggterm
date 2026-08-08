@@ -1602,7 +1602,7 @@ mod tests {
     /// once: the uv install of `kimi` (landed in `~/.local/bin`), the vendor
     /// install of `muse` (landed in `~/.local/bin`) and the `agy update` that
     /// installed nothing anywhere ALL reported *"a Yggterm-managed <CLI>
-    /// toolchain under /home/pi/.yggterm/npm"*. One sentence, true of the npm
+    /// toolchain under ~/.yggterm/npm"*. One sentence, true of the npm
     /// lane only. A user who goes looking in the named directory for the binary
     /// we just installed finds nothing and concludes the install failed.
     #[test]
@@ -2113,7 +2113,7 @@ fn provision_step_is_runnable(paths: &ManagedCliPaths, tool: ManagedCliTool) -> 
 /// What actually happened, in the words of the method that did it.
 ///
 /// ⛔ MEASURED WRONG, live on jojo 2026-08-08: every install reported *"a
-/// Yggterm-managed <CLI> toolchain under /home/pi/.yggterm/npm"* — including the
+/// Yggterm-managed <CLI> toolchain under ~/.yggterm/npm"* — including the
 /// uv install that landed in `~/.local/bin`, the vendor install that landed in
 /// `~/.local/bin`, and the `agy update` that installed nothing at all. Three
 /// methods, one sentence, and it was true of only one of them. A status line

@@ -1,4 +1,4 @@
-DREAM from fingraph row 5.2 (mid-wave, per the standing instruction to always send yggterm a dream
+DREAM from another campaign row (mid-wave, per the standing instruction to always send yggterm a dream
 list). The test is not "is this a bug" but "did an agent hand-assemble this chore from primitives
 and get it wrong?" — and today it did, and it halted a live pipeline.
 
