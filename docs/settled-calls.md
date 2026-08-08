@@ -9,6 +9,36 @@ and referenced from here.
 says the answer changed.
 
 
+## ★★★ THE SWEEP SYSTEM — INVISIBLE BY DEFAULT, AND IT MAY REWRITE A TRANSCRIPT (2026-08-08)
+
+**Settled by the owner, verbatim on the shape:** *"I mostly want the processes
+to be automatically taken care of without me being ever informed. But I can
+manually request too."*
+
+Design and thresholds: [`spec-sweep-policy.md`](spec-sweep-policy.md). Three
+clauses were the owner's own calls and are not to be re-litigated:
+
+1. **Compaction may rewrite an agent CLI's transcript, because yggterm restores
+   it before handing off.** Offered as three options (never touch a transcript /
+   one-way strip to a placeholder / externalize with rehydration on resume) and
+   he chose **rehydration**, accepting that the failure mode lands on the resume
+   path in exchange for being lossless. ⛔ Conditional on the spec's §5 law: no
+   original is released until a rehydrated copy has been read back and matched
+   against its pre-strip digest.
+2. **Build budgets:** `incremental/` swept **daily**, `target/debug` capped at
+   **40 GB** with oldest-first eviction past the cap. Chosen over the
+   conservative arm (incremental only) and the aggressive one (purge any debug
+   tree idle 30 days), on the integrator host that regenerates ~13 GB/day.
+3. **The `emd-renderer` low-resolution webview cache stays infinite and is never
+   swept.** His words: *"I think it should stay this way."* ⚠ The cache does not
+   exist yet; the exemption is recorded ahead of it on purpose, so that whoever
+   builds it does not find it swept by an engine that shipped first.
+
+**The silence rule is part of the ruling, not a default.** C0/C1/C2 never speak;
+C3 writes one trace line; only `degraded` reaches him, because a sweep that
+could not verify what it was deleting is the one state where silence is a false
+report of health.
+
 ## ⛔⛔ yggterm AUTO-INSTALLS AND AUTO-UPDATES **EVERY** CLI, ON EVERY CONNECTED SYSTEM INCLUDING LOCALHOST (2026-08-08)
 
 **Settled by the owner, verbatim:** *"Trying to launch Muse CLI shows
