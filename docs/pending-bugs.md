@@ -13,6 +13,113 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⛔⛔ A REMOTE ROW FOR ANY OF THE SIX NEW AGENT CLIs IS BORN A PLAIN SHELL — six for six, and every field says healthy
+
+**Status:** OPEN
+
+Measured 2026-08-08 12:15–12:35 IST on the live fleet (GUI jojo 3.0.52, remote
+host `dev`), by launching all six new kinds twice: once remote, once local.
+
+**Remote (`--kind <cli> --machine-key dev`)** — `terminal new` answers
+`session_kind:"pi"`, `launch.applied:true`, `seat.honoured:true`, and the row
+renders with `machine_health:"healthy"`, `remote_deploy_state:"Ready"`. The
+process that actually appears on `dev` is:
+
+```
+3841329  /bin/bash -i      <- kind=pi
+3846866  /bin/bash -i      <- kind=opencode
+3847130  /bin/bash -i      <- kind=qwen-code
+3847507  /bin/bash -i      <- kind=kimi
+3847985  /bin/bash -i      <- kind=muse
+3848634  /bin/bash -i      <- kind=antigravity
+```
+
+No CLI is exec'd, and nothing fails: there is no `command not found`, because
+the CLI was never invoked. The row's path is `live::<uuid>` — a generic remote
+shell — not an agent scheme, and its icon is `$_`. **The `$_` icon is not an
+icon bug; it is the truth about a row that really is a shell.**
+
+**Local control (same kinds, no `--machine-key`)** — the CLI is exec'd
+(`… && pi`, `node …/qwen-code/cli.js`, opencode's TUI on screen) and the row
+carries its own `icon_kind`/`icon_text`: `π_ OC_ Q_ K_ M_ A_`. So the
+descriptors, the registry, the icon pipeline and the auto-provisioner are all
+correct. **Only the remote launch path is deaf to the new kinds.**
+
+**Root cause, in the code:** `crates/yggterm-core/src/agent_scheme.rs:347` —
+*"Current remote AGENT ROW schemes — `remote-session://` and `remote-cc://`"*.
+There are exactly two, minted for codex and Claude Code. A kind with no remote
+scheme falls through to the plain live-shell path, which is why the request is
+accepted and the row is wrong.
+
+**What it costs:** the handoff *is* the product — click a row, get
+`ssh <machine> "cd <cwd> && <cli> resume <uuid>"`. For six of the nine
+first-class CLIs that handoff does not exist on any machine but the GUI's own,
+and it fails **silently**, which is worse than refusing.
+
+**Fix shape:** carry the descriptor's slug across the hop — either one generic
+`remote-agent://<host>/<slug>/<uuid>` scheme (so the tenth CLI stays data) or a
+per-CLI scheme minted from the descriptor. ⛔ Until it lands, `terminal new
+--machine-key` must **refuse by name** any kind it cannot carry. A launch that
+degrades to a shell while reporting `applied:true` is the response-layer defect
+this repo already has an entry for, in its most expensive form.
+
+**Falsifier:** launch `--kind pi --machine-key dev`, then read
+`/proc/<pid>/cmdline` of the process the remote daemon spawned. `pi` means
+fixed; `bash -i` means this entry stands.
+
+## THE `--kind` VOCABULARY IS WRONG IN TWO DIRECTIONS AT ONCE
+
+**Status:** OPEN
+
+Found 2026-08-08 while probing the six-CLI intake on 3.0.52.
+
+1. **`--help` under-reports.** Both usage blocks for `server app terminal new`
+   still read `--kind <shell|codex|claude-code>`. The parser accepts nine:
+   `codex, codex-litellm, claude-code, pi, opencode, qwen-code, kimi, muse,
+   antigravity`. An agent that reads the help cannot discover six of them.
+   ⭐ The *refusal* string already lists all nine correctly — the help is the
+   only surface that lies, so this is a one-line drift with a ready source of
+   truth.
+2. **The reply over-reports, and does not round-trip.** `--kind opencode`
+   answers `session_kind:"open_code"`; `--kind qwen-code` answers
+   `"qwen_code"`. Feeding either back is refused:
+   `unsupported app-control terminal kind "open_code"`. **A caller that reads a
+   row's kind and launches another like it fails on exactly two of nine kinds.**
+
+Both halves are the same defect — the kind vocabulary has three encodings (flag
+token, enum debug name, help text) and no owner. Collapse them onto the
+descriptor's `slug`, which is already the SSOT the intake built.
+
+## AUTO-PROVISIONING COVERS THREE OF THE SIX NEW CLIs — the other three land in a shell that stays
+
+**Status:** OPEN
+
+Measured 2026-08-08 by launching all six locally on jojo, which had none of them
+installed at the start. `~/.yggterm/npm/bin` afterwards: `claude codex
+codex-litellm opencode pi qwen` — **`pi`, `opencode` and `qwen` were provisioned
+on demand and launched.** The other three showed, as the whole of the session:
+
+```
+/bin/bash: line 1: kimi: command not found
+/bin/bash: line 1: muse: command not found
+/bin/bash: line 1: agy: command not found
+```
+
+The row stays `healthy`, the shell stays open at a prompt, and **nothing above
+the terminal screen says the CLI is missing** — no launch error, no row state,
+no trace event. The only instrument that can answer "did my CLI start?" is
+reading the screen text.
+
+Muse is the owner-gated one and is correctly parked in `owner-attention.md`.
+**`kimi` and `agy` are not owner-gated — they are simply outside the npm
+provisioner**, and `agy` is installed on `dev` today, so the gap is the
+provisioning method, not the package.
+
+**Two things owed:** (a) teach the provisioner the non-npm install methods, or
+declare per-descriptor that a CLI is *host-provided* and check for it before
+launch; (b) **a failed exec must surface as a row-level launch failure**, not as
+a line of scrollback in a shell that outlives it.
+
 ## ⛔⛔ `terminal new --prompt` DROPPED A DELEGATE'S ENTIRE BRIEF AND REPORTED A GOOD LAUNCH — 8 HOURS LOST
 
 **Status:** OPEN
