@@ -46,13 +46,56 @@ the exact defect the titlebar `+` menu is filed for two entries below.
 ⚠ It also inherits the row menu's proof problem: if app control cannot open the
 modal, the verb to open it is part of this work, not a follow-up.
 
-## `codex-litellm` IS A CLI KIND AND THE OWNER SAYS IT IS NOT A CLI
+## THE INTERFACE LLM IS HARD-WIRED TO ONE HTTP PROVIDER — it needs a provider dropdown
+
+**Status:** OPEN
+
+⭐ **Owner-directed 2026-08-08.**
+
+The interface LLM — the model yggterm itself calls for titles, summaries and the
+working indicator — is fixed to an endpoint + API key + model (LiteLLM). His
+ask: *"the interface settings system (currently we use litellm) should be
+preceded by a dropdown of litellm (selected default) or any cli sdk (those have
+available, like claude code, codex, etc.) and the model to be used."*
+
+**Why it is more than a convenience:** a CLI SDK provider needs **no key and no
+endpoint** — the CLI is already logged in on that host — so the interface stops
+depending on one HTTP service that has already rate-limited this fleet with 429s.
+
+Design + the measured eligibility list (a CLI qualifies iff it has a
+non-interactive mode AND a model selector — claude `-p`, `codex exec`, pi
+`--print`, qwen `-p`, opencode `run`/`serve` all do; kimi is documented but not
+installed; antigravity and muse do not):
+[`spec-settings-model-providers.md`](spec-settings-model-providers.md) §2.
+
+⛔ Three traps written into that spec because each has already bitten something:
+a process spawn per title is not an HTTP call (keep the chore caps), a failed
+generation never persists a heuristic, and a CLI provider only works on hosts
+where that CLI is installed — the setting must say which.
+
+## THE CODEX BACKEND NEEDS A `codex ↔ Anything` SLIDER
+
+**Status:** OPEN
+
+⭐ **Owner-directed 2026-08-08:** *"codex sessions should have an extra slider in
+settings codex ↔ Anything."* This is the other half of removing `codex-anything`
+from the kind list: the capability needs a home before its CLI-hood is deleted.
+
+⚠ The same choice is currently encoded **three times** — a `--kind` value, a
+separate binary (`~/.yggterm/npm/bin/codex-litellm → @avikalpa/codex`, a private
+fork), and a provider key in `~/.codex/config.toml` (`[model_providers.litellm]`).
+Part of this work is deciding which one is the mechanism and retiring the others;
+the spec refuses to pick for the implementer but requires the reason be written
+down. → [`spec-settings-model-providers.md`](spec-settings-model-providers.md) §1.
+
+## `codex-anything` IS A CLI KIND AND THE OWNER SAYS IT IS NOT A CLI
 
 **Status:** OPEN
 
 Settled 2026-08-08 (`settled-calls.md`): *"we should not have codex-litellm as
 another CLI. It is a special codex session flip switch … a codex ONLY sessions
-superpower."*
+superpower."* The name is **locked as `codex-anything`** for every human-facing
+surface; `codex-litellm` stays only as repo/binary/provider identifiers.
 
 Today it is a first-class `--kind` value — `terminal new` names it in its own
 refusal message (`expected shell or one of: codex, codex-litellm, claude-code,
@@ -64,8 +107,14 @@ extra-args modal, and re-express it as a **flip on a codex session** — the
 capability stays, its CLI-hood goes. The LiteLLM endpoint/API-key/interface-model
 settings that feed it stay where they are; they are codex configuration.
 
-⚠ The rename to `codex-anything` is his and has not happened. Do not build for
-the new name, and do not leave a second encoding of the old one behind.
+**The flip's home is a `codex ↔ Anything` slider** in settings —
+[`spec-settings-model-providers.md`](spec-settings-model-providers.md) — not a
+row in the session menu.
+
+⚠ Rename the LABEL, never the identifier: the binary stays
+`~/.yggterm/npm/bin/codex-litellm` and the codex provider key stays
+`[model_providers.litellm]`. A label that leaks into an identifier is how one
+thing becomes two.
 
 ## NOTHING KEEPS yggterm's OWN BINARY AT PARITY ACROSS THE FLEET — measured by md5, not by `--version`
 
@@ -290,35 +339,6 @@ DID produce a transcript file, 28 KB of it — **existence proved nothing.**
 impatient; it was writing into a buffer it could not see and could not take back.
 
 
-## ⛔ THE START-PAGE SPLIT-BUTTON MENU IS TRANSPARENT — the page reads straight through it
-
-**Status:** OPEN
-
-Owner-reported with a screenshot 2026-08-08, against `981cc98f` (nine CLIs reach the menus). Every recent-work card behind the open
-"New Codex Session" menu is legible through its items, so the list of nine CLIs
-cannot be read at all.
-
-**Root cause, exactly:** `start_page_split_palette` (`shell.rs:120455`) passes
-`palette.panel_alt` as the split button's `surface`, and `panel_alt` is
-`rgba(255,255,255,0.18)` light / `rgba(255,255,255,0.05)` dark
-(`shell.rs:130858`, `:130876`). The menu paints `background:{palette.surface}`
-(`libyggterm crates/yggui/src/split_button.rs`), so a floating overlay is
-painted with an **18% white tint**.
-
-⭐ **The token is not wrong; it is doing two jobs with opposite requirements.**
-`SplitButtonPalette`'s `surface` is documented as "fill for a neutral button AND
-for the menu surface". A tint is correct for a button sitting on an opaque page
-— that is the glass look. It is never correct for a menu floating over content.
-
-**Owed, in libyggterm (component fix, not a yggterm override):** the menu needs
-an opaque surface of its own — a `menu_surface` slot, or compositing the tint
-over an opaque base inside the component. Then bump the pinned tag
-(`Cargo.toml`: `yggui = { … tag = "v0.12.0" }`).
-
-⚠ The owner named the reference behaviour: *"I like the right click context
-menu (simple works here)"* — match that surface treatment rather than inventing.
-
-
 ## ⛔ THE START PAGE DOES NOT LIST EVERY SESSION — a closed row could not be found to respawn
 
 **Status:** OPEN
@@ -336,8 +356,28 @@ surfaces it binds.
 
 ⛔ `server app start-page` is a verb that OPENS the page and answers only
 `{accepted, selected_paths}` — it cannot be used to read what the page lists.
-That missing read is itself why this could not be settled from the CLI, and is
-probably the first thing to build.
+
+### ✅ THE READ ALREADY EXISTS, AND IT MOVES THE QUESTION
+
+Measured on jojo 2026-08-08 (3.0.53). `server app state` → `dom` already carries
+`start_page_recent_count`, `start_page_recent_sessions` (each with its own
+`session_path` and rect) and `start_page_text_sample`. So the page CAN be read
+from the CLI after `server app start-page`; the missing verb was never the
+blocker, and it read **190 shown** with the orchestrator row selected.
+
+⚠ **Take the reading twice, with a DIFFERENT ROW SELECTED each time**, because
+the next suspect is a filter nothing on the page admits to:
+`start_page_recent_scope` (`shell.rs`) derives a `{machine_key, cwd}` scope
+**from `snapshot.selected_row`**, and `start_page_recent_scope_allows_browser_row`
+drops every candidate outside it. The header says "190 shown" and never says
+"…of N, scoped to this machine and cwd" — so a row that is filtered out looks
+exactly like a row that does not exist, which is the symptom as reported.
+
+Two other exclusions are already read from the source and are NOT the cause on
+their own, but must be held constant while testing the scope: the ACTIVE session
+is dropped by `push_candidate` on purpose, and the candidate list is built ONLY
+from `all_sidebar_rows_for_selection()` — so a session the sidebar does not hold
+cannot appear on the start page at all, whatever its JSONL still says.
 
 
 ## THREE `yggterm-server` LIB TESTS FAIL ON A CLEAN TREE — two of them reach the NETWORK

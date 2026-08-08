@@ -41,13 +41,29 @@ compiles unchanged.
 | `permission_preset.args` | string | the exact flags, or empty for "the CLI's own default" |
 | `permission_preset.explanation` | string | one sentence, in the CLI's own vocabulary |
 | `permission_default` | preset id | which one pre-populates an unset box |
-| `permission_provenance` | enum | `measured` \| `unmeasured` — see §5 |
+| `permission_provenance` | enum | `measured` \| `documented` \| `unmeasured` — see §5 |
+| `interface_mode` | enum | whether this CLI can drive the INTERFACE LLM — `spec-settings-model-providers.md` |
 
 ## 3. The content, measured 2026-08-08 on this fleet
 
-Every flag below was read from that CLI's own `--help` on a host where it is
-installed, on the versions this fleet runs today. **Absences are measurements
-too** and are marked as such.
+⛔⛔ **THE LAW OF THIS SECTION, owner-directed:** *"study each CLI's nuances and
+we do the bypass as they want it."* **Each CLI's bypass is expressed in that
+CLI's own idiom.** They are not the same shape and must not be flattened into
+one: two are flags, one is a config file, one is a *hidden* flag, and one CLI
+has no permission gate at all. A modal that pretends they are five spellings of
+the same thing will hand the user a flag their CLI ignores.
+
+⚠ **`--help` is not a CLI's contract.** Measured here: qwen's `--help` lists
+neither `--approval-mode` nor `--yolo`, and **both exist and work** — found by
+grepping the shipped bundle and confirmed with a controlled probe (`qwen
+--approval-mode bogus` names its own choices). ⇒ probe the binary, then read the
+docs; never conclude a flag is absent from `--help` alone. This is the repo's
+one-shape law in a new costume: I asked *"what does `--help` list"* and read the
+answer as *"what does the CLI accept"*.
+
+**Provenance, and it is part of the row (§5):**
+`measured` = read off a running binary on this fleet · `documented` = from the
+vendor's own reference, binary not installed here · `unmeasured` = neither.
 
 ### codex
 | tier | args | explanation shown |
@@ -57,7 +73,16 @@ too** and are marked as such.
 | **Skip checks** (default) | `-s danger-full-access` | No sandbox: model-generated commands run against the whole machine. `--dangerously-bypass-approvals-and-sandbox` additionally skips every confirmation prompt. |
 
 Approval policies in this build: `untrusted`, `on-request`, `never` — ⚠ there is
-no `on-failure` and **no `--full-auto`**; do not offer either.
+no `on-failure` and **no `--full-auto`**; do not offer either. Provenance:
+**measured**.
+
+⭐ **Nuance:** codex's real home for this is `~/.codex/config.toml`
+(`approval_policy`, `sandbox_mode`, `sandbox_permissions`, per-project trust),
+and `-c key=value` overrides any of it per launch. So the modal's box is a
+*per-launch override of a config file the user may also be editing* — say so in
+the row, and never silently write his config.toml from the modal.
+`--dangerously-bypass-hook-trust` is a **second, separate** danger switch (it
+runs hooks without persisted trust) and must not be folded into the first.
 
 ### claude-code
 | tier | args | explanation shown |
@@ -68,38 +93,71 @@ no `on-failure` and **no `--full-auto`**; do not offer either.
 
 Modes in this build: `acceptEdits`, `auto`, `bypassPermissions`, `manual`,
 `dontAsk`, `plan`. `--allowedTools` / `--disallowedTools` take tool-name lists
-for a middle ground.
+for a middle ground, and `settings.json` carries a `permissions` block
+(allow/deny/ask) that outlives any single launch. Provenance: **measured**.
+
+⚠ Two flags one letter apart: `--dangerously-skip-permissions` *is* the bypass;
+`--allow-dangerously-skip-permissions` only *enables* it being used. Offer the
+first; mention the second exists so nobody pastes it expecting the bypass.
 
 ### pi
+⛔⛔ **pi HAS NO PERMISSION GATE AT ALL, and that is its documented design.** Its
+own README: *"**No permission popups.** Run in a container, or build your own
+confirmation flow with extensions."* ⇒ **there is nothing to bypass**, and a
+"Skip checks" tier for pi would be theatre. Provenance: **measured** (`--help` +
+the shipped README).
+
+What the flags actually control is a *different question* — trust of
+**project-local settings files**, not tool calls:
+
 | tier | args | explanation shown |
 |---|---|---|
-| Ask each time | `--no-approve` | Project-local files are ignored, so nothing in the repo can widen what pi may do. |
-| Allowlist | `--tools <names>` | Only the named tools are enabled; `--no-tools` disables all of them, `--exclude-tools` denies specific ones. |
-| **Skip checks** (default) | `--approve` | Trusts project-local files for this run. |
+| **Restricted** | `--tools <names>` | Only the named tools are enabled. `--no-tools` disables all built-ins and extensions; `--exclude-tools <names>` denies specific ones. **This is pi's only real safety control.** |
+| Ignore project settings | `--no-approve` | Nothing in the repo can widen what pi may do this run. |
+| **Trust project settings** (default) | `--approve` | Trusts project-local settings files for this run. ⚠ This is *not* a tool-permission bypass — pi never asks about tool calls either way. |
 
-⚠ **pi has no blanket permission bypass** — its safety model is a tool
-allow/deny list plus project-file trust. The modal must not invent one; the
-"Skip checks" tier here is genuinely weaker than codex's or Claude's.
+Global default for that trust lives in pi's settings as `defaultProjectTrust`
+(`ask` — the default — · `never` · `always`); non-interactive modes (`-p`,
+`--mode json`, `--mode rpc`) never show the trust prompt and fall back to it.
+
+⇒ **The modal's explanation for pi must say the quiet part out loud:** every pi
+session runs its tools unprompted. That is a fact about the CLI, and hiding it
+behind a tier ladder that looks like Claude's would mislead.
 
 ### opencode
 | tier | args | explanation shown |
 |---|---|---|
 | Ask each time | *(empty)* | opencode's own default: each permission is asked. |
-| **Skip checks** (default) | `--auto` | Auto-approves every permission that is not explicitly denied — opencode's own help calls this dangerous. |
+| **Skip checks** (default) | `--auto` | Auto-approves every permission that is **not explicitly denied** — opencode's own help calls this dangerous. |
 
-Denials live in opencode's config file, not in flags; the modal should say so
-rather than offer a flag that does not exist.
+⭐ **Nuance: opencode's permission model is a CONFIG FILE, and the flag only
+raises the floor.** `opencode.json` takes a `permission` block whose values are
+`allow` · `ask` · `deny`, keyed by tool — `read`, `edit`, `glob`, `grep`,
+`bash`, `task`, `skill`, `lsp`, `question`, `webfetch`, `websearch`,
+`external_directory`, `doom_loop` — with `*` as the catch-all and glob patterns
+inside `bash`:
+
+```json
+{ "permission": { "*": "ask", "bash": { "*": "ask", "git *": "allow", "rm *": "deny" } } }
+```
+
+⇒ **`--auto` respects `deny` and overrides `ask`.** The modal must say that,
+because it is the one case where a user's *config* still constrains the box's
+value. Provenance: **measured** (`--help`) + **documented** (opencode.ai/docs).
 
 ### qwen-code
 | tier | args | explanation shown |
 |---|---|---|
-| Ask each time | *(empty)* | Qwen Code's own default. |
-| **Sandboxed** (default) | `-s` | Runs the session inside Qwen's sandbox. |
+| Ask each time | `--approval-mode default` | Every tool call is confirmed. `plan` is read-only planning. |
+| Auto-edit | `--approval-mode auto-edit` | File edits apply unprompted; commands still ask. |
+| Sandboxed | `-s` | Runs the session inside Qwen's sandbox — **composable with any approval mode**. |
+| **Skip checks** (default) | `--yolo` | Auto-approves everything (`--approval-mode yolo`). |
 
-⚠ **No bypass flag exists in this build** — `--yolo` and `--approval-mode` are
-absent from `qwen --help`. Approval is changed inside the session, not at launch.
-The default here is therefore the sandbox tier, and the modal must say why the
-third tier is missing rather than leaving an empty slot.
+⛔ **These flags are HIDDEN from `qwen --help`** and my first pass wrongly filed
+them as non-existent. Confirmed by probe: `--approval-mode bogus` answers
+`Choices: "plan", "default", "auto-edit", "auto", "yolo"`, and `--yolo` is
+accepted. Its settings file also carries `approvalMode` and `trustedFolders`.
+Provenance: **measured**.
 
 ### antigravity (`agy`)
 | tier | args | explanation shown |
@@ -109,20 +167,30 @@ third tier is missing rather than leaving an empty slot.
 | **Skip checks** (default) | `--dangerously-skip-permissions` | Auto-approves all tool permission requests without prompting. |
 
 ### kimi
-⛔ **Unmeasured.** `kimi` is installed on no fleet host (see
-`pending-bugs.md` § *AUTO-PROVISIONING COVERS THREE OF THE SIX NEW CLIs*), so
-its flags cannot be read off a running binary. The modal shows the row with an
-empty box and the honest label **"not measured — this CLI is not installed on
-any host yet"**. ⛔ Do not copy another CLI's flags into it.
+| tier | args | explanation shown |
+|---|---|---|
+| Ask each time | *(empty)* | Kimi's own default: every tool call is confirmed. |
+| **Skip checks** (default) | `--yolo` | Auto-approves all tool calls; you are still reachable for `AskUserQuestion`. Aliases: `-y`, `--yes`, `--auto-approve`. |
+| Away from keyboard | `--afk` | Auto-approves **and** auto-dismisses `AskUserQuestion` — nothing can stop to ask you. |
+
+Provenance: **documented** — from Moonshot's own command reference, because the
+binary is installed on no fleet host (`pending-bugs.md` § *AUTO-PROVISIONING
+COVERS THREE OF THE SIX NEW CLIs*). ⇒ the row renders with the documented values
+and a **"documented, not verified here"** marker until kimi is provisioned and
+one probe confirms them. ⛔ No sandbox flag is documented; do not invent one.
 
 ### muse
 ⛔ **Unmeasured and owner-gated** — closed source, needs the owner's vendor
 login (`docs/owner-attention.md`). Same treatment as kimi.
 
-### codex-litellm
+### codex-anything
 ⛔ **Not a row in this modal.** Settled by the owner 2026-08-08: it is a codex
-session's *flip switch*, not a CLI. See `docs/settled-calls.md` and the queue
-entry that removes it from the kind list.
+session's *flip switch*, not a CLI, and its home is the **codex ↔ Anything**
+slider in [`spec-settings-model-providers.md`](spec-settings-model-providers.md).
+The name `codex-anything` is locked for every human-facing surface;
+`codex-litellm` remains only as repo/binary/provider identifiers. See
+`docs/settled-calls.md` and the queue entry that removes it from the kind list.
+⇒ A codex row's extra-args box applies to **both** backends — one CLI, one box.
 
 ## 4. Behaviour
 
@@ -140,9 +208,10 @@ entry that removes it from the kind list.
 
 ## 5. Provenance is part of the UI, not a footnote
 
-A row whose flags were read off a running binary and a row whose flags were
-guessed must not look the same. `permission_provenance: unmeasured` renders the
-box disabled with the reason. **This is the same rule the descriptor table
+A row whose flags were read off a running binary, a row taken from a vendor doc,
+and a row that is guessed must not look the same. `measured` renders plain;
+`documented` renders with a **"documented, not verified here"** marker (kimi
+today); `unmeasured` renders the box disabled with the reason (muse today). **This is the same rule the descriptor table
 already follows** — the intake declared muse's fields as placeholders rather
 than faking measurements, and the modal inherits that discipline.
 
