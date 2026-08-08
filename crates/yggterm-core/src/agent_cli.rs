@@ -66,13 +66,65 @@ pub enum CliInstall {
     Npm(&'static str),
     /// `uv tool install <package>` — a Python CLI.
     Uv(&'static str),
-    /// A vendor installer that writes into `~/.local/bin`. The str is the URL a
-    /// human would pipe to a shell; yggterm records it so the provisioner can
-    /// name what is missing, and does NOT run it unattended.
+    /// A vendor installer that writes into `~/.local/bin`. The str is the URL
+    /// yggterm fetches and runs.
+    ///
+    /// ⚠ **The clause that stood here until 2026-08-08 — "yggterm records it so
+    /// the provisioner can name what is missing, and does NOT run it
+    /// unattended" — is SUPERSEDED by an owner ruling** (`docs/settled-calls.md`):
+    /// *"yggterm should auto install, update ALL clis in all connected systems
+    /// including localhost."* It is rewritten here rather than left standing
+    /// because a reader who finds the old refusal in the type's own
+    /// documentation re-derives the refusal, and the ruling loses.
+    ///
+    /// ⛔ The user-local constraint is NOT relaxed with it: the script is run
+    /// with `HOME` intact and no privilege escalation, and a vendor installer
+    /// that wants `sudo` or `/usr/local` is a bug report, not an install.
     VendorScript(&'static str),
-    /// Closed-source or licence-gated: yggterm can detect it and refuse cleanly,
-    /// but must never try to install it.
+    /// yggterm cannot FETCH this one — closed-source, licence-gated, or served
+    /// only behind a sign-in the daemon does not hold. It detects it and refuses
+    /// cleanly.
+    ///
+    /// ⚠ `Manual` is about ARRIVAL ONLY. It says nothing about whether the CLI
+    /// stays current — see [`CliUpdate`], which is a separate axis precisely
+    /// because the one `Manual` CLI in the registry updates itself.
     Manual,
+}
+
+impl CliInstall {
+    /// Whether yggterm fetches this CLI itself, with no human in the loop.
+    ///
+    /// The ONE predicate the provisioner gates on. It used to be spelled
+    /// "does this have an npm package", which answered `false` for a uv or
+    /// vendor CLI that yggterm is perfectly able to install — the conflation
+    /// the owner's 2026-08-08 ruling struck down.
+    pub fn provisions_unattended(self) -> bool {
+        match self {
+            Self::Npm(_) | Self::Uv(_) | Self::VendorScript(_) => true,
+            Self::Manual => false,
+        }
+    }
+}
+
+/// How a CLI that is ALREADY on the machine is kept current.
+///
+/// A second axis from [`CliInstall`], because arrival and staying-current are
+/// answered by different things. Antigravity cannot be fetched by yggterm at
+/// all ([`CliInstall::Manual`]) and yet updates itself perfectly (`agy update`,
+/// read off its own `--help` on jojo, 2026-08-08); codex arrives from npm and
+/// is updated by re-running that same install. Collapsing the two axes would
+/// have made "yggterm keeps every CLI current" false for the one CLI that needs
+/// no help doing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliUpdate {
+    /// Re-run the install method — `npm i -g <pkg>@latest`, `uv tool upgrade
+    /// <pkg>`, or the vendor script again (vendor installers upgrade in place).
+    Reinstall,
+    /// The CLI ships its own updater, and THAT is what runs — it is the only
+    /// thing that knows where its own payload lives. `agy update` replaces a
+    /// 166 MB self-contained binary no package manager on the machine has ever
+    /// seen; an install-method refresh could not touch it.
+    SelfCommand(&'static [&'static str]),
 }
 
 /// One phrase that means "a turn is in flight", as read off this CLI's SCREEN.
@@ -446,6 +498,8 @@ pub struct AgentCliDescriptor {
     pub binary_name: &'static str,
     /// How yggterm provisions the binary when a machine lacks it.
     pub install: CliInstall,
+    /// How yggterm keeps the binary current once the machine has it.
+    pub update: CliUpdate,
     /// The boxed-glyph mark drawn in the sidebar, start page and row JSON —
     /// codex `>_`, Claude Code `*_`, a shell `$_`.
     ///
@@ -713,11 +767,13 @@ impl AgentCliDescriptor {
                 "yggterm provisions {} from npm ({package}) — an install may be in flight, so retry in a moment.",
                 self.binary_name
             ),
-            CliInstall::Uv(package) => {
-                format!("Install it with `uv tool install {package}`.")
-            }
+            CliInstall::Uv(package) => format!(
+                "yggterm provisions {} with uv ({package}) — an install may be in flight, so retry in a moment.",
+                self.binary_name
+            ),
             CliInstall::VendorScript(url) => format!(
-                "Install it with the vendor installer at {url}; yggterm never runs that unattended."
+                "yggterm provisions {} with the vendor installer at {url} — an install may be in flight, so retry in a moment.",
+                self.binary_name
             ),
             CliInstall::Manual => format!(
                 "Install `{}` by hand — yggterm never provisions this CLI.",
@@ -965,6 +1021,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         slug: "codex",
         binary_name: "codex",
         install: CliInstall::Npm("@openai/codex"),
+        update: CliUpdate::Reinstall,
         icon_glyph: ">_",
         menu_hint: 'c',
         // Codex records no title of its own; yggterm's LLM chore writes one.
@@ -1064,6 +1121,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // provisioning it all along, in the same batch as codex and claude.
         // The wrong value would have quietly stopped that.
         install: CliInstall::Npm("@avikalpa/codex-litellm"),
+        update: CliUpdate::Reinstall,
         icon_glyph: ">_",
         menu_hint: 'z',
         title_authority: TitleAuthority::Generated,
@@ -1145,6 +1203,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         slug: "claude-code",
         binary_name: "claude",
         install: CliInstall::Npm("@anthropic-ai/claude-code"),
+        update: CliUpdate::Reinstall,
         icon_glyph: "*_",
         menu_hint: 'l',
         // CC does the hard work of titling its own sessions and yggterm must
@@ -1234,6 +1293,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         slug: "pi",
         binary_name: "pi",
         install: CliInstall::Npm("@earendil-works/pi-coding-agent"),
+        update: CliUpdate::Reinstall,
         // The mathematical constant is pi's own mark.
         icon_glyph: "\u{3c0}_",
         menu_hint: 'p',
@@ -1293,6 +1353,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `opencode`. Naming the wrong one is how provisioning silently
         // installs nothing.
         install: CliInstall::Npm("opencode-ai"),
+        update: CliUpdate::Reinstall,
         icon_glyph: "OC_",
         menu_hint: 'o',
         // A title agent EXISTS in the tree but is not wired into the v2 runner
@@ -1343,6 +1404,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         slug: "qwen-code",
         binary_name: "qwen",
         install: CliInstall::Npm("@qwen-code/qwen-code"),
+        update: CliUpdate::Reinstall,
         icon_glyph: "Q_",
         menu_hint: 'q',
         // Qwen generates and PERSISTS its own title as a `custom_title` record
@@ -1391,6 +1453,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         binary_name: "kimi",
         // A Python CLI; `uv tool install` is what its own getting-started says.
         install: CliInstall::Uv("kimi-cli"),
+        update: CliUpdate::Reinstall,
         icon_glyph: "K_",
         menu_hint: 'k',
         // `state.json` carries `custom_title` with a `title_generated` flag and
@@ -1464,6 +1527,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // what `spec-cli-binary-auto-provisioning` requires. Credentials land
         // in ~/.config/muse/auth.json.
         install: CliInstall::VendorScript("https://dev.meta.ai/install.sh"),
+        update: CliUpdate::Reinstall,
         icon_glyph: "M_",
         menu_hint: 'm',
         title_authority: TitleAuthority::Generated,
@@ -1508,6 +1572,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         slug: "antigravity",
         binary_name: "agy",
         install: CliInstall::Manual,
+        // ⭐ MEASURED on jojo 2026-08-08, `agy --help`: `update  Update CLI`.
+        // yggterm cannot FETCH agy — a 166 MB self-contained binary served
+        // behind a sign-in — but it must not therefore go stale, and the CLI
+        // itself is the thing that knows how to replace it.
+        update: CliUpdate::SelfCommand(&["update"]),
         icon_glyph: "A_",
         menu_hint: 'a',
         // The conversation file carries a `name` field, which is the CLI's own
@@ -2329,20 +2398,84 @@ mod tests {
 
         // Muse is the owner-gated case the report came from: closed source,
         // installed nowhere on the fleet, and the ONE thing yggterm knows is the
-        // vendor installer it must never run unattended.
+        // vendor installer — which, since the owner's 2026-08-08 ruling, it RUNS.
+        //
+        // ⛔ This assertion used to demand the words "never runs that unattended".
+        // Inverted deliberately: the sentence a user reads is the only place the
+        // superseded refusal could survive, so the test now FAILS if it comes back.
         let muse = agent_cli_descriptor(SessionKind::Muse).unwrap();
         let muse_instruction = muse.install_instruction();
         assert!(muse_instruction.contains("https://dev.meta.ai/install.sh"));
         assert!(
-            muse_instruction.contains("never runs that unattended"),
-            "a vendor script is recorded, not executed: {muse_instruction:?}"
+            !muse_instruction.contains("never runs that unattended"),
+            "the vendor-script refusal is superseded and must not be re-stated: \
+             {muse_instruction:?}"
         );
 
-        // An npm CLI tells the user to WAIT rather than to install by hand,
-        // because the attach that produced this refusal also kicked the
-        // background provision.
-        let claude = agent_cli_descriptor(SessionKind::ClaudeCode).unwrap();
-        assert!(claude.install_instruction().contains("retry in a moment"));
+        // Every CLI yggterm provisions tells the user to WAIT rather than to
+        // install by hand, because the attach that produced this refusal also
+        // kicked the background provision. npm, uv and vendor-script alike —
+        // that parity IS the ruling.
+        for descriptor in AGENT_CLIS {
+            let instruction = descriptor.install_instruction();
+            if descriptor.install.provisions_unattended() {
+                assert!(
+                    instruction.contains("retry in a moment"),
+                    "{}: a CLI yggterm provisions must tell the user to wait, got \
+                     {instruction:?}",
+                    descriptor.display_name
+                );
+            } else {
+                assert!(
+                    !instruction.contains("retry in a moment"),
+                    "{}: a CLI yggterm does NOT provision must not promise an install \
+                     is in flight, got {instruction:?}",
+                    descriptor.display_name
+                );
+            }
+        }
+    }
+
+    /// Arrival and staying-current are separate questions, and the registry must
+    /// answer both for every CLI.
+    ///
+    /// ⛔ The failure this guards: the owner ruled that yggterm auto-installs AND
+    /// auto-updates every CLI on every host. Before this, "can yggterm install
+    /// it" was the only question asked, so Antigravity — which yggterm genuinely
+    /// cannot fetch — was written off entirely, and the `agy update` its own
+    /// `--help` advertises was never run. A CLI that cannot be installed can
+    /// still be updated, and the registry has to be able to say so.
+    #[test]
+    fn a_cli_yggterm_cannot_install_can_still_be_updated() {
+        let antigravity = agent_cli_descriptor(SessionKind::Antigravity).unwrap();
+        assert!(
+            !antigravity.install.provisions_unattended(),
+            "agy is served behind a sign-in; yggterm cannot fetch it"
+        );
+        assert_eq!(
+            antigravity.update,
+            CliUpdate::SelfCommand(&["update"]),
+            "agy updates itself — measured from its own --help"
+        );
+
+        // The converse: an npm CLI has no self-updater to prefer, so its refresh
+        // is the install method run again.
+        let codex = agent_cli_descriptor(SessionKind::Codex).unwrap();
+        assert!(codex.install.provisions_unattended());
+        assert_eq!(codex.update, CliUpdate::Reinstall);
+
+        // ⛔ No CLI may be BOTH unfetchable and unupdatable — that is a row in
+        // the registry yggterm can do nothing for, and it must be noticed at
+        // build time rather than by a user whose CLI silently rots.
+        for descriptor in AGENT_CLIS {
+            if !descriptor.install.provisions_unattended() {
+                assert!(
+                    matches!(descriptor.update, CliUpdate::SelfCommand(argv) if !argv.is_empty()),
+                    "{}: yggterm can neither install nor update this CLI",
+                    descriptor.display_name
+                );
+            }
+        }
     }
 
     // These token shapes ARE the shipped invocations. They are asserted here so

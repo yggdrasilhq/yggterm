@@ -9,7 +9,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
-use yggterm_core::agent_cli::{AgentCliDescriptor, CliInstall, agent_cli_descriptor};
+use yggterm_core::agent_cli::{AgentCliDescriptor, CliInstall, CliUpdate, agent_cli_descriptor};
 use yggterm_core::{
     AgentLaunchOptions, ENV_YGGTERM_HOME, PerfSpan, SessionStore, append_trace_event,
     resolve_yggterm_home,
@@ -47,6 +47,13 @@ const TERMINAL_IDENTITY_ENV_REMOVALS: &[&str] = &["NO_COLOR"];
 const MANAGED_CLI_REFRESH_STATE_FILENAME: &str = "managed-cli-refresh-state.json";
 const MANAGED_CLI_REFRESH_TTL_ENV: &str = "YGGTERM_MANAGED_CLI_REFRESH_TTL_MS";
 const MANAGED_CLI_BACKGROUND_INSTALL_ENV: &str = "YGGTERM_MANAGED_CLI_BACKGROUND_INSTALL";
+/// Where fetched vendor installers land, under `~/.yggterm`. Kept rather than
+/// deleted so a failed unattended install can be read afterwards.
+const VENDOR_INSTALLER_DIRNAME: &str = "vendor-installers";
+/// Ceiling on the FETCH of a vendor installer. The installer's own run is not
+/// bounded here — the Muse launcher downloads a multi-hundred-MB payload — but
+/// it runs with stdin closed, so it cannot block on a prompt.
+const VENDOR_FETCH_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_MANAGED_CLI_REFRESH_TTL_MS: u64 = 6 * 60 * 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,7 +239,10 @@ impl ManagedCliTool {
         match self.descriptor().install {
             CliInstall::Npm(package) | CliInstall::Uv(package) => package,
             CliInstall::VendorScript(url) => url,
-            CliInstall::Manual => "(installed by hand — yggterm never provisions it)",
+            // ⚠ NOT "yggterm never provisions it" — that was true of the whole
+            // CLI when install was the only question asked. yggterm cannot FETCH
+            // agy; it updated it from 1.0.5 to 1.1.11 on jojo the same day.
+            CliInstall::Manual => "a hand-installed binary (yggterm keeps it updated)",
         }
     }
 
@@ -629,12 +639,12 @@ fn managed_cli_background_install_enabled() -> bool {
 
 fn managed_cli_refresh_should_attempt_install(
     background: bool,
-    npm_available: bool,
+    provisioner_available: bool,
     skipped_recently: bool,
     install_deferred: bool,
     background_install_enabled: bool,
 ) -> bool {
-    npm_available
+    provisioner_available
         && !skipped_recently
         && !install_deferred
         && (!background || background_install_enabled)
@@ -1464,6 +1474,188 @@ mod tests {
         assert_eq!(extract_semver_like_version("tool 1.2"), None);
     }
 
+    fn provision_test_paths(tag: &str) -> ManagedCliPaths {
+        let tmp = std::env::temp_dir().join(format!(
+            "ygg-provision-{tag}-{}-{}",
+            std::process::id(),
+            current_time_ms()
+        ));
+        let bin_dir = tmp.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create temp managed bin dir");
+        ManagedCliPaths {
+            home: tmp.clone(),
+            prefix: tmp.join("managed-npm"),
+            bin_dir,
+            cache_dir: tmp.join("cache"),
+        }
+    }
+
+    /// The owner's 2026-08-08 ruling, asserted as a property of the registry:
+    /// *"yggterm should auto install, update ALL clis in all connected systems
+    /// including localhost."*
+    ///
+    /// ⛔ The failure this guards, which is what the ruling was about: the
+    /// provisioner asked ONE question — "does this CLI have an npm package?" —
+    /// and three of the nine registered CLIs answered no. `kimi` (uv), `muse`
+    /// (vendor script) and `agy` (unfetchable, but self-updating) were therefore
+    /// never installed and never updated, silently, while the refresh reported
+    /// success for the six it did cover.
+    #[test]
+    fn every_registered_cli_has_something_yggterm_can_run_for_it() {
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            ManagedCliTool::from_session_kind(descriptor.kind)
+                .expect("every registered CLI is a managed tool");
+            // A binary yggterm can FETCH needs no help from the machine.
+            if descriptor.install.provisions_unattended() {
+                assert!(
+                    provision_step_for(descriptor, false).is_some(),
+                    "{}: yggterm declares it provisions this CLI but has no step for it",
+                    descriptor.display_name
+                );
+                continue;
+            }
+            // One it cannot fetch must at least be updatable once present.
+            assert!(
+                matches!(
+                    provision_step_for(descriptor, true),
+                    Some(ProvisionStep::SelfUpdate(argv)) if !argv.is_empty()
+                ),
+                "{}: yggterm can neither fetch nor update this CLI",
+                descriptor.display_name
+            );
+        }
+    }
+
+    /// ⭐ A CLI's own updater outranks re-running its install method — but only
+    /// once the binary exists, because an updater cannot install what is absent.
+    ///
+    /// Antigravity is the case that forced the two axes apart: yggterm cannot
+    /// fetch `agy` (166 MB, served behind a sign-in) yet `agy --help` advertises
+    /// `update`. Asking only "can we install it" wrote the CLI off entirely.
+    #[test]
+    fn a_self_updating_cli_updates_itself_only_once_it_is_present() {
+        let agy = ManagedCliTool::Antigravity.descriptor();
+        // Absent: nothing yggterm can do, and it must say so rather than run an
+        // updater against a binary that is not there.
+        assert_eq!(
+            provision_step_for(agy, false),
+            None,
+            "an absent unfetchable CLI has no step"
+        );
+        assert_eq!(
+            provision_step_for(agy, true),
+            Some(ProvisionStep::SelfUpdate(&["update"])),
+            "a present self-updating CLI runs its own updater"
+        );
+        // And an npm CLI does NOT acquire a self-updater by being present.
+        let codex = ManagedCliTool::Codex.descriptor();
+        assert_eq!(provision_step_for(codex, true), Some(ProvisionStep::Npm));
+        assert_eq!(provision_step_for(codex, false), Some(ProvisionStep::Npm));
+    }
+
+    /// The non-npm methods are RUN, not recorded.
+    ///
+    /// ⛔ Guards the exact regression the ruling reversed: `npm_package()`
+    /// answering `None` for kimi and muse used to be the gate that skipped them.
+    /// It still answers `None` — that is correct, they are not npm packages —
+    /// so the gate had to move to a different question, and this proves it did.
+    #[test]
+    fn a_uv_or_vendor_cli_is_provisioned_rather_than_refused() {
+        assert_eq!(ManagedCliTool::Kimi.npm_package(), None);
+        assert_eq!(ManagedCliTool::Muse.npm_package(), None);
+        for present in [false, true] {
+            assert_eq!(
+                provision_step_for(ManagedCliTool::Kimi.descriptor(), present),
+                Some(ProvisionStep::Uv("kimi-cli"))
+            );
+            assert_eq!(
+                provision_step_for(ManagedCliTool::Muse.descriptor(), present),
+                Some(ProvisionStep::VendorScript("https://dev.meta.ai/install.sh"))
+            );
+        }
+    }
+
+    /// ⛔ npm fails a WHOLE `install -g` batch on one unresolvable name. A uv
+    /// package handed to that line would not install the wrong thing — it would
+    /// take codex and claude's refresh down with it. Now that every tool is
+    /// passed to `install_latest`, that separation is load-bearing.
+    #[test]
+    fn only_npm_packages_reach_the_npm_batch() {
+        let paths = provision_test_paths("batch");
+        for tool in managed_cli_tools_for_refresh() {
+            if provision_step_for(tool.descriptor(), false) == Some(ProvisionStep::Npm) {
+                assert!(
+                    tool.npm_package().is_some(),
+                    "{} would be appended to `npm install -g` with no package",
+                    tool.display_name()
+                );
+            }
+        }
+        // An empty batch is a no-op, not an "npm is required" error — the case a
+        // machine with only uv/vendor CLIs to refresh hits every time.
+        assert!(install_npm_batch(&paths, &[], true).is_ok());
+    }
+
+    /// The status line must name the method that ACTUALLY ran.
+    ///
+    /// ⛔ MEASURED WRONG, live on jojo 2026-08-08, on all three new lanes at
+    /// once: the uv install of `kimi` (landed in `~/.local/bin`), the vendor
+    /// install of `muse` (landed in `~/.local/bin`) and the `agy update` that
+    /// installed nothing anywhere ALL reported *"a Yggterm-managed <CLI>
+    /// toolchain under /home/pi/.yggterm/npm"*. One sentence, true of the npm
+    /// lane only. A user who goes looking in the named directory for the binary
+    /// we just installed finds nothing and concludes the install failed.
+    #[test]
+    fn the_install_detail_names_the_method_that_ran() {
+        let paths = provision_test_paths("detail");
+        // uv: the package and the uv verb, never the npm prefix.
+        let kimi = provision_detail(&paths, ManagedCliTool::Kimi);
+        assert!(kimi.contains("kimi-cli"), "{kimi}");
+        assert!(kimi.contains("uv tool install --upgrade"), "{kimi}");
+        assert!(!kimi.contains("npm"), "a uv install must not name the npm prefix: {kimi}");
+
+        // vendor: the URL that was executed.
+        let muse = provision_detail(&paths, ManagedCliTool::Muse);
+        assert!(muse.contains("https://dev.meta.ai/install.sh"), "{muse}");
+        assert!(!muse.contains("npm"), "a vendor install must not name the npm prefix: {muse}");
+
+        // npm: still names the prefix, because for npm that IS where it went.
+        let codex = provision_detail(&paths, ManagedCliTool::Codex);
+        assert!(codex.contains(&paths.prefix.display().to_string()), "{codex}");
+
+        // ⚠ `package_name` is the other half of the same lie: it called an
+        // unfetchable CLI one "yggterm never provisions", which stopped being
+        // true the moment yggterm started updating it.
+        let manual = ManagedCliTool::Antigravity.package_name();
+        assert!(
+            !manual.contains("never provisions"),
+            "yggterm updates this CLI: {manual}"
+        );
+    }
+
+    /// Each method's prerequisite is its OWN, and the report must name it.
+    ///
+    /// ⚠ The single global `npm_available` this replaced was wrong twice over on
+    /// a uv CLI: npm's absence is not why `kimi` is missing, and npm's presence
+    /// would not have fixed it.
+    #[test]
+    fn a_missing_provisioner_is_named_per_method() {
+        assert_eq!(ManagedCliTool::Kimi.package_name(), "kimi-cli");
+        assert_eq!(
+            ManagedCliTool::Muse.package_name(),
+            "https://dev.meta.ai/install.sh"
+        );
+        // The vendor installer is fetched to a stable, collision-free path.
+        let stem = vendor_script_stem("https://dev.meta.ai/install.sh");
+        assert_eq!(stem, "https---dev-meta-ai-install-sh");
+        assert!(!stem.contains('/'), "a URL stem must not create directories");
+        assert_ne!(
+            vendor_script_stem("https://dev.meta.ai/install.sh"),
+            vendor_script_stem("https://astral.sh/uv/install.sh"),
+            "two vendors must not share one installer path"
+        );
+    }
+
     // WITHOUT running a `<cli> --version` subprocess — that subprocess (claude up to
     // 910ms) plus the npm install it can trigger is the cold-switch latency we removed.
     // version==None is the proof that no subprocess ran.
@@ -1811,7 +2003,14 @@ fn probe_tool(paths: &ManagedCliPaths, tool: ManagedCliTool) -> ToolProbe {
             available: true,
         };
     }
-    if let Some(system_binary) = resolve_binary_on_path(tool.binary_name()) {
+    // ⛔ LAUNCH PARITY, not the daemon's own `PATH`. An npm install lands in
+    // `paths.bin_dir` and is found by the check above, so this asymmetry never
+    // mattered while npm was the only method. A uv or vendor install lands in
+    // `~/.local/bin`, which the daemon's `PATH` routinely omits — so probing
+    // the daemon `PATH` alone would report a CLI we JUST installed as still
+    // absent, and `ensure_local_managed_cli` would bail with "did not become
+    // available after the managed install finished" on a successful install.
+    if let Some(system_binary) = resolve_binary_for_launch_parity(tool.binary_name()) {
         return ToolProbe {
             version: run_version_command(&system_binary),
             source: Some(ManagedCliBinarySource::System),
@@ -1829,31 +2028,300 @@ fn npm_binary() -> Option<PathBuf> {
     resolve_binary_on_path("npm")
 }
 
+/// `uv` is installed into `~/.local/bin`, which the daemon's own `PATH`
+/// routinely omits — so this must resolve with LAUNCH PARITY, exactly like the
+/// CLIs themselves. Resolving it off the daemon `PATH` alone reported "uv is
+/// unavailable" on jojo, where `~/.local/bin/uv` has been present since May.
+fn uv_binary() -> Option<PathBuf> {
+    resolve_binary_for_launch_parity("uv")
+}
+
+fn curl_binary() -> Option<PathBuf> {
+    resolve_binary_for_launch_parity("curl")
+}
+
+/// The ONE thing yggterm will actually RUN to make a tool present and current.
+///
+/// Derived from the two registry axes — [`CliInstall`] (how it arrives) and
+/// [`CliUpdate`] (how it stays current) — so that "what do we run for this CLI"
+/// has one answer instead of one per call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvisionStep {
+    /// Batched into a single `npm install -g` line with every other npm tool.
+    Npm,
+    Uv(&'static str),
+    VendorScript(&'static str),
+    /// The CLI's own updater, e.g. `agy update`. Only reachable when the binary
+    /// is already present — an updater cannot install what does not exist.
+    SelfUpdate(&'static [&'static str]),
+}
+
+/// What to run for `tool`, or `None` when yggterm can do nothing for it.
+///
+/// ⭐ The self-updater WINS over the install method when the binary is already
+/// there. That ordering is the owner's ruling read literally: he asked for
+/// auto-install *and* auto-update, and a CLI that ships its own updater knows
+/// where its payload lives in a way an install method re-run does not. It is
+/// also the only thing that makes Antigravity — which yggterm cannot fetch at
+/// all — a CLI yggterm keeps current rather than one it writes off.
+fn provision_step(paths: &ManagedCliPaths, tool: ManagedCliTool) -> Option<ProvisionStep> {
+    provision_step_for(
+        tool.descriptor(),
+        probe_tool_existence_only(paths, tool).available,
+    )
+}
+
+/// The RULE, with the machine taken out of it.
+///
+/// ⚠ Split from [`provision_step`] because the rule could not otherwise be
+/// tested: `agy` happens to be installed on jojo, so a test that asked for the
+/// absent-CLI branch silently got the present one and passed for the wrong
+/// reason. A decision that reads the filesystem cannot be locked by a test that
+/// also reads the filesystem.
+fn provision_step_for(descriptor: &AgentCliDescriptor, present: bool) -> Option<ProvisionStep> {
+    if let CliUpdate::SelfCommand(argv) = descriptor.update
+        && !argv.is_empty()
+        && present
+    {
+        return Some(ProvisionStep::SelfUpdate(argv));
+    }
+    match descriptor.install {
+        CliInstall::Npm(_) => Some(ProvisionStep::Npm),
+        CliInstall::Uv(package) => Some(ProvisionStep::Uv(package)),
+        CliInstall::VendorScript(url) => Some(ProvisionStep::VendorScript(url)),
+        CliInstall::Manual => None,
+    }
+}
+
+/// Whether yggterm has a way to make this tool present-and-current on THIS
+/// machine right now: a step exists AND the thing that runs it is installed.
+///
+/// ⚠ Each method has its OWN prerequisite, and they are not interchangeable —
+/// a machine with npm but no uv can refresh claude and not kimi. Answering this
+/// with one global "is npm here" is how a uv CLI came to be reported
+/// `system_fallback` on a machine that could have installed it.
+fn provision_step_is_runnable(paths: &ManagedCliPaths, tool: ManagedCliTool) -> bool {
+    match provision_step(paths, tool) {
+        Some(ProvisionStep::Npm) => npm_binary().is_some(),
+        Some(ProvisionStep::Uv(_)) => uv_binary().is_some(),
+        Some(ProvisionStep::VendorScript(_)) => curl_binary().is_some(),
+        Some(ProvisionStep::SelfUpdate(_)) => true,
+        None => false,
+    }
+}
+
+/// What actually happened, in the words of the method that did it.
+///
+/// ⛔ MEASURED WRONG, live on jojo 2026-08-08: every install reported *"a
+/// Yggterm-managed <CLI> toolchain under /home/pi/.yggterm/npm"* — including the
+/// uv install that landed in `~/.local/bin`, the vendor install that landed in
+/// `~/.local/bin`, and the `agy update` that installed nothing at all. Three
+/// methods, one sentence, and it was true of only one of them. A status line
+/// that names the wrong directory is how a user looking for the binary we just
+/// installed concludes we did not install it.
+fn provision_detail(paths: &ManagedCliPaths, tool: ManagedCliTool) -> String {
+    let name = tool.display_name();
+    match provision_step(paths, tool) {
+        Some(ProvisionStep::Npm) => format!(
+            "Installed or refreshed a Yggterm-managed {name} toolchain under {}.",
+            paths.prefix.display()
+        ),
+        Some(ProvisionStep::Uv(package)) => {
+            format!("Installed or upgraded {name} with `uv tool install --upgrade {package}`.")
+        }
+        Some(ProvisionStep::VendorScript(url)) => {
+            format!("Installed or upgraded {name} by running the vendor installer at {url}.")
+        }
+        Some(ProvisionStep::SelfUpdate(argv)) => format!(
+            "Updated {name} with its own updater, `{} {}`.",
+            tool.binary_name(),
+            argv.join(" ")
+        ),
+        None => format!("Yggterm cannot install or update {name} on this machine."),
+    }
+}
+
+/// `uv tool install --upgrade <package>` — one command that both installs a
+/// missing tool and upgrades a present one, so the install path and the update
+/// path cannot drift apart.
+///
+/// ⛔ No prefix override: uv's default tool bin dir is `~/.local/bin`, which is
+/// user-local and already on the login PATH. Forcing it under `~/.yggterm/npm`
+/// would put a Python CLI inside the npm prefix and hide it from `uv tool list`.
+fn install_via_uv(package: &str) -> Result<()> {
+    let uv = uv_binary().context(
+        "uv is required to install this CLI and is not on the login PATH — \
+         install uv (https://astral.sh/uv) and the next refresh will pick it up",
+    )?;
+    let mut command = Command::new(uv);
+    command
+        .arg("tool")
+        .arg("install")
+        .arg("--upgrade")
+        .arg(package)
+        .env("PATH", provision_env_path());
+    run_provision_command(command, &format!("uv tool install {package}"))
+}
+
+/// Fetch a vendor installer and run it, unattended and user-local.
+///
+/// ⚠ Superseded doctrine, stated here so it is not silently reversed: until the
+/// owner's 2026-08-08 ruling yggterm recorded this URL and refused to execute
+/// it. It now executes it. What did NOT change is the boundary — `HOME` intact,
+/// no privilege escalation, stdin closed so an installer that wants to ask a
+/// question fails fast instead of hanging a background thread forever.
+fn install_via_vendor_script(paths: &ManagedCliPaths, url: &str) -> Result<()> {
+    let curl = curl_binary().context("curl is required to fetch a vendor CLI installer")?;
+    let dir = paths.home.join(VENDOR_INSTALLER_DIRNAME);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("creating vendor installer dir {}", dir.display()))?;
+    // Named for the URL, not for a counter or a clock: two refreshes of the same
+    // CLI reuse one path, and two different CLIs never collide.
+    let script = dir.join(format!("{}.sh", vendor_script_stem(url)));
+    let mut fetch = Command::new(curl);
+    fetch
+        .arg("--fail")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--location")
+        .arg("--max-redirs")
+        .arg("3")
+        .arg("--proto")
+        .arg("=https")
+        .arg("--proto-redir")
+        .arg("=https")
+        .arg("--tlsv1.2")
+        .arg("--max-time")
+        .arg(VENDOR_FETCH_TIMEOUT_SECS.to_string())
+        .arg("--output")
+        .arg(&script)
+        .arg(url)
+        .env("PATH", provision_env_path());
+    run_provision_command(fetch, &format!("fetching vendor installer {url}"))?;
+
+    let mut run = Command::new("bash");
+    run.arg(&script).env("PATH", provision_env_path());
+    run_provision_command(run, &format!("running vendor installer {url}"))
+}
+
+/// Run a CLI's own updater, e.g. `agy update`.
+fn update_via_self_command(tool: ManagedCliTool, argv: &[&str]) -> Result<()> {
+    let binary = resolve_binary_for_launch_parity(tool.binary_name()).with_context(|| {
+        format!(
+            "{} advertises its own updater but is not on the login PATH",
+            tool.display_name()
+        )
+    })?;
+    let mut command = Command::new(binary);
+    command.args(argv).env("PATH", provision_env_path());
+    run_provision_command(
+        command,
+        &format!("{} {}", tool.binary_name(), argv.join(" ")),
+    )
+}
+
+/// The `PATH` every provisioning subprocess runs with: the daemon's own, plus
+/// the login-shell dirs. An installer that shells out to `curl`, `tar` or
+/// `python` must see what a human's shell sees, or it fails on the daemon's
+/// stripped `PATH` in ways no user can reproduce.
+fn provision_env_path() -> OsString {
+    let mut parts: Vec<PathBuf> = Vec::new();
+    if let Some(current) = env::var_os("PATH") {
+        parts.extend(env::split_paths(&current));
+    }
+    for dir in login_shell_path_dirs() {
+        if !parts.contains(dir) {
+            parts.push(dir.clone());
+        }
+    }
+    env::join_paths(parts).unwrap_or_else(|_| env::var_os("PATH").unwrap_or_default())
+}
+
+/// A filesystem-safe stem for a vendor installer URL.
+fn vendor_script_stem(url: &str) -> String {
+    let stem: String = url
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    stem.trim_matches('-').to_string()
+}
+
+/// Run one provisioning subprocess with stdin CLOSED and stderr captured.
+///
+/// ⛔ `Stdio::null()` on stdin is load-bearing, not tidiness: this runs on a
+/// background thread with no terminal, and an installer that stops to ask a
+/// question would otherwise block that thread for the daemon's lifetime.
+fn run_provision_command(mut command: Command, what: &str) -> Result<()> {
+    let output = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("running {what}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        anyhow::bail!("{what} exited with status {}", output.status);
+    }
+    anyhow::bail!("{what} exited with status {}: {stderr}", output.status);
+}
+
 fn install_latest(
     paths: &ManagedCliPaths,
     tools: &[ManagedCliTool],
     background: bool,
 ) -> Result<()> {
-    // ⛔ A tool whose descriptor does not say `CliInstall::Npm` is REFUSED BY
-    // NAME here, never appended to the npm line. npm fails a whole `install -g`
-    // batch on one unresolvable name, so a silent fallthrough would not install
-    // the wrong package — it would take every OTHER tool's refresh down with it
-    // and report the failure against all of them.
-    let (npm_tools, refused): (Vec<_>, Vec<_>) = tools
-        .iter()
-        .copied()
-        .partition(|tool| tool.npm_package().is_some());
-    if !refused.is_empty() {
-        let names = refused
-            .iter()
-            .map(|tool| format!("{} ({})", tool.display_name(), tool.package_name()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        anyhow::bail!(
-            "these CLIs are not npm-provisionable and must not be handed to `npm install -g`: \
-             {names}"
-        );
+    // ⛔ Each method runs SEPARATELY, and only the npm ones are batched. npm
+    // fails a whole `install -g` batch on one unresolvable name, so a uv or
+    // vendor CLI appended to that line would not install the wrong package — it
+    // would take every OTHER tool's refresh down with it and report the failure
+    // against all of them. A tool yggterm can neither install nor update is
+    // SKIPPED here (the probe that follows reports it `unavailable` by name);
+    // the by-name refusal a user reads lives at the launch site.
+    let mut npm_tools: Vec<ManagedCliTool> = Vec::new();
+    let mut per_tool: Vec<(ManagedCliTool, ProvisionStep)> = Vec::new();
+    for tool in tools.iter().copied() {
+        match provision_step(paths, tool) {
+            Some(ProvisionStep::Npm) => npm_tools.push(tool),
+            Some(step) => per_tool.push((tool, step)),
+            None => {}
+        }
     }
+
+    // ⛔ Collected, never short-circuited: one CLI's vendor installer failing
+    // must not stop the next CLI's update. The old single-method installer had
+    // no such case, so `?` was safe there and is not safe here.
+    let mut failures: Vec<String> = Vec::new();
+    for (tool, step) in per_tool {
+        let outcome = match step {
+            ProvisionStep::Npm => unreachable!("npm tools are batched above"),
+            ProvisionStep::Uv(package) => install_via_uv(package),
+            ProvisionStep::VendorScript(url) => install_via_vendor_script(paths, url),
+            ProvisionStep::SelfUpdate(argv) => update_via_self_command(tool, argv),
+        };
+        if let Err(error) = outcome {
+            failures.push(format!("{}: {error}", tool.display_name()));
+        }
+    }
+
+    if let Err(error) = install_npm_batch(paths, &npm_tools, background) {
+        failures.push(error.to_string());
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", failures.join("; "))
+    }
+}
+
+fn install_npm_batch(
+    paths: &ManagedCliPaths,
+    npm_tools: &[ManagedCliTool],
+    background: bool,
+) -> Result<()> {
     if npm_tools.is_empty() {
         return Ok(());
     }
@@ -1873,7 +2341,7 @@ fn install_latest(
     if background {
         command.arg("--silent");
     }
-    for tool in &npm_tools {
+    for tool in npm_tools {
         let package = tool
             .npm_package()
             .expect("partitioned above: only npm-provisionable tools reach here");
@@ -2442,8 +2910,12 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
     // refresh on it here (rather than letting `install_latest` bail) keeps the
     // ready/system_fallback answer for a uv- or vendor-installed CLI that is
     // sitting on PATH — refusing to install must not read as "unavailable".
-    let npm_available = npm_binary().is_some() && tool.npm_package().is_some();
-    if npm_available
+    // ⛔ Was `npm_binary().is_some() && tool.npm_package().is_some()`, which
+    // answered `false` for every uv, vendor-script and self-updating CLI and so
+    // silently exempted three of the nine registered CLIs from the refresh the
+    // owner ruled must cover all of them (2026-08-08).
+    let provisioner_available = provision_step_is_runnable(&paths, tool);
+    if provisioner_available
         && managed_cli_explicit_refresh_needed(tool, &before, &refresh_state, now_ms, ttl_ms)
     {
         install_latest(&paths, &[tool], false)?;
@@ -2459,11 +2931,7 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
             before,
             after,
             "installed",
-            format!(
-                "Installed or refreshed a Yggterm-managed {} toolchain under {}.",
-                tool.display_name(),
-                paths.prefix.display()
-            ),
+            provision_detail(&paths, tool),
         );
         if let Err(error) = persist_managed_cli_refresh_state(
             &paths.home,
@@ -2544,9 +3012,9 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
     // descriptor declares, because "yggterm will fix this for you" is a promise
     // it cannot keep for a uv/vendor/manual CLI and a silent npm attempt would
     // install nothing under a name that looks right.
-    if tool.npm_package().is_none() {
+    if !tool.descriptor().install.provisions_unattended() {
         anyhow::bail!(
-            "{} is not installed and yggterm does not provision it — install it yourself from {}",
+            "{} is not installed and yggterm cannot fetch it — install it yourself from {}",
             tool.display_name(),
             tool.package_name()
         );
@@ -2564,11 +3032,7 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
         before,
         after,
         "installed",
-        format!(
-            "Installed a Yggterm-managed {} toolchain under {}.",
-            tool.display_name(),
-            paths.prefix.display()
-        ),
+        provision_detail(&paths, tool),
     );
     if let Err(error) =
         persist_managed_cli_refresh_state(&paths.home, &[(tool, probe_tool(&paths, tool))], now_ms)
@@ -2628,7 +3092,14 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
     );
 
     let refresh_state = load_managed_cli_refresh_state(&paths.home);
-    let npm_available = npm_binary().is_some();
+    // ⛔ Was `npm_binary().is_some()` — one global answer for a question that is
+    // now per-tool. It gated the WHOLE refresh, so a machine without npm skipped
+    // the uv and vendor CLIs it was perfectly able to install. True when ANY
+    // registered CLI has a runnable step; the per-tool truth is re-asked below.
+    let provisioner_available = tools
+        .iter()
+        .copied()
+        .any(|tool| provision_step_is_runnable(&paths, tool));
     let background_install_enabled = managed_cli_background_install_enabled();
     let mut install_error = None::<String>;
     let mut install_attempted = false;
@@ -2636,7 +3107,7 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
     let mut background_install_deferred = false;
     let mut skipped_recently = false;
     let mut ttl_remaining_ms = None::<u64>;
-    if background && npm_available {
+    if background && provisioner_available {
         ttl_remaining_ms =
             managed_cli_refresh_skip_remaining_ms(&before, &refresh_state, now_ms, ttl_ms);
         skipped_recently = ttl_remaining_ms.is_some();
@@ -2685,21 +3156,22 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
     }
     if managed_cli_refresh_should_attempt_install(
         background,
-        npm_available,
+        provisioner_available,
         skipped_recently,
         install_deferred,
         background_install_enabled,
     ) {
         install_attempted = true;
         let install_perf = PerfSpan::start(&paths.home, "cli", "refresh_managed_codex_install");
-        // Only the npm half goes to npm. The uv/vendor/manual CLIs are still
-        // PROBED above (their version is reported like any other), they are just
-        // not this installer's to fetch — and handing them over would fail the
-        // whole batch, taking codex and claude's refresh with them.
+        // ⭐ EVERY tool goes in. `install_latest` partitions by method — only
+        // the npm ones share a batch — so a uv or vendor CLI can no longer poison
+        // codex and claude's refresh, and no longer has to be filtered out to
+        // protect them. The filter this replaces is exactly what made "yggterm
+        // updates all CLIs" false for three of the nine.
         let installable = tools
             .iter()
             .copied()
-            .filter(|tool| tool.npm_package().is_some())
+            .filter(|tool| provision_step_is_runnable(&paths, *tool))
             .collect::<Vec<_>>();
         if let Err(error) = install_latest(&paths, &installable, background) {
             install_error = Some(error.to_string());
@@ -2722,7 +3194,7 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
         "after",
     );
 
-    if npm_available && install_error.is_none() && !skipped_recently && !install_deferred {
+    if provisioner_available && install_error.is_none() && !skipped_recently && !install_deferred {
         if let Err(error) = persist_managed_cli_refresh_state(&paths.home, &after, now_ms) {
             append_trace_event(
                 &paths.home,
@@ -2772,16 +3244,21 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
                     "error",
                     format!("{} refresh failed: {error}", tool.display_name()),
                 )
-            } else if !npm_available {
+            } else if !provision_step_is_runnable(&paths, tool) {
+                // ⚠ Per-tool, and it NAMES the missing provisioner. The single
+                // "npm is unavailable" sentence this replaces was wrong twice
+                // over on a uv CLI: npm's absence is not why kimi is missing,
+                // and npm's presence would not have fixed it.
                 let action = if after_probe.available { "system_fallback" } else { "unavailable" };
+                let source = tool.package_name();
                 let detail = if after_probe.available {
                     format!(
-                        "npm is unavailable on this machine, so Yggterm kept using the existing {} binary from PATH.",
+                        "Yggterm cannot provision {} on this machine (needs {source}), so it kept using the existing binary from PATH.",
                         tool.display_name()
                     )
                 } else {
                     format!(
-                        "npm is unavailable on this machine and {} is not currently installed.",
+                        "Yggterm cannot provision {} on this machine (needs {source}) and it is not currently installed.",
                         tool.display_name()
                     )
                 };
@@ -2822,7 +3299,7 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
     perf.finish(serde_json::json!({
         "background": background,
         "ttl_ms": ttl_ms,
-        "npm_available": npm_available,
+        "provisioner_available": provisioner_available,
         "install_attempted": install_attempted,
         "install_deferred": install_deferred,
         "background_install_deferred": background_install_deferred,

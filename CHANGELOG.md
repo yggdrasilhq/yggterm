@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **yggterm installs and updates EVERY agent CLI, by every method — not just the
+  npm ones.** The owner's ruling: *"yggterm should auto install, update ALL clis
+  in all connected systems including localhost."* The provisioner asked one
+  question — "does this CLI have an npm package?" — so `kimi` (a uv tool), `muse`
+  (a vendor installer) and `agy` (fetchable only behind a sign-in) were never
+  installed and never updated, while the refresh reported success for the six it
+  did cover. It now dispatches per method: npm tools still share one batched
+  `npm install -g` line, uv tools get `uv tool install --upgrade`, and a vendor
+  installer is fetched over pinned HTTPS and run with `HOME` intact, no
+  privilege escalation and stdin closed. A failure in one CLI's method no longer
+  stops the next CLI's update.
+
+- **A CLI yggterm cannot install can still be kept current.** Arrival and
+  staying-current are now separate declarations in the registry. `agy` is a
+  166 MB self-contained binary yggterm has no way to fetch, and it advertises
+  `agy update` in its own `--help` — so yggterm runs THAT, and a CLI that ships
+  its own updater is always preferred over re-running its install method. The
+  registry now fails to build if any CLI is both unfetchable and unupdatable.
+
 - **Rail text selects.** The session metadata rail draws a session's cwd, PID,
   daemon version and error strings — reading material you copy — but the shell
   root sets `user-select:none` so that dragging a row or the titlebar does not

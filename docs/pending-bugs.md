@@ -916,22 +916,43 @@ localhost."* ⇒ **there is no per-descriptor opt-out to write.** Every CLI is
 auto-installed, and Muse is no longer parked in `owner-attention.md` (only its
 LOGIN is still his). Full ruling: [`settled-calls.md`](settled-calls.md).
 
-**What is owed here now, in three parts — the third has no code at all today:**
+### ✅ Built in 3.0.65 — the LOCAL lane, live proof owed
 
-1. **Teach the provisioner the non-npm methods.** `CliInstall` already names
-   them: `Uv(pkg)`, `VendorScript(url)`, `Manual`. `kimi` and `agy` are simply
-   outside the npm provisioner (`agy` is installed on `dev` today, so the gap is
-   the METHOD, not the package).
-2. **Run `VendorScript` unattended.** Its doc comment in
-   `yggterm-core/src/agent_cli.rs` still says yggterm *"does NOT run it
-   unattended"* — that clause is superseded and must be rewritten with the fix,
-   or the next reader will re-derive the refusal from it. `CliInstall::Manual`
-   ("must never try to install it") needs the same audit: after this ruling, is
-   any CLI genuinely `Manual`?
-3. ⭐ **UPDATE, which does not exist.** Provisioning today happens on demand at
-   LAUNCH; nothing keeps an installed CLI current on any host. He asked for
-   "install, update", and the update half is unbuilt for every method and every
-   machine. Prefer each CLI's own updater where it has one.
+1. ✅ **The provisioner dispatches per method.** `install_latest` partitions by
+   `ProvisionStep`: npm tools still share ONE batched `npm install -g` line, uv
+   tools get `uv tool install --upgrade <pkg>`, and a `VendorScript` is fetched
+   over pinned HTTPS (`--proto '=https'`, `--tlsv1.2`) and executed. A failure in
+   one CLI's method is COLLECTED, not short-circuited, so one vendor installer
+   dying no longer stops the next CLI's update.
+2. ✅ **The superseded clause is rewritten, not merely outvoted.** The
+   `VendorScript` doc comment now carries the ruling and says why the old text is
+   gone, and `every_cli_says_how_it_is_installed` FAILS if the words "never runs
+   that unattended" come back — the refusal cannot be re-derived from the type's
+   own documentation.
+3. ✅ **The `Manual` audit answered a question the entry did not ask.** `agy
+   --help` on jojo advertises `update  Update CLI`. So `Manual` is right about
+   ARRIVAL — yggterm cannot fetch a 166 MB binary served behind a sign-in — and
+   wrong as a verdict on the CLI: it keeps itself current perfectly. Arrival and
+   staying-current are now two registry axes (`CliInstall` + `CliUpdate`), a
+   self-updater is PREFERRED over re-running the install method, and the registry
+   fails its own test if any CLI is both unfetchable and unupdatable.
+4. ✅ **`probe_tool` reads the LAUNCH-PARITY PATH.** An npm install lands in
+   `~/.yggterm/npm/bin` and was found by path; a uv or vendor install lands in
+   `~/.local/bin`, which the daemon's own `PATH` omits. Without this the probe
+   would report a CLI we had just installed as absent and `ensure_local_managed_cli`
+   would bail with *"did not become available after the managed install
+   finished"* — on a SUCCESSFUL install.
+5. ✅ **The `npm is unavailable` gate is per-tool and names the right thing.**
+   One global "is npm here" was wrong twice over on a uv CLI: npm's absence is
+   not why `kimi` is missing, and npm's presence would not have fixed it.
+
+**What is still owed:**
+
+- ⛔ **The REMOTE lane is untouched.** He said "all connected systems **including
+  localhost**", and localhost is what 3.0.65 serves. Remote provisioning is
+  different code and a fix proven on one lane is not proven on the other.
+- ⛔ **Live proof on jojo** per the falsifier below — `command -v` read on the
+  host itself, not an echo of the launch.
 
 ⚠ Scope word he used: **"all connected systems including localhost"**. Localhost
 is named because the local path and the remote-provisioning path are different
