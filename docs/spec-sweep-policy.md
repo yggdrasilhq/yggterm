@@ -41,8 +41,13 @@ in ZFS.
 writes `.bak.<timestamp>` copies of its own rollouts and nothing has ever pruned
 them. yggterm already knows they exist and merely ignores them
 (`AgentCliDescriptor::store_excluded_name_fragments = [".bak."]`). Fleet total:
-**61.1 GB**, including one rollout present in five byte-identical copies on the
+**61.1 GB**, including one rollout present in five same-size copies on the
 integrator host.
+
+⚠ **Corrected 2026-08-08 while executing this class:** an earlier draft of this
+line said *five byte-identical copies*, which was inferred from identical sizes
+and never measured. Redundancy in this store is **semantic, not textual** — see
+§9.6, which is the single most expensive thing this document has learned.
 
 | host role | codex `.bak.` copies | `target/` | sessions (real `.jsonl`) |
 |---|---|---|---|
@@ -234,6 +239,36 @@ the bug**; the engine adopts the existing names once and no new ad-hoc name is
 created after that.
 
 **9.4 Own host, own stores.** §2.
+
+**9.6 ⛔ Redundancy is SEMANTIC, and every byte figure here is LOGICAL.** Both
+halves were learned the hard way while executing C0 on 2026-08-08, and both
+would have made a naive implementation either destructive or wrong.
+
+*The proof.* A rollout is append-only, so the obvious redundancy proof is a
+**byte-prefix**: a real backup should be a prefix of the file it came from. That
+proof **refused 624 of 753 copies** on the GUI host. It was right to refuse and
+the premise was wrong. Codex **re-serialised its entire store on 2026-03-14 with
+a different JSON key order**, so a `.bak.` holds the pre-migration text of the
+very same conversation: same records, same count, different bytes. (That
+migration is also the event behind measurement (b) — it rewrote every file and
+stamped every mtime.) ⇒ **A copy is redundant only when its records,
+canonicalised as JSON with sorted keys, are a prefix of the live file's
+records.** Byte comparison survives strictly as a fast path. Stream the
+comparison in lockstep; these files reach 5.5 GB and must never be held in
+memory.
+
+⚖ The general form, worth more than the instance: **an append-only store stops
+being append-only the moment its writer migrates the format**, and any proof
+built on physical layout silently becomes a proof of "was this written before
+the migration". Prove redundancy at the level the data means something.
+
+*The units.* The fleet's pools run `compression=zstd` at `compressratio=1.54x`.
+The GUI host's 3.2 GB of swept copies were **~2.0 GB of actual disk**. `du`
+reports compressed bytes and `find -printf %s` reports logical bytes; they
+disagree by design. ⇒ **Every figure in this document is logical.** A budget or
+watermark written against logical bytes over-collects by the compression ratio,
+and a reclaim reported to the user in logical bytes overstates what they got
+back. Read the ratio from the dataset; do not assume 1.0.
 
 **9.5 Determinism.** `plan` is a pure function of the store state and the clock:
 the same inputs yield the same plan, per the no-non-determinism rule in
