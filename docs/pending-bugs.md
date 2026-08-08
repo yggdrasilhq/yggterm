@@ -261,6 +261,24 @@ work must use the PREFIXED form or it is decoration. The metadata group's
 collapse toggle is one of the 15: inside the rail it now selects, which is
 harmless — collapse still fires (`data-metadata-group-expanded` 1→0→1, live).
 
+⚠ **THE HOOK THE RAIL FIX HANGS ON IS libyggterm's, NOT OURS — measured
+2026-08-08, and it shapes the remaining work.** `.yggui-rail-scroll` is applied
+by the LIBRARY (`yggui`, pinned `tag = "v0.12.1"`), not by this shell; the shell
+only mounts the rule. The library's class vocabulary is small and mostly
+composer/conversation-oriented (`yggui-conv-*`, `yggui-composer-*`, `yggui-otp-*`,
+`yggui-rail-scroll`), so **the start page, dialogs, titlebar text and
+notification cards may have no stable class to select on.** ⇒ Before writing CSS,
+check whether the target surface HAS a hook; if it does not, the fix is either a
+yggterm-side attribute on our own markup or a coordinated libyggterm release —
+and Cargo.toml's law is ONE libyggterm version, never two, so a tag bump moves
+every `yggui*` dep together. Do not assume this is a shell-only edit.
+
+⭐ **SEQUENCING: batch this with the remote-provisioning live proof.** Both are
+blocked on the same gate — the GUI must restart onto a build containing the
+change before either can be verified (the daemon socket is version-keyed, so a
+GUI one version behind never reaches the new daemon). One restart window should
+serve both.
+
 ## ⛔ `server app clients` ANSWERS IN A DIFFERENT ENVELOPE FROM EVERY OTHER APP VERB
 
 **Status:** OPEN
