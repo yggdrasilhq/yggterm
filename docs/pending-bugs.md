@@ -136,7 +136,7 @@ a merely-busy session must not reach it), and **the interrupted set must be
 computed before the old daemon dies** — after the swap every interrupted session
 looks idle, so the list cannot be re-derived.
 
-## ⭐ THE `.bak.` RECLAIM IS DONE ON TWO HOSTS AND STILL RUNNING ON THE THIRD
+## ⭐ THE `.bak.` RECLAIM IS DONE FLEET-WIDE — WHAT REMAINS IS THE ENGINE
 
 **Status:** OPEN
 
@@ -151,12 +151,12 @@ temporary: C0 belongs in the daemon engine, per
 |---|---|---|
 | GUI | 624 copies / 3.2 GB logical (~2.0 GB disk) | 127: **125 no-base survivors**, 1 base-shorter, 1 diverged |
 | workshop | 36 copies / 357 MB | 16: 6 no-base (now trashed as noise), 10 diverged |
-| integrator | 145 copies / **51.1 GB** proven redundant; sweep RUNNING | 6.2 GB: 24 no-base (now repaired: 7 restored, 15 trashed), 5 base-shorter, **75 diverged** |
+| integrator | 145 copies / **51.1 GB** (32 GB of disk) | 6.1 GB: 5 base-shorter, **76 diverged**; 24 no-base repaired (7 restored, 16 trashed) |
 
-**What remains open:** the integrator host, and the two findings below.
-
-⛔ **DO NOT re-run the GUI or workshop hosts, and do not start a second proof on
-the integrator.**
+**Fleet converged: 0 orphans on all three hosts.** `~/.codex/sessions` went
+47G→14G on the integrator, 4.0G→2.0G on the GUI host, 875M→689M on the workshop.
+⛔ **DO NOT re-run any host.** What remains open is the ENGINE (next entry) and
+the resume-id finding below — the one-shot reclaim is finished.
 
 ### ⛔ THE FIRST PROOF WAS WRONG, AND ITS REFUSAL WAS CORRECT
 
@@ -205,19 +205,20 @@ is at risk while this is open. What would settle it: whether the ids collide in
 codex's `threads` table, and what the 4th differing record carries.
 
 **Still open:**
-- **The integrator's 51.1 GB sweep is running** (proven: 145 copies redundant,
-  6.2 GB kept as no-base/base-shorter/diverged).
-- **The live count is unconfirmed.** The chain is verified by source —
-  `store_file_name_is_session` rejects `.bak.` (that WAS the invisibility), a
-  renamed file passes the glob, and `build_local_cwd_tree` groups by the cwd
-  STRING with no `is_dir()` check, which matters because **all three restored
-  cwds no longer exist on disk**. But `local_tree_scan`'s own
-  `codex_sessions` annotation still reads 618: the chore tick is throttled
-  (`local_tree_scanned:false`, `superseded:true`) and no fresh scan has been
-  observed. ⇒ Confirm it reads 623 before calling this proven.
-  ⚠ `server app state` does NOT carry the tree's contents, only its UI state
-  (width, rename, selection) — grepping it for a session id is a BLIND
-  instrument, not a negative result.
+⭐ **LIVE-PROVEN on the GUI host:** `local_tree_scan`'s own `codex_sessions`
+annotation now reads **623**, up from 618, across five consecutive scans. The
+restored sessions are in the tree. This also confirms the source reading that
+predicted it: `store_file_name_is_session` rejects `.bak.` (that WAS the
+invisibility), a renamed file passes the glob, and `build_local_cwd_tree` groups
+by the cwd STRING with no `is_dir()` check — which mattered, because **all three
+restored cwds no longer exist on disk**.
+
+⚠ Two instruments that lied on the way there, both now in the field guide:
+`server app state` does NOT carry the tree's contents, only its UI state (width,
+rename, selection), so grepping it for a session id is a BLIND instrument rather
+than a negative result; and the scan annotation is throttled behind
+`local_tree_scanned:false` / `superseded:true`, so a stale count reads exactly
+like a current one — **check `ts_ms` before believing it.**
 - ⚠ **`regenerate-copy --budget 0` does NOT mean "no generation"** — it began
   requesting titles from litellm immediately. It is not a safe way to force a
   scan.
