@@ -169,23 +169,23 @@ print("PRED_LABEL="+((pred.get("session_title") or pred.get("label") or "") if p
 case "$PLAN" in ERR*) echo "ygg-claim: ${PLAN#ERR }" >&2; exit 2 ;; esac
 eval "$(printf '%s\n' "$PLAN" | grep -E '^(MINE|MINE_LABEL|NUM|PRED|PRED_LABEL)=' | sed 's/=/="/; s/$/"/')"
 
-# ⛔ THE SEAT GOES IN THE TITLE, and this is NOT what the API suggests.
+# THE SEAT GOES IN THE TITLE **AS WELL AS** IN `outline` — belt and braces.
 #
-# `session outline` stores a prefix separately, and `server app rows` then reports
-# a composed `label` ("4 topic: …") — which reads exactly like proof that the
-# sidebar renders the two together. IT DOES NOT. Measured 2026-08-08 against a
-# screenshot of the real sidebar: every row displays its `session_title` ALONE,
-# so a row seated only via `outline` shows up with no number at all while its
-# `label` field cheerfully claims otherwise.
+# The sidebar builder re-composes `outline_prefix` onto the row's label as its
+# last act, precisely so a CLI re-titling itself cannot drop the number, and the
+# sidebar draws that composed label. So the API and the screen agree BY DESIGN,
+# and seat/title separation is the better architecture.
 #
-# ⇒ `label` is not what gets labelled. It is the same failure this skill documents
-# elsewhere — a field that answers a neighbouring question — and it is worth more
-# care than most, because here the LIE IS THE HELPFUL-LOOKING FIELD.
+# ⚠ But a stored prefix has been observed to VANISH between two reads (2026-08-08),
+# leaving the row unnumbered. Until that durability defect is closed, also compose
+# the number into the title — the field the watch below defends.
 #
-# So: compose the number into the title (matching the convention every existing
-# row uses), and ALSO write `outline` — harmless today, correct if the GUI ever
-# renders it. The watch below is what defends the name against the CLI's own
-# self-title.
+# ⛔ A CORRECTION WORTH KEEPING: I first read a composed label from the API, saw an
+# unnumbered row in a screenshot taken 40 minutes later, and concluded the field
+# was lying about what the sidebar renders. FALSE — the seat had evaporated in
+# between. An API read taken at a DIFFERENT MOMENT from the screenshot is not a
+# verification of the screen: sample both at once, or the difference you find may
+# be TIME rather than disagreement.
 case "$NUM" in
   *.*) FINAL_TITLE="${NUM} ${TITLE}" ;;   # sub-seat: "5.1 topic"
   *)   FINAL_TITLE="${NUM}. ${TITLE}" ;;  # top-level: "4. topic"
