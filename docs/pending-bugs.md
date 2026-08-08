@@ -13,6 +13,133 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⛔⛔ OWNER-REPORTED: THE RIGHT PANEL IS A GLOBAL SLOT — one app's rail renders over another app's row, and "I cannot see any files" is that same bug
+
+**Status:** OPEN
+
+Owner-reported 2026-08-08, with a screenshot: *"Right click context menu ychrome
+launch launches plain terminal. yedit launch opens blank viewport on libyggterm
+surface; I cannot see any files at all. Weird bugs: I see ychrome tabs sidebar in
+terminal (which is supposed to be yedit). I think the context menu wiring of the
+clis and the apps and app renderings are fucked up."*
+
+The screenshot: the `New Yedit` row is SELECTED, the viewport is a bash prompt
+showing `yedit: document surface opened`, and the right panel is **ychrome's**
+chrome — a Tabs rail listing Khan Academy tabs, a `tables` folder, and a URL bar
+on `khanacademy.org`.
+
+### ⭐ THE UNIFICATION: the file list IS the rail, so two of his symptoms are one bug
+
+yedit's FILES list is not a separate widget — it is the `notes` **rail pane** the
+app contributes. The rail is a **global slot keyed by pane id with no session**,
+so when its tenancy check fails it falls back to whatever else holds the slot,
+which on his machine was ychrome's tab rail. ⇒ *"I cannot see any files at all"*
+and *"I see ychrome tabs sidebar where yedit should be"* are the **same defect**,
+not two. A live trace caught the mirror image as well: yedit's `AppPane("notes")`
+rail displayed while the ACTIVE session was the **ychrome** row.
+
+`right_panel_mode` is one window-global field. The rail's schema fetch resolves
+its control endpoint from the **active** session while the document's fetch
+resolves from the **owning** session — two identity models for the two panes of
+one declare.
+
+**Fix shape (do not widen it):** an app-contributed pane is addressed by the
+session that DECLARED it. `RightPanelMode::AppPane { session_path, pane_id }`,
+the app-pane schema slot keyed by `(session_path, pane_id)`, and
+`app_pane_fetch_schema` taking the owning `session_path` like its document twin
+already does. ⛔ Do not fix this by masking the panel after the fact — the panel
+mode must be a function of the active session, not global state with a filter.
+
+### The blank viewport is a SECOND, smaller defect underneath it
+
+`DocumentSurfaceBody` (`shell.rs` ~123815) renders an **opaque empty layer** when
+it has no schema: there is no loading, empty, or error state. So a fetch that
+never landed and a document that is genuinely empty are pixel-identical, and both
+read as "blank viewport". It needs an explicit tri-state body — fetching / error /
+no-content — driven off `DocumentSurfaceSnapshot { schema, error }`.
+
+⚠ And a `New Yedit` with no argument has nothing to show anyway (manifest args
+are `[]`, no active note, no recents), so an actionable empty state is the honest
+rendering, not a blank rectangle.
+
+### ⛔ FIVE HYPOTHESES ALREADY FALSIFIED — do not re-derive them
+- **"one OSC declare, TWO parsers"** — the JS forwarder and the Rust wire parser
+  agree field-for-field on both `sidebar` and `web-surface`. The live trace shows
+  yedit's declare arriving and producing a contribution. NOT a parser skew.
+- **The 13-day-old `~/.local/bin/yedit` binary** — does not predate any wire or
+  contract change; refuted on every axis. Do not spend a rebuild on it. (Residual
+  and untested: the six-day-old yedit *daemon process*.)
+- **Commit `ac624b85` (3.0.59)** — does not touch the app launch path at all.
+  Plainly ruled out as the regression.
+- **A key-spelling mismatch between the snapshot map and the mount gate** —
+  `snapshot.active_session` is *filtered* to equal `active_session_path`
+  (`shell.rs` ~18286), so those two cannot disagree.
+- **`icon_kind: "terminal"` / `document_kind: null` on an app row** — these are
+  CORRECT. See the next entry: an app row is a shell by design.
+
+### The instrument that was missing is now shipped (3.0.60)
+`server app state` reports `document_surfaces` and `sidebar_contributions`, each
+contribution carrying `document_surface_visible_live` beside `in_snapshot_map`.
+`true` with `false` is the bug shape, named. ⚠ Still missing and worth adding:
+the right-panel mode does not report its **pane id**, and the document channel and
+the contribution sweep emit **no trace events at all**.
+
+## ⛔⛔ AN APP ROW IS A SHELL WITH NO APP IDENTITY — so a restart resurrects bare bash, and a missing app binary cannot be refused
+
+**Status:** OPEN
+
+Split out of the owner report above. `spawn_launch_app_verb` (`shell.rs` ~37495)
+asks the daemon for `SessionKind::Shell` (~37521) and then types the app's command
+into the new PTY out-of-band via `write_app_verb_command` (~37556). This is
+deliberate and documented — *"the same thing the user would do by hand"* — and the
+row being a shell is NOT itself the bug. **The bug is that nothing on the wire
+says "this row is ychrome".** Three consequences, each live-proven:
+
+1. **A restart resurrects bare bash.** The row's stored launch command is
+   `exec '/bin/bash' -i`. His ychrome row carries exactly that, plus
+   `Runtime Restore Reason: update-restart` — so a daemon swap relaunched bash and
+   the app was gone permanently. ⇒ This is the honest explanation of *"ychrome
+   launch launches plain terminal"* for a row that has survived a deploy.
+   ⚠⚠ **It also means every GUI restart re-breaks his app rows**, so a deploy must
+   not be done casually while app rows are live.
+2. **The missing-binary refusal shipped in 3.0.59 cannot speak for an app.**
+   `local_managed_cli_tool_for` (`lib.rs` ~15555) returns `None` for a Shell, so
+   the exact failure `ac624b85` fixed for CLIs — a binary that prints, exits, and
+   leaves bash alive looking healthy — is still wide open for apps.
+3. **The sidebar icon is derived from the kind**, so an app row is visually a
+   shell (`tree_icon_kind`, `shell.rs` ~86250).
+
+**Fix shape:** route the launch through `start_command_session` (`lib.rs` ~7521),
+which already HOLDS the command as `session.launch_command` and stamps a `Source`
+label — it is used today only by the terminal-recipe door. ⚠ Cross-layer: the app
+path currently goes through the `start_local_session_placed` endpoint RPC while
+`start_command_session` is a direct state mutation, and the app path needs the
+`insert_after` placement the RPC provides. `SessionKind::Shell` staying the kind
+is fine; the missing piece is row-level app IDENTITY, not a new enum variant.
+
+### Two more launch defects found in the same sweep
+- **`write_app_verb_command` types into whatever the daemon calls the ACTIVE
+  session, not into the session it just created**, and returns silently when it
+  can resolve neither. A row that never received its command line is a bare prompt
+  forever. ⚠ NOT confirmed to have fired in the live incident. The start reply
+  already knows which session it created — carry that path through and delete the
+  active-session inference.
+- **A bare `ychrome` takes the PROFILE-PICKER path, and the daemon's retention
+  allow-list DISCARDS that declare** (`app_declare.rs` ~87), so a bare-ychrome row
+  never gets a retained declare at all. Either the `new` verb stops being
+  argument-less, or `retention_for` gains the picker verb with the pick made
+  idempotent. ⚠ The declare-wire parity lock (`shell.rs` ~149698) covers the two
+  parsers but NOT this allow-list, which is the third reader of the same wire and
+  the only one that disagrees.
+
+### ⚠ Structural, and the reason this class keeps recurring
+**yedit has NO libyggterm dependency** — the app tier is a hand-copied protocol,
+not a shared crate, so every wire contract exists twice with nothing keeping the
+two in step. A wire change should be a compile error in the apps; today it is a
+silent null. libyggterm needs an app-side crate that yedit, ychrome and yrdp all
+depend on.
+
+
 ## ★★ OWNER-REPORTED: THE FIRST TAB REFUSES CLOSE, DUPLICATE AND DRAG — the refusals are right, the AFFORDANCES are the bug
 
 **Status:** OPEN
