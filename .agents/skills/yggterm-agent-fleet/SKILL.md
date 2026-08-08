@@ -192,6 +192,30 @@ So put a token in every brief (`ACK-<something-unique>`) and grep for it. Thirty
 seconds, and it is the difference between "a session is running" and "a session
 is running MY errand".
 
+### ⭐ MEASURED AGAIN 2026-08-08 — and the discriminator is the TRANSCRIPT FILE, not the field
+
+Two delegates spawned back to back, identical four-step sequence, both rows answering
+`consuming_input: true` before the submit. Both submits answered:
+
+```
+{"submitted": true, "waited_ms": 246}     <- row A
+{"submitted": true, "waited_ms": 249}     <- row B
+```
+
+**Row A produced an 86 KB transcript within a minute. Row B produced NO TRANSCRIPT AT ALL**, and
+still answered `consuming_input: true` when re-probed two minutes later — i.e. a healthy, ready,
+empty row. A second identical submit landed immediately (111 KB, ACK token × 7).
+
+⇒ **The drop is INTERMITTENT, which is worse than a consistent one**, because a spawn that worked
+last time is not evidence for this time. `submitted: true` describes the write, never the delivery.
+
+**The cheapest honest check, and it needs no token to run:** does
+`~/.claude/projects/<cwd-slug>/<row-uuid>.jsonl` EXIST yet? An agent-CLI row that took a brief
+starts writing within seconds. **File absent after ~60 s = the brief was dropped: re-submit.**
+Then grep the ACK token to confirm it is *your* brief and not a leftover.
+⚠ Do not read "no transcript" as "still starting" past a minute, and do not read a transcript that
+exists as proof of delivery — that is what the token is for.
+
 ### ⚠ The readiness probe is not free
 
 yggterm proves a CLI is reading by WRITING a probe string and watching it echo.
