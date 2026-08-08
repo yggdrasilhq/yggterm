@@ -53805,6 +53805,77 @@ fn describe_app_state_snapshot(
             })
         })
         .collect::<Vec<_>>();
+    // ⭐ THE TWO DERIVATIONS OF "IS THIS APP'S SURFACE IN THE VIEWPORT", side by
+    // side — because they have disagreed on a live machine and NOTHING could see
+    // it. A yedit row whose rail renders correctly while the viewport still
+    // shows bash is exactly that disagreement, and diagnosing it previously
+    // needed a dom-eval on a `data-` attribute plus inference (the yedit
+    // document-surface regression in `docs/pending-bugs.md` says so in as many
+    // words: "Both maps belong in the state dump").
+    //
+    // They are NOT redundant, and which one is missing is the whole diagnosis:
+    // `snapshot.document_surfaces` is built ONLY for the co-visible set (the
+    // active session plus the active split's members), so it can silently lack
+    // the row it is rendering; `document_surface_visible_for` is the live
+    // derivation and answers for ANY session. Reporting them together per
+    // contribution turns "the map is missing its own active row" from a guess
+    // into a readable fact.
+    //
+    // ⚠ Sorted by session path: an operator diffs two dumps, and a HashMap's
+    // order would manufacture a change that never happened.
+    let document_surfaces_debug = {
+        let mut surfaces: Vec<serde_json::Value> = snapshot
+            .document_surfaces
+            .iter()
+            .map(|(path, surface)| {
+                json!({
+                    "session_path": path.clone(),
+                    "pane_id": surface.pane.pane_id.clone(),
+                    "visible": surface.pane.visible,
+                    "stale": surface.pane.stale,
+                    "app_name": surface.pane.app_name.clone(),
+                    "has_schema": surface.schema.is_some(),
+                    "error": surface.error.clone(),
+                })
+            })
+            .collect();
+        surfaces.sort_by(|left, right| {
+            left["session_path"]
+                .as_str()
+                .cmp(&right["session_path"].as_str())
+        });
+        surfaces
+    };
+    let sidebar_contributions_debug = {
+        let mut contributions: Vec<serde_json::Value> = shell
+            .sidebar_contributions
+            .iter()
+            .map(|(path, contribution)| {
+                json!({
+                    "session_path": path.clone(),
+                    "app_name": contribution.app_name.clone(),
+                    "control_url": contribution.control_url.clone(),
+                    "declared_control_url": contribution.declared_control_url.clone(),
+                    "panes": contribution.panes.len(),
+                    "has_viewport_pane": contribution
+                        .panes
+                        .iter()
+                        .any(|pane| pane.placement == PanePlacement::Viewport),
+                    // The live derivation, beside the snapshot map's answer for
+                    // the same session. `visible_live: true` with
+                    // `in_snapshot_map: false` IS the bug shape.
+                    "document_surface_visible_live": shell.document_surface_visible_for(path),
+                    "in_snapshot_map": snapshot.document_surfaces.contains_key(path),
+                })
+            })
+            .collect();
+        contributions.sort_by(|left, right| {
+            left["session_path"]
+                .as_str()
+                .cmp(&right["session_path"].as_str())
+        });
+        contributions
+    };
     let pending_delete_debug = shell.pending_delete.as_ref().map(|pending| {
         json!({
             "document_paths": pending.document_paths.clone(),
@@ -54155,6 +54226,9 @@ fn describe_app_state_snapshot(
             "alt_derived_sequence": shell.alt_derived_sequence,
             "alt_derived_tips": shell.alt_derived_tips,
             "selected_tree_paths": selected_tree_paths,
+            // The app-surface pair. See where they are built, above.
+            "document_surfaces": document_surfaces_debug,
+            "sidebar_contributions": sidebar_contributions_debug,
             "selection_anchor": shell.selection_anchor,
             "pending_delete": pending_delete_debug,
             // CAMERA / MICROPHONE: the prompt a page raised and nobody has
@@ -189511,6 +189585,34 @@ mod media_capture_locks {
     /// promise. A non-empty ask list beside a null dialog, with no
     /// `media_permission_request` row anywhere, IS the signature of the hang —
     /// and before this an operator could not see any of it.
+    #[test]
+    /// Both derivations of "is this app's surface in the viewport" reach
+    /// `server app state`.
+    ///
+    /// They answer the same question from two sides and are allowed to
+    /// disagree — that disagreement IS the yedit/ychrome regression where an
+    /// app's rail renders over a viewport still showing bash. Exporting only
+    /// one of them is what forced that diagnosis through a dom-eval on a
+    /// `data-` attribute; exporting neither is how it stayed invisible.
+    #[test]
+    fn app_state_reports_the_snapshot_and_live_views_of_every_app_surface() {
+        let product = product_source();
+        let body = function_body(&product, "fn describe_app_state_snapshot(");
+        for needle in [
+            "\"document_surfaces\": document_surfaces_debug,",
+            "\"sidebar_contributions\": sidebar_contributions_debug,",
+            "\"document_surface_visible_live\": shell.document_surface_visible_for(path),",
+            "\"in_snapshot_map\": snapshot.document_surfaces.contains_key(path),",
+        ] {
+            assert!(
+                body.contains(needle),
+                "`app state` lost `{needle}` — without BOTH sides an operator \
+                 cannot tell a surface that never mounted from one the snapshot \
+                 map never carried, which is the whole yedit diagnosis",
+            );
+        }
+    }
+
     #[test]
     fn app_state_reports_both_the_capture_dialog_and_the_pages_waiting_on_one() {
         let product = product_source();
