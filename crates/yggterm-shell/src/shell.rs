@@ -79931,6 +79931,9 @@ fn app() -> Element {
     let titlebar_autohide_linger_generation = titlebar_autohide.linger_generation;
     let mut last_active_terminal_input_policy =
         use_signal(|| None::<ActiveTerminalInputPolicySignature>);
+    // Last value pushed to the vendored chord claimer (`None` == never pushed),
+    // so an unchanged answer costs nothing every render.
+    let mut last_web_page_chords_armed = use_signal(|| None::<bool>);
     let mut startup_sync_started = use_signal(|| false);
     let mut browser_tree_load_started = use_signal(|| false);
     let browser_tree_refresh_loop_started = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
@@ -81164,6 +81167,49 @@ fn app() -> Element {
             .is_some_and(|prev| !prev.window_focused && policy_signature.window_focused);
         last_active_terminal_input_policy.set(Some(policy_signature.clone()));
         apply_active_terminal_input_policy(&policy_signature, foreground_regained, &trace_home);
+    });
+    // ⭐ ARM (or disarm) the LEGACY BROWSER CHORDS for a keyboard the shell's
+    // OWN webview holds — see `web_page_chords_serve_over_shell_focus` for why
+    // the vendored claimer cannot work this out for itself. Pushed on the EDGE
+    // only: the answer is re-derived every render, but the host is told just
+    // when it changes.
+    use_effect(move || {
+        let armed = {
+            let shell = state.read();
+            let active_session_has_web_surface = shell
+                .server
+                .active_session_path()
+                .is_some_and(|path| shell.has_live_web_surface(path, current_millis()));
+            // The omnibox and the find bar, asked of the ACTIVE surface — the
+            // same fact the reconciler stands the page's keyboard down for.
+            let surface_control_holds_keyboard = shell
+                .server
+                .active_session_path()
+                .and_then(|path| shell.web_surfaces.get(path))
+                .is_some_and(web_surface_shell_control_holds_keyboard);
+            web_page_chords_serve_over_shell_focus(
+                shell.server.active_view_mode(),
+                active_session_has_web_surface,
+                shell.has_modal_over_viewport(),
+                shell_dom_control_holds_keyboard(
+                    shell.search_focused,
+                    is_command_query(&shell.search_query),
+                    titlebar_transient_focus_blocking(
+                        shell.titlebar_new_menu_open,
+                        shell.titlebar_session_menu_open,
+                        shell.titlebar_overflow_menu_open,
+                    ),
+                    shell.tree_rename_path.is_some(),
+                    shell.active_web_find_focused(),
+                ),
+                surface_control_holds_keyboard,
+            )
+        };
+        if *last_web_page_chords_armed.peek() == Some(armed) {
+            return;
+        }
+        last_web_page_chords_armed.set(Some(armed));
+        window().set_web_surface_page_chords_armed(armed);
     });
     use_effect(move || {
         let active = state.read().server.active_session().cloned();
@@ -106805,6 +106851,101 @@ fn dispatch_web_page_chord(mut state: Signal<ShellState>, id: &str) -> bool {
     }
     true
 }
+/// ⭐ **IS A SHELL DOM CONTROL HOLDING THE KEYBOARD RIGHT NOW — one list, one
+/// name, and every layer that needs the answer asks THIS.**
+///
+/// The shell's whole chrome — the sidebar, the search field, the command
+/// palette, a titlebar menu, a rename box, the find bar — lives in ONE Dioxus
+/// webview, and so does the terminal canvas. GTK therefore cannot tell any of
+/// them apart: the focused *widget* is the same object for a user typing at a
+/// PTY and a user renaming a row. Only the shell knows which, and this is where
+/// it says so.
+///
+/// Two layers ask, and they must never disagree:
+///
+/// - [`terminal_should_accept_input`] — may the PTY have this keystroke? (No:
+///   the rename box is eating it.)
+/// - [`web_page_chords_serve_over_shell_focus`] — may a `page_only` browser
+///   chord serve while the shell's own webview holds the toplevel's focus? (No,
+///   for the same reason and the same list: `Ctrl+W` belongs to the rename box.)
+///
+/// A second encoding of this list is how the two would drift, and the drift is
+/// user-visible in both directions at once — a chord that eats a rename, or a
+/// rename that kills a chord.
+fn shell_dom_control_holds_keyboard(
+    search_focused: bool,
+    command_mode_active: bool,
+    titlebar_transient_open: bool,
+    tree_rename_active: bool,
+    web_find_bar_focused: bool,
+) -> bool {
+    search_focused
+        || command_mode_active
+        || titlebar_transient_open
+        || tree_rename_active
+        // A FOCUSED find bar holds the keyboard; an open-but-unfocused one holds
+        // nothing (`web_find::find_bar_blocks_terminal_input`). Without this
+        // clause every letter typed into the find field would ALSO reach the PTY
+        // underneath, which is the leak the focus lock exists to forbid.
+        || web_find::find_bar_blocks_terminal_input(web_find_bar_focused)
+}
+
+/// ⭐ **MAY A LEGACY BROWSER CHORD SERVE WHILE THE SHELL'S OWN WEBVIEW HOLDS
+/// THE KEYBOARD?** — the third face of the 2026-08-01 keyboard bug, reported
+/// again on 2026-08-08: *"legacy shortcuts in ychrome like CTRL+T works when
+/// viewport is active but not when sidebar is active."*
+///
+/// Every `WEB_PAGE_CHORDS` row is `page_only`, and the vendored window claimer
+/// stands a `page_only` row down unless one of its OWN surface webviews holds
+/// the toplevel's focus. Click the sidebar and the focused widget is the
+/// shell's Dioxus webview, which is not one of them — so every browser chord
+/// died. That gate is not sloppy: it is the only reason `Ctrl+R` is still
+/// readline's reverse-search in every terminal in the app.
+///
+/// ⛔ **"Also allow it when the toplevel webview has focus" is the wrong fix**,
+/// and it is wrong for a structural reason: **the terminal canvas and the
+/// sidebar live in the SAME webview.** GTK cannot separate them, which is
+/// precisely why the claimer's gate was written at the widget level. So the
+/// finer answer has to come DOWN from the shell, which is the only layer that
+/// knows whether the viewport in front of the user is a browser or a PTY.
+///
+/// This is that answer, pushed to the host as DATA exactly like the claim table
+/// itself (`set_web_surface_page_chords_armed`). It is TRUE only when a browser
+/// really is what the keystroke would have gone to:
+///
+/// - the workspace is showing a session's viewport (`Terminal` view mode — a
+///   web surface is an overlay *on* that viewport, not a mode of its own), and
+/// - that session HAS a live web surface, so there is a page to reload, a tab
+///   to open, DevTools to toggle, and
+/// - no over-viewport modal is up — the reconciler hides the page under one, and
+///   a `Ctrl+W` that closed a tab behind a confirm dialog is a key fired blind,
+/// - no shell DOM control has the keys
+///   ([`shell_dom_control_holds_keyboard`] — the same list the PTY asks, so a
+///   sidebar rename still eats its own `Ctrl+W`),
+/// - and no control belonging to the SURFACE has them
+///   ([`web_surface_shell_control_holds_keyboard`] — the omnibox's edit mode and
+///   the find bar, the pair the reconciler already stands the page down for).
+///
+/// ⚠ **That last clause was proved necessary on the live host, not reasoned
+/// into existence.** Without it, `Ctrl+T` opened a tab typing-ready in the
+/// omnibox and the very next `Ctrl+W` — a word delete in every address bar ever
+/// built — closed the tab out from under the half-typed URL. Which is to say:
+/// the arm must go DOWN the instant a chord's own target takes the keyboard,
+/// and the two facts the reconciler already uses for that are the two to read.
+fn web_page_chords_serve_over_shell_focus(
+    active_view_mode: WorkspaceViewMode,
+    active_session_has_web_surface: bool,
+    modal_over_viewport: bool,
+    shell_dom_control_holds_keyboard: bool,
+    surface_control_holds_keyboard: bool,
+) -> bool {
+    active_view_mode == WorkspaceViewMode::Terminal
+        && active_session_has_web_surface
+        && !modal_over_viewport
+        && !shell_dom_control_holds_keyboard
+        && !surface_control_holds_keyboard
+}
+
 fn terminal_should_accept_input(
     active_view_mode: WorkspaceViewMode,
     active_session_path: Option<&str>,
@@ -106817,15 +106958,15 @@ fn terminal_should_accept_input(
 ) -> bool {
     active_view_mode == WorkspaceViewMode::Terminal
         && active_session_path == Some(session_path)
-        && !search_focused
-        && !command_mode_active
-        && !titlebar_transient_open
-        && !tree_rename_active
-        // A FOCUSED find bar holds the keyboard; an open-but-unfocused one holds
-        // nothing (`web_find::find_bar_blocks_terminal_input`). Without this
-        // clause every letter typed into the find field would ALSO reach the PTY
-        // underneath, which is the leak the focus lock exists to forbid.
-        && !web_find::find_bar_blocks_terminal_input(web_find_bar_focused)
+        // THE list of shell controls that can hold the keyboard, asked by name
+        // rather than restated — see `shell_dom_control_holds_keyboard`.
+        && !shell_dom_control_holds_keyboard(
+            search_focused,
+            command_mode_active,
+            titlebar_transient_open,
+            tree_rename_active,
+            web_find_bar_focused,
+        )
 }
 fn titlebar_transient_focus_blocking(
     titlebar_new_menu_open: bool,
@@ -135939,6 +136080,251 @@ mod tests {
             GLUE.contains("host.install_window_chord_claimer("),
             "the glue that owns the toplevel must be the one that attaches the \
              claimer to it"
+        );
+    }
+
+    /// ⭐ **THE SHELL'S ARM IS THE OTHER HALF OF "WHO HOLDS THE KEYBOARD" — the
+    /// widget test alone is blind whenever the sidebar has focus.**
+    ///
+    /// Reported 2026-08-08: *"legacy shortcuts in ychrome like CTRL+T works when
+    /// viewport is active but not when sidebar is active."* The claimer asks the
+    /// toplevel which widget has focus and stands a `page_only` row down unless
+    /// it is one of this host's surface webviews; the sidebar is in the SHELL's
+    /// webview, which never is one. So the whole browser layer died on a click.
+    ///
+    /// ⛔ **The tempting fix — widen the widget test to "the toplevel webview
+    /// has focus" — is the one thing this lock forbids**, because the terminal
+    /// canvas lives in that SAME webview: it would hand `Ctrl+R` to a reload
+    /// while the user meant readline's reverse-search. The shell pushes the
+    /// finer answer as DATA instead, and the widget test stays exactly as strict
+    /// as it was.
+    #[test]
+    fn the_page_layer_is_armed_by_the_shell_and_never_by_a_wider_widget_test() {
+        const HOST: &str = include_str!("../../../vendor/dioxus-desktop/src/web_surface.rs");
+        let claimer = HOST
+            .split("fn connect_window_chord_claimer(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn rect_logical(").next())
+            .expect("the surface host must define `connect_window_chord_claimer`");
+        assert!(
+            claimer.contains("let page_focused = armed.get() || {"),
+            "the shell's arm must be the FIRST of the two ways the page layer \
+             owns the keyboard — without it every browser chord is dead the \
+             moment the sidebar is clicked:\n{claimer}"
+        );
+        // …and the widget half stays STRICT. `is_visible` plus identity against
+        // this host's OWN surfaces is what keeps a terminal's Ctrl+R its own.
+        assert!(
+            claimer.contains("gtk::prelude::WidgetExt::is_visible(widget) && *widget == focus"),
+            "the widget test must still demand a VISIBLE surface webview of \
+             this host — widening it hands Ctrl+R to a reload over a terminal, \
+             because the terminal canvas is in the shell's webview too:\n{claimer}"
+        );
+        // The arm is DATA the shell pushes, exactly like the claim table. A
+        // default of `true` would ship the widened test through the back door.
+        assert!(
+            HOST.contains("page_chords_armed: Rc::new(Cell::new(false)),"),
+            "a host whose shell never pushes must behave as it did before this \
+             existed: page chords serve only for a focused page"
+        );
+        assert!(
+            HOST.contains("pub fn set_page_chords_armed(&self, armed: bool) {"),
+            "the arm needs a door for the shell to push through"
+        );
+    }
+
+    /// ⭐ **WHEN A BROWSER CHORD SERVES OVER SHELL FOCUS — all four clauses, and
+    /// each one is a bug that has been reported or is one keystroke away.**
+    #[test]
+    fn a_browser_chord_serves_over_the_sidebar_but_never_over_a_terminal() {
+        // THE REPORT: a ychrome session in front, the user clicked the sidebar.
+        assert!(
+            web_page_chords_serve_over_shell_focus(
+                WorkspaceViewMode::Terminal,
+                true,
+                false,
+                false,
+                false
+            ),
+            "Ctrl+T must open a tab with a browser session active and the \
+             sidebar clicked — this is the 2026-08-08 report"
+        );
+        // ⛔ THE REGRESSION THE FIX MUST NOT CAUSE: a plain terminal session has
+        // no web surface, so the layer stays disarmed and Ctrl+R is readline's.
+        assert!(
+            !web_page_chords_serve_over_shell_focus(
+                WorkspaceViewMode::Terminal,
+                false,
+                false,
+                false,
+                false
+            ),
+            "a session with no web surface must never arm the browser layer — \
+             Ctrl+R over a terminal belongs to readline forever"
+        );
+        // A shell control with the keys keeps them: a sidebar rename eats its
+        // own Ctrl+W rather than closing the tab underneath.
+        assert!(
+            !web_page_chords_serve_over_shell_focus(
+                WorkspaceViewMode::Terminal,
+                true,
+                false,
+                true,
+                false
+            ),
+            "a focused shell control (rename, search, command mode, find bar) \
+             holds the keyboard against the page layer"
+        );
+        // ⛔ MEASURED ON THE LIVE HOST, not reasoned: with the omnibox holding a
+        // half-typed URL after a Ctrl+T, the next Ctrl+W closed the tab instead
+        // of deleting a word. A chord's own target taking the keyboard must
+        // disarm the layer.
+        assert!(
+            !web_page_chords_serve_over_shell_focus(
+                WorkspaceViewMode::Terminal,
+                true,
+                false,
+                false,
+                true
+            ),
+            "the omnibox in edit mode (or a focused find bar) holds the keyboard \
+             against the very chords that opened it"
+        );
+        // A modal over the viewport HIDES the page (the reconciler stashes or
+        // covers it), so a chord fired now would act on something invisible.
+        assert!(
+            !web_page_chords_serve_over_shell_focus(
+                WorkspaceViewMode::Terminal,
+                true,
+                true,
+                false,
+                false
+            ),
+            "no browser chord may fire blind behind a confirm dialog"
+        );
+        // Not the session viewport at all (a rendered document view): there is
+        // no page in front to reload.
+        assert!(
+            !web_page_chords_serve_over_shell_focus(
+                WorkspaceViewMode::Rendered,
+                true,
+                false,
+                false,
+                false
+            ),
+            "the browser layer belongs to the session viewport, not to every \
+             view mode the workspace can be in"
+        );
+    }
+
+    /// ⛔ **ONE LIST OF SHELL CONTROLS, TWO READERS — and neither restates it.**
+    ///
+    /// The PTY asks "may I have this keystroke" and the browser layer asks "may
+    /// a page chord serve"; both bottom out in the same question, *is a shell
+    /// DOM control holding the keyboard*. A second copy of that list drifts, and
+    /// the drift is user-visible in both directions at once: a chord that eats a
+    /// rename, or a rename that kills a chord.
+    #[test]
+    fn one_list_names_the_shell_controls_that_hold_the_keyboard() {
+        let source = include_str!("shell.rs");
+        // Every clause of the list lives in the ONE owner…
+        let owner = source
+            .split("fn shell_dom_control_holds_keyboard(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("shell.rs must define the shell-control fact");
+        for clause in [
+            "search_focused",
+            "command_mode_active",
+            "titlebar_transient_open",
+            "tree_rename_active",
+            "web_find::find_bar_blocks_terminal_input(web_find_bar_focused)",
+        ] {
+            assert!(
+                owner.contains(clause),
+                "{clause} is one of the controls that can hold the keyboard and \
+                 must be in the ONE list:\n{owner}"
+            );
+        }
+        // …and the terminal-input rule SPENDS that answer rather than rebuilding
+        // it. The `&& !search_focused` shape is exactly the second encoding.
+        let terminal = source
+            .split("fn terminal_should_accept_input(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("shell.rs must define the terminal input rule");
+        assert!(
+            terminal.contains("!shell_dom_control_holds_keyboard("),
+            "the terminal rule must ASK the one fact:\n{terminal}"
+        );
+        assert!(
+            !terminal.contains("&& !search_focused"),
+            "…and must not also restate it — two copies of this list is how the \
+             PTY and the browser layer come to disagree about who is typing:\n{terminal}"
+        );
+        // The truth table of the fact itself: any one control is enough.
+        assert!(!shell_dom_control_holds_keyboard(
+            false, false, false, false, false
+        ));
+        for one in 0..5 {
+            let arg = |n: usize| n == one;
+            assert!(
+                shell_dom_control_holds_keyboard(arg(0), arg(1), arg(2), arg(3), arg(4)),
+                "control {one} alone must hold the keyboard"
+            );
+        }
+    }
+
+    /// The arm is pushed to the host on the EDGE, from the shell's own state.
+    ///
+    /// A fact computed and never delivered is the same as no fact at all, and
+    /// this one is delivered across an FFI boundary that no unit test can watch.
+    #[test]
+    fn the_shell_pushes_the_page_chord_arm_to_the_host() {
+        // PRODUCT lines only. This test's own string literals are the thing a
+        // whole-file scan would count, and a self-counting lock is a lock that
+        // goes green for the wrong reason.
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell.rs"),
+        )
+        .expect("read shell.rs");
+        let source = yggterm_core::agent_cli::product_lines(&raw)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            source
+                .matches("window().set_web_surface_page_chords_armed(")
+                .count(),
+            1,
+            "one push site: a second would be a second answer to who holds the \
+             keyboard, delivered in whichever order the effects happen to run"
+        );
+        let effect = source
+            .split("let armed = {")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("window().set_web_surface_page_chords_armed(armed);")
+                    .next()
+            })
+            .expect("the arm must be computed and pushed in one place");
+        assert!(
+            effect.contains("web_page_chords_serve_over_shell_focus("),
+            "the pushed value must be THE rule's answer, not a hand-rolled \
+             condition beside it:\n{effect}"
+        );
+        assert!(
+            effect.contains("web_surface_shell_control_holds_keyboard"),
+            "the pushed value must read the SURFACE's own controls too — without \
+             it, Ctrl+T's typing-ready omnibox loses its next Ctrl+W to a tab \
+             close (measured live, 2026-08-08):\n{effect}"
+        );
+        assert!(
+            effect.contains("last_web_page_chords_armed.set(Some(armed));"),
+            "the push must be edge-driven — this effect re-runs on every render \
+             and an unconditional FFI call every frame is a cost with no \
+             benefit:\n{effect}"
         );
     }
 
