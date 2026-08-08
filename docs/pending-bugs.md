@@ -13,6 +13,156 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⛔⛔ OWNER-REPORTED, LIVE: THE SESSION METADATA RAIL RENDERS ITS HEADER AND NOTHING ELSE
+
+**Status:** OPEN
+
+Reported 2026-08-08 with two screenshots: *"The entire session metadata sidebar
+is borked … and showing double notifications somehow."*
+
+**Reproduced on 3.0.62, and it is NOT transient.** A faithful screenshot taken
+with no toast in flight, on a different active row than his, shows the identical
+thing: the rail draws `Session Metadata` and an empty body.
+
+### What that rules out, which is most of the obvious answers
+`MetadataRailBody` (`shell.rs` ~126018) renders **three groups unconditionally**:
+a `Session` group (*"No session selected"* when there is none), a `Client` group
+(*"always knowable — it is this process"*, added precisely so a blank rail could
+not happen again), and a `Daemon` group that falls back to a visible
+"unreachable" row. ⇒ **No combination of missing data can produce an empty body.**
+- Not a mode mis-resolution: `server app state` → `shell.right_panel` reports
+  `requested_mode: metadata`, `rendered_mode: metadata`, `docked: true`, and the
+  HEADER is drawn, which is emitted by this same component.
+- Not a panic during content construction: `content:` is an eagerly-built prop,
+  so a panic there would take the header with it.
+- Not `RailScrollBody`: it is `flex:1; overflow:auto` around `{content}` and has
+  not changed.
+⇒ The remaining shape is that the `content:` **Element itself is empty/Err**.
+Start there, not at the data.
+
+### ⚠ Attribution is OPEN and the deploy is a suspect I could not clear
+The live host went 3.0.59 → 3.0.62 in one hop, which also landed 3.0.60's rail
+tenancy rework that had never been deployed. Nothing in `git log -S` touches
+`MetadataRailBody`, `render_session_metadata` or `client_metadata_entries`
+recently, so the change is more likely indirect. **The measurement that settles
+it is a 3.0.59 build side by side** — do that before theorising further.
+
+### Second, separate symptom in the same report: TWO toasts, two anchors
+His second screenshot has `Restoring Remote Terminal` at top-CENTRE and
+`Image Staged` at top-RIGHT at the same time, the right-hand one painted OVER the
+rail's header. Two live toast surfaces at two anchors is the "double
+notifications" he named. `ToastAnchor` is a real type; the question is who is
+mounting a second host.
+
+## ⭐ OWNER-REQUESTED: TEXT IS NOT SELECTABLE, AND THE METADATA RAIL IS THE WORST CASE
+
+**Status:** OPEN
+
+His words, 2026-08-08: *"I pasted this screenshot because I cannot select the
+title name from the metadata sidebar. The metadata sidebar entries or text in
+general (mostly anywhere) should be selectable."*
+
+**He had to take and paste a SCREENSHOT to tell an agent what a row was called.**
+That is the cost, and it recurs: the same panel renders the ssh reattach command
+and the Claude Code session uuid — two things a human copies constantly and
+currently cannot.
+
+Scope as he framed it, and do not narrow it to the Title field: metadata rail
+entries first, then text in general. ⚠ The shell sets `user-select` globally to
+make the chrome feel native; the fix is to make CONTENT selectable rather than to
+lift the rule everywhere (a selectable sidebar row would break drag-to-reorder).
+
+## ⛔ `server app clients` ANSWERS IN A DIFFERENT ENVELOPE FROM EVERY OTHER APP VERB
+
+**Status:** OPEN
+
+Measured by the taxgraph row, 2026-08-08, which wrote the bug and only caught it
+because it tested against a host it KNEW had a live GUI. `server app clients`
+answers with a top-level `{clients, count}`; every other app verb wraps its
+payload in `{data: {...}}`. So the obvious parser reads `data.clients`, finds
+nothing, and concludes there is no GUI on any host — **indistinguishable from a
+real "GUI not running"**. Either one envelope for every app verb, or `clients`
+says plainly in its own `--help` that it is special.
+
+## ⛔ `session remove` ORPHANS THE FAR-SIDE RUNTIME AND REPORTS IT IN A FIELD NOBODY READS
+
+**Status:** OPEN
+
+5th sighting in the fleet record; measured again 2026-08-08. Removing a
+`remote-cc` row answered `row_still_listed:false` AND `verified:false` with
+`verified_refusal:"remote_runtime_survived"`, `reaped_processes` naming only the
+ssh transport. Both fields are true and they answer different questions: the ROW
+left the sidebar, the AGENT kept running on `dev` holding its context, and the
+caller reaped it by `/proc` by hand. Either `remove` reaps the far-side runtime,
+or it says plainly *"row removed; runtime orphaned at pid N on host H"* so the
+caller knows there is a second step. Today the caller has to already know to look.
+
+## ⭐ A ROW'S SEAT SHOULD BE A VERB — `session claim`
+
+**Status:** OPEN
+
+Every campaign session hand-assembles the same chore from primitives: find my row
+by uuid, derive a seat number that does not collide, rename, read the title back
+because the verb reports the request rather than the effect, re-assert against the
+CLI's self-title, and when superseding an older row remove it and reap what
+`remove` leaves behind. It has been shipped as a script
+(`.agents/skills/yggterm-agent-fleet/ygg-claim.sh`) — which is the wrong layer,
+because it re-derives from primitives what the app already knows.
+
+⚖ This is the owner's standing test applied exactly: *did an agent hand-assemble
+this chore from primitives and get it wrong?* It did, repeatedly. ⇒ Make it a
+verb: `session claim --title T [--seat N] [--replace UUID]`. His reason for
+preferring a verb to a documented recipe: **an agent's discipline resets every
+session; a verb's does not.**
+
+⚠ A related trap the same investigation surfaced, and it is why the seat must be
+first-class: an ssh helper written as `ssh host "yggterm $*"` lets the REMOTE
+shell re-split the title on whitespace, so `rename` keeps only the first word —
+and a truncation at a turn boundary is **indistinguishable from the app
+re-titling itself**. Anyone driving app control from another host will
+misdiagnose it the same way.
+
+## ⛔ `outline_prefix` DOES NOT SURVIVE, AND `rows.label` MAKES IT LOOK LIKE IT DID
+
+**Status:** OPEN
+
+Measured 2026-08-08: a seat set via `session outline` and read back correctly at
+19:18 was gone by 20:02 with the row untouched. `PersistedLiveSession.outline_prefix`
+exists and is serialized, so this is not a missing field — something clears it, or
+it is lost on a path that rebuilds the row.
+
+⚠ **The report that came with it blamed the wrong thing, and the correction
+matters more than the bug.** It was filed as *"`label` composes a prefix the
+sidebar never renders"*. It does render: `build_sidebar_rows` re-composes the
+outline onto `row.label` as its LAST act (`shell.rs` ~49500), specifically so a
+CLI re-titling itself cannot drop the number, and the sidebar draws `row.label`.
+⇒ **Do not "fix" this by dropping the composed label or by adding a second
+renderer.** The API and the screen agreed; the PREFIX had vanished between the
+two readings. One bug, in durability.
+
+⚖ The generalisable lesson is still the reporter's, and it is worth keeping: an
+API read taken at a different moment from the screenshot is not a verification of
+the screen.
+
+## ⭐ A STALL IS A RECOVERABLE STATE AND NOTHING RECOVERS IT
+
+**Status:** OPEN
+
+Owner-directed 2026-08-08, with a live instance he noticed himself: *"the yggterm
+session stalled suddenly. Our relay system or monitor system should yank a
+continue intelligently for such edge cases (cli bug, API error, DEMOTED etc.)."*
+
+A row whose turn ENDED with the work unfinished and no error in its transcript is
+one `continue` from resuming. Today the monitor DETECTS that and tells a human.
+The discriminators already exist in the transcript: turn ended + no activity past
+a threshold, api errors, `model_refusal_fallback`.
+
+⛔ Three guards, and each has already been named as the way this goes wrong: an
+ASSIGNED row that stalls gets the nudge and a PARKED row idling by design must
+never get one; the nudge fires ONCE per stall, not per poll (a watcher that
+re-nudges every tick is worse than one that never nudges); and it escalates if the
+row does not wake.
+
 ## ⛔⛔ OWNER-REPORTED: THE RIGHT PANEL IS A GLOBAL SLOT — one app's rail renders over another app's row, and "I cannot see any files" is that same bug
 
 **Status:** OPEN
