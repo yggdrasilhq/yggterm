@@ -101,38 +101,49 @@ remote agent can reach. Worth closing when this area is next touched.
 ⇒ Still open, and the next capture will answer it: the rail watcher now freezes
 every `[data-yggui-toast*]` element's rect and text at break time.
 
-## ⭐ NOTHING SWEEPS 61 GB OF CODEX'S OWN `.bak.` ROLLOUT COPIES
+## ⭐ THE `.bak.` RECLAIM IS DONE ON TWO HOSTS AND STILL RUNNING ON THE THIRD
 
 **Status:** OPEN
 
-Measured across the fleet 2026-08-08. Codex writes `.bak.<timestamp>` copies of
-its own rollout files and nothing has ever pruned them. yggterm already **knows**
-they exist and merely skips them
-(`AgentCliDescriptor::store_excluded_name_fragments = [".bak."]`, agent_cli.rs)
-so they are invisible in the session index while sitting on the disk forever.
+**Owner said "I say the word" 2026-08-08 and it was executed the same session.**
+Tool: `~/.local/bin/ygg-bak-sweep` (python3, fleet-deployed; `--dry-run`,
+`--quiet`, `--root`). It is **not in this repo** — it follows `ygg-build-sweep`'s
+precedent of living in `~/.local/bin` under fleet-binary-sync, and it is
+temporary: C0 belongs in the daemon engine, per
+[`spec-sweep-policy.md`](spec-sweep-policy.md) §3.
 
-| host role | `.bak.` copies |
-|---|---|
-| integrator | **57.3 GB** (250 files) |
-| GUI | 3.3 GB (751 files) |
-| workshop | 0.5 GB (54 files) |
+| host role | swept | kept, and why |
+|---|---|---|
+| GUI | 624 copies / 3.2 GB logical (~2.0 GB disk) | 127: **125 no-base survivors**, 1 base-shorter, 1 diverged |
+| workshop | 36 copies / 357 MB | 16: 6 no-base, 10 diverged |
+| integrator | **still proving** (57.3 GB) → `/tmp/bak-sweep-dryrun.log` on that host | — |
 
-One 5.5 GB rollout on the integrator exists in **five byte-identical copies**
-(`.bak.20260415…`, `.bak.20260419…`, `.bak.20260424…`, `.bak.20260429…`,
-`.bak.20260701…`) — 27 GB for one conversation. The extension histogram shows
-the copies arrive in bulk events (36 files sharing one suffix, 33 sharing
-another), so this is codex snapshotting a store, not a per-file accident.
+**What remains open:** the integrator host, and the two findings below.
 
-**This is class C0 in [`spec-sweep-policy.md`](spec-sweep-policy.md) and it is
-the first shippable subset of the sweep engine:** a `.bak.` copy is by
-definition redundant with a live rollout, so reclaiming it deletes no session
-and loses no information. It needs none of the scoring in §4, none of the
-compaction in §5, and no owner decision.
+⛔ **DO NOT re-run the GUI or workshop hosts, and do not start a second proof on
+the integrator.**
 
-⚠ **The one guard that is not optional:** a `.bak.` whose *base* rollout is
-missing is not redundant, it is the only surviving copy. Keep it, and keep the
-newest `.bak.` of any base that fails to parse. Per §9.1, absence of proof keeps
-the file.
+### ⛔ THE FIRST PROOF WAS WRONG, AND ITS REFUSAL WAS CORRECT
+
+Redundancy was first proved by **byte-prefix** (a rollout is append-only, so a
+backup should be a prefix of it). It **refused 624 of 753** copies. The premise,
+not the copies, was wrong: **codex re-serialised its entire store on 2026-03-14
+with a different JSON key order**, so a `.bak.` is the pre-migration text of the
+same conversation. Same records, same count, different bytes — and that same
+migration is what flattened every mtime in the store.
+
+⇒ The shipped proof is a **canonical-JSON record-prefix**, streamed in lockstep.
+Full statement, and the general law behind it, in `spec-sweep-policy.md` §9.6.
+
+### ⚠ 125 SESSIONS EXIST ONLY AS A `.bak.` AND THE PRODUCT CANNOT SEE THEM
+
+On the GUI host, 125 copies have **no live rollout at all**. They were correctly
+kept (they are the only surviving copy), but they are invisible in yggterm
+because the session index excludes `.bak.` by name
+(`store_excluded_name_fragments`). **Whether those are sessions the product
+should be SHOWING rather than hiding is an open spec question**, and it is the
+kind of question a sweep is well placed to ask: the sweep found them precisely
+because it was looking for things nothing else looks at.
 
 ## THERE IS NO SESSION SWEEP, AND THE BUILD SWEEP RUNS TOO RARELY TO KEEP UP
 
