@@ -150,8 +150,8 @@ temporary: C0 belongs in the daemon engine, per
 | host role | swept | kept, and why |
 |---|---|---|
 | GUI | 624 copies / 3.2 GB logical (~2.0 GB disk) | 127: **125 no-base survivors**, 1 base-shorter, 1 diverged |
-| workshop | 36 copies / 357 MB | 16: 6 no-base, 10 diverged |
-| integrator | **still proving** (57.3 GB) → `/tmp/bak-sweep-dryrun.log` on that host | — |
+| workshop | 36 copies / 357 MB | 16: 6 no-base (now trashed as noise), 10 diverged |
+| integrator | 145 copies / **51.1 GB** proven redundant; sweep RUNNING | 6.2 GB: 24 no-base (now repaired: 7 restored, 15 trashed), 5 base-shorter, **75 diverged** |
 
 **What remains open:** the integrator host, and the two findings below.
 
@@ -181,9 +181,32 @@ noise sessions are **deleted**. Executed on the GUI host — 5 restored (623 liv
 up from 618), 118 noise copies trashed to `~/.yggterm/session-trash`, 0 orphans
 left, manifest at `~/.yggterm/bak-restore-manifest.jsonl`.
 
+### ⚠ THE SWEEP SURFACED EVIDENCE OF RESUME-ID COLLISION — NOT CHASED
+
+The proof refuses copies whose records diverge, and the **refusal rate is wildly
+asymmetric**: 1 on the GUI host, 10 on the workshop, **75 on the integrator** —
+the host that resumes most. Inspecting the workshop's divergent pairs:
+
+- record counts are **identical** (7234/7234, 9751/9751, 8696/8696)
+- `base_instructions` are **identical** (12,217 chars both sides)
+- the only differing key, in records 0-3, is **`id`**
+- the filenames share ONE uuid with timestamps **seconds apart**
+  (`…T12-22-56-019c7e88…`, `…T12-22-59-019c7e88…`, `…T12-23-08-019c7e88…`)
+
+⇒ The same conversation exists under **different session ids**, written seconds
+apart. `retention.rs`'s own header already names *"agent resume UUID conflicts"*
+as an incident class worth correlating, which makes this a second sighting from
+a completely independent direction.
+
+⚠ **HYPOTHESIS, NOT PROVEN:** that a resume forks the rollout rather than
+appending to it, under some condition the integrator hits most. Not chased — the
+sweep's behaviour is already correct (it KEEPS every divergent copy), so nothing
+is at risk while this is open. What would settle it: whether the ids collide in
+codex's `threads` table, and what the 4th differing record carries.
+
 **Still open:**
-- **The other two hosts have not been repaired** (`--restore-orphans`). The
-  integrator's 57.3 GB proof was still running when this was written.
+- **The integrator's 51.1 GB sweep is running** (proven: 145 copies redundant,
+  6.2 GB kept as no-base/base-shorter/diverged).
 - **The live count is unconfirmed.** The chain is verified by source —
   `store_file_name_is_session` rejects `.bak.` (that WAS the invisibility), a
   renamed file passes the glob, and `build_local_cwd_tree` groups by the cwd
