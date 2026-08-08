@@ -101,6 +101,83 @@ remote agent can reach. Worth closing when this area is next touched.
 ⇒ Still open, and the next capture will answer it: the rail watcher now freezes
 every `[data-yggui-toast*]` element's rect and text at break time.
 
+## ⭐ NOTHING SWEEPS 61 GB OF CODEX'S OWN `.bak.` ROLLOUT COPIES
+
+**Status:** OPEN
+
+Measured across the fleet 2026-08-08. Codex writes `.bak.<timestamp>` copies of
+its own rollout files and nothing has ever pruned them. yggterm already **knows**
+they exist and merely skips them
+(`AgentCliDescriptor::store_excluded_name_fragments = [".bak."]`, agent_cli.rs)
+so they are invisible in the session index while sitting on the disk forever.
+
+| host role | `.bak.` copies |
+|---|---|
+| integrator | **57.3 GB** (250 files) |
+| GUI | 3.3 GB (751 files) |
+| workshop | 0.5 GB (54 files) |
+
+One 5.5 GB rollout on the integrator exists in **five byte-identical copies**
+(`.bak.20260415…`, `.bak.20260419…`, `.bak.20260424…`, `.bak.20260429…`,
+`.bak.20260701…`) — 27 GB for one conversation. The extension histogram shows
+the copies arrive in bulk events (36 files sharing one suffix, 33 sharing
+another), so this is codex snapshotting a store, not a per-file accident.
+
+**This is class C0 in [`spec-sweep-policy.md`](spec-sweep-policy.md) and it is
+the first shippable subset of the sweep engine:** a `.bak.` copy is by
+definition redundant with a live rollout, so reclaiming it deletes no session
+and loses no information. It needs none of the scoring in §4, none of the
+compaction in §5, and no owner decision.
+
+⚠ **The one guard that is not optional:** a `.bak.` whose *base* rollout is
+missing is not redundant, it is the only surviving copy. Keep it, and keep the
+newest `.bak.` of any base that fails to parse. Per §9.1, absence of proof keeps
+the file.
+
+## THERE IS NO SESSION SWEEP, AND THE BUILD SWEEP RUNS TOO RARELY TO KEEP UP
+
+**Status:** OPEN
+
+Owner-requested 2026-08-08: *"we need a systematic session sweeping system …
+intelligently dropping most unimportant and least touched sessions"*, and
+*"the stale builds of yggterm everywhere where we are building should be sweeped
+up intelligently too to save GBs of space."* The design is settled and lives in
+[`spec-sweep-policy.md`](spec-sweep-policy.md); the owner's own calls are in
+[`settled-calls.md`](settled-calls.md). What follows is only what is UNBUILT.
+
+**Nothing exists for sessions.** `clipboard_sweep.rs` and `socket_sweep.rs` are
+the two working precedents and the shape to copy (per-host, own `$YGGTERM_HOME`
+only, positive liveness proof, fail-safe on any read that cannot complete), but
+no code reclaims an agent transcript.
+
+**The build sweep is not broken, it is under-scheduled.** `ygg-build-sweep` ran
+on the integrator on 2026-08-02 and reclaimed 28.7 GB with `0 skipped as
+active`. It is on a **weekly** timer against a host that regenerates ~13 GB/day
+of incremental cache, so `target/debug/incremental` was back to **80 GB** six
+days later. ⛔ Do not go looking for a quiet-gate bug here; the 2 h grace window
+was checked and the directory's own mtime was ~7 h old at measurement time. The
+fix is cadence (daily) plus the `target/debug` budget, both settled.
+
+Suggested order, each independently shippable:
+
+1. **C0 `.bak.` copies** — the entry above. 61 GB, zero risk, no new engine.
+2. **C0/C1 build classes** — daily `incremental/`, 40 GB `target/debug` budget,
+   plus the ad-hoc binary copies in `$YGGTERM_HOME/{bin,binbak,deploy-backup,
+   versions}` (~260 MB of `.rollback-3051` / `.pre-inputdead-<epoch>` /
+   `.pre-phaseE` names with no convention and no retention rule). ⛔ §9.3: the
+   retention set is load-bearing for the CONSTITUTION's version-coexisting
+   daemons — deleting the binary an older live daemon would restart from turns
+   housekeeping into another agent's outage.
+3. **The session index and score** (§4) — and this is where the real work is,
+   because `mtime` cannot be used (see the field guide) and both substance and
+   touch-frequency have to be read out of the transcripts themselves.
+4. **Compaction with verified rehydration** (§5) — last, because its failure
+   mode lands on the resume path, which is the product.
+
+⚠ **Unproven and required before (4) ships:** that codex accepts a rehydrated
+rollout at all, and that rehydration fits inside a click. Neither has been
+tested.
+
 ## 3.0.63's APP-ROW PERSISTENCE IS UNPROVABLE WHILE THE QUIET GATE HOLDS THE DAEMON
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
