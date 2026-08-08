@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Launching a CLI that is not installed now FAILS the row, by name, instead of
+  dropping you in a shell.** Reported: *"All CLIs might not be installed. I tried
+  launching Muse Code and the viewport reported CLI binary not found."* A
+  session's launch command is `bash -lc '<exports> && muse'`; with no `muse` on
+  the machine, bash printed `muse: command not found`, exited that one command,
+  and then **stayed alive at a prompt**. So the row went `healthy`, its launch
+  phase went `Running`, its launch error stayed `none`, and the only instrument
+  that could answer *"did my CLI actually start?"* was reading the terminal
+  screen. Nine CLIs are first-class now and several are absent on any given
+  host, so that was the common case, not an edge. Every local agent session's
+  PTY passes through one funnel; it now checks — against the same launch-parity
+  PATH resolution the provisioner already trusts, with no `--version` subprocess
+  on the attach path — that the binary the exec will look for actually exists,
+  and refuses the launch when it does not. The refusal names the CLI, the
+  executable it looked for, and how that CLI gets installed, and it is recorded
+  on the row (`last_launch_error`, status line, `Launch Error` metadata) rather
+  than only on screen. A remote agent row is untouched: its CLI runs on the
+  other machine, so the local probe says nothing about it.
+
 - **A browser chord works again when the sidebar has focus.** Reported: *"legacy
   shortcuts in ychrome like CTRL+T works when viewport is active but not when
   sidebar is active."* Every legacy browser chord is `page_only`, and the window
