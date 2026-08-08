@@ -75,8 +75,31 @@ timestamp the transition rather than guess at it.
 His second screenshot has `Restoring Remote Terminal` at top-CENTRE and
 `Image Staged` at top-RIGHT at the same time, the right-hand one painted OVER the
 rail's header. Two live toast surfaces at two anchors is the "double
-notifications" he named. `ToastAnchor` is a real type; the question is who is
-mounting a second host.
+notifications" he named.
+
+⛔ **`ToastAnchor` HAS NO TopRight** — it is `TopCenter | BottomLeft |
+BottomRight` (libyggterm `notifications.rs`), and `toast_anchor()` returns
+TopCenter or a BOTTOM anchor by sidebar edge. ⇒ **the top-right card is not a
+`ToastViewport` toast**, so "who mounts a second toast host" is the wrong
+question. Ask what draws at top-right that is not a toast.
+
+⛔ **AND IT IS NOT A DESKTOP NOTIFICATION EITHER — hypothesis raised and
+FALSIFIED 2026-08-08.** "Image Staged" *is* a yggterm notification (clipboard
+image paste) and yggterm can deliver to the desktop via `notify-send`
+(`yggterm-platform/src/lib.rs`), which KDE draws top-right over the window — a
+clean fit. But the live host's `~/.yggterm/settings.json` reads
+`in_app_notifications: true, system_notifications: false`, and
+`notification_delivery_mode()` maps `(true, false)` to `InApp`. **No system
+notification is being sent on this machine.** Do not re-derive this.
+
+⚠ **INSTRUMENT GAP found while falsifying it:** the delivery mode is **not
+exposed in `server app state` at all** — no `notification_delivery`,
+`in_app_notifications` or `system_notifications` field anywhere in the payload.
+The only way to read it is `~/.yggterm/settings.json` on the GUI host, which no
+remote agent can reach. Worth closing when this area is next touched.
+
+⇒ Still open, and the next capture will answer it: the rail watcher now freezes
+every `[data-yggui-toast*]` element's rect and text at break time.
 
 ## 3.0.63's APP-ROW PERSISTENCE IS UNPROVABLE WHILE THE QUIET GATE HOLDS THE DAEMON
 
