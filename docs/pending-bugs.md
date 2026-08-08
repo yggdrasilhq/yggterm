@@ -3161,6 +3161,39 @@ inherits a sibling's liveness; (iv) `pgrep` counts the querying shell. **Same sh
 split every time: asked about one thing, answered about another.** Only `terminal submit`'s
 `unanswerable` currently keeps the law.
 
+## A POPUP-based re-auth cannot be completed on a web surface — the parent never resumes
+
+**Status:** OPEN · raised 2026-08-08 · **operator-confirmed by doing it in Chromium instead**
+
+Field report: **[`docs/agent-cobrowse-gaps-2026-08-08.md`](agent-cobrowse-gaps-2026-08-08.md)**.
+Filed from fingraph row 5.5 after *"close the fake Google payments profile"* was driven to the
+last step four times and abandoned. His words: *"I manually removed the Anthony profile on a
+chromium browser. It was ychrome browser shortcoming."*
+
+**The shape, and it is general — not a Google bug and not a payments bug.** Any flow of the form
+`window.open(reauth) → user verifies → popup closes → parent resumes` dies at the last arrow. The
+re-auth itself SUCCEEDS on the agent plane (measured: password filled to a page-side length of 40
+in the popup tab, `accounts.google.com/CheckCookie` reached, popup self-closes) and
+**`window.opener` is correctly wired** (a same-origin popup reads `openerOrigin` fine). What never
+happens is the parent's continuation: its document is replaced and every injected global is gone,
+with no dialog and no error.
+
+⭐ **Leading hypothesis, stated so it can be falsified cheaply:** on a `--no-activate` surface
+`visibilityState` is `hidden`, rAF never fires, and **the opener is never sent `focus` or
+`visibilitychange` when its popup closes** — so a continuation gated on any of the three cannot
+run. Shimming all four page-side made the flow's own dialog lay out larger (448×80 → 560×80), so
+the frozen frame clock was demonstrably affecting it; the flow still did not resume, and **the
+parent's navigation wipes any page-side shim anyway.** ⇒ this class cannot be fixed from the page;
+it needs a "presented" contract in the engine.
+
+Two more defects in the same report, both costed: **(2)** when a popup tab closes, the ACTIVE tab
+lands on a `no_webview` ghost and every verb answers *"web surface not live (session backgrounded
+or not yet revealed)"* about a page that is alive — no verb takes `--tab`, and the recovery
+(`web close --session`, which closes the ghost and re-activates the real tab) is discoverable only
+by guessing; **(3)** an agent's OWN `web do click` later counts as `seat_input_on_unrevealed_surface`
+and locks it out of `fill-vault`, with a refusal that prescribes revealing the surface — the one
+act the detached-by-default doctrine forbids.
+
 ## `server app web fill-card` answers `matched:false` on fills that landed perfectly
 
 **Status:** OPEN
