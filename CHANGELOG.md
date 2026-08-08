@@ -4,6 +4,20 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **"New Terminal" is its own button on the start page, not an item inside the
+  session menu.** Being in that menu meant being sticky: choose a plain shell
+  once and it became the face of the button you reach for to start an agent, so
+  the next click started a shell. It had also gone from one of two entries to
+  one of ten as the agent CLIs landed, which made the simplest thing on the page
+  the hardest to find. It is always visible and always one click now.
+
+- **The start page's split-button menu is no longer see-through.** The menu drew
+  on the same colour as the button it hangs off, and that colour is a TINT — the
+  right choice for a button, which has the page's own opaque background behind
+  it, and the wrong one for a panel floating over whatever happens to be under
+  it. The menu now takes the same fill as the right-click context menu, which is
+  the reference the owner named.
+
 - **Asking whether a session is listening now also tells you whether it is
   working.** The check proved that input reaches a session, and an idle session
   answers that exactly as well as a busy one — so a paused session read as a
