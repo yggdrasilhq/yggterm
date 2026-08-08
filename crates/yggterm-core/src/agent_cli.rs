@@ -698,6 +698,34 @@ impl AgentCliDescriptor {
         }
     }
 
+    /// One sentence a human can act on when this CLI's binary is not on the
+    /// machine a session is trying to launch it on.
+    ///
+    /// The descriptor already declares HOW the binary arrives ([`CliInstall`]);
+    /// this turns that declaration into the words a refusal shows, so a launch
+    /// that cannot run names the CLI *and* the way to fix it. Owned here rather
+    /// than at the refusal site because the refusal site is not the thing that
+    /// knows — a second copy beside the launcher is exactly how the install
+    /// method and the message drift apart.
+    pub fn install_instruction(&self) -> String {
+        match self.install {
+            CliInstall::Npm(package) => format!(
+                "yggterm provisions {} from npm ({package}) — an install may be in flight, so retry in a moment.",
+                self.binary_name
+            ),
+            CliInstall::Uv(package) => {
+                format!("Install it with `uv tool install {package}`.")
+            }
+            CliInstall::VendorScript(url) => format!(
+                "Install it with the vendor installer at {url}; yggterm never runs that unattended."
+            ),
+            CliInstall::Manual => format!(
+                "Install `{}` by hand — yggterm never provisions this CLI.",
+                self.binary_name
+            ),
+        }
+    }
+
     /// The store roots — each glob's literal prefix — relative to `$HOME`,
     /// e.g. `.codex/sessions`. Derived, never declared twice.
     pub fn store_roots(&self) -> Vec<&'static str> {
@@ -2271,6 +2299,50 @@ mod tests {
             assert!(!descriptor.binary_name.is_empty());
             assert!(!descriptor.display_name.is_empty());
         }
+    }
+
+    /// A launch refused for a missing binary shows this sentence, so every CLI
+    /// owes one that actually points somewhere.
+    ///
+    /// ⛔ The failure it guards: the refusal is the ONLY thing the user sees when
+    /// a CLI is absent (owner-reported 2026-08-08, Muse Code). A descriptor whose
+    /// instruction did not name its package, its URL or "by hand" would refuse a
+    /// launch and leave the user with nothing to do about it — which is the
+    /// silent `/bin/bash` failure again, wearing an error message.
+    #[test]
+    fn every_cli_says_how_it_is_installed() {
+        for descriptor in AGENT_CLIS {
+            let instruction = descriptor.install_instruction();
+            let names_its_source = match descriptor.install {
+                CliInstall::Npm(package) | CliInstall::Uv(package) => {
+                    instruction.contains(package)
+                }
+                CliInstall::VendorScript(url) => instruction.contains(url),
+                CliInstall::Manual => instruction.contains(descriptor.binary_name),
+            };
+            assert!(
+                names_its_source,
+                "{}: install_instruction must name what it declares in CliInstall, got {instruction:?}",
+                descriptor.display_name
+            );
+        }
+
+        // Muse is the owner-gated case the report came from: closed source,
+        // installed nowhere on the fleet, and the ONE thing yggterm knows is the
+        // vendor installer it must never run unattended.
+        let muse = agent_cli_descriptor(SessionKind::Muse).unwrap();
+        let muse_instruction = muse.install_instruction();
+        assert!(muse_instruction.contains("https://dev.meta.ai/install.sh"));
+        assert!(
+            muse_instruction.contains("never runs that unattended"),
+            "a vendor script is recorded, not executed: {muse_instruction:?}"
+        );
+
+        // An npm CLI tells the user to WAIT rather than to install by hand,
+        // because the attach that produced this refusal also kicked the
+        // background provision.
+        let claude = agent_cli_descriptor(SessionKind::ClaudeCode).unwrap();
+        assert!(claude.install_instruction().contains("retry in a moment"));
     }
 
     // These token shapes ARE the shipped invocations. They are asserted here so

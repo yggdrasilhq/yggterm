@@ -5838,6 +5838,32 @@ impl DaemonRuntime {
                 yggterm_core::PerfGuard::new(self.store.home_dir(), "attach", "managed_cli_ensure");
             self.server.ensure_managed_cli_for_session_path(path)?
         };
+        // ⛔ The CLI's binary is checked AFTER the ensure above and BEFORE any PTY
+        // is spawned, because this is the one funnel every local agent session's
+        // terminal passes through. Refusing here is what makes a missing binary a
+        // LAUNCH FAILURE rather than a line of scrollback inside a `/bin/bash`
+        // that outlives the CLI it was supposed to become (owner-reported
+        // 2026-08-08, "I tried launching Muse Code and the viewport reported CLI
+        // binary not found"). The ensure runs first on purpose: for an
+        // npm-provisionable CLI it kicks the background install this refusal then
+        // tells the user to wait for.
+        if let Some(refusal) = self.server.local_agent_cli_launch_refusal_for_path(path) {
+            self.server.record_launch_refusal_for_path(path, &refusal);
+            if let Ok(home) = crate::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "daemon",
+                    "terminal_ensure",
+                    "launch_refused_cli_binary_missing",
+                    serde_json::json!({
+                        "path": path,
+                        "refusal": refusal,
+                    }),
+                );
+            }
+            let _ = self.persist_state_only();
+            bail!("{refusal}");
+        }
         if path.starts_with("remote-session://")
             && let Ok(home) = crate::resolve_yggterm_home()
         {

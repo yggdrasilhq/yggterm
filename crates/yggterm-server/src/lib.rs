@@ -173,8 +173,9 @@ pub use terminal::{
 use anyhow::Context;
 use codex_cli::{
     ManagedCliAction, ManagedCliRefreshReport, best_effort_cwd_shell_prefix,
-    ensure_local_managed_cli, ensure_local_managed_cli_for_focus, managed_cli_shell_command,
-    managed_cli_shell_command_full, managed_cli_shell_command_with_terminal_appearance,
+    ensure_local_managed_cli, ensure_local_managed_cli_for_focus,
+    local_agent_cli_missing_binary_refusal, managed_cli_shell_command, managed_cli_shell_command_full,
+    managed_cli_shell_command_with_terminal_appearance,
     refresh_local_managed_cli,
     summarize_managed_cli_report, sync_terminal_identity_env,
     terminal_identity_appearance_from_environment, terminal_identity_shell_exports_for_remote,
@@ -2424,6 +2425,16 @@ pub enum TerminalLaunchPhase {
     BridgePending,
     RemoteBootstrap,
     Running,
+    /// The launch was REFUSED and no PTY will appear. Terminal, not a stage.
+    ///
+    /// ⛔ Added 2026-08-08 because the other four are all stages of a launch
+    /// that is still COMING, so a row that could never start had to borrow one
+    /// of them — and the GUI's "did my CLI start?" answer is derived from this
+    /// enum (`friendly_launch_phase`). Without this variant a refused launch
+    /// reads as `running` in the session inspector, which is the same lie as
+    /// the `healthy` row the missing-binary gate exists to remove, moved one
+    /// field over. `last_launch_error` carries WHY.
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -6733,30 +6744,74 @@ impl YggtermServer {
         machine.health = RemoteMachineHealth::Healthy;
     }
 
+    /// Which LOCAL managed CLI this session path will actually exec, if any.
+    ///
+    /// ONE owner for the question, because two consumers ask it on the same
+    /// attach: the provisioning ensure below, and the missing-binary launch gate
+    /// (`local_agent_cli_launch_refusal_for_path`). Answering it twice is how a
+    /// gate ends up refusing a row the ensure considers none of its business.
+    fn local_managed_cli_tool_for_session_path(&self, path: &str) -> Option<ManagedCliTool> {
+        let key = self.resolve_session_storage_key(path)?;
+        let session = self.sessions.get(key)?;
+        local_managed_cli_tool_for(path, session.source, session.kind)
+    }
+
+    /// Why this session's PTY must not be spawned — the CLI it would exec is not
+    /// installed here — or `None` when the launch can proceed.
+    ///
+    /// ⛔ Owner-reported 2026-08-08: *"All CLIs might not be installed. I tried
+    /// launching Muse Code and the viewport reported CLI binary not found."* The
+    /// exec fell through to `/bin/bash`, which printed `command not found` and
+    /// then OUTLIVED the CLI at a prompt, so the row reported `healthy` with no
+    /// launch error. A launch that cannot run must fail BY NAME instead of
+    /// handing the user a shell that impersonates it.
+    pub fn local_agent_cli_launch_refusal_for_path(&self, path: &str) -> Option<String> {
+        let tool = self.local_managed_cli_tool_for_session_path(path)?;
+        local_agent_cli_missing_binary_refusal(tool)
+    }
+
+    /// Record a refused launch ON THE ROW, so the failure is readable without
+    /// reading the terminal screen — the instrument gap the owner's report named.
+    pub fn record_launch_refusal_for_path(&mut self, path: &str, message: &str) {
+        let Some(key) = self.resolve_session_storage_key(path).map(str::to_string) else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return;
+        };
+        session.last_launch_error = Some(message.to_string());
+        // The GUI's "did my CLI start?" answer is derived from `launch_phase`
+        // (`friendly_launch_phase`), so a refusal that left it alone read as
+        // `running` in the session inspector — live-observed on jojo before this
+        // line existed. `Failed` is the only value that is not a promise.
+        session.launch_phase = TerminalLaunchPhase::Failed;
+        upsert_session_metadata(&mut session.metadata, "Launch Error", message.to_string());
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Status",
+            "CLI binary not installed".to_string(),
+        );
+        session.status_line = format!("launch refused · {message}");
+        // ⛔ And say it IN THE VIEWPORT. The owner's report was about what the
+        // screen showed; a refusal recorded only in metadata trades a shell that
+        // lied for a viewport that says nothing at all, which is not obviously
+        // better. No PTY exists for a refused row, so these lines are all the
+        // terminal pane has to render.
+        session.terminal_lines = vec![
+            message.to_string(),
+            String::new(),
+            "yggterm refused this launch instead of dropping you in a shell: a \
+             shell that outlives the CLI it was supposed to become looks like a \
+             working session."
+                .to_string(),
+        ];
+    }
+
     pub fn ensure_managed_cli_for_session_path(
         &self,
         path: &str,
     ) -> anyhow::Result<Option<String>> {
-        let Some(key) = self.resolve_session_storage_key(path) else {
-            return Ok(None);
-        };
-        let Some(session) = self.sessions.get(key) else {
-            return Ok(None);
-        };
-        // Remote agent sessions — codex (`remote-session://`) AND Claude Code
-        // (`remote-cc://`) — run their CLI on the REMOTE machine via the host-daemon
-        // resume/start lane, so the LOCAL managed toolchain is irrelevant to them.
-        // Probing the local `<cli> --version` here is pure waste on the attach path,
-        // and for the node-based claude CLI it cost ~85-910ms PER focus of a remote
-        // CC session (live-measured on jojo, 2026-06-13) — the user's most-used
-        // session kind. The `remote-cc://` arm was missing, so only codex was
-        // exempt; both must be. Background machine refreshes keep the remote
-        // toolchains current; PTY restore must not block on a synchronous local
-        // probe or SSH upgrade.
-        if !session_path_uses_local_managed_cli(path) {
-            return Ok(None);
-        }
-        let Some(tool) = ManagedCliTool::from_session_kind(session.kind) else {
+        let Some(tool) = self.local_managed_cli_tool_for_session_path(path) else {
             return Ok(None);
         };
         // Focus/attach path: reuse a recent ensure result so a session switch does not
@@ -15472,6 +15527,43 @@ fn remote_cc_session_path(machine_key: &str, session_id: &str) -> String {
 /// `ensure_managed_cli_for_session_path`.
 fn session_path_uses_local_managed_cli(path: &str) -> bool {
     !(path.starts_with("remote-session://") || path.starts_with("remote-cc://"))
+}
+
+/// Which LOCAL managed CLI a session will exec, from the three facts that decide
+/// it — nothing else about the session matters, so this is a pure function and
+/// the `&self` method is a lookup in front of it.
+///
+/// ⚠ Both `None` arms are FALSE-REFUSAL guards, and each has already been the
+/// wrong answer somewhere in this file:
+///
+/// - A `remote-*://` agent row — codex `remote-session://` AND Claude Code
+///   `remote-cc://` — runs its CLI on the REMOTE machine via the host-daemon
+///   resume/start lane, so the local toolchain is irrelevant to it. Probing the
+///   local `<cli> --version` for one is pure waste on the attach path, and for
+///   the node-based claude CLI it cost ~85-910ms PER focus of a remote CC
+///   session (live-measured on jojo, 2026-06-13) — the user's most-used session
+///   kind. The `remote-cc://` arm was missing once, so only codex was exempt;
+///   both must be. Background machine refreshes keep the remote toolchains
+///   current; PTY restore must not block on a synchronous local probe or SSH
+///   upgrade.
+/// - A `LiveSsh` row carries an agent KIND while its runtime is on the other
+///   machine too — the six new CLIs are born exactly like that today
+///   (`live::<uuid>` + `session_kind:"pi"`), so keying only on the scheme would
+///   refuse a remote `pi` row because the GUI host has no `pi`.
+///
+/// A shell or document answers `None` because it has no CLI to be missing.
+fn local_managed_cli_tool_for(
+    path: &str,
+    source: SessionSource,
+    kind: SessionKind,
+) -> Option<ManagedCliTool> {
+    if !session_path_uses_local_managed_cli(path) {
+        return None;
+    }
+    if source == SessionSource::LiveSsh {
+        return None;
+    }
+    ManagedCliTool::from_session_kind(kind)
 }
 
 fn parse_remote_cc_session_path(path: &str) -> Option<(&str, &str)> {
@@ -25953,10 +26045,14 @@ fn describe_status_line_with_error(
         remote_deploy_state,
         daemon_runtime_available,
     );
-    if matches!(
+    // A refused launch carries its reason on EVERY lane, not just the remote
+    // one: `Failed` only ever means "this row will not start", and the reason is
+    // the only thing the user can act on.
+    if (matches!(
         (source, remote_deploy_state),
         (SessionSource::LiveSsh, RemoteDeployState::Planned)
-    ) && let Some(error) = last_launch_error
+    ) || launch_phase == TerminalLaunchPhase::Failed)
+        && let Some(error) = last_launch_error
     {
         let trimmed = error.trim();
         if !trimmed.is_empty() {
@@ -25967,7 +26063,11 @@ fn describe_status_line_with_error(
                 .chars()
                 .take(240)
                 .collect::<String>();
-            launch_status = format!("remote bootstrap blocked: {single_line}");
+            launch_status = if launch_phase == TerminalLaunchPhase::Failed {
+                format!("launch failed: {single_line}")
+            } else {
+                format!("remote bootstrap blocked: {single_line}")
+            };
         }
     }
     format!("{backend_label} · {appearance} scheme requested · {launch_status}")
@@ -25985,6 +26085,11 @@ fn describe_launch_phase(
         "runtime degraded"
     };
     match (source, launch_phase, remote_deploy_state) {
+        // ⛔ FIRST, and deliberately blind to source and deploy state: `Failed`
+        // is terminal for every lane. It sits above the arms below because the
+        // catch-all at the bottom answers "launch queued", and a refused launch
+        // described as queued is a row the user waits on forever.
+        (_, TerminalLaunchPhase::Failed, _) => format!("launch failed · {runtime}"),
         (SessionSource::Stored, TerminalLaunchPhase::Queued, _) => {
             format!("stored attach queued · {runtime}")
         }
@@ -26031,6 +26136,7 @@ fn build_live_terminal_lines(session: &ManagedSessionView) -> Vec<String> {
         TerminalLaunchPhase::BridgePending => "bridge pending",
         TerminalLaunchPhase::RemoteBootstrap => "remote bootstrap",
         TerminalLaunchPhase::Running => "running",
+        TerminalLaunchPhase::Failed => "launch failed",
     };
     vec![
         format!("$ {}", session.launch_command),
@@ -27027,9 +27133,10 @@ mod tests {
     }
     use super::{
         local_cc_current_session_id_in, local_cc_registry_session_id_in,
-        owning_daemon_endpoint_from_statuses, parse_remote_agent_runtime_alive_output,
-        select_claude_code_storage_candidate,
+        local_managed_cli_tool_for, owning_daemon_endpoint_from_statuses,
+        parse_remote_agent_runtime_alive_output, select_claude_code_storage_candidate,
     };
+    use crate::codex_cli::ManagedCliTool;
 
     /// ⛔ NO MACHINE NAME MAY BE HARDCODED HERE. This function used to carry a
     /// `match` arm mapping one fleet host's misspelling to its real name, which
@@ -30574,6 +30681,113 @@ mod tests {
         );
         assert!(status.contains("remote bootstrap planned"));
         assert!(!status.contains("blocked"));
+    }
+
+    /// A refused launch says so, and says WHY, on every lane.
+    ///
+    /// ⛔ `Failed` must not fall through to the catch-all, which answers "launch
+    /// queued" — a row the user would wait on forever. And the reason must ride
+    /// along on a LOCAL row too: the error injection used to be gated on
+    /// `(LiveSsh, Planned)`, which is the remote-bootstrap case only, so a local
+    /// CLI that could never start would have shown a bare phase.
+    #[test]
+    fn a_failed_launch_reports_the_reason_on_every_lane() {
+        let local = describe_status_line_with_error(
+            TerminalBackend::Xterm,
+            UiTheme::ZedDark,
+            SessionSource::LiveLocal,
+            TerminalLaunchPhase::Failed,
+            RemoteDeployState::NotRequired,
+            true,
+            Some("Muse Code is not installed on this machine — `muse` is not on the launch PATH."),
+        );
+        assert!(local.contains("launch failed:"), "{local}");
+        assert!(local.contains("Muse Code is not installed"), "{local}");
+        assert!(!local.contains("queued"), "{local}");
+
+        // With no reason recorded it still must not read as "coming".
+        let bare = describe_status_line_with_error(
+            TerminalBackend::Xterm,
+            UiTheme::ZedDark,
+            SessionSource::Stored,
+            TerminalLaunchPhase::Failed,
+            RemoteDeployState::NotRequired,
+            true,
+            None,
+        );
+        assert!(bare.contains("launch failed"), "{bare}");
+        assert!(!bare.contains("queued"), "{bare}");
+    }
+
+    /// WHICH rows the missing-binary launch gate is allowed to refuse.
+    ///
+    /// ⚠ This test is the false-refusal guard, and it is the expensive half of
+    /// the fix: refusing a launch that WOULD have worked is worse than the
+    /// silent shell it replaces, because it takes a working row away. The gate
+    /// may only speak for a CLI that this machine is about to exec itself.
+    #[test]
+    fn the_missing_binary_gate_speaks_only_for_locally_executed_clis() {
+        // A local agent row — the case the owner hit with Muse Code.
+        assert_eq!(
+            local_managed_cli_tool_for(
+                "local://abc",
+                SessionSource::LiveLocal,
+                SessionKind::Muse
+            ),
+            Some(ManagedCliTool::Muse)
+        );
+        // A stored row is resumed locally too, so it is gated the same way.
+        assert_eq!(
+            local_managed_cli_tool_for(
+                "local://abc",
+                SessionSource::Stored,
+                SessionKind::ClaudeCode
+            ),
+            Some(ManagedCliTool::ClaudeCode)
+        );
+
+        // ⛔ A remote agent row runs its CLI on the OTHER machine. The local
+        // binary says nothing about it, and refusing on that basis would break
+        // the user's most-used session kind on a host that never had `claude`.
+        assert_eq!(
+            local_managed_cli_tool_for(
+                "remote-cc://dev/abc",
+                SessionSource::LiveSsh,
+                SessionKind::ClaudeCode
+            ),
+            None
+        );
+        assert_eq!(
+            local_managed_cli_tool_for(
+                "remote-session://dev/abc",
+                SessionSource::LiveSsh,
+                SessionKind::Codex
+            ),
+            None
+        );
+        // ⛔ And the six new CLIs are born REMOTE as `live::<uuid>` carrying an
+        // agent kind (docs/pending-bugs.md, "A REMOTE ROW FOR ANY OF THE SIX NEW
+        // AGENT CLIs IS BORN A PLAIN SHELL"). Keying only on the scheme would
+        // refuse a remote `pi` row because the GUI host has no `pi` — so the
+        // source must carry the decision, not the path alone.
+        assert_eq!(
+            local_managed_cli_tool_for("live::abc", SessionSource::LiveSsh, SessionKind::Pi),
+            None
+        );
+
+        // A shell has no CLI to be missing.
+        assert_eq!(
+            local_managed_cli_tool_for("local://abc", SessionSource::LiveLocal, SessionKind::Shell),
+            None
+        );
+        assert_eq!(
+            local_managed_cli_tool_for(
+                "local://abc",
+                SessionSource::LiveLocal,
+                SessionKind::Document
+            ),
+            None
+        );
     }
 
     #[test]

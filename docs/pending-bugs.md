@@ -44,32 +44,49 @@ shapes, and the choice is a spec call rather than a patch:
 `persist_web_tabs`' marked-row invariant — do not start it without deciding what
 a ychrome session with NO app tab is.
 
-## ⭐ OWNER-REPORTED: LAUNCHING MUSE CODE LANDS IN A SHELL THAT SAYS `command not found`
+## ⛔ A REFUSED LAUNCH IS RECORDED IN THE DAEMON AND STILL RENDERS AS `running` IN THE GUI
 
 **Status:** OPEN
 
-⭐ **Owner-reported 2026-08-08:** *"All CLIs might not be installed. I tried
-launching Muse Code and the viewport reported CLI binary not found."*
+Found 2026-08-08 while shipping the missing-binary launch gate (3.0.59), by
+looking at the screen instead of at the reply.
 
-The measured half is already filed one entry down ("AUTO-PROVISIONING COVERS
-THREE OF THE SIX NEW CLIs"), and Muse is correctly parked in
-`owner-attention.md` — it is closed source and installed nowhere on the fleet, so
-no provisioner can fetch it. **That part is not a bug and must not be "fixed" by
-guessing at an installer.**
+**What DOES work, live-proven on jojo** — do not re-do it: `terminal new --kind
+muse` is refused by name with Muse's install method, `--kind kimi` is refused
+with kimi's *different* (uv) one, and `pgrep` finds **no process at all** for the
+refused row. The `/bin/bash` that used to print `command not found` and then
+outlive the CLI is gone. That was the owner's report and it is closed.
 
-What the report proves is the OTHER half, and it is now owner-confirmed rather
-than agent-measured: **a missing binary is not a launch failure anywhere in the
-product.** The exec falls through to `/bin/bash`, the row goes `healthy`, the
-shell outlives the CLI at a prompt, and the only instrument that can answer *"did
-my CLI start?"* is reading the screen text. Nine CLIs are first-class now and
-several are not installed on any given host, so this is the common case, not the
-edge.
+**What does NOT work:** a refused row LEFT IN THE SIDEBAR renders with
+`Status: running · —` in the session inspector and a blank viewport.
+`record_launch_refusal_for_path` sets `launch_phase = Failed`,
+`last_launch_error`, the status line and viewport lines — **in the DAEMON's copy
+of the session.** The GUI renders from its OWN in-process `ManagedSessionServer`,
+and the create that would have carried a fresh snapshot back returned an ERROR
+instead, so the GUI keeps its pre-refusal state. Same shape as
+`[[finding-daemon-side-fix-inert-under-proxy]]`: the fix is real and lands on the
+wrong side of a seam.
 
-**Owed:** `AgentCliDescriptor` already names `binary_name` — check it on the
-launch path, and when it is absent fail the ROW with the CLI's name and its
-documented install method, instead of handing the user a shell. The descriptor
-for Muse already carries the sentence to show (`⛔ UNMEASURED … installs
-user-local into ~/.local/bin`).
+⚠ **`friendly_launch_phase` is what the inspector's "Status" is derived from**,
+so this is the field that decides whether a user believes their CLI started. The
+`Failed` variant now exists (3.0.59) and is correct — it just never reaches the
+renderer on this path.
+
+**Fix shape:** a refused ensure must return a snapshot, not only an error, so the
+GUI applies the row's Failed state. ⛔ Do not "fix" it by having the GUI re-derive
+the refusal locally — that mints a second owner for "is this CLI installed", on a
+machine that may not be the one the CLI runs on.
+
+**Falsifier:** `terminal new --kind muse`, then read the row's `launch_phase` out
+of `server app state`. `Failed` means fixed; `Running`/`RemoteBootstrap` means
+this entry stands.
+
+⚠ **And the daemon's own trace file is blind on this path** — the live daemon
+(pid held on `event-trace.g<ts>.jsonl`) had **2 startup lines and nothing else**
+while 18 `before_request_terminal_launch` events went to an OLDER file. Any agent
+using the trace to decide whether a daemon code path fired will read a zero and
+believe it. That is worth its own look; it made this fix briefly appear not to
+run at all.
 
 ## ⛔⛔ SIX yggterm-shell RETENTION TESTS ARE RED AT HEAD — and the recorded baseline still says green
 
@@ -103,8 +120,37 @@ recorded baseline is *"1844 tests, 1843 pass + 1 ignored"*, so every brief tells
 the next agent the suite is green. It is not, and the first thing an agent does
 with an unexplained red is suspect its own diff. That cost this session a stash,
 a rebuild and a re-run to disprove. **A wrong baseline is worse than no
-baseline** — until this is fixed, the number to quote is 1840 pass + 6 fail + 1
-ignored.
+baseline** — until this is fixed, the number to quote is **1844 pass + 6 fail +
+1 ignored**.
+
+⛔⛔ **AND THE SAME ROT IS IN THE `yggterm-server` NUMBER, measured 2026-08-08.**
+Every brief records *"three `yggterm-server` lib tests"* as baseline red. It is
+**SIX**, proven not-ours the expensive way: a `git worktree add <tmp> HEAD` at
+`90d13a06`, built clean, ran `cargo test -p yggterm-server --lib`, and got the
+IDENTICAL six.
+
+```
+daemon::tests::daemon_binary_is_legacy_allows_deleted_current_install_path
+tests::legacy_agent_launch_command_uses_best_effort_cwd_resolution
+tests::remote_resume_shell_command_wraps_prefix_and_cwd
+tests::start_remote_claude_session_assigns_authoritative_session_id
+tests::start_remote_codex_session_uses_remote_start_codex_launch_contract
+tests::stored_codex_litellm_sessions_use_litellm_resume_command
+```
+
+⭐ **Three of those six are a real, unfiled regression, not a network flake.**
+`legacy_agent_launch_command_uses_best_effort_cwd_resolution`,
+`remote_resume_shell_command_wraps_prefix_and_cwd` and
+`stored_codex_litellm_sessions_use_litellm_resume_command` each assert the
+resume SUBCOMMAND is in the built command (`codex resume -C "$PWD" <id>`,
+`codex-litellm resume`) and it is not. That is the launch string the PTY runs,
+so whatever dropped the token is a live-behaviour question, not a stale test —
+**start there, and do not assume the test is the thing that is wrong.** The
+other three reach the network / a fleet path.
+
+⚖ **The counting law this keeps breaking:** a baseline is a MEASUREMENT and it
+goes stale like any other. Re-measure at HEAD in a clean worktree before quoting
+one; never inherit a number from a brief.
 
 ## ★★★ THE EXTRA-ARGS SETTINGS ARE TWO TEXT BOXES AND THERE ARE NINE CLIs — build the modal
 
@@ -349,10 +395,15 @@ Muse is the owner-gated one and is correctly parked in `owner-attention.md`.
 provisioner**, and `agy` is installed on `dev` today, so the gap is the
 provisioning method, not the package.
 
-**Two things owed:** (a) teach the provisioner the non-npm install methods, or
-declare per-descriptor that a CLI is *host-provided* and check for it before
-launch; (b) **a failed exec must surface as a row-level launch failure**, not as
-a line of scrollback in a shell that outlives it.
+**What is owed here now:** teach the provisioner the non-npm install methods, or
+declare per-descriptor that a CLI is *host-provided*.
+
+✅ The other half — **a failed exec must surface as a row-level launch failure,
+not as a line of scrollback in a shell that outlives it** — shipped in 3.0.59.
+A local agent launch now probes the binary at the one PTY funnel and refuses by
+name; `kimi`, `muse` and `agy` fail their rows instead of becoming a shell. That
+does NOT close this entry: a refusal is the right answer only for a CLI yggterm
+genuinely cannot install, and `kimi` and `agy` are not that.
 
 ## ⛔⛔ `terminal new --prompt` DROPPED A DELEGATE'S ENTIRE BRIEF AND REPORTED A GOOD LAUNCH — 8 HOURS LOST
 
@@ -3322,6 +3373,35 @@ measured over 20 s from `/proc` (never `ps %CPU`): **web content 0.241 cores
 + GUI 0.399 cores = 0.85 cores total against jojo's ~0.5-core idle floor**,
 Tctl 61.6 °C — the user's fan spun up on a machine that had been silent all
 evening, while they were touching nothing.
+⛔⛔ **RE-MEASURED 2026-08-08 17:22 IST ON jojo, AND IT IS WORSE THAN THE 0.85
+CORES ABOVE — the owner asked why his fan was loud, unprompted.** Taken from
+`/proc` over 20 s with NO build running and the user touching nothing:
+
+```
+yggterm GUI              0.597 cores
+WebKitWebProcess (6)     0.902 cores   <- ONE of them is 0.637 alone
+yggterm-headless (6)     0.068 cores
+TOTAL                    1.567 cores
+```
+
+A per-process pass puts **0.637 cores in a single web surface** and 0.269 in the
+shell's own Dioxus webview; the other four surfaces are at zero. So the cost is
+not spread — it is one surface painting, which is precisely the shape this entry
+describes.
+
+⚠ **Honest attribution, because the agent measuring it was also the load:** the
+owner's report arrived during ~50 minutes of continuous `cargo` builds and two
+6-minute test suites (load average 6-11), and THAT was the dominant heat. The
+1.567 cores above is the residual measured after the builds stopped, so it is
+the part that does NOT go away when the agent stops. Both were true at once, and
+saying only the first would have been convenient and wrong.
+
+⇒ **This is the live A/B the entry has been waiting for, half-done: the "after"
+arm on 3.0.59 still costs 1.567 cores.** What is still missing is the controlled
+comparison (same surfaces, throttle forced on vs off) and the identity of pid
+2886588's surface — capture `engine_visible` from the trace for each surface
+before assuming it is the same unrevealed-surface mechanism.
+
 **Why it is a product bug, not the page's fault:** every browser throttles
 `requestAnimationFrame`, CSS animations and timers on a hidden page — that is
 the Page Visibility contract, and it is the ONLY thing that makes background

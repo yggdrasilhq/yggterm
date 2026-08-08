@@ -1522,6 +1522,42 @@ mod tests {
         }
     }
 
+    /// The refusal a user reads when the CLI they clicked is not on the machine.
+    ///
+    /// ⛔ It must name THREE things, because each replaces a thing the old
+    /// silent-shell failure made the user work out for themselves: which CLI
+    /// (the row said `healthy`), which executable was looked for (`command not
+    /// found` was buried in scrollback), and what to do about it (nothing said
+    /// anything). Owner-reported 2026-08-08.
+    #[test]
+    fn a_missing_cli_is_refused_by_name_with_its_install_method() {
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            let message = missing_binary_refusal_message(descriptor);
+            assert!(
+                message.contains(descriptor.display_name),
+                "{:?}: the refusal must name the CLI: {message:?}",
+                descriptor.kind
+            );
+            assert!(
+                message.contains(descriptor.binary_name),
+                "{:?}: the refusal must name the executable it looked for: {message:?}",
+                descriptor.kind
+            );
+            assert!(
+                message.contains(&descriptor.install_instruction()),
+                "{:?}: the refusal must carry the descriptor's install method: {message:?}",
+                descriptor.kind
+            );
+            // ⛔ "not installed" is the whole claim. A refusal that hedged would
+            // read as a transient glitch and send the user back to clicking.
+            assert!(
+                message.contains("is not installed on this machine"),
+                "{:?}: {message:?}",
+                descriptor.kind
+            );
+        }
+    }
+
     // Byte-for-byte lock on the invocations the descriptor now builds. These
     // strings are what actually reaches the PTY, and phase 1 is a REFACTOR —
     // any change here is a behavior change wearing a refactor's clothes.
@@ -2259,6 +2295,51 @@ fn probe_tool_existence_only(paths: &ManagedCliPaths, tool: ManagedCliTool) -> T
         source: None,
         available: false,
     }
+}
+
+/// Why a LOCAL agent-CLI PTY must be REFUSED instead of spawned — or `None`
+/// when the binary the launch will exec genuinely resolves.
+///
+/// ⛔ The defect this closes, owner-reported 2026-08-08: a missing binary was
+/// not a launch failure ANYWHERE in the product. The launch command is
+/// `bash -lc '<exports> && muse'`; with no `muse` on the machine, bash printed
+/// `muse: command not found`, **exited that one command, and stayed alive at a
+/// prompt**. The row went `healthy`, `launch_phase:Running`, `last_launch_error:
+/// none` — and the only instrument that could answer "did my CLI start?" was
+/// reading the screen text. Nine CLIs are first-class and several are absent on
+/// any given host, so that is the common case, not an edge.
+///
+/// ⚠ [[finding-a-set-is-not-a-fill]]: this is a READBACK, never the descriptor's
+/// own hope. It reuses [`probe_tool_existence_only`] — the same launch-parity
+/// resolution (managed bin dir, else the login-shell PATH the PTY will run
+/// under) the focus path already trusts to decide `available` — so the gate and
+/// the provisioner can never disagree about whether a binary is there.
+/// ⚠ [[finding-a-build-identity-is-not-what-version-says]]: deliberately NO
+/// `--version`/`--help` probe. Those are pure builtins exempt from the exec
+/// handoff, so neither can prove a binary exists at the far end of a launch —
+/// and a subprocess here would sit on the terminal-attach critical path.
+///
+/// A machine whose managed layout cannot be resolved at all answers `None`: this
+/// gate exists to refuse a launch that is KNOWN to fail, and "I could not look"
+/// is not that.
+pub(crate) fn local_agent_cli_missing_binary_refusal(tool: ManagedCliTool) -> Option<String> {
+    let paths = ManagedCliPaths::resolve().ok()?;
+    if probe_tool_existence_only(&paths, tool).available {
+        return None;
+    }
+    Some(missing_binary_refusal_message(tool.descriptor()))
+}
+
+/// The words a refused launch shows. Split from the probe so the message is
+/// testable without a machine that happens to lack a CLI — the probe is a
+/// filesystem fact, this is a contract.
+fn missing_binary_refusal_message(descriptor: &AgentCliDescriptor) -> String {
+    format!(
+        "{} is not installed on this machine — `{}` is not on the launch PATH, so yggterm cannot start this session. {}",
+        descriptor.display_name,
+        descriptor.binary_name,
+        descriptor.install_instruction(),
+    )
 }
 
 /// Per-tool in-flight guard so at most one background provision/refresh runs per tool
