@@ -335,7 +335,7 @@ pub fn managed_cli_refresh_ttl_ms() -> u64 {
         .unwrap_or(DEFAULT_MANAGED_CLI_REFRESH_TTL_MS)
 }
 
-fn current_time_ms() -> u64 {
+pub(crate) fn current_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)

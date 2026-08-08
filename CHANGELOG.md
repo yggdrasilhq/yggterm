@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Launching an agent session on another machine now installs that machine's
+  CLI.** The previous release honoured the owner's "auto install, update ALL
+  clis in all connected systems" ruling for the machine yggterm runs on; a
+  remote row still had to find its CLI already there. The attach path asked only
+  which LOCAL CLI a row would exec, and answered "none" for every remote agent
+  row — correctly, since their CLI runs elsewhere — but nothing then asked the
+  other question, so the six newer CLIs simply never arrived on a remote host.
+  The background machine refresh that was supposed to cover this could not: it
+  is opt-in behind an environment variable that defaults off, so it reported
+  work it had structurally declined to do. Launching a remote agent row now
+  provisions that one CLI on the machine that will run it, through the same
+  per-machine verb the remote binary already exposes.
+
+  Focus stays free: the answer is cached per machine-and-CLI, so only the first
+  launch of a given CLI on a given machine costs a round trip and every switch
+  after it costs nothing. The install runs off the attach path — waiting for it
+  would stall every other session on the machine, and cutting it short would
+  leave a half-installed toolchain behind.
+
 - **yggterm installs and updates EVERY agent CLI, by every method — not just the
   npm ones.** The owner's ruling: *"yggterm should auto install, update ALL clis
   in all connected systems including localhost."* The provisioner asked one

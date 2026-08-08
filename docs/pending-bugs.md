@@ -1042,18 +1042,57 @@ on every background refresh, for all nine CLIs at once — and the owner notices
 when the GUI host runs hot.
 
 **The symmetric fix is the local lane's own shape:** provision ONE CLI, ON
-DEMAND, in the FOREGROUND, at the moment a remote agent row is launched, by
-invoking the verb that already exists. ⚠ It must hang off the CREATE path, not
-the focus path: `ensure_terminal_for_path_with_initial_size_and_seed` is the
-funnel for both, and an ssh round trip per focus is the ~85-910 ms regression
+DEMAND, at the moment a remote agent row is launched, by invoking the verb that
+already exists. ⚠ It must hang off the CREATE path, not the focus path:
+`ensure_terminal_for_path_with_initial_size_and_seed` is the funnel for both, and
+an ssh round trip per focus is the ~85-910 ms regression
 `local_managed_cli_tool_for`'s own comment was written to prevent. A TTL cache
 keyed by `(machine_key, tool)` is what makes create-vs-focus separable, mirroring
 `ensure_local_managed_cli_for_focus`.
 
+### ✅ Built in 3.0.66 — the REMOTE lane, live proof owed
+
+1. ✅ **`remote_managed_cli_tool_for` is the EXACT COMPLEMENT of
+   `local_managed_cli_tool_for`.** Between them every agent row is claimed by
+   exactly one provisioning lane — `every_agent_row_is_provisioned_by_exactly_one_lane`
+   asserts the partition over all nine agent kinds × six row arms, so neither a
+   gap (a row nobody provisions — this bug) nor an overlap (a remote row paying
+   for a local `<cli> --version` per focus) can reopen as row kinds grow.
+2. ✅ **The machine comes from `session.ssh_target`, and that was MEASURED, not
+   assumed.** It is the exact input `machine_key_from_ssh_target` →
+   `remote_target_for_machine_key` consume, so it round-trips to the target that
+   made the row. `host_label` is `SshConnectTarget::label`, a DISPLAY string read
+   elsewhere through the looser `machine_key_from_labelish`, and it coincides
+   only on fleets whose labels equal their ssh aliases. Live daemon snapshot:
+   **32 of 32 `LiveSsh` rows carried a non-null `ssh_target`; zero nulls.** All
+   seven non-test `LiveSsh` birth sites set it.
+3. ✅ **The ensure is cached per `(machine_key, tool)`**, so only the FIRST launch
+   of a CLI on a machine costs an ssh hop and every focus inside the TTL costs
+   nothing — create-vs-focus separated without plumbing an "is this a create"
+   flag through the funnel.
+4. ⭐ **The local lane's negative-cache rule DOES NOT TRANSFER, and copying it
+   would have been the regression.** `managed_cli_focus_cache_entry_is_fresh` is
+   `available && …` — locally a negative is never cached, which is right when a
+   miss is a filesystem stat and the install is kicked to a thread. Remotely a
+   miss is an SSH ROUND TRIP, so an uncached negative charges one on EVERY focus
+   of a row whose CLI is missing — the ~85-910 ms regression, on the machine
+   where it hurts most. Two TTLs instead: 6 h for present, 60 s retry for absent.
+   `a_missing_remote_cli_is_cached_so_focus_never_pays_per_click` locks it, and
+   goes red when the local rule is pasted in.
+5. ⭐ **The install runs in the BACKGROUND, and the brief's "foreground" was
+   refuted by measurement.** The funnel is `&mut self` on the daemon's request
+   path, so an unbounded foreground ensure would stall every other row on the
+   machine for a whole first-run npm install; a *bounded* one would `kill()` that
+   install mid-flight and leave a half-written npm tree. It therefore mirrors
+   `spawn_background_managed_cli_refresh`, deduped per `(machine_key, tool)`.
+6. ✅ **Provisioning cannot fail a launch.** `ensure_remote_managed_cli_for_session_path`
+   returns `()`, not `Result`: a briefly unreachable host yields a warning and a
+   60 s negative entry, never a dead row.
+
 **What is still owed:**
 
-- ⛔ **The wiring above is DESIGNED AND UNBUILT.** Root cause is settled and
-  live-proven; no code has landed on the remote lane.
+- ⛔ **LIVE PROOF.** The wiring is built and unit-locked; it has not yet been
+  exercised end to end against a host with the CLI genuinely absent.
 - ⚠ **A second, smaller gap sits behind it, now MEASURED rather than assumed.**
   The remote binaries are 3.0.64 and 3.0.62, so their `ensure_local_managed_cli`
   predates 3.0.65's per-method dispatch. Run by hand against both remotes:
@@ -1068,6 +1107,31 @@ keyed by `(machine_key, tool)` is what makes create-vs-focus separable, mirrorin
   new bytes anywhere. The lane being dead for npm CLIs too is what makes the
   wiring the first fix and the distribution the second.
 
+- ⚠ **RE-MEASURED 2026-08-08, and the inherited baseline was wrong twice.**
+  Probed BY FILE across the launch-parity dirs on every remote machine the
+  daemon knows, not just the two that had been looked at:
+
+  | machine | yggterm | carries |
+  |---|---|---|
+  | integrator | **3.0.65** (not 3.0.64 as recorded) | codex claude agy qwen pi opencode |
+  | workshop | 3.0.62 | codex claude agy qwen pi opencode |
+  | two further hosts | 3.0.62 | codex claude agy **only** |
+
+  ⇒ **There are FOUR remote machines in the registry, not two.** The two that
+  were never hand-touched still lack all six new CLIs, so they are the clean
+  falsifier targets — and being 3.0.62 they can still install the npm three
+  without any remote deploy at all. The integrator being 3.0.65 also means the
+  uv half is testable there TODAY.
+
+- ⛔ **yggterm bootstraps a MISSING remote binary; it never upgrades a STALE
+  one** — which is why remote hosts sit at whatever version first bootstrapped
+  them. `resolve_remote_yggterm_binary` caches per `local_build_id`, but the
+  revalidation it runs is `check_remote_protocol_version` — a PROTOCOL check.
+  A remote at 3.0.62 whose protocol still matches is accepted and never
+  re-uploaded, so a release with new provisioning behaviour does not reach it.
+  This is a distinct defect from the lane wiring and is what the uv/vendor half
+  is actually blocked on.
+
 ⚠ **STATE CHANGED ON TWO REMOTE HOSTS, 2026-08-08 — declared, not hidden.** The
 by-hand `ensure-managed-cli` falsifier installed `qwen`, `pi` and `opencode` on
 both the integrator and the workshop. They now carry 6 of the 8 (`codex`,
@@ -1075,16 +1139,23 @@ both the integrator and the workshop. They now carry 6 of the 8 (`codex`,
 table). A later session must not read those hosts as pristine, and must not read
 the presence of those three as evidence that the lane works — **it does not; a
 human ran the verb.**
-- ⛔ **Live proof on jojo** per the falsifier below — `command -v` read on the
-  host itself, not an echo of the launch.
+- ⛔ **Live proof on jojo** per the falsifier below — read BY FILE on the host
+  itself, not an echo of the launch.
 
 ⚠ Scope word he used: **"all connected systems including localhost"**. Localhost
 is named because the local path and the remote-provisioning path are different
 code, and a fix proven on one is not proven on the other.
 
 ⚠ Falsifier for a fix (do not accept an echo): on a host with `muse` absent,
-launch a Muse row and then read `command -v muse` **on that host** — plus
+launch a Muse row and then read the binary **BY FILE on that host** — plus
 `~/.config/muse/auth.json` presence to tell "installed" from "authenticated".
+
+⛔⛔ **DO NOT use `command -v <cli>` over `ssh host 'cmd'` — it is a BLIND
+INSTRUMENT, measured 2026-08-08.** A non-interactive ssh runs no login shell, so
+`PATH` omits both `~/.local/bin` and `~/.yggterm/npm/bin`; it reported every CLI
+ABSENT on a host that was carrying three. Test each launch-parity directory as a
+FILE instead. This is the same root as 3.0.65's `probe_tool` fix, one layer out —
+and it is why the line above no longer prescribes `command -v`.
 The existing 3.0.59 refusal-by-name will otherwise fail the row cleanly and look
 like correct behaviour.
 

@@ -174,7 +174,7 @@ pub use terminal::{
 use anyhow::Context;
 use codex_cli::{
     ManagedCliAction, ManagedCliRefreshReport, best_effort_cwd_shell_prefix,
-    ensure_local_managed_cli, ensure_local_managed_cli_for_focus,
+    current_time_ms, ensure_local_managed_cli, ensure_local_managed_cli_for_focus,
     local_agent_cli_missing_binary_refusal, managed_cli_shell_command, managed_cli_shell_command_full,
     managed_cli_shell_command_with_terminal_appearance,
     refresh_local_managed_cli,
@@ -6854,6 +6854,70 @@ impl YggtermServer {
                 install_deferred: false,
             },
         )))
+    }
+
+    /// The remote machine and the ONE CLI a session will provision there, or
+    /// `None` when this row's CLI is not the remote lane's business.
+    ///
+    /// ⭐ The machine comes from `session.ssh_target`, NOT `host_label`.
+    /// `ssh_target` is the exact input `machine_key_from_ssh_target` →
+    /// `remote_target_for_machine_key` consume, so it round-trips back to the
+    /// target that created the row; `host_label` is a DISPLAY string
+    /// (`SshConnectTarget::label`) that merely coincides with it on fleets whose
+    /// labels happen to equal their ssh aliases, and is read elsewhere through a
+    /// looser `machine_key_from_labelish` rule. Live-measured on the daemon
+    /// 2026-08-08: 32 of 32 `LiveSsh` rows carried a non-null `ssh_target`.
+    ///
+    /// A row whose `ssh_target` is missing is deliberately left unprovisioned
+    /// rather than reconstructed from its `remote-*://` path — the path is
+    /// BUILT from the machine key, so parsing it back would be a second encoding
+    /// of the same fact, free to drift from the first.
+    fn remote_managed_cli_target_for_session_path(
+        &self,
+        path: &str,
+    ) -> Option<(String, ManagedCliTool)> {
+        let key = self.resolve_session_storage_key(path)?;
+        let session = self.sessions.get(key)?;
+        let tool = remote_managed_cli_tool_for(path, session.source, session.kind)?;
+        let ssh_target = session.ssh_target.as_deref()?.trim();
+        if ssh_target.is_empty() {
+            return None;
+        }
+        Some((machine_key_from_ssh_target(ssh_target), tool))
+    }
+
+    /// Provision this row's CLI on the machine that will actually exec it.
+    ///
+    /// The remote half of the owner's ruling that yggterm "auto install, update
+    /// ALL clis in all connected systems". The local half runs in
+    /// `ensure_managed_cli_for_session_path` above; this one exists because the
+    /// background machine refresh that was supposed to cover remotes is
+    /// structurally forbidden from installing (it defers on
+    /// `YGGTERM_MANAGED_CLI_BACKGROUND_INSTALL`, default false), so remote
+    /// toolchains never actually became current the way
+    /// `local_managed_cli_tool_for`'s comment claimed.
+    ///
+    /// ⛔ Returns `()`, not `Result`, ON PURPOSE: provisioning is best effort and
+    /// must never convert a launch on a briefly unreachable host into a refusal.
+    /// A failure is a warning plus a short-lived negative cache entry, never a
+    /// dead row.
+    pub fn ensure_remote_managed_cli_for_session_path(&self, path: &str) {
+        let Some((machine_key, tool)) = self.remote_managed_cli_target_for_session_path(path)
+        else {
+            return;
+        };
+        let now_ms = current_time_ms();
+        if let Ok(cache) = remote_managed_cli_ensure_cache().lock()
+            && let Some((available, cached_at_ms)) =
+                cache.get(&(machine_key.clone(), tool.binary_name()))
+            && remote_managed_cli_ensure_entry_is_fresh(*available, *cached_at_ms, now_ms)
+        {
+            return;
+        }
+        let Ok(target) = self.remote_target_for_machine_key(&machine_key) else {
+            return;
+        };
+        spawn_remote_managed_cli_ensure(machine_key, target.ssh_target, target.prefix, tool);
     }
 
     pub fn refresh_managed_cli(
@@ -18274,6 +18338,155 @@ fn refresh_remote_managed_cli(
         .with_context(|| format!("parsing remote managed cli refresh report for {ssh_target}"))
 }
 
+/// Provision ONE managed CLI on ONE remote machine, by invoking the verb the
+/// remote binary already routes (`remote_cli.rs` → `run_remote_ensure_managed_cli`
+/// → `ensure_local_managed_cli`). Unlike the machine-wide
+/// `refresh-managed-cli`, this is scoped to the single tool the row being
+/// launched will actually exec, so a launch never pays for the other eight.
+fn ensure_remote_managed_cli(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    tool: ManagedCliTool,
+) -> anyhow::Result<ManagedCliToolStatus> {
+    let output = run_remote_yggterm_command(
+        ssh_target,
+        exec_prefix,
+        &["server", "remote", "ensure-managed-cli", tool.binary_name()],
+        None,
+    )?;
+    serde_json::from_str(output.trim())
+        .with_context(|| format!("parsing remote managed cli ensure status for {ssh_target}"))
+}
+
+/// How long a CONFIRMED-present remote CLI stays cached before the launch path
+/// asks that machine again. Long on purpose: a CLI that is installed does not
+/// disappear, and every miss here costs an SSH ROUND TRIP.
+const REMOTE_MANAGED_CLI_ENSURE_TTL_MS: u64 = 6 * 60 * 60_000;
+
+/// How long an ABSENT-or-failed answer stays cached.
+///
+/// ⛔ The local twin (`managed_cli_focus_cache_entry_is_fresh`) is
+/// `available && …` — it deliberately never caches a negative, so an absent CLI
+/// is re-probed on every focus. **That rule must NOT be copied here.** Locally a
+/// miss is a filesystem stat; remotely it is an ssh round trip, so an uncached
+/// negative would charge one on EVERY focus of a row whose CLI is missing —
+/// which is the ~85-910 ms-per-focus regression `local_managed_cli_tool_for`
+/// documents, landing on the one machine where it is worst. A short retry TTL
+/// keeps a genuinely fresh install discoverable without ever billing the focus
+/// path per click.
+const REMOTE_MANAGED_CLI_ENSURE_FAILURE_TTL_MS: u64 = 60_000;
+
+/// Whether a cached remote-ensure answer may still be trusted. Two TTLs, because
+/// "it is there" and "it is not there yet" decay at very different rates.
+fn remote_managed_cli_ensure_entry_is_fresh(
+    available: bool,
+    cached_at_ms: u64,
+    now_ms: u64,
+) -> bool {
+    let ttl = if available {
+        REMOTE_MANAGED_CLI_ENSURE_TTL_MS
+    } else {
+        REMOTE_MANAGED_CLI_ENSURE_FAILURE_TTL_MS
+    };
+    now_ms.saturating_sub(cached_at_ms) < ttl
+}
+
+type RemoteManagedCliEnsureCache = Mutex<HashMap<(String, &'static str), (bool, u64)>>;
+
+/// `(machine_key, tool)` -> (available, cached_at_ms).
+///
+/// ⭐ The key is what makes create-vs-focus separable WITHOUT plumbing an "is
+/// this a create" flag down the attach funnel: the first launch of a tool on a
+/// machine misses and provisions, every focus afterwards hits and costs nothing.
+fn remote_managed_cli_ensure_cache() -> &'static RemoteManagedCliEnsureCache {
+    static CACHE: OnceLock<RemoteManagedCliEnsureCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remote_managed_cli_ensure_inflight() -> &'static Mutex<HashSet<(String, &'static str)>> {
+    static INFLIGHT: OnceLock<Mutex<HashSet<(String, &'static str)>>> = OnceLock::new();
+    INFLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Run the remote ensure on a detached thread so it NEVER blocks the attach.
+///
+/// ⛔ This is background rather than foreground for a measured reason, and the
+/// two obvious alternatives are both worse:
+/// - **Unbounded foreground** would hold `&mut self` on the daemon's request
+///   path (`ensure_terminal_for_path_with_initial_size_and_seed`) for the whole
+///   of a first-run npm install, stalling every other row on the machine.
+/// - **Bounded foreground** would `kill()` that install mid-flight when the
+///   bound expired, leaving a half-written npm tree behind — worse than not
+///   having tried.
+///
+/// So it mirrors `spawn_background_managed_cli_refresh`, which is how the LOCAL
+/// lane already resolved this exact tension: return immediately, install off the
+/// hot path, prime the cache on the way out so the next launch is instant.
+/// Deduped per `(machine_key, tool)` so a burst of clicks is one ssh, not ten.
+fn spawn_remote_managed_cli_ensure(
+    machine_key: String,
+    ssh_target: String,
+    exec_prefix: Option<String>,
+    tool: ManagedCliTool,
+) {
+    let cache_key = (machine_key.clone(), tool.binary_name());
+    {
+        let Ok(mut inflight) = remote_managed_cli_ensure_inflight().lock() else {
+            return;
+        };
+        if !inflight.insert(cache_key.clone()) {
+            return;
+        }
+    }
+    std::thread::spawn(move || {
+        let result = ensure_remote_managed_cli(&ssh_target, exec_prefix.as_deref(), tool);
+        let available = match &result {
+            Ok(status) => status.available,
+            Err(error) => {
+                warn!(
+                    machine_key = %machine_key,
+                    ssh_target = %ssh_target,
+                    tool = tool.binary_name(),
+                    error = %error,
+                    "remote managed cli ensure failed"
+                );
+                false
+            }
+        };
+        if let Ok(mut cache) = remote_managed_cli_ensure_cache().lock() {
+            cache.insert(cache_key.clone(), (available, current_time_ms()));
+        }
+        if let Ok(mut inflight) = remote_managed_cli_ensure_inflight().lock() {
+            inflight.remove(&cache_key);
+        }
+    });
+}
+
+/// Which REMOTE managed CLI a session will exec on the machine that owns it, or
+/// `None` when the CLI runs HERE (the local lane owns that row) or the row has
+/// no CLI at all.
+///
+/// ⭐ This is the EXACT COMPLEMENT of `local_managed_cli_tool_for`'s refusals,
+/// and deliberately so: between the two, every agent row is owned by exactly one
+/// provisioning lane, and neither a gap nor an overlap can open up as the row
+/// kinds grow. The three arms that function returns `None` for — a
+/// `remote-session://` row, a `remote-cc://` row, and any `LiveSsh` row (how all
+/// six new CLIs are born) — are precisely the ones whose CLI must be provisioned
+/// on the other machine instead. Its doc comment promised that "background
+/// machine refreshes keep the remote toolchains current"; they did not, because
+/// the background lane is structurally forbidden from installing, which is the
+/// hole this function closes.
+fn remote_managed_cli_tool_for(
+    path: &str,
+    source: SessionSource,
+    kind: SessionKind,
+) -> Option<ManagedCliTool> {
+    if session_path_uses_local_managed_cli(path) && source != SessionSource::LiveSsh {
+        return None;
+    }
+    ManagedCliTool::from_session_kind(kind)
+}
+
 /// SSH-invoked on the remote machine: append a Claude Code `custom-title`
 /// (user rename) to the session's JSONL there, using the same core helper the
 /// local rename path uses. The write-back half of yggterm's CC rename
@@ -27614,6 +27827,109 @@ mod tests {
         assert!(super::session_path_uses_local_managed_cli(
             "cc-runtime://8466ad90-f807-4f4d-bff9-d9cf71753c90"
         ));
+    }
+
+    // Every agent row belongs to EXACTLY ONE provisioning lane. The remote
+    // chooser is written as the exact complement of the local one's three
+    // refusals, so this asserts the partition rather than re-listing the arms:
+    // a gap means a row nobody provisions (the six new CLIs' bug — a remote
+    // `pi` row was refused locally because the GUI host has no `pi`, and the
+    // background refresh that was supposed to cover it cannot install), and an
+    // overlap means a remote row paying for a pointless LOCAL `<cli> --version`
+    // on every focus (~85-910ms, the regression the local exemption exists for).
+    #[test]
+    fn every_agent_row_is_provisioned_by_exactly_one_lane() {
+        use super::SessionKind::*;
+        let agent_kinds = [
+            Codex,
+            CodexLiteLlm,
+            ClaudeCode,
+            Pi,
+            OpenCode,
+            QwenCode,
+            Kimi,
+            Muse,
+            Antigravity,
+        ];
+        let arms = [
+            ("local://a1b2c3d4", super::SessionSource::LiveLocal),
+            ("cc-runtime://a1b2c3d4", super::SessionSource::LiveLocal),
+            ("live::a1b2c3d4", super::SessionSource::LiveSsh),
+            ("remote-cc://buildbox/a1b2c3d4", super::SessionSource::LiveSsh),
+            (
+                "remote-session://buildbox/a1b2c3d4",
+                super::SessionSource::LiveSsh,
+            ),
+            (
+                "remote-session://buildbox/a1b2c3d4",
+                super::SessionSource::Stored,
+            ),
+        ];
+        for kind in agent_kinds {
+            for (path, source) in arms {
+                let local = local_managed_cli_tool_for(path, source, kind);
+                let remote = super::remote_managed_cli_tool_for(path, source, kind);
+                assert_ne!(
+                    local.is_some(),
+                    remote.is_some(),
+                    "{path} ({source:?}, {kind:?}) must be claimed by exactly one lane, \
+                     got local={local:?} remote={remote:?}"
+                );
+            }
+        }
+        // A row with no CLI to be missing is claimed by NEITHER lane, on either
+        // side of the split — a shell must never trigger an ssh provision.
+        for kind in [Shell, SshShell, Document] {
+            for (path, source) in arms {
+                assert!(local_managed_cli_tool_for(path, source, kind).is_none());
+                assert!(super::remote_managed_cli_tool_for(path, source, kind).is_none());
+            }
+        }
+    }
+
+    // ⛔ The remote lane MUST cache a negative; the local lane deliberately does
+    // not. Locally a miss is a filesystem stat, so re-probing every focus is
+    // free. Remotely a miss is an SSH ROUND TRIP, so copying the local rule
+    // would charge one on every single focus of a row whose CLI is missing —
+    // exactly the per-focus regression the local exemption was written to stop,
+    // landing on the machine where it hurts most. Two TTLs, and the short one
+    // still has to be a real cache.
+    #[test]
+    fn a_missing_remote_cli_is_cached_so_focus_never_pays_per_click() {
+        let now = 10_000_000_u64;
+        // Present: trusted for a long time — an installed CLI does not vanish.
+        assert!(super::remote_managed_cli_ensure_entry_is_fresh(true, now, now));
+        assert!(super::remote_managed_cli_ensure_entry_is_fresh(
+            true,
+            now,
+            now + super::REMOTE_MANAGED_CLI_ENSURE_TTL_MS - 1
+        ));
+        assert!(!super::remote_managed_cli_ensure_entry_is_fresh(
+            true,
+            now,
+            now + super::REMOTE_MANAGED_CLI_ENSURE_TTL_MS
+        ));
+        // Absent: STILL CACHED (this is the clause that differs from the local
+        // twin), but on a much shorter TTL so a fresh install is discoverable.
+        assert!(super::remote_managed_cli_ensure_entry_is_fresh(
+            false, now, now
+        ));
+        assert!(super::remote_managed_cli_ensure_entry_is_fresh(
+            false,
+            now,
+            now + super::REMOTE_MANAGED_CLI_ENSURE_FAILURE_TTL_MS - 1
+        ));
+        assert!(!super::remote_managed_cli_ensure_entry_is_fresh(
+            false,
+            now,
+            now + super::REMOTE_MANAGED_CLI_ENSURE_FAILURE_TTL_MS
+        ));
+        // A negative must expire STRICTLY sooner than a positive, or a machine
+        // that was briefly unreachable stays written off for hours.
+        assert!(
+            super::REMOTE_MANAGED_CLI_ENSURE_FAILURE_TTL_MS
+                < super::REMOTE_MANAGED_CLI_ENSURE_TTL_MS
+        );
     }
 
     // Keep-alive parity: remote-cc:// (Claude Code) is the twin of
