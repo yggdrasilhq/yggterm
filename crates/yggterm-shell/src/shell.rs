@@ -37598,10 +37598,15 @@ fn spawn_launch_app_verb(
 ) {
     let command = app.command_for(&verb);
     let title_hint = verb.label.clone();
-    // The row's `Source` metadata — the one place a row says WHICH app it is.
-    // The registry key, not the display label: it is the name the manifest is
-    // filed under and the only stable identifier an app has.
-    let source_label = format!("app:{}", app.name);
+    // The row's `Source` metadata — the one place a row says WHICH app it is,
+    // and the SAME `app:<name>:<verb>` token every launcher menu speaks
+    // (`app_verb_token_parts` is its one parser). Registry key, not display
+    // label: it is the name the manifest is filed under and the only stable
+    // identifier an app has. ⛔ The VERB belongs in it: this stamp is what the
+    // daemon persists and re-derives the row's command from across a restart,
+    // and a token naming only the app would have to guess which verb the row
+    // was — silently changing what it runs.
+    let source_label = format!("app:{}:{}", app.name, verb.id);
     let pending = format!("starting {}", verb.label);
     let terminal_appearance =
         state.with(|shell| shell.effective_terminal_identity_appearance().to_string());
@@ -74026,6 +74031,103 @@ async fn process_pending_app_control_requests(
                     "dom": dom_snapshot,
                     "state": state_snapshot,
                 })),
+                error: None,
+            }
+        }
+        // ⛔ THE SAME OWNER EVERY LAUNCHER SURFACE USES. `spawn_launch_app_verb`
+        // is what the titlebar `+`, the cwd-tree row menu and the start page all
+        // call, so an agent's launch is the same event as a human's — and the
+        // app-launch path becomes testable at all, which it was not: an app row
+        // could only ever be created by a pointer click on a menu.
+        AppControlCommand::LaunchApp {
+            app,
+            verb,
+            cwd,
+            insert_after,
+        } => {
+            // Resolved against the registry of the machine the launch will run
+            // on, exactly as `resolve_app_verb_for_row` insists — a name matched
+            // against the GUI host's registry instead is a launcher that lies
+            // about having launched.
+            let resolved = state.with(|shell| {
+                let apps = app_registry_for_launch_anchor(
+                    shell,
+                    None,
+                    shell.server.active_session_path(),
+                );
+                apps.iter().find(|entry| entry.name == *app).and_then(|entry| {
+                    let chosen = match verb.as_deref() {
+                        // No verb named = the app's FIRST, which is the one a
+                        // menu shows first.
+                        None => entry.verbs.first(),
+                        Some(id) => entry.verbs.iter().find(|candidate| candidate.id == id),
+                    }?;
+                    Some((entry.clone(), chosen.clone()))
+                })
+            });
+            let (accepted, reason, launched_verb, launch_command) = match resolved {
+                Some((manifest, verb)) => {
+                    let command = manifest.command_for(&verb);
+                    let verb_id = verb.id.clone();
+                    let launch_context = launch_context_for_optional_row(
+                        state,
+                        insert_after.as_ref().and_then(|path| {
+                            state.with(|shell| {
+                                shell
+                                    .snapshot()
+                                    .rows
+                                    .iter()
+                                    .find(|row| row.full_path == *path)
+                                    .cloned()
+                            })
+                        }),
+                    );
+                    spawn_launch_app_verb(
+                        state,
+                        manifest,
+                        verb,
+                        launch_context,
+                        insert_after.clone(),
+                    );
+                    (true, None, Some(verb_id), Some(command))
+                }
+                None => (
+                    false,
+                    Some(format!(
+                        "no app verb for {app}{}",
+                        verb.as_deref()
+                            .map(|id| format!(":{id}"))
+                            .unwrap_or_default()
+                    )),
+                    None,
+                    None,
+                ),
+            };
+            // The launch is a spawned server action, so the row is not born by
+            // the time this returns. Settle before snapshotting, then report
+            // what the ROW was actually born with — the same rule the create
+            // reply follows, and the only way a version-skewed owner shows up
+            // as a mismatch rather than as silence.
+            sleep(Duration::from_millis(700)).await;
+            let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
+            if let Some(shell) = state_snapshot.get_mut("shell").and_then(Value::as_object_mut) {
+                shell.insert(
+                    "launch_app".to_string(),
+                    json!({
+                        "app": app,
+                        "verb": launched_verb,
+                        "accepted": accepted,
+                        "reason": reason,
+                        "launch_command": launch_command,
+                    }),
+                );
+            }
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(state_snapshot),
                 error: None,
             }
         }
