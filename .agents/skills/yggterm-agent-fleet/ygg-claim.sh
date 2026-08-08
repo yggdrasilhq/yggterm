@@ -74,7 +74,15 @@ done
 
 ygg() {  # run an app-control verb wherever the GUI actually lives
   if [ -n "$HOST" ] && [ "$HOST" != "$(hostname)" ]; then
-    ssh "$HOST" "\$HOME/.yggterm/bin/yggterm $*" 2>/dev/null
+    # ⛔ QUOTE EVERY ARGUMENT FOR THE REMOTE SHELL. `ssh host "cmd $*"` hands the
+    # far side ONE string which it re-splits on whitespace, so a multi-word title
+    # arrives as several arguments and `rename` silently takes only the first —
+    # a row asked for "topic: the long name" ends up titled "topic:". It looks
+    # exactly like the CLI re-titling itself, which is the wrong diagnosis and
+    # sends you hunting a defect in the app instead of in your own quoting.
+    local q="" a
+    for a in "$@"; do q="$q $(printf '%q' "$a")"; done
+    ssh "$HOST" "\$HOME/.yggterm/bin/yggterm$q" 2>/dev/null
   else
     "$BIN" "$@" 2>/dev/null
   fi
@@ -116,8 +124,15 @@ pred=next((r for r in sess if rep and rep in (r.get("full_path") or "") and uuid
 # siblings = other rows already numbered, so we can pick a number that is free
 def title(r): return (r.get("session_title") or r.get("label") or "")
 def num(r):
-    m=re.match(r"^\s*(\d+)(?:\.(\d+))?",title(r))
-    return (int(m.group(1)),int(m.group(2)) if m.group(2) else None) if m else None
+    # Prefer the STORED seat. Falling back to the title is only for rows that
+    # predate seat/title separation and still carry their number in the name —
+    # and it is why this must not read the title first: once a row is seated
+    # properly its title has no number at all, and a title-first parser would
+    # conclude the row is unseated and hand out a duplicate.
+    for src in (r.get("outline_prefix") or "", title(r)):
+        m=re.match(r"^\s*(\d+)(?:\.(\d+))?",str(src))
+        if m: return (int(m.group(1)), int(m.group(2)) if m.group(2) else None)
+    return None
 def isme(r):  return uuid in (r.get("full_path") or "")
 def ispred(r):return bool(pred) and r.get("full_path")==pred.get("full_path")
 others=[r for r in sess if not isme(r) and not ispred(r)]
@@ -154,12 +169,15 @@ print("PRED_LABEL="+((pred.get("session_title") or pred.get("label") or "") if p
 case "$PLAN" in ERR*) echo "ygg-claim: ${PLAN#ERR }" >&2; exit 2 ;; esac
 eval "$(printf '%s\n' "$PLAN" | grep -E '^(MINE|MINE_LABEL|NUM|PRED|PRED_LABEL)=' | sed 's/=/="/; s/$/"/')"
 
-# Seat formatting follows the sidebar's own convention: a top-level seat takes a
-# trailing dot ("4. topic"), a sub-seat does not ("5.1 topic").
-case "$NUM" in
-  *.*) FINAL_TITLE="${NUM} ${TITLE}" ;;
-  *)   FINAL_TITLE="${NUM}. ${TITLE}" ;;
-esac
+# ⛔ THE SEAT DOES NOT GO IN THE TITLE. It goes in `session outline`, which stores
+# it SEPARATELY and composes the label at render time:
+#     outline_prefix "4" + session_title "topic: …"  ->  label "4 topic: …"
+# Verified 2026-08-08 by reading all three fields back. This matters because the
+# CLI composes its OWN title at a turn boundary: when the seat lives in the title,
+# a self-title destroys the number too and the row loses its place in the outline.
+# Held in `outline`, a self-title can only ever clobber the topic — the seat
+# survives, and the watch below restores the name.
+FINAL_TITLE="$TITLE"
 log "row      : $MINE"
 log "was      : $MINE_LABEL"
 log "claiming : $FINAL_TITLE"
@@ -168,36 +186,37 @@ log "claiming : $FINAL_TITLE"
 if [ "$DRY" = 1 ]; then log "dry run — nothing changed"; exit 0; fi
 
 # --- apply, then READ THE TITLE BACK. Never trust the verb's own field. -----
-assert_title() {
-  ygg server app session rename "$MINE" "$FINAL_TITLE" >/dev/null 2>&1
+read_state() {  # -> "<outline_prefix>\t<session_title>", straight from the row table
   rows_json | MINE="$MINE" python3 -c '
 import json,os,sys
 rows=json.load(sys.stdin)["data"]["rows"]
 r=next((x for x in rows if x.get("full_path")==os.environ["MINE"]),None)
-print((r.get("session_title") or r.get("label") or "") if r else "")' 2>/dev/null
+print(((r.get("outline_prefix") or "") + "\t" + (r.get("session_title") or "")) if r else "\t")' 2>/dev/null
+}
+assert_state() {
+  ygg server app session outline "$MINE" "$NUM"          >/dev/null 2>&1
+  ygg server app session rename  "$MINE" "$FINAL_TITLE"  >/dev/null 2>&1
+  read_state
 }
 GOT=""
 for attempt in 1 2 3; do
-  GOT="$(assert_title)"
-  [ "$GOT" = "$FINAL_TITLE" ] && break
+  GOT="$(assert_state)"
+  [ "$GOT" = "$(printf '%s\t%s' "$NUM" "$FINAL_TITLE")" ] && break
   sleep 3
 done
-[ "$GOT" = "$FINAL_TITLE" ] || { echo "ygg-claim: rename never verified (row still reads: $GOT)" >&2; exit 3; }
-log "claimed and verified by read-back: $FINAL_TITLE"
+[ "$GOT" = "$(printf '%s\t%s' "$NUM" "$FINAL_TITLE")" ] || {
+  echo "ygg-claim: claim never verified (row reads: $(printf '%s' "$GOT" | tr '\t' '|'))" >&2; exit 3; }
+log "claimed and verified by read-back: seat=$NUM title=$FINAL_TITLE"
 
 # The CLI composes its own title when its first turn ends and will clobber this.
 # Re-assert in the background for a while rather than assuming one write holds.
 if [ "${WATCH:-0}" -gt 0 ]; then
+  WANT="$(printf '%s\t%s' "$NUM" "$FINAL_TITLE")"
   ( for _ in $(seq 1 $((WATCH/10)) ); do
       sleep 10
-      cur="$(rows_json | MINE="$MINE" python3 -c '
-import json,os,sys
-rows=json.load(sys.stdin)["data"]["rows"]
-r=next((x for x in rows if x.get("full_path")==os.environ["MINE"]),None)
-print((r.get("session_title") or r.get("label") or "") if r else "")' 2>/dev/null)"
-      [ "$cur" = "$FINAL_TITLE" ] || ygg server app session rename "$MINE" "$FINAL_TITLE" >/dev/null 2>&1
+      [ "$(read_state)" = "$WANT" ] || assert_state >/dev/null
     done ) >/dev/null 2>&1 &
-  log "watching the title for ${WATCH}s (the CLI self-titles at first-turn end)"
+  log "watching seat+title for ${WATCH}s (the CLI self-titles at first-turn end)"
 fi
 
 # --- retire the predecessor, and REAP IT YOURSELF --------------------------

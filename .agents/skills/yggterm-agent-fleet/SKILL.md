@@ -441,6 +441,24 @@ done
 alive. **Never use a count as proof of life or death** — identify each candidate
 and check its cmdline. `ygg-claim.sh --replace` does all of this for you.
 
+### ⚖ Before blaming the verb, check your own transport
+
+App control answers only on the host where the GUI process runs, so an agent on
+any other host reaches it over ssh — and **`ssh host "yggterm $*"` hands the far
+side ONE string, which the remote shell re-splits on whitespace.** A multi-word
+title therefore arrives as several arguments and `rename` takes only the first:
+ask for `"topic: the long name"` and the row comes back titled `topic:`.
+
+**That looks exactly like the CLI re-titling itself**, and it is not. Measured
+2026-08-08: the same rename, sent with each argument quoted, held indefinitely;
+sent unquoted it truncated every time. The wrong diagnosis sends you hunting a
+defect in the application while your own helper corrupts every call it makes.
+
+⇒ **Quote each argument for the remote shell** (`printf '%q'`), and when a verb
+"misbehaves", reproduce it with the simplest possible direct invocation before
+concluding anything about the verb. ⚖ Hold your own theory to the falsification
+bar you would demand of anyone else's.
+
 ### A quiet row is not necessarily an idle row
 
 Three distinct failures all look like *"the row is idle"*, and each needs a
