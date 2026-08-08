@@ -9,11 +9,21 @@ and referenced from here.
 says the answer changed.
 
 
-## ★★ `codex-litellm` IS NOT A CLI — IT IS A CODEX SESSION'S FLIP SWITCH (2026-08-08)
+## ★★ `codex-anything` IS NOT A CLI — IT IS A CODEX SESSION'S FLIP SWITCH (2026-08-08)
 
 **Settled by the user, verbatim:** *"we should not have codex-litellm as another
 CLI. It is a special codex session flip switch to codex-litellm (which I will
 later rename to codex-anything). It is a codex ONLY sessions superpower."*
+
+⛔ **THE NAME IS LOCKED — same day, second directive:** *"Everywhere start
+referencing codex-litellm as codex-anything from now on. The name is locked but
+the repo and binary is still called codex-litellm."*
+⇒ **`codex-anything` is the name in every surface a human reads** — UI labels,
+docs, specs, commit messages, this file. **`codex-litellm` survives only as an
+identifier**: the repo, the binary at `~/.yggterm/npm/bin/codex-litellm`, the
+provider key in `~/.codex/config.toml` (`[model_providers.litellm]`), and any
+path or package name. ⛔ Do not rename the binary to chase the label, and do not
+let the label leak back into an identifier — that is how one thing becomes two.
 
 ⇒ It is **not** a first-class agent CLI, it gets **no** row in the
 `Open Session Here ▸` submenu, **no** icon of its own, and **no** row in the
@@ -27,9 +37,9 @@ binary at `~/.yggterm/npm/bin/codex-litellm` on every host. Removing it from the
 kind list without removing the capability is the work; it is filed in
 [`pending-bugs.md`](pending-bugs.md).
 
-⚖ The rename to `codex-anything` is **his to make, later** — do not pre-empt it,
-and do not build a name-agnostic abstraction on the strength of a rename that
-has not happened.
+⚖ The flip belongs to the codex session's own surface: a **codex ↔ Anything**
+slider in settings (`spec-settings-model-providers.md`), never a separate row in
+the session menu.
 
 ## ★★★ NO REPO MAY CARRY TWO LICENCE CLAIMS, AND GADGETS GATES GOING PUBLIC (2026-08-07)
 
