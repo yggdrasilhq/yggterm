@@ -231,6 +231,58 @@ in the composer, as the delegate's opening message. So:
 - **Never treat "not ready" as "nothing happened".**
 - **Never spawn and walk away.** Which is what the next section is for.
 
+### ⛔⛔ A FINISHED DELEGATE AND A STALLED ONE LOOK IDENTICAL — run `ygg-babysit.py`
+
+**Owner-reported 2026-08-08, and it halted a live pipeline:** *"I am seeing that they both
+stopped. So this is a monitor/relay system bug and should be resolved. These yggterm fleet kinks
+should be seen, 'dreamt' of it and then auto-resolved whenever encountered by any agent."*
+
+**Measured that hour.** Two delegates spawned together. One had **landed its entire subset**; the
+other had **ended its turn after acknowledging the brief** and sat idle for **54 minutes**. From
+`server app rows` the two are indistinguishable — both are "alive, nothing happening". The
+orchestrator cannot tell success from a halted pipeline, and the stall is found only when a human
+notices.
+
+⇒ **`rows` reports EXISTENCE, not LIVENESS**, and an agent-CLI sits at its prompt forever. This is
+the same family as everything else in §7: *silence is the most dangerous value a status can take.*
+
+```sh
+# after spawning, record who you spawned:
+printf '%s\n' "$ROW_A" "$ROW_B" > ~/.yggterm/relay/spawned-by-$YGGTERM_SESSION_UUID.txt
+
+.agents/skills/yggterm-agent-fleet/ygg-babysit.py --spawned-by <my-uuid>            # one pass
+.agents/skills/yggterm-agent-fleet/ygg-babysit.py --spawned-by <my-uuid> --watch 1800   # keep watch
+.agents/skills/yggterm-agent-fleet/ygg-babysit.py --row <path> --dry-run            # classify only
+```
+
+**What it does, and the asymmetry that decides the design:** a spurious `continue` to a finished
+row costs **one cheap turn**; a missed stall costs **the pipeline until a human looks**. ⇒ when
+idle is ambiguous, NUDGE — bounded to `MAX_NUDGES=2`, then escalate and stop, so a finished row is
+never poked forever.
+
+| state | how it is decided | action |
+|---|---|---|
+| `WORKING` | last real turn is a `tool_use`/`tool_result`, fresh | none |
+| `JUST_ENDED` | turn ended < 4 min ago | none — let it be |
+| `IDLE` | turn ENDED and untouched ≥ 4 min | ⭐ **one `continue`** |
+| ⛔ `STUCK` | MID-TURN and untouched ≥ 15 min | **escalate, never nudge** — typing races its own input |
+| ⛔ `NO_TRANSCRIPT` | the JSONL never appeared | the brief was **dropped**: re-submit it |
+
+⛔ **It never nudges a mid-turn row.** And it classifies from the **last real turn** — system and
+hook rows are not turns, and treating the file's final line as the turn returns UNKNOWN for nearly
+every session.
+
+⚠ **Honest limits, so nobody over-trusts it:** the `STUCK` branch has **not** been exercised
+against a genuinely wedged row — only `WORKING`, `JUST_ENDED`, `IDLE→NUDGE` and `NO_TRANSCRIPT`
+were proven live. And a nudge's delivery is confirmed by **transcript GROWTH on the next pass**,
+never by `submitted:true`, which describes the write.
+
+⭐ **A defect caught in the tool itself, worth repeating because it is generic:** the first version
+incremented the nudge counter **under `--dry-run`**, so classifying a row twice burned its whole
+budget without sending anything and the next real pass would have escalated instead of nudged.
+**A dry run that mutates state is not a dry run** — an instrument whose observation changes what it
+observes.
+
 ### Arm a dead-man check on yourself
 
 After spawning, schedule your own wake-up a few minutes out. If you wake and the
