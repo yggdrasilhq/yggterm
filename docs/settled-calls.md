@@ -9,6 +9,39 @@ and referenced from here.
 says the answer changed.
 
 
+## ⛔⛔ yggterm AUTO-INSTALLS AND AUTO-UPDATES **EVERY** CLI, ON EVERY CONNECTED SYSTEM INCLUDING LOCALHOST (2026-08-08)
+
+**Settled by the owner, verbatim:** *"Trying to launch Muse CLI shows
+notification to install it. yggterm should auto install, update ALL clis in all
+connected systems including localhost."*
+
+**This overrides two standing design decisions, both of which must now change:**
+
+1. **`CliInstall::VendorScript` no longer means "record the URL and refuse".**
+   Its doc comment says *"yggterm records it so the provisioner can name what is
+   missing, and does NOT run it unattended"* — that clause is superseded. Muse
+   (`https://dev.meta.ai/install.sh`), and every other vendor-script CLI,
+   is to be installed automatically.
+2. **Muse is NO LONGER AN OWNER GATE.** `owner-attention.md` parked it as
+   needing his login first; he has now ruled that the INSTALL must happen
+   unattended. (A LOGIN may still be his — installing a CLI and authenticating
+   it are different acts — but the install must not wait on him.)
+
+**"update" is half the ruling and is the half with no code at all today.** The
+provisioner installs on demand at launch; nothing keeps an already-installed CLI
+current, on any host. Both verbs are owed, on **all connected systems including
+localhost** — localhost named explicitly because the fleet paths and the local
+path are different code today.
+
+⚠ **Stated once, not as an objection:** this makes yggterm pipe a vendor's
+`install.sh` from the internet, unattended, on every machine it touches. That is
+his call to make on his own fleet and it is made; the implementation should still
+prefer the CLI's own updater where one exists, keep every install USER-LOCAL (the
+existing `⛔ never sudo` rule is untouched), and record what it ran.
+
+Build state: [`pending-bugs.md`](pending-bugs.md) ▸ *AUTO-PROVISIONING…*.
+
+
 ## ★★ `codex-anything` IS NOT A CLI — IT IS A CODEX SESSION'S FLIP SWITCH (2026-08-08)
 
 **Settled by the user, verbatim:** *"we should not have codex-litellm as another
