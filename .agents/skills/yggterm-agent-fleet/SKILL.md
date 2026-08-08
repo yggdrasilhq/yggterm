@@ -272,10 +272,28 @@ never poked forever.
 hook rows are not turns, and treating the file's final line as the turn returns UNKNOWN for nearly
 every session.
 
-⚠ **Honest limits, so nobody over-trusts it:** the `STUCK` branch has **not** been exercised
-against a genuinely wedged row — only `WORKING`, `JUST_ENDED`, `IDLE→NUDGE` and `NO_TRANSCRIPT`
-were proven live. And a nudge's delivery is confirmed by **transcript GROWTH on the next pass**,
-never by `submitted:true`, which describes the write.
+✅ **All five branches are now proven live**, including `STUCK` — which fired within minutes of
+being written, on the **yggterm row itself**: mid-turn and untouched for 54 minutes, which is
+exactly why a `terminal submit` to it answered `{"submitted": false}` after a 30-second wait.
+⇒ **A wedged row REFUSES a submit, and that refusal is the one honest signal in the relay.** A
+nudge's delivery is otherwise confirmed by **transcript GROWTH on the next pass**, never by
+`submitted:true`.
+
+⛔⛔ **TWO BUGS CAUGHT BY DOGFOODING IT WITHIN A MINUTE OF WRITING IT** — both generic, both worth
+more than the tool:
+
+1. **It searched `~/.claude/projects` on the LOCAL host for every row.** A `local://<uuid>` row runs
+   on the GUI host, so its transcript is on *that* machine — and the tool reported `NO_TRANSCRIPT`
+   and announced *"the brief was dropped, re-submit it"* about a perfectly healthy session on
+   another box. ⇒ **"I looked in the wrong place" and "it is not there" are different facts**, and
+   this is the same *cause-not-derived-from-a-measurement* defect the whole fleet keeps re-finding.
+   Fixed: the row path names its host (`remote-cc://<host>/…`, `local://…` = the GUI host), the
+   probe runs WHERE THE TRANSCRIPT LIVES, and an unreadable host reports **`UNREACHABLE` /
+   `CANNOT-SEE`** — never a verdict about the row.
+2. ⚠ **`ssh host python3 -c <multi-line-script> <arg>` arrives MANGLED.** `subprocess` passes argv
+   unquoted and **ssh joins argv into ONE remote shell command string**, which the remote shell then
+   re-parses. The failure looks like a dead host. ⇒ **feed the script on STDIN** (`ssh host
+   "python3 - '<path>'"`, `input=SCRIPT`), where no shell can touch it.
 
 ⭐ **A defect caught in the tool itself, worth repeating because it is generic:** the first version
 incremented the nudge counter **under `--dry-run`**, so classifying a row twice burned its whole

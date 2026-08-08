@@ -76,14 +76,76 @@ def ygg(host, *args):
         return {}
 
 
-def find_transcript(uuid):
+def row_host(row, gui_host):
+    """Which MACHINE holds this row's transcript.
+
+    ⛔⛔ THE BUG THIS FIXES, caught by dogfooding within a minute of writing the
+    tool. It searched `~/.claude/projects` on the LOCAL host for every row, so a
+    `local://<uuid>` row — which runs on the GUI host — came back NO_TRANSCRIPT,
+    and the tool confidently announced "the brief was dropped, re-submit it"
+    about a perfectly healthy session on another machine.
+    ⇒ That is the exact defect this whole fleet keeps re-finding: A CAUSE NOT
+      DERIVED FROM A MEASUREMENT, stated with confidence. "I looked in the wrong
+      place" and "it is not there" are different facts.
+
+    Row path forms: `remote-cc://<host>/<uuid>` · `remote-session://<host>/<uuid>`
+    · `local://<uuid>` (the GUI host) · a bare uuid (assume local)."""
+    if "://" not in row:
+        return None                                   # bare uuid: this host
+    scheme, rest = row.split("://", 1)
+    if scheme.startswith("remote") and "/" in rest:
+        return rest.split("/", 1)[0]
+    if scheme == "local":
+        return gui_host
+    return None
+
+
+def find_transcript(uuid, host=None):
     """The row uuid names the transcript — but only in the project dir for its cwd.
 
     ⚠ Do NOT fall back to "newest file in the directory". Linking a pid or a row
     to a transcript by recency is how a probe reports one session's health as
     another's; the uuid is the only honest key."""
+    if host:
+        r = subprocess.run(
+            ["ssh", host, f"ls -1 ~/.claude/projects/*/{uuid}.jsonl 2>/dev/null | head -1"],
+            capture_output=True, text=True, timeout=60)
+        out = (r.stdout or "").strip()
+        return out or None
     hits = list(PROJECTS.glob(f"*/{uuid}.jsonl"))
-    return hits[0] if hits else None
+    return str(hits[0]) if hits else None
+
+
+REMOTE_PROBE = r'''
+import json,os,sys,time
+p=sys.argv[1]
+try: rows=[json.loads(l) for l in open(p) if l.strip()]
+except Exception as e: print(json.dumps(["UNREADABLE",0,str(e)])); sys.exit()
+age=time.time()-os.path.getmtime(p)
+last=next((r for r in reversed(rows) if r.get("type") in ("assistant","user")),None)
+if last is None: print(json.dumps(["EMPTY",age,""])); sys.exit()
+if last["type"]=="user": print(json.dumps(["MIDTURN",age,""])); sys.exit()
+items=[c for c in (last.get("message",{}).get("content") or []) if isinstance(c,dict)]
+if any(c.get("type")=="tool_use" for c in items): print(json.dumps(["MIDTURN",age,""])); sys.exit()
+t=" ".join(" ".join(c.get("text","") for c in items if c.get("type")=="text").split())
+print(json.dumps(["TURN_ENDED",age,t[:300]]))
+'''
+
+
+def turn_state_remote(host, path):
+    """Same classification, executed WHERE THE TRANSCRIPT LIVES."""
+    # ⛔ NOT `ssh host python3 -c <script> <path>`. subprocess passes argv
+    #    unquoted, and ssh JOINS argv into ONE remote shell command string — so a
+    #    multi-line script with quotes is re-parsed by the remote shell and
+    #    arrives mangled. It fails as UNREACHABLE, which reads like a dead host.
+    #    Feed the script on STDIN, where no shell can touch it.
+    r = subprocess.run(["ssh", host, f"python3 - '{path}'"],
+                       input=REMOTE_PROBE, capture_output=True, text=True, timeout=90)
+    try:
+        st, age, tail = json.loads((r.stdout or "").strip().splitlines()[-1])
+        return st, age, tail
+    except Exception:
+        return "UNREACHABLE", 0, ""
 
 
 def turn_state(path):
@@ -111,13 +173,17 @@ def turn_state(path):
     return ("TURN_ENDED", age, text[:300])
 
 
-def classify(uuid):
-    t = find_transcript(uuid)
+def classify(uuid, host=None):
+    t = find_transcript(uuid, host)
     if t is None:
         # ⛔ NOT "still starting" past a minute. An agent-CLI that took a brief
         #    writes within seconds; absence means the brief was DROPPED.
         return {"state": "NO_TRANSCRIPT", "age": 0, "tail": "", "path": None}
-    state, age, tail = turn_state(t)
+    state, age, tail = (turn_state_remote(host, t) if host
+                        else turn_state(Path(t)))
+    if state == "UNREACHABLE":
+        # ⛔ Say "I could not look", never "it is not there".
+        return {"state": "UNREACHABLE", "age": 0, "tail": "", "path": t}
     if state == "MIDTURN":
         state = "WORKING" if age < MIDTURN_STUCK_SECS else "STUCK"
     elif state == "TURN_ENDED":
@@ -196,9 +262,15 @@ def main():
         report = []
         for row in rows:
             uuid = row.rstrip("/").split("/")[-1]
-            c = classify(uuid)
+            rhost = row_host(row, args.host)
+            if rhost and rhost == os.uname().nodename:
+                rhost = None                      # it is this machine after all
+            c = classify(uuid, rhost)
             st = load_state(uuid)
-            size = os.path.getsize(c["path"]) if c["path"] else 0
+            try:
+                size = os.path.getsize(c["path"]) if (c["path"] and not rhost) else 0
+            except OSError:
+                size = 0
             grew = size > st["last_size"]
             st["last_size"] = size
             action = "-"
@@ -210,6 +282,8 @@ def main():
                 rc = max(rc, 4)
                 escalate(args.host, row, "no transcript: the brief was dropped, re-submit it",
                          args.notify_session)
+            elif c["state"] == "UNREACHABLE":
+                action = "CANNOT-SEE"             # not a verdict about the row
             elif c["state"] == "STUCK":
                 action = "ESCALATE"
                 rc = max(rc, 4)
