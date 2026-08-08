@@ -279,6 +279,27 @@ exactly why a `terminal submit` to it answered `{"submitted": false}` after a 30
 nudge's delivery is otherwise confirmed by **transcript GROWTH on the next pass**, never by
 `submitted:true`.
 
+⛔⛔ **AND THE ONE THE OWNER CAUGHT — `--session` WITH THE WRONG STRING MAKES AN INERT CARD.**
+His report: *"Clicking these delegate notification does not transfer me to the required attention
+session."* Two separate mistakes, both mine, both worth more than the fix:
+
+1. **`$YGGTERM_SESSION_ID` is `cc-runtime://<uuid>`; the row is `remote-cc://<host>/<uuid>`.** Same
+   uuid, different string. Pass the former to `notify --session` and the card renders, looks
+   correct, and **does nothing when clicked.** The verb's own help warns about this — which is
+   exactly the shape this skill exists to kill, because *a warning in prose is something an agent
+   has to remember*. ⇒ `ygg-babysit` now RESOLVES any identifier to a real row path by matching its
+   UUID against `server app rows`, so passing the wrong one is impossible rather than discouraged.
+2. ⭐ **The card must point at the row that NEEDS ATTENTION, not at the orchestrator that noticed
+   it.** I pointed it at myself. That is worse than inert: it works, and takes the human to the
+   wrong place. **A notification is an ADDRESS, and the address is where the problem is.**
+
+⛔⛔ **AND A RETIRED ROW READS AS A WEDGED ONE.** On first real use the tool reported the yggterm row
+`STUCK` for 54 minutes and I relayed that to the owner. It was a **corpse** — the row had been
+retired by its campaign's baton relay, and **a retired row's transcript is frozen mid-turn forever**.
+It also explains a `submitted:false` that looked like a busy row refusing input: there was no row.
+⇒ **A transcript cannot distinguish KILLED from WEDGED. Only the row list can, so ask it FIRST** —
+`GONE` is now checked before any transcript is opened.
+
 ⛔⛔ **TWO BUGS CAUGHT BY DOGFOODING IT WITHIN A MINUTE OF WRITING IT** — both generic, both worth
 more than the tool:
 
