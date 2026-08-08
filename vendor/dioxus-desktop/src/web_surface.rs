@@ -1907,6 +1907,21 @@ pub struct WebSurfaceHost {
     /// keymap on every bridge (re)install, so an accelerator the user rebinds
     /// is claimed at its NEW chord without a restart.
     claimed_chords: Rc<RefCell<Vec<ClaimedChord>>>,
+    /// ⭐ **The SHELL's answer to "may a `page_only` row serve even though my
+    /// OWN webview holds the toplevel's focus?"** — DATA, pushed, exactly like
+    /// `claimed_chords` and for the same reason: this layer stays a matcher.
+    ///
+    /// The widget test in [`connect_window_chord_claimer`] is the honest
+    /// reading of who holds the keyboard, and it is blind in exactly one
+    /// direction: the shell's Dioxus webview holds the sidebar AND the terminal
+    /// canvas, so GTK answers the same widget for "clicked a sidebar row over a
+    /// browser session" and "typing at a terminal". Widening the widget test
+    /// would hand `Ctrl+R` back to readline's reverse-search; only the shell can
+    /// tell those two apart, so it says which, here.
+    ///
+    /// Defaults to FALSE, which is the pre-existing behaviour: a host whose
+    /// shell never pushes claims a `page_only` chord only for a focused page.
+    page_chords_armed: Rc<Cell<bool>>,
     /// The entries the shell contributes to every page's WebKit context menu,
     /// as DATA — the same shape as `claimed_chords`, and for the same reason:
     /// this layer appends labels and relays ids, and knows what none of them
@@ -3344,10 +3359,12 @@ fn claimed_chord<'a>(
 fn connect_window_chord_claimer(
     window: &gtk::Window,
     table: &Rc<RefCell<Vec<ClaimedChord>>>,
+    armed: &Rc<Cell<bool>>,
     surfaces: &Rc<RefCell<HashMap<u64, Surface>>>,
     notify: &Rc<RefCell<Option<Rc<dyn Fn(ClaimedChord)>>>>,
 ) {
     let table = table.clone();
+    let armed = armed.clone();
     let surfaces = surfaces.clone();
     let notify = notify.clone();
     window.connect_key_press_event(move |window, event| {
@@ -3358,12 +3375,20 @@ fn connect_window_chord_claimer(
             alt: mask.contains(gdk::ModifierType::MOD1_MASK),
             key: press_key(event.keyval()),
         };
-        // Does a PAGE own the keyboard right now? Asked of the widget the
-        // toplevel says has focus, against the surfaces this host owns — the
-        // shell's own webview is not among them, so a shell-focused (and
-        // therefore terminal-focused) keyboard reads FALSE and a `page_only`
-        // chord stands down.
-        let page_focused = {
+        // Does the PAGE LAYER own the keyboard right now? TWO ways to be true,
+        // and the second one exists because the first cannot see everything:
+        //
+        // 1. **A visible surface webview holds the toplevel's focus.** The
+        //    honest reading, and the only one available inside this host.
+        // 2. **…or the SHELL has ARMED the layer** (`page_chords_armed`). The
+        //    shell's own webview is not one of this host's surfaces, so clicking
+        //    the sidebar over a browser session read FALSE here and killed every
+        //    browser chord (reported 2026-08-08). It cannot be fixed by widening
+        //    (1) to "the toplevel webview has focus": that same widget IS the
+        //    terminal canvas, and `Ctrl+R` over a terminal belongs to readline
+        //    forever. Only the shell knows which of the two is in front, and the
+        //    arm is it saying so.
+        let page_focused = armed.get() || {
             use gtk::prelude::GtkWindowExt as _;
             match window.focused_widget() {
                 Some(focus) => surfaces.borrow().values().any(|surface| {
@@ -4303,6 +4328,7 @@ impl WebSurfaceHost {
             alt_tap: Rc::new(RefCell::new(None)),
             chord: Rc::new(RefCell::new(None)),
             claimed_chords: Rc::new(RefCell::new(Vec::new())),
+            page_chords_armed: Rc::new(Cell::new(false)),
             page_menu_items: Rc::new(RefCell::new(Vec::new())),
             page_menu: Rc::new(RefCell::new(None)),
             fullscreen: Rc::new(Cell::new(None)),
@@ -4379,11 +4405,24 @@ impl WebSurfaceHost {
         *self.claimed_chords.borrow_mut() = chords;
     }
 
+    /// Arm or disarm the `page_only` rows for a keyboard the SHELL's own
+    /// webview holds — see the `page_chords_armed` field for why this layer
+    /// cannot work it out for itself. Pushed on the edge; cheap and idempotent.
+    pub fn set_page_chords_armed(&self, armed: bool) {
+        self.page_chords_armed.set(armed);
+    }
+
     /// Attach the claimer to the toplevel window. Called ONCE, from the glue
     /// that owns the window — see [`connect_window_chord_claimer`] for why the
     /// window and not each surface.
     pub(crate) fn install_window_chord_claimer(&self, window: &gtk::Window) {
-        connect_window_chord_claimer(window, &self.claimed_chords, &self.surfaces, &self.chord);
+        connect_window_chord_claimer(
+            window,
+            &self.claimed_chords,
+            &self.page_chords_armed,
+            &self.surfaces,
+            &self.chord,
+        );
     }
 
     /// Paint the native backdrop (the overlay's base child) in the app's
