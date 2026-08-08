@@ -977,11 +977,89 @@ LOGIN is still his). Full ruling: [`settled-calls.md`](settled-calls.md).
    One global "is npm here" was wrong twice over on a uv CLI: npm's absence is
    not why `kimi` is missing, and npm's presence would not have fixed it.
 
+### ⭐⭐ ROOT-CAUSED 2026-08-08: THE REMOTE LANE IS A DEFAULT THAT OUTLIVED ITS ROLE
+
+**It is NOT a binary-distribution problem, and it is NOT a missing capability.**
+Both hypotheses were tested and both are false. Do not re-derive either.
+
+The remote lane's provisioning route is exempted at
+`local_managed_cli_tool_for` (lib.rs ~15591): a `remote-session://` /
+`remote-cc://` path, **and any `SessionSource::LiveSsh` row** (which is how all
+six new CLIs are born), returns `None`, so the attach funnel's
+`ensure_managed_cli_for_session_path` never provisions them. The doc comment
+justifies that exemption in one sentence: *"Background machine refreshes keep the
+remote toolchains current."*
+
+**That refresh runs, and is structurally forbidden from installing anything.**
+The GUI's `maybe_spawn_missing_managed_cli_refreshes` (shell.rs ~36196) does
+iterate remote machines and does fire — but it calls
+`refresh_managed_cli(.., background = true)`, and
+`refresh_local_managed_cli` then hits:
+
+    if !skipped_recently && !install_deferred && !background_install_enabled {
+        install_deferred = true;          // trace: refresh_defer_background_install
+    }
+
+`managed_cli_background_install_enabled()` reads
+`YGGTERM_MANAGED_CLI_BACKGROUND_INSTALL` and **defaults to false**. The variable
+is set nowhere in the repo or on any fleet host. ⇒ every remote refresh is
+probe-only, forever.
+
+**LIVE-PROVEN from the mechanism's own trace, on both remote hosts:**
+
+| host | `refresh_begin` | `refresh_defer_background_install` |
+|---|---|---|
+| integrator | 2 | **2** |
+| workshop | 13 | **13** |
+
+Payload: `{"background":true,"reason":"background_install_opt_in_required",
+"env":"YGGTERM_MANAGED_CLI_BACKGROUND_INSTALL"}`. Outcome agrees: both remotes
+carried exactly `codex`, `claude`, `agy` and **none** of the six new CLIs.
+
+⚖ **The default was CORRECT when it was written** and the CHANGELOG says why:
+*"Keep background managed-Codex refresh probe-only by default, so live terminal
+recovery and remote scans cannot spawn `npm install @latest` and blow the
+fan/CPU budget."* The owner's ruling changed the component's role, so the
+default became the bug — [[finding-our-own-policy-was-the-bug]] exactly.
+
+### ⛔ THE CAPABILITY HAS BEEN PRESENT ALL ALONG — nothing calls it
+
+`server remote ensure-managed-cli <slug>` is routed
+(`remote_cli.rs:243/353` → `run_remote_ensure_managed_cli` →
+`ensure_local_managed_cli`) and **works on the OLD remote binaries**. Run by
+hand 2026-08-08 against the integrator (3.0.64) and the workshop (3.0.62), it
+installed `qwen` 0.21.8 on both in seconds; verified by file
+(`~/.yggterm/npm/bin/qwen`), not by the command's own echo.
+
+⇒ One hand-run command did what months of background refreshes could not.
+**The remote binary is capable; the launch path simply never asks.**
+
+### ⛔ THE OBVIOUS FIX IS THE WRONG ONE
+
+Do **not** flip `managed_cli_background_install_enabled()` to default true. That
+re-creates precisely the fan/CPU problem the CHANGELOG records, on every machine,
+on every background refresh, for all nine CLIs at once — and the owner notices
+when the GUI host runs hot.
+
+**The symmetric fix is the local lane's own shape:** provision ONE CLI, ON
+DEMAND, in the FOREGROUND, at the moment a remote agent row is launched, by
+invoking the verb that already exists. ⚠ It must hang off the CREATE path, not
+the focus path: `ensure_terminal_for_path_with_initial_size_and_seed` is the
+funnel for both, and an ssh round trip per focus is the ~85-910 ms regression
+`local_managed_cli_tool_for`'s own comment was written to prevent. A TTL cache
+keyed by `(machine_key, tool)` is what makes create-vs-focus separable, mirroring
+`ensure_local_managed_cli_for_focus`.
+
 **What is still owed:**
 
-- ⛔ **The REMOTE lane is untouched.** He said "all connected systems **including
-  localhost**", and localhost is what 3.0.65 serves. Remote provisioning is
-  different code and a fix proven on one lane is not proven on the other.
+- ⛔ **The wiring above is DESIGNED AND UNBUILT.** Root cause is settled and
+  live-proven; no code has landed on the remote lane.
+- ⚠ **A second, smaller gap sits behind it:** the remote binaries are 3.0.64 and
+  3.0.62, so their `ensure_local_managed_cli` predates 3.0.65's per-method
+  dispatch. npm CLIs install there today (proven with `qwen`); a **uv** CLI
+  (`kimi`) or a **vendor-script** CLI (`muse`) will not until those hosts carry
+  3.0.65+. That is a real distribution dependency, but it is second — the lane is
+  dead for npm CLIs too, and that half needs no new bytes anywhere.
 - ⛔ **Live proof on jojo** per the falsifier below — `command -v` read on the
   host itself, not an echo of the launch.
 
