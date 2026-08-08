@@ -2505,6 +2505,13 @@ struct SidebarContributionState {
     /// `MAX_POLICY_FETCH_ATTEMPTS` the gate opens anyway — a page with no
     /// adblock beats no page — and the failure is surfaced to the user.
     policy_attempts: u32,
+    /// When the fetch budget for the current stamp ran out. `None` whenever a
+    /// budget remains. This is what makes exhaustion RECOVERABLE on an
+    /// UNCHANGED control url: a new stamp already re-arms the fetch, but a
+    /// daemon that re-binds its old port changes nothing the declare can see,
+    /// so without a clock the 3rd failure was permanent. ⛔ It moves with
+    /// `policy_attempts` and only through `reset_policy_fetch`.
+    policy_exhausted_at_ms: Option<u64>,
     /// The app's display name for the zoom control ("Ychrome Global Zoom"). The
     /// app declares it; the shell never hardcodes an app's name.
     app_name: Option<String>,
@@ -2577,6 +2584,19 @@ struct SidebarContributionState {
     /// until the first batch is drained.
     acked_command_batch: Option<String>,
     last_seen_ms: u64,
+}
+
+impl SidebarContributionState {
+    /// Hand the policy fetch a fresh budget. ⛔ THE ONE OWNER of that reset.
+    /// Four callers re-arm a policy fetch — a declare whose stamp moved, an
+    /// applied policy, an invalidation, the agent door's re-arm — and every one
+    /// of them must clear the exhausted mark with the counter. An exhausted mark
+    /// left behind on a contribution that has just been re-armed would put a
+    /// perfectly healthy session into a cooldown it never entered.
+    fn reset_policy_fetch(&mut self) {
+        self.policy_attempts = 0;
+        self.policy_exhausted_at_ms = None;
+    }
 }
 
 /// What a re-declare tells the reconciler to refetch. Independent stamps
@@ -2935,6 +2955,39 @@ impl SurfacePolicyGate {
 /// Attempts at `<control>/policy` for one `policy_version` before the reconciler
 /// gives up waiting and creates the surface unprotected.
 const MAX_POLICY_FETCH_ATTEMPTS: u32 = 3;
+
+/// How long an exhausted policy-fetch budget stays exhausted before the
+/// contribution is handed a fresh one. A minute, deliberately: it costs ~1
+/// fetch/min against an endpoint that is permanently dead, and heals a
+/// transient refusal — a boot race, a daemon that re-binds its old port, a few
+/// seconds of a busy host — within a minute rather than never.
+const POLICY_FETCH_COOLDOWN_MS: u64 = 60_000;
+
+/// Whether a policy fetch should be issued for a contribution in this state.
+/// Pure, so the cooldown BOUNDARY is testable without a shell or a clock.
+///
+/// Below the budget every heartbeat retries, which is the original behaviour.
+/// Once the budget is spent the retries stop — *"a permanently broken endpoint
+/// must not mean one fetch every 4s for the life of the session"* — but they
+/// stop for `POLICY_FETCH_COOLDOWN_MS`, not forever. Forever was the bug: a
+/// changed stamp re-armed the fetch, and a same-port recovery has no stamp
+/// change to ride in on, so the surface the gate opened unprotected stayed
+/// unprotected for the life of the session.
+fn sidebar_policy_refetch_due(attempts: u32, exhausted_at_ms: Option<u64>, now_ms: u64) -> bool {
+    if attempts < MAX_POLICY_FETCH_ATTEMPTS {
+        return true;
+    }
+    match exhausted_at_ms {
+        // Budget spent, no mark. `reset_policy_fetch` moves the two together and
+        // the exhausting failure stamps the mark, so this is unreachable — and
+        // it falls DUE rather than silent on purpose: the defect being fixed
+        // here is a PERMANENT refusal, and a missing mark must not be a second
+        // way to recreate it. Falling due costs exactly one fetch, never a loop,
+        // because that fetch's failure stamps the mark.
+        None => true,
+        Some(exhausted_at_ms) => now_ms.saturating_sub(exhausted_at_ms) >= POLICY_FETCH_COOLDOWN_MS,
+    }
+}
 
 /// The schema the app-pane renderer is currently drawing.
 #[derive(Debug, Clone, PartialEq)]
@@ -19400,7 +19453,7 @@ impl ShellState {
             if existing.policy_version != policy_version {
                 existing.policy_version = policy_version.clone();
                 existing.policy = None;
-                existing.policy_attempts = 0;
+                existing.reset_policy_fetch();
             }
             // Zoom is non-gating: on a stamp change keep the OLD overrides
             // applied (no flicker to global) and just mark them stale until the
@@ -19429,10 +19482,21 @@ impl ShellState {
             // Retry a failed fetch on the next heartbeat, but only until the
             // attempts run out — a permanently broken endpoint must not mean one
             // fetch every 4s for the life of the session.
+            //
+            // ⚠ For the POLICY that cap used to be PERMANENT, and a policy is
+            // the one stamp here that gates a surface: a same-port recovery has
+            // no stamp change to re-arm it, so three failures meant the surface
+            // opened unprotected and stayed unprotected. Its budget re-arms on a
+            // cooldown instead. Zoom, appearance and document are cosmetic and
+            // keep the hard cap.
             return SidebarRefetch {
                 policy: !policy_version.is_empty()
                     && existing.policy.is_none()
-                    && existing.policy_attempts < MAX_POLICY_FETCH_ATTEMPTS,
+                    && sidebar_policy_refetch_due(
+                        existing.policy_attempts,
+                        existing.policy_exhausted_at_ms,
+                        now_ms,
+                    ),
                 zoom: !zoom_version.is_empty()
                     && !existing.zoom_loaded
                     && existing.zoom_attempts < MAX_ZOOM_FETCH_ATTEMPTS,
@@ -19463,6 +19527,7 @@ impl ShellState {
                 policy_version: policy_version.clone(),
                 policy: None,
                 policy_attempts: 0,
+                policy_exhausted_at_ms: None,
                 app_name,
                 zoom_version: zoom_version.clone(),
                 zoom_overrides: HashMap::new(),
@@ -19746,7 +19811,7 @@ impl ShellState {
             && contribution.policy_version == policy_version
         {
             contribution.policy = Some(policy);
-            contribution.policy_attempts = 0;
+            contribution.reset_policy_fetch();
         }
     }
     /// Drop the policy we hold for a session, without touching its stamp. The
@@ -19755,7 +19820,7 @@ impl ShellState {
     fn invalidate_sidebar_policy(&mut self, session_path: &str) {
         if let Some(contribution) = self.sidebar_contributions.get_mut(session_path) {
             contribution.policy = None;
-            contribution.policy_attempts = 0;
+            contribution.reset_policy_fetch();
         }
     }
     /// Re-arm an ABANDONED policy fetch — attempts exhausted for the current
@@ -19774,7 +19839,7 @@ impl ShellState {
         {
             return None;
         }
-        contribution.policy_attempts = 0;
+        contribution.reset_policy_fetch();
         Some(contribution.policy_version.clone())
     }
     /// The stamp a policy fetch for this session should be filed under. `None`
@@ -19787,7 +19852,18 @@ impl ShellState {
     }
     /// Count a failed `<control>/policy` fetch. Returns true once the reconciler
     /// should stop waiting and create the surface with no policy at all.
-    fn fail_sidebar_policy(&mut self, session_path: &str, policy_version: &str) -> bool {
+    ///
+    /// The exhausting call also STAMPS when the budget ran out, which is the
+    /// whole of what lets `sidebar_policy_refetch_due` hand back a fresh one a
+    /// minute later. Without the stamp, exhaustion could only be undone by a
+    /// stamp change — and an endpoint that recovers on its OLD url never sends
+    /// one.
+    fn fail_sidebar_policy(
+        &mut self,
+        session_path: &str,
+        policy_version: &str,
+        now_ms: u64,
+    ) -> bool {
         let Some(contribution) = self.sidebar_contributions.get_mut(session_path) else {
             return false;
         };
@@ -19795,7 +19871,15 @@ impl ShellState {
             return false;
         }
         contribution.policy_attempts += 1;
-        contribution.policy_attempts >= MAX_POLICY_FETCH_ATTEMPTS
+        let exhausted = contribution.policy_attempts >= MAX_POLICY_FETCH_ATTEMPTS;
+        if exhausted {
+            // Re-stamped on EVERY exhausting failure, not only the first: a
+            // cooldown retry that also fails must restart the cooldown, or the
+            // very next heartbeat would fetch again and the cap would be back to
+            // meaning nothing.
+            contribution.policy_exhausted_at_ms = Some(now_ms);
+        }
+        exhausted
     }
     /// The stamp a zoom fetch for this session should be filed under. `None` when
     /// the app ships no per-site zoom.
@@ -61899,8 +61983,10 @@ async fn app_policy_fetch(
             });
         }
         Err(error) => {
-            let exhausted =
-                state.with_mut(|shell| shell.fail_sidebar_policy(&session_path, &policy_version));
+            let failed_at_ms = current_millis();
+            let exhausted = state.with_mut(|shell| {
+                shell.fail_sidebar_policy(&session_path, &policy_version, failed_at_ms)
+            });
             append_trace_event(
                 &trace_home,
                 "ui",
@@ -149673,7 +149759,10 @@ mod tests {
         declare_with_policy(&mut shell, "local://p", Some("v1"), 1_000);
 
         for attempt in 1..MAX_POLICY_FETCH_ATTEMPTS {
-            assert!(!shell.fail_sidebar_policy("local://p", "v1"), "gave up early");
+            assert!(
+                !shell.fail_sidebar_policy("local://p", "v1", 1_000 + attempt as u64),
+                "gave up early"
+            );
             assert_eq!(
                 shell.web_surface_policy_gate("local://p"),
                 SurfacePolicyGate::Pending
@@ -149683,7 +149772,10 @@ mod tests {
                 "stopped retrying while attempts remained"
             );
         }
-        assert!(shell.fail_sidebar_policy("local://p", "v1"), "never gave up");
+        assert!(
+            shell.fail_sidebar_policy("local://p", "v1", 1_100),
+            "never gave up"
+        );
         let gate = shell.web_surface_policy_gate("local://p");
         assert_eq!(
             gate,
@@ -149706,6 +149798,173 @@ mod tests {
             shell.web_surface_policy_gate("local://p"),
             SurfacePolicyGate::Pending
         );
+    }
+
+    // THE COOLDOWN BOUNDARY, as a table. Pure, so the exact edge is locked
+    // without a clock or a shell: measured from the moment the budget ran out,
+    // `>=` not `>`, and never consulted at all while attempts remain.
+    #[test]
+    fn a_spent_policy_budget_is_refetched_only_after_the_cooldown() {
+        assert!(
+            sidebar_policy_refetch_due(0, None, 0),
+            "a fresh budget was refused"
+        );
+        assert!(
+            sidebar_policy_refetch_due(MAX_POLICY_FETCH_ATTEMPTS - 1, Some(0), 0),
+            "an unspent budget was made to wait out a cooldown it never entered"
+        );
+        assert!(
+            !sidebar_policy_refetch_due(MAX_POLICY_FETCH_ATTEMPTS, Some(1_000), 1_000),
+            "the cooldown does nothing — a dead endpoint is polled every heartbeat again"
+        );
+        assert!(
+            !sidebar_policy_refetch_due(
+                MAX_POLICY_FETCH_ATTEMPTS,
+                Some(1_000),
+                1_000 + POLICY_FETCH_COOLDOWN_MS - 1
+            ),
+            "refetched one millisecond early"
+        );
+        assert!(
+            sidebar_policy_refetch_due(
+                MAX_POLICY_FETCH_ATTEMPTS,
+                Some(1_000),
+                1_000 + POLICY_FETCH_COOLDOWN_MS
+            ),
+            "the cooldown never elapses — exhaustion is still permanent"
+        );
+        // A mark in the future (a clock that stepped backwards) must read as
+        // "wait", not as an elapsed cooldown. Saturating, so it cannot underflow
+        // into an immediate refetch.
+        assert!(
+            !sidebar_policy_refetch_due(MAX_POLICY_FETCH_ATTEMPTS, Some(9_000), 1_000),
+            "a backwards clock underflowed into an immediate refetch"
+        );
+        // Unreachable by construction, and it falls DUE on purpose: the defect
+        // being fixed here is a permanent refusal, and a missing mark must not
+        // be a second way to spell one.
+        assert!(
+            sidebar_policy_refetch_due(MAX_POLICY_FETCH_ATTEMPTS, None, 0),
+            "a spent budget with no mark refused forever"
+        );
+    }
+
+    // THE REPORTED CASE: the endpoint comes back on the SAME url. A changed
+    // stamp already re-arms the fetch — but a daemon that re-binds its old port
+    // sends no stamp change and no new url, so nothing in the declare could ever
+    // notice, and the 3rd failure was final for the life of the session.
+    #[test]
+    fn an_exhausted_policy_fetch_rearms_on_an_unchanged_control_url() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
+        declare_with_policy(&mut shell, "local://p", Some("v1"), 1_000);
+        for attempt in 0..MAX_POLICY_FETCH_ATTEMPTS {
+            shell.fail_sidebar_policy("local://p", "v1", 1_000 + attempt as u64);
+        }
+        let exhausted_at_ms = 1_000 + (MAX_POLICY_FETCH_ATTEMPTS as u64 - 1);
+
+        // Inside the cooldown every heartbeat is still refused — that is the cap
+        // doing the job it was written for.
+        assert!(
+            !declare_with_policy(
+                &mut shell,
+                "local://p",
+                Some("v1"),
+                exhausted_at_ms + POLICY_FETCH_COOLDOWN_MS - 1
+            ),
+            "polled a dead endpoint inside the cooldown"
+        );
+        // The heartbeat after it is handed a fresh budget, with the stamp and
+        // the url both unchanged.
+        assert!(
+            declare_with_policy(
+                &mut shell,
+                "local://p",
+                Some("v1"),
+                exhausted_at_ms + POLICY_FETCH_COOLDOWN_MS
+            ),
+            "a same-port recovery can never land: the fetch never re-arms"
+        );
+
+        // A cooldown retry that also fails restarts the cooldown. Otherwise the
+        // first elapsed cooldown would leave the flag armed on every heartbeat
+        // from then on, and the cap would mean nothing.
+        let retry_failed_at_ms = exhausted_at_ms + POLICY_FETCH_COOLDOWN_MS;
+        assert!(
+            shell.fail_sidebar_policy("local://p", "v1", retry_failed_at_ms),
+            "a failure past the budget stopped reporting exhaustion"
+        );
+        assert!(
+            !declare_with_policy(&mut shell, "local://p", Some("v1"), retry_failed_at_ms + 1),
+            "a failed cooldown retry left the fetch armed on every heartbeat"
+        );
+
+        // The gate does not move while a retry is out. The surface is already on
+        // screen unprotected; re-gating it to `Pending` would defer the NEXT
+        // create behind the same dead endpoint. Repairing what is already built
+        // belongs to the recreate rule, once a policy actually lands.
+        assert_eq!(
+            shell.web_surface_policy_gate("local://p"),
+            SurfacePolicyGate::Abandoned,
+            "a cooldown retry re-gated a surface that is already on screen"
+        );
+    }
+
+    // ⛔ THE MARK MOVES WITH THE COUNTER, from all four owners that re-arm a
+    // policy fetch. A re-armed contribution that kept its exhausted mark would
+    // be one predicate change away from putting a healthy session into a
+    // cooldown it never entered — and the claim that the no-mark branch of
+    // `sidebar_policy_refetch_due` is unreachable rests entirely on this.
+    #[test]
+    fn every_policy_fetch_rearm_clears_the_exhausted_mark() {
+        let rearms: Vec<(&str, Box<dyn Fn(&mut ShellState)>)> = vec![
+            (
+                "a declare whose stamp moved",
+                Box::new(|shell: &mut ShellState| {
+                    declare_with_policy(shell, "local://p", Some("v2"), 90_000);
+                }),
+            ),
+            (
+                "an applied policy",
+                Box::new(|shell: &mut ShellState| {
+                    shell.apply_sidebar_policy("local://p", "v1", WebSurfacePolicy::default());
+                }),
+            ),
+            (
+                "an invalidated policy",
+                Box::new(|shell: &mut ShellState| shell.invalidate_sidebar_policy("local://p")),
+            ),
+            (
+                "the agent door's re-arm",
+                Box::new(|shell: &mut ShellState| {
+                    shell.rearm_abandoned_sidebar_policy_fetch("local://p");
+                }),
+            ),
+        ];
+        for (owner, rearm) in rearms {
+            let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
+            declare_with_policy(&mut shell, "local://p", Some("v1"), 1_000);
+            for attempt in 0..MAX_POLICY_FETCH_ATTEMPTS {
+                shell.fail_sidebar_policy("local://p", "v1", 1_000 + attempt as u64);
+            }
+            assert!(
+                shell.sidebar_contributions["local://p"]
+                    .policy_exhausted_at_ms
+                    .is_some(),
+                "{owner}: the budget ran out without recording when"
+            );
+
+            rearm(&mut shell);
+
+            let contribution = &shell.sidebar_contributions["local://p"];
+            assert_eq!(
+                contribution.policy_attempts, 0,
+                "{owner}: the counter was not re-armed"
+            );
+            assert_eq!(
+                contribution.policy_exhausted_at_ms, None,
+                "{owner}: re-armed the counter but kept the exhausted mark"
+            );
+        }
     }
 
     // THE DEFER TABLE, whole. One owner decides which gate state makes the
@@ -149745,8 +150004,8 @@ mod tests {
             "re-armed while the heartbeat loop still owned the retries"
         );
 
-        for _ in 0..MAX_POLICY_FETCH_ATTEMPTS {
-            shell.fail_sidebar_policy("local://p", "v1");
+        for attempt in 0..MAX_POLICY_FETCH_ATTEMPTS {
+            shell.fail_sidebar_policy("local://p", "v1", 1_000 + attempt as u64);
         }
         assert_eq!(
             shell.web_surface_policy_gate("local://p"),
