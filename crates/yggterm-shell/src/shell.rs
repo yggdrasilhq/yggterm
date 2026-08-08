@@ -1426,6 +1426,44 @@ const MENU_SURFACE_CSS: &str = r#"
     box-shadow: none;
 }
 "#;
+/// A RAIL IS CONTENT, SO ITS TEXT IS SELECTABLE — declared ONCE for the whole
+/// window, exactly like the session-row and text-field rules below it.
+///
+/// The shell root sets `user-select:none` (chrome must not select when you drag
+/// a row or a titlebar), and every rail inherits it. That is right for chrome
+/// and wrong for a rail body, which is READING material: the owner could not
+/// select a session's cwd, its PID, a daemon version or an error string to
+/// paste anywhere — only the Connect command, which had hand-rolled its own
+/// `user-select:text` inline (2026-08-08 report: *"I still cannot select any
+/// text on session metadata other than the connect code row"*). One opt-in on
+/// one block is the same mistake the `session_row_hover_css` comment names: a
+/// rule injected per body only reaches the bodies that remember to inject it.
+///
+/// ⛔ NO `!important`. An inline declaration beats a stylesheet selector, so a
+/// control that opts out INLINE keeps its `none` and the opt-out list stays the
+/// one already in the markup rather than a second list here that could drift.
+///
+/// ⚠ MEASURED ON THE LIVE HOST, because the obvious version of that sentence is
+/// WRONG: **on WebKitGTK an inline `user-select:none` with no `-webkit-`
+/// twin is INERT.** The engine resolves `-webkit-user-select`, and 15 of the
+/// shell's 41 `user-select:none` sites write only the unprefixed property — the
+/// metadata group's collapse toggle among them. Those were never doing any work;
+/// they looked effective only because the shell ROOT sets BOTH properties and
+/// everything inherited its `none`. So inside a rail they now select, and the
+/// opt-out that actually holds is the prefixed one.
+///
+/// That is left as-is deliberately: the owner asked for *"every text"* in the
+/// rail to be selectable, a heading is text, and **selection does not eat the
+/// click** — collapse was verified still working (`data-metadata-group-expanded`
+/// 1→0→1 on the live host, 3.0.64). A control that must NOT select has to say
+/// `-webkit-user-select:none` inline; unprefixed alone is decoration.
+const RAIL_TEXT_SELECTION_CSS: &str = r#"
+.yggui-rail-scroll,
+.yggui-rail-scroll * {
+    user-select: text;
+    -webkit-user-select: text;
+}
+"#;
 /// The keyboard focus ring for FORM dialogs (spec §12.4 clause 5, DESIGN.md ▸
 /// Control language ▸ Keyboard focus ring). A dialog operated by focus rather
 /// than by badges is worthless if you cannot see where the keyboard is.
@@ -82572,6 +82610,11 @@ fn app() -> Element {
             style { "{WEB_UNDER_GLASS_CSS}" }
             style { "{MENU_SURFACE_CSS}" }
             style { "{FORM_DIALOG_FOCUS_CSS}" }
+            // A rail body is reading material, so its text selects. Declared
+            // here for the same reason as the two rules above: every rail —
+            // metadata, settings, connect, notifications, the tab rail and every
+            // contributed app pane — draws into `.yggui-rail-scroll`.
+            style { "{RAIL_TEXT_SELECTION_CSS}" }
             style { "{WEB_SURFACE_VTAB_CSS}" }
             style { "{shell_document_css}" }
             // KeyTips chord breadcrumb: shows the leader + the chord typed so far
@@ -136045,6 +136088,70 @@ mod tests {
         // A remembered Metadata rail is a valid user choice and is preserved.
         plain.right_panel_restore_mode = RightPanelMode::Metadata;
         assert_eq!(plain.revealed_right_panel_mode(1_000), RightPanelMode::Metadata);
+    }
+
+    /// A RAIL IS CONTENT: its text selects, and the opt-out stays INLINE.
+    ///
+    /// The shell root sets `user-select:none` so chrome does not select when you
+    /// drag a row or a titlebar, and every rail inherits it. Before 3.0.64
+    /// exactly ONE block bought itself out with an inline `user-select:text`
+    /// (`MetadataConnectBlock`), so the owner could copy the Connect command and
+    /// nothing else — not a cwd, not a PID, not a daemon version, not an error
+    /// string (report 2026-08-08).
+    ///
+    /// Three halves are locked, because each is separately satisfiable by a
+    /// broken fix: the rule must reach DESCENDANTS (the label/value spans are
+    /// what inherit `none`), it must be MOUNTED (a constant nothing renders is
+    /// inert), and it must carry NO `!important` — which would out-specify the
+    /// inline `user-select:none` on the metadata group's collapse toggle and
+    /// make a group heading select instead of fold.
+    #[test]
+    fn the_rail_declares_its_text_selectable_once_and_without_important() {
+        let source = include_str!("shell.rs");
+        assert!(
+            RAIL_TEXT_SELECTION_CSS.contains(".yggui-rail-scroll *"),
+            "the rule must reach the rail's DESCENDANTS: every label and value \
+             span inherits `none` from the shell root, so a rule on the scroller \
+             alone leaves all of them unselectable"
+        );
+        assert!(
+            RAIL_TEXT_SELECTION_CSS.contains("user-select: text"),
+            "the rail selection rule stopped declaring `user-select: text`"
+        );
+        // ⛔ NOT `source.contains("style { \"{RAIL_TEXT_SELECTION_CSS}\" }")`.
+        // That assert cannot fail: the needle also matches THIS test's own
+        // string literal, and it matches a line someone has commented out.
+        // Mutation-proved GREEN on 2026-08-08 with the mount commented out —
+        // the assert has to demand a LIVE `style {` line, not a substring.
+        assert!(
+            source.lines().any(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+                    && trimmed.starts_with("style {")
+                    && trimmed.contains("RAIL_TEXT_SELECTION_CSS")
+            }),
+            "RAIL_TEXT_SELECTION_CSS is defined but never mounted in a live \
+             `style {{ }}` node — a stylesheet constant nothing renders selects \
+             nothing"
+        );
+        assert!(
+            !RAIL_TEXT_SELECTION_CSS.contains("!important"),
+            "`!important` would beat the INLINE `user-select:none` the metadata \
+             group's collapse toggle relies on, so a heading would select instead \
+             of collapse — the opt-out list must stay the one already in the markup"
+        );
+        // ⚠ NOT an assert that the collapse toggle stays unselectable. It does
+        // NOT: its inline rule is the unprefixed `user-select:none` only, which
+        // WebKitGTK ignores, so it computes `text` under this stylesheet — read
+        // off the live host, 3.0.64. Asserting the opposite would have locked in
+        // a belief the browser never honoured. What IS locked is the prefixed
+        // form being the one that works, so a future opt-out is written to bite.
+        assert!(
+            RAIL_TEXT_SELECTION_CSS.contains("-webkit-user-select: text"),
+            "WebKitGTK resolves `-webkit-user-select`; the unprefixed property \
+             alone changes nothing on the live host, so the rail would still be \
+             unselectable with a rule that omits the prefixed form"
+        );
     }
 
     /// ⛔ THE INSTRUMENT GAP that cost two full reproductions (2026-08-08): the

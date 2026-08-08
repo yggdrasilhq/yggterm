@@ -44,13 +44,11 @@ copies.
   card fix is written and tested here; it is never exercised against a live
   gateway.
 
-- **Muse Code needs his login before anything about it can be MEASURED** — the
-  CLI is closed source and installing it requires a vendor account only he holds.
-  Its descriptor ships with its resume flag, composer glyph and working phrase
-  marked as placeholders rather than measurements, and says so on the value. →
-  `docs/spec-adding-an-agent-cli.md` §6.
-  *Meanwhile:* the other eight CLIs are wired, and Muse's row is data — one
-  descriptor edit once a real `muse --help` and a real screen exist.
+- **Muse Code: only the LOGIN is still his — the INSTALL is not.** He ruled
+  2026-08-08 that yggterm auto-installs and auto-updates every CLI on every
+  connected system including localhost, so the install must no longer wait on
+  him; see `settled-calls.md`. What remains his: authenticating Muse once it
+  is installed, since the credential is his.
 
 ## Third parties only he can chase
 

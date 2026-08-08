@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Rail text selects.** The session metadata rail draws a session's cwd, PID,
+  daemon version and error strings — reading material you copy — but the shell
+  root sets `user-select:none` so that dragging a row or the titlebar does not
+  smear a selection across the chrome, and every rail inherited it. One block
+  had bought itself out inline (the Connect command), so that was the only text
+  in the whole rail you could select. The rule is now declared ONCE for the
+  window, like the session-row and text-field rules beside it, and reaches every
+  rail: metadata, settings, connect, notifications, the tab rail, and every
+  contributed app pane. Controls keep their INLINE `user-select:none`, so a
+  metadata group's heading still folds on a drag instead of selecting — the
+  opt-out list stays the one already in the markup rather than a second list
+  that could drift from it.
+
 - **An app row now survives a DAEMON restart as itself, which is the half the
   create-time fix could not reach.** Born holding the app's command was not
   enough: the persisted form of a live row has never carried `launch_command` at
