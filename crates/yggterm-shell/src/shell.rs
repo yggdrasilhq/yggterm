@@ -1457,9 +1457,29 @@ const MENU_SURFACE_CSS: &str = r#"
 /// click** — collapse was verified still working (`data-metadata-group-expanded`
 /// 1→0→1 on the live host, 3.0.64). A control that must NOT select has to say
 /// `-webkit-user-select:none` inline; unprefixed alone is decoration.
+/// ⭐ THE HEADER WAS THE HALF THIS RULE MISSED, and 3.0.67 adds it after a
+/// whole-document sweep found it (see below). `.yggui-rail-scroll` is the
+/// rail's SCROLL BODY; the rail's own heading is a SIBLING of it, so opting the
+/// body back in left "Session Metadata" — the rail's own title — unselectable
+/// while every value under it selected. Measured on the live host, the rail
+/// container's four children computed:
+///
+/// | child | `-webkit-user-select` |
+/// |---|---|
+/// | `[data-yggui-rail-header]` | **none** ← the gap |
+/// | the scrollbar `<style>` node | none (no visible text) |
+/// | `[data-yggui-rail-scroll]` | text (3.0.64, working) |
+/// | `[data-rail-resize-handle]` | none (a DRAG handle, and it must stay none) |
+///
+/// ⇒ The `none` is not global and never was: it is set INLINE on
+/// `[data-yggui-side-rail]` — the shell's own rail container — and everything
+/// inside inherits it. That is why the opt-in has to name each rail child that
+/// holds reading material, and why the resize handle is deliberately not named.
 const RAIL_TEXT_SELECTION_CSS: &str = r#"
 .yggui-rail-scroll,
-.yggui-rail-scroll * {
+.yggui-rail-scroll *,
+[data-yggui-rail-header],
+[data-yggui-rail-header] * {
     user-select: text;
     -webkit-user-select: text;
 }
@@ -75788,7 +75808,8 @@ async fn process_pending_app_control_requests(
                         output_path: None,
                         data: None,
                         error: Some(
-                            "app-control remote terminal creation supports shell or codex"
+                            "app-control remote terminal creation supports shell, codex and \
+                             claude-code"
                                 .to_string(),
                         ),
                     }
@@ -75826,6 +75847,38 @@ async fn process_pending_app_control_requests(
                                     Some(&terminal_appearance_for_task),
                                     &launch_for_task,
                                     &seat_for_task,
+                                )
+                            } else if requested_kind_for_task.is_agent() {
+                                // ⛔⛔ THE SILENT DOWNGRADE, REFUSED BY NAME —
+                                // measured 2026-08-09 by asking for a remote
+                                // `opencode` row and getting a bash prompt that
+                                // reported success.
+                                //
+                                // Only codex and claude-code have a remote start
+                                // contract above. Every OTHER agent kind used to
+                                // fall into the ssh-shell arm below, so the row
+                                // was born a plain shell while its label still
+                                // said the CLI's name — and the create answered
+                                // `error: null`. Nothing downstream could tell:
+                                // the session's stored kind is `ssh_shell`, so
+                                // even the remote CLI provisioner correctly
+                                // declined to install anything for it.
+                                //
+                                // ⚖ This is the `_ => "shell"` failure the
+                                // automation `--kind` parser already carries a
+                                // warning about, reappearing one layer out. The
+                                // CodexLiteLlm arm two matches above ALREADY
+                                // refuses by name for exactly this reason; this
+                                // extends that precedent to the rest instead of
+                                // leaving six kinds silently downgraded.
+                                anyhow::bail!(
+                                    "a REMOTE {} row cannot be created through app-control: only \
+                                     codex and claude-code have a remote start contract. Creating \
+                                     it would open a PLAIN SSH SHELL and report success, which is \
+                                     the silent downgrade this refusal exists to end. Launch it \
+                                     from the GUI on that machine, or use --kind codex / \
+                                     --kind claude-code.",
+                                    yggterm_server::session_kind_label(requested_kind_for_task)
                                 )
                             } else {
                                 yggterm_server::start_ssh_session_seated(
@@ -136151,6 +136204,67 @@ mod tests {
             "WebKitGTK resolves `-webkit-user-select`; the unprefixed property \
              alone changes nothing on the live host, so the rail would still be \
              unselectable with a rule that omits the prefixed form"
+        );
+        // ⭐ THE HEADER, added in 3.0.67. A rail is not just its scroll body:
+        // the heading is a SIBLING of `.yggui-rail-scroll` under the container
+        // that actually sets `none`, so opting in the body alone left the rail's
+        // own title unselectable while every value beneath it selected.
+        assert!(
+            RAIL_TEXT_SELECTION_CSS.contains("[data-yggui-rail-header] *"),
+            "the rail HEADER is a sibling of the scroll body, not a descendant \
+             of it: without naming it, `Session Metadata` stays unselectable \
+             while everything under it selects — measured on the live host"
+        );
+        // ⛔ The resize handle is the rail's DRAG surface. It carries no text,
+        // and naming it would put a grab target into a selection rule for no
+        // gain — the same mistake in miniature that keeps the titlebar out.
+        assert!(
+            !RAIL_TEXT_SELECTION_CSS.contains("data-rail-resize-handle"),
+            "the rail resize handle is a drag surface, not reading material"
+        );
+    }
+
+    /// ⛔ A REMOTE AGENT ROW MUST NOT SILENTLY BECOME A SHELL.
+    ///
+    /// Measured 2026-08-09: `server app terminal new --machine-key <host>
+    /// --kind opencode` answered `error: null`, created a row LABELLED
+    /// "Agent unnamed opencode", and gave it `kind: ssh_shell` with a plain
+    /// `server attach` launch command. Everything downstream then behaved
+    /// correctly on wrong data — including the remote CLI provisioner, which
+    /// declined to install `opencode` because an `ssh_shell` has no managed CLI.
+    /// The bug was invisible from every field except the session's stored kind.
+    ///
+    /// Only `Codex` and `ClaudeCode` have a remote start contract. This test
+    /// locks the ORDER of the arms, because the defect was purely positional:
+    /// the `is_agent()` refusal must come BEFORE the ssh-shell fallback, or the
+    /// fallback swallows every remaining agent kind again.
+    ///
+    /// ⚠ Source-shaped on purpose. The arms live inside an async closure in a
+    /// several-thousand-line match on the app-control wire, so there is no unit
+    /// seam to call; libyggterm's own titlebar-drag test locks its handlers the
+    /// same way. What it can still prove is the one thing that regressed.
+    #[test]
+    fn a_remote_agent_row_is_refused_by_name_rather_than_downgraded_to_a_shell() {
+        let source = include_str!("shell.rs");
+        let arm = source
+            .find("app_control_create_terminal_remote")
+            .expect("the remote create arm");
+        let block = &source[arm..];
+        let refusal = block
+            .find("requested_kind_for_task.is_agent()")
+            .expect(
+                "the remote create arm no longer refuses unsupported agent kinds by name: every \
+                 kind but codex and claude-code would fall through to the ssh-shell arm and be \
+                 born a plain shell while reporting success",
+            );
+        let fallback = block
+            .find("start_ssh_session_seated")
+            .expect("the ssh-shell fallback");
+        assert!(
+            refusal < fallback,
+            "the `is_agent()` refusal must be checked BEFORE the ssh-shell fallback — after it, \
+             the fallback has already claimed every agent kind that is not codex or claude-code, \
+             which is exactly the silent downgrade this locks out"
         );
     }
 
