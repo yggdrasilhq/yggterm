@@ -227,6 +227,19 @@ If a change affects how sessions appear, check both the CWD tree sidebar and the
 
 `DESIGN.md` is the source of truth for colors, typography, spacing, button shapes, and interaction vocabulary. Do not invent new styles. If a style decision is not in `DESIGN.md` and needs to be durable, add it there, not in a comment or chat history.
 
+## ⛔ BEFORE YOU SPAWN A SESSION, OR HAND WORK TO ANOTHER AGENT
+
+Read `.agents/skills/yggterm-agent-fleet/SKILL.md`. It is the contract for the
+four powers an agent CLI gains by running inside yggterm — its own addressable
+row, spawning a delegate **and proving it received the brief**, messaging any
+other row, and reading its own context budget before it runs out.
+
+⛔ **`terminal new --prompt` has silently dropped an entire brief** while
+reporting a good launch, costing eight hours of campaign time. The skill's §3
+carries the four-step recipe that replaces it, and the one check that cannot lie:
+**grep the delegate's transcript for a token from your own brief.** A transcript
+file existing proves only that a process started.
+
 ## Custom commands
 
 - `/yggui` — take a live screenshot, query app state, or run a terminal probe on the desktop host. See `.agents/skills/yggui-app-control/SKILL.md`.
