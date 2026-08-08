@@ -44,30 +44,35 @@ print(next(r['full_path'] for r in rows if r['full_path'].endswith('$UUID')))")
 ⛔ Pasting `$YGGTERM_SESSION_ID` where a row path is wanted fails quietly — the
 verb accepts the string and addresses nothing.
 
-### ⚠ Title and seat LOOK separate. Do not rely on it.
+### Title and seat are separate by design — but the seat can EVAPORATE
 
 `server app session outline <row> <prefix>` stores a number apart from the title,
-and `server app rows` then reports a composed `label` ("4 topic: …") — which reads
-like proof that the sidebar renders the two together.
+and the sidebar builder re-composes that prefix onto the row's label as its last
+act — **specifically so that a CLI re-titling itself cannot drop the number.** The
+API and the screen agree by construction. Good design, and worth keeping.
 
-⛔ **It does not.** Measured against a screenshot of the real sidebar: **every row
-displays its `session_title` ALONE**, so a row seated only via `outline` appears
-with no number at all while `label` claims otherwise. The stored prefix has also
-been observed to disappear on its own between reads.
-
-⇒ **`label` is not what gets labelled** — the same shape as §7, and a nastier
-instance, because here *the lie is the helpful-looking field* and it specifically
-defeats whoever does the right thing by verifying against the API.
+⚠ **The live defect is DURABILITY, not rendering: a stored prefix has been
+observed to vanish on its own between two reads**, leaving the row unnumbered.
+⇒ **Until that is fixed, compose the number into the title as well** — belt and
+braces, and the title is the thing the watch defends:
 
 ```sh
-# Write the number INTO the title (what the sidebar shows), and set outline too —
-# harmless today, correct if the GUI ever renders it.
 yggterm server app session rename  "$ROW" "4. topic: what I am actually doing"
 yggterm server app session outline "$ROW" 4          # "" clears
 ```
 
-⚖ **Verify a display claim against the DISPLAY.** An API field describing what a
-user sees is a claim about pixels, and only pixels settle it.
+⛔⛔ **THE LESSON HERE IS NOT ABOUT LABELS, AND I GOT IT WRONG FIRST.** Seeing a
+composed label in the API and an unnumbered row in a screenshot, I concluded the
+field was lying about what the sidebar renders, and published that. **It was
+false** — the two observations were **taken at different MOMENTS**, and the seat
+had disappeared in between. One durability bug wearing the costume of two.
+
+⇒ **AN API READ TAKEN AT A DIFFERENT MOMENT FROM THE SCREENSHOT IS NOT A
+VERIFICATION OF THE SCREEN.** When you compare an instrument against a display,
+**the two samples must be simultaneous, or the difference you find may be time
+rather than disagreement.** This generalises well past this one field, and it is
+the failure §7's own advice ("read state back") walks you straight into if you
+read it back *later*.
 
 ### ⛔ CLAIM YOUR ROW AS YOUR FIRST ACT ON A CAMPAIGN — do not wait to be asked
 
