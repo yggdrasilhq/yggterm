@@ -13,52 +13,6 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
-## ★★★ OWNER-REPORTED: A LEGACY BROWSER CHORD IS DEAD WHENEVER THE SIDEBAR HAS FOCUS
-
-**Status:** OPEN
-
-⭐ **Owner-reported 2026-08-08:** *"legacy shortcuts in ychrome like CTRL+T works
-when viewport is active but not when sidebar is active."*
-
-This is the THIRD face of the bug reported twice on 2026-08-01 (a revealed page
-with no keyboard; an omnibox focus that lasted a split second), and the first two
-fixes cannot reach it, because this one is not about which surface was revealed.
-
-`WEB_PAGE_CHORDS` is `page_only` to the last row, and the window claimer stands a
-`page_only` row down *"unless the focused widget is one of this host's VISIBLE
-surface webviews"* (`shell.rs`, the `WEB_PAGE_CHORDS` doc). Click the sidebar and
-the focused GTK widget is the **shell's own Dioxus webview**, so every browser
-chord stands down. That gate is not sloppy — it is the reason `Ctrl+R` is still
-readline's reverse-search in every terminal, and `assert_accels_pty_safe` plus
-`assert_no_legacy_chord_is_an_accel` hold the two layers disjoint by name.
-
-The gate is two lines, both in the vendored crate:
-`vendor/dioxus-desktop/src/web_surface.rs` — `claimed_chord`'s
-`(!entry.page_only || page_focused)`, and the `page_focused` it is handed, which
-matches `window.focused_widget()` against *"the surfaces this host owns — the
-shell's own webview is not among them"*.
-
-⛔ **The obvious fix is wrong.** "Also allow the chord when the toplevel webview
-has focus" hands `Ctrl+R`/`Ctrl+T`/`Ctrl+W` back to the terminal, because **the
-terminal canvas and the sidebar live in the SAME webview** — GTK cannot tell them
-apart, and that indistinguishability is precisely why the gate was written at the
-widget level. So the answer has to come DOWN from the shell into the vendored
-claimer, not be re-derived inside it.
-
-**So the gate needs a second, finer question that only the shell can answer:** is
-the shell's own DOM focus in a terminal or a text field right now? The find bar
-already owns a fact of that exact shape
-(`web_find::find_bar_blocks_terminal_input`), so the honest move is to name the
-DOM-focus fact ONCE and have both read it, not to add a second encoding. A chord
-would then serve when the active session's view is a web surface AND the shell's
-DOM focus is neither the terminal nor an input.
-
-**Acceptance:** with a ychrome session active and the sidebar clicked, `Ctrl+T`
-opens a tab; with a terminal session active and the sidebar clicked, `Ctrl+R`
-still reaches readline; and a rename field in the sidebar still eats its own
-`Ctrl+W`. ⚠ Live proof is a keystroke through app control, not a unit test — the
-whole bug lives in which widget GTK considers focused.
-
 ## ★★ OWNER-REPORTED: THE FIRST TAB REFUSES CLOSE, DUPLICATE AND DRAG — the refusals are right, the AFFORDANCES are the bug
 
 **Status:** OPEN

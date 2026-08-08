@@ -4,6 +4,29 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A browser chord works again when the sidebar has focus.** Reported: *"legacy
+  shortcuts in ychrome like CTRL+T works when viewport is active but not when
+  sidebar is active."* Every legacy browser chord is `page_only`, and the window
+  claimer stood a `page_only` row down unless one of its OWN surface webviews
+  held the toplevel's focus — the sidebar lives in the shell's Dioxus webview,
+  which never is one, so one click killed `Ctrl+T`, `Ctrl+R`, `Ctrl+L`, `F12`
+  and the rest. The gate could not simply be widened to "the toplevel webview
+  has focus": the terminal canvas lives in that SAME webview, and GTK cannot
+  tell a sidebar click from a user typing at a PTY, so widening it would hand
+  `Ctrl+R` to a page reload while the user meant readline's reverse-search.
+  Instead the shell — the only layer that knows which viewport is in front —
+  now pushes the finer answer to the host as DATA, exactly as it already pushes
+  the claim table itself. A chord serves over shell focus only when the session
+  viewport is showing, that session HAS a live web surface, no over-viewport
+  modal is up, and no shell DOM control holds the keys. That last list had been
+  written out twice (once for the PTY, once implied here); it is now
+  `shell_dom_control_holds_keyboard`, named once and read by both, so a sidebar
+  rename still eats its own `Ctrl+W` and cannot drift away from what the
+  terminal believes. The arm also stands down for the surface's OWN controls —
+  measured live rather than reasoned: without that clause, `Ctrl+T`'s
+  typing-ready omnibox lost its very next `Ctrl+W` to a tab close instead of a
+  word delete.
+
 - **An exhausted policy fetch now re-arms after a minute, so an endpoint that
   comes back on the SAME port is finally noticed.** The repair rule above can
   only fire if a policy ever arrives, and after three failed fetches nothing

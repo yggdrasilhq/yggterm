@@ -406,6 +406,15 @@ impl DesktopService {
         }
     }
 
+    /// ARM or disarm the `page_only` rows of that table for a keyboard the
+    /// SHELL's own webview holds (see `web_surface::WebSurfaceHost`'s
+    /// `page_chords_armed`). The shell owns the answer; the host only reads it.
+    pub fn set_web_surface_page_chords_armed(&self, armed: bool) {
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.set_page_chords_armed(armed);
+        }
+    }
+
     /// Hand keyboard focus to a page webview — the GIVE-BACK half of the
     /// ALT-layer focus loan (the tap notifier grabs focus for the shell; when
     /// the KeyTips layer closes over a revealed surface, focus returns here).
