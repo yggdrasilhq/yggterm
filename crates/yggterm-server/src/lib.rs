@@ -27887,6 +27887,105 @@ mod tests {
         }
     }
 
+    // The machine a remote row provisions on comes from `ssh_target`, NOT
+    // `host_label`. `ssh_target` is the exact input `machine_key_from_ssh_target`
+    // -> `remote_target_for_machine_key` consume, so it round-trips to the target
+    // that made the row; `host_label` is `SshConnectTarget::label`, a DISPLAY
+    // string that merely coincides with it on fleets whose labels equal their ssh
+    // aliases — read elsewhere through the looser `machine_key_from_labelish`.
+    //
+    // ⚠ The fixture sets `host_label` to something DELIBERATELY WRONG and gives
+    // `ssh_target` a form that only normalization can resolve (user@Host with
+    // capitals). A resolver that reached for `host_label`, or one that skipped
+    // `machine_key_from_ssh_target`, fails here instead of passing by accident on
+    // a fleet where the two happen to agree.
+    #[test]
+    fn a_remote_row_provisions_on_the_machine_its_ssh_target_names() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.ssh_targets.push(SshConnectTarget {
+            label: "Build Farm".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "pi@Farm-One".to_string(),
+            prefix: None,
+            cwd: None,
+        });
+        let path = "live::c0ffee00-0000-4000-8000-000000000001";
+        let mut session = build_session(
+            SessionKind::Pi,
+            path,
+            Some("c0ffee00-0000-4000-8000-000000000001"),
+            Some("/home/user"),
+            Some("remote pi row"),
+            None,
+            server.backend,
+            server.theme,
+            server.ghostty_host.bridge_enabled,
+            StoredPreviewHydrationMode::Deferred,
+        );
+        session.source = SessionSource::LiveSsh;
+        session.ssh_target = Some("pi@Farm-One".to_string());
+        // The display label disagrees with the machine on purpose.
+        session.host_label = "Build Farm".to_string();
+        server.sessions.insert(path.to_string(), session);
+
+        let (machine_key, tool) = server
+            .remote_managed_cli_target_for_session_path(path)
+            .expect("a LiveSsh agent row must resolve to a machine and a tool");
+        assert_eq!(machine_key, "farm-one");
+        assert_eq!(tool.binary_name(), "pi");
+        // And the key must actually find the target again — the round trip is
+        // the whole reason `ssh_target` is authoritative.
+        assert_eq!(
+            server
+                .remote_target_for_machine_key(&machine_key)
+                .expect("machine key must resolve back to its ssh target")
+                .ssh_target,
+            "pi@Farm-One"
+        );
+
+        // A row with no ssh_target is left unprovisioned rather than guessed at.
+        let orphan = "live::c0ffee00-0000-4000-8000-000000000002";
+        let mut no_target = build_session(
+            SessionKind::Pi,
+            orphan,
+            Some("c0ffee00-0000-4000-8000-000000000002"),
+            Some("/home/user"),
+            Some("orphan"),
+            None,
+            server.backend,
+            server.theme,
+            server.ghostty_host.bridge_enabled,
+            StoredPreviewHydrationMode::Deferred,
+        );
+        no_target.source = SessionSource::LiveSsh;
+        no_target.ssh_target = None;
+        no_target.host_label = "Build Farm".to_string();
+        server.sessions.insert(orphan.to_string(), no_target);
+        assert!(
+            server
+                .remote_managed_cli_target_for_session_path(orphan)
+                .is_none(),
+            "host_label must not be used as a fallback machine source"
+        );
+    }
+
     // ⛔ The remote lane MUST cache a negative; the local lane deliberately does
     // not. Locally a miss is a filesystem stat, so re-probing every focus is
     // free. Remotely a miss is an SSH ROUND TRIP, so copying the local rule

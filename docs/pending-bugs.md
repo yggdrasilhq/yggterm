@@ -1089,10 +1089,42 @@ keyed by `(machine_key, tool)` is what makes create-vs-focus separable, mirrorin
    returns `()`, not `Result`: a briefly unreachable host yields a warning and a
    60 s negative entry, never a dead row.
 
-**What is still owed:**
+### What 3.0.66 has and has NOT been proven to do
 
-- ⛔ **LIVE PROOF.** The wiring is built and unit-locked; it has not yet been
-  exercised end to end against a host with the CLI genuinely absent.
+✅ **PROVEN LIVE, by file.** The verb and slug this code sends —
+`server remote ensure-managed-cli qwen`, the slug being
+`ManagedCliTool::binary_name()` — installed Qwen Code 0.21.8 on a host that had
+never carried it, read back as
+`~/.yggterm/npm/bin/qwen -> ../lib/node_modules/@qwen-code/qwen-code/cli-entry.js`
+and NOT from the command's own echo. That also confirms `binary_name()` is an
+accepted slug for `parse_managed_cli_tool`.
+
+✅ **UNIT-LOCKED, each mutation-proven red.** The lane partition
+(`every_agent_row_is_provisioned_by_exactly_one_lane`), the two-TTL negative
+cache (`a_missing_remote_cli_is_cached_so_focus_never_pays_per_click`), and the
+`ssh_target`-not-`host_label` resolution against a real server object
+(`a_remote_row_provisions_on_the_machine_its_ssh_target_names`, whose fixture
+sets `host_label` to a deliberately wrong value and passes only if the resolver
+round-trips the machine key back to its target).
+
+⛔ **NOT PROVEN: the funnel-to-install chain driven from the GUI.** Nobody has
+yet clicked a remote agent row whose CLI is absent and watched the binary appear.
+The daemon socket is version-keyed (`server-3-0-66.sock`), so a 3.0.65 GUI never
+reaches a 3.0.66 daemon — end-to-end proof needs the GUI itself on 3.0.66, i.e. a
+GUI restart, which was deliberately not taken while the empty-rail watcher was
+running. **Do this first when the watcher is retired.**
+
+⚠ **An isolated-daemon harness was tried and does NOT substitute.** A synthetic
+`live_sessions` row rehydrates as a plain local shell (`exec '/bin/bash' -i`),
+and `server attach` takes a UUID — it prefixes `local://`, producing
+`local://remote-session://…`, which the remote lane then correctly declines.
+`server connect`, the headless twin of clicking a row, lives in the GUI binary
+and is not in `yggterm-headless`. ⇒ a headless daemon cannot birth a real remote
+agent row; do not spend another session rebuilding this harness.
+
+⚠ **STATE CHANGED ON A THIRD HOST, 2026-08-08 — declared.** The falsifier above
+installed `qwen` on one of the two previously-untouched remotes. It now carries
+`codex claude agy qwen`. A later session must not read it as pristine.
 - ⚠ **A second, smaller gap sits behind it, now MEASURED rather than assumed.**
   The remote binaries are 3.0.64 and 3.0.62, so their `ensure_local_managed_cli`
   predates 3.0.65's per-method dispatch. Run by hand against both remotes:
