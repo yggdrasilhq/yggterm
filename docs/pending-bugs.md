@@ -13,6 +13,50 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⛔ MUSE STARTS AND EXITS 0 IMMEDIATELY — IT ASKS THE TERMINAL A QUESTION NOBODY IS THERE TO ANSWER
+
+**Status:** OPEN
+
+Split out of the launch-PATH fix (3.0.70), which it is NOT: `muse` now resolves
+and executes — the `command not found` and the `Thu: unbound variable` are both
+gone, and `agy` and `kimi` come up as full TUIs on the same launch path. muse
+alone paints nothing and its PTY is gone within seconds
+(`launch_phase: RemoteBootstrap`, no surviving process).
+
+**What it emits before dying, captured in a bare pty** (`script -qec muse`),
+with every printable byte shown:
+
+```
+ESC]10;?  ESC]11;?  ESC]4;0;? … ESC]4;15;?      (OSC colour queries ×18)
+ESC[>1u  ESC[<1u  ESC[<u  ESC[<1u  ESC[<u        (Kitty keyboard protocol)
+MUSE_EXIT=0
+```
+
+⇒ It opens with a **terminal capability handshake** and quits **cleanly** —
+exit 0, no diagnostic — when the answers do not come. Not a crash, not a login
+failure: `~/.config/muse/{auth.json,settings.json,trust.json}` are all present
+and current.
+
+⚠ **Why this is plausibly OURS and not muse's.** A yggterm row's PTY is owned by
+the daemon, and the renderer attaches afterwards. A CLI that queries the
+terminal in its first moments is querying a PTY with **no renderer on the other
+end yet**, so nothing replies within its timeout. Every other agent CLI shipped
+so far tolerates silence; muse treats it as "no terminal" and leaves. ⇒ the
+class is *"a CLI that probes the terminal at startup"*, and muse is simply the
+first one to be strict about it.
+
+**The falsifier, and run it before writing any code:** does muse survive when
+something ANSWERS the queries? Compare (a) muse under a plain `script` pty
+(silent — reproduces the exit), (b) muse typed into an already-attached yggterm
+row rather than launched as the row's command, and (c) muse under a terminal
+that does reply. If (b) lives, the fix is to hold the launch until a renderer is
+attached, or to answer the DA/OSC handshake from the daemon's own vt100 —
+`terminal_lines` proves the daemon parses these sequences, so it is positioned
+to reply. If (a) and (b) both die, it is muse's bug and belongs upstream.
+
+⛔ Do not "fix" this by sleeping before exec. The question is whether anyone
+answers, not how long muse waits.
+
 ## ⛔⛔ `terminal new` REPORTS A TIMEOUT AND CREATES THE ROW ANYWAY — SO A RETRY LOOP IS A ROW BOMB
 
 **Status:** OPEN
