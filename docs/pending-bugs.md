@@ -129,23 +129,37 @@ particular, which is most of what the door is for.
 is active, then read `session_cwd` back from `server app rows` — echoing the
 request is not proof, the row must be re-read.
 
-## ⭐ OWNER-REQUESTED: TEXT IS NOT SELECTABLE, AND THE METADATA RAIL IS THE WORST CASE
+## ⭐ OWNER-REQUESTED: TEXT OUTSIDE THE RAILS IS STILL NOT SELECTABLE
 
 **Status:** OPEN
 
-His words, 2026-08-08: *"I pasted this screenshot because I cannot select the
-title name from the metadata sidebar. The metadata sidebar entries or text in
-general (mostly anywhere) should be selectable."*
+⇒ The RAIL half shipped in 3.0.64; what is below is the remainder.
 
-**He had to take and paste a SCREENSHOT to tell an agent what a row was called.**
-That is the cost, and it recurs: the same panel renders the ssh reattach command
-and the Claude Code session uuid — two things a human copies constantly and
-currently cannot.
+His words, 2026-08-08: *"The metadata sidebar entries or text in general (mostly
+anywhere) should be selectable"*, and again the same day after the first report:
+*"I still cannot select any text on session metadata other than the connect code
+row. Every text should be selectable."*
 
-Scope as he framed it, and do not narrow it to the Title field: metadata rail
-entries first, then text in general. ⚠ The shell sets `user-select` globally to
-make the chrome feel native; the fix is to make CONTENT selectable rather than to
-lift the rule everywhere (a selectable sidebar row would break drag-to-reorder).
+**Shipped (3.0.64):** `RAIL_TEXT_SELECTION_CSS` on `.yggui-rail-scroll *`,
+mounted once in the shell's global `style {}` block, so every rail — metadata,
+settings, connect, notifications, tab rail, contributed app panes — selects.
+Live-proved on jojo: a rail span computes `-webkit-user-select:text` and a Range
+over it returns its text, while a sidebar row computes `none` and returns empty.
+
+**What remains: everywhere that is not a rail** — the start page, dialogs,
+the titlebar's own text, notification cards. The rule to follow is the one the
+rail fix established: make CONTENT selectable, never lift the global rule (a
+selectable sidebar row would break drag-to-reorder — measured: a sidebar row
+still returns an empty selection, which is correct).
+
+⚠ **THE TRAP, MEASURED 2026-08-08 — an unprefixed inline `user-select:none` is
+INERT on WebKitGTK.** The engine resolves `-webkit-user-select`; **15 of the
+shell's 41 `user-select:none` sites write only the unprefixed property** and were
+never doing anything (they looked effective only because the shell ROOT sets
+both and everything inherited its `none`). ⇒ Any opt-out written as part of this
+work must use the PREFIXED form or it is decoration. The metadata group's
+collapse toggle is one of the 15: inside the rail it now selects, which is
+harmless — collapse still fires (`data-metadata-group-expanded` 1→0→1, live).
 
 ## ⛔ `server app clients` ANSWERS IN A DIFFERENT ENVELOPE FROM EVERY OTHER APP VERB
 
@@ -795,13 +809,39 @@ the terminal screen says the CLI is missing** — no launch error, no row state,
 no trace event. The only instrument that can answer "did my CLI start?" is
 reading the screen text.
 
-Muse is the owner-gated one and is correctly parked in `owner-attention.md`.
-**`kimi` and `agy` are not owner-gated — they are simply outside the npm
-provisioner**, and `agy` is installed on `dev` today, so the gap is the
-provisioning method, not the package.
+⛔⛔ **THE OWNER OVERRULED THE "declare it host-provided" ESCAPE HATCH,
+2026-08-08:** *"Trying to launch Muse CLI shows notification to install it.
+yggterm should auto install, update ALL clis in all connected systems including
+localhost."* ⇒ **there is no per-descriptor opt-out to write.** Every CLI is
+auto-installed, and Muse is no longer parked in `owner-attention.md` (only its
+LOGIN is still his). Full ruling: [`settled-calls.md`](settled-calls.md).
 
-**What is owed here now:** teach the provisioner the non-npm install methods, or
-declare per-descriptor that a CLI is *host-provided*.
+**What is owed here now, in three parts — the third has no code at all today:**
+
+1. **Teach the provisioner the non-npm methods.** `CliInstall` already names
+   them: `Uv(pkg)`, `VendorScript(url)`, `Manual`. `kimi` and `agy` are simply
+   outside the npm provisioner (`agy` is installed on `dev` today, so the gap is
+   the METHOD, not the package).
+2. **Run `VendorScript` unattended.** Its doc comment in
+   `yggterm-core/src/agent_cli.rs` still says yggterm *"does NOT run it
+   unattended"* — that clause is superseded and must be rewritten with the fix,
+   or the next reader will re-derive the refusal from it. `CliInstall::Manual`
+   ("must never try to install it") needs the same audit: after this ruling, is
+   any CLI genuinely `Manual`?
+3. ⭐ **UPDATE, which does not exist.** Provisioning today happens on demand at
+   LAUNCH; nothing keeps an installed CLI current on any host. He asked for
+   "install, update", and the update half is unbuilt for every method and every
+   machine. Prefer each CLI's own updater where it has one.
+
+⚠ Scope word he used: **"all connected systems including localhost"**. Localhost
+is named because the local path and the remote-provisioning path are different
+code, and a fix proven on one is not proven on the other.
+
+⚠ Falsifier for a fix (do not accept an echo): on a host with `muse` absent,
+launch a Muse row and then read `command -v muse` **on that host** — plus
+`~/.config/muse/auth.json` presence to tell "installed" from "authenticated".
+The existing 3.0.59 refusal-by-name will otherwise fail the row cleanly and look
+like correct behaviour.
 
 ✅ The other half — **a failed exec must surface as a row-level launch failure,
 not as a line of scrollback in a shell that outlives it** — shipped in 3.0.59.
