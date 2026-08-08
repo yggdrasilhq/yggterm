@@ -144,19 +144,46 @@ are not throwaways.
 
 `build_local_cwd_tree` groups by the cwd **string** and never calls `is_dir()`
 (`yggterm-core/src/lib.rs`), so they render as ordinary rows under ordinary
-folders. That is what made the repair work at all, and it is deliberate — but it
-means **clicking one runs the product's core promise (`ssh … && cd <cwd> &&
-codex resume <uuid>`) against a directory that is not there.**
+folders. That is what made the repair work at all, and it is deliberate.
 
-⛔ Do NOT "fix" this by hiding them: that is precisely the mistake the orphan
-repair just undid, where a session was invisible because of a naming rule. The
-question is how a still-valuable session with a vanished workspace should
-PRESENT and what clicking it should do — resume in the nearest surviving parent,
-resume read-only, or offer to re-point the cwd. That is a spec call, not a
-defect to patch at a callsite.
+### ⛔ IT DOES NOT FAIL — `best_effort_cwd_shell_prefix` ALREADY WALKS UP
 
-⚠ The condition is general, not an artefact of the repair: any session outlives
-its directory eventually.
+An earlier draft of this entry said clicking one aims `cd` at a directory that is
+not there. **That is wrong and must not be re-derived.**
+`best_effort_cwd_shell_prefix` (`yggterm-server/src/codex_cli.rs:2773`) emits a
+prelude that climbs to the nearest surviving ancestor, with two guards: landing
+on `/` when `/` was not what was asked for redirects to `$HOME`, and a total
+failure redirects to `$HOME`. Measured for the three restored sessions:
+
+    /home/pi/data/cases-debug-cli                → /home/pi/data
+    /home/pi/data/cases-debug-movefix            → /home/pi/data
+    /run/smb4k/…/dada/obsidian/codex/yggterm     → /run/smb4k/…/dada/obsidian
+
+So the click WORKS and codex resumes. **The defect is that it works silently and
+imperfectly**, which is a narrower and harder problem than a failure:
+
+1. **Nothing discloses the substitution.** The row advertises the original cwd;
+   the shell lands somewhere else. Neither the human nor the resumed agent is
+   told, so the agent believes it is in the workspace and every relative path in
+   11,006 records of transcript resolves against the wrong directory.
+2. **Distinct sessions collapse onto one location.** Both 181-turn sessions land
+   in `/home/pi/data`, so the cwd no longer distinguishes them.
+
+⇒ The open question is **disclosure, not resolution**: should a session whose
+recorded cwd is gone SAY so — in the row, on open, or both — instead of quietly
+resuming a level up? Options include marking the row, telling the agent in its
+seed, or offering to re-point the cwd.
+
+⛔ Do NOT "fix" this by hiding such rows: that is precisely the mistake the
+orphan repair just undid, where a session was invisible because of a naming rule.
+
+⚠ The condition is general, not an artefact of the repair — any session outlives
+its directory eventually — and the walk-up predates all of this. The repair only
+made it easy to notice.
+
+⚠ Related, do not conflate: `legacy_agent_launch_command_uses_best_effort_cwd_resolution`
+is one of the six baseline-red `yggterm-server` tests and covers this same
+function.
 
 ## ⚖⚖ THE HOT-RESTART GATE IS UNBUILT — THE DESIGN IS NOW SETTLED
 
