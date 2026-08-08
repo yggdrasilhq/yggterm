@@ -4,6 +4,20 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **`server app state` now reports BOTH derivations of "is this app's surface in
+  the viewport", side by side.** A yedit row renders its rail correctly while the
+  viewport still shows a bash prompt, and until now the only way to compare the
+  two answers that disagree was a dom-eval on a `data-` attribute plus inference
+  — the filed regression says so in as many words: *"Both maps belong in the
+  state dump."* They are not redundant, and which one is missing IS the
+  diagnosis: `document_surfaces` is built only for the co-visible set (the active
+  session plus the active split's members), so it can silently lack the very row
+  it is rendering, while `document_surface_visible_for` is the live derivation
+  and answers for any session at all. Each contribution now carries
+  `document_surface_visible_live` beside `in_snapshot_map`; `true` with `false`
+  is the bug shape, named. Both lists are sorted by session path so an operator
+  diffing two dumps is not shown a change that never happened.
+
 - **Launching a CLI that is not installed now FAILS the row, by name, instead of
   dropping you in a shell.** Reported: *"All CLIs might not be installed. I tried
   launching Muse Code and the viewport reported CLI binary not found."* A
