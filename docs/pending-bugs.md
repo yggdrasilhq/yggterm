@@ -13,6 +13,78 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⛔⛔ `terminal new` REPORTS A TIMEOUT AND CREATES THE ROW ANYWAY — SO A RETRY LOOP IS A ROW BOMB
+
+**Status:** OPEN
+
+Measured 2026-08-09 on a live 3.0.69/3.0.70 GUI, and the owner saw the damage
+before the measurement did: *"Why are you spawning a billion kimi sessions?"*
+
+`server app terminal new` answers `Error: timed out waiting for app control
+response <id> after 15000 ms` — and the row **is created**, every time. Six
+"failed" attempts left six rows. Ten rows in total had to be reaped by hand.
+
+⛔ **This is the [[finding-a-set-is-not-a-fill]] family inverted, and the
+inverted form is far more expensive.** A verb that reports success on failure
+wastes a verification; a verb that reports FAILURE ON SUCCESS invites the caller
+to retry, and every retry is another real, side-effecting create. The natural
+agent reflex — "the create failed, try again" — is precisely what turns one
+slow response into a sidebar full of orphans on the owner's screen.
+
+Two things are wrong and they are separable:
+
+1. **The 15 s app-control deadline is shorter than a create takes on a busy
+   GUI.** `server app rows` answered throughout, so the GUI was not wedged; it
+   was rehydrating 44 rows plus remote-machine refreshes. The create itself
+   completed — only the reply missed the window.
+2. **A timed-out app-control request has no outcome the caller can read.** There
+   is no "what did request `<id>` actually do?" lookup, so the caller cannot
+   distinguish *never ran* from *ran and the answer was late*. `~/.yggterm/
+   app-control-responses` exists; nothing points the CLI at it on timeout.
+
+**Fix shape:** the timeout message must carry the request id AND tell the caller
+how to resolve it, and `terminal new` must be idempotent per request id (a
+retried create with the same id adopts the existing row rather than making a
+second). ⛔ Do not "fix" this by raising the deadline alone — that only moves
+the cliff, and the row bomb happens at whatever the new number is.
+
+⚠ Until then, **never loop on a `terminal new` timeout.** Read `server app rows`
+first; the row is probably already there.
+
+## ⛔ OWNER-REPORTED: THERE IS NO FLEET-WIDE CLI INSTALL/UPDATE PIPELINE
+
+**Status:** OPEN
+
+Owner, 2026-08-09: *"We need a installation pipeline that installs all the clis
+and updates them frequently across the connected fleet."* This restates the
+settled call already in `docs/settled-calls.md` (*"yggterm should auto install,
+update ALL clis in all connected systems including localhost"*) as a thing that
+still does not exist.
+
+**What DOES exist, measured:** `refresh_local_managed_cli` already covers every
+registered CLI — the tool list is derived from the registry
+(`managed_cli_tools_for_refresh`), and per-tool install methods (npm, uv, vendor
+script) all run. `server remote ensure-managed-cli <slug>` provisions one CLI on
+one machine and is proven (Qwen Code 0.21.8 installed on a host that never had
+it). So the ENGINE is built and works.
+
+**What is missing is the fan-out and the cadence, and both are small:**
+
+- `YggtermServer::refresh_managed_cli(machine_key, background)` treats
+  `machine_key: None` as **local**, not as *"every machine"*. There is no arm
+  that walks `self.remote_machines`. Same for
+  `queue_background_managed_cli_refresh`.
+- There is **no periodic chore** that fires it. Every refresh today is
+  demand-driven (a focus, an attach, an explicit call), so a machine the owner
+  has not opened in a week never updates.
+
+**Fix shape:** a third scope — local · one machine · **all connected machines**
+— on the one function that already knows how to refresh one target, plus a
+daemon chore on the existing tick. ⚠ Pace it: the external LLM endpoint's 429
+lesson applies to ssh fan-out too, and a fleet refresh that runs npm/uv on four
+machines at once is exactly the kind of thing the owner notices as fan noise.
+⛔ Do not add a second refresh path; extend the scope of the one that exists.
+
 ## ⛔⛔ OWNER-REPORTED, LIVE: THE SESSION METADATA RAIL RENDERS ITS HEADER AND NOTHING ELSE
 
 **Status:** OPEN
@@ -690,6 +762,33 @@ contribution carrying `document_surface_visible_live` beside `in_snapshot_map`.
 `true` with `false` is the bug shape, named. ⚠ Still missing and worth adding:
 the right-panel mode does not report its **pane id**, and the document channel and
 the contribution sweep emit **no trace events at all**.
+
+### ⛔ THE INSTRUMENT ABOVE IS ONLY READABLE ON THE **ACTIVE** ROW — corrected 2026-08-09
+
+Re-reported by the owner the same day (*"yedit viewport is still not working. It
+either shows the terminal or empty viewport. The editing surface is gone."*), and
+the first reading of the new instrument was **misread by the session doing the
+re-measuring**, so the correction is recorded here rather than learned twice.
+
+`server app state` reported three Yedit contributions, every one
+`document_surface_visible_live: true` with `in_snapshot_map: false` — the exact
+pair named as the bug shape — and `document_surfaces: []`. That reading proves
+**nothing**: `snapshot.document_surfaces` is built ONLY for the CO-VISIBLE set
+(the active session plus the active split group's members, `shell.rs` ~18859,
+and the debug block says so at ~54004). Every one of those yedit rows was in the
+background, so `in_snapshot_map: false` was the CORRECT answer for all three.
+
+⇒ **`document_surface_visible_live: true` + `in_snapshot_map: false` is the bug
+shape ONLY when the row is the ACTIVE one.** On a background row it is the
+contract. Any future reading must first make the yedit row active
+(`server app open <path>`) and then re-read; a sweep across all rows will report
+the bug shape for every background app row and mean nothing by it.
+
+⚠ The rail half of this entry has since been implemented — `RightPanelMode::
+AppPane(AppPaneRef)` carries the declaring `session_path` (locked by
+`a_rail_that_is_not_docked_still_renders_a_body_and_the_overlay_names_its_owner`).
+What the owner is still reporting is the **viewport**, i.e. the second, smaller
+defect above: `DocumentSurfaceBody`'s opaque empty layer. Start there.
 
 ## ⛔⛔ AN APP ROW IS A SHELL WITH NO APP IDENTITY — so a restart resurrects bare bash, and a missing app binary cannot be refused
 
