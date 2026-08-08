@@ -5853,6 +5853,20 @@ impl DaemonRuntime {
                 yggterm_core::PerfGuard::new(self.store.home_dir(), "attach", "managed_cli_ensure");
             self.server.ensure_managed_cli_for_session_path(path)?
         };
+        // The REMOTE half of the same ensure, on the same funnel, because a row
+        // whose CLI lives on another machine passes through here too and the
+        // local ensure above answers `None` for exactly those rows. Kicks a
+        // background provision on the machine that will exec the CLI; a
+        // `(machine_key, tool)` cache means only the FIRST launch of a tool on a
+        // machine costs an ssh hop and every focus after it costs nothing.
+        {
+            let _perf = yggterm_core::PerfGuard::new(
+                self.store.home_dir(),
+                "attach",
+                "remote_managed_cli_ensure",
+            );
+            self.server.ensure_remote_managed_cli_for_session_path(path);
+        }
         // ⛔ The CLI's binary is checked AFTER the ensure above and BEFORE any PTY
         // is spawned, because this is the one funnel every local agent session's
         // terminal passes through. Refusing here is what makes a missing binary a
