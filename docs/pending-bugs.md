@@ -1054,12 +1054,27 @@ keyed by `(machine_key, tool)` is what makes create-vs-focus separable, mirrorin
 
 - ⛔ **The wiring above is DESIGNED AND UNBUILT.** Root cause is settled and
   live-proven; no code has landed on the remote lane.
-- ⚠ **A second, smaller gap sits behind it:** the remote binaries are 3.0.64 and
-  3.0.62, so their `ensure_local_managed_cli` predates 3.0.65's per-method
-  dispatch. npm CLIs install there today (proven with `qwen`); a **uv** CLI
-  (`kimi`) or a **vendor-script** CLI (`muse`) will not until those hosts carry
-  3.0.65+. That is a real distribution dependency, but it is second — the lane is
-  dead for npm CLIs too, and that half needs no new bytes anywhere.
+- ⚠ **A second, smaller gap sits behind it, now MEASURED rather than assumed.**
+  The remote binaries are 3.0.64 and 3.0.62, so their `ensure_local_managed_cli`
+  predates 3.0.65's per-method dispatch. Run by hand against both remotes:
+
+  | method | CLI | old remote binary answers |
+  |---|---|---|
+  | npm | `qwen`, `pi`, `opencode` | **installs** (0.21.8 / 0.84.1 / 1.18.15) |
+  | uv | `kimi` | `Error: … yggterm does not provision it — install it yourself from kimi-cli` |
+  | vendor | `muse` | `Error: … install it yourself from <vendor installer>` |
+
+  ⇒ the uv/vendor half needs 3.0.65+ ON THE REMOTE HOST; the npm half needs no
+  new bytes anywhere. The lane being dead for npm CLIs too is what makes the
+  wiring the first fix and the distribution the second.
+
+⚠ **STATE CHANGED ON TWO REMOTE HOSTS, 2026-08-08 — declared, not hidden.** The
+by-hand `ensure-managed-cli` falsifier installed `qwen`, `pi` and `opencode` on
+both the integrator and the workshop. They now carry 6 of the 8 (`codex`,
+`claude`, `agy`, `qwen`, `pi`, `opencode`; `kimi` and `muse` still absent per the
+table). A later session must not read those hosts as pristine, and must not read
+the presence of those three as evidence that the lane works — **it does not; a
+human ran the verb.**
 - ⛔ **Live proof on jojo** per the falsifier below — `command -v` read on the
   host itself, not an echo of the launch.
 
