@@ -348,6 +348,38 @@ from `server app rows`, and no surviving process.
 
 ---
 
+### ⛔⛔ WHO A NOTIFICATION IS ADDRESSED TO — owner-caught twice in one hour
+
+`notify --session <row>` makes the card **clickable through to that row**. So the `--session` is
+not bookkeeping, it is a **destination**: it decides where the human lands when they act on it.
+
+> **The rule: a notification is an ADDRESS, and the address is WHERE THE ATTENTION IS NEEDED —
+> never the row that happens to be reporting.**
+
+Both halves of this were got wrong on 2026-08-08, in opposite directions:
+
+1. An orchestrator escalating *about a delegate* addressed the card **to itself**. It works, and it
+   takes the human to the wrong place — **worse than inert, because it looks like it functioned.**
+2. A delegate announcing **its own landing** was told by its brief to notify the orchestrator's
+   row. The owner clicked it and landed in the orchestrator's session, not on the work. His
+   question — *"Was this intended?"* — is the right test, and the honest answer was **no, the brief
+   was wrong**.
+
+⇒ **A delegate reporting on ITSELF addresses its OWN row.** A card about row X carries row X.
+
+⚠ **And do not use a human-facing toast to talk to another agent.** They are different channels:
+
+| to reach | use | why |
+|---|---|---|
+| the **human**, about row X | `notify --session <row X>` | a clickable card that lands on the work |
+| **another agent** | `terminal submit <their row> --stdin` | agent-to-agent; costs the human nothing |
+| **your own bookkeeping** | `notify --pid/--client` | ⛔ otherwise it lands on *his* screen |
+
+⛔ And the identifier must be a **row path**. `$YGGTERM_SESSION_ID` is `cc-runtime://<uuid>` while
+the row is `remote-cc://<host>/<uuid>` — same uuid, different string, and the card renders, looks
+correct and **does nothing when clicked**. Resolve it against `server app rows` first;
+`ygg-babysit.py`'s `resolve_row_path()` does exactly this so the mistake cannot be made.
+
 ## 4. Correspondence — any session can reach any other
 
 A row is an address. That is the whole mechanism, and it needs no new protocol:
