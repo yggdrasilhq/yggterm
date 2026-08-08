@@ -11611,7 +11611,7 @@ async fn web_surface_native_reconcile_loop(
     // (open pane, the page it was drawn for). A pane that is still the same pane
     // but is now looking at a different page has to be redrawn — see the refetch
     // below.
-    let mut last_app_pane_page: Option<(String, Option<String>)> = None;
+    let mut last_app_pane_page: Option<(AppPaneRef, Option<String>)> = None;
     // Under-glass mode + backdrop color, change-gated: the DOM stamp keys the
     // page-hole transparency chain, the backdrop paints the theme background
     // behind pages. Both follow a runtime probe demotion within one tick.
@@ -11941,12 +11941,15 @@ async fn web_surface_native_reconcile_loop(
                 .zip(page.as_ref())
                 .is_some_and(|(before, now)| before.0 == now.0 && before.1 != now.1);
             last_app_pane_page = page;
-            if pane_moved
-                && let Some((pane_id, _)) = last_app_pane_page.clone()
-            {
+            if pane_moved && let Some((open_pane, _)) = last_app_pane_page.clone() {
                 let mut writable = state;
                 let seq = writable.with_mut(|shell| shell.app_pane_next_request());
-                spawn(app_pane_fetch_schema(state, pane_id, seq));
+                spawn(app_pane_fetch_schema(
+                    state,
+                    open_pane.session,
+                    open_pane.pane,
+                    seq,
+                ));
             }
         }
         // The WebKit zoom factor for one surface: the per-site override for the
@@ -15884,7 +15887,7 @@ fn right_panel_last_action(mode: &RightPanelMode) -> String {
         RightPanelMode::Connect => "ssh connect opened".to_string(),
         RightPanelMode::Notifications => "notifications opened".to_string(),
         RightPanelMode::WebTabs => "web tabs opened".to_string(),
-        RightPanelMode::AppPane(pane) => format!("app pane {pane} opened"),
+        RightPanelMode::AppPane(pane) => format!("app pane {} opened", pane.pane),
     }
 }
 const KEEP_DAEMON_RUNNING_AFTER_LAST_CLIENT: bool = true;
@@ -15895,6 +15898,35 @@ const SIDEBAR_RENAME_AUTOSCROLL_SUPPRESS_MS: u64 = 4_000;
 /// Minimum spacing between terminal-driven attention pings (BEL / OSC 9 / 777)
 /// per session, so a chatty TUI can't spam toasts/OS notifications.
 const TERMINAL_NOTIFY_PING_MIN_INTERVAL_MS: u64 = 2_500;
+/// WHOSE contributed pane the rail is showing: the session that DECLARED it,
+/// and the app's own id for it.
+///
+/// ⛔ The session half is load-bearing and was missing until 2026-08-08. A
+/// pane id alone is not an address: two apps may both declare `notes`, and a
+/// tenancy test written against the id asks "does the ACTIVE session offer a
+/// pane called this" when the only correct question is "is this pane's OWNER
+/// the session on screen". With the owner unnamed, `app_pane_fetch_schema`
+/// also had to resolve its control endpoint from the ACTIVE session, so the
+/// rail could fetch app B's schema into app A's open pane. Live-caught: the
+/// `New Yedit` row selected, its files nowhere, and ychrome's chrome — omnibox,
+/// Khan Academy tabs, `tables` folder — painted in the rail beside it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct AppPaneRef {
+    /// The session whose contribution declares this pane. The rail is a TENANT
+    /// of it; when another session is active the tenancy is over, whatever the
+    /// pane is called.
+    session: String,
+    /// The app's own pane id. yggterm never interprets it.
+    pane: String,
+}
+impl AppPaneRef {
+    fn new(session: impl Into<String>, pane: impl Into<String>) -> Self {
+        Self {
+            session: session.into(),
+            pane: pane.into(),
+        }
+    }
+}
 /// NOT `Copy`: `AppPane` carries the app-chosen pane id, which is a `String`.
 /// The alternative — a unit `AppPane` plus a separate `active_app_pane:
 /// Option<String>` field — would be two encodings of one fact that can
@@ -15924,7 +15956,10 @@ enum RightPanelMode {
     /// This variant is the reason `RightPanelMode::Vault` and `::AppSidebar` no
     /// longer exist: app chrome does not belong in yggterm. Every remaining
     /// variant above is yggterm's own.
-    AppPane(String),
+    ///
+    /// Addressed by [`AppPaneRef`] — the DECLARING session plus the pane id —
+    /// because a pane id alone cannot say whose pane it is.
+    AppPane(AppPaneRef),
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreviewLayoutMode {
@@ -19751,13 +19786,13 @@ impl ShellState {
             .get(session_path)
             .is_some_and(|contribution| {
                 contribution.panes.iter().any(|pane| {
-                    pane.placement == PanePlacement::Rail && pane.id == open_pane
+                    pane.placement == PanePlacement::Rail && pane.id == open_pane.pane
                 })
             });
         if !declares_rail_pane {
             return None;
         }
-        Some((open_pane, self.app_pane_next_request()))
+        Some((open_pane.pane, self.app_pane_next_request()))
     }
 
     fn apply_sidebar_ping(
@@ -19989,12 +20024,18 @@ impl ShellState {
     /// `+`/`-` step from what is actually on screen.
     fn active_web_surface_effective_zoom_percent(&self) -> Option<f32> {
         let session_path = self.server.active_session_path()?.to_string();
-        self.web_surfaces.get(&session_path)?;
+        self.web_surface_effective_zoom_percent(&session_path)
+    }
+    /// The same answer for a NAMED session. A rail pane's page context belongs
+    /// to the app that declared the pane, which is not always the app the user
+    /// is looking at — see [`app_pane_fetch_schema`].
+    fn web_surface_effective_zoom_percent(&self, session_path: &str) -> Option<f32> {
+        self.web_surfaces.get(session_path)?;
         let global = self.settings.web_surface_zoom_percent;
-        let host = self.web_surface_host_label(&session_path);
+        let host = self.web_surface_host_label(session_path);
         let override_pct = host
             .as_deref()
-            .and_then(|host| self.web_surface_zoom_override(&session_path, host));
+            .and_then(|host| self.web_surface_zoom_override(session_path, host));
         Some(override_pct.unwrap_or(global))
     }
     /// Whether the active web surface's current page loaded over HTTPS. `None`
@@ -20002,8 +20043,15 @@ impl ShellState {
     /// page context the settings pane shows as a connection indicator.
     fn active_web_surface_secure(&self) -> Option<bool> {
         let session_path = self.server.active_session_path()?.to_string();
-        let surface = self.web_surfaces.get(&session_path)?;
-        let tab = surface.tabs.iter().find(|tab| tab.id == surface.active_tab)?;
+        self.web_surface_secure(&session_path)
+    }
+    /// [`active_web_surface_secure`] for a NAMED session, same reason.
+    fn web_surface_secure(&self, session_path: &str) -> Option<bool> {
+        let surface = self.web_surfaces.get(session_path)?;
+        let tab = surface
+            .tabs
+            .iter()
+            .find(|tab| tab.id == surface.active_tab)?;
         let scheme = tab.url.split_once("://").map(|(scheme, _)| scheme)?;
         match scheme.to_ascii_lowercase().as_str() {
             "https" => Some(true),
@@ -20272,16 +20320,15 @@ impl ShellState {
     /// One owner for "what page context is this pane drawn for", so the refetch
     /// that keeps the pane honest and the fetch that fills it in both ask the
     /// same question. `None` = no app pane is open, and nothing to keep honest.
-    fn active_app_pane_page(&self) -> Option<(String, Option<String>)> {
-        let RightPanelMode::AppPane(pane_id) = &self.right_panel_mode else {
+    fn active_app_pane_page(&self) -> Option<(AppPaneRef, Option<String>)> {
+        let RightPanelMode::AppPane(open_pane) = &self.right_panel_mode else {
             return None;
         };
-        let host = self
-            .server
-            .active_session_path()
-            .map(str::to_string)
-            .and_then(|path| self.web_surface_host_label(&path));
-        Some((pane_id.clone(), host))
+        // The page context belongs to the pane's OWNER, not to whatever session
+        // happens to be active: a refetch that read the active session would
+        // hand one app's pane the host of another app's page.
+        let host = self.web_surface_host_label(&open_pane.session);
+        Some((open_pane.clone(), host))
     }
     /// The token that session's app declared for its control endpoint's
     /// GUI-only routes. Empty (or absent) ⇒ send no credential; see
@@ -22217,9 +22264,9 @@ impl ShellState {
         // returning to its session still restores it. (On the pane's OWN
         // session the change really does displace the pane — that path keeps
         // the existing leave-tenancy semantics below.)
-        if let RightPanelMode::AppPane(pane_id) = &self.right_panel_mode
+        if let RightPanelMode::AppPane(open_pane) = &self.right_panel_mode
             && !matches!(mode, RightPanelMode::AppPane(_))
-            && !self.active_session_offers_pane(&pane_id.clone())
+            && !self.active_session_offers_pane(&open_pane.clone())
         {
             if mode == RightPanelMode::WebTabs
                 && self.right_panel_mode_before_app_pane != Some(RightPanelMode::WebTabs)
@@ -22319,26 +22366,39 @@ impl ShellState {
     ///
     /// Draft input values never survive a pane switch: a search term or an
     /// add-form password belongs to the pane the user was looking at.
-    fn toggle_app_pane(&mut self, pane_id: &str) -> Option<u64> {
-        if self.right_panel_mode == RightPanelMode::AppPane(pane_id.to_string()) {
+    fn toggle_app_pane(&mut self, pane_id: &str) -> Option<(AppPaneRef, u64)> {
+        if matches!(
+            &self.right_panel_mode,
+            RightPanelMode::AppPane(open_pane) if open_pane.pane == pane_id
+        ) {
             self.close_app_pane();
             return None;
         }
-        Some(self.open_app_pane(pane_id))
+        self.open_app_pane(pane_id)
     }
     /// Open an app-contributed pane, idempotently. Returns the request sequence
     /// to fetch the schema under. Unlike `toggle_app_pane` this never closes,
     /// so `app right-panel pane:<id>` means the same thing however many times
     /// an agent runs it.
-    fn open_app_pane(&mut self, pane_id: &str) -> u64 {
+    ///
+    /// THE OWNER IS STAMPED HERE, at the one moment it is unambiguous: a rail
+    /// button (or `app right-panel pane:<id>`) can only ever mean the pane the
+    /// ACTIVE session's app declared, because those are the only pane buttons
+    /// the rail offers. Resolving it later — at fetch time, at render time —
+    /// is what let the answer drift to a different session's app. `None` when
+    /// no session is active: a contributed pane with no contributor is not a
+    /// pane, and opening one would pin the slot to nothing.
+    fn open_app_pane(&mut self, pane_id: &str) -> Option<(AppPaneRef, u64)> {
+        let owner = self.server.active_session_path()?.to_string();
         // Remember the user's own view exactly once, so a pane→pane hop cannot
         // overwrite it with another app's pane.
         if !matches!(self.right_panel_mode, RightPanelMode::AppPane(_)) {
             self.right_panel_mode_before_app_pane = Some(self.right_panel_mode.clone());
         }
         self.clear_app_pane_draft();
-        self.set_right_panel_mode(RightPanelMode::AppPane(pane_id.to_string()));
-        self.app_pane_request_seq
+        let open_pane = AppPaneRef::new(owner, pane_id);
+        self.set_right_panel_mode(RightPanelMode::AppPane(open_pane.clone()));
+        Some((open_pane, self.app_pane_request_seq))
     }
     /// Give the right panel back to whatever the user had open before an app's
     /// pane borrowed it — `Hidden` only if that is what they had. Uses the
@@ -22367,16 +22427,22 @@ impl ShellState {
     /// reclaimed. That stranded tenancy is what put a live GUI into the
     /// un-closable right sidebar reported on 2026-07-21.
     fn release_vanished_app_pane(&mut self) {
-        let RightPanelMode::AppPane(pane_id) = &self.right_panel_mode else {
+        let RightPanelMode::AppPane(open_pane) = &self.right_panel_mode else {
             return;
         };
-        let pane_id = pane_id.clone();
-        let still_declared = self.sidebar_contributions.values().any(|contribution| {
-            contribution
-                .panes
-                .iter()
-                .any(|pane| pane.placement == PanePlacement::Rail && pane.id == pane_id)
-        });
+        let open_pane = open_pane.clone();
+        // Asked of the DECLARING session, not of every contribution: another
+        // app that happens to use the same pane id is a different pane, and
+        // letting it answer here is what kept a dead tenancy alive under a
+        // stranger's name.
+        let still_declared =
+            self.sidebar_contributions
+                .get(&open_pane.session)
+                .is_some_and(|contribution| {
+                    contribution.panes.iter().any(|pane| {
+                        pane.placement == PanePlacement::Rail && pane.id == open_pane.pane
+                    })
+                });
         if still_declared {
             return;
         }
@@ -22453,18 +22519,25 @@ impl ShellState {
             settled => settled,
         }
     }
-    /// Does the ACTIVE session's live contribution offer pane `pane_id`?
-    /// The displacement test: an app pane whose session this is NOT has
+    /// Is `open_pane` still a live tenant of the rail — i.e. is its OWNER the
+    /// session on screen, and does that owner still declare it?
+    ///
+    /// ⛔ BOTH halves, and the first one is the fix. The old test asked only
+    /// "does the active session offer a pane with this id", which is a
+    /// different question with the same answer only by luck: `notes` declared
+    /// by yedit and `notes` declared by anything else are not the same pane,
+    /// and a tenancy that survives on a name match renders one app's rail
+    /// against another app's row. The owner is carried in
+    /// [`AppPaneRef::session`] precisely so this can be asked properly.
+    ///
+    /// The displacement test too: an app pane whose session this is NOT has
     /// fallen back to the base view, and rail changes there edit the BASE.
-    fn active_session_offers_pane(&self, pane_id: &str) -> bool {
-        self.server
-            .active_session_path()
-            .map(str::to_string)
-            .is_some_and(|path| {
-                self.active_sidebar_panes(&path, current_millis())
-                    .iter()
-                    .any(|pane| pane.id == pane_id)
-            })
+    fn active_session_offers_pane(&self, open_pane: &AppPaneRef) -> bool {
+        self.server.active_session_path() == Some(open_pane.session.as_str())
+            && self
+                .active_sidebar_panes(&open_pane.session, current_millis())
+                .iter()
+                .any(|pane| pane.id == open_pane.pane)
     }
     /// What a HIDDEN right rail reveals (or un-hides) to. The docked rail is
     /// resolved through `effective_right_panel_mode` so it can never show a
@@ -22485,18 +22558,23 @@ impl ShellState {
     fn revealed_right_panel_mode(&self, now_ms: u64) -> RightPanelMode {
         // The active session's live rail panes (a document app's intrinsic
         // sidebar — yedit's notes tabs), resolved at this frame's clock.
-        let active_rail_panes: Vec<String> = self
-            .server
-            .active_session_path()
-            .map(str::to_string)
+        let active_session = self.server.active_session_path().map(str::to_string);
+        let active_rail_panes: Vec<String> = active_session
+            .as_deref()
             .map(|path| {
-                self.active_sidebar_panes(&path, now_ms)
+                self.active_sidebar_panes(path, now_ms)
                     .into_iter()
                     .map(|pane| pane.id)
                     .collect()
             })
             .unwrap_or_default();
-        let offers = |pane_id: &str| active_rail_panes.iter().any(|id| id == pane_id);
+        // Same two-part tenancy question as `active_session_offers_pane`: the
+        // pane's OWNER must be the session on screen before its id is even
+        // worth comparing.
+        let offers = |open_pane: &AppPaneRef| {
+            active_session.as_deref() == Some(open_pane.session.as_str())
+                && active_rail_panes.iter().any(|id| *id == open_pane.pane)
+        };
         // Walk the same tenancy fallback the docked rail uses, seeded with the
         // remembered mode instead of the (Hidden) current one. Each dead tenant
         // stands down by its own rule, re-checked per encountered pane.
@@ -22523,8 +22601,8 @@ impl ShellState {
         if dead {
             // A document app's rail is what the user means by "reveal my
             // sidebar"; fall to it before any generic rail.
-            if let Some(pane_id) = active_rail_panes.first() {
-                return RightPanelMode::AppPane(pane_id.clone());
+            if let (Some(session), Some(pane_id)) = (&active_session, active_rail_panes.first()) {
+                return RightPanelMode::AppPane(AppPaneRef::new(session.clone(), pane_id.clone()));
             }
             return RightPanelMode::Metadata;
         }
@@ -32646,7 +32724,12 @@ async fn ping_and_apply_contribution(
         && let Some((pane_id, seq)) =
             state.with_mut(|shell| shell.document_rail_pane_to_refetch(&session_path))
     {
-        spawn(app_pane_fetch_schema(state, pane_id, seq));
+        spawn(app_pane_fetch_schema(
+            state,
+            session_path.clone(),
+            pane_id,
+            seq,
+        ));
     }
     // Command envelope (Phase 5): navigate the tabs the drain minted, activating
     // the session when the command asked to raise, then journal the batch.
@@ -52871,19 +52954,28 @@ fn right_panel_mode_label(mode: &RightPanelMode) -> &'static str {
     }
 }
 
-fn app_control_right_panel_mode(mode: &AppControlRightPanelMode) -> RightPanelMode {
+/// The wire mode as one of yggterm's OWN rail views. `None` for `AppPane`,
+/// deliberately: a contributed pane is addressed by its DECLARING session as
+/// well as its id, and this conversion has no session to give it. That caller
+/// goes through `open_app_pane`, which stamps the owner. Returning a
+/// session-less `AppPane` here instead would put an unowned tenancy in the slot
+/// — the exact shape this refactor exists to make unrepresentable.
+fn app_control_right_panel_mode(mode: &AppControlRightPanelMode) -> Option<RightPanelMode> {
     match mode {
-        AppControlRightPanelMode::Hidden => RightPanelMode::Hidden,
-        AppControlRightPanelMode::Connect => RightPanelMode::Connect,
-        AppControlRightPanelMode::Notifications => RightPanelMode::Notifications,
-        AppControlRightPanelMode::Settings => RightPanelMode::Settings,
-        AppControlRightPanelMode::Metadata => RightPanelMode::Metadata,
-        AppControlRightPanelMode::AppPane { id } => RightPanelMode::AppPane(id.clone()),
+        AppControlRightPanelMode::Hidden => Some(RightPanelMode::Hidden),
+        AppControlRightPanelMode::Connect => Some(RightPanelMode::Connect),
+        AppControlRightPanelMode::Notifications => Some(RightPanelMode::Notifications),
+        AppControlRightPanelMode::Settings => Some(RightPanelMode::Settings),
+        AppControlRightPanelMode::Metadata => Some(RightPanelMode::Metadata),
+        AppControlRightPanelMode::AppPane { .. } => None,
     }
 }
 
 fn app_control_right_panel_mode_label(mode: &AppControlRightPanelMode) -> &'static str {
-    right_panel_mode_label(&app_control_right_panel_mode(mode))
+    match app_control_right_panel_mode(mode) {
+        Some(mode) => right_panel_mode_label(&mode),
+        None => "app_pane",
+    }
 }
 
 fn app_control_dom_rect_visible(dom: &Value, key: &str) -> bool {
@@ -61826,14 +61918,24 @@ fn web_surface_stale_handle(
 /// The fetch is blocking (a plain TcpStream to a loopback endpoint, possibly
 /// the local end of an `ssh -L`), so it runs on `spawn_blocking` — never the UI
 /// event loop. `seq` guards against a slow reply overwriting a newer schema.
-async fn app_pane_fetch_schema(mut state: Signal<ShellState>, pane_id: String, seq: u64) {
+/// Fetch a RAIL pane's schema from the app that DECLARED it.
+///
+/// ⛔ `session_path` is the OWNER's, exactly like `document_pane_fetch_schema`'s
+/// already is — not the active session's. Resolving the control endpoint from
+/// whatever session happened to be active is how one app's rail could be filled
+/// with another app's schema: the two are the same object only while nobody
+/// switches rows, and a session switch mid-fetch is the common case.
+async fn app_pane_fetch_schema(
+    mut state: Signal<ShellState>,
+    session_path: String,
+    pane_id: String,
+    seq: u64,
+) {
     let (control_url, control_token) = {
         let shell = state.read();
-        let path = shell.server.active_session_path().map(str::to_string);
         (
-            path.as_deref().and_then(|path| shell.sidebar_control_url(path)),
-            path.as_deref()
-                .and_then(|path| shell.sidebar_control_token(path)),
+            shell.sidebar_control_url(&session_path),
+            shell.sidebar_control_token(&session_path),
         )
     };
     let Some(control_url) = control_url else {
@@ -61844,15 +61946,11 @@ async fn app_pane_fetch_schema(mut state: Signal<ShellState>, pane_id: String, s
     };
     let (host, zoom, secure, vertical_tabs, restore_tabs) = {
         let shell = state.read();
-        let host = shell
-            .server
-            .active_session_path()
-            .map(str::to_string)
-            .and_then(|path| shell.web_surface_host_label(&path));
+        let host = shell.web_surface_host_label(&session_path);
         (
             host,
-            shell.active_web_surface_effective_zoom_percent(),
-            shell.active_web_surface_secure(),
+            shell.web_surface_effective_zoom_percent(&session_path),
+            shell.web_surface_secure(&session_path),
             shell.settings.web_surface_vertical_tabs,
             shell.settings.web_surface_restore_tabs,
         )
@@ -73953,16 +74051,19 @@ async fn process_pending_app_control_requests(
                     )
                     .await;
                 }
-                if let Ok(seq) = safe_shell_mut(state, "app_control_open_app_pane", |shell| {
-                    shell.open_app_pane(id)
-                }) {
-                    app_pane_fetch_schema(state, id.clone(), seq).await;
+                if let Ok(Some((open_pane, seq))) =
+                    safe_shell_mut(state, "app_control_open_app_pane", |shell| {
+                        shell.open_app_pane(id)
+                    })
+                {
+                    app_pane_fetch_schema(state, open_pane.session, open_pane.pane, seq).await;
                 }
             } else {
-                let requested_mode = app_control_right_panel_mode(&mode);
-                let _ = safe_shell_mut(state, "app_control_set_right_panel_mode", |shell| {
-                    shell.set_right_panel_mode(requested_mode);
-                });
+                if let Some(requested_mode) = app_control_right_panel_mode(&mode) {
+                    let _ = safe_shell_mut(state, "app_control_set_right_panel_mode", |shell| {
+                        shell.set_right_panel_mode(requested_mode);
+                    });
+                }
             }
             sleep(Duration::from_millis(40)).await;
             let dom_snapshot =
@@ -82987,8 +83088,13 @@ fn app() -> Element {
                             // round trip.
                             let opened = state.with_mut(|shell| shell.toggle_app_pane(&pane_id));
                             sync_active_terminal_input_policy(state);
-                            if let Some(seq) = opened {
-                                spawn(app_pane_fetch_schema(state, pane_id, seq));
+                            if let Some((open_pane, seq)) = opened {
+                                spawn(app_pane_fetch_schema(
+                                    state,
+                                    open_pane.session,
+                                    open_pane.pane,
+                                    seq,
+                                ));
                             }
                             },
                             on_toggle_web_tabs: move || {
@@ -84924,7 +85030,11 @@ fn Titlebar(
                                 title: "{pane.title}",
                                 style: utility_icon_style(
                                     snapshot.palette,
-                                    snapshot.right_panel_mode == RightPanelMode::AppPane(pane.id.clone())
+                                    matches!(
+                                        &snapshot.right_panel_mode,
+                                        RightPanelMode::AppPane(open_pane)
+                                            if open_pane.pane == pane.id
+                                    )
                                 ),
                                 onmousedown: |evt| {
                                     evt.prevent_default();
@@ -95350,7 +95460,12 @@ fn TerminalCanvas(
                                                 )
                                             })
                                         {
-                                            spawn(app_pane_fetch_schema(state, pane_id, seq));
+                                            spawn(app_pane_fetch_schema(
+                                                state,
+                                                contribution_session_path.clone(),
+                                                pane_id,
+                                                seq,
+                                            ));
                                         }
                                         // A document app's RAIL pane opens WITH
                                         // its document (the ychrome tab-rail
@@ -95381,14 +95496,18 @@ fn TerminalCanvas(
                                                                 contribution_session_path.clone(),
                                                             ) =>
                                                 {
-                                                    let seq = shell.open_app_pane(&pane_id);
-                                                    Some((pane_id, seq))
+                                                    shell.open_app_pane(&pane_id)
                                                 }
                                                 _ => None,
                                             }
                                         });
-                                        if let Some((pane_id, seq)) = auto_open_pane {
-                                            spawn(app_pane_fetch_schema(state, pane_id, seq));
+                                        if let Some((open_pane, seq)) = auto_open_pane {
+                                            spawn(app_pane_fetch_schema(
+                                                state,
+                                                open_pane.session,
+                                                open_pane.pane,
+                                                seq,
+                                            ));
                                         }
                                     }
                                     "close" => {
@@ -121669,9 +121788,18 @@ fn RightRail(
     // A contributed pane lives and dies with its declaration: when the app stops
     // declaring (exited, session switched, contribution swept) the pane
     // collapses, and it re-reveals when the app is back.
+    // ⛔ BOTH halves, as everywhere else: the pane's OWNER must be the session
+    // on screen, and that owner must still declare it. `sidebar_panes` is the
+    // ACTIVE session's declaration list, so matching an id against it while
+    // ignoring the owner is how another app's rail earned the right to paint
+    // over this row (live-caught 2026-08-08).
     let app_pane_available = |mode: &RightPanelMode| match mode {
-        RightPanelMode::AppPane(pane_id) => {
-            snapshot.sidebar_panes.iter().any(|pane| pane.id == *pane_id)
+        RightPanelMode::AppPane(open_pane) => {
+            snapshot.active_session_path.as_deref() == Some(open_pane.session.as_str())
+                && snapshot
+                    .sidebar_panes
+                    .iter()
+                    .any(|pane| pane.id == open_pane.pane)
         }
         _ => true,
     };
@@ -121683,8 +121811,13 @@ fn RightRail(
     };
     // Extracted before the rsx! chain: an `if let` arm inside it defeats the
     // macro's branch-type inference.
+    // Only the pane ID reaches the body: `rendered_mode` can be `AppPane` ONLY
+    // when `app_pane_available` said the owner is the active session, so every
+    // active-session lookup below it resolves to that same owner by
+    // construction. That invariant is what keeps the body from needing the
+    // session too — break it and this must carry the whole ref.
     let rendered_app_pane_id = match &rendered_mode {
-        RightPanelMode::AppPane(pane_id) => Some(pane_id.clone()),
+        RightPanelMode::AppPane(open_pane) => Some(open_pane.pane.clone()),
         _ => None,
     };
     // A hidden rail hover-reveals from the right edge as a floating card, exactly
@@ -135520,6 +135653,83 @@ mod tests {
         shell
     }
 
+    // ⛔ OWNER-REPORTED 2026-08-08, with a screenshot: the `New Yedit` row
+    // selected, its files nowhere, and ychrome's chrome — omnibox, Khan Academy
+    // tabs, its `tables` folder — painted in the rail beside it.
+    //
+    // The rail is a SINGLETON SLOT, and until this commit its tenant carried
+    // only a pane id. So every tenancy test asked "does the ACTIVE session
+    // offer a pane called this" instead of "is this pane's OWNER the session on
+    // screen", and two apps that both declare `notes` were one pane. The mode
+    // stayed alive across the switch, the rail kept painting, and the schema
+    // fetch — which resolved its control endpoint from the ACTIVE session —
+    // would have filled the survivor with the WRONG app's schema.
+    //
+    // MUTATION PROOF: drop the session half of `active_session_offers_pane`
+    // (or of the rail component's `app_pane_available`) and this goes red.
+    #[test]
+    fn a_pane_is_a_tenant_of_the_session_that_declared_it_never_of_a_namesake() {
+        // The real clock, because `displayed_right_panel_mode` reads it: a
+        // declaration stamped in the past is a STALE one, which would refuse
+        // the pane for a reason that has nothing to do with tenancy.
+        let now = current_millis();
+        let mut shell = shell_with_rail_pane("local://yedit", "notes", now);
+        shell.set_right_panel_mode(RightPanelMode::Metadata);
+        let yedit_notes = shell
+            .open_app_pane("notes")
+            .expect("the active session owns the pane")
+            .0;
+        assert_eq!(
+            yedit_notes,
+            AppPaneRef::new("local://yedit", "notes"),
+            "the owner is stamped at open, the one moment it is unambiguous"
+        );
+        assert!(shell.active_session_offers_pane(&yedit_notes));
+
+        // A SECOND app declares a rail pane with the SAME id, and the user
+        // switches to its row. Nothing about yedit's pane changed.
+        declare_pane(&mut shell, "local://other", "notes", now);
+        shell.server.open_or_focus_session(
+            SessionKind::Shell,
+            "local://other",
+            None,
+            None,
+            None,
+            None,
+        );
+        shell.sidebar_reads_live_since = Some(("local://other".to_string(), now));
+
+        assert!(
+            !shell.active_session_offers_pane(&yedit_notes),
+            "a namesake pane on another session is NOT this pane; the tenancy is over"
+        );
+        assert_eq!(
+            shell.displayed_right_panel_mode(),
+            RightPanelMode::Metadata,
+            "the rail must fall back to the user's own view, never keep painting \
+             the other app's pane under this one's name"
+        );
+        // The raw tenancy survives, so returning to yedit re-reveals it for free.
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::AppPane(yedit_notes.clone())
+        );
+        shell.server.open_or_focus_session(
+            SessionKind::Shell,
+            "local://yedit",
+            None,
+            None,
+            None,
+            None,
+        );
+        shell.sidebar_reads_live_since = Some(("local://yedit".to_string(), now));
+        assert_eq!(
+            shell.displayed_right_panel_mode(),
+            RightPanelMode::AppPane(yedit_notes),
+            "back on its own row the pane returns without a re-open"
+        );
+    }
+
     // The rail stack, display half (user bug 2026-07-17): an app pane's
     // remembered base can itself be a tenant (WebTabs), and a single-step
     // fallback handed a native session the near-blank "No web surface" rail.
@@ -135528,7 +135738,8 @@ mod tests {
     fn a_displaced_pane_resolves_through_a_nested_tenant_to_the_real_base() {
         let bootstrap = test_shell_bootstrap_with_active_session("local://native");
         let mut shell = ShellState::new(bootstrap);
-        shell.right_panel_mode = RightPanelMode::AppPane("vault".to_string());
+        shell.right_panel_mode =
+            RightPanelMode::AppPane(AppPaneRef::new("local://native", "vault"));
         shell.right_panel_mode_before_app_pane = Some(RightPanelMode::WebTabs);
         shell.right_panel_mode_before_web_tabs = Some(RightPanelMode::Metadata);
 
@@ -135604,7 +135815,7 @@ mod tests {
         shell.right_panel_mode_before_web_tabs = None;
         assert_eq!(
             shell.revealed_right_panel_mode(1_000),
-            RightPanelMode::AppPane("notes".to_string()),
+            RightPanelMode::AppPane(AppPaneRef::new("local://yedit", "notes")),
             "the reveal shows the active app's sidebar, never a dead WebTabs rail"
         );
 
@@ -135633,10 +135844,13 @@ mod tests {
     #[test]
     fn a_rail_change_while_displaced_edits_the_base_and_keeps_the_pane() {
         let mut shell = shell_with_rail_pane("local://app", "notes", 1_000);
-        shell.open_app_pane("notes");
+        let open_pane = AppPaneRef::new("local://app", "notes");
+        shell
+            .open_app_pane("notes")
+            .expect("the active session owns the pane");
         assert_eq!(
             shell.right_panel_mode,
-            RightPanelMode::AppPane("notes".to_string())
+            RightPanelMode::AppPane(open_pane.clone())
         );
 
         // Simulate being on a session that does NOT serve the pane by
@@ -135650,12 +135864,12 @@ mod tests {
             .unwrap()
             .last_seen_ms = 0;
         shell.sidebar_reads_live_since = Some(("local://app".to_string(), 0));
-        assert!(!shell.active_session_offers_pane("notes"));
+        assert!(!shell.active_session_offers_pane(&open_pane));
 
         shell.set_right_panel_mode(RightPanelMode::Metadata);
         assert_eq!(
             shell.right_panel_mode,
-            RightPanelMode::AppPane("notes".to_string()),
+            RightPanelMode::AppPane(open_pane.clone()),
             "the pane's tenancy survives a displaced base edit"
         );
         assert_eq!(
@@ -135675,10 +135889,10 @@ mod tests {
             .get_mut("local://app")
             .unwrap()
             .last_seen_ms = current_millis();
-        assert!(shell.active_session_offers_pane("notes"));
+        assert!(shell.active_session_offers_pane(&open_pane));
         assert_eq!(
             shell.effective_right_panel_mode(true, 1_000),
-            RightPanelMode::AppPane("notes".to_string())
+            RightPanelMode::AppPane(open_pane.clone())
         );
 
         // On the pane's OWN session the same change closes the pane.
@@ -138791,10 +139005,12 @@ mod tests {
         );
         assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
 
-        shell.open_app_pane("settings");
+        shell
+            .open_app_pane("settings")
+            .expect("the active session owns the pane");
         assert_eq!(
             shell.right_panel_mode,
-            RightPanelMode::AppPane("settings".to_string()),
+            RightPanelMode::AppPane(AppPaneRef::new("local://ws", "settings")),
             "a pane may borrow the slot"
         );
 
@@ -138997,10 +139213,12 @@ mod tests {
         let mut shell = ShellState::new(bootstrap);
         shell.set_right_panel_mode(RightPanelMode::Metadata);
         declare_pane(&mut shell, "local://ws", "vault", 2_000);
-        shell.open_app_pane("vault");
+        shell
+            .open_app_pane("vault")
+            .expect("the active session owns the pane");
         assert_eq!(
             shell.right_panel_mode,
-            RightPanelMode::AppPane("vault".into())
+            RightPanelMode::AppPane(AppPaneRef::new("local://ws", "vault"))
         );
 
         // Still declared → the tenancy holds (this is also the session-switch
@@ -139009,7 +139227,7 @@ mod tests {
         shell.sweep_stale_sidebar_contributions(2_000);
         assert_eq!(
             shell.right_panel_mode,
-            RightPanelMode::AppPane("vault".into()),
+            RightPanelMode::AppPane(AppPaneRef::new("local://ws", "vault")),
             "a live declaration must keep its pane"
         );
 
@@ -139043,11 +139261,13 @@ mod tests {
         // contribution swept) — the raw mode stays `AppPane`, the display falls
         // back to Metadata.
         declare_pane(&mut shell, "local://ws", "vault", current_millis());
-        shell.open_app_pane("vault");
+        shell
+            .open_app_pane("vault")
+            .expect("the active session owns the pane");
         shell.sidebar_contributions.clear();
         assert_eq!(
             shell.right_panel_mode,
-            RightPanelMode::AppPane("vault".into()),
+            RightPanelMode::AppPane(AppPaneRef::new("local://ws", "vault")),
             "the tenancy is expected to survive so returning to the app re-reveals it"
         );
         assert_eq!(
@@ -139106,10 +139326,12 @@ mod tests {
 
         // The app's settings pane borrows the rail...
         declare_pane(&mut shell, "local://ws", "settings", current_millis());
-        shell.open_app_pane("settings");
+        shell
+            .open_app_pane("settings")
+            .expect("the active session owns the pane");
         assert_eq!(
             shell.right_panel_mode,
-            RightPanelMode::AppPane("settings".into())
+            RightPanelMode::AppPane(AppPaneRef::new("local://ws", "settings"))
         );
 
         // ...and the ⊟ button takes it back for the tabs.
@@ -150500,19 +150722,27 @@ mod tests {
     fn an_unserved_app_pane_displays_the_users_own_view() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
         shell.set_right_panel_mode(RightPanelMode::Metadata);
-        shell.open_app_pane("vault");
-        assert_eq!(shell.right_panel_mode, RightPanelMode::AppPane("vault".into()));
+        shell
+            .open_app_pane("vault")
+            .expect("the active session owns the pane");
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::AppPane(AppPaneRef::new("local://pane", "vault"))
+        );
 
         // Active session offers the pane → it shows.
         assert_eq!(
             shell.effective_right_panel_mode(true, current_millis()),
-            RightPanelMode::AppPane("vault".into())
+            RightPanelMode::AppPane(AppPaneRef::new("local://pane", "vault"))
         );
         // Active session does NOT offer it (switched to a non-app session, or the
         // app died) → the user's remembered view, not a blank rail.
         assert_eq!(shell.effective_right_panel_mode(false, current_millis()), RightPanelMode::Metadata);
         // The underlying mode is untouched — switching back re-reveals the pane.
-        assert_eq!(shell.right_panel_mode, RightPanelMode::AppPane("vault".into()));
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::AppPane(AppPaneRef::new("local://pane", "vault"))
+        );
     }
 
     // A pane opened from a hidden rail falls back to hidden, not to a panel the
@@ -150521,8 +150751,13 @@ mod tests {
     fn an_unserved_app_pane_falls_back_to_hidden_when_that_is_what_the_user_had() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
         shell.set_right_panel_mode(RightPanelMode::Hidden);
-        shell.open_app_pane("vault");
-        assert_eq!(shell.effective_right_panel_mode(false, current_millis()), RightPanelMode::Hidden);
+        shell
+            .open_app_pane("vault")
+            .expect("the active session owns the pane");
+        assert_eq!(
+            shell.effective_right_panel_mode(false, current_millis()),
+            RightPanelMode::Hidden
+        );
     }
 
     // The end-to-end path the renderer reads: the snapshot shows the vault pane
@@ -150534,10 +150769,12 @@ mod tests {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://web"));
         shell.set_right_panel_mode(RightPanelMode::Metadata);
         declare_pane(&mut shell, "local://web", "vault", current_millis());
-        shell.open_app_pane("vault");
+        shell
+            .open_app_pane("vault")
+            .expect("the active session owns the pane");
         assert_eq!(
             shell.snapshot().right_panel_mode,
-            RightPanelMode::AppPane("vault".into())
+            RightPanelMode::AppPane(AppPaneRef::new("local://web", "vault"))
         );
 
         // The app goes away (died, or the user switched to a session without it).
@@ -150552,7 +150789,7 @@ mod tests {
         declare_pane(&mut shell, "local://web", "vault", current_millis());
         assert_eq!(
             shell.snapshot().right_panel_mode,
-            RightPanelMode::AppPane("vault".into())
+            RightPanelMode::AppPane(AppPaneRef::new("local://web", "vault"))
         );
     }
 
@@ -150667,10 +150904,23 @@ mod tests {
     #[test]
     fn app_pane_modes_are_distinguished_by_pane_id() {
         assert_ne!(
-            RightPanelMode::AppPane("vault".into()),
-            RightPanelMode::AppPane("settings".into())
+            RightPanelMode::AppPane(AppPaneRef::new("local://a", "vault")),
+            RightPanelMode::AppPane(AppPaneRef::new("local://a", "settings"))
         );
-        assert_eq!(right_panel_mode_label(&RightPanelMode::AppPane("vault".into())), "app_pane");
+        // ...AND by the session that declared them. Two apps may both call a
+        // pane `notes`; they are not the same pane, and a rail that treats them
+        // as one renders yedit's files against ychrome's row.
+        assert_ne!(
+            RightPanelMode::AppPane(AppPaneRef::new("local://a", "notes")),
+            RightPanelMode::AppPane(AppPaneRef::new("local://b", "notes"))
+        );
+        assert_eq!(
+            right_panel_mode_label(&RightPanelMode::AppPane(AppPaneRef::new(
+                "local://a",
+                "vault"
+            ))),
+            "app_pane"
+        );
     }
 
     fn live_session_keep_alive_dot_renders_in_fixed_leading_rail() {
