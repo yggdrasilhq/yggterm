@@ -1,6 +1,6 @@
 ---
 name: yggterm-agent-fleet
-description: What an agent CLI gains by running inside yggterm — its own addressable row, the ability to spawn and verify delegate sessions, to message any other session, to read its own context budget, and a one-time bootstrap that wires a durable memory + campaign system. Read this before spawning any session, before claiming a row at the start of a campaign, before SUCCEEDING a session that has gone cold (§6 — harvest its transcript, never prompt it), before handing work to another agent, and before trusting any row-management verb's own success field (§7).
+description: What an agent CLI gains by running inside yggterm — its own addressable row, the ability to spawn and verify delegate sessions, to message any other session, to read its own context budget, and a one-time bootstrap that wires a durable memory + campaign system. Read this before spawning any session, before claiming a row at the start of a campaign (§1), before SUCCEEDING a session that has gone cold (§6 — harvest its transcript, never prompt it), before trusting any row-management verb's own success field (§7), before HANDING OFF a campaign to a successor (§8 — the baton relay, and how to write the brief), and before messaging another campaign or recovering a stalled one (§9 — cross-talk and the single `continue`).
 ---
 
 # You are running inside yggterm. Here is what that gives you.
@@ -44,16 +44,30 @@ print(next(r['full_path'] for r in rows if r['full_path'].endswith('$UUID')))")
 ⛔ Pasting `$YGGTERM_SESSION_ID` where a row path is wanted fails quietly — the
 verb accepts the string and addresses nothing.
 
-### Title and seat are separate, on purpose
+### ⚠ Title and seat LOOK separate. Do not rely on it.
 
-`server app session outline <row> <prefix>` stores a number APART from the
-title, composed at render time. So a CLI that re-titles itself cannot destroy
-its own position. Set the seat once; let the CLI name itself.
+`server app session outline <row> <prefix>` stores a number apart from the title,
+and `server app rows` then reports a composed `label` ("4 topic: …") — which reads
+like proof that the sidebar renders the two together.
+
+⛔ **It does not.** Measured against a screenshot of the real sidebar: **every row
+displays its `session_title` ALONE**, so a row seated only via `outline` appears
+with no number at all while `label` claims otherwise. The stored prefix has also
+been observed to disappear on its own between reads.
+
+⇒ **`label` is not what gets labelled** — the same shape as §7, and a nastier
+instance, because here *the lie is the helpful-looking field* and it specifically
+defeats whoever does the right thing by verifying against the API.
 
 ```sh
-yggterm server app session outline "$ROW" 4.2      # seats it; "" clears
-yggterm server app session rename  "$ROW" "topic: what I am actually doing"
+# Write the number INTO the title (what the sidebar shows), and set outline too —
+# harmless today, correct if the GUI ever renders it.
+yggterm server app session rename  "$ROW" "4. topic: what I am actually doing"
+yggterm server app session outline "$ROW" 4          # "" clears
 ```
+
+⚖ **Verify a display claim against the DISPLAY.** An API field describing what a
+user sees is a claim about pixels, and only pixels settle it.
 
 ### ⛔ CLAIM YOUR ROW AS YOUR FIRST ACT ON A CAMPAIGN — do not wait to be asked
 
@@ -483,7 +497,114 @@ and #3 — read it, do not just check the boolean.
 
 ---
 
-## 8. Adapting this to your own setup
+## 8. The baton relay — a campaign session does not END, it HANDS OFF
+
+§6 is what you do when a session has *already* gone cold. **This is the planned
+version, and it is strictly better: a living session hands the work on while it
+still knows everything.** Relay when you can; harvest when you must.
+
+**A campaign outlives one context window only by handing itself off**, and the
+handoff is a cycle, not an ending:
+
+1. ⛔ **KILL YOUR PREDECESSOR FIRST — before any work.** Two sessions of the same
+   campaign must never grind at once: they fight over the branch, the daemon and
+   the deploy lane. ⇒ **the brief you write MUST carry the outgoing row's own
+   path**, or your successor cannot honour this and you get two. Prove it by the
+   row's absence and by `/proc`, never by the verb's own field (§7).
+2. **Take the MOST LOAD-BEARING subset — not the next item in file order.** One
+   subset per session.
+3. **Stop on EITHER of two conditions:** the subset is done, or it needs the
+   human. ⛔ **There is no third condition** — "I ran low on context" does not
+   license skipping the handoff, it is precisely when the handoff matters.
+4. **When it needs the human, RAISE A NOTIFICATION targeted at your own row.**
+   They are not watching; an unnotified question is a stall discovered hours
+   later.
+5. **Spawn the successor, then die.** Hand it (a) your row path to kill, (b) the
+   subset you finished, (c) the next load-bearing subset, (d) anything parked
+   for the human. Then it kills you.
+6. **Repeat until the campaign is finished.**
+
+⚖ **Titles across a relay.** Read the live outline and take the slot the campaign
+actually occupies — the number is not a constant, it moves as lanes come and go.
+⛔ **Never invent a number, and never inherit the predecessor's title unchanged:**
+a relay of five rows all called `6. campaign` is unreadable, and the sidebar is
+the human's working instrument. `ygg-claim.sh --replace <predecessor>` does the
+kill, the seat and the rename as one step.
+
+### ⛔ The brief has TWO sections, and conflating them makes fixes stupid
+
+A brief that opens *"NO research, NO subagents, every fact is inlined"* is wrong,
+and it was struck down for a good reason: **a bug is by definition something
+nobody has understood yet.** Forbid investigation on one and the successor must
+guess or hand it back — which produces the unintelligent fix every time:
+assertions relaxed instead of causes found, symptoms patched at one callsite,
+root cause never named.
+
+- **INLINED FACTS — do not re-derive.** Versions, paths, row ids, baselines, what
+  shipped, what was already falsified. Be exhaustive; this is the context gift.
+- **OPEN QUESTIONS — research these.** Name the unknowns and the instruments that
+  answer them. Research, subagents and fan-out are all in scope here.
+
+⇒ **What is worth forbidding is re-deriving a SETTLED fact, never investigating
+an UNSETTLED one.** ⚠ And *"do not re-derive"* is not *"do not verify"* — an
+inherited fact can be wrong, and stale baselines passed down a relay are a
+documented failure.
+
+---
+
+## 9. Cross-talk — campaigns that answer each other
+
+§4 gives you the verb; this is the standing practice built on it. **Long-running
+campaigns accumulate findings that belong to a DIFFERENT campaign**, and the
+default failure is that they die in a transcript. Cross-talk is two-way on
+purpose: a finding goes out, an answer comes back.
+
+**The rules that make it work:**
+
+1. **A finding goes to the OWNER of the thing, not to whoever is nearest.** If
+   your campaign trips over a defect in another campaign's surface, that is their
+   input stream, not your side note. Triage and hand over; do not fix it for them
+   and do not hoard it.
+2. **Say who you are and name the return address**, or the other session has to
+   guess and will guess wrong.
+3. **Put an ACK token in every message and verify by TRANSCRIPT** (§3). `submit`
+   reporting `submitted:true` means it was written, not that it landed where you
+   think.
+4. **A busy row queues your message and answers at its turn boundary.** You do not
+   need it idle. You DO need to not send five times because it was quiet.
+5. ⛔ **A relay of a human's words is NOT that human's ruling** for a session that
+   did not hear them say it. It may direct FUTURE work; **only they can order the
+   UNDOING of work already done.** When a steer applies to several sessions, say
+   so in each brief and name the others, so nobody infers authority from a
+   sibling.
+6. ⚠ **Reachability is asymmetric.** App control resolves only where the GUI
+   process runs, so a session on another host must route through that host or
+   fall back to files. **Do not write "message the other row" into a brief for a
+   session that cannot reach the row plane** — write "drop a file and tell the
+   orchestrator".
+
+### Stall recovery — a stopped session is usually one word from resuming
+
+**A session's dominant failure is STOPPING, not dying**, and the two look
+identical from outside. Signature of a stall: **the turn ENDED, the work is
+unfinished, and the transcript shows no error, no API failure and no model
+fallback.** Causes are mundane — a CLI hiccup, a transient API error, a model
+demotion mid-turn.
+
+⇒ **That state is recoverable by a single `continue`.** A monitor that only
+*detects* stalls and tells a human is doing half the job.
+
+⛔ Three guards, or the cure is worse than the disease:
+- **Once per stall, never per poll.** A watcher that re-nudges every tick is
+  worse than one that never nudges.
+- **Only ASSIGNED sessions.** A session parked by design is *supposed* to be
+  idle; nudging it trains its reader to ignore the alarm.
+- **Escalate if it does not resume.** One unanswered nudge means the fault is not
+  a stall, and a human should hear about it.
+
+---
+
+## 10. Adapting this to your own setup
 
 Everything above is generic. To make it yours:
 
