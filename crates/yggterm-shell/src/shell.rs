@@ -120281,7 +120281,19 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
     let scope = start_page_recent_scope(snapshot);
     let live_projection_paths = start_page_live_projection_paths(snapshot);
     let live_paths_for_rank = &live_projection_paths;
-    let mut candidates = Vec::<(BrowserRow, bool, i64, String, usize)>::new();
+    // ⛔ THE SCOPE RANKS, IT DOES NOT DROP. (Root-caused 2026-08-08.)
+    //
+    // These predicates used to FILTER, and the header said only "N shown" — so
+    // one page read three times with a different row selected answered 188,
+    // then 40, then 4, and a row outside the selected row's `{machine_key, cwd}`
+    // looked exactly like a row that never existed. The owner hit that removing
+    // a delegate and going to the start page to respawn it.
+    //
+    // The scope is RIGHT for the create buttons ("create work in this scope" is
+    // what the subtitle promises) and wrong for a list that
+    // [[spec-active-sessions-dual-presence]] binds to showing every session. So
+    // it stays, as a RANK: in-scope work still leads, and nothing vanishes.
+    let mut candidates = Vec::<(BrowserRow, bool, bool, i64, String, usize)>::new();
     // Dedup on SESSION IDENTITY, not on the path string. A running session and
     // its stored JSONL row are one session under two spellings — `local://<id>`
     // and `~/.codex/sessions/<...>.jsonl` — which no path normalization relates,
@@ -120289,24 +120301,32 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
     // live row is no longer filtered out. The session id is the one thing both
     // spellings agree on; the normalized path is the fallback for rows that
     // carry no id (documents, recipes).
-    let mut push_candidate = |row: BrowserRow, modified_epoch: i64, started_at: String| {
-        let key = start_page_recent_identity_key(&row);
-        if active_path
-            .as_deref()
-            .is_some_and(|active| active == normalize_live_session_path(&row.full_path))
-        {
-            return;
-        }
-        if seen.insert(key) {
-            let ix = candidates.len();
-            // A running session is the most current thing on the page, and a
-            // stored transcript's mtime cannot express that — a live row often
-            // carries no epoch at all and would sort BELOW week-old files.
-            let is_live =
-                live_paths_for_rank.contains(&normalize_live_session_path(&row.full_path));
-            candidates.push((row, is_live, modified_epoch, started_at, ix));
-        }
-    };
+    let mut push_candidate =
+        |row: BrowserRow, modified_epoch: i64, started_at: String, in_scope: bool| {
+            let keys = start_page_recent_identity_keys(&row);
+            if active_path
+                .as_deref()
+                .is_some_and(|active| active == normalize_live_session_path(&row.full_path))
+            {
+                return;
+            }
+            // ANY key already claimed means this session is already on the page
+            // under one of its other names. Then claim them all, so the next
+            // spelling matches whichever name it happens to know.
+            let fresh = !keys.iter().any(|key| seen.contains(key));
+            for key in keys {
+                seen.insert(key);
+            }
+            if fresh {
+                let ix = candidates.len();
+                // A running session is the most current thing on the page, and a
+                // stored transcript's mtime cannot express that — a live row often
+                // carries no epoch at all and would sort BELOW week-old files.
+                let is_live =
+                    live_paths_for_rank.contains(&normalize_live_session_path(&row.full_path));
+                candidates.push((row, is_live, in_scope, modified_epoch, started_at, ix));
+            }
+        };
 
     // SPEC (user directive 2026-08-06, REVERSING the 2026-05-26 call recorded
     // in [[spec-active-sessions-dual-presence]]): a running session KEEPS its
@@ -120335,7 +120355,6 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
         .iter()
         .filter(|row| matches!(row.kind, BrowserRowKind::Session))
         .filter(|row| live_projection_paths.contains(&normalize_live_session_path(&row.full_path)))
-        .filter(|row| start_page_recent_scope_allows_browser_row(&scope, row))
         .collect::<Vec<_>>();
     // Same recency order the page sorts by, so that when two live spellings of
     // one session both qualify the winner is deterministic rather than
@@ -120347,7 +120366,8 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
     });
     for row in live_first {
         let modified_epoch = browser_row_modified_epoch(row);
-        push_candidate(row.clone(), modified_epoch, String::new());
+        let in_scope = start_page_recent_scope_allows_browser_row(&scope, row);
+        push_candidate(row.clone(), modified_epoch, String::new(), in_scope);
     }
 
     for machine in &snapshot.remote_machines {
@@ -120362,13 +120382,11 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
             if !remote_scanned_session_is_start_page_durable(session) {
                 continue;
             }
-            if !start_page_recent_scope_allows_remote_session(&scope, machine, session) {
-                continue;
-            }
             push_candidate(
                 browser_row_for_remote_scanned_session(machine, session, &remote_short_ids),
                 session.modified_epoch,
                 session.started_at.clone(),
+                start_page_recent_scope_allows_remote_session(&scope, machine, session),
             );
         }
     }
@@ -120380,23 +120398,29 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
             row.kind == BrowserRowKind::Session
                 || row.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe)
         })
-        .filter(|row| start_page_recent_scope_allows_browser_row(&scope, row))
     {
         let modified_epoch = browser_row_modified_epoch(row);
-        push_candidate(row.clone(), modified_epoch, String::new());
+        let in_scope = start_page_recent_scope_allows_browser_row(&scope, row);
+        push_candidate(row.clone(), modified_epoch, String::new(), in_scope);
     }
 
     // Running sessions first, then recency. Ordering "by recency" was the
     // 2026-05-25 spec and still governs everything below the live block; live
     // rows sit above it because "running right now" outranks any file mtime,
     // and because a live row's epoch is frequently 0.
+    //
+    // ⭐ THEN the scope, which is where a filter used to be. In-scope work leads
+    // the list, exactly as it did when everything else was thrown away — the
+    // difference is that "further down" replaced "gone", and a row the owner is
+    // looking for can now be FOUND rather than only remembered.
     candidates.sort_by(|left, right| {
         right
             .1
             .cmp(&left.1)
             .then_with(|| right.2.cmp(&left.2))
             .then_with(|| right.3.cmp(&left.3))
-            .then_with(|| left.4.cmp(&right.4))
+            .then_with(|| right.4.cmp(&left.4))
+            .then_with(|| left.5.cmp(&right.5))
     });
     candidates.into_iter().map(|(row, ..)| row).collect()
 }
@@ -120598,10 +120622,29 @@ fn start_page_run_app_choice(
 /// thing wearing two paths, and only the session id relates them. Rows without
 /// an id fall back to the normalized path, which is what documents and terminal
 /// recipes are keyed by.
-fn start_page_recent_identity_key(row: &BrowserRow) -> String {
+/// EVERY name one session answers to, so a dedup on any one of them collapses
+/// the rest.
+///
+/// ⛔ It used to return ONE key — the session id when there was one, the
+/// normalized path otherwise — and that is a dedup that misses exactly when two
+/// spellings of one session disagree about whether they carry an id. The sidebar
+/// holds precisely that pair: the live row knows its session id and the folder
+/// row for the same session does not, so the two keys never met and the page
+/// listed the session twice.
+///
+/// It went unseen because the scope FILTER happened to drop the second copy
+/// first: `start_page_recent_scope_allows_browser_row` refuses any row with no
+/// `session_cwd`, which is the same rows that carry no id. Turning that filter
+/// into a rank (2026-08-08) removed the mask and the duplicate appeared — which
+/// is the honest order of events, and the reason this is fixed in the same
+/// change rather than shipped as a "new" bug.
+fn start_page_recent_identity_keys(row: &BrowserRow) -> Vec<String> {
+    let path_key = format!("path:{}", normalize_live_session_path(&row.full_path));
     match row.session_id.as_deref().map(str::trim) {
-        Some(session_id) if !session_id.is_empty() => format!("session-id:{session_id}"),
-        _ => format!("path:{}", normalize_live_session_path(&row.full_path)),
+        Some(session_id) if !session_id.is_empty() => {
+            vec![format!("session-id:{session_id}"), path_key]
+        }
+        _ => vec![path_key],
     }
 }
 
@@ -174885,7 +174928,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
-    fn start_page_recent_rows_scope_selected_remote_folder_by_last_used() {
+    fn start_page_recent_rows_scope_selected_remote_folder_leads_and_the_rest_follow() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
         let remote_session =
             |machine: &str, name: &str, cwd: &str, modified_epoch: i64| RemoteScannedSession {
@@ -174974,15 +175017,37 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(
             paths,
             [
+                // The selected folder's own machine and cwd LEAD, by recency.
                 "remote-session://dev/newest-yggterm",
                 "remote-session://dev/child-yggterm",
                 "remote-session://dev/older-yggterm",
+                // Then everything else, still by recency: another machine, then
+                // another cwd on this one. Both used to be dropped, and a
+                // dropped row cannot be told apart from a row that never was.
+                "remote-session://oc/newer-oc",
+                "remote-session://dev/newer-other-cwd",
             ]
         );
     }
 
+    /// ⭐ THE SCOPE RANKS, IT DOES NOT DROP — and this test used to assert the
+    /// opposite, which is how it caught the change honestly.
+    ///
+    /// It was `..._excludes_remote_same_cwd`, and the exclusion it locked in is
+    /// exactly the bug the owner hit on 2026-08-08: he removed a delegate row,
+    /// went to the start page to reopen it, and it was not there. Measured that
+    /// day, one page read three times with a different row selected answered
+    /// **188 shown, then 40, then 4** — the list is scoped to the selected row's
+    /// `{machine_key, cwd}` and the header says only "N shown", so a filtered
+    /// row and a nonexistent one look identical.
+    ///
+    /// So the two facts are now asserted TOGETHER, because either alone is the
+    /// wrong behaviour: the in-scope local rows still LEAD (the page promises
+    /// "create work in this scope" and that ordering is what makes it true), and
+    /// the out-of-scope remote rows are still PRESENT, at the end, where they
+    /// can be found.
     #[test]
-    fn start_page_recent_rows_scope_selected_local_folder_excludes_remote_same_cwd() {
+    fn start_page_recent_rows_scope_ranks_out_of_scope_rows_last_instead_of_dropping_them() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
         let remote_session =
             |machine: &str, name: &str, cwd: &str, modified_epoch: i64| RemoteScannedSession {
@@ -175092,9 +175157,15 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(
             paths,
             [
+                // In scope, by recency — the head of the list is unchanged.
                 "/home/user/.codex/sessions/local-newer.jsonl",
                 "/home/user/.codex/sessions/local-child.jsonl",
                 "/home/user/.codex/sessions/local-old.jsonl",
+                // Out of scope, still listed, by recency among themselves. These
+                // two used to be DROPPED — and a dropped row is indistinguishable
+                // from one that does not exist, which is the whole bug.
+                "remote-session://practice/practice-home",
+                "remote-session://dev/dev-home",
             ]
         );
     }
@@ -175521,15 +175592,20 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .collect::<Vec<_>>();
         // SPEC (user directive 2026-08-06, reversing the 2026-05-26 call): the
         // retained live session in this folder KEEPS its card, and sorts above
-        // the durable ones because running-now outranks a file mtime. The
-        // folder selection still scopes recents to this folder — `newer-other`
-        // is in /home/user/gh/other and stays out.
+        // the durable ones because running-now outranks a file mtime.
+        //
+        // The folder selection still SCOPES the list — it just ranks now rather
+        // than dropping (2026-08-08). `newer-other` lives in /home/user/gh/other
+        // and therefore sorts LAST, where it can still be found; it used to be
+        // thrown away, and a thrown-away row reads to the owner as a row that
+        // never existed.
         assert_eq!(
             recent_paths,
             vec![
                 "remote-session://dev/live-active".to_string(),
                 "remote-session://dev/newest-yggterm".to_string(),
                 "remote-session://dev/older-yggterm".to_string(),
+                "remote-session://dev/newer-other".to_string(),
             ]
         );
     }
