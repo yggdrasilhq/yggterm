@@ -101,6 +101,41 @@ remote agent can reach. Worth closing when this area is next touched.
 ⇒ Still open, and the next capture will answer it: the rail watcher now freezes
 every `[data-yggui-toast*]` element's rect and text at break time.
 
+## ⚖⚖ THE HOT-RESTART GATE IS UNBUILT — THE DESIGN IS NOW SETTLED
+
+**Status:** OPEN
+
+**This is the CONSTITUTION's unmet guarantee and the highest-value work in the
+project.** The design was owner-settled 2026-08-08 and is no longer an open
+question: [`spec-hot-restart-relay-gate.md`](spec-hot-restart-relay-gate.md) owns
+it, [`settled-calls.md`](settled-calls.md) owns his ruling. ⛔ The former
+prohibition on deadlining the gate is SUPERSEDED; do not cite it.
+
+**Live evidence, measured while the spec was written:** GUI **3.0.67**, daemon
+**3.0.65**, older daemons alive at 3.0.62 / 3.0.59 / 3.0.29, and
+
+    hot_restart_pending      true
+    hot_restart_blockers     []
+    hot_restart_block_reason null
+    last successful swap     241 minutes earlier
+
+⭐ **A gate reporting that nothing blocks it while not firing is worse than one
+held by a named blocker** — there is nothing to clear, so no human or agent can
+help it along. Spec §8 makes "report a nameable reason, or fire" a requirement.
+
+**What has to be built** (spec sections in brackets): drive swaps from relay
+boundaries rather than polling for silence [§2] · classify sessions
+idle/blocked-on-human/working/orchestrating instead of inferring from output
+[§3] · queue requests so none is lost [§4] · a 30-minute deadline that forces
+the swap **and** injects `continue` into exactly the sessions it interrupted
+[§5] · an unbounded wait for sessions running sub-agents [§6].
+
+⚠ **Two things that must be true before it ships** and are easy to get wrong:
+sub-agent detection must be POSITIVE (it is the state with an unbounded wait, so
+a merely-busy session must not reach it), and **the interrupted set must be
+computed before the old daemon dies** — after the swap every interrupted session
+looks idle, so the list cannot be re-derived.
+
 ## ⭐ THE `.bak.` RECLAIM IS DONE ON TWO HOSTS AND STILL RUNNING ON THE THIRD
 
 **Status:** OPEN
@@ -135,15 +170,34 @@ migration is what flattened every mtime in the store.
 ⇒ The shipped proof is a **canonical-JSON record-prefix**, streamed in lockstep.
 Full statement, and the general law behind it, in `spec-sweep-policy.md` §9.6.
 
-### ⚠ 125 SESSIONS EXIST ONLY AS A `.bak.` AND THE PRODUCT CANNOT SEE THEM
+### ⚠ THE MIGRATION LOST 67 SESSIONS — REPAIRED ON THE GUI HOST, NOT YET ELSEWHERE
 
-On the GUI host, 125 copies have **no live rollout at all**. They were correctly
-kept (they are the only surviving copy), but they are invisible in yggterm
-because the session index excludes `.bak.` by name
-(`store_excluded_name_fragments`). **Whether those are sessions the product
-should be SHOWING rather than hiding is an open spec question**, and it is the
-kind of question a sweep is well placed to ask: the sweep found them precisely
-because it was looking for things nothing else looks at.
+The 125 no-base copies were **67 distinct sessions the 2026-03-14 codex
+migration LOST**: it wrote the backup and never produced the replacement. None
+has a row in codex's own `threads` table, so codex does not know them either.
+
+Owner-ruled on being shown them (`settled-calls.md`): lost sessions **show**,
+noise sessions are **deleted**. Executed on the GUI host — 5 restored (623 live,
+up from 618), 118 noise copies trashed to `~/.yggterm/session-trash`, 0 orphans
+left, manifest at `~/.yggterm/bak-restore-manifest.jsonl`.
+
+**Still open:**
+- **The other two hosts have not been repaired** (`--restore-orphans`). The
+  integrator's 57.3 GB proof was still running when this was written.
+- **The live count is unconfirmed.** The chain is verified by source —
+  `store_file_name_is_session` rejects `.bak.` (that WAS the invisibility), a
+  renamed file passes the glob, and `build_local_cwd_tree` groups by the cwd
+  STRING with no `is_dir()` check, which matters because **all three restored
+  cwds no longer exist on disk**. But `local_tree_scan`'s own
+  `codex_sessions` annotation still reads 618: the chore tick is throttled
+  (`local_tree_scanned:false`, `superseded:true`) and no fresh scan has been
+  observed. ⇒ Confirm it reads 623 before calling this proven.
+  ⚠ `server app state` does NOT carry the tree's contents, only its UI state
+  (width, rename, selection) — grepping it for a session id is a BLIND
+  instrument, not a negative result.
+- ⚠ **`regenerate-copy --budget 0` does NOT mean "no generation"** — it began
+  requesting titles from litellm immediately. It is not a safe way to force a
+  scan.
 
 ## THERE IS NO SESSION SWEEP, AND THE BUILD SWEEP RUNS TOO RARELY TO KEEP UP
 

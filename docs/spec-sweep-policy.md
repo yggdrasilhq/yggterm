@@ -100,9 +100,17 @@ so that it cannot be outvoted by an accumulation of small penalties:
 
 For everything below the floor:
 
-- **substance** = count of **user turns**, log-scaled. Not bytes: measurement
-  (c) proves bytes track attachments, so a byte-weighted score would call an
-  image dump important and a long argument trivial.
+- **substance** = count of **records**, log-scaled. Not bytes: measurement (c)
+  proves bytes track attachments, so a byte-weighted score would call an image
+  dump important and a long argument trivial.
+
+  ⛔ **And not user turns either — corrected 2026-08-08 against real data.** An
+  earlier draft of this line said user turns. Among the orphaned sessions one has
+  **2 user turns and 238 records**: the human asked twice and the agent worked for
+  an hour. A turn-count floor calls that noise and deletes it. **Records count the
+  agent's work, which is most of what a session IS in this product.** ⇒ Any
+  substance measure must count what the agent did, not merely how often the human
+  spoke.
 - **frequency** = count of **distinct days on which the transcript was appended
   to**, which is its resume-episode count. A file returned to across a year is
   precious even if each visit was short.
@@ -116,10 +124,18 @@ regret goes first. This is the clause that makes the ladder actually free space:
 under a pure importance ordering the engine would delete 500 trivial sessions,
 free 2 MB, and still be facing the two files that hold 74% of the store.
 
-The **substance floor** for C2 is a session that never exceeded a handful of
-user turns and was never resumed. That is the "hi" / "testing" tier. It is swept
-for index hygiene and scan speed, and the plan must not claim a space win for
-it.
+The **substance floor** for C2 is a session below the record floor that was
+never resumed. That is the "hi" / "testing" tier. **Owner-ruled 2026-08-08:
+*"Noise sessions should be deleted"*** — C2 is a real deletion, not merely a
+demotion. It still takes the §9.2 trash hop, and the plan must not claim a space
+win for it (the 62 noise sessions found on the GUI host totalled 286 KB).
+
+⭐ **Set the floor from the distribution, never from taste.** The orphaned
+sessions ran `…15, 16, 16, 17, 238, 385, 1583, 11006, 11006` — a **14x gap** the
+data cuts itself on. A floor that sits in a gap that wide needs no defending and
+will not drift when someone disagrees about what "trivial" means. If a store
+shows no such gap, that is evidence the floor is the wrong instrument for it,
+not licence to pick a number.
 
 ## 5. Compaction, and the rehydration contract
 
