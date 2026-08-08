@@ -4,6 +4,28 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Asking for a remote agent session yggterm cannot start now says so, instead
+  of quietly opening a shell.** Only Codex and Claude Code can currently be
+  started on another machine. Asking for any of the other agent CLIs there used
+  to produce a row that carried the CLI's name, reported success, and was
+  actually a plain SSH shell — the kind of failure you only notice when the
+  thing you expected to be running clearly is not. It now refuses by name and
+  says which kinds do work. Starting those CLIs on a remote machine is still not
+  possible; it is now visibly not possible.
+
+- **A rail's own heading now selects, like everything under it.** The previous
+  release made rail CONTENT selectable, which is what had been asked for, but it
+  named only the rail's scrolling body — and a rail's title sits beside that
+  body rather than inside it. So "Session Metadata" stayed uncopyable while
+  every value beneath it copied fine. Rail headings are now included.
+
+  The other surfaces that were assumed to need the same treatment turned out not
+  to: measured across the whole window, the start page and notification cards
+  were already fully selectable, and selection is not switched off globally the
+  way the note describing this work claimed. What is genuinely not selectable is
+  the sidebar tree and the titlebar, and both are deliberate — those are the
+  surfaces you drag, and text selection is what dragging would turn into.
+
 - **Launching an agent session on another machine now installs that machine's
   CLI.** The previous release honoured the owner's "auto install, update ALL
   clis in all connected systems" ruling for the machine yggterm runs on; a

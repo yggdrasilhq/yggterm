@@ -26917,7 +26917,7 @@ fn local_session_target(kind: SessionKind, cwd: Option<&str>) -> SshConnectTarge
 /// because that slug is the same string the flag parser accepts: spelling them
 /// separately is how a kind could be LABELLED `pi` and yet be unparseable as
 /// `--kind pi`.
-pub(crate) fn session_kind_label(kind: SessionKind) -> &'static str {
+pub fn session_kind_label(kind: SessionKind) -> &'static str {
     if let Some(descriptor) = agent_cli_descriptor(kind) {
         return descriptor.slug;
     }

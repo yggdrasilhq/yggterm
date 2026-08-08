@@ -317,55 +317,142 @@ particular, which is most of what the door is for.
 is active, then read `session_cwd` back from `server app rows` — echoing the
 request is not proof, the row must be re-read.
 
-## ⭐ OWNER-REQUESTED: TEXT OUTSIDE THE RAILS IS STILL NOT SELECTABLE
+## ⭐ OWNER-REQUESTED: SELECTABLE TEXT — THE RAIL HEADER WAS THE LAST REAL GAP
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-⇒ The RAIL half shipped in 3.0.64; what is below is the remainder.
+⇒ Rails shipped 3.0.64. The rail HEADER shipped 3.0.67. What is below is the
+measurement that closed the rest of the list, and it is mostly a correction.
 
 His words, 2026-08-08: *"The metadata sidebar entries or text in general (mostly
-anywhere) should be selectable"*, and again the same day after the first report:
-*"I still cannot select any text on session metadata other than the connect code
-row. Every text should be selectable."*
+anywhere) should be selectable"*, and again the same day: *"I still cannot select
+any text on session metadata other than the connect code row."*
 
-**Shipped (3.0.64):** `RAIL_TEXT_SELECTION_CSS` on `.yggui-rail-scroll *`,
-mounted once in the shell's global `style {}` block, so every rail — metadata,
-settings, connect, notifications, tab rail, contributed app panes — selects.
-Live-proved on jojo: a rail span computes `-webkit-user-select:text` and a Range
-over it returns its text, while a sidebar row computes `none` and returns empty.
+### ⭐⭐ THE PREVIOUS VERSION OF THIS ENTRY WAS WRONG, AND IT WAS WRONG BY ASSUMING
 
-**What remains: everywhere that is not a rail** — the start page, dialogs,
-the titlebar's own text, notification cards. The rule to follow is the one the
-rail fix established: make CONTENT selectable, never lift the global rule (a
-selectable sidebar row would break drag-to-reorder — measured: a sidebar row
-still returns an empty selection, which is correct).
+It said the remainder was *"the start page, dialogs, the titlebar's own text,
+notification cards"*. **Nobody had measured that.** A whole-document sweep on the
+live host (3.0.65, before the fix) walked all 122 text-bearing elements and
+bucketed them by computed `-webkit-user-select`:
 
-⚠ **THE TRAP, MEASURED 2026-08-08 — an unprefixed inline `user-select:none` is
-INERT on WebKitGTK.** The engine resolves `-webkit-user-select`; **15 of the
-shell's 41 `user-select:none` sites write only the unprefixed property** and were
-never doing anything (they looked effective only because the shell ROOT sets
-both and everything inherited its `none`). ⇒ Any opt-out written as part of this
-work must use the PREFIXED form or it is decoration. The metadata group's
-collapse toggle is one of the 15: inside the rail it now selects, which is
-harmless — collapse still fires (`data-metadata-group-expanded` 1→0→1, live).
+| surface | text elements | unselectable | verdict |
+|---|---|---|---|
+| start page | 5571 | **0** | already fine — never broken |
+| toast / notification cards | 2 | **0** | already fine — never broken |
+| rail scroll body | — | 0 | 3.0.64, working |
+| **rail HEADER** | 1 | **1** | ⭐ the one real gap |
+| sidebar / cwd tree | 62 | 62 | ⛔ MUST stay — drag-to-reorder |
+| titlebar | 8 | 8 | ⛔ cannot change — see below |
 
-⚠ **THE HOOK THE RAIL FIX HANGS ON IS libyggterm's, NOT OURS — measured
-2026-08-08, and it shapes the remaining work.** `.yggui-rail-scroll` is applied
-by the LIBRARY (`yggui`, pinned `tag = "v0.12.1"`), not by this shell; the shell
-only mounts the rule. The library's class vocabulary is small and mostly
-composer/conversation-oriented (`yggui-conv-*`, `yggui-composer-*`, `yggui-otp-*`,
-`yggui-rail-scroll`), so **the start page, dialogs, titlebar text and
-notification cards may have no stable class to select on.** ⇒ Before writing CSS,
-check whether the target surface HAS a hook; if it does not, the fix is either a
-yggterm-side attribute on our own markup or a coordinated libyggterm release —
-and Cargo.toml's law is ONE libyggterm version, never two, so a tag bump moves
-every `yggui*` dep together. Do not assume this is a shell-only edit.
+⛔ **There is NO global `user-select:none`, and the old entry's premise that
+"the shell root sets it and every surface inherits" is false.** Measured: `body`
+and `[data-yggterm-shell]` both compute `text`. The `none` is set INLINE on
+individual chrome containers — `[data-yggui-side-rail]` for the rail, and the
+libyggterm titlebar's own root. That is why the start page, which is main
+content and has no such ancestor, was selectable all along.
 
-⭐ **SEQUENCING: batch this with the remote-provisioning live proof.** Both are
-blocked on the same gate — the GUI must restart onto a build containing the
-change before either can be verified (the daemon socket is version-keyed, so a
-GUI one version behind never reaches the new daemon). One restart window should
-serve both.
+### ⭐ THE RAIL HEADER — what 3.0.67 fixes
+
+`.yggui-rail-scroll` is the rail's SCROLL BODY. The heading is a **sibling** of
+it under `[data-yggui-side-rail]`, which is where the `none` is set. So opting
+the body in left the rail's own title unselectable while every value under it
+selected. The rail container's four children measured:
+
+| child | `-webkit-user-select` |
+|---|---|
+| `[data-yggui-rail-header]` | **none** ← the gap |
+| the scrollbar `<style>` node | none (no visible text) |
+| `[data-yggui-rail-scroll]` | text (3.0.64, working) |
+| `[data-rail-resize-handle]` | none (a DRAG handle — must stay) |
+
+**Live-proven on jojo, GUI 3.0.67:** the header span computes
+`-webkit-user-select: text` and a Range over it returns `"Yedit"`. Before, the
+same probe on the same element returned `none` and an empty string.
+
+### ⛔⛔ THE TITLEBAR CANNOT HAVE THIS, AND THE REASON IS MECHANICAL
+
+Do not re-attempt it. The titlebar's root div IS the window drag handle
+(libyggterm `crates/yggui/src/chrome.rs:141`):
+
+    onmousedown  -> evt.prevent_default()               /* cancels the selection gesture */
+    onmousemove  -> past TITLEBAR_DRAG_THRESHOLD_PX -> window().drag()
+
+**Each half defeats selection independently**: `prevent_default()` on mousedown
+cancels the browser's selection gesture before it starts, and the native drag
+seizes the pointer mid-gesture. Selectable title text therefore costs dragging
+the window by its title. The same strings are selectable in the metadata rail,
+so no text is actually out of reach. A test asserts the rule never names the
+titlebar, and states this reason.
+
+⚠ **The trap that still holds for any future opt-out:** an inline
+`user-select:none` with no `-webkit-` twin is INERT on WebKitGTK — 15 of the
+shell's 41 sites write only the unprefixed property. Independently corroborated
+by the sweep: `getComputedStyle` returns `""` for the unprefixed property on
+every element and a real value only for the prefixed one.
+
+⛔ **Do not "simplify" this by flipping a root to `user-select:text`.** It would
+break drag-to-reorder on the 62 sidebar elements, and it would un-protect those
+15 inert opt-outs, which work only by inheriting a container's `none`.
+
+**Live proof still owed:** the header was proven on the metadata/Yedit rail. The
+other rails (settings, connect, notifications, tab rail, contributed app panes)
+share the same `RailHeader` component and so are covered by construction, but
+none has been observed directly.
+
+## ⛔⛔ A REMOTE AGENT ROW SILENTLY BECAME A PLAIN SHELL — SIX OF NINE CLIs
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Measured 2026-08-09 while trying to live-prove the remote provisioning lane, and
+it is what BLOCKED that proof.
+
+`server app terminal new --machine-key <host> --kind opencode` answered
+`error: null`, created a row labelled *"Agent unnamed opencode"* — and gave it
+`kind: ssh_shell`, `icon_text: "$_"`, and a launch command that was a plain
+`yggterm server attach <uuid> <cwd>`. **A bash prompt wearing the CLI's name,
+reporting success.**
+
+`shell.rs` ▸ the `app_control_create_terminal_remote` arm:
+
+```rust
+if requested_kind == SessionKind::Codex        { start_remote_codex_session_seated(..) }
+else if requested_kind == SessionKind::ClaudeCode { start_remote_claude_session_seated(..) }
+else                                            { start_ssh_session_seated(..) }   /* ⛔ */
+```
+
+Only two kinds have a remote start contract. **The `else` swallowed the other
+six** (`pi`, `opencode`, `qwen`, `kimi`, `muse`, `agy`) plus anything added
+later. `--kind` was parsed correctly, validated correctly, and travelled the
+wire correctly as `session_kind`; it was dropped at the last branch.
+
+⚖ **This is the `_ => "shell"` failure the automation `--kind` parser already
+carries a warning about** (`automation_cli.rs:454`: *"an automation configured
+for ANY CLI outside the hand-list launched a PLAIN SHELL on its schedule, and
+the create reported success"*), reappearing one layer out. The `CodexLiteLlm`
+arm in the SAME match already refused by name for exactly this reason — the
+precedent was there and the `else` went around it.
+
+⛔ **WHY IT WAS INVISIBLE, and this is the transferable part:** every downstream
+consumer behaved CORRECTLY on the wrong data. The row rendered, the machine was
+right, `remote_deploy_state` was `Ready`, health was green — and the remote CLI
+provisioner *correctly declined* to install `opencode`, because
+`ManagedCliTool::from_session_kind(SshShell)` is `None` and an ssh shell has no
+managed CLI. ⇒ **A silent kind-downgrade looks exactly like a correct refusal
+one layer down.** Only the session's stored `kind` disagreed with the label, and
+nothing surfaces that pair together.
+
+**Fixed in 3.0.67:** the remote arm now refuses an unsupported agent kind BY
+NAME before the ssh-shell fallback can claim it, naming the kind and saying what
+would otherwise happen. `a_remote_agent_row_is_refused_by_name_rather_than_downgraded_to_a_shell`
+locks the ORDER of the arms (the defect was purely positional) and is
+mutation-proven red. The `CodexLiteLlm` refusal's message, which still said
+"supports shell or codex", now says claude-code too.
+
+⇒ **The remaining work is the real fix**, and it is bigger than this refusal:
+the six CLIs have no remote start contract at all, so a remote `pi`/`opencode`/
+`qwen`/`kimi`/`muse`/`agy` row cannot be created from app-control by any route.
+Today it is a loud refusal instead of a quiet lie, which is strictly better and
+is not the same as working.
 
 ## ⛔ `server app clients` ANSWERS IN A DIFFERENT ENVELOPE FROM EVERY OTHER APP VERB
 
@@ -1213,12 +1300,37 @@ cache (`a_missing_remote_cli_is_cached_so_focus_never_pays_per_click`), and the
 sets `host_label` to a deliberately wrong value and passes only if the resolver
 round-trips the machine key back to its target).
 
-⛔ **NOT PROVEN: the funnel-to-install chain driven from the GUI.** Nobody has
-yet clicked a remote agent row whose CLI is absent and watched the binary appear.
-The daemon socket is version-keyed (`server-3-0-66.sock`), so a 3.0.65 GUI never
-reaches a 3.0.66 daemon — end-to-end proof needs the GUI itself on 3.0.66, i.e. a
-GUI restart, which was deliberately not taken while the empty-rail watcher was
-running. **Do this first when the watcher is retired.**
+⛔ **STILL NOT PROVEN, and 2026-08-09 found out WHY — the blocker is a second
+defect, not the restart.** The GUI restart WAS taken (3.0.67, watcher left
+running deliberately and it rode through). The attempt then failed for a reason
+nobody had predicted:
+
+**There is no headless route that can birth a remote agent row for these six
+CLIs.** `server app terminal new --machine-key <host> --kind opencode` created
+an `ssh_shell` wearing the label "Agent unnamed opencode" — see
+[the silent-downgrade entry](#-a-remote-agent-row-silently-became-a-plain-shell--six-of-nine-clis).
+So the row under test was never an opencode row, and **the provisioning lane
+declined it CORRECTLY**: `ManagedCliTool::from_session_kind(SshShell)` is `None`.
+Zero provisioning trace events fired, which was the right behaviour on the data
+it was given.
+
+⚖ **Read that carefully before treating it as a failure of this lane.** Nothing
+was learned against the provisioning code; the test was invalid. What WAS
+learned is that the falsifier needs a genuine remote agent row, and today only
+`codex` and `claude-code` can be born remotely at all — neither of which is
+absent on any fleet host, so neither can demonstrate an install.
+
+⇒ **The proof is blocked on giving the six CLIs a remote start contract**, which
+is the remaining work in the silent-downgrade entry. Until then the honest
+statement is: the verb and slug are proven by hand, the resolution is proven by
+unit test against a real server object, and **the funnel-to-install chain has
+never been observed end to end.**
+
+⚠ Confirmed en route, so it need not be re-derived: the session record for a
+`--machine-key` row DOES carry `ssh_target` (non-null, equal to the machine
+key) and
+`source: LiveSsh`. The predecessor's `ssh_target`-not-`host_label` finding holds
+on this birth path too — the kind was the only thing wrong.
 
 ⚠ **An isolated-daemon harness was tried and does NOT substitute.** A synthetic
 `live_sessions` row rehydrates as a plain local shell (`exec '/bin/bash' -i`),
