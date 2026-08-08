@@ -173,6 +173,20 @@ def turn_state(path):
     return ("TURN_ENDED", age, text[:300])
 
 
+def row_exists(gui_host, ident):
+    """Is this row still IN THE LIVE ORDER?
+
+    ⛔⛔ WITHOUT THIS, A RETIRED ROW READS AS A WEDGED ONE — measured 2026-08-08,
+    on my own first use. The yggterm row had been retired by its campaign's baton
+    relay; its transcript is frozen MID-TURN forever, so the classifier called it
+    `STUCK` for 54 minutes and I reported that to the owner as a live wedge. It
+    was a corpse.
+    ⇒ **A transcript cannot distinguish KILLED from WEDGED.** Only the row list
+      can, and it must be consulted FIRST. (It also explains a `submitted:false`
+      that looked like a busy row refusing input: there was no row.)"""
+    return resolve_row_path(gui_host, ident) is not None
+
+
 def classify(uuid, host=None):
     t = find_transcript(uuid, host)
     if t is None:
@@ -226,11 +240,51 @@ def nudge(host, row, dry):
     return "submitted" in (ok.stdout or "") or bool(r)
 
 
+_ROWS_CACHE = {}
+
+
+def resolve_row_path(host, ident):
+    """Turn ANY session identifier into a real ROW PATH, or None.
+
+    ⛔⛔ THE TRAP THIS CLOSES, owner-reported 2026-08-08: *"Clicking these delegate
+    notification does not transfer me to the required attention session."*
+
+    `notify --session` makes the card clickable through to that row — but ONLY if
+    it is given a genuine row path. `$YGGTERM_SESSION_ID` is `cc-runtime://<uuid>`
+    while the row is `remote-cc://<host>/<uuid>`: same uuid, different string. Pass
+    the former and the card renders, looks correct, and is **INERT**. The verb's
+    own help warns about it — which is precisely the shape this skill exists to
+    kill, because a warning in prose is something an agent has to REMEMBER.
+    ⇒ Resolve by UUID against `server app rows` so passing the wrong one is
+      impossible rather than merely discouraged."""
+    if not ident:
+        return None
+    uuid = ident.rstrip("/").split("/")[-1]
+    if not _ROWS_CACHE:
+        d = ygg(host, "server", "app", "rows")
+        for r in (d.get("data", {}) or {}).get("rows", []) or []:
+            path = r.get("path") or ""
+            if path:
+                _ROWS_CACHE[path.rstrip("/").split("/")[-1]] = path
+    return _ROWS_CACHE.get(uuid)
+
+
 def escalate(host, row, why, notify_session):
+    """Tell a human — and make the card land WHERE THE ATTENTION IS NEEDED.
+
+    ⛔ The card must point at the ROW THAT IS STUCK, not at the orchestrator that
+       noticed. Pointing it at myself was the second half of the same bug: the
+       notification worked and took him to the wrong place, which is worse than
+       inert because it looks like it functioned."""
     log(f"ESCALATE {row}: {why}")
-    if notify_session:
-        ygg(host, "server", "app", "notify", "delegate needs a human", why,
-            "--tone", "warning", "--session", notify_session)
+    target = resolve_row_path(host, row) or resolve_row_path(host, notify_session)
+    if target is None:
+        log(f"  ⚠ no row path resolves for {row} — sending an UNTARGETED card "
+            f"rather than an inert one")
+    args = ["server", "app", "notify", "delegate needs a human", why, "--tone", "warning"]
+    if target:
+        args += ["--session", target]
+    ygg(host, *args)
 
 
 def main():
@@ -265,6 +319,13 @@ def main():
             rhost = row_host(row, args.host)
             if rhost and rhost == os.uname().nodename:
                 rhost = None                      # it is this machine after all
+            if not row_exists(args.host, row):
+                # ⛔ Ask the ROW LIST before the transcript. A retired row's
+                #    transcript is frozen mid-turn and is indistinguishable from
+                #    a live wedge.
+                report.append({"row": row, "state": "GONE", "age_min": 0,
+                               "action": "RETIRED", "tail": ""})
+                continue
             c = classify(uuid, rhost)
             st = load_state(uuid)
             try:
