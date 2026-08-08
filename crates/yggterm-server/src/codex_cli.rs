@@ -283,6 +283,44 @@ impl ManagedCliPaths {
         env::join_paths(parts).unwrap_or_else(|_| OsString::from(""))
     }
 
+    /// The `PATH` prefix a LAUNCHED session gets, single-quoted and joined —
+    /// the managed npm bin dir, then every login-shell dir the daemon's own
+    /// `PATH` lacks.
+    ///
+    /// ⛔ **THE DEFECT THIS CLOSES, owner-reported 2026-08-09: `muse`, `kimi`
+    /// and `agy` were "not found" on a machine that HAS all three.** The PTY is
+    /// spawned `$SHELL -c` — NOT `-lc` (`terminal.rs` `shell_command`) — so it
+    /// inherits the daemon's stripped `PATH`, measured on the live host as
+    /// `/usr/local/bin:/usr/bin:/bin:/usr/games`. This export prepended the
+    /// managed npm bin dir and nothing else, so the split was exact and
+    /// invisible: `pi`/`opencode`/`qwen` arrive via npm INTO that dir and
+    /// launched fine, while `kimi` (uv), `muse` (vendor script) and `agy`
+    /// (manual) land in `~/.local/bin` — on the login `PATH`, on no `PATH` the
+    /// PTY could see. `bash` printed `muse: command not found` and stayed at a
+    /// prompt, so the row read `Running` with `Launch Error: none`.
+    ///
+    /// ⚖ It is a [[project-purpose]] WRAPPER-VS-MANUAL PARITY break, which is
+    /// why the fix is here and not in a per-CLI flag: typing `muse` into a
+    /// normal shell on that host works, and a session yggterm opens must
+    /// resolve binaries the same way the user's own terminal does.
+    ///
+    /// ⚠ [[finding-a-set-is-not-a-fill]] applies to the pairing, not the value:
+    /// the probe that decides `available` (and the launch refusal gate built on
+    /// it) resolves against [`login_shell_path_dirs`], so a launch that did NOT
+    /// see those dirs could only ever disagree with it. Both sides now read the
+    /// same list — the gate can no longer pass a launch that is going to fail.
+    fn launch_path_prefix(&self) -> String {
+        compose_launch_path_prefix_dirs(
+            Some(&self.bin_dir),
+            user_local_bin_dir().as_deref(),
+            &login_shell_path_dirs(),
+        )
+        .iter()
+        .map(|dir| shell_single_quote(&dir.display().to_string()))
+        .collect::<Vec<_>>()
+        .join(":")
+    }
+
     fn shell_exports(&self, tool: ManagedCliTool) -> String {
         self.shell_exports_with_terminal_appearance(tool, None)
     }
@@ -309,10 +347,7 @@ impl ManagedCliPaths {
             "export npm_config_update_notifier=false".to_string(),
             "export npm_config_audit=false".to_string(),
             "export npm_config_fund=false".to_string(),
-            format!(
-                "export PATH={}:\"$PATH\"",
-                shell_single_quote(&self.bin_dir.display().to_string())
-            ),
+            format!("export PATH={}:\"$PATH\"", self.launch_path_prefix()),
         ]);
         if tool == ManagedCliTool::CodexLiteLlm {
             let codex_home = dirs::home_dir()
@@ -1837,7 +1872,78 @@ mod tests {
         assert!(exports.contains("export npm_config_update_notifier=false"));
         assert!(exports.contains("export npm_config_audit=false"));
         assert!(exports.contains("export npm_config_fund=false"));
-        assert!(exports.contains("export PATH='/tmp/yggterm-home/npm/bin':\"$PATH\""));
+        // ⚠ Shape, not the whole string: the prefix now also carries the
+        // login-shell dirs the daemon's `PATH` lacks, which differ per machine.
+        // Asserting the full literal would make this test read the tester's
+        // environment — the composition itself is locked deterministically by
+        // `a_launch_path_prefix_carries_the_dirs_uv_and_vendor_installs_land_in`.
+        assert!(
+            exports.contains("export PATH='/tmp/yggterm-home/npm/bin':"),
+            "the managed bin dir must stay FIRST on the launch PATH: {exports}"
+        );
+        assert!(exports.contains(":\"$PATH\""), "{exports}");
+    }
+
+    /// ⛔ owner-reported 2026-08-09: `muse`, `kimi` and `agy` were "not found"
+    /// on a host carrying all three. The PTY is spawned `$SHELL -c`, not
+    /// `-lc`, so it sees the daemon's stripped `PATH`; this prefix was the
+    /// managed npm bin dir ALONE, so the three CLIs that do not arrive by npm
+    /// — uv, vendor script, manual, all landing in `~/.local/bin` — were
+    /// unreachable while the npm three worked.
+    #[test]
+    fn a_launch_path_prefix_carries_the_dirs_uv_and_vendor_installs_land_in() {
+        let managed = PathBuf::from("/tmp/yggterm-home/npm/bin");
+        // A real login `PATH` shape: a user dir first, the system dirs in the
+        // middle, and a dir the user deliberately put LAST.
+        let login = vec![
+            PathBuf::from("/home/user/.local/bin"),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/home/user/.local/bin"),
+            PathBuf::from("/opt/plan9/bin"),
+        ];
+
+        let user_local = PathBuf::from("/home/user/.local/bin");
+
+        let dirs = compose_launch_path_prefix_dirs(Some(&managed), Some(&user_local), &login);
+
+        assert_eq!(
+            dirs.first(),
+            Some(&managed),
+            "a yggterm-MANAGED binary must still outrank a system copy"
+        );
+        assert_eq!(
+            dirs,
+            vec![
+                managed.clone(),
+                user_local.clone(),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/opt/plan9/bin"),
+            ],
+            "the login shell's ORDER is reproduced verbatim (repeats collapsed \
+             to their first position). Dropping a dir because the daemon's own \
+             PATH also has it promotes everything after it — that is how \
+             /opt/plan9/bin got in front of /usr/bin and every session was \
+             handed Plan 9's `date`"
+        );
+
+        // ⛔ THE HALF THAT MUST NOT DEPEND ON A SUBPROCESS. When the login-shell
+        // probe returns nothing — it did, live, on a daemon under swap pressure
+        // — the uv/vendor install dir must STILL be there, or the fix silently
+        // reverts to the bug it was written for.
+        assert_eq!(
+            compose_launch_path_prefix_dirs(Some(&managed), Some(&user_local), &[]),
+            vec![managed.clone(), user_local.clone()],
+            "with no login-shell answer at all, yggterm's OWN install dirs are \
+             still on the launch PATH"
+        );
+
+        // No managed dir: the probe's search order, which must be the launch's
+        // minus that one entry — or the probe reports a binary the launch will
+        // not exec.
+        assert_eq!(
+            compose_launch_path_prefix_dirs(None, Some(&user_local), &login),
+            dirs[1..].to_vec()
+        );
     }
 
     #[test]
@@ -2225,16 +2331,94 @@ fn update_via_self_command(tool: ManagedCliTool, argv: &[&str]) -> Result<()> {
 /// `python` must see what a human's shell sees, or it fails on the daemon's
 /// stripped `PATH` in ways no user can reproduce.
 fn provision_env_path() -> OsString {
-    let mut parts: Vec<PathBuf> = Vec::new();
-    if let Some(current) = env::var_os("PATH") {
-        parts.extend(env::split_paths(&current));
-    }
+    let mut parts: Vec<PathBuf> = inherited_path_dirs();
     for dir in login_shell_path_dirs() {
-        if !parts.contains(dir) {
-            parts.push(dir.clone());
+        if !parts.contains(&dir) {
+            parts.push(dir);
         }
     }
     env::join_paths(parts).unwrap_or_else(|_| env::var_os("PATH").unwrap_or_default())
+}
+
+/// The `PATH` this PROCESS carries — the daemon's own, which a launched PTY
+/// inherits verbatim because the shell is spawned `-c` and not `-lc`.
+fn inherited_path_dirs() -> Vec<PathBuf> {
+    env::var_os("PATH")
+        .map(|current| env::split_paths(&current).collect())
+        .unwrap_or_default()
+}
+
+/// The directories a launched session's `PATH` is prefixed with, in search
+/// order: the managed npm bin dir first (a yggterm-managed binary must outrank
+/// a system copy — that ordering predates this function and is preserved), then
+/// every login-shell dir the inherited `PATH` does not already carry.
+///
+/// Split out from [`ManagedCliPaths::launch_path_prefix`] — which explains WHY
+/// this exists — so the composition is testable without a machine that happens
+/// to be missing a directory.
+/// ⛔ **THE LOGIN SHELL'S OWN ORDER IS THE AUTHORITY — do not "optimise" the
+/// dirs the inherited `PATH` already carries out of this list.** Dropping them
+/// looks like harmless dedup and is not: it promotes every REMAINING login dir
+/// above the ones it removed, so a dir the user deliberately put LAST outranks
+/// `/usr/bin`. Measured live on 3.0.68 within minutes of the first attempt —
+/// `/opt/plan9/bin` sits last on this host's login `PATH`, the filtered prefix
+/// hoisted it above `/usr/bin`, and every launched session got Plan 9's `date`,
+/// which ignores `+%s` and prints `Thu Jan  1 ...`. A vendor launcher doing
+/// `now="$(date +%s)"` under `set -u` then died with `Thu: unbound variable`.
+/// Duplicates in a `PATH` cost nothing; a REORDERED `PATH` is a different
+/// machine.
+fn compose_launch_path_prefix_dirs(
+    managed_bin_dir: Option<&Path>,
+    user_local_bin_dir: Option<&Path>,
+    login_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = managed_bin_dir.map(Path::to_path_buf).into_iter().collect();
+    for dir in user_local_bin_dir.into_iter().map(Path::to_path_buf) {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    for dir in login_dirs {
+        if !dirs.contains(dir) {
+            dirs.push(dir.clone());
+        }
+    }
+    dirs
+}
+
+/// Where yggterm's own NON-npm installs land: `uv tool install`'s default tool
+/// bin dir and the target every vendor installer writes to — `CliInstall::Uv`
+/// and `CliInstall::VendorScript` each name it, and [`install_via_uv`]
+/// deliberately declines to override the prefix.
+///
+/// ⛔ It is on the launch `PATH` BY CONSTRUCTION, never because a login shell
+/// was asked. [`login_shell_path_dirs`] is a parity EXTENSION — it makes a
+/// session resolve binaries the way the user's own terminal does — but it
+/// spawns a subprocess, and a subprocess can fail. A fix for "yggterm installed
+/// this CLI and then could not run it" must not itself depend on something that
+/// can fail; when the probe came back empty on 3.0.69, the whole fix silently
+/// evaporated and `kimi: command not found` came back.
+fn user_local_bin_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".local").join("bin"))
+}
+
+/// Every directory a launched session will search for a binary, in the order
+/// it searches them — the launch prefix, then the inherited `PATH` the export
+/// appends with `:"$PATH"`. The managed bin dir is NOT included: its callers
+/// check it first themselves, which is the position it holds in the launch.
+///
+/// ⚠ The ORDER is load-bearing, not decoration. A probe that searched the
+/// inherited `PATH` first would report the version and source of a DIFFERENT
+/// copy than the launch execs whenever a binary sits in two dirs
+/// ([[finding-a-build-identity-is-not-what-version-says]]).
+fn launch_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = compose_launch_path_prefix_dirs(
+        None,
+        user_local_bin_dir().as_deref(),
+        &login_shell_path_dirs(),
+    );
+    dirs.extend(inherited_path_dirs());
+    dirs
 }
 
 /// A filesystem-safe stem for a vendor installer URL.
@@ -2707,33 +2891,52 @@ fn managed_cli_focus_cache_entry_is_fresh(available: bool, cached_at_ms: u64, no
 /// absent and fires a pointless `npm install` on every cold focus (the 5.5s stall
 /// measured on guihost, 2026-06-14). Resolving via the login shell closes that gap so the
 /// probe matches launch parity. One subprocess per daemon lifetime; never on the hot path.
-fn login_shell_path_dirs() -> &'static [PathBuf] {
-    static DIRS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
-    DIRS.get_or_init(|| {
-        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let output = Command::new(&shell)
-            .arg("-lc")
-            .arg("printf %s \"$PATH\"")
-            .output();
-        match output {
-            Ok(output) if output.status.success() => {
-                let path = String::from_utf8_lossy(&output.stdout);
-                env::split_paths(path.trim()).collect()
-            }
-            _ => Vec::new(),
+///
+/// ⛔ **A FAILED PROBE IS NOT CACHED, and that is the whole point of the mutex.**
+/// This was a `OnceLock`, so the FIRST answer stood for the process's whole life
+/// — including an empty one. Measured live on 3.0.69: a daemon that had just
+/// restored 40 sessions under swap pressure got nothing back from its one
+/// `bash -lc`, froze `[]`, and every session it launched afterwards was composed
+/// with the managed npm dir alone. The symptom was the ORIGINAL bug returning at
+/// random (`kimi: command not found` on a host with kimi installed), which is
+/// worse than the bug: it is the bug, intermittently, with a fix in the tree.
+/// A miss now costs one more subprocess on the next call and nothing else.
+fn login_shell_path_dirs() -> Vec<PathBuf> {
+    static DIRS: std::sync::Mutex<Option<Vec<PathBuf>>> = std::sync::Mutex::new(None);
+    if let Ok(cached) = DIRS.lock()
+        && let Some(dirs) = cached.as_ref()
+    {
+        return dirs.clone();
+    }
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let output = Command::new(&shell)
+        .arg("-lc")
+        .arg("printf %s \"$PATH\"")
+        .output();
+    let dirs: Vec<PathBuf> = match output {
+        Ok(output) if output.status.success() => {
+            let path = String::from_utf8_lossy(&output.stdout);
+            env::split_paths(path.trim()).collect()
         }
-    })
+        _ => Vec::new(),
+    };
+    // Only a USEFUL answer is remembered. An empty one means the probe failed
+    // (or the login shell genuinely has no PATH, which is the same thing for
+    // our purposes) and must be retried rather than enshrined.
+    if !dirs.is_empty()
+        && let Ok(mut cached) = DIRS.lock()
+    {
+        *cached = Some(dirs.clone());
+    }
+    dirs
 }
 
 /// Resolve a binary the way the launched session will: daemon `PATH` first (cheap,
 /// already in-process), then the cached login-shell `PATH`. Existence check only —
 /// no `--version` subprocess.
 fn resolve_binary_for_launch_parity(binary_name: &str) -> Option<PathBuf> {
-    if let Some(path) = resolve_binary_on_path(binary_name) {
-        return Some(path);
-    }
-    login_shell_path_dirs()
-        .iter()
+    launch_search_dirs()
+        .into_iter()
         .map(|base| base.join(binary_name))
         .find(|candidate| candidate.is_file())
 }

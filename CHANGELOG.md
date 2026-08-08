@@ -4,6 +4,26 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Muse, Kimi and Antigravity now start on a machine that has them.** All
+  three were reported "not found" on a host carrying all three, while Pi,
+  OpenCode and Qwen started fine on the same host. The split was exact: a
+  session's shell inherits the daemon's own `PATH`, which is a bare
+  `/usr/local/bin:/usr/bin:/bin:/usr/games`, and yggterm added only its managed
+  npm directory to it. The three CLIs that arrive by npm land in that directory
+  and worked; the three that arrive by uv, by a vendor installer, or by hand
+  land in `~/.local/bin` — on your login `PATH`, on no path the session could
+  see. Worse, `bash` printed `command not found` and stayed at a prompt, so the
+  row looked like it was running.
+
+  A session now searches for binaries exactly the way your own terminal does:
+  your login `PATH`, in your own order, with yggterm's managed directory in
+  front. The order matters as much as the contents — the first attempt at this
+  fix hoisted every login directory above the system ones, which put a Plan 9
+  `date` ahead of `/usr/bin/date` and broke a vendor launcher that asks for the
+  time. The same list now answers both "is this CLI installed?" and "what can
+  this session run?", so yggterm can no longer report a CLI as present and then
+  fail to start it.
+
 - **Asking for a remote agent session yggterm cannot start now says so, instead
   of quietly opening a shell.** Only Codex and Claude Code can currently be
   started on another machine. Asking for any of the other agent CLIs there used
