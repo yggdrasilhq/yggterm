@@ -78,6 +78,57 @@ rail's header. Two live toast surfaces at two anchors is the "double
 notifications" he named. `ToastAnchor` is a real type; the question is who is
 mounting a second host.
 
+## 3.0.63's APP-ROW PERSISTENCE IS UNPROVABLE WHILE THE QUIET GATE HOLDS THE DAEMON
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+3.0.63 is built and deployed to both `~/.local/bin` and `~/.yggterm/bin`, and the
+GUI is running it — the metadata rail reports it of itself:
+`Client Version 3.0.63 · daemon is on 3.0.62`.
+
+**The proof cannot be taken, and the reason is structural, not effort.** The fix
+is DAEMON-side (`PersistedLiveSession` now carries the `app:<name>:<verb>` token
+and `restore_live_session` re-derives against the current registry), so it is
+inert until a daemon owns it — the "a daemon-side fix is inert under proxy" rule.
+The live daemon is still 3.0.62, reports `Restart deferred`, and owns 10 live
+sessions. Confirmed inert by measurement: **zero records in
+`~/.yggterm/server-state.json` carry an `app:` token** after creating an app row
+against the 3.0.62 daemon.
+
+⇒ Forcing the swap is the only way to run the falsifier, and forcing it now would
+put ~10 live agent sessions through the very mechanism the constitution records
+as still destructive (`kill -TERM` cost ~7 agent PTYs because the idle gate never
+converges under load). **This falsifier is therefore BLOCKED BY the quiet-gate
+bug** — which is worth stating plainly, because it is the first case where the
+gate is not merely slowing a deploy but preventing a fix from being verified at
+all.
+
+⚠ Falsifier, once a 3.0.63 daemon owns the row: create an app row
+(`server app launch-app ychrome --cwd <dir>`), force a daemon swap, then read the
+row — **a bash prompt with no app means it did not hold**. Check
+`server-state.json` for the `app:` token first; absent, the swap proves nothing.
+
+## `server app launch-app --cwd` IS IGNORED — THE ROW INHERITS THE ACTIVE SESSION'S CWD
+
+**Status:** OPEN
+
+`launch-app ychrome --cwd /home/pi/gh/yggterm` answered `accepted:true` with
+`launch_command: /home/pi/.local/bin/ychrome` and created a row whose
+`session_cwd` was **`/home/pi/data/taxgraph`** — the ACTIVE session's cwd, not the
+one passed (measured 2026-08-08 on 3.0.63). The reply's `shell.launch_app` block
+does not carry the cwd at all, so it reports a good launch either way.
+
+This sits directly beside the already-known "with no `--cwd` it answers
+`accepted:true` and creates nothing". Together they say the cwd argument reaches
+the accept path but never reaches the row: ⇒ **the row is placed by inheritance,
+and `--cwd` decides only whether the create is attempted.** An agent using this
+door to exercise the app-launch path therefore cannot put an app row anywhere in
+particular, which is most of what the door is for.
+
+⚠ Falsifier for a fix: create with `--cwd <dir>` while a row with a DIFFERENT cwd
+is active, then read `session_cwd` back from `server app rows` — echoing the
+request is not proof, the row must be re-read.
+
 ## ⭐ OWNER-REQUESTED: TEXT IS NOT SELECTABLE, AND THE METADATA RAIL IS THE WORST CASE
 
 **Status:** OPEN
