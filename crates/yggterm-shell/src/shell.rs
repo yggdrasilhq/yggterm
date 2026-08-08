@@ -5653,6 +5653,18 @@ struct AppliedWebSurface {
     /// Profile (storage jar) the surface's WebContext was created with. Also
     /// fixed per WebContext — a change means destroy + recreate.
     profile: String,
+    /// Is there nothing further to do about THIS webview's app policy — its
+    /// userscripts and its adblock ruleset? True when it was built with the
+    /// policy attached, and true for an adopted popup (WebKit owns the
+    /// navigation that made it, so there is no faithful rebuild).
+    ///
+    /// `init_script` binds at webview CREATION, so a surface built while the
+    /// policy was unreachable runs script-less for its whole life however late
+    /// the policy lands — a reload does NOT fix it. That is the one fact
+    /// [`web_surface_recreate_reason`]'s `policy_arrived` needs, and the reason
+    /// a daemon handover used to cost the user adblock until they closed the
+    /// tab (ychrome `docs/pending-bugs.md`, the stranded-control-port entry).
+    policy_settled: bool,
     /// WebKit page-zoom factor (1.0 == 100%) last pushed to this surface. The
     /// reconciler re-applies whenever the desired factor (the global "Web View"
     /// zoom setting; per-site overrides land later) diverges from this.
@@ -5722,6 +5734,10 @@ impl AppliedWebSurface {
         reload_nonce: u64,
         socks_port: Option<u16>,
         profile: String,
+        // …and whether the app's policy was ATTACHED to the webview the caller
+        // just built. Not "was a policy known" — what this record must hold is
+        // what the view carries, because that is what a rebuild would change.
+        policy_attached: bool,
         zoom_factor: f64,
         now_ms: u64,
     ) -> Self {
@@ -5736,6 +5752,7 @@ impl AppliedWebSurface {
             reload_nonce,
             socks_port,
             profile,
+            policy_settled: policy_attached,
             zoom_factor,
             stashed_at_ms: (!want_visible).then_some(now_ms),
             ever_revealed: want_visible,
@@ -5779,6 +5796,13 @@ impl AppliedWebSurface {
             reload_nonce: 0,
             socks_port,
             profile,
+            // A popup is never rebuilt for policy, so its policy question is
+            // closed at birth: WebKit built this webview inside the opener's
+            // create handler and owns the navigation that fills it, so there is
+            // no url we could faithfully re-open — destroying one to re-attach
+            // scripts would kill a `window.open` sign-in mid-flow. It already
+            // carries whatever `attach_userscripts` gave the opener's window.
+            policy_settled: true,
             zoom_factor,
             stashed_at_ms: None,
             ever_revealed: !background,
@@ -6829,6 +6853,7 @@ mod web_surface_reclaim_locks {
             reload_nonce: 0,
             socks_port: None,
             profile: "default".to_string(),
+            policy_settled: true,
             zoom_factor: 1.0,
             stashed_at_ms,
             ever_revealed: true,
@@ -12135,14 +12160,22 @@ async fn web_surface_native_reconcile_loop(
                 //     only destroying a webview re-blits). Recreating against
                 //     the SAME persistent per-profile jar keeps cookies/session,
                 //     so recreate-on-reload is lossless.
+                //   - the app's policy ARRIVED for a webview built without it:
+                //     userscripts and the adblock ruleset bind at creation, so
+                //     the surface a daemon handover opened unprotected can only
+                //     be repaired by rebuilding it. Background surfaces only —
+                //     see the rule's own note on why the user's page waits.
                 if let Some(entry) = applied.get(&key)
                     && let Some(reason) = web_surface_recreate_reason(
                         entry.socks_port,
                         &entry.profile,
                         entry.reload_nonce,
+                        entry.policy_settled,
+                        entry.visible,
                         socks_port,
                         &profile,
                         reload_nonce,
+                        matches!(policy_gate, SurfacePolicyGate::Ready(_)),
                     )
                 {
                     let native_id = entry.native_id;
@@ -12731,6 +12764,13 @@ async fn web_surface_native_reconcile_loop(
                                     reload_nonce,
                                     socks_port,
                                     profile,
+                                    // What the webview CARRIES, read off the
+                                    // same gate the create above spent: a
+                                    // `Ready` policy went in with it, anything
+                                    // else means this view has no userscripts
+                                    // and no ruleset and can only be repaired
+                                    // by a rebuild.
+                                    matches!(policy_gate, SurfacePolicyGate::Ready(_)),
                                     open_zoom,
                                     current_millis(),
                                 ),
@@ -61878,9 +61918,17 @@ async fn app_policy_fetch(
                     shell.push_notification(
                         NotificationTone::Error,
                         "Web policy unavailable",
+                        // ⛔ SAY WHAT HAPPENS NEXT. "Open unprotected" alone was
+                        // true and useless: it read as permanent, and it WAS
+                        // permanent until the repair below existed. A surface
+                        // built without the policy is now rebuilt once the
+                        // policy is reachable, so the notice must not describe
+                        // a state the app will leave on its own.
                         format!(
                             "The app did not serve its ad-block and userscript policy \
-                             ({error}). Its surfaces open unprotected."
+                             ({error}). Its surfaces open unprotected and are rebuilt \
+                             with the policy once it answers — a page you are looking \
+                             at when that happens is rebuilt after you leave it."
                         ),
                     );
                 });
@@ -66341,6 +66389,7 @@ mod web_do_verb_tests {
                 reload_nonce: 0,
                 socks_port: None,
                 profile: "default".to_string(),
+                policy_settled: true,
                 zoom_factor: 1.0,
                 // BOTH are stashed: that is the point — `stashed` cannot tell
                 // "never shown" from "shown, then backgrounded".
@@ -66434,6 +66483,7 @@ mod web_do_verb_tests {
                 0,
                 None,
                 "default".to_string(),
+                true,
                 1.0,
                 1_000,
             )
@@ -66547,6 +66597,7 @@ mod web_do_verb_tests {
             0,
             None,
             "default".to_string(),
+            true,
             1.0,
             1_000,
         );
@@ -127329,13 +127380,35 @@ fn web_profile_switch_plan(
 /// It is also what makes the PROFILE SWITCH work: retargeting a surface's tabs
 /// onto a new profile makes every one of them answer `profile_changed` here, so
 /// the old context is destroyed and the new one opens on the new jar.
+///
+/// ## The fourth reason: `policy_arrived`
+///
+/// A FOURTH fact binds at creation and no live view can adopt it either — the
+/// app's userscripts and adblock ruleset, which ride `init_script`. A surface
+/// built while the policy endpoint was unreachable (a ychrome daemon handover
+/// strands the GUI on the retired daemon's control port; the fetch exhausts
+/// `MAX_POLICY_FETCH_ATTEMPTS` and the gate opens unblocked rather than never
+/// opening) therefore runs with NO adblock and NO userscripts for its whole
+/// life — reloading the page does not fix it, only rebuilding the webview does.
+/// So when the policy does land, the surface is rebuilt under it.
+///
+/// ⚠ It is asked LAST, and only of a surface nobody is looking at. The rebuild
+/// is visible — the page reloads and its scroll and form state go with it — so
+/// a background tab, a stashed session and an agent's headless surface are
+/// repaired the moment the policy lands, while the page in front of the user is
+/// left alone until they next leave it. Deferring is not "never": the same rule
+/// fires on the tick after it stops being visible.
+#[allow(clippy::too_many_arguments)]
 fn web_surface_recreate_reason(
     applied_socks_port: Option<u16>,
     applied_profile: &str,
     applied_reload_nonce: u64,
+    applied_policy_settled: bool,
+    applied_visible: bool,
     socks_port: Option<u16>,
     profile: &str,
     reload_nonce: u64,
+    policy_ready: bool,
 ) -> Option<&'static str> {
     if applied_socks_port != socks_port {
         Some("socks_port_changed")
@@ -127343,6 +127416,8 @@ fn web_surface_recreate_reason(
         Some("profile_changed")
     } else if applied_reload_nonce != reload_nonce {
         Some("reload")
+    } else if !applied_policy_settled && policy_ready && !applied_visible {
+        Some("policy_arrived")
     } else {
         None
     }
@@ -159534,6 +159609,7 @@ mod tests {
                     0,
                     None,
                     "default".to_string(),
+                    true,
                     1.0,
                     1_000,
                 ),
@@ -182678,9 +182754,12 @@ mod webtabs_menu_switcher_locks {
                     tab.socks_port,
                     WEB_SURFACE_TEMP_PROFILE,
                     tab.reload_nonce,
+                    true,
+                    true,
                     tab.socks_port,
                     &tab.profile,
                     tab.reload_nonce,
+                    true,
                 ),
                 Some("profile_changed"),
                 "tab {} must be rebuilt against the new jar",
@@ -182693,9 +182772,12 @@ mod webtabs_menu_switcher_locks {
                     tab.socks_port,
                     &tab.profile,
                     tab.reload_nonce,
+                    true,
+                    true,
                     tab.socks_port,
                     &tab.profile,
                     tab.reload_nonce,
+                    true,
                 ),
                 None,
             );
@@ -182708,21 +182790,83 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-    /// The recreate rule keeps its other two reasons, in priority order — this
-    /// function is the reconciler's ONE owner of "must I destroy this webview".
+    /// The recreate rule keeps its other three reasons, in priority order —
+    /// this function is the reconciler's ONE owner of "must I destroy this
+    /// webview".
     #[test]
     fn the_recreate_rule_still_answers_for_proxy_and_reload() {
+        // (settled, visible) = a surface with nothing owed on its policy, in
+        // front of the user: the state in which only the first three fire.
         assert_eq!(
-            web_surface_recreate_reason(Some(1080), "work", 0, Some(1081), "work", 0),
+            web_surface_recreate_reason(
+                Some(1080),
+                "work",
+                0,
+                true,
+                true,
+                Some(1081),
+                "work",
+                0,
+                true
+            ),
             Some("socks_port_changed"),
         );
         assert_eq!(
-            web_surface_recreate_reason(None, "work", 0, None, "work", 1),
+            web_surface_recreate_reason(None, "work", 0, true, true, None, "work", 1, true),
             Some("reload"),
         );
         assert_eq!(
-            web_surface_recreate_reason(None, "work", 3, None, "work", 3),
+            web_surface_recreate_reason(None, "work", 3, true, true, None, "work", 3, true),
             None,
+        );
+    }
+
+    /// THE FOURTH REASON, as arithmetic: a webview built with no userscripts and
+    /// no adblock is rebuilt once the app's policy lands — and only then, and
+    /// only while nobody is looking at it.
+    ///
+    /// This is the repair half of the ychrome daemon-handover bug: the fetch
+    /// exhausted its attempts against the retired daemon's control port, the
+    /// gate opened unblocked, and `init_script` binds at creation — so the
+    /// surface ran with no adblock and no SponsorBlock for its whole life,
+    /// which a reload could not fix.
+    #[test]
+    fn a_surface_built_without_the_policy_is_rebuilt_when_the_policy_lands() {
+        // Built unprotected, backgrounded, and the policy is now in hand.
+        assert_eq!(
+            web_surface_recreate_reason(None, "work", 0, false, false, None, "work", 0, true),
+            Some("policy_arrived"),
+            "a surface that opened unblocked must be repaired once the policy is \
+             reachable — rebuilding is the ONLY way to attach init_script"
+        );
+        // The page the user is READING is left alone. A rebuild reloads it and
+        // takes its scroll and its half-typed form with it; the same rule fires
+        // on the tick after they leave it.
+        assert_eq!(
+            web_surface_recreate_reason(None, "work", 0, false, true, None, "work", 0, true),
+            None,
+            "a visible page must not be yanked out from under the user"
+        );
+        // No policy to repair WITH: an app that serves none (gate Absent), or a
+        // fetch still exhausted. Destroying here would rebuild the same
+        // unprotected surface forever.
+        assert_eq!(
+            web_surface_recreate_reason(None, "work", 0, false, false, None, "work", 0, false),
+            None,
+            "without a policy in hand the rebuild would be a treadmill"
+        );
+        // …and once repaired it stays repaired: the rebuilt surface records
+        // that it carries the policy, so the rule cannot fire on it twice.
+        assert_eq!(
+            web_surface_recreate_reason(None, "work", 0, true, false, None, "work", 0, true),
+            None,
+            "a surface that already carries the policy must never be rebuilt for it"
+        );
+        // Priority: a context-fixed fact still outranks it, and its own reason
+        // is the one journaled (that rebuild attaches the policy anyway).
+        assert_eq!(
+            web_surface_recreate_reason(None, "work", 0, false, false, None, "play", 0, true),
+            Some("profile_changed"),
         );
     }
 
