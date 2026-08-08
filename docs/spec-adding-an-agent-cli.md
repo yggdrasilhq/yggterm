@@ -35,12 +35,13 @@ Every field is a claim about a real program. Read the CLI's source, or run its
 binary, and put the provenance in a comment beside the value — the shipped
 descriptors do this and it is what makes them trustworthy two versions later.
 
-Nine questions, and the answer to each is a descriptor field:
+Ten questions, and the answer to each is a descriptor field:
 
 | # | Question | How to answer it | Field |
 |---|---|---|---|
 | 1 | What is the binary called on `PATH`? | `package.json` `bin`, `pyproject.toml` `[project.scripts]`, or the installer's `command_name` | `binary_name` |
 | 2 | How is it installed, user-locally? | its own README; ⛔ never a `sudo`/`/usr/local` route — see `spec-cli-binary-auto-provisioning` | `install` |
+| 2b | How does it STAY current? | `--help` on an installed copy: does it ship its own `update`? | `update` |
 | 3 | How does it RESUME an existing session by id? | its arg parser | `resume_selector`, `resume_re_roots_with_cwd` |
 | 4 | Does it accept a caller-supplied session id at BIRTH? | look for a `--session-id`-shaped flag, and check what it does on a MISS (creates? errors?) | `id_assigned_at_birth` |
 | 5 | Where does it persist its own sessions, and what is in one file? | its session/store module | `session_store_globs`, `store_excluded_name_fragments`, `read_store_entry`, or a declared `store_scan_gap` |
@@ -186,9 +187,24 @@ Almost all of this is now free. What is genuinely per-CLI:
 ### Step 8 — provisioning
 
 `spec-cli-binary-auto-provisioning` requires a user-local install and login-shell
-PATH parity. `CliInstall::Npm` flows through the existing `ManagedCliTool` lane.
-`Uv`, `VendorScript` and `Manual` must **refuse by name** rather than silently
-falling through to an npm install of the wrong package.
+PATH parity. **Every method is RUN**, per the owner's 2026-08-08 ruling
+(`settled-calls.md`): `Npm` is batched into one `npm install -g` line, `Uv` runs
+`uv tool install --upgrade`, and a `VendorScript` is fetched over pinned HTTPS
+and executed with `HOME` intact, no privilege escalation and stdin closed.
+
+⛔ **The methods never share a command line.** npm fails a whole `install -g`
+batch on one unresolvable name, so a uv package appended to that line would not
+install the wrong package — it would take every other CLI's refresh down with it
+and report the failure against all of them.
+
+⭐ **`install` and `update` are two questions, and a CLI may answer them
+differently.** `CliInstall::Manual` means only *yggterm cannot fetch this* — it
+says nothing about staying current. Antigravity is exactly that case: a 166 MB
+binary served behind a sign-in, which advertises `agy update` in its own
+`--help`. A CLI that ships its own updater has that updater PREFERRED over
+re-running its install method, because it is the only thing that knows where its
+own payload lives. A descriptor that is both unfetchable and unupdatable fails
+the registry's own test.
 
 ### Step 9 — prove it
 
