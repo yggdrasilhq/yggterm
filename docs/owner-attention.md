@@ -37,17 +37,6 @@ copies.
   *Meanwhile:* the relay is fixing them one at a time in the pattern the rule
   would generalise, so either answer is cheaper afterwards, not dearer.
 
-- **Should a session whose CWD is gone SAY so, instead of silently resuming a
-  level up?** — the repair recovered 12 lost sessions whose workspaces no longer
-  exist. Clicking one already works (yggterm walks up to the nearest surviving
-  ancestor), but nothing tells him or the resumed agent, so both 181-turn
-  sessions land in `/home/pi/data` and every relative path resolves against the
-  wrong directory. → yggterm `docs/pending-bugs.md` § *A SESSION WHOSE CWD NO
-  LONGER EXISTS…* (`Status: AWAITING A DECISION`).
-  *Meanwhile:* nothing is blocked — they show and they open, which is the half he
-  already ruled on (*"They should show"*). ⛔ Hiding them is not an available
-  answer; that is the exact mistake the repair undid.
-
 ## Credentials and real-money actions (the vault and the card rails)
 
 - **Any card payment is his, per action, every time** — his standing rule for

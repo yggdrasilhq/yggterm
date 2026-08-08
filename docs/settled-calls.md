@@ -9,6 +9,45 @@ and referenced from here.
 says the answer changed.
 
 
+## ★★★ QUIET BY DEFAULT — THE CHIME LADDER IS THE ONLY UNQUIET CHANNEL (2026-08-08)
+
+**Settled by the owner, verbatim:** *"Quietly. The only unquiet part is
+notifications with the triple beeps."*
+
+**The question it answered:** a session whose recorded cwd no longer exists
+already resumes in the nearest surviving ancestor
+(`best_effort_cwd_shell_prefix`, `codex_cli.rs`). Should it SAY so? **No. It
+stays quiet.** ⇒ No code change; the behaviour already matches, and the
+`pending-bugs.md` entry asking the question is deleted rather than implemented.
+
+⚖ **Read it as the general law, because that is how he phrased it.** The product
+is quiet by default, and **the notification system is the ONE sanctioned loud
+channel.** His *"triple beeps"* is `ChimeTone::Error` — the top of the ladder in
+`yggterm-core/src/notification_audio.rs`:
+
+| tone | pattern |
+|---|---|
+| `Info` | one chime |
+| `Success` | one chime — deliberately identical to `Info`; the cabin vocabulary has a single *"something wants you"* and splitting it would make neither recognisable |
+| `Warning` | the hi-lo pair |
+| **`Error`** | **the hi-lo pair three times over** |
+
+⚠ The patterns are borrowed from aircraft cabin calls (passenger call ·
+crew interphone · emergency) and that lineage is in the module comment, but
+**yggterm's own names are Info/Success/Warning/Error** — describe a level by the
+product's word, not by the aviation one it was modelled on. Note also that
+*warning* is the DOUBLE; only `Error` is the triple.
+
+**What this forbids:** inventing a second attention-demanding surface for a
+condition that is merely unusual. A best-effort fallback, a substituted path, a
+degraded-but-working state — these are handled quietly, and if one genuinely
+needs the user, it goes through the notification channel that already exists
+rather than growing a new badge, banner, or row decoration beside it.
+
+⇒ Consistent with the sweep policy's §7 silence rule, which was settled the same
+day on the same instinct: routine work is silent, and only a state that would
+make silence a *false report of health* is allowed to speak.
+
 ## ⚖⚖ THE HOT-RESTART GATE IS RELAY-AWARE, DEADLINED, AND REPAIRS WHAT IT BREAKS (2026-08-08)
 
 **Settled by the owner, and it unblocks the CONSTITUTION's unmet guarantee.**
