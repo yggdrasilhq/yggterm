@@ -52276,6 +52276,27 @@ fn context_menu_position_style(placement: ContextMenuPlacement) -> String {
 /// content-box the 6px padding made the drawn menu 12px wider than the placed
 /// one, and on a narrow rail those 12px are the difference between "inside the
 /// band" and "clipped by the page".
+/// THE fill for a panel that FLOATS over other content — the right-click menu,
+/// and every dropdown that should read as the same family of surface.
+///
+/// One owner, because the requirement is not a taste: an overlay is drawn over
+/// content the panel knows nothing about, so anything the eye can see through
+/// makes the text underneath collide with the text on top. The start-page
+/// split-button menu shipped with `panel_alt` (`rgba(255,255,255,0.18)`) and was
+/// reported see-through on 2026-08-08 — a token that is exactly right as a TINT
+/// on a button, because a button has the page's own opaque background behind it,
+/// and exactly wrong one layer up.
+///
+/// The owner named the reference himself: *"I like the right click context menu
+/// (simple works here)"*. So this is that menu's fill, and anything else that
+/// floats reads it rather than picking its own.
+fn overlay_surface(palette: Palette) -> &'static str {
+    if palette_is_dark(palette) {
+        "rgba(22,28,34,0.98)"
+    } else {
+        "rgba(248,249,252,0.98)"
+    }
+}
 fn context_menu_surface_style(
     palette: Palette,
     placement_style: &str,
@@ -52286,12 +52307,8 @@ fn context_menu_surface_style(
     // is how the profile dropdown came to hang off the bottom of the window.
     max_height: f64,
 ) -> String {
+    let background = overlay_surface(palette);
     let dark = palette_is_dark(palette);
-    let background = if dark {
-        "rgba(22,28,34,0.98)"
-    } else {
-        "rgba(248,249,252,0.98)"
-    };
     let shadow = if dark {
         "0 18px 42px rgba(0,0,0,0.42), inset 0 0 0 1px rgba(86,103,120,0.72)"
     } else {
@@ -120401,12 +120418,22 @@ enum StartPageFamily {
 /// Order is deliberate and not frequency-sorted: a menu that reorders itself
 /// under the user destroys the muscle memory the sticky face is there to build.
 /// The face moves; the list does not.
+/// The SESSION family: one member per REGISTERED agent CLI, in registry order —
+/// the same derivation the cwd-tree row menu uses, so the two surfaces cannot
+/// offer different CLIs. It used to be two hardcoded entries, which is one of
+/// the four places a new CLI had to be remembered by hand.
+///
+/// ⛔ **A plain terminal is NOT a member** (owner directive 2026-08-08: *"New
+/// terminal should be a separate button and not included in sessions"*). It sat
+/// in the family as an unaccented last entry, and being in the family means
+/// being STICKY: choosing a shell once made "New Terminal" the face, so the
+/// button the user reaches for by muscle memory to start an agent quietly
+/// started a shell instead. It also grew from one of two entries to one of ten
+/// as the CLIs landed, so the shell became the least findable thing on a page
+/// whose whole job is starting one. It is [`start_page_new_terminal_button`]
+/// now — always visible, never the face of something else.
 fn start_page_session_items(accent: &str) -> Vec<SplitButtonItem> {
-    // One member per REGISTERED agent CLI, in registry order — the same
-    // derivation the cwd-tree row menu uses, so the two surfaces cannot offer
-    // different CLIs. It used to be two hardcoded entries, which is one of the
-    // four places a new CLI had to be remembered by hand.
-    let mut items: Vec<SplitButtonItem> = yggterm_core::agent_cli::AGENT_CLIS
+    yggterm_core::agent_cli::AGENT_CLIS
         .iter()
         .map(|descriptor| {
             SplitButtonItem::new(descriptor.slug, format!("{} Session", descriptor.display_name))
@@ -120416,13 +120443,7 @@ fn start_page_session_items(accent: &str) -> Vec<SplitButtonItem> {
                 ))
                 .accent(session_kind_primary_bg(descriptor.kind, accent))
         })
-        .collect();
-    // No accent: a plain shell is not one of the branded agent CLIs, and
-    // giving it one would imply a kinship it does not have.
-    items.push(
-        SplitButtonItem::new("terminal", "Terminal").detail("Plain shell in the selected scope"),
-    );
-    items
+        .collect()
 }
 
 /// The id an app verb answers to, and the key its stickiness is stored under.
@@ -120452,11 +120473,17 @@ fn start_page_app_items(apps: &[AppManifest]) -> Vec<SplitButtonItem> {
 /// owning material while `DESIGN.md` keeps owning colour. Every value here is
 /// already what the buttons this control replaced were using — the shape
 /// changed, the palette did not.
+/// ⛔ The BUTTON's fill and the MENU's fill are two decisions, and they were one
+/// until 2026-08-08. `panel_alt` is a tint — right for the button, because the
+/// start page is opaque behind it — and it made the floating menu see-through.
+/// The menu reads [`overlay_surface`], the same fill the right-click menu uses,
+/// which is the reference the owner named.
 fn start_page_split_palette(palette: &Palette) -> SplitButtonPalette {
     SplitButtonPalette::new(
         palette.text.clone(),
         palette.muted.clone(),
         palette.panel_alt.clone(),
+        overlay_surface(*palette),
         "rgba(120,142,166,0.16)",
         palette.panel.clone(),
         palette.accent.clone(),
@@ -120482,10 +120509,12 @@ fn start_page_run_session_choice(
     // would make every new CLI a new event nobody has a dashboard for, and the
     // thing being traced is "the start page launched a session", which the
     // payload already qualifies.
-    let (trace_name, id_owned) = match (agent_kind, id) {
-        (Some(_), _) => ("start_page_new_agent_session", id.to_string()),
-        (None, "terminal") => ("start_page_new_terminal", id.to_string()),
-        (None, _) => return,
+    let (trace_name, id_owned) = match agent_kind {
+        Some(_) => ("start_page_new_agent_session", id.to_string()),
+        // A plain shell is no longer a family member — it is its own button
+        // (`start_page_run_new_terminal`), so an id that names no CLI names
+        // nothing this function can run.
+        None => return,
     };
     if !start_page_is_current_surface(&state) {
         suppress_phantom_start_action(
@@ -120499,14 +120528,35 @@ fn start_page_run_session_choice(
     state.with_mut(|shell| {
         shell.remember_start_page_choice(StartPageFamily::Session, &id_owned);
     });
-    match (agent_kind, id) {
+    match agent_kind {
         // Codex means "whatever the user set as their default agent" — the
         // `AgentSessionProfile` setting picks the fork, as it always has.
-        (Some(SessionKind::Codex), _) => spawn_start_preferred_agent_session_for_row(state, row),
-        (Some(kind), _) => spawn_start_agent_session_for_row(state, row, kind),
-        (None, "terminal") => spawn_start_terminal_session_for_row(state, row),
-        (None, _) => {}
+        Some(SessionKind::Codex) => spawn_start_preferred_agent_session_for_row(state, row),
+        Some(kind) => spawn_start_agent_session_for_row(state, row, kind),
+        None => {}
     }
+}
+
+/// Start a plain shell from the start page's own button.
+///
+/// Not a family member and therefore NOT sticky: it starts a shell every time
+/// and never becomes the face of the session button. That is the whole point of
+/// the split — see [`start_page_session_items`].
+///
+/// The phantom-start guard is the same one every family member gets, and for
+/// the same reason: the start page can go out from under a queued click, and
+/// starting a session the user did not ask for is worse than dropping the
+/// click. Sharing the guard rather than reimplementing it is what keeps the two
+/// paths from drifting.
+fn start_page_run_new_terminal(state: Signal<ShellState>, row: Option<BrowserRow>) {
+    if !start_page_is_current_surface(&state) {
+        suppress_phantom_start_action(
+            "start_page_new_terminal",
+            json!({ "row": row.as_ref().map(|row| row.full_path.clone()) }),
+        );
+        return;
+    }
+    spawn_start_terminal_session_for_row(state, row);
 }
 
 /// Run one member of the APPS family and make it the sticky face.
@@ -120802,6 +120852,7 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
     let selected_action_row = snapshot.selected_row.clone();
     let selected_agent_action_row = selected_action_row.clone();
     let selected_app_action_row = selected_action_row.clone();
+    let selected_terminal_action_row = selected_action_row.clone();
     let session_items = start_page_session_items(&palette.accent);
     let app_items = start_page_app_items(&snapshot.apps);
     let can_create_folder_in_selected = selected_action_row
@@ -120890,6 +120941,29 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                 start_page_run_app_choice(state, &id, &apps, row.clone());
                             }
                         },
+                    }
+                    // A plain shell, on its own button and never inside the
+                    // session menu (owner directive 2026-08-08). Unconditional,
+                    // unlike "New Folder" below: a terminal in the selected
+                    // scope is always startable, and the point of pulling it
+                    // out of the family was that it should always be one click.
+                    button {
+                        r#type: "button",
+                        "data-yggterm-start-action": "terminal",
+                        style: "{quick_button_style}",
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: {
+                            let row = selected_terminal_action_row.clone();
+                            move |evt: MouseEvent| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                                start_page_run_new_terminal(state, row.clone());
+                            }
+                        },
+                        "New Terminal"
                     }
                     if can_create_folder_in_selected {
                         if let Some(row) = selected_action_row.clone() {
@@ -175148,31 +175222,32 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     fn both_start_page_families_still_offer_every_action_the_old_row_had() {
         let session = start_page_session_items("#2563eb");
         let ids = session.iter().map(|i| i.id.as_str()).collect::<Vec<_>>();
-        // DERIVED: one member per registered agent CLI, then the plain shell.
-        // Transcribing the three shipped ids here made the lock stop describing
-        // the family the moment a CLI was added.
-        let mut expected: Vec<&str> = yggterm_core::agent_cli::AGENT_CLIS
+        // DERIVED: one member per registered agent CLI, and NOTHING else.
+        // Transcribing the shipped ids here made the lock stop describing the
+        // family the moment a CLI was added.
+        let expected: Vec<&str> = yggterm_core::agent_cli::AGENT_CLIS
             .iter()
             .map(|descriptor| descriptor.slug)
             .collect();
-        expected.push("terminal");
         assert_eq!(ids, expected);
         assert!(ids.contains(&"codex") && ids.contains(&"claude-code"));
-        // Every agent CLI carries an accent; the plain shell is deliberately
-        // neutral and is always LAST. Indexing by position `[2]` meant "the
-        // terminal" only while exactly two CLIs existed.
-        for item in &session[..session.len() - 1] {
+        // ⛔ The plain shell is NOT a member (owner directive 2026-08-08). Being
+        // in the family means being STICKY, so a shell chosen once became the
+        // face of the button people reach for to start an agent. It has its own
+        // button now; a member that carries no accent is the shape of the bug
+        // coming back, because every agent CLI has one.
+        assert!(
+            !ids.contains(&"terminal"),
+            "a plain shell must not be a member of the sticky session family"
+        );
+        for item in &session {
             assert!(
                 !item.accent.trim().is_empty(),
-                "{} is an agent CLI and must carry an accent",
+                "{} is in the session family and must therefore be an agent CLI, \
+                 which carries an accent",
                 item.id
             );
         }
-        assert!(
-            session
-                .last()
-                .is_some_and(|item| item.id == "terminal" && item.accent.trim().is_empty())
-        );
 
         let apps = vec![AppManifest {
             name: "ychrome".to_string(),
