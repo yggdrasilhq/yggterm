@@ -4,6 +4,31 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A contributed rail pane is now addressed by the session that DECLARED it, so
+  one app's sidebar can no longer paint over another app's row.** Reported, with
+  a screenshot: *"yedit launch opens blank viewport on libyggterm surface; I
+  cannot see any files at all. Weird bugs: I see ychrome tabs sidebar in terminal
+  (which is supposed to be yedit)."* Reproduced live on jojo: the `New Yedit` row
+  selected, its own files nowhere, and ychrome's chrome — omnibox, Khan Academy
+  tabs, its `tables` folder — painted in the rail beside it, while yedit's
+  control endpoint was answering `/pane/notes` perfectly well the whole time.
+  The right panel is a SINGLETON SLOT and its tenant carried only a pane id, so
+  every tenancy test asked *"does the ACTIVE session offer a pane called this"*
+  when the only correct question is *"is this pane's OWNER the session on
+  screen"* — two apps that both declare `notes` were one pane. With the owner
+  unnamed, `app_pane_fetch_schema` also had to resolve its control endpoint
+  (and its page context — host, zoom, HTTPS) from whatever session happened to
+  be active, so a switch mid-fetch could fill one app's open pane with another
+  app's schema. `RightPanelMode::AppPane` now carries an `AppPaneRef { session,
+  pane }`, stamped at open — the one moment the owner is unambiguous, because a
+  rail button can only ever mean the active session's app. The tenancy tests,
+  the reveal resolution, the vanished-pane release and the rail component's own
+  check all ask both halves; the fetch takes the OWNING session exactly as its
+  document twin already did. A pane whose owner is not on screen falls back to
+  the user's own remembered view and returns for free when they switch back.
+  `app right-panel pane:<id>` over the wire refuses to set a session-less
+  tenancy rather than inventing one.
+
 - **`server app state` now reports BOTH derivations of "is this app's surface in
   the viewport", side by side.** A yedit row renders its rail correctly while the
   viewport still shows a bash prompt, and until now the only way to compare the

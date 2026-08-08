@@ -17,6 +17,29 @@ Closed narratives from before 2026-08-02 are in
 
 **Status:** OPEN
 
+⭐ **The tenancy half is FIXED IN CODE (3.0.60) and LIVE PROOF IS OWED.**
+`RightPanelMode::AppPane` now carries `AppPaneRef { session, pane }`, stamped at
+open; every tenancy test, the reveal resolution, the vanished-pane release, the
+rail component's own check and `app_pane_fetch_schema` (which now takes the
+OWNING session, with its page context) ask whose pane it is. Lock:
+`a_pane_is_a_tenant_of_the_session_that_declared_it_never_of_a_namesake`,
+mutation-proven red. ⛔ **Not yet deployed** — see the app-identity entry below:
+a GUI restart currently resurrects the owner's live app rows as bare bash, so
+the two must land together and deploy once. Falsifier for the live proof: open
+the `New Yedit` row and read the rail; ychrome's omnibox/tabs/`tables` folder
+appearing there again means this did not close it.
+
+⚠ **STILL OPEN underneath it, and NOT what the fix above addresses:** the
+photographed rail also painted ychrome's chrome while `right_panel_mode`
+reported `hidden`. `WebTabsRailBody` draws `snapshot.active_web_surface_overlay`,
+which IS keyed on `active_session_path` — so either that overlay resolved to a
+non-active session's surface, or the collapsed-rail body
+(`rendered_mode = right_panel_reveal_mode` when `visible == false`) painted a
+tenant of a session that was no longer on screen. The instrument to separate
+those does not exist: `server app state` reports the rail's MODE but not its
+rendered pane id, its tenant session, or which session the overlay it is
+drawing belongs to. **Add that first; do not guess between the two.**
+
 Owner-reported 2026-08-08, with a screenshot: *"Right click context menu ychrome
 launch launches plain terminal. yedit launch opens blank viewport on libyggterm
 surface; I cannot see any files at all. Weird bugs: I see ychrome tabs sidebar in
@@ -61,6 +84,26 @@ no-content — driven off `DocumentSurfaceSnapshot { schema, error }`.
 ⚠ And a `New Yedit` with no argument has nothing to show anyway (manifest args
 are `[]`, no active note, no recents), so an actionable empty state is the honest
 rendering, not a blank rectangle.
+
+### ✅ WHAT THE LIVE PROBE SETTLED, 2026-08-08 (do not re-derive)
+
+- **yedit is HEALTHY and serving.** Its control endpoint answers `/ping` 200,
+  `/pane/doc` with the owner's real note text, and `/pane/notes` with the full
+  files rail (toolbar, search box, footer word count). The app is not the bug;
+  the GUI is not showing what the app is offering.
+- **The declare arrives and is consumed.** `server terminal app-declares` holds
+  yedit's `sidebar;declare` with both panes (`doc` @ viewport, `notes` @ rail),
+  and the GUI logged exactly ONE `sidebar_contribution/declare`
+  (`source: terminal_stream`) for it. `seq: 1`, and nothing after — yedit
+  declares once and exits, so `last_seen_ms` is frozen while the app lives, and
+  only the `/ping` heartbeat refreshes it.
+- **`server app panel pane:notes` DOES open the pane** on that row (mode goes
+  `hidden` → `app_pane`), so the contribution is present and offers `notes`.
+  The rail nonetheless painted ychrome. ⇒ the failure is on the RENDER side of
+  the mode, not in whether the pane exists.
+- **The rail's reported mode and its pixels disagree** — `hidden` while
+  ychrome's tab rail and omnibox are drawn. That disagreement is the fault to
+  chase, and it needs the instrument named above.
 
 ### ⛔ FIVE HYPOTHESES ALREADY FALSIFIED — do not re-derive them
 - **"one OSC declare, TWO parsers"** — the JS forwarder and the Rust wire parser
