@@ -24,28 +24,52 @@ is borked … and showing double notifications somehow."*
 with no toast in flight, on a different active row than his, shows the identical
 thing: the rail draws `Session Metadata` and an empty body.
 
-### What that rules out, which is most of the obvious answers
-`MetadataRailBody` (`shell.rs` ~126018) renders **three groups unconditionally**:
-a `Session` group (*"No session selected"* when there is none), a `Client` group
-(*"always knowable — it is this process"*, added precisely so a blank rail could
-not happen again), and a `Daemon` group that falls back to a visible
-"unreachable" row. ⇒ **No combination of missing data can produce an empty body.**
-- Not a mode mis-resolution: `server app state` → `shell.right_panel` reports
-  `requested_mode: metadata`, `rendered_mode: metadata`, `docked: true`, and the
-  HEADER is drawn, which is emitted by this same component.
-- Not a panic during content construction: `content:` is an eagerly-built prop,
-  so a panic there would take the header with it.
-- Not `RailScrollBody`: it is `flex:1; overflow:auto` around `{content}` and has
-  not changed.
-⇒ The remaining shape is that the `content:` **Element itself is empty/Err**.
-Start there, not at the data.
+### ⛔ IT IS NOT A BUILD REGRESSION — SETTLED 2026-08-08 20:47 BY RESTART
+**A freshly restarted GUI on the SAME 3.0.62 bytes renders the rail correctly**
+(`div[data-yggui-rail-scroll]` present, 7 entry rows, real content). The GUI that
+was broken had been launched CLEANLY at 20:04:56 against a binary written at
+20:04, with zero hot-restarts in its log, and the owner reported the empty rail
+six minutes later. ⇒ **the GUI FALLS INTO this state at runtime.** The 3.0.59
+bisect this entry used to demand is NOT the measurement that settles it, and
+`git log -S` was already the wrong instrument: the rail code is materially
+unchanged since 3.0.59, and libyggterm's `rails.rs` is byte-identical across the
+pinned checkouts (v0.12.1 predates 3.0.59).
 
-### ⚠ Attribution is OPEN and the deploy is a suspect I could not clear
-The live host went 3.0.59 → 3.0.62 in one hop, which also landed 3.0.60's rail
-tenancy rework that had never been deployed. Nothing in `git log -S` touches
-`MetadataRailBody`, `render_session_metadata` or `client_metadata_entries`
-recently, so the change is more likely indirect. **The measurement that settles
-it is a 3.0.59 build side by side** — do that before theorising further.
+### The failure is STRUCTURAL, and the DOM names it exactly
+Read with `server app dom-eval` (a function BODY — it needs `return`; without one
+it answers `result:null`, which is not a negative result). Broken rail:
+
+    card children = [ DIV[data-yggui-rail-header], STYLE, <!--placeholder-->, DIV[data-rail-resize-handle] ]
+    document.querySelectorAll('[data-yggui-rail-scroll]').length === 0
+
+`RailScrollBody` emits TWO roots — a `<style>` and the scroll `div`. **The
+`<style>` mounted and the scroll `div` did not**; a Dioxus placeholder comment
+sits in its slot, so every metadata group is absent because its CONTAINER is.
+⇒ The old "the `content:` Element is empty/Err" reading is FALSIFIED: an empty
+`content` would still leave the scroll `div` in the DOM.
+
+Second, and it is the discriminator for whoever fixes this: **once broken, the
+rail's BODY subtree never updates again** — the header stays `Session Metadata`
+while `server app panel settings|notifications|connect` flips
+`rendered_mode` correctly in `server app state`. Meanwhile the rail's OUTER
+element keeps patching normally (`data-yggui-side-rail-visible` flips 0↔1, width
+6↔272). So one subtree is dead while its parent is live. The sidebar keeps
+repainting throughout (proven by renaming a row and seeing it change), so this is
+not a frozen webview and not a frozen VirtualDom.
+
+⛔ Do NOT re-derive these dead ends: memoisation is not the cause (`VNode`'s
+`PartialEq` is `Rc::ptr_eq`, so freshly built `rsx!` props are never equal, and
+`SharedSnapshot` is `Arc<RenderSnapshot>`, which compares structurally); the
+card's flex geometry is correct (`sidebar_panel_card_style` already emits
+`display:flex; flex-direction:column; min-height:0`); there is no ghost root
+(`shell_root_count == 1`); and there is no panic in the GUI's launch log.
+
+### What does NOT reproduce it on a fresh GUI
+Cycling `hidden|metadata|settings|notifications|connect`, scrolling the rail, and
+switching the active session onto a ychrome web-surface row and back — the rail
+stayed live through all of it and its content tracked the row correctly. The
+trigger is still OPEN; a watcher that polls the rail DOM every 30s is the way to
+timestamp the transition rather than guess at it.
 
 ### Second, separate symptom in the same report: TWO toasts, two anchors
 His second screenshot has `Restoring Remote Terminal` at top-CENTRE and
