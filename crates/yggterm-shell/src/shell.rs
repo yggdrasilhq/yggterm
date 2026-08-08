@@ -125776,6 +125776,7 @@ fn friendly_launch_phase(phase: TerminalLaunchPhase) -> &'static str {
         TerminalLaunchPhase::BridgePending => "starting",
         TerminalLaunchPhase::RemoteBootstrap => "bootstrapping",
         TerminalLaunchPhase::Running => "running",
+        TerminalLaunchPhase::Failed => "launch failed",
     }
 }
 /// "How to connect to that PTY" — the product's core value, surfaced verbatim.
