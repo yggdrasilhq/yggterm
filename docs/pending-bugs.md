@@ -13,6 +13,55 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ★★ AN EXHAUSTED POLICY FETCH NEVER RE-ARMS, SO A SAME-PORT RECOVERY NEVER LANDS
+
+**Status:** OPEN
+
+The repair half of the stranded-control-port bug SHIPPED in 3.0.55: a web
+surface built without the app's policy is rebuilt once the policy arrives
+(`web_surface_recreate_reason` → `policy_arrived`). It fires on the reported
+case, where a `ychrome daemon restart` moves the control port, the client
+re-declares the new url on its ~4s heartbeat, `sidebar_contribution_matches_
+declare` tears the contribution down, and the fresh one fetches with a clean
+budget.
+
+**It cannot fire when the endpoint comes back on the SAME url.** After
+`MAX_POLICY_FETCH_ATTEMPTS` (3) failures, `apply_sidebar_declare`'s refetch flag
+goes false and STAYS false for the life of the contribution:
+
+```rust
+policy: !policy_version.is_empty()
+    && existing.policy.is_none()
+    && existing.policy_attempts < MAX_POLICY_FETCH_ATTEMPTS,
+```
+
+So a transient refusal — a boot race, a daemon that re-binds its old port, a
+few seconds of a busy host — is permanent: no fetch is ever tried again, the
+policy never lands, and the surface the gate opened unblocked stays unblocked.
+`rearm_abandoned_sidebar_policy_fetch` exists for exactly this and is wired to
+the AGENT door (`web ensure`) only; a human's surfaces have no such door.
+
+⚠ The comment guarding that line is right and must survive the fix: *"a
+permanently broken endpoint must not mean one fetch every 4s for the life of the
+session."* The answer is a COOLDOWN, not an uncapped retry — a fresh budget once
+per minute rather than never, which costs ~1 fetch/min against a dead endpoint
+and heals a transient one within a minute.
+
+**Shape of the fix:** record WHEN the budget was exhausted
+(`policy_exhausted_at_ms`, set by `fail_sidebar_policy` on the call that returns
+true), and make the heartbeat's refetch flag a pure `sidebar_policy_refetch_due(
+attempts, exhausted_at_ms, now_ms)`. ⛔ `policy_attempts` is reset in five
+places (declare stamp change, insert, apply, invalidate, re-arm); the new field
+must move WITH it from ONE owner — a `reset_policy_fetch()` on the contribution
+— or the exhausted mark goes stale and the cooldown fires on a healthy session.
+
+**Acceptance:** a contribution whose fetch has failed 3 times against an
+unchanged control url is asked to fetch again after the cooldown and not before,
+and a surface built under `Abandoned` is then repaired by the rule that already
+exists. Mutation-prove the cooldown boundary, not just the happy path.
+
+---
+
 ## ★★★ THE EXTRA-ARGS SETTINGS ARE TWO TEXT BOXES AND THERE ARE NINE CLIs — build the modal
 
 **Status:** OPEN

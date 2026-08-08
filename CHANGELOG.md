@@ -4,6 +4,24 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A web surface that opened without ad-block is now REBUILT once the policy
+  arrives, instead of running unprotected for its whole life.** Userscripts and
+  the adblock ruleset ride `init_script`, which binds at webview CREATION — so
+  when a `ychrome daemon restart` left the GUI briefly fetching the retired
+  daemon's control port, the fetch exhausted its attempts, the gate opened the
+  page unblocked (a page with no adblock beats no page), and RELOADING COULD NOT
+  FIX IT. Measured on a real YouTube page in a shadow session: every yggterm
+  shim present, not one ychrome userscript, `window.__ytAdDefense` undefined —
+  so pre-rolls played and SponsorBlock never ran, silently, until the user
+  happened to close the tab. `web_surface_recreate_reason` — the reconciler's
+  one owner of "must I destroy this webview" — now answers `policy_arrived`
+  alongside its three context-fixed reasons. ⚠ It is asked only of a surface
+  nobody is looking at: a background tab, a stashed session and an agent's
+  headless surface repair the moment the policy lands, while the page in front
+  of the user waits until they leave it, because the rebuild reloads the page
+  and takes its scroll and its half-typed form with it. The notice now says so
+  rather than describing a state the app will leave on its own.
+
 - **The start page lists every session again — the scope now RANKS instead of
   dropping.** RECENT WORK was filtered by a `{machine_key, cwd}` scope taken
   from whichever row was selected, while the header said only "N shown". The
