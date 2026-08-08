@@ -9,6 +9,28 @@ and referenced from here.
 says the answer changed.
 
 
+## ★★ `codex-litellm` IS NOT A CLI — IT IS A CODEX SESSION'S FLIP SWITCH (2026-08-08)
+
+**Settled by the user, verbatim:** *"we should not have codex-litellm as another
+CLI. It is a special codex session flip switch to codex-litellm (which I will
+later rename to codex-anything). It is a codex ONLY sessions superpower."*
+
+⇒ It is **not** a first-class agent CLI, it gets **no** row in the
+`Open Session Here ▸` submenu, **no** icon of its own, and **no** row in the
+extra-args modal (`spec-agent-cli-extra-args-modal.md`). It is a *mode a codex
+session can be flipped into*, and the flip belongs to the codex session's own
+surface.
+
+⚠ It is a `--kind` value today (`codex, codex-litellm, claude-code, pi,
+opencode, qwen-code, kimi, muse, antigravity`) and has its own provisioned
+binary at `~/.yggterm/npm/bin/codex-litellm` on every host. Removing it from the
+kind list without removing the capability is the work; it is filed in
+[`pending-bugs.md`](pending-bugs.md).
+
+⚖ The rename to `codex-anything` is **his to make, later** — do not pre-empt it,
+and do not build a name-agnostic abstraction on the strength of a rename that
+has not happened.
+
 ## ★★★ NO REPO MAY CARRY TWO LICENCE CLAIMS, AND GADGETS GATES GOING PUBLIC (2026-08-07)
 
 **Settled by the user, verbatim:** *"Such duplicity of licenses must be force

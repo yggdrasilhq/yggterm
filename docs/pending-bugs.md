@@ -13,6 +13,98 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ★★★ THE EXTRA-ARGS SETTINGS ARE TWO TEXT BOXES AND THERE ARE NINE CLIs — build the modal
+
+**Status:** OPEN
+
+⭐ **Load-bearing, owner-directed 2026-08-08.**
+
+The settings rail holds **Codex Extra Args** and **Claude Code Extra Args**: two
+free-text boxes, one helper line each. Nine CLIs are now first-class, each with
+its own permission vocabulary — codex has `-a/--sandbox` policies, Claude has
+six `--permission-mode` values, opencode has one `--auto` flag and puts denials
+in a config file, qwen has a sandbox and **no bypass flag at all**, and pi has no
+blanket bypass but does have tool allow/deny lists. Nine more boxes in a rail
+would be nine chances to type the wrong CLI's flag.
+
+**Owner directive:** *"since we have so many CLIs now, the settings extra args
+system needs to be a modal … pre-populate the same type of least-permission-
+checks input box populated, and the explanations for each of the CLIs."*
+
+**The design and the per-CLI content are written and measured:**
+[`spec-agent-cli-extra-args-modal.md`](spec-agent-cli-extra-args-modal.md) — a
+descriptor-generated modal, three tiers per CLI (`Ask each time` · `Sandboxed` ·
+`Skip checks`), each tier's exact flags and its one-sentence explanation read off
+that CLI's own `--help` on this fleet, with kimi and muse declared **unmeasured**
+rather than guessed.
+
+⛔ Two things that would make this a regression rather than a feature: **resetting
+the two values the owner has already set** (migrate them verbatim), and
+**hand-writing nine rows of `rsx!`** instead of generating from the descriptor —
+the exact defect the titlebar `+` menu is filed for two entries below.
+
+⚠ It also inherits the row menu's proof problem: if app control cannot open the
+modal, the verb to open it is part of this work, not a follow-up.
+
+## `codex-litellm` IS A CLI KIND AND THE OWNER SAYS IT IS NOT A CLI
+
+**Status:** OPEN
+
+Settled 2026-08-08 (`settled-calls.md`): *"we should not have codex-litellm as
+another CLI. It is a special codex session flip switch … a codex ONLY sessions
+superpower."*
+
+Today it is a first-class `--kind` value — `terminal new` names it in its own
+refusal message (`expected shell or one of: codex, codex-litellm, claude-code,
+pi, opencode, qwen-code, kimi, muse, antigravity`) — and it has its own
+provisioned binary at `~/.yggterm/npm/bin/codex-litellm` on all three hosts.
+
+**The work:** remove it from the agent-CLI kind list, the session submenu and the
+extra-args modal, and re-express it as a **flip on a codex session** — the
+capability stays, its CLI-hood goes. The LiteLLM endpoint/API-key/interface-model
+settings that feed it stay where they are; they are codex configuration.
+
+⚠ The rename to `codex-anything` is his and has not happened. Do not build for
+the new name, and do not leave a second encoding of the old one behind.
+
+## NOTHING KEEPS yggterm's OWN BINARY AT PARITY ACROSS THE FLEET — measured by md5, not by `--version`
+
+**Status:** OPEN
+
+Owner, 2026-08-08: *"yggterm needs to keep its binary copies regularly updated
+across all the connected fleet … See how we handle codex or CC's binary copy."*
+
+**The asymmetry he is pointing at is real: yggterm keeps OTHER people's binaries
+current better than its own.** The CLI provisioner fetches and updates
+`claude`, `codex`, `codex-litellm` (and now `pi`, `opencode`, `qwen`) into
+`~/.yggterm/npm/bin` on demand, per host. Nothing does that for `yggterm` itself.
+
+Measured 2026-08-08 12:45 IST by **md5 + mtime** — deliberately not `--version`,
+which this repo has already filed as a blind instrument (it is a pure builtin and
+reports the binary you typed):
+
+| host | `~/.local/bin/yggterm` | `~/.local/bin/yggterm-headless` | `~/.yggterm/bin/*` |
+|---|---|---|---|
+| jojo | `a2c67e3c` 08-08 03:31 | `a262a396` 08-08 03:31 | current |
+| dev | `c0ffc9ea` **08-06 22:16** | `fddd8fd0` **08-07 05:11** | `a262a396` 08-08 03:32 |
+| oc | `c0ffc9ea` **08-06 22:17** | `ef4c1803` **08-06 22:17** | `a262a396` 08-08 03:32 |
+
+⇒ **three different headless binaries are live on the fleet under one name**, and
+on oc the PATH copy is the stale one. The `~/.yggterm/bin` copies are current
+everywhere — so the deploy is not broken, it is *partial*, and nothing is
+watching the difference.
+
+**This is not the same entry as the deploy-writes-three-copies bug below.** That
+one is about a single deploy missing a path. This one is about there being **no
+recurring parity sweep at all**: a fleet-wide property (binary, config, cert)
+needs an AUDIT that runs on its own schedule, because the deploy that would fix
+it can be structurally blocked on the busiest host while nothing says so.
+
+**Fix shape:** a scheduled parity check over every host × every install path,
+comparing **hashes**, that either self-heals or reports which host is behind —
+and it must survive the case it exists for, a host where the hot-restart gate
+never opens.
+
 ## ⛔⛔ A REMOTE ROW FOR ANY OF THE SIX NEW AGENT CLIs IS BORN A PLAIN SHELL — six for six, and every field says healthy
 
 **Status:** OPEN
