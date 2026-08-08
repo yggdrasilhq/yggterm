@@ -300,11 +300,13 @@ const ARMS: &[Arm] = &[
         remote_start_subcommand: None,
         write_strategy_without_local_runtime: TerminalWriteStrategy::LocalRuntimeFallback,
         binary: "muse",
-        // ⛔ PLACEHOLDER, not a measurement: Muse Code is installed nowhere on
-        // the fleet, so `--resume` is what the descriptor records as unverified.
-        // This cell exists so the matrix stays the same shape; it is locked to
-        // the descriptor, and both move together when a real `muse --help` is read.
-        resume_selector_token: "--resume",
+        // ⭐ MEASURED 2026-08-08 from `muse resume --help` on a real install
+        // (yggterm provisioned Muse from its vendor installer the same day):
+        // `muse resume <session-uuid>` — a SUBCOMMAND, not a flag. The cell that
+        // stood here said `--resume` and said in its own words that it was a
+        // placeholder which would move when a real `--help` was read. It did,
+        // and THIS TEST is what forced the second copy to move with the first.
+        resume_selector_token: "resume",
         re_roots_with_cwd: false,
         store_globs: &[],
     },
@@ -317,7 +319,8 @@ const ARMS: &[Arm] = &[
         remote_start_subcommand: Some("start-muse"),
         write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
         binary: "muse",
-        resume_selector_token: "--resume",
+        // Same measurement as the local arm above: `muse resume <uuid>`.
+        resume_selector_token: "resume",
         re_roots_with_cwd: false,
         store_globs: &[],
     },
