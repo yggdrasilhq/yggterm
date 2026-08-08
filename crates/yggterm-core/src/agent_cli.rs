@@ -1487,6 +1487,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // not `thinking...` — kept explicit so a future needle widening cannot
         // silently swallow it.
         working_screen_negations: &["thought for "],
+        // ⭐ CONFIRMED 2026-08-08 against a real `kimi --help` on jojo (yggterm
+        // provisioned it via uv the same day): `--session,--resume  -S,-r`. The
+        // value was read from source at intake and is now MEASURED — recorded
+        // because an agreeing measurement is still a measurement, and the next
+        // reader should not have to re-run it to find that out.
         resume_selector: ResumeSelector::Flag("--resume"),
         // `kimi -w <dir>` is how a new session is rooted; resume takes the id
         // and re-derives the work dir from its own metadata.
@@ -1495,8 +1500,17 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         composer_marker: '\u{276f}',
         composer_footer_hints: &["ctrl", "kimi", "/help", "tab"],
         working_footer_hints: &["composing...", "thinking..."],
-        permission_modes: &[(AgentPermissionMode::Default, &[])],
-        overridden_flags: &[("--model", FlagArity::TakesValue, OverriddenBy::Model)],
+        // MEASURED from the same `--help`: `--yolo,--yes,--auto-approve  -y`
+        // ("Automatically approve all actions"). kimi expresses no plan or
+        // accept-edits posture, so neither is mapped onto something close.
+        permission_modes: &[
+            (AgentPermissionMode::Default, &[]),
+            (AgentPermissionMode::Bypass, &["--yolo"]),
+        ],
+        overridden_flags: &[
+            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
+            ("--yolo", FlagArity::Standalone, OverriddenBy::PermissionMode),
+        ],
         // Resume replays only the last 5 turns to the screen; the full history
         // stays on disk, so the PTY is NOT a faithful re-derivation.
         content_rederives_on_resume: false,
@@ -1540,29 +1554,47 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // "paused" into "grinding". Fill this from a screen.
         working_screen_phrases: &[],
         working_screen_negations: &[],
-        resume_selector: ResumeSelector::Flag("--resume"),
+        // ⭐ MEASURED 2026-08-08 on jojo, from `muse resume --help` on a real
+        // install: `muse resume` / `muse resume --last` / `muse resume
+        // <session-uuid>`. ⛔ The placeholder here said `Flag("--resume")`,
+        // guessed from the other CLIs — a resume built from it would have
+        // handed `muse --resume <uuid>` to an arg parser that has no such flag,
+        // and EVERY Muse resume would have failed. The click-to-resume handoff
+        // is the product; a guessed resume selector breaks exactly that.
+        resume_selector: ResumeSelector::Subcommand("resume"),
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
         composer_footer_hints: &[],
         composer_marker: '\u{276f}',
         working_footer_hints: &[],
-        permission_modes: &[(AgentPermissionMode::Default, &[])],
-        overridden_flags: &[("--model", FlagArity::TakesValue, OverriddenBy::Model)],
+        // MEASURED from `muse --help` §Safety: approval and the sandbox are ON
+        // by default, and `--yolo` is the one flag that turns both off. Muse
+        // expresses no plan/accept-edits posture, so those are absent rather
+        // than mapped onto something close.
+        permission_modes: &[
+            (AgentPermissionMode::Default, &[]),
+            (AgentPermissionMode::Bypass, &["--yolo"]),
+        ],
+        overridden_flags: &[
+            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
+            ("--yolo", FlagArity::Standalone, OverriddenBy::PermissionMode),
+        ],
         content_rederives_on_resume: true,
         session_store_globs: &[],
         store_excluded_name_fragments: &[],
         // None of the 2026-08-08 intake relocates its home with an env var.
         store_home_env_override: None,
         store_scan_gap: Some(
-            "Muse Code is closed source and NOT INSTALLED on any fleet host, so its \
-             store layout, resume flag and working phrase are all UNOBSERVED. What is \
-             known came from reading the public installer without running it: the \
-             binary is `muse`, it installs user-local into ~/.local/bin, and it keeps \
-             credentials at ~/.config/muse/auth.json. `resume_selector`, \
-             `composer_marker` and the phrase lists here are PLACEHOLDERS to be \
-             replaced from a real `muse --help` and a real screen — they are not \
-             measurements. Installing it needs a Meta login, which only the owner has: \
-             tracked in docs/owner-attention.md.",
+            "Muse Code IS installed on jojo since 2026-08-08 (yggterm provisioned it \
+             from the vendor installer), so `resume_selector`, `model_flag` and \
+             `permission_modes` are now MEASURED from a real `muse --help` — and the \
+             resume selector the placeholder guessed was WRONG (a flag; it is a \
+             subcommand). What is still UNOBSERVED needs a running SESSION, which \
+             needs a Meta login only the owner holds (docs/owner-attention.md): the \
+             on-disk session store (`session_store_globs` is still empty, and \
+             `--no-session-log` in --help proves there IS one), the composer glyph, \
+             and the working-screen phrases. Those three are still PLACEHOLDERS and \
+             must be replaced from a real screen, not from this help text.",
         ),
         read_store_entry: read_no_store_entry,
     },
