@@ -628,6 +628,51 @@ cheap way to force a local tree scan. `local_tree_scan` is throttled behind
 session store cannot ask the product to re-read it. A read-only
 `sessions rescan` would have made this entry unnecessary.
 
+## ⛔⛔ OWNER-REPORTED, LIVE 2026-08-09: A DEPLOY MADE HIS OWN ROW UNREACHABLE FOR 5-10 MINUTES — "the pain we go through is IMMENSELY irritating"
+
+**Status:** OPEN
+
+His words: *"The hot restart needs to be seamless. The pain that we go through is
+IMMENSELY irritating. YOU were stuck for ~5-10 mins and I could not communicate
+to you."*
+
+⚖ **This is the CONSTITUTION's second obligation failing on the owner himself** —
+*"They never stall their work waiting for ours. A restart of ours must not
+interrupt, reset, or destroy what another agent is doing."* The agent he could
+not reach was the yggterm campaign row, and what made it unreachable was that
+row's own deploy.
+
+**What that session did, so the next one can reproduce it rather than guess:**
+three deploys in one sitting (3.0.81, 3.0.82, 3.0.84), each a `mv`-in-place over
+four paths on three hosts, each followed by a daemon handover under live rows —
+including the row he types into. Interleaved with 2-14 minute release builds and
+a 844 s test suite, all of which hold the turn.
+
+⚠ **Two candidate causes and they need separating before anything is built.**
+They are not the same bug and the fix for one does nothing for the other:
+
+1. **The turn was busy.** A long build/deploy holds the agent's turn, so his
+   input queues and nothing answers until it ends. Nothing to do with daemons;
+   the fix is that a long operation must not be run in the foreground of a row
+   he might type into.
+2. **The handover broke the row's path to the agent.** A daemon swap under a live
+   `remote-cc://` row, with the click/bridge work of 3.0.80 in between. This IS
+   the constitution's clause.
+
+⇒ **Measure which one, first.** The trace has both: `daemon_self_retire_handoff_ok`
+timestamps against his input's arrival time in the row's transcript. If his
+keystrokes landed and simply waited, it is (1). If they never landed, it is (2).
+⛔ Do not build the relay gate as an answer to this until that is settled — it
+would be a large fix aimed at a cause nobody has confirmed.
+
+⭐ **And whatever the cause: he had no way to tell us.** A session that cannot be
+reached for 5-10 minutes should be visibly *busy*, not silently absent, and there
+is no channel that outruns a held turn. The booter exists to kick a stalled
+session; nothing exists to let HIM interrupt a busy one.
+
+**Falsifier:** deploy a version bump across the fleet while he types into a row,
+and every keystroke is acknowledged inside a second.
+
 ## ⚖⚖ THE HOT-RESTART GATE IS UNBUILT — THE DESIGN IS NOW SETTLED
 
 **Status:** OPEN
