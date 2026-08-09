@@ -16818,11 +16818,33 @@ fn daemon_request_outcome_for_response(
     }
 }
 
+/// ⛔⛔ **SERIALIZE INTO MEMORY, THEN WRITE ONCE. NEVER `to_writer` STRAIGHT AT A
+/// SOCKET.** `serde_json::to_writer` emits every token through a separate
+/// `write` — one syscall for `{`, one for `"`, one for `kind`, one for `:` —
+/// so a single response cost HUNDREDS of syscalls. Measured on the owner's
+/// laptop 2026-08-09 while he was reporting the machine was hot and unusable:
+/// an *idle* 3.0.85 daemon was issuing **~7,000 `sendto`/second**, in exactly
+/// that shape:
+///
+///     sendto(8, "{",    1, MSG_NOSIGNAL, NULL, 0) = 1
+///     sendto(8, "\"",   1, MSG_NOSIGNAL, NULL, 0) = 1
+///     sendto(8, "kind", 4, MSG_NOSIGNAL, NULL, 0) = 4
+///
+/// ⭐ The tell was sitting in this very function's twin: `read_request` wraps
+/// its side in a `BufReader`, and this one wrapped nothing. **An asymmetry
+/// between the read and write halves of one protocol is worth a look every
+/// time** — the two are written together and diverge silently.
+///
+/// A `Vec` rather than a `BufWriter` because it is the version that cannot be
+/// got subtly wrong: no nested flush ordering, no "flushed the wrapper but not
+/// the socket", and the terminator is appended before anything reaches the
+/// kernel, so a response and its newline can never be split across two writes.
 fn write_response<W: Write>(writer: &mut W, response: &ServerResponse) -> Result<()> {
-    serde_json::to_writer(&mut *writer, response).context("serializing daemon response")?;
+    let mut framed = serde_json::to_vec(response).context("serializing daemon response")?;
+    framed.push(b'\n');
     writer
-        .write_all(b"\n")
-        .context("writing daemon response terminator")?;
+        .write_all(&framed)
+        .context("writing daemon response")?;
     writer.flush().context("flushing daemon response")?;
     Ok(())
 }
@@ -18588,6 +18610,59 @@ mod tests {
             // not block it. Agent sessions get their own cases below.
             transcript: TranscriptActivity::NotAnAgentSession,
         }
+    }
+
+    /// Counts `write` CALLS, not bytes — the syscall is the cost being guarded.
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_daemon_response_costs_exactly_one_write() {
+        // ⛔ THE REGRESSION THIS PINS: `serde_json::to_writer` aimed straight at
+        // a socket emits one write PER TOKEN — `{`, `"`, `kind`, `"`, `:` … so a
+        // single response cost hundreds of syscalls. Measured on the owner's
+        // laptop 2026-08-09 while he reported it hot and unusable: an idle
+        // daemon issuing ~7,000 `sendto`/second, one byte at a time.
+        //
+        // A response with many small tokens is the case that discriminates: a
+        // token-at-a-time writer scales its syscalls with the token count, a
+        // framed one does not.
+        let response = super::ServerResponse::WorkingFlags {
+            flags: (0..64)
+                .map(|i| (format!("cc-runtime://session-{i}"), i % 2 == 0))
+                .collect(),
+        };
+        let mut writer = CountingWriter {
+            writes: 0,
+            bytes: Vec::new(),
+        };
+        super::write_response(&mut writer, &response).expect("write response");
+
+        assert_eq!(
+            writer.writes, 1,
+            "a response must reach the socket in ONE write, not one per JSON token \
+             (got {} writes for {} bytes)",
+            writer.writes,
+            writer.bytes.len()
+        );
+        // The frame is still exactly what the reader expects: one JSON line,
+        // newline-terminated, parseable.
+        assert!(writer.bytes.ends_with(b"\n"), "response must be line-framed");
+        let line = String::from_utf8(writer.bytes).expect("utf8 response");
+        serde_json::from_str::<super::ServerResponse>(line.trim_end()).expect("response round-trips");
     }
 
     #[test]

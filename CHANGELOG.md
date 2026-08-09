@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The daemon was writing every response to its sockets one JSON token at a
+  time — 528 syscalls for a 2,169-byte reply.** `write_response` handed
+  `serde_json::to_writer` a raw socket, and serde emits each token through its
+  own `write`: one for `{`, one for `"`, one for `kind`, one for `:`. Measured
+  on the owner's laptop while he reported the machine hot and unusable: an idle
+  daemon issuing ~7,000 one-byte `sendto` calls per second, multiplied by every
+  live daemon on the host. Responses are now serialized into memory and written
+  once. The tell was in this function's own twin — `read_request` wraps its side
+  in a `BufReader` and the write half wrapped nothing; an asymmetry between the
+  two halves of one protocol is worth a look every time. Pinned by
+  `a_daemon_response_costs_exactly_one_write`, which is mutation-proven: restore
+  `to_writer` and it reports the exact old cost (528 writes).
+
 - **A pasted newline is content, not Enter — the daemon's model of the composer
   said otherwise, and both of its readers acted on that.**
   `input_line_has_unsent_draft_after` reconstructs "is there unsent text in the
