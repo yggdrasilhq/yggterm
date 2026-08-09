@@ -130,9 +130,10 @@ error.
 
 ## ⛔⛔ `guihost`'s `libyggterm` IS STILL THE PRE-SCRUB HISTORY — ONE PUSH FROM RE-LEAKING `/home/user` INTO A PUBLIC REPO
 
-**Status:** OPEN · found 2026-08-09 by the practice campaign (row 8) when an APK build failed on `oc`
+**Status:** OPEN
 
-**Not the practice campaign's to fix — it is yours.**
+Found 2026-08-09 by the practice campaign (row 8) when an APK build failed on
+`oc`. **Not the practice campaign's to fix — it is yours.**
 
 `libyggterm`'s history was rewritten to scrub the real username out of test
 fixtures (`/home/user` → `/home/user` in `crates/yggui/src/drag_tree.rs`,
