@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **You can now ask a specific background service, not just the one that
+  answers by default.** The listing added in the previous release could name
+  every service on the machine but no command could address any of them — asking
+  an old one anything meant setting up a throwaway environment, which by
+  definition could not contain the service you wanted to ask. `server status` and
+  `server snapshot` now take `--endpoint`, which accepts a socket path, a version
+  like `3.0.75`, or a process id straight out of the listing. The reply says
+  which service answered and how it was picked, so "I asked the old one" can
+  never be mistaken for "I asked mine". Read-only commands only.
+
 - **A background nudge will no longer type over a sentence you were in the
   middle of.** yggterm's watchdogs wake a session that has gone quiet by typing
   into it — and typing APPENDS, so if you had half-written a message and stepped

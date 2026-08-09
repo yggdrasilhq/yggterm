@@ -11589,6 +11589,95 @@ pub struct DaemonCensusRow {
     pub is_default_endpoint: bool,
 }
 
+/// How a `--endpoint` selector was read. Returned alongside the endpoint so a
+/// caller can say WHICH daemon it aimed at, in the selector's own terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonSelectorKind {
+    /// Contained a `/` — taken as a socket path verbatim.
+    SocketPath,
+    /// Contained a `.` — taken as a version, mapped to `server-a-b-c.sock`.
+    Version,
+    /// Bare digits — taken as a pid and looked up in the census.
+    Pid,
+}
+
+/// Resolve a `--endpoint` selector to one daemon's socket.
+///
+/// ⛔ Before this existed, `server daemons` could NAME 28 daemons and address
+/// none of them: every verb resolved its endpoint from `YGGTERM_HOME`, so
+/// interrogating a stale daemon meant building a private home — which by
+/// construction cannot contain the daemon you wanted to ask.
+///
+/// Three forms, disambiguated by shape rather than by a flag, because a caller
+/// reading the census has a PID in hand and a caller reading a trace has a
+/// version:
+///
+/// - `…/server-3-0-75.sock` (contains `/`) — a socket path, used verbatim.
+/// - `3.0.75` (contains `.`) — a version; becomes `server-3-0-75.sock` in home.
+/// - `426042` (digits only) — a pid, looked up in the live census.
+///
+/// ⚠ A pid is resolved by ASKING every reachable daemon who it is, not by
+/// guessing a socket name from it: pid→socket has no derivable mapping, and a
+/// pid that has been reused would otherwise silently address the wrong process.
+pub fn resolve_daemon_endpoint_selector(
+    home_dir: &Path,
+    selector: &str,
+) -> Result<(ServerEndpoint, DaemonSelectorKind)> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        bail!("--endpoint needs a socket path, a version like 3.0.75, or a pid");
+    }
+    if selector.contains('/') {
+        let path = PathBuf::from(selector);
+        if !path.exists() {
+            bail!("no socket at {selector}");
+        }
+        #[cfg(unix)]
+        return Ok((
+            ServerEndpoint::UnixSocket(path),
+            DaemonSelectorKind::SocketPath,
+        ));
+        #[cfg(not(unix))]
+        bail!("socket-path selectors are unix-only");
+    }
+    if selector.contains('.') {
+        let socket = home_dir.join(format!("server-{}.sock", selector.replace('.', "-")));
+        if !socket.exists() {
+            bail!(
+                "no daemon socket for version {selector} \
+                 (looked for {}); `server daemons` lists the versions that are live",
+                socket.display()
+            );
+        }
+        #[cfg(unix)]
+        return Ok((
+            ServerEndpoint::UnixSocket(socket),
+            DaemonSelectorKind::Version,
+        ));
+        #[cfg(not(unix))]
+        bail!("version selectors are unix-only");
+    }
+    let pid: u32 = selector
+        .parse()
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "unreadable --endpoint {selector}: \
+                 expected a socket path, a version like 3.0.75, or a pid"
+            )
+        })?;
+    #[cfg(unix)]
+    {
+        for (endpoint, status) in reachable_versioned_daemon_statuses(home_dir) {
+            if status.server_pid == pid {
+                return Ok((endpoint, DaemonSelectorKind::Pid));
+            }
+        }
+        bail!("no reachable daemon with pid {pid}; `server daemons` lists the live ones");
+    }
+    #[cfg(not(unix))]
+    bail!("pid selectors are unix-only");
+}
+
 /// Every reachable daemon on this host, as rows.
 #[cfg(unix)]
 pub fn daemon_census(home_dir: &Path) -> Vec<DaemonCensusRow> {
@@ -17804,6 +17893,63 @@ mod tests {
             !refused(Some("this refused: pending input draft is a suffix")),
             "the marker must anchor at the start, or any prose containing it reads as a refusal"
         );
+    }
+
+    #[test]
+    fn an_endpoint_selector_is_read_by_shape_and_says_what_to_do_when_it_misses() {
+        // Three forms, disambiguated by shape rather than by three flags,
+        // because a reader of the census has a PID in hand and a reader of a
+        // trace has a version. Every refusal must name the next move — a
+        // selector that misses is the moment the user knows least.
+        let home = std::env::temp_dir().join(format!(
+            "ygg-selector-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&home).expect("scratch home");
+
+        let empty = super::resolve_daemon_endpoint_selector(&home, "  ")
+            .expect_err("an empty selector is not a daemon");
+        assert!(empty.to_string().contains("socket path"), "{empty}");
+
+        let nonsense = super::resolve_daemon_endpoint_selector(&home, "nonsense")
+            .expect_err("a bare word is neither pid, version nor path");
+        assert!(nonsense.to_string().contains("unreadable"), "{nonsense}");
+
+        let missing_version = super::resolve_daemon_endpoint_selector(&home, "9.9.9")
+            .expect_err("no socket for that version");
+        let text = missing_version.to_string();
+        assert!(text.contains("server-9-9-9.sock"), "name the path tried: {text}");
+        assert!(
+            text.contains("server daemons"),
+            "point at the instrument that lists the live ones: {text}"
+        );
+
+        let missing_path = super::resolve_daemon_endpoint_selector(&home, "/no/such/server.sock")
+            .expect_err("a path selector must exist");
+        assert!(missing_path.to_string().contains("no socket at"), "{missing_path}");
+
+        // A version whose socket EXISTS resolves, and is read as a version
+        // rather than as anything else.
+        let socket = home.join("server-3-0-75.sock");
+        std::fs::write(&socket, b"").expect("placeholder socket");
+        let (endpoint, kind) = super::resolve_daemon_endpoint_selector(&home, "3.0.75")
+            .expect("an existing versioned socket resolves");
+        assert_eq!(kind, super::DaemonSelectorKind::Version);
+        assert_eq!(
+            endpoint,
+            super::ServerEndpoint::UnixSocket(socket.clone()),
+            "the version must map to its own socket, not to the default"
+        );
+
+        let (_, kind) = super::resolve_daemon_endpoint_selector(
+            &home,
+            &socket.to_string_lossy(),
+        )
+        .expect("an existing path resolves");
+        assert_eq!(kind, super::DaemonSelectorKind::SocketPath);
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
