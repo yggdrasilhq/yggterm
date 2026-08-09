@@ -179,6 +179,7 @@ fn print_server_help() {
   yggterm-headless server ping
   yggterm-headless server status
   yggterm-headless server daemons [--json]
+  yggterm-headless server <status|snapshot> --endpoint <socket-path|version|pid>
   yggterm-headless server snapshot
   yggterm-headless server shutdown
   yggterm-headless server terminal write <session> (--data <data>|--stdin) [--refuse-if-draft]
@@ -3419,6 +3420,54 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&rows)?);
         } else {
             print!("{}", yggterm_server::format_daemon_census(&rows));
+        }
+        return Ok(());
+    }
+    // `--endpoint <path|version|pid>` aims a READ-ONLY verb at one of the
+    // daemons the census names. Read-only on purpose: seeing all 28 and being
+    // able to ask any of them is the gap; being able to MUTATE an arbitrary one
+    // by hand is a footgun, and `server update-daemons` already owns the
+    // sanctioned way to act on the whole set.
+    if let Some(index) = args.iter().position(|arg| arg == "--endpoint") {
+        let selector = args.get(index + 1).cloned().unwrap_or_default();
+        let rest = args
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| *position != index && *position != index + 1)
+            .map(|(_, arg)| arg.clone())
+            .collect::<Vec<_>>();
+        if !matches!(
+            rest.as_slice(),
+            [command, verb] if command == "server" && (verb == "status" || verb == "snapshot")
+        ) {
+            bail!(
+                "--endpoint applies to the read-only verbs only (server status, server snapshot); \
+                 got: {}",
+                rest.join(" ")
+            );
+        }
+        let (endpoint, kind) =
+            yggterm_server::resolve_daemon_endpoint_selector(store.home_dir(), &selector)?;
+        let runtime = status(&endpoint)?;
+        let mut value = serde_json::to_value(&runtime)?;
+        if let Some(object) = value.as_object_mut() {
+            // Say WHICH daemon answered and how it was chosen. A reply that does
+            // not name its own subject is how "I asked the stale one" becomes
+            // indistinguishable from "I asked mine".
+            object.insert(
+                "answered_for".to_string(),
+                serde_json::json!({
+                    "selector": selector,
+                    "selector_kind": format!("{kind:?}"),
+                    "server_pid": runtime.server_pid,
+                    "server_version": runtime.server_version,
+                }),
+            );
+        }
+        if rest.last().is_some_and(|verb| verb == "snapshot") {
+            println!("{}", serde_json::to_string_pretty(&snapshot(&endpoint)?)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&value)?);
         }
         return Ok(());
     }

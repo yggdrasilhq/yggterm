@@ -41,43 +41,34 @@ libyggterm has no live campaign row to route it to.
 **Falsifier:** in a libyggterm checkout, change `STABLE_THEME_ALPHA` to `0.5` and
 run its CI locally. Something must go red. Today nothing does.
 
-## ⭐ A VERB CANNOT BE AIMED AT A SPECIFIC DAEMON, AND THE HEADLESS SURFACE CAN CREATE A ROW IT CANNOT REMOVE
+## ⭐ THE HEADLESS SURFACE CAN CREATE A SESSION AND CANNOT REMOVE ONE
 
 **Status:** OPEN
 
-Two of the three gaps filed 2026-08-09 from the hot-restart-gate lane. The third
-— no census — is shipped (`server daemons`, 3.0.82; git remembers it), and its
-first live run is the argument for finishing these two: **28 reachable daemons on
-the integrator host, 27 of them running replaced binaries, holding 58 live PTYs
-between them, back to `2.11.1` at 646 hours.**
+The last of the three daemon-plane gaps filed 2026-08-09. The other two shipped:
+the census (`server daemons`, 3.0.82) and `--endpoint` targeting for the
+read-only verbs (3.0.84). Git remembers both.
 
-**1. A verb cannot be aimed at a specific daemon.** `server status` resolves the
-endpoint from `YGGTERM_HOME`; there is no `--endpoint` / `--pid` flag and no
-`YGGTERM_SERVER_ENDPOINT` override (grepped: the constant does not exist). The
-version-aliased sockets are right there — `server-3-0-75.sock`,
-`server-3-0-76.sock`, … — and nothing can address them. ⇒ to ask a stale daemon
-anything beyond what the census prints, you must build a private `YGGTERM_HOME`
-sandbox, which by construction cannot contain the daemon you wanted to ask.
-`server daemons` now names all 28; `server status --endpoint <path|version>`
-would let you interrogate one.
-
-**2. The headless surface can CREATE a session and cannot REMOVE one.**
 `yggterm-headless server attach <uuid> <cwd>` makes a live `local://` row on
-whatever daemon it finds; there is no `server session remove` anywhere on that
+whatever daemon it finds. There is no `server session remove` anywhere on that
 surface — removal lives only under `server app`, which refuses outright on a host
 with no GUI client. Writing `exit` into the terminal frees the runtime
 (`owned_terminal_session_keys` drops, the block reason clears) and **leaves the
-session record listed forever**. ⇒ an agent on a headless host can make a row it
-has no way to unmake. Measured 2026-08-09 on `dev` while live-proving the gate.
+session record listed forever**.
 
-⭐ **The test both pass is the one that matters:** an agent hand-assembled the
-chore from primitives, and an agent's discipline resets every session while a
-verb's does not. Same shape as the five verbs in
+⇒ **An agent on a headless host can make a row it has no way to unmake.**
+Measured 2026-08-09 on `dev` while live-proving the retire gate: the probe row's
+record was still listed after its runtime was gone, and nothing on the CLI could
+retire it. (It never reached the GUI's sidebar — a `local://` session on dev's own
+daemon is not in guihost's row list — so it cost the owner nothing this time. On the
+GUI host it would have been a row he had to close by hand.)
+
+⭐ **The test it passes:** an agent hand-assembled the chore from primitives and
+still could not finish it. Same shape as the five verbs in
 `docs/agent-field-guide.md` §*this instrument answers a different question*.
 
-**Falsifier:** `server status --endpoint 3.0.75` answers for pid 426042 rather
-than for the CLI's own daemon; and a session created by `server attach` can be
-removed from the same surface that created it.
+**Falsifier:** a session created by `server attach` can be removed from the same
+surface that created it, and `server status` stops listing it.
 
 ## ⭐ A FAILED `server app` VERB ANSWERS IN PROSE ON stderr WHILE EVERY SUCCESS ANSWERS IN JSON ON stdout — so a JSON caller parses nothing and blames the parser
 
