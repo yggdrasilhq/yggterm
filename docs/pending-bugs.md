@@ -648,30 +648,103 @@ four paths on three hosts, each followed by a daemon handover under live rows �
 including the row he types into. Interleaved with 2-14 minute release builds and
 a 844 s test suite, all of which hold the turn.
 
-⚠ **Two candidate causes and they need separating before anything is built.**
-They are not the same bug and the fix for one does nothing for the other:
+### ⭐ MEASURED 2026-08-09 ~20:30 — BOTH FILED CANDIDATE CAUSES ARE FALSIFIED
 
-1. **The turn was busy.** A long build/deploy holds the agent's turn, so his
-   input queues and nothing answers until it ends. Nothing to do with daemons;
-   the fix is that a long operation must not be run in the foreground of a row
-   he might type into.
-2. **The handover broke the row's path to the agent.** A daemon swap under a live
-   `remote-cc://` row, with the click/bridge work of 3.0.80 in between. This IS
-   the constitution's clause.
+The entry named two candidates ((1) the turn was busy, (2) the handover broke the
+row's path) and said to measure before building. That has now been done, from
+that row's own transcript and the booter's log. **Neither is what happened.**
 
-⇒ **Measure which one, first.** The trace has both: `daemon_self_retire_handoff_ok`
-timestamps against his input's arrival time in the row's transcript. If his
-keystrokes landed and simply waited, it is (1). If they never landed, it is (2).
-⛔ Do not build the relay gate as an answer to this until that is settled — it
-would be a large fix aimed at a cause nobody has confirmed.
+**(1) is falsified 4 for 4.** Every message he sent that day landed on a row
+whose turn had **already ended** — idle before his message: 28.3 m, 67.9 m,
+14.0 m, 3.3 m. Not once was his input queued behind a build, a deploy or the
+844 s suite. A busy turn was never the thing in his way.
 
-⭐ **And whatever the cause: he had no way to tell us.** A session that cannot be
-reached for 5-10 minutes should be visibly *busy*, not silently absent, and there
-is no channel that outruns a held turn. The booter exists to kick a stalled
-session; nothing exists to let HIM interrupt a busy one.
+**(2) is falsified at the moment it names.** The turn that preceded the long
+outage ended at **18:00:29 with a complete, successful report** — two minutes
+after the 3.0.82 deploy and its handover. The daemon swap neither killed the turn
+nor broke the path; his text arrived the instant he typed it.
+
+⇒ **The real mechanism, and it is a third thing: the row STOPPED, and the
+watchdog that exists to restart it could not press Enter.** The turn ended at
+18:00:29; the booter fired five boots (18:09, 18:20, 18:26, 19:01, 19:07) and
+**none woke it**, because it wrote `\n` where an agent CLI in raw mode needs a
+discrete `\r`. The text landed in the composer and sat there. He walked over at
+19:08 and described exactly that: *"I just saw `continue, the booter booted` and
+a empty line. The enter key did not send the prompt."* **68 minutes, not 5-10.**
+
+⭐ **The A/B is already in `booter.log` and needs no new run:** before the fix,
+`pty-write` boots woke the session **0 of 5**; after `efb02e26` (19:16) they woke
+it **2 of 2**, the second one flushing four backed-up boot lines in a single
+message. ⇒ **the cause was fixed at 19:16 by the very session that received the
+complaint at 20:16, and neither it nor this entry realised the two were the same
+thing.**
+
+⚠ **What that leaves genuinely open**, with the dead framing removed:
+
+- **His falsifier has still not been run end to end** (below). The keystroke path
+  was never the proven defect, but it was never measured across a fleet bump
+  either, and his sentence is about the deploy.
+- ⭐ **He still has no channel that outruns a held turn**, and no way to tell a
+  *busy* row from a *stopped* one from a *stopped-with-text-stuck-in-the-composer*
+  one. All three look identical in the sidebar. This is the part of the entry that
+  survives measurement intact.
+- ⚠ **After 3 failed boots the booter escalates and then stops booting entirely** —
+  correct in principle ("a human owns it now"), but it turned a 7-minute recovery
+  into a 68-minute one, and the escalation is a notify card he did not see for 37
+  minutes.
+
+⭐ **And the same wrong encoding of Enter was found living in the DAEMON**, where
+it is worse — see the paste-draft entry below. Fixed in 3.0.85.
 
 **Falsifier:** deploy a version bump across the fleet while he types into a row,
 and every keystroke is acknowledged inside a second.
+
+## ⛔ THE DAEMON'S MODEL OF THE COMPOSER STILL READS A BARE `\n` AS A SUBMIT — right for a shell, wrong for every agent row
+
+**Status:** OPEN
+
+The other half of the paste-draft fix that shipped in 3.0.85. `input_line_has_unsent_draft_after`
+(`yggterm-core/src/lib.rs`) reconstructs "is there unsent text in the composer"
+from the bytes the client forwards — it is a MODEL of the composer, not a read of
+one — and on the un-escaped stream it still does:
+
+    b'\r' | b'\n' if paste_depth == 0 => draft = false,
+
+**That is correct for a `local://` shell and wrong for every agent row.** A shell's
+tty is in canonical mode, where `ICRNL` really does turn a bare `\n` into a
+submit. An agent CLI runs its tty in RAW mode and reads bytes itself, so `\n` is
+inserted as a literal newline and the draft REMAINS — the identical fact that
+`efb02e26` fixed in the watchdogs, and that the owner watched happen:
+*"the enter key did not send the prompt."*
+
+⇒ **Anything that writes a bare `\n` to an agent row leaves a real draft the
+daemon believes is not there.** The consequence is not cosmetic: `--refuse-if-draft`
+then types over his text, and `session_is_migratable`'s clause (b) — the one whose
+own docstring calls losing unsent work *"the cardinal sin"* — is free to release
+that session across a hot restart.
+
+⚠ **Why 3.0.85 did not just fix it too, rather than this being an oversight.**
+The bracketed-paste half needed no session kind: `ESC [ 200~` exists precisely so
+a receiver can tell a pasted newline from a pressed Enter, so newlines inside the
+markers are unambiguously content. This half genuinely needs to know *what kind
+of session this is*, and the function is deliberately kind-agnostic — the
+docstring one screen above it, on `screen_text_shows_agent_working`, is the
+project already warning that a kind-agnostic predicate is the trap
+(*"Where the kind IS known … call `AgentCliDescriptor::screen_shows_working`
+instead"*). Threading the kind in is the fix; guessing at it in a shared
+predicate is how the shell case breaks instead.
+
+⚖ **Blast radius today is smaller than it was this morning** and that is worth
+stating rather than overselling the entry: the two writers that actually sent
+bare `\n` to agent rows were the booter and babysit, both fixed in `efb02e26`.
+What remains is the class — any future writer, any script, any new surface — plus
+the fact that the daemon's model and the terminal's reality disagree about the
+single most common keystroke there is.
+
+**Falsifier:** write `b"typed\n"` to a live `cc-runtime://` row, then
+`server terminal write <row> --stdin --refuse-if-draft`. It answers
+`refused_for_draft: false` while the composer visibly holds `typed`. Measured on
+3.0.84 and still true on 3.0.85 (arm C of `draftprobe.sh`).
 
 ## ⚖⚖ THE HOT-RESTART GATE IS UNBUILT — THE DESIGN IS NOW SETTLED
 

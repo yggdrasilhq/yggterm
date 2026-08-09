@@ -1411,6 +1411,24 @@ pub fn screen_text_shows_agent_working(sample: &str) -> bool {
 ///   safe — it only delays a migration; a false-negative would lose work).
 /// - Any printable, non-whitespace char sets the draft.
 ///
+/// ⛔⛔ **INSIDE A BRACKETED PASTE A NEWLINE IS CONTENT, NOT A SUBMIT** — and
+/// getting that wrong is a FALSE NEGATIVE, the one direction the rule above says
+/// "would lose work". A paste arrives as `ESC [ 200~ … ESC [ 201~`; the markers
+/// were already skipped, but the newlines *between* them were being read on the
+/// un-escaped stream and cleared the flag. So pasting a multi-line prompt and
+/// walking away left the daemon believing the composer was EMPTY:
+/// `--refuse-if-draft` would then type over it, and the migration predicate —
+/// whose whole job is that "releasing such a session would lose the draft" —
+/// was free to release it across a hot restart. Bracketed paste exists PRECISELY
+/// so a receiver can tell a pasted newline from a pressed Enter; this predicate
+/// was throwing that distinction away. Found 2026-08-09 by reading the model
+/// after the same wrong encoding of Enter was fixed in the watchdogs
+/// (`efb02e26`) — [[finding-the-enter-key-is-a-separate-write-of-cr]].
+/// ⚠ A bare `\n` OUTSIDE a paste still clears, and that is correct for a plain
+/// shell (canonical mode's `ICRNL` really does submit it) but wrong for an
+/// agent CLI in raw mode. Fixing that needs the session's KIND, which this
+/// kind-agnostic function does not have; filed rather than guessed at here.
+///
 /// Mirrors the GUI's per-keystroke optimistic busy hint
 /// (`terminal_input_busy_hint_decision`) but is byte-level, escape-aware, and
 /// returns only the sticky-draft bit the migration predicate needs.
@@ -1423,14 +1441,31 @@ pub fn input_line_has_unsent_draft_after(prev: bool, data: &[u8]) -> bool {
         Ss3,
         Osc,
     }
+    /// `ESC [ 200~` / `ESC [ 201~`. Held as bytes so the comparison is against
+    /// the parameter text itself rather than a number parsed out of it.
+    const PASTE_START_PARAMS: &[u8] = b"200";
+    const PASTE_END_PARAMS: &[u8] = b"201";
     let mut draft = prev;
     let mut state = EscState::Normal;
+    // Depth, not a bool: an unbalanced `ESC [ 201~` with no opener must not
+    // wrap around and leave every later newline looking pasted.
+    let mut paste_depth: u32 = 0;
+    // Parameter bytes of the CSI sequence currently being consumed. Four is
+    // enough for `200` / `201`; anything longer cannot be a paste marker, and
+    // overflowing simply stops matching (the safe direction).
+    let mut csi_params = [0u8; 4];
+    let mut csi_len = 0usize;
+    let mut csi_overflow = false;
     for &byte in data {
         match state {
             EscState::Normal => match byte {
                 0x1b => state = EscState::Escape,
-                b'\r' | b'\n' => draft = false,
-                0x03 | 0x15 => draft = false,
+                // In a paste these are content the composer keeps, so they
+                // must not clear the draft. Outside one they are the submit.
+                b'\r' | b'\n' if paste_depth == 0 => draft = false,
+                b'\r' | b'\n' => {}
+                0x03 | 0x15 if paste_depth == 0 => draft = false,
+                0x03 | 0x15 => {}
                 0x08 | 0x7f => {}
                 // Printable, non-whitespace bytes (incl. UTF-8 continuation
                 // bytes >= 0x80) are typed text. Control bytes (< 0x20) and
@@ -1440,7 +1475,11 @@ pub fn input_line_has_unsent_draft_after(prev: bool, data: &[u8]) -> bool {
             },
             EscState::Escape => {
                 state = match byte {
-                    b'[' => EscState::Csi,
+                    b'[' => {
+                        csi_len = 0;
+                        csi_overflow = false;
+                        EscState::Csi
+                    }
                     b'O' => EscState::Ss3,
                     b']' => EscState::Osc,
                     // Two-byte ESC sequence (e.g. Alt-key, ESC ESC) — consume
@@ -1451,9 +1490,27 @@ pub fn input_line_has_unsent_draft_after(prev: bool, data: &[u8]) -> bool {
             EscState::Csi => {
                 // CSI parameter/intermediate bytes run until a final byte in
                 // 0x40..=0x7e. Bracketed-paste `ESC [ 200~` terminates at `~`,
-                // so the pasted content that follows is parsed as Normal text.
+                // so the pasted content that follows is parsed as Normal text —
+                // but it is parsed as PASTED text, which is why the parameters
+                // are kept rather than discarded.
                 if (0x40..=0x7e).contains(&byte) {
+                    if byte == b'~' && !csi_overflow {
+                        let params = &csi_params[..csi_len];
+                        if params == PASTE_START_PARAMS {
+                            paste_depth = paste_depth.saturating_add(1);
+                        } else if params == PASTE_END_PARAMS {
+                            paste_depth = paste_depth.saturating_sub(1);
+                        }
+                    }
                     state = EscState::Normal;
+                } else if csi_len < csi_params.len() {
+                    csi_params[csi_len] = byte;
+                    csi_len += 1;
+                } else {
+                    // Too long to be a paste marker. Mark it rather than
+                    // truncate, so a `200`-prefixed longer parameter list can
+                    // never compare equal to the marker.
+                    csi_overflow = true;
                 }
             }
             EscState::Ss3 => state = EscState::Normal,
@@ -2979,6 +3036,69 @@ mod tests {
         // Ctrl-C / Ctrl-U clear a pending line.
         assert!(!input_line_has_unsent_draft_after(true, b"\x03"));
         assert!(!input_line_has_unsent_draft_after(true, b"\x15"));
+    }
+
+    #[test]
+    fn input_draft_survives_newlines_inside_a_bracketed_paste() {
+        // ⛔ THE REGRESSION: he pastes a multi-line prompt and walks away. The
+        // markers were already skipped, but the newlines BETWEEN them were read
+        // as submits and cleared the flag — so the daemon believed the composer
+        // was empty, `--refuse-if-draft` would type over it, and the migration
+        // predicate was free to release the session and lose the text.
+        const START: &[u8] = b"\x1b[200~";
+        const END: &[u8] = b"\x1b[201~";
+
+        let mut pasted = Vec::new();
+        pasted.extend_from_slice(START);
+        pasted.extend_from_slice(b"line one\nline two\n");
+        pasted.extend_from_slice(END);
+        assert!(
+            input_line_has_unsent_draft_after(false, &pasted),
+            "a pasted multi-line block is an unsent draft"
+        );
+
+        // The trailing newline is the one that used to clear it — the paste is
+        // still sitting in the composer when the last byte is a newline.
+        let mut trailing = Vec::new();
+        trailing.extend_from_slice(START);
+        trailing.extend_from_slice(b"only line\n");
+        trailing.extend_from_slice(END);
+        assert!(input_line_has_unsent_draft_after(false, &trailing));
+
+        // Split across writes: the daemon sees whatever chunk sizes the client
+        // sends, so paste state must survive a call boundary... it does NOT
+        // (the flag is the only thing carried), which is why the START marker
+        // and its content arriving together is the case that matters. Assert
+        // the sticky flag still protects the split case.
+        let mut draft = input_line_has_unsent_draft_after(false, START);
+        draft = input_line_has_unsent_draft_after(draft, b"typed");
+        assert!(draft, "content after a paste opener is a draft");
+
+        // Once the paste is over, Enter means Enter again.
+        let mut after = Vec::new();
+        after.extend_from_slice(START);
+        after.extend_from_slice(b"pasted");
+        after.extend_from_slice(END);
+        after.extend_from_slice(b"\r");
+        assert!(
+            !input_line_has_unsent_draft_after(false, &after),
+            "a real submit after the paste still clears"
+        );
+
+        // An unbalanced closer must not underflow into "everything is pasted".
+        let mut unbalanced = Vec::new();
+        unbalanced.extend_from_slice(END);
+        unbalanced.extend_from_slice(b"typed\n");
+        assert!(
+            !input_line_has_unsent_draft_after(false, &unbalanced),
+            "a stray paste-end must leave newline handling alone"
+        );
+
+        // A longer parameter list that merely STARTS with 200 is not a marker.
+        assert!(
+            !input_line_has_unsent_draft_after(false, b"\x1b[2000~typed\n"),
+            "only the exact 200/201 parameters open and close a paste"
+        );
     }
 
     #[test]
