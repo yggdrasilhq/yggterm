@@ -75,7 +75,22 @@ BOOT_TEXT = "continue, the booter booted"
 # How long a subscribed row may sit with its turn ENDED before it is booted.
 # Deliberately longer than babysit's 240s: a subscriber is a long-running campaign
 # session that may legitimately pause between phases, and a boot costs it a turn.
-BOOT_AFTER_SECS = 420
+#
+# ⛔ RAISED 420 -> 1800 ON OWNER DIRECTIVE, 2026-08-09: *"in case of long waits,
+# the booter should also wait ~30min before booting to avoid unnecessarily
+# booting."* Measured cause: a campaign session waiting on `cargo test
+# --workspace` was booted FIVE times in 45 min (12:26 · 12:36 · 12:51 · 13:01 ·
+# 13:11) while one test target alone ran 2386s. It was working the whole time.
+#
+# ⚠ THE BLIND SPOT THIS ACCEPTS, stated so nobody re-derives it: a session
+# waiting on a long child process and a session that has genuinely stalled look
+# IDENTICAL from here — turn ended, transcript not growing. 420s could not tell
+# them apart either; it just guessed sooner and was wrong most of the time. The
+# real discriminator is whether the row still has a live child doing work
+# (a build, a test binary, an ssh), which this watcher does not read today. Until
+# it does, 1800s is the honest trade: a genuine stall is caught inside half an
+# hour, and legitimate long work is left alone.
+BOOT_AFTER_SECS = 1800
 # Consecutive boots that produced no transcript growth before a human is told.
 MAX_BOOTS = 3
 DEFAULT_INTERVAL = 300
