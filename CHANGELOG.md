@@ -4,6 +4,21 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A web surface's loading light never expired, so an unobserved surface blinked
+  for the life of the row.** Owner-reported: *"on restart all my ychromes keep on
+  blinking."* Measured on his GUI — 3 of 6 ychrome rows sat at
+  `busy_reason: web_surface_loading` **45 minutes** after the restart that made
+  them. A tab is born `loading: true`, which is correct (WebKit really did begin a
+  load when it made the view), and the ONLY thing that clears it is the reconciler
+  reading a live engine's `is-loading`. A surface whose engine is never polled
+  therefore keeps its birth value forever. The light now carries the moment it
+  rose and stops claiming the sidebar dot after 30 s. Past the ceiling a tab is
+  either genuinely stuck or merely unobserved — indistinguishable from the
+  sidebar, which is exactly why a timeout is the honest answer rather than a guess
+  about which. ⇒ Same shape as the working-dot carry-forward shipped beside it:
+  **the fix for a claim nobody clears is not to stop making it, it is to make it
+  expire.**
+
 - **The working dot was wrong in both directions at once, and the two causes are
   opposite.** (a) *No blink on working sessions*: `working` has two writers — the
   daemon's snapshot, which sets it from its OWN terminals and writes `None` for

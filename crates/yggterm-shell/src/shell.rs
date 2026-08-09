@@ -1747,6 +1747,25 @@ struct WebTabFolder {
 }
 #[derive(Debug, Clone)]
 struct WebSurfaceTab {
+    /// When `loading` last became true, so the blink can EXPIRE.
+    ///
+    /// ⛔⛔ **A POSITIVE CLAIM WITH NO EXPIRY IS A PERMANENT LIE WHEN ITS
+    /// CLEARER NEVER RUNS.** A tab is born `loading: true` — correctly, WebKit
+    /// really did begin a load the moment it made the view — and the ONLY thing
+    /// that clears it is the reconciler reading the engine's `is-loading` on a
+    /// tab with a live webview. A surface whose engine is never polled therefore
+    /// keeps its birth value for the life of the row. Owner-reported 2026-08-09:
+    /// *"on restart all my ychromes keep on blinking"*; measured on his GUI, 3 of
+    /// 6 ychrome rows sat at `busy_reason: web_surface_loading` 45 minutes after
+    /// the restart that made them.
+    ///
+    /// ⚠ Same shape as the working-dot carry-forward beside it: the fix is not
+    /// to stop making the claim, it is to make the claim STALE-ABLE. A load that
+    /// has not finished inside [`WEB_SURFACE_LOADING_MAX_MS`] is not something to
+    /// show the user as live activity, whether it is genuinely stuck or merely
+    /// unobserved — and both of those are indistinguishable from here, which is
+    /// exactly why a timeout is the honest answer rather than a guess about which.
+    loading_since_ms: u64,
     id: u64,
     /// Requested/display URL (what the address bar shows). Empty on a fresh
     /// user tab that has not navigated yet.
@@ -5711,6 +5730,22 @@ const WEB_SURFACE_RECONCILE_TICK_MS: u64 = 300;
 const WEB_SURFACE_RECONCILE_BEAT_MS: u64 = 16;
 /// Idle poll cadence when no surfaces exist and none are applied.
 const WEB_SURFACE_RECONCILE_IDLE_MS: u64 = 750;
+/// How long a tab's loading light may claim the sidebar dot. Generous for a real
+/// page load on a slow link, and far below "forever" — which is what an
+/// unobserved surface's birth value amounts to today. See
+/// [`WebSurfaceTab::loading_since_ms`].
+const WEB_SURFACE_LOADING_MAX_MS: u64 = 30_000;
+
+/// Does a tab's loading light still deserve the sidebar dot?
+///
+/// ⛔ EXPIRE IT. A tab is born `loading: true` and only the reconciler reading a
+/// LIVE engine clears it, so a surface nobody polls keeps its birth value for the
+/// life of the row. Past the ceiling the tab is either genuinely stuck or merely
+/// unobserved — indistinguishable from here, which is precisely why a timeout is
+/// the honest answer instead of a guess about which one it is.
+fn web_surface_tab_loading_is_live(loading: bool, loading_since_ms: u64, now_ms: u64) -> bool {
+    loading && now_ms.saturating_sub(loading_since_ms) <= WEB_SURFACE_LOADING_MAX_MS
+}
 /// ⭐ **WHO HOLDS THE KEYBOARD OVER A WEB SURFACE — one rule, one answer.**
 ///
 /// This is not a nicety. Every legacy browser chord (`WEB_PAGE_CHORDS`) is
@@ -18824,11 +18859,18 @@ impl ShellState {
                     .iter()
                     .filter(|(_, surface)| surface.picker.is_none())
                     .map(|(path, surface)| {
+                        let now = current_millis();
                         let loading = surface
                             .tabs
                             .iter()
                             .find(|tab| tab.id == surface.active_tab)
-                            .is_some_and(|tab| tab.loading);
+                            .is_some_and(|tab| {
+                                web_surface_tab_loading_is_live(
+                                    tab.loading,
+                                    tab.loading_since_ms,
+                                    now,
+                                )
+                            });
                         (path.clone(), loading)
                     })
                     .collect()
@@ -19202,6 +19244,7 @@ impl ShellState {
             folder: None,
             custom_title: None,
             loading: true,
+            loading_since_ms: current_millis(),
             theme_color: None,
             lease_until_ms: None,
             script_opened: false,
@@ -19269,6 +19312,7 @@ impl ShellState {
                 // A restored tab has no webview until it is selected, so nothing
                 // is loading in it.
                 loading: false,
+                loading_since_ms: 0,
                 theme_color: None,
                 lease_until_ms: None,
                 script_opened: false,
@@ -19388,6 +19432,7 @@ impl ShellState {
             folder: None,
             custom_title: None,
             loading: false,
+            loading_since_ms: 0,
             theme_color: None,
             lease_until_ms: None,
             script_opened: false,
@@ -20588,6 +20633,7 @@ impl ShellState {
                 folder: placement.folder.clone(),
                 custom_title: None,
                 loading: false,
+                loading_since_ms: 0,
                 theme_color: None,
                 lease_until_ms: None,
                 script_opened: false,
@@ -20689,6 +20735,7 @@ impl ShellState {
                 custom_title: None,
                 // WebKit began the load the moment it made the view.
                 loading: true,
+                loading_since_ms: current_millis(),
                 theme_color: None,
                 lease_until_ms: None,
                 // A script opened it, so a script may close it.
@@ -21427,6 +21474,12 @@ impl ShellState {
         if let Some(surface) = self.web_surfaces.get_mut(session_path)
             && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
         {
+            // Stamp the RISING edge only. Re-stamping while it stays true would
+            // reset the ceiling on every poll and the light could never expire —
+            // which is the bug, rebuilt.
+            if loading && !tab.loading {
+                tab.loading_since_ms = current_millis();
+            }
             tab.loading = loading;
         }
     }
@@ -135588,6 +135641,7 @@ mod tests {
                     folder: None,
                     custom_title: None,
                     loading: false,
+                    loading_since_ms: 0,
                     theme_color: None,
                     lease_until_ms: None,
                     script_opened: false,
@@ -150755,6 +150809,45 @@ mod tests {
     // Pointer identity is the assertion because it is the one a deep copy
     // cannot satisfy: a size or timing check would pass on a fast machine with
     // a small ruleset, which is exactly the configuration nobody ships.
+    /// ⛔⛔ Owner-reported 2026-08-09: *"on restart all my ychromes keep on
+    /// blinking."* Measured on his GUI: 3 of 6 ychrome rows sat at
+    /// `busy_reason: web_surface_loading` **45 minutes** after the restart that
+    /// created them. A tab is born `loading: true` — correctly — and only a live
+    /// engine poll clears it, so a surface nobody polls blinks for the life of
+    /// the row.
+    #[test]
+    fn a_loading_light_expires_so_an_unobserved_surface_stops_blinking() {
+        let now = current_millis();
+        // Fresh: the light is real and must show.
+        assert!(
+            web_surface_tab_loading_is_live(true, now.saturating_sub(1_000), now),
+            "a load that started a second ago is genuinely loading"
+        );
+        // Just inside the ceiling.
+        assert!(web_surface_tab_loading_is_live(
+            true,
+            now.saturating_sub(WEB_SURFACE_LOADING_MAX_MS - 1),
+            now
+        ));
+        // Past it: stuck or merely unobserved — indistinguishable from here, and
+        // neither is something to draw as live activity.
+        assert!(
+            !web_surface_tab_loading_is_live(
+                true,
+                now.saturating_sub(WEB_SURFACE_LOADING_MAX_MS + 1),
+                now
+            ),
+            "a load older than the ceiling must stop claiming the dot"
+        );
+        // His actual case, to the minute.
+        assert!(
+            !web_surface_tab_loading_is_live(true, now.saturating_sub(45 * 60 * 1_000), now),
+            "45 minutes of 'loading' is the reported bug"
+        );
+        // A tab that is not loading never blinks, however old the stamp.
+        assert!(!web_surface_tab_loading_is_live(false, 0, now));
+    }
+
     #[test]
     fn the_policy_gate_hands_out_a_handle_and_never_copies_the_ruleset() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
