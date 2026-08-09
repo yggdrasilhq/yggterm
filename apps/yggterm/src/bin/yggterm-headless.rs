@@ -181,7 +181,7 @@ fn print_server_help() {
   yggterm-headless server daemons [--json]
   yggterm-headless server snapshot
   yggterm-headless server shutdown
-  yggterm-headless server terminal write <session> (--data <data>|--stdin)
+  yggterm-headless server terminal write <session> (--data <data>|--stdin) [--refuse-if-draft]
   yggterm-headless server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
   yggterm-headless server terminal tenants [<session>]
   yggterm-headless server wpe <verb> [--key value ...]
@@ -1351,13 +1351,24 @@ fn main() -> Result<()> {
                 .context("missing --data or --stdin for server terminal write")?
                 .to_string()
         };
-        terminal_write(&endpoint, &args[3], &data)?;
+        // ⛔ `"accepted": true` used to be a LITERAL here — printed whatever the
+        // daemon replied, so the field could never report anything but success.
+        // It is now the daemon's own answer, which is what makes
+        // `--refuse-if-draft` observable at all: a guard whose refusal prints as
+        // `accepted:true` is not a guard.
+        // [[finding-a-constant-anomaly-is-a-measurement-bug]]
+        let refuse_if_draft = args.iter().any(|arg| arg == "--refuse-if-draft");
+        let message =
+            yggterm_server::terminal_write_guarded(&endpoint, &args[3], &data, refuse_if_draft)?;
+        let refused = yggterm_server::terminal_write_was_refused_for_draft(message.as_deref());
         println!(
             "{}",
             serde_json::to_string(&serde_json::json!({
-                "accepted": true,
+                "accepted": !refused,
+                "refused_for_draft": refused,
                 "session_path": args[3],
                 "bytes": data.len(),
+                "message": message,
             }))?
         );
         return Ok(());

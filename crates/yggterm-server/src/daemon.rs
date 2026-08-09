@@ -2415,6 +2415,24 @@ pub enum ServerRequest {
     TerminalWrite {
         path: String,
         data: String,
+        /// Refuse the write when the session has typed-but-unsent input on its
+        /// current line. For an automated writer — a watchdog boot, a relay
+        /// nudge — a draft is the OWNER mid-thought, and a PTY write APPENDS:
+        /// typing over it glues machine text onto his sentence and submits the
+        /// pair as one message.
+        ///
+        /// ⚠ **The check has to happen at the daemon that OWNS the PTY**, which
+        /// is the only one that can see the draft — a proxying daemon reads
+        /// `None` for a row it does not hold. So the flag travels with the
+        /// request through the proxy rather than being evaluated by the caller,
+        /// and it is TOCTOU-free for the same reason.
+        ///
+        /// `#[serde(default)]` = `false`, so a pre-3.0.83 daemon simply ignores
+        /// it and behaves exactly as it always did. ⛔ That means a caller CANNOT
+        /// treat acceptance as proof the guard ran — an old owner accepts
+        /// everything. Read the response message.
+        #[serde(default)]
+        refuse_if_draft: bool,
     },
     TerminalResize {
         path: String,
@@ -8721,13 +8739,43 @@ impl DaemonRuntime {
                     message: Some(format!("recorded tenancy for {path}")),
                 }
             }
-            ServerRequest::TerminalWrite { path, data } => {
+            ServerRequest::TerminalWrite {
+                path,
+                data,
+                refuse_if_draft,
+            } => {
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
+                // The draft guard, checked HERE because this is where a runtime
+                // is owned. A daemon that only proxies the row reads `None` and
+                // must not decide — it forwards the flag and lets the owner
+                // answer. `Some(false)` and `None` both proceed: refusing on
+                // "unknown" would make every proxied row unbootable, which on
+                // the GUI host is all of them.
+                if refuse_if_draft
+                    && self.terminals.session_has_pending_input_draft(&runtime_path) == Some(true)
+                {
+                    return Ok(ServerResponse::Ack {
+                        message: Some(format!(
+                            "{DRAFT_REFUSAL_MESSAGE}: {runtime_path} has typed-but-unsent input"
+                        )),
+                    });
+                }
                 if let Some(owner_endpoint) =
                     self.preserved_owner_endpoint_for_request(&runtime_path)
                 {
-                    match terminal_write(&owner_endpoint, &runtime_path, &data) {
-                        Ok(_) => return Ok(ServerResponse::Ack { message: None }),
+                    match terminal_write_guarded(
+                        &owner_endpoint,
+                        &runtime_path,
+                        &data,
+                        refuse_if_draft,
+                    ) {
+                        // ⛔ Propagate the owner's message rather than dropping
+                        // it. This arm used to answer a bare `Ack { None }`, so a
+                        // draft REFUSAL from the owner would have reached the
+                        // caller as a plain success — the guard would have been
+                        // silently disarmed for exactly the proxied rows it
+                        // exists to protect.
+                        Ok(message) => return Ok(ServerResponse::Ack { message }),
                         Err(error) => {
                             self.handle_preserved_owner_request_error(
                                 &runtime_path,
@@ -12960,13 +13008,39 @@ pub fn declare_session_tenancy(
 }
 
 pub fn terminal_write(endpoint: &ServerEndpoint, path: &str, data: &str) -> Result<Option<String>> {
+    terminal_write_guarded(endpoint, path, data, false)
+}
+
+/// The stable marker a caller matches on to tell a refusal from a delivery.
+///
+/// It is a prefix of the Ack message rather than a distinct response variant so
+/// that an OLDER daemon — which has no idea the guard exists — still parses the
+/// reply. ⛔ Which is also the caveat: a bare acceptance from an old owner is not
+/// proof the guard ran, only that nothing objected.
+pub const DRAFT_REFUSAL_MESSAGE: &str = "refused: pending input draft";
+
+/// [`terminal_write`] with the draft guard. See
+/// [`ServerRequest::TerminalWrite::refuse_if_draft`] for why the flag travels to
+/// the owner instead of being evaluated here.
+pub fn terminal_write_guarded(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    data: &str,
+    refuse_if_draft: bool,
+) -> Result<Option<String>> {
     expect_ack(send_request(
         endpoint,
         &ServerRequest::TerminalWrite {
             path: path.to_string(),
             data: data.to_string(),
+            refuse_if_draft,
         },
     )?)
+}
+
+/// Did this write land, or was it refused because the owner has unsent text?
+pub fn terminal_write_was_refused_for_draft(message: Option<&str>) -> bool {
+    message.is_some_and(|message| message.starts_with(DRAFT_REFUSAL_MESSAGE))
 }
 
 pub fn terminal_resize(
@@ -17711,6 +17785,28 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_refusal_is_distinguishable_from_a_delivery() {
+        use super::terminal_write_was_refused_for_draft as refused;
+        // The whole guard rests on a caller being able to tell these apart. It
+        // rides in the Ack MESSAGE rather than a new response variant so an
+        // older owner still parses the reply — which means the discriminator is
+        // a string, and a string discriminator that nobody tests drifts.
+        assert!(refused(Some(&format!(
+            "{}: cc-runtime://abc has typed-but-unsent input",
+            super::DRAFT_REFUSAL_MESSAGE
+        ))));
+        assert!(!refused(None), "a delivered write carries no message");
+        assert!(
+            !refused(Some("wrote 12 bytes")),
+            "an unrelated message is not a refusal"
+        );
+        assert!(
+            !refused(Some("this refused: pending input draft is a suffix")),
+            "the marker must anchor at the start, or any prose containing it reads as a refusal"
+        );
+    }
+
+    #[test]
     fn an_empty_census_says_so_rather_than_printing_a_bare_header() {
         let rendered = super::format_daemon_census(&[]);
         assert!(rendered.contains("no reachable yggterm daemons"), "{rendered}");
@@ -19306,6 +19402,7 @@ mod tests {
             ServerRequest::TerminalWrite {
                 path: "p".into(),
                 data: "x".into(),
+                refuse_if_draft: false,
             },
             ServerRequest::TerminalResize {
                 path: "p".into(),
