@@ -186,6 +186,20 @@ at scale. `server app rows` before and after: **43 → 43, nothing lost, nothing
 invented.** The agent rows stayed on their original PTYs under the preserved
 owner while progressive migration drained them to the successor one at a time.
 
+⭐ **And then `dev`, on the daemon that did the damage.** The same in-place
+recipe over `dev`'s four paths, 14:31:
+
+```
+14:31:32  12141  daemon_self_retire_handoff_ok
+                 "hot update handoff started: preserving 56 live terminal runtime(s)"
+14:31:48  2144501 (3.0.78)  pty_handoff_listener_bound
+```
+
+**Pid 12141 is the daemon whose predecessor cold-killed 55 PTYs at 12:10:20 this
+morning.** It has now handed 56 of them over instead, and the `claude` process of
+the session that ran the deploy stayed on its original PTY throughout — the
+inverse of the incident, on the same host, the same day.
+
 ⚠ **What is still NOT proven, and it is the other half of the falsifier:** the
 CLICK. This proves the swap no longer destroys the row; it does not prove that
 clicking a row owned by an older daemon opens it. Testing that means taking the
