@@ -133,3 +133,32 @@ ygg-booter.py subscribe --row <spawned-row> --campaign <token> --max-hours 12
 itself. The delegate re-running its own claim is then a harmless no-op (a row that already has a
 subscription keeps it, same as its seat). This is the §DREAM test verbatim — I hand-assembled the
 chore from primitives, and I only noticed because I happened to run `ygg-booter.py list`.
+
+---
+
+## ⭐ D6 — `notify` gives no way to verify the ADDRESS, and the address is its known failure mode
+
+`server app notify … --session <row-path>` answers `{"delivered": true, "error": null}`. That is a
+claim about the *send*, and the documented failure of this verb is not the send — it is the
+**address**: a card given `$YGGTERM_SESSION_ID` (`cc-runtime://…` rather than a row path) *"renders
+a card that looks right and does nothing when clicked"* (owner-caught, atlasgraph, 2026-08-08).
+
+So the one field that has actually been wrong in production is the one field the reply does not
+report, and `server app state` exposes nothing notification-shaped either — I looked, expecting to
+cross-check, and there is no key for it.
+
+⇒ Two cheap fixes, either is enough:
+1. **Echo the resolved target in the reply** — `session_path` as the daemon bound it (or `null`
+   with a named reason when the string did not resolve to a live row). A caller can then verify
+   the address without touching the human's screen.
+2. **Expose delivered/pending cards in `server app state`**, so an agent can confirm after the
+   fact rather than guessing.
+
+⚠ **Why this bites harder than it looks.** atlasgraph now has an alarm whose entire job is to
+interrupt a human when the fills lane goes blind, and its writeup had to record an honest hole:
+*"it has never sent a real card — the address resolution is proven against the live row list, the
+delivery only with a stubbed transport."* The team deliberately would not fire a test card, because
+firing one **is** the thing being tested and it costs the user an interruption. A reply that echoed
+the bound address would let that alarm be verified for free, instead of leaving a
+never-fired-in-anger alarm — which is exactly the *second silent thing* the whole night was spent
+eliminating.
