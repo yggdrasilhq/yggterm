@@ -337,20 +337,63 @@ def boot(host, row, dry):
        the layer that exists whether or not anything is mounted — and delivered
        on the same row in the same minute.
 
-    ⇒ Try the composer first (it is the right door for an agent CLI that is
-      reading input), and fall back to the PTY when it says it did not land.
-      ⚠ The newline is the Enter; without it the text sits in the line editor.
-      One line only — a multi-line send is one Enter per line and the rest queue."""
+    3. ⛔⛔ **THE ENTER IS A SEPARATE WRITE OF `\\r`, AND THIS FUNCTION SENT ONE
+       CONCATENATED `\\n`.** Owner-reported 2026-08-09 ~19:10, watching it happen:
+       *"I just saw `continue, the booter booted` and an empty line. The enter key
+       did not send the prompt."* Two independent mistakes in one line:
+
+       - **`\\n` is not Enter.** An agent CLI runs its tty in RAW mode and reads
+         bytes itself, so Enter is **CR (`\\r`, 0x0D)**; a bare LF is inserted as a
+         literal newline — the empty line he saw. A plain shell forgives this
+         (canonical mode's `ICRNL` translates for you), which is exactly why it
+         survived: it works everywhere except the row type this tool exists for.
+       - **And `text + "\\r"` in ONE write does not submit either.** yggterm's own
+         `server app terminal submit` (`shell.rs:76405`) writes the TEXT, sleeps
+         80 ms, then writes `"\\r"` as a DISCRETE second write, and says why:
+         *"codex treats a `\\r` concatenated with the text in one write as a pasted
+         newline (composer content), not a submit (verified live 2026-06-04)."*
+         ⇒ my first fix here was `BOOT_TEXT + "\\r"` in one write, which would
+         have reproduced the bug in a new costume. **The product already knew;
+         the watchdog had its own private encoding of "press Enter".**
+
+       Measured cost of the old `\\n`: `booter.log` shows `BOOT#1..#3:pty-write`
+       then `ESCALATE ... did not wake after 3 boots (21 min idle)`, twice over,
+       while the session sat idle for 40 minutes with every boot logged delivered.
+
+    ⇒ **PTY FIRST, composer as the fallback** — the reverse of the original order,
+      and the measurement is the reason. Every boot in the log took the fallback:
+      `pty-write`, 5 for 5. A composer attempt on an unmounted row is not a cheap
+      first try, it is a 30-SECOND STALL in front of the thing that works, and an
+      "exception" branch with a 100% hit rate means the code above it is
+      decoration. [[finding-a-deadline-shorter-than-its-release-condition]]
+      One line only — a multi-line send is one Enter per line and the rest queue.
+
+    ⚠ **KNOWN HAZARD, unchanged by this fix and filed rather than fixed here:**
+      the write APPENDS to whatever is in the composer, so a half-typed draft is
+      submitted with the boot text glued onto it. The daemon knows
+      (`session_has_pending_input_draft`); the booter does not ask."""
     if dry:
         log(f"DRY-RUN would boot {row}")
         return "dry-run"
+    if _pty_type_and_enter(host, row):
+        return "pty-write"
     r = _run(host, ["server", "app", "terminal", "submit", row, "--stdin"], BOOT_TEXT)
     if _field(r.stdout or "", "submitted") is True:
         return "submit"
-    w = _run(host, ["server", "terminal", "write", row, "--stdin"], BOOT_TEXT + "\n")
-    if _field(w.stdout or "", "accepted") is True:
-        return "pty-write"
     return ""
+
+
+def _pty_type_and_enter(host, row):
+    """Type the boot text, pause, then press Enter — as TWO writes.
+
+    The 80 ms mirrors `shell.rs`'s own submit path exactly; see `boot`'s §3 for
+    why a concatenated Enter reads as pasted content rather than a submit."""
+    typed = _run(host, ["server", "terminal", "write", row, "--stdin"], BOOT_TEXT)
+    if _field(typed.stdout or "", "accepted") is not True:
+        return False
+    time.sleep(0.08)
+    enter = _run(host, ["server", "terminal", "write", row, "--stdin"], "\r")
+    return _field(enter.stdout or "", "accepted") is True
 
 
 def escalate(host, row, why):
