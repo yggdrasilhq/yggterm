@@ -1594,29 +1594,91 @@ fn yggterm_process_args(args: &[String]) -> bool {
     })
 }
 
+/// What is holding an agent session that yggterm has been asked to resume.
+///
+/// The distinction is the whole point: **both verdicts stop a second resume**
+/// (racing either one corrupts the transcript), but they are not the same
+/// event and must not wear the same words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentResumeHolderKind {
+    /// A resume yggterm did not start, or started for a DIFFERENT row. The
+    /// user has it open somewhere we do not control; only they can close it.
+    External,
+    /// This session's OWN yggterm-launched process, orphaned by a daemon that
+    /// exited without handing its PTYs over. Nothing to close, nobody to
+    /// chase: its PTY is already collapsing and the wait is a reattach.
+    StrandedYggtermOwned,
+}
+
+/// Is this `claude`/`codex` process holding `session_id`, and on whose behalf?
+///
+/// ⛔ **Ancestry cannot answer this, and a daemon swap is exactly when it
+/// lies.** The real chain is `daemon → bash -c <exports…> claude … → claude`,
+/// and the wrapper `bash` matches neither arm of [`yggterm_process_args`] — so
+/// the DAEMON's presence in the ancestor list was the only thing making a
+/// session "ours". A version swap reparents the wrapper to init, the ancestor
+/// list becomes `[bash, init]`, and every session that daemon owned
+/// reclassifies as somebody else's. The guard then refuses to attach to the
+/// session yggterm itself started, and tells the owner to close an external
+/// terminal that never existed (measured on `dev`, 2026-08-09 12:10:22).
+///
+/// The process's own environment answers it properly: it is stamped at exec by
+/// `terminal::apply_session_identity_env` and therefore survives reparenting,
+/// daemon death and the swap itself. `marker` is that stamp, read through
+/// [`session_tenancy::session_marker_from_proc_environ`] — `None` means the
+/// environ could not be read, which stays External, because "cannot say" must
+/// never widen what we are willing to race.
+#[cfg(target_os = "linux")]
+fn agent_resume_process_holder_for_session(
+    kind: SessionKind,
+    args: &[String],
+    ancestor_args: &[Vec<String>],
+    marker: Option<&str>,
+    session_id: &str,
+) -> Option<AgentResumeHolderKind> {
+    if !agent_resume_args_match_session(kind, args, session_id) {
+        return None;
+    }
+    if marker.is_some_and(|marker| {
+        session_tenancy::session_marker_names_session(marker, session_id)
+    }) {
+        return Some(AgentResumeHolderKind::StrandedYggtermOwned);
+    }
+    // The ancestry walk stays as a FALLBACK for anything predating the marker:
+    // a live yggterm ancestor still means the process is not somebody else's.
+    if ancestor_args
+        .iter()
+        .any(|ancestor| yggterm_process_args(ancestor))
+    {
+        return Some(AgentResumeHolderKind::StrandedYggtermOwned);
+    }
+    Some(AgentResumeHolderKind::External)
+}
+
 #[cfg(target_os = "linux")]
 fn agent_resume_process_is_external_for_session(
     kind: SessionKind,
     args: &[String],
     ancestor_args: &[Vec<String>],
+    marker: Option<&str>,
     session_id: &str,
 ) -> bool {
-    agent_resume_args_match_session(kind, args, session_id)
-        && !ancestor_args
-            .iter()
-            .any(|ancestor| yggterm_process_args(ancestor))
+    agent_resume_process_holder_for_session(kind, args, ancestor_args, marker, session_id)
+        == Some(AgentResumeHolderKind::External)
 }
 
 #[cfg(target_os = "linux")]
 fn codex_resume_process_is_external_for_session(
     args: &[String],
     ancestor_args: &[Vec<String>],
+    marker: Option<&str>,
     session_id: &str,
 ) -> bool {
     agent_resume_process_is_external_for_session(
         SessionKind::Codex,
         args,
         ancestor_args,
+        marker,
         session_id,
     )
 }
@@ -1643,6 +1705,10 @@ fn linux_proc_ancestor_cmdline_args(pid: u32) -> Vec<Vec<String>> {
 struct ExternalCodexResumeProcess {
     pid: u32,
     argv0: String,
+    /// Whose resume this is. Carried on the process rather than re-derived by
+    /// each consumer, so the wait, the refusal and the message can never
+    /// disagree about what they are looking at.
+    holder: AgentResumeHolderKind,
 }
 
 #[cfg(target_os = "linux")]
@@ -1665,11 +1731,19 @@ fn external_agent_resume_processes_for_session(
                 return None;
             }
             let ancestor_args = linux_proc_ancestor_cmdline_args(pid);
-            agent_resume_process_is_external_for_session(kind, &args, &ancestor_args, session_id)
-                .then(|| ExternalCodexResumeProcess {
-                    pid,
-                    argv0: args.first().cloned().unwrap_or_default(),
-                })
+            let marker = session_tenancy::session_marker_from_proc_environ(pid);
+            let holder = agent_resume_process_holder_for_session(
+                kind,
+                &args,
+                &ancestor_args,
+                marker.as_deref(),
+                session_id,
+            )?;
+            Some(ExternalCodexResumeProcess {
+                pid,
+                argv0: args.first().cloned().unwrap_or_default(),
+                holder,
+            })
         })
         .collect::<Vec<_>>();
     processes.sort_by_key(|process| process.pid);
@@ -1689,6 +1763,7 @@ fn external_codex_resume_processes_for_session(
 struct ExternalCodexResumeProcess {
     pid: u32,
     argv0: String,
+    holder: AgentResumeHolderKind,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1706,45 +1781,115 @@ fn external_agent_resume_processes_for_session(
     Vec::new()
 }
 
-fn remote_resume_external_active_message(
+/// What the viewport says while the resume is held.
+///
+/// ⛔ **This text is the whole of defect 2, and its cost was a minute of the
+/// owner's time.** The line it replaces was a bare `Error:` that named a pid
+/// which no longer existed by the time anyone looked, and then instructed
+/// *"close that external terminal"* — pointing at nothing, on a session
+/// yggterm itself had started. A refusal that cannot be acted on is worse than
+/// silence, because the reader spends their attention looking for a terminal
+/// that was never open.
+///
+/// `elapsed_secs` is re-rendered as the wait runs: one static line in a blank
+/// viewport is indistinguishable from a hang, which is precisely how this read
+/// to the person waiting on it.
+fn remote_resume_external_active_message_with_elapsed(
+    kind: SessionKind,
     session_id: &str,
     processes: &[ExternalCodexResumeProcess],
+    elapsed_secs: Option<u64>,
 ) -> String {
+    let display = remote_runtime_agent_display(kind);
     let pids = processes
         .iter()
         .map(|process| process.pid.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        "yggterm: Codex session {session_id} is already active outside Yggterm (pid {pids}); waiting instead of starting a second resume. Close that external terminal to let Yggterm attach."
-    )
+    // Mixed holders are reported as external: the strictest reading is the one
+    // that keeps a resume we do not understand from being raced.
+    let stranded = !processes.is_empty()
+        && processes
+            .iter()
+            .all(|process| process.holder == AgentResumeHolderKind::StrandedYggtermOwned);
+    let waited = match elapsed_secs {
+        Some(secs) if secs > 0 => format!(" Waiting {secs}s so far."),
+        _ => String::new(),
+    };
+    if stranded {
+        format!(
+            "yggterm: {display} session {session_id} is still held by a yggterm process (pid {pids}) \
+             whose daemon exited without handing it over; waiting for it to release the session \
+             instead of starting a second resume. There is nothing to close — this clears itself.{waited}"
+        )
+    } else {
+        format!(
+            "yggterm: {display} session {session_id} is already active outside Yggterm (pid {pids}); \
+             waiting instead of starting a second resume. Close that external terminal to let \
+             Yggterm attach.{waited}"
+        )
+    }
 }
 
+fn remote_resume_external_active_message(
+    kind: SessionKind,
+    session_id: &str,
+    processes: &[ExternalCodexResumeProcess],
+) -> String {
+    remote_resume_external_active_message_with_elapsed(kind, session_id, processes, None)
+}
+
+/// Is this viewport showing the guard's banner rather than a failed resume?
+///
+/// ⚠ Both wordings must be recognised. The banner reaches this function having
+/// been through a terminal, so it arrives WRAPPED — the live sample from
+/// 2026-08-09 reads `yggterm:codex session<uuid>is already active…`, with the
+/// spaces eaten at the wrap points. Match on short fragments that a wrap is
+/// unlikely to land inside, never on the whole sentence.
 fn remote_resume_snapshot_is_external_active_guard(bytes: &[u8]) -> bool {
     let normalized = String::from_utf8_lossy(bytes).to_ascii_lowercase();
-    normalized.contains("yggterm:")
-        && normalized.contains("already active outside yggterm")
-        && normalized.contains("waiting instead of starting a second resume")
+    if !normalized.contains("yggterm:") {
+        return false;
+    }
+    let external = normalized.contains("already active outside yggterm")
+        && normalized.contains("waiting instead of starting a second resume");
+    let stranded = normalized.contains("still held by a yggterm process")
+        && normalized.contains("waiting for it to release the session");
+    external || stranded
 }
 
 fn wait_for_external_codex_resume_to_clear(home: &Path, session_id: &str) {
     wait_for_external_agent_resume_to_clear(SessionKind::Codex, home, session_id)
 }
 
+/// How long the banner may sit unchanged before it is re-rendered with the
+/// elapsed time. Long enough not to scroll a viewport, short enough that a
+/// person who looks away and back can tell the wait is still live.
+const EXTERNAL_ACTIVE_WAIT_REPRINT: Duration = Duration::from_secs(10);
+
 fn wait_for_external_agent_resume_to_clear(kind: SessionKind, home: &Path, session_id: &str) {
-    let mut announced = false;
+    let started = Instant::now();
+    let mut announced: Option<Instant> = None;
     let mut last_pids = Vec::<u32>::new();
     loop {
         let processes = external_agent_resume_processes_for_session(kind, session_id);
         if processes.is_empty() {
-            if announced {
+            if announced.is_some() {
                 append_trace_event(
                     home,
                     "remote",
                     "resume_codex",
                     "external_active_wait_end",
-                    json!({ "session_id": session_id }),
+                    json!({
+                        "session_id": session_id,
+                        "waited_secs": started.elapsed().as_secs(),
+                    }),
                 );
+                // The wait ENDING is as load-bearing as its starting: the
+                // viewport otherwise keeps the last banner and reads as stuck
+                // right up to the moment the agent repaints over it.
+                println!("yggterm: the session was released; attaching now.");
+                let _ = std::io::stdout().flush();
             }
             return;
         }
@@ -1752,7 +1897,8 @@ fn wait_for_external_agent_resume_to_clear(kind: SessionKind, home: &Path, sessi
             .iter()
             .map(|process| process.pid)
             .collect::<Vec<_>>();
-        if !announced || pids != last_pids {
+        let stale = announced.is_some_and(|at| at.elapsed() >= EXTERNAL_ACTIVE_WAIT_REPRINT);
+        if announced.is_none() || pids != last_pids || stale {
             append_trace_event(
                 home,
                 "remote",
@@ -1762,19 +1908,29 @@ fn wait_for_external_agent_resume_to_clear(kind: SessionKind, home: &Path, sessi
                     "session_id": session_id,
                     "pids": pids,
                     "argv0": processes.iter().map(|process| process.argv0.clone()).collect::<Vec<_>>(),
+                    "holder": processes
+                        .iter()
+                        .map(|process| match process.holder {
+                            AgentResumeHolderKind::External => "external",
+                            AgentResumeHolderKind::StrandedYggtermOwned => "stranded_yggterm_owned",
+                        })
+                        .collect::<Vec<_>>(),
+                    "waited_secs": started.elapsed().as_secs(),
                     "policy": "session_survival_before_yggterm_attach",
                 }),
             );
             println!(
                 "{}",
-                remote_resume_external_active_message(session_id, &processes)
+                remote_resume_external_active_message_with_elapsed(
+                    kind,
+                    session_id,
+                    &processes,
+                    Some(started.elapsed().as_secs()),
+                )
             );
             let _ = std::io::stdout().flush();
-            announced = true;
-            last_pids = processes
-                .iter()
-                .map(|process| process.pid)
-                .collect::<Vec<_>>();
+            announced = Some(Instant::now());
+            last_pids = pids;
         }
         std::thread::sleep(Duration::from_millis(3_000));
     }
@@ -8164,11 +8320,20 @@ impl YggtermServer {
                         json!({
                             "session_id": session_id,
                             "pids": external_processes.iter().map(|process| process.pid).collect::<Vec<_>>(),
+                            "holder": external_processes
+                                .iter()
+                                .map(|process| match process.holder {
+                                    AgentResumeHolderKind::External => "external",
+                                    AgentResumeHolderKind::StrandedYggtermOwned =>
+                                        "stranded_yggterm_owned",
+                                })
+                                .collect::<Vec<_>>(),
                             "policy": "session_survival_before_yggterm_attach",
                         }),
                     );
                 }
                 anyhow::bail!(remote_resume_external_active_message(
+                    kind,
                     session_id,
                     &external_processes
                 ));
@@ -29106,6 +29271,7 @@ mod tests {
         assert!(super::codex_resume_process_is_external_for_session(
             &external,
             &[],
+            None,
             "019dfde8-d02a-7c23-a270-bab0539e7025"
         ));
 
@@ -29117,8 +29283,92 @@ mod tests {
         assert!(!super::codex_resume_process_is_external_for_session(
             &external,
             &[yggterm_ancestor],
+            None,
             "019dfde8-d02a-7c23-a270-bab0539e7025"
         ));
+    }
+
+    /// ⛔ THE STRANDING. A version swap kills the owning daemon, the wrapper
+    /// `bash` reparents to init, and the ancestor list becomes `[bash, init]` —
+    /// neither of which is a yggterm process. Ancestry alone therefore calls
+    /// yggterm's OWN agent somebody else's, refuses to attach to it, and tells
+    /// the owner to close an external terminal that never existed.
+    ///
+    /// The process's environment is stamped at exec and outlives all of that.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reparented_agent_is_still_ours_by_its_own_environment() {
+        use super::AgentResumeHolderKind;
+
+        let session = "bb658b4b-99c1-4920-8edc-ea25f6455468";
+        // Measured live on `dev`: this is the real argv and the real ancestry
+        // after the owning daemon exits.
+        let claude = vec![
+            "claude".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--session-id".to_string(),
+            session.to_string(),
+        ];
+        let orphan_ancestry = vec![
+            vec!["/bin/bash".to_string(), "-c".to_string()],
+            vec!["/usr/lib/systemd/systemd".to_string()],
+        ];
+
+        let holder = |marker: Option<&str>| {
+            super::agent_resume_process_holder_for_session(
+                SessionKind::ClaudeCode,
+                &claude,
+                &orphan_ancestry,
+                marker,
+                session,
+            )
+        };
+
+        // The bug: ancestry alone, no marker, and it is called external.
+        assert_eq!(holder(None), Some(AgentResumeHolderKind::External));
+
+        // The fix: its own stamp names this session, so it is ours — stranded,
+        // not foreign.
+        assert_eq!(
+            holder(Some(&format!("cc-runtime://{session}"))),
+            Some(AgentResumeHolderKind::StrandedYggtermOwned),
+        );
+        // ⛔ And through an ssh hop, where sshd has stripped the unprefixed
+        // name and only the `LC_` mirror survived. Reading one name would pass
+        // the line above and fail on every remote row — which is the only kind
+        // of row this bug happens to.
+        assert_eq!(
+            super::session_tenancy::session_marker_from_environ_bytes(
+                format!("LANG=C\0LC_YGGTERM_SESSION_ID=remote-cc://dev/{session}\0").as_bytes()
+            )
+            .as_deref(),
+            Some(format!("remote-cc://dev/{session}").as_str()),
+        );
+        assert_eq!(
+            holder(Some(&format!("remote-cc://dev/{session}"))),
+            Some(AgentResumeHolderKind::StrandedYggtermOwned),
+        );
+
+        // ⛔ A marker naming a DIFFERENT row stays external. A user who typed
+        // `claude --resume <this session>` inside some other yggterm shell row
+        // really would race us, and "it is inside yggterm somewhere" is not the
+        // question being asked.
+        assert_eq!(
+            holder(Some("local://0e96c07d-cc0e-45ec-b04a-5da4186752a5")),
+            Some(AgentResumeHolderKind::External),
+        );
+
+        // A process that is not this session's resume at all is not a holder.
+        assert_eq!(
+            super::agent_resume_process_holder_for_session(
+                SessionKind::ClaudeCode,
+                &["claude".to_string()],
+                &orphan_ancestry,
+                None,
+                session,
+            ),
+            None,
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -29141,25 +29391,86 @@ mod tests {
 
     #[test]
     fn external_active_guard_message_is_not_a_failed_resume() {
-        let message = super::remote_resume_external_active_message(
-            "abc123",
-            &[super::ExternalCodexResumeProcess {
-                pid: 42,
-                argv0: "node".to_string(),
-            }],
-        );
-        assert!(super::remote_resume_snapshot_is_external_active_guard(
-            message.as_bytes()
-        ));
-        assert!(!remote_resume_runtime_output_requires_restart(
-            message.as_bytes()
-        ));
-        assert!(
-            !super::remote_resume_runtime_output_mismatches_saved_session(
+        for holder in [
+            super::AgentResumeHolderKind::External,
+            super::AgentResumeHolderKind::StrandedYggtermOwned,
+        ] {
+            let message = super::remote_resume_external_active_message(
+                SessionKind::Codex,
                 "abc123",
+                &[super::ExternalCodexResumeProcess {
+                    pid: 42,
+                    argv0: "node".to_string(),
+                    holder,
+                }],
+            );
+            // ⛔ BOTH wordings must read as the guard's banner. A wording the
+            // classifier does not know is read as a FAILED resume, and the
+            // recovery for that is a restart — which is the one thing this
+            // banner exists to avoid.
+            assert!(
+                super::remote_resume_snapshot_is_external_active_guard(message.as_bytes()),
+                "unrecognised banner for {holder:?}: {message}"
+            );
+            assert!(!remote_resume_runtime_output_requires_restart(
                 message.as_bytes()
-            )
+            ));
+            assert!(
+                !super::remote_resume_runtime_output_mismatches_saved_session(
+                    "abc123",
+                    message.as_bytes()
+                )
+            );
+        }
+    }
+
+    /// The banner must not tell the owner to close something that does not
+    /// exist, and must not claim a Claude Code session is a Codex one.
+    #[test]
+    fn a_stranded_session_is_not_reported_as_an_external_terminal() {
+        let stranded = [super::ExternalCodexResumeProcess {
+            pid: 3_942_934,
+            argv0: "claude".to_string(),
+            holder: super::AgentResumeHolderKind::StrandedYggtermOwned,
+        }];
+        let message = super::remote_resume_external_active_message_with_elapsed(
+            SessionKind::ClaudeCode,
+            "bb658b4b-99c1-4920-8edc-ea25f6455468",
+            &stranded,
+            Some(24),
         );
+        assert!(
+            !message.contains("outside Yggterm"),
+            "a session yggterm started is not outside it: {message}"
+        );
+        assert!(
+            !message.contains("Close that external terminal"),
+            "the one instruction it gave pointed at nothing: {message}"
+        );
+        assert!(message.contains("Claude Code"), "{message}");
+        // The elapsed time is what separates a live wait from a hang.
+        assert!(message.contains("Waiting 24s"), "{message}");
+
+        // A genuinely external holder keeps the instruction that CAN be acted
+        // on — the fix removes a lie, not the guidance.
+        let external = [super::ExternalCodexResumeProcess {
+            pid: 42,
+            argv0: "node".to_string(),
+            holder: super::AgentResumeHolderKind::External,
+        }];
+        let message = super::remote_resume_external_active_message(
+            SessionKind::Codex,
+            "abc123",
+            &external,
+        );
+        assert!(message.contains("Close that external terminal"), "{message}");
+
+        // ⛔ Mixed holders report as external: the strictest reading is the one
+        // that keeps a resume we do not understand from being raced.
+        let mixed = [external[0].clone(), stranded[0].clone()];
+        let message =
+            super::remote_resume_external_active_message(SessionKind::Codex, "abc123", &mixed);
+        assert!(message.contains("already active outside Yggterm"), "{message}");
     }
 
     #[cfg(unix)]

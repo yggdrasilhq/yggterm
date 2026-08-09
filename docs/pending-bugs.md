@@ -49,118 +49,128 @@ one measurement, not a guess.
 
 ## ⛔⛔ A DEPLOY STRANDS THE DEPLOYER'S OWN ROW: THE WORKING DOT GOES STILL, THE CLICK BLOCKS A MINUTE, AND THE RE-RESUME KILLS THE WORK
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 ⚖ **The CONSTITUTION's *"a session owned by an OLDER daemon is still a
 first-class row in the current GUI, and clicking it must WORK"* failing, reported
-by the owner 2026-08-09 ~12:13 while it was happening to him.** He saw an agent
-row's working indicator stop blinking, went to check on it, and **could not do
-anything for about a minute**.
-
-**Measured timeline, one host (`dev`), one row (`remote-cc://dev/bb658b4b…`):**
-
-| time | event |
-|---|---|
-| 12:01:34 | a session installs 3.0.77 over `~/.yggterm/bin/yggterm-headless` |
-| 12:09:24 | a NEW daemon (pid 12141) starts from that path; the row's PTY still belongs to the superseded one |
-| 12:13 | the owner clicks the row. The viewport shows a raw `Error:` line and nothing else for ~1 min |
-| after | the row attaches as a **brand-new** `claude --resume` process; every background job the old process had in flight is gone |
-
-The error he was shown, verbatim:
+by the owner 2026-08-09 while it was happening to him.** He saw an agent row's
+working indicator stop blinking, went to check on it, and **could not do anything
+for about a minute**. The error he was shown, verbatim:
 
 ```
 Error: yggterm: Codex session <uuid> is already active outside Yggterm (pid 3942934);
 waiting instead of starting a second resume. Close that external terminal to let Yggterm attach.
 ```
 
-⇒ **Three separate defects share this one cause, and each is worth fixing on its
-own terms:**
+### ⭐ ROOT-CAUSED FROM THE TRACE, 2026-08-09 — AND THE FIRST DIAGNOSIS WAS THE AGGRAVATOR, NOT THE CAUSE
 
-1. ⛔ **The liveness instrument goes dark, so a HEALTHY session reads as
-   stalled.** The working indicator is fed by PTY output from the daemon that
-   OWNS the row; once ownership is stranded the GUI has no stream at all, and a
-   still dot is indistinguishable from a dead agent. Two instruments disagreed
-   and the wrong one was on screen: the booter, reading transcript activity,
-   logged `WORKING` at 11:46 · 11:51 · 11:56 · 12:01 · 12:06 · 12:11 throughout —
-   it was right, and it correctly declined to boot a row that was not stalled.
-   ⇒ [[finding-agent-session-liveness-is-invisible-to-os-signals]]
-2. ⛔ **The guard is correct and its PRESENTATION is the bug.** Refusing a second
-   resume is right. Printing one `Error:` line into a blank viewport and then
-   blocking with no progress, no elapsed time and no way out is what turned a
-   correct refusal into a minute of the owner's time. ⚠ It also names a pid
-   (`3942934`) that **no longer exists** by the time anyone looks, so the one
-   actionable instruction it gives — *"close that external terminal"* — points at
-   nothing.
-3. ⛔⛔ **The re-resume DESTROYS in-flight work.** The row came back as a new
-   process, so the stranded one's running jobs (here: a full `cargo test
-   --workspace`, ~20 min in) died with it, silently and with no record. This is
-   the constitution's *"they never stall their work waiting for ours"* inverted —
-   **our deploy did not stall the other agent's work, it deleted it** — and the
-   agent it happened to was the one that ran the deploy.
+⛔ **The entry previously filed here named the ancestry predicate as THE cause and
+put the click at 12:13. Both were wrong**, and the daemon's own trace said so —
+it had recorded the real answer in a field nobody read. Corrected timeline, one
+host (`dev`), one row (`cc-runtime://bb658b4b…`), every line from
+`~/.yggterm/event-trace*.jsonl`:
 
-### ⭐ DIAGNOSED, 2026-08-09 — OWNERSHIP IS DECIDED BY ANCESTRY, AND ANCESTRY IS EXACTLY WHAT A DAEMON SWAP DESTROYS
+| time | event |
+|---|---|
+| 12:01:34 | a session installs 3.0.77 by `mv`-ing the OLD binary aside and `rm`-ing the backup |
+| 12:09:40 | **the owner clicks the row** — `server remote resume-cc bb658b4b … --require-existing` |
+| 12:09:43 | the click SYNCHRONOUSLY starts a hot update of the stale 3.0.76 owner (pid 3779735) |
+| 12:09:56 | `hot_update_handoff_prepared` — "preserving 55 live terminal runtime(s)" |
+| 12:10:07 | `hot_update_stale_runtime_owner_not_ready` → `..._direct_bridge_fallback` |
+| 12:10:16 | ⛔ `daemon_self_retire_handoff_skipped` `reason:replacement_binary_missing` |
+| 12:10:20 | the 3.0.76 daemon **cold-exits, taking all 55 PTYs with it** |
+| 12:10:22 | the new daemon meets the orphaned `claude`, calls it EXTERNAL, and refuses |
+| 12:11:15 | a retry spawns a **brand-new** `claude` (pid 27685). The 20-minute `cargo test` is gone |
 
-Defect 2 above is not a heuristic that got unlucky; it is structural, and it is
-provable from the code without needing a live repro.
-`agent_resume_process_is_external_for_session` (`lib.rs:1598`) calls a session
-external iff **no ancestor** satisfies `yggterm_process_args` (`lib.rs:1580`),
-which matches only when argv0's basename is `yggterm` / `yggterm-headless`, or
-the argv contains a `server remote resume-codex|start-codex|resume-cc|start-cc`
-triple.
+⭐ **THE ROOT: the daemon derives its successor binary from the grave of its own
+binary.** `disk_replace_handoff_target` read `/proc/self/exe`, stripped the
+literal `" (deleted)"` suffix, and treated what was left as the newly-installed
+binary. The trace prints the value it got:
 
-The real chain for every agent row is **daemon → `bash -c <exports…> claude …` →
-`claude`**, and that wrapper `bash` matches **neither** arm. ⇒ **the daemon's own
-presence in the ancestry is the ONLY thing making the session "ours."** When the
-owning daemon exits — which is what a version swap does, and what the
-constitution explicitly sanctions — the wrapper is reparented to init and the
-ancestor list becomes `[bash, init]`. Both fail the test, so a perfectly
-legitimate yggterm-owned agent is reclassified **external**, the guard fires, and
-`wait_for_external_agent_resume_to_clear` blocks until that session dies.
+```
+exe_link: "/home/user/.yggterm/bin/yggterm-headless.old.4121874 (deleted)"
+new_exe : "/home/user/.yggterm/bin/yggterm-headless.old.4121874"     ← does not exist
+```
 
-⛔ **So the guard's failure mode is precisely inverted from its purpose.** It
-exists to stop a SECOND resume racing a real external terminal; what it actually
-does on a daemon swap is refuse to attach to the session yggterm itself started,
-then wait for that session to die — which is why the owner's minute ended with
-the row coming back as a NEW process.
+⇒ **`/proc/self/exe` names where this daemon's binary WAS, not where the install
+IS, and which of those two the path means is decided by the DEPLOYER'S
+choreography.** `mv new …/yggterm-headless` (the field guide's own recipe, §4.2)
+replaces in place and the derivation holds. `mv yggterm-headless
+yggterm-headless.old.$$ ; cp new yggterm-headless ; rm -f *.old.*` renames the
+OLD binary away first — the exe link follows the rename, the `rm` deletes it, and
+the derivation lands on a path nothing will ever create again. The handoff is
+skipped, the daemon cold-exits, and **every PTY it owns dies**. The install was
+sitting beside it under its canonical name the whole time.
 
-⭐ **Candidate fix, and it collapses a duplicate rather than adding a layer:** a
-yggterm-spawned agent already carries durable proof of ownership **on the process
-itself** — `YGGTERM_TERM_PROGRAM=yggterm` and
-`YGGTERM_SESSION_ID=cc-runtime://<uuid>` in `/proc/<pid>/environ`, verified
-present on a live row. Environment is fixed at exec, so it **survives
-reparenting, daemon death and version swaps**, and `YGGTERM_SESSION_ID` answers
-the sharper question ("is this MY session?") that ancestry can only approximate.
-Read ownership there; keep the ancestry walk at most as a fallback for processes
-predating the marker.
+⚠ **The two failures wore the same costume, which is why this hid.** A skipped
+handoff and a broken predicate both end with "the row came back as a new
+process"; only the trace separates them, and only one of them is why 55 sessions
+died.
 
-⭐ **And the question already has an owner — do not write a second answer.**
-`session_tenancy.rs` exists to say *"which session does this process belong
-to"*, and `parent_session_path_from_env` (`session_tenancy.rs:96`) already reads
-the key list **`["YGGTERM_SESSION_ID", "LC_YGGTERM_SESSION_ID"]`**. The resume
-guard is asking that same question a second, worse way; the fix is to collapse
-the duplicate, per `CLAUDE.md` §single source of truth.
+⭐ **THE AGGRAVATOR (real, and worth its own fix): ownership was decided by
+ancestry, and ancestry is exactly what a daemon swap destroys.** The chain for
+every agent row is **daemon → `bash -c <exports…> claude …` → `claude`**, and the
+wrapper `bash` matches neither arm of `yggterm_process_args` — so the daemon's own
+presence was the ONLY thing making a session "ours". Once it exits the wrapper
+reparents to init, the ancestor list becomes `[bash, init]`, and yggterm's own
+agent is reclassified **external**. The guard's failure mode is then precisely
+inverted from its purpose: it exists to stop a second resume racing a real
+external terminal, and what it did was refuse to attach to the session yggterm
+itself started — while naming a pid that no longer existed and instructing the
+owner to close a terminal that was never open.
 
-⛔ **The `LC_` twin is not redundancy, and missing it would break exactly the
-remote rows this bug is about:** `session_tenancy.rs:93` records that **sshd
-strips `YGGTERM_SESSION_ID`**, so on any ssh-borne row the marker survives only
-as `LC_YGGTERM_SESSION_ID`. A fix that reads one name would work locally and fail
-on every remote row — [[finding-a-claim-proven-on-one-lane-is-not-proven]].
+### WHAT SHIPPED
 
-⚠ Two things to check before building, both cheap:
-- `parent_session_path_from_env` reads **this** process's env via `std::env`; the
-  guard needs the env of a CANDIDATE pid (`/proc/<pid>/environ`). Add the sibling
-  read **in that module** so the key list and the sshd caveat keep one home —
-  do not copy the names into `lib.rs`.
-- `terminal.rs:3278/3289` sets both names on the PTY spawn. Confirm that is the
-  funnel EVERY agent launch passes through (local, remote, ssh, command rows)
-  before relying on the marker.
+1. **`disk_replace_handoff_candidates`** (`daemon.rs`) returns an ORDERED
+   candidate list — the in-place path first, then the canonical name beside the
+   backup — and the caller takes the first that is a file. A skip now traces
+   every path it looked at, not just the first.
+2. **`agent_resume_process_holder_for_session`** (`lib.rs`) reads the candidate
+   pid's OWN `/proc/<pid>/environ` through a new sibling in `session_tenancy.rs`,
+   so the key list and the sshd caveat keep one home. Environment is fixed at
+   exec and therefore survives reparenting, daemon death and the swap itself.
+   Ancestry stays as a fallback for processes predating the marker.
+   ⛔ Both `YGGTERM_SESSION_ID` and the `LC_` mirror are read: **sshd strips the
+   unprefixed name**, so a fix reading one would pass locally and fail on every
+   remote row — which is the only kind of row this happens to.
+   ⛔ A marker naming a DIFFERENT row stays external: a `claude --resume` the
+   user typed in some other yggterm shell really would race us.
+3. **The banner tells the truth and shows its elapsed time.** A stranded holder
+   is no longer reported as an external terminal, the CLI is named correctly
+   (it said "Codex session" on Claude Code rows), and the wait re-renders every
+   10 s so a live wait cannot read as a hang. Both wordings are recognised by
+   `remote_resume_snapshot_is_external_active_guard` — a wording the classifier
+   does not know is read as a FAILED resume, whose recovery is the restart this
+   banner exists to avoid.
+
+⛔ **Both verdicts still REFUSE a second resume, and that is deliberate.** The
+tempting reading of "it is ours after all" is *proceed* — which would spawn a
+second `claude` beside a live one and corrupt the transcript. The fix removes a
+lie; it does not widen what we are willing to race.
+
+### WHAT IS STILL OPEN UNDER THIS ENTRY
+
+- ⚠ **The click drives a 24-second synchronous hot-update of the stale owner**,
+  then reports `not_ready` and falls back to a direct bridge that lasted **one
+  second** before the owner died under it. That is most of the owner's minute and
+  none of it is fixed here.
+- ⚠ **The working indicator still goes dark** whenever a row's owning daemon is
+  gone: it is fed by PTY output from the OWNER, so a still dot is
+  indistinguishable from a dead agent. The booter, reading transcript activity,
+  logged `WORKING` at 11:46 · 11:51 · 11:56 · 12:01 · 12:06 · 12:11 throughout —
+  it was right, and the instrument on screen was not.
+  ⇒ [[finding-agent-session-liveness-is-invisible-to-os-signals]]
 
 ⚠ **Do not file this as "the deployer should be more careful."** Deploying over a
 running daemon is sanctioned and routine (`docs/agent-field-guide.md` §4); the
-architecture promises the row survives it. **The falsifier:** with a live agent
-row mid-work on host H, deploy a new daemon to H, then click that row from the
-GUI — it must attach to the SAME process, keep its jobs, and never show a raw
-error.
+architecture promises the row survives it, and a promise that depends on which
+`mv` the deployer typed is not a promise.
+
+**The falsifier, and it is the whole entry:** with a live agent row mid-work on
+host H, deploy a new daemon to H by renaming the old binary aside, then click
+that row from the GUI. It must attach to the SAME process, keep its jobs, and
+never show a raw error. If `daemon_self_retire_handoff_skipped` appears in the
+trace again, candidate 2 did not resolve and this is not fixed.
 
 ## ⛔⛔ `guihost`'s `libyggterm` IS STILL THE PRE-SCRUB HISTORY — ONE PUSH FROM RE-LEAKING `/home/user` INTO A PUBLIC REPO
 

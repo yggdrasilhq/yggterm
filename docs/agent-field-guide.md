@@ -45,6 +45,7 @@ Every entry below cost a session at least once.
 | `element.hasAttribute('data-web-tab-active')` (or any `data-*` flag) | Whenever the attribute is rendered with the literal value `"false"` — presence is not truth, so every tab reads "active" | `getAttribute(...)` and compare the VALUE |
 | `grep` over the working tree for shipped behaviour | Whenever your lane branch is behind `main` — you read source the running binary was never built from, and conclude a shipped knob does not exist | `git show origin/main:<path>`, and check `git log --oneline origin/main` first |
 | **A contributed rail pane you are looking at** | The app's daemon predates the installed binary. The pane's schema is served by the DAEMON's resident code, so a shipped, committed, deployed fix renders as the pre-fix pane and every instrument agrees with it. The documented ychrome landmine says a stale daemon REFUSES a new invocation; it has a quieter mode where it ACCEPTS one and serves the old schema (measured 2026-08-02: daemon started 11:58, binary installed 21:11, Edit tab drew the pre-fix wording verbatim) | Compare the daemon process's start time against the binary's mtime BEFORE reading anything into the UI — `ps -eo pid,lstart,args \| grep '[y]chrome --daemon'` vs `ls -la ~/.local/bin/ychrome` |
+| `/proc/<daemon-pid>/exe` as "where the installed binary is" | Whenever a deploy RENAMED rather than replaced in place. The link follows a rename, so after `mv yggterm-headless yggterm-headless.old.$$ ; cp new yggterm-headless ; rm -f *.old.*` it reads `…/yggterm-headless.old.4121874 (deleted)` — the grave of the OLD binary, not the install sitting beside it. It names where this process's file WAS. Reading it as the install is what skipped the PTY handoff on `dev` 2026-08-09 and cold-killed **55 live terminals** | The canonical name in that directory (`…/yggterm-headless`), with the exe link as one candidate among several — never as the answer. `disk_replace_handoff_candidates` is the one place that decides this |
 | A directory listing of `~/.yggterm/server-*.sock` | Always, if you read it as litter. guihost holds **633** of them going back to 2.1.x and **every one accepts a connection**: all but the current version are SYMLINKS the daemon retargets to its live socket at startup (`refresh_legacy_server_socket_aliases`) so an older client can still find it. Sweeping them deletes the cross-version compatibility plane | `ls -l` (they are symlinks, not sockets), or connect and read `server_version` |
 
 **The rule underneath all of them:** if the symptom is visual, the proof is a
@@ -194,6 +195,16 @@ The live host runs the daemon from `~/.local/bin/`, but remote wrappers invoke
 
 `cp -a` each to `*.rollback` first, then **`mv` the new binary in — never `cp`**
 (cp over a running binary is `ETXTBSY`).
+
+⛔ **And never "fix" that `ETXTBSY` by moving the OLD binary aside first.** The
+improvisation it invites — `mv yggterm-headless yggterm-headless.old.$$ ; cp new
+yggterm-headless ; rm -f *.old.*` — succeeds, prints the new `--version`, and
+looks identical to the recipe above. What it actually does is drag every running
+daemon's `/proc/self/exe` onto the backup's name and then delete it, which used
+to leave the daemon unable to find its successor: it skipped the PTY handoff and
+cold-exited, killing **55 live terminals** on `dev` on 2026-08-09. The daemon now
+looks in both places, so this no longer destroys sessions — but `mv` in place is
+still the one form where nothing has to be recovered from.
 
 ⚠ **Cap the rollbacks — they are ~48 MB each and pile up fast.** A single
 `*.rollback` per dir would be overwritten each swap, but a dated/named rollback
