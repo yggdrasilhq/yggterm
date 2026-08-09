@@ -4,6 +4,24 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A pasted newline is content, not Enter — the daemon's model of the composer
+  said otherwise, and both of its readers acted on that.**
+  `input_line_has_unsent_draft_after` reconstructs "is there unsent text in the
+  composer" from forwarded input bytes. It skipped the bracketed-paste markers
+  but read the newlines BETWEEN them on the un-escaped stream, so a pasted
+  multi-line prompt cleared the very flag that protects it. The two readers are
+  `--refuse-if-draft`, which would then type over the owner's pasted text, and
+  `session_is_migratable` clause (b), whose own docstring calls losing unsent
+  work "the cardinal sin" and which was therefore free to release that session
+  across a hot restart. `ESC [ 200~` exists precisely so a receiver can tell a
+  pasted newline from a pressed Enter; the predicate was discarding that
+  distinction. Newlines inside a paste are now content, tracked by depth so an
+  unbalanced closer cannot make every later newline look pasted.
+  A/B on the real daemon wire (`draftprobe.sh`): a paste with no newline refuses
+  on both binaries (the control), the same paste WITH newlines answers
+  `refused_for_draft:false` on 3.0.84 and `true` on 3.0.85, and a bare newline
+  outside a paste is unchanged on both.
+
 - **You can now ask a specific background service, not just the one that
   answers by default.** The listing added in the previous release could name
   every service on the machine but no command could address any of them — asking
