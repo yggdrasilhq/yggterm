@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Opening a session that an older background service still owns is now
+  immediate instead of taking twenty seconds.** After an update, sessions that
+  were already running stay with the service that started them until they are
+  done. Clicking one of those used to make yggterm upgrade that older service
+  first and wait for the replacement to be ready — but it only waited eight
+  seconds, and the replacement needs about fifteen, so the wait always ran out
+  and yggterm then connected to the older service anyway: the one it could have
+  used at the start. You paid eighteen seconds for a step that changed nothing.
+  It now connects straight away and does the upgrade behind your session once it
+  is on screen. Measured on a live machine: the session appears **0.7 seconds**
+  after the connection is resolved, and the upgrade still happens.
+
 - **Updating yggterm no longer kills the sessions that were running while it
   updated.** When a new version was installed, the old background service was
   supposed to hand its live terminals to the new one and step aside. Instead it

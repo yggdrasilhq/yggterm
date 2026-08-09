@@ -195,7 +195,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use tracing::{debug, info, warn};
@@ -17317,30 +17317,21 @@ pub fn control_endpoint_for_runtime_key(home: &Path, runtime_key: &str) -> Serve
         .unwrap_or_else(|| default_endpoint(home))
 }
 
-fn wait_for_current_live_remote_runtime_key(
-    home: &Path,
-    runtime_key: &str,
-    timeout: Duration,
-) -> Option<(ServerEndpoint, String)> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(endpoint) = endpoint_with_current_live_remote_runtime_key(home, runtime_key) {
-            return Some(endpoint);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(120));
-    }
-}
-
+/// Upgrade the stale daemon that owns `runtime_key` to the current version,
+/// preserving its live PTYs.
+///
+/// ⛔ **This does NOT return an endpoint, and nothing waits for one.** It used
+/// to poll for 8 s for a successor that could serve the key, and then bridge to
+/// this same owner when the poll expired — see
+/// [`spawn_background_stale_runtime_owner_hot_update`] for the measurement that
+/// killed that shape.
 fn hot_update_stale_remote_runtime_owner_for_bridge(
     home: &Path,
     owner_endpoint: &ServerEndpoint,
     runtime_key: &str,
     owner_version: &str,
     owner_pid: u32,
-) -> anyhow::Result<Option<(ServerEndpoint, String)>> {
+) -> anyhow::Result<()> {
     let current_exe = std::env::current_exe().context("resolving current yggterm executable")?;
     let daemon_exe =
         local_headless_companion_executable_from_current(&current_exe).with_context(|| {
@@ -17431,23 +17422,145 @@ fn hot_update_stale_remote_runtime_owner_for_bridge(
             });
         }
     }
-    let current =
-        wait_for_current_live_remote_runtime_key(home, runtime_key, Duration::from_secs(8));
-    if current.is_none() {
+    append_trace_event(
+        home,
+        "server",
+        "remote_runtime",
+        "hot_update_stale_runtime_owner_background_complete",
+        json!({
+            "runtime_key": runtime_key,
+            "owner_endpoint": format!("{owner_endpoint:?}"),
+            "owner_version": owner_version,
+            "owner_pid": owner_pid,
+        }),
+    );
+    Ok(())
+}
+
+/// The gate the background upgrade waits behind: released by the bridge's first
+/// paint, and by a deadline so an upgrade is never simply lost.
+static DEFERRED_STALE_OWNER_HOT_UPDATE_GATE: OnceLock<(Mutex<Option<&'static str>>, Condvar)> =
+    OnceLock::new();
+
+fn deferred_stale_owner_hot_update_gate() -> &'static (Mutex<Option<&'static str>>, Condvar) {
+    DEFERRED_STALE_OWNER_HOT_UPDATE_GATE.get_or_init(|| (Mutex::new(None), Condvar::new()))
+}
+
+/// The session is on screen — the upgrade may now have the owner daemon.
+fn release_deferred_stale_owner_hot_update(reason: &'static str) {
+    let (lock, condvar) = deferred_stale_owner_hot_update_gate();
+    if let Ok(mut released) = lock.lock() {
+        if released.is_none() {
+            *released = Some(reason);
+        }
+    }
+    condvar.notify_all();
+}
+
+/// ⛔ **A DEADLINE, because this is an absence-gate and the QUIET-GATE LAW
+/// applies to ours too.** A bridge that never paints (a dead runtime, a session
+/// the user closed at once) must not silently strand the owner on an old
+/// version forever.
+const DEFERRED_STALE_OWNER_HOT_UPDATE_DEADLINE: Duration = Duration::from_secs(45);
+
+/// Kick the stale owner's upgrade onto a detached thread so **the click does not
+/// wait for it**.
+///
+/// ⭐ **Measured in an isolated `YGGTERM_HOME`, 2026-08-09, one stale
+/// (3.0.77) owner and one live `cc-runtime://` PTY.** The click used to be
+/// synchronous and the trace timed every phase of it:
+///
+/// | +0.3 s | `hot_update_stale_runtime_owner_begin` |
+/// | +10.5 s | handoff prepared, successor child spawned |
+/// | +10.5→18.5 s | 8 s poll for a successor that can serve the key |
+/// | +18.5 s | `not_ready` → `direct_bridge_fallback` → **first paint** |
+/// | +26.0 s | the successor finally binds its socket |
+///
+/// ⇒ **the 8 s deadline expires 7.5 s before the thing it waits for can
+/// possibly happen**, so the fallback was not an exception path, it was the
+/// only path — and the endpoint it fell back to was the one we already held at
+/// +0.3 s. Every click on a stale-owned row bought 18 s of nothing.
+/// [[THE QUIET-GATE LAW]] again, in a new place: an absence-gate whose release
+/// condition its own workload cannot satisfy in time.
+///
+/// ⛔ The upgrade is NOT dropped — dropping it would be a policy change riding
+/// on a latency fix. It still runs, behind the bridge, on the same
+/// `session_survival_before_update_completion` priority: the same run showed a
+/// bridge to a mid-handoff owner staying live and painting for 100 s while the
+/// old daemon worked through its retire.
+fn spawn_background_stale_runtime_owner_hot_update(
+    home: &Path,
+    owner_endpoint: &ServerEndpoint,
+    runtime_key: &str,
+    owner_version: &str,
+    owner_pid: u32,
+) {
+    let thread_home = home.to_path_buf();
+    let thread_endpoint = owner_endpoint.clone();
+    let thread_runtime_key = runtime_key.to_string();
+    let thread_owner_version = owner_version.to_string();
+    if std::thread::Builder::new()
+        .name("stale-owner-hot-update".to_string())
+        .spawn(move || {
+            // ⛔ WAIT FOR THE SESSION TO BE ON SCREEN FIRST. Measured live on
+            // `dev` 2026-08-09: the owner daemon serves one request at a time
+            // and a hot-restart request holds it for ~11 s, so an upgrade
+            // kicked at resolve time is still IN FRONT of the click — the
+            // foreground's own pre-bridge calls to that same daemon queue
+            // behind it and first paint lands at +15.1 s instead of +3.0 s.
+            // Whether the click was fast then came down to which thread
+            // reached the socket first, which is a race, not a fix.
+            let (lock, condvar) = deferred_stale_owner_hot_update_gate();
+            let waited_for = lock
+                .lock()
+                .ok()
+                .and_then(|released| {
+                    condvar
+                        .wait_timeout_while(
+                            released,
+                            DEFERRED_STALE_OWNER_HOT_UPDATE_DEADLINE,
+                            |released| released.is_none(),
+                        )
+                        .ok()
+                        .map(|(released, _)| *released)
+                })
+                .flatten()
+                .unwrap_or("deadline");
+            append_trace_event(
+                &thread_home,
+                "server",
+                "remote_runtime",
+                "stale_runtime_owner_hot_update_released",
+                json!({
+                    "runtime_key": thread_runtime_key,
+                    "owner_pid": owner_pid,
+                    "released_by": waited_for,
+                }),
+            );
+            let _ = hot_update_stale_remote_runtime_owner_for_bridge(
+                &thread_home,
+                &thread_endpoint,
+                &thread_runtime_key,
+                &thread_owner_version,
+                owner_pid,
+            );
+        })
+        .is_err()
+    {
+        // The bridge still stands — only the upgrade is skipped, and a skipped
+        // upgrade that nobody records is how an old daemon lives forever.
         append_trace_event(
             home,
             "server",
             "remote_runtime",
-            "hot_update_stale_runtime_owner_not_ready",
+            "hot_update_stale_runtime_owner_background_spawn_failed",
             json!({
                 "runtime_key": runtime_key,
-                "owner_endpoint": format!("{owner_endpoint:?}"),
                 "owner_version": owner_version,
                 "owner_pid": owner_pid,
             }),
         );
     }
-    Ok(current)
 }
 
 fn endpoint_with_live_remote_runtime_key_for_bridge(
@@ -17470,49 +17583,30 @@ fn endpoint_with_live_remote_runtime_key_for_bridge(
             server_version,
             server_pid,
         }) => {
-            let ready = match hot_update_stale_remote_runtime_owner_for_bridge(
+            // BRIDGE NOW, UPGRADE BEHIND IT. The owner we already hold can
+            // serve this key immediately; waiting for its successor only ever
+            // ended in bridging here anyway, 18 s later.
+            append_trace_event(
+                home,
+                "server",
+                "remote_runtime",
+                "stale_runtime_owner_bridged_before_hot_update",
+                json!({
+                    "runtime_key": runtime_key,
+                    "owner_endpoint": format!("{endpoint:?}"),
+                    "owner_version": server_version,
+                    "owner_pid": server_pid,
+                    "update_priority": "session_survival_before_update_completion",
+                }),
+            );
+            spawn_background_stale_runtime_owner_hot_update(
                 home,
                 &endpoint,
                 &runtime_key,
                 &server_version,
                 server_pid,
-            ) {
-                Ok(ready) => ready,
-                Err(error) => {
-                    append_trace_event(
-                        home,
-                        "server",
-                        "remote_runtime",
-                        "hot_update_stale_runtime_owner_failed_preserving_owner",
-                        json!({
-                            "runtime_key": runtime_key,
-                            "owner_endpoint": format!("{endpoint:?}"),
-                            "owner_version": server_version,
-                            "owner_pid": server_pid,
-                            "error": error.to_string(),
-                            "update_priority": "session_survival_before_update_completion",
-                        }),
-                    );
-                    return Ok(Some((endpoint, runtime_key)));
-                }
-            };
-            if ready.is_none() {
-                append_trace_event(
-                    home,
-                    "server",
-                    "remote_runtime",
-                    "hot_update_stale_runtime_owner_direct_bridge_fallback",
-                    json!({
-                        "runtime_key": runtime_key,
-                        "owner_endpoint": format!("{endpoint:?}"),
-                        "owner_version": server_version,
-                        "owner_pid": server_pid,
-                        "reason": "current_daemon_not_ready_after_handoff",
-                        "update_priority": "session_survival_before_update_completion",
-                    }),
-                );
-            }
-            Ok(ready.or(Some((endpoint, runtime_key))))
+            );
+            Ok(Some((endpoint, runtime_key)))
         }
         None => Ok(None),
     }
@@ -18685,6 +18779,7 @@ fn bridge_remote_runtime_session_stdio(
                 wrote_initial_visible_chunks = true;
                 if initial_snapshot_pending && bridge_initial_snapshot_should_use_raw_stream(path) {
                     initial_snapshot_pending = false;
+                    release_deferred_stale_owner_hot_update("bridge_first_paint");
                     trace_remote_bridge_event(
                         "initial_raw_stream_first_paint",
                         json!({
@@ -42526,6 +42621,66 @@ terminal_window_id: None,
         assert_eq!(
             owning_daemon_endpoint_from_statuses(statuses, "cc-runtime://missing"),
             None
+        );
+    }
+
+    /// THE CLICK MUST NOT WAIT FOR A DAEMON SWAP.
+    ///
+    /// Measured in an isolated `YGGTERM_HOME` 2026-08-09, one stale 3.0.77
+    /// owner and one live `cc-runtime://` PTY: the synchronous form took
+    /// **18.5 s to first paint** — 10.5 s to prepare the handoff, then an 8 s
+    /// poll for a successor that did not bind its socket until **+26 s** — and
+    /// then bridged to the very owner it had already resolved at +0.3 s. The
+    /// deadline expired 7.5 s before its own release condition could occur, so
+    /// the `direct_bridge_fallback` was not an exception path, it was the only
+    /// path this code ever took. Same shape as THE QUIET-GATE LAW: an
+    /// absence-gate whose release condition the workload cannot satisfy.
+    ///
+    /// ⛔ The upgrade must still be KICKED — dropping it would be a policy
+    /// change riding on a latency fix, and old daemons that nobody upgrades
+    /// live forever.
+    #[test]
+    fn a_stale_owner_is_bridged_before_its_upgrade_not_after() {
+        let source = include_str!("lib.rs");
+        let function = source
+            .split("fn endpoint_with_live_remote_runtime_key_for_bridge(")
+            .nth(1)
+            .expect("the bridge-owner resolver is present");
+        let arm = function
+            .split("StaleNeedsHotUpdate {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("None => Ok(None),").next())
+            .expect("the stale-owner arm is present");
+        assert!(
+            arm.contains("spawn_background_stale_runtime_owner_hot_update"),
+            "the stale-owner arm must kick the upgrade onto a detached thread"
+        );
+        assert!(
+            !arm.contains("hot_update_stale_remote_runtime_owner_for_bridge("),
+            "the upgrade is back INLINE on the click path: whatever it waits for, \
+             the owner endpoint that serves the click is already in hand and the \
+             wait can only delay first paint"
+        );
+
+        // …and OFF the click path is not the same as OUT OF ITS WAY. Measured
+        // live on `dev`: the owner daemon serves one request at a time, a
+        // hot-restart request holds it ~11 s, and the foreground's own
+        // pre-bridge calls to that same daemon then queue behind it — first
+        // paint at +15.1 s instead of +3.0 s. Which one won was a thread race.
+        let background = source
+            .split("fn spawn_background_stale_runtime_owner_hot_update(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n}\n").next())
+            .expect("the background upgrade is present");
+        assert!(
+            background.contains("deferred_stale_owner_hot_update_gate()"),
+            "the background upgrade must wait for the session to be ON SCREEN before \
+             it takes the owner daemon, or it races the very click it is behind"
+        );
+        assert!(
+            source.contains("release_deferred_stale_owner_hot_update(\"bridge_first_paint\")"),
+            "nothing releases the upgrade gate: first paint is the positive signal that \
+             the click has been served"
         );
     }
 

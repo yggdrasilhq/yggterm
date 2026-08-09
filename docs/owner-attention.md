@@ -37,6 +37,14 @@ copies.
   *Meanwhile:* the relay is fixing them one at a time in the pattern the rule
   would generalise, so either answer is cheaper afterwards, not dearer.
 
+- **Should a CLICK be allowed to start a daemon swap?** The swap that cost 55
+  PTYs on 2026-08-09 was begun by him clicking a row, and the settled relay-gate
+  design makes a swap an appointment at a relay boundary — which a click is not.
+  → yggterm `docs/pending-bugs.md` § *A DAEMON SERVES ONE REQUEST AT A TIME*.
+  *Meanwhile:* 3.0.80 already takes the wait off the click (first paint at
+  +0.74 s instead of +18.5 s), so nothing is slow while this waits; the question
+  is only whether the upgrade should still be kicked at all.
+
 ## Credentials and real-money actions (the vault and the card rails)
 
 - **Any card payment is his, per action, every time** — his standing rule for
