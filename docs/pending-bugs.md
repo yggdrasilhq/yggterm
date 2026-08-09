@@ -128,6 +128,48 @@ row mid-work on host H, deploy a new daemon to H, then click that row from the
 GUI — it must attach to the SAME process, keep its jobs, and never show a raw
 error.
 
+## ⛔⛔ `guihost`'s `libyggterm` IS STILL THE PRE-SCRUB HISTORY — ONE PUSH FROM RE-LEAKING `/home/user` INTO A PUBLIC REPO
+
+**Status:** OPEN · found 2026-08-09 by the practice campaign (row 8) when an APK build failed on `oc`
+
+**Not the practice campaign's to fix — it is yours.**
+
+`libyggterm`'s history was rewritten to scrub the real username out of test
+fixtures (`/home/user` → `/home/user` in `crates/yggui/src/drag_tree.rs`,
+`conversation.rs`, `crates/yggui/README.md`). **Two of three fleet checkouts were
+left on the pre-scrub side of that rewrite**, and neither can fast-forward.
+
+| host | HEAD | commits | state |
+|---|---|---|---|
+| `dev` | `01e1454` | 288 | post-scrub, correct |
+| `oc` | was `c05b93d`, **now `01e1454`** | 262 → 288 | **fixed 2026-08-09**, see below |
+| `guihost` | `50250fc` | 262 | ⛔ **PRE-SCRUB, still carries `/home/user`** |
+
+⚠ **`guihost` is the GUI host and the one work is made on.** `git status` there is
+clean and `git cherry @{u} HEAD` reports **26** commits with no patch-equivalent
+upstream — but on `oc` the identical pattern turned out to be pure rewrite
+artefact: every one of its 27 had exactly one subject-identical counterpart
+upstream, and the only content difference was the scrub itself. **guihost was NOT
+touched on that assumption.** Whoever owns this repo should confirm the same is
+true there and then reset, because the current state is one `git push` away from
+putting the owner's home path back into a public repo's history.
+
+**What was done to `oc`, and why that was safe:** it is a build-host checkout, its
+tree was clean, and its HEAD content differed from the equivalent upstream commit
+*only* by the scrub. It was reset to `origin/main` with the old head kept as the
+branch `pre-scrub-backup-2026-08-09` (`c05b93d`) so nothing is unrecoverable.
+
+**What it cost:** the practice-rs Android APK would not compile on `oc` at all —
+`OtpAlphabet::Alphanumeric` and its import resolved nowhere, because that fix
+(`01e1454`) is post-scrub and `oc` could not see it. ⚠ And
+`scripts/build-android-armv8.sh` **exited 0 on that failure** while leaving a
+two-day-old `.apk` in place, so the build looked like it had succeeded.
+
+**Falsifier when fixed:** `ssh guihost 'cd ~/gh/libyggterm && git status -sb'` shows
+no divergence, and `grep -r "/home/user" ~/gh/libyggterm/crates/*/src/*.rs` on guihost
+returns nothing.
+
+
 ## ⛔⛔ A PLAIN SHELL DIES ACROSS A HANDOVER AND A WEB-SURFACE ROW BESIDE IT SURVIVES — SAME PRESERVED LIST, OPPOSITE OUTCOMES
 
 **Status:** OPEN
