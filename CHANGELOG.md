@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Yggterm no longer deletes the agent CLI it is installing.** Setting up a CLI
+  on another machine could leave that machine with the tool missing entirely,
+  and the error blamed a missing `sh`. Neither part was what it looked like.
+  Yggterm installs a CLI from several places at once — the row you just clicked
+  asks for the one tool it needs, the hourly sweep refreshes all nine, and every
+  running copy of yggterm does its own — and nothing stopped two of them writing
+  the same toolchain at the same time. When that happened, one install deleted
+  the half-written package directory the other was still working in, both
+  failed, and the CLI was left absent. Installing it by hand afterwards worked,
+  which made this look like a problem with how yggterm ran `npm` rather than how
+  many times it ran it at once.
+
+  Installs are now serialised across every copy of yggterm on a machine: the
+  second one waits for the first instead of writing over it, and usually finds
+  the tool already installed when its turn comes. Measured before the fix by
+  running two installs of the same CLI while watching its directory — the
+  directory vanished for about 150ms, both installs failed, and the CLI was
+  gone.
+
 - **A terminal you create without switching to it now opens when you go back to
   it — and is the right size in the meantime.** A session created in the
   background had nobody to say how big it should be, so it was born at a
