@@ -13,6 +13,99 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⛔⛔ OWNER-REPORTED, LIVE 2026-08-09: "I CANNOT USE YGGTERM. IT IS SO JANK" — the tmpfs, the daemon pile, and the two hot loops
+
+**Status:** OPEN
+
+His words: *"the daemon and switching system is infuriating and slowly becoming
+unusable … Why switching tax is insane? Why daemon tax is insane? … Everything
+hits swap. I ONLY HAVE YGGTERM RUNNING and KDE DE. I cannot go more minimal than
+this!! I have 16GB of RAM and an extremely fast last gen SSD."*
+
+**Measured on his laptop the same evening, so the next session argues with
+numbers rather than adjectives.** Two causes are FIXED (git remembers them); the
+rest is what stays open.
+
+### What the measurement found, in order of size
+
+1. ⭐ **FIXED — the GUI deep-copied a 19.2 MB adblock ruleset per web surface,
+   3.3x a second, on the main thread.** `web_surface_policy_gate` returned the
+   policy by value into a per-tick snapshot. Stack-sampling his GUI: 11 of 24
+   samples in that path; after the fix, **0 of 24**, with the main thread idle
+   in `ppoll` 22 of 24. Settled CPU 17.75% -> 11.75% on the same 45 rows.
+2. ⭐ **FIXED — the daemon wrote every response one JSON token at a time**, 528
+   syscalls for a 2,169-byte reply; an idle daemon was issuing ~7,000 one-byte
+   `sendto` calls a second, times every daemon alive.
+3. ⛔ **`/tmp` IS A tmpfs AND IT HAD 4.5 GB IN IT — that is RAM, and it can only
+   ever go to swap, never be reclaimed.** This is the direct answer to "why does
+   everything hit swap". At the time of the report: 7,793 MB of swap in use
+   against 6,810 MB of FREE RAM — the machine was not under pressure, it was
+   carrying pages evicted during an earlier spike that never came back. Process
+   swap accounted for only 3,068 MB; `/tmp` was the missing ~4.5 GB.
+   ⇒ **297 entries of it were OURS** — deploy staging directories, one per
+   version, back to 3.0.0, each holding a copy of both binaries (~74 MB) — plus
+   21 more under other names, 864 MB. Reclaiming them took swap from 7,791 MB to
+   5,366 MB with no other change. **Nothing sweeps `/tmp`**, and the fleet
+   already ships `ygg-bak-sweep` and `ygg-build-sweep`, so the gap is a missing
+   sibling, not a missing idea.
+4. ⛔ **SIX daemons on the GUI host, THIRTY on dev, each burning 1.3-2.3% CPU
+   forever** — ~12% of a core on his laptop, permanently, for daemons that own
+   almost nothing. **They are immortal by construction as of 3.0.81:** every
+   generation leaves behind a ychrome launcher shell
+   (`bash -c 'ychrome; exec bash -i'` — ychrome daemonises, the shell falls back
+   to an idle interactive bash), and a plain shell is now a PERMANENT blocker on
+   cold shutdown. So the pile grows by one per deploy and never shrinks.
+   ⇒ The exit is not "let the gate kill shells again" (that was the bug 3.0.81
+   fixed) — it is to **hand the PTY over**. `pty_handoff.rs` already passes an
+   `OwnedFd`; plain shells are simply not routed through it.
+5. ⛔ **Twelve `[ssh] <defunct>` zombies, 10.9 hours old**, under the armed
+   daemon — the SIGCHLD reaper gap, still owed.
+6. ⛔ **A busy-wait that prints every 12 s and never gives up.** His screenshot:
+   *"Claude Code session … is still held by a yggterm process (pid …) whose
+   daemon exited without handing it over; waiting for it to release … Waiting
+   157s so far."* A daemon exited WITHOUT a handoff — that is the stranding
+   path — and the client's response is an unbounded spin with no ceiling and no
+   escalation.
+
+⚖ **What is NOT the cause, so nobody re-chases it:** yggterm's own resident
+footprint on his laptop is small — 554 MB RSS and 158 MB of swap across 17
+processes, against KDE/Plasma's 1,098 MB of swap. **The pressure was never
+yggterm sitting still; it was what yggterm ALLOCATES (the 19 MB tick) and what
+it LEAVES BEHIND (the tmpfs staging).** Same shape as
+[[finding-dbus-autolaunch-leak-and-memory-probe]].
+
+**Falsifier for what remains:** a fleet deploy adds nothing to `/tmp`, the daemon
+count on a host does not grow across a version bump, and a switch to a cold
+session reveals without a multi-second stall.
+
+## ⛔ THE DAEMON PANEL OFFERS AN UPGRADE THAT HAS NOTHING TO UPGRADE — `hot_restart_pending` outranks the version comparison
+
+**Status:** OPEN
+
+Owner-reported 2026-08-09, alongside the performance report: *"Why we update same
+client and daemon (see screenshot NO DAEMON TO UPGRADE)?"*
+
+`DaemonMetadataGroup` builds the Version line as:
+
+    match (daemon.hot_restart_pending, versions_agree) {
+        (true, _) => format!("{} · newer build on disk", daemon.version),
+        ...
+
+**`hot_restart_pending` is checked FIRST and swallows the version comparison.**
+So when the client and the daemon are the same version — nothing to upgrade, by
+the only definition the user cares about — the panel still says *"newer build on
+disk"* and offers the action, which then reports there is no daemon to upgrade.
+
+⇒ The line answers two different questions in one field: *"is my client talking
+to an out-of-date daemon?"* (`versions_agree`) and *"is there a newer binary on
+the filesystem?"* (`hot_restart_pending`). The second is our bookkeeping and,
+per the constitution, is precisely what the user is never supposed to have to
+know about.
+
+**Falsifier:** with client and daemon on the same version and a newer binary
+staged on disk, the panel must not offer an upgrade whose own answer is that
+there is nothing to upgrade.
+
 ## ⚠ THE STABLE-THEME PIN LEFT FOR libyggterm AND NOTHING GUARDS IT THERE — a tag bump can change the theme silently
 
 **Status:** OPEN
