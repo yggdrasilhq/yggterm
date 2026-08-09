@@ -159,26 +159,71 @@ fixture; if it does not, the 40 minutes are real work and this entry is wrong.
 ⛔ Do that before optimising anything — a slow suite everyone pays for is worth
 one measurement, not a guess.
 
-## ⛔ THE WORKING INDICATOR GOES DARK WHEN A ROW'S OWNING DAEMON IS GONE — a healthy agent reads as stalled
+## ⛔ THE WORKING FLAG HAS TWO WRITERS AND THE BLIND ONE WINS — a healthy agent reads as stalled once its owning daemon is gone
 
 **Status:** OPEN
 
 Split out 2026-08-09 from the row-stranding entry, whose other halves are fixed
-and live-proven (git remembers it; `3.0.78` and `3.0.80` carry the fixes).
+and live-proven. **Root-caused by code reading 2026-08-09 ~17:20; the mechanism
+below replaces the original one-line guess ("the dot is fed by PTY output from
+the owning daemon, so it simply stops"). That guess was right about the symptom
+and wrong about why, and the difference decides the fix.**
 
-The dot is fed by PTY output **from the owning daemon**, so when a row's owner
-retires or dies the dot simply stops — and a still dot is indistinguishable from
-a dead agent. That is what sent the owner to check on a session that was working
-fine, which is where the whole stranding incident started.
+⭐ **`ManagedSessionView.working` is written by TWO paths that know different
+things, and they overwrite each other:**
 
-⭐ **The instrument that was RIGHT throughout that incident reads a different
-source:** the booter, which watches transcript activity, logged `WORKING` at
-11:46 · 11:51 · 11:56 · 12:01 · 12:06 · 12:11 while the on-screen dot said
-nothing. ⇒ liveness has a source that survives daemon topology, and the dot is
-not using it. [[finding-agent-session-liveness-is-invisible-to-os-signals]]
+1. **The daemon's snapshot.** `refresh_snapshot_session_*`
+   (`daemon.rs:4039`/`4049`) sets `working` from **its own `terminals` screen** —
+   `Some(true)`/`Some(false)` for a runtime it owns, and **`None` for anything it
+   does not**. `None` here honestly means *"I hold no live screen for this row"*.
+2. **The GUI's 2.5 s working-flags poll.** `working_flags_including_proxied`
+   (`daemon.rs:3677`) is the informed one: for a row the serving daemon does not
+   own it **asks the preserved owner over its socket** and merges the answer.
+   The GUI applies it with `apply_live_session_working_flags`.
+
+⛔ **And `apply_snapshot` does `self.sessions.clear()` and rebuilds every session
+from the snapshot (`lib.rs:6074`).** So every snapshot apply overwrites the
+polled value with the daemon's — including overwriting a *known* `Some(true)`
+with an *unknown* `None`. The dot then reads idle, because the GUI blinks only on
+`Some(true)` and collapses `Some(false)` and `None` to idle
+(`shell.rs:86613`, deliberately, to stop a frozen frame blinking forever).
+
+⇒ **While the owner is reachable the poll keeps re-winning the race, so the dot
+mostly works. The moment the owner becomes unreachable the poll contributes
+nothing for that row, the snapshot's `None` stands unopposed, and the dot goes
+dark and stays dark** — on a session that may be mid-turn. That is what sent the
+owner to check on a session that was fine.
+
+⚠ **Two writers, one field: this is the SSOT law, and the less-informed writer
+wins.** `None` is *"I don't know"* and must never overwrite *"I asked the owner
+and was told"*.
+
+⛔ **The obvious fix is a trap.** "On apply, keep the old `working` when the
+incoming is `None`" resurrects the bug the 86613 comment records — a session
+blinking forever on a frozen last frame after its turn ended, because a truly
+dead owner also produces `None` for ever. Any preservation needs a bound: an age,
+or a positive "the owner answered" signal, not silence.
+
+⭐ **The instrument that was RIGHT throughout the incident reads a third source:**
+the booter, which watches transcript activity, logged `WORKING` at 11:46 · 11:51
+· 11:56 · 12:01 · 12:06 · 12:11 while the on-screen dot said nothing.
+[[finding-agent-session-liveness-is-invisible-to-os-signals]] ⚠ Its cost is real
+and must be priced before it is chosen: for a `remote-cc://<host>/<uuid>` row the
+transcript lives on the FAR host, so this is an ssh hop per row per poll unless
+it is routed through that host's own daemon.
+
+⚖ **And the design slot already exists, unwired.** `DESIGN.md` §*Status indicator
+vocabulary* reserves `ORANGE/AMBER` for *"recovery in progress, degraded
+runtime"*, and a row whose owner cannot be reached is exactly a degraded runtime.
+An amber dot cannot restore the signal, but it can stop the app asserting a
+liveness verdict it does not hold — which is the half that cost the owner his
+time. ⛔ Wiring it means editing that DESIGN.md section first; it says so.
 
 **Falsifier:** with a row's owning daemon retired and the agent mid-turn, the
-row's indicator still blinks.
+row's indicator still blinks. **Cheaper intermediate falsifier for the mechanism
+above:** on a GUI whose daemon owns few of its rows, watch `working_edge` in the
+UI telemetry — `working_flags_poll` and `snapshot_apply` should be seen writing
+the same row in opposite directions.
 
 ## ⛔ A DAEMON SERVES ONE REQUEST AT A TIME, AND A HOT-RESTART REQUEST HOLDS IT FOR ~11 SECONDS — so anything else asking that daemon waits
 
