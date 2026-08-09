@@ -2390,3 +2390,81 @@ reconcile_repaint_nudge      {reason: reveal_screen_reconcile, cols: 170, rows: 
 `the_first_reconcile_after_a_reveal_may_always_ask_the_cli_to_redraw` ·
 `repaint_nudges_are_rate_limited_so_a_rearming_reconcile_cannot_loop` ·
 `the_redraw_gate_covers_claude_code_not_just_codex`
+
+## no-activate-row-born-at-default-grid
+
+STATUS: **FIXED** in 3.0.76.
+
+### Symptom
+
+A row created with `--no-activate` could never be opened afterwards:
+
+```
+server app terminal new --machine-key dev --kind opencode --no-activate   → ok
+server app open remote-opencode://dev/<uuid> --view terminal
+  → Error: session/view contract violation: Client viewport 169×65 diverges
+    from daemon PTY grid 120×36 (broken-bottom risk)
+```
+
+⚠ **The filed entry called this a property of remote agent rows. It is not.**
+Measured 2026-08-09 on a **local `--kind shell`** row: identical failure, same
+numbers. Neither the scheme nor the CLI kind is doing any work here — what
+matters is only that the row was born with no viewer.
+
+### Root cause — two layers, and the filed hypothesis was wrong about both
+
+The entry guessed *"nothing ever resizes an unactivated row's PTY away from the
+default"*. Measured, that is true only until the row is opened, and it is not
+what makes `open` fail.
+
+1. **BIRTH.** A create carries no client grid (`ensure_session_begin` logs
+   `initial_cols: null, initial_rows: null`), and a brand-new session has no
+   persisted grid either, so `effective_initial_size` fell through to DEFAULT
+   120×36. **A row nobody ever opens keeps 120×36 for its whole life** — proven
+   by asking one directly: `stty size` answered `36 120` at 3 s, 25 s and 70 s.
+   ⇒ every row an agent creates ran at 120×36, because
+   `docs/agent-row-hygiene.md` asks agents to pass `--no-activate`.
+
+2. **THE FALSE ALARM THAT OUTLIVED THE PROBLEM.** On open, the client mounts and
+   resizes correctly — trace `server resize` shows
+   `actual_before 120×36 → actual_after 169×65` at **+4.5 s**. But the daemon's
+   grid reaches the GUI *only* as the `"PTY size"` metadata string on the
+   live-session snapshot, which refreshes every
+   `LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS` = **60 s** when nothing is
+   foreground-busy. So the divergence check compared a live viewport against an
+   up-to-60-s-old copy and kept reporting a broken bottom that the resize had
+   already repaired. Measured on one row: **real for ~4.5 s, reported for 46 s**
+   — against `open`'s 15 s deadline, which is why it failed ~75% of the time and
+   looked non-deterministic.
+
+⚠ The guard itself was never wrong, and is unchanged. Its INPUT was stale.
+
+### Workaround / fix
+
+- A session born with no caller grid and no persisted grid now falls back to the
+  **desktop's own grid** — the last grid any client asserted by resize — before
+  DEFAULT 120×36. One fallback, in the one place every create path already
+  funnels through, so local/remote/ssh/command rows are all covered.
+- A successful resize now pulls the live-session snapshot refresh forward, so the
+  actor that just changed the grid stops comparing against its own stale copy.
+
+### Code locations
+
+- `crates/yggterm-server/src/lib.rs` — `client_viewport_grid` field +
+  `record_client_viewport_grid` / `client_viewport_grid` accessors
+- `crates/yggterm-server/src/daemon.rs` — recorded ABOVE both arms of the
+  `TerminalResize` handler (the forwarding arm must not skip it); consumed as the
+  third `.or_else` in `ensure_terminal_for_path_with_initial_size_and_seed`
+- `crates/yggterm-shell/src/shell.rs` — `LIVE_SESSION_SNAPSHOT_POST_RESIZE_REFRESH_MS`,
+  scheduled from the resize success arm
+
+### Tests
+
+- `daemon::tests::a_session_born_with_no_viewer_falls_back_to_the_desktops_grid`
+- `tests::the_desktops_grid_is_recorded_apart_from_any_sessions_grid`
+- `shell::tests::a_successful_resize_pulls_the_session_snapshot_forward`
+
+### Related memory
+
+`[[finding-a-claim-proven-on-one-lane-is-not-proven]]` — the entry's "remote"
+framing survived only because nobody ran the local lane.

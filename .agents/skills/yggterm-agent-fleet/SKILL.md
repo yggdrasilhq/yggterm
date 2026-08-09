@@ -322,6 +322,63 @@ budget without sending anything and the next real pass would have escalated inst
 **A dry run that mutates state is not a dry run** — an instrument whose observation changes what it
 observes.
 
+### ⛔⛔ ARM THE BOOTER — a stalled session CANNOT restart itself
+
+**Owner-directed 2026-08-09, said while he was hand-booting a stalled relay row:**
+*"I have seen you stall sometimes, so arm a booter in a fleet. A booter is a tool
+that monitors any session that has subscribed to it, to kick it and say 'continue,
+the booter booted'. Sometimes you may feel that the work is done so you need to
+unsubscribe from the booter."*
+
+```sh
+.agents/skills/yggterm-agent-fleet/ygg-booter.py subscribe --campaign yggterm
+.agents/skills/yggterm-agent-fleet/ygg-booter.py status      # is a watcher alive?
+.agents/skills/yggterm-agent-fleet/ygg-booter.py unsubscribe # ⛔ when the work is DONE
+```
+
+⭐ **`ygg-claim.sh` now subscribes you automatically**, because claiming a row is
+the moment a session becomes long-running work — and an arming step you have to
+remember separately is the one skipped on the session that needed it. Pass
+`--no-booter` to opt out.
+
+**The one structural fact, and it decides the whole design: anything that runs
+INSIDE the session is dead in exactly the case that matters**, because the stall
+IS the turn ending early. A wakeup you schedule, a loop you drive, a check at the
+end of your own turn — none of them fire. ⇒ the watcher is a DETACHED process
+that outlives its subscribers, and subscribing is something done TO it.
+
+| | `ygg-babysit.py` | `ygg-booter.py` |
+|---|---|---|
+| watches | rows the ORCHESTRATOR spawned | rows that SUBSCRIBED themselves |
+| lives | one run | until unsubscribed |
+| ends by | the orchestrator finishing | ⭐ the subscriber's own `unsubscribe` |
+
+⛔ **The classifier is NOT duplicated** — the booter imports babysit's, so "is
+this row working, idle, stuck or gone" has one owner. Both therefore inherit:
+ask the ROW LIST before the transcript (a retired row's transcript is frozen
+mid-turn and reads as a live wedge), never type into a MID-TURN row, and
+*"I could not look"* is never *"it is not there"*.
+
+⛔⛔ **TWO DELIVERY BUGS MEASURED 2026-08-09 — the second one had been live in
+`ygg-babysit.py` since the day it was written:**
+
+1. **`"submitted" in stdout` IS TRUE FOR `"submitted": false`.** The verb reported
+   an honest failure; the substring test read it as success. **Every nudge
+   babysit ever logged as sent was logged identically whether it landed or not.**
+   ⇒ read a field's VALUE, never its presence. This is the §7 law arriving inside
+   the tool written to enforce §7.
+2. **`terminal submit` drives the GUI's MOUNTED terminal host.** A row with
+   nothing mounted waits out its 30 s deadline and answers `submitted:false` —
+   and rows nobody is looking at are *exactly* what a watchdog exists for.
+   `server terminal write` addresses the PTY, the layer that exists whether or
+   not anything is mounted. Measured on one row in one minute: submit
+   `submitted:false`, PTY write delivered. ⇒ **try the composer, fall back to the
+   PTY**, and log WHICH door delivered.
+
+⚠ The boot text is `continue, the booter booted` — deliberately recognisable in a
+transcript, so a session (and a human reading back) can tell *a machine woke me*
+from *a person asked for something*.
+
 ### Arm a dead-man check on yourself
 
 After spawning, schedule your own wake-up a few minutes out. If you wake and the

@@ -29,6 +29,9 @@
 #     --inherit-number   take the predecessor's number instead of deriving one
 #     --session UUID     claim a row other than your own (default: $YGGTERM_SESSION_ID)
 #     --watch-secs N     keep re-asserting the title for N seconds (default 240)
+#     --no-booter        do NOT subscribe this row to the booter (default: DO —
+#                        a claimed row is long-running work, and a stalled
+#                        session cannot boot itself)
 #     --host H           GUI host; default: auto-detect, then $YGG_GUI_HOST
 #     --dry-run          print what would happen, change nothing
 #
@@ -46,6 +49,7 @@ while [ $# -gt 0 ]; do
     --campaign)       CAMPAIGN="${2:-}"; shift 2 ;;
     --replace)        REPLACE="${2:-}"; shift 2 ;;
     --inherit-number) INHERIT=1; shift ;;
+    --no-booter)      BOOTER=0; shift ;;
     --session)        SESSION="${2:-}"; shift 2 ;;
     --watch-secs)     WATCH="${2:-}"; shift 2 ;;
     --host)           HOST="${2:-}"; shift 2 ;;
@@ -219,6 +223,22 @@ done
 [ "$GOT" = "$(printf '%s\t%s' "$NUM" "$FINAL_TITLE")" ] || {
   echo "ygg-claim: claim never verified (row reads: $(printf '%s' "$GOT" | tr '\t' '|'))" >&2; exit 3; }
 log "claimed and verified by read-back: seat=$NUM title=$FINAL_TITLE"
+
+# --- ARM THE BOOTER ---------------------------------------------------------
+# Owner-directed 2026-08-09, said while he was hand-booting a stalled relay row:
+# *"I have seen you stall sometimes, so arm a booter in a fleet."* A session that
+# stalls cannot restart itself — the stall IS its turn ending — so something
+# OUTSIDE it has to. Claiming a row is the moment a session becomes long-running
+# work, which makes it the one honest place to subscribe: an arming step that has
+# to be remembered separately is an arming step that gets skipped on the session
+# that needed it. ⛔ Unsubscribing is the SUBSCRIBER's job when the work is done
+# (`ygg-booter.py unsubscribe`); the booter retires a row only on facts it can
+# see for itself — the row is gone, or the subscription expired.
+if [ "${BOOTER:-1}" = 1 ] && [ -x "$(dirname "$0")/ygg-booter.py" ]; then
+  "$(dirname "$0")/ygg-booter.py" subscribe \
+      ${CAMPAIGN:+--campaign "$CAMPAIGN"} --note "$FINAL_TITLE" 2>&1 \
+    | sed 's/^/  /' || log "⚠ booter subscribe failed — this row is NOT watched"
+fi
 
 # The CLI composes its own title when its first turn ends and will clobber this.
 # Re-assert in the background for a while rather than assuming one write holds.

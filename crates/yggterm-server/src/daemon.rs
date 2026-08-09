@@ -6333,7 +6333,18 @@ impl DaemonRuntime {
         // otherwise defaults to 120x36 and only repairs the ACTIVE session), fall back
         // to the session's PERSISTED grid so EVERY re-resumed session comes back at its
         // real grid, not just the mounted one.
-        let effective_initial_size = initial_size.or_else(|| self.server.session_pty_grid(path));
+        //
+        // THIRD FALLBACK — a session with NO history either: born with no viewer,
+        // so neither the caller nor the store can say how big it should be. Before
+        // this it took DEFAULT 120x36 and, if nobody ever opened it, KEPT 120x36
+        // for its whole life — which is every row an agent creates, because
+        // `docs/agent-row-hygiene.md` tells agents to pass `--no-activate` so a
+        // spawn does not steal the user's screen. The desktop's own grid is a
+        // strictly better answer, and it is the grid the row will be viewed at
+        // when somebody does open it. See docs/xterm-bugs.md#no-activate-row-born-at-default-grid.
+        let effective_initial_size = initial_size
+            .or_else(|| self.server.session_pty_grid(path))
+            .or_else(|| self.server.client_viewport_grid());
         self.terminals.ensure_session_with_size(
             &runtime_path,
             &launch_command,
@@ -8729,6 +8740,13 @@ impl DaemonRuntime {
                 );
             }
             ServerRequest::TerminalResize { path, cols, rows } => {
+                // BORN-AT-THE-VIEWPORT'S-GRID: a resize is the only moment a
+                // client tells the daemon how big a terminal is on its screen.
+                // Record it here — ABOVE both branches, so the forwarding
+                // (preserved-owner) arm cannot skip it — as the desktop's grid,
+                // which is what a session created with no viewer is then born
+                // at instead of DEFAULT 120x36.
+                self.server.record_client_viewport_grid(cols, rows);
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
                 if let Some(owner_endpoint) =
                     self.preserved_owner_endpoint_for_request(&runtime_path)
@@ -18172,6 +18190,41 @@ mod tests {
         assert!(
             ensure_block.contains("self.forward_remote_pty_resize(path, cols, rows);"),
             "EVERY ensure of a remote session must forward the grid to the remote daemon's PTY"
+        );
+    }
+
+    /// BORN-AT-THE-VIEWPORT'S-GRID. A session created with no viewer has no
+    /// caller-supplied grid and no persisted one, so without a third fallback it
+    /// is born at DEFAULT 120x36 — and a row nobody opens (every row an agent
+    /// creates, because row hygiene asks for `--no-activate`) stays there for its
+    /// whole life. The two halves are asserted together because either one alone
+    /// is inert: a fallback nothing feeds, or a recorded value nothing reads.
+    #[test]
+    fn a_session_born_with_no_viewer_falls_back_to_the_desktops_grid() {
+        let source = include_str!("daemon.rs");
+        let ensure_block = source
+            .split("fn ensure_terminal_for_path_with_initial_size_and_seed")
+            .nth(1)
+            .and_then(|suffix| suffix.split("ensure_session_end").next())
+            .expect("ensure-with-initial-size body present");
+        assert!(
+            ensure_block.contains(".or_else(|| self.server.client_viewport_grid())"),
+            "a session with no caller grid and no persisted grid must fall back to the \
+             desktop's grid before DEFAULT 120x36"
+        );
+        let resize_block = source
+            .split("ServerRequest::TerminalResize { path, cols, rows } =>")
+            .nth(1)
+            .and_then(|suffix| suffix.split("ServerRequest::TerminalRestart").next())
+            .expect("TerminalResize handler present");
+        let forward_arm_start = resize_block
+            .find("preserved_owner_endpoint_for_request(&runtime_path)")
+            .expect("forwarding arm present");
+        assert!(
+            resize_block[..forward_arm_start]
+                .contains("self.server.record_client_viewport_grid(cols, rows);"),
+            "the desktop's grid must be recorded ABOVE both resize arms, or the \
+             forwarding (preserved-owner) arm never feeds it"
         );
     }
 
