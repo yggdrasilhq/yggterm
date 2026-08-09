@@ -64,6 +64,46 @@ own terms:**
    **our deploy did not stall the other agent's work, it deleted it** — and the
    agent it happened to was the one that ran the deploy.
 
+### ⭐ DIAGNOSED, 2026-08-09 — OWNERSHIP IS DECIDED BY ANCESTRY, AND ANCESTRY IS EXACTLY WHAT A DAEMON SWAP DESTROYS
+
+Defect 2 above is not a heuristic that got unlucky; it is structural, and it is
+provable from the code without needing a live repro.
+`agent_resume_process_is_external_for_session` (`lib.rs:1598`) calls a session
+external iff **no ancestor** satisfies `yggterm_process_args` (`lib.rs:1580`),
+which matches only when argv0's basename is `yggterm` / `yggterm-headless`, or
+the argv contains a `server remote resume-codex|start-codex|resume-cc|start-cc`
+triple.
+
+The real chain for every agent row is **daemon → `bash -c <exports…> claude …` →
+`claude`**, and that wrapper `bash` matches **neither** arm. ⇒ **the daemon's own
+presence in the ancestry is the ONLY thing making the session "ours."** When the
+owning daemon exits — which is what a version swap does, and what the
+constitution explicitly sanctions — the wrapper is reparented to init and the
+ancestor list becomes `[bash, init]`. Both fail the test, so a perfectly
+legitimate yggterm-owned agent is reclassified **external**, the guard fires, and
+`wait_for_external_agent_resume_to_clear` blocks until that session dies.
+
+⛔ **So the guard's failure mode is precisely inverted from its purpose.** It
+exists to stop a SECOND resume racing a real external terminal; what it actually
+does on a daemon swap is refuse to attach to the session yggterm itself started,
+then wait for that session to die — which is why the owner's minute ended with
+the row coming back as a NEW process.
+
+⭐ **Candidate fix, and it collapses a duplicate rather than adding a layer:** a
+yggterm-spawned agent already carries durable proof of ownership **on the process
+itself** — `YGGTERM_TERM_PROGRAM=yggterm` and
+`YGGTERM_SESSION_ID=cc-runtime://<uuid>` in `/proc/<pid>/environ`, verified
+present on a live row. Environment is fixed at exec, so it **survives
+reparenting, daemon death and version swaps**, and `YGGTERM_SESSION_ID` answers
+the sharper question ("is this MY session?") that ancestry can only approximate.
+Read ownership there; keep the ancestry walk at most as a fallback for processes
+predating the marker.
+
+⚠ Check before building: confirm the marker is exported on EVERY agent launch
+path (local, remote, ssh, command rows), or the fix will be
+[[finding-a-claim-proven-on-one-lane-is-not-proven]] again — `shell_exports` is
+the place to prove it.
+
 ⚠ **Do not file this as "the deployer should be more careful."** Deploying over a
 running daemon is sanctioned and routine (`docs/agent-field-guide.md` §4); the
 architecture promises the row survives it. **The falsifier:** with a live agent
