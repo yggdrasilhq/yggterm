@@ -5929,3 +5929,40 @@ Evidence and repro live in this session's yRDP UX pass; the scratch target
 recipe (two `*.toml` files, Xvfb + x11vnc, `YRDP_TARGETS_DIR`/`YRDP_STATE_DIR`
 pointed at a temp dir) reproduces the whole flow on any host with no guest and
 no risk to a live one.
+
+## ⚠ `ygg-claim.sh` PRINTS RAW `/proc` ERRORS INTO A SUCCESSFUL CLAIM — and they sit ABOVE the line that says it worked
+
+**Status:** OPEN
+
+**Reported by the `practice` campaign row 2026-08-09** (filed here rather than
+sent, because row 6 was not consuming input at the time — `input-check` said
+`consuming_input:false`, `activity:unknown`, transcript idle ten minutes).
+
+Real output from today's claim on `guihost` (replacing `8ffdb7e3`):
+
+```
+15:42:22 ygg-claim remove: row_still_listed=False verified=False remote_runtime_survived
+ygg-claim.sh: line 275: /proc/3270168/cmdline: No such file or directory
+15:42:22 ygg-claim reaping surviving agent pids:2777668 2777671
+ygg-claim.sh: line 275: /proc/3270508/cmdline: No such file or directory
+ygg-claim.sh: line 275: /proc/3270545/cmdline: No such file or directory
+15:42:24 ygg-claim predecessor retired and reaped clean
+```
+
+The pids exit between the listing and the `/proc/<pid>/cmdline` read. That race
+is **normal and expected** — the script is reaping them, and it succeeds. But
+the unguarded read turns it into three `No such file` lines interleaved with the
+progress log, and the verdict that says it actually worked (`reaped clean`) is
+printed **below** them. A caller scanning for failure reads the errors first.
+
+**Why this is worth a line and not a shrug:** this is the **first output of every
+relay session on every campaign**, and it is exactly where the reader is deciding
+"did my claim work". The script's own conclusion is correct; the noise contradicts
+it. It is the same family as the entry at the top of this file — an instrument
+reporting in a register that makes success look like failure.
+
+**Fix:** guard the read (`[ -r "/proc/$pid/cmdline" ] || continue`, or redirect and
+skip). Not a logic change — the reaping is right.
+
+**Falsifier when fixed:** a `ygg-claim.sh --replace <uuid>` run whose predecessor
+exits mid-reap prints no `No such file` lines.
