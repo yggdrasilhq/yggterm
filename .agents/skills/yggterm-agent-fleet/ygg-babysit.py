@@ -247,21 +247,43 @@ def nudge(host, row, dry):
     `server terminal write`, which addresses the PTY itself. Measured on a live
     row: submit `submitted:false`, PTY write delivered, same minute.
 
+    ⛔⛔ ALSO FIXED 2026-08-09, owner-reported while watching it fail: **the Enter
+    is a SEPARATE write of `\r`, and this sent one concatenated `\n`.** Two
+    mistakes in one line. `\n` is not Enter — an agent CLI runs its tty in RAW
+    mode, so Enter is CR and a bare LF is inserted as a literal newline; his
+    words: *"I just saw `continue, the booter booted` and an empty line. The enter
+    key did not send the prompt."* And `text + "\r"` in ONE write does not submit
+    either: yggterm's own `server app terminal submit` (`shell.rs:76405`) writes
+    the text, sleeps 80 ms, then writes `"\r"` discretely, because *"codex treats
+    a `\r` concatenated with the text in one write as a pasted newline (composer
+    content), not a submit"*. ⇒ The product already knew how to press Enter; both
+    watchdogs had invented their own encoding of it.
+
+    ⇒ PTY FIRST. In `ygg-booter.py`'s log every boot took the fallback —
+    `pty-write`, 5 for 5 — so a composer attempt on an unmounted row is not a
+    cheap first try, it is a 30-second stall in front of the thing that works.
+
     Even so: `submitted:true` describes the WRITE, never the delivery. The only
     proof is transcript GROWTH on the next pass — that is what `last_size` is."""
     if dry:
         log(f"DRY-RUN would nudge {row}")
         return "dry-run"
     binp = "$HOME/.yggterm/bin/yggterm"
+
+    def write(payload):
+        out = subprocess.run(
+            ["ssh", host, f"{binp} server terminal write '{row}' --stdin"],
+            input=payload, capture_output=True, text=True, timeout=180)
+        return _field(out.stdout or "", "accepted") is True
+
+    if write("continue"):
+        time.sleep(0.08)
+        if write("\r"):
+            return "pty-write"
     r = subprocess.run(
         ["ssh", host, f"{binp} server app terminal submit '{row}' --stdin"],
         input="continue", capture_output=True, text=True, timeout=180)
-    if _field(r.stdout or "", "submitted") is True:
-        return "submit"
-    w = subprocess.run(
-        ["ssh", host, f"{binp} server terminal write '{row}' --stdin"],
-        input="continue\n", capture_output=True, text=True, timeout=180)
-    return "pty-write" if _field(w.stdout or "", "accepted") is True else ""
+    return "submit" if _field(r.stdout or "", "submitted") is True else ""
 
 
 _ROWS_CACHE = {}

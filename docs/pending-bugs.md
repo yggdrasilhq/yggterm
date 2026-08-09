@@ -41,6 +41,32 @@ libyggterm has no live campaign row to route it to.
 **Falsifier:** in a libyggterm checkout, change `STABLE_THEME_ALPHA` to `0.5` and
 run its CI locally. Something must go red. Today nothing does.
 
+## ⚠ A BOOT/NUDGE WRITE APPENDS TO A HALF-TYPED DRAFT AND SUBMITS IT WITH THE OWNER'S WORDS GLUED ON
+
+**Status:** OPEN
+
+Found 2026-08-09 while fixing the watchdogs' Enter (that fix is shipped; git
+remembers it). `ygg-booter.py` and `ygg-babysit.py` deliver by writing into the
+row's PTY and then pressing Enter. **The write APPENDS to whatever the composer
+already holds.** So a row the owner had half-typed into and walked away from —
+which is exactly the shape of a row a watchdog decides is idle — gets
+`continue, the booter booted` glued onto the end of his sentence and the whole
+thing submitted as one message.
+
+⚠ **"Idle" is not "empty".** The idle classifier reads transcript activity; it
+never asks whether there is unsent text on the line. The daemon already knows —
+`session_has_pending_input_draft` is the signal the migration predicate uses to
+refuse releasing a session with a protected draft — and it is not exposed to the
+watchdogs.
+
+**The fix:** a boot checks for a pending draft first and, if there is one,
+escalates instead of typing. A draft is the owner mid-thought; appending to it is
+worse than not booting at all, because it destroys the sentence AND sends
+something he did not write.
+
+**Falsifier:** type half a sentence into an idle row, leave it, let the booter
+fire. The row must be escalated, not submitted.
+
 ## ⭐ A VERB CANNOT BE AIMED AT A SPECIFIC DAEMON, AND THE HEADLESS SURFACE CAN CREATE A ROW IT CANNOT REMOVE
 
 **Status:** OPEN
