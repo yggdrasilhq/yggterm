@@ -2722,6 +2722,16 @@ fn managed_cli_install_lock_is_busy(error: &std::io::Error) -> bool {
 /// that was about to become valid. Waiting also makes the wait FREE in the
 /// common case — by the time the lock is ours the other writer has usually
 /// installed the very tool we wanted, and the probe that follows finds it.
+///
+/// ⚠ **WHO CAN BE MADE TO WAIT, stated plainly because it is a launch path.**
+/// Every direct caller of `install_latest` is a `run_remote_*` verb — a
+/// short-lived process spawned over ssh — and the only in-daemon caller is
+/// `spawn_background_managed_cli_refresh`, which is on its own thread. So this
+/// wait can NEVER be held while the daemon holds `&mut self`, and it cannot
+/// stall other rows. It CAN delay one launch, when a sweep is mid-install and
+/// that row's TTL says a refresh is due. **That delay is protective, not a
+/// regression:** the alternative is exec'ing a binary another process is part
+/// way through replacing. The TTL gate means most launches never reach here.
 fn acquire_managed_cli_install_lock(home: &Path) -> Result<ManagedCliInstallLock> {
     acquire_managed_cli_install_lock_waiting(home, MANAGED_CLI_INSTALL_LOCK_WAIT_MS)
 }
