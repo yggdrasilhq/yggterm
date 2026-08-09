@@ -110,3 +110,26 @@ reported rc=0, because the checks ANDed two facts about two different processes.
 
 ⭐ If any of these are already known or already fixed on a branch, say so and I will correct
 atlasgraph's record — a stale negative repeated is how the fabric grows wrong facts.
+
+---
+
+## ⭐ D5 — a delegate is UNWATCHED for exactly the window in which it is most likely to stall
+
+`ygg-claim.sh` subscribes a row to the booter — which is the right design, and it is why a claimed
+row is protected. But the subscription happens when **the delegate runs its own claim**, i.e. some
+minutes into its first turn. Measured tonight: of three delegates spawned together, only one had
+subscribed itself twenty minutes later. The other two were **unwatched through boot and their
+entire first turn** — which is precisely the window where a dropped brief (D1) leaves a session
+sitting at its composer forever, and the window where nothing inside the session can rescue it,
+because *a stalled session cannot boot itself* (the booter's own founding argument).
+
+I closed it by hand:
+
+```sh
+ygg-booter.py subscribe --row <spawned-row> --campaign <token> --max-hours 12
+```
+
+⇒ **The SPAWNER should subscribe the row at creation**, not wait for the spawned agent to protect
+itself. The delegate re-running its own claim is then a harmless no-op (a row that already has a
+subscription keeps it, same as its seat). This is the §DREAM test verbatim — I hand-assembled the
+chore from primitives, and I only noticed because I happened to run `ygg-booter.py list`.
