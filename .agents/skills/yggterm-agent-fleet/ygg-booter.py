@@ -76,21 +76,39 @@ BOOT_TEXT = "continue, the booter booted"
 # Deliberately longer than babysit's 240s: a subscriber is a long-running campaign
 # session that may legitimately pause between phases, and a boot costs it a turn.
 #
-# ⛔ RAISED 420 -> 1800 ON OWNER DIRECTIVE, 2026-08-09: *"in case of long waits,
-# the booter should also wait ~30min before booting to avoid unnecessarily
-# booting."* Measured cause: a campaign session waiting on `cargo test
-# --workspace` was booted FIVE times in 45 min (12:26 · 12:36 · 12:51 · 13:01 ·
-# 13:11) while one test target alone ran 2386s. It was working the whole time.
+# ⛔ THIS STAYS THE DEFAULT FOR EVERY SUBSCRIBER. A session that KNOWS it is about
+# to wait — a release build, a 40-minute test target, an ssh fan-out — asks for a
+# longer window for that wait only (`defer`, below). Raising the default instead
+# would make every genuinely stalled session in the fleet sit undetected for the
+# length of the slowest thing anyone ever does.
+BOOT_AFTER_SECS = 420
+
+# ⛔⛔ THE CEILING IS A BILLING LIMIT, NOT A TUNING KNOB — owner-directed
+# 2026-08-09. The plan's prompt cache stays hot for ~1 hour; a session that does
+# NOTHING for an hour comes back to a COLD cache, and re-reading a large campaign
+# context at full price is the expensive failure. So no session may ever ask to
+# be left alone for an hour. 55 min leaves five minutes of margin for the tick
+# interval and the boot's own round trip.
+# ⇒ requests above this are CLAMPED, never refused: a refusal would leave the
+# caller on the 420s default, which is the opposite of what it asked for.
 #
-# ⚠ THE BLIND SPOT THIS ACCEPTS, stated so nobody re-derives it: a session
-# waiting on a long child process and a session that has genuinely stalled look
-# IDENTICAL from here — turn ended, transcript not growing. 420s could not tell
-# them apart either; it just guessed sooner and was wrong most of the time. The
-# real discriminator is whether the row still has a live child doing work
-# (a build, a test binary, an ssh), which this watcher does not read today. Until
-# it does, 1800s is the honest trade: a genuine stall is caught inside half an
-# hour, and legitimate long work is left alone.
-BOOT_AFTER_SECS = 1800
+# ⚠ WHY 3000 AND NOT 3300 — the number that must stay under the hour is the
+# WORST-CASE DELIVERY, not the setting. The watcher only looks every
+# DEFAULT_INTERVAL (300s), so a row crossing its window right after a tick waits
+# almost a full interval more: 3000 + 300 = 3300s (55 min) worst case, which is
+# the real five minutes of margin. Setting this to 3300 would put worst-case
+# delivery at exactly 3600s — the cache expiry itself, margin zero. Any change
+# here must keep `MAX_BOOT_AFTER_SECS + DEFAULT_INTERVAL` comfortably below 3600.
+MAX_BOOT_AFTER_SECS = 3000
+MIN_BOOT_AFTER_SECS = 60
+
+# ⭐ THE ONE EXCEPTION THE OWNER NAMED: a session running sub-agents or workflows
+# INSIDE itself is mid-turn, and `classify` already reports that as STUCK, which
+# escalates instead of booting ("a boot here races the agent's own input"). Those
+# sessions keep their own cache warm by working, so the ceiling does not apply and
+# no `defer` is needed. ⚠ In relay mode sub-agents are discouraged anyway, so this
+# arm should almost never fire — if it fires often, something is spawning agents
+# that should not be.
 # Consecutive boots that produced no transcript growth before a human is told.
 MAX_BOOTS = 3
 DEFAULT_INTERVAL = 300
@@ -199,6 +217,62 @@ def cmd_subscribe(args):
     back = [s for s in load_subs() if s["uuid"] == uuid]
     log(f"read-back: {'present' if back else '⛔ ABSENT — subscription did not land'}")
     return 0 if back else 1
+
+
+def boot_after_for(s):
+    """This subscriber's boot window RIGHT NOW, and why.
+
+    ⛔ The override must EXPIRE on its own. A session that asked for 50 minutes,
+    then died mid-wait, must not keep that window forever — the next session to
+    inherit the row would be watched far too loosely. So the deferral carries a
+    wall-clock deadline and the default resumes the moment it passes, with no
+    action required from a session that may no longer exist to take one."""
+    secs = s.get("boot_after_secs")
+    until = s.get("boot_after_until", 0)
+    if not secs:
+        return BOOT_AFTER_SECS, ""
+    if time.time() >= until:
+        return BOOT_AFTER_SECS, "deferral-expired"
+    return int(secs), s.get("boot_after_note") or "deferred"
+
+
+def cmd_defer(args):
+    """Ask for a longer boot window while waiting on something long.
+
+    The caller is the only one who knows it is about to block for 40 minutes on a
+    test suite; the watcher cannot see that (a waiting session and a stalled one
+    are identical from outside). So the session declares it, for that wait only."""
+    uuid = (args.row or "").rstrip("/").split("/")[-1] or own_uuid()
+    p = sub_path(uuid)
+    if not p.exists():
+        log(f"{uuid} is not subscribed — nothing to defer")
+        return 2
+    s = json.loads(p.read_text())
+
+    if args.clear:
+        for k in ("boot_after_secs", "boot_after_until", "boot_after_note"):
+            s.pop(k, None)
+        p.write_text(json.dumps(s, indent=1))
+        log(f"deferral cleared for {uuid[:8]} — back to the {BOOT_AFTER_SECS}s default")
+        return 0
+
+    asked = int(args.secs)
+    secs = max(MIN_BOOT_AFTER_SECS, min(asked, MAX_BOOT_AFTER_SECS))
+    if secs != asked:
+        log(f"⚠ clamped {asked}s to {secs}s — the {MAX_BOOT_AFTER_SECS}s ceiling is the "
+            f"prompt-cache/billing limit, not a preference")
+    # The window outlives the wait by one boot interval, so a job that overruns
+    # slightly is not booted the instant it goes long.
+    s["boot_after_secs"] = secs
+    s["boot_after_until"] = time.time() + secs + DEFAULT_INTERVAL
+    s["boot_after_note"] = args.note or "long wait"
+    p.write_text(json.dumps(s, indent=1))
+
+    back = json.loads(p.read_text())
+    ok = back.get("boot_after_secs") == secs
+    log(f"defer {uuid[:8]}: boot after {secs}s ({secs/60:.0f} min) — {s['boot_after_note']}")
+    log(f"read-back: {'present' if ok else '⛔ ABSENT — deferral did not land'}")
+    return 0 if ok else 1
 
 
 def cmd_unsubscribe(args):
@@ -347,7 +421,7 @@ def tick(args):
                 escalate(host, row, f"mid-turn and untouched for {c['age']/60:.0f} min — "
                                     f"a boot would race its own input")
                 s["escalated"] = True
-        elif state == "IDLE" and c["age"] >= BOOT_AFTER_SECS:
+        elif state == "IDLE" and c["age"] >= (boot_after := boot_after_for(s)[0]):
             if grew:
                 s["boots"] = 0                 # it worked since last tick
             if s["boots"] >= MAX_BOOTS:
@@ -363,6 +437,11 @@ def tick(args):
                 # Say WHICH door delivered it. A watchdog that reports "booted"
                 # without saying how cannot be debugged when it silently stops.
                 action = f"BOOT#{s['boots']}:{via or 'NOT-DELIVERED'}"
+                # ⭐ A deferral covers ONE wait. Once the boot it was protecting
+                # has fired, the reason for it is over — leaving it set would
+                # silently widen the window for everything that follows.
+                for k in ("boot_after_secs", "boot_after_until", "boot_after_note"):
+                    s.pop(k, None)
                 if not via:
                     rc = max(rc, 4)
                     if not s["escalated"]:
@@ -374,7 +453,12 @@ def tick(args):
         #    changes what it observes is not an instrument.
         if not args.dry_run:
             sub_path(uuid).write_text(json.dumps(s, indent=1))
-        log(f"{state:<14} {c['age']/60:>6.1f}m  {action:<12} {uuid[:8]}")
+        # Print the WINDOW this row is being judged against, not just its age.
+        # Without it a deferred row and a default one look the same in the log,
+        # and "why was it not booted at 8 minutes" costs a code read to answer.
+        win, why = boot_after_for(s)
+        window = f"{win//60}m" + (f"/{why}" if why else "")
+        log(f"{state:<14} {c['age']/60:>6.1f}m  {action:<12} {uuid[:8]}  win={window}")
     return rc
 
 
@@ -443,7 +527,14 @@ def cmd_status(args):
 def main():
     ap = argparse.ArgumentParser(description="boot a stalled session that subscribed")
     ap.add_argument("action",
-                    choices=["subscribe", "unsubscribe", "list", "tick", "watch", "status"])
+                    choices=["subscribe", "unsubscribe", "defer", "list", "tick",
+                             "watch", "status"])
+    ap.add_argument("--secs", type=int, default=0,
+                    help=f"defer: boot window for one long wait, clamped to "
+                         f"{MIN_BOOT_AFTER_SECS}-{MAX_BOOT_AFTER_SECS}s "
+                         f"(the ceiling is the prompt-cache limit)")
+    ap.add_argument("--clear", action="store_true",
+                    help="defer: drop the deferral and return to the default window")
     ap.add_argument("--row", default="")
     ap.add_argument("--campaign", default="")
     ap.add_argument("--note", default="")
@@ -456,6 +547,7 @@ def main():
     return {
         "subscribe": cmd_subscribe,
         "unsubscribe": cmd_unsubscribe,
+        "defer": cmd_defer,
         "list": cmd_list,
         "tick": tick,
         "watch": cmd_watch,

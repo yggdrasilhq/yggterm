@@ -333,8 +333,46 @@ unsubscribe from the booter."*
 ```sh
 .agents/skills/yggterm-agent-fleet/ygg-booter.py subscribe --campaign yggterm
 .agents/skills/yggterm-agent-fleet/ygg-booter.py status      # is a watcher alive?
+.agents/skills/yggterm-agent-fleet/ygg-booter.py defer --secs 2700 --note "cargo test"
+.agents/skills/yggterm-agent-fleet/ygg-booter.py defer --clear
 .agents/skills/yggterm-agent-fleet/ygg-booter.py unsubscribe # ⛔ when the work is DONE
 ```
+
+#### ⛔⛔ BEFORE A LONG WAIT, `defer` — THE WATCHER CANNOT SEE THAT YOU ARE BUSY
+
+**Owner-directed 2026-08-09:** *"A waiting session on a long task should ask the
+booter that for this time use a custom time (less than 55 mins) to boot."*
+
+⭐ **Why the session must ask, rather than the watcher work it out: a session
+waiting on a 40-minute build and a session that has genuinely stalled are
+IDENTICAL from outside** — turn ended, transcript not growing. Only the session
+knows it just started something long. The default window is deliberately short
+(**420 s**) so a real stall is caught fast; **you** widen it for one wait and it
+closes again by itself.
+
+⛔ **The ceiling is a BILL, not a preference.** The plan's prompt cache stays hot
+for ~1 hour; a session that does nothing for an hour resumes against a COLD cache
+and re-reads a large campaign context at full price. So `--secs` is clamped to
+**3000 s (50 min)** — never refused, because refusing would drop you back to 420 s,
+the opposite of what you asked for. ⚠ The number that must stay under the hour is
+**worst-case delivery, not the setting**: the watcher only looks every 300 s, so
+50 + 5 = 55 min worst case, and 5 min of real margin. Anyone retuning this must
+keep `MAX_BOOT_AFTER_SECS + interval` well under 3600.
+
+**It expires on its own, two ways** — after the boot it was protecting fires, and
+at a wall-clock deadline. A session that asked for 45 minutes and then died must
+not leave that window open for whoever inherits the row.
+
+⭐ **The one case needing no `defer`: sub-agents or workflows running INSIDE your
+session.** That is mid-turn, `classify` reports `STUCK`, and the booter escalates
+rather than boots — *a boot there races the agent's own input*. Such a session
+also keeps its own cache warm by working. ⚠ In relay mode sub-agents are
+discouraged anyway, so if this arm fires often, something is spawning agents that
+should not be.
+
+⚠ Read `win=` in the log to see which window a row is being judged against —
+`win=7m` is the default, `win=50m/cargo test` is a live deferral. Without it,
+*"why was it not booted at 8 minutes"* costs a code read to answer.
 
 ⭐ **`ygg-claim.sh` now subscribes you automatically**, because claiming a row is
 the moment a session becomes long-running work — and an arming step you have to
