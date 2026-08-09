@@ -13963,18 +13963,70 @@ fn parse_self_retire_handoff_disabled(value: Option<&str>) -> bool {
     }
 }
 
-/// Resolve the replacement binary for a `disk_binary_replaced` retire. Linux
-/// appends the literal " (deleted)" suffix to `/proc/self/exe` once the file at
-/// our launch path is overwritten, so the un-suffixed path now points at the
-/// NEW on-disk binary. Returns `None` when the link is not a replaced-binary
-/// link (so the handoff is skipped and the caller cold-shuts-down).
+/// Deploy decorations a backup copy of a daemon binary carries. Read off what
+/// the live hosts actually hold (`yggterm-headless.old.4121874`,
+/// `.rollback`, `.rollback.1784794147`, `.rollback-3.0.24`, `yggterm.bak-1538`)
+/// — the point is to recover the CANONICAL name from a backup's name, so the
+/// list is the set of suffixes a deploy is known to append, not a wildcard.
 #[cfg(target_os = "linux")]
-fn disk_replace_handoff_target(exe_link: &str) -> Option<PathBuf> {
-    let path = exe_link.strip_suffix(" (deleted)")?;
+const DEPLOY_BACKUP_NAME_MARKERS: &[&str] = &[".old.", ".rollback", ".bak-", ".previous"];
+
+/// The canonical binary name behind a deploy backup's name, if this IS one.
+/// `yggterm-headless.old.4121874` → `yggterm-headless`.
+#[cfg(target_os = "linux")]
+fn canonical_name_behind_deploy_backup(file_name: &str) -> Option<&str> {
+    DEPLOY_BACKUP_NAME_MARKERS
+        .iter()
+        .filter_map(|marker| file_name.find(marker))
+        .min()
+        .map(|at| &file_name[..at])
+        .filter(|stem| !stem.is_empty())
+}
+
+/// Where the replacement binary for a `disk_binary_replaced` retire might be,
+/// best candidate first. The caller takes the first that is a file.
+///
+/// ⛔ **`/proc/self/exe` names where this daemon's binary WAS, not where the
+/// installed binary IS**, and the difference is decided by the DEPLOYER's
+/// choreography, not by us:
+///
+/// - `mv new ~/.yggterm/bin/yggterm-headless` (the field guide's recipe,
+///   §4.2) replaces in place, so our link becomes
+///   `…/yggterm-headless (deleted)` and stripping the suffix lands on the new
+///   binary. Candidate 1.
+/// - `mv yggterm-headless yggterm-headless.old.$$; cp new yggterm-headless;
+///   rm -f *.old.*` renames the OLD binary away first. Our link follows the
+///   rename, so stripping the suffix lands on the backup's grave — a path that
+///   the `rm` has already removed. Candidate 1 misses; the install is sitting
+///   right beside it under its canonical name. Candidate 2.
+///
+/// **Measured on `dev` 2026-08-09**: candidate 1 resolved to
+/// `…/yggterm-headless.old.4121874`, the handoff was skipped
+/// `replacement_binary_missing` at 12:10:16, and the daemon cold-exited four
+/// seconds later taking **55 live PTYs** with it — including the row of the
+/// agent that ran the deploy, mid-`cargo test`. The constitution's *"other
+/// agents' sessions survive our restarts"* was defeated by a filename.
+///
+/// Returns empty when the link is not a replaced-binary link at all (so the
+/// handoff is skipped and the caller cold-shuts-down, as before).
+#[cfg(target_os = "linux")]
+fn disk_replace_handoff_candidates(exe_link: &str) -> Vec<PathBuf> {
+    let Some(path) = exe_link.strip_suffix(" (deleted)") else {
+        return Vec::new();
+    };
     if path.is_empty() {
-        return None;
+        return Vec::new();
     }
-    Some(PathBuf::from(path))
+    let replaced_in_place = PathBuf::from(path);
+    let installed_beside_the_backup = replaced_in_place
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(canonical_name_behind_deploy_backup)
+        .map(|canonical| replaced_in_place.with_file_name(canonical));
+    [Some(replaced_in_place), installed_beside_the_backup]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// Hand this daemon's live PTYs to a freshly-spawned new-version successor
@@ -13991,10 +14043,15 @@ fn attempt_self_retire_preserving_handoff(
     exe_link: &str,
     owned: &[String],
 ) -> bool {
-    let Some(new_exe) = disk_replace_handoff_target(exe_link) else {
-        return false;
-    };
-    if !new_exe.is_file() {
+    let candidates = disk_replace_handoff_candidates(exe_link);
+    let Some(new_exe) = candidates
+        .iter()
+        .find(|candidate| candidate.is_file())
+        .cloned()
+    else {
+        if candidates.is_empty() {
+            return false;
+        }
         append_trace_event(
             home_dir,
             "daemon",
@@ -14002,11 +14059,20 @@ fn attempt_self_retire_preserving_handoff(
             "daemon_self_retire_handoff_skipped",
             serde_json::json!({
                 "reason": "replacement_binary_missing",
-                "new_exe": new_exe.display().to_string(),
+                // Every path we looked at, not just the first — the single
+                // `new_exe` this replaced named the backup's grave and read as
+                // "there is no new binary" when the install was sitting beside
+                // it under its canonical name.
+                "candidates": candidates
+                    .iter()
+                    .map(|candidate| candidate.display().to_string())
+                    .collect::<Vec<_>>(),
+                "new_exe": candidates[0].display().to_string(),
+                "exe_link": exe_link,
             }),
         );
         return false;
-    }
+    };
     match hot_restart_detailed(
         endpoint,
         &new_exe,
@@ -22351,21 +22417,76 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn disk_replace_handoff_target_strips_deleted_suffix() {
+        use std::path::PathBuf;
+
         // Linux marks an overwritten /proc/self/exe with the " (deleted)"
         // suffix; the un-suffixed path is the NEW on-disk binary to hand off to.
         assert_eq!(
-            super::disk_replace_handoff_target("/home/user/.yggterm/bin/yggterm-headless (deleted)"),
-            Some(std::path::PathBuf::from(
-                "/home/user/.yggterm/bin/yggterm-headless"
-            )),
+            super::disk_replace_handoff_candidates(
+                "/home/user/.yggterm/bin/yggterm-headless (deleted)"
+            ),
+            vec![PathBuf::from("/home/user/.yggterm/bin/yggterm-headless")],
         );
         // A live (un-replaced) link must NOT trigger a handoff.
-        assert_eq!(
-            super::disk_replace_handoff_target("/home/user/.yggterm/bin/yggterm-headless"),
-            None,
+        assert!(
+            super::disk_replace_handoff_candidates("/home/user/.yggterm/bin/yggterm-headless")
+                .is_empty()
         );
         // Defensive: a bare suffix yields no usable path.
-        assert_eq!(super::disk_replace_handoff_target(" (deleted)"), None);
+        assert!(super::disk_replace_handoff_candidates(" (deleted)").is_empty());
+    }
+
+    /// ⛔ THE 55-PTY CASE. A deploy that renames the OLD binary away
+    /// (`mv yggterm-headless yggterm-headless.old.$$; cp new yggterm-headless;
+    /// rm -f *.old.*`) leaves our exe link pointing at the BACKUP's grave. The
+    /// first candidate is therefore a path nothing will ever create again, and
+    /// reading that as "there is no new binary" is what skipped the handoff on
+    /// `dev` at 12:10:16 on 2026-08-09 and cold-killed 55 live PTYs four
+    /// seconds later. The install was sitting beside it the whole time.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_deploy_that_renamed_the_old_binary_away_still_finds_the_install() {
+        use std::path::PathBuf;
+
+        assert_eq!(
+            super::disk_replace_handoff_candidates(
+                "/home/user/.yggterm/bin/yggterm-headless.old.4121874 (deleted)"
+            ),
+            vec![
+                PathBuf::from("/home/user/.yggterm/bin/yggterm-headless.old.4121874"),
+                PathBuf::from("/home/user/.yggterm/bin/yggterm-headless"),
+            ],
+            "the canonical install beside the backup must be a candidate"
+        );
+
+        // The other decorations the live hosts carry, all recovering the same
+        // canonical name.
+        for decorated in [
+            "yggterm-headless.rollback",
+            "yggterm-headless.rollback.1784794147",
+            "yggterm-headless.rollback-3.0.24",
+            "yggterm-headless.previous",
+        ] {
+            assert_eq!(
+                super::canonical_name_behind_deploy_backup(decorated),
+                Some("yggterm-headless"),
+                "{decorated} must resolve to the canonical daemon name"
+            );
+        }
+        assert_eq!(
+            super::canonical_name_behind_deploy_backup("yggterm.bak-1538"),
+            Some("yggterm"),
+        );
+
+        // ⛔ An UNDECORATED name yields no second candidate — otherwise an
+        // in-place replace would offer its own path twice and a caller could
+        // read the duplicate as a fallback that was checked.
+        assert_eq!(
+            super::canonical_name_behind_deploy_backup("yggterm-headless"),
+            None,
+        );
+        // A name that is ONLY a decoration recovers nothing to fall back to.
+        assert_eq!(super::canonical_name_behind_deploy_backup(".rollback"), None);
     }
 
     #[cfg(target_os = "linux")]

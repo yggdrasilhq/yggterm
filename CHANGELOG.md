@@ -4,6 +4,27 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Updating yggterm no longer kills the sessions that were running while it
+  updated.** When a new version was installed, the old background service was
+  supposed to hand its live terminals to the new one and step aside. Instead it
+  looked for the new version in the wrong place, decided there wasn't one, and
+  shut down cold — taking 55 running terminals with it, including a session that
+  had been working for twenty minutes. Where it looked depended on how the
+  update had been copied in: replacing the file in place worked, and moving the
+  old file aside first did not, because the service was then looking for the
+  file it had been moved out of rather than the new one sitting next to it. It
+  now checks both places.
+
+  The session you clicked on could also come back with a message saying it was
+  "already active outside Yggterm" and telling you to close an external terminal
+  — one that was never open, belonging to a process that had already exited. Once
+  the old service was gone, yggterm could no longer recognise its own sessions
+  and mistook them for somebody else's. It now recognises them by a marker the
+  session carries itself, which survives the update. Yggterm still refuses to
+  start a second copy of a session that is already running anywhere, but it now
+  says which of the two it is looking at, names the right CLI, and shows how long
+  it has been waiting instead of leaving one unchanging error on the screen.
+
 - **Yggterm no longer deletes the agent CLI it is installing.** Setting up a CLI
   on another machine could leave that machine with the tool missing entirely,
   and the error blamed a missing `sh`. Neither part was what it looked like.

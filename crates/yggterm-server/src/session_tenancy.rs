@@ -85,20 +85,87 @@ pub struct CreatorStamp {
     pub parent_session_path: Option<String>,
 }
 
+/// The names a yggterm-owned PTY stamps its row under, in read precedence.
+///
+/// ⛔ **The `LC_` twin is not redundancy.** sshd strips `YGGTERM_SESSION_ID`
+/// and forwards `LC_*` (the `SendEnv LANG LC_*` / `AcceptEnv LANG LC_*`
+/// Debian defaults), so on any ssh-borne row the marker survives ONLY as the
+/// mirror. A reader that consults one name passes locally and fails on every
+/// remote row — so every reader consults this list and nothing copies the
+/// names elsewhere. Written by `terminal::apply_session_identity_env`.
+pub const SESSION_MARKER_ENV_KEYS: [&str; 2] = ["YGGTERM_SESSION_ID", "LC_YGGTERM_SESSION_ID"];
+
 /// The row this process is running INSIDE, from the environment yggterm
 /// already gives every PTY it owns.
 ///
 /// ⭐ This is why nesting can record itself with no caller changes: a delegate
 /// that launches ychrome does not have to know it is nested, and historically
-/// would not have said so. `YGGTERM_SESSION_ID` is stripped by sshd, so the
-/// `LC_` mirror is what actually survives a remote hop — read both, in that
-/// order, exactly as the terminal side sets them.
+/// would not have said so.
 pub fn parent_session_path_from_env() -> Option<String> {
-    ["YGGTERM_SESSION_ID", "LC_YGGTERM_SESSION_ID"]
+    SESSION_MARKER_ENV_KEYS
         .iter()
         .find_map(|key| std::env::var(key).ok())
         .map(|value| sanitize_path_token(&value))
         .filter(|value| !value.is_empty())
+}
+
+/// The row a CANDIDATE process is running inside, out of the NUL-separated
+/// `KEY=VALUE` list Linux exposes as `/proc/<pid>/environ`.
+///
+/// The twin of [`parent_session_path_from_env`], which can only ever answer
+/// for the process doing the asking. Same keys, same precedence, same sshd
+/// caveat — deliberately here rather than at the callsite so the two readings
+/// cannot drift apart.
+///
+/// ⭐ **Why a caller wants the ENVIRONMENT and not the process tree:** a
+/// process's environment is fixed at exec, so it survives reparenting, its
+/// daemon's death and a version swap. Ancestry survives none of those.
+pub fn session_marker_from_environ_bytes(raw: &[u8]) -> Option<String> {
+    let entries = raw
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .collect::<Vec<_>>();
+    // Precedence is the KEY order, never the order the entries happen to sit
+    // in: `environ` is the process's own layout and puts the `LC_` mirror
+    // first as often as not.
+    SESSION_MARKER_ENV_KEYS
+        .iter()
+        .find_map(|key| {
+            entries
+                .iter()
+                .find_map(|entry| entry.strip_prefix(&format!("{key}=")))
+        })
+        .map(sanitize_path_token)
+        .filter(|value| !value.is_empty())
+}
+
+/// [`session_marker_from_environ_bytes`] against a live pid. `None` when the
+/// process is gone or its environ is unreadable — which is never read as "not
+/// ours", only as "cannot say".
+#[cfg(target_os = "linux")]
+pub fn session_marker_from_proc_environ(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    session_marker_from_environ_bytes(&raw)
+}
+
+/// Does a session marker name `session_id`?
+///
+/// A marker is a ROW PATH — `cc-runtime://<id>`, `codex-runtime://<id>`,
+/// `remote-cc://<host>/<id>`, `local://<row-id>` — and the agent session id is
+/// always its last segment, which is exactly how the fleet tools read
+/// `$YGGTERM_SESSION_ID`. Comparing the whole marker would fail on every
+/// scheme but one; comparing a substring would let `local://<row>` claim an
+/// agent session whose id merely appears inside it.
+pub fn session_marker_names_session(marker: &str, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    marker
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .is_some_and(|tail| tail == session_id)
 }
 
 impl CreatorStamp {
@@ -1161,6 +1228,75 @@ mod tests {
             idle_secs,
             running,
         }
+    }
+
+    #[test]
+    /// ⛔ The `LC_` mirror is the only marker that survives an ssh hop, and the
+    /// last path segment is the only part of a marker that identifies the
+    /// session. Both are load-bearing for the resume guard: reading the
+    /// unprefixed name alone, or comparing whole markers, passes on a local row
+    /// and fails on every remote one.
+    #[test]
+    fn a_session_marker_is_read_by_key_precedence_and_matched_by_its_last_segment() {
+        let session = "bb658b4b-99c1-4920-8edc-ea25f6455468";
+
+        // Key precedence, not the order the entries happen to sit in.
+        assert_eq!(
+            session_marker_from_environ_bytes(
+                format!(
+                    "LC_YGGTERM_SESSION_ID=local://mirror\0PATH=/bin\0YGGTERM_SESSION_ID=cc-runtime://{session}\0"
+                )
+                .as_bytes()
+            )
+            .as_deref(),
+            Some(format!("cc-runtime://{session}").as_str()),
+        );
+        // sshd stripped the unprefixed name: the mirror is all there is.
+        assert_eq!(
+            session_marker_from_environ_bytes(
+                format!("LANG=C\0LC_YGGTERM_SESSION_ID=remote-cc://dev/{session}\0").as_bytes()
+            )
+            .as_deref(),
+            Some(format!("remote-cc://dev/{session}").as_str()),
+        );
+        // Absence is representable, and is never an empty string.
+        assert_eq!(
+            session_marker_from_environ_bytes(b"PATH=/bin\0HOME=/root\0"),
+            None
+        );
+        assert_eq!(session_marker_from_environ_bytes(b"YGGTERM_SESSION_ID=\0"), None);
+        // A key that merely ENDS with ours must not answer for it.
+        assert_eq!(
+            session_marker_from_environ_bytes(b"NOT_YGGTERM_SESSION_ID=cc-runtime://x\0"),
+            None
+        );
+
+        // Every scheme a row is spelled in ends in the session id.
+        for marker in [
+            format!("cc-runtime://{session}"),
+            format!("codex-runtime://{session}"),
+            format!("remote-cc://dev/{session}"),
+            format!("remote-cc://dev/{session}/"),
+        ] {
+            assert!(
+                session_marker_names_session(&marker, session),
+                "{marker} names {session}"
+            );
+        }
+        // A different row does not, and neither does a partial id — a
+        // substring test would let a longer id claim a shorter one's session.
+        assert!(!session_marker_names_session(
+            "local://0e96c07d-cc0e-45ec-b04a-5da4186752a5",
+            session
+        ));
+        assert!(!session_marker_names_session(
+            &format!("cc-runtime://{session}"),
+            "bb658b4b"
+        ));
+        assert!(!session_marker_names_session(
+            &format!("cc-runtime://{session}"),
+            ""
+        ));
     }
 
     #[test]
