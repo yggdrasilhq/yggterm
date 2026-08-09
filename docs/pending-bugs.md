@@ -13,38 +13,33 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
-## ⛔ THE CI ARCHITECTURE GUARD CRASHES ON A CRATE THAT NO LONGER EXISTS — so every contract after it is unchecked
+## ⚠ THE STABLE-THEME PIN LEFT FOR libyggterm AND NOTHING GUARDS IT THERE — a tag bump can change the theme silently
 
 **Status:** OPEN
 
-Measured on `dev` 2026-08-09 at HEAD (`aeebd540`), and confirmed pre-existing by
-re-running it on a clean stash:
+Surfaced 2026-08-09 while repairing this repo's architecture guard (that repair
+is shipped; git remembers it). The four assertions that pinned the stable theme —
+`STABLE_THEME_ALPHA = 0.96`, `STABLE_THEME_GRAIN = 0.0`, and the two clamp lines
+that force a saved profile back onto them before rendering — named
+`crates/yggui/src/theme.rs`, which left this repo in the 3.0.0 separation
+(`3a51d499`, 2026-08-02). They could not be re-pointed: `yggui` now arrives as a
+git dependency **pinned by tag** (`Cargo.toml`: `tag = "v0.12.1"`), and a
+contract here cannot reach into a pinned dep's source. They were deleted.
 
-    $ python3 scripts/check_architecture_contracts.py
-    FileNotFoundError: [Errno 2] No such file or directory:
-      '…/crates/yggui/src/theme.rs'
+⚠ **The invariant is real and is now unguarded on both sides.** The constants
+still hold their values in `libyggterm/crates/yggui/src/theme.rs`, but a grep of
+that repo's `scripts/` and `.github/workflows/` finds nothing asserting them —
+it ships one `gallery-shot.sh` and a `ci.yml` that does not. ⇒ **whoever bumps
+the `yggui` tag can change the stable theme's alpha or grain, or drop the clamp
+that overrides a saved profile, and no check anywhere will notice.**
 
-`crates/yggui` is gone — `crates/` holds `yggterm-{core,ghostty-bridge,gtk-glue,
-platform,server,shell,webprobe,wpe}` and nothing else, and `find` locates no
-`theme.rs` anywhere in `crates/` or `apps/`. The script asserts four contracts
-against that path (`STABLE_THEME_ALPHA`, `STABLE_THEME_GRAIN`, and the two clamp
-lines), and `require_contains` raises rather than failing the check, so the run
-**aborts at the first one**.
+⚖ **The guard belongs in libyggterm's CI, not here** — the assertion has to sit
+beside the source it protects. It is tracked in *this* queue because this repo is
+what depends on the tag and what breaks when the invariant moves, and because
+libyggterm has no live campaign row to route it to.
 
-⛔ **This is [[finding-a-red-target-hides-every-test-behind-it]]:** it is
-`.github/workflows/ci.yml:25`, so the guard runs on every push — and everything
-it would have checked after line 243 has been unchecked for as long as the crate
-has been missing. A crash is not a failing assertion; it is no assertion at all.
-
-⚠ **Do not just delete the four lines.** The question is where the stable-theme
-pin LIVES now — the neighbouring contracts moved to
-`crates/yggterm-shell/src/theme_contract.rs`, so the likely answer is that these
-four should have moved with them and the contract is genuinely unenforced.
-Settle that before editing, or the guard goes green while the pin stays loose.
-
-**Falsifier:** `python3 scripts/check_architecture_contracts.py` exits 0 or 1
-with a verdict line, never a traceback; and deliberately breaking a contract
-declared AFTER the theme block is caught.
+**Falsifier:** in a libyggterm checkout, change `STABLE_THEME_ALPHA` to `0.5` and
+run its CI locally. Something must go red. Today nothing does.
 
 ## ⭐ THE DAEMON PLANE HAS NO INSTRUMENT — every verb answers for THE daemon, and this project's hardest bug is about the OTHER five
 
