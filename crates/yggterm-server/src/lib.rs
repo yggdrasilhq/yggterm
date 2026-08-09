@@ -137,8 +137,8 @@ pub use daemon::{
     start_command_session_with_terminal_appearance, start_local_session,
     start_local_session_at, start_local_session_at_with_terminal_appearance,
     start_local_session_placed, start_local_session_seated,
-    start_local_session_with_launch_options, start_remote_claude_session_seated,
-    start_remote_codex_session_seated, start_ssh_session_seated,
+    start_local_session_with_launch_options, start_remote_agent_session_seated,
+    start_remote_claude_session_seated, start_remote_codex_session_seated, start_ssh_session_seated,
     start_remote_claude_session_at_with_terminal_appearance, start_remote_claude_session_placed,
     start_remote_claude_session_with_launch_options, start_remote_codex_session_at,
     start_remote_codex_session_at_with_terminal_appearance, start_remote_codex_session_placed,
@@ -783,14 +783,15 @@ fn local_live_session_kind_is_recoverable(kind: SessionKind) -> bool {
 }
 
 fn persisted_live_session_is_recoverable(live: &PersistedLiveSession) -> bool {
-    // remote-cc:// is the Claude Code twin of remote-session:// — both are
-    // first-class remote agent sessions ([[spec-unify-local-remote]]). Only
-    // recognizing the codex scheme here dropped every remote CC keep-alive
-    // session at daemon restart (fell through to the SshShell-only arm;
-    // live-caught 2026-06-10: all CC sessions gone after the 2.8.73 swap).
-    if parse_remote_scanned_session_path(&live.key).is_some()
-        || parse_remote_cc_session_path(&live.key).is_some()
-    {
+    // EVERY remote agent row scheme, from the registry. remote-cc:// is the
+    // Claude Code twin of remote-session:// and both are first-class remote
+    // agent sessions ([[spec-unify-local-remote]]); recognizing only the codex
+    // scheme dropped every remote CC keep-alive session at daemon restart (fell
+    // through to the SshShell-only arm; live-caught 2026-06-10: all CC sessions
+    // gone after the 2.8.73 swap). Naming schemes is what put that hole here, so
+    // the list is derived — a CLI given a remote start contract survives a
+    // daemon swap the moment its scheme is registered, not one incident later.
+    if session_path_is_remote_agent(&live.key) {
         return !is_loopback_ssh_target(&live.ssh_target);
     }
     if is_local_codex_storage_session_path(&live.key)
@@ -815,7 +816,7 @@ fn persisted_live_session_is_recoverable(live: &PersistedLiveSession) -> bool {
 /// PTY. The scheme alone implies the agent kind (there is no remote-scanned
 /// plain shell), so no kind gate is needed here.
 pub(crate) fn session_path_is_remote_agent(path: &str) -> bool {
-    parse_remote_scanned_session_path(path).is_some() || parse_remote_cc_session_path(path).is_some()
+    parse_remote_agent_session_path_with_kind(path).is_some()
 }
 
 /// Per the first-class agent-session spec (gate #6 of the persistence saga,
@@ -1041,10 +1042,9 @@ fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) 
     {
         return false;
     }
-    // remote-cc:// twin of remote-session:// — see persisted_live_session_is_recoverable.
-    if parse_remote_scanned_session_path(key).is_some()
-        || parse_remote_cc_session_path(key).is_some()
-    {
+    // EVERY remote agent row scheme — see persisted_live_session_is_recoverable
+    // for why this is derived from the registry rather than listed here.
+    if session_path_is_remote_agent(key) {
         return session
             .ssh_target
             .as_deref()
@@ -6612,6 +6612,59 @@ impl YggtermServer {
         title_hint: Option<&str>,
         launch: &AgentLaunchOptions,
     ) -> anyhow::Result<String> {
+        self.start_remote_agent_session_with_launch_options(
+            SessionKind::ClaudeCode,
+            target,
+            prefix,
+            cwd,
+            title_hint,
+            launch,
+        )
+    }
+
+    /// Start a NEW remote session for ANY agent CLI with a remote arm.
+    ///
+    /// This is the generalization of the Claude Code start above, and it is the
+    /// LOCAL half of the remote start contract — the half that was missing.
+    /// The wrapper half has existed since the six-CLI intake: `start-<slug>`
+    /// parses, routes and runs for every registered CLI. What did not exist was
+    /// any way to ASK for one: app-control's remote arm knew two kinds, and the
+    /// other six fell through to a plain ssh shell that reported success
+    /// (3.0.67 replaced that silent downgrade with a loud refusal — strictly
+    /// better, and not the same as working).
+    ///
+    /// Everything that used to be spelled "Claude Code" here is now read from
+    /// the CLI's descriptor: the row scheme, the wrapper verb, the display name
+    /// in the metadata rail, and the Restore line. That is deliberate — a second
+    /// copy of this function per CLI is exactly the shape that let six kinds be
+    /// forgotten at one branch.
+    ///
+    /// ⛔ Refuses a kind with NO remote arm rather than borrowing another CLI's
+    /// scheme. `remote_agent_session_path` and `remote_agent_start_subcommand`
+    /// both answer `None` for a local-only CLI, and either `None` is a refusal
+    /// the caller reads.
+    pub fn start_remote_agent_session_with_launch_options(
+        &mut self,
+        kind: SessionKind,
+        target: &str,
+        prefix: Option<&str>,
+        cwd: Option<&str>,
+        title_hint: Option<&str>,
+        launch: &AgentLaunchOptions,
+    ) -> anyhow::Result<String> {
+        let Some(descriptor) = agent_cli_descriptor(kind) else {
+            anyhow::bail!(
+                "{} is not an agent CLI, so it has no remote start contract",
+                session_kind_label(kind)
+            );
+        };
+        let start_verb = remote_agent_start_subcommand(kind).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} is a LOCAL-ONLY CLI (it declares no remote wrapper), so a remote row for it \
+                 cannot be started",
+                descriptor.display_name
+            )
+        })?;
         let ssh_target = canonicalize_ssh_target_alias(target);
         if ssh_target.is_empty() {
             anyhow::bail!("enter an SSH target such as dev, pi@raspberry, or user@ip");
@@ -6654,15 +6707,20 @@ impl YggtermServer {
         self.upsert_ssh_target(&registry_target);
         self.ensure_remote_machine_stub(&registry_target);
 
-        let cc_target = SshConnectTarget {
+        let agent_target = SshConnectTarget {
             label: target_label.clone(),
-            kind: SessionKind::ClaudeCode,
+            kind,
             ssh_target: ssh_target.clone(),
             prefix: prefix.clone(),
             cwd: cwd.clone(),
         };
         let uuid = Uuid::new_v4().to_string();
-        let session_path = remote_cc_session_path(&machine_key, &uuid);
+        let session_path = remote_agent_session_path(kind, &machine_key, &uuid).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} declares no remote row scheme, so a remote row for it has no identity",
+                descriptor.display_name
+            )
+        })?;
         let cwd_display = cwd.clone().unwrap_or_default();
         // Host-daemon runtime lane (start-cc), mirroring start-codex — the
         // remote daemon owns the claude PTY so the session survives local
@@ -6677,25 +6735,21 @@ impl YggtermServer {
             &ssh_target,
             prefix.as_deref(),
             &remote_binary,
-            &["server", "remote", "start-cc", &uuid, &cwd_display],
-            &claude_extra_args_remote_exports_with_launch(launch),
+            &["server", "remote", &start_verb, &uuid, &cwd_display],
+            &remote_agent_start_exports(kind, launch),
         );
         let title = title_hint
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| {
-                live_session_default_title(
-                    SessionKind::ClaudeCode,
-                    cwd.as_deref(),
-                    &ssh_machine_label(&cc_target),
-                )
+                live_session_default_title(kind, cwd.as_deref(), &ssh_machine_label(&agent_target))
             });
 
         let mut session = build_live_session(
             &uuid,
-            SessionKind::ClaudeCode,
-            &cc_target,
+            kind,
+            &agent_target,
             self.backend,
             self.theme,
             self.ghostty_host.bridge_enabled,
@@ -6710,7 +6764,7 @@ impl YggtermServer {
         session.ssh_prefix = prefix.clone();
         session.launch_command = launch_command;
         session.terminal_lines = vec![
-            format!("Queue new remote Claude Code session {uuid}"),
+            format!("Queue new remote {} session {uuid}", descriptor.display_name),
             format!("Target host: {ssh_target}"),
             format!(
                 "Workspace: {}",
@@ -6726,12 +6780,28 @@ impl YggtermServer {
         }
         upsert_session_metadata(&mut session.metadata, "Host", ssh_target.clone());
         upsert_session_metadata(&mut session.metadata, "UUID", uuid.clone());
-        upsert_session_metadata(&mut session.metadata, "Claude Code Session", uuid.clone());
+        // The rail's per-CLI row. Claude Code keeps its exact shipped spelling
+        // ("Claude Code Session") because that is what its descriptor carries,
+        // and the label is not decoration: predicates READ "Codex Session" to
+        // recover a row's session id. `SessionMetadataEntry::label` is a
+        // `&'static str`, so this one field is transcribed rather than
+        // `format!`ed — and locked to `"<display_name> Session"` by
+        // `the_session_metadata_label_is_the_display_name_plus_session`.
         upsert_session_metadata(
             &mut session.metadata,
-            "Restore",
-            format!("ssh {ssh_target} 'yggterm server remote resume-cc {uuid} --require-existing'"),
+            descriptor.session_metadata_label,
+            uuid.clone(),
         );
+        if let Some(resume_verb) = remote_agent_resume_subcommand(kind) {
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Restore",
+                format!(
+                    "ssh {ssh_target} 'yggterm server remote {resume_verb} {uuid} \
+                     --require-existing'"
+                ),
+            );
+        }
 
         apply_birth_keep_alive(&mut session);
         self.sessions.insert(session_path.clone(), session);
@@ -8027,8 +8097,9 @@ impl YggtermServer {
         session_id: &str,
         cwd: Option<&str>,
         terminal_appearance: Option<&str>,
+        launch: &AgentLaunchOptions,
     ) -> anyhow::Result<String> {
-        self.start_remote_runtime_agent_session(kind, session_id, cwd, terminal_appearance)
+        self.start_remote_runtime_agent_session(kind, session_id, cwd, terminal_appearance, launch)
     }
 
     fn ensure_remote_runtime_agent_session(
@@ -8207,6 +8278,7 @@ impl YggtermServer {
             session_id,
             cwd,
             terminal_appearance,
+            &AgentLaunchOptions::default(),
         )
     }
 
@@ -8221,6 +8293,7 @@ impl YggtermServer {
             session_id,
             cwd,
             terminal_appearance,
+            &AgentLaunchOptions::default(),
         )
     }
 
@@ -8230,6 +8303,7 @@ impl YggtermServer {
         session_id: &str,
         cwd: Option<&str>,
         terminal_appearance: Option<&str>,
+        launch: &AgentLaunchOptions,
     ) -> anyhow::Result<String> {
         let display = remote_runtime_agent_display(kind);
         let key = remote_runtime_agent_session_key(kind, session_id)
@@ -8270,31 +8344,32 @@ impl YggtermServer {
         // (`--session-id <id>`) so the JSONL on disk matches the row; a bare
         // `claude` would mint its own id. Codex keeps the plain launch (it
         // reports its id via the session file watch instead).
+        //
+        // ⚠ The launch's model / permission mode is composed HERE because this
+        // daemon owns the CLI and its descriptor. The legacy fallback
+        // deliberately drops the options for the same reason
+        // `agent_launch_command_with_options` does: it exists for a host whose
+        // managed layout cannot be resolved at all, and a command that silently
+        // ran on the wrong model would be worse than one visibly missing flags.
+        let composed = managed_cli_shell_command_full(
+            kind,
+            cwd,
+            ManagedCliAction::Launch,
+            terminal_appearance,
+            launch,
+        );
         let launch_command = if kind == SessionKind::ClaudeCode {
-            managed_cli_shell_command_with_terminal_appearance(
-                kind,
-                cwd,
-                ManagedCliAction::Launch,
-                terminal_appearance,
-            )
-            .map(|command| {
-                format!("{command} --session-id {}", shell_single_quote(session_id))
-            })
-            .unwrap_or_else(|_| {
-                format!(
-                    "{} --session-id {}",
-                    legacy_agent_launch_command(kind, cwd, None),
-                    shell_single_quote(session_id)
-                )
-            })
+            composed
+                .map(|command| format!("{command} --session-id {}", shell_single_quote(session_id)))
+                .unwrap_or_else(|_| {
+                    format!(
+                        "{} --session-id {}",
+                        legacy_agent_launch_command(kind, cwd, None),
+                        shell_single_quote(session_id)
+                    )
+                })
         } else {
-            managed_cli_shell_command_with_terminal_appearance(
-                kind,
-                cwd,
-                ManagedCliAction::Launch,
-                terminal_appearance,
-            )
-            .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, None))
+            composed.unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, None))
         };
         let home = resolve_yggterm_home()?;
         let registry = RemoteRuntimeRegistry::open(&home)?;
@@ -10461,7 +10536,52 @@ fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
 /// ⚠ Use this whenever the question is "which remote agent session is this",
 /// and reach for the scheme-specific parser ONLY when the answer must be Codex.
 fn parse_remote_agent_session_path(path: &str) -> Option<(&str, &str)> {
-    parse_remote_scanned_session_path(path).or_else(|| parse_remote_cc_session_path(path))
+    parse_remote_agent_session_path_with_kind(path)
+        .map(|(machine_key, session_id, _kind)| (machine_key, session_id))
+}
+
+/// The same question, plus the answer the SCHEME already carries: which CLI.
+///
+/// Derived from [`yggterm_core::agent_scheme`] rather than from a hand-written
+/// `remote-session:// | remote-cc://` pair, because the pair was the bug. Every
+/// caller below used to spell those two prefixes itself, so registering a
+/// seventh CLI's scheme covered NONE of them — and a `remote-opencode://` row
+/// would have parsed to `None` everywhere at once: no machine to resize, no
+/// runtime to write to, no recovery at daemon swap. The scheme registry already
+/// knows every remote row prefix and the kind it implies; this reads it.
+///
+/// ⛔ A scheme with no `kind` cannot answer here. That is `ssh://`'s honest
+/// answer (a shell is not an agent), and `remote_agent_row_schemes` filters it
+/// out already — the `?` is belt and braces, not a second policy.
+fn parse_remote_agent_session_path_with_kind(path: &str) -> Option<(&str, &str, SessionKind)> {
+    yggterm_core::agent_scheme::remote_agent_row_schemes().find_map(|scheme| {
+        let kind = scheme.kind?;
+        let rest = path.strip_prefix(scheme.prefix)?;
+        let (machine_key, session_id) = rest.split_once('/')?;
+        Some((machine_key, session_id, kind))
+    })
+}
+
+/// The ROW path a remote session of `kind` is born with, from the descriptor's
+/// declared `remote_row_scheme`.
+///
+/// `None` means this kind has NO remote arm — a local-only CLI (`CodexLiteLlm`,
+/// which says so by carrying no `wrapper_slug`), a shell, a document. A caller
+/// that cannot build a path must REFUSE; the one thing it must never do is
+/// borrow another CLI's scheme, which is how a remote codex-litellm row would
+/// have been resumed as codex — the wrong binary against the wrong store.
+///
+/// The two shipped builders (`remote_scanned_session_path`,
+/// `remote_cc_session_path`) produce the same strings this does, locked by
+/// `remote_agent_session_path_agrees_with_the_two_shipped_builders`.
+fn remote_agent_session_path(
+    kind: SessionKind,
+    machine_key: &str,
+    session_id: &str,
+) -> Option<String> {
+    agent_cli_descriptor(kind)
+        .and_then(|descriptor| descriptor.remote_row_scheme)
+        .map(|scheme| format!("{scheme}{machine_key}/{session_id}"))
 }
 
 fn remote_runtime_codex_session_key(session_id: &str) -> String {
@@ -10484,24 +10604,19 @@ fn parse_remote_runtime_cc_session_key(path: &str) -> Option<&str> {
 /// on that machine, and the agent kind — **the row scheme alone implies the
 /// kind**, per [`yggterm_core::agent_scheme`].
 ///
-/// This is the ONE table mapping `remote-session://` → Codex and `remote-cc://`
-/// → Claude Code for callers that hold a machine list rather than the daemon's
-/// state (the GUI's app-control handlers, the CLI). Every remote agent control
-/// op — resize, terminate, liveness — must resolve through here or through
+/// This is the ONE mapping from a remote row scheme to its CLI for callers that
+/// hold a machine list rather than the daemon's state (the GUI's app-control
+/// handlers, the CLI). Every remote agent control op — resize, terminate,
+/// liveness — must resolve through here or through
 /// [`ServerState::remote_agent_pty_target_for_path`], never by re-parsing one
 /// scheme and treating the other as absent. Doing exactly that is what left
-/// remote Claude Code agents running after their row was removed.
+/// remote Claude Code agents running after their row was removed — so the table
+/// is now the scheme registry itself and covers every CLI with a remote arm.
 pub fn remote_agent_row_target(
     remote_machines: &[RemoteMachineSnapshot],
     path: &str,
 ) -> Option<(RemoteMachineRef, String, SessionKind)> {
-    let (raw_machine_key, session_id, kind) =
-        if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(path) {
-            (machine_key, session_id, SessionKind::Codex)
-        } else {
-            let (machine_key, session_id) = parse_remote_cc_session_path(path)?;
-            (machine_key, session_id, SessionKind::ClaudeCode)
-        };
+    let (raw_machine_key, session_id, kind) = parse_remote_agent_session_path_with_kind(path)?;
     let machine_key = normalize_machine_key(raw_machine_key);
     let machine = remote_machines
         .iter()
@@ -10553,18 +10668,16 @@ pub fn remote_agent_row_runtime_after_removal(
 }
 
 /// Machine key + per-kind daemon runtime key for the direct remote write
-/// fallback. BOTH remote agent schemes, not just codex (the same hole
+/// fallback. EVERY remote agent scheme, not just codex (the same hole
 /// `forward_remote_pty_resize` had): a `remote-cc://` path used to parse to
 /// None in `remote_terminal_write_for_path`, so the direct-write fallback
 /// silently declined and the caller fell through to the local PTY — a runtime
 /// that does not exist for a remote session. That is the post-daemon-swap
-/// "active remote-cc un-inputable for minutes" window.
+/// "active remote-cc un-inputable for minutes" window, and a seventh CLI
+/// spelled here by hand would have re-earned it.
 fn remote_direct_write_target_for_path(path: &str) -> Option<(&str, String)> {
-    if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(path) {
-        return Some((machine_key, remote_runtime_codex_session_key(session_id)));
-    }
-    let (machine_key, session_id) = parse_remote_cc_session_path(path)?;
-    Some((machine_key, remote_runtime_cc_session_key(session_id)))
+    let (machine_key, session_id, kind) = parse_remote_agent_session_path_with_kind(path)?;
+    Some((machine_key, remote_runtime_agent_session_key(kind, session_id)?))
 }
 
 /// Per-kind table for the daemon-owned agent-runtime lane
@@ -12099,6 +12212,41 @@ fn claude_extra_args_remote_exports_with_launch(launch: &AgentLaunchOptions) -> 
     )]
 }
 
+/// The ssh exports a remote `start-<slug>` needs to honour ONE launch's model /
+/// permission mode.
+///
+/// ⚠ Claude Code keeps its own lane, and the fork is real rather than tidy: CC's
+/// remote start also carries the user's configured `claude_code_extra_args` from
+/// the settings store, which is not a launch option and has no equivalent for
+/// any other CLI. Collapsing the two would either drop that setting or invent it
+/// for eight CLIs that have no such field.
+fn remote_agent_start_exports(kind: SessionKind, launch: &AgentLaunchOptions) -> Vec<String> {
+    if kind == SessionKind::ClaudeCode {
+        return claude_extra_args_remote_exports_with_launch(launch);
+    }
+    agent_launch_options_remote_exports(launch)
+}
+
+/// `--model` / `--permission-mode` as JSON in one export, for the machine that
+/// owns the CLI to compose with its own descriptor.
+///
+/// Empty options export nothing at all: a launch that asked for neither must
+/// leave the remote command byte-for-byte what it was, so an unasked-for
+/// variable can never change a session's behaviour.
+fn agent_launch_options_remote_exports(launch: &AgentLaunchOptions) -> Vec<String> {
+    if launch.is_empty() {
+        return Vec::new();
+    }
+    let Ok(encoded) = serde_json::to_string(launch) else {
+        return Vec::new();
+    };
+    vec![format!(
+        "export {}={}",
+        codex_cli::ENV_YGGTERM_AGENT_LAUNCH_OPTIONS,
+        shell_single_quote(&encoded)
+    )]
+}
+
 fn remote_ssh_shell_command(ssh_target: &str, prefix: Option<&str>, inner: &str) -> String {
     let env_exports = terminal_identity_shell_exports_for_remote().join(" && ");
     let inner = if env_exports.is_empty() {
@@ -12150,26 +12298,28 @@ fn refresh_remote_codex_terminal_identity_launch_command(
     session: &mut ManagedSessionView,
     remote_machines: &[RemoteMachineSnapshot],
 ) -> bool {
-    // Codex (remote-session://) AND its Claude Code twin (remote-cc://):
-    // both kinds keep their launch command on the host-daemon wrapper lane.
-    // This refresh is also the HEALING path that rewrites pre-2.9.5 raw
-    // `ssh … claude --resume` CC rows onto resume-cc
-    // ([[finding-cc-sessions-bypass-host-daemon]]).
-    let is_codex = session.kind == SessionKind::Codex
-        && session.session_path.starts_with("remote-session://");
-    let is_cc = session.kind == SessionKind::ClaudeCode
-        && session.session_path.starts_with("remote-cc://");
-    if session.source != SessionSource::LiveSsh || (!is_codex && !is_cc) {
+    // EVERY remote agent row keeps its launch command on the host-daemon
+    // wrapper lane, so the scheme registry answers both halves at once: which
+    // machine owns the row, and which CLI the scheme names. This refresh is also
+    // the HEALING path that rewrites pre-2.9.5 raw `ssh … claude --resume` CC
+    // rows onto resume-cc ([[finding-cc-sessions-bypass-host-daemon]]).
+    //
+    // ⛔ The kind the SCHEME implies must equal the kind the ROW carries. That
+    // agreement was the point of the old `is_codex`/`is_cc` pair — a row
+    // labelled one CLI sitting on another's scheme is corrupt, and refreshing it
+    // would hand it the wrong wrapper verb. Keeping the check while deriving the
+    // pair is what lets a seventh CLI heal without being listed here.
+    if session.source != SessionSource::LiveSsh {
         return false;
     }
-    let parsed = if is_cc {
-        parse_remote_cc_session_path(&session.session_path)
-    } else {
-        parse_remote_scanned_session_path(&session.session_path)
-    };
-    let Some((raw_machine_key, path_session_id)) = parsed else {
+    let Some((raw_machine_key, path_session_id, path_kind)) =
+        parse_remote_agent_session_path_with_kind(&session.session_path)
+    else {
         return false;
     };
+    if path_kind != session.kind {
+        return false;
+    }
     let machine_key = normalize_machine_key(raw_machine_key);
     let machine = remote_machines
         .iter()
@@ -16676,6 +16826,14 @@ pub fn run_remote_start_agent(
     if let Some(tool) = ManagedCliTool::from_session_kind(kind) {
         let _ = ensure_local_managed_cli(tool)?;
     }
+    // The launch's model / permission mode, if the caller asked for one. THIS
+    // machine owns the CLI, so this is where the options meet the descriptor
+    // that knows how to spell them — a mode this CLI cannot express fails here,
+    // by name, rather than being dropped on the way over.
+    let launch = remote_agent_launch_options_from_environment();
+    if !launch.is_empty() {
+        launch.launch_tokens(kind).map_err(anyhow::Error::msg)?;
+    }
     let home = resolve_yggterm_home()?;
     let runtime_key = remote_runtime_agent_session_key(kind, session_id)
         .with_context(|| format!("session kind {kind:?} has no daemon runtime lane"))?;
@@ -16701,8 +16859,25 @@ pub fn run_remote_start_agent(
         cwd,
         initial_size,
         Some(&terminal_appearance),
+        &launch,
     )?;
     bridge_remote_runtime_session_stdio(&endpoint, &key)
+}
+
+/// The launch options this wrapper invocation was handed over ssh.
+///
+/// A missing or unparseable variable is EMPTY options, never an error: the
+/// variable is ours, and a session that fails to start because our own export
+/// was malformed would be a worse outcome than one that starts on the CLI's
+/// defaults. A launch that actually asked for something and could not have it
+/// is refused by `launch_tokens` at the callsite, which is a different failure
+/// and a loud one.
+fn remote_agent_launch_options_from_environment() -> AgentLaunchOptions {
+    std::env::var(codex_cli::ENV_YGGTERM_AGENT_LAUNCH_OPTIONS)
+        .ok()
+        .filter(|raw| !raw.trim().is_empty())
+        .and_then(|raw| serde_json::from_str::<AgentLaunchOptions>(&raw).ok())
+        .unwrap_or_default()
 }
 
 /// `<slug>-session-exists` for every CLI — the descriptor-driven store lookup,
@@ -40755,6 +40930,181 @@ terminal_window_id: None,
             session_metadata_value(session, "Claude Code Session").as_deref(),
             Some(session.id.as_str()),
         );
+    }
+
+    /// A remote row for a machine-key'd host, built the way the app-control
+    /// remote arm builds one.
+    fn server_with_one_remote_machine() -> YggtermServer {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            apps: Vec::new(),
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
+        server
+    }
+
+    /// ⛔⛔ THE SIX-CLI REMOTE START CONTRACT — every registered CLI, not two.
+    ///
+    /// Measured 2026-08-09: `server app terminal new --machine-key dev --kind
+    /// opencode` created a row with `kind: ssh_shell` and a bare `server attach`
+    /// launch command, and answered `error: null`. The wrapper half had existed
+    /// since the six-CLI intake (`start-<slug>` parses and runs for every CLI);
+    /// what was missing was any way to ASK for one, so six kinds fell to the
+    /// ssh-shell arm and were born a bash prompt wearing the CLI's name.
+    ///
+    /// ⚠ This loops the REGISTRY rather than listing kinds, which is the whole
+    /// point: the defect was a hand-listed pair, and a test that hand-lists the
+    /// same eight would stop covering the ninth CLI on the day it lands. Every
+    /// assertion below is a thing that was WRONG for six of them:
+    ///
+    /// - the row's stored `kind` (it was `SshShell` — the only field that
+    ///   disagreed, and nothing surfaced it next to the label);
+    /// - the row's SCHEME (a borrowed scheme is how a remote codex-litellm row
+    ///   would have been resumed as codex — wrong binary, wrong store);
+    /// - the wrapper verb in the launch command (it was `server attach`, which
+    ///   is a plain shell);
+    /// - the rail's session-id row and the Restore line, which are what a human
+    ///   uses to reconnect by hand.
+    #[test]
+    fn every_cli_with_a_remote_arm_starts_a_remote_row_on_its_own_scheme_and_verb() {
+        let mut started = 0;
+        // ONE server for every kind: the rows are keyed by scheme AND uuid, so
+        // they cannot collide, and `YggtermServer::new` is the expensive part of
+        // this test rather than the start it is measuring.
+        let mut server = server_with_one_remote_machine();
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            let kind = descriptor.kind;
+            // ⛔ NO cwd, deliberately. `normalize_remote_attach_cwd` SHELLS OUT
+            // over ssh, so a cwd here would make this test's runtime — and on
+            // a reachable host its VERDICT — depend on network reach to another
+            // machine. That defect already has an entry of its own (two red
+            // baseline tests measure the network); looping nine CLIs through it
+            // would multiply it by nine. What travels with the cwd is proven
+            // there, once that resolver is injected rather than shelled out.
+            let result = server.start_remote_agent_session_with_launch_options(
+                kind,
+                "dev",
+                None,
+                None,
+                None,
+                &AgentLaunchOptions::default(),
+            );
+            let Some(scheme) = descriptor.remote_row_scheme else {
+                // A LOCAL-ONLY CLI must be REFUSED, never given a borrowed
+                // scheme. codex-litellm is the standing case.
+                assert!(
+                    result.is_err(),
+                    "{:?} declares no remote arm, so a remote start must refuse rather than \
+                     invent an identity for it",
+                    kind,
+                );
+                continue;
+            };
+            let key = result.unwrap_or_else(|error| {
+                panic!("{kind:?}: remote start failed: {error:#}");
+            });
+            started += 1;
+            assert!(
+                key.starts_with(scheme),
+                "{kind:?}: row {key} is not on its own declared scheme {scheme}",
+            );
+            let session = server.sessions.get(&key).expect("the started row");
+            assert_eq!(
+                session.kind, kind,
+                "{kind:?}: the row's stored kind is the one field that disagreed with its label \
+                 when this was broken",
+            );
+            assert_eq!(session.source, SessionSource::LiveSsh);
+            assert_eq!(session.ssh_target.as_deref(), Some("dev"));
+            let start_verb = descriptor
+                .start_subcommand()
+                .expect("a CLI with a remote arm has a start verb");
+            assert!(
+                session.launch_command.contains(&start_verb),
+                "{kind:?}: launch command must invoke `{start_verb}`, got {}",
+                session.launch_command,
+            );
+            assert!(
+                !session.launch_command.contains("server attach"),
+                "{kind:?}: `server attach` IS the plain shell this contract exists to stop \
+                 being born: {}",
+                session.launch_command,
+            );
+            assert_eq!(
+                session_metadata_value(session, descriptor.session_metadata_label).as_deref(),
+                Some(session.id.as_str()),
+                "{kind:?}: the rail must name this CLI's own session id row",
+            );
+            let restore = session_metadata_value(session, "Restore")
+                .unwrap_or_else(|| panic!("{kind:?}: a remote row owes a Restore line"));
+            let resume_verb = descriptor
+                .resume_subcommand()
+                .expect("a CLI with a remote arm has a resume verb");
+            assert!(
+                restore.contains(&resume_verb),
+                "{kind:?}: Restore must hand back the CLI's own resume verb: {restore}",
+            );
+            // The row path parses back to the same machine, id and KIND — the
+            // predicate every control op (resize, terminate, liveness, recovery
+            // at daemon swap) goes through. A row that starts but cannot be
+            // parsed back is a row nothing downstream can drive.
+            let (machine_key, session_id, parsed_kind) =
+                crate::parse_remote_agent_session_path_with_kind(&key)
+                    .unwrap_or_else(|| panic!("{kind:?}: row {key} does not parse back"));
+            assert_eq!(machine_key, "dev");
+            assert_eq!(session_id, session.id);
+            assert_eq!(parsed_kind, kind);
+            assert!(crate::session_path_is_remote_agent(&key), "{kind:?}: {key}");
+        }
+        assert!(
+            started >= 8,
+            "the registry should have started at least the eight CLIs with remote arms, got \
+             {started} — a shrinking count means this test stopped covering what it names",
+        );
+    }
+
+    /// The generic builder and the two shipped ones are ONE spelling of the
+    /// remote row path, not three.
+    #[test]
+    fn remote_agent_session_path_agrees_with_the_two_shipped_builders() {
+        assert_eq!(
+            crate::remote_agent_session_path(SessionKind::Codex, "dev", "abc").as_deref(),
+            Some(crate::remote_scanned_session_path("dev", "abc").as_str()),
+        );
+        assert_eq!(
+            crate::remote_agent_session_path(SessionKind::ClaudeCode, "dev", "abc").as_deref(),
+            Some(crate::remote_cc_session_path("dev", "abc").as_str()),
+        );
+        // ⛔ A local-only CLI gets NO path rather than a borrowed one.
+        assert_eq!(
+            crate::remote_agent_session_path(SessionKind::CodexLiteLlm, "dev", "abc"),
+            None,
+        );
+        assert_eq!(crate::remote_agent_session_path(SessionKind::Shell, "dev", "abc"), None);
     }
 
     #[test]

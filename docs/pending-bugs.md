@@ -568,60 +568,78 @@ other rails (settings, connect, notifications, tab rail, contributed app panes)
 share the same `RailHeader` component and so are covered by construction, but
 none has been observed directly.
 
-## ⛔⛔ A REMOTE AGENT ROW SILENTLY BECAME A PLAIN SHELL — SIX OF NINE CLIs
+## ⛔⛔ A ROW CREATED WITH `--no-activate` CAN NEVER BE OPENED AFTERWARDS
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** OPEN
 
-Measured 2026-08-09 while trying to live-prove the remote provisioning lane, and
-it is what BLOCKED that proof.
+Measured 2026-08-09 on the GUI host while live-proving the six-CLI remote start.
 
-`server app terminal new --machine-key <host> --kind opencode` answered
-`error: null`, created a row labelled *"Agent unnamed opencode"* — and gave it
-`kind: ssh_shell`, `icon_text: "$_"`, and a launch command that was a plain
-`yggterm server attach <uuid> <cwd>`. **A bash prompt wearing the CLI's name,
-reporting success.**
-
-`shell.rs` ▸ the `app_control_create_terminal_remote` arm:
-
-```rust
-if requested_kind == SessionKind::Codex        { start_remote_codex_session_seated(..) }
-else if requested_kind == SessionKind::ClaudeCode { start_remote_claude_session_seated(..) }
-else                                            { start_ssh_session_seated(..) }   /* ⛔ */
+```
+server app terminal new --machine-key dev --kind opencode --no-activate   → ok
+server app open remote-opencode://dev/<uuid> --view terminal
+  → Error: session/view contract violation: Client viewport 169×65 diverges
+    from daemon PTY grid 120×36 (broken-bottom risk)
 ```
 
-Only two kinds have a remote start contract. **The `else` swallowed the other
-six** (`pi`, `opencode`, `qwen`, `kimi`, `muse`, `agy`) plus anything added
-later. `--kind` was parsed correctly, validated correctly, and travelled the
-wire correctly as `session_kind`; it was dropped at the last branch.
+⚠ **Falsified against the shipped kind before filing.** The same two commands with
+`--kind claude-code` fail IDENTICALLY (`remote-cc://dev/<uuid>`, same 169×65 vs
+120×36), so this is NOT a property of the new remote start — it is what
+`--no-activate` does to any remote row. The same create WITHOUT `--no-activate`
+opens and paints fine; that is how the OpenCode TUI was photographed.
 
-⚖ **This is the `_ => "shell"` failure the automation `--kind` parser already
-carries a warning about** (`automation_cli.rs:454`: *"an automation configured
-for ANY CLI outside the hand-list launched a PLAIN SHELL on its schedule, and
-the create reported success"*), reappearing one layer out. The `CodexLiteLlm`
-arm in the SAME match already refused by name for exactly this reason — the
-precedent was there and the `else` went around it.
+**The mechanism, as far as the evidence goes.** A row born unactivated has no
+viewer, so nothing ever resizes its PTY away from the 120×36 default — the
+launch preamble says so in its own words, waiting on `stty size` to stop reading
+`"36 120"`. The contract check then compares the client's real viewport against
+that default and refuses. So the guard is right about the divergence and wrong
+about what to do with it: the first open is precisely the moment a resize should
+happen.
 
-⛔ **WHY IT WAS INVISIBLE, and this is the transferable part:** every downstream
-consumer behaved CORRECTLY on the wrong data. The row rendered, the machine was
-right, `remote_deploy_state` was `Ready`, health was green — and the remote CLI
-provisioner *correctly declined* to install `opencode`, because
-`ManagedCliTool::from_session_kind(SshShell)` is `None` and an ssh shell has no
-managed CLI. ⇒ **A silent kind-downgrade looks exactly like a correct refusal
-one layer down.** Only the session's stored `kind` disagreed with the label, and
-nothing surfaces that pair together.
+**Why it matters more than it looks.** `--no-activate` is what an agent uses so
+its probe does not steal the user's screen — `docs/agent-row-hygiene.md` asks for
+it. ⇒ **every row an agent creates politely is a row the agent can then never
+look at**, which is why this went unnoticed: the delegate-spawn path submits a
+brief and never opens the row.
 
-**Fixed in 3.0.67:** the remote arm now refuses an unsupported agent kind BY
-NAME before the ssh-shell fallback can claim it, naming the kind and saying what
-would otherwise happen. `a_remote_agent_row_is_refused_by_name_rather_than_downgraded_to_a_shell`
-locks the ORDER of the arms (the defect was purely positional) and is
-mutation-proven red. The `CodexLiteLlm` refusal's message, which still said
-"supports shell or codex", now says claude-code too.
+**Falsifier for a fix:** create with `--no-activate`, then `server app open` it —
+it must paint, not refuse. Keep the divergence check; make the open resize first.
 
-⇒ **The remaining work is the real fix**, and it is bigger than this refusal:
-the six CLIs have no remote start contract at all, so a remote `pi`/`opencode`/
-`qwen`/`kimi`/`muse`/`agy` row cannot be created from app-control by any route.
-Today it is a loud refusal instead of a quiet lie, which is strictly better and
-is not the same as working.
+## ⛔ THE REMOTE CLI PROVISIONER FAILS WHERE A HAND-RUN `npm install` SUCCEEDS
+
+**Status:** OPEN
+
+Measured 2026-08-09, and it was INVISIBLE until this version: while the six CLIs
+had no remote start, `ManagedCliTool::from_session_kind(SshShell)` was `None` and
+the provisioner *correctly declined* to install anything for the downgraded row.
+The first remote `opencode` row that was really an opencode row ran the
+provisioner for real, and its PTY showed:
+
+```
+npm error syscall spawn sh
+npm error path /home/user/.yggterm/npm/lib/node_modules/opencode-ai
+npm error errno -2
+npm error enoent spawn sh ENOENT
+```
+
+The same install by hand on the same machine, with the same
+`NPM_CONFIG_PREFIX`, **succeeds** — and notes that it SKIPPED the postinstall
+(`npm warn allow-scripts   opencode-ai@1.18.15 (postinstall: node ./postinstall.mjs)`).
+⇒ the divergence is around the postinstall script and the environment it is
+spawned in, not around the package or the prefix.
+
+⚠ **Not diagnosed, deliberately.** Two candidate causes are untested: the
+daemon's frozen environment ([[finding-daemon-frozen-env-poisons-sessions]])
+leaving no `sh` on `PATH` at spawn time, and npm's `allow-scripts` gate behaving
+differently between the two invocations. Naming one without probing it would be
+the free-association `CLAUDE.md` forbids.
+
+**Falsifier:** provision a CLI onto a machine that lacks it through the
+provisioner alone (no hand install) and watch the row come up. Today that is
+`pi`, `kimi`, `muse` or `agy` on `dev`.
+
+⭐ **The transferable part:** a layer that cannot be REACHED cannot be OBSERVED.
+This failure sat behind a silent kind-downgrade for as long as the downgrade
+existed, and looked exactly like a correct refusal from every angle above it.
 
 ## ⛔ `server app clients` ANSWERS IN A DIFFERENT ENVELOPE FROM EVERY OTHER APP VERB
 

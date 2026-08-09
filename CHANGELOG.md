@@ -4,6 +4,26 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Six of the nine agent CLIs can now be started on another machine.** Asking
+  for a remote `pi`, `opencode`, `qwen`, `kimi`, `muse` or `agy` row used to be
+  impossible: two CLIs — codex and Claude Code — had a remote start, and every
+  other kind fell past them into the plain-shell arm, so the row was born a bash
+  prompt wearing the CLI's name, and the create reported success. The last
+  version replaced that silent downgrade with a refusal that said so out loud,
+  which was honest and still meant you could not do it.
+
+  Now every CLI that can run on another machine can be started there, and it is
+  the CLI's own registration that says so rather than a list kept somewhere else
+  — its scheme names the row, its own wrapper starts the session, its own name
+  appears in the metadata rail, and the Restore line hands you its own resume
+  command to type by hand. A CLI that is local-only is still refused, by name,
+  for the reason it is local-only.
+
+  `--model` and `--permission-mode` travel with the launch too. They are
+  composed on the machine that owns the CLI, because that is the only machine
+  that knows how that CLI spells them — so a mode a CLI cannot express is
+  refused there, by name, instead of being quietly dropped on the way over.
+
 - **Yggterm now installs and updates every agent CLI across your whole fleet, on
   its own schedule.** The engine to do it has been there for a while — a refresh
   covers every registered CLI, and one CLI can be provisioned onto one machine

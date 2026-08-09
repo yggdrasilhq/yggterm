@@ -2038,6 +2038,35 @@ pub enum ServerRequest {
         #[serde(default)]
         launch_options: Option<AgentLaunchOptions>,
     },
+    /// Start a NEW remote row for ANY agent CLI that has a remote arm — the
+    /// kind-bearing generalization of [`Self::StartRemoteClaudeSession`].
+    ///
+    /// ⚠ Codex and Claude Code KEEP their own variants byte-for-byte, exactly as
+    /// they did when `StartRemoteRuntimeAgentSession` arrived one layer down at
+    /// 3.0.52. A daemon older than this has never heard of this variant and
+    /// errors on it, which is the loud failure the split was designed for; the
+    /// two shipped kinds keep working against every daemon in the fleet, and
+    /// only the six CLIs that could not be started at ALL depend on the new
+    /// shape.
+    StartRemoteAgentSession {
+        session_kind: SessionKind,
+        target: String,
+        prefix: Option<String>,
+        cwd: Option<String>,
+        title_hint: Option<String>,
+        #[serde(default)]
+        terminal_appearance: Option<String>,
+        #[serde(default)]
+        insert_after: Option<String>,
+        /// See [`Self::StartSshSession::outline_prefix`].
+        #[serde(default)]
+        outline_prefix: Option<String>,
+        /// Per-launch model / permission mode; carried to the owning machine as
+        /// JSON in `YGGTERM_AGENT_LAUNCH_OPTIONS` and composed there against
+        /// that CLI's own descriptor.
+        #[serde(default)]
+        launch_options: Option<AgentLaunchOptions>,
+    },
     OpenRemoteSession {
         machine_key: String,
         session_id: String,
@@ -2273,6 +2302,11 @@ pub enum ServerRequest {
         initial_cols: Option<u16>,
         #[serde(default)]
         initial_rows: Option<u16>,
+        /// The launch's model / permission mode, composed HERE — this daemon
+        /// owns the CLI, so this is the only machine that knows how it spells
+        /// them.
+        #[serde(default)]
+        launch_options: Option<AgentLaunchOptions>,
     },
     /// Daemon-owned resumable plain-shell session (tmux replacement for
     /// `server attach`). The host daemon owns/persists the shell PTY.
@@ -2713,6 +2747,7 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::StartSshSession { .. }
         | ServerRequest::StartRemoteCodexSession { .. }
         | ServerRequest::StartRemoteClaudeSession { .. }
+        | ServerRequest::StartRemoteAgentSession { .. }
         | ServerRequest::OpenRemoteSession { .. }
         | ServerRequest::RefreshRemoteMachine { .. }
         | ServerRequest::RefreshManagedCli { .. }
@@ -7471,6 +7506,37 @@ impl DaemonRuntime {
                 self.persist()?;
                 self.snapshot_response(Some(format!("started {key}")))
             }
+            ServerRequest::StartRemoteAgentSession {
+                session_kind,
+                target,
+                prefix,
+                cwd,
+                title_hint,
+                terminal_appearance,
+                insert_after,
+                outline_prefix,
+                launch_options,
+            } => {
+                sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
+                let key = self.server.start_remote_agent_session_with_launch_options(
+                    session_kind,
+                    &target,
+                    prefix.as_deref(),
+                    cwd.as_deref(),
+                    title_hint.as_deref(),
+                    &launch_options.unwrap_or_default(),
+                )?;
+                self.server.seat_created_live_session(
+                    &key,
+                    outline_prefix.as_deref(),
+                    insert_after.as_deref(),
+                );
+                if self.server.active_session_supports_terminal() {
+                    self.ensure_terminal_for_active()?;
+                }
+                self.persist()?;
+                self.snapshot_response(Some(format!("started {key}")))
+            }
             ServerRequest::OpenRemoteSession {
                 machine_key,
                 session_id,
@@ -8139,6 +8205,7 @@ impl DaemonRuntime {
                 terminal_appearance,
                 initial_cols,
                 initial_rows,
+                launch_options,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_remote_runtime_agent_session_public(
@@ -8146,6 +8213,7 @@ impl DaemonRuntime {
                     &session_id,
                     cwd.as_deref(),
                     terminal_appearance.as_deref(),
+                    &launch_options.unwrap_or_default(),
                 )?;
                 let _ = self.ensure_terminal_for_path_with_initial_size(
                     &key,
@@ -10452,6 +10520,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::StartSshSession { .. } => "start_ssh_session",
         ServerRequest::StartRemoteCodexSession { .. } => "start_remote_codex_session",
         ServerRequest::StartRemoteClaudeSession { .. } => "start_remote_claude_session",
+        ServerRequest::StartRemoteAgentSession { .. } => "start_remote_agent_session",
         ServerRequest::OpenRemoteSession { .. } => "open_remote_session",
         ServerRequest::RefreshRemoteMachine { .. } => "refresh_remote_machine",
         ServerRequest::RefreshManagedCli { .. } => "refresh_managed_cli",
@@ -11736,6 +11805,38 @@ pub fn start_remote_claude_session_seated(
     )?)
 }
 
+/// A remote start for ANY agent CLI, landing at a REQUESTED seat.
+///
+/// The kind-bearing twin of [`start_remote_claude_session_seated`]. Codex and
+/// Claude Code keep their own verbs (see [`ServerRequest::StartRemoteAgentSession`]
+/// for why); this is what the other six CLIs are born through.
+pub fn start_remote_agent_session_seated(
+    endpoint: &ServerEndpoint,
+    kind: SessionKind,
+    target: &str,
+    prefix: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    terminal_appearance: Option<&str>,
+    launch: &AgentLaunchOptions,
+    seat: &crate::RowSeatRequest,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::StartRemoteAgentSession {
+            session_kind: kind,
+            target: target.to_string(),
+            prefix: prefix.map(ToOwned::to_owned),
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+            terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            insert_after: seat.insert_after.clone(),
+            outline_prefix: seat.outline_prefix.clone(),
+            launch_options: (!launch.is_empty()).then(|| launch.clone()),
+        },
+    )?)
+}
+
 pub fn refresh_remote_machine(
     endpoint: &ServerEndpoint,
     machine_key: &str,
@@ -12241,6 +12342,7 @@ pub fn start_remote_runtime_agent_session(
     cwd: Option<&str>,
     initial_size: Option<(u16, u16)>,
     terminal_appearance: Option<&str>,
+    launch: &AgentLaunchOptions,
 ) -> Result<String> {
     expect_ack(send_request(
         endpoint,
@@ -12251,6 +12353,7 @@ pub fn start_remote_runtime_agent_session(
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             initial_cols: initial_size.map(|(cols, _)| cols),
             initial_rows: initial_size.map(|(_, rows)| rows),
+            launch_options: (!launch.is_empty()).then(|| launch.clone()),
         },
     )?)?
     .with_context(|| format!("missing runtime session key for {session_id}"))
@@ -16451,6 +16554,7 @@ fn daemon_request_io_timeout_ms(request: &ServerRequest) -> u64 {
         ServerRequest::StartSshSession { .. }
         | ServerRequest::StartRemoteCodexSession { .. }
         | ServerRequest::StartRemoteClaudeSession { .. }
+        | ServerRequest::StartRemoteAgentSession { .. }
         | ServerRequest::OpenRemoteSession { .. }
         | ServerRequest::RefreshPreview { .. }
         | ServerRequest::EnsureRemoteRuntimeCodexSession { .. }
@@ -23930,21 +24034,25 @@ mod tests {
     /// wire divergence is the lost-PTY latch storm of 2026-07-17.
     #[test]
     fn protocol_shape_stamp_forces_version_bump() {
-        // Re-stamped for 3.0.52: `EnsureRemoteRuntimeAgentSession` /
-        // `StartRemoteRuntimeAgentSession` arrived — ONE kind-bearing pair
-        // serving every CLI registered after codex/cc, which keep their own
-        // variants byte-for-byte. A daemon older than this has never heard of
-        // the new variants and errors on them, which is the loud failure the
-        // codex/cc split was designed for, one CLI generation on.
+        // Re-stamped for 3.0.75: `StartRemoteAgentSession` arrived — the
+        // kind-bearing ROW start that gives the six CLIs a remote start
+        // contract at last — and `StartRemoteRuntimeAgentSession` gained
+        // `launch_options`, so the machine that owns a CLI composes the
+        // launch's model / permission mode against its own descriptor.
         //
-        // ✅ The workspace version was bumped 3.0.51 → 3.0.52 IN THE SAME
+        // ⚠ Same shape as the 3.0.52 stamp below it in spirit: codex and
+        // Claude Code keep their own variants byte-for-byte, and a daemon
+        // older than this has never heard of the new one and errors on it —
+        // the loud failure the split was designed for, one CLI generation on.
+        //
+        // ✅ The workspace version was bumped 3.0.74 → 3.0.75 IN THE SAME
         // COMMIT as the wire change, which is the whole point of this stamp: a
         // wire change shipping under an unchanged version leaves the fleet's
         // version-ordered compatibility gate looking at two builds of one
         // version with different shapes — the lost-PTY latch storm of
         // 2026-07-17.
-        const STAMPED_AT_VERSION: &str = "3.0.61";
-        const STAMPED_SHAPE_HASH: u64 = 0x6d402f7c3075445c;
+        const STAMPED_AT_VERSION: &str = "3.0.75";
+        const STAMPED_SHAPE_HASH: u64 = 0x70c12d5892f4f3c1;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
