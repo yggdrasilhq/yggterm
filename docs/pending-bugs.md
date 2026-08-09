@@ -13,6 +13,86 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⛔ THE CI ARCHITECTURE GUARD CRASHES ON A CRATE THAT NO LONGER EXISTS — so every contract after it is unchecked
+
+**Status:** OPEN
+
+Measured on `dev` 2026-08-09 at HEAD (`aeebd540`), and confirmed pre-existing by
+re-running it on a clean stash:
+
+    $ python3 scripts/check_architecture_contracts.py
+    FileNotFoundError: [Errno 2] No such file or directory:
+      '…/crates/yggui/src/theme.rs'
+
+`crates/yggui` is gone — `crates/` holds `yggterm-{core,ghostty-bridge,gtk-glue,
+platform,server,shell,webprobe,wpe}` and nothing else, and `find` locates no
+`theme.rs` anywhere in `crates/` or `apps/`. The script asserts four contracts
+against that path (`STABLE_THEME_ALPHA`, `STABLE_THEME_GRAIN`, and the two clamp
+lines), and `require_contains` raises rather than failing the check, so the run
+**aborts at the first one**.
+
+⛔ **This is [[finding-a-red-target-hides-every-test-behind-it]]:** it is
+`.github/workflows/ci.yml:25`, so the guard runs on every push — and everything
+it would have checked after line 243 has been unchecked for as long as the crate
+has been missing. A crash is not a failing assertion; it is no assertion at all.
+
+⚠ **Do not just delete the four lines.** The question is where the stable-theme
+pin LIVES now — the neighbouring contracts moved to
+`crates/yggterm-shell/src/theme_contract.rs`, so the likely answer is that these
+four should have moved with them and the contract is genuinely unenforced.
+Settle that before editing, or the guard goes green while the pin stays loose.
+
+**Falsifier:** `python3 scripts/check_architecture_contracts.py` exits 0 or 1
+with a verdict line, never a traceback; and deliberately breaking a contract
+declared AFTER the theme block is caught.
+
+## ⭐ THE DAEMON PLANE HAS NO INSTRUMENT — every verb answers for THE daemon, and this project's hardest bug is about the OTHER five
+
+**Status:** OPEN
+
+Filed 2026-08-09 from the hot-restart-gate lane, where the whole subject is
+daemons that are *not* the current one. Two gaps, one shape.
+
+**1. A verb cannot be aimed at a specific daemon.** `server status` resolves the
+endpoint from `YGGTERM_HOME` and there is no `--endpoint` / `--pid` flag and no
+`YGGTERM_SERVER_ENDPOINT` override (grepped: the constant does not exist). The
+version-aliased sockets are right there — `server-3-0-75.sock`,
+`server-3-0-76.sock`, … — and nothing can address them. ⇒ to ask a stale daemon
+what it is holding you must build a private `YGGTERM_HOME` sandbox, which by
+construction cannot contain the daemon you wanted to ask.
+
+**2. There is no census.** "Which daemons are alive, at what version, owning
+what, blocked by what, and for how long" is the first question of every
+stale-daemon investigation, and it has to be hand-assembled every time from
+`ps -eo pid,etimes,args` + `readlink /proc/<pid>/exe` + a `grep` over
+`event-trace*.jsonl` joined on pid. Two throwaway Python scripts, `scp`ed to the
+GUI host, to answer it once. `retire_stale_daemons` already walks exactly this
+set internally — it just never reports it.
+
+**3. The headless surface can CREATE a session and cannot REMOVE one.**
+`yggterm-headless server attach <uuid> <cwd>` makes a live `local://` row on
+whatever daemon it finds; there is no `server session remove` anywhere on that
+surface — removal lives only under `server app`, which refuses outright on a host
+with no GUI client. Writing `exit` into the terminal frees the runtime
+(`owned_terminal_session_keys` drops, the block reason clears) and **leaves the
+session record listed forever**. ⇒ an agent on a headless host can make a row it
+has no way to unmake. Measured 2026-08-09 on `dev` while live-proving the gate.
+
+⭐ **The test all three pass is the one that matters:** an agent hand-assembled
+the chore from primitives, and an agent's discipline resets every session while a
+verb's does not. Same shape as the five verbs in
+`docs/agent-field-guide.md` §*this instrument answers a different question*.
+
+**The fix:** `server daemons [--json]` — one row per reachable daemon: pid,
+version, exe path (with `(deleted)`), uptime, owned/preserved runtime counts,
+`hot_restart_pending`, and the blocker summary with its `permanent` flag. Plus
+`--endpoint <path|version>` on the read-only verbs so an existing daemon can be
+interrogated directly instead of impersonated.
+
+**Falsifier:** on the GUI host, `yggterm-headless server daemons` names every
+`yggterm-headless server daemon` process `ps` shows, with a version for each —
+including the ones whose binary is `(deleted)`, which are the ones that matter.
+
 ## ⭐ A FAILED `server app` VERB ANSWERS IN PROSE ON stderr WHILE EVERY SUCCESS ANSWERS IN JSON ON stdout — so a JSON caller parses nothing and blames the parser
 
 **Status:** OPEN
@@ -60,7 +140,7 @@ Measured on `dev` 2026-08-09, during a routine `cargo test --workspace
 - `yggterm-shell --lib` alone reported `finished in 2386.60s` — **39.8 minutes**,
   the whole cost of the suite for practical purposes;
 - while it ran, the test binary held **open file descriptors on real session
-  transcripts** under `/home/user/.claude/projects/-home-pi-gh-yggterm/*.jsonl`;
+  transcripts** under `$HOME/.claude/projects/<project-slug>/*.jsonl`;
 - that store is **960 MB across 655 `.jsonl` files** on this host today.
 
 ⇒ A test is walking the developer's **actual Claude Code history** rather than a
@@ -272,6 +352,25 @@ token and no session id to resume, rather than at whether the record was written
 handover, and read `server app rows` back. Three rows with the same paths is a
 pass; the reply's own `preserved_terminal_owner_keys` echoing them is NOT — that
 is precisely the field that was already true while they died.
+
+⭐ **A SECOND, SIMPLER CANDIDATE CAUSE — measured 2026-08-09, and it fits every
+column of the table above.** Look at *when* the shells died rather than at the
+handover itself. Until 3.0.81 the predecessor's retire loop cold-shut-down as
+soon as its owned sessions passed 300 s of silence, and a cold shutdown kills its
+PTY children. So the sequence is: the handoff honestly preserves all six rows
+(hence `preserved_terminal_owner_keys` being true at the time) → the preserved
+owner keeps polling → the shells fall quiet → the gate opens → **the preserved
+owner retires by destroying them.** Agent rows survive because they are
+re-resumed; ychrome rows survive because an app row declares an identity to
+relaunch from; a plain shell has neither, which is the asymmetry this entry
+already noticed.
+
+⇒ **Re-run the falsifier on 3.0.81 before spending a session inside
+`restore_live_session`.** The cold-kill is now refused
+([[finding-hot-update-never-converges-idle-gate]], the plain-shell retire entry),
+so if the three shells now survive, this entry is closed and the preservation
+path was never the defect. If they still die, the cause is where this entry says
+it is and the ground is now clear.
 
 ## ⛔⛔ THE CLI DRIFT REPORTER RESOLVES AGAINST A `PATH` THE LAUNCH STOPPED USING IN 3.0.70 — SO IT NOW CRIES DRIFT ON A CORRECT MACHINE
 
@@ -522,6 +621,33 @@ sub-agent detection must be POSITIVE (it is the state with an unbounded wait, so
 a merely-busy session must not reach it), and **the interrupted set must be
 computed before the old daemon dies** — after the swap every interrupted session
 looks idle, so the list cannot be re-derived.
+
+**Landed so far — §3's first increment, in 3.0.81.** The gate's release condition
+now asks what a session *is* before asking how quiet it has been. A session whose
+state does not outlive its PTY (`session_kind_state_survives_pty_loss` — a plain
+shell) blocks the cold shutdown **permanently**, and `HotRestartBlocker` carries
+`permanent: true` so a reader can tell "waiting for a moment that will come" from
+"lingering on purpose, forever". The summary names a clearable blocker first, so
+the headline is never a session the user is not supposed to close.
+
+⭐ **Fresh live evidence, and it is better than the 2026-08-08 sample above
+because the blocker is NAMED.** On the GUI host, daemon pid 426042 (3.0.75, a
+successor at 3.0.80 already live) logged `daemon_cold_shutdown_deferred_idle_gate`
+**823 times across 275 minutes** — one every 20 s, never once opening — with the
+same single blocker every time: a `local://` ychrome shell, `idle_ms: 632`
+against a 300 000 ms window. ⇒ the 2026-08-08 reading *"0 of 40 samples"* is now
+0 of 823, and the QUIET-GATE LAW's premise is not a theory about agent CLIs — a
+plain shell hosting a browser is just as never-silent.
+
+**Still unbuilt:** §2 (relay boundaries as the appointment), §4 (the queue), §5
+(the deadline + `continue` repair), §6 (the orchestrating exemption), and the
+rest of §3 — **blocked-on-human is not yet a state**, and an agent session is
+still classified by silence rather than by a positive liveness signal.
+⚠ The positive signal is the piece with a known cost: `session_transcript_activity`
+answers `Unknown` for every agent session on purpose, and for a `remote-cc://` row
+the transcript lives on the FAR host, so reading it is an ssh hop per session per
+poll. The booter reads exactly this signal and was right throughout the
+2026-08-09 stranding incident, so the source is proven — the transport is not.
 
 ## ⭐ THE `.bak.` RECLAIM IS DONE FLEET-WIDE — WHAT REMAINS IS THE ENGINE
 
@@ -3422,6 +3548,33 @@ it is never released, and there is no other way for a PTY to leave its daemon.**
 The owner therefore lingers on its old version for as long as that shell lives,
 which for a keep-alive shell is forever. guihost's preserved set was 8 `local://`
 shells to 2 `remote-cc://` rows, so this is the common case, not the corner.
+
+⛔ **CORRECTION, measured 2026-08-09 — the sentence above was wrong in the one
+way that mattered, and the fix is shipped in 3.0.81.** There *was* a second way
+for a PTY to leave its daemon: the retire loop's **cold shutdown**, which killed
+it. The cold-shutdown gate deferred only while a session was *recently active*,
+so a shell that fell silent for 300 s cleared the gate and the daemon retired
+**by destroying it** — the absence-gate treating idleness as safety for the one
+class of session where idleness proves nothing at all. So a daemon owning a
+plain shell did not linger forever; it lingered until the user stopped typing.
+
+Falsified live, both arms, in an isolated `YGGTERM_HOME` with
+`YGGTERM_HOT_UPDATE_IDLE_THRESHOLD_MS=1` and one live `local://` shell:
+
+| binary | `hot_restart_blockers` |
+|---|---|
+| shipped 3.0.80 | `[]` — nothing blocking; the next tick would have killed it |
+| 3.0.81 | one `not_restorable`, `permanent: true` |
+
+3.0.81 makes this entry's own premise TRUE: `session_kind_state_survives_pty_loss`
+is now the single fact both PTY-destroying paths read, so the retire loop refuses
+exactly what migration already refused. ⚠ **That closes a data-loss path; it does
+not converge anything** — a daemon holding a shell now genuinely never retires,
+which is why step 3 below is still the answer and is now the *only* one.
+⚠ `YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE` deliberately does NOT clear this blocker;
+it was a licence to skip prompt-cache freshness, never to destroy a live shell.
+⚠ Guard the regression the other way too: an AGENT session must stay clearable.
+Proven in the same sandbox — a `cc-runtime://` row reports `blockers: []`.
 
 **Steps 1 and 2 are done.**
 

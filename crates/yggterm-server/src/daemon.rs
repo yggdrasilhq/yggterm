@@ -530,6 +530,11 @@ fn hot_update_idle_threshold_ms() -> u64 {
 /// agent/dev deploy that must land now). Cache preservation is the default
 /// priority, so this is an explicit override rather than something `--force`
 /// implies (`--force` only bypasses the same-version target check).
+///
+/// ⛔ It waives WAITING, not SAFETY. A session whose state does not outlive its
+/// PTY still blocks — see [`DaemonRuntime::hot_update_idle_gate_blockers`]. An
+/// override that quietly destroyed a live shell would be the very bug the gate
+/// exists to prevent, wearing a flag.
 fn hot_update_idle_gate_overridden() -> bool {
     std::env::var("YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE")
         .ok()
@@ -1904,12 +1909,16 @@ pub struct ServerRuntimeStatus {
 pub const HOT_RESTART_BLOCKER_WORKING: &str = "working";
 /// A session was active inside the idle window, so a swap could still eat a turn.
 pub const HOT_RESTART_BLOCKER_RECENTLY_ACTIVE: &str = "recently_active";
+/// A session whose PTY cannot be recreated, so no amount of quiet makes a cold
+/// shutdown safe. See [`session_kind_state_survives_pty_loss`].
+pub const HOT_RESTART_BLOCKER_NOT_RESTORABLE: &str = "not_restorable";
 
 /// One session holding a hot-restart open, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HotRestartBlocker {
     pub session_key: String,
-    /// [`HOT_RESTART_BLOCKER_WORKING`] or [`HOT_RESTART_BLOCKER_RECENTLY_ACTIVE`].
+    /// [`HOT_RESTART_BLOCKER_WORKING`], [`HOT_RESTART_BLOCKER_RECENTLY_ACTIVE`]
+    /// or [`HOT_RESTART_BLOCKER_NOT_RESTORABLE`].
     pub kind: String,
     /// How long since this session last produced output. `None` when unreadable.
     #[serde(default)]
@@ -1917,6 +1926,24 @@ pub struct HotRestartBlocker {
     /// The idle window the session is being measured against.
     #[serde(default)]
     pub threshold_ms: u64,
+    /// `true` when waiting cannot clear this blocker — the session will still be
+    /// unsafe to cold-kill in an hour, so a reader must not report it as "any
+    /// moment now". Only [`HOT_RESTART_BLOCKER_NOT_RESTORABLE`] sets it.
+    ///
+    /// `#[serde(default)]` = `false`, so an older daemon's blockers read as
+    /// clearable, which is exactly what they were.
+    #[serde(default)]
+    pub permanent: bool,
+}
+
+/// Order blockers so the headline names something the reader can act on.
+///
+/// The summary prints `first()`, and a PERMANENT blocker is by construction the
+/// one nobody can clear — leading with it would tell the user to go close a
+/// shell that is meant to stay open, while the session actually pinning the swap
+/// goes unmentioned. Clearable first, permanent last; stable within each group.
+fn hot_restart_blockers_actionable_first(blockers: &mut [HotRestartBlocker]) {
+    blockers.sort_by_key(|blocker| blocker.permanent);
 }
 
 /// Collapse the blocker list into the single line the metadata panel prints. Pure, so the
@@ -1927,6 +1954,10 @@ pub fn hot_restart_block_reason_summary(blockers: &[HotRestartBlocker]) -> Optio
         HOT_RESTART_BLOCKER_WORKING => {
             format!("{} is working (esc to interrupt)", first.session_key)
         }
+        HOT_RESTART_BLOCKER_NOT_RESTORABLE => format!(
+            "{} is a plain shell with no store to resume from; a cold shutdown would destroy it",
+            first.session_key
+        ),
         _ => match first.idle_ms {
             Some(idle_ms) => format!(
                 "{} was active {}s ago (idle window {}s)",
@@ -3779,10 +3810,29 @@ impl DaemonRuntime {
     /// Idle gate for hot-update (#19): every owned session currently DEFERRING a
     /// hot-restart, in the daemon's own words.
     ///
-    /// Blocks when a session is working (`esc to interrupt`, via the shared
-    /// [`yggterm_core::screen_text_shows_agent_working`] SSOT) or produced output more
-    /// recently than the idle threshold. Fail-safe: unknown/unreadable sessions do not
-    /// block. Overridable via `YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE`.
+    /// This gate guards the COLD SHUTDOWN — the path that destroys this daemon's
+    /// PTY children. It is not on the preserving handoff, which keeps every
+    /// runtime and therefore needs no permission.
+    ///
+    /// Three reasons a session blocks, and only two of them can ever clear:
+    ///
+    /// - [`HOT_RESTART_BLOCKER_NOT_RESTORABLE`] — the session's state IS its PTY
+    ///   ([`session_kind_state_survives_pty_loss`]), so destroying it is lossy no
+    ///   matter how long we wait. **Permanent**, and it outranks the override.
+    /// - [`HOT_RESTART_BLOCKER_WORKING`] — a positive signal (`esc to interrupt`,
+    ///   via the shared [`yggterm_core::screen_text_shows_agent_working`] SSOT).
+    /// - [`HOT_RESTART_BLOCKER_RECENTLY_ACTIVE`] — the absence test, kept only
+    ///   for restorable sessions, where 300 s of true silence really is evidence
+    ///   that no turn is in flight (THE QUIET-GATE LAW: a working agent turn is
+    ///   never output-silent).
+    ///
+    /// Fail-safe: unknown/unreadable sessions do not block.
+    ///
+    /// ⛔ `YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE` clears the CLEARABLE blockers
+    /// only. It exists so a deploy need not wait on prompt-cache freshness; it
+    /// was never a licence to destroy a session that cannot be brought back, and
+    /// an override that silently did so would be indistinguishable from the bug
+    /// this gate is here to prevent. Close the shell to release it.
     ///
     /// Returns ALL blockers, not just the first. Reporting only the first made the
     /// deferral opaque: the user clears the named session, the restart still defers, and
@@ -3793,13 +3843,34 @@ impl DaemonRuntime {
         &self,
         owned_runtime_keys: &[String],
     ) -> Vec<HotRestartBlocker> {
-        if hot_update_idle_gate_overridden() {
-            return Vec::new();
-        }
+        let overridden = hot_update_idle_gate_overridden();
         let threshold_ms = hot_update_idle_threshold_ms();
         let mut blockers = Vec::new();
         for key in owned_runtime_keys {
             let runtime_path = self.terminal_runtime_key_for_path(key);
+            // Restorability first: it is the only answer that does not depend on
+            // what the session happened to be doing this instant, and it is the
+            // only one the override may not clear.
+            if !self
+                .server
+                .live_session_kind(key)
+                .map(session_kind_state_survives_pty_loss)
+                // A key whose kind we cannot read is not provably restorable, and
+                // the safety bias on a PTY-destroying decision is to refuse.
+                .unwrap_or(false)
+            {
+                blockers.push(HotRestartBlocker {
+                    session_key: key.clone(),
+                    kind: HOT_RESTART_BLOCKER_NOT_RESTORABLE.to_string(),
+                    idle_ms: self.terminals.session_idle_for_ms(&runtime_path),
+                    threshold_ms,
+                    permanent: true,
+                });
+                continue;
+            }
+            if overridden {
+                continue;
+            }
             if let Some(screen) = self.terminals.session_screen_snapshot(&runtime_path)
                 && yggterm_core::screen_text_shows_agent_working(&screen)
             {
@@ -3808,6 +3879,7 @@ impl DaemonRuntime {
                     kind: HOT_RESTART_BLOCKER_WORKING.to_string(),
                     idle_ms: self.terminals.session_idle_for_ms(&runtime_path),
                     threshold_ms,
+                    permanent: false,
                 });
                 continue;
             }
@@ -3819,9 +3891,11 @@ impl DaemonRuntime {
                     kind: HOT_RESTART_BLOCKER_RECENTLY_ACTIVE.to_string(),
                     idle_ms: Some(idle_ms),
                     threshold_ms,
+                    permanent: false,
                 });
             }
         }
+        hot_restart_blockers_actionable_first(&mut blockers);
         blockers
     }
 
@@ -13444,7 +13518,16 @@ fn spawn_disk_binary_version_poll(
         const POLL_INTERVAL_MS: u64 = 20_000;
         // Periodic stale-daemon sweep cadence: every Nth poll ≈ 3 minutes.
         const STALE_SWEEP_EVERY_N_POLLS: u32 = 9;
+        // How often a SETTLED deferral (every blocker permanent) repeats itself in
+        // the trace: every 15th poll ≈ 5 minutes. Not silence — a stale daemon must
+        // stay mineable — just not one identical line every 20 seconds forever.
+        const SETTLED_DEFERRAL_HEARTBEAT_EVERY_N_POLLS: u32 = 15;
         let mut stale_sweep_countdown = STALE_SWEEP_EVERY_N_POLLS;
+        // Deferral bookkeeping: the reason we last WROTE, how many polls we have
+        // deferred in total, and how many we have skipped writing since.
+        let mut deferred_reason_last: Option<String> = None;
+        let mut deferred_polls: u64 = 0;
+        let mut deferred_polls_since_logged: u32 = SETTLED_DEFERRAL_HEARTBEAT_EVERY_N_POLLS;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
             // Retire trigger 1: our on-disk binary was replaced by an update.
@@ -13596,7 +13679,11 @@ fn spawn_disk_binary_version_poll(
             // Defer while any owned session is mid-turn or was active inside the
             // idle window, and re-check next poll; we retire only once idle, so a
             // busy agent's job is never broken.
-            // Overridable via YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE.
+            // ⛔ And for a session that CANNOT be re-resumed — a plain shell —
+            // "once idle" is not a safe moment, it is just the moment we would
+            // have destroyed it. Those defer permanently, override or not.
+            // Overridable (for the clearable blockers) via
+            // YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE.
             let block_reason = {
                 let rt = lock_daemon_runtime(&runtime, "cold_shutdown_idle_gate");
                 let owned = rt.terminals.session_keys();
@@ -13608,31 +13695,59 @@ fn spawn_disk_binary_version_poll(
                 // after the fact — guihost ran 2.10.3 for 19h44m with 2.10.13 on disk and
                 // there was nothing to mine that said why ([[finding-stale-daemon-trap]]).
                 // Carries EVERY blocker, so "which session pinned it, for how long" is
-                // answerable from the trace alone. Once per poll is fine: the retire loop
-                // ticks slowly and a stale daemon is exactly the thing worth over-logging.
+                // answerable from the trace alone.
                 let blockers = {
                     let rt = lock_daemon_runtime(&runtime, "cold_shutdown_idle_gate_blockers");
                     let owned = rt.terminals.session_keys();
                     rt.hot_update_idle_gate_blockers(&owned)
                 };
-                append_trace_event(
-                    &home_dir,
-                    "daemon",
-                    "lifecycle",
-                    "daemon_cold_shutdown_deferred_idle_gate",
-                    serde_json::json!({
-                        "retire_trigger": retire_trigger,
-                        "exe_link": exe_link,
-                        "newer_daemon_version": newer_daemon_version,
-                        "current_version": SERVER_PROTOCOL_VERSION,
-                        "current_pid": std::process::id(),
-                        "current_uptime_ms": current_millis_u64()
-                            .saturating_sub(*DAEMON_STARTED_AT_MS),
-                        "reason": reason,
-                        "blocker_count": blockers.len(),
-                        "blockers": blockers,
-                    }),
-                );
+                let settled = !blockers.is_empty()
+                    && blockers.iter().all(|blocker| blocker.permanent);
+                deferred_polls = deferred_polls.saturating_add(1);
+                // Every poll while ANY blocker is clearable — that is the case the
+                // probe was written for, and a daemon inching toward a swap is worth
+                // over-logging. When every blocker is PERMANENT the next thousand
+                // lines are identical by construction (the reason cannot change
+                // without the blocker set changing), so say it on change and then
+                // heartbeat. Measured 2026-08-09: 823 byte-identical lines over 275
+                // minutes, all naming one ychrome shell.
+                let changed = deferred_reason_last.as_deref() != Some(reason.as_str());
+                let heartbeat = deferred_polls_since_logged
+                    >= SETTLED_DEFERRAL_HEARTBEAT_EVERY_N_POLLS;
+                if changed || heartbeat || !settled {
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "lifecycle",
+                        "daemon_cold_shutdown_deferred_idle_gate",
+                        serde_json::json!({
+                            "retire_trigger": retire_trigger,
+                            "exe_link": exe_link,
+                            "newer_daemon_version": newer_daemon_version,
+                            "current_version": SERVER_PROTOCOL_VERSION,
+                            "current_pid": std::process::id(),
+                            "current_uptime_ms": current_millis_u64()
+                                .saturating_sub(*DAEMON_STARTED_AT_MS),
+                            "reason": reason,
+                            "blocker_count": blockers.len(),
+                            // A reader must be able to tell "waiting for a moment
+                            // that will come" from "lingering on purpose, forever".
+                            "settled": settled,
+                            "permanent_blocker_count": blockers
+                                .iter()
+                                .filter(|blocker| blocker.permanent)
+                                .count(),
+                            "deferred_polls": deferred_polls,
+                            "poll_interval_ms": POLL_INTERVAL_MS,
+                            "blockers": blockers,
+                        }),
+                    );
+                    deferred_polls_since_logged = 0;
+                } else {
+                    deferred_polls_since_logged =
+                        deferred_polls_since_logged.saturating_add(1);
+                }
+                deferred_reason_last = Some(reason);
                 continue;
             }
             // B4: make it loud if this cold shutdown would strand rows a
@@ -13668,30 +13783,62 @@ fn progressive_migration_enabled() -> bool {
     }
 }
 
-/// Only agent CLI sessions are migratable via release+re-resume: their state
-/// persists in the agent's own JSONL, so killing the PTY and re-resuming on the
-/// newest daemon is lossless (once the migration predicate has ruled out an
-/// unsent draft). A plain shell has no such persistence — re-running its launch
-/// command yields a fresh shell — so it is never released this way (it stays
-/// with the lingering owner, awaiting a future lossless fd-handoff).
+/// Only agent CLI sessions are migratable via release+re-resume: killing the PTY
+/// and re-resuming on the newest daemon is lossless (once the migration
+/// predicate has ruled out an unsent draft) precisely because their state
+/// survives the PTY. A shell that cannot migrate stays with the lingering owner,
+/// awaiting a future lossless fd-handoff.
 ///
-/// ⚠ This is about the PTY, not the ROW. A shell that cannot migrate must still
-/// keep its row when its daemon finally goes: that guarantee lives in
-/// [`snapshot_session_is_handover_orphaned_row`] and does not depend on this
-/// predicate. Widening this list to admit `Shell` would kill a live shell and
-/// hand back an empty one, which is not migration.
+/// ⛔ The reasoning lives in [`session_kind_state_survives_pty_loss`], not here —
+/// this is one of TWO paths that destroy a PTY, and when each carried its own
+/// copy of the argument the other one drifted and started killing shells.
 fn session_kind_is_migratable_agent(kind: SessionKind) -> bool {
+    session_kind_state_survives_pty_loss(kind)
+}
+
+/// THE fact both PTY-destroying paths turn on: **does this session's state live
+/// anywhere other than the PTY?**
+///
+/// An agent CLI writes its own JSONL, so destroying the PTY and re-resuming is
+/// recoverable. A plain shell's state IS the PTY — re-running its launch command
+/// yields a *different* shell — so destroying it is lossy, permanently and
+/// regardless of how quiet it has been.
+///
+/// ⛔ It is one function because the two paths had drifted into contradicting
+/// each other on the same session. Progressive migration refused to release a
+/// shell (this fact, correctly applied); the retire loop's cold shutdown killed
+/// it anyway as soon as it passed 300 s of silence — the absence-gate treating
+/// *idleness* as *safety* for the one session class where idleness proves
+/// nothing at all. Measured on the GUI host 2026-08-09: a daemon deferred its
+/// cold shutdown 823 consecutive times on a single `local://` ychrome shell, and
+/// every one of those deferrals was the gate promising to kill that shell the
+/// moment it went quiet. See [[finding-hot-update-never-converges-idle-gate]].
+///
+/// ⚠ This is about the PTY, not the ROW. A shell whose PTY may not be destroyed
+/// must still keep its row when its daemon finally goes: that guarantee lives in
+/// [`snapshot_session_is_handover_orphaned_row`] and does not depend on this.
+///
+/// ⚠ **Two kinds are refused here that MIGHT be recoverable, and the refusal is
+/// deliberate rather than analysed.** A `Document` row's content is a file on
+/// disk, and an APP row (a ychrome shell) declares an app identity to relaunch
+/// from — both plausibly re-derivable, and app rows were in fact measured
+/// surviving a handover while plain shells died beside them. Neither has been
+/// measured surviving a *cold kill*, which is the thing this predicate licenses,
+/// so both stay on the refusing side. ⇒ To narrow this, read the app
+/// declaration rather than the kind, and measure first: the cost of being wrong
+/// is a destroyed row, and the cost of being conservative is a daemon that
+/// lingers — which the constitution explicitly accepts.
+///
+/// ⚠ `content_rederives_on_resume` is FALSE for opencode and kimi (their resume
+/// does not replay the full transcript to the screen), which is a real per-CLI
+/// fact this predicate could one day read. It is NOT read here yet: the
+/// losslessness argument is about the CLI's STORE, not its scrollback, and
+/// narrowing on a field whose consequence has not been measured live would be a
+/// guess. Recorded so the next session can settle it rather than rediscover it.
+fn session_kind_state_survives_pty_loss(kind: SessionKind) -> bool {
     // Registry-derived. The hand-list this replaced is the shape where a new
     // CLI is quietly non-migratable, so its PTY lingers with a dying daemon
     // instead of converging onto the newest one.
-    //
-    // ⚠ `content_rederives_on_resume` is FALSE for opencode and kimi (their
-    // resume does not replay the full transcript to the screen), which is a
-    // real per-CLI fact this predicate could one day read. It is NOT read here
-    // yet: migration's losslessness argument is about the CLI's STORE, not its
-    // scrollback, and narrowing on a field whose consequence has not been
-    // measured live would be a guess. Recorded so the next session can settle
-    // it rather than rediscover it.
     kind.is_agent()
 }
 
@@ -16721,8 +16868,8 @@ pub(crate) fn terminal_write_strategy_for_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonRuntime, HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, HOT_RESTART_BLOCKER_WORKING,
-        HotRestartBlocker, hot_restart_block_reason_summary,
+        DaemonRuntime, HOT_RESTART_BLOCKER_NOT_RESTORABLE, HOT_RESTART_BLOCKER_RECENTLY_ACTIVE,
+        HOT_RESTART_BLOCKER_WORKING, HotRestartBlocker, hot_restart_block_reason_summary,
     };
     use crate::live_row_tombstones::LiveRowTombstones;
 
@@ -17348,6 +17495,7 @@ mod tests {
             kind: kind.to_string(),
             idle_ms,
             threshold_ms: 300_000,
+            permanent: kind == HOT_RESTART_BLOCKER_NOT_RESTORABLE,
         }
     }
 
@@ -17407,6 +17555,80 @@ mod tests {
         .expect("three blockers defer the restart");
         assert!(reason.contains("local://a"), "{reason}");
         assert!(reason.contains("+2 more session(s)"), "{reason}");
+    }
+
+    #[test]
+    fn a_plain_shell_is_named_as_unkillable_not_as_merely_busy() {
+        // "was active 0s ago (idle window 300s)" is a promise that waiting will
+        // help. For a shell it is the opposite of true: waiting is what finally
+        // lets the gate destroy it.
+        let reason = hot_restart_block_reason_summary(&[blocker(
+            "local://shell",
+            HOT_RESTART_BLOCKER_NOT_RESTORABLE,
+            Some(0),
+        )])
+        .expect("a non-restorable session defers the cold shutdown");
+        assert!(reason.contains("local://shell"), "{reason}");
+        assert!(
+            reason.contains("destroy"),
+            "the consequence must be stated, not the idle time: {reason}"
+        );
+        assert!(
+            !reason.contains("idle window"),
+            "a permanent blocker must not be dressed as a countdown: {reason}"
+        );
+    }
+
+    #[test]
+    fn the_headline_names_a_blocker_the_user_can_actually_clear() {
+        // A daemon holding one working agent and four permanent shells must not
+        // tell the user to go close a shell that is meant to stay open.
+        let mut blockers = vec![
+            blocker("local://shell", HOT_RESTART_BLOCKER_NOT_RESTORABLE, Some(0)),
+            blocker(
+                "remote-cc://dev/agent",
+                HOT_RESTART_BLOCKER_WORKING,
+                Some(10),
+            ),
+        ];
+        super::hot_restart_blockers_actionable_first(&mut blockers);
+        let reason = hot_restart_block_reason_summary(&blockers).expect("two blockers defer");
+        assert!(
+            reason.starts_with("remote-cc://dev/agent"),
+            "clearable first: {reason}"
+        );
+        assert!(reason.contains("+1 more session(s)"), "{reason}");
+    }
+
+    #[test]
+    fn only_a_session_whose_state_outlives_its_pty_may_be_cold_killed() {
+        use super::session_kind_state_survives_pty_loss as survives;
+        // The two PTY-destroying paths — progressive migration and the retire
+        // loop's cold shutdown — had drifted apart on exactly this question, and
+        // the retire loop's answer destroyed shells. One fact, one function.
+        assert!(survives(SessionKind::ClaudeCode));
+        assert!(survives(SessionKind::Codex));
+        assert!(survives(SessionKind::CodexLiteLlm));
+        assert!(
+            !survives(SessionKind::Shell),
+            "a shell's state IS its PTY; no amount of quiet makes killing it safe"
+        );
+        for refused in [SessionKind::SshShell, SessionKind::Document] {
+            // Refused conservatively rather than proven lossy — see the
+            // predicate's own note. Locked so a narrowing is a deliberate edit
+            // with a measurement behind it, not a drive-by.
+            assert!(!survives(refused), "{refused:?} is not provably restorable");
+        }
+        // Derived from the registry, not a hand-list: a tenth agent CLI is
+        // covered by registering its descriptor, exactly like every other
+        // kind-derived predicate in the project.
+        for descriptor in yggterm_core::AGENT_CLIS {
+            assert!(
+                survives(descriptor.kind),
+                "{} is a registered agent CLI and must be restorable",
+                descriptor.binary_name
+            );
+        }
     }
 
     // `shutdown()` must never make a pre-2.9.66 daemon type `/exit` into the

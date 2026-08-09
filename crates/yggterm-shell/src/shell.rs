@@ -126255,12 +126255,19 @@ fn DaemonMetadataGroup(
         },
         // The transparency the whole group exists for: the daemon's OWN words for why
         // it is holding off, not a guess reconstructed in the UI.
+        //
+        // ⚠ A blocker only DEFERS something when a swap is actually wanted. The
+        // daemon computes its blocker list unconditionally, and once a plain
+        // shell became a permanent blocker (3.0.81) an idle, up-to-date daemon
+        // started reporting "deferred — …" forever, on a machine with nothing to
+        // deploy. Read `hot_restart_pending` first; it is the field that says
+        // whether there is a swap to be deferred at all.
         SessionMetadataEntry {
             label: "Restart",
             value: match (&daemon.hot_restart_block_reason, daemon.hot_restart_pending) {
-                (Some(reason), _) => format!("deferred — {reason}"),
+                (Some(reason), true) => format!("deferred — {reason}"),
                 (None, true) => "ready — newer build waiting".to_string(),
-                (None, false) => "nothing pending".to_string(),
+                (_, false) => "nothing pending".to_string(),
             },
         },
     ];
@@ -126268,22 +126275,31 @@ fn DaemonMetadataGroup(
     // by three agents used to read as an endless unexplained wait, because clearing the
     // named session just surfaced another. Now the user can see the whole set, and what
     // each one is doing, so "when will this land" has an answer.
-    for blocker in &daemon.hot_restart_blockers {
-        entries.push(SessionMetadataEntry {
-            label: "Blocking",
-            value: match (blocker.kind.as_str(), blocker.idle_ms) {
-                (yggterm_server::HOT_RESTART_BLOCKER_WORKING, _) => {
-                    format!("{} — working now", blocker.session_key)
-                }
-                (_, Some(idle_ms)) => format!(
-                    "{} — active {} ago (idle window {})",
-                    blocker.session_key,
-                    friendly_duration_ms(idle_ms),
-                    friendly_duration_ms(blocker.threshold_ms),
-                ),
-                (_, None) => format!("{} — recently active", blocker.session_key),
-            },
-        });
+    if daemon.hot_restart_pending {
+        for blocker in &daemon.hot_restart_blockers {
+            entries.push(SessionMetadataEntry {
+                label: "Blocking",
+                value: match (blocker.kind.as_str(), blocker.idle_ms) {
+                    (yggterm_server::HOT_RESTART_BLOCKER_WORKING, _) => {
+                        format!("{} — working now", blocker.session_key)
+                    }
+                    // A permanent blocker must never be drawn as a countdown. The
+                    // idle time is real and irrelevant: waiting is what would let
+                    // the daemon destroy this shell, not what would release it.
+                    (yggterm_server::HOT_RESTART_BLOCKER_NOT_RESTORABLE, _) => format!(
+                        "{} — a plain terminal; it stays open, so this daemon stays",
+                        blocker.session_key
+                    ),
+                    (_, Some(idle_ms)) => format!(
+                        "{} — active {} ago (idle window {})",
+                        blocker.session_key,
+                        friendly_duration_ms(idle_ms),
+                        friendly_duration_ms(blocker.threshold_ms),
+                    ),
+                    (_, None) => format!("{} — recently active", blocker.session_key),
+                },
+            });
+        }
     }
     rsx! {
         MetadataGroup { title: "Daemon".to_string(), entries, palette }

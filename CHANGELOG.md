@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A plain terminal is no longer closed by yggterm tidying up after an update.**
+  An old background service retires once the sessions it is holding go quiet.
+  For an agent session that is safe — the agent keeps its own history and simply
+  picks up where it left off. For a plain terminal there is no history to pick
+  up: the terminal *is* the thing, so closing it loses whatever was in it, and
+  going quiet for five minutes was never a sign that you were finished with it.
+  Yggterm now keeps a plain terminal's service alive for as long as the terminal
+  is open, and says so plainly instead of counting down. Measured on the live
+  machine before the fix: one service reported itself blocked from tidying up
+  **823 times in a row over four and a half hours**, each time naming a single
+  terminal — and each of those was a promise to close that terminal the moment
+  it fell silent.
+
 - **Opening a session that an older background service still owns is now
   immediate instead of taking twenty seconds.** After an update, sessions that
   were already running stay with the service that started them until they are
