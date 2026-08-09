@@ -9,6 +9,31 @@ and referenced from here.
 says the answer changed.
 
 
+## ★★ MUSE'S FIRST-RUN QUESTION IS MUSE, NOT US — IT IS ACCOUNT SETUP (2026-08-09)
+
+**Settled by the owner, verbatim:** *"Muse starts for the first time asking
+question but that is normal. That is normal. After account setup the CLI
+launches normally."*
+
+**The question it answered:** `muse` was filed as a yggterm bug — it opens with
+18 OSC colour queries plus the Kitty keyboard handshake and exits 0 within
+seconds, and the entry's theory was that a row's PTY has no renderer attached
+yet, so nobody answers and muse leaves. ⇒ **No. That is muse's own first-run
+account-setup prompt**, and once the account is set up it starts like every
+other CLI. No code change; the `pending-bugs.md` entry is deleted rather than
+implemented.
+
+⚠ **What the investigation got wrong, because it is the reusable part.** It
+checked that `~/.config/muse/{auth.json,settings.json,trust.json}` were present
+and current, and read that as *"account setup is done, therefore this is not a
+setup prompt"*. Config files existing is not the same as an account being set
+up — **the presence of a config is not the completion of the thing it configures.**
+The owner, who has actually completed the flow, could settle in one sentence
+what a byte-level pty capture could not.
+
+⇒ ⛔ Do not re-open this from the capture. If muse ever exits with **no visible
+question**, that is a different observation and needs its own entry.
+
 ## ★★★ QUIET BY DEFAULT — THE CHIME LADDER IS THE ONLY UNQUIET CHANNEL (2026-08-08)
 
 **Settled by the owner, verbatim:** *"Quietly. The only unquiet part is

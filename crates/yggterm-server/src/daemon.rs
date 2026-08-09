@@ -7527,8 +7527,10 @@ impl DaemonRuntime {
                     self.server
                         .queue_background_managed_cli_refresh(machine_key.as_deref())?
                 } else {
-                    self.server
-                        .refresh_managed_cli(machine_key.as_deref(), background)?
+                    self.server.refresh_managed_cli(
+                        machine_key.as_deref(),
+                        crate::ManagedCliRefreshMode::Foreground,
+                    )?
                 };
                 ServerResponse::Ack {
                     message: Some(message),
@@ -14009,6 +14011,122 @@ fn run_socket_sweep_chore_if_due(home_dir: &Path, now_ms: u64) {
 #[cfg(not(unix))]
 fn run_socket_sweep_chore_if_due(_home_dir: &Path, _now_ms: u64) {}
 
+/// How often a daemon sweeps the managed CLIs across the whole connected fleet.
+///
+/// Matches the per-machine refresh TTL: a shorter cadence would be work the TTL
+/// throws away, a longer one would leave a machine the owner has not opened
+/// stale for longer than the product's own idea of stale.
+const MANAGED_CLI_FLEET_SWEEP_INTERVAL_MS: u64 = 6 * 60 * 60_000;
+const ENV_YGGTERM_MANAGED_CLI_FLEET_SWEEP_INTERVAL_MS: &str =
+    "YGGTERM_MANAGED_CLI_FLEET_SWEEP_INTERVAL_MS";
+const MANAGED_CLI_FLEET_SWEEP_MARKER_NAME: &str = "managed-cli-fleet-sweep";
+
+/// How long after a daemon starts before it may sweep.
+///
+/// ⛔ Not politeness either. A daemon's first minutes are its worst: it is
+/// restoring dozens of sessions, re-attaching remote rows and re-deriving
+/// launch commands, and a hot-restart deploy is precisely when that happens.
+/// Firing an ssh fan-out plus an `npm install` per machine INTO that window
+/// would land the sweep's cost on the one moment the daemon has none to spare —
+/// and on a fresh install, where the marker is absent and the sweep is due
+/// immediately, that is the very first thing it would do.
+const MANAGED_CLI_FLEET_SWEEP_STARTUP_GRACE_MS: u64 = 5 * 60_000;
+
+fn managed_cli_fleet_sweep_interval_ms() -> u64 {
+    std::env::var(ENV_YGGTERM_MANAGED_CLI_FLEET_SWEEP_INTERVAL_MS)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(MANAGED_CLI_FLEET_SWEEP_INTERVAL_MS)
+}
+
+/// Whether the scheduled fleet sweep may run on this tick.
+///
+/// ⛔ A SUPERSEDED daemon never sweeps. Coexisting daemons are the constitution's
+/// design, not an accident, and on this host there are routinely four of them —
+/// if each ran its own sweep the fleet would take four npm runs per machine per
+/// interval to do one machine's worth of work. The current daemon owns the
+/// chore; the retired ones keep serving their sessions and nothing else.
+fn managed_cli_fleet_sweep_is_due(
+    is_superseded: bool,
+    last_run_ms: Option<u64>,
+    now_ms: u64,
+    interval_ms: u64,
+    daemon_uptime_ms: u64,
+) -> bool {
+    if is_superseded || daemon_uptime_ms < MANAGED_CLI_FLEET_SWEEP_STARTUP_GRACE_MS {
+        return false;
+    }
+    match last_run_ms {
+        None => true,
+        Some(last_run_ms) => now_ms.saturating_sub(last_run_ms) >= interval_ms,
+    }
+}
+
+/// The scheduled half of the CLI install/update pipeline, riding the EXISTING
+/// chore tick (owner-asked twice: *"we need a installation pipeline that
+/// installs all the clis and updates them frequently across the connected
+/// fleet"*).
+///
+/// Demand-driven refreshes — a focus, an attach, an explicit verb — already
+/// covered every registered CLI on the machine being touched. What was missing
+/// was the two things a pipeline needs and a demand-driven path structurally
+/// cannot have: **reach** (a machine nobody opened this week is never touched)
+/// and **cadence**.
+///
+/// ⛔ The marker is stamped BEFORE the sweep runs, not after. It is shared by
+/// every daemon in this `$YGGTERM_HOME`, and the sweep takes minutes; stamping
+/// afterwards would leave the whole window open for a second daemon to start
+/// the same fan-out in parallel — the fan noise the owner notices, doubled, for
+/// no extra freshness.
+fn run_managed_cli_fleet_sweep_chore_if_due(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    home_dir: &Path,
+    now_ms: u64,
+    daemon_uptime_ms: u64,
+) {
+    let interval_ms = managed_cli_fleet_sweep_interval_ms();
+    let marker = home_dir.join(MANAGED_CLI_FLEET_SWEEP_MARKER_NAME);
+    let last_run_ms = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    let is_superseded = daemon_is_superseded_on_this_platform(home_dir);
+    if !managed_cli_fleet_sweep_is_due(
+        is_superseded,
+        last_run_ms,
+        now_ms,
+        interval_ms,
+        daemon_uptime_ms,
+    ) {
+        return;
+    }
+    // ⛔ The target list is snapshotted under the lock and the WORK happens
+    // outside it. An ssh hop plus an npm install under the daemon runtime lock
+    // would stall every request on this daemon for the length of the sweep.
+    let targets = {
+        let runtime = lock_daemon_runtime(runtime, "managed_cli_fleet_sweep_targets");
+        runtime.server.connected_managed_cli_fleet_targets()
+    };
+    let _ = std::fs::write(&marker, now_ms.to_string());
+    append_trace_event(
+        home_dir,
+        "daemon",
+        "chore",
+        "managed_cli_fleet_sweep_begin",
+        serde_json::json!({
+            "machine_count": targets.len() + 1,
+            "interval_ms": interval_ms,
+            "last_run_ms": last_run_ms,
+        }),
+    );
+    // ⛔ The sweep runs on the chore THREAD, not the request path, and it does
+    // not report its own outcome here: `run_managed_cli_fleet_refresh` writes
+    // the `server/managed_cli/fleet_refresh` event for every caller, so a second
+    // copy of it would be two records of one sweep that could disagree.
+    let _ =
+        crate::run_managed_cli_fleet_refresh(&targets, crate::ManagedCliRefreshMode::Scheduled);
+}
+
 /// GATE #8 startup hook: run the superseded-daemon takeover once, off the
 /// accept path, under the runtime lock (see
 /// [`DaemonRuntime::takeover_superseded_daemon_state`]), then sweep dead
@@ -14297,6 +14415,10 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         std::thread::spawn(move || {
             let mut sleep_ms = BACKGROUND_COPY_CHORE_MS;
             let mut remote_cc_confirmed: HashSet<String> = HashSet::new();
+            // This daemon's own uptime, for the fleet sweep's startup grace.
+            // An `Instant`, not a wall clock: the grace is "how long have I been
+            // up", which a clock adjustment must not be able to satisfy.
+            let chore_started_at = std::time::Instant::now();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 run_preserved_owner_revalidation_if_due(&runtime);
@@ -14359,6 +14481,16 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 // Versioned-socket autoclean, same shape and same tick: own
                 // $YGGTERM_HOME only, interval-gated inside, no runtime lock.
                 run_socket_sweep_chore_if_due(&chore_home_dir, crate::current_millis_u64());
+                // The fleet CLI install/update sweep, same tick and same
+                // interval-gated-inside shape. It is the ONLY thing in the
+                // product with reach onto a machine the owner has not opened,
+                // which is exactly the machine that goes stale.
+                run_managed_cli_fleet_sweep_chore_if_due(
+                    &runtime,
+                    &chore_home_dir,
+                    crate::current_millis_u64(),
+                    chore_started_at.elapsed().as_millis() as u64,
+                );
                 match run_background_copy_chore(
                     &runtime,
                     generation_enabled,
@@ -23699,6 +23831,64 @@ mod tests {
             linux_yggterm_home_from_environ_bytes(env),
             Some(std::path::PathBuf::from("/home/user/.yggterm"))
         );
+    }
+
+    /// The scheduled fleet sweep's gate. Two properties, and the SUPERSEDED one
+    /// is the load-bearing half: version-coexisting daemons are the
+    /// constitution's design, and this host routinely runs four at once. A
+    /// sweep that every daemon ran would be four npm runs per machine per
+    /// interval to accomplish one machine's worth of work — and the owner
+    /// hears every one of them.
+    #[test]
+    fn only_the_current_daemon_sweeps_the_fleet_and_only_on_its_interval() {
+        use super::{MANAGED_CLI_FLEET_SWEEP_STARTUP_GRACE_MS, managed_cli_fleet_sweep_is_due};
+        let interval_ms = 6 * 60 * 60_000u64;
+        let now_ms = 100 * interval_ms;
+        let settled = MANAGED_CLI_FLEET_SWEEP_STARTUP_GRACE_MS;
+
+        // Never run before: due, so a fresh install provisions its fleet.
+        assert!(managed_cli_fleet_sweep_is_due(
+            false, None, now_ms, interval_ms, settled
+        ));
+        // Just ran: not due.
+        assert!(!managed_cli_fleet_sweep_is_due(
+            false,
+            Some(now_ms.saturating_sub(1)),
+            now_ms,
+            interval_ms,
+            settled
+        ));
+        // Exactly one interval later: due. `>=`, not `>`, so a sweep cannot
+        // drift a whole tick later every time it runs.
+        assert!(managed_cli_fleet_sweep_is_due(
+            false,
+            Some(now_ms.saturating_sub(interval_ms)),
+            now_ms,
+            interval_ms,
+            settled
+        ));
+
+        // ⛔ A superseded daemon never sweeps, however overdue the marker is.
+        for last_run_ms in [None, Some(0u64), Some(now_ms.saturating_sub(interval_ms))] {
+            assert!(
+                !managed_cli_fleet_sweep_is_due(true, last_run_ms, now_ms, interval_ms, settled),
+                "a superseded daemon must not sweep (last_run_ms={last_run_ms:?})"
+            );
+        }
+
+        // ⛔ And a daemon still in its startup grace never sweeps — the case
+        // that matters is a FRESH install (no marker, so due immediately),
+        // where the sweep would otherwise fire into the restore storm.
+        assert!(!managed_cli_fleet_sweep_is_due(
+            false,
+            None,
+            now_ms,
+            interval_ms,
+            settled.saturating_sub(1)
+        ));
+        assert!(!managed_cli_fleet_sweep_is_due(
+            false, None, now_ms, interval_ms, 0
+        ));
     }
 
     /// The source text of `pub enum Name {` through its matching close brace.

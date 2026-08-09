@@ -349,6 +349,13 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
                         .to_string(),
                 );
             }
+            // The fleet scope lives in `machine_key` — see
+            // `yggterm_server::MANAGED_CLI_FLEET_SCOPE`. This is a spelling of
+            // `--machine-key '*'` that survives a shell without quoting, since
+            // an unquoted `*` globs against the cwd before it ever reaches us.
+            "--fleet" => {
+                machine_key = Some(yggterm_server::MANAGED_CLI_FLEET_SCOPE.to_string());
+            }
             "--background" => {
                 background = true;
             }

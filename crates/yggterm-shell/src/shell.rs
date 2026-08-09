@@ -209,8 +209,8 @@ use yggterm_server::{
     app_control_requests_pending_for_worker, cleanup_legacy_daemons,
     complete_app_control_request, connect_ssh_custom, enqueue_app_control_request,
     fetch_remote_generation_context, focus_live_with_view, hot_restart, hot_restart_detailed,
-    local_app_verb_launch_command, local_headless_companion_executable_from_current,
-    managed_cli_refresh_ttl_ms,
+    ManagedCliRefreshMode, local_app_verb_launch_command,
+    local_headless_companion_executable_from_current, managed_cli_refresh_ttl_ms,
     open_remote_session_with_view, open_stored_session, open_stored_session_with_view,
     persist_remote_generated_copy, ping, prepare_client_close, prepare_update_restart,
     reachable_versioned_daemon_statuses, refresh_local_managed_cli_now, refresh_managed_cli,
@@ -37184,7 +37184,10 @@ fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: St
         let request_scope = scope_key.clone();
         let outcome = task::spawn_blocking(move || {
             if request_scope == "local" {
-                refresh_local_managed_cli_now(true).map(Some)
+                // Incidental: this is the GUI's own background nudge, not a
+                // scheduled sweep — it must never run an install on the
+                // owner's machine off a focus.
+                refresh_local_managed_cli_now(ManagedCliRefreshMode::Incidental).map(Some)
             } else {
                 refresh_managed_cli(&endpoint, Some(request_scope.as_str()), true)
             }

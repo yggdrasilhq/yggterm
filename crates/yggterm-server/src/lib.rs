@@ -182,7 +182,8 @@ use codex_cli::{
     terminal_identity_appearance_from_environment, terminal_identity_shell_exports_for_remote,
 };
 pub use codex_cli::{
-    sync_terminal_identity_appearance, sync_terminal_identity_appearance_with_profile,
+    ManagedCliRefreshMode, sync_terminal_identity_appearance,
+    sync_terminal_identity_appearance_with_profile,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -245,13 +246,241 @@ const REMOTE_COMMAND_CACHE_VERIFY_TTL_MS: u64 = 10 * 60_000;
 /// back to being proven in the foreground.
 const REMOTE_COMMAND_CACHE_HARD_STALE_MS: u64 = 6 * 60 * 60_000;
 const REMOTE_YGGTERM_COMMAND_TIMEOUT_MS: u64 = 45_000;
+
+/// How long a remote managed-CLI PROVISIONING command may take.
+///
+/// ⛔ MEASURED 2026-08-09, and the 45 s general budget is why the first fleet
+/// sweep refreshed nothing remotely: **all four remote machines timed out, all
+/// four with the same message**, while the identical work on the local machine
+/// took 67 s. The general timeout is sized for a QUERY — resolve a binary, read
+/// a title, list sessions — and an `npm install -g` of nine packages is not a
+/// query. A budget shorter than the work can never do anything but fail, and it
+/// fails after having very possibly started an install it then SIGHUPs
+/// halfway.
+///
+/// ⚠ It is affordable only because the fleet fan-out is off the request path
+/// (see the Fleet arm of `refresh_managed_cli`): nothing is waiting on this, so
+/// the cost of a generous budget is a slow sweep, never a slow product.
+const REMOTE_MANAGED_CLI_COMMAND_TIMEOUT_MS: u64 = 10 * 60_000;
 const REMOTE_PYTHON_COMMAND_TIMEOUT_MS: u64 = 20_000;
 
-pub fn refresh_local_managed_cli_now(background: bool) -> anyhow::Result<String> {
+pub fn refresh_local_managed_cli_now(mode: ManagedCliRefreshMode) -> anyhow::Result<String> {
     Ok(summarize_managed_cli_report(
         "local",
-        &refresh_local_managed_cli(background)?,
+        &refresh_local_managed_cli(mode)?,
     ))
+}
+
+/// The literal `machine_key` that means *this machine and every connected
+/// remote machine*.
+///
+/// ⭐ It is `*` and nothing else, deliberately. `machine_key` has always carried
+/// the scope — `None` already meant "local" — so the fleet scope belongs in the
+/// same field rather than in a second flag beside it that could disagree with
+/// it. And `*` is the one spelling that can never collide with a real machine:
+/// `normalize_machine_key` maps every non-alphanumeric byte to `-`, so a host
+/// genuinely called `all` or `fleet` would normalise to itself and shadow the
+/// sentinel, while `*` normalises to the empty string and can therefore never
+/// be produced from an ssh target.
+pub const MANAGED_CLI_FLEET_SCOPE: &str = "*";
+
+/// Which machines a managed-CLI refresh covers. Parsed from the one field that
+/// has always carried it; see [`MANAGED_CLI_FLEET_SCOPE`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManagedCliRefreshScope {
+    /// This machine only. What an absent/empty `machine_key` has always meant.
+    Local,
+    /// This machine AND every connected remote machine.
+    Fleet,
+    /// One named remote machine.
+    Machine(String),
+}
+
+impl ManagedCliRefreshScope {
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).filter(|value| !value.is_empty()) {
+            None => Self::Local,
+            Some(value) if value == MANAGED_CLI_FLEET_SCOPE => Self::Fleet,
+            Some(value) => Self::Machine(normalize_machine_key(value)),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Local => "local".to_string(),
+            Self::Fleet => "fleet".to_string(),
+            Self::Machine(machine_key) => machine_key.clone(),
+        }
+    }
+}
+
+/// How long the fan-out pauses between machines.
+///
+/// ⚠ Not politeness — pacing. A fleet refresh runs npm and uv on every
+/// connected machine, and firing four of those at once is the fan noise the
+/// owner notices from the next room, plus the burst that gets an external
+/// endpoint to answer 429. Sequential with a gap costs nothing anyone is
+/// waiting on: the sweep is scheduled, so its latency is invisible.
+const MANAGED_CLI_FLEET_HOP_PACING_MS: u64 = 2_000;
+
+/// What one fleet sweep did, in a shape a caller can trace without re-parsing
+/// the human summary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagedCliFleetRefreshOutcome {
+    /// Machines that answered, `local` included.
+    pub refreshed: Vec<String>,
+    /// `(machine_key, error)` for machines that did not. ⭐ Kept rather than
+    /// counted: "two machines failed" is not actionable, "`oc`: ssh timeout" is.
+    pub failed: Vec<(String, String)>,
+    pub summary: String,
+}
+
+impl ManagedCliFleetRefreshOutcome {
+    pub fn machine_count(&self) -> usize {
+        self.refreshed.len() + self.failed.len()
+    }
+
+    /// Whether this call actually swept, as opposed to being declined because
+    /// another sweep held the guard. ⭐ Distinguishable from a sweep that failed
+    /// everywhere: that one names its machines.
+    pub fn did_sweep(&self) -> bool {
+        self.machine_count() > 0
+    }
+}
+
+/// Process-wide "a fleet sweep is in flight" flag, released on drop so an early
+/// return or a panic cannot wedge every later sweep out.
+static MANAGED_CLI_FLEET_SWEEP_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+struct ManagedCliFleetSweepGuard;
+
+impl ManagedCliFleetSweepGuard {
+    fn acquire() -> Option<Self> {
+        MANAGED_CLI_FLEET_SWEEP_RUNNING
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for ManagedCliFleetSweepGuard {
+    fn drop(&mut self) {
+        MANAGED_CLI_FLEET_SWEEP_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The fan-out itself: this machine first — it is the one the owner is sitting
+/// at — then every connected remote machine, sequentially and paced.
+///
+/// ⛔ A FREE function taking an already-snapshotted target list, on purpose. The
+/// scheduled sweep calls it from the daemon's chore thread, where holding the
+/// runtime lock across an ssh hop and an `npm install` would freeze every
+/// request on the daemon for minutes. Its only other caller
+/// ([`YggtermServer::refresh_managed_cli`]) passes the same list, so there is
+/// still exactly one fan-out.
+///
+/// ⛔ Failures are COLLECTED, never short-circuited: one unreachable machine
+/// must not stop the sweep from updating the rest, and stopping at the first bad
+/// hop would report a partial pass as a full one.
+pub fn run_managed_cli_fleet_refresh(
+    targets: &[(String, String, Option<String>)],
+    mode: ManagedCliRefreshMode,
+) -> ManagedCliFleetRefreshOutcome {
+    // ⛔ ONE sweep at a time, per process. The chore fires on a clock and the
+    // verb fires on demand, so the two WILL eventually overlap — and two
+    // concurrent fan-outs mean every machine on the fleet runs npm and uv twice
+    // at once, which is the fan noise this whole feature is paced to avoid. The
+    // guard lives HERE rather than at either door, because a guard on one door
+    // is not a guard.
+    let _sweep = match ManagedCliFleetSweepGuard::acquire() {
+        Some(guard) => guard,
+        None => {
+            let summary =
+                "managed cli fleet refresh already running; this request was not a second sweep"
+                    .to_string();
+            warn!(summary, "declined a concurrent fleet managed cli refresh");
+            return ManagedCliFleetRefreshOutcome {
+                summary,
+                ..Default::default()
+            };
+        }
+    };
+    let mut outcome = ManagedCliFleetRefreshOutcome::default();
+    let mut lines: Vec<String> = Vec::new();
+    match refresh_local_managed_cli(mode) {
+        Ok(report) => {
+            outcome.refreshed.push("local".to_string());
+            lines.push(summarize_managed_cli_report("local", &report));
+        }
+        Err(error) => {
+            warn!(error = %error, "fleet managed cli refresh failed for local");
+            outcome.failed.push(("local".to_string(), error.to_string()));
+            lines.push(format!("local: refresh failed: {error}"));
+        }
+    }
+    for (machine_key, ssh_target, prefix) in targets {
+        std::thread::sleep(std::time::Duration::from_millis(
+            MANAGED_CLI_FLEET_HOP_PACING_MS,
+        ));
+        match refresh_remote_managed_cli(ssh_target, prefix.as_deref(), mode) {
+            Ok(report) => {
+                outcome.refreshed.push(machine_key.clone());
+                lines.push(summarize_managed_cli_report(machine_key, &report));
+            }
+            Err(error) => {
+                warn!(
+                    machine_key = %machine_key,
+                    ssh_target = %ssh_target,
+                    error = %error,
+                    "fleet managed cli refresh failed"
+                );
+                outcome
+                    .failed
+                    .push((machine_key.clone(), error.to_string()));
+                lines.push(format!("{machine_key}: refresh failed: {error}"));
+            }
+        }
+    }
+    outcome.summary = format!(
+        "managed cli refresh across {} machine(s), {} failed: {}",
+        outcome.machine_count(),
+        outcome.failed.len(),
+        lines.join(" | ")
+    );
+    // ⭐ Traced HERE, in the fan-out itself, rather than in each caller. The
+    // fleet scope always runs detached (see the Fleet arm of
+    // `refresh_managed_cli`), so the reply the caller got said only "started" —
+    // this event is the only record of what actually happened, and it must
+    // exist no matter which door started the sweep.
+    if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "server",
+            "managed_cli",
+            "fleet_refresh",
+            json!({
+                "mode": mode.as_str(),
+                "machine_count": outcome.machine_count(),
+                "refreshed": outcome.refreshed,
+                "failed": outcome
+                    .failed
+                    .iter()
+                    .map(|(machine_key, error)| json!({
+                        "machine_key": machine_key,
+                        "error": error,
+                    }))
+                    .collect::<Vec<_>>(),
+                "summary": outcome.summary,
+            }),
+        );
+    }
+    outcome
 }
 
 #[derive(Debug, Clone)]
@@ -6920,42 +7149,103 @@ impl YggtermServer {
         spawn_remote_managed_cli_ensure(machine_key, target.ssh_target, target.prefix, tool);
     }
 
+    /// Every connected remote machine, as `(machine_key, ssh_target, prefix)`,
+    /// deduplicated and in a stable order.
+    ///
+    /// ⛔ Deduplicated on `machine_key`, because `ssh_targets` and
+    /// `remote_machines` are two registers of the same fleet and a host in both
+    /// would otherwise be refreshed twice per sweep — the same npm run, billed
+    /// again, on the machine that already just did it.
+    pub(crate) fn connected_managed_cli_fleet_targets(
+        &self,
+    ) -> Vec<(String, String, Option<String>)> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut targets = Vec::new();
+        for (ssh_target, prefix) in self
+            .ssh_targets
+            .iter()
+            .map(|target| (target.ssh_target.clone(), target.prefix.clone()))
+            .chain(
+                self.remote_machines
+                    .iter()
+                    .map(|machine| (machine.ssh_target.clone(), machine.prefix.clone())),
+            )
+        {
+            if ssh_target.trim().is_empty() {
+                continue;
+            }
+            let machine_key = machine_key_from_ssh_target(&ssh_target);
+            if machine_key.is_empty() || !seen.insert(machine_key.clone()) {
+                continue;
+            }
+            targets.push((machine_key, ssh_target, prefix));
+        }
+        targets
+    }
+
+    /// Refresh the managed CLIs on one scope: this machine, one named machine,
+    /// or the whole connected fleet.
+    ///
+    /// ⛔ There is exactly ONE refresh path and this is it. The fleet arm does
+    /// not reimplement anything — it walks the machines and calls the same
+    /// per-target function the single-machine arm calls. A second fan-out path
+    /// is how "we update every CLI everywhere" becomes true on one route and
+    /// false on the other.
     pub fn refresh_managed_cli(
         &self,
         machine_key: Option<&str>,
-        background: bool,
+        mode: ManagedCliRefreshMode,
     ) -> anyhow::Result<String> {
-        let (scope, report) = match machine_key.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(machine_key) => {
-                let machine_key = normalize_machine_key(machine_key);
-                let target = self.remote_target_for_machine_key(&machine_key)?;
-                let report = refresh_remote_managed_cli(
-                    &target.ssh_target,
-                    target.prefix.as_deref(),
-                    background,
-                )?;
-                (machine_key, report)
+        let scope = ManagedCliRefreshScope::parse(machine_key);
+        let (label, report) = match &scope {
+            ManagedCliRefreshScope::Machine(machine_key) => {
+                let target = self.remote_target_for_machine_key(machine_key)?;
+                let report =
+                    refresh_remote_managed_cli(&target.ssh_target, target.prefix.as_deref(), mode)?;
+                (machine_key.clone(), report)
             }
-            None => ("local".to_string(), refresh_local_managed_cli(background)?),
+            ManagedCliRefreshScope::Local => {
+                ("local".to_string(), refresh_local_managed_cli(mode)?)
+            }
+            // ⛔⛔ THE FLEET SCOPE IS ALWAYS QUEUED, EVEN WHEN THE CALLER ASKED
+            // FOR THE FOREGROUND — measured 2026-08-09 on a live 3.0.71 daemon,
+            // and it cost the daemon.
+            //
+            // Running the fan-out inline held the request path for the whole
+            // sweep: the client's own read deadline expired at ~10 s and then
+            // `server status` did not answer AT ALL for minutes, on the daemon
+            // that owns the owner's live rows. A single-machine refresh is a
+            // request; a fleet refresh is an ssh hop plus an `npm`/`uv` run per
+            // machine, and no request deadline is ever going to be longer than
+            // that. It is not a slow request — it is the wrong shape for one.
+            //
+            // ⇒ `foreground` on a FLEET scope now means "start it now", not
+            // "block until it finishes". The outcome is reported through the
+            // `managed_cli_fleet_refresh` trace event, which is the only place
+            // that can carry it after the reply has already gone.
+            ManagedCliRefreshScope::Fleet => {
+                return self.queue_background_managed_cli_refresh(machine_key);
+            }
         };
-        Ok(summarize_managed_cli_report(&scope, &report))
+        Ok(summarize_managed_cli_report(&label, &report))
     }
 
     pub fn queue_background_managed_cli_refresh(
         &self,
         machine_key: Option<&str>,
     ) -> anyhow::Result<String> {
-        match machine_key.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(machine_key) => {
-                let machine_key = normalize_machine_key(machine_key);
+        match ManagedCliRefreshScope::parse(machine_key) {
+            ManagedCliRefreshScope::Machine(machine_key) => {
                 let target = self.remote_target_for_machine_key(&machine_key)?;
                 let ssh_target = target.ssh_target.clone();
                 let prefix = target.prefix.clone();
                 let queued_scope = machine_key.clone();
                 std::thread::spawn(move || {
-                    if let Err(error) =
-                        refresh_remote_managed_cli(&ssh_target, prefix.as_deref(), true)
-                    {
+                    if let Err(error) = refresh_remote_managed_cli(
+                        &ssh_target,
+                        prefix.as_deref(),
+                        ManagedCliRefreshMode::Incidental,
+                    ) {
                         warn!(
                             machine_key = %queued_scope,
                             ssh_target = %ssh_target,
@@ -6966,13 +7256,31 @@ impl YggtermServer {
                 });
                 Ok(format!("queued managed cli refresh for {machine_key}"))
             }
-            None => {
+            ManagedCliRefreshScope::Local => {
                 std::thread::spawn(|| {
-                    if let Err(error) = refresh_local_managed_cli(true) {
+                    if let Err(error) =
+                        refresh_local_managed_cli(ManagedCliRefreshMode::Incidental)
+                    {
                         warn!(error = %error, "background managed cli refresh failed");
                     }
                 });
                 Ok("queued managed cli refresh for local".to_string())
+            }
+            ManagedCliRefreshScope::Fleet => {
+                // ⭐ Queued in SCHEDULED mode, not Incidental. A caller who asks
+                // for the whole fleet is asking for the thing the owner asked
+                // for twice — install and update everywhere — and the incidental
+                // arm is the one that is forbidden to install.
+                let targets = self.connected_managed_cli_fleet_targets();
+                let machine_count = targets.len() + 1;
+                std::thread::spawn(move || {
+                    let outcome =
+                        run_managed_cli_fleet_refresh(&targets, ManagedCliRefreshMode::Scheduled);
+                    info!(summary = %outcome.summary, "queued fleet managed cli refresh finished");
+                });
+                Ok(format!(
+                    "queued managed cli refresh for {machine_count} machine(s)"
+                ))
             }
         }
     }
@@ -14628,6 +14936,24 @@ fn run_remote_binary_command(
     args: &[&str],
     stdin_bytes: Option<&[u8]>,
 ) -> anyhow::Result<String> {
+    run_remote_binary_command_with_timeout(
+        ssh_target,
+        exec_prefix,
+        binary_expr,
+        args,
+        stdin_bytes,
+        REMOTE_YGGTERM_COMMAND_TIMEOUT_MS,
+    )
+}
+
+fn run_remote_binary_command_with_timeout(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    binary_expr: &str,
+    args: &[&str],
+    stdin_bytes: Option<&[u8]>,
+    timeout_ms: u64,
+) -> anyhow::Result<String> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("ConnectTimeout=5");
     cmd.arg("-o").arg("BatchMode=yes");
@@ -14658,7 +14984,7 @@ fn run_remote_binary_command(
     }
     let output = wait_remote_command_with_timeout(
         child,
-        REMOTE_YGGTERM_COMMAND_TIMEOUT_MS,
+        timeout_ms,
         &format!("{ssh_target} {binary_invocation}"),
     )
     .with_context(|| format!("failed waiting for remote yggterm command on {ssh_target}"))?;
@@ -14678,9 +15004,32 @@ fn run_remote_yggterm_command(
     args: &[&str],
     stdin_bytes: Option<&[u8]>,
 ) -> anyhow::Result<String> {
+    run_remote_yggterm_command_with_timeout(
+        ssh_target,
+        exec_prefix,
+        args,
+        stdin_bytes,
+        REMOTE_YGGTERM_COMMAND_TIMEOUT_MS,
+    )
+}
+
+fn run_remote_yggterm_command_with_timeout(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    args: &[&str],
+    stdin_bytes: Option<&[u8]>,
+    timeout_ms: u64,
+) -> anyhow::Result<String> {
     let cache_key = remote_cache_key(ssh_target, exec_prefix);
     let resolved = resolve_remote_yggterm_binary(ssh_target, exec_prefix)?;
-    match run_remote_binary_command(ssh_target, exec_prefix, &resolved.0, args, stdin_bytes) {
+    match run_remote_binary_command_with_timeout(
+        ssh_target,
+        exec_prefix,
+        &resolved.0,
+        args,
+        stdin_bytes,
+        timeout_ms,
+    ) {
         Ok(output) => Ok(output),
         Err(first_error) => {
             if !should_fallback_to_python(&first_error) {
@@ -14693,10 +15042,17 @@ fn run_remote_yggterm_command(
             // CLIMBING fast is the wedged-target spin (surfaced in status).
             REMOTE_YGGTERM_RETRY_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let retried = resolve_remote_yggterm_binary(ssh_target, exec_prefix)?;
-            run_remote_binary_command(ssh_target, exec_prefix, &retried.0, args, stdin_bytes)
-                .with_context(|| {
-                    format!("retrying remote yggterm command after cache reset: {first_error:#}")
-                })
+            run_remote_binary_command_with_timeout(
+                ssh_target,
+                exec_prefix,
+                &retried.0,
+                args,
+                stdin_bytes,
+                timeout_ms,
+            )
+            .with_context(|| {
+                format!("retrying remote yggterm command after cache reset: {first_error:#}")
+            })
         }
     }
 }
@@ -18314,25 +18670,22 @@ fn current_tty_size() -> Option<(u16, u16)> {
     None
 }
 
+/// ⚠ CROSS-VERSION: a remote binary older than the refresh MODE compares
+/// `args[3] == "background"` and nothing else, so it reads `scheduled` as
+/// foreground — it installs and ignores its own TTL. That is a sweep that costs
+/// more than it should on an old host, never a sweep that silently does
+/// nothing, which is the failure worth guarding against here.
 fn refresh_remote_managed_cli(
     ssh_target: &str,
     exec_prefix: Option<&str>,
-    background: bool,
+    mode: ManagedCliRefreshMode,
 ) -> anyhow::Result<ManagedCliRefreshReport> {
-    let output = run_remote_yggterm_command(
+    let output = run_remote_yggterm_command_with_timeout(
         ssh_target,
         exec_prefix,
-        &[
-            "server",
-            "remote",
-            "refresh-managed-cli",
-            if background {
-                "background"
-            } else {
-                "foreground"
-            },
-        ],
+        &["server", "remote", "refresh-managed-cli", mode.as_str()],
         None,
+        REMOTE_MANAGED_CLI_COMMAND_TIMEOUT_MS,
     )?;
     serde_json::from_str(output.trim())
         .with_context(|| format!("parsing remote managed cli refresh report for {ssh_target}"))
@@ -18348,11 +18701,16 @@ fn ensure_remote_managed_cli(
     exec_prefix: Option<&str>,
     tool: ManagedCliTool,
 ) -> anyhow::Result<ManagedCliToolStatus> {
-    let output = run_remote_yggterm_command(
+    // Same budget as the machine-wide refresh, for the same reason: this
+    // INSTALLS. It already runs on a spawned thread
+    // (`spawn_remote_managed_cli_ensure`), never on a launch or a request, so
+    // nothing is held waiting on it either.
+    let output = run_remote_yggterm_command_with_timeout(
         ssh_target,
         exec_prefix,
         &["server", "remote", "ensure-managed-cli", tool.binary_name()],
         None,
+        REMOTE_MANAGED_CLI_COMMAND_TIMEOUT_MS,
     )?;
     serde_json::from_str(output.trim())
         .with_context(|| format!("parsing remote managed cli ensure status for {ssh_target}"))
@@ -24062,8 +24420,8 @@ pub fn run_app_control_restart_session(session_path: &str, timeout_ms: u64) -> a
     Ok(())
 }
 
-pub fn run_remote_refresh_managed_cli(background: bool) -> anyhow::Result<()> {
-    let report = refresh_local_managed_cli(background)?;
+pub fn run_remote_refresh_managed_cli(mode: ManagedCliRefreshMode) -> anyhow::Result<()> {
+    let report = refresh_local_managed_cli(mode)?;
     write_stdout_payload(&serde_json::to_string(&report)?)?;
     Ok(())
 }
@@ -29930,6 +30288,177 @@ mod tests {
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         )
+    }
+
+    /// The scope vocabulary, including the one property that makes a sentinel
+    /// in this field safe rather than a collision waiting to happen.
+    #[test]
+    fn the_fleet_scope_sentinel_cannot_be_produced_by_any_real_machine() {
+        use crate::{MANAGED_CLI_FLEET_SCOPE, ManagedCliRefreshScope as Scope, normalize_machine_key};
+        assert_eq!(Scope::parse(None), Scope::Local);
+        assert_eq!(Scope::parse(Some("")), Scope::Local);
+        assert_eq!(Scope::parse(Some("   ")), Scope::Local);
+        assert_eq!(Scope::parse(Some(MANAGED_CLI_FLEET_SCOPE)), Scope::Fleet);
+        assert_eq!(
+            Scope::parse(Some("Alpha-Host")),
+            Scope::Machine("alpha-host".to_string())
+        );
+
+        // ⭐ The load-bearing property. `normalize_machine_key` maps every
+        // non-alphanumeric byte to `-` and trims, so `*` collapses to the empty
+        // string: no ssh target can ever normalise INTO the sentinel, and the
+        // sentinel is therefore not a machine key that a host could steal.
+        assert_eq!(normalize_machine_key(MANAGED_CLI_FLEET_SCOPE), "");
+        // …whereas the readable spellings could be stolen, which is why they
+        // are NOT accepted: a host genuinely called `all` normalises to itself.
+        assert_eq!(normalize_machine_key("all"), "all");
+        assert_eq!(
+            Scope::parse(Some("all")),
+            Scope::Machine("all".to_string()),
+            "a host named `all` must stay one machine, not become the fleet"
+        );
+    }
+
+    /// ⛔ MEASURED 2026-08-09: the first live fleet sweep refreshed the local
+    /// machine and FAILED on all four remotes, every one of them with
+    /// `failed waiting for remote yggterm command` — the general 45 s remote
+    /// budget, against work that took 67 s locally. A provisioning command is
+    /// not a query and must not share the query budget.
+    /// ⛔ The chore fires on a clock and the verb fires on demand, so they will
+    /// overlap. Two concurrent fan-outs run npm and uv twice at once on every
+    /// machine — the exact cost the 2 s hop pacing exists to avoid, multiplied
+    /// rather than spread.
+    ///
+    /// ⚠ Asserted on the GUARD, not by racing two real sweeps: a behavioural
+    /// version would have to run installs against the developer's own machine.
+    #[test]
+    fn a_second_fleet_sweep_is_declined_while_one_is_in_flight() {
+        use crate::ManagedCliFleetSweepGuard;
+        let first = ManagedCliFleetSweepGuard::acquire();
+        assert!(first.is_some(), "the first sweep takes the guard");
+        assert!(
+            ManagedCliFleetSweepGuard::acquire().is_none(),
+            "a second concurrent sweep must be declined, not doubled"
+        );
+        // ⭐ Released on DROP, so an early return or a panic inside a sweep
+        // cannot wedge every later sweep out of running.
+        drop(first);
+        let after = ManagedCliFleetSweepGuard::acquire();
+        assert!(
+            after.is_some(),
+            "the guard must be reusable once the sweep ends"
+        );
+        drop(after);
+    }
+
+    #[test]
+    fn a_remote_provisioning_command_gets_more_time_than_a_remote_query() {
+        use crate::{REMOTE_MANAGED_CLI_COMMAND_TIMEOUT_MS, REMOTE_YGGTERM_COMMAND_TIMEOUT_MS};
+        assert!(
+            REMOTE_MANAGED_CLI_COMMAND_TIMEOUT_MS > REMOTE_YGGTERM_COMMAND_TIMEOUT_MS,
+            "an install budget shorter than the install can only ever fail"
+        );
+        // The measured local leg was 67 s with one CLI actually updating. A
+        // budget must clear that by enough that a slower machine, or several
+        // CLIs updating at once, still fits.
+        assert!(
+            REMOTE_MANAGED_CLI_COMMAND_TIMEOUT_MS >= 5 * 60_000,
+            "67 s was one machine with one update; the budget must clear that \
+             with room for a slow host"
+        );
+    }
+
+    /// ⛔⛔ MEASURED ON A LIVE DAEMON, 2026-08-09: running the fleet fan-out on
+    /// the request path held `server status` unanswered for MINUTES on the
+    /// daemon owning the owner's live rows, and the caller's own read deadline
+    /// expired at ~10 s — a verb that reports failure while the work continues,
+    /// which is the shape that recruits a retry.
+    ///
+    /// A fleet refresh is an ssh hop plus an `npm`/`uv` run per machine. No
+    /// request deadline will ever be longer than that, so it must never be a
+    /// blocking request, whatever mode the caller asked for.
+    ///
+    /// ⚠ A SOURCE-SHAPE test, deliberately: the defect is purely structural
+    /// (which function the arm calls), and the behavioural version of this
+    /// assertion would have to actually run npm against the developer's own
+    /// `~/.yggterm` to observe it.
+    #[test]
+    fn the_fleet_scope_is_never_run_inline_on_the_request_path() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("    pub fn refresh_managed_cli(")
+            .expect("refresh_managed_cli defined");
+        let end = source[start..]
+            .find("\n    pub fn queue_background_managed_cli_refresh(")
+            .expect("queue_background_managed_cli_refresh follows it")
+            + start;
+        let body = &source[start..end];
+
+        let fleet_arm = body
+            .find("ManagedCliRefreshScope::Fleet =>")
+            .map(|offset| &body[offset..])
+            .expect("the fleet arm is handled by name, not by a catch-all");
+        assert!(
+            fleet_arm.contains("queue_background_managed_cli_refresh"),
+            "the fleet scope must be QUEUED; blocking the request path on it \
+             stalled a live daemon for minutes"
+        );
+        assert!(
+            !fleet_arm.contains("run_managed_cli_fleet_refresh"),
+            "the fleet arm must not call the fan-out inline — that is the \
+             defect this locks"
+        );
+    }
+
+    /// ⛔ `ssh_targets` and `remote_machines` are two registers of one fleet.
+    /// A host in both was refreshed twice per sweep before this — the same npm
+    /// run, billed again, on the machine that had just done it.
+    #[test]
+    fn the_fleet_target_list_counts_a_machine_in_both_registers_once() {
+        let mut server = test_server();
+        server.ssh_targets.push(SshConnectTarget {
+            label: "Alpha".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "alpha-host".to_string(),
+            prefix: None,
+            cwd: None,
+        });
+        server.remote_machines.push(RemoteMachineSnapshot {
+            apps: Vec::new(),
+            machine_key: "alpha-host".to_string(),
+            label: "Alpha".to_string(),
+            ssh_target: "alpha-host".to_string(),
+            prefix: None,
+            remote_binary_expr: None,
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
+        server.remote_machines.push(RemoteMachineSnapshot {
+            apps: Vec::new(),
+            machine_key: "beta-host".to_string(),
+            label: "Beta".to_string(),
+            ssh_target: "builder@beta-host".to_string(),
+            prefix: Some("exec ".to_string()),
+            remote_binary_expr: None,
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
+
+        let targets = server.connected_managed_cli_fleet_targets();
+        let keys = targets
+            .iter()
+            .map(|(machine_key, _, _)| machine_key.as_str())
+            .collect::<Vec<_>>();
+        // Whole vector, in order — a `contains` check is blind to a duplicate
+        // that lands beside the original ([[finding-a-dedup-that-reorders-is-not-a-dedup]]).
+        assert_eq!(keys, vec!["alpha-host", "beta-host"]);
+        // The ssh REGISTER wins for the fields that drive the hop, because it
+        // is the register the connection itself came from.
+        assert_eq!(targets[0].1, "alpha-host");
+        assert_eq!(targets[1].1, "builder@beta-host");
+        assert_eq!(targets[1].2.as_deref(), Some("exec "));
     }
 
     /// ⛔ OWNER-REPORTED 2026-08-08: his live ychrome row came back from a

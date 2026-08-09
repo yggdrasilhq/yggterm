@@ -13,49 +13,108 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
-## ⛔ MUSE STARTS AND EXITS 0 IMMEDIATELY — IT ASKS THE TERMINAL A QUESTION NOBODY IS THERE TO ANSWER
+## ⛔⛔ A PLAIN SHELL DIES ACROSS A HANDOVER AND A WEB-SURFACE ROW BESIDE IT SURVIVES — SAME PRESERVED LIST, OPPOSITE OUTCOMES
 
 **Status:** OPEN
 
-Split out of the launch-PATH fix (3.0.70), which it is NOT: `muse` now resolves
-and executes — the `command not found` and the `Thu: unbound variable` are both
-gone, and `agy` and `kimi` come up as full TUIs on the same launch path. muse
-alone paints nothing and its PTY is gone within seconds
-(`launch_phase: RemoteBootstrap`, no surviving process).
+⚖ **This is the CONSTITUTION's *"plain shells are first-class and must survive a
+bump like anything else"* failing, measured cleanly for the first time.**
+`CLAUDE.md` records *"a plain shell's row was lost outright"* from 2026-07-26 as
+part of the hot-restart story; nothing in this queue owned it, and the
+hot-restart gate entry is about the gate not FIRING, which is a different
+question from what happens when it does.
 
-**What it emits before dying, captured in a bare pty** (`script -qec muse`),
-with every printable byte shown:
+**Measured 2026-08-09 across four daemon handovers (3.0.70 → 71 → 72 → 73 → 74),
+each a clean `hot-restart` with the GUI left untouched.** Rows 45 → 41. One loss
+was deliberate (a retired predecessor row). The other three were not:
+
+| row | kind | survived? |
+|---|---|---|
+| three plain shells rooted at the repo | terminal, `icon_text: "$_"` | ⛔ **all three gone** |
+| three web-surface rows | ychrome | ✅ all three survived |
+| every numbered agent row (12 of them) | codex / claude-code | ✅ all survived |
+
+⭐ **The discriminator, and it is what makes this worth chasing:** all six of the
+first two groups were named TOGETHER in the same `preserved_terminal_owner_keys`
+list in the handoff's own reply — the daemon said it was preserving all of them,
+and then preserved half. So this is not "plain shells are not preserved"; it is
+**the preservation path reporting success for a class it does not actually carry
+across.** The agent rows survive for a different reason entirely (their state is
+in their own JSONL and the resume path rebuilds them), so their survival is not
+evidence that the preservation mechanism works.
+
+⚠ **Why the asymmetry points somewhere specific:** a ychrome row is an APP row
+with a declared app identity to restore from, and an agent row has a transcript.
+A plain shell has neither — it is the one class whose entire existence is the
+live PTY, which is exactly the class `retention.rs` notes cannot be re-derived.
+⇒ Look at what `restore_live_session` does when a preserved record has no app
+token and no session id to resume, rather than at whether the record was written.
+
+**Falsifier:** open three plain shells, note their `full_path`s, force a daemon
+handover, and read `server app rows` back. Three rows with the same paths is a
+pass; the reply's own `preserved_terminal_owner_keys` echoing them is NOT — that
+is precisely the field that was already true while they died.
+
+## ⛔⛔ THE CLI DRIFT REPORTER RESOLVES AGAINST A `PATH` THE LAUNCH STOPPED USING IN 3.0.70 — SO IT NOW CRIES DRIFT ON A CORRECT MACHINE
+
+**Status:** OPEN
+
+Surfaced 2026-08-09 by the first fleet sweep, which is the first thing that ever
+ran a refresh on every machine and so the first thing to read this reporter's
+output in bulk. Measured on the GUI host, 3.0.73:
 
 ```
-ESC]10;?  ESC]11;?  ESC]4;0;? … ESC]4;15;?      (OSC colour queries ×18)
-ESC[>1u  ESC[<1u  ESC[<u  ESC[<1u  ESC[<u        (Kitty keyboard protocol)
-MUSE_EXIT=0
+effective_cli_version_drift  tool=codex  managed_version=0.147.0
+                             effective_path=~/.local/bin/codex  effective_version=0.144.6
+  "the refresh updated the managed copy, but the login shell resolves a
+   DIFFERENT install — sessions on this machine run the version reported as
+   effective_version"
+effective_cli_unresolvable   tool=pi        managed_version=0.84.1
+effective_cli_unresolvable   tool=opencode  managed_version=1.18.15
+effective_cli_unresolvable   tool=qwen      managed_version=0.21.8
+  "the login shell resolves no such binary, so a session cannot launch this
+   CLI on this machine"
 ```
 
-⇒ It opens with a **terminal capability handshake** and quits **cleanly** —
-exit 0, no diagnostic — when the answers do not come. Not a crash, not a login
-failure: `~/.config/muse/{auth.json,settings.json,trust.json}` are all present
-and current.
+**All four sentences are false, and the machine is fine.** Probed directly:
 
-⚠ **Why this is plausibly OURS and not muse's.** A yggterm row's PTY is owned by
-the daemon, and the renderer attaches afterwards. A CLI that queries the
-terminal in its first moments is querying a PTY with **no renderer on the other
-end yet**, so nothing replies within its timeout. Every other agent CLI shipped
-so far tolerates silence; muse treats it as "no terminal" and leaves. ⇒ the
-class is *"a CLI that probes the terminal at startup"*, and muse is simply the
-first one to be strict about it.
+| path | codex version |
+|---|---|
+| `~/.yggterm/npm/bin/codex` (managed) | **0.147.0** |
+| `~/.local/bin/codex` (a second npm prefix) | 0.144.6 |
+| `bash -lc 'command -v codex'` | `~/.local/bin/codex` → 0.144.6 |
 
-**The falsifier, and run it before writing any code:** does muse survive when
-something ANSWERS the queries? Compare (a) muse under a plain `script` pty
-(silent — reproduces the exit), (b) muse typed into an already-attached yggterm
-row rather than launched as the row's command, and (c) muse under a terminal
-that does reply. If (b) lives, the fix is to hold the launch until a renderer is
-attached, or to answer the DA/OSC handshake from the daemon's own vt100 —
-`terminal_lines` proves the daemon parses these sequences, so it is positioned
-to reply. If (a) and (b) both die, it is muse's bug and belongs upstream.
+⇒ A LOGIN SHELL does resolve 0.144.6. **A yggterm session does not run a login
+shell's `PATH` any more.** 3.0.70 changed the launch to compose
+`'~/.yggterm/npm/bin':'~/.local/bin':…:"$PATH"` with the managed directory
+FIRST, so a launched codex row runs 0.147.0 — the version the reporter says it
+does not. Same for pi, opencode and qwen: they live only in the managed npm
+directory, which is exactly why 3.0.70 put it on the launch path, and the
+reporter calls all three unlaunchable.
 
-⛔ Do not "fix" this by sleeping before exec. The question is whether anyone
-answers, not how long muse waits.
+⚖ **This is the 3.0.70 root cause reappearing one layer out, in the instrument
+instead of the launch.** That bug was *"a gate and a launch that resolve against
+different sets can only disagree"*; `login_shell_resolved_cli`'s doc comment
+still says it *"reproduces the resolution a real launch performs, deliberately
+WITHOUT the managed prefix"* — which was TRUE when it was written and stopped
+being true when the launch was fixed underneath it. ⇒ **When a resolution rule
+changes, every instrument that models that rule is part of the change.**
+
+**Why it matters rather than being cosmetic:** it fires on every refresh, on
+every machine, for 3 of 9 CLIs plus any CLI with a second install — and now the
+sweep runs it fleet-wide on a clock. An alarm that is always on cannot report
+the case it exists for, which is a managed install that a session genuinely
+cannot reach.
+
+⚠ **Do NOT "fix" it by deleting the reporter.** The condition it was built for is
+real, and the drift it would catch is the silent kind. Fix it by resolving
+against the SAME composition the launch uses — there is one owner of that string
+already — and keep the login-shell answer only as the separate question it
+actually is (*"what would the user's own terminal run"*), reported as that.
+
+**Falsifier for a fix:** on this host, a refresh must emit no
+`effective_cli_version_drift` for codex and no `effective_cli_unresolvable` for
+pi/opencode/qwen, while a genuinely unreachable managed CLI still raises one.
 
 ## ⛔⛔ `terminal new` REPORTS A TIMEOUT AND CREATES THE ROW ANYWAY — SO A RETRY LOOP IS A ROW BOMB
 
@@ -94,40 +153,6 @@ the cliff, and the row bomb happens at whatever the new number is.
 
 ⚠ Until then, **never loop on a `terminal new` timeout.** Read `server app rows`
 first; the row is probably already there.
-
-## ⛔ OWNER-REPORTED: THERE IS NO FLEET-WIDE CLI INSTALL/UPDATE PIPELINE
-
-**Status:** OPEN
-
-Owner, 2026-08-09: *"We need a installation pipeline that installs all the clis
-and updates them frequently across the connected fleet."* This restates the
-settled call already in `docs/settled-calls.md` (*"yggterm should auto install,
-update ALL clis in all connected systems including localhost"*) as a thing that
-still does not exist.
-
-**What DOES exist, measured:** `refresh_local_managed_cli` already covers every
-registered CLI — the tool list is derived from the registry
-(`managed_cli_tools_for_refresh`), and per-tool install methods (npm, uv, vendor
-script) all run. `server remote ensure-managed-cli <slug>` provisions one CLI on
-one machine and is proven (Qwen Code 0.21.8 installed on a host that never had
-it). So the ENGINE is built and works.
-
-**What is missing is the fan-out and the cadence, and both are small:**
-
-- `YggtermServer::refresh_managed_cli(machine_key, background)` treats
-  `machine_key: None` as **local**, not as *"every machine"*. There is no arm
-  that walks `self.remote_machines`. Same for
-  `queue_background_managed_cli_refresh`.
-- There is **no periodic chore** that fires it. Every refresh today is
-  demand-driven (a focus, an attach, an explicit call), so a machine the owner
-  has not opened in a week never updates.
-
-**Fix shape:** a third scope — local · one machine · **all connected machines**
-— on the one function that already knows how to refresh one target, plus a
-daemon chore on the existing tick. ⚠ Pace it: the external LLM endpoint's 429
-lesson applies to ssh fan-out too, and a fleet refresh that runs npm/uv on four
-machines at once is exactly the kind of thing the owner notices as fan noise.
-⛔ Do not add a second refresh path; extend the scope of the one that exists.
 
 ## ⛔⛔ OWNER-REPORTED, LIVE: THE SESSION METADATA RAIL RENDERS ITS HEADER AND NOTHING ELSE
 
@@ -971,70 +996,6 @@ using the trace to decide whether a daemon code path fired will read a zero and
 believe it. That is worth its own look; it made this fix briefly appear not to
 run at all.
 
-## ⛔⛔ SIX yggterm-shell RETENTION TESTS ARE RED AT HEAD — and the recorded baseline still says green
-
-**Status:** OPEN
-
-Measured on guihost at `a9773099`, deterministic, single-threaded, and **proven not
-to be the measuring session's own change**: stashing only `shell.rs` and
-rebuilding at HEAD reproduces all six.
-
-```
-inactive_retained_ready_session_keeps_bridge_mounted_but_pauses_reads
-prune_terminal_attach_in_flight_drops_background_retained_attach
-retained_background_session_trickles_reads_instead_of_pausing
-shell_snapshot_retains_live_local_stored_codex_sessions
-shell_snapshot_trims_inactive_live_payloads_for_sidebar_and_retention
-sync_live_terminal_retention_keeps_active_not_fresh_inactive_live_sessions
-```
-
-They all say one thing: a session that was explicitly retained and marked
-resume-ready is **no longer in `snapshot().retained_terminal_sessions`** after
-`sync_live_terminal_retention()`.
-
-**Where NOT to look:** the retention code itself. `git log -S` puts the last edit
-to `sync_live_terminal_retention` at 2.4.0 and to `retained_terminal_sessions` at
-2.10.8. **Start at the start-page scope work** (`e492cdff`, `a3ae8ed6`) — it
-changed what `snapshot()` puts in the live/recent lists, which is what these
-tests read.
-
-⚠ **The reason this is filed at ⛔⛔ rather than as a chore:** the campaign's
-recorded baseline is *"1844 tests, 1843 pass + 1 ignored"*, so every brief tells
-the next agent the suite is green. It is not, and the first thing an agent does
-with an unexplained red is suspect its own diff. That cost this session a stash,
-a rebuild and a re-run to disprove. **A wrong baseline is worse than no
-baseline** — until this is fixed, the number to quote is **1844 pass + 6 fail +
-1 ignored**.
-
-⛔⛔ **AND THE SAME ROT IS IN THE `yggterm-server` NUMBER, measured 2026-08-08.**
-Every brief records *"three `yggterm-server` lib tests"* as baseline red. It is
-**SIX**, proven not-ours the expensive way: a `git worktree add <tmp> HEAD` at
-`90d13a06`, built clean, ran `cargo test -p yggterm-server --lib`, and got the
-IDENTICAL six.
-
-```
-daemon::tests::daemon_binary_is_legacy_allows_deleted_current_install_path
-tests::legacy_agent_launch_command_uses_best_effort_cwd_resolution
-tests::remote_resume_shell_command_wraps_prefix_and_cwd
-tests::start_remote_claude_session_assigns_authoritative_session_id
-tests::start_remote_codex_session_uses_remote_start_codex_launch_contract
-tests::stored_codex_litellm_sessions_use_litellm_resume_command
-```
-
-⭐ **Three of those six are a real, unfiled regression, not a network flake.**
-`legacy_agent_launch_command_uses_best_effort_cwd_resolution`,
-`remote_resume_shell_command_wraps_prefix_and_cwd` and
-`stored_codex_litellm_sessions_use_litellm_resume_command` each assert the
-resume SUBCOMMAND is in the built command (`codex resume -C "$PWD" <id>`,
-`codex-litellm resume`) and it is not. That is the launch string the PTY runs,
-so whatever dropped the token is a live-behaviour question, not a stale test —
-**start there, and do not assume the test is the thing that is wrong.** The
-other three reach the network / a fleet path.
-
-⚖ **The counting law this keeps breaking:** a baseline is a MEASUREMENT and it
-goes stale like any other. Re-measure at HEAD in a clean worktree before quoting
-one; never inherit a number from a brief.
-
 ## ★★★ THE EXTRA-ARGS SETTINGS ARE TWO TEXT BOXES AND THERE ARE NINE CLIs — build the modal
 
 **Status:** OPEN
@@ -1665,9 +1626,56 @@ DID produce a transcript file, 28 KB of it — **existence proved nothing.**
 impatient; it was writing into a buffer it could not see and could not take back.
 
 
-## THREE `yggterm-server` LIB TESTS FAIL ON A CLEAN TREE — two of them reach the NETWORK
+## THE SUITE BASELINE — FOUR RED AT HEAD, AND TWO OF THEM REACH THE NETWORK
 
 **Status:** OPEN
+
+⭐ **This entry is the ONE owner of "what is red at HEAD", and the number in it
+is load-bearing** — every brief quotes it, and the first thing an agent does with
+an unexplained red is suspect its own diff, which has cost a session a stash, a
+rebuild and a re-run more than once. **A wrong baseline is worse than none.**
+
+### ✅ MEASURED 2026-08-09 ON THE INTEGRATOR, `cargo test --workspace --no-fail-fast`
+
+⛔ Use `--no-fail-fast`. Plain `cargo test` is fail-fast **across targets**, so a
+red target hides every target behind it and the tail still prints `ok`
+([[finding-a-red-target-hides-every-test-behind-it]]).
+
+**24 targets · 3501 passed · 4 failed · 1 ignored.**
+
+```
+daemon::tests::daemon_binary_is_legacy_allows_deleted_current_install_path
+tests::start_remote_claude_session_assigns_authoritative_session_id
+tests::start_remote_codex_session_uses_remote_start_codex_launch_contract
+shell::tests::a_pane_is_a_tenant_of_the_session_that_declared_it_never_of_a_namesake   (own entry: flaky in parallel)
+```
+
+### ⭐ NINE TESTS THIS ENTRY USED TO LIST AS RED ARE GREEN — VERIFIED ONE BY ONE
+
+The previous baseline said **six** yggterm-shell retention tests plus **six**
+yggterm-server tests. Each of the nine that are no longer failing was re-run
+**individually by name** rather than inferred from the totals
+([[feedback-never-bulk-close-by-category]]), and all nine pass:
+
+- the six retention tests (`inactive_retained_ready_session_…`,
+  `prune_terminal_attach_in_flight_…`, `retained_background_session_trickles_…`,
+  `shell_snapshot_retains_live_local_stored_codex_sessions`,
+  `shell_snapshot_trims_inactive_live_payloads_…`,
+  `sync_live_terminal_retention_keeps_active_…`);
+- the three the entry called *"a real, unfiled regression"* because the resume
+  SUBCOMMAND had gone missing from the built launch string
+  (`legacy_agent_launch_command_uses_best_effort_cwd_resolution`,
+  `remote_resume_shell_command_wraps_prefix_and_cwd`,
+  `stored_codex_litellm_sessions_use_litellm_resume_command`).
+
+⚠ **Honest limits on that.** Nobody bisected what fixed them — the launch-string
+three are plausibly the 3.0.70 launch-composition work, but that is a guess and
+is recorded as one. And this was measured on the INTEGRATOR; the previous
+measurement was on the GUI host, and two of the four survivors are known to be
+environment-dependent, so *green here* is not *green everywhere*
+([[finding-a-claim-proven-on-one-lane-is-not-proven]]).
+
+### The two that measure the network, which is the real defect
 
 Confirmed 2026-08-08 during the six-CLI intake, and confirmed NOT caused by it:
 `git diff` touches none of the three functions under test.

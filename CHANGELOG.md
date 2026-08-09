@@ -4,6 +4,45 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Yggterm now installs and updates every agent CLI across your whole fleet, on
+  its own schedule.** The engine to do it has been there for a while — a refresh
+  covers every registered CLI, and one CLI can be provisioned onto one machine
+  by name — but nothing ever pointed it at more than one machine, and nothing
+  ever fired it on a clock. Every refresh was triggered by you: opening a
+  session, focusing a row, asking for one explicitly. A machine you had not
+  opened in a week therefore never updated anything, and there was no way to ask
+  for the fleet at all.
+
+  Two things close that. A refresh can now be scoped to **every connected
+  machine**, not just this one or one named one — `--fleet` on the
+  `managed-cli-refresh` scenario, or `--machine-key '*'`. And every daemon
+  sweeps that scope on its own six-hour cadence, so a machine goes stale only
+  for as long as the product's own idea of stale.
+
+  The sweep is deliberately quiet about it. Machines are refreshed one at a time
+  with a pause between them — a fleet refresh runs `npm` and `uv` on every host,
+  and four at once is a room full of fans — an unreachable machine is recorded
+  and stepped over rather than stopping the rest, and only the current daemon
+  sweeps, so the several daemon versions that coexist here do not each repeat
+  the same work. It also waits five minutes after a daemon starts, so it never
+  lands on top of a restart restoring your sessions, and a second sweep asked
+  for while one is already running is declined rather than doubled — the clock
+  and an explicit request will eventually coincide, and two fan-outs at once is
+  every machine installing twice over.
+
+  Two things were wrong on the way here and both were caught by running it for
+  real rather than by a test. Asking for the whole fleet in the foreground ran
+  the fan-out on the daemon's request path and **left the daemon unable to
+  answer anything for four and a half minutes** — a fleet refresh is an ssh hop
+  plus an install per machine, which is not a shape a request can have, so it is
+  now always started rather than waited on, and reports itself through the
+  trace. And the first sweep that did complete **failed on all four remote
+  machines**, every one of them on the general 45-second remote-command budget,
+  against work that had just taken 67 seconds locally: a provisioning command
+  now gets a provisioning-sized budget. With both fixed, one sweep refreshed all
+  five machines with nothing failed, while `server status` kept answering in
+  ~50 ms throughout.
+
 - **Muse, Kimi and Antigravity now start on a machine that has them.** All
   three were reported "not found" on a host carrying all three, while Pi,
   OpenCode and Qwen started fine on the same host. The split was exact: a
