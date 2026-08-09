@@ -115,6 +115,7 @@ pub use daemon::{
     release_profile_write_lock,
     current_client_identity, parse_client_role, set_client_identity,
     verify_shadow_client_can_attach,
+    DaemonCensusRow, daemon_census, format_daemon_census,
     HOT_RESTART_BLOCKER_NOT_RESTORABLE, HOT_RESTART_BLOCKER_RECENTLY_ACTIVE,
     HOT_RESTART_BLOCKER_WORKING,
     HotRestartBlocker, HotRestartResult, SERVER_PROTOCOL_VERSION, ServerEndpoint, ServerRequest,

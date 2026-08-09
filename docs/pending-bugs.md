@@ -41,30 +41,27 @@ libyggterm has no live campaign row to route it to.
 **Falsifier:** in a libyggterm checkout, change `STABLE_THEME_ALPHA` to `0.5` and
 run its CI locally. Something must go red. Today nothing does.
 
-## ⭐ THE DAEMON PLANE HAS NO INSTRUMENT — every verb answers for THE daemon, and this project's hardest bug is about the OTHER five
+## ⭐ A VERB CANNOT BE AIMED AT A SPECIFIC DAEMON, AND THE HEADLESS SURFACE CAN CREATE A ROW IT CANNOT REMOVE
 
 **Status:** OPEN
 
-Filed 2026-08-09 from the hot-restart-gate lane, where the whole subject is
-daemons that are *not* the current one. Two gaps, one shape.
+Two of the three gaps filed 2026-08-09 from the hot-restart-gate lane. The third
+— no census — is shipped (`server daemons`, 3.0.82; git remembers it), and its
+first live run is the argument for finishing these two: **28 reachable daemons on
+the integrator host, 27 of them running replaced binaries, holding 58 live PTYs
+between them, back to `2.11.1` at 646 hours.**
 
 **1. A verb cannot be aimed at a specific daemon.** `server status` resolves the
-endpoint from `YGGTERM_HOME` and there is no `--endpoint` / `--pid` flag and no
+endpoint from `YGGTERM_HOME`; there is no `--endpoint` / `--pid` flag and no
 `YGGTERM_SERVER_ENDPOINT` override (grepped: the constant does not exist). The
 version-aliased sockets are right there — `server-3-0-75.sock`,
 `server-3-0-76.sock`, … — and nothing can address them. ⇒ to ask a stale daemon
-what it is holding you must build a private `YGGTERM_HOME` sandbox, which by
-construction cannot contain the daemon you wanted to ask.
+anything beyond what the census prints, you must build a private `YGGTERM_HOME`
+sandbox, which by construction cannot contain the daemon you wanted to ask.
+`server daemons` now names all 28; `server status --endpoint <path|version>`
+would let you interrogate one.
 
-**2. There is no census.** "Which daemons are alive, at what version, owning
-what, blocked by what, and for how long" is the first question of every
-stale-daemon investigation, and it has to be hand-assembled every time from
-`ps -eo pid,etimes,args` + `readlink /proc/<pid>/exe` + a `grep` over
-`event-trace*.jsonl` joined on pid. Two throwaway Python scripts, `scp`ed to the
-GUI host, to answer it once. `retire_stale_daemons` already walks exactly this
-set internally — it just never reports it.
-
-**3. The headless surface can CREATE a session and cannot REMOVE one.**
+**2. The headless surface can CREATE a session and cannot REMOVE one.**
 `yggterm-headless server attach <uuid> <cwd>` makes a live `local://` row on
 whatever daemon it finds; there is no `server session remove` anywhere on that
 surface — removal lives only under `server app`, which refuses outright on a host
@@ -73,20 +70,14 @@ with no GUI client. Writing `exit` into the terminal frees the runtime
 session record listed forever**. ⇒ an agent on a headless host can make a row it
 has no way to unmake. Measured 2026-08-09 on `dev` while live-proving the gate.
 
-⭐ **The test all three pass is the one that matters:** an agent hand-assembled
-the chore from primitives, and an agent's discipline resets every session while a
+⭐ **The test both pass is the one that matters:** an agent hand-assembled the
+chore from primitives, and an agent's discipline resets every session while a
 verb's does not. Same shape as the five verbs in
 `docs/agent-field-guide.md` §*this instrument answers a different question*.
 
-**The fix:** `server daemons [--json]` — one row per reachable daemon: pid,
-version, exe path (with `(deleted)`), uptime, owned/preserved runtime counts,
-`hot_restart_pending`, and the blocker summary with its `permanent` flag. Plus
-`--endpoint <path|version>` on the read-only verbs so an existing daemon can be
-interrogated directly instead of impersonated.
-
-**Falsifier:** on the GUI host, `yggterm-headless server daemons` names every
-`yggterm-headless server daemon` process `ps` shows, with a version for each —
-including the ones whose binary is `(deleted)`, which are the ones that matter.
+**Falsifier:** `server status --endpoint 3.0.75` answers for pid 426042 rather
+than for the CLI's own daemon; and a session created by `server attach` can be
+removed from the same surface that created it.
 
 ## ⭐ A FAILED `server app` VERB ANSWERS IN PROSE ON stderr WHILE EVERY SUCCESS ANSWERS IN JSON ON stdout — so a JSON caller parses nothing and blames the parser
 

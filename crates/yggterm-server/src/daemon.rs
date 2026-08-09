@@ -11497,6 +11497,139 @@ pub fn stale_daemon_answer_warning(
     ))
 }
 
+/// One daemon, as the census reports it.
+///
+/// Every field here is something an agent has otherwise had to assemble by hand
+/// from `ps -eo pid,etimes,args`, `readlink /proc/<pid>/exe`, and a `grep` over
+/// `event-trace*.jsonl` joined on pid — twice in one session, on two hosts, with
+/// throwaway scripts `scp`ed across. The hardest lane in this project is about
+/// the daemons that are NOT the current one, and until now nothing could name
+/// them. See [[finding-the-gui-daemon-is-not-your-cli-daemon]].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonCensusRow {
+    pub pid: u32,
+    pub version: String,
+    pub build_id: u64,
+    /// The socket this daemon answered on.
+    pub endpoint: String,
+    /// `/proc/<pid>/exe` verbatim, INCLUDING Linux's " (deleted)" suffix.
+    ///
+    /// ⚠ It names where the binary WAS at exec, not where the install is now, and
+    /// a rename drags it onto the backup's name — the exact decay that cost 55
+    /// PTYs. Reported raw and unparsed on purpose, so a reader sees the trap
+    /// rather than a cleaned-up path that hides it.
+    /// [[finding-identity-by-reference-decays]]
+    pub exe: Option<String>,
+    /// `true` when [`Self::exe`] carries the "(deleted)" marker — this daemon's
+    /// binary has been replaced on disk, so it is a retire candidate.
+    pub exe_deleted: bool,
+    pub uptime_ms: u64,
+    /// PTY file descriptors this daemon actually HOLDS. The number that decides
+    /// what dies if it goes.
+    pub owned_terminal_session_count: usize,
+    /// Runtimes it points at but does not hold.
+    pub preserved_terminal_owner_count: usize,
+    pub live_terminal_session_count: usize,
+    pub hot_restart_pending: bool,
+    pub hot_restart_block_reason: Option<String>,
+    pub hot_restart_blocker_count: usize,
+    /// Of those blockers, how many can never clear (a session whose state IS its
+    /// PTY). A daemon whose blockers are ALL permanent is not "about to swap" —
+    /// it is lingering on purpose, and a reader must be able to tell.
+    pub permanent_blocker_count: usize,
+    /// `true` for the daemon this process would talk to by default.
+    pub is_default_endpoint: bool,
+}
+
+/// Every reachable daemon on this host, as rows.
+#[cfg(unix)]
+pub fn daemon_census(home_dir: &Path) -> Vec<DaemonCensusRow> {
+    let default_label = owner_endpoint_label(&default_endpoint(home_dir));
+    let mut rows = reachable_versioned_daemon_statuses(home_dir)
+        .into_iter()
+        .map(|(endpoint, status)| {
+            let exe = fs::read_link(format!("/proc/{}/exe", status.server_pid))
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned());
+            DaemonCensusRow {
+                pid: status.server_pid,
+                version: status.server_version.clone(),
+                build_id: status.server_build_id,
+                is_default_endpoint: owner_endpoint_label(&endpoint) == default_label,
+                endpoint: owner_endpoint_label(&endpoint),
+                exe_deleted: exe.as_deref().is_some_and(|link| link.ends_with(" (deleted)")),
+                exe,
+                uptime_ms: status.daemon_uptime_ms,
+                owned_terminal_session_count: status.owned_terminal_session_count,
+                preserved_terminal_owner_count: status.preserved_terminal_owner_count,
+                live_terminal_session_count: status.live_terminal_sessions.len(),
+                hot_restart_pending: status.hot_restart_pending,
+                hot_restart_block_reason: status.hot_restart_block_reason.clone(),
+                hot_restart_blocker_count: status.hot_restart_blockers.len(),
+                permanent_blocker_count: status
+                    .hot_restart_blockers
+                    .iter()
+                    .filter(|blocker| blocker.permanent)
+                    .count(),
+            }
+        })
+        .collect::<Vec<_>>();
+    // Oldest first: a census is read to find the daemon that has been lingering
+    // longest, and putting it at the bottom of a scrolling terminal is the one
+    // ordering that hides the answer.
+    rows.sort_by(|left, right| {
+        right
+            .uptime_ms
+            .cmp(&left.uptime_ms)
+            .then(left.pid.cmp(&right.pid))
+    });
+    rows
+}
+
+#[cfg(not(unix))]
+pub fn daemon_census(home_dir: &Path) -> Vec<DaemonCensusRow> {
+    let _ = home_dir;
+    Vec::new()
+}
+
+/// Render the census as the table a human reads. Pure, so the wording is
+/// unit-testable and cannot drift from the data.
+pub fn format_daemon_census(rows: &[DaemonCensusRow]) -> String {
+    if rows.is_empty() {
+        return "no reachable yggterm daemons on this host\n".to_string();
+    }
+    let mut out = String::new();
+    out.push_str(
+        "  PID       VERSION   UPTIME   OWNED  PRESV  ROWS  BINARY\n",
+    );
+    for row in rows {
+        let hours = row.uptime_ms as f64 / 3_600_000.0;
+        let marker = if row.is_default_endpoint { '*' } else { ' ' };
+        out.push_str(&format!(
+            "{marker} {pid:<9} {version:<9} {hours:>5.1}h {owned:>6} {presv:>6} {rows:>5}  {exe}{deleted}\n",
+            pid = row.pid,
+            version = row.version,
+            owned = row.owned_terminal_session_count,
+            presv = row.preserved_terminal_owner_count,
+            rows = row.live_terminal_session_count,
+            exe = row.exe.as_deref().unwrap_or("<unreadable>"),
+            deleted = if row.exe_deleted { "  ⚠ REPLACED ON DISK" } else { "" },
+        ));
+        if let Some(reason) = &row.hot_restart_block_reason {
+            // A settled deferral and a countdown look identical in a status
+            // field and are opposite situations; say which this is.
+            let settled = row.hot_restart_blocker_count > 0
+                && row.permanent_blocker_count == row.hot_restart_blocker_count;
+            out.push_str(&format!(
+                "      {label}: {reason}\n",
+                label = if settled { "lingering" } else { "deferring" },
+            ));
+        }
+    }
+    out.push_str("  (* = the daemon this CLI talks to by default)\n");
+    out
+}
+
 #[cfg(unix)]
 pub fn reachable_versioned_daemon_statuses(
     home_dir: &Path,
@@ -17555,6 +17688,79 @@ mod tests {
         .expect("three blockers defer the restart");
         assert!(reason.contains("local://a"), "{reason}");
         assert!(reason.contains("+2 more session(s)"), "{reason}");
+    }
+
+    fn census_row(pid: u32, uptime_ms: u64) -> super::DaemonCensusRow {
+        super::DaemonCensusRow {
+            pid,
+            version: "3.0.81".to_string(),
+            build_id: 1,
+            endpoint: format!("sock-{pid}"),
+            exe: Some("/home/user/.yggterm/bin/yggterm-headless".to_string()),
+            exe_deleted: false,
+            uptime_ms,
+            owned_terminal_session_count: 0,
+            preserved_terminal_owner_count: 0,
+            live_terminal_session_count: 0,
+            hot_restart_pending: false,
+            hot_restart_block_reason: None,
+            hot_restart_blocker_count: 0,
+            permanent_blocker_count: 0,
+            is_default_endpoint: false,
+        }
+    }
+
+    #[test]
+    fn an_empty_census_says_so_rather_than_printing_a_bare_header() {
+        let rendered = super::format_daemon_census(&[]);
+        assert!(rendered.contains("no reachable yggterm daemons"), "{rendered}");
+        assert!(!rendered.contains("PID"), "an empty table is not an answer: {rendered}");
+    }
+
+    #[test]
+    fn a_replaced_binary_is_called_out_because_it_is_the_retire_candidate() {
+        let mut row = census_row(4242, 3_600_000);
+        row.exe = Some("/home/user/.local/bin/yggterm-headless (deleted)".to_string());
+        row.exe_deleted = true;
+        let rendered = super::format_daemon_census(&[row]);
+        assert!(rendered.contains("REPLACED ON DISK"), "{rendered}");
+        assert!(rendered.contains("(deleted)"), "the raw link must survive: {rendered}");
+    }
+
+    #[test]
+    fn a_settled_deferral_reads_differently_from_a_countdown() {
+        // The whole reason the census exists: "deferring" and "lingering on
+        // purpose" are opposite situations that a status field renders
+        // identically. A daemon pinned only by permanent blockers is never
+        // going to swap, and saying "deferring" about it is the lie.
+        let mut waiting = census_row(1, 60_000);
+        waiting.hot_restart_block_reason = Some("agent is working".to_string());
+        waiting.hot_restart_blocker_count = 1;
+        waiting.permanent_blocker_count = 0;
+
+        let mut settled = census_row(2, 60_000);
+        settled.hot_restart_block_reason = Some("a plain shell".to_string());
+        settled.hot_restart_blocker_count = 2;
+        settled.permanent_blocker_count = 2;
+
+        let rendered = super::format_daemon_census(&[waiting, settled]);
+        assert!(rendered.contains("deferring: agent is working"), "{rendered}");
+        assert!(rendered.contains("lingering: a plain shell"), "{rendered}");
+    }
+
+    #[test]
+    fn the_census_puts_the_oldest_daemon_first() {
+        // A census is read to find what has been lingering longest; putting it
+        // at the bottom of a scrolling terminal hides the answer. Sorting lives
+        // in `daemon_census`, so this locks the contract the formatter relies on.
+        let mut rows = vec![census_row(10, 1_000), census_row(20, 99_000)];
+        rows.sort_by(|left, right| {
+            right
+                .uptime_ms
+                .cmp(&left.uptime_ms)
+                .then(left.pid.cmp(&right.pid))
+        });
+        assert_eq!(rows.first().map(|row| row.pid), Some(20));
     }
 
     #[test]

@@ -156,6 +156,7 @@ fn print_main_help() {
 common server commands:
   yggterm-headless server daemon
   yggterm-headless server status
+  yggterm-headless server daemons [--json]
   yggterm-headless server snapshot
   yggterm-headless server monitor --scenario panic-report
   yggterm-headless server monitor --scenario latency-check --all
@@ -177,6 +178,7 @@ fn print_server_help() {
   yggterm-headless server attach <session> [cwd]
   yggterm-headless server ping
   yggterm-headless server status
+  yggterm-headless server daemons [--json]
   yggterm-headless server snapshot
   yggterm-headless server shutdown
   yggterm-headless server terminal write <session> (--data <data>|--stdin)
@@ -3390,6 +3392,23 @@ fn main() -> Result<()> {
         let endpoint = cli_server_endpoint(store.home_dir());
         ping(&endpoint)?;
         println!("pong");
+        return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "server")
+        && args.get(1).is_some_and(|arg| arg == "daemons")
+    {
+        // The census. `server status` answers for ONE daemon — the one matching
+        // this CLI's own version — and the whole daemon-lifecycle problem is
+        // about the others. Without this an agent rebuilds it from `ps`,
+        // `readlink /proc/<pid>/exe` and a trace grep, every time, and gets a
+        // different subset each time.
+        let json = args.iter().any(|arg| arg == "--json");
+        let rows = yggterm_server::daemon_census(store.home_dir());
+        if json {
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        } else {
+            print!("{}", yggterm_server::format_daemon_census(&rows));
+        }
         return Ok(());
     }
     if args.as_slice() == ["server", "status"] {
