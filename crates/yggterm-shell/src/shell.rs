@@ -2565,7 +2565,7 @@ struct SidebarContributionState {
     /// `None` while a declared policy is still in flight. The surface reconciler
     /// WAITS on that: userscripts inject at document-start, so a surface created
     /// before the policy arrives would silently run without them, forever.
-    policy: Option<WebSurfacePolicy>,
+    policy: Option<Arc<WebSurfacePolicy>>,
     /// Failed fetches for the current `policy_version`. After
     /// `MAX_POLICY_FETCH_ATTEMPTS` the gate opens anyway — a page with no
     /// adblock beats no page — and the failure is surfaced to the user.
@@ -2993,7 +2993,18 @@ enum SurfacePolicyGate {
     /// race — and the app declares BEFORE it opens, so this normally resolves
     /// before a rect ever exists.
     Pending,
-    Ready(WebSurfacePolicy),
+    /// ⛔⛔ **`Arc`, NOT the policy by value.** `adblock_rules` is a WebKit
+    /// content-blocker JSON blob held as a `String` — **19.2 MB on the owner's
+    /// machine, measured 2026-08-09** — and `web_surface_native_reconcile_loop`
+    /// builds one of these PER WEB SURFACE on every 300 ms tick, on the GUI's
+    /// main thread. By value that is ~64 MB/s of `memmove` per surface, forever,
+    /// in front of the render loop: it showed up as the top stack in 11 of 24
+    /// samples while he was reporting the app hot and unusable, and the
+    /// allocator churn is its own contribution to the memory pressure that put
+    /// 8 GB into swap. A handle makes the per-tick cost a refcount bump.
+    /// ⇒ Anything reachable from a per-tick snapshot must be cheap to clone; a
+    /// `String` field is only cheap until something puts a ruleset in it.
+    Ready(Arc<WebSurfacePolicy>),
 }
 
 impl SurfacePolicyGate {
@@ -14827,7 +14838,7 @@ mod web_ensure_policy_gate_locks {
     #[test]
     fn the_policy_gate_step_table_is_exactly_this() {
         use WebEnsurePolicyGateStep::*;
-        let ready = SurfacePolicyGate::Ready(WebSurfacePolicy::default());
+        let ready = SurfacePolicyGate::Ready(Arc::new(WebSurfacePolicy::default()));
         for rearmed in [false, true] {
             assert_eq!(
                 web_ensure_policy_gate_step(&ready, false, rearmed),
@@ -19921,7 +19932,7 @@ impl ShellState {
         if let Some(contribution) = self.sidebar_contributions.get_mut(session_path)
             && contribution.policy_version == policy_version
         {
-            contribution.policy = Some(policy);
+            contribution.policy = Some(Arc::new(policy));
             contribution.reset_policy_fetch();
         }
     }
@@ -20143,7 +20154,7 @@ impl ShellState {
             return SurfacePolicyGate::Absent;
         };
         match &contribution.policy {
-            Some(policy) => SurfacePolicyGate::Ready(policy.clone()),
+            Some(policy) => SurfacePolicyGate::Ready(Arc::clone(policy)),
             // Gave up after MAX_POLICY_FETCH_ATTEMPTS: the reconciler shows the
             // page. Named `Abandoned`, not folded into `Absent`, because the
             // agent door refuses on it — see the variant's own comment.
@@ -150734,6 +150745,49 @@ mod tests {
         );
     }
 
+    // ⛔⛔ THE 19 MB PER TICK REGRESSION. `web_surface_native_reconcile_loop`
+    // asks this gate for EVERY web surface on every 300 ms tick, on the GUI's
+    // main thread. `adblock_rules` is a WebKit content-blocker blob — 19.2 MB
+    // on the owner's machine, measured — so a gate that copies its policy turns
+    // the render loop into ~64 MB/s of memmove per surface. It did, and it was
+    // the top stack in 11 of 24 samples while he reported the app unusable.
+    //
+    // Pointer identity is the assertion because it is the one a deep copy
+    // cannot satisfy: a size or timing check would pass on a fast machine with
+    // a small ruleset, which is exactly the configuration nobody ships.
+    #[test]
+    fn the_policy_gate_hands_out_a_handle_and_never_copies_the_ruleset() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
+        assert!(declare_with_policy(&mut shell, "local://p", Some("v1"), 1_000));
+        shell.apply_sidebar_policy(
+            "local://p",
+            "v1",
+            WebSurfacePolicy {
+                // Stand-in for the real ruleset: big enough that a copy is a
+                // measurable event, small enough to keep the test instant.
+                adblock_rules: Some("x".repeat(1 << 20)),
+                userscripts: vec!["console.log(1)".to_string()],
+                userscripts_v2: None,
+                user_agent: None,
+            },
+        );
+
+        let (SurfacePolicyGate::Ready(first), SurfacePolicyGate::Ready(second)) = (
+            shell.web_surface_policy_gate("local://p"),
+            shell.web_surface_policy_gate("local://p"),
+        ) else {
+            panic!("policy did not become ready");
+        };
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "each tick's gate must hand out the SAME allocation — a clone here \
+             copies the whole adblock ruleset, once per surface, 3.3x a second"
+        );
+        // And the content still arrives intact, so this is not cheap-by-losing-it.
+        assert_eq!(first.adblock_rules.as_deref().map(str::len), Some(1 << 20));
+        assert_eq!(first.effective_userscripts().len(), 1);
+    }
+
     // A declared policy GATES the surface create until it lands. Userscripts
     // only inject at document-start, so a surface built before the policy
     // arrives would run without them for its whole life.
@@ -151231,7 +151285,7 @@ mod tests {
         assert!(!SurfacePolicyGate::Absent.defers_surface_create());
         assert!(!SurfacePolicyGate::Abandoned.defers_surface_create());
         assert!(
-            !SurfacePolicyGate::Ready(WebSurfacePolicy::default()).defers_surface_create()
+            !SurfacePolicyGate::Ready(Arc::new(WebSurfacePolicy::default())).defers_surface_create()
         );
     }
 

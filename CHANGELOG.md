@@ -4,6 +4,23 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The GUI was deep-copying a 19.2 MB adblock ruleset per web surface, 3.3
+  times a second, on its main thread.** `web_surface_native_reconcile_loop`
+  rebuilds a snapshot of every web surface on each 300 ms tick, and
+  `web_surface_policy_gate` returned `SurfacePolicyGate::Ready(policy.clone())`
+  — where `WebSurfacePolicy::adblock_rules` is a WebKit content-blocker JSON
+  blob held as a `String`, measured at 19,213,613 bytes on the owner's machine.
+  That is ~64 MB/s of `memmove` per surface in front of the render loop; it was
+  the top stack in 11 of 24 samples taken while he reported the app hot and
+  unusable, and its allocator churn contributed to the memory pressure that had
+  put 8 GB into swap. The gate now hands out an `Arc`, so a tick costs a
+  refcount bump. Guarded by
+  `the_policy_gate_hands_out_a_handle_and_never_copies_the_ruleset`, which
+  asserts pointer identity — the one property a deep copy cannot fake, and
+  unlike a size or timing check it does not quietly pass on a small ruleset.
+  ⇒ Anything reachable from a per-tick snapshot must be cheap to clone; a
+  `String` field is only cheap until something puts a ruleset in it.
+
 - **The daemon was writing every response to its sockets one JSON token at a
   time — 528 syscalls for a 2,169-byte reply.** `write_response` handed
   `serde_json::to_writer` a raw socket, and serde emits each token through its
