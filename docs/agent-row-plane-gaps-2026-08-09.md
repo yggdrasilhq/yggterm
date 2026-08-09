@@ -162,3 +162,56 @@ firing one **is** the thing being tested and it costs the user an interruption. 
 the bound address would let that alarm be verified for free, instead of leaving a
 never-fired-in-anger alarm — which is exactly the *second silent thing* the whole night was spent
 eliminating.
+
+---
+
+## ⛔⛔ D6 — TWO `claude` PROCESSES RAN ON ONE SESSION ID, and nothing refused it
+
+Measured 2026-08-10 00:14 on **dev**, row `remote-cc://dev/4bca407a-2118-4a84-9dfe-1a4e362c7af5`:
+
+```
+pid 1545513  started Sun 22:56:19  claude --dangerously-skip-permissions --session-id 4bca407a-…
+pid 2403202  started Sun 23:42:08  claude --model claude-opus-5 --dangerously-skip-permissions --resume 4bca407a-…
+```
+
+Both alive, both `Sl+`, **both parented by yggterm row shells** (`1545508`, `2403197` — the standard
+`__yggterm_requested=…` launch wrapper). I launched neither the second one nor anything that would
+have; the session had been running unattended-but-live since 22:56. **From 23:42 that row was two
+agents wearing one identity**, appending to one transcript and committing to one working tree.
+
+**What it looked like from inside, before I found the cause** — all of these are real and cost time:
+
+- a background task I scheduled **once** fired **twice**, producing interleaved output in one file
+  and two concurrent guest operations in the same second;
+- an `Edit` failed with *"file has been modified since read"* on a file only "I" was editing;
+- **commits appeared in my own voice, with my own row label, that I did not make.** They were good
+  commits. I spent twenty minutes hunting a phantom third session in a shared tree before checking
+  the process table.
+
+⛔ **WHY THIS IS NOT COSMETIC, AND THE ASYMMETRY THAT DECIDES IT.** The doubled action that actually
+occurred was a read (two `fg-fills` harvests colliding on a fixed local tunnel port — benign, and
+the lane's own record now carries it). **But this same row spent the evening killing and relaunching
+Trader Workstation on a Windows guest, to repair an 18-hour outage whose root cause was *a second
+TWS instance being launched beside a running one*.** A doubled launch from a doubled agent is that
+identical fault, one layer up, and **nothing in the row plane, the CLI, or the guest scripts would
+have refused it.** It did not happen. That is luck, not a rail.
+
+⭐ **The shape is worth naming because it is the same as the bug the graph fixed tonight:** *two
+processes sharing one identity, with facts about them silently attributed to a single subject.* A
+health check that ANDs "a TWS is alive" and "the port is listening" passes when those are two
+different processes; a row plane that treats a session id as an identity is wrong in the same way
+when two processes hold it.
+
+**What would fix it, in preference order:**
+1. **Refuse the second attach.** A session id is an identity — `--resume` onto an id whose process
+   is alive should fail by name, or take over and reap the incumbent. Either is defensible; silently
+   running both is not.
+2. If a hot restart / re-attach path is what spawns it (the timing at 23:42 suggests a re-attach
+   rather than a user action), **reap the old process as part of re-attaching** — the row menu's
+   restart already knows the pid it is replacing.
+3. At minimum, make it **visible**: `server app rows` reporting more than one live pid for a row,
+   so the duplicate is diagnosable from the row plane instead of from `pgrep`.
+
+⚠ I have deliberately **not killed either process**: the two samples needed to tell which one the
+GUI actually renders must be taken simultaneously (§1's own lesson), and killing the wrong one
+takes down the row the user is looking at. Flagged to the owner instead.
