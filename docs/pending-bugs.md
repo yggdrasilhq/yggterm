@@ -148,6 +148,27 @@ tempting reading of "it is ours after all" is *proceed* — which would spawn a
 second `claude` beside a live one and corrupt the transcript. The fix removes a
 lie; it does not widen what we are willing to race.
 
+### ⭐ PROVEN A/B IN A SANDBOX `YGGTERM_HOME`, 2026-08-09 — AND THE THIRD ARM IS THE DEPLOY RECIPE
+
+One daemon, one live PTY, the offending deploy replayed verbatim. Same
+`exe_link` in both arms; opposite outcome:
+
+| daemon code | deploy shape | trace verdict |
+|---|---|---|
+| 3.0.77 (unfixed) | rename-aside + `rm -f *.old.*` | ⛔ `daemon_self_retire_handoff_skipped` `replacement_binary_missing` → falls through to `daemon_cold_shutdown_deferred_idle_gate`, the PTY-killing path |
+| 3.0.78 (fixed) | rename-aside + `rm -f *.old.*` | ✅ `daemon_self_retire_handoff_ok` `outcome:preserved_owner_handoff`, "preserving 1 live terminal runtime(s)". No cold-shutdown event at all; the PTY's `/bin/bash -i` was still alive afterwards |
+| 3.0.77 (**unfixed**) | **`mv` in place** | ✅ `daemon_self_retire_handoff_ok` |
+
+⭐ **The third arm is the operationally load-bearing one.** The fix only protects
+a swap where the RETIRING daemon already runs it — so it cannot reach a host by
+the broken path. An in-place `mv` hands off correctly *on the old code*, which is
+how 3.0.78 gets onto a host still running 3.0.7x without paying the cost one last
+time. ⇒ deploy in place; see the `guihost` entry below for that host's own hazard.
+
+⚠ **What the sandbox does NOT prove:** it exercised ONE daemon owning ONE local
+PTY. `guihost` runs FIVE coexisting daemons and the busiest owns five rows, four of
+them `remote-cc://` bridges. The multi-daemon, multi-bridge handoff is untested.
+
 ### WHAT IS STILL OPEN UNDER THIS ENTRY
 
 - ⚠ **The click drives a 24-second synchronous hot-update of the stale owner**,
@@ -171,6 +192,56 @@ host H, deploy a new daemon to H by renaming the old binary aside, then click
 that row from the GUI. It must attach to the SAME process, keep its jobs, and
 never show a raw error. If `daemon_self_retire_handoff_skipped` appears in the
 trace again, candidate 2 did not resolve and this is not fixed.
+
+## ⛔ `guihost` IS CARRYING THE STRANDING BUG ARMED: ONE DAEMON'S BINARY *IS* THE BACKUP FILE, AND `rm -f *.old.*` IS THE TRIGGER
+
+**Status:** OPEN
+
+Measured on `guihost` 2026-08-09 14:2x, read-only, while proving out the deploy path
+for the entry above.
+
+| pid | version | `/proc/<pid>/exe` | owns |
+|---|---|---|---|
+| 523808 | 3.0.76 | `…/yggterm-headless` (live) | 5 — every `remote-cc://dev/*` agent row |
+| **426042** | **3.0.75** | **`…/yggterm-headless.old.522814` (live)** | **2** |
+| 3844228 | 3.0.70 | `…/yggterm-headless (deleted)` | 1 |
+| 2824474 | 3.0.59 | `…/yggterm-headless (deleted)` | 1 |
+| 169710 | 3.0.29 | `…/yggterm-headless (deleted)` | 1 |
+
+⛔ **426042 is running FROM the backup file.** A past deploy renamed the live
+binary to `yggterm-headless.old.522814` while that daemon held it, so its exe link
+followed the rename onto a path no install will ever write again. It is quiet
+today only because the file still exists: `binary_replaced` is false, so it never
+tries to retire.
+
+⇒ **Deleting `~/.local/bin/yggterm-headless.old.522814` fires it.** The link
+becomes `(deleted)`, the retire triggers, the pre-3.0.78 derivation lands on the
+file that was just removed, the handoff is skipped, and the cold shutdown kills
+its 2 PTYs. That deletion is the **last step of the very deploy dance that created
+this** (`rm -f ~/.yggterm/bin/*.old.*`), so the ordinary next deploy is the
+trigger.
+
+⚠ **And an automated sweep already knows the file by name.** The
+`fleet-binary-sync` startup hook lists `yggterm-headless.old.522814` and
+`yggterm.old.522814` in its 11-binary roster, so it is a candidate for exactly
+the kind of tidy-up that would fire this.
+
+**The safe moves, in order:**
+1. **Do not delete `*.old.*` on `guihost` while 426042 lives.** Leave the file.
+2. Deploy 3.0.78 with an **in-place `mv`** over `~/.local/bin/yggterm-headless`.
+   It does not write the `.old.522814` path, so it disarms nothing and arms
+   nothing, and the four daemons whose links point at the canonical path hand off
+   correctly even on their old code (measured — see the entry above).
+3. Retire 426042 deliberately once its 2 rows are drained, then remove the file.
+
+⚠ The other three daemons already read `(deleted)` on the CANONICAL path, which
+is the case the old code gets right — they are not armed. That they have not
+retired anyway is the separate long-standing `old daemon never retires` shape, and
+their non-empty `preserved_terminal_owner_keys` say they are lingering as
+preserved owners rather than stuck.
+
+**Falsifier:** `readlink /proc/426042/exe` no longer ends in `.old.522814`, or the
+pid is gone. Either way this entry is spent.
 
 ## ⛔⛔ `guihost`'s `libyggterm` IS STILL THE PRE-SCRUB HISTORY — ONE PUSH FROM RE-LEAKING `/home/user` INTO A PUBLIC REPO
 
