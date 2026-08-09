@@ -4,6 +4,26 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The working dot was wrong in both directions at once, and the two causes are
+  opposite.** (a) *No blink on working sessions*: `working` has two writers — the
+  daemon's snapshot, which sets it from its OWN terminals and writes `None` for
+  everything it does not own, and the WorkingFlags poll, which asks the preserved
+  owner and is the informed one. `apply_snapshot` rebuilds the session map
+  wholesale, so every apply overwrote the polled answer — "I don't know"
+  clobbering "I asked and was told". On the owner's GUI the current daemon owned
+  **3 of 45 rows**, so 42 rows were proxied and their dots stayed dark. The
+  informed answer is now carried back over an uninformed `None`, **bounded** to
+  ~3 poll ticks so a session whose owner has DIED goes honestly dark instead of
+  blinking on a corpse. (b) *Every ychrome row blinking forever after a restart*:
+  a plain shell's working state is the OS fact "a foreground command is running",
+  which is a fair proxy for a shell and flatly wrong for an app row, whose whole
+  job is to hold ONE long-lived foreground process. Measured on his machine: five
+  `ychrome` children in state `Sl+` — the `+` is the foreground process group —
+  one per launcher shell, hours old. An app row now reports `Some(false)`: an app
+  that is running is not working. The recogniser sits beside the launch-command
+  builder it inverts and is locked to it by a round-trip test, because two
+  encodings of "this row is an app" is how the blink comes back.
+
 - **The GUI was deep-copying a 19.2 MB adblock ruleset per web surface, 3.3
   times a second, on its main thread.** `web_surface_native_reconcile_loop`
   rebuilds a snapshot of every web surface on each 300 ms tick, and

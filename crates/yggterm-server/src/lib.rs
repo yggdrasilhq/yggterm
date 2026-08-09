@@ -3538,6 +3538,13 @@ pub struct ManagedSessionView {
 /// The one place that decides whether a polled working flag differs from what a
 /// session already holds. Both the working-flags mutator and its would-change
 /// predicate route through this so they cannot drift apart.
+/// How long an informed `working` answer keeps standing in for a snapshot that
+/// says `None`. The WorkingFlags poll ticks every 2.5 s, so this is ~3 ticks:
+/// long enough that a snapshot apply landing between polls never blanks a live
+/// dot, short enough that a session whose owner died goes dark within seconds
+/// instead of blinking forever.
+const WORKING_CARRY_FORWARD_MS: u128 = 8_000;
+
 fn working_flag_differs(session: &ManagedSessionView, working: bool) -> bool {
     session.working != Some(working)
 }
@@ -3592,6 +3599,26 @@ pub struct YggtermServer {
     /// Deliberately NOT persisted: it is a reading position, not session
     /// identity, and a daemon handover that reset it costs one click.
     preview_history_budgets: HashMap<String, usize>,
+    /// The last INFORMED answer to "is this session working", per path, with the
+    /// millisecond it was learned.
+    ///
+    /// ⛔⛔ **TWO WRITERS, AND THE BLIND ONE USED TO WIN.** The daemon's snapshot
+    /// sets `working` from its OWN terminals and writes `None` for every session
+    /// it does not own; the WorkingFlags poll asks the PRESERVED OWNER and is the
+    /// informed one. `apply_snapshot` rebuilds `sessions` wholesale, so each
+    /// apply overwrote the polled answer — *"I don't know"* clobbering *"I asked
+    /// and was told"*. Owner-reported 2026-08-09 as working sessions showing no
+    /// blink, on a GUI whose current daemon owned 3 of 45 rows: with 42 rows
+    /// proxied, the `None` stood unopposed and the dots stayed dark.
+    ///
+    /// ⚠ **The naive fix — "keep the old value whenever the incoming is `None`"
+    /// — is a TRAP**, because a session whose owner has DIED also yields `None`
+    /// forever, and the dot would then blink for eternity on a corpse. That is
+    /// the frozen-frame bug the daemon-side screen scrape already guards. So the
+    /// carry-forward is BOUNDED by [`WORKING_CARRY_FORWARD_MS`]: an answer stops
+    /// being carried once it is older than a few poll ticks, and the row goes
+    /// honestly dark instead of lying in either direction.
+    working_last_informed: BTreeMap<String, (bool, u128)>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3637,6 +3664,7 @@ impl YggtermServer {
             session_pty_grids: HashMap::new(),
             client_viewport_grid: None,
             preview_history_budgets: HashMap::new(),
+            working_last_informed: BTreeMap::new(),
         };
 
         this
@@ -5180,7 +5208,14 @@ impl YggtermServer {
         flags: &[(String, bool)],
     ) -> Vec<(String, bool)> {
         let mut changed = Vec::new();
+        // The stamp goes on EVERY answer, not only the ones that changed a
+        // field: "the owner told me `true` again" is exactly the freshness the
+        // carry-forward needs, and a session working steadily for a minute
+        // reports no change at all.
+        let now = current_millis();
         for (path, working) in flags {
+            self.working_last_informed
+                .insert(path.clone(), (*working, now));
             if let Some(session) = self.sessions.get_mut(path)
                 && working_flag_differs(session, *working)
             {
@@ -5189,6 +5224,26 @@ impl YggtermServer {
             }
         }
         changed
+    }
+
+    /// Re-apply a recent INFORMED working answer over a snapshot that said
+    /// `None`. See [`Self::working_last_informed`] for why the blind writer used
+    /// to win, and [`WORKING_CARRY_FORWARD_MS`] for why this is bounded.
+    fn restore_informed_working_flags(&mut self) {
+        let now = current_millis();
+        // Collected first: `retain` holds a mutable borrow of the map, so the
+        // liveness test cannot reach `self.sessions` from inside it.
+        let live: std::collections::HashSet<String> = self.sessions.keys().cloned().collect();
+        self.working_last_informed.retain(|path, (_, seen)| {
+            now.saturating_sub(*seen) <= WORKING_CARRY_FORWARD_MS && live.contains(path)
+        });
+        for (path, (working, _)) in &self.working_last_informed {
+            if let Some(session) = self.sessions.get_mut(path)
+                && session.working.is_none()
+            {
+                session.working = Some(*working);
+            }
+        }
     }
 
     pub fn live_session_order_keys(&self) -> &[String] {
@@ -6110,6 +6165,11 @@ impl YggtermServer {
         {
             self.active_session_path = self.live_session_order.first().cloned();
         }
+        // ⛔ LAST, and after the rebuild: this apply just replaced every row's
+        // `working` with whatever the ANSWERING daemon knew, which is `None` for
+        // every session it does not own. Put the informed answer back before the
+        // GUI renders a dot from it.
+        self.restore_informed_working_flags();
         self.normalize_active_view_mode();
     }
 
@@ -27377,6 +27437,33 @@ pub fn local_app_verb_launch_command(app_command: &str) -> String {
     format!("{app_command}; exec \"${{SHELL:-/bin/bash}}\" -i")
 }
 
+/// The tail [`local_app_verb_launch_command`] appends, as a recogniser. Kept
+/// beside the builder and locked to it by
+/// `an_app_verb_launch_command_recognises_itself`, because a recogniser that
+/// drifts from its constructor is the classic two-encodings-of-one-concept bug.
+const LOCAL_APP_VERB_SHELL_TAIL: &str = "; exec \"${SHELL:-/bin/bash}\" -i";
+const LOCAL_APP_VERB_SHELL_TAIL_WINDOWS: &str = " & %COMSPEC%";
+
+/// Was this launch command built by [`local_app_verb_launch_command`] — i.e. is
+/// this row an APP hosted in a shell, rather than a shell someone types in?
+///
+/// ⛔⛔ **AN APP THAT IS RUNNING IS NOT "WORKING".** A plain shell's working
+/// state is the OS fact *a foreground command is running in the tty*, which is a
+/// fair proxy for a shell: commands start, run, finish. It is WRONG for an app
+/// row, whose entire purpose is to hold one long-lived foreground process that
+/// never exits — so the dot blinks from launch until the row dies. Owner-reported
+/// 2026-08-09: *"on restart all my ychromes keep on blinking."* Measured on his
+/// machine: five `ychrome` children in state `Sl+` (the `+` is the foreground
+/// process group), one per launcher shell, each hours old.
+///
+/// ⚠ The shell never even reaches its `exec` tail while the app lives, which is
+/// why the tail is still the right marker: it records what the row WAS LAUNCHED
+/// AS, not what it happens to be doing now.
+pub fn launch_command_is_local_app_verb(launch_command: &str) -> bool {
+    launch_command.ends_with(LOCAL_APP_VERB_SHELL_TAIL)
+        || launch_command.ends_with(LOCAL_APP_VERB_SHELL_TAIL_WINDOWS)
+}
+
 fn legacy_agent_launch_command(
     kind: SessionKind,
     cwd: Option<&str>,
@@ -31091,6 +31178,39 @@ mod tests {
     /// surface opened` and exits), so a launch command of the bare app verb
     /// would end the PTY seconds after birth. The row must run the app AND
     /// still be a terminal afterwards.
+    /// ⛔ Owner-reported 2026-08-09: *"on restart all my ychromes keep on
+    /// blinking."* An app row holds ONE long-lived foreground process, so the
+    /// shell's "a foreground command is running" proxy is true from launch until
+    /// death. The recogniser is locked to its own builder here, because two
+    /// encodings of "this row is an app" is how the dot comes back.
+    #[test]
+    fn an_app_verb_launch_command_recognises_itself() {
+        for app_command in [
+            "'/home/user/.local/bin/ychrome' 'new'",
+            "yedit /tmp/a.md",
+            "some-app --flag 'x y'",
+        ] {
+            let built = local_app_verb_launch_command(app_command);
+            assert!(
+                super::launch_command_is_local_app_verb(&built),
+                "the recogniser must accept what the builder produces: {built}"
+            );
+        }
+        // A shell the user typed in is NOT an app row and must keep blinking on
+        // real foreground work — that is the whole point of the indicator.
+        for plain in [
+            "/bin/bash -i",
+            "ssh dev",
+            "claude -r 00000000-0000-0000-0000-000000000000",
+            "",
+        ] {
+            assert!(
+                !super::launch_command_is_local_app_verb(plain),
+                "a plain launch command must not read as an app row: {plain:?}"
+            );
+        }
+    }
+
     #[test]
     fn an_app_row_holds_its_app_command_so_a_restart_brings_the_app_back() {
         let mut server = test_server();
@@ -31168,6 +31288,48 @@ mod tests {
                 "{not_a_token} does not name an app verb and must not be treated as one"
             );
         }
+    }
+
+    /// ⛔⛔ Owner-reported 2026-08-09: working sessions showing NO blink, on a
+    /// GUI whose current daemon owned 3 of 45 rows. The snapshot writes `None`
+    /// for every session its answering daemon does not own, and `apply_snapshot`
+    /// rebuilds the whole map — so *"I don't know"* overwrote *"I asked the
+    /// owner and was told"*, once per apply, forever.
+    #[test]
+    fn a_snapshot_that_does_not_know_cannot_blank_an_informed_working_dot() {
+        let mut server = test_server();
+        let path = server.start_local_session(SessionKind::ClaudeCode, Some("/home/user"), None);
+
+        // The informed poll: this row IS working, straight from its owner.
+        server.apply_live_session_working_flags(&[(path.clone(), true)]);
+        assert_eq!(server.sessions.get(&path).and_then(|s| s.working), Some(true));
+
+        // A snapshot from a daemon that does not own it says nothing at all.
+        if let Some(session) = server.sessions.get_mut(&path) {
+            session.working = None;
+        }
+        server.restore_informed_working_flags();
+        assert_eq!(
+            server.sessions.get(&path).and_then(|s| s.working),
+            Some(true),
+            "an uninformed None must not blank an answer the owner gave"
+        );
+
+        // ⚠ AND THE OTHER DIRECTION, which is why this is bounded: an owner that
+        // has DIED also yields `None` forever, so an unbounded carry-forward
+        // would blink on a corpse. Age the stamp past the window.
+        if let Some(entry) = server.working_last_informed.get_mut(&path) {
+            entry.1 = entry.1.saturating_sub(super::WORKING_CARRY_FORWARD_MS + 1);
+        }
+        if let Some(session) = server.sessions.get_mut(&path) {
+            session.working = None;
+        }
+        server.restore_informed_working_flags();
+        assert_eq!(
+            server.sessions.get(&path).and_then(|s| s.working),
+            None,
+            "a stale answer must stop standing in, so the row goes honestly dark"
+        );
     }
 
     #[test]
