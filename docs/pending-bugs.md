@@ -13,6 +13,43 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⭐ A FAILED `server app` VERB ANSWERS IN PROSE ON stderr WHILE EVERY SUCCESS ANSWERS IN JSON ON stdout — so a JSON caller parses nothing and blames the parser
+
+**Status:** OPEN
+
+**Reported by the `practice` campaign row 2026-08-09**, as: *"`server app rows`
+prints 'no live Yggterm GUI client is registered … (dev)' to stderr and EXITS
+0 … mine died downstream in `json.load` with a `JSONDecodeError` pointing at
+nothing."*
+
+⛔ **The exit-code half does NOT reproduce, and the correction matters more than
+the report.** Measured on `dev` 2026-08-09 across four binaries — `yggterm`
+3.0.78, `yggterm-headless` 3.0.78, both `*.rollback-3.0.78-pre` (3.0.77), and
+the build-tree `target/release/yggterm-headless`: **every one exits 1** with
+exactly the quoted message. So a caller that read `0` read it from something
+else — most likely the last stage of a pipeline
+([[feedback-locks-survive-contract-changes]], the `cargo test | tail` shape) or
+a `subprocess.run` without `check`. ⇒ **Do not "fix" the exit code; it is
+already right.**
+
+⭐ **What IS real, and is the whole entry:** the verb has TWO answer shapes and
+the caller cannot tell which it will get. A success is a JSON envelope on
+stdout (`request_id`, `handled_by_pid`, `data`); a pre-flight refusal is three
+lines of English on stderr with empty stdout. Every `server app` caller in the
+fleet is a JSON consumer, so the refusal — the single most useful message we
+print, naming the host and the fix — is the one output none of them can read.
+The reporter's `JSONDecodeError` was that gap, and it points the agent at its
+own parser instead of at the host it ran on.
+
+**The fix:** a refusal emits a JSON error envelope on stdout as well (same
+`request_id` shape, an `error` member carrying the prose), and keeps both the
+non-zero exit and the human text on stderr. One question, two audiences, no
+second encoding to diverge.
+
+**Falsifier:** `yggterm server app rows` on a host with no GUI, piped to
+`python3 -c 'import json,sys; print(json.load(sys.stdin)["error"])'`, prints the
+host-and-fix sentence instead of raising.
+
 ## ⚠ THE `yggterm-shell` TEST TARGET READS THE DEVELOPER'S LIVE `~/.claude/projects` — 40 MINUTES, AND GROWING FOREVER
 
 **Status:** OPEN
@@ -47,187 +84,59 @@ fixture; if it does not, the 40 minutes are real work and this entry is wrong.
 ⛔ Do that before optimising anything — a slow suite everyone pays for is worth
 one measurement, not a guess.
 
-## ⛔⛔ A DEPLOY STRANDS THE DEPLOYER'S OWN ROW: THE WORKING DOT GOES STILL, THE CLICK BLOCKS A MINUTE, AND THE RE-RESUME KILLS THE WORK
+## ⛔ THE WORKING INDICATOR GOES DARK WHEN A ROW'S OWNING DAEMON IS GONE — a healthy agent reads as stalled
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** OPEN
 
-⚖ **The CONSTITUTION's *"a session owned by an OLDER daemon is still a
-first-class row in the current GUI, and clicking it must WORK"* failing, reported
-by the owner 2026-08-09 while it was happening to him.** He saw an agent row's
-working indicator stop blinking, went to check on it, and **could not do anything
-for about a minute**. The error he was shown, verbatim:
+Split out 2026-08-09 from the row-stranding entry, whose other halves are fixed
+and live-proven (git remembers it; `3.0.78` and `3.0.80` carry the fixes).
 
-```
-Error: yggterm: Codex session <uuid> is already active outside Yggterm (pid 3942934);
-waiting instead of starting a second resume. Close that external terminal to let Yggterm attach.
-```
+The dot is fed by PTY output **from the owning daemon**, so when a row's owner
+retires or dies the dot simply stops — and a still dot is indistinguishable from
+a dead agent. That is what sent the owner to check on a session that was working
+fine, which is where the whole stranding incident started.
 
-### ⭐ ROOT-CAUSED FROM THE TRACE, 2026-08-09 — AND THE FIRST DIAGNOSIS WAS THE AGGRAVATOR, NOT THE CAUSE
+⭐ **The instrument that was RIGHT throughout that incident reads a different
+source:** the booter, which watches transcript activity, logged `WORKING` at
+11:46 · 11:51 · 11:56 · 12:01 · 12:06 · 12:11 while the on-screen dot said
+nothing. ⇒ liveness has a source that survives daemon topology, and the dot is
+not using it. [[finding-agent-session-liveness-is-invisible-to-os-signals]]
 
-⛔ **The entry previously filed here named the ancestry predicate as THE cause and
-put the click at 12:13. Both were wrong**, and the daemon's own trace said so —
-it had recorded the real answer in a field nobody read. Corrected timeline, one
-host (`dev`), one row (`cc-runtime://bb658b4b…`), every line from
-`~/.yggterm/event-trace*.jsonl`:
+**Falsifier:** with a row's owning daemon retired and the agent mid-turn, the
+row's indicator still blinks.
 
-| time | event |
-|---|---|
-| 12:01:34 | a session installs 3.0.77 by `mv`-ing the OLD binary aside and `rm`-ing the backup |
-| 12:09:40 | **the owner clicks the row** — `server remote resume-cc bb658b4b … --require-existing` |
-| 12:09:43 | the click SYNCHRONOUSLY starts a hot update of the stale 3.0.76 owner (pid 3779735) |
-| 12:09:56 | `hot_update_handoff_prepared` — "preserving 55 live terminal runtime(s)" |
-| 12:10:07 | `hot_update_stale_runtime_owner_not_ready` → `..._direct_bridge_fallback` |
-| 12:10:16 | ⛔ `daemon_self_retire_handoff_skipped` `reason:replacement_binary_missing` |
-| 12:10:20 | the 3.0.76 daemon **cold-exits, taking all 55 PTYs with it** |
-| 12:10:22 | the new daemon meets the orphaned `claude`, calls it EXTERNAL, and refuses |
-| 12:11:15 | a retry spawns a **brand-new** `claude` (pid 27685). The 20-minute `cargo test` is gone |
+## ⛔ A DAEMON SERVES ONE REQUEST AT A TIME, AND A HOT-RESTART REQUEST HOLDS IT FOR ~11 SECONDS — so anything else asking that daemon waits
 
-⭐ **THE ROOT: the daemon derives its successor binary from the grave of its own
-binary.** `disk_replace_handoff_target` read `/proc/self/exe`, stripped the
-literal `" (deleted)"` suffix, and treated what was left as the newly-installed
-binary. The trace prints the value it got:
+**Status:** OPEN
 
-```
-exe_link: "/home/user/.yggterm/bin/yggterm-headless.old.4121874 (deleted)"
-new_exe : "/home/user/.yggterm/bin/yggterm-headless.old.4121874"     ← does not exist
-```
+Measured on `dev` 2026-08-09 while fixing the click path, and it is the reason
+the first fix there did not work.
 
-⇒ **`/proc/self/exe` names where this daemon's binary WAS, not where the install
-IS, and which of those two the path means is decided by the DEPLOYER'S
-choreography.** `mv new …/yggterm-headless` (the field guide's own recipe, §4.2)
-replaces in place and the derivation holds. `mv yggterm-headless
-yggterm-headless.old.$$ ; cp new yggterm-headless ; rm -f *.old.*` renames the
-OLD binary away first — the exe link follows the rename, the `rm` deletes it, and
-the derivation lands on a path nothing will ever create again. The handoff is
-skipped, the daemon cold-exits, and **every PTY it owns dies**. The install was
-sitting beside it under its canonical name the whole time.
+The click's stale-owner upgrade was moved off the click's thread, so the
+endpoint resolved at **+2.96 s**. First paint still landed at **+15.12 s**. The
+gap is the owner daemon: the background thread's `hot_restart` request reached
+it first and held it, and the foreground's own pre-bridge calls to that **same
+daemon** — the appearance check and the identity-profile sync — queued behind
+it. Whichever thread reached the socket first decided whether the user's click
+was fast. ⛔ A race, not a fix.
 
-⚠ **The two failures wore the same costume, which is why this hid.** A skipped
-handoff and a broken predicate both end with "the row came back as a new
-process"; only the trace separates them, and only one of them is why 55 sessions
-died.
+3.0.80 works around it by holding the upgrade until the bridge's first paint
+(`stale_runtime_owner_hot_update_released released_by:"bridge_first_paint"`),
+which is correct for that path but does not make the daemon concurrent. **Any
+other caller that asks a daemon anything while it prepares a handoff still
+waits ~11 s**, and nothing tells it why.
 
-⭐ **THE AGGRAVATOR (real, and worth its own fix): ownership was decided by
-ancestry, and ancestry is exactly what a daemon swap destroys.** The chain for
-every agent row is **daemon → `bash -c <exports…> claude …` → `claude`**, and the
-wrapper `bash` matches neither arm of `yggterm_process_args` — so the daemon's own
-presence was the ONLY thing making a session "ours". Once it exits the wrapper
-reparents to init, the ancestor list becomes `[bash, init]`, and yggterm's own
-agent is reclassified **external**. The guard's failure mode is then precisely
-inverted from its purpose: it exists to stop a second resume racing a real
-external terminal, and what it did was refuse to attach to the session yggterm
-itself started — while naming a pid that no longer existed and instructing the
-owner to close a terminal that was never open.
+⚖ **And the question underneath, which is the owner's to settle:** should a
+CLICK drive a daemon swap at all? The swap that cost 55 PTYs this morning was
+started by the owner clicking a row (12:09:40 click → 12:10:16 retire). The
+settled relay-gate design makes a swap **an appointment at a relay boundary**,
+not a search — and a click is not a relay boundary. The deploy path already
+upgrades every daemon by itself, so the click-driven upgrade may be redundant
+as well as dangerous. ⇒ `docs/owner-attention.md`; not changed unilaterally,
+because removing it is a policy change and this was a latency fix.
 
-### WHAT SHIPPED
-
-1. **`disk_replace_handoff_candidates`** (`daemon.rs`) returns an ORDERED
-   candidate list — the in-place path first, then the canonical name beside the
-   backup — and the caller takes the first that is a file. A skip now traces
-   every path it looked at, not just the first.
-2. **`agent_resume_process_holder_for_session`** (`lib.rs`) reads the candidate
-   pid's OWN `/proc/<pid>/environ` through a new sibling in `session_tenancy.rs`,
-   so the key list and the sshd caveat keep one home. Environment is fixed at
-   exec and therefore survives reparenting, daemon death and the swap itself.
-   Ancestry stays as a fallback for processes predating the marker.
-   ⛔ Both `YGGTERM_SESSION_ID` and the `LC_` mirror are read: **sshd strips the
-   unprefixed name**, so a fix reading one would pass locally and fail on every
-   remote row — which is the only kind of row this happens to.
-   ⛔ A marker naming a DIFFERENT row stays external: a `claude --resume` the
-   user typed in some other yggterm shell really would race us.
-3. **The banner tells the truth and shows its elapsed time.** A stranded holder
-   is no longer reported as an external terminal, the CLI is named correctly
-   (it said "Codex session" on Claude Code rows), and the wait re-renders every
-   10 s so a live wait cannot read as a hang. Both wordings are recognised by
-   `remote_resume_snapshot_is_external_active_guard` — a wording the classifier
-   does not know is read as a FAILED resume, whose recovery is the restart this
-   banner exists to avoid.
-
-⛔ **Both verdicts still REFUSE a second resume, and that is deliberate.** The
-tempting reading of "it is ours after all" is *proceed* — which would spawn a
-second `claude` beside a live one and corrupt the transcript. The fix removes a
-lie; it does not widen what we are willing to race.
-
-### ⭐ PROVEN A/B IN A SANDBOX `YGGTERM_HOME`, 2026-08-09 — AND THE THIRD ARM IS THE DEPLOY RECIPE
-
-One daemon, one live PTY, the offending deploy replayed verbatim. Same
-`exe_link` in both arms; opposite outcome:
-
-| daemon code | deploy shape | trace verdict |
-|---|---|---|
-| 3.0.77 (unfixed) | rename-aside + `rm -f *.old.*` | ⛔ `daemon_self_retire_handoff_skipped` `replacement_binary_missing` → falls through to `daemon_cold_shutdown_deferred_idle_gate`, the PTY-killing path |
-| 3.0.78 (fixed) | rename-aside + `rm -f *.old.*` | ✅ `daemon_self_retire_handoff_ok` `outcome:preserved_owner_handoff`, "preserving 1 live terminal runtime(s)". No cold-shutdown event at all; the PTY's `/bin/bash -i` was still alive afterwards |
-| 3.0.77 (**unfixed**) | **`mv` in place** | ✅ `daemon_self_retire_handoff_ok` |
-
-⭐ **The third arm is the operationally load-bearing one.** The fix only protects
-a swap where the RETIRING daemon already runs it — so it cannot reach a host by
-the broken path. An in-place `mv` hands off correctly *on the old code*, which is
-how 3.0.78 gets onto a host still running 3.0.7x without paying the cost one last
-time. ⇒ deploy in place; see the `guihost` entry below for that host's own hazard.
-
-### ⭐ LIVE-PROVEN ON `guihost` — 3.0.78 DEPLOYED IN PLACE, 43 ROWS IN, 43 ROWS OUT
-
-The sandbox exercised one daemon and one local PTY; `guihost` runs FIVE coexisting
-daemons and the busiest owned five rows, four of them `remote-cc://` bridges. So
-the recipe was run for real, 2026-08-09 14:28, `mv` in place over all four paths,
-no GUI restart, `*.old.*` deliberately untouched:
-
-```
-14:28:33  523808  daemon_self_retire  exe_link:"…/yggterm-headless (deleted)"
-                                      retire_trigger:"disk_binary_replaced"
-14:28:43  523808  daemon_self_retire_handoff_ok
-                  "hot update handoff started: preserving 10 live terminal runtime(s)"
-14:28:47  864647  (3.0.78) pty_handoff_listener_bound
-```
-
-**`handoff_ok`, not `_skipped` — the exact inversion of the incident**, on a
-daemon still running the OLD 3.0.76 code, which is the third sandbox arm holding
-at scale. `server app rows` before and after: **43 → 43, nothing lost, nothing
-invented.** The agent rows stayed on their original PTYs under the preserved
-owner while progressive migration drained them to the successor one at a time.
-
-⭐ **And then `dev`, on the daemon that did the damage.** The same in-place
-recipe over `dev`'s four paths, 14:31:
-
-```
-14:31:32  12141  daemon_self_retire_handoff_ok
-                 "hot update handoff started: preserving 56 live terminal runtime(s)"
-14:31:48  2144501 (3.0.78)  pty_handoff_listener_bound
-```
-
-**Pid 12141 is the daemon whose predecessor cold-killed 55 PTYs at 12:10:20 this
-morning.** It has now handed 56 of them over instead, and the `claude` process of
-the session that ran the deploy stayed on its original PTY throughout — the
-inverse of the incident, on the same host, the same day.
-
-⚠ **What is still NOT proven, and it is the other half of the falsifier:** the
-CLICK. This proves the swap no longer destroys the row; it does not prove that
-clicking a row owned by an older daemon opens it. Testing that means taking the
-owner's viewport, so it waits for a moment when that is his to give.
-
-### WHAT IS STILL OPEN UNDER THIS ENTRY
-
-- ⚠ **The click drives a 24-second synchronous hot-update of the stale owner**,
-  then reports `not_ready` and falls back to a direct bridge that lasted **one
-  second** before the owner died under it. That is most of the owner's minute and
-  none of it is fixed here.
-- ⚠ **The working indicator still goes dark** whenever a row's owning daemon is
-  gone: it is fed by PTY output from the OWNER, so a still dot is
-  indistinguishable from a dead agent. The booter, reading transcript activity,
-  logged `WORKING` at 11:46 · 11:51 · 11:56 · 12:01 · 12:06 · 12:11 throughout —
-  it was right, and the instrument on screen was not.
-  ⇒ [[finding-agent-session-liveness-is-invisible-to-os-signals]]
-
-⚠ **Do not file this as "the deployer should be more careful."** Deploying over a
-running daemon is sanctioned and routine (`docs/agent-field-guide.md` §4); the
-architecture promises the row survives it, and a promise that depends on which
-`mv` the deployer typed is not a promise.
-
-**The falsifier, and it is the whole entry:** with a live agent row mid-work on
-host H, deploy a new daemon to H by renaming the old binary aside, then click
-that row from the GUI. It must attach to the SAME process, keep its jobs, and
-never show a raw error. If `daemon_self_retire_handoff_skipped` appears in the
-trace again, candidate 2 did not resolve and this is not fixed.
+**Falsifier:** `server status` against a daemon that is mid-`hot_restart`
+answers within a second.
 
 ## ⛔ `guihost` IS CARRYING THE STRANDING BUG ARMED: ONE DAEMON'S BINARY *IS* THE BACKUP FILE, AND `rm -f *.old.*` IS THE TRIGGER
 
