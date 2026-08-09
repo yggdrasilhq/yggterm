@@ -3405,6 +3405,20 @@ pub struct YggtermServer {
     /// `TerminalManager::session_size` (daemon-owned); this is the persisted
     /// last-known used only at re-resume time.
     session_pty_grids: HashMap<String, (u16, u16)>,
+    /// The grid of the VIEWER's terminal viewport, as last asserted by a client
+    /// resize. A different question from `session_pty_grids` — that one answers
+    /// "what grid is session X's PTY", this one answers "what grid does a
+    /// terminal on this desktop get shown at" — so it is not a second copy of
+    /// anything, and it has exactly ONE writer (the `TerminalResize` handler,
+    /// the same single writer the per-session grid has).
+    ///
+    /// It exists because a session born with no viewer had no third answer to
+    /// fall back on and was born at DEFAULT 120x36 — which for a row created
+    /// `--no-activate` (what `docs/agent-row-hygiene.md` asks every agent to
+    /// pass) meant it stayed 120x36 for its whole life unless a human opened
+    /// it. Shadow viewers never write this: they are denied resize outright, so
+    /// a read-only observer's window cannot redefine the desktop's grid.
+    client_viewport_grid: Option<(u16, u16)>,
     /// How far back a reader has asked to see, per session path, in transcript
     /// ENTRIES. Absent means the default one page.
     ///
@@ -3461,6 +3475,7 @@ impl YggtermServer {
             live_session_order: Vec::new(),
             local_cc_sessions,
             session_pty_grids: HashMap::new(),
+            client_viewport_grid: None,
             preview_history_budgets: HashMap::new(),
         };
 
@@ -3712,6 +3727,24 @@ impl YggtermServer {
         }
         let key = self.resolve_session_storage_key(path)?;
         self.session_pty_grids.get(key).copied()
+    }
+
+    /// Record the grid a client just asserted as its own terminal viewport.
+    /// Called from the SAME place that records the per-session grid, so the two
+    /// can never be fed by different events. Returns `true` on a real change.
+    pub fn record_client_viewport_grid(&mut self, cols: u16, rows: u16) -> bool {
+        if cols == 0 || rows == 0 {
+            return false;
+        }
+        self.client_viewport_grid.replace((cols, rows)) != Some((cols, rows))
+    }
+
+    /// The grid a terminal on this desktop is shown at, if any client has ever
+    /// said. The LAST fallback for a session being born — better than DEFAULT
+    /// 120x36 in every case, and `None` on a daemon no GUI has attached to,
+    /// which keeps a headless daemon behaving exactly as before.
+    pub fn client_viewport_grid(&self) -> Option<(u16, u16)> {
+        self.client_viewport_grid
     }
 
     pub(crate) fn focus_live_session_without_launch_if_active_missing(
@@ -30974,6 +31007,36 @@ mod tests {
         // Zero dims are ignored (no clobber of a good grid).
         server.record_session_pty_grid(&path, 0, 0);
         assert_eq!(server.session_pty_grid(&path), Some((159, 63)));
+    }
+
+    // BORN-AT-THE-VIEWPORT'S-GRID: the desktop's grid answers a DIFFERENT question
+    // from any session's grid ("how big is a terminal on this screen" vs "how big is
+    // session X's PTY"), and it is what a session born with no viewer is created at.
+    // A daemon no client has ever resized against still answers None, so a headless
+    // daemon keeps the old DEFAULT-120x36 behaviour rather than inventing a grid.
+    #[test]
+    fn the_desktops_grid_is_recorded_apart_from_any_sessions_grid() {
+        let mut server = test_server();
+        assert_eq!(
+            server.client_viewport_grid(),
+            None,
+            "a daemon no client has resized against must not invent a grid"
+        );
+        assert!(server.record_client_viewport_grid(169, 65));
+        assert_eq!(server.client_viewport_grid(), Some((169, 65)));
+        assert!(
+            !server.record_client_viewport_grid(169, 65),
+            "an unchanged grid is not a change"
+        );
+        // Zero dims are ignored, exactly as for a session's own grid.
+        assert!(!server.record_client_viewport_grid(0, 0));
+        assert_eq!(server.client_viewport_grid(), Some((169, 65)));
+        // It is NOT a copy of any session's grid: recording one leaves the other
+        // alone in both directions.
+        let path = server.start_local_session(SessionKind::Codex, Some("/home/user"), Some("codex"));
+        assert_eq!(server.session_pty_grid(&path), None);
+        server.record_session_pty_grid(&path, 120, 36);
+        assert_eq!(server.client_viewport_grid(), Some((169, 65)));
     }
 
     // The synchronous-flush logic in the TerminalResize handler + record-on-create

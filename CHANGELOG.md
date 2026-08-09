@@ -4,6 +4,23 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A terminal you create without switching to it now opens when you go back to
+  it — and is the right size in the meantime.** A session created in the
+  background had nobody to say how big it should be, so it was born at a
+  fallback 120×36 and, if you never opened it, stayed 120×36 for the rest of its
+  life. That is what every row an agent creates looks like, because agents are
+  asked to create rows without stealing your screen. Opening one afterwards then
+  failed outright: the guard that protects you from a squished, broken-bottom
+  terminal compared your real viewport against that 120×36 and refused.
+
+  A session created with no viewer is now born at the size a terminal actually
+  is on your desktop, so there is nothing to diverge. The guard is unchanged —
+  it was right, and it stays. What was wrong underneath it was that a resize
+  repaired the terminal within a few seconds while the check kept reading a copy
+  of the old size for up to a minute afterwards, so it went on reporting a
+  problem that had already been fixed; the copy is now refreshed as soon as
+  anything resizes a terminal.
+
 - **Six of the nine agent CLIs can now be started on another machine.** Asking
   for a remote `pi`, `opencode`, `qwen`, `kimi`, `muse` or `agy` row used to be
   impossible: two CLIs — codex and Claude Code — had a remote start, and every

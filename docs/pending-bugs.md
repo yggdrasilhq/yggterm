@@ -568,42 +568,6 @@ other rails (settings, connect, notifications, tab rail, contributed app panes)
 share the same `RailHeader` component and so are covered by construction, but
 none has been observed directly.
 
-## ⛔⛔ A ROW CREATED WITH `--no-activate` CAN NEVER BE OPENED AFTERWARDS
-
-**Status:** OPEN
-
-Measured 2026-08-09 on the GUI host while live-proving the six-CLI remote start.
-
-```
-server app terminal new --machine-key dev --kind opencode --no-activate   → ok
-server app open remote-opencode://dev/<uuid> --view terminal
-  → Error: session/view contract violation: Client viewport 169×65 diverges
-    from daemon PTY grid 120×36 (broken-bottom risk)
-```
-
-⚠ **Falsified against the shipped kind before filing.** The same two commands with
-`--kind claude-code` fail IDENTICALLY (`remote-cc://dev/<uuid>`, same 169×65 vs
-120×36), so this is NOT a property of the new remote start — it is what
-`--no-activate` does to any remote row. The same create WITHOUT `--no-activate`
-opens and paints fine; that is how the OpenCode TUI was photographed.
-
-**The mechanism, as far as the evidence goes.** A row born unactivated has no
-viewer, so nothing ever resizes its PTY away from the 120×36 default — the
-launch preamble says so in its own words, waiting on `stty size` to stop reading
-`"36 120"`. The contract check then compares the client's real viewport against
-that default and refuses. So the guard is right about the divergence and wrong
-about what to do with it: the first open is precisely the moment a resize should
-happen.
-
-**Why it matters more than it looks.** `--no-activate` is what an agent uses so
-its probe does not steal the user's screen — `docs/agent-row-hygiene.md` asks for
-it. ⇒ **every row an agent creates politely is a row the agent can then never
-look at**, which is why this went unnoticed: the delegate-spawn path submits a
-brief and never opens the row.
-
-**Falsifier for a fix:** create with `--no-activate`, then `server app open` it —
-it must paint, not refuse. Keep the divergence check; make the open resize first.
-
 ## ⛔ THE REMOTE CLI PROVISIONER FAILS WHERE A HAND-RUN `npm install` SUCCEEDS
 
 **Status:** OPEN

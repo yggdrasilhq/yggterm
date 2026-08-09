@@ -224,20 +224,44 @@ def save_state(uuid, st):
     state_file(uuid).write_text(json.dumps(st))
 
 
+def _field(out, name):
+    try:
+        d = json.loads(out[out.find("{"):])
+    except Exception:
+        return None
+    return (d.get("data") or d).get(name)
+
+
 def nudge(host, row, dry):
-    """Send exactly one `continue`. Never more, never to a mid-turn row."""
+    """Send exactly one `continue`. Never more, never to a mid-turn row.
+
+    ⛔⛔ FIXED 2026-08-09, and it had been lying since this file was written:
+    `"submitted" in stdout` IS TRUE FOR `"submitted": false`. Every nudge this
+    function ever reported as sent was reported the same way whether it landed or
+    not — a watchdog whose success field is a substring match on the word for
+    failure. **Read the FIELD'S VALUE.**
+
+    ⚠ And `terminal submit` drives the GUI's MOUNTED terminal host, so a row with
+    nothing mounted waits out its 30s deadline and honestly answers
+    `submitted:false` — which is most rows a babysitter looks at. Fall back to
+    `server terminal write`, which addresses the PTY itself. Measured on a live
+    row: submit `submitted:false`, PTY write delivered, same minute.
+
+    Even so: `submitted:true` describes the WRITE, never the delivery. The only
+    proof is transcript GROWTH on the next pass — that is what `last_size` is."""
     if dry:
         log(f"DRY-RUN would nudge {row}")
-        return True
-    tmp = "/tmp/.ygg-babysit-continue"
-    subprocess.run(["ssh", host, f"printf 'continue' > {tmp}"], timeout=60)
-    r = ygg(host, "server", "app", "terminal", "submit", row, "--stdin")
-    # ⚠ `submitted:true` describes the WRITE, not the delivery — the caller must
-    #   confirm by transcript GROWTH on the next pass, which is what last_size is.
-    ok = subprocess.run(
-        ["ssh", host, f"$HOME/.yggterm/bin/yggterm server app terminal submit '{row}' --stdin < {tmp}"],
-        capture_output=True, text=True, timeout=120)
-    return "submitted" in (ok.stdout or "") or bool(r)
+        return "dry-run"
+    binp = "$HOME/.yggterm/bin/yggterm"
+    r = subprocess.run(
+        ["ssh", host, f"{binp} server app terminal submit '{row}' --stdin"],
+        input="continue", capture_output=True, text=True, timeout=180)
+    if _field(r.stdout or "", "submitted") is True:
+        return "submit"
+    w = subprocess.run(
+        ["ssh", host, f"{binp} server terminal write '{row}' --stdin"],
+        input="continue\n", capture_output=True, text=True, timeout=180)
+    return "pty-write" if _field(w.stdout or "", "accepted") is True else ""
 
 
 _ROWS_CACHE = {}

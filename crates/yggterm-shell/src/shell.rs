@@ -1185,6 +1185,11 @@ const LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS: u64 = 1_200;
 const LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS: u64 = 10_000;
 const LIVE_SESSION_SNAPSHOT_BACKGROUND_BUSY_POLL_MS: u64 = 15_000;
 const LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS: u64 = 60_000;
+/// How soon to re-read the live-session snapshot after this process resized a
+/// PTY. Short because the daemon has already applied and recorded the grid by
+/// the time the resize call returns, and because the metadata string it
+/// refreshes is the only input the PTY-grid divergence check has.
+const LIVE_SESSION_SNAPSHOT_POST_RESIZE_REFRESH_MS: u64 = 400;
 const TERMINAL_INPUT_HOT_SUPPRESS_MS: u64 = 2_000;
 // "Input hot until" is a per-keystroke timestamp that suppresses background
 // snapshot applies so they can't interrupt the user mid-type. It lives in a
@@ -97725,6 +97730,24 @@ fn TerminalCanvas(
                                             && last_sent_terminal_resize_cols != cols;
                                         last_sent_terminal_resize_cols = cols;
                                         last_sent_terminal_resize_rows = rows;
+                                        // The daemon's PTY grid reaches this process ONLY as the
+                                        // "PTY size" metadata string on the live-session snapshot,
+                                        // and that snapshot refreshes every 60s while nothing is
+                                        // foreground-busy. So the one actor that just CHANGED the
+                                        // grid would go on comparing the live viewport against its
+                                        // own minute-old copy — and the SSOT divergence check would
+                                        // keep reporting a broken bottom that the resize had already
+                                        // repaired. Measured: the divergence was real for ~4.5s and
+                                        // reported for 46s, which is how `server app open` came to
+                                        // fail on a healthy row at its 15s deadline. Pull the refresh
+                                        // forward instead of widening the check's tolerance: the
+                                        // check is right, its input was stale.
+                                        state.with_mut(|shell| {
+                                            schedule_live_session_snapshot_refresh(
+                                                shell,
+                                                LIVE_SESSION_SNAPSHOT_POST_RESIZE_REFRESH_MS,
+                                            );
+                                        });
                                         if column_changed {
                                             screen_reconcile_due_at_ms = current_millis()
                                                 .saturating_add(POST_RESIZE_SCREEN_RECONCILE_SETTLE_MS);
@@ -166567,6 +166590,31 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(terminal_geometry_resize_should_send(80, 24, 110, 50));
         assert!(!terminal_geometry_resize_should_send(110, 50, 110, 50));
         assert!(!terminal_geometry_resize_should_send(0, 0, 10, 2));
+    }
+    /// A successful resize must pull the live-session snapshot forward. The
+    /// daemon's PTY grid reaches this process ONLY as the "PTY size" string on
+    /// that snapshot, so without this the actor that just changed the grid keeps
+    /// comparing the live viewport against its own up-to-60s-old copy, and the
+    /// divergence check reports a broken bottom the resize already repaired.
+    /// Measured on the GUI host: real for ~4.5s, reported for 46s.
+    #[test]
+    fn a_successful_resize_pulls_the_session_snapshot_forward() {
+        let source = include_str!("shell.rs");
+        let resize_ok_arm = source
+            .split("match terminal_resize_async(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("Err(error) => {").next())
+            .expect("resize success arm present");
+        assert!(
+            resize_ok_arm.contains("LIVE_SESSION_SNAPSHOT_POST_RESIZE_REFRESH_MS"),
+            "a successful resize must reschedule the live-session snapshot, or the \
+             PTY-grid divergence check keeps reading a stale grid"
+        );
+        assert!(
+            LIVE_SESSION_SNAPSHOT_POST_RESIZE_REFRESH_MS < LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS,
+            "the post-resize refresh must be sooner than the busiest normal poll, \
+             otherwise it never moves the schedule at all"
+        );
     }
     #[test]
     fn fresh_remote_codex_start_surface_requires_prompt_ready_surface() {
