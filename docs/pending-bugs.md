@@ -568,43 +568,6 @@ other rails (settings, connect, notifications, tab rail, contributed app panes)
 share the same `RailHeader` component and so are covered by construction, but
 none has been observed directly.
 
-## ⛔ THE REMOTE CLI PROVISIONER FAILS WHERE A HAND-RUN `npm install` SUCCEEDS
-
-**Status:** OPEN
-
-Measured 2026-08-09, and it was INVISIBLE until this version: while the six CLIs
-had no remote start, `ManagedCliTool::from_session_kind(SshShell)` was `None` and
-the provisioner *correctly declined* to install anything for the downgraded row.
-The first remote `opencode` row that was really an opencode row ran the
-provisioner for real, and its PTY showed:
-
-```
-npm error syscall spawn sh
-npm error path /home/user/.yggterm/npm/lib/node_modules/opencode-ai
-npm error errno -2
-npm error enoent spawn sh ENOENT
-```
-
-The same install by hand on the same machine, with the same
-`NPM_CONFIG_PREFIX`, **succeeds** — and notes that it SKIPPED the postinstall
-(`npm warn allow-scripts   opencode-ai@1.18.15 (postinstall: node ./postinstall.mjs)`).
-⇒ the divergence is around the postinstall script and the environment it is
-spawned in, not around the package or the prefix.
-
-⚠ **Not diagnosed, deliberately.** Two candidate causes are untested: the
-daemon's frozen environment ([[finding-daemon-frozen-env-poisons-sessions]])
-leaving no `sh` on `PATH` at spawn time, and npm's `allow-scripts` gate behaving
-differently between the two invocations. Naming one without probing it would be
-the free-association `CLAUDE.md` forbids.
-
-**Falsifier:** provision a CLI onto a machine that lacks it through the
-provisioner alone (no hand install) and watch the row come up. Today that is
-`pi`, `kimi`, `muse` or `agy` on `dev`.
-
-⭐ **The transferable part:** a layer that cannot be REACHED cannot be OBSERVED.
-This failure sat behind a silent kind-downgrade for as long as the downgrade
-existed, and looked exactly like a correct refusal from every angle above it.
-
 ## ⛔ `server app clients` ANSWERS IN A DIFFERENT ENVELOPE FROM EVERY OTHER APP VERB
 
 **Status:** OPEN

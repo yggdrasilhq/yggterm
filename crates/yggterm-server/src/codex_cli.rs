@@ -5,10 +5,13 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use yggterm_core::agent_cli::{AgentCliDescriptor, CliInstall, CliUpdate, agent_cli_descriptor};
 use yggterm_core::{
     AgentLaunchOptions, ENV_YGGTERM_HOME, PerfSpan, SessionStore, append_trace_event,
@@ -1182,6 +1185,44 @@ fn the_terminal_identity_env_has_exactly_one_test_guard() {
 mod tests {
     use super::*;
     use super::env_test_guard;
+
+    /// ⛔ The regression this pins is DESTRUCTIVE, not merely redundant: two
+    /// `npm install -g` runs against one prefix were measured deleting the CLI
+    /// they were both installing, leaving `opencode` absent from the managed bin
+    /// dir entirely. See [`ManagedCliInstallLock`] for the measurement.
+    ///
+    /// ⚠ Same-process acquisition is a REAL test of the cross-process contract
+    /// here: `flock` is owned by the open file description, and each acquire
+    /// opens the lock file afresh, so two guards in one process contend exactly
+    /// as two daemons would.
+    #[cfg(unix)]
+    #[test]
+    fn one_writer_at_a_time_owns_this_machines_managed_toolchain() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-managed-cli-lock-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let held = acquire_managed_cli_install_lock_waiting(&home, 0)
+            .expect("the first writer takes the toolchain lock");
+
+        // A second writer must NOT proceed into the install while the first
+        // holds it — the whole defect was both writers proceeding.
+        let refused = acquire_managed_cli_install_lock_waiting(&home, 200);
+        let message = format!("{:#}", refused.expect_err("a concurrent install must be refused"));
+        assert!(
+            message.contains("installing managed CLIs"),
+            "the refusal must say a concurrent install is why, got: {message}"
+        );
+
+        // ...and the lock must be released by the kernel when the guard drops,
+        // or one crashed install would wedge provisioning until reboot.
+        drop(held);
+        acquire_managed_cli_install_lock_waiting(&home, 0)
+            .expect("the lock is released when the guard drops");
+
+        let _ = fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn managed_cli_focus_cache_reuses_recent_available_probe() {
@@ -2596,11 +2637,185 @@ fn run_provision_command(mut command: Command, what: &str) -> Result<()> {
     anyhow::bail!("{what} exited with status {}: {stderr}", output.status);
 }
 
+/// How long an install waits for another process to finish writing this
+/// machine's managed toolchain. Generous because the thing being waited on is a
+/// real `npm install -g` of up to nine packages, bounded because a wedged holder
+/// must not pin a daemon thread for the life of the process.
+const MANAGED_CLI_INSTALL_LOCK_WAIT_MS: u64 = 5 * 60_000;
+
+/// Exclusive, CROSS-PROCESS lock over this machine's managed CLI toolchain,
+/// held for the whole of one [`install_latest`].
+///
+/// ⛔ **THE DEFECT THIS CLOSES, measured 2026-08-09: two installs running at
+/// once DELETE the CLI they are both installing.** Reproduced on `dev` by
+/// running two `npm install -g opencode-ai@latest` against one
+/// `NPM_CONFIG_PREFIX` while sampling the package directory every 50 ms: the
+/// directory was ABSENT for 3 of 153 samples, both installs failed (`exit=1`
+/// and `exit=239 EEXIST`), and `opencode` was left **entirely missing** from the
+/// managed bin dir. A single hand-run afterwards restored it — which is exactly
+/// the shape the bug was filed under, *"the provisioner fails where a hand-run
+/// `npm install` succeeds"*. The hand-run does not succeed because a human typed
+/// it; it succeeds because it is the only writer.
+///
+/// ⚠ **The filed mechanism was wrong, and it was wrong in a way worth
+/// remembering.** The symptom is npm reporting `enoent spawn sh ENOENT`, which
+/// reads as *"`sh` is not on `PATH`"* — so the entry blamed the daemon's frozen
+/// environment. It is not that: `/bin/sh` is on every daemon `PATH` on all three
+/// fleet hosts, and [`ManagedCliPaths::env_path`] PREPENDS to the inherited
+/// `PATH` rather than replacing it. Node reports a spawn whose **`cwd` does not
+/// exist** as `ENOENT` attributed to the COMMAND, so the missing thing was the
+/// package directory the lifecycle script was told to run in — deleted by the
+/// other install mid-flight. ⇒ [[finding-enoent-blames-the-command-for-a-missing-cwd]]
+///
+/// ⛔ It must be a FILE lock, not a `Mutex`, and that is forced by the
+/// constitution rather than chosen: version-coexisting daemons are a guarantee
+/// this project makes, a per-tool ensure arrives as its OWN short-lived process
+/// over ssh (`remote_cli.rs` → `run_remote_ensure_managed_cli`), and the
+/// scheduled fleet sweep is a third writer. An in-process lock cannot see any of
+/// them. The three contenders are all real today: the remote ensure de-dupes on
+/// `(machine_key, tool)`, so provisioning two DIFFERENT tools on one machine is
+/// concurrent by construction.
+#[derive(Debug)]
+struct ManagedCliInstallLock {
+    #[cfg(unix)]
+    file: fs::File,
+    #[cfg(unix)]
+    home: PathBuf,
+    #[cfg(unix)]
+    path: PathBuf,
+}
+
+impl Drop for ManagedCliInstallLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            unsafe {
+                let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+            append_trace_event(
+                &self.home,
+                "managed_cli",
+                "install",
+                "lock_released",
+                serde_json::json!({
+                    "path": self.path.display().to_string(),
+                    "pid": std::process::id(),
+                }),
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn managed_cli_install_lock_is_busy(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::WouldBlock
+        || error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+}
+
+/// Take the toolchain lock, WAITING for a holder rather than skipping past one.
+///
+/// ⭐ Waiting is the whole point and the obvious alternative is a bug: a caller
+/// that gave up and returned would report "not installed" for a tool that is
+/// being installed right now, and the launch gate above it would refuse a row
+/// that was about to become valid. Waiting also makes the wait FREE in the
+/// common case — by the time the lock is ours the other writer has usually
+/// installed the very tool we wanted, and the probe that follows finds it.
+fn acquire_managed_cli_install_lock(home: &Path) -> Result<ManagedCliInstallLock> {
+    acquire_managed_cli_install_lock_waiting(home, MANAGED_CLI_INSTALL_LOCK_WAIT_MS)
+}
+
+/// The body of [`acquire_managed_cli_install_lock`], with the deadline passed in
+/// so a test can prove the contention behaviour without waiting out the real
+/// five-minute budget.
+fn acquire_managed_cli_install_lock_waiting(
+    home: &Path,
+    wait_ms: u64,
+) -> Result<ManagedCliInstallLock> {
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(home)
+            .with_context(|| format!("creating yggterm home {}", home.display()))?;
+        let path = home.join("managed-cli-install.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening managed cli install lock {}", path.display()))?;
+        let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
+        let mut waited = false;
+        loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                if waited {
+                    append_trace_event(
+                        home,
+                        "managed_cli",
+                        "install",
+                        "lock_acquired_after_wait",
+                        serde_json::json!({
+                            "path": path.display().to_string(),
+                            "pid": std::process::id(),
+                        }),
+                    );
+                }
+                return Ok(ManagedCliInstallLock {
+                    file,
+                    home: home.to_path_buf(),
+                    path,
+                });
+            }
+            let error = std::io::Error::last_os_error();
+            if !managed_cli_install_lock_is_busy(&error) {
+                return Err(anyhow!(error))
+                    .with_context(|| format!("locking managed cli install {}", path.display()));
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "another yggterm process has been installing managed CLIs for over {}ms \
+                     (lock {}); refusing to write the toolchain concurrently",
+                    wait_ms,
+                    path.display()
+                );
+            }
+            if !waited {
+                waited = true;
+                append_trace_event(
+                    home,
+                    "managed_cli",
+                    "install",
+                    "lock_busy",
+                    serde_json::json!({
+                        "path": path.display().to_string(),
+                        "pid": std::process::id(),
+                    }),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (home, wait_ms);
+        Ok(ManagedCliInstallLock {})
+    }
+}
+
 fn install_latest(
     paths: &ManagedCliPaths,
     tools: &[ManagedCliTool],
     background: bool,
 ) -> Result<()> {
+    // ⛔ ONE WRITER PER MACHINE, across processes. Held for the WHOLE function
+    // rather than around the npm batch alone: uv and the vendor scripts install
+    // into `~/.local/bin`, which every other lane also reads and writes, so the
+    // resource being serialised is "this machine's managed toolchain", not "the
+    // npm prefix". See [`ManagedCliInstallLock`] for the measurement.
+    let _install_guard = acquire_managed_cli_install_lock(&paths.home)?;
+
     // ⛔ Each method runs SEPARATELY, and only the npm ones are batched. npm
     // fails a whole `install -g` batch on one unresolvable name, so a uv or
     // vendor CLI appended to that line would not install the wrong package — it
