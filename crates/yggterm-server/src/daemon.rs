@@ -4057,6 +4057,21 @@ impl DaemonRuntime {
                 session.working = screen_text
                     .as_deref()
                     .map(|screen| descriptor.screen_shows_working(screen));
+            } else if session.kind == SessionKind::Shell
+                && crate::launch_command_is_local_app_verb(&session.launch_command)
+            {
+                // ⛔ AN APP ROW IS NOT "WORKING", IT IS RUNNING. The foreground
+                // test below is a fair proxy for a shell — commands start, run,
+                // finish — and flatly wrong for a row whose whole job is to hold
+                // ONE long-lived foreground process. Owner-reported 2026-08-09:
+                // *"on restart all my ychromes keep on blinking."* Measured: one
+                // `ychrome` per launcher shell, state `Sl+` (foreground group),
+                // hours old, so `foreground_process_active` answered `true`
+                // truthfully and forever.
+                // `Some(false)`, never `None`: the row is confidently NOT
+                // working, and `None` would mean "nobody knows", which invites
+                // the carry-forward in `apply_snapshot` to keep a stale blink.
+                session.working = Some(false);
             } else if session.kind == SessionKind::Shell {
                 // Issue #1 ("shell always working"): a plain shell has no agent
                 // footer to scrape — its working state is the OS fact "a
