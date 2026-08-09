@@ -165,9 +165,31 @@ the broken path. An in-place `mv` hands off correctly *on the old code*, which i
 how 3.0.78 gets onto a host still running 3.0.7x without paying the cost one last
 time. ⇒ deploy in place; see the `guihost` entry below for that host's own hazard.
 
-⚠ **What the sandbox does NOT prove:** it exercised ONE daemon owning ONE local
-PTY. `guihost` runs FIVE coexisting daemons and the busiest owns five rows, four of
-them `remote-cc://` bridges. The multi-daemon, multi-bridge handoff is untested.
+### ⭐ LIVE-PROVEN ON `guihost` — 3.0.78 DEPLOYED IN PLACE, 43 ROWS IN, 43 ROWS OUT
+
+The sandbox exercised one daemon and one local PTY; `guihost` runs FIVE coexisting
+daemons and the busiest owned five rows, four of them `remote-cc://` bridges. So
+the recipe was run for real, 2026-08-09 14:28, `mv` in place over all four paths,
+no GUI restart, `*.old.*` deliberately untouched:
+
+```
+14:28:33  523808  daemon_self_retire  exe_link:"…/yggterm-headless (deleted)"
+                                      retire_trigger:"disk_binary_replaced"
+14:28:43  523808  daemon_self_retire_handoff_ok
+                  "hot update handoff started: preserving 10 live terminal runtime(s)"
+14:28:47  864647  (3.0.78) pty_handoff_listener_bound
+```
+
+**`handoff_ok`, not `_skipped` — the exact inversion of the incident**, on a
+daemon still running the OLD 3.0.76 code, which is the third sandbox arm holding
+at scale. `server app rows` before and after: **43 → 43, nothing lost, nothing
+invented.** The agent rows stayed on their original PTYs under the preserved
+owner while progressive migration drained them to the successor one at a time.
+
+⚠ **What is still NOT proven, and it is the other half of the falsifier:** the
+CLICK. This proves the swap no longer destroys the row; it does not prove that
+clicking a row owned by an older daemon opens it. Testing that means taking the
+owner's viewport, so it waits for a moment when that is his to give.
 
 ### WHAT IS STILL OPEN UNDER THIS ENTRY
 
