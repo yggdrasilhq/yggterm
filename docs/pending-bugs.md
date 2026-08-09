@@ -99,10 +99,27 @@ the sharper question ("is this MY session?") that ancestry can only approximate.
 Read ownership there; keep the ancestry walk at most as a fallback for processes
 predating the marker.
 
-⚠ Check before building: confirm the marker is exported on EVERY agent launch
-path (local, remote, ssh, command rows), or the fix will be
-[[finding-a-claim-proven-on-one-lane-is-not-proven]] again — `shell_exports` is
-the place to prove it.
+⭐ **And the question already has an owner — do not write a second answer.**
+`session_tenancy.rs` exists to say *"which session does this process belong
+to"*, and `parent_session_path_from_env` (`session_tenancy.rs:96`) already reads
+the key list **`["YGGTERM_SESSION_ID", "LC_YGGTERM_SESSION_ID"]`**. The resume
+guard is asking that same question a second, worse way; the fix is to collapse
+the duplicate, per `CLAUDE.md` §single source of truth.
+
+⛔ **The `LC_` twin is not redundancy, and missing it would break exactly the
+remote rows this bug is about:** `session_tenancy.rs:93` records that **sshd
+strips `YGGTERM_SESSION_ID`**, so on any ssh-borne row the marker survives only
+as `LC_YGGTERM_SESSION_ID`. A fix that reads one name would work locally and fail
+on every remote row — [[finding-a-claim-proven-on-one-lane-is-not-proven]].
+
+⚠ Two things to check before building, both cheap:
+- `parent_session_path_from_env` reads **this** process's env via `std::env`; the
+  guard needs the env of a CANDIDATE pid (`/proc/<pid>/environ`). Add the sibling
+  read **in that module** so the key list and the sshd caveat keep one home —
+  do not copy the names into `lib.rs`.
+- `terminal.rs:3278/3289` sets both names on the PTY spawn. Confirm that is the
+  funnel EVERY agent launch passes through (local, remote, ssh, command rows)
+  before relying on the marker.
 
 ⚠ **Do not file this as "the deployer should be more careful."** Deploying over a
 running daemon is sanctioned and routine (`docs/agent-field-guide.md` §4); the
