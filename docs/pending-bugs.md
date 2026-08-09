@@ -219,11 +219,30 @@ An amber dot cannot restore the signal, but it can stop the app asserting a
 liveness verdict it does not hold — which is the half that cost the owner his
 time. ⛔ Wiring it means editing that DESIGN.md section first; it says so.
 
+⛔ **NEGATIVE RESULT, measured 2026-08-09 ~17:40 — do not re-chase this.** The
+tempting next step is "the race must be visible as a flickering dot, so fix the
+clobber and watch the flicker stop". **It is not visible at 1 Hz.** On the GUI
+host, whose daemon owns **0 of 39 rows** — so every single row is proxied and
+every one is subject to the race — `server app rows` sampled once a second for 14
+seconds returned a *stable* busy set (7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 7, 7, 7),
+and the single 6 is consistent with one agent genuinely ending a turn.
+
+⇒ The mechanism above is real and code-cited, but the snapshot apply is **rare
+relative to the 2.5 s poll**, so the clobber is a brief dropout rather than a
+sustained flicker, and a working row's dot mostly holds its polled value. ⚠ **So
+the visible payoff of fixing the clobber alone is UNMEASURED**, and a fix shipped
+on the flicker theory would be shipped on nothing. Measure the dropout window
+first (sub-second sampling of the `data-sidebar-live-session-working` attribute,
+or trace the apply), or go straight for the part that IS user-visible: the
+permanent dark dot once the owner is unreachable.
+
 **Falsifier:** with a row's owning daemon retired and the agent mid-turn, the
 row's indicator still blinks. **Cheaper intermediate falsifier for the mechanism
-above:** on a GUI whose daemon owns few of its rows, watch `working_edge` in the
-UI telemetry — `working_flags_poll` and `snapshot_apply` should be seen writing
-the same row in opposite directions.
+above:** on a GUI whose daemon owns few of its rows, sample the dot's
+`data-sidebar-live-session-working` attribute FASTER THAN THE SNAPSHOT CADENCE
+and look for dropouts on a row the poll is reporting as working — 1 Hz is too
+slow, as measured above. (`working_edge` telemetry cannot see it: that trace
+skips `None` entirely, so the clobber leaves no edge.)
 
 ## ⛔ A DAEMON SERVES ONE REQUEST AT A TIME, AND A HOT-RESTART REQUEST HOLDS IT FOR ~11 SECONDS — so anything else asking that daemon waits
 
