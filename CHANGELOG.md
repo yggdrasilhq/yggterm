@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **`yggterm-headless server daemons` — one command that lists every background
+  service on the machine.** yggterm keeps older services alive on purpose so that
+  work already running is never interrupted by an update, but until now nothing
+  could show you them: each command answered only for the service matching its
+  own version. The new listing gives one line per service — version, how long it
+  has been up, which binary it is running (flagged when that binary has since
+  been replaced), how many terminals it is actually holding, and, if it is
+  waiting to retire, what it is waiting for. It also distinguishes a service that
+  is *about* to hand over from one that is deliberately staying put, which read
+  identically before. `--json` for scripts. First run on the development machine
+  found 28 of them, holding 58 terminals between them, the oldest running for 27
+  days.
+
 - **An internal safety check had been silently switched off for a week.** The
   project runs a set of architecture checks on every change; one of them pointed
   at a file that moved out to a separate library on 2 August. Rather than
