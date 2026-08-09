@@ -23,8 +23,20 @@ cd "$(dirname "$0")/.." || exit 2
 fail=0
 note() { echo "privacy: $*" >&2; fail=1; }
 
-# Tracked files only, minus vendored/third-party trees and binary-ish assets.
-files=$(git ls-files \
+# Tracked files AND untracked-but-not-ignored ones, minus vendored/third-party
+# trees and binary-ish assets.
+#
+# ⛔ WHY UNTRACKED FILES ARE IN SCOPE, learned 2026-08-09: this checker is meant
+# to run BEFORE a commit, and before a commit a newly written doc is exactly
+# `??` — untracked. Scanning `git ls-files` alone therefore reported "ok" on a
+# file containing a real home path, a private store name and a host name,
+# because the file had not been added yet. The one moment the lock exists to
+# cover was the one moment it could not see. Verified by writing a deliberately
+# leaky file and watching the checker pass.
+#
+# `--exclude-standard` keeps .gitignore'd build output out, so this stays fast
+# and does not flood on target/ or node_modules.
+files=$(git ls-files --cached --others --exclude-standard \
   | grep -vE '^(vendor|third_party|node_modules)/' \
   | grep -vE '^assets/' \
   | grep -vE '(Cargo\.lock|\.b64|\.woff2?|\.png|\.jpg|\.ico|\.gz|\.zip)$' \
