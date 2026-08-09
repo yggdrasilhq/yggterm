@@ -699,6 +699,42 @@ it is worse — see the paste-draft entry below. Fixed in 3.0.85.
 **Falsifier:** deploy a version bump across the fleet while he types into a row,
 and every keystroke is acknowledged inside a second.
 
+## ⛔ A ROW WITH A DRAFT IN IT CAN NEVER BE BOOTED AGAIN, AND NOTHING SAYS SO — the booter skips it silently, forever
+
+**Status:** OPEN
+
+`ygg-booter.py`'s `tick` handles a draft refusal correctly as far as it goes: a
+refusal is not a failed boot, so it gives the attempt back (`s["boots"] -= 1`)
+and retries next tick. **But there is no exit from that state.** `boots` can
+never reach `MAX_BOOTS`, so the escalation branch is unreachable, `escalated` is
+never set, and the row is skipped on every tick from then on — visible only as a
+`SKIP:drafting` line in a log nobody reads.
+
+⇒ **He half-types a sentence into a row, walks away, and that row is removed from
+the watchdog's care permanently without anyone being told.** The shape is the
+one this project keeps re-finding: a guard that is right about the moment and
+wrong about the *forever* — see
+[`agent-field-guide.md`](agent-field-guide.md) and the retire-gate entry.
+
+⚠ **This was widened by the 3.0.85 paste-draft fix, and that is why it is filed
+here rather than left for someone to trip over.** Before it, a pasted multi-line
+draft read as "no draft", so those rows were still bootable — by accident, via a
+bug. Now that the flag is correct, a pasted draft correctly refuses boots, which
+makes this silent-skip state genuinely reachable for the first time. **A correct
+signal reaching a reader with no exit condition is not neutral.**
+
+⚖ Note the two arms want different answers and neither is "boot anyway": a
+draft the OWNER typed must never be typed over (that is the whole point of
+`--refuse-if-draft`), but it should be *escalated* — he is the only one who can
+clear it. A draft left by a failed boot is our own litter and should be cleared
+by us, not treated as his sentence. The booter cannot currently tell the two
+apart, and distinguishing them is the real work here.
+
+**Falsifier:** leave an unsubmitted draft in a subscribed row and let it go idle
+past its boot window. Today the log prints `SKIP:drafting` forever and no card is
+ever sent. It should escalate once, name the row, and say the draft is what is
+blocking it.
+
 ## ⛔ THE DAEMON'S MODEL OF THE COMPOSER STILL READS A BARE `\n` AS A SUBMIT — right for a shell, wrong for every agent row
 
 **Status:** OPEN
