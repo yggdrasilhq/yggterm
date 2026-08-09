@@ -1,5 +1,6 @@
 use crate::{
-    ManagedCliTool, run_remote_ensure_managed_cli, run_remote_generation_context,
+    ManagedCliRefreshMode, ManagedCliTool, run_remote_ensure_managed_cli,
+    run_remote_generation_context,
     run_remote_cc_rename, run_remote_local_codex_identities, run_remote_preview,
     run_remote_preview_head,
     run_remote_preview_tail, run_remote_protocol_version, run_remote_refresh_managed_cli,
@@ -43,7 +44,7 @@ pub enum RemoteServerCommand {
         cwd: Option<String>,
     },
     RefreshManagedCli {
-        background: bool,
+        mode: ManagedCliRefreshMode,
     },
     EnsureManagedCli {
         tool: ManagedCliTool,
@@ -238,7 +239,7 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
                 .filter(|value| !value.is_empty()),
         },
         "refresh-managed-cli" if args.len() >= 4 => RemoteServerCommand::RefreshManagedCli {
-            background: args[3] == "background",
+            mode: ManagedCliRefreshMode::from_wire_word(&args[3]),
         },
         "ensure-managed-cli" if args.len() >= 4 => RemoteServerCommand::EnsureManagedCli {
             tool: parse_managed_cli_tool(&args[3])?,
@@ -347,9 +348,7 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
         RemoteServerCommand::StartCc { session_id, cwd } => {
             run_remote_start_cc(&session_id, cwd.as_deref())
         }
-        RemoteServerCommand::RefreshManagedCli { background } => {
-            run_remote_refresh_managed_cli(background)
-        }
+        RemoteServerCommand::RefreshManagedCli { mode } => run_remote_refresh_managed_cli(mode),
         RemoteServerCommand::EnsureManagedCli { tool } => run_remote_ensure_managed_cli(tool),
         RemoteServerCommand::Scan { codex_home } => run_remote_scan(codex_home.as_deref()),
         RemoteServerCommand::Apps => run_remote_apps(),

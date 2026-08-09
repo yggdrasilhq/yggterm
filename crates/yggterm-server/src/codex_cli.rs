@@ -362,6 +362,73 @@ impl ManagedCliPaths {
     }
 }
 
+/// WHY a managed-CLI refresh is happening, which is the only thing that decides
+/// whether it may install.
+///
+/// ⛔ This replaces a bare `background: bool` that was answering two unrelated
+/// questions at once — *"may I spend time?"* and *"may I install?"* — and the
+/// conflation is precisely why the fleet pipeline the owner asked for twice
+/// could not be built out of the engine that already existed. A scheduled sweep
+/// wants the TTL (its whole job is cadence) **and** the install (its whole job
+/// is keeping the CLIs current); `background: true` gave it the first and
+/// forbade the second, `background: false` gave it the second and threw away
+/// the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedCliRefreshMode {
+    /// A human, or an explicit CLI verb, asked for it. Install now and ignore
+    /// the TTL — someone is waiting on the answer and asked for it by name.
+    Foreground,
+    /// Incidental: a focus, an attach or a launch brushed the provisioning path.
+    /// Respect the TTL **and** defer every install behind
+    /// `YGGTERM_MANAGED_CLI_BACKGROUND_INSTALL`. ⛔ Do not weaken this arm — it
+    /// fires on the owner's hot paths, and an npm/uv run there is the fan and
+    /// CPU regression that got background installs opted out of in the first
+    /// place.
+    Incidental,
+    /// The scheduled fleet sweep. Respect the TTL — the chore's own cadence plus
+    /// the TTL is the pacing — but DO install, because installing and updating
+    /// every CLI on every connected machine is the entire reason the sweep runs.
+    Scheduled,
+}
+
+impl ManagedCliRefreshMode {
+    /// The legacy wire/flag word. `Scheduled` reports itself as background so a
+    /// remote binary too old to know the mode still gets the cheaper arm.
+    pub fn is_background(self) -> bool {
+        !matches!(self, Self::Foreground)
+    }
+
+    /// Whether a refresh this recent may be skipped outright.
+    fn respects_ttl(self) -> bool {
+        !matches!(self, Self::Foreground)
+    }
+
+    /// Whether installs are deferred rather than performed. Only the incidental
+    /// arm defers; see the variant docs.
+    fn defers_installs(self) -> bool {
+        matches!(self, Self::Incidental)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground",
+            Self::Incidental => "background",
+            Self::Scheduled => "scheduled",
+        }
+    }
+
+    /// Parse the word a remote `yggterm server remote refresh-managed-cli`
+    /// carries. Unknown words mean foreground, which is what the pre-mode
+    /// `args[3] == "background"` comparison already did.
+    pub fn from_wire_word(raw: &str) -> Self {
+        match raw.trim() {
+            "background" => Self::Incidental,
+            "scheduled" => Self::Scheduled,
+            _ => Self::Foreground,
+        }
+    }
+}
+
 pub fn managed_cli_refresh_ttl_ms() -> u64 {
     env::var(MANAGED_CLI_REFRESH_TTL_ENV)
         .ok()
@@ -653,11 +720,15 @@ fn managed_cli_has_existing_managed_install(probes: &[(ManagedCliTool, ToolProbe
         .any(|(_, probe)| probe.source == Some(ManagedCliBinarySource::Managed))
 }
 
+/// Whether the very FIRST managed install on a machine waits for an explicit
+/// launch. Incidental refreshes defer it; a scheduled sweep does not, because a
+/// machine the owner has not opened in a week is exactly the one the sweep
+/// exists to provision.
 fn managed_cli_should_defer_initial_install(
-    background: bool,
+    mode: ManagedCliRefreshMode,
     probes: &[(ManagedCliTool, ToolProbe)],
 ) -> bool {
-    background && !managed_cli_has_existing_managed_install(probes)
+    mode.defers_installs() && !managed_cli_has_existing_managed_install(probes)
 }
 
 fn managed_cli_background_install_enabled() -> bool {
@@ -673,7 +744,7 @@ fn managed_cli_background_install_enabled() -> bool {
 }
 
 fn managed_cli_refresh_should_attempt_install(
-    background: bool,
+    mode: ManagedCliRefreshMode,
     provisioner_available: bool,
     skipped_recently: bool,
     install_deferred: bool,
@@ -682,7 +753,7 @@ fn managed_cli_refresh_should_attempt_install(
     provisioner_available
         && !skipped_recently
         && !install_deferred
-        && (!background || background_install_enabled)
+        && (!mode.defers_installs() || background_install_enabled)
 }
 
 fn managed_cli_deferred_install_detail(tool: ManagedCliTool, probe: &ToolProbe) -> String {
@@ -1373,34 +1444,95 @@ mod tests {
                 available: true,
             },
         )];
-        assert!(managed_cli_should_defer_initial_install(true, &system_only));
-        assert!(!managed_cli_should_defer_initial_install(
-            false,
+        assert!(managed_cli_should_defer_initial_install(
+            ManagedCliRefreshMode::Incidental,
             &system_only
         ));
         assert!(!managed_cli_should_defer_initial_install(
-            true,
+            ManagedCliRefreshMode::Foreground,
+            &system_only
+        ));
+        assert!(!managed_cli_should_defer_initial_install(
+            ManagedCliRefreshMode::Incidental,
             &managed_present
+        ));
+        // The scheduled sweep exists to provision the machine nobody has
+        // opened. Deferring its FIRST install would be deferring the whole
+        // point of it — a machine with no managed install would never get one.
+        assert!(!managed_cli_should_defer_initial_install(
+            ManagedCliRefreshMode::Scheduled,
+            &system_only
         ));
     }
 
     #[test]
     fn background_managed_cli_refresh_requires_install_opt_in() {
+        use ManagedCliRefreshMode::{Foreground, Incidental};
         assert!(!managed_cli_refresh_should_attempt_install(
-            true, true, false, false, false
+            Incidental, true, false, false, false
         ));
         assert!(managed_cli_refresh_should_attempt_install(
-            true, true, false, false, true
+            Incidental, true, false, false, true
         ));
         assert!(managed_cli_refresh_should_attempt_install(
-            false, true, false, false, false
+            Foreground, true, false, false, false
         ));
         assert!(!managed_cli_refresh_should_attempt_install(
-            true, true, true, false, true
+            Incidental, true, true, false, true
         ));
         assert!(!managed_cli_refresh_should_attempt_install(
-            true, true, false, true, true
+            Incidental, true, false, true, true
         ));
+    }
+
+    /// ⭐ The load-bearing property of the third mode, and the reason it exists
+    /// rather than a third `bool`: the scheduled sweep must be TTL-gated (so a
+    /// redundant fan-out from a second daemon costs a probe, not an install)
+    /// and must still INSTALL (so a machine the owner has not opened in a week
+    /// actually gets its CLIs). No setting of the old `background: bool` gives
+    /// both — `true` forbids the install, `false` throws away the TTL.
+    #[test]
+    fn a_scheduled_refresh_keeps_the_ttl_and_still_installs() {
+        use ManagedCliRefreshMode::{Foreground, Incidental, Scheduled};
+
+        assert!(Scheduled.respects_ttl(), "the sweep is paced by the TTL");
+        assert!(
+            !Scheduled.defers_installs(),
+            "a sweep that installs nothing is not an install pipeline"
+        );
+        assert!(Incidental.respects_ttl() && Incidental.defers_installs());
+        assert!(!Foreground.respects_ttl() && !Foreground.defers_installs());
+
+        // With no opt-in env — the default on every machine — the scheduled
+        // sweep installs and the incidental refresh does not.
+        assert!(managed_cli_refresh_should_attempt_install(
+            Scheduled, true, false, false, false
+        ));
+        assert!(!managed_cli_refresh_should_attempt_install(
+            Incidental, true, false, false, false
+        ));
+        // …and a TTL skip still stops the sweep, which is what keeps a
+        // redundant fan-out cheap.
+        assert!(!managed_cli_refresh_should_attempt_install(
+            Scheduled, true, true, false, false
+        ));
+    }
+
+    /// A remote binary older than this change compares `args[3] == "background"`
+    /// and has never heard of `scheduled`. It must not accidentally read as the
+    /// deferring arm, and the word must survive its own round trip.
+    #[test]
+    fn the_refresh_mode_wire_word_round_trips_and_degrades_to_foreground() {
+        use ManagedCliRefreshMode as Mode;
+        for mode in [Mode::Foreground, Mode::Incidental, Mode::Scheduled] {
+            assert_eq!(Mode::from_wire_word(mode.as_str()), mode, "{mode:?}");
+        }
+        assert_eq!(Mode::from_wire_word("nonsense"), Mode::Foreground);
+        assert_eq!(Mode::from_wire_word(""), Mode::Foreground);
+        // An old remote binary sees a word that is not "background", so it runs
+        // its foreground arm: it installs and ignores its TTL. That is a
+        // DEGRADED sweep, never a silent no-op.
+        assert_ne!(Mode::Scheduled.as_str(), "background");
     }
 
     #[test]
@@ -3266,7 +3398,10 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
     Ok(status)
 }
 
-pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRefreshReport> {
+pub(crate) fn refresh_local_managed_cli(
+    mode: ManagedCliRefreshMode,
+) -> Result<ManagedCliRefreshReport> {
+    let background = mode.is_background();
     let paths = ManagedCliPaths::resolve()?;
     let now_ms = current_time_ms();
     let ttl_ms = managed_cli_refresh_ttl_ms();
@@ -3276,6 +3411,7 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
         "managed_cli",
         "refresh_begin",
         serde_json::json!({
+            "mode": mode.as_str(),
             "background": background,
             "ttl_ms": ttl_ms,
         }),
@@ -3310,7 +3446,7 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
     let mut background_install_deferred = false;
     let mut skipped_recently = false;
     let mut ttl_remaining_ms = None::<u64>;
-    if background && provisioner_available {
+    if mode.respects_ttl() && provisioner_available {
         ttl_remaining_ms =
             managed_cli_refresh_skip_remaining_ms(&before, &refresh_state, now_ms, ttl_ms);
         skipped_recently = ttl_remaining_ms.is_some();
@@ -3328,7 +3464,7 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
             );
         }
         install_deferred =
-            !skipped_recently && managed_cli_should_defer_initial_install(background, &before);
+            !skipped_recently && managed_cli_should_defer_initial_install(mode, &before);
         if install_deferred {
             append_trace_event(
                 &paths.home,
@@ -3336,12 +3472,17 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
                 "managed_cli",
                 "refresh_defer_initial_install",
                 serde_json::json!({
+                    "mode": mode.as_str(),
                     "background": background,
                     "reason": "missing_managed_install",
                 }),
             );
         }
-        if !skipped_recently && !install_deferred && !background_install_enabled {
+        if !skipped_recently
+            && !install_deferred
+            && mode.defers_installs()
+            && !background_install_enabled
+        {
             install_deferred = true;
             background_install_deferred = true;
             append_trace_event(
@@ -3350,6 +3491,7 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
                 "managed_cli",
                 "refresh_defer_background_install",
                 serde_json::json!({
+                    "mode": mode.as_str(),
                     "background": background,
                     "reason": "background_install_opt_in_required",
                     "env": MANAGED_CLI_BACKGROUND_INSTALL_ENV,
@@ -3358,7 +3500,7 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
         }
     }
     if managed_cli_refresh_should_attempt_install(
-        background,
+        mode,
         provisioner_available,
         skipped_recently,
         install_deferred,
