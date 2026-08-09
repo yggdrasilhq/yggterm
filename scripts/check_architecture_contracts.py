@@ -19,7 +19,30 @@ FAILURES: list[str] = []
 
 
 def read(path: str) -> str:
-    return (ROOT / path).read_text(encoding="utf-8")
+    """Read a contract's subject, or record its absence and keep going.
+
+    ⛔ This used to let `FileNotFoundError` escape, and that turned a moved file
+    into an ABORT rather than a failure. On 2026-08-02 the 3.0.0 separation took
+    `crates/yggui` out to libyggterm (commit 3a51d499); four assertions still
+    named `crates/yggui/src/theme.rs`, so from that day the script died on the
+    5th of its 10 check groups and the five after it — including the hot-update
+    and GUI-binary contracts — never ran again. Seven days, in CI, on every push.
+
+    A crash is not a failing assertion; it is no assertion at all, and it hides
+    every assertion behind it. A contract whose subject has left the repo is an
+    UNENFORCED INVARIANT and must say so by name, in the same report as
+    everything else. See [[finding-a-red-target-hides-every-test-behind-it]].
+    """
+    try:
+        return (ROOT / path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        fail(
+            f"{path}: SUBJECT FILE IS MISSING — every contract naming it is "
+            "unenforced. Either the file moved (re-point the contract) or it "
+            "left the repo (delete the contract and say where the invariant "
+            "went); do not leave it dangling."
+        )
+        return ""
 
 
 def fail(message: str) -> None:
@@ -239,26 +262,18 @@ def check_stable_theme_contract() -> None:
         r"fn linux_compositor_blur_active_for_app_control\(\) -> bool\s*\{\s*false\s*\}",
         "stable app-control must report compositor blur inactive",
     )
-    require_contains(
-        "crates/yggui/src/theme.rs",
-        "const STABLE_THEME_ALPHA: f32 = 0.96;",
-        "stable alpha must be pinned",
-    )
-    require_contains(
-        "crates/yggui/src/theme.rs",
-        "const STABLE_THEME_GRAIN: f32 = 0.0;",
-        "stable grain must be pinned",
-    )
-    require_contains(
-        "crates/yggui/src/theme.rs",
-        "next.alpha = STABLE_THEME_ALPHA;",
-        "saved alpha must clamp before rendering",
-    )
-    require_contains(
-        "crates/yggui/src/theme.rs",
-        "next.grain = STABLE_THEME_GRAIN;",
-        "saved grain must clamp before rendering",
-    )
+    # ⛔ The alpha/grain pin is NOT asserted here any more, and its absence is
+    # deliberate rather than an oversight: `crates/yggui` left this repo for
+    # libyggterm in the 3.0.0 separation (3a51d499, 2026-08-02) and now arrives
+    # as a git dependency pinned by tag. A contract in this repo cannot reach
+    # into a pinned dep's source, and the four assertions that tried to were
+    # what crashed this whole script for seven days.
+    #
+    # ⚠ The invariant itself is real and currently UNGUARDED — the constants
+    # still hold their values in libyggterm's `crates/yggui/src/theme.rs`, but
+    # nothing over there asserts them, so a tag bump could change the stable
+    # theme silently. Its guard belongs in libyggterm's own CI; tracked in this
+    # repo's queue because this repo is what depends on it.
     for needle in [
         "live_blur_supported=false",
         "css_backdrop_filter_enabled=false",

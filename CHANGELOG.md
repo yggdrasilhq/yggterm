@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **An internal safety check had been silently switched off for a week.** The
+  project runs a set of architecture checks on every change; one of them pointed
+  at a file that moved out to a separate library on 2 August. Rather than
+  reporting that, the checker crashed on it — and a crash meant the five groups
+  of checks that came after it stopped running too. Nothing had actually drifted
+  in that week, but nothing would have been caught if it had. The checker now
+  reports a missing subject and carries on, so one stale reference can no longer
+  take the rest down with it, and the check now runs in the ordinary test suite
+  instead of only on the build server.
+
 - **A plain terminal is no longer closed by yggterm tidying up after an update.**
   An old background service retires once the sessions it is holding go quiet.
   For an agent session that is safe — the agent keeps its own history and simply
