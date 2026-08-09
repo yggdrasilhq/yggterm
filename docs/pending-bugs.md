@@ -13,6 +13,64 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⛔⛔ A DEPLOY STRANDS THE DEPLOYER'S OWN ROW: THE WORKING DOT GOES STILL, THE CLICK BLOCKS A MINUTE, AND THE RE-RESUME KILLS THE WORK
+
+**Status:** OPEN
+
+⚖ **The CONSTITUTION's *"a session owned by an OLDER daemon is still a
+first-class row in the current GUI, and clicking it must WORK"* failing, reported
+by the owner 2026-08-09 ~12:13 while it was happening to him.** He saw an agent
+row's working indicator stop blinking, went to check on it, and **could not do
+anything for about a minute**.
+
+**Measured timeline, one host (`dev`), one row (`remote-cc://dev/bb658b4b…`):**
+
+| time | event |
+|---|---|
+| 12:01:34 | a session installs 3.0.77 over `~/.yggterm/bin/yggterm-headless` |
+| 12:09:24 | a NEW daemon (pid 12141) starts from that path; the row's PTY still belongs to the superseded one |
+| 12:13 | the owner clicks the row. The viewport shows a raw `Error:` line and nothing else for ~1 min |
+| after | the row attaches as a **brand-new** `claude --resume` process; every background job the old process had in flight is gone |
+
+The error he was shown, verbatim:
+
+```
+Error: yggterm: Codex session <uuid> is already active outside Yggterm (pid 3942934);
+waiting instead of starting a second resume. Close that external terminal to let Yggterm attach.
+```
+
+⇒ **Three separate defects share this one cause, and each is worth fixing on its
+own terms:**
+
+1. ⛔ **The liveness instrument goes dark, so a HEALTHY session reads as
+   stalled.** The working indicator is fed by PTY output from the daemon that
+   OWNS the row; once ownership is stranded the GUI has no stream at all, and a
+   still dot is indistinguishable from a dead agent. Two instruments disagreed
+   and the wrong one was on screen: the booter, reading transcript activity,
+   logged `WORKING` at 11:46 · 11:51 · 11:56 · 12:01 · 12:06 · 12:11 throughout —
+   it was right, and it correctly declined to boot a row that was not stalled.
+   ⇒ [[finding-agent-session-liveness-is-invisible-to-os-signals]]
+2. ⛔ **The guard is correct and its PRESENTATION is the bug.** Refusing a second
+   resume is right. Printing one `Error:` line into a blank viewport and then
+   blocking with no progress, no elapsed time and no way out is what turned a
+   correct refusal into a minute of the owner's time. ⚠ It also names a pid
+   (`3942934`) that **no longer exists** by the time anyone looks, so the one
+   actionable instruction it gives — *"close that external terminal"* — points at
+   nothing.
+3. ⛔⛔ **The re-resume DESTROYS in-flight work.** The row came back as a new
+   process, so the stranded one's running jobs (here: a full `cargo test
+   --workspace`, ~20 min in) died with it, silently and with no record. This is
+   the constitution's *"they never stall their work waiting for ours"* inverted —
+   **our deploy did not stall the other agent's work, it deleted it** — and the
+   agent it happened to was the one that ran the deploy.
+
+⚠ **Do not file this as "the deployer should be more careful."** Deploying over a
+running daemon is sanctioned and routine (`docs/agent-field-guide.md` §4); the
+architecture promises the row survives it. **The falsifier:** with a live agent
+row mid-work on host H, deploy a new daemon to H, then click that row from the
+GUI — it must attach to the SAME process, keep its jobs, and never show a raw
+error.
+
 ## ⛔⛔ A PLAIN SHELL DIES ACROSS A HANDOVER AND A WEB-SURFACE ROW BESIDE IT SURVIVES — SAME PRESERVED LIST, OPPOSITE OUTCOMES
 
 **Status:** OPEN
