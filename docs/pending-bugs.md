@@ -13,6 +13,40 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⚠ THE `yggterm-shell` TEST TARGET READS THE DEVELOPER'S LIVE `~/.claude/projects` — 40 MINUTES, AND GROWING FOREVER
+
+**Status:** OPEN
+
+Measured on `dev` 2026-08-09, during a routine `cargo test --workspace
+--no-fail-fast`:
+
+- `yggterm-shell --lib` alone reported `finished in 2386.60s` — **39.8 minutes**,
+  the whole cost of the suite for practical purposes;
+- while it ran, the test binary held **open file descriptors on real session
+  transcripts** under `/home/user/.claude/projects/-home-pi-gh-yggterm/*.jsonl`;
+- that store is **960 MB across 655 `.jsonl` files** on this host today.
+
+⇒ A test is walking the developer's **actual Claude Code history** rather than a
+fixture. That breaks `CLAUDE.md` §*No non-determinism* — *"do not introduce
+behavior that differs based on timing, environment, or ordering that the code
+does not control"* — in the most literal way available: the input is a live,
+per-machine, monotonically growing directory that no test controls. Two agents on
+two hosts run different tests; the same agent runs a slower one every week.
+
+⚠ **WHAT IS NOT PINNED, stated so nobody quotes this as more than it is: WHICH
+test opens those files.** The open fds prove the target does it; they do not name
+the case. Grepping `yggterm-shell` for `home_dir()` finds only `store.home_dir()`
+(the *yggterm* home, a different path), so the read most likely arrives through a
+shared crate — `AgentCliDescriptor.session_store_globs` is
+`".claude/projects/*/*.jsonl"` (`yggterm-core/src/agent_cli.rs:1296`) and is the
+obvious place to start.
+
+**Falsifier, cheap:** run `-p yggterm-shell --lib` with `HOME` pointed at an empty
+scratch dir. If the runtime collapses, the scan is the cost and the fix is a
+fixture; if it does not, the 40 minutes are real work and this entry is wrong.
+⛔ Do that before optimising anything — a slow suite everyone pays for is worth
+one measurement, not a guess.
+
 ## ⛔⛔ A DEPLOY STRANDS THE DEPLOYER'S OWN ROW: THE WORKING DOT GOES STILL, THE CLICK BLOCKS A MINUTE, AND THE RE-RESUME KILLS THE WORK
 
 **Status:** OPEN
