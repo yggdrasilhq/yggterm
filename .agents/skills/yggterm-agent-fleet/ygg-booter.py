@@ -375,8 +375,9 @@ def boot(host, row, dry):
     if dry:
         log(f"DRY-RUN would boot {row}")
         return "dry-run"
-    if _pty_type_and_enter(host, row):
-        return "pty-write"
+    outcome = _pty_type_and_enter(host, row)
+    if outcome:
+        return outcome
     r = _run(host, ["server", "app", "terminal", "submit", row, "--stdin"], BOOT_TEXT)
     if _field(r.stdout or "", "submitted") is True:
         return "submit"
@@ -387,13 +388,26 @@ def _pty_type_and_enter(host, row):
     """Type the boot text, pause, then press Enter — as TWO writes.
 
     The 80 ms mirrors `shell.rs`'s own submit path exactly; see `boot`'s §3 for
-    why a concatenated Enter reads as pasted content rather than a submit."""
-    typed = _run(host, ["server", "terminal", "write", row, "--stdin"], BOOT_TEXT)
+    why a concatenated Enter reads as pasted content rather than a submit.
+
+    ⛔ `--refuse-if-draft` is not optional politeness. A PTY write APPENDS, so if
+    the owner half-typed a sentence into this row and walked away — which is
+    precisely the shape of a row a watchdog calls idle — an unguarded boot glues
+    `continue, the booter booted` onto the end of HIS sentence and submits the
+    pair. The guard is evaluated by the daemon that OWNS the PTY (the only one
+    that can see a draft) and is therefore TOCTOU-free.
+    ⚠ A pre-3.0.83 owner ignores the flag, so acceptance is not proof the guard
+    ran. That is the honest limit and it is why the return distinguishes a
+    refusal rather than folding it into failure."""
+    typed = _run(host, ["server", "terminal", "write", row, "--stdin",
+                        "--refuse-if-draft"], BOOT_TEXT)
+    if _field(typed.stdout or "", "refused_for_draft") is True:
+        return "refused-draft"
     if _field(typed.stdout or "", "accepted") is not True:
-        return False
+        return ""
     time.sleep(0.08)
     enter = _run(host, ["server", "terminal", "write", row, "--stdin"], "\r")
-    return _field(enter.stdout or "", "accepted") is True
+    return "pty-write" if _field(enter.stdout or "", "accepted") is True else ""
 
 
 def escalate(host, row, why):
@@ -477,21 +491,34 @@ def tick(args):
             else:
                 s["boots"] += 1
                 via = boot(host, row, args.dry_run)
-                # Say WHICH door delivered it. A watchdog that reports "booted"
-                # without saying how cannot be debugged when it silently stops.
-                action = f"BOOT#{s['boots']}:{via or 'NOT-DELIVERED'}"
-                # ⭐ A deferral covers ONE wait. Once the boot it was protecting
-                # has fired, the reason for it is over — leaving it set would
-                # silently widen the window for everything that follows.
-                for k in ("boot_after_secs", "boot_after_until", "boot_after_note"):
-                    s.pop(k, None)
-                if not via:
-                    rc = max(rc, 4)
-                    if not s["escalated"]:
-                        escalate(host, row, "a boot could not be delivered by either "
-                                            "the composer or the PTY")
-                        s["escalated"] = True
-                rc = max(rc, 3)
+                if via == "refused-draft":
+                    # ⛔ A refusal is NOT a failed boot and must not count as one.
+                    # The row is idle because its owner is mid-sentence, which is
+                    # the one state where booting is worse than waiting — so give
+                    # the attempt back, keep the deferral, and try again next
+                    # tick. ⚠ Do NOT `continue` here: the state write and the
+                    # window log at the bottom of the loop are what make a
+                    # skipped row visible instead of merely absent.
+                    s["boots"] -= 1
+                    action = "SKIP:drafting"
+                else:
+                    # Say WHICH door delivered it. A watchdog that reports
+                    # "booted" without saying how cannot be debugged when it
+                    # silently stops.
+                    action = f"BOOT#{s['boots']}:{via or 'NOT-DELIVERED'}"
+                    # ⭐ A deferral covers ONE wait. Once the boot it was
+                    # protecting has fired, the reason for it is over — leaving
+                    # it set would silently widen the window for everything that
+                    # follows.
+                    for k in ("boot_after_secs", "boot_after_until", "boot_after_note"):
+                        s.pop(k, None)
+                    if not via:
+                        rc = max(rc, 4)
+                        if not s["escalated"]:
+                            escalate(host, row, "a boot could not be delivered by either "
+                                                "the composer or the PTY")
+                            s["escalated"] = True
+                    rc = max(rc, 3)
         # ⛔ A dry run must not mutate state — an instrument whose observation
         #    changes what it observes is not an instrument.
         if not args.dry_run:

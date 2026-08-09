@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A background nudge will no longer type over a sentence you were in the
+  middle of.** yggterm's watchdogs wake a session that has gone quiet by typing
+  into it — and typing APPENDS, so if you had half-written a message and stepped
+  away, the nudge used to be glued onto the end of your sentence and the whole
+  thing sent. A row you left mid-thought looks exactly like a row that has
+  stalled, which is why this could happen at all. Writes made on your behalf now
+  ask the terminal whether there is unsent text on the line first, and quietly
+  skip the row if there is; it will be tried again on the next pass. Your own
+  typing is unaffected.
+
 - **`yggterm-headless server daemons` — one command that lists every background
   service on the machine.** yggterm keeps older services alive on purpose so that
   work already running is never interrupted by an update, but until now nothing
