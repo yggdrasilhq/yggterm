@@ -75810,9 +75810,16 @@ async fn process_pending_app_control_requests(
                         completed_at_ms: current_millis() as u128,
                         output_path: None,
                         data: None,
+                        // ⛔ codex-litellm is the one agent CLI that is
+                        // LOCAL-ONLY by declaration (`wrapper_slug: None`), so
+                        // it has no remote wrapper to start and never will
+                        // until one is written. The server refuses it by name
+                        // too, from the descriptor; this arm answers earlier
+                        // and cheaper, and says the same thing.
                         error: Some(
-                            "app-control remote terminal creation supports shell, codex and \
-                             claude-code"
+                            "codex-litellm is a LOCAL-ONLY CLI: it declares no remote wrapper, so \
+                             there is no remote row to create. Every other agent CLI can be \
+                             started remotely."
                                 .to_string(),
                         ),
                     }
@@ -75852,36 +75859,45 @@ async fn process_pending_app_control_requests(
                                     &seat_for_task,
                                 )
                             } else if requested_kind_for_task.is_agent() {
-                                // ⛔⛔ THE SILENT DOWNGRADE, REFUSED BY NAME —
-                                // measured 2026-08-09 by asking for a remote
+                                // ⛔⛔ THE ARM THAT WAS THE SILENT DOWNGRADE.
+                                //
+                                // Measured 2026-08-09 by asking for a remote
                                 // `opencode` row and getting a bash prompt that
-                                // reported success.
+                                // reported success: only codex and claude-code
+                                // had a remote start contract, so every OTHER
+                                // agent kind fell into the ssh-shell arm below,
+                                // was born a plain shell with the CLI's name on
+                                // its label, and answered `error: null`. Nothing
+                                // downstream could tell — the stored kind was
+                                // `ssh_shell`, so even the remote CLI
+                                // provisioner correctly declined to install
+                                // anything for it.
                                 //
-                                // Only codex and claude-code have a remote start
-                                // contract above. Every OTHER agent kind used to
-                                // fall into the ssh-shell arm below, so the row
-                                // was born a plain shell while its label still
-                                // said the CLI's name — and the create answered
-                                // `error: null`. Nothing downstream could tell:
-                                // the session's stored kind is `ssh_shell`, so
-                                // even the remote CLI provisioner correctly
-                                // declined to install anything for it.
+                                // 3.0.67 replaced the fall-through with a
+                                // refusal BY NAME, which was strictly better and
+                                // was never the same as working. This is the
+                                // actual contract: every CLI with a remote arm
+                                // starts through the kind-bearing verb, and a
+                                // LOCAL-ONLY CLI is still refused by name —
+                                // by the server, which owns the descriptor that
+                                // knows, rather than by a list kept here.
                                 //
-                                // ⚖ This is the `_ => "shell"` failure the
-                                // automation `--kind` parser already carries a
-                                // warning about, reappearing one layer out. The
-                                // CodexLiteLlm arm two matches above ALREADY
-                                // refuses by name for exactly this reason; this
-                                // extends that precedent to the rest instead of
-                                // leaving six kinds silently downgraded.
-                                anyhow::bail!(
-                                    "a REMOTE {} row cannot be created through app-control: only \
-                                     codex and claude-code have a remote start contract. Creating \
-                                     it would open a PLAIN SSH SHELL and report success, which is \
-                                     the silent downgrade this refusal exists to end. Launch it \
-                                     from the GUI on that machine, or use --kind codex / \
-                                     --kind claude-code.",
-                                    yggterm_server::session_kind_label(requested_kind_for_task)
+                                // ⚠ ARM ORDER IS LOAD-BEARING and locked by
+                                // `a_remote_agent_row_is_refused_by_name_rather_than_downgraded_to_a_shell`:
+                                // the original defect was purely positional, so
+                                // an agent kind must be decided BEFORE the
+                                // ssh-shell arm can claim it, whichever way it
+                                // is then decided.
+                                yggterm_server::start_remote_agent_session_seated(
+                                    &endpoint,
+                                    requested_kind_for_task,
+                                    &machine.ssh_target,
+                                    machine.prefix.as_deref(),
+                                    cwd_for_task.as_deref(),
+                                    title_hint_for_task.as_deref(),
+                                    Some(&terminal_appearance_for_task),
+                                    &launch_for_task,
+                                    &seat_for_task,
                                 )
                             } else {
                                 yggterm_server::start_ssh_session_seated(
@@ -136237,37 +136253,52 @@ mod tests {
     /// declined to install `opencode` because an `ssh_shell` has no managed CLI.
     /// The bug was invisible from every field except the session's stored kind.
     ///
-    /// Only `Codex` and `ClaudeCode` have a remote start contract. This test
-    /// locks the ORDER of the arms, because the defect was purely positional:
-    /// the `is_agent()` refusal must come BEFORE the ssh-shell fallback, or the
-    /// fallback swallows every remaining agent kind again.
+    /// This locks the ORDER of the arms, because the defect was purely
+    /// positional: an agent kind must be DECIDED before the ssh-shell fallback
+    /// can claim it. 3.0.67 decided it by refusing the six by name; this version
+    /// decides it by starting them properly. Either answer keeps the row from
+    /// being born a shell — the position is what must not move.
+    ///
+    /// ⚠ The arm must also reach the KIND-BEARING verb, not one of the two
+    /// hand-listed ones. A future edit that routed the remaining kinds through
+    /// `start_remote_claude_session_seated` would pass an order-only check while
+    /// starting `claude` on every machine for every CLI.
     ///
     /// ⚠ Source-shaped on purpose. The arms live inside an async closure in a
     /// several-thousand-line match on the app-control wire, so there is no unit
     /// seam to call; libyggterm's own titlebar-drag test locks its handlers the
     /// same way. What it can still prove is the one thing that regressed.
     #[test]
-    fn a_remote_agent_row_is_refused_by_name_rather_than_downgraded_to_a_shell() {
+    fn a_remote_agent_row_is_decided_by_kind_before_the_ssh_shell_arm_can_claim_it() {
         let source = include_str!("shell.rs");
         let arm = source
             .find("app_control_create_terminal_remote")
             .expect("the remote create arm");
         let block = &source[arm..];
-        let refusal = block
+        let agent_arm = block
             .find("requested_kind_for_task.is_agent()")
             .expect(
-                "the remote create arm no longer refuses unsupported agent kinds by name: every \
-                 kind but codex and claude-code would fall through to the ssh-shell arm and be \
-                 born a plain shell while reporting success",
+                "the remote create arm no longer decides agent kinds at all: every kind but \
+                 codex and claude-code would fall through to the ssh-shell arm and be born a \
+                 plain shell while reporting success",
             );
         let fallback = block
             .find("start_ssh_session_seated")
             .expect("the ssh-shell fallback");
         assert!(
-            refusal < fallback,
-            "the `is_agent()` refusal must be checked BEFORE the ssh-shell fallback — after it, \
-             the fallback has already claimed every agent kind that is not codex or claude-code, \
+            agent_arm < fallback,
+            "the `is_agent()` arm must come BEFORE the ssh-shell fallback — after it, the \
+             fallback has already claimed every agent kind that is not codex or claude-code, \
              which is exactly the silent downgrade this locks out"
+        );
+        let kind_bearing = block.find("start_remote_agent_session_seated").expect(
+            "the agent arm must reach the KIND-BEARING remote start verb: routing it through \
+             either hand-listed verb would start the wrong CLI on the remote machine while \
+             passing an order-only check",
+        );
+        assert!(
+            agent_arm < kind_bearing && kind_bearing < fallback,
+            "the kind-bearing start belongs INSIDE the agent arm, between it and the fallback"
         );
     }
 

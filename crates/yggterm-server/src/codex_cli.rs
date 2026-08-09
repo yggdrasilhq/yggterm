@@ -23,6 +23,18 @@ const YGGTERM_TERM_PROGRAM: &str = "yggterm";
 const YGGTERM_TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ENV_YGGTERM_TERMINAL_APPEARANCE: &str = "YGGTERM_TERMINAL_APPEARANCE";
 pub(crate) const ENV_YGGTERM_CC_EXTRA_ARGS: &str = "YGGTERM_CC_EXTRA_ARGS";
+/// One launch's model / permission mode, as JSON, carried over ssh to the
+/// remote `start-<slug>` wrapper.
+///
+/// ⚠ Deliberately NOT a second `*_EXTRA_ARGS` variable. `YGGTERM_CC_EXTRA_ARGS`
+/// carries already-composed claude TOKENS — the user's configured extra args
+/// plus the launch's flags, flattened — so reading it tells you what to append
+/// but not what was asked for. A per-CLI copy of that would need the composing
+/// to happen on the LOCAL side against the REMOTE CLI's flag spellings, which
+/// is the machine that does not know them. Sending the OPTIONS instead lets the
+/// owning machine compose them with its own descriptor, and lets a CLI that
+/// cannot express a mode refuse by name there rather than silently drop it.
+pub(crate) const ENV_YGGTERM_AGENT_LAUNCH_OPTIONS: &str = "YGGTERM_AGENT_LAUNCH_OPTIONS";
 const ENV_YGGTERM_TERMINAL_COLOR_FOREGROUND: &str = "YGGTERM_TERMINAL_COLOR_FOREGROUND";
 const ENV_YGGTERM_TERMINAL_COLOR_BACKGROUND: &str = "YGGTERM_TERMINAL_COLOR_BACKGROUND";
 const ENV_YGGTERM_TERMINAL_COLOR_PALETTE: [&str; 16] = [

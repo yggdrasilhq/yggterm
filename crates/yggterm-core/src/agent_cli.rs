@@ -485,6 +485,18 @@ pub struct AgentCliDescriptor {
     pub kind: SessionKind,
     /// Human name for UI ("Codex", "Claude Code", …).
     pub display_name: &'static str,
+    /// The metadata-rail row that names this CLI's session id — always
+    /// `"<display_name> Session"`, locked by
+    /// [`the_session_metadata_label_is_the_display_name_plus_session`].
+    ///
+    /// ⚠ **Transcribed rather than computed, and only because it must be
+    /// `&'static str`:** `SessionMetadataEntry::label` is a static string by
+    /// design (184 callers, and the rail's readers match on it), so a
+    /// `format!` cannot produce one. The lock is what makes the transcription
+    /// safe — and it earns its place, because `"Codex Session"` and
+    /// `"Claude Code Session"` are not decoration: predicates READ them to
+    /// recover a row's session id.
+    pub session_metadata_label: &'static str,
     /// The ONE lowercase wire name for this CLI: the `--kind` flag value, the
     /// `session_kind_label` string, and the `icon_kind` the row JSON reports.
     ///
@@ -1018,6 +1030,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     AgentCliDescriptor {
         kind: SessionKind::Codex,
         display_name: "Codex",
+        session_metadata_label: "Codex Session",
         slug: "codex",
         binary_name: "codex",
         install: CliInstall::Npm("@openai/codex"),
@@ -1111,6 +1124,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     AgentCliDescriptor {
         kind: SessionKind::CodexLiteLlm,
         display_name: "Codex-LiteLLM",
+        session_metadata_label: "Codex-LiteLLM Session",
         slug: "codex-litellm",
         binary_name: "codex-litellm",
         // ⚠ CORRECTED 2026-08-08 from `CliInstall::Manual` / "yggterm never
@@ -1200,6 +1214,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     AgentCliDescriptor {
         kind: SessionKind::ClaudeCode,
         display_name: "Claude Code",
+        session_metadata_label: "Claude Code Session",
         slug: "claude-code",
         binary_name: "claude",
         install: CliInstall::Npm("@anthropic-ai/claude-code"),
@@ -1290,6 +1305,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     AgentCliDescriptor {
         kind: SessionKind::Pi,
         display_name: "Pi",
+        session_metadata_label: "Pi Session",
         slug: "pi",
         binary_name: "pi",
         install: CliInstall::Npm("@earendil-works/pi-coding-agent"),
@@ -1347,6 +1363,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     AgentCliDescriptor {
         kind: SessionKind::OpenCode,
         display_name: "OpenCode",
+        session_metadata_label: "OpenCode Session",
         slug: "opencode",
         binary_name: "opencode",
         // The npm package is `opencode-ai`; the binary it installs is
@@ -1401,6 +1418,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     AgentCliDescriptor {
         kind: SessionKind::QwenCode,
         display_name: "Qwen Code",
+        session_metadata_label: "Qwen Code Session",
         slug: "qwen-code",
         binary_name: "qwen",
         install: CliInstall::Npm("@qwen-code/qwen-code"),
@@ -1449,6 +1467,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     AgentCliDescriptor {
         kind: SessionKind::Kimi,
         display_name: "Kimi",
+        session_metadata_label: "Kimi Session",
         slug: "kimi",
         binary_name: "kimi",
         // A Python CLI; `uv tool install` is what its own getting-started says.
@@ -1534,6 +1553,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     AgentCliDescriptor {
         kind: SessionKind::Muse,
         display_name: "Muse Code",
+        session_metadata_label: "Muse Code Session",
         slug: "muse",
         binary_name: "muse",
         // The vendor installer writes a launcher to ~/.local/bin/muse which
@@ -1601,6 +1621,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     AgentCliDescriptor {
         kind: SessionKind::Antigravity,
         display_name: "Antigravity",
+        session_metadata_label: "Antigravity Session",
         slug: "antigravity",
         binary_name: "agy",
         install: CliInstall::Manual,
@@ -2399,6 +2420,26 @@ mod tests {
         for descriptor in AGENT_CLIS {
             assert!(!descriptor.binary_name.is_empty());
             assert!(!descriptor.display_name.is_empty());
+        }
+    }
+
+    /// The metadata-rail label is the display name plus one word, and nothing
+    /// else — so the field that has to be transcribed (a `&'static str` cannot
+    /// be `format!`ed) cannot drift from the name it is made of.
+    ///
+    /// ⚠ Not cosmetic. `"Codex Session"` and `"Claude Code Session"` are READ by
+    /// predicates that recover a row's session id from its rail, so a label that
+    /// drifted from its CLI would make those rows unidentifiable — silently, and
+    /// only for the CLI whose spelling moved.
+    #[test]
+    fn the_session_metadata_label_is_the_display_name_plus_session() {
+        for descriptor in AGENT_CLIS {
+            assert_eq!(
+                descriptor.session_metadata_label,
+                format!("{} Session", descriptor.display_name),
+                "{:?}: the rail label must be its display name plus \" Session\"",
+                descriptor.kind,
+            );
         }
     }
 
