@@ -69,6 +69,31 @@ copies.
   him; see `settled-calls.md`. What remains his: authenticating Muse once it
   is installed, since the credential is his.
 
+- **The two-app split for phone superpowers is a product call, not a build
+  call.** A clean `yggterm` for the stores, versus a sideload-only
+  `yggterm-agent` carrying accessibility, SMS and overlay permissions. It is his
+  because it decides what the product IS on a phone, and because the store
+  consequences are irreversible in the direction that matters: Play forbids
+  `READ_SMS` for a terminal client and removes AccessibilityService abusers, and
+  iOS has none of these APIs at all, so a single app that wants them can never
+  be listed. **Recommendation on file: split.**
+  *Meanwhile:* nothing waits on it. v3.1 needs none of those permissions — the
+  manifest declares no permissions at all today — so the phone lane proceeds and
+  the split is a fork taken later, not a prerequisite.
+
+- **Whether the relay moves up the queue on the strength of ADR-0002 §9.** §3
+  ruled "relay is v2" when the phone was only ever going to carry a terminal, at
+  kilobytes a second. §9 changed the subject: he asked for the phone to be a
+  remote SURFACE for libyggterm apps (his example — guihost runs ychrome on Khan
+  Academy, he solves on the phone, guihost's page updates), and a streamed surface
+  is not a terminal's bandwidth. He named it a relay priority himself, which is
+  what makes this his to re-rank rather than the campaign's.
+  *Meanwhile:* the transport work that §9 would build on is the same either way
+  — protocol extraction, then the facade — so the lane is not idle while this
+  sits. ⚠ And one thing must be said plainly when he answers: §9 promotes the
+  constitution's **unsolved per-viewer-geometry problem** from blocker to
+  feature. The read-only pinned shadow viewer does not solve it, it dodges it.
+
 ## Third parties only he can chase
 
 - **Google Play identity verification is his, and it gates every listing** — the
