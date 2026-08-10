@@ -155,11 +155,27 @@ appearing here and there and going away on scrolll."*
 on the GUI host, `capture_faithful: true`. Two artifact classes, both present in
 one frame:
 
-1. **Orphan glyphs at the right margin.** Single characters sitting past the end
-   of wrapped lines, at the far-right column, on several rows at once. They
-   belong to no word on their row.
+1. **Orphan single characters that belong to no word on their row.**
 2. **A row painted twice.** The CLI's own footer hint line rendered as two
    identical adjacent rows.
+
+⭐⭐ **AND THE ORPHANS SIT IN THE CELL AFTER A WIDE GLYPH — WHICH MAKES THEM A
+DIFFERENT BUG FROM THE DOUBLED ROW.** A second faithful frame 12 minutes later
+(same host, same session) caught three at once, and the position is the finding:
+each sits **immediately after a two-cell emoji, in the cell the emoji overhangs,
+where a blank belongs**. Rendered as `<emoji>r The two…`, `<emoji>It refuses…`,
+`<emoji>IAnd it refuses…` — in every case the space after the emoji is occupied
+by a leftover character. That is **wide-glyph second-cell residue**: xterm.js
+marks the overhang cell as a wide-char placeholder that must paint blank, and the
+renderer is leaving the previous frame's glyph there instead.
+⛔ **This entry first said "at the right margin", from the first frame alone.
+That was wrong** — the first frame's examples happened to fall near the wrap
+column and the shared trait was invisible with n=2. Right-margin position is a
+coincidence; **adjacency to a wide glyph is the signal.** ⇒ do not go looking at
+wrap/reflow handling; go to the wide-cell path.
+⚠ The doubled row and the orphans are therefore **two bugs sharing one report**,
+not one. Only the doubled row is traced to the rAF-gap atlas staleness fixed in
+3.0.105. The orphans have their own mechanism and are **untouched by that fix**.
 
 ⭐ **THE DUPLICATE IS NOT CONTENT — SO IT IS OURS.** The daemon's vt100 screen is
 the SSOT for what the terminal HOLDS, and it holds that row exactly **once**
@@ -206,11 +222,16 @@ his viewport). What is owed, after his next restart:
 1. A faithful screenshot with no orphan glyphs and no doubled row.
 2. `stale_atlas_heal_outcome` records present with `atlas_cleared: true` — the
    first evidence in this bug's history that a heal did anything at all.
-3. ⛔ **Whether the right-margin orphans share this cause is NOT established.**
-   The doubled row and the orphans were assumed to be one bug because they appear
-   together and both clear on scroll; only the doubled row has been traced to a
-   mechanism. If the orphans survive the fix, they are a second bug and the
-   `render_lag_after_gap_ms` field now on the record is what tells them apart.
+3. ⛔ **The orphans are a SEPARATE, UNFIXED bug** — see the wide-glyph finding
+   above. 3.0.105 does nothing for them. They are the half the owner is most
+   likely to keep seeing, because agent CLIs emit emoji bullets constantly.
+
+**Next step for the orphan half, and it needs no new instrument:** the overhang
+cell of a wide glyph must paint blank. Find who writes that cell in the WebGL
+path and why the previous frame's glyph survives there — a damage-region that
+marks only the emoji's FIRST cell dirty would produce exactly this. A repro is
+cheap and does not need the owner's screen: print a line of emoji-space-text,
+overwrite it in place with a shorter line, and look at the overhang cells.
 
 ## ⛔⛔ SWITCHING ROWS HAS A FAT TAIL TO 60 s, AND 11 REVEALS NEVER FINISHED AT ALL
 
