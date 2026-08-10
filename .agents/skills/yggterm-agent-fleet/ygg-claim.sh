@@ -29,9 +29,10 @@
 #     --inherit-number   take the predecessor's number instead of deriving one
 #     --session UUID     claim a row other than your own (default: $YGGTERM_SESSION_ID)
 #     --watch-secs N     keep re-asserting the title for N seconds (default 240)
-#     --no-booter        do NOT subscribe this row to the booter (default: DO —
-#                        a claimed row is long-running work, and a stalled
-#                        session cannot boot itself)
+#     --booter           subscribe this row to the booter, so that a STALL is
+#                        woken from outside. ⛔ OFF by default — arm it only for
+#                        relay/unattended work (see "ARM THE BOOTER" below)
+#     --no-booter        accepted and ignored; kept so older call sites still run
 #     --host H           GUI host; default: auto-detect, then $YGG_GUI_HOST
 #     --dry-run          print what would happen, change nothing
 #
@@ -41,6 +42,9 @@ set -uo pipefail
 
 TITLE=""; NUMBER=""; CAMPAIGN=""; REPLACE=""; INHERIT=0
 SESSION="${YGGTERM_SESSION_ID:-}"; WATCH=240; HOST="${YGG_GUI_HOST:-}"; DRY=0
+# ⛔ OFF unless asked. A session that claims a row is not thereby unattended —
+# see "ARM THE BOOTER" below for why this default was inverted 2026-08-10.
+BOOTER="${YGG_BOOTER:-0}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -49,6 +53,7 @@ while [ $# -gt 0 ]; do
     --campaign)       CAMPAIGN="${2:-}"; shift 2 ;;
     --replace)        REPLACE="${2:-}"; shift 2 ;;
     --inherit-number) INHERIT=1; shift ;;
+    --booter)         BOOTER=1; shift ;;
     --no-booter)      BOOTER=0; shift ;;
     --session)        SESSION="${2:-}"; shift 2 ;;
     --watch-secs)     WATCH="${2:-}"; shift 2 ;;
@@ -224,17 +229,36 @@ done
   echo "ygg-claim: claim never verified (row reads: $(printf '%s' "$GOT" | tr '\t' '|'))" >&2; exit 3; }
 log "claimed and verified by read-back: seat=$NUM title=$FINAL_TITLE"
 
-# --- ARM THE BOOTER ---------------------------------------------------------
+# --- ARM THE BOOTER (OPT-IN) ------------------------------------------------
 # Owner-directed 2026-08-09, said while he was hand-booting a stalled relay row:
 # *"I have seen you stall sometimes, so arm a booter in a fleet."* A session that
 # stalls cannot restart itself — the stall IS its turn ending — so something
-# OUTSIDE it has to. Claiming a row is the moment a session becomes long-running
-# work, which makes it the one honest place to subscribe: an arming step that has
-# to be remembered separately is an arming step that gets skipped on the session
-# that needed it. ⛔ Unsubscribing is the SUBSCRIBER's job when the work is done
-# (`ygg-booter.py unsubscribe`); the booter retires a row only on facts it can
-# see for itself — the row is gone, or the subscription expired.
-if [ "${BOOTER:-1}" = 1 ] && [ -x "$(dirname "$0")/ygg-booter.py" ]; then
+# OUTSIDE it has to.
+#
+# ⛔ DEFAULT INVERTED 2026-08-10, owner-directed: *"When there is no relay mode
+# the booter should not self arm. You should not be booted."* It fired on him in
+# a session he had opened with "NOT like a relay, all agents contained in the
+# session" — the row was claimed, so the row self-armed, and he was answered by a
+# machine wake-up he had explicitly ruled out.
+#
+# ⚠ The bad inference, named so it is not re-derived: **claiming a row is not
+# evidence that a session is unattended.** The old rationale — "claiming a row is
+# the moment a session becomes long-running work" — conflated LONG-RUNNING with
+# UNATTENDED. An interactive session at a keyboard is long-running too, and the
+# one thing it never needs is to be woken by a robot. The scope the owner
+# actually set was "in a fleet", i.e. relay/delegate work; the tool widened it to
+# every claim.
+#
+# ⇒ Arm it where the unattendedness is KNOWN, not where a row is claimed:
+#   • a DELEGATE is armed by its SPAWNER, explicitly, at spawn (SKILL.md §9) —
+#     that path is untouched by this default and is the one that matters;
+#   • a relay session arms itself with `--booter` (or `YGG_BOOTER=1`);
+#   • a session a human is talking to arms nothing.
+#
+# ⛔ Unsubscribing is the SUBSCRIBER's job when the work is done
+# (`ygg-booter.py unsubscribe --row <path>`); the booter retires a row only on
+# facts it can see for itself — the row is gone, or the subscription expired.
+if [ "${BOOTER:-0}" = 1 ] && [ -x "$(dirname "$0")/ygg-booter.py" ]; then
   "$(dirname "$0")/ygg-booter.py" subscribe \
       ${CAMPAIGN:+--campaign "$CAMPAIGN"} --note "$FINAL_TITLE" 2>&1 \
     | sed 's/^/  /' || log "⚠ booter subscribe failed — this row is NOT watched"
