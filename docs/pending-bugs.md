@@ -1976,6 +1976,32 @@ against `server snapshot`. Today the key appears in the first and not the second
 ⚠ Not yet established: whether the record promotes later (making this a startup
 race) or never (making it durable). Measure before fixing.
 
+⚠ **HOW FAR 3.0.101 IS PROVEN, and where it stops.** Everything below the gate
+is proven on REAL data via the shipped functions: a genuine sub-agent transcript
+classifies `SubAgent`, its parent `MainLoop`, a session that never delegated
+answers `None`, and a delegate that finished **16 days ago** correctly ages out
+(the arm that stops an unbounded wait from being unbounded). Five parser tests
+are mutation-falsified — scan-direction, detector-disabled and the record
+admission test are each caught by a different subset. The NEGATIVE arm is
+live-proven at fleet scale: guihost's 3.0.101 daemon owning **6 real agent rows**
+reports only `working`/`recently_active`, with no spurious `orchestrating`.
+
+⛔ **NOT proven live: the blocker appearing in a daemon's `hot_restart_blockers`.**
+It is not manufacturable from here, and the reason is worth recording so the next
+session does not spend the same hours on it. `server attach` mints a `shell` by
+design (correctly — it really does spawn one), and a shell is `not_restorable`,
+which blocks FIRST and hides the state under test; seeding an agent-kind record
+into `server-state.json` does not survive, because attach rewrites `kind`. The
+real launch path (`server app terminal new --kind claude-code`) does create a
+genuine `claude --session-id <row-id>` process — ⭐ **so a LOCAL CC row's yggterm
+id IS its CC session id**, which is why the existing `local://` branch already
+resolved — but a fresh session writes no transcript until its first turn, and the
+one thing that would complete the arm is a session actually running a delegate.
+⇒ **Catch it in the wild instead:** `orchestrating` in `server status`
+`hot_restart_blockers`, or `daemon_cold_shutdown_deferred_idle_gate` trace events
+whose `blockers[].kind` is `orchestrating`. Neither existed before 3.0.101, so
+the first occurrence is the proof.
+
 **Still unbuilt:** §2 (relay boundaries as the appointment), §4 (the queue), §5
 (the deadline + `continue` repair), and the rest of §3 — **blocked-on-human is
 not yet a state**, and an agent session's WORKING state is still inferred from
