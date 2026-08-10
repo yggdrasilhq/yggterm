@@ -15606,14 +15606,52 @@ fn is_remote_protocol_probe_recoverable(output: &str) -> bool {
 /// never sent unprompted, and any wire change MUST bump the version — enforced
 /// by `protocol_shape_stamp_forces_version_bump` in `daemon.rs`. `build_id`
 /// stays in the descriptor for freshness telemetry only.
+/// The version of the payload we would actually INSTALL on a remote, which is
+/// not necessarily our own.
+///
+/// ⛔ **THE CHECK MUST DEMAND WHAT THE BOOTSTRAP CAN DELIVER.** `bootstrap_remote_yggterm`
+/// uploads [`local_remote_bootstrap_executable`] — the neighbouring
+/// `yggterm-headless` — to the remote. On a host where the GUI has been updated
+/// but that payload has not, the two disagree, and comparing a remote against
+/// OUR version asks for something we cannot install:
+///
+/// ```text
+/// GUI      = 3.0.92   <- what the old check demanded
+/// headless = 3.0.91   <- what it actually ships
+/// ```
+///
+/// Measured 2026-08-10 on the owner's machine: image paste to `dev` failed with
+/// *"expected 3.0.92@…, got 3.0.91@…"* forever, because every attempt
+/// bootstrapped 3.0.91 and then rejected it for not being 3.0.92. An unreachable
+/// success condition, reported honestly at every step.
+///
+/// Falls back to our own version when the payload cannot be interrogated, which
+/// is exactly the previous behaviour.
+fn local_bootstrap_payload_version() -> String {
+    fn probe() -> Option<String> {
+        let path = local_remote_bootstrap_executable()?;
+        let out = std::process::Command::new(&path).arg("--version").output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let token = text.split_whitespace().find(|t| looks_like_version(t))?;
+        Some(token.to_string())
+    }
+    probe().unwrap_or_else(|| daemon::SERVER_PROTOCOL_VERSION.to_string())
+}
+
+/// The pure decision, so it can be tested without a filesystem.
+fn remote_version_is_compatible_with_payload(remote_version: &str, payload_version: &str) -> bool {
+    let Some(remote) = daemon::parse_daemon_version_triple(remote_version.trim()) else {
+        return false;
+    };
+    let Some(payload) = daemon::parse_daemon_version_triple(payload_version.trim()) else {
+        return false;
+    };
+    remote >= payload
+}
+
 fn remote_descriptor_is_protocol_compatible(descriptor: &RemoteProtocolDescriptor) -> bool {
-    let Some(remote) = daemon::parse_daemon_version_triple(descriptor.version.trim()) else {
-        return false;
-    };
-    let Some(local) = daemon::parse_daemon_version_triple(daemon::SERVER_PROTOCOL_VERSION) else {
-        return false;
-    };
-    remote >= local
+    // ⛔ Against the PAYLOAD's version, not ours — see `local_bootstrap_payload_version`.
+    remote_version_is_compatible_with_payload(&descriptor.version, &local_bootstrap_payload_version())
 }
 
 fn check_remote_protocol_version(
@@ -30660,6 +30698,30 @@ mod tests {
         );
         handle.join().expect("status socket thread");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ⛔ THE UNREACHABLE SUCCESS CONDITION.
+    ///
+    /// The compatibility check used to compare a remote against OUR version
+    /// while the bootstrap installs the neighbouring `yggterm-headless`. On the
+    /// owner's machine those were 3.0.92 and 3.0.91, so image paste bootstrapped
+    /// 3.0.91 and then rejected it for not being 3.0.92 — forever.
+    #[test]
+    fn compatibility_is_judged_against_what_the_bootstrap_can_actually_install() {
+        // The live failure, and it must now PASS: the payload we would install
+        // is 3.0.91, and the remote already has 3.0.91.
+        assert!(
+            super::remote_version_is_compatible_with_payload("3.0.91", "3.0.91"),
+            "a remote matching the payload we would install must be compatible"
+        );
+        // Still refuse a remote OLDER than what we would install — that one
+        // really does need the bootstrap.
+        assert!(!super::remote_version_is_compatible_with_payload("3.0.89", "3.0.91"));
+        // Newer than the payload is fine; never downgrade a peer.
+        assert!(super::remote_version_is_compatible_with_payload("3.0.99", "3.0.91"));
+        // Unparseable on either side is never silently "compatible".
+        assert!(!super::remote_version_is_compatible_with_payload("", "3.0.91"));
+        assert!(!super::remote_version_is_compatible_with_payload("3.0.91", "junk"));
     }
 
     /// ⛔ The "untouchable row": a session born in the LOCAL lane, opened
