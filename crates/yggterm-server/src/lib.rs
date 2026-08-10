@@ -104,7 +104,13 @@ pub use app_control::{
 pub use app_control_web_cli::{
     WEB_ACTIONS, run_app_control_web_cli, web_action_names, web_usage_block,
 };
-pub use attach::{AttachMetadata, run_attach};
+pub use attach::{
+    ATTACH_BACKEND_DAEMON_SHELL, ATTACH_BACKEND_NONE, ATTACH_BACKEND_PENDING,
+    ATTACH_BACKEND_PLAIN_SHELL, AttachDowngradeDecision, AttachMetadata, DaemonShellUnavailable,
+    PLAIN_SHELL_DOWNGRADE_MARKER, PLAIN_SHELL_FALLBACK_ENV, PLAIN_SHELL_FALLBACK_FLAG,
+    PLAIN_SHELL_REFUSED_MARKER, PlainShellFallback, parse_attach_args, resolve_plain_shell_fallback,
+    run_attach,
+};
 pub use codex_cli::{
     ManagedCliTool, ManagedCliToolStatus, TerminalIdentityColorProfile, managed_cli_refresh_ttl_ms,
 };
@@ -9894,7 +9900,13 @@ impl YggtermServer {
                                 &ssh_target,
                                 ssh_prefix.as_deref(),
                                 &remote_binary,
-                                &["server", "attach", &session.id, &cwd],
+                                &[
+                                    "server",
+                                    "attach",
+                                    &session.id,
+                                    &cwd,
+                                    crate::attach::PLAIN_SHELL_FALLBACK_FLAG,
+                                ],
                             )
                         };
                     upsert_session_metadata(
@@ -10538,7 +10550,13 @@ impl YggtermServer {
             &target.ssh_target,
             target.prefix.as_deref(),
             remote_binary,
-            &["server", "attach", session.id.as_str(), launch_cwd.as_str()],
+            &[
+                "server",
+                "attach",
+                session.id.as_str(),
+                launch_cwd.as_str(),
+                crate::attach::PLAIN_SHELL_FALLBACK_FLAG,
+            ],
         );
         session.terminal_lines = vec![
             format!("$ {}", session.launch_command),
@@ -16995,12 +17013,99 @@ pub fn run_remote_resume_codex(
 /// per [[spec-decentralized-host-daemon]]), then bridge stdio to it using the
 /// same transport the remote codex path uses. No external multiplexer involved.
 pub fn run_daemon_shell_attach(session_id: &str, cwd: Option<&str>) -> anyhow::Result<()> {
+    let (endpoint, key) = ensure_daemon_shell_session_for_attach(session_id, cwd)?;
+    bridge_remote_runtime_session_stdio(&endpoint, &key)
+}
+
+/// Stage one of [`run_daemon_shell_attach`]: obtain the daemon-owned shell
+/// session, returning the endpoint that owns it and its runtime key.
+///
+/// Split out because the caller must be able to tell the two stages apart. A
+/// failure HERE means nothing was created and no work exists to strand; a
+/// failure while bridging means the opposite. `attach::run_attach` is only
+/// allowed to consider a non-persistent substitute for the first.
+///
+/// ⚠ **OWNERSHIP FIRST, VERSION ONLY AS A LAST RESORT.** `default_endpoint`
+/// names this build's own version socket, which a daemon only back-aliases for
+/// versions <= its own — so a client newer than the running daemon finds
+/// nothing there, spawns a second daemon, and creates a BRAND NEW shell instead
+/// of reattaching to the one the older daemon is still holding. That is the
+/// constitution's *"a session owned by an OLDER daemon is still a first-class
+/// row, and clicking it must WORK"* failing quietly, on the one verb whose
+/// entire job is reattachment.
+///
+/// ADR-0002 §4.4 proposes `resolve_client_daemon_endpoint` for this. That is
+/// the wrong instrument twice over, and the repo already has the right one:
+///
+/// - `resolve_client_daemon_endpoint` picks by **version** (the highest
+///   reachable daemon) and only when our own socket is unreachable. Neither
+///   condition has anything to do with which daemon holds THIS shell. On a host
+///   where our own daemon is up but a 2.12.19 daemon owns the PTY — the exact
+///   live case recorded on [`owning_daemon_endpoint_for_runtime_key`] — it
+///   changes nothing at all and the reattach still misses.
+/// - [`owning_daemon_endpoint_for_runtime_key`] answers the question actually
+///   being asked, by `owned_terminal_session_keys`, **ignoring version**.
+///
+/// The version fallback still runs, but only for the CREATE case (nobody owns
+/// this id yet), where "some reachable daemon" is a defensible answer.
+pub fn ensure_daemon_shell_session_for_attach(
+    session_id: &str,
+    cwd: Option<&str>,
+) -> anyhow::Result<(ServerEndpoint, String)> {
     let home = resolve_yggterm_home()?;
     let initial_size = current_tty_size();
-    let endpoint = default_endpoint(&home);
-    ensure_local_daemon_running(&endpoint)?;
-    let key = daemon::ensure_shell_session(&endpoint, session_id, cwd, initial_size)?;
-    bridge_remote_runtime_session_stdio(&endpoint, &key)
+    // REATTACH: whoever holds the PTY, whatever version it is.
+    if let Some(owner) =
+        owning_daemon_endpoint_for_runtime_key(&home, &local_live_runtime_key(session_id))
+    {
+        let key = daemon::ensure_shell_session(&owner, session_id, cwd, initial_size)?;
+        return Ok((owner, key));
+    }
+    // CREATE: nobody holds it. Prefer our own version (spawning one if needed),
+    // and fall back to a reachable older daemon rather than stranding.
+    let resolved = resolve_client_daemon_endpoint(&home);
+    if attach_should_ensure_local_daemon(resolved.version_mismatch.as_ref()) {
+        ensure_local_daemon_running(&resolved.endpoint)?;
+    }
+    let key = daemon::ensure_shell_session(&resolved.endpoint, session_id, cwd, initial_size)?;
+    Ok((resolved.endpoint, key))
+}
+
+/// Whether [`ensure_local_daemon_running`] should run against the endpoint the
+/// resolver handed back.
+///
+/// ⛔ **NO when the resolver fell back to an older daemon**, and this is not a
+/// nicety — running it there cannot succeed. ADR-0002 §4.4 calls routing attach
+/// through `resolve_client_daemon_endpoint` "a one-line change"; reading the
+/// code says otherwise, because `ensure_local_daemon_running` means *make a
+/// daemon of MY OWN VERSION exist*, not *make this endpoint reachable*:
+///
+/// 1. `reachable_local_daemon_is_current` returns `false` for any
+///    `server_version != SERVER_PROTOCOL_VERSION` — which the fallback endpoint
+///    is BY CONSTRUCTION, so it can never be satisfied;
+/// 2. it then burns two 3 s `wait_for_existing_local_daemon_boot` windows (the
+///    old daemon's pid is right there, so the wait always runs to its deadline),
+///    takes the home-wide `daemon.spawn.lock`, and spawns a child;
+/// 3. `spawn_daemon_process_from_executable` runs a bare `server daemon`, which
+///    binds `default_endpoint(home)` — its OWN version socket, never the older
+///    path it was asked about;
+/// 4. `wait_for_local_daemon` then polls that impossible condition 100 × 150 ms
+///    and fails with "local yggterm daemon did not become reachable".
+///
+/// ⇒ ~24 s of blocking, 15 s of it holding the shared spawn lock — the exact
+/// machine-wide "flawless but untypeable" lockout documented on
+/// `DAEMON_SPAWN_LOCK_WAIT_MS` — and then an error. Under the pre-fix
+/// `run_attach` that error went straight into a silent plain shell.
+///
+/// Skipping it is safe precisely because the resolver only returns a different
+/// endpoint after `ping` succeeded on it: that daemon is already running, so
+/// there is nothing to ensure. When the resolver kept our own endpoint
+/// (`version_mismatch: None`) the ensure is meaningful and still runs — that is
+/// the no-daemon case the fallback comment was written for.
+pub(crate) fn attach_should_ensure_local_daemon(
+    version_mismatch: Option<&(String, String)>,
+) -> bool {
+    version_mismatch.is_none()
 }
 
 pub fn run_remote_start_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Result<()> {
@@ -26858,7 +26963,13 @@ fn build_live_session_with_launch_options(
                     &target.ssh_target,
                     target.prefix.as_deref(),
                     "$HOME/.yggterm/bin/yggterm",
-                    &["server", "attach", uuid, default_cwd.as_str()],
+                    &[
+                        "server",
+                        "attach",
+                        uuid,
+                        default_cwd.as_str(),
+                        crate::attach::PLAIN_SHELL_FALLBACK_FLAG,
+                    ],
                 ),
                 format!("ssh://{}/{}", target.ssh_target, uuid),
                 "live-ssh".to_string(),
@@ -28552,6 +28663,59 @@ fn short_session_id(session_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// ⛔ The REATTACH-before-CREATE ordering in
+    /// [`ensure_daemon_shell_session_for_attach`], pinned at the source.
+    ///
+    /// **Why a source test and not a behavioural one.** The verifier of the
+    /// original fix deleted the entire ownership block and the suite came back
+    /// byte-identical: 1035 passed, 3 failed, exactly as unmutated. The change
+    /// that reroutes attach to the daemon that actually HOLDS the PTY — the
+    /// riskiest production edit in that diff — had no test that would notice its
+    /// removal. The function does real I/O at every step (`resolve_yggterm_home`,
+    /// `ensure_shell_session`), so nothing short of a live multi-daemon fixture
+    /// exercises it, and this crate already uses source introspection for exactly
+    /// this shape of contract (`pty_adoption.rs`, `app_control_web_cli.rs`).
+    ///
+    /// What it guards: a session's PTY is owned by ONE daemon, possibly an older
+    /// coexisting one. Asking the *resolver* first hands back our own version and
+    /// silently creates a SECOND shell instead of reattaching to the user's live
+    /// one — which is the constitution's stated case ("clicking it must WORK").
+    #[test]
+    fn attach_asks_who_owns_the_pty_before_it_asks_the_resolver() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("pub fn ensure_daemon_shell_session_for_attach(")
+            .expect("ensure_daemon_shell_session_for_attach should exist");
+        let body = &source[start..];
+        let end = body
+            .find("\npub(crate) fn attach_should_ensure_local_daemon")
+            .expect("the guard fn should follow it");
+        let body = &body[..end];
+
+        let owner_lookup = body
+            .find("owning_daemon_endpoint_for_runtime_key")
+            .expect(
+                "attach must ask who OWNS the pty; without this it creates a second \
+                 shell instead of reattaching to the user's live one",
+            );
+        let resolver = body
+            .find("resolve_client_daemon_endpoint")
+            .expect("the create path should still use the resolver");
+
+        assert!(
+            owner_lookup < resolver,
+            "the ownership lookup must come FIRST: asking the resolver first \
+             returns our own version and strands a session held by an older \
+             coexisting daemon"
+        );
+        assert!(
+            body[owner_lookup..resolver].contains("local_live_runtime_key"),
+            "the ownership lookup must be keyed by local_live_runtime_key(session_id) \
+             — that is the key ensure_shell_runtime_session registers under, so any \
+             other key silently finds no owner and falls through to CREATE"
+        );
+    }
     use super::PreviewBlockKind;
     use super::app_control_open_path_ready;
     use super::canonicalize_remote_machine_alias;
@@ -41790,6 +41954,56 @@ terminal_window_id: None,
         assert_eq!(
             owning_daemon_endpoint_from_statuses(statuses, "cc-runtime://missing"),
             None
+        );
+    }
+
+    /// ⛔ `server attach` IS a reattach verb, so it obeys the same law — and it
+    /// did not. It resolved `default_endpoint`, which names the socket of the
+    /// daemon this BINARY would spawn, so a shell PTY held by an older
+    /// coexisting daemon was never found and a brand-new shell was created
+    /// beside it. The user's own work sat in the row they had just clicked.
+    ///
+    /// This pins the resolution `ensure_daemon_shell_session_for_attach` now
+    /// performs: the shell's runtime key is `local://<uuid>` and the owner is
+    /// found across versions, exactly as for `cc-runtime://`.
+    #[test]
+    fn attach_reaches_the_daemon_that_holds_the_shell_whatever_version_it_is() {
+        let uuid = "0199fc00-0000-7000-8000-00000000abcd";
+        let key = super::local_live_runtime_key(uuid);
+        assert_eq!(key, format!("local://{uuid}"));
+
+        let statuses = vec![
+            (socket("server-3-0-97"), owner_status("3.0.97", &[])),
+            (socket("server-3-0-90"), owner_status("3.0.90", &[&key])),
+        ];
+        assert_eq!(
+            owning_daemon_endpoint_from_statuses(statuses, &key),
+            Some(socket("server-3-0-90")),
+            "reattach must reach the daemon HOLDING the shell, not the one we would spawn"
+        );
+    }
+
+    /// ⛔ FEEDING THE GUARD THE THING IT CATCHES. ADR-0002 §4.4 calls routing
+    /// attach through `resolve_client_daemon_endpoint` "a one-line change".
+    /// Reading the code says the one line is only safe with this guard beside
+    /// it: on the version-fallback endpoint `ensure_local_daemon_running` can
+    /// never be satisfied — `reachable_local_daemon_is_current` compares against
+    /// `SERVER_PROTOCOL_VERSION`, and the spawned child binds its OWN socket,
+    /// not the older path it was asked about. It burns two 3 s boot waits, holds
+    /// the home-wide `daemon.spawn.lock` through a 15 s `wait_for_local_daemon`,
+    /// and then fails — the machine-wide "flawless but untypeable" lockout
+    /// documented on `DAEMON_SPAWN_LOCK_WAIT_MS`, on every mixed-version attach.
+    #[test]
+    fn the_ensure_is_skipped_exactly_when_it_could_not_succeed() {
+        assert!(
+            super::attach_should_ensure_local_daemon(None),
+            "our own endpoint: the ensure is meaningful and may need to SPAWN"
+        );
+        let fell_back = ("3.0.97".to_string(), "3.0.90".to_string());
+        assert!(
+            !super::attach_should_ensure_local_daemon(Some(&fell_back)),
+            "the resolver only returns a different endpoint after PINGING it — that \
+             daemon is already up, and ensuring it would block ~24s and then fail"
         );
     }
 

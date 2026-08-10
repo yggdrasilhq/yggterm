@@ -839,7 +839,7 @@ fn print_server_help() {
     println!(
         "usage:
   yggterm server daemon
-  yggterm server attach <session> [cwd]
+  yggterm server attach <session> [cwd] [--allow-plain-shell-fallback]
   yggterm server connect <session-path> [--view terminal|preview] [--top|--after <path>]
   yggterm server connect --list
   yggterm server order [--json]
@@ -1598,12 +1598,8 @@ fn main() -> Result<()> {
         return run_daemon(&endpoint, host);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "attach" {
-        return run_attach(
-            &args[2],
-            args.get(3)
-                .map(String::as_str)
-                .filter(|value| !value.is_empty()),
-        );
+        let (cwd, fallback) = yggterm_server::parse_attach_args(&args[3..]);
+        return run_attach(&args[2], cwd.as_deref(), fallback);
     }
     // `yggterm server connect <session-path>|--list` — headless twin of clicking
     // a session row. Manually connect an existing-but-unconnected ("void")

@@ -4,6 +4,32 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A shell that says it survives now actually has to (3.0.99).** `server attach`
+  fell back to a plain, non-persistent login shell whenever the daemon could not
+  be reached, and announced it with one line on **stderr**. On a desktop that is
+  a shrug; on a phone stderr does not exist, so the product's one differentiator
+  — *your session survives when the terminal closes* — could silently become the
+  exact thing it differentiates against, and you would find out by losing work.
+  Three changes: the fallback is now an explicit policy argument that **defaults
+  to refusing** (a caller has to opt in with `--allow-plain-shell-fallback`), a
+  refusal exits non-zero so a machine can detect it without parsing anything, and
+  the announcement moved to **stdout**, which is the stream the PTY actually
+  carries to every viewer. `session.json` also stopped lying: `backend` was
+  written as `daemon-shell` *before* the attach was attempted and never
+  corrected, so the metadata vouched for persistence a fallback session did not
+  have — it now records the outcome, and carries the daemon's verbatim error
+  when it degraded.
+- **Attach now asks who OWNS the pty before asking the resolver (3.0.99).** It
+  resolved the endpoint by version first, so a session held by an older
+  coexisting daemon was not reattached — a second shell was created beside the
+  user's live one. That is the constitution's own case ("a session owned by an
+  OLDER daemon is still a first-class row, and clicking it must WORK").
+  ⚠ ADR-0002 called routing this through `resolve_client_daemon_endpoint` "a
+  one-line change"; reading the code says otherwise, and the ADR is wrong on that
+  point — `ensure_local_daemon_running` means *make a daemon of my own version
+  exist*, which on a fallback endpoint can never be satisfied and burns ~24 s
+  holding the shared spawn lock before failing. It is now skipped exactly when it
+  could not have succeeded.
 - **Switching away from a row that is still opening no longer earns you a red
   error toast a minute later (3.0.98).** Click a session, change your mind,
   click another one: sixty seconds after you had moved on, the row you left
