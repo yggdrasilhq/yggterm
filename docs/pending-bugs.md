@@ -628,9 +628,14 @@ deploy sees success.
    / a viewer being attached, not only on output silence — the same
    classification the settled relay-gate design already calls for
    (`docs/spec-hot-restart-relay-gate.md`).
-3. **Deploy discipline meanwhile:** one deploy per session, and watch the trace for
-   `daemon_self_retire` on the superseded daemon for the following ~6 minutes rather
-   than declaring the deploy done when the hot-restart returns.
+3. **Deploy discipline meanwhile:** one **DAEMON-BINARY** deploy per session, and
+   watch the trace for `daemon_self_retire` on the superseded daemon for the
+   following ~6 minutes rather than declaring the deploy done when the hot-restart
+   returns.
+   ⛔ **This does NOT gate a GUI restart or a GUI-binary install** — those have
+   none of this blast radius, and the owner has settled that they need no
+   permission (`settled-calls.md`). A session read this line as covering the GUI
+   and stopped restarting; he had to ask why. Say DAEMON, every time.
 
 ⚠ **Do not "fix" this by making the gate never open** — that is the immortal-daemon
 bug this campaign just spent a day removing.

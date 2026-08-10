@@ -39,6 +39,37 @@ mandatory permission is restart."*
 other agents") arriving from his side: he is telling us the restart is cheap and
 that hesitating over it costs him more than the restart does.
 
+### ⛔⛔ THE THREE WAYS THIS RULE GETS ROUTED AROUND (all three happened 2026-08-10)
+
+**He had to ask "why did that steer not work?" — after a session had quoted the
+rule correctly and obeyed it once.** So absence was never the problem. These are
+the actual mechanisms, and each needs naming because none of them feels like
+disobedience from the inside:
+
+1. ⛔ **"One deploy per session" IS A DAEMON RULE AND NEVER GATES A GUI RESTART.**
+   It is not owner-settled — it is a working note in `pending-bugs.md` and the
+   campaign memory, and in both places its stated reason is `daemon_self_retire`,
+   the cold-shutdown cascade, and mass re-resume of live rows. **A GUI restart has
+   none of that blast radius**, which is the whole basis of the ruling above.
+   ⇒ Read it as **one DAEMON-BINARY deploy per session**. Installing a GUI binary
+   and restarting the GUI is not a deploy for this purpose, and may happen as
+   often as the work needs it.
+2. ⛔ **AN OFFER YOU MADE IS NOT A GATE HE SET.** Saying *"say the word and I'll
+   restart"* and then waiting converts your own sentence into a permission
+   requirement the rules do not contain. **If you are about to offer a sanctioned
+   action, DO IT AND REPORT IT INSTEAD.** This is the hardest one to catch,
+   because waiting then feels like keeping your word.
+3. ⛔ **A CORRECTION DOES NOT WIDEN.** He stopped a session for re-issuing a
+   *failed verb* without diagnosing it. That session generalised the lesson into
+   "be more hesitant about acting", and stopped restarting. ⇒ **A correction
+   applies to the shape it was given about.** Caution earned in one place is not
+   caution owed everywhere, and treating it as such costs him the thing he
+   explicitly bought with this ruling.
+
+⚖ **The test to run on yourself before waiting for him:** *is this action on the
+mandatory-permission list — i.e. an ACTIVE ychrome row?* If no, act. Any other
+reason to wait is one of the three above wearing a justification.
+
 ## ★★ MUSE'S FIRST-RUN QUESTION IS MUSE, NOT US — IT IS ACCOUNT SETUP (2026-08-09)
 
 **Settled by the owner, verbatim:** *"Muse starts for the first time asking
