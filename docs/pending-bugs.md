@@ -224,9 +224,13 @@ cold-shutdown cascade (see the deploy entry above). So "just keep them matched" 
 one outage for another.
 
 **Fix directions, none free:**
-1. **Make the compatibility check ask the payload's version, not the GUI's** — the
-   check should demand what it can actually deliver. Smallest change, and it makes the
-   error honest instead of unreachable.
+1. ✅ **DONE 3.0.93 — the check now asks the PAYLOAD's version, not the GUI's.**
+   `local_bootstrap_payload_version()` interrogates the binary the bootstrap would
+   actually upload, falling back to our own version when it cannot be read (i.e. the
+   previous behaviour). The decision is split into a pure
+   `remote_version_is_compatible_with_payload` and pinned by a test carrying the live
+   failure: payload 3.0.91 + remote 3.0.91 must be COMPATIBLE, while remote 3.0.89
+   must still bootstrap. ⇒ The unreachable success condition is gone.
 2. **Ship the payload as a separate versioned file** the daemon never executes, so it
    can be replaced at any time without touching a running process.
 3. Keep them matched and solve the running-daemon replacement properly (that is the
