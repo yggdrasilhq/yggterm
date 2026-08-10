@@ -71,7 +71,33 @@ HEARTBEAT = STATE / "booter.heartbeat"
 # The words he used. A boot must be recognisable AS a boot in the transcript —
 # both to a human reading back and to the session itself, which should be able to
 # tell "a machine woke me" from "a person asked for something".
-BOOT_TEXT = "continue, the booter booted"
+#
+# ⭐⭐ AND IT NOW CARRIES A STEER, owner-directed 2026-08-10: *"if the booter is armed then I
+#   want a relay. relay and booter go hand in hand and are part of a system."*
+#
+#   His reasoning is exact, and it is the same argument as putting a refusal at the point of
+#   the mistake rather than in a document: THE SUBSCRIPTION IS THE SIGNAL. Only long-running
+#   relay work subscribes, so this text can assert relay context with no false positives, and
+#   it lands at the one moment that is definitionally "a turn just ended".
+#
+# ⛔ THE PREFIX IS UNCHANGED ON PURPOSE. Detectors in the wild match the exact phrase
+#   "continue, the booter booted" (row-health probes, delivery checks, a human's eye). The
+#   steer is APPENDED so every existing matcher keeps working — changing the marker to improve
+#   the message would have broken the instruments that prove the message arrived.
+#
+# ⚠ AND THE HONEST LIMIT, measured the day it was written: this reaches a session that stalled
+#   SILENTLY. It does NOT reach one that stalled BY ASKING — a question gets answered by him,
+#   the row classifies as WORKING, and no boot ever fires. That hole is closed elsewhere (the
+#   context-gauge hook's NOTICE tier), not here. Two different stalls, two different cures.
+BOOT_TEXT = (
+    "continue, the booter booted"
+    " — you are a RELAY session: the booter and the relay are one system, so if you are "
+    "subscribed you are long-running work. DECIDE and ACT; do not end this turn on a "
+    "question. If the next plane belongs to a fresh session, execute the handover yourself "
+    "(brief, spawn, verify armed, stand down). If the work is genuinely finished, "
+    "`ygg-booter.py unsubscribe` — but ⛔ a MONITOR is never finished while the thing it "
+    "watches is live."
+)
 
 # How long a subscribed row may sit with its turn ENDED before it is booted.
 # Deliberately longer than babysit's 240s: a subscriber is a long-running campaign
