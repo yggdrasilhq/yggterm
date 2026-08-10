@@ -1890,12 +1890,18 @@ primitives and got it wrong* — so each wants to be a verb.
    the newest sub-agent file and its age would have answered it in one line — and
    is the instrument the NEXT person debugging a wrong `orchestrating` verdict
    will need anyway.
-3. **`server app session remove` answered with every field null** (`verified`,
-   `row_still_listed`, `live_processes`, `message` all `null`, `error: null`).
-   The field guide's law is that a row verb reports the REQUEST not the EFFECT;
-   this one reported *nothing*, which is worse — there is no field to distrust.
-   The removal did work (read back: gone from the blocker set, no surviving
-   process), so the verb is lying by silence, not by outcome.
+3. ⛔ **RETRACTED BEFORE IT WAS PUSHED — the verb was innocent and the READER was
+   wrong, which is the more useful finding.** This was filed as "`server app
+   session remove` answered with every field null". It did not: the response
+   envelope puts the payload under **`data`**, and the extractor read `result`,
+   so every field came back `None` from a dict that never had them. Re-run raw,
+   the same call answers `verified: true`, `row_still_listed: false`,
+   `live_processes: []`, `message: "no live session for …"`.
+   ⇒ **An all-null read is a shape mismatch until proven otherwise.** Filing it
+   as a defect would have sent the next session to audit a verb that works, and
+   the retraction is cheaper than the audit. Kept rather than deleted because the
+   envelope really does have two plausible keys (`data` vs `result`) and the next
+   reader will guess the same way.
 
 ⚠ Also: the pre-push privacy guard's `aadhaar-like` rule fires on **invented
 UUIDs** whose last group is twelve digits with no hex letters in it. Failing closed is
@@ -1904,7 +1910,7 @@ But the cheap fix is guidance, not code: *invent test ids with letters in them.*
 
 **Falsifier:** `server attach --kind claude-code <key> <cwd>` exists and the
 resulting row reports a non-permanent blocker set; `server sessions classify`
-exists; `session remove` answers with a populated `verified`.
+exists. (The third item is retracted, not open.)
 
 ## ⚖⚖ THE HOT-RESTART GATE IS UNBUILT — THE DESIGN IS NOW SETTLED
 
