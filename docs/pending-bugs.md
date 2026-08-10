@@ -2005,6 +2005,43 @@ which means the window used (`start … ready + 2 s`) is catching reconcile acti
 that belongs to the period AFTER the switch completed, not to the switch. The
 honest claim from this table is the first row only.
 
+### ⛔⛔ ROOT CAUSE, CODE-CITED: THE REVEAL RECONCILE IS SCHEDULED INSIDE THE BRANCH THAT DOES NOT RUN
+
+`shell.rs` ~95065 arms the reveal-time repaint:
+
+    let mut screen_reconcile_due_at_ms = current_millis() + REVEAL_SCREEN_RECONCILE_SETTLE_MS;
+    let mut screen_reconcile_reason = "reveal_screen_reconcile";
+
+and its own comment states the failure it exists to prevent, exactly:
+*"while a retained host sits inactive its bootstrap is skipped entirely — no
+reads run, so the client buffer misses the TUI's in-place repaints … the reveal
+then paints the stale bottom and an idle TUI never re-emits it. EVERY bootstrap
+spawn therefore schedules one settled repaint."*
+
+⛔ **But those lines live INSIDE the bootstrap task**, and `shell.rs` ~94361
+returns before spawning it whenever `terminal_session_should_bootstrap_host` is
+false — the `bootstrap_spawn_skipped_inactive_retained_host` branch, **249
+firings**. ⇒ *"every bootstrap spawn schedules one repaint"* is true and useless
+for the population that needs it: **the case with no spawn has no repaint.** The
+guard was written against precisely this scenario and then placed where that
+scenario cannot reach it.
+
+⚠ **The remaining unknown, and it decides the fix:** on a switch the row becomes
+active, so `should_bootstrap_host` ought to flip true and spawn. `mount_epoch_reused`
+fires **197** times, which suggests a retained host re-activating REUSES its mount
+rather than re-running the effect — in which case the bootstrap never re-spawns on
+reveal and the reconcile is never armed. **Read `terminal_session_should_bootstrap_host`
+and the mount-epoch reuse path before changing anything**; if that is confirmed,
+the fix is to arm the reconcile on the REVEAL transition rather than on the
+bootstrap spawn, which is where it belongs anyway — the reveal is the event that
+makes a stale surface visible.
+
+⭐ **Same shape as the bug fixed in 3.0.98/3.0.100 tonight, one layer over:** that
+skip branch also "wrote a trace event and nothing else", leaving an open attempt to
+die at the 60 s ceiling. It was taught to resolve the attempt. It still does not
+arm the repaint. ⇒ **when a skip branch is found to owe one thing to the rest of
+the system, ask what ELSE the branch it skipped was responsible for.**
+
 ⚠ **Still a hypothesis, not a finding.** It is consistent with all six measured
 quantities, and no competing explanation now fits `overlay_visible: False` plus a
 retained host plus an 11.7 s output wait — but nobody has yet watched a screen
