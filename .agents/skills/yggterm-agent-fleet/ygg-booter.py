@@ -41,6 +41,7 @@ subscribing is a thing you do TO it, not a thing you run inside your own loop.
 
 Usage:
     ygg-booter.py subscribe [--row <path>] [--campaign yggterm] [--max-hours 12]
+                            [--kind task|monitor]   # monitor: unsubscribe needs --force
     ygg-booter.py unsubscribe [--row <path>]        # no --row = this session
     ygg-booter.py list
     ygg-booter.py tick [--dry-run]                  # one pass over all subscribers
@@ -204,6 +205,10 @@ def cmd_subscribe(args):
         "host": args.host,
         "subscribed_at": time.time(),
         "max_hours": args.max_hours,
+        # ⭐ WHAT KIND OF WATCH THIS IS. "task" has a terminal state and may
+        #    unsubscribe itself when the work is done; "monitor" does not --
+        #    see cmd_unsubscribe.
+        "kind": getattr(args, "kind", None) or "task",
         "boots": 0,
         "last_size": 0,
         "escalated": False,
@@ -276,9 +281,37 @@ def cmd_defer(args):
 
 
 def cmd_unsubscribe(args):
+    """⛔ "UNSUBSCRIBE WHEN THE WORK IS DONE" IS WRONG FOR A MONITOR.
+
+    That instruction is right for work with a TERMINAL STATE (a build, a review,
+    a migration) and wrong for a watch, where "done" is never true while the
+    thing being watched is still live. So "am I done?" is the wrong question to
+    hand such a session, and ANY agent asked it eventually answers yes — at the
+    moment its task list happens to look empty.
+
+    Measured 2026-08-10 (reported by a sibling campaign): a relay row armed the
+    booter, finished its task, and unsubscribed ITSELF at 00:40:43 following the
+    contract verbatim. At 02:33 the thing it was watching died. At 09:15 the
+    market opened. 7h43m of blindness, ended only when the owner hand-booted it.
+
+    ⚠ The fix is deliberately NOT a better instruction — a rule saying "do not
+    unsubscribe" is the same class of object that just failed. The refusal lives
+    HERE, at the point where the mistake is actually made.
+    """
     uuid = (args.row or "").rstrip("/").split("/")[-1] or own_uuid()
     p = sub_path(uuid)
     if p.exists():
+        try:
+            rec = json.loads(p.read_text())
+        except Exception:
+            rec = {}
+        if rec.get("kind") == "monitor" and not getattr(args, "force", False):
+            log(f"⛔ {uuid[:8]} is a MONITOR subscription — refusing to unsubscribe.")
+            log("   A monitor has no 'done': the thing it watches is still live, and")
+            log("   'my task list looks empty' is not the same question. If you really")
+            log("   mean to stop watching, say so explicitly:")
+            log(f"   ygg-booter.py unsubscribe --row {uuid} --force")
+            return 3
         p.unlink()
         log(f"unsubscribed {uuid}")
     else:
@@ -634,6 +667,12 @@ def main():
     ap.add_argument("--host", default=os.environ.get("YGG_GUI_HOST", "guihost"),
                     help="the GUI host — app control resolves only there")
     ap.add_argument("--max-hours", type=float, default=12.0)
+    ap.add_argument("--kind", choices=("task", "monitor"), default="task",
+                    help="task: has a terminal state, may unsubscribe itself when done. "
+                         "monitor: watches something still live, so 'done' is never true — "
+                         "unsubscribing one needs --force")
+    ap.add_argument("--force", action="store_true",
+                    help="unsubscribe: stop watching even a monitor subscription")
     ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
