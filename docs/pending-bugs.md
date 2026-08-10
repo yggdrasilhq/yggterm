@@ -151,6 +151,19 @@ user sees or a trace event naming the refusal — never a row that says `running
 **Owner-reported 2026-08-11, verbatim:** *"Renders in TUI are weird characters
 appearing here and there and going away on scrolll."*
 
+⛔⛔ **AND THE SEVERITY IS FAR WORSE THAN THAT SENTENCE — HE THEN SENT THE
+FRAME.** It is not stray cells: **the ENTIRE terminal viewport was garbled, every
+glyph wrong, top to bottom.** The structure survives perfectly — word shapes,
+line lengths, indentation, colours, emoji placement, the highlighted user blocks
+— while every character is a different character. The DOM sidebar and the
+notification panel in the same screenshot render flawlessly. ⇒ **the WebGL glyph
+atlas is being indexed wholesale wrong**, which is the textbook full form of
+`webgl-stale-atlas-garble`, and the terminal is simply unreadable while it lasts.
+⚠ **Do not size this bug from the reported sentence.** "Weird characters here and
+there" describes the mild case; the pasted frame is the same defect at full
+amplitude, and it is the one that matters. The mild case and the full case are
+the same mechanism at different atlas-staleness depths.
+
 **Confirmed in a faithful pixel**, not from telemetry — `server app screenshot`
 on the GUI host, `capture_faithful: true`. Two artifact classes, both present in
 one frame:
@@ -214,6 +227,15 @@ carries `render_lag_after_gap_ms`, and the heal traces its own outcome
 separately as `stale_atlas_heal_outcome{atlas_cleared, rows_refreshed,
 duration_ms}`. Guarded by
 `shell::tests::terminal_eval_script_wires_stale_atlas_paint_detector`.
+
+⭐⭐ **AND 3.0.106 STOPS REPAIRING IT AND PREVENTS IT.** Detection is inherently
+too late: it can only fire once a garbled frame has been painted and *seen*, and
+what he saw was every glyph on the screen. The rAF gap monitor's own tick is the
+first frame after the throttle ends, so it runs before any render can use the
+stale atlas — every mounted host's atlas is now cleared *there*, and the clear
+stamps the same `lastAtlasClearAtMs` the detector reads, so the repair path
+correctly stands down when prevention already did the work. The repair path stays
+as the backstop for staleness that arrives by some other route.
 
 ⚠ **STILL OPEN, and this is the honest part.** The fix is shipped and unproven
 on the owner's screen: a GUI change needs a GUI restart, and his was mid-session
