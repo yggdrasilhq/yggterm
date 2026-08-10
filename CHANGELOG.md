@@ -4,8 +4,23 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
-- **The GUI took ~37 s to become usable on every start, and the whole of it was
-  a handoff that could never have worked.** This is the owner's headline
+- **The `yggterm-server` test suite is green again — four red tests, all test
+  hygiene, no production defect behind any of them.** They had failed at HEAD on
+  `dev`, and a red bar teaches whoever runs the suite that red means "not mine".
+  All four fed placeholder paths or ambient state to code that consults the real
+  world: (1) `daemon_binary_is_legacy_allows_deleted_current_install_path`
+  handed `/home/user/...` to a companion-resolver that stats the filesystem —
+  now a `tempdir` with real files (and confirmed NOT the deploy blocker it was
+  feared to be; the sole production caller reads live `/proc`); (2)/(3) the two
+  remote-launch-contract tests performed a live `ssh` to resolve a cwd that does
+  not exist on the host, which correctly collapsed `/home/user/gh/yggterm` to
+  `/home` — now a `#[cfg(test)]` seam injects the resolver instead of shelling
+  out; (4) `pty_runtime_answers_default_color_query_to_child` flaked only under
+  `--workspace` because it read `YGGTERM_TERMINAL_COLOR_*` from the process env
+  for both its expectation and the runtime, and a neighbour's `env::set_var`
+  flipped the foreground between the two reads — the launch command now carries
+  its full colour profile so both sides resolve from the command, not the
+  environment. `cargo test --workspace --lib` is clean three runs running. This is the owner's headline
   symptom — *"sessions are untypeable even though I see a flawless rendering of
   the session"* — and the reason it survived so many "looks fine" checks is that
   the painted screen is genuinely correct throughout; only the connection is

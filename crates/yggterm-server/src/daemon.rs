@@ -24131,30 +24131,56 @@ mod tests {
         assert!(!versioned_socket_alias_is_legacy(current, (2, 1, 33)));
     }
 
+    // ⛔ HERMETIC: the earlier version fed the placeholder paths
+    // `/home/user/.yggterm/bin/yggterm{,-headless}`, but the companion binary is
+    // resolved by asking the FILESYSTEM (`is_file()`), so on a host without
+    // `/home/user` the companion came back `None`, the headless argv0 fell out
+    // of the allowed set, and every case was judged legacy — a red bar that was
+    // a test artefact, never a defect in the reap decision (the sole production
+    // caller at `daemon.rs` operates on live `/proc` entries whose files exist).
+    // A placeholder path cannot be handed to a predicate that stats it. Real
+    // files in a tempdir make the resolver work and keep the public repo free of
+    // a hard-coded home path.
     #[cfg(target_os = "linux")]
     #[test]
     fn daemon_binary_is_legacy_allows_deleted_current_install_path() {
-        let current = Path::new("/home/user/.yggterm/bin/yggterm");
+        let root = tenancy_round_trip_dir("legacy-binary");
+        let current = root.join("yggterm");
+        let headless = root.join("yggterm-headless");
+        fs::write(&current, b"#!/bin/sh\n").expect("write yggterm");
+        fs::write(&headless, b"#!/bin/sh\n").expect("write yggterm-headless");
+
+        let current_str = current.to_string_lossy().to_string();
+        let headless_str = headless.to_string_lossy().to_string();
+
+        // The current install path, seen as `(deleted)` after a deploy replaced
+        // the inode under a still-running daemon: not legacy.
         assert!(!daemon_binary_is_legacy(
-            current,
-            "/home/user/.yggterm/bin/yggterm",
-            Some(Path::new("/home/user/.yggterm/bin/yggterm (deleted)")),
+            &current,
+            &current_str,
+            Some(&PathBuf::from(format!("{current_str} (deleted)"))),
         ));
+        // The same path, still on disk: not legacy.
         assert!(!daemon_binary_is_legacy(
-            current,
-            "/home/user/.yggterm/bin/yggterm",
-            Some(Path::new("/home/user/.yggterm/bin/yggterm")),
+            &current,
+            &current_str,
+            Some(&current),
         ));
+        // The headless companion beside it: not legacy.
         assert!(!daemon_binary_is_legacy(
-            current,
-            "/home/user/.yggterm/bin/yggterm-headless",
-            Some(Path::new("/home/user/.yggterm/bin/yggterm-headless")),
+            &current,
+            &headless_str,
+            Some(&headless),
         ));
+        // A foreign binary from nowhere near the install: legacy.
+        let foreign = root.join("old-yggterm-from-elsewhere");
         assert!(daemon_binary_is_legacy(
-            current,
-            "/tmp/old-yggterm",
-            Some(Path::new("/tmp/old-yggterm")),
+            &current,
+            &foreign.to_string_lossy(),
+            Some(&foreign),
         ));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(target_os = "linux")]
