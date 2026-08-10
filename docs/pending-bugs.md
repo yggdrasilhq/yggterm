@@ -2005,42 +2005,51 @@ which means the window used (`start … ready + 2 s`) is catching reconcile acti
 that belongs to the period AFTER the switch completed, not to the switch. The
 honest claim from this table is the first row only.
 
-### ⛔⛔ ROOT CAUSE, CODE-CITED: THE REVEAL RECONCILE IS SCHEDULED INSIDE THE BRANCH THAT DOES NOT RUN
+### ⛔⛔ ROOT CAUSE: THE RETRY BUDGET EXPIRES AT ~6.4 s AND THE SCREEN BECOMES WRITABLE AT ~11.7 s
 
-`shell.rs` ~95065 arms the reveal-time repaint:
+⛔ **This SUPERSEDES an earlier claim in this entry's history that the repaint is
+"armed inside a branch that never runs". That was wrong and the data killed it.**
+Counting events once per switch, within 8 s of the switch starting:
 
-    let mut screen_reconcile_due_at_ms = current_millis() + REVEAL_SCREEN_RECONCILE_SETTLE_MS;
-    let mut screen_reconcile_reason = "reveal_screen_reconcile";
+| event | slow >10 s (n=31) | fast ≤1 s (n=175) |
+|---|---|---|
+| `bootstrap_spawn_scheduled` | 17/31 | 166/175 |
+| **`screen_reconcile_skipped_unwritable`** | **19/31** | **0/175** |
+| `reveal_screen_reconcile` (the write happening) | 2/31 | 94/175 |
+| `bootstrap_spawn_skipped_inactive_retained_host` | 11/31 | 24/175 |
 
-and its own comment states the failure it exists to prevent, exactly:
-*"while a retained host sits inactive its bootstrap is skipped entirely — no
-reads run, so the client buffer misses the TUI's in-place repaints … the reveal
-then paints the stale bottom and an idle TUI never re-emits it. EVERY bootstrap
-spawn therefore schedules one settled repaint."*
+⇒ the bootstrap DOES spawn and the repaint IS armed. **`skipped_unwritable` at
+19/31 vs 0/175 is a near-perfect separator** — the write is armed and then
+REJECTED because the daemon screen is empty/launch-seed at the settle deadline.
 
-⛔ **But those lines live INSIDE the bootstrap task**, and `shell.rs` ~94361
-returns before spawning it whenever `terminal_session_should_bootstrap_host` is
-false — the `bootstrap_spawn_skipped_inactive_retained_host` branch, **249
-firings**. ⇒ *"every bootstrap spawn schedules one repaint"* is true and useless
-for the population that needs it: **the case with no spawn has no repaint.** The
-guard was written against precisely this scenario and then placed where that
-scenario cannot reach it.
+**The arithmetic, and it is the whole bug** (`shell.rs`):
 
-⚠ **The remaining unknown, and it decides the fix:** on a switch the row becomes
-active, so `should_bootstrap_host` ought to flip true and spawn. `mount_epoch_reused`
-fires **197** times, which suggests a retained host re-activating REUSES its mount
-rather than re-running the effect — in which case the bootstrap never re-spawns on
-reveal and the reconcile is never armed. **Read `terminal_session_should_bootstrap_host`
-and the mount-epoch reuse path before changing anything**; if that is confirmed,
-the fix is to arm the reconcile on the REVEAL transition rather than on the
-bootstrap spawn, which is where it belongs anyway — the reveal is the event that
-makes a stale surface visible.
+    const REVEAL_SCREEN_RECONCILE_SETTLE_MS: u64 = 1600;   // :617
+    let retry = screen_reconcile_unwritable_retries < 3;    // :95497
 
-⭐ **Same shape as the bug fixed in 3.0.98/3.0.100 tonight, one layer over:** that
-skip branch also "wrote a trace event and nothing else", leaving an open attempt to
-die at the 60 s ceiling. It was taught to resolve the attempt. It still does not
-arm the repaint. ⇒ **when a skip branch is found to owe one thing to the rest of
-the system, ask what ELSE the branch it skipped was responsible for.**
+⇒ one settle plus three retries ≈ **6.4 s of total patience**, against a measured
+`surface_mounted_to_first_output_ms` median of **11,673 ms** on this population.
+**The guard gives up roughly halfway to the moment it is waiting for**, then
+leaves the stale surface up until live output arrives.
+⭐ This is [[finding-a-deadline-shorter-than-its-release-condition]] exactly: a
+countdown that can expire before its release condition can physically occur. The
+code's own comment even records the symptom — *"live timeline showed a 15 s stale
+window the user 'fixes' with a forced refresh"* — and the 3-strike retry was the
+fix for it. **The fix was calibrated to a window it does not cover.**
+
+**THE FIX, specified so the next turn is mechanical:** replace the fixed strike
+count with a DEADLINE on the condition (keep re-arming while the screen is
+unwritable, up to a bound comfortably past the observed p90), or better, re-arm the
+reconcile on `attach_ready` (212 firings) — the event that means the remote attach
+finished and the daemon screen became writable. ⛔ Keep the WORKING-surface guard
+untouched: overwriting mid-turn tears, and that arm is not implicated (2/175 fast,
+0 slow). The unwritable arm is safe to extend by construction, because
+"unwritable" means there was nothing usable to paint anyway.
+
+⛔ **NOT SHIPPED HERE, deliberately.** It is a render-path change and this
+project's law is that a visual fix needs a faithful pixel; the proof requires
+switching rows on HIS GUI, and he was typing into it. Ship it with a before/after
+screenshot of a row left idle, not on the strength of this arithmetic alone.
 
 ⚠ **Still a hypothesis, not a finding.** It is consistent with all six measured
 quantities, and no competing explanation now fits `overlay_visible: False` plus a
