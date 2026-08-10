@@ -165,6 +165,36 @@ underneath it is real and unexplained.
 ⇒ The median switch is fine. **The tail is the product.** A cold p90 of 35 s is
 his "18-20 s" and worse, and **11 of 106 reveals never became ready** — those sit
 at ~60-122 s, which is a user staring at nothing for two minutes.
+
+### ⛔ STILL TRUE AT 3.0.101, AND THE 60 s CEILING IS NOW A COIN FLIP
+
+Owner-supplied 2026-08-10 21:20 (his notification panel). ONE agent row, three
+consecutive reveals — read from `server app state` → `reveal_log`:
+
+| finished | outcome | first output | total |
+|---|---|---|---|
+| 21:22:29 | **failed** — *"did not become interactive in time"* | — | 60,057 ms |
+| 21:22:33 | ready | **63,092 ms** | 64,004 ms |
+| 21:24:26 | ready | 36,548 ms | 45,963 ms |
+
+⭐ **The first two are the SAME reveal.** The ceiling gave up at 60.0 s and the
+terminal became interactive at 63.1 s — so the failure toast was **3.9 seconds
+early**, and the user was told a session had not come up while it was coming up.
+⇒ **A 60 s ceiling on a path whose real p90 reaches 63 s does not report failure,
+it reports impatience.** Raising it is not the fix either — the fix is the 36-63 s
+first-output itself; but until then the ceiling should not claim a failure it
+cannot distinguish from a slow success. ⚠ This is NOT the shape-B false toast
+(that one is fixed and confirmed below): here the row WAS the active terminal, so
+the stand-down correctly did not apply. Different bug, same toast.
+
+⛔ **Memory is excluded by the instrument itself** on all three: 8,741-8,958 MB of
+15,110 MB available, PSI `full avg60` **0.00%**, reclaim posture comfortable. A
+DIFFERENT agent row in the same window took **38,135 ms** to first output, so it
+is not one sick row. All four reveals are `remote-cc://dev/*`, i.e. the reach
+into `dev` — where 24 replaced daemons were alive alongside the live one.
+⇒ **Next measurement, and it is unstarted:** split that 36-63 s into ssh-connect ·
+daemon-resolve · attach · first-byte on the `dev` side. Nothing currently
+attributes it, which is why this entry keeps being re-measured rather than fixed.
 ⚠ **A GUI restart takes 17-156 s to first answer, against the owner's 3 s bar.**
 Measured on the same host: **18,473 ms**, **16,460 ms**, and then **156,524 ms**
 — the last one bad enough that the owner intervened mid-restart (*"I had to
@@ -362,19 +392,33 @@ restarted, 46→46 rows preserved):**
   **zero** `reveal_cancelled` and **zero** `reveal_failed`, and the shadow
   raised **0** notifications. The `ready_at_ms` / active-session guards hold on
   the live binary.
-- ⏳ **The in-flight-abandon resolution itself is NOT yet live-caught, and
-  cannot be manufactured on this host.** On a healthy fast `dev` the daemon
-  retains every session's host, so a reveal is always hot and readies in ~1.1 s
-  — *before* the skip fires (measured: attempt `ready` at 18:41:38.188, skip at
-  18:41:39). Shape B only occurs when the daemon-side attach is genuinely SLOW
-  (the 60 s remote-resume tail), which needs an unhealthy/cold remote I cannot
-  force without disturbing another agent's session. The code path is locked by
-  five mutation-falsified unit tests; the live confirmation will come from the
-  trace the next time a slow resume is abandoned. **Instrument to grep on the
-  GUI host:** `bootstrap_skip_cancelled_open_attempt` and `resume_timeout_stood_
-  down` (present ⇒ fixed) vs a `reveal_failed` / `resume_timeout_cleared_inflight`
-  carrying *"did not become interactive"* under a 3.0.100 GUI (present ⇒ the fix
-  did not cover that path). None of the latter appeared in the post-deploy window.
+- ✅ **THE IN-FLIGHT ABANDON IS NOW LIVE-CAUGHT — 2026-08-10 21:31, on the GUI
+  host, in the owner's own use.** It was filed as unmanufacturable (on a healthy
+  fast `dev` the daemon retains every host, so a reveal readies in ~1.1 s, before
+  the skip fires) and the prediction was that the trace would confirm it the next
+  time a slow resume was abandoned. It did, unprompted, and the whole chain is in
+  one 59-second window:
+
+      21:31:02  bootstrap_skip_cancelled_open_attempt   ×2
+      21:31:10  bootstrap_skip_cancelled_open_attempt
+      21:32:01  resume_timeout_stood_down
+
+  The GUI's own reveal log matches those to the millisecond — three entries whose
+  `failure_reason` is *"the reveal was cancelled: this session stopped being the
+  active terminal before its host could mount"* (`total_ms` 3,133 / 4,519 /
+  9,132; two with **no first output at all**, i.e. genuinely mid-flight, which is
+  exactly shape B). **The 60 s ceiling then arrived and STOOD DOWN** rather than
+  raising *"did not become interactive"*. Fleet totals on that host:
+  **13 `bootstrap_skip_cancelled_open_attempt`, 5 `resume_timeout_stood_down`,
+  16 `reveal_cancelled`** — and `reveal_cancelled` is not counted as
+  `reveal_failed`, so the toast population is unaffected.
+  ⇒ 3.0.98 + 3.0.100 are confirmed on the path they were written for.
+  ⭐ **The capture came from the OWNER sending a screenshot of his notification
+  panel**, not from an agent probe — the surface an agent never looks at was
+  holding the evidence for an entry marked unprovable. See the reveal-log
+  instrument below; it is `server app state` → `reveal_log`, and it is far more
+  legible than the trace (label, `first_output_ms`, `total_ms`, failure reason,
+  memory posture, per reveal).
 
 ⇒ **Shape A is the one that most likely IS the owner's "new session never
 starts"**: no process, no output, no error — the same silence. **It is
