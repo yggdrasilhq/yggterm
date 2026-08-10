@@ -4,6 +4,50 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The fan: yggterm was 71% of the idle CPU on the owner's laptop, and 27
+  daemons on `dev` were burning 8.12 cores between them — one root cause, three
+  defects.** Measured 2026-08-10, not inferred. The chain: a declaring app
+  (ychrome, yedit) re-emits its full OSC 7717 payload on a **~4 s heartbeat**, by
+  design; the daemon's PTY reader stamped the session's activity clock on **every**
+  chunk, including that one; so five `bash -i` shells nobody had touched in weeks
+  reported `idle_ms` of 266, 1079, 1387, 1711 and 3433 against a 300,000 ms
+  threshold. The hot-restart idle gate is an AND over owned sessions, so it could
+  never open — **THE QUIET-GATE LAW, with the app itself as the thing that is
+  never quiet.** Underneath it sat a second defect: a daemon owning a PTY had no
+  exit at ALL, because the idle shutdown refuses while it owns anything and the
+  lossless fd handoff — built, tested, and complete — was behind an opt-in nobody
+  set. And a third: two poll loops (20 s and 5 s) answered "is a newer daemon
+  live?" by pulling every peer's FULL status, which carries the machine's entire
+  live-session roster — ~140 status round trips a second across 27 daemons to
+  compute a boolean, O(N²·M) in a quantity that only ever grows.
+  ⇒ Our own control traffic no longer moves the idle clock (one-directionally: a
+  declare split across a chunk boundary still counts as activity, because
+  discounting real output is the dangerous error and a spinner frame IS the agent
+  working). A superseded daemon now hands every PTY to the newest live successor
+  and exits. And supersession is asked through the version in the socket NAME, so
+  a current daemon probes nothing and an old one probes 0-2 peers.
+  ⚠ The daemons were never junk — most were holding the owner's live agent rows,
+  which is version coexistence working as designed. The bug was that **nothing
+  ever moved that work forward**, so the count could only grow, one per deploy.
+
+- **Clicking a row could hang forever on a session that was perfectly healthy.**
+  Owner-reported: a row left untouchable overnight, and a second one reproducing
+  it live. The banner said *"still held by a yggterm process whose daemon exited
+  without handing it over … this clears itself"* — and every clause of that was
+  false. The daemon was alive and holding the PTY; nothing was going to clear;
+  one row waited **3,293 s** before being killed by hand, the other **1,101 s**.
+  Three fixes: **(a)** a Claude Code session born in the local lane is owned as
+  `local://<id>` while the same session born in the remote lane is owned as
+  `cc-runtime://<id>`, and both render as one row — so the "bind to the existing
+  runtime first" guard, which was correct and already there, could not see it and
+  fell through to a cold resume that collided with the session's own `claude`. A
+  session's identity is its ID; the lane it was born in is not a second identity.
+  **(b)** The wait now carries a deadline (120 s) and refuses rather than falling
+  through into a transcript-corrupting second resume — an absence-gate waiting for
+  a working process to EXIT can never end on its own. **(c)** The banner no longer
+  asserts that a daemon died; that was never checked, and saying it cost the owner
+  his morning.
+
 - **A web surface's loading light never expired, so an unobserved surface blinked
   for the life of the row.** Owner-reported: *"on restart all my ychromes keep on
   blinking."* Measured on his GUI — 3 of 6 ychrome rows sat at

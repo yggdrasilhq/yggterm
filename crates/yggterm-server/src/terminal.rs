@@ -2065,7 +2065,16 @@ impl PtySessionRuntime {
                                 );
                             }
                             reader_runtime_output_seen.store(true, Ordering::SeqCst);
-                            reader_activity.store(now_millis(), Ordering::SeqCst);
+                            // ⛔ Our OWN control heartbeat is not session
+                            // activity. Everything else about this chunk is
+                            // unchanged — it still reaches the screen, the ring
+                            // and the declare log; only the idle clock, which
+                            // the hot-restart gate reads as "a human or an agent
+                            // is doing something here", declines to move.
+                            // See [`crate::app_declare::chunk_is_only_app_declares`].
+                            if !crate::app_declare::chunk_is_only_app_declares(&data) {
+                                reader_activity.store(now_millis(), Ordering::SeqCst);
+                            }
                             let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
                             let mut retained = reader_retained_bytes.load(Ordering::SeqCst);
                             chunks.push_back(TerminalChunk {
