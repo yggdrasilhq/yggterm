@@ -113,7 +113,34 @@ actually fired, and a session's discipline resets every launch:
 ## 2. Know your own context budget
 
 An agent that runs out of context mid-campaign loses everything it had not
-written down. You cannot read your own token count directly — but you can ask
+written down.
+
+### ⛔⛔ THE AUTOMATIC PATH — a manual budget check is one an agent under load skips
+
+**Measured 2026-08-10, and it is the only fleet session ever to hit the wall.**
+practice row `8` (`569e15eb`) ran a relay 8.5 h on `opus[1m]` with
+`autoCompactEnabled:false`, reached **976,493 tokens**, and from `00:00:37` every
+turn returned **"Prompt is too long"** — unrecoverable, no compaction armed. It
+had this section available and never ran it, because the check below costs a
+round trip, can stall your own loop, and must be **remembered**.
+
+⇒ **`~/.claude/hooks/context-relay-gauge.py`, wired as a `UserPromptSubmit` hook,
+fires on EVERY prompt** — including the booter's, the caller with no judgement of
+its own. Silent under 55%; **NOTICE 55%** (open no new plane of work), **LAND 70%**
+(commit → update door + queue → spawn successor → unsubscribe → retire),
+**CRITICAL 85%**. On demand: `python3 ~/.claude/hooks/context-relay-gauge.py --report`.
+⭐ It publishes `~/.claude/context-gauge/<session_id>.json`
+(`pct`/`used`/`window`/`verdict`/`dead`) — **a watchdog cannot see a token count**,
+which is exactly why `ygg-babysit` has to infer liveness from file mtimes, and why
+a corpse answering in 5 ms reads to it as `WORKING`.
+
+⚠ §8 step 3 already *forbade* dying this way. **A prohibition with no measurement
+is unenforceable** — that is why the hook exists and this section no longer relies
+on you choosing to look.
+
+### The interactive check, for when you want the CLI's own breakdown
+
+You cannot read your own token count directly — but you can ask
 your own session, because a row can be sent input like any other:
 
 ```sh
@@ -855,6 +882,45 @@ handoff is a cycle, not an ending:
    subset you finished, (c) the next load-bearing subset, (d) anything parked
    for the human. Then it kills you.
 6. **Repeat until the campaign is finished.**
+
+### ⛔⛔ IN RELAY MODE, STOPPING IS A SIN — DECIDE, RECORD, CONTINUE (owner-directed 2026-08-10)
+
+His words, after a relay session ended two consecutive turns by asking him a
+question: *"In relay mode, you should not wait or ask me any questions. All
+questions and ambiguity are to be recorded … and you simply finish all parts of
+the campaign. In your questions I almost always (99% of the time) choose your
+recommendations anyway."*
+
+**⇒ THE ASK IS THE DEFECT, NOT THE UNCERTAINTY.** A relay session that surfaces a
+fork and halts has converted a 99%-predictable decision into an idle row and a
+context window going cold. **Take your own recommendation, do the work, and write
+down what you chose and what would reverse it.**
+
+1. ⛔ **NEVER end a relay turn on a question.** Not "shall I continue?", not
+   "which of these three?", not "want me to do X next?". If you can name a
+   recommendation, you can act on it.
+2. ⭐ **EVERY campaign gets ONE questions file, and the campaign door points at
+   it.** Not a chat message, which dies with the transcript, and not the bug
+   queue, which answers a different question. Name it for the plane it serves —
+   `docs/pending-information-from-user.md` is the practice-rs spelling.
+   Each entry carries: **the question · the options · ⭐ MY RECOMMENDATION · what
+   I DID in the meantime · how to reverse it.** An entry with no recommendation
+   is an unfinished entry.
+3. ⚖ **The bar for acting is REVERSIBILITY, not certainty.** Reversible and
+   recommended ⇒ do it and log it. Irreversible, destructive, outward-facing
+   (a payment, a public post, mail to a third party, a force-push over someone
+   else's work) or spending his money ⇒ log it and route around it, and **carry
+   on with the rest of the campaign** rather than stalling on it.
+4. ⛔ **"Blocked" is a claim you must test before you file it.** A missing
+   credential is not a block until you have tried the vault and the fabric
+   (see the `data-fabric` skill). File it only with the falsifier you ran.
+5. ⭐ **He reads the file at the END.** So the last act of a campaign — not of
+   every session — is to present it. Mid-relay, a question is a row in a file,
+   never an interruption.
+
+⚠ **This does NOT license silent scope changes.** Deciding a fork he handed you
+is the point; inventing new scope, or quietly narrowing his, is a different
+failure and is still forbidden.
 
 ⚖ **Titles across a relay.** Read the live outline and take the slot the campaign
 actually occupies — the number is not a constant, it moves as lanes come and go.
