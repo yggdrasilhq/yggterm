@@ -13,6 +13,75 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⛔⛔ THE BOOTER KICKED A CONTEXT-DEAD SESSION EVERY 10 MINUTES FOR TEN HOURS, AND ITS OWN LOG SAID "WORKING"
+
+**Status:** OPEN
+
+**Reported by row 8 (practice campaign) 2026-08-10, MEASURED not theoretical**, on
+`ygg-booter` / `ygg-babysit` in `.agents/skills/yggterm-agent-fleet/` — which this
+campaign owns. Return address `remote-cc://dev/4ff2ecbd-aee7-48f9-b8f5-e68142828863`.
+Evidence: `~/.yggterm/relay/booter.log` lines 225-390 (00:00-02:30), and 9
+`Prompt is too long` rows in that session's transcript between 00:00:37 and 02:20:54.
+
+**The incident.** Session `569e15eb` ran a relay 8.5 h with `autoCompactEnabled:false`
+and grew 49k → **976,493 tokens**. From 00:00:37Z every turn returned
+*"Prompt is too long"* — unrecoverable, nothing armed to compact it. The booter then
+kicked the corpse every ~10 min for **ten hours**, and the owner found it by looking
+at a screen. (This is the same row whose viewport also carried the untouchable-resume
+bug; the two are unrelated.)
+
+### ⭐ DEFECT 1 — A CORPSE ANSWERS FASTER THAN A WORKER, SO THE CLASSIFIER CALLS IT WORKING
+
+`ygg-babysit.classify()` derives liveness from `os.path.getmtime(transcript)`. A
+REFUSED turn writes three rows (user + synthetic assistant + turn_duration) in
+**5-66 ms**, so the mtime resets and age goes to ~0. The log literally reads
+`WORKING 0.1m 569e15eb` about a session dead for two hours, alternating
+WORKING / JUST_ENDED / IDLE→BOOT#1 forever.
+
+⇒ **THE GENERALISING LAW, and it is the reusable part: an error returned FASTER than
+a success looks like HEALTH to anything that measures ACTIVITY rather than OUTCOME.**
+Same family as this repo's own *verbs report the request, not the effect*.
+
+### ⭐ DEFECT 2 — THE ANTI-FLAP COUNTER IS DEFEATED BY THE SAME WRITE
+
+In `tick()`, `grew = size > last_size`, and both `if grew: s["boots"]=0` and the
+WORKING/JUST_ENDED branch reset the counter. **The rejection GROWS the file**, so
+`boots` never accumulates. Fingerprint: every boot in the log is `BOOT#1` — never #2,
+never #3 — so `MAX_BOOTS`/escalate could not fire for the real reason. It escalated
+hours later only once boots stopped landing at all, and the subscription died at
+10:46 on `--max-hours 12`, not on a diagnosis.
+⇒ *"Did the file grow"* is not *"did the agent work"*. Candidate discriminator:
+growth containing no `tool_use` and no non-zero `usage` is not progress.
+
+### ⭐ DEFECT 3 — THERE IS NO CONTEXT-DEATH STATE, AND IT IS THE ONE A BOOT CANNOT FIX
+
+Booting a context-exhausted session is not merely useless — it is the only case where
+retrying is **guaranteed** to fail forever. It needs its own terminal state: stop
+booting, escalate ONCE, and say the true thing (*"this session is unrecoverable,
+relay it"*) instead of *"did not wake after 3 boots"*.
+
+### ⭐ THE SEAM IS ALREADY BUILT — do not re-derive it
+
+An external watchdog cannot see a token count; it exists only inside the CLI, which is
+why it infers from mtimes. Row 8 shipped a `UserPromptSubmit` hook
+(`~/.claude/hooks/context-relay-gauge.py`, registered in `~/.claude/settings.json`,
+proved end-to-end on a live session) that writes on EVERY prompt:
+`~/.claude/context-gauge/<session_id>.json` →
+`{"pct":98,"used":976493,"window":1000000,"verdict":"CRITICAL","dead":true,...}`
+`verdict` is OK/NOTICE/LAND/CRITICAL; `dead:true` means the tail already carries
+*"Prompt is too long"*. ⇒ **"Is this row about to die" becomes a lookup, one `open()`.**
+⚠ Staleness is ours to handle: the file is only as fresh as that row's last prompt.
+
+### ⚠ DEFECT 4 — SKILL, NOT CODE: the only context instrument in the fleet is MANUAL
+
+`yggterm-agent-fleet/SKILL.md` §2 tells an agent to submit `/context` to its own row
+and then chase it with `continue` or stall its own loop. **A measurement that costs a
+round trip, can stall the caller, and must be REMEMBERED is one an agent under load
+skips** — and this one skipped it for 8.5 hours. §8 step 3 already forbids the outcome
+(*"I ran low on context does not license skipping the handoff"*) but **a prohibition
+with no trigger is unenforceable**. §2 should point at the gauge as the automatic path
+and keep `/context` as the interactive one.
+
 ## ⛔⛔ OWNER-REPORTED 2026-08-10: "SHELL SESSIONS NEVER BREAK, OUR SPECIAL SESSIONS ONLY BREAK — OUR PIPELINE IS BACKWARDS"
 
 **Status:** OPEN
@@ -70,18 +139,45 @@ composer's **first line was perfect and the wrapped second line lost ~half its
 characters in irregular gaps** — the gaps are CUF-skipped cells that were never
 painted.
 
-### ⇒ WHERE TO LOOK NEXT (paint layer, not the buffer)
+### ⭐ FOUND AND FIXED IN 3.0.92 — the discriminator was one boolean
 
-- `requestVisiblePaint(false)` = a DAMAGE-TRACKED partial paint. Every site that
-  calls it after the grid may have changed wholesale — a reflow/resize
-  (`scheduleSettledResizePaint`, `shell.rs:114120`), or a resumed paint suspension —
-  is a candidate, because a damage record taken before a reflow does not describe
-  the cells the reflow moved.
-- ⛔ **Do NOT try SIGWINCH / resize-nudge again.** Tried three times; 3.0.28 shipped
-  and 3.0.29 reverted it the same hour.
-- **Falsifier:** if the buffer were wrong, `term.refresh()` would preserve the
-  corruption. It does not. Any candidate cause that implies a wrong buffer is dead
-  on arrival.
+`recentFrameLikeWriteUntilMs` is armed for ≥600 ms by **any** payload containing
+`\x1b[?25l` (hide cursor). **Every TUI emits hide-cursor before every redraw**, so
+on an agent-CLI row that flag is re-armed on every frame and is effectively always
+true; a plain shell, which does not bracket its output that way, almost never arms
+it. The forced full refresh — **the only thing that repairs a partial paint** — was
+gated `&& !recentFrameLikeWrite`. ⇒ **an agent-CLI-only suppression of the only
+repair path.** That is the owner's "shells never break, our special sessions ONLY
+break", in one boolean.
+
+And the refusal branch **destroyed** the demand rather than deferring it:
+`pendingVisiblePaintForceFullRefresh` is cleared at the top of the rAF, and the
+`else if` only called `recordVisiblePaintRefreshSkipped`. `input_hot` re-armed
+itself; `frame_like` and `rate_limited` did not. **The same latch-loss the
+function's own header says it was restructured to prevent, surviving one layer
+down.**
+
+**The fix (3.0.92):** the refusal re-arms the latch and schedules a recovery for
+when the refusing condition can have lapsed, and a
+`VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS = 1500` ceiling means a continuously
+redrawing TUI cannot defer the repair forever. Throttling is preserved; dropping is
+not. ⚠ The guard test `terminal_eval_script_throttles_hot_render_bridge_work` **had
+pinned the defect verbatim** and now pins the fix, including a structural assertion
+that the refusal branch re-arms.
+
+**Live proof:** GUI 3.0.92 on the owner's host, faithful capture
+(`capture_faithful:true`, `xterm_canvas_composite_over_dom`) of an agent row
+mid-turn — the frame-like-hot state that used to suppress the repair — full
+viewport, no missing middle, no broken bottom, `session_view_contract_violations:[]`.
+⚠ **One clean frame is not proof the intermittent corruption is gone.** It is
+intermittent by construction; the real falsifier is the owner typing for an
+extended stretch without a hole appearing.
+
+⛔ **Do NOT try SIGWINCH / resize-nudge again.** Tried three times; 3.0.28 shipped
+and 3.0.29 reverted it the same hour.
+**Falsifier that killed the wrong class:** if the buffer were wrong, `term.refresh()`
+would preserve the corruption. It does not. Any candidate cause implying a wrong
+buffer is dead on arrival.
 
 ## ⛔⛔ OWNER-REPORTED, LIVE 2026-08-09: "I CANNOT USE YGGTERM. IT IS SO JANK" — the tmpfs, the daemon pile, and the two hot loops
 
