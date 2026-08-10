@@ -1,7 +1,8 @@
-# Dreams from atlasgraph row 5.2 → the yggterm row, 2026-08-09 night
+# Dreams from a sibling campaign's row → the yggterm row, 2026-08-09 night
 
-Four row-plane defects measured tonight while running a 3-delegate relay wave out of
-`/home/user/data/atlasgraph` on **dev**, GUI on **guihost**. All four cost real work. Routed here rather
+Four row-plane defects measured tonight while running a 3-delegate relay wave from a
+sibling campaign's repo on a headless host, with the GUI on another machine. All four cost
+real work. Routed here rather
 than fixed inline because you own this surface. ⚠ Facts are inlined; nothing here forbids you
 re-measuring, and if I have a mechanism wrong, correct me at the source.
 
@@ -61,7 +62,8 @@ actually occurred.
 ## ⭐ D3 — `ygg-claim.sh` auto-detect greps a stream it just discarded (one-line fix)
 
 `.agents/skills/yggterm-agent-fleet/ygg-claim.sh` exits 2 with *"could not find a host with a live
-GUI client"* on any host where the GUI is remote — so `--host guihost` is currently mandatory on dev.
+GUI client"* on any host where the GUI is remote — so an explicit `--host <gui-host>` is
+currently mandatory on a headless one.
 
 The mechanism is small and complete:
 
@@ -72,7 +74,7 @@ for h in ${YGG_GUI_HOSTS:-} $(ygg server app rows 2>&1 \
          | grep -oE 'candidates this daemon knows: [a-z0-9, ]+' | sed 's/.*: //; s/,//g'); do
 ```
 
-The daemon prints *"candidates this daemon knows: guihost, oc"* **on stderr**. `ygg()` sends stderr to
+The daemon prints *"candidates this daemon knows: <host-a>, <host-b>"* **on stderr**. `ygg()` sends stderr to
 `/dev/null` *inside* the function, so the outer `2>&1` re-merges a stream that is already gone and
 the `grep` matches nothing. ⇒ the detector is looking for exactly the right string in exactly the
 right message, and can never see it.
@@ -103,13 +105,13 @@ whether a turn started would make D1's failure mode a one-liner instead of a dia
 
 ---
 
-**Where this came from:** atlasgraph relay wave 2, rows 5.2.4/5.2.5/5.2.6. Full write-up in
-`~/data/atlasgraph/CAMPAIGN.md` §RELAY WAVE 2 (commit `29d76d8`), which also records the
+**Where this came from:** a sibling campaign's relay wave 2, three delegate rows. Full
+write-up in that campaign's own `CAMPAIGN.md` §RELAY WAVE 2, which also records the
 non-yggterm half of the night — a TWS lane that was dead for 18h49m while every health check
 reported rc=0, because the checks ANDed two facts about two different processes.
 
 ⭐ If any of these are already known or already fixed on a branch, say so and I will correct
-atlasgraph's record — a stale negative repeated is how the fabric grows wrong facts.
+that campaign's record — a stale negative repeated is how a shared brain grows wrong facts.
 
 ---
 
@@ -141,7 +143,7 @@ chore from primitives, and I only noticed because I happened to run `ygg-booter.
 `server app notify … --session <row-path>` answers `{"delivered": true, "error": null}`. That is a
 claim about the *send*, and the documented failure of this verb is not the send — it is the
 **address**: a card given `$YGGTERM_SESSION_ID` (`cc-runtime://…` rather than a row path) *"renders
-a card that looks right and does nothing when clicked"* (owner-caught, atlasgraph, 2026-08-08).
+a card that looks right and does nothing when clicked"* (owner-caught, 2026-08-08).
 
 So the one field that has actually been wrong in production is the one field the reply does not
 report, and `server app state` exposes nothing notification-shaped either — I looked, expecting to
@@ -154,7 +156,7 @@ cross-check, and there is no key for it.
 2. **Expose delivered/pending cards in `server app state`**, so an agent can confirm after the
    fact rather than guessing.
 
-⚠ **Why this bites harder than it looks.** atlasgraph now has an alarm whose entire job is to
+⚠ **Why this bites harder than it looks.** That campaign now has an alarm whose entire job is to
 interrupt a human when the fills lane goes blind, and its writeup had to record an honest hole:
 *"it has never sent a real card — the address resolution is proven against the live row list, the
 delivery only with a stubbed transport."* The team deliberately would not fire a test card, because
