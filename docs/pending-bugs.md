@@ -346,6 +346,14 @@ daemon handover, not a spawn storm.
 that walk began**. The deploy did not cause this gap; it killed the daemon that
 was already stuck in it. The serial supersede walk remains a separate real cost.
 
+⭐ **Corroborated by the app's own notifications, and it rules out the resource
+explanation.** His GUI at 22:58 on 2026-08-10 carried three `Slow terminal
+reveal` cards — **38.8 s, 46.0 s and 64.0 s** — each of which already states
+*"Memory is not the cause"*, with **8.7-9.3 GB of 15.1 GB free and the kernel
+stalled on reclaim 0.00% of the time**. ⇒ The machine was not short of anything.
+A daemon with RAM to spare, idle reclaim, and a 64-second reveal is a daemon that
+is **blocked**, not loaded — which is what the lock measurement says.
+
 ⚠ **Trace hygiene defect found while measuring:** unit tests write into the live
 `~/.yggterm/event-trace*.jsonl` — pids 3387039 / 3895848 emit
 `live_session_birth` for `abc123`, `kept-samplenotes`, `synthetic-runtime`. Any
