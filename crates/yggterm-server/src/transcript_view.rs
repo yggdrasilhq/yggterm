@@ -119,7 +119,47 @@ pub fn local_transcript_path_for_session(session_path: &str) -> Result<Option<Pa
     if let Some(uuid) = session_path.strip_prefix("local://") {
         return Ok(yggterm_core::local_cc_session_jsonl_path(uuid));
     }
+    // …and so is a live RUNTIME KEY (`cc-runtime://<uuid>`), which is the shape
+    // every agent row this daemon actually owns has: `local://` carries the
+    // yggterm RUNTIME id, not the CLI's, so the branch above resolves nothing
+    // for them. Measured on `dev` 2026-08-10 — every `local://` key its nine
+    // daemons owned had no CC transcript, while the rows themselves were
+    // `cc-runtime://<cc-session-id>`.
+    //
+    // ⛔ Dispatched through the scheme REGISTRY rather than by hand-writing
+    // another prefix: `agent_scheme.rs` exists because a hand-listed set of
+    // schemes is what rots, and its own docs name a sanitizer that was missing
+    // `cc-runtime://` as the standing exhibit.
+    if let Some(id) = id_addressable_claude_code_session(session_path) {
+        return Ok(yggterm_core::local_cc_session_jsonl_path(id));
+    }
     Ok(None)
+}
+
+/// The Claude Code session id inside a runtime key, when the path is one.
+///
+/// Pure and registry-driven, so the one judgement here — *"is this string a
+/// LOCAL runtime key whose id names a CC transcript"* — is testable without a
+/// home directory, and cannot drift from `agent_scheme.rs`.
+///
+/// ⛔ Only Claude Code is id-addressable: it stores a session as `<id>.jsonl`.
+/// A codex rollout is named by TIMESTAMP under a dated directory, so finding one
+/// by id means walking the store — different work, and not what this caller
+/// needs (codex has no sub-agent plane, which is what the gate reads this for).
+pub fn id_addressable_claude_code_session(session_path: &str) -> Option<&str> {
+    let (prefix, id) = session_path.split_once("://")?;
+    let descriptor = yggterm_core::agent_scheme::scheme_for_prefix(&format!("{prefix}://"))?;
+    if descriptor.role != yggterm_core::agent_scheme::SchemeRole::RuntimeKey
+        || descriptor.kind != Some(yggterm_core::SessionKind::ClaudeCode)
+        // A remote row (`remote-cc://<machine>/<id>`) keeps its transcript on the
+        // FAR host. The `/` is what separates the two shapes, and treating a
+        // remote id as local would glob for a file that is not this machine's.
+        || id.contains('/')
+        || id.is_empty()
+    {
+        return None;
+    }
+    Some(id)
 }
 
 /// The messages payload for `session_path`, as the page consumes it.
@@ -325,6 +365,45 @@ mod tests {
         let payload = messages_payload("remote-cc://dev/not-here").unwrap();
         assert_eq!(payload["messages"].as_array().unwrap().len(), 0);
         assert!(payload.get("error").is_none());
+    }
+
+    // The shape every agent row this daemon OWNS actually has. Measured on `dev`
+    // 2026-08-10: the terminal map is keyed `local://<yggterm-runtime-id>` and
+    // the row is `cc-runtime://<cc-session-id>` — so a resolver that knew only
+    // the first two branches returned `None` for every live CC session on the
+    // machine while looking entirely correct.
+    #[test]
+    fn a_live_runtime_key_names_the_claude_code_session_behind_it() {
+        assert_eq!(
+            id_addressable_claude_code_session(
+                "cc-runtime://2765f233-53ae-49f6-bb19-a156ea81d677"
+            ),
+            Some("2765f233-53ae-49f6-bb19-a156ea81d677")
+        );
+    }
+
+    // Each of these would send the reader looking for a file that is not on this
+    // machine, or not a transcript at all.
+    #[test]
+    fn nothing_else_is_id_addressable_on_this_machine() {
+        for path in [
+            // A remote row's transcript lives on the far host.
+            "remote-cc://dev/2765f233-53ae-49f6-bb19-a156ea81d677",
+            // Codex names its rollout by timestamp, not by id.
+            "codex-runtime://2765f233-53ae-49f6-bb19-a156ea81d677",
+            // A row identity, not a runtime key.
+            "session://2765f233-53ae-49f6-bb19-a156ea81d677",
+            // Not a scheme this project registers.
+            "postgres://2765f233-53ae-49f6-bb19-a156ea81d677",
+            "cc-runtime://",
+            "no-scheme-at-all",
+        ] {
+            assert_eq!(
+                id_addressable_claude_code_session(path),
+                None,
+                "{path} must not be treated as a local CC session id"
+            );
+        }
     }
 
     // Only the two build products are servable; this server sits beside the

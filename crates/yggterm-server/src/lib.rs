@@ -4975,6 +4975,19 @@ impl YggtermServer {
             .map(|(_resolved_key, session)| session.kind)
     }
 
+    /// The ROW PATH behind a runtime key.
+    ///
+    /// The two are not the same string and the difference is load-bearing: the
+    /// terminal map is keyed by `local://<yggterm-runtime-id>`, while the row —
+    /// and everything that identifies the agent to its own CLI, including where
+    /// its transcript lives — is `cc-runtime://<cc-session-id>`. A caller that
+    /// hands a runtime key to a store resolver silently gets nothing back, which
+    /// is a fix that looks shipped and does nothing.
+    pub fn live_session_path(&self, key_or_path: &str) -> Option<String> {
+        self.resolve_live_session_entry(key_or_path)
+            .map(|(_resolved_key, session)| session.session_path)
+    }
+
     /// EVERY promoted live session path, keep-alive or not.
     ///
     /// The twin below filters keep-alive out because it answers a different

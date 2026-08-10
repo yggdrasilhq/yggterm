@@ -141,8 +141,9 @@ pub use trace::{
 };
 pub use transcript::{
     TranscriptEntry, TranscriptEntryKind, TranscriptMessage, TranscriptRole, TranscriptTail,
-    TranscriptToolCall, TranscriptViewMessage, generation_context_from_messages,
-    message_lines_from_payload, read_agent_transcript_entries,
+    TranscriptToolCall, TranscriptViewMessage, TranscriptWriter,
+    generation_context_from_messages, message_lines_from_payload,
+    newest_transcript_writer, newest_transcript_writer_in_tail, read_agent_transcript_entries,
     read_agent_transcript_entries_tail_limited, read_agent_transcript_messages,
     read_claude_code_transcript_entries, read_claude_code_transcript_messages,
     read_codex_transcript_entries, read_codex_transcript_messages,
@@ -1945,6 +1946,58 @@ fn local_cc_projects_dir() -> Option<PathBuf> {
         .store_roots_absolute(&dirs::home_dir()?)
         .into_iter()
         .next()
+}
+
+/// Where a Claude Code session's SUB-AGENTS write, given its own transcript.
+///
+/// The layout is `…/projects/<slug>/<id>.jsonl` for the session and
+/// `…/projects/<slug>/<id>/subagents/agent-<agent-id>.jsonl` for each sub-agent
+/// it launches, beside an `agent-<id>.meta.json` naming the `agentType` and the
+/// `toolUseId` that spawned it. ⇒ **the parent transcript is not where sub-agent
+/// work is recorded**, which is why a session running delegates can look idle in
+/// every signal that reads the parent.
+pub fn local_subagent_transcript_dir(session_jsonl: &Path) -> Option<PathBuf> {
+    let stem = session_jsonl.file_stem()?;
+    Some(session_jsonl.with_file_name(stem).join("subagents"))
+}
+
+/// How long since ANY sub-agent of this session last wrote, and the file that
+/// did — `None` when the session has never launched one.
+///
+/// ⭐ This is the only signal on the machine that sees a session whose main loop
+/// is stalled while its delegates work. Measured across every transcript on
+/// `dev` 2026-08-10: of **73,764 sub-agent records in 33 sessions, 21,453
+/// (29.1%) were written while the parent transcript was silent for over a
+/// minute**, and the longest such silence around a live sub-agent record was
+/// **30.6 minutes** — past the hot-restart gate's 300 s window, and past the
+/// 30-minute deadline `docs/spec-hot-restart-relay-gate.md` §5 sets. A daemon
+/// reading only the parent would have called that session idle and cold-killed
+/// it, stranding every delegate.
+pub fn newest_subagent_transcript(
+    session_jsonl: &Path,
+) -> Option<(PathBuf, std::time::Duration)> {
+    let dir = local_subagent_transcript_dir(session_jsonl)?;
+    let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("agent-") && name.ends_with(".jsonl"))
+        {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(_, best)| modified > *best) {
+            newest = Some((path, modified));
+        }
+    }
+    let (path, modified) = newest?;
+    // A future mtime (clock skew, or a write landing this instant) is maximally
+    // fresh, not unreadable.
+    Some((path, modified.elapsed().unwrap_or(std::time::Duration::ZERO)))
 }
 
 /// `local_cc_session_jsonl_path` against an explicit projects dir — the seam the

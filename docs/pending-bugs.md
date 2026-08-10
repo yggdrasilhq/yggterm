@@ -1917,14 +1917,44 @@ against a 300 000 ms window. ⇒ the 2026-08-08 reading *"0 of 40 samples"* is n
 0 of 823, and the QUIET-GATE LAW's premise is not a theory about agent CLIs — a
 plain shell hosting a browser is just as never-silent.
 
+**Landed — §6 and the sub-agent half of §3, in 3.0.101.** ORCHESTRATING is a
+named blocker (`HOT_RESTART_BLOCKER_ORCHESTRATING`), read POSITIVELY from the
+agent's own `subagents/agent-*.jsonl` and checked BEFORE the
+`YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE` override, because the override waives
+waiting and §6's wait is a refusal to strand another agent's delegates. It is
+NOT `permanent` — it clears when the delegates stop writing — so `server daemons`
+still separates "deferring" from "lingering". `hot_restart_blocker_is_deadline_exempt`
+is the predicate §5's deadline must read; it is derived from the kind so the gate
+and the deadline cannot come to disagree about who may be interrupted.
+
+⭐ **The measurement that justifies the unbounded wait, taken on `dev` across
+every Claude Code transcript on the host:** of **73,764 sub-agent records in 33
+sessions, 21,453 (29.1%) were written while the parent transcript was silent for
+over a minute**, and the longest such silence around a live sub-agent record was
+**30.6 minutes** — past the gate's 300 s window and past §5's 30-minute deadline.
+Those sessions had no blocker of any kind before 3.0.101.
+
+⛔ **And the instrument that looked obvious is the wrong file.** `isSidechain` in
+the PARENT transcript is `false` on **all 179,392 records on this host**, across
+sessions that made **195 `Agent` and 29 `Workflow` calls** — sub-agents write to
+`<session-id>/subagents/agent-<id>.jsonl` instead. A gate built on the parent
+would have compiled, shipped, read as correct in review, and never once fired.
+[[finding-a-set-is-not-a-fill]] shape: the field was present everywhere and
+carried no signal.
+
 **Still unbuilt:** §2 (relay boundaries as the appointment), §4 (the queue), §5
-(the deadline + `continue` repair), §6 (the orchestrating exemption), and the
-rest of §3 — **blocked-on-human is not yet a state**, and an agent session is
-still classified by silence rather than by a positive liveness signal.
-⚠ The positive signal is the piece with a known cost: `session_transcript_activity`
-answers `Unknown` for every agent session on purpose, and for a `remote-cc://` row
-the transcript lives on the FAR host, so reading it is an ssh hop per session per
-poll. The booter reads exactly this signal and was right throughout the
+(the deadline + `continue` repair), and the rest of §3 — **blocked-on-human is
+not yet a state**, and an agent session's WORKING state is still inferred from
+silence rather than from a positive signal.
+⚠ Two known gaps in what landed, both in the safe direction (they answer "not
+orchestrating", which is exactly the pre-3.0.101 behaviour, so nothing regressed):
+a `remote-cc://` row's transcript lives on the FAR host and reading it is an ssh
+hop per session per 20 s poll; and codex is not id-addressable (its rollout is
+named by timestamp, not session id) — it has no sub-agent plane, so this costs
+nothing today but will the moment a second CLI grows one.
+⚠ The positive WORKING signal has a known cost too: `session_transcript_activity`
+answers `Unknown` for every agent session on purpose. The booter reads exactly
+this signal and was right throughout the
 2026-08-09 stranding incident, so the source is proven — the transport is not.
 
 ## ⭐ THE `.bak.` RECLAIM IS DONE FLEET-WIDE — WHAT REMAINS IS THE ENGINE
