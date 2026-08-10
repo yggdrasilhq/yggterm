@@ -13,6 +13,76 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⛔⛔ OWNER-REPORTED 2026-08-10: "SHELL SESSIONS NEVER BREAK, OUR SPECIAL SESSIONS ONLY BREAK — OUR PIPELINE IS BACKWARDS"
+
+**Status:** OPEN
+
+Cause NARROWED by a 9-agent investigation whose headline answer was REFUTED 3/3.
+What survives is better than what was proposed, and it is mostly **already in this
+repo in the owner's own words.**
+
+His framing, verbatim: *"shell claude code sessions run smoothly. NEVER bottom
+broken. Our special sessions ONLY break. Simplicity triumphs in shell sessions
+rendering. It is not just CC, all other CLIs are same too. So our pipeline is
+backwards. We are fighting these issues from the first month of yggterm."*
+
+### ⛔ THE ATTRACTIVE ANSWER, AND WHY IT IS WRONG — record this before re-deriving it
+
+The synthesis said: *agent CLIs get the daemon's reconstructed vt100 screen as
+AUTHORITATIVE while shells get raw bytes, and that is backwards because a TUI is a
+differential renderer.* Three independent verifiers refuted it:
+
+1. **The discriminator does not exist.** `shell.rs:94756-94758` schedules a reveal
+   reconcile that is **UNCONDITIONAL** — every session, every kind, 1.6 s after
+   every mount, and `screen_reconcile_decision` (`shell.rs:673-681`) takes only the
+   screen TEXT, no `SessionKind`. **Plain shells are repainted from the daemon's
+   authoritative screen too.** So "who gets the authoritative screen" cannot be why
+   shells are immune.
+2. **The payload is a faithful ABSOLUTE repaint**, not a relative one:
+   `state_formatted()` emits `\x1b[m` + `\x1b[H\x1b[J` + every row at absolute
+   `CSI r;cH` + a final absolute CUP, and
+   `viewport_reconcile_replay_restores_daemon_screen_and_cursor_on_desynced_client`
+   (`terminal.rs:4609-4647`) is an executable test asserting the cursor returns to
+   daemon truth so relative diffs re-anchor.
+3. **It is not novel and its remedy already failed.** `docs/xterm-bugs.md:2256`
+   states it almost verbatim, STATUS OPEN, and `a5137e03` demoted it with a live
+   measurement: on the rows he actually looks at, the accused write is REFUSED by
+   `SkipUnwritable` and the corruption is there anyway.
+
+### ⭐ WHAT SURVIVED — and the one observation that decides it is HIS
+
+**"A TUI refresh fixes it every time"** (`docs/pending-bugs.md`, his words). A
+client-side `term.refresh()` adds no bytes and changes no buffer content. **If the
+buffer had been reseeded wrongly, a refresh would repaint the WRONG content
+faithfully. It heals — therefore the BUFFER IS RIGHT AND THE PAINT IS WRONG.**
+The repo already says this twice in his words: *"the daemon's screen is right and
+the CLIENT is painting less than it holds"*.
+
+⇒ **The discriminator is not AUTHORITY, it is RECOVERY.** A shell appends at the
+cursor unconditionally, so any partial paint is overwritten at the next prompt —
+it self-heals within one line. An agent CLI redraws in place using cursor-forward
+for runs of spaces (measured on his own stream:
+`❯ On\x1b[C the\x1b[C meta\x1b[C page`), and **cells that CUF skips keep whatever
+was already in them**. So a partial paint LATCHES, permanently. Every lossy step a
+shell shrugs off is forever for a TUI. That is exactly why "shells never break and
+agent CLIs only break", and it explains the owner's 2026-08-10 screenshot where a
+composer's **first line was perfect and the wrapped second line lost ~half its
+characters in irregular gaps** — the gaps are CUF-skipped cells that were never
+painted.
+
+### ⇒ WHERE TO LOOK NEXT (paint layer, not the buffer)
+
+- `requestVisiblePaint(false)` = a DAMAGE-TRACKED partial paint. Every site that
+  calls it after the grid may have changed wholesale — a reflow/resize
+  (`scheduleSettledResizePaint`, `shell.rs:114120`), or a resumed paint suspension —
+  is a candidate, because a damage record taken before a reflow does not describe
+  the cells the reflow moved.
+- ⛔ **Do NOT try SIGWINCH / resize-nudge again.** Tried three times; 3.0.28 shipped
+  and 3.0.29 reverted it the same hour.
+- **Falsifier:** if the buffer were wrong, `term.refresh()` would preserve the
+  corruption. It does not. Any candidate cause that implies a wrong buffer is dead
+  on arrival.
+
 ## ⛔⛔ OWNER-REPORTED, LIVE 2026-08-09: "I CANNOT USE YGGTERM. IT IS SO JANK" — the tmpfs, the daemon pile, and the two hot loops
 
 **Status:** OPEN

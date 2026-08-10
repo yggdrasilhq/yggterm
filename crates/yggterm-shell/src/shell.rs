@@ -126267,6 +126267,41 @@ fn MetadataRailBody(
         }
     }
 }
+
+/// How the serving daemon's version stands against this window's.
+///
+/// Four answers, because the three the panel used to give could not tell "newer"
+/// from "older" — it only knew "different". See the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonVersionRank {
+    Newer,
+    Older,
+    Same,
+    /// One of the two did not parse as a dotted triple. Never guess a direction
+    /// from an unparseable version — that is how the inverted label happened.
+    Unknown,
+}
+
+fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.trim().split('.');
+    let major = parts.next()?.trim().parse::<u64>().ok()?;
+    let minor = parts.next()?.trim().parse::<u64>().ok()?;
+    let patch = parts.next().unwrap_or("0").trim().parse::<u64>().ok()?;
+    Some((major, minor, patch))
+}
+
+fn daemon_version_rank(daemon_version: &str, client_version: &str) -> DaemonVersionRank {
+    let (Some(daemon), Some(client)) = (version_triple(daemon_version), version_triple(client_version))
+    else {
+        return DaemonVersionRank::Unknown;
+    };
+    match daemon.cmp(&client) {
+        std::cmp::Ordering::Greater => DaemonVersionRank::Newer,
+        std::cmp::Ordering::Less => DaemonVersionRank::Older,
+        std::cmp::Ordering::Equal => DaemonVersionRank::Same,
+    }
+}
+
 /// The Client group: which build THIS window is, and whether the daemon agrees.
 /// Separate from the daemon group because it must survive the daemon being silent.
 fn client_metadata_entries(daemon: Option<&DaemonPanelStatus>) -> Vec<SessionMetadataEntry> {
@@ -126293,13 +126328,39 @@ fn DaemonMetadataGroup(
     // versions read in a single glance and a mismatch is something the user trips over
     // rather than goes looking for. See [[finding-stale-daemon-trap]].
     let versions_agree = daemon.client_version == daemon.version;
+    // ⛔ WHICH ONE IS OLDER IS A QUESTION THIS USED TO SKIP. The arm below was
+    // `(false, false) => "{version} · older than this client"`, on the bare fact
+    // that the strings DIFFER — so a daemon NEWER than the window reported itself
+    // as older. Owner-reported live 2026-08-10 with the numbers on screen: client
+    // 3.0.89, daemon 3.0.91, label *"3.0.91 · older than this client"*. A panel
+    // that inverts the one comparison it exists to make is worse than a blank one.
+    //
+    // ⛔ And `hot_restart_pending` no longer outranks the comparison. It meant the
+    // panel offered an upgrade whenever the daemon merely THOUGHT a swap was
+    // pending — his words, *"we daemon update when there is no daemon to update"*.
+    // A pending flag is only worth saying when there is somewhere newer to go.
+    let daemon_rank = daemon_version_rank(&daemon.version, &daemon.client_version);
     let mut entries = vec![
         SessionMetadataEntry {
             label: "Version",
-            value: match (daemon.hot_restart_pending, versions_agree) {
-                (true, _) => format!("{} · newer build on disk", daemon.version),
-                (false, false) => format!("{} · older than this client", daemon.version),
-                (false, true) => daemon.version.clone(),
+            value: match daemon_rank {
+                DaemonVersionRank::Newer => {
+                    format!("{} · newer than this client", daemon.version)
+                }
+                DaemonVersionRank::Older if daemon.hot_restart_pending => {
+                    format!("{} · newer build on disk", daemon.version)
+                }
+                DaemonVersionRank::Older => {
+                    format!("{} · older than this client", daemon.version)
+                }
+                DaemonVersionRank::Same if daemon.hot_restart_pending => {
+                    format!("{} · newer build on disk", daemon.version)
+                }
+                DaemonVersionRank::Same => daemon.version.clone(),
+                DaemonVersionRank::Unknown if versions_agree => daemon.version.clone(),
+                DaemonVersionRank::Unknown => {
+                    format!("{} · differs from this client", daemon.version)
+                }
             },
         },
         SessionMetadataEntry {

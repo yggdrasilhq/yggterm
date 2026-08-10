@@ -9,6 +9,36 @@ and referenced from here.
 says the answer changed.
 
 
+## ⛔⛔ A GUI RESTART NEEDS NO PERMISSION — EXCEPT ON AN ACTIVE ychrome ROW (2026-08-10)
+
+**Settled by the owner, verbatim:** *"Alwasy do GUI restart. Please write it in
+where all your future sessions will [see] this as a non-issue. This is because
+from the daemon design NOTHING is ever lost and I can resume within 3-4 seconds.
+ONLY when ychrome session is the active session (since a payment might get
+stalled or my work gets cancelled from the restart reload of a webpage) you wait
+for my permission. In this case permission is mandatory. In any other case, the
+mandatory permission is restart."*
+
+**The rule, in the order it must be applied:**
+
+1. **Default: RESTART THE GUI. Do not ask.** The daemon owns every PTY, so a GUI
+   restart loses nothing and he is back in 3-4 seconds. Asking is the wrong
+   reflex and it treats a designed-for operation as if it were damage.
+2. ⛔ **THE ONE EXCEPTION, and here permission is MANDATORY: the ACTIVE session
+   is a ychrome row.** A restart reloads the page, which can stall a payment
+   mid-flight or throw away work he has typed into a web form. Check what the
+   active session actually IS before restarting; a ychrome row that is merely
+   OPEN somewhere is not the exception — it has to be the ACTIVE one.
+3. ⛔ **AFTER the restart, VERIFY IT — every time.** He has had restarts fail and
+   had to spawn a session just to find out why. Confirm the process is actually
+   back, and confirm it came back on the build you intended.
+4. ⛔ **TIME IT. A GUI restart taking more than 3 SECONDS IS ITSELF A BUG** — his
+   ruling, not a guideline. File it rather than shrugging at it.
+
+⇒ This is the CONSTITUTION's obligation 1 ("we never stall our work waiting for
+other agents") arriving from his side: he is telling us the restart is cheap and
+that hesitating over it costs him more than the restart does.
+
 ## ★★ MUSE'S FIRST-RUN QUESTION IS MUSE, NOT US — IT IS ACCOUNT SETUP (2026-08-09)
 
 **Settled by the owner, verbatim:** *"Muse starts for the first time asking
