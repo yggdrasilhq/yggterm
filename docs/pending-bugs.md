@@ -1932,6 +1932,33 @@ skip to code.**
    number is just how long until the agent next spoke — and 315 s is a row that
    said nothing for five minutes, not a five-minute hang.
 
+### ⭐ THE DISCRIMINATOR WAS RUN FROM THE TRACE, AND IT POINTS AT (1)
+
+The mount-time seed exists — `daemon_screen_snapshot_replay_considered`
+(`shell.rs` ~94255) picks between the retained buffer and the daemon's screen and
+replays it into the canvas. **It fired TWICE across every trace generation on the
+host, against 262 switches.** In practice the canvas is not seeded on mount.
+
+And the machinery that would otherwise paint the daemon's held content is
+overwhelmingly declining to run:
+
+| `terminal_mount` reconcile outcome | count |
+|---|---|
+| `screen_reconcile_deferred_recent_output` | 619 |
+| `screen_reconcile_skipped_working_surface` | 553 |
+| `screen_reconcile_forced_deadline` | 499 |
+
+⇒ **the mechanism is a gate that defers exactly the thing the user is waiting
+for**, and one firing in three only happens because a deadline forces it. That is
+THE QUIET-GATE LAW's shape again, on the render path this time.
+
+⚠ **What this does NOT yet prove**, and the next session must not skip it: that
+the user's canvas is visibly empty or stale during those 11.7 s. The counts prove
+the seed did not run and the reconcile deferred; they do not prove what was on
+screen. A faithful screenshot taken on an idle row, at switch time, closes it —
+and it must be HIS row on HIS GUI, which means asking or waiting for a moment he
+is not typing.
+
 **The discriminator, and it is cheap:** switch to a row whose agent is provably
 idle and look at the canvas. Content there immediately ⇒ (2), and the metric
 needs a different end-marker (seeded-and-typeable, not first-output). Empty or
