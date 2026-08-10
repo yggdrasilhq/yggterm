@@ -4,6 +4,27 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The stale-atlas heal stops missing the case that actually happens, and stops
+  claiming it worked (3.0.105).** Owner-reported: stray characters appearing in
+  the TUI and clearing on scroll. Confirmed in a faithful screenshot — orphan
+  glyphs past the right margin of wrapped lines, and one row painted twice — and
+  proven to be **ours**: the daemon's vt100 screen, which is the source of truth
+  for what the terminal holds, contains that row exactly once, so the second copy
+  is painted-but-not-in-buffer. On this Wayland host the WebGL renderer is
+  active, making it the known stale-glyph-atlas family. The detector required the
+  garbled render to land within **600 ms** of the rAF-throttle gap ending, but a
+  glyph atlas that went stale during a gap stays stale until something clears it
+  — so the everyday shape (window occluded, terminal repaints seconds later when
+  the agent writes) was never detected and never healed. The window is gone; the
+  per-episode latch, not a clock, bounds the heal.
+- ⚠ **And the trace had been vouching for a repair nobody measured.** Every one of
+  the 8 stale-atlas episodes on the owner's host recorded `healed: true` while he
+  was looking at garble, because that field was the literal `true`, written before
+  the heal was even scheduled. Detection now records `heal_scheduled` plus
+  `render_lag_after_gap_ms`, and the heal traces its own outcome separately
+  (`stale_atlas_heal_outcome{atlas_cleared, rows_refreshed, duration_ms}`).
+  ⛔ The fix is **not yet proven on the owner's screen** — a GUI change needs a
+  GUI restart and his was mid-session with live agent work.
 - **The daemon stops re-reading 49.9 MB of transcripts every time it saves state
   (3.0.104).** Every `persist()` runs under the daemon's one global runtime
   mutex, so whatever it does, no other client is served meanwhile. It was

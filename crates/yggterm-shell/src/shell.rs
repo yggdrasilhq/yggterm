@@ -118077,11 +118077,24 @@ fn terminal_eval_script_with_canvas_renderer(
             try {{
                 const rafGapMonitor = window.__yggtermRafGapMonitor;
                 const staleAtlasNowMs = Date.now();
+                // ⛔ NO PROXIMITY WINDOW. This used to also require the render to
+                // land within 600 ms of the gap ENDING, which asked the wrong
+                // question: what makes a paint garble is that the atlas has not
+                // been cleared since the gap began, and that stays true for as
+                // long as nothing clears it — 600 ms, 6 s or a minute later. The
+                // common shape on the owner's desktop is precisely the one the
+                // window excluded: the window is occluded, rAF throttles, and the
+                // terminal does not repaint again until the agent writes its next
+                // output seconds later. That paint is just as garbled and was
+                // never detected, never healed, and never traced.
+                // [[finding-a-guard-that-cannot-see-the-moment-it-guards]]
+                // The staleness test below (`atlasClearedAtMs < gapStartedAtMs`)
+                // is the real condition, and the per-episode latch already stops
+                // the heal's own refresh from re-triggering it.
                 if (
                     rafGapMonitor
                     && rafGapMonitor.lastGapEndedAtMs > 0
                     && rafGapMonitor.lastGapMs > 1000
-                    && staleAtlasNowMs - rafGapMonitor.lastGapEndedAtMs < 600
                     && rafGapMonitor.lastGapEndedAtMs !== lastStaleAtlasHealGapEndMs
                     && host.getAttribute('data-active-session-host') === 'true'
                 ) {{
@@ -118098,21 +118111,48 @@ fn terminal_eval_script_with_canvas_renderer(
                             staleAtlasEntry.staleAtlasHealCount = staleAtlasHealCount;
                             staleAtlasEntry.lastStaleAtlasHealAtMs = staleAtlasNowMs;
                         }}
+                        // `heal_scheduled`, NOT `healed`. This field was the
+                        // literal `true`, written HERE — before the setTimeout
+                        // below had even been armed, let alone run. So every one
+                        // of the 8 stale-atlas episodes on the owner's host
+                        // reported a successful repair while he was looking at
+                        // garbled glyphs, and the trace vouched for a fix nobody
+                        // had measured. [[finding-a-set-is-not-a-fill]]: this
+                        // records an INTENT, and only the follow-up below may
+                        // speak about the outcome.
                         pendingRenderAnomaly = JSON.stringify({{
                             pattern: 'stale_atlas_paint',
                             raf_gap_ms: rafGapMonitor.lastGapMs,
                             atlas_age_ms: atlasClearedAtMs > 0 ? staleAtlasNowMs - atlasClearedAtMs : -1,
+                            render_lag_after_gap_ms: staleAtlasNowMs - rafGapMonitor.lastGapEndedAtMs,
                             heal_count: staleAtlasHealCount,
                             window_focused: document.hasFocus(),
                             visibility: String(document.visibilityState || ''),
-                            healed: true,
+                            heal_scheduled: true,
                         }});
                         window.setTimeout(() => {{
+                            const healStartedAtMs = Date.now();
+                            let atlasCleared = false;
+                            let rowsRefreshed = -1;
                             try {{
                                 clearTerminalTextureAtlas();
+                                atlasCleared = true;
                                 if (term.refresh) {{
-                                    term.refresh(0, Math.max(0, term.rows - 1));
+                                    rowsRefreshed = Math.max(0, term.rows - 1);
+                                    term.refresh(0, rowsRefreshed);
                                 }}
+                            }} catch (_error) {{}}
+                            // The outcome, separately traced, so a heal that
+                            // throws or finds no `refresh` can no longer hide
+                            // behind the intent recorded above.
+                            try {{
+                                pendingRenderAnomaly = JSON.stringify({{
+                                    pattern: 'stale_atlas_heal_outcome',
+                                    heal_count: staleAtlasHealCount,
+                                    atlas_cleared: atlasCleared,
+                                    rows_refreshed: rowsRefreshed,
+                                    duration_ms: Date.now() - healStartedAtMs,
+                                }});
                             }} catch (_error) {{}}
                             try {{ emitHostHealth(); }} catch (_error) {{}}
                         }}, 0);
@@ -152644,6 +152684,37 @@ mod tests {
                 "rafGapMonitor.lastGapEndedAtMs !== lastStaleAtlasHealGapEndMs"
             ),
             "the stale-atlas heal must be latched per gap episode so its own refresh cannot loop"
+        );
+        // ⛔ The detector must NOT also require the render to land soon after the
+        // gap. A stale atlas stays stale until something clears it, so the first
+        // repaint after an occlusion garbles whether it lands in 600 ms or in a
+        // minute — and "the agent wrote its next output a few seconds later" is
+        // the shape the owner actually hits. The latch above, not a proximity
+        // window, is what bounds the heal.
+        assert!(
+            !script.contains("staleAtlasNowMs - rafGapMonitor.lastGapEndedAtMs < 600"),
+            "the stale-atlas detector must not re-introduce a proximity window that \
+             blinds it to a late first repaint"
+        );
+        assert!(
+            script.contains("render_lag_after_gap_ms:"),
+            "the lag between the gap ending and the garbled render must be recorded, \
+             since it is no longer a precondition"
+        );
+        // The intent and the outcome are separate records. `healed: true` used to
+        // be a literal written before the heal was even armed, so the trace
+        // reported 8 successful repairs while the owner watched garbled glyphs.
+        assert!(
+            !script.contains("healed: true"),
+            "a heal that has not run yet must never claim it succeeded"
+        );
+        assert!(
+            script.contains("heal_scheduled: true"),
+            "the detection record states the INTENT to heal"
+        );
+        assert!(
+            script.contains("pattern: 'stale_atlas_heal_outcome'"),
+            "the heal must trace what it actually did, separately from deciding to do it"
         );
     }
 

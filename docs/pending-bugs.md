@@ -144,6 +144,74 @@ Where to look next, in order:
 **Falsifier:** a `start-cc` that spawns no process must leave either an error the
 user sees or a trace event naming the refusal — never a row that says `running`.
 
+## ⛔⛔ STRAY GLYPHS APPEAR IN THE TUI AND CLEAR ON SCROLL, AND THE HEAL CLAIMED SUCCESS EVERY TIME
+
+**Status:** OPEN
+
+**Owner-reported 2026-08-11, verbatim:** *"Renders in TUI are weird characters
+appearing here and there and going away on scrolll."*
+
+**Confirmed in a faithful pixel**, not from telemetry — `server app screenshot`
+on the GUI host, `capture_faithful: true`. Two artifact classes, both present in
+one frame:
+
+1. **Orphan glyphs at the right margin.** Single characters sitting past the end
+   of wrapped lines, at the far-right column, on several rows at once. They
+   belong to no word on their row.
+2. **A row painted twice.** The CLI's own footer hint line rendered as two
+   identical adjacent rows.
+
+⭐ **THE DUPLICATE IS NOT CONTENT — SO IT IS OURS.** The daemon's vt100 screen is
+the SSOT for what the terminal HOLDS, and it holds that row exactly **once**
+(`server snapshot` → `active_session.terminal_lines`, one match). The canvas
+painted two. ⇒ the extra row is painted-but-not-in-buffer: stale canvas cells,
+not a CLI repaint and not a grid mismatch. This is the falsification that
+matters, because a resize mismatch would have put a real duplicate in the buffer
+too — and it did not.
+
+**The renderer is WebGL** on this host (`xterm_renderer_mode: canvas`,
+`xterm_renderer_policy_reason: xterm_webgl_enabled_for_wayland`), so this is the
+`webgl-stale-atlas-garble` family (docs/xterm-bugs.md).
+
+⛔⛔ **AND THE DETECTOR HAS BEEN VOUCHING FOR A REPAIR NOBODY MEASURED.**
+`render_fail_pattern/detected` carries **8 × `stale_atlas_paint`** on this host,
+every one of them `healed: true` — while the owner was looking at garble. That
+field was **the literal `true`, written into the payload before the
+`setTimeout` that performs the heal had even been armed.** It asserted an
+intent and was read as an outcome, which is why this symptom survived every
+"the trace says it is being handled" pass. [[finding-a-set-is-not-a-fill]]
+
+**Root cause of the misses, code-cited (`crates/yggterm-shell/src/shell.rs`,
+the `term.onRender` stale-atlas block):** detection also required
+`staleAtlasNowMs - rafGapMonitor.lastGapEndedAtMs < 600` — the render had to
+land within 600 ms of the rAF-throttle gap ENDING. But what makes a paint
+garble is that the glyph atlas has not been cleared since the gap BEGAN, and
+that stays true until something clears it. The everyday shape is exactly the one
+the window excluded: the window is occluded, rAF throttles, and the terminal does
+not repaint until the agent writes its next output *seconds* later. That paint is
+equally garbled and was never detected, never healed, never traced.
+[[finding-a-guard-that-cannot-see-the-moment-it-guards]]
+
+**Fixed in 3.0.105:** the proximity window is gone (the per-episode latch, not a
+clock, is what bounds the heal), the detection record says `heal_scheduled` and
+carries `render_lag_after_gap_ms`, and the heal traces its own outcome
+separately as `stale_atlas_heal_outcome{atlas_cleared, rows_refreshed,
+duration_ms}`. Guarded by
+`shell::tests::terminal_eval_script_wires_stale_atlas_paint_detector`.
+
+⚠ **STILL OPEN, and this is the honest part.** The fix is shipped and unproven
+on the owner's screen: a GUI change needs a GUI restart, and his was mid-session
+with live agent work, so it was not restarted (standing directive: never whoop
+his viewport). What is owed, after his next restart:
+1. A faithful screenshot with no orphan glyphs and no doubled row.
+2. `stale_atlas_heal_outcome` records present with `atlas_cleared: true` — the
+   first evidence in this bug's history that a heal did anything at all.
+3. ⛔ **Whether the right-margin orphans share this cause is NOT established.**
+   The doubled row and the orphans were assumed to be one bug because they appear
+   together and both clear on scroll; only the doubled row has been traced to a
+   mechanism. If the orphans survive the fix, they are a second bug and the
+   `render_lag_after_gap_ms` field now on the record is what tells them apart.
+
 ## ⛔⛔ SWITCHING ROWS HAS A FAT TAIL TO 60 s, AND 11 REVEALS NEVER FINISHED AT ALL
 
 **Status:** OPEN
@@ -6014,7 +6082,13 @@ symptoms, and the last two are strongly suspected to share a root:
  found instead is a real, previously-unread presentation-layer suspect, and
  what it eliminated:
 
- **`app_render_storm` is live, large and unexplained.** On guihost 2026-08-01 the
+ ⚠ **STILL LIVE ON 2026-08-11, ten days later.** The GUI host's trace carries
+**32 `app_render_storm` detections and 17 autopsies**, the sampled one at
+**4,661 renders in 60 s = 77.7/s** — same order as the 2026-08-01 measurement,
+so nothing since has touched it. Found while investigating the TUI glyph-garble
+entry above; not otherwise re-examined.
+
+**`app_render_storm` is live, large and unexplained.** On guihost 2026-08-01 the
  Dioxus root rendered at **85–118 renders/s for a continuous 30 minutes**
  (16:57:40→17:27:40) and in 202 one-minute windows across the trace, against a
  calm baseline of 0.8–0.9/s. Measured cost while it ran at 33–47/s: the GUI's
