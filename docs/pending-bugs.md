@@ -1984,6 +1984,27 @@ correlate per switch: `reveal_screen_reconcile` (153 firings) against
 `screen_reconcile_deferred_recent_output` (619) for the same session — if the
 slow population is dominated by deferrals, the gate is the mechanism.
 
+**And the refresh that would fix a stale screen mostly does not run.** Correlating
+`terminal_mount` reconcile events against the 31 slow switches, within each
+switch's own window:
+
+| event | fired for slow switches | median offset from switch |
+|---|---|---|
+| `reveal_screen_reconcile` | **3 of 31** | 1,831 ms |
+| `screen_reconcile_deferred_recent_output` | 18 | 31,938 ms |
+| `screen_reconcile_skipped_working_surface` | 10 | 30,996 ms |
+| `screen_reconcile_forced_deadline` | 10 | 44,115 ms |
+
+⇒ **28 of 31 slow switches never got a reveal-time screen reconcile at all.** That
+is the load-bearing row; the reveal-time reconcile is the thing that would replace
+a stale surface with the daemon's current screen, and on the slow population it
+essentially does not fire.
+⚠ **Read the other three rows with care and do NOT quote them as "the catch-up
+arrives at 44 s".** Their median offsets exceed the switch's own `request_to_ready_ms`,
+which means the window used (`start … ready + 2 s`) is catching reconcile activity
+that belongs to the period AFTER the switch completed, not to the switch. The
+honest claim from this table is the first row only.
+
 ⚠ **Still a hypothesis, not a finding.** It is consistent with all six measured
 quantities, and no competing explanation now fits `overlay_visible: False` plus a
 retained host plus an 11.7 s output wait — but nobody has yet watched a screen
