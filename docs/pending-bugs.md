@@ -157,10 +157,32 @@ same word), and it is **not** `STAMPED_SHAPE_HASH` either (12005138361312769415 
 "equal id ⇒ wire compatible" is an assumption, and weakening a compatibility guard on
 an assumption is how a mixed-version fleet starts failing silently.
 
-⇒ **First task on this entry: name what `server remote protocol-version`'s `build_id`
-is derived from.** If it turns out to track the wire shape, it is the correct
-compatibility test and the version ordering should be replaced by it. If it does not,
-the right fix is a declared MINIMUM compatible version rather than `>=` self.
+### ✅ ANSWERED 2026-08-10 — `build_id` DESCRIBES A DIFFERENT FILE THAN THE BINARY ANSWERING
+
+`run_remote_protocol_version` (`lib.rs:16803`) emits
+`{"version": SERVER_PROTOCOL_VERSION, "build_id": current_local_build_id()}`, and
+`current_local_build_id()` hashes `local_remote_bootstrap_executable()` — the
+neighbouring **`yggterm-headless` bootstrap payload**, *not* the running binary.
+
+**Decisive experiment** — two byte-identical `yggterm` 3.0.92 binaries, differing only
+in which `yggterm-headless` sits beside them:
+
+```
+~/.yggterm/bin/yggterm  (neighbour headless 3.0.91) -> {"build_id":12072927657283082749,"version":"3.0.92"}
+~/.local/bin/yggterm    (neighbour headless 3.0.92) -> {"build_id":12300672197703280345,"version":"3.0.92"}
+```
+
+⇒ **The descriptor pairs one fact about ME with one fact about MY NEIGHBOUR.** The
+matching ids in the owner's paste failure were a coincidence of the shared neighbour,
+not evidence of compatibility — so "accept when build ids match" would have compared
+the wrong file entirely. Another member of the instrument family: *this probe answers a
+different question than its name suggests.*
+
+**⇒ Therefore the fix is a declared MINIMUM COMPATIBLE VERSION**, not `remote >= local`
+and not build-id equality. `build_id` is meaningful for its real job (deciding whether
+the bootstrap payload needs re-copying) and must keep it — but it should be NAMED for
+that (`bootstrap_payload_id`), because a field called `build_id` next to `version`
+reads as "the build of the thing that just answered", and that is false.
 
 **What was done meanwhile:** dev's `~/.yggterm/bin/yggterm` was brought to 3.0.92 to
 match the GUI, which makes the existing test pass deterministically. Nothing was
