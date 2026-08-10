@@ -1865,7 +1865,7 @@ single most common keystroke there is.
 `refused_for_draft: false` while the composer visibly holds `typed`. Measured on
 3.0.84 and still true on 3.0.85 (arm C of `draftprobe.sh`).
 
-## ⛔ OWNER-REPORTED: SWITCHING TO A SESSION IS "STILL JANK, BUT MUCH IMPROVED" — AND IT HAS NO END-TO-END INSTRUMENT
+## ⛔ OWNER-REPORTED: SWITCHING ROWS IS "STILL JANK, BUT MUCH IMPROVED" — p50 711 ms, p90 12 s, AND THE TAIL IS ONE PHASE
 
 **Status:** OPEN
 
@@ -1886,26 +1886,62 @@ synchronous bookkeeping call, not a user-visible switch. **An event named
 ([[finding-a-substring-test-reads-failure-as-success]] family: the shape looked
 like a measurement and was not one).
 
-**What is actually missing:** nothing times *click → the terminal is painted and
-typeable*, which is the only definition of the switch the user has. The pieces
-exist separately (`first_bytes`, `bridge_first_paint`, the reveal attempt states,
-`resume_timeout_*`) but nothing joins them per switch, so "jank" has no number,
-no distribution, and no way to tell a slow tail from a stalled one.
+⛔ **AND THE SECOND RED HERRING WAS MINE: I FILED "nothing measures this". IT
+DOES.** `record_terminal_open_attempt_event` (`yggterm-shell/src/shell.rs`
+~25506) has emitted a full phase breakdown all along — `request_to_ready_ms`,
+`request_to_surface_mounted_ms`, `surface_mounted_to_first_output_ms`,
+`request_to_first_meaningful_output_ms`. I concluded it was missing after reading
+one server-side bookkeeping pair. ⚠ **It is also not in `event-trace.jsonl`:** the
+GUI writes GENERATION-SUFFIXED files (`event-trace.g<gen>.jsonl`), so a scan of
+the obvious filename returns zero and reads exactly like "the event does not
+exist". ⇒ *glob the generations, and grep the emitter, before declaring an
+instrument absent.*
 
-**The work:** emit one span per switch — begin at the click, end when the canvas
-has painted AND input is ready — carrying the row path, whether the owning daemon
-is a DIFFERENT process than the GUI's own (the proxied case is the one that was
-18.5 s before `b30e7dd6`), and which reveal branch was taken. Then measure the
-distribution before changing anything: the campaign has twice "fixed" a latency
-that the measurement later showed was not the one the user felt.
+### ⭐ MEASURED ON HIS OWN SWITCHES — "much improved" is the median, "jank" is the tail
 
-⚠ **Not started here because `crates/yggterm-server/src/lib.rs` is being edited by
-a sibling session in this shared checkout** (whole-file and same-region writes
-clobber). Next relay turn, or whoever holds that file.
+262 switches carrying a `request_to_ready_ms` on the GUI host, 2026-08-10:
 
-**Falsifier:** a single trace event per switch whose payload carries a
-`switch_to_interactive_ms`, and a p50/p90/max over a day of his real switches.
-Today that number does not exist anywhere.
+| p50 | p75 | p90 | p99 | max |
+|---|---|---|---|---|
+| **711 ms** | 1,864 ms | **12,058 ms** | 63,863 ms | 315,779 ms |
+
+89 over 1 s · 58 over 3 s · **31 over 10 s**. One switch in ten takes 12 s+.
+
+**The tail is ONE phase, and it is not the mount** (fast = `<=1s`, n=173;
+slow = `>10s`, n=31; medians):
+
+| phase | fast | slow |
+|---|---|---|
+| request → surface mounted | 376 ms | **290 ms** |
+| surface mounted → first output | 202 ms | **11,673 ms** |
+| request → first *meaningful* output | 613 ms | **22,210 ms** |
+| first output → ready | 0 ms | 914 ms |
+
+⇒ **The canvas is up in ~300 ms in BOTH populations — the slow ones marginally
+FASTER.** The entire tail is spent on a *mounted, empty* terminal waiting for the
+session to emit. `rearm_count` and `observations` are 0 in both, so it is not a
+retry loop; `source` is `hot_open_row` in both, so it is not a startup path.
+
+⚖ **TWO EXPLANATIONS SURVIVE THIS DATA AND THEY DEMAND OPPOSITE FIXES — do not
+skip to code.**
+1. **Real jank:** the viewport is not seeded from the daemon's held screen on
+   mount, so the user stares at an empty or stale canvas until the next live byte
+   arrives.
+2. **A metric measuring the AGENT, not us:** if the viewport IS seeded and
+   `first_output` only means "the next live byte", then on an IDLE agent row that
+   number is just how long until the agent next spoke — and 315 s is a row that
+   said nothing for five minutes, not a five-minute hang.
+
+**The discriminator, and it is cheap:** switch to a row whose agent is provably
+idle and look at the canvas. Content there immediately ⇒ (2), and the metric
+needs a different end-marker (seeded-and-typeable, not first-output). Empty or
+stale until the agent speaks ⇒ (1), and the seed is the bug. ⚠ His verdict
+outranks the number either way — he says it is jank, which already argues for (1)
+or for a mixture.
+⛔ Note the connection to the reveal ceiling: if `ready` requires first output,
+an IDLE row can never become ready promptly, and the 60 s "did not become
+interactive" timer is aimed at a condition that row cannot satisfy — the same
+family as the shape-B skip fixed in 3.0.98/3.0.100.
 
 ## ⭐ THERE IS NO WAY TO MINT A TEST AGENT SESSION, SO THE GATE'S AGENT ARMS CANNOT BE SANDBOXED
 
