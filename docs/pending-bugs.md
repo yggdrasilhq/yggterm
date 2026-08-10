@@ -196,10 +196,36 @@ is the CURE.** The full trace, and it changes what the fix is:
     21:22:33.396  reveal_ready  first_output_ms 63,092
 
 ⇒ **Recovery attempt 1 is a no-op: it begins and ends in ONE MILLISECOND and
-achieves nothing, then nothing happens for 45 s.** What actually restores the
-session is attempt 2, which only exists because the 60 s ceiling fired — and it
-takes **378 ms**. Had attempt 2's strategy run at 21:21:32 instead of attempt 1's,
-this reveal would have been ~3.5 s, not 63 s.
+achieves nothing, then nothing happens for 45 s.**
+
+⛔ **CORRECTION, and it changes the fix.** This entry first said *"had attempt 2's
+strategy run at 21:21:32 this would have been 3.5 s"*. **There is no second
+strategy.** Both call the SAME `terminal_attempt_resume_recovery_async`
+(`shell.rs`), whose whole body is `terminal_ensure_with_retry_async`; `reason` is
+a TRACE LABEL and is never read as behaviour. Attempt 2 differs only in *when* it
+ran — by then the far daemon could answer. ⚠ Two trace events with different
+`reason` strings are not two mechanisms; read the callee before believing the
+label.
+
+**The real root cause is two lines, and both are code-cited:**
+
+1. ⭐ **Stall recovery is capped at ONE attempt** — the guard is
+   `… && resume_recovery_attempts < 1` (`shell.rs`, the
+   `blank_remote_resume_runtime_output || stalled_remote_resume || …` branch).
+   After that single shot nothing retries until the 60 s ceiling. **That cap IS
+   the 45-second dead gap**, and the gap is structural, not a stall in any call.
+2. ⭐ **That one shot asks a question whose answer was already "yes."**
+   `terminal_ensure_async` returned Ok in **1 ms**: the daemon confirmed the
+   terminal RECORD exists. Existence is not output, and the session was producing
+   none — [[finding-a-set-is-not-a-fill]] on the reveal path.
+
+⇒ **Fix shape (unbuilt, and it needs care):** retry stall recovery on a backoff
+until the ceiling instead of once, and/or make the ensure postcondition "bytes
+arrived", not "a record exists". ⛔ Do not simply raise the cap: the far daemon in
+this incident was mid-turnover and already failing to answer (`os error 11`), so a
+tight retry loop would hammer a daemon that is struggling. Measure what
+`terminal_ensure_async` does against an unresponsive far daemon BEFORE choosing a
+cadence.
 
 ⛔ **So the ceiling is MISLABELLED, not mistimed.** It is announced to the user as
 *"did not become interactive in time"* at the exact instant it triggers the repair
@@ -247,8 +273,8 @@ is not one sick row. All four reveals are `remote-cc://dev/*`, i.e. the reach
 into `dev` — where 24 replaced daemons were alive alongside the live one.
 ⇒ **That measurement is now DONE — see the trace above.** The 63 s is not spread
 across ssh-connect/resolve/attach at all: it is 3 s of real work, a 45 s dead gap
-after a no-op recovery, and a 3.5 s repair that only starts when the ceiling
-fires. **Do not re-measure it; fix `no_output_stall`.**
+caused by a one-shot recovery cap, and a repair that only starts when the ceiling
+fires. **Do not re-measure it; fix the cap and the ensure postcondition.**
 ⚠ **A GUI restart takes 17-156 s to first answer, against the owner's 3 s bar.**
 Measured on the same host: **18,473 ms**, **16,460 ms**, and then **156,524 ms**
 — the last one bad enough that the owner intervened mid-restart (*"I had to
