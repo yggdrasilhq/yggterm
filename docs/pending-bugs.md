@@ -89,11 +89,128 @@ skips** — and this one skipped it for 8.5 hours. §8 step 3 already forbids th
 with no trigger is unenforceable**. §2 should point at the gauge as the automatic path
 and keep `/context` as the interactive one.
 
+## ⛔⛔ A DEPLOY ARMS THE OLD DAEMON'S COLD SHUTDOWN, WHICH MASS-RE-RESUMES EVERY AGENT ~5 MINUTES LATER
+
+**Status:** OPEN
+
+**Owner-reported 2026-08-10** — *"while you were idle, you were untypable for half an
+hour"*, and a session restart he attempted came back failed. **Caused by this
+session's own deploy**, and the trace names every step:
+
+```
+12:27:36 → 12:31:52  pid 1751132 (3.0.89)  daemon_self_retire ×12,
+                     each deferring: blockers = recently_active, idle_ms 50s → 288s
+12:31:54  pid 1751132  run_end                ← COLD SHUTDOWN
+12:32:42  pid 2785975  live_session_birth     ← fresh daemon re-resumes everything
+12:32:47  live_session_birth
+12:34:15  live_session_birth
+```
+
+**The mechanism, and none of it is a malfunction.** Deploying 3.0.91 gave the running
+3.0.89 daemon a strictly-newer sibling, so `retire_trigger = newer_daemon_live` fired.
+It had no lossless handoff (that ships in 3.0.90+), so its only exit was the cold
+shutdown — which the code documents as *"kills this daemon's PTY children and makes
+the next client recovery-spawn a daemon that RE-RESUMES every agent on a fresh
+PTY"*. The idle gate held it off for five minutes and then correctly opened, because
+the sessions really were idle past 300 s. **Idle is not the same as unattended**: the
+owner was reading, and every agent row on the host was re-resumed under him.
+
+⇒ **A deploy therefore has a DELAYED blast radius nobody watches for.** The hot-restart
+at deploy time looks clean and preserves sessions; the damage lands ~5 minutes later
+when the superseded daemon finally clears its gate. Anyone who checks right after the
+deploy sees success.
+
+### What to change
+
+1. ⭐ **A superseded daemon whose successor can ADOPT should never reach the cold
+   shutdown.** 3.0.90+ has `spawn_superseded_self_retire_sweep` (lossless fd handoff,
+   exits only on `AllMoved`) — the gap is that a PRE-3.0.90 daemon cannot use it, and
+   the fleet is full of them. Options: teach the successor to PULL from a superseded
+   predecessor, or accept that the pile must age out and never deploy onto a host
+   still carrying old daemons that own live rows.
+2. **The idle gate's 300 s is a proxy for "nobody is looking", and it is a bad one.**
+   A row the user has open and is reading is idle. Consider gating on the ACTIVE row
+   / a viewer being attached, not only on output silence — the same
+   classification the settled relay-gate design already calls for
+   (`docs/spec-hot-restart-relay-gate.md`).
+3. **Deploy discipline meanwhile:** one deploy per session, and watch the trace for
+   `daemon_self_retire` on the superseded daemon for the following ~6 minutes rather
+   than declaring the deploy done when the hot-restart returns.
+
+⚠ **Do not "fix" this by making the gate never open** — that is the immortal-daemon
+bug this campaign just spent a day removing.
+
+## ⛔⛔ A PLAIN SHELL IS NOT GETTING ITS PERMANENT BLOCKER, AND 3.0.90 REMOVED THE ACCIDENT THAT WAS COVERING FOR IT
+
+**Status:** OPEN
+
+⛔ **BLOCKS BROAD DEPLOYMENT OF A 3.0.90+ DAEMON ONTO SHELL-OWNING HOSTS.** Found
+2026-08-10 by checking the blast radius of this session's own OSC-heartbeat fix,
+rather than by a report.
+
+### The measurement
+
+`server status --endpoint 1837801` (v2.12.24, owns **9 plain `bash -i` shells**):
+
+```
+ver 2.12.24  owns 9 shells;  permanent_blocker_count = 0
+  local://2fd6638d…  -> NO BLOCKER
+  local://808d6ea7…  -> recently_active perm=False
+  … 6 × recently_active …
+  local://cf3c17a6…  -> NO BLOCKER
+  local://f42611f7…  -> NO BLOCKER
+```
+
+**Every one of those nine should be `not_restorable, permanent=true`.** The cold
+shutdown path says so in its own comment: *"for a session that CANNOT be re-resumed —
+a plain shell — 'once idle' is not a safe moment, it is just the moment we would have
+destroyed it. Those defer permanently, override or not."* And
+`session_kind_state_survives_pty_loss(kind) = kind.is_agent()` (`daemon.rs:14278`) is
+the correct rule. So the RULE is right and its INPUT is wrong:
+`live_session_kind(key)` must be returning an agent-ish kind for these shell rows,
+because a `None` would `.unwrap_or(false)` into the permanent blocker and be SAFE.
+
+### ⛔ Why this is urgent now, and it is this session's own doing
+
+Six of the nine were held only by `recently_active` — **the ychrome OSC heartbeat**,
+i.e. an ACCIDENT, not the designed protection. 3.0.90 correctly stops that heartbeat
+from bumping the idle clock (see the daemon-pile entry). ⇒ On a 3.0.90+ daemon in the
+same situation **all nine would read NO BLOCKER**, and the cold-shutdown retire —
+which explicitly *"kills this daemon's PTY children"* — becomes free to fire on plain
+shells that cannot be brought back.
+
+That is **the 3.0.81 bug returning through a side door**, and it can take a background
+ychrome with it, which is the owner's hard constraint #1 (*"suppose I have a youtube
+playlist running in background while I work here"*).
+
+⚠ **Not yet observed firing.** No 3.0.90+ daemon has owned a plain shell yet — the
+current one owns 6 agent rows and blocks correctly on the 4 that are working. So this
+is a demonstrated GAP plus a mechanism, not a demonstrated incident. Do not soften it
+on that account: the gap is measured and the mechanism is read from the code.
+
+### What was done about it meanwhile
+
+The 3.0.92 daemon was deliberately **NOT** deployed onto any running daemon path.
+`~/.local/bin` (which is what `PATH` resolves) was brought to 3.0.92 fleet-wide;
+`~/.yggterm/bin/yggterm-headless`, which the live daemons run from, was left at 3.0.91
+on all three hosts. That was originally to avoid disturbing sessions; it is now also
+the thing keeping this gap out of the fleet.
+
+### Fix direction
+
+Find why `live_session_kind` reports a restorable kind for a `local://` shell row, and
+make the blocker walk **fail closed**: if the owned runtime's launch command is a plain
+shell, it is not restorable regardless of what the row registry says. The row registry
+and the runtime are two answers to one question — per the SSOT law, collapse them or
+make the destructive path trust the runtime.
+**Falsifier:** a daemon owning any plain shell must report
+`permanent_blocker_count >= 1`. Today it reports 0.
+
 ## ⭐ "UNSUBSCRIBE WHEN THE WORK IS DONE" IS WRONG FOR A MONITOR — AND THE SESSION ALWAYS SAYS YES
 
 **Status:** OPEN
 
-**Reported by atlasgraph row 5.3, 2026-08-10, measured.** Their full write-up (evidence,
+**Reported by a sibling campaign's row, 2026-08-10, measured.** Their full write-up (evidence,
 three fix shapes, caveats) is in that campaign's own `crossings/` note; this entry
 owns the yggterm side. ⛔ It is a CONTRACT gap, not a bug — `ygg-booter` did exactly
 what it documents.
