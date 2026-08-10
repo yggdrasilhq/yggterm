@@ -3417,11 +3417,21 @@ impl DaemonRuntime {
         // Push the profiling toggle into the process-global gate at startup. The chore
         // re-reads settings each tick, so a GUI toggle propagates to the daemon there.
         yggterm_core::set_perf_profiling_enabled(settings.perf_profiling_enabled);
-        let tree = store
-            .load_codex_tree(&settings)
-            .or_else(|_| store.load_tree())?;
+        // NO machine-wide transcript walk here, and the reason is a hard one:
+        // `run_daemon` calls this BEFORE it binds the socket, so every
+        // millisecond spent here is a millisecond in which this daemon answers
+        // nothing — no `status`, no `start-cc`, no row. `load_codex_tree`
+        // walked every codex + Claude Code transcript on the machine (17.8 GB /
+        // 807 files on the dev fleet host, 2026-08-10; `background/
+        // local_tree_scan` p50 8.3 s, max 27.4 s) to fill a parameter
+        // `YggtermServer::new` has ignored since v2.1.31. That is the same
+        // defect the chore shed in 38885207 — "walking to build an answer
+        // nobody reads" — with the startup copy missed, and it is why a freshly
+        // spawned daemon could take half a minute to answer its first request
+        // (owner: "even a new session does not want to start", 2026-08-10).
+        //
+        // The tree is not daemon state: every consumer rebuilds it on demand.
         let mut server = YggtermServer::new(
-            &tree,
             settings.prefer_ghostty_backend,
             support.clone(),
             settings.theme,
@@ -20362,6 +20372,53 @@ mod tests {
         );
     }
 
+    /// `run_daemon` calls `DaemonRuntime::load` BEFORE it binds the socket, so
+    /// anything in load that reads the machine's transcript corpus is time this
+    /// daemon answers nothing at all — no `status`, no `start-cc`, no row. It
+    /// used to call `load_codex_tree`, walking every codex + Claude Code
+    /// transcript on the machine (17.8 GB / 807 files on the dev fleet host,
+    /// 2026-08-10) to fill a `YggtermServer::new` parameter that had been
+    /// ignored since v2.1.31 — measured `background/local_tree_scan` p50 8.3 s,
+    /// max 27.4 s, which is what "even a new session does not want to start"
+    /// looked like from the owner's chair.
+    ///
+    /// The chore shed the identical walk in 38885207; this is the startup copy
+    /// that commit missed. Guarded by source text and not by a timing test on
+    /// purpose: the cost is proportional to a corpus a test machine does not
+    /// have, so only the CALL can be asserted, and the call is the defect.
+    #[test]
+    fn daemon_runtime_load_does_not_walk_the_transcript_corpus() {
+        let source = include_str!("daemon.rs");
+        let load_body = source
+            .split("fn load(support: GhosttyHostSupport) -> Result<Self> {")
+            .nth(1)
+            .and_then(|body| body.split("fn preserved_terminal_owner_keys").next())
+            .expect("DaemonRuntime::load body should be present");
+        assert!(
+            !load_body.contains("load_codex_tree("),
+            "DaemonRuntime::load must not walk every transcript on the machine \
+             before the daemon binds its socket"
+        );
+        assert!(
+            !load_body.contains("scan_local_claude_code_sessions("),
+            "DaemonRuntime::load must not scan the Claude Code corpus before the \
+             daemon binds its socket"
+        );
+
+        // The other half of the same walk: `YggtermServer::new` is what load
+        // constructs, so an expensive constructor is an expensive load.
+        let server_new = include_str!("lib.rs")
+            .split("    pub fn new(\n        prefer_ghostty_backend: bool,")
+            .nth(1)
+            .and_then(|body| body.split("\n    pub fn backend(").next())
+            .expect("YggtermServer::new body should be present");
+        assert!(
+            !server_new.contains("scan_local_claude_code_sessions("),
+            "YggtermServer::new must stay cheap — the daemon builds it before it \
+             can answer anything"
+        );
+    }
+
     #[test]
     fn runtime_load_defers_preserved_owner_deep_reconcile_until_after_socket_bind() {
         let source = include_str!("daemon.rs");
@@ -20746,20 +20803,6 @@ mod tests {
         );
     }
 
-    fn daemon_test_tree() -> yggterm_core::SessionNode {
-        yggterm_core::SessionNode {
-            kind: yggterm_core::SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        }
-    }
 
     fn daemon_test_snapshot_session(path: &str, source: SessionSource) -> SnapshotSessionView {
         SnapshotSessionView {
@@ -20805,9 +20848,7 @@ mod tests {
 
     #[test]
     fn preserved_owner_snapshot_restores_missing_live_session_row() {
-        let tree = daemon_test_tree();
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -20862,9 +20903,7 @@ mod tests {
         // B4 dormant-row prevention: the successor adopts a predecessor's dormant
         // rows, which the live snapshot path does NOT carry. Adoption must add the
         // row, be idempotent, and never steal the user's focus.
-        let tree = daemon_test_tree();
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -20899,9 +20938,7 @@ mod tests {
 
     #[test]
     fn preserved_owner_recovery_only_restores_kept_or_update_restart_snapshot_rows() {
-        let tree = daemon_test_tree();
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -21046,9 +21083,7 @@ mod tests {
 
     #[test]
     fn daemon_snapshot_keeps_remote_agent_rows_across_runtime_gap() {
-        let tree = daemon_test_tree();
         let server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -21136,9 +21171,7 @@ mod tests {
     // `a_plain_shells_row_survives_the_daemon_bump_that_killed_its_pty`.
     #[test]
     fn local_agent_rows_survive_runtime_exit_but_plain_shells_do_not() {
-        let tree = daemon_test_tree();
         let server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -21224,9 +21257,7 @@ mod tests {
     /// display time.
     #[test]
     fn a_plain_shells_row_survives_the_daemon_bump_that_killed_its_pty() {
-        let tree = daemon_test_tree();
         let mut predecessor = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -21267,7 +21298,6 @@ mod tests {
         let rescued = super::peer_live_rows_marked_as_rescued(&advertised, &peer_owned);
 
         let mut successor = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -21442,9 +21472,7 @@ mod tests {
         // launch" and cold-remounted the healthy ACTIVE session after every
         // background snapshot — the sudden-blank-viewport loop. Runtime truth
         // must win in the promote direction too.
-        let tree = daemon_test_tree();
         let server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -21483,9 +21511,7 @@ mod tests {
 
     #[test]
     fn daemon_snapshot_preserves_restored_remote_agent_without_runtime() {
-        let tree = daemon_test_tree();
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -21574,9 +21600,7 @@ mod tests {
 
     #[test]
     fn daemon_snapshot_preserves_keep_alive_remote_live_without_runtime_for_restore() {
-        let tree = daemon_test_tree();
         let server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -21638,9 +21662,7 @@ mod tests {
 
     #[test]
     fn daemon_snapshot_keeps_active_pending_launch_before_runtime_exists() {
-        let tree = daemon_test_tree();
         let server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -21717,14 +21739,7 @@ mod tests {
         // collect_live_cc_title_syncs must fail open: no CC JSONL on disk →
         // no update (and never touch non-CC or remote sessions).
         let server = {
-            let tree = yggterm_core::SessionNode {
-                kind: yggterm_core::SessionNodeKind::Group,
-                name: "sessions".to_string(),
-                path: std::path::PathBuf::from("/"),
-                ..Default::default()
-            };
             let mut server = crate::YggtermServer::new(
-                &tree,
                 false,
                 crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
                 yggui_contract::UiTheme::ZedLight,
@@ -21760,14 +21775,7 @@ mod tests {
         // confirmed once against the remote JSONL (heals stale launch hints
         // after a restore). Non-CC and non-remote-cc rows are never selected.
         let template = {
-            let tree = yggterm_core::SessionNode {
-                kind: yggterm_core::SessionNodeKind::Group,
-                name: "sessions".to_string(),
-                path: std::path::PathBuf::from("/"),
-                ..Default::default()
-            };
             let mut server = crate::YggtermServer::new(
-                &tree,
                 false,
                 crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
                 yggui_contract::UiTheme::ZedLight,
@@ -21832,14 +21840,7 @@ mod tests {
         // but the row must be CONSIDERED (regression lock for the local://
         // -only filter that left host-daemon CC rows stuck on launch hints).
         let session = {
-            let tree = yggterm_core::SessionNode {
-                kind: yggterm_core::SessionNodeKind::Group,
-                name: "sessions".to_string(),
-                path: std::path::PathBuf::from("/"),
-                ..Default::default()
-            };
             let mut server = crate::YggtermServer::new(
-                &tree,
                 false,
                 crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
                 yggui_contract::UiTheme::ZedLight,
@@ -21865,14 +21866,7 @@ mod tests {
         // spec-title-summary-working-indicator: a live agent session becomes
         // a title candidate ONLY while working; idle sessions are never
         // scanned or sent to the LLM.
-        let tree = yggterm_core::SessionNode {
-            kind: yggterm_core::SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            path: std::path::PathBuf::from("/"),
-            ..Default::default()
-        };
         let mut server = crate::YggtermServer::new(
-            &tree,
             false,
             crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
             yggui_contract::UiTheme::ZedLight,
@@ -22912,9 +22906,7 @@ mod tests {
 
     #[test]
     fn preserved_owner_runtime_prune_candidates_reject_closed_ghost_keys() {
-        let tree = daemon_test_tree();
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -22994,9 +22986,7 @@ mod tests {
 
     #[test]
     fn preserved_owner_runtime_scan_recovers_plain_running_rows_as_update_restore() {
-        let tree = daemon_test_tree();
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -23056,9 +23046,7 @@ mod tests {
 
     #[test]
     fn represented_keep_alive_live_session_still_needs_preserved_owner_without_local_runtime() {
-        let tree = daemon_test_tree();
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -23098,9 +23086,7 @@ mod tests {
 
     #[test]
     fn represented_plain_live_session_does_not_recover_unregistered_owner() {
-        let tree = daemon_test_tree();
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -23139,9 +23125,7 @@ mod tests {
 
     #[test]
     fn preserved_owner_runtime_prune_candidates_reject_duplicate_current_owner_keys() {
-        let tree = daemon_test_tree();
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -23190,9 +23174,7 @@ mod tests {
 
     #[test]
     fn preserved_owner_runtime_prune_candidates_reject_keys_assigned_to_other_owner() {
-        let tree = daemon_test_tree();
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -24338,9 +24320,7 @@ mod tests {
     /// unordered source the gate stops firing and this test is the notice.
     #[test]
     fn identical_logical_state_serializes_to_identical_bytes() {
-        let tree = daemon_test_tree();
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,

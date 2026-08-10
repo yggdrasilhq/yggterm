@@ -4,6 +4,33 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A new daemon answered nothing for 15 seconds because it walked every agent
+  transcript on the machine first — to fill an argument nobody has read since
+  v2.1.31.** Owner-reported as *"even a new session does not want to start"*.
+  `run_daemon` calls `DaemonRuntime::load` **before** it binds its socket, and
+  load walked the whole codex + Claude Code corpus (17.8 GB / 807 files on `dev`)
+  twice over: once via `load_codex_tree`, whose result went into a
+  `YggtermServer::new` parameter named `_tree`, and once inside that constructor,
+  which built an index of every Claude Code transcript on the machine. Until both
+  finished the daemon was **not listening at all** — a spawn-then-immediately-ask
+  caller reached nobody. ⇒ **Measured A/B on the same corpus, three runs each:
+  time-to-first-answer 15.1 s → 0.14 s.**
+  ⚠ Scoped honestly: this is 15 s of hard unavailability per daemon start, but it
+  is NOT proven to be the owner's 13:00:40 `start-cc` that produced no process —
+  that daemon's only walk was at 11:19:15, 100 minutes earlier. That symptom stays
+  open in `docs/pending-bugs.md` and still wants its own root cause.
+  The index is gone too: its only reader looks up ONE
+  session whose transcript path it already holds, so it now reads that file — an
+  O(1) answer to an O(1) question, and a fresher one, since the daemon never
+  refreshed that index and a session created after daemon start was silently
+  resumed at the default cwd instead of its own.
+  ⚠ This is the same defect the background chore shed in 38885207 (*"walking
+  4 GB to build an answer nobody reads"*), with the **startup** copy missed —
+  worth remembering as a shape: when a wasteful call is deleted in one place,
+  grep for its siblings before closing the entry.
+  ⛔ Pre-3.0 daemons still running carry the old code and cannot be fixed by
+  shipping; see `docs/pending-bugs.md`.
+
 - **The fan: yggterm was 71% of the idle CPU on the owner's laptop, and 27
   daemons on `dev` were burning 8.12 cores between them — one root cause, three
   defects.** Measured 2026-08-10, not inferred. The chain: a declaring app
