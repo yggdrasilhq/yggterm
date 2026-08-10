@@ -53,6 +53,13 @@ hours later only once boots stopped landing at all, and the subscription died at
 ⇒ *"Did the file grow"* is not *"did the agent work"*. Candidate discriminator:
 growth containing no `tool_use` and no non-zero `usage` is not progress.
 
+⭐ **VERIFIED against `booter.log` by this row, not taken on trust:** in the stated
+00:00-02:30 window there are **8 boots and all 8 are `BOOT#1`**. Across the whole
+log the counter *does* reach #2 and #3 — 43×#1, 6×#2, 4×#3 — which corroborates the
+mechanism rather than contradicting it: the counter accumulates only when the file
+does NOT grow, i.e. on a genuinely idle session, and resets on every context-death
+rejection.
+
 ### ⭐ DEFECT 3 — THERE IS NO CONTEXT-DEATH STATE, AND IT IS THE ONE A BOOT CANNOT FIX
 
 Booting a context-exhausted session is not merely useless — it is the only case where
@@ -81,6 +88,53 @@ skips** — and this one skipped it for 8.5 hours. §8 step 3 already forbids th
 (*"I ran low on context does not license skipping the handoff"*) but **a prohibition
 with no trigger is unenforceable**. §2 should point at the gauge as the automatic path
 and keep `/context` as the interactive one.
+
+## ⭐ "UNSUBSCRIBE WHEN THE WORK IS DONE" IS WRONG FOR A MONITOR — AND THE SESSION ALWAYS SAYS YES
+
+**Status:** OPEN
+
+**Reported by atlasgraph row 5.3, 2026-08-10, measured.** Their full write-up (evidence,
+three fix shapes, caveats) is in that campaign's own `crossings/` note; this entry
+owns the yggterm side. ⛔ It is a CONTRACT gap, not a bug — `ygg-booter` did exactly
+what it documents.
+
+A relay row armed the booter, was booted once, worked, finished — and then ran
+`ygg-booter.py unsubscribe` on itself at 00:40:43, following the contract verbatim:
+*"Sometimes you may feel that the work is done so you need to unsubscribe."*
+At 02:33 the thing it was watching died. At 09:15 the market opened. **7h43m of
+blindness, straight through the open**, ending only when the owner hand-booted it.
+
+⇒ **The generic finding: "unsubscribe when the work is done" is right for work with a
+TERMINAL STATE (build, review, migration) and wrong for a MONITOR, where "done" is
+never true while the watched thing is live.** So *"am I done?"* is the wrong question
+to hand such a session, and any agent asked it eventually answers yes — at the moment
+the task list happens to look empty.
+
+⚠ **Do not fix this with a better instruction.** A rule saying *"do not unsubscribe"*
+is the same class of object that just failed. Their own fix built a verb answering a
+different question instead.
+
+**Three shapes offered, no preference expressed; ⭐ marks their lean:**
+1. doc caveat only;
+2. ⭐ **a subscription KIND** — `subscribe --kind monitor` makes `unsubscribe` require
+   `--force` and state why, putting the refusal where the mistake is made;
+3. conditional expiry (they call it probably over-built).
+
+**Two measured notes if this is touched:**
+- `max_hours` fires on a wall clock unrelated to the work. Theirs would have expired
+  ten minutes before the window it existed to cover. Renewing while work remains turns
+  expiry into a **dead-man's switch** — a dead session still expires, a live one
+  cannot.
+- ⛔ **`defer` expiring by itself is RIGHT — do not make deferrals sticky.** The window
+  reverts on its own, so a relay tick that never happens fails toward MORE watching.
+  That failure direction is deliberate and it is what saved their lane.
+
+**Their one open question, ANSWERED here from `booter.log` so nobody re-runs the
+experiment:** boots ARE delivered to `remote-cc://dev/...` rows via `pty-write`, and
+row 8's context-death incident is direct evidence they ARRIVE — 9 refused turns are 9
+prompts that landed. ⚠ Delivery is not wakefulness: the 2026-08-09 `\n`-vs-`\r`
+defect proves a delivered boot can sit unsent in the composer. Treat *"the booter says
+it booted"* as a request, not an effect — which is exactly the caution they applied.
 
 ## ⛔⛔ OWNER-REPORTED 2026-08-10: "SHELL SESSIONS NEVER BREAK, OUR SPECIAL SESSIONS ONLY BREAK — OUR PIPELINE IS BACKWARDS"
 
