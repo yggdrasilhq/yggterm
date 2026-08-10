@@ -4,6 +4,28 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A phone can now be given the fleet without being given a shell (3.0.102).**
+  New verb `server daemon-bridge`: newline-delimited JSON in on stdin, the
+  daemon's answers out on stdout, one connection per request because that is the
+  daemon's own model. It exists to be a **forced command** —
+  `restrict,command="…yggterm-headless server daemon-bridge"` in
+  `authorized_keys` — so a phone's key reaches the daemon protocol and nothing
+  else. Without it, enrolling a phone means a bare key, and a bare key is a full
+  shell as the user who owns the permanent Android signing keystore: a stolen
+  phone would be a supply-chain compromise of every install, not a lost session.
+  Proven end to end over ssh: the bridge answers, a requested shell command
+  produces **no output at all**, and a port-forward attempt is refused
+  `administratively prohibited`. ⚠ It is shell *denial*, not a sandbox — some
+  daemon requests legitimately start processes. Narrowing which requests a device
+  may send belongs in the daemon and is not built.
+- It is a **raw line proxy** on purpose: it never deserializes `ServerRequest`,
+  so a phone shipping on a store review cycle is not coupled to the daemon's enum
+  and the bridge needs no release when a verb is added. It also names the daemon's
+  worst failure shape — an unknown `kind` fails to deserialize *before* any
+  response is written, so the socket just closes and a client sees a parse error
+  on `""`, indistinguishable from a crash. That now comes back as an explicit
+  `bridge_error` line **and the stream survives it**.
+
 - **A session running delegates is no longer the easiest one on the machine to
   kill (3.0.101).** When an agent launches sub-agents and then waits for them,
   every liveness signal yggterm had went quiet: the screen loses its `esc to

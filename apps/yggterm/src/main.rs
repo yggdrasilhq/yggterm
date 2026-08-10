@@ -1597,6 +1597,11 @@ fn main() -> Result<()> {
         let host = detect_ghostty_host();
         return run_daemon(&endpoint, host);
     }
+    // ⛔ The forced command behind a phone's ssh key. See
+    // `yggterm_server::daemon_bridge` for why a bare key is a supply-chain risk.
+    if args.as_slice() == ["server", "daemon-bridge"] {
+        return yggterm_server::daemon_bridge::run_daemon_bridge();
+    }
     if args.len() >= 3 && args[0] == "server" && args[1] == "attach" {
         let (cwd, fallback) = yggterm_server::parse_attach_args(&args[3..]);
         return run_attach(&args[2], cwd.as_deref(), fallback);
