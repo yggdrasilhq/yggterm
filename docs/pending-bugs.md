@@ -246,14 +246,40 @@ that the record exists. ⇒ **Retrying a call that returns `Ok` in 1 ms returns
   one session received nothing. ⇒ **The gap is SPECIFIC to this session's read
   stream, not a property of the host**, and every hypothesis in this entry that
   blamed something global has now been wrong.
-⇒ **The measurement now owed is narrower:** identify WHICH daemon owned
-`remote-cc://dev/<id>` at 21:21:32 and read only that pid's activity in the gap.
-The host-wide answer cannot settle it — 24 daemons were alive and the busiest in
-that window were stale ones (2.11.1, 2.12.24, 3.0.77), not necessarily the owner.
-⚠ Also unexplained and possibly the same thread: **236 `live_session_birth`
-events in those 75 seconds**.
+### ⭐⭐ THE OWNING DAEMON HAD THE BYTES 50 SECONDS BEFORE THE CLIENT DID
+
+That narrower measurement is **DONE**. Filtering the far host's trace to the one
+owning daemon gives a complete attribution, and it is not any of the four
+hypotheses above:
+
+| far-host event (owning daemon) | at | Δ |
+|---|---|---|
+| `live_session_birth` | 21:21:32.248 | — |
+| `request_terminal_launch` | 21:21:32.272 | |
+| `ensure_session_begin` · `terminal_spec_resolved` · `spawn` | 21:21:41.632 | **+9.4 s hole** |
+| **`first_bytes`** | 21:21:42.421 | +0.8 s — the spawn itself is FAST |
+| `ensure_session_end` | 21:22:06.350 | **+23.9 s hole**, with bytes already flowing |
+| *client's* first output | ~21:22:32.5 | **+26.2 s hole** |
+
+⇒ ⭐ **The runtime produced its first bytes at 21:21:42 and the client did not
+render any until 21:22:32 — a 50-second delivery gap on a stream whose source was
+ready the whole time.** The actual work (spawn → first bytes) took **0.79 s**. The
+other 62 seconds are three separate holes, none of them the work.
+
+⛔ **So it is not the client's retry, not the host's availability, and not the
+ceiling.** The bytes existed and were not delivered. ⚠ *Why* each hole exists is
+NOT established — that is the next measurement, and it is now a delivery-path
+question (daemon→stream→client), not a reveal-path one.
+
+⭐ **Top lead: this reveal was a RELAUNCH, not a reattach.** `live_session_birth`
+fires at reveal time, beside `restored_codex_runtime_launch_repaired` and
+`local_cc_relaunch_command_rebuilt` — the row's PTY was respawned rather than
+adopted. Ask why a switch to an existing row births a session before assuming
+anything downstream is at fault.
+⚠ Related and unexplained: **236 `live_session_birth` events in 75 seconds** on
+that host.
 ⚖ The supersede walk (24 daemons, 23 s, serial) remains a real cost worth fixing,
-but it is now a SEPARATE finding — it is not established as the cause of this gap.
+but it is a SEPARATE finding — not established as the cause of this gap.
 
 ⚠ **Method note, because this entry has now had three fixes proposed and two
 retracted:** each "the fix is X" survived until one more layer was read — the
