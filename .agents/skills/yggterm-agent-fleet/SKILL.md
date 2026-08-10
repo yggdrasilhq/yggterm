@@ -496,6 +496,70 @@ points anywhere useful, and certainly not that anyone can act on it. ⇒ *"row 5
 This is the `§7` law — *verbs report the REQUEST, not the EFFECT* — arriving in the one place where
 the request and the effect are separated by a human being.
 
+### ⛔⛔ 3b. CLAIM EVERY SESSION YOU SPAWN, AND SWEEP IT WHEN IT IS DONE
+
+**Owner-directed 2026-08-10, after finding an unswept session still holding a row's identity:**
+
+> *"Your predecessor or its predecessor started it and did not sweep it once done. I think right
+> now you are the only one. If you spawn other related sessions, make sure to claim them otherwise
+> it causes ambiguity like you just saw."*
+
+**A session has TWO lifetimes and they end separately: the ROW and the PROCESS.** Everything else
+here follows from that, and every trap below has actually fired.
+
+**① CLAIM IT AT SPAWN — do not wait for the delegate to claim itself.** `ygg-claim.sh` is written
+for a session to run on itself, and a delegate does run it — *minutes into its first turn*. Until
+then the row is unclaimed, unnumbered, and **unsubscribed from the booter**, which is precisely the
+window in which a dropped brief (§3) leaves it parked at its composer forever. Measured: of three
+delegates spawned together, only one had subscribed itself twenty minutes later. ⇒ the SPAWNER
+seats it (`--outline`), titles it, and subscribes it:
+```sh
+ygg-booter.py subscribe --row "$ROW" --campaign <token> --max-hours 12
+```
+The delegate's own later claim is then a harmless no-op — a row that already has a seat keeps it.
+⚠ `--outline` takes a LITERAL string: shell arithmetic like `5.$(…)` has seated rows at `5.5`
+instead of `5.2.5`, one of them colliding with a live row. Pass `5.2.5` literally and read the seat
+back.
+
+**② ⛔ RETIRING THE ROW DOES NOT KILL THE PROCESS — and a finished delegate does not exit.** An
+agent CLI sits at its prompt forever after its last turn. `session remove` can answer
+`row_still_listed:false` while the process runs on. Measured 2026-08-10: three delegates had
+written their crossings, pushed their commits, **removed their own rows** — and all three `claude`
+processes were still resident hours later, holding session ids that no row could address. They are
+invisible to `server app rows` by construction, so **the row plane can never show you this.**
+
+**③ ⛔⛔ THE FAILURE THAT COSTS MOST: TWO PROCESSES ON ONE SESSION ID.** Found on the orchestrator's
+own row — one `--session-id` from 22:56 and one `--resume` from 23:42, both parented by yggterm row
+shells, both live. Symptoms, none of which point at the cause: a background task scheduled ONCE
+fired TWICE · an `Edit` failing with *"file has been modified since read"* on a file only you are
+editing · **commits appearing in your own voice and row label that you did not make.** Twenty
+minutes went into hunting a phantom third party in the tree.
+⇒ ⭐ **It is `§7`'s lesson generalised: a session id is an IDENTITY, and two processes holding one
+identity make every fact about "that row" ambiguous.** The benign version doubles a read. The row
+in question was that evening killing and relaunching an application on a remote guest to repair an
+outage **whose root cause was a second instance being launched beside a running one** — a doubled
+launch from a doubled agent is that identical fault, and nothing would have refused it.
+
+**④ THE SWEEP — run it before you hand off, and after any GUI restart.** Identify, never count
+(`pgrep -c` counts your own shell). ⚠ Find your OWN pid by walking up from `$$` to the first
+`claude` process — do not infer it from flags, because killing the wrong one takes down the row the
+human is looking at.
+```sh
+ROWS=$(yggterm server app rows | python3 -c "import json,sys;print(' '.join(
+  r['full_path'].split('/')[-1] for r in json.load(sys.stdin)['data']['rows'] if r.get('full_path')))")
+for p in $(pgrep -x claude); do
+  uuid=$(tr '\0' ' ' </proc/$p/cmdline | grep -oE '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}' | head -1)
+  case " $ROWS " in *" $uuid "*) ;; *) echo "⛔ ORPHAN pid=$p $uuid";; esac
+done
+```
+Before reaping, prove it is DONE and not merely quiet — **a finished delegate and a stalled one are
+indistinguishable from the row plane** (§6). Cheap discriminators: its last transcript message is a
+completion report, `pgrep -P <pid>` shows no children, and its work is committed. Then `TERM`,
+**read `/proc/<pid>` back**, and escalate to `KILL` only if it survives.
+
+⚖ **Whose job:** the session that SPAWNED it. Not the delegate — it cannot reap itself after its
+last turn — and not the next human to notice.
+
 ## 4. Correspondence — any session can reach any other
 
 A row is an address. That is the whole mechanism, and it needs no new protocol:
