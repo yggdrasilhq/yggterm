@@ -178,11 +178,35 @@ not evidence of compatibility — so "accept when build ids match" would have co
 the wrong file entirely. Another member of the instrument family: *this probe answers a
 different question than its name suggests.*
 
-**⇒ Therefore the fix is a declared MINIMUM COMPATIBLE VERSION**, not `remote >= local`
-and not build-id equality. `build_id` is meaningful for its real job (deciding whether
-the bootstrap payload needs re-copying) and must keep it — but it should be NAMED for
-that (`bootstrap_payload_id`), because a field called `build_id` next to `version`
-reads as "the build of the thing that just answered", and that is false.
+⚠ `build_id` should still be RENAMED to `bootstrap_payload_id`: a field called
+`build_id` sitting beside `version` reads as "the build of the thing that just
+answered", and that is false.
+
+### ⛔ CORRECTION — THE VERSION CHECK IS NOT THE BUG. BOOTSTRAP IS.
+
+**Earlier in this same session I filed "the fix is a declared MINIMUM COMPATIBLE
+VERSION". That is WRONG**, and recorded here rather than quietly deleted, because
+leaving it would send the next session down a dead path.
+
+The version ordering ALREADY has the right escape, and the design comment above
+`remote_descriptor_is_protocol_compatible` states the intent: *"an OLDER remote falls
+through to bootstrap, which is a benign monotonic upgrade rather than a bail."* And it
+does — `is_remote_protocol_probe_recoverable("3.0.91")` returns **true** via
+`looks_like_version(text) && text != SERVER_PROTOCOL_VERSION` (`lib.rs:15581`). So
+neither probe site (`lib.rs:16059`, `:16100`) bails on a merely-older remote.
+
+⇒ **The bail the owner hit can only be the THIRD site, `lib.rs:16118` — the POST-bootstrap
+re-probe, which has no recoverable escape, correctly: if bootstrap just ran and the
+remote is STILL old, something is genuinely wrong.**
+
+⇒ **So the real defect is that `bootstrap_remote_yggterm` ran against the remote and
+did not upgrade it.** The version mismatch was the symptom, reported honestly.
+
+**Next task, restated:** instrument the bootstrap — did it copy, to WHICH path, and did
+the re-probe read the path it wrote? ⚠ These hosts carry FOUR copies
+(`~/.local/bin/{yggterm,yggterm-headless}` + `~/.yggterm/bin/{...}`), and `PATH`
+resolves `~/.local/bin` while the daemons run from `~/.yggterm/bin`. A bootstrap that
+writes one and a probe that reads the other produces exactly this.
 
 **What was done meanwhile:** dev's `~/.yggterm/bin/yggterm` was brought to 3.0.92 to
 match the GUI, which makes the existing test pass deterministically. Nothing was
