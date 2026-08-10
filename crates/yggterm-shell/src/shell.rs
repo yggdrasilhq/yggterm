@@ -24379,29 +24379,60 @@ impl ShellState {
         );
         let notify_label = entry.label.clone();
         let notify_total_ms = entry.total_ms();
-        let notify_swap_used_mb = entry.memory_pressure.swap_used_mb();
-        let notify_swap_pressured = entry.memory_pressure.swap_pressured();
+        let notify_mem_available_mb = entry.memory_pressure.mem_available_mb();
+        let notify_mem_total_mb = entry.memory_pressure.mem_total_mb();
+        let notify_psi_full_pct = entry.memory_pressure.psi_full_avg60_pct();
+        let notify_reclaim_pressured = entry.memory_pressure.reclaim_pressured();
         self.reveal_log.push_back(entry);
         while self.reveal_log.len() > REVEAL_LOG_CAP {
             self.reveal_log.pop_front();
         }
-        // Surface the finding's headline: a reveal that dragged on while swap was
-        // thrashing is a memory-pressure problem, not a yggterm render bug. Tell
-        // the user so they can free RAM instead of chasing a phantom. Conservative
-        // threshold so it only fires on the genuinely painful cases;
-        // push_notification dedups repeats. See
-        // [[finding-xterm6-cold-reveal-render-starvation]].
+        // Report a slow reveal, and NAME A CAUSE ONLY WHEN ONE WAS MEASURED.
+        //
+        // ⛔ This used to gate on `swap_pressured()` and tell the user to free
+        // RAM. That predicate is `swap_used_kb > 512 MB`, and `swap_used` is a
+        // HISTORY counter — the doc on `reclaim_pressured` already says it
+        // "latches TRUE after one bad afternoon and never clears", which is
+        // exactly why the reclaim path stopped reading it. The notification kept
+        // reading it. Measured on the live host 2026-08-10 across every reveal on
+        // disk: `swap_pressured` was true on **106 of 106**, so it carried no
+        // information at all; of the 21 reveals that took 6 s or more, ZERO had
+        // `reclaim_pressured`, zero had PSI `full avg60` at or above the 10%
+        // thrash line (the worst was 0.23%), and the median machine had 9.4 GB of
+        // 15.1 GB available. Every one of those notices sent the owner to free RAM
+        // he already had, for a slowness memory was not causing. His words:
+        // "what is swapping and it is probably a lie". It was.
+        //
+        // ⇒ A diagnostic that asserts an unmeasured cause is worse than silence:
+        // it ends the investigation with the wrong answer. Same family as
+        // [[finding-a-constant-anomaly-is-a-measurement-bug]] — a flag that is
+        // true on 106/106 samples is a broken measurement, not a finding.
         const SLOW_REVEAL_NOTIFY_MS: u64 = 6_000;
-        if outcome == "ready" && notify_total_ms >= SLOW_REVEAL_NOTIFY_MS && notify_swap_pressured {
+        if outcome == "ready" && notify_total_ms >= SLOW_REVEAL_NOTIFY_MS {
+            let seconds = notify_total_ms as f64 / 1000.0;
+            let detail = if notify_reclaim_pressured {
+                // The honest predicate agrees: memory really is the problem.
+                format!(
+                    "The machine is short of memory ({} MB of {} MB available), so freeing RAM should help.",
+                    notify_mem_available_mb, notify_mem_total_mb,
+                )
+            } else {
+                // Say what was ruled out, so the next person does not re-chase it.
+                match notify_psi_full_pct {
+                    Some(psi) => format!(
+                        "Memory is not the cause: {} MB of {} MB available and the kernel stalled on reclaim {:.2}% of the time.",
+                        notify_mem_available_mb, notify_mem_total_mb, psi,
+                    ),
+                    None => format!(
+                        "Memory does not look like the cause: {} MB of {} MB available.",
+                        notify_mem_available_mb, notify_mem_total_mb,
+                    ),
+                }
+            };
             self.push_notification(
                 NotificationTone::Info,
                 "Slow terminal reveal",
-                format!(
-                    "Revealing {} took {:.1}s while swap was at {} MB in use. Free RAM to speed up reveals.",
-                    notify_label,
-                    notify_total_ms as f64 / 1000.0,
-                    notify_swap_used_mb,
-                ),
+                format!("Revealing {notify_label} took {seconds:.1}s. {detail}"),
             );
         }
     }
@@ -167948,8 +167979,14 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(shell.active_reveal_status_json().is_null());
     }
 
+    /// The live failure, pinned: **swap sitting high while the machine is
+    /// comfortable must never be reported as the cause.** This is the exact
+    /// shape measured on the owner's laptop 2026-08-10 — 9.4 GB of 15.1 GB
+    /// available, kernel reclaim stall 0.00%, and 9,400 MB of swap left over
+    /// from an earlier squeeze. The old notification told him to free RAM he
+    /// already had, on every slow reveal, for weeks.
     #[test]
-    fn slow_reveal_under_swap_pressure_notifies_to_free_ram() {
+    fn slow_reveal_with_stale_swap_but_free_memory_does_not_blame_memory() {
         let active_session_path = "remote-session://oc/reveal-slow-swap";
         let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
         let mut shell = ShellState::new(bootstrap);
@@ -167959,24 +167996,70 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         let attempt_id =
             shell.begin_terminal_open_attempt(active_session_path, "req-slow", 3, "open_row");
-        // Force a slow reveal that started 7s ago under heavy swap.
         if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
             attempt.started_at_ms = current_millis().saturating_sub(7_000);
             attempt.memory_pressure_at_start = MemoryPressureSnapshot {
                 swap_used_kb: 9_400 * 1024,
                 swap_total_kb: 16_000 * 1024,
-                mem_available_kb: 1_000 * 1024,
+                mem_available_kb: 9_400 * 1024,
+                mem_total_kb: 15_110 * 1024,
+                psi_full_avg60_bp: Some(0),
+                ..Default::default()
+            };
+        }
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        let notification = shell
+            .notifications
+            .iter()
+            .find(|notification| notification.title == "Slow terminal reveal")
+            .expect("a 7s reveal must still be reported — the duration is real");
+        assert!(
+            !notification.message.contains("Free RAM")
+                && !notification.message.contains("short of memory"),
+            "must not blame memory on a comfortable machine: {}",
+            notification.message
+        );
+        assert!(
+            notification.message.contains("Memory is not the cause"),
+            "should say what was RULED OUT so nobody re-chases it: {}",
+            notification.message
+        );
+    }
+
+    /// The other side: when the honest predicate agrees the machine is short,
+    /// freeing RAM really is the advice, and it must still be given.
+    #[test]
+    fn slow_reveal_on_a_genuinely_short_machine_still_says_free_ram() {
+        let active_session_path = "remote-session://oc/reveal-slow-short";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.in_app_notifications = true;
+        shell.settings.system_notifications = false;
+        shell.settings.notification_sound = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-short", 3, "open_row");
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.started_at_ms = current_millis().saturating_sub(7_000);
+            // Below the 15% available floor — genuinely short.
+            attempt.memory_pressure_at_start = MemoryPressureSnapshot {
+                swap_used_kb: 9_400 * 1024,
+                swap_total_kb: 16_000 * 1024,
+                mem_available_kb: 800 * 1024,
                 mem_total_kb: 16_000 * 1024,
                 ..Default::default()
             };
         }
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        let notification = shell
+            .notifications
+            .iter()
+            .find(|notification| notification.title == "Slow terminal reveal")
+            .expect("a slow reveal on a short machine must notify");
         assert!(
-            shell
-                .notifications
-                .iter()
-                .any(|notification| notification.title == "Slow terminal reveal"),
-            "a slow reveal under swap pressure should warn the user to free RAM"
+            notification.message.contains("short of memory"),
+            "a genuinely short machine should still be told: {}",
+            notification.message
         );
     }
 

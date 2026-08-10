@@ -187,26 +187,67 @@ and has to decide, every time, which red is theirs.
 **Falsifier:** `cargo test --workspace --lib` returns 0 failures on `dev`, twice
 in a row.
 
-## ⚠ A GUI RESTART TAKES 18.5 SECONDS BEFORE IT ANSWERS
+## ⛔⛔ SWITCHING ROWS HAS A FAT TAIL TO 60 s, AND 11 REVEALS NEVER FINISHED AT ALL
 
 **Status:** OPEN
 
-Measured on the live host 2026-08-10 while deploying the 3.0.94 GUI: from `TERM`
-on the old process to the first `server app state` the new one answers,
-**18,473 ms**. The bar the campaign has been holding itself to is **3 s**, and a
-restart is something an agent does routinely — the field guide's own rule is
-"restart it yourself rather than hand the task back", which is only true while a
-restart is cheap.
+**Owner-reported 2026-08-10, verbatim:** *"ALL Switches take ~18-20s time to
+spawn with a swap message."* He also said the swap message *"is probably a lie"*.
+**He was right about the lie** — that half is fixed below — and the slowness
+underneath it is real and unexplained.
 
-⚠ Not the same thing as the daemon-side stall fixed in 3.0.94 (that was the
-daemon walking the corpus before binding; this is the GUI process, and its daemon
-was already up and answering in 10 ms throughout). Do not assume the fix carried
-over — measure the GUI's own startup and find where the 18 s goes. 38 live
-session rows were being restored, which is the obvious first suspect and
-therefore the one to falsify first rather than accept.
+### Measured from every reveal on the GUI host's disk trace (n=106)
 
-**Falsifier:** TERM-to-first-answered-`app state` under 3 s on a host with a
-comparable row count.
+| tier / outcome | n | p50 | p90 | max |
+|---|---|---|---|---|
+| hot · ready | 75 | 676 ms | 2,260 ms | **63,863 ms** |
+| cold · ready | 20 | 2,625 ms | **35,497 ms** | 61,983 ms |
+| cold · **failed** | 7 | 62,098 ms | 97,950 ms | **97,950 ms** |
+| hot · **failed** | 4 | 63,837 ms | 122,174 ms | **122,174 ms** |
+
+⇒ The median switch is fine. **The tail is the product.** A cold p90 of 35 s is
+his "18-20 s" and worse, and **11 of 106 reveals never became ready** — those sit
+at ~60-122 s, which is a user staring at nothing for two minutes.
+⚠ A separate datapoint of the same shape: a GUI restart took **18,473 ms** from
+`TERM` to its first answered `server app state`, with 38 rows to restore. Whether
+that shares a cause with the reveal tail is unknown and worth asking early.
+
+### ⛔ Why this was never investigated: the instrument blamed memory, every time
+
+`swap_pressured()` is `swap_used_kb > 512 MB`. `swap_used` is a **history
+counter** — the doc comment on `reclaim_pressured` in `terminal_observe.rs`
+already said so, and the reclaim path was fixed to stop reading it. **The
+notification kept reading it.** Across all 106 reveals `swap_pressured` was true
+**106 times** — a predicate true on every sample discriminates nothing. Of the 21
+reveals that took 6 s or more:
+
+- `reclaim_pressured`: true on **0**
+- PSI `full avg60` at or above the 10% thrash line: **0** (worst seen: 0.23%)
+- memory available: median **9,362 MB of 15,110 MB**
+
+So every "Free RAM to speed up reveals" notice fired on a machine with ~9 GB
+free. ⇒ **A diagnostic that asserts an unmeasured cause is worse than silence: it
+ends the investigation with the wrong answer.** Same family as
+*a constant anomaly is a measurement bug*.
+
+⭐ **FIXED in the notification:** it now reports the duration always, and names
+memory as the cause only when `reclaim_pressured` agrees; otherwise it says what
+was *ruled out* (`"Memory is not the cause: 9362 MB of 15110 MB available and the
+kernel stalled on reclaim 0.00% of the time"`) so nobody re-chases it. Pinned by
+`slow_reveal_with_stale_swap_but_free_memory_does_not_blame_memory` carrying the
+live numbers, and its opposite so a genuinely short machine is still told.
+
+### What is still open, and where to start
+
+The reveal-log already records `surface_mounted_ms` and `first_output_ms` beside
+`total_ms`, and in the fast cases they nearly coincide (mount 268-488 ms, first
+output 367-653 ms). **Get those two fields for the SLOW cases** — that alone
+splits the tail into "the surface took forever to mount" versus "the surface was
+up and no output came", which are different bugs with different owners.
+⛔ Do not start from the memory angle again; it has been measured and excluded.
+
+**Falsifier:** cold-tier p90 under 3 s and zero `reveal_failed` over a comparable
+sample on the live host.
 
 ## ⭐ A NEW SESSION'S ROW IS NAMED AFTER THE ROW YOU RIGHT-CLICKED
 
