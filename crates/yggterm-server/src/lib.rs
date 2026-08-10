@@ -46,6 +46,7 @@ mod clipboard_sweep;
 mod socket_sweep;
 mod codex_cli;
 mod daemon;
+pub mod daemon_bridge;
 pub mod grid_overlay;
 mod host;
 mod live_row_tombstones;
