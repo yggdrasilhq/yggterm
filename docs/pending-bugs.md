@@ -202,11 +202,39 @@ remote is STILL old, something is genuinely wrong.**
 ⇒ **So the real defect is that `bootstrap_remote_yggterm` ran against the remote and
 did not upgrade it.** The version mismatch was the symptom, reported honestly.
 
-**Next task, restated:** instrument the bootstrap — did it copy, to WHICH path, and did
-the re-probe read the path it wrote? ⚠ These hosts carry FOUR copies
-(`~/.local/bin/{yggterm,yggterm-headless}` + `~/.yggterm/bin/{...}`), and `PATH`
-resolves `~/.local/bin` while the daemons run from `~/.yggterm/bin`. A bootstrap that
-writes one and a probe that reads the other produces exactly this.
+### ✅ CHAIN CLOSED — THE GUI CHECKS ITS OWN VERSION BUT SHIPS ITS NEIGHBOUR'S BINARY
+
+`bootstrap_remote_yggterm` (`lib.rs:15782`) resolves
+`local_remote_bootstrap_executable()` — **the GUI host's `yggterm-headless`** — and
+uploads THAT to both remote paths (`$HOME/.yggterm/bin/yggterm` and
+`…/yggterm-headless`). Measured on the live host at the time of the failure:
+
+```
+guihost GUI      = 3.0.92     <- the version the compatibility check demands
+guihost headless = 3.0.91     <- the payload it actually ships to remotes
+```
+
+⇒ The GUI demanded 3.0.92, bootstrapped `dev` with **3.0.91**, re-probed, found 3.0.91,
+and bailed. Every step honest; the two facts simply came from **two different files**.
+
+⛔ **THE STRUCTURAL BIND, and it is why this is not a one-line fix.** The payload the
+GUI bootstraps with IS ALSO the running daemon's binary. Replacing it to keep the two
+in step is exactly the act that renames a live daemon's `/proc/self/exe` and arms the
+cold-shutdown cascade (see the deploy entry above). So "just keep them matched" trades
+one outage for another.
+
+**Fix directions, none free:**
+1. **Make the compatibility check ask the payload's version, not the GUI's** — the
+   check should demand what it can actually deliver. Smallest change, and it makes the
+   error honest instead of unreachable.
+2. **Ship the payload as a separate versioned file** the daemon never executes, so it
+   can be replaced at any time without touching a running process.
+3. Keep them matched and solve the running-daemon replacement properly (that is the
+   constitution's lane, not this one).
+
+**Immediate state:** dev's `~/.yggterm/bin/yggterm` was set to 3.0.92 by hand, so the
+first probe now succeeds and bootstrap never runs — his paste works. ⚠ This is a
+patched symptom on ONE host; any other remote the GUI has outrun will hit it again.
 
 **What was done meanwhile:** dev's `~/.yggterm/bin/yggterm` was brought to 3.0.92 to
 match the GUI, which makes the existing test pass deterministically. Nothing was
