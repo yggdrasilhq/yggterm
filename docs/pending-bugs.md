@@ -1865,6 +1865,48 @@ single most common keystroke there is.
 `refused_for_draft: false` while the composer visibly holds `typed`. Measured on
 3.0.84 and still true on 3.0.85 (arm C of `draftprobe.sh`).
 
+## ⛔ OWNER-REPORTED: SWITCHING TO A SESSION IS "STILL JANK, BUT MUCH IMPROVED" — AND IT HAS NO END-TO-END INSTRUMENT
+
+**Status:** OPEN
+
+His words, 2026-08-10: *"Probe the switch to active sessions. It is still jank.
+But much improved."* ⇒ the recent reveal work (3.0.97/98/100) moved it, and what
+is left cannot currently be measured, only felt.
+
+⛔ **FIRST, THE RED HERRING, KILLED — do not re-chase it.** On guihost's trace,
+`request_terminal_launch_for_active_begin` fires **58** times and
+`..._end` only **17**, which reads like 41 switches that never finished. **It is
+not a span.** There are **11 `return` statements** between the two emit sites
+(`yggterm-server/src/lib.rs`, ~9489 → ~10008), and every `remote-cc://` row —
+which is *every agent row on the GUI host* — takes `parse_remote_cc_session_path`
+and returns long before the end event. The 41 are by construction.
+⇒ And the 17 that DO pair read **0–1 ms**, because that pair measures a
+synchronous bookkeeping call, not a user-visible switch. **An event named
+`_begin`/`_end` is not a span until you have read what returns between them**
+([[finding-a-substring-test-reads-failure-as-success]] family: the shape looked
+like a measurement and was not one).
+
+**What is actually missing:** nothing times *click → the terminal is painted and
+typeable*, which is the only definition of the switch the user has. The pieces
+exist separately (`first_bytes`, `bridge_first_paint`, the reveal attempt states,
+`resume_timeout_*`) but nothing joins them per switch, so "jank" has no number,
+no distribution, and no way to tell a slow tail from a stalled one.
+
+**The work:** emit one span per switch — begin at the click, end when the canvas
+has painted AND input is ready — carrying the row path, whether the owning daemon
+is a DIFFERENT process than the GUI's own (the proxied case is the one that was
+18.5 s before `b30e7dd6`), and which reveal branch was taken. Then measure the
+distribution before changing anything: the campaign has twice "fixed" a latency
+that the measurement later showed was not the one the user felt.
+
+⚠ **Not started here because `crates/yggterm-server/src/lib.rs` is being edited by
+a sibling session in this shared checkout** (whole-file and same-region writes
+clobber). Next relay turn, or whoever holds that file.
+
+**Falsifier:** a single trace event per switch whose payload carries a
+`switch_to_interactive_ms`, and a p50/p90/max over a day of his real switches.
+Today that number does not exist anywhere.
+
 ## ⭐ THERE IS NO WAY TO MINT A TEST AGENT SESSION, SO THE GATE'S AGENT ARMS CANNOT BE SANDBOXED
 
 **Status:** OPEN
