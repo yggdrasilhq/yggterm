@@ -349,6 +349,33 @@ bug**; grep `resume_timeout_cleared_inflight` as well, or the population is
 invisible. The stand-down covers it (no attempt + not the active terminal) and
 still runs the whole cleanup.
 
+**LIVE ON THE GUI HOST, 2026-08-10 (3.0.100 deployed to both guihost paths, GUI
+restarted, 46→46 rows preserved):**
+- ✅ **Deploy + faithful render.** A shadow-client reveal on the 3.0.100 binary
+  paints a full, correct terminal (scrollback + live prompt, no squish/blank/
+  broken-bottom); metadata pane reads `Client 3.0.100 · daemon 3.0.91`. The
+  reveal-path change did not break the normal reveal.
+- ✅ **No fast-path regression, no false cancel, no false toast.** Multiple
+  live switch-aways (reveal A, immediately reveal B) on the shadow: every
+  abandoned-but-already-ready session resolved `reveal_ready`, the harmless
+  *outgoing*-session `bootstrap_spawn_skipped_inactive_retained_host` triggered
+  **zero** `reveal_cancelled` and **zero** `reveal_failed`, and the shadow
+  raised **0** notifications. The `ready_at_ms` / active-session guards hold on
+  the live binary.
+- ⏳ **The in-flight-abandon resolution itself is NOT yet live-caught, and
+  cannot be manufactured on this host.** On a healthy fast `dev` the daemon
+  retains every session's host, so a reveal is always hot and readies in ~1.1 s
+  — *before* the skip fires (measured: attempt `ready` at 18:41:38.188, skip at
+  18:41:39). Shape B only occurs when the daemon-side attach is genuinely SLOW
+  (the 60 s remote-resume tail), which needs an unhealthy/cold remote I cannot
+  force without disturbing another agent's session. The code path is locked by
+  five mutation-falsified unit tests; the live confirmation will come from the
+  trace the next time a slow resume is abandoned. **Instrument to grep on the
+  GUI host:** `bootstrap_skip_cancelled_open_attempt` and `resume_timeout_stood_
+  down` (present ⇒ fixed) vs a `reveal_failed` / `resume_timeout_cleared_inflight`
+  carrying *"did not become interactive"* under a 3.0.100 GUI (present ⇒ the fix
+  did not cover that path). None of the latter appeared in the post-deploy window.
+
 ⇒ **Shape A is the one that most likely IS the owner's "new session never
 starts"**: no process, no output, no error — the same silence. **It is
 untouched by the 3.0.98 fix** — shape A never spoke at all, so there was no
