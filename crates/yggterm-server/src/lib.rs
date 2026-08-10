@@ -15151,12 +15151,62 @@ fn remote_shell_command(exec_prefix: Option<&str>, inner: &str) -> String {
 // remote tmux/screen pane to seed the resume view. yggterm no longer uses any
 // external multiplexer; remote screens come from the host daemon.
 
+/// ⛔ TEST SEAM — `normalize_remote_attach_cwd` SHELLS OUT over ssh to resolve a
+/// requested cwd up to the nearest existing ancestor. That is correct in
+/// production but makes any unit test that passes a cwd depend on network reach
+/// to a real host: the launch-contract tests passed `/home/user/gh/yggterm`,
+/// which does not exist on `dev`, so the resolver honestly collapsed it to
+/// `/home` and the assertions read that as truncation. The resolver is right;
+/// the defect is a unit test performing a live ssh at all. A test installs a
+/// resolver here (per-thread, so parallel tests never see each other's) and the
+/// shell-out is skipped. Absent from every shipping binary — `#[cfg(test)]`.
+#[cfg(test)]
+thread_local! {
+    static REMOTE_ATTACH_CWD_RESOLVER_OVERRIDE: std::cell::RefCell<
+        Option<Box<dyn Fn(&str, Option<&str>, &str) -> Option<String>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_remote_attach_cwd_resolver_override(
+    resolver: Option<Box<dyn Fn(&str, Option<&str>, &str) -> Option<String>>>,
+) {
+    REMOTE_ATTACH_CWD_RESOLVER_OVERRIDE.with(|cell| *cell.borrow_mut() = resolver);
+}
+
+/// Run `body` with the cwd resolver replaced by `resolver`, restoring the prior
+/// state afterwards even on panic. The pass-through resolver (return the
+/// requested path verbatim) is what the launch-contract tests want.
+#[cfg(test)]
+fn with_remote_attach_cwd_resolver<R>(
+    resolver: Box<dyn Fn(&str, Option<&str>, &str) -> Option<String>>,
+    body: impl FnOnce() -> R,
+) -> R {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_remote_attach_cwd_resolver_override(None);
+        }
+    }
+    set_remote_attach_cwd_resolver_override(Some(resolver));
+    let _restore = Restore;
+    body()
+}
+
 fn normalize_remote_attach_cwd(
     ssh_target: &str,
     exec_prefix: Option<&str>,
     cwd: Option<&str>,
 ) -> Option<String> {
     let requested = cwd.map(str::trim).filter(|value| !value.is_empty())?;
+    #[cfg(test)]
+    if let Some(resolved) = REMOTE_ATTACH_CWD_RESOLVER_OVERRIDE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|resolver| resolver(ssh_target, exec_prefix, requested))
+    }) {
+        return resolved;
+    }
     let resolver = format!(
         "p={requested}; while [ -n \"$p\" ] && [ ! -d \"$p\" ]; do \
             if [ \"$p\" = \"/\" ]; then break; fi; \
@@ -40545,9 +40595,22 @@ terminal_window_id: None,
             sessions: Vec::new(),
         });
 
-        let key = server
-            .start_remote_codex_session("dev", None, Some("/home/user/gh/yggterm"), Some("Yggterm"))
-            .expect("start remote codex");
+        // Pass the requested cwd through verbatim instead of shelling out over
+        // ssh to resolve it against a host where it does not exist (see the
+        // seam on `normalize_remote_attach_cwd`).
+        let key = super::with_remote_attach_cwd_resolver(
+            Box::new(|_ssh_target, _prefix, requested| Some(requested.to_string())),
+            || {
+                server
+                    .start_remote_codex_session(
+                        "dev",
+                        None,
+                        Some("/home/user/gh/yggterm"),
+                        Some("Yggterm"),
+                    )
+                    .expect("start remote codex")
+            },
+        );
 
         let session = server.sessions.get(&key).expect("remote codex session");
         assert!(key.starts_with("remote-session://dev/"));
@@ -40604,9 +40667,22 @@ terminal_window_id: None,
             sessions: Vec::new(),
         });
 
-        let key = server
-            .start_remote_claude_session("dev", None, Some("/home/user/gh/yggterm"), Some("CC"))
-            .expect("start remote claude");
+        // Pass the requested cwd through verbatim instead of shelling out over
+        // ssh to resolve it against a host where it does not exist (see the
+        // seam on `normalize_remote_attach_cwd`).
+        let key = super::with_remote_attach_cwd_resolver(
+            Box::new(|_ssh_target, _prefix, requested| Some(requested.to_string())),
+            || {
+                server
+                    .start_remote_claude_session(
+                        "dev",
+                        None,
+                        Some("/home/user/gh/yggterm"),
+                        Some("CC"),
+                    )
+                    .expect("start remote claude")
+            },
+        );
 
         let session = server.sessions.get(&key).expect("remote claude session");
         assert_eq!(session.kind, SessionKind::ClaudeCode);

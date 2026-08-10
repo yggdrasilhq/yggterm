@@ -144,49 +144,6 @@ Where to look next, in order:
 **Falsifier:** a `start-cc` that spawns no process must leave either an error the
 user sees or a trace event naming the refusal — never a row that says `running`.
 
-## ⛔ FOUR TESTS FAIL ON `dev` AT HEAD, AND A RED TARGET HIDES EVERY TEST BEHIND IT
-
-**Status:** OPEN
-
-`cargo test -p yggterm-server --lib` on `dev` returns **1022 passed, 3 failed**,
-and it failed identically on a pristine `git worktree` at HEAD — so this is the
-state of the repo, not anyone's working tree. A fourth fails only under
-`--workspace`. Anyone running the suite to check their own change reads a red bar
-and has to decide, every time, which red is theirs.
-
-1. **`daemon_binary_is_legacy_allows_deleted_current_install_path`** — the test
-   feeds the placeholder paths `/home/user/.yggterm/bin/yggterm{,-headless}`, but
-   the function under test resolves its companion binary by asking the
-   **filesystem** (`preferred_install_headless_bootstrap_executable` → `is_file()`).
-   On a machine where `/home/user` does not exist the companion resolves to
-   `None`, so an argv0 of `…/yggterm-headless` is not in the allowed set and the
-   binary is judged legacy. ⇒ **A placeholder path cannot be fed to a predicate
-   that stats it.** The fix is a `tempdir` with both names actually created, which
-   makes the test hermetic and keeps the public repo free of a real home path.
-   ⚠ Worth fixing early: this predicate is what decides whether a deploy reaps the
-   *previous* daemon, which is the mechanism behind "a deploy mass-re-resumes every
-   agent row". A red test over that decision is the worst place to have one.
-2. **`start_remote_codex_session_uses_remote_start_codex_launch_contract`** and
-3. **`start_remote_claude_session_assigns_authoritative_session_id`** — both assert
-   the built launch command contains the cwd they passed
-   (`'/home/user/gh/yggterm'`); the command actually carries `'/home'`. Same family
-   as (1) — the test reaches a resolver that consults the real host — but the
-   truncation to `/home` has NOT been explained yet and could be a genuine defect
-   in the remote launch path rather than a test artefact. **Do not assume it is
-   cosmetic: find out which, then fix the right one.**
-
-4. **`pty_runtime_answers_default_color_query_to_child` is FLAKY, not red** — it
-   fails under `cargo test --workspace --lib` (the whole workspace running at
-   once) and passes on its own, every time. It spawns a real PTY and waits for the
-   child's reply, so it is losing a race under load. ⚠ A flaky test in the same
-   run as three deterministic ones is worse than either alone: it teaches whoever
-   reruns the suite that red means "try again", which is exactly how the three
-   real failures below stayed unfixed. Give it a deadline it can actually meet, or
-   make it not depend on scheduling.
-
-**Falsifier:** `cargo test --workspace --lib` returns 0 failures on `dev`, twice
-in a row.
-
 ## ⛔⛔ SWITCHING ROWS HAS A FAT TAIL TO 60 s, AND 11 REVEALS NEVER FINISHED AT ALL
 
 **Status:** OPEN

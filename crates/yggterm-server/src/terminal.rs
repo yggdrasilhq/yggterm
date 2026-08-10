@@ -4091,11 +4091,21 @@ mod tests {
     /// A child that asks the terminal for its foreground colour and reports
     /// whether the answer matched `YGG_EXPECT_FG_HEX` (hex so no escape
     /// sequence has to survive shell quoting).
+    // ⛔ THE DEADLINE THAT MATTERS IS HERE, IN THE CHILD, not in the Rust poll
+    // that waits for this to print. The child fired the OSC-10 query and gave the
+    // daemon a single 2.0 s `select` to answer; under `cargo test --workspace`
+    // the daemon's reply misses that window, the child reads nothing, prints
+    // COLOR_BAD, and the outer poll (which breaks on any "COLOR_") fails the
+    // COLOR_OK assert. Raising the OUTER poll did nothing — it was guarding the
+    // wrong moment. Now the child accumulates across a wall-clock deadline and
+    // stops the instant the full reply has arrived, so a slow schedule is a late
+    // answer, never a wrong one.
     const OSC_COLOR_QUERY_CHILD: &str = r#"python3 - <<'PY'
 import os
 import select
 import sys
 import termios
+import time
 import tty
 
 fd = os.open('/dev/tty', os.O_RDWR | getattr(os, 'O_NOCTTY', 0))
@@ -4104,9 +4114,15 @@ data = b''
 try:
     tty.setraw(fd)
     os.write(fd, b'\x1b]10;?\x1b\\')
-    ready, _, _ = select.select([fd], [], [], 2.0)
-    if ready:
-        data = os.read(fd, 64)
+    expected = bytes.fromhex(os.environ['YGG_EXPECT_FG_HEX'])
+    deadline = time.monotonic() + 10.0
+    while data != expected:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([fd], [], [], min(1.0, remaining))
+        if ready:
+            data += os.read(fd, 64)
 finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
     os.close(fd)
@@ -4898,14 +4914,44 @@ line-two on the real screen\r\n\
 
     #[test]
     fn pty_runtime_answers_default_color_query_to_child() {
-        // The daemon answers with ITS profile, and that profile legitimately
-        // picks up the host's YGGTERM_TERMINAL_COLOR_* when the launch command
-        // carries none — which this suite does whenever it is run from a
-        // terminal inside yggterm. So derive the expectation from the same
-        // profile the runtime will use: hardcoding the built-in dark grey made
-        // this test fail in-session only, which reads as "your change broke it".
-        let appearance_export = "export YGGTERM_TERMINAL_APPEARANCE=dark; ";
-        let (r, g, b) = TerminalProtocolProfile::from_launch_command(appearance_export).foreground;
+        // ⛔ THE LAUNCH COMMAND MUST STATE ITS OWN COLOURS. The daemon answers
+        // OSC-10 from `from_launch_command`, and when the command carries no
+        // explicit `YGGTERM_TERMINAL_COLOR_*` that resolver falls through to
+        // `terminal_identity_color_profile_from_environment()` — a read of the
+        // PROCESS env. The `expected` here read the same env. Standalone the two
+        // reads agreed, but under `cargo test --workspace` a concurrent test
+        // mutates those env vars (`env::set_var`/`remove_var` are process-global
+        // in Rust), so between computing `expected` and spawning the runtime the
+        // foreground flipped from the dark profile's #e5e5e5 to the built-in base
+        // #cccccc — a WRONG colour, not a late one, which is why raising the read
+        // deadline did nothing. Carrying the full profile in the command makes
+        // `terminal_identity_color_profile_from_launch_command` resolve it and
+        // short-circuit the env entirely, so both sides are deterministic
+        // regardless of what any neighbour does to the environment.
+        let color_exports = "\
+            export YGGTERM_TERMINAL_APPEARANCE=dark; \
+            export YGGTERM_TERMINAL_COLOR_FOREGROUND='#e5e5e5'; \
+            export YGGTERM_TERMINAL_COLOR_BACKGROUND='#262a33'; \
+            export YGGTERM_TERMINAL_COLOR_0='#000000'; \
+            export YGGTERM_TERMINAL_COLOR_1='#cd3131'; \
+            export YGGTERM_TERMINAL_COLOR_2='#05bc79'; \
+            export YGGTERM_TERMINAL_COLOR_3='#e5e512'; \
+            export YGGTERM_TERMINAL_COLOR_4='#2472c8'; \
+            export YGGTERM_TERMINAL_COLOR_5='#bc3fbc'; \
+            export YGGTERM_TERMINAL_COLOR_6='#0fa8cd'; \
+            export YGGTERM_TERMINAL_COLOR_7='#e5e5e5'; \
+            export YGGTERM_TERMINAL_COLOR_8='#666666'; \
+            export YGGTERM_TERMINAL_COLOR_9='#cd3131'; \
+            export YGGTERM_TERMINAL_COLOR_10='#05bc79'; \
+            export YGGTERM_TERMINAL_COLOR_11='#e5e512'; \
+            export YGGTERM_TERMINAL_COLOR_12='#2472c8'; \
+            export YGGTERM_TERMINAL_COLOR_13='#bc3fbc'; \
+            export YGGTERM_TERMINAL_COLOR_14='#0fa8cd'; \
+            export YGGTERM_TERMINAL_COLOR_15='#e5e5e5'; ";
+        // host_profile None: the command carries the colours, so no ambient read.
+        let (r, g, b) =
+            TerminalProtocolProfile::from_launch_command_with_host_profile(color_exports, None)
+                .foreground;
         let expected_response =
             format!("\u{1b}]10;rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\u{1b}\\");
         let expected_hex: String = expected_response
@@ -4913,7 +4959,7 @@ line-two on the real screen\r\n\
             .map(|byte| format!("{byte:02x}"))
             .collect();
         let launch_command = format!(
-            "{appearance_export}export YGG_EXPECT_FG_HEX={expected_hex}; {OSC_COLOR_QUERY_CHILD}"
+            "{color_exports}export YGG_EXPECT_FG_HEX={expected_hex}; {OSC_COLOR_QUERY_CHILD}"
         );
         let runtime = PtySessionRuntime::spawn(
             "local://osc-color-query",
@@ -4922,8 +4968,15 @@ line-two on the real screen\r\n\
             None,
         )
         .expect("spawn OSC color query test runtime");
+        // Wait for the child to print its verdict. Its OSC read has its own
+        // deadline; this ceiling only has to outlast it, so the child's own
+        // COLOR_BAD is what fails the assert, not a premature give-up here.
+        // Breaks the instant "COLOR_" appears — free on the happy path. The read
+        // is cumulative (re-collects from offset 0 every pass), so a slow child
+        // is a late verdict, never a lost byte.
         let mut combined = String::new();
-        for _ in 0..80 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
             let read = runtime.read(0);
             combined = read
                 .chunks
