@@ -1865,6 +1865,47 @@ single most common keystroke there is.
 `refused_for_draft: false` while the composer visibly holds `typed`. Measured on
 3.0.84 and still true on 3.0.85 (arm C of `draftprobe.sh`).
 
+## ⭐ THERE IS NO WAY TO MINT A TEST AGENT SESSION, SO THE GATE'S AGENT ARMS CANNOT BE SANDBOXED
+
+**Status:** OPEN
+
+Three tooling gaps found while trying to live-prove 3.0.101's `orchestrating`
+blocker. Each is the dream test — *an agent hand-assembled this chore from
+primitives and got it wrong* — so each wants to be a verb.
+
+1. **No agent-kind session outside the real launch path.** `server attach
+   <cc-runtime://…> <cwd>` mints a `shell` (it genuinely spawns one, so calling
+   it an agent would be a lie), and pre-seeding `server-state.json` with
+   `kind: claude_code` is **overwritten on attach**. ⇒ every predicate keyed on
+   `session_kind_state_survives_pty_loss` — the whole restorable/not-restorable
+   axis the gate turns on — is unreachable in a sandbox, and the 3.0.81 agent arm
+   that the campaign memory calls *"the load-bearing one"* had to be run against
+   a live daemon on the real host. A `server attach --kind <k>` (sandbox-only, or
+   refusing unless `YGGTERM_HOME` is non-default) would make the gate's arms
+   ordinary tests instead of expeditions.
+2. **No way to ask the product what it thinks a transcript is.** Checking that
+   `newest_transcript_writer` / `newest_subagent_transcript` agree with reality on
+   real data required building a throwaway cargo crate against `yggterm-core`.
+   A read-only `server sessions classify <session-path|file>` printing the writer,
+   the newest sub-agent file and its age would have answered it in one line — and
+   is the instrument the NEXT person debugging a wrong `orchestrating` verdict
+   will need anyway.
+3. **`server app session remove` answered with every field null** (`verified`,
+   `row_still_listed`, `live_processes`, `message` all `null`, `error: null`).
+   The field guide's law is that a row verb reports the REQUEST not the EFFECT;
+   this one reported *nothing*, which is worse — there is no field to distrust.
+   The removal did work (read back: gone from the blocker set, no surviving
+   process), so the verb is lying by silence, not by outcome.
+
+⚠ Also: the pre-push privacy guard's `aadhaar-like` rule fires on **invented
+UUIDs** whose last group is twelve digits with no hex letters in it. Failing closed is
+correct and the override was NOT used — the ids were rewritten with hex letters.
+But the cheap fix is guidance, not code: *invent test ids with letters in them.*
+
+**Falsifier:** `server attach --kind claude-code <key> <cwd>` exists and the
+resulting row reports a non-permanent blocker set; `server sessions classify`
+exists; `session remove` answers with a populated `verified`.
+
 ## ⚖⚖ THE HOT-RESTART GATE IS UNBUILT — THE DESIGN IS NOW SETTLED
 
 **Status:** OPEN
