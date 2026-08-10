@@ -4,6 +4,32 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **"What is swapping, and it is probably a lie." It was.** Owner-reported: every
+  row switch feels like 18-20 s and arrives with a notification telling him to
+  free RAM. The notification gated on `swap_pressured()` — `swap_used_kb > 512 MB`
+  — and `swap_used` is a HISTORY counter. The doc comment on the neighbouring
+  `reclaim_pressured` already said so in as many words (*"latches TRUE after one
+  bad afternoon and never clears"*), and the memory-reclaim path had been fixed to
+  stop reading it. **The notification was never updated.** Measured across every
+  reveal on his machine's disk trace (n=106): `swap_pressured` was true on
+  **106 of 106** — a predicate true on every sample discriminates nothing. Of the
+  21 reveals that took 6 s or more, **zero** had `reclaim_pressured`, **zero** hit
+  the 10% PSI thrash line (worst 0.23%), and the median machine had **9.4 GB of
+  15.1 GB available**. Every one of those notices sent him to free RAM he already
+  had.
+  ⇒ The notification now always reports the duration, names memory only when
+  `reclaim_pressured` agrees, and otherwise says what was **ruled out** — *"Memory
+  is not the cause: 9362 MB of 15110 MB available and the kernel stalled on
+  reclaim 0.00% of the time"* — so the next reader does not re-chase it. Pinned by
+  a test carrying the live numbers, plus its opposite so a genuinely short machine
+  is still told to free RAM.
+  ⚠ **The slowness underneath is real and stays OPEN**, and it is worse than
+  reported: hot reveals p50 676 ms but max 63.9 s, cold p90 **35.5 s**, and
+  **11 of 106 reveals never became ready at all** (~60-122 s). Filed with the
+  distribution and a first split to try. ⇒ **A diagnostic that asserts an
+  unmeasured cause is worse than silence: it ends the investigation with the wrong
+  answer, and this one ended it for weeks.**
+
 - **"I cannot Ctrl+V screenshots" and "the row rename does nothing" were ONE bug,
   and it was already fixed — just not deployed.** The GUI logged the cause
   verbatim, twice within 40 seconds: `Rename Failed` and `clipboard_paste_failed`

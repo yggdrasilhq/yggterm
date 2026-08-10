@@ -128,8 +128,23 @@ impl MemoryPressureSnapshot {
     /// True when enough swap is in use that a cold mount is likely to fault
     /// against it. >512 MB is the rough floor where the finding saw cold-reveal
     /// mounts start thrashing; below that, swap is incidental.
+    ///
+    /// ⛔ REPORTED ONLY — never gate user-facing advice on this. `swap_used` is a
+    /// history counter, so this latches TRUE after one bad afternoon and never
+    /// clears: measured true on **106 of 106** reveals on the live host
+    /// (2026-08-10), including 21 slow ones where the machine had 9.4 GB of
+    /// 15.1 GB free and PSI `full avg60` never exceeded 0.23%. A predicate that
+    /// is true on every sample cannot discriminate anything. Ask
+    /// [`Self::reclaim_pressured`] instead.
     pub(crate) fn swap_pressured(&self) -> bool {
         self.swap_used_kb > 512 * 1024
+    }
+    /// PSI `memory` → `full avg60` as a percentage of wall time, or `None` when
+    /// the kernel does not report it. ONE owner for the basis-point conversion,
+    /// so the JSON view and any caller that reasons about thrashing cannot
+    /// disagree about what the number means.
+    pub(crate) fn psi_full_avg60_pct(&self) -> Option<f64> {
+        self.psi_full_avg60_bp.map(|bp| f64::from(bp) / 100.0)
     }
     /// True when the machine is short of memory RIGHT NOW, i.e. when reclaiming
     /// a user's live pages is worth what it costs them.
@@ -228,8 +243,8 @@ impl MemoryPressureSnapshot {
                 .map(|bp| Value::from(f64::from(bp) / 100.0))
                 .unwrap_or(Value::Null),
             "psi_full_avg60_pct": self
-                .psi_full_avg60_bp
-                .map(|bp| Value::from(f64::from(bp) / 100.0))
+                .psi_full_avg60_pct()
+                .map(Value::from)
                 .unwrap_or(Value::Null),
         })
     }
