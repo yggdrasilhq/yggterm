@@ -176,6 +176,53 @@ impl AppDeclareScanner {
     }
 }
 
+/// Is this chunk NOTHING but libyggterm's own OSC 7717 control traffic?
+///
+/// ⛔ **This is the answer to "was the SESSION active", and the two are not the
+/// same question.** The daemon's PTY reader stamps `last_activity_ms` on every
+/// chunk it sees, and the hot-restart idle gate then asks whether every owned
+/// session has been silent for 300 s. But a declaring app re-emits its full
+/// payload on a **~4 s heartbeat** (see this module's header), so a session
+/// hosting one is never silent for more than four seconds — by our own design,
+/// not by anything the human or the agent did.
+///
+/// Measured on `dev`, 2026-08-10: five `bash -i` shells that no human had
+/// touched in weeks reported `idle_ms` of 266, 1079, 1387, 1711 and 3433 against
+/// a 300,000 ms threshold, every one of them a ychrome launcher whose
+/// daemonised child still held the PTY and heartbeated `web-surface;pick` onto
+/// it. The gate is an AND over owned sessions, so it could never open; the
+/// daemon could never retire; and the pile reached **27 daemons on one machine,
+/// burning 8.1 cores and 23 GB between them** — one per deploy, going back 27
+/// days. THE QUIET-GATE LAW with the app as the thing that is never quiet.
+///
+/// ⚠ **The bias is deliberately one-directional.** A sequence split across two
+/// chunks is recognised in neither half, so both halves count as activity — a
+/// late retire, which costs nothing. The opposite error would discount real
+/// output and let a daemon cold-shutdown a session mid-turn, which is the bug
+/// the gate exists to prevent. Never widen this to "no visible text": an agent
+/// CLI's spinner frame is pure cursor movement and IS the session working.
+pub fn chunk_is_only_app_declares(data: &str) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let mut rest = data;
+    let mut saw_declare = false;
+    while let Some(start) = rest.find(OSC_PREFIX) {
+        // Anything before the sequence is real output from the session.
+        if start > 0 {
+            return false;
+        }
+        let body_start = OSC_PREFIX.len();
+        let Some((body_len, terminator_len)) = find_terminator(&rest[body_start..]) else {
+            // Incomplete tail: cannot prove it is ours, so it is activity.
+            return false;
+        };
+        saw_declare = true;
+        rest = &rest[body_start + body_len + terminator_len..];
+    }
+    saw_declare && rest.is_empty()
+}
+
 /// BEL or ST, whichever comes first. Returns (body length, terminator length).
 fn find_terminator(rest: &str) -> Option<(usize, usize)> {
     let bel = rest.find('\x07').map(|index| (index, 1));
@@ -478,6 +525,60 @@ mod tests {
         assert!(
             log.records().is_empty(),
             "a deliberate close must leave nothing to rebuild from"
+        );
+    }
+
+    /// The heartbeat that made 27 daemons immortal.
+    ///
+    /// The literal bytes are the ones measured coming off a ychrome launcher
+    /// PTY on `dev` (2026-08-10), payload replaced with an invented one.
+    #[test]
+    fn a_lone_app_declare_heartbeat_is_not_session_activity() {
+        let payload = base64::engine::general_purpose::STANDARD
+            .encode(br#"{"session":"local://11111111-2222-3333-4444-555555555555","url":"https://example.test/"}"#);
+        let beat = format!("\x1b]7717;web-surface;pick;{payload}\x07");
+        assert!(
+            super::chunk_is_only_app_declares(&beat),
+            "our own ~4s control heartbeat must not move the session idle clock"
+        );
+        // `pick` is Retention::Ignore, and that must not change the verdict:
+        // the question is whose bytes these are, not whether we retain them.
+        let stored = format!("\x1b]7717;web-surface;heartbeat;{payload}\x07");
+        assert!(super::chunk_is_only_app_declares(&stored));
+        // ST-terminated is the same sequence in its other legal spelling.
+        let st = format!("\x1b]7717;web-surface;pick;{payload}\x1b\\");
+        assert!(super::chunk_is_only_app_declares(&st));
+        // Two beats coalesced into one read.
+        assert!(super::chunk_is_only_app_declares(&format!("{beat}{beat}")));
+    }
+
+    /// ⛔ The one-directional bias. Each of these MUST count as activity —
+    /// discounting any of them would let the gate cold-shutdown a live turn.
+    #[test]
+    fn anything_that_is_not_purely_our_own_control_traffic_is_activity() {
+        let payload = base64::engine::general_purpose::STANDARD.encode(br#"{"a":1}"#);
+        let beat = format!("\x1b]7717;web-surface;pick;{payload}\x07");
+
+        for (data, why) in [
+            ("", "an empty chunk has nothing to discount"),
+            ("hello\n", "plain output"),
+            ("\x1b[2K\x1b[G", "a spinner frame is pure control and IS the agent working"),
+            ("\x1b]0;a title\x07", "somebody else's OSC is not ours to discount"),
+            ("\x1b]7717;web-surface;pick;dGVzdA==", "an unterminated tail cannot be proven ours"),
+        ] {
+            assert!(
+                !super::chunk_is_only_app_declares(data),
+                "must count as activity: {why}"
+            );
+        }
+
+        assert!(
+            !super::chunk_is_only_app_declares(&format!("output {beat}")),
+            "output before a declare is still output"
+        );
+        assert!(
+            !super::chunk_is_only_app_declares(&format!("{beat} output")),
+            "output after a declare is still output"
         );
     }
 }

@@ -1821,10 +1821,18 @@ fn remote_resume_external_active_message_with_elapsed(
         _ => String::new(),
     };
     if stranded {
+        // ⛔ THIS LINE MUST NOT CLAIM THE DAEMON DIED. It used to say "whose
+        // daemon exited without handing it over … this clears itself", and
+        // [`AgentResumeHolderKind::StrandedYggtermOwned`] never checked any such
+        // thing — it means only that the process's environ marker names this
+        // session, i.e. "this is ours". On 2026-08-10 that sentence was printed
+        // for 55 minutes about a session whose daemon was alive the whole time
+        // and holding its PTY, so "this clears itself" was false and the owner
+        // waited on it. Say what is actually known.
         format!(
-            "yggterm: {display} session {session_id} is still held by a yggterm process (pid {pids}) \
-             whose daemon exited without handing it over; waiting for it to release the session \
-             instead of starting a second resume. There is nothing to close — this clears itself.{waited}"
+            "yggterm: {display} session {session_id} is already running under yggterm \
+             (pid {pids}); waiting to attach instead of starting a second resume, which would \
+             corrupt the transcript. Nothing to close.{waited}"
         )
     } else {
         format!(
@@ -1857,12 +1865,16 @@ fn remote_resume_snapshot_is_external_active_guard(bytes: &[u8]) -> bool {
     }
     let external = normalized.contains("already active outside yggterm")
         && normalized.contains("waiting instead of starting a second resume");
-    let stranded = normalized.contains("still held by a yggterm process")
-        && normalized.contains("waiting for it to release the session");
+    // ⛔ The 3.0.90 wording AND its predecessor, because a fleet runs several
+    // daemon versions at once BY DESIGN — a matcher that only knows the newest
+    // spelling goes blind against every older peer still emitting the old one.
+    let stranded = normalized.contains("already running under yggterm")
+        || (normalized.contains("still held by a yggterm process")
+            && normalized.contains("waiting for it to release the session"));
     external || stranded
 }
 
-fn wait_for_external_codex_resume_to_clear(home: &Path, session_id: &str) {
+fn wait_for_external_codex_resume_to_clear(home: &Path, session_id: &str) -> ExternalResumeWait {
     wait_for_external_agent_resume_to_clear(SessionKind::Codex, home, session_id)
 }
 
@@ -1871,7 +1883,35 @@ fn wait_for_external_codex_resume_to_clear(home: &Path, session_id: &str) {
 /// person who looks away and back can tell the wait is still live.
 const EXTERNAL_ACTIVE_WAIT_REPRINT: Duration = Duration::from_secs(10);
 
-fn wait_for_external_agent_resume_to_clear(kind: SessionKind, home: &Path, session_id: &str) {
+/// How long the wait may run before it gives up and says so.
+///
+/// ⛔ **THE QUIET-GATE LAW: an absence-gate must carry a deadline.** This wait
+/// had none. It waits for a `claude`/`codex` process to EXIT, which is a thing
+/// that only happens if somebody makes it happen — so when the holder was a
+/// healthy working session rather than a dying one, the wait could not end.
+/// Measured 2026-08-10: 3,293 s on one row overnight (killed by hand) and
+/// 1,101 s and counting on another, both printing a reassuring
+/// "this clears itself" the entire time.
+///
+/// Two minutes is chosen against what the wait is FOR: a genuinely collapsing
+/// PTY releases in seconds. Past that, the honest answer is that this is not
+/// going to clear, and an error the owner can see beats a banner that lies
+/// quietly. It never becomes a second resume — racing the transcript stays
+/// forbidden at any elapsed time.
+const EXTERNAL_ACTIVE_WAIT_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Did the holder let go, or did we stop waiting for it?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalResumeWait {
+    Released,
+    DeadlineExpired,
+}
+
+fn wait_for_external_agent_resume_to_clear(
+    kind: SessionKind,
+    home: &Path,
+    session_id: &str,
+) -> ExternalResumeWait {
     let started = Instant::now();
     let mut announced: Option<Instant> = None;
     let mut last_pids = Vec::<u32>::new();
@@ -1895,7 +1935,22 @@ fn wait_for_external_agent_resume_to_clear(kind: SessionKind, home: &Path, sessi
                 println!("yggterm: the session was released; attaching now.");
                 let _ = std::io::stdout().flush();
             }
-            return;
+            return ExternalResumeWait::Released;
+        }
+        if started.elapsed() >= EXTERNAL_ACTIVE_WAIT_DEADLINE {
+            append_trace_event(
+                home,
+                "remote",
+                "resume_codex",
+                "external_active_wait_deadline",
+                json!({
+                    "session_id": session_id,
+                    "pids": processes.iter().map(|process| process.pid).collect::<Vec<_>>(),
+                    "waited_secs": started.elapsed().as_secs(),
+                    "deadline_secs": EXTERNAL_ACTIVE_WAIT_DEADLINE.as_secs(),
+                }),
+            );
+            return ExternalResumeWait::DeadlineExpired;
         }
         let pids = processes
             .iter()
@@ -16836,7 +16891,17 @@ pub fn run_remote_resume_codex(
         ));
     }
     if saved_session_exists {
-        wait_for_external_codex_resume_to_clear(&home, session_id);
+        let wait = wait_for_external_codex_resume_to_clear(&home, session_id);
+        // ⛔ Falling through here would start a SECOND resume against a
+        // transcript the holder still has open. The deadline is a refusal, not
+        // a licence — see EXTERNAL_ACTIVE_WAIT_DEADLINE.
+        if wait == ExternalResumeWait::DeadlineExpired {
+            anyhow::bail!(remote_resume_external_active_message(
+                SessionKind::Codex,
+                session_id,
+                &external_agent_resume_processes_for_session(SessionKind::Codex, session_id),
+            ));
+        }
     }
     let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
     let endpoint = default_endpoint(&home);
@@ -16988,7 +17053,18 @@ pub fn run_remote_resume_cc(
         ));
     }
     if saved_session_exists {
-        wait_for_external_agent_resume_to_clear(SessionKind::ClaudeCode, &home, session_id);
+        let wait =
+            wait_for_external_agent_resume_to_clear(SessionKind::ClaudeCode, &home, session_id);
+        // ⛔ Falling through here would start a SECOND resume against a
+        // transcript the holder still has open. The deadline is a refusal, not
+        // a licence — see EXTERNAL_ACTIVE_WAIT_DEADLINE.
+        if wait == ExternalResumeWait::DeadlineExpired {
+            anyhow::bail!(remote_resume_external_active_message(
+                SessionKind::ClaudeCode,
+                session_id,
+                &external_agent_resume_processes_for_session(SessionKind::ClaudeCode, session_id),
+            ));
+        }
     }
     let _ = ensure_local_managed_cli(ManagedCliTool::ClaudeCode)?;
     let endpoint = default_endpoint(&home);
@@ -17059,7 +17135,17 @@ pub fn run_remote_resume_agent(
         anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
     }
     if saved_session_exists {
-        wait_for_external_agent_resume_to_clear(kind, &home, session_id);
+        let wait = wait_for_external_agent_resume_to_clear(kind, &home, session_id);
+        // ⛔ Falling through here would start a SECOND resume against a
+        // transcript the holder still has open. The deadline is a refusal, not
+        // a licence — see EXTERNAL_ACTIVE_WAIT_DEADLINE.
+        if wait == ExternalResumeWait::DeadlineExpired {
+            anyhow::bail!(remote_resume_external_active_message(
+                kind,
+                session_id,
+                &external_agent_resume_processes_for_session(kind, session_id),
+            ));
+        }
     }
     if let Some(tool) = ManagedCliTool::from_session_kind(kind) {
         let _ = ensure_local_managed_cli(tool)?;
@@ -17229,11 +17315,49 @@ enum RemoteRuntimeBridgeOwner {
     },
 }
 
+/// Every runtime key under which ONE agent session can legitimately be owned.
+///
+/// ⛔ **A session's identity is its ID. The LANE it was born in is not a second
+/// identity**, and treating it as one is the whole of the "untouchable row" bug.
+/// A Claude Code session started through the remote lane is owned as
+/// `cc-runtime://<id>`; the SAME session started as a local session on that
+/// machine — which is what an agent spawning a row does — is owned as
+/// `local://<id>`. Both appear in the sidebar as `remote-cc://<host>/<id>`.
+///
+/// The bridge resolver matched one spelling, so opening a row born in the other
+/// lane found no live owner, decided this was a cold resume, and ran head-first
+/// into the session's own healthy `claude` process. The guard that caught that
+/// collision then waited for the holder to exit — forever, because the holder
+/// was not dying, it was WORKING.
+///
+/// Measured on `dev`, 2026-08-10: row 8 (`569e15eb…`) owned by the live 3.0.89
+/// daemon as `local://569e15eb…`, waited **1,101 s and counting**; the row above
+/// it had waited **3,293 s** overnight and had to be killed by hand. The banner
+/// said *"whose daemon exited without handing it over"* about a daemon that was
+/// alive and holding the PTY the whole time.
+fn agent_runtime_key_aliases(runtime_key: &str) -> Vec<String> {
+    let mut keys = vec![runtime_key.to_string()];
+    // Only widen from an agent RUNTIME lane to the local lane, never the other
+    // way: `local://` is also a plain shell's key, and a shell must never be
+    // mistaken for an agent runtime.
+    if let Some(id) = parse_remote_runtime_cc_session_key(runtime_key)
+        .or_else(|| runtime_key.strip_prefix("codex-runtime://"))
+        .filter(|id| !id.trim().is_empty())
+    {
+        let local = local_live_runtime_key(id);
+        if local != runtime_key {
+            keys.push(local);
+        }
+    }
+    keys
+}
+
 fn remote_runtime_bridge_owner_from_statuses(
     statuses: Vec<(ServerEndpoint, ServerRuntimeStatus)>,
     runtime_key: &str,
     current_version: &str,
 ) -> Option<RemoteRuntimeBridgeOwner> {
+    let aliases = agent_runtime_key_aliases(runtime_key);
     let mut stale_owner = None;
     for (endpoint, runtime) in statuses {
         // Only a daemon that OWNS the live PTY can serve a bridge. `terminal_session_keys`
@@ -17246,23 +17370,27 @@ fn remote_runtime_bridge_owner_from_statuses(
         // and tore down immediately instead of routing to the stale daemon that actually
         // holds the PTY. Match `owned_terminal_session_keys` so a preserved-only entry defers
         // to the real owner (StaleNeedsHotUpdate -> hot-update handoff / direct bridge).
-        if !runtime
+        // The key the OWNER actually holds — carried forward rather than echoing
+        // what we were asked for, because the bridge has to address the runtime
+        // by the owner's own spelling of it.
+        let Some(owned_key) = runtime
             .owned_terminal_session_keys
             .iter()
-            .any(|key| key == runtime_key)
-        {
+            .find(|key| aliases.iter().any(|alias| alias == *key))
+            .cloned()
+        else {
             continue;
-        }
+        };
         if runtime.server_version == current_version {
             return Some(RemoteRuntimeBridgeOwner::Current {
                 endpoint,
-                runtime_key: runtime_key.to_string(),
+                runtime_key: owned_key,
             });
         }
         if stale_owner.is_none() {
             stale_owner = Some(RemoteRuntimeBridgeOwner::StaleNeedsHotUpdate {
                 endpoint,
-                runtime_key: runtime_key.to_string(),
+                runtime_key: owned_key,
                 server_version: runtime.server_version,
                 server_pid: runtime.server_pid,
             });
@@ -30532,6 +30660,71 @@ mod tests {
         );
         handle.join().expect("status socket thread");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ⛔ The "untouchable row": a session born in the LOCAL lane, opened
+    /// through the REMOTE one.
+    ///
+    /// The owner holds `local://<id>`; the bridge asks for `cc-runtime://<id>`.
+    /// Matching one spelling made the resolver report NO live owner, so the
+    /// caller decided this was a cold resume and collided with the session's own
+    /// healthy `claude`. Live on `dev` 2026-08-10: two rows unusable, one for
+    /// 3,293 s. The owner's spelling must come back, because that is the key the
+    /// bridge has to address.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_owned_under_the_local_lane_is_still_found_by_its_remote_key() {
+        let asked_for = "cc-runtime://11111111-2222-3333-4444-555555555555";
+        let owned_as = "local://11111111-2222-3333-4444-555555555555";
+        let endpoint = ServerEndpoint::UnixSocket(PathBuf::from(format!(
+            "/tmp/yggterm-server-{}.sock",
+            super::daemon::SERVER_PROTOCOL_VERSION.replace('.', "-")
+        )));
+        let owner = super::remote_runtime_bridge_owner_from_statuses(
+            vec![(
+                endpoint.clone(),
+                minimal_runtime_status_with_version(
+                    super::daemon::SERVER_PROTOCOL_VERSION,
+                    vec![owned_as.to_string()],
+                ),
+            )],
+            asked_for,
+            super::daemon::SERVER_PROTOCOL_VERSION,
+        )
+        .expect("the live owner must be found under either lane");
+
+        assert_eq!(
+            owner,
+            super::RemoteRuntimeBridgeOwner::Current {
+                endpoint,
+                runtime_key: owned_as.to_string(),
+            },
+            "the bridge must address the runtime by the OWNER's key, not the one it asked with"
+        );
+    }
+
+    /// ⛔ And the widening is one-directional. `local://` is also a plain
+    /// shell's key; a shell must never be mistaken for an agent runtime.
+    #[test]
+    fn the_lane_alias_never_widens_a_plain_shell_into_an_agent_runtime() {
+        assert_eq!(
+            super::agent_runtime_key_aliases("local://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            vec!["local://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()],
+            "a local key must not acquire an agent-runtime alias"
+        );
+        assert_eq!(
+            super::agent_runtime_key_aliases("cc-runtime://abc"),
+            vec!["cc-runtime://abc".to_string(), "local://abc".to_string()]
+        );
+        assert_eq!(
+            super::agent_runtime_key_aliases("codex-runtime://abc"),
+            vec!["codex-runtime://abc".to_string(), "local://abc".to_string()]
+        );
+        assert_eq!(
+            super::agent_runtime_key_aliases("cc-runtime://"),
+            vec!["cc-runtime://".to_string()],
+            "an empty id must not alias to a bare local:// prefix"
+        );
     }
 
     #[cfg(unix)]

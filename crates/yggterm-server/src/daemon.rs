@@ -10515,40 +10515,77 @@ pub(crate) fn parse_daemon_version_triple(version: &str) -> Option<(u64, u64, u6
 /// whose parsed version is HIGHER than ours are probed (so a busy machine with
 /// many dead lower-version socket files stays cheap), and the probe confirms the
 /// peer actually reports a newer version before we treat ourselves as superseded.
+/// ⭐ **THE ONE OWNER of "is there a newer daemon, and which is the newest?"**
+///
+/// Returns the version string of the NEWEST live daemon strictly newer than
+/// this one, or `None`. Everything about supersession — the retire triggers,
+/// the migration drain, the handoff target — is this one question, so it is
+/// asked in one place and asked the cheap way.
+///
+/// ⛔ **The cheap way is the whole point, and it is why this function exists at
+/// all.** Two periodic loops used to answer it by calling
+/// [`reachable_versioned_daemon_statuses_excluding_endpoint`], which fetches
+/// each peer's FULL [`ServerRuntimeStatus`] — and that carries the machine's
+/// entire live-session roster. On `dev`, 2026-08-10, that was ~100 KB per peer,
+/// pulled from 26 peers, on a 20 s loop AND a 5 s loop, in each of **27
+/// daemons**: measured at 3 connects to every peer socket per 10 s per daemon,
+/// ≈ 140 status round trips a second machine-wide, to answer a boolean. Cost:
+/// **8.12 cores and 23 GB** on an otherwise idle box, and the pre-3.0.86 peers
+/// answered one `sendto` per byte (372,631 of them in 12 s from a single
+/// daemon). O(N² · M) where both N and M only ever grow.
+///
+/// The socket NAME carries the version, so the filter is a `read_dir` and a
+/// string parse: a CURRENT daemon probes nothing at all, and an old one probes
+/// only what could outrank it, newest first, stopping at the first confirmation.
+/// The probe still confirms against the peer's own reported version — a socket
+/// file is a claim, and a stale one from a dead daemon must not count.
 #[cfg(unix)]
-fn daemon_is_superseded(home_dir: &Path) -> bool {
-    let Some(my_version) = parse_daemon_version_triple(SERVER_PROTOCOL_VERSION) else {
-        return false;
-    };
-    let own_socket = match default_endpoint(home_dir) {
-        ServerEndpoint::UnixSocket(path) => fs::canonicalize(&path).ok(),
-        #[allow(unreachable_patterns)]
-        _ => None,
-    };
-    let Ok(entries) = fs::read_dir(home_dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(socket_version) = parse_versioned_server_socket_name(&path) else {
-            continue;
-        };
-        if socket_version <= my_version {
-            continue;
-        }
-        if let Some(own) = own_socket.as_ref()
-            && fs::canonicalize(&path).ok().as_ref() == Some(own)
+fn live_newer_daemon_version(home_dir: &Path, own_endpoint: &ServerEndpoint) -> Option<String> {
+    let my_version = parse_daemon_version_triple(SERVER_PROTOCOL_VERSION)?;
+    let mut own_sockets = Vec::new();
+    for endpoint in [&default_endpoint(home_dir), own_endpoint] {
+        if let ServerEndpoint::UnixSocket(path) = endpoint
+            && let Ok(canonical) = fs::canonicalize(path)
         {
-            continue;
-        }
-        if let Ok(status) = status(&ServerEndpoint::UnixSocket(path))
-            && parse_daemon_version_triple(&status.server_version)
-                .is_some_and(|peer| peer > my_version)
-        {
-            return true;
+            own_sockets.push(canonical);
         }
     }
-    false
+    let mut candidates = fs::read_dir(home_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let socket_version = parse_versioned_server_socket_name(&path)?;
+            // Only what could outrank us. This is the line that turns 26 probes
+            // into 0-2.
+            if socket_version <= my_version {
+                return None;
+            }
+            if let Ok(canonical) = fs::canonicalize(&path)
+                && own_sockets.contains(&canonical)
+            {
+                return None;
+            }
+            Some((socket_version, path))
+        })
+        .collect::<Vec<_>>();
+    // Newest first, so the first confirmation is also the best handoff target.
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    candidates.into_iter().find_map(|(_, path)| {
+        let status = status(&ServerEndpoint::UnixSocket(path)).ok()?;
+        parse_daemon_version_triple(&status.server_version)
+            .is_some_and(|peer| peer > my_version)
+            .then(|| status.server_version.trim().to_string())
+    })
+}
+
+/// Per [[bug-class-old-daemon-never-retires]]: in the managed-versions install
+/// model every daemon binary lives at its own path, so the `(deleted)` exe poll
+/// never fires and stale daemons never retire. Detect supersession structurally
+/// instead — see [`live_newer_daemon_version`], which owns the question.
+#[cfg(unix)]
+fn daemon_is_superseded(home_dir: &Path) -> bool {
+    live_newer_daemon_version(home_dir, &default_endpoint(home_dir)).is_some()
 }
 
 /// [`daemon_is_superseded`] where the concept exists, `false` where it does not.
@@ -11321,19 +11358,112 @@ fn versioned_server_status_probe_paths_excluding_endpoint(
 
 /// Is the lossless PTY fd handoff armed on this daemon?
 ///
-/// **Opt-in for its first release**, the same integrator gate increment 1 used.
-/// The failure it guards against is not cosmetic: a handoff that goes wrong
-/// after the commit point destroys a live shell. Default OFF until it has run
-/// in a sandbox against two real daemons.
+/// ⚖ **DEFAULT ON as of 3.0.90, and the switch was inverted deliberately.** It
+/// shipped opt-in because a handoff that fails past its commit point destroys a
+/// live shell — a real risk, correctly weighed at the time. What the opt-in
+/// could not weigh is the cost of it never being ON: it is the ONLY exit a
+/// daemon owning a PTY has, so with nobody setting the variable, every daemon
+/// that ever owned a session lived forever.
+///
+/// Measured on `dev`, 2026-08-10: **27 daemons**, the oldest 27 days and 25
+/// versions old, together burning **8.12 cores and 23 GB** — each one kept alive
+/// by a handful of orphaned `bash -i` shells, and each polling every other for
+/// the machine's full 260-session roster (O(N²), and the pre-3.0.86 ones
+/// serialising the answer one byte per `sendto`). On the owner's laptop the same
+/// pile made yggterm **71% of all idle CPU**, which is the fan he actually
+/// complains about.
+///
+/// ⚠ The safety argument is unchanged and still holds — it is [`HandoffSweep`]
+/// that carries it, not this flag: all-or-nothing, stop at the first failure,
+/// and exit ONLY on [`HandoffSweep::AllMoved`]. `Partial` keeps the daemon
+/// alive precisely because exiting would close the descriptors it still holds.
+/// Setting the variable to `0`/`off` restores the old lingering behaviour.
 #[cfg(target_os = "linux")]
 fn pty_fd_handoff_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("YGGTERM_ENABLE_PTY_FD_HANDOFF")
             .ok()
             .as_deref()
             .map(str::trim),
-        Some("1") | Some("true") | Some("yes") | Some("on")
+        Some("0") | Some("false") | Some("no") | Some("off")
     )
+}
+
+/// How often a superseded daemon asks whether it can hand its PTYs over and go.
+///
+/// Slow on purpose: the answer only changes when a newer daemon appears or the
+/// last session on this one ends, and the probe costs a status round trip to
+/// every reachable peer.
+#[cfg(target_os = "linux")]
+const SUPERSEDED_SELF_RETIRE_POLL_MS: u64 = 60_000;
+
+/// A superseded daemon's own way out — the missing half of version coexistence.
+///
+/// ⛔ **Before this, a daemon that had ever owned a PTY could not retire by ANY
+/// path.** [`daemon_should_idle_shutdown`] refuses while
+/// `terminal_session_count > 0`, and the only handoff was a `HotUpdateHandoff`
+/// RPC that nothing sends periodically. So the pile could only grow, one daemon
+/// per deploy, forever — which is exactly what 27 daemons on `dev` and 6 on the
+/// owner's laptop were.
+///
+/// The constitution's promise is that a new daemon serves new work while older
+/// ones keep the sessions that were mid-flight **until that work finishes on its
+/// own terms**. This is "on its own terms" arriving: the move is LOSSLESS (the
+/// descriptor changes hands; the child is never signalled and simply reparents),
+/// so it needs no idle window and no permission — which matters, because a
+/// machine that is always busy can never produce a quiet one.
+///
+/// Exits the process on success, and ONLY on success: see the `AllMoved` arm.
+#[cfg(target_os = "linux")]
+fn spawn_superseded_self_retire_sweep(
+    home_dir: PathBuf,
+    endpoint: ServerEndpoint,
+    runtime: Arc<Mutex<DaemonRuntime>>,
+) {
+    if !pty_fd_handoff_enabled() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("yggterm-superseded-retire".to_string())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    SUPERSEDED_SELF_RETIRE_POLL_MS,
+                ));
+                let Some(successor) = live_newer_daemon_version(&home_dir, &endpoint) else {
+                    continue;
+                };
+                let sweep = {
+                    let mut rt = lock_daemon_runtime(&runtime, "superseded_self_retire");
+                    // Nothing to move: the idle-shutdown path owns that case,
+                    // and it can reach it now that we hold no sessions.
+                    if rt.terminals.session_keys().is_empty() {
+                        continue;
+                    }
+                    rt.hand_off_all_runtimes(&successor)
+                };
+                append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "lifecycle",
+                    "superseded_self_retire_sweep",
+                    serde_json::json!({
+                        "successor_version": successor,
+                        "outcome": format!("{sweep:?}"),
+                        "server_version": SERVER_PROTOCOL_VERSION,
+                        "pid": std::process::id(),
+                    }),
+                );
+                if let HandoffSweep::AllMoved { .. } = sweep {
+                    // The successor holds every descriptor. Exiting is the only
+                    // way to release ours — dropping runtimes individually
+                    // leaves reader threads on cloned masters, and two daemons
+                    // reading one PTY means the shell never sees EOF.
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    std::process::exit(0);
+                }
+            }
+        });
 }
 
 /// What a whole-daemon handoff attempt concluded.
@@ -13853,15 +13983,14 @@ fn spawn_disk_binary_version_poll(
             // remote-session terminal streams on the seed placeholder (= blank
             // viewport on every update). Retiring the stale daemon collapses back to
             // one. See [[finding-blank-on-restart-split-brain-daemon]].
+            // ⛔ Asked through the cheap owner, not a full-roster sweep of every
+            // peer — see [`live_newer_daemon_version`]. This loop and the
+            // migration drain below it were together the O(N²·M) that cost 8.12
+            // cores on a 27-daemon machine.
             let newer_daemon_version = if binary_replaced {
                 None
             } else {
-                reachable_versioned_daemon_statuses_excluding_endpoint(&home_dir, &endpoint)
-                    .into_iter()
-                    .map(|(_, status)| status.server_version)
-                    .find(|version| {
-                        server_version_is_strictly_newer(version, SERVER_PROTOCOL_VERSION)
-                    })
+                live_newer_daemon_version(&home_dir, &endpoint)
             };
             let retire_trigger = if binary_replaced {
                 "disk_binary_replaced"
@@ -14331,13 +14460,10 @@ fn spawn_progressive_session_migration(
             // the whole point of the handoff (converge ownership onto the newest
             // build). An older or same-version peer means there is nobody to
             // converge onto, and lingering harmlessly is the correct outcome.
-            let successor_reachable =
-                reachable_versioned_daemon_statuses_excluding_endpoint(&home_dir, &endpoint)
-                    .into_iter()
-                    .any(|(_endpoint, status)| {
-                        daemon_version_is_newer_successor(&status.server_version)
-                    });
-            if !successor_reachable {
+            // ⛔ On a 5 s loop, so this MUST be the cheap probe: pulling every
+            // peer's full session roster here is half of the O(N²·M) that cost
+            // 8.12 cores on `dev`. See [`live_newer_daemon_version`].
+            if live_newer_daemon_version(&home_dir, &endpoint).is_none() {
                 continue;
             }
             // Snapshot the ledger and release its lock BEFORE taking the daemon
@@ -14938,6 +15064,13 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
     // derives our address from our VERSION, so it can knock the moment we exist.
     #[cfg(target_os = "linux")]
     spawn_pty_handoff_listener(home_dir.clone(), Arc::clone(&runtime));
+    // And the other half: once a newer daemon exists, give it everything and go.
+    #[cfg(target_os = "linux")]
+    spawn_superseded_self_retire_sweep(
+        home_dir.clone(),
+        endpoint.clone(),
+        Arc::clone(&runtime),
+    );
     {
         // Perf incident monitor: catch the RANDOM "fan gets angry" flares the user
         // can't predict. Every 30s, summarize the last 60s of perf telemetry and, if
@@ -18394,16 +18527,22 @@ mod tests {
         ));
     }
 
-    /// The gate is OFF unless explicitly armed — the first release of something
-    /// whose failure destroys a live shell does not default to on.
+    /// The gate is ON unless explicitly disarmed.
+    ///
+    /// ⚖ This test used to assert the opposite, and inverting it was the point
+    /// of 3.0.90: the handoff is the ONLY exit a daemon owning a PTY has, so
+    /// while it defaulted off, every daemon that had ever owned a session lived
+    /// forever — 27 of them on `dev`, 8.12 cores between them. The safety the
+    /// opt-in bought is carried by [`super::HandoffSweep`] instead, which is
+    /// where it belongs.
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_fd_handoff_is_opt_in() {
+    fn the_fd_handoff_is_armed_by_default_and_can_be_disarmed() {
         // Reads the process environment, which no test sets, so this asserts
         // the DEFAULT rather than a parse.
         assert!(
-            !super::pty_fd_handoff_enabled(),
-            "YGGTERM_ENABLE_PTY_FD_HANDOFF must be opt-in"
+            super::pty_fd_handoff_enabled(),
+            "the fd handoff must be armed by default — it is the only way out"
         );
     }
 
@@ -24986,8 +25125,8 @@ mod tests {
         // version-ordered compatibility gate looking at two builds of one
         // version with different shapes — the lost-PTY latch storm of
         // 2026-07-17.
-        const STAMPED_AT_VERSION: &str = "3.0.75";
-        const STAMPED_SHAPE_HASH: u64 = 0x70c12d5892f4f3c1;
+        const STAMPED_AT_VERSION: &str = "3.0.90";
+        const STAMPED_SHAPE_HASH: u64 = 0xa69ad1bbd1767587;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

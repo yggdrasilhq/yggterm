@@ -48,24 +48,71 @@ rest is what stays open.
    5,366 MB with no other change. **Nothing sweeps `/tmp`**, and the fleet
    already ships `ygg-bak-sweep` and `ygg-build-sweep`, so the gap is a missing
    sibling, not a missing idea.
-4. ⛔ **SIX daemons on the GUI host, THIRTY on dev, each burning 1.3-2.3% CPU
-   forever** — ~12% of a core on his laptop, permanently, for daemons that own
-   almost nothing. **They are immortal by construction as of 3.0.81:** every
-   generation leaves behind a ychrome launcher shell
-   (`bash -c 'ychrome; exec bash -i'` — ychrome daemonises, the shell falls back
-   to an idle interactive bash), and a plain shell is now a PERMANENT blocker on
-   cold shutdown. So the pile grows by one per deploy and never shrinks.
-   ⇒ The exit is not "let the gate kill shells again" (that was the bug 3.0.81
-   fixed) — it is to **hand the PTY over**. `pty_handoff.rs` already passes an
-   `OwnedFd`; plain shells are simply not routed through it.
+4. ⭐ **FIXED in 3.0.90 — the daemon pile, and it was never really about
+   shells.** Re-measured 2026-08-10: **27 daemons on `dev`** (oldest 27 days and
+   25 versions old) burning **8.12 cores and 23 GB** between them, and **6 on the
+   GUI host**, where yggterm was **71% of all idle CPU** (0.46 of the machine's
+   0.64 cores) — the fan. Three defects in one chain, each fixed:
+   - ⭐ **The idle gate was being bumped by OUR OWN control traffic.** A
+     declaring app re-emits its full OSC 7717 payload on a **~4 s heartbeat**, by
+     design, and the PTY reader stamped `last_activity_ms` on every chunk. So
+     five `bash -i` shells nobody had touched in weeks reported `idle_ms` of 266,
+     1079, 1387, 1711 and 3433 against a 300,000 ms threshold. The gate is an AND
+     over owned sessions ⇒ **it could never open.** THE QUIET-GATE LAW, with the
+     app as the thing that is never quiet. Fixed: a chunk that is nothing but our
+     own declares does not move the idle clock
+     (`app_declare::chunk_is_only_app_declares`), one-directionally — a split
+     sequence still counts as activity, because discounting real output is the
+     dangerous error.
+   - ⭐ **A daemon owning a PTY had NO exit at all.** `daemon_should_idle_shutdown`
+     refuses while `terminal_session_count > 0`, and the only handoff was a
+     `HotUpdateHandoff` RPC nothing sends periodically, behind an opt-in env var
+     nobody set. `pty_handoff.rs` was built, tested and unreachable. Fixed:
+     `spawn_superseded_self_retire_sweep` hands every PTY to the newest live
+     successor and exits, and the fd handoff now defaults ON (`HandoffSweep`
+     carries the safety: all-or-nothing, exit only on `AllMoved`).
+   - ⭐ **O(N²·M) peer gossip.** Two loops (20 s and 5 s) answered "is a newer
+     daemon live?" by pulling every peer's FULL `ServerRuntimeStatus`, which
+     carries the machine's entire live-session roster (~100 KB × 26 peers ×
+     27 daemons ≈ 140 status round trips a second). Measured: 3 connects to every
+     peer socket per 10 s per daemon; 372,631 `sendto` in 12 s from one daemon.
+     Fixed: `live_newer_daemon_version` filters by the version in the socket NAME
+     first, so a current daemon probes nothing and an old one probes 0-2, newest
+     first, stopping at the first confirmation.
+   ⚠ **The 3.0.81 framing in the old version of this entry was too narrow** and
+   is corrected here: the pile was NOT mostly orphan shells. Of 27 daemons only 6
+   held pure orphans — the rest were holding the owner's **live agent rows**,
+   which is version coexistence working as designed. The bug was never that they
+   existed; it was that **nothing ever moved that work forward**, so the count
+   could only grow.
+   ⛔ **STILL OPEN: the EXISTING pile does not drain itself.** The self-retire
+   ships in 3.0.90, and the 27 daemons already running are older binaries that do
+   not have it. They must be drained by hand or as their sessions end.
 5. ⛔ **Twelve `[ssh] <defunct>` zombies, 10.9 hours old**, under the armed
    daemon — the SIGCHLD reaper gap, still owed.
-6. ⛔ **A busy-wait that prints every 12 s and never gives up.** His screenshot:
-   *"Claude Code session … is still held by a yggterm process (pid …) whose
-   daemon exited without handing it over; waiting for it to release … Waiting
-   157s so far."* A daemon exited WITHOUT a handoff — that is the stranding
-   path — and the client's response is an unbounded spin with no ceiling and no
-   escalation.
+6. ⭐ **FIXED in 3.0.90 — and the banner was lying about the cause.** Reported
+   again 2026-08-10 on two rows: one waited **3,293 s** overnight and had to be
+   killed by hand, the other **1,101 s and counting** while it was diagnosed.
+   - ⛔ **The session was never stranded.** `AgentResumeHolderKind::StrandedYggtermOwned`
+     means only that the process's environ marker names this session — it never
+     checked whether any daemon had exited. Row 8's holder was owned by the
+     **live 3.0.89 daemon**, which was holding its PTY the whole time, so
+     *"whose daemon exited without handing it over … this clears itself"* was
+     false in every clause. Reworded to what is actually known.
+   - ⭐ **The real cause is a SECOND KEY NAMESPACE for one session.** A CC session
+     born in the remote lane is owned as `cc-runtime://<id>`; the same session
+     born as a local session on that machine — what an agent spawning a row
+     does — is owned as `local://<id>`. Both render as `remote-cc://<host>/<id>`.
+     `remote_runtime_bridge_owner_from_statuses` matched one spelling, so the
+     "bind to the existing runtime first" guard (which is correct, and was
+     already there) found no owner, decided this was a cold resume, and collided
+     with the session's own healthy `claude`. Fixed: `agent_runtime_key_aliases`,
+     matched one-directionally so a plain shell is never mistaken for an agent
+     runtime, returning the key the OWNER holds.
+   - ⭐ **The wait had no deadline** — an absence-gate waiting for a process to
+     EXIT, which a working session never does. Now bounded at 120 s and it
+     refuses rather than falling through into a transcript-corrupting second
+     resume.
 
 ⚖ **What is NOT the cause, so nobody re-chases it:** yggterm's own resident
 footprint on his laptop is small — 554 MB RSS and 158 MB of swap across 17
@@ -77,6 +124,10 @@ it LEAVES BEHIND (the tmpfs staging).** Same shape as
 **Falsifier for what remains:** a fleet deploy adds nothing to `/tmp`, the daemon
 count on a host does not grow across a version bump, and a switch to a cold
 session reveals without a multi-second stall.
+
+⇒ **The daemon-count half of that falsifier is now testable**: on 3.0.90+, deploy
+twice and the count must go DOWN, not up, because each superseded daemon hands
+its PTYs to the newest and exits.
 
 ## ⛔ THE DAEMON PANEL OFFERS AN UPGRADE THAT HAS NOTHING TO UPGRADE — `hot_restart_pending` outranks the version comparison
 
