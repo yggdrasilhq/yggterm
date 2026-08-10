@@ -15,7 +15,10 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔⛔ THE BOOTER KICKED A CONTEXT-DEAD SESSION EVERY 10 MINUTES FOR TEN HOURS, AND ITS OWN LOG SAID "WORKING"
 
-**Status:** OPEN — defects 1, 2 and 4 FIXED 2026-08-10; defect 3 was the same fix as 1.
+**Status:** OPEN
+
+⭐ Defects 1, 2 and 4 FIXED 2026-08-10; defect 3 turned out to be the same fix as 1.
+What remains open is the monitor-subscription question filed separately below.
 
 **Reported by row 8 (practice campaign) 2026-08-10, MEASURED not theoretical**, on
 `ygg-booter` / `ygg-babysit` in `.agents/skills/yggterm-agent-fleet/` — which this
