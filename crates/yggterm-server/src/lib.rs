@@ -120,6 +120,7 @@ pub use daemon::{
     terminal_write_guarded, terminal_write_was_refused_for_draft,
     HOT_RESTART_BLOCKER_NOT_RESTORABLE, HOT_RESTART_BLOCKER_RECENTLY_ACTIVE,
     HOT_RESTART_BLOCKER_WORKING,
+    hot_update_handoff_would_refuse_binary,
     HotRestartBlocker, HotRestartResult, SERVER_PROTOCOL_VERSION, ServerEndpoint, ServerRequest,
     ServerResponse, ServerRuntimeStatus, hot_restart_block_reason_summary,
     TerminalStreamChunk, cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint,
@@ -15617,14 +15618,29 @@ fn is_remote_protocol_probe_recoverable(output: &str) -> bool {
 /// Falls back to our own version when the payload cannot be interrogated, which
 /// is exactly the previous behaviour.
 fn local_bootstrap_payload_version() -> String {
-    fn probe() -> Option<String> {
-        let path = local_remote_bootstrap_executable()?;
-        let out = std::process::Command::new(&path).arg("--version").output().ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let token = text.split_whitespace().find(|t| looks_like_version(t))?;
-        Some(token.to_string())
-    }
-    probe().unwrap_or_else(|| daemon::SERVER_PROTOCOL_VERSION.to_string())
+    local_remote_bootstrap_executable()
+        .and_then(|path| yggterm_executable_reported_version(&path))
+        .unwrap_or_else(|| daemon::SERVER_PROTOCOL_VERSION.to_string())
+}
+
+/// The version a yggterm executable on disk will report when it runs — asked of
+/// the artefact itself, never assumed from our own `CARGO_PKG_VERSION`.
+///
+/// ⭐ **THE ONE OWNER of "what version is that binary?"** Both callers exist
+/// because the same divergence bites twice on a split install: the payload we
+/// would upload to a remote, and the daemon we would spawn locally for a
+/// hot-update handoff. Sharing the probe keeps the two answers from drifting.
+///
+/// `None` when the binary cannot be interrogated at all; callers decide whether
+/// an unknown version is a reason to proceed or to hold back.
+pub fn yggterm_executable_reported_version(path: &Path) -> Option<String> {
+    let out = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let token = text.split_whitespace().find(|t| looks_like_version(t))?;
+    Some(token.to_string())
 }
 
 /// The pure decision, so it can be tested without a filesystem.
@@ -18568,6 +18584,28 @@ fn reap_spawned_child_in_background(
     });
 }
 
+/// The log a spawned daemon child writes into, resolved to the SAME file
+/// `read_daemon_startup_log_tail` (yggterm-shell) quotes back when a wait times
+/// out — `<socket dir>/daemon.log`. If the two ever name different files the
+/// failure message goes back to describing someone else's daemon.
+///
+/// `None` for TCP endpoints: the shell's path for that case is a bare relative
+/// `daemon.log`, and this spawn sets `current_dir` to the binary's directory,
+/// so honouring it would scatter a log next to the executable that no reader
+/// looks for. Writing nowhere is better than writing where nobody reads.
+fn daemon_startup_log_file_for_endpoint(endpoint: &ServerEndpoint) -> Option<std::fs::File> {
+    let path = match endpoint {
+        #[cfg(unix)]
+        ServerEndpoint::UnixSocket(path) => path.parent()?.join("daemon.log"),
+        ServerEndpoint::Tcp { .. } => return None,
+    };
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
 pub(crate) fn spawn_hot_restart_daemon_process(
     daemon_exe: &Path,
     endpoint: &ServerEndpoint,
@@ -18587,12 +18625,29 @@ fn spawn_daemon_process_from_executable(
     child_event: &'static str,
 ) -> anyhow::Result<()> {
     let mut command = Command::new(daemon_exe);
-    command
-        .arg("server")
-        .arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    command.arg("server").arg("daemon").stdin(Stdio::null());
+    // ⛔ THE CHILD'S REASON FOR DYING IS THE ONE THING THE WAITER NEEDS. This
+    // spawn nulled both streams while its sibling `spawn_daemon_process` in
+    // yggterm-shell wrote them to the very `daemon.log` that
+    // `read_daemon_startup_log_tail` quotes back in the failure message — so a
+    // hot-restart child that died on `refusing hot-update handoff target
+    // regression from 3.0.96 to 3.0.92` printed that line into /dev/null, and
+    // the resulting "daemon did not become reachable" quoted a tail left by an
+    // unrelated daemon days earlier (a 3-0-32 socket's idle shutdown). Two
+    // siblings doing one job, only one of them logging.
+    match daemon_startup_log_file_for_endpoint(endpoint) {
+        Some(log_file) => match log_file.try_clone() {
+            Ok(clone) => {
+                command.stdout(clone).stderr(log_file);
+            }
+            Err(_) => {
+                command.stdout(Stdio::null()).stderr(log_file);
+            }
+        },
+        None => {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
     configure_background_service_command(&mut command);
     if let Some(parent) = daemon_exe.parent() {
         command.current_dir(parent);

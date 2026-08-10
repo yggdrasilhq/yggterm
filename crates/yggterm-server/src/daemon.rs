@@ -493,6 +493,33 @@ fn parse_protocol_version(value: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+/// Whether a hot-update handoff that promises `promised_version` would be
+/// REFUSED by a daemon binary that reports `binary_version` when it boots.
+///
+/// ⛔ **The version a handoff PROMISES and the BINARY that must honour it are
+/// two separate facts, and on a split install they diverge.** The requester
+/// promises its OWN version (`current_version()`); the child is spawned from
+/// whatever `yggterm-headless` sits next to it. When the binary is older, the
+/// child boots, finds a registry expecting a newer target, refuses the
+/// regression below, and exits 1 — an unreachable success condition, exactly
+/// the shape already fixed on the remote-bootstrap path by
+/// `local_bootstrap_payload_version` ("expected 3.0.92, got 3.0.91 forever").
+///
+/// ⭐ This asks the SAME predicate the child will apply, rather than
+/// re-deriving the comparison, so a pre-flight check can never drift from the
+/// gate it is predicting — and `YGGTERM_ALLOW_HOT_UPDATE_TARGET_DOWNGRADE`
+/// keeps working for both at once.
+///
+/// Measured on the owner's machine 2026-08-10: GUI 3.0.96 against
+/// `~/.local/bin/yggterm-headless` at 3.0.92 made every GUI start pay
+/// 10.2 s (the `hot_restart` request) + 15.4 s (`wait_for_daemon`) + 11.6 s
+/// (the next instance queued behind the process guard) = a ~37 s
+/// `startup/initial_server_sync` in which the screen is painted and nothing is
+/// connected. See [[bug-class-old-daemon-never-retires]].
+pub fn hot_update_handoff_would_refuse_binary(promised_version: &str, binary_version: &str) -> bool {
+    hot_update_target_regression(Some(promised_version), Some(binary_version)).is_some()
+}
+
 fn hot_update_target_regression(
     existing_expected: Option<&str>,
     requested_expected: Option<&str>,
@@ -17346,8 +17373,57 @@ mod tests {
     use super::{
         DaemonRuntime, HOT_RESTART_BLOCKER_NOT_RESTORABLE, HOT_RESTART_BLOCKER_RECENTLY_ACTIVE,
         HOT_RESTART_BLOCKER_WORKING, HotRestartBlocker, hot_restart_block_reason_summary,
+        hot_update_handoff_would_refuse_binary,
     };
     use crate::live_row_tombstones::LiveRowTombstones;
+
+    /// The live case, fed to the guard exactly as it occurred: GUI 3.0.96
+    /// promising itself as the handoff target while
+    /// `~/.local/bin/yggterm-headless` on the same host was 3.0.92. The child
+    /// refused and exited 1; the requester then waited out 10.2 s + 15.4 s of
+    /// deadlines before falling back to the preserve path. A pre-flight that
+    /// cannot see this case is decoration.
+    #[test]
+    fn a_handoff_promising_a_newer_version_than_the_binary_is_predicted_refused() {
+        assert!(
+            hot_update_handoff_would_refuse_binary("3.0.96", "3.0.92"),
+            "the 2026-08-10 guihost split install must be caught before the request is sent"
+        );
+    }
+
+    /// The opposite, so the guard cannot pass by refusing everything — a
+    /// swap that CAN be honoured must still be attempted, or a GUI-and-daemon
+    /// deploy could never hand over at all.
+    #[test]
+    fn a_handoff_the_binary_can_honour_is_not_predicted_refused() {
+        for (promised, binary) in [("3.0.96", "3.0.96"), ("3.0.92", "3.0.96")] {
+            assert!(
+                !hot_update_handoff_would_refuse_binary(promised, binary),
+                "promised={promised} binary={binary} is deliverable and must not be skipped"
+            );
+        }
+    }
+
+    /// ⭐ The pre-flight asks the SAME function the child applies, so the two
+    /// cannot drift. Pin that they agree, including on unparseable input where
+    /// the child proceeds and so must we.
+    #[test]
+    fn the_preflight_agrees_with_the_gate_it_predicts() {
+        for (promised, binary) in [
+            ("3.0.96", "3.0.92"),
+            ("3.0.96", "3.0.96"),
+            ("3.0.92", "3.0.96"),
+            ("3.1.0", "3.0.99"),
+            ("not-a-version", "3.0.92"),
+            ("3.0.96", "not-a-version"),
+        ] {
+            assert_eq!(
+                hot_update_handoff_would_refuse_binary(promised, binary),
+                super::hot_update_target_regression(Some(promised), Some(binary)).is_some(),
+                "pre-flight and gate disagreed on promised={promised} binary={binary}"
+            );
+        }
+    }
 
     fn peer_row(key: &str, kind: crate::SessionKind) -> crate::PersistedLiveSession {
         crate::PersistedLiveSession {
