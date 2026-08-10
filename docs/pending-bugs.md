@@ -89,6 +89,60 @@ skips** — and this one skipped it for 8.5 hours. §8 step 3 already forbids th
 with no trigger is unenforceable**. §2 should point at the gauge as the automatic path
 and keep `/context` as the interactive one.
 
+## ⛔⛔ EVERY GUI DEPLOY BREAKS IMAGE PASTE TO EVERY HOST YOU HAVE NOT UPDATED YET
+
+**Status:** OPEN
+
+**Owner-reported 2026-08-10** — *"now I cannot ctrl+V screenshots"*. Found in the GUI's
+own launch log, which names it exactly:
+
+```
+WARN terminal clipboard paste request  session=remote-cc://dev/<uuid>
+WARN terminal clipboard paste failed   session=remote-cc://dev/<uuid>
+     error=remote yggterm protocol mismatch for dev:
+           expected 3.0.92@12072927657283082749, got 3.0.91@12072927657283082749
+```
+
+⚠ **TEXT paste kept working** (`terminal clipboard text paste accepted` in the same
+log) — only the IMAGE path does a remote handshake, which is why this reads as "paste
+is broken" rather than "the remote is stale".
+
+### The mechanism
+
+`remote_descriptor_is_protocol_compatible` (`lib.rs:15609`) is `remote >= local` on the
+parsed version triple. The GUI is by construction the FIRST thing updated (he restarts
+it; the daemons and remote helpers lag deliberately, per the constitution's
+version-coexistence guarantee). So **the moment the GUI moves, every remote that has
+not moved yet fails the test**, and image paste to those hosts dies until each one is
+chased. A guarantee that old and new must coexist, and a check that forbids it.
+
+### ⛔ The obvious fix is NOT yet justified — measured, do not skip this
+
+The two sides reported the **same `build_id`** (`12072927657283082749`), so "accept when
+the build ids match" looks right. **It is not established.** Probing both binaries
+directly:
+
+```
+.yggterm/bin/yggterm            -> {"build_id":12072927657283082749,"version":"3.0.92"}
+.yggterm/bin/yggterm.rollback   -> {"build_id":12072927657283082749,"version":"3.0.91"}
+```
+
+Two genuinely different builds, same id. So `build_id` here is **not** a content hash
+(despite `current_local_build_id()` hashing binary bytes — a different notion under the
+same word), and it is **not** `STAMPED_SHAPE_HASH` either (12005138361312769415 ≠
+12072927657283082749). Until somebody establishes what this id actually denotes,
+"equal id ⇒ wire compatible" is an assumption, and weakening a compatibility guard on
+an assumption is how a mixed-version fleet starts failing silently.
+
+⇒ **First task on this entry: name what `server remote protocol-version`'s `build_id`
+is derived from.** If it turns out to track the wire shape, it is the correct
+compatibility test and the version ordering should be replaced by it. If it does not,
+the right fix is a declared MINIMUM compatible version rather than `>=` self.
+
+**What was done meanwhile:** dev's `~/.yggterm/bin/yggterm` was brought to 3.0.92 to
+match the GUI, which makes the existing test pass deterministically. Nothing was
+weakened. **To reverse:** `~/.yggterm/bin/yggterm.rollback-3.0.92-pre` is in place.
+
 ## ⛔⛔ A DEPLOY ARMS THE OLD DAEMON'S COLD SHUTDOWN, WHICH MASS-RE-RESUMES EVERY AGENT ~5 MINUTES LATER
 
 **Status:** OPEN
@@ -196,15 +250,36 @@ The 3.0.92 daemon was deliberately **NOT** deployed onto any running daemon path
 on all three hosts. That was originally to avoid disturbing sessions; it is now also
 the thing keeping this gap out of the fleet.
 
-### Fix direction
+### Fix direction — ⭐ RECOMMENDED SHAPE, and why it was NOT shipped blind
 
-Find why `live_session_kind` reports a restorable kind for a `local://` shell row, and
-make the blocker walk **fail closed**: if the owned runtime's launch command is a plain
-shell, it is not restorable regardless of what the row registry says. The row registry
-and the runtime are two answers to one question — per the SSOT law, collapse them or
-make the destructive path trust the runtime.
-**Falsifier:** a daemon owning any plain shell must report
-`permanent_blocker_count >= 1`. Today it reports 0.
+**Narrowed 2026-08-10.** Current code is SAFE in two of the three cases:
+`live_session_kind` returning `None` → `.unwrap_or(false)` → permanent blocker ✓;
+`Some(Shell)` → `is_agent()` false → permanent blocker ✓. The ONLY unsafe case is
+`Some(<agent kind>)` for a runtime that is actually a `bash -i` — i.e. **the row
+registry disagreeing with the process**. That is what the 2.12.24 measurement shows;
+it is NOT yet demonstrated on current code, because no 3.0.90+ daemon has owned a
+plain shell.
+
+⭐ **Recommended:** verify the registry against process truth using the discriminator
+that already exists and is tested — `session_tenancy`'s `command_is_shell` /
+`oldest` (the oldest NON-shell tenant, `session_tenancy.rs:955-963`). A runtime whose
+tree contains **no non-shell tenant** is a plain shell whatever the registry says.
+Reuse it; do not invent a launch-command matcher.
+
+⛔ **Why it was not shipped in the same session that found it.** The failure is
+BIDIRECTIONAL. Marking a real agent row "not restorable" pins its daemon **permanently**
+— which is precisely the immortal-daemon bug this campaign spent the day removing. An
+agent row whose CLI has exited leaves only its wrapper shell and would trip exactly
+that. So the change needs a grace period and a live case to test against, and there is
+no current daemon owning a plain shell to test on. Guessing on a path that KILLS PTYs
+is how the 3.0.81/3.0.90 pendulum swings again.
+
+**What was done meanwhile:** the 3.0.92 daemon was deliberately NOT deployed to any
+running daemon path (`~/.yggterm/bin/yggterm-headless` stays 3.0.91 fleet-wide), so the
+gap cannot reach the fleet.
+**To reverse:** nothing to reverse; no behaviour changed.
+**Falsifier, unchanged:** a daemon owning any plain shell must report
+`permanent_blocker_count >= 1`. The 2.12.24 daemon reports 0 with 9 shells.
 
 ## ⭐ "UNSUBSCRIBE WHEN THE WORK IS DONE" IS WRONG FOR A MONITOR — AND THE SESSION ALWAYS SAYS YES
 
