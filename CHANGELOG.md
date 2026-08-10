@@ -26,7 +26,15 @@ This file tracks user-visible changes in `yggterm`.
   remote host's binaries were still 3.0.91 afterwards and all eight live
   `resume-cc`/`start-cc` shims were still running; daemon counts unchanged on both
   hosts.
+  ⇒ **Owner-confirmed: "CTRL+V works"**, with a staged file on the remote host to
+  match — which is the end of the path, not just the gate.
   ⚠ The restart itself took **18.5 s** to answer, against a 3 s bar — filed.
+  ⚠ One thing recorded as evidence and NOT as conclusion: the same GUI process
+  staged an image successfully at 12:58 and refused at 14:53. So the gate is not
+  hit from process start; something made a served answer go back to probing
+  (`cache_stale_served_while_revalidating` appears at 14:57). Cache expiry is the
+  obvious candidate and has not been proven. It matters because it is the whole
+  reason the failure read as intermittent — "it worked earlier today" was true.
 
 - **A new daemon answered nothing for 15 seconds because it walked every agent
   transcript on the machine first — to fill an argument nobody has read since
