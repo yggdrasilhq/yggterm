@@ -4,6 +4,33 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Every session on the machine refused input at once, behind screens that had
+  already painted perfectly.** Owner-reported: *"sessions are untypeable even
+  though I see a flawless rendering of the session"*, with the cause sitting in
+  his own composer — `Error: timed out waiting for daemon spawn lock`.
+  `acquire_daemon_spawn_lock` waited `for _ in 0..120` at 100 ms — **~12 s — for a
+  lock that stays valid for 15 s while its holder is alive.** A waiter that gives
+  up before the thing it waits on can even be declared stale can never wait out a
+  legitimate holder, so every give-up in that 3 s gap is a spurious failure; and
+  because `ensure_local_daemon_running` sits on the terminal read/write path, one
+  slow daemon spawn locks out every session at once.
+  ⇒ The wait is now a wall-clock deadline derived from the staleness window
+  (`DAEMON_SPAWN_LOCK_WAIT_MS = DAEMON_SPAWN_LOCK_STALE_MS + 10 s`), not a loop
+  count — the branches sleep for different durations, so an iteration count never
+  corresponded to any particular amount of waiting, which is how the ceiling
+  silently ended up shorter than the window it had to outlast. Two tests: the
+  invariant (falsified against the shipped 12 s value — it fails with *"a 12000ms
+  wait cannot outlast a 15000ms staleness window"*), and a source assertion that
+  the wait stays a deadline.
+  ⚠ **What held the lock that long was the 15 s daemon spawn removed in 3.0.94** —
+  which is still not deployed to any daemon. This fix removes the guaranteed
+  failure window; the daemon fix removes the cause.
+  ⚠ **Deploy note that cost the owner his fix once already:** his launcher runs
+  `~/.local/bin/yggterm` while an earlier install went only to
+  `~/.yggterm/bin/yggterm`, so his own restart silently reverted it. Both copies
+  are written now — the fleet audit hook has been saying "fix the deploy to write
+  every copy" and it was right.
+
 - **"What is swapping, and it is probably a lie." It was.** Owner-reported: every
   row switch feels like 18-20 s and arrives with a notification telling him to
   free RAM. The notification gated on `swap_pressured()` — `swap_used_kb > 512 MB`
