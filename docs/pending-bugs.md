@@ -238,13 +238,22 @@ that the record exists. ⇒ **Retrying a call that returns `Ok` in 1 ms returns
 - **HIGH — `ensure` is the wrong verb for stall recovery.** Its postcondition is
   "a record exists", which was already true. A recovery whose success condition
   is satisfied by the state that PROVOKED it cannot recover anything.
-- **MEDIUM — the 45 s is the FAR daemon being unavailable, so the fix belongs
-  there**, not in the reveal path: the same host answered `os error 11` to a
-  different call at 21:22:17 and was walking 24 stale daemons serially for 23 s.
-  ⚠ Not proven that it was unresponsive for the whole 45 s — that is the one
-  measurement still owed, and it is taken on the FAR host, not the GUI.
-⇒ **Most promising fix, unbuilt: make the supersede walk concurrent or bounded**
-so a turnover cannot make a host unanswerable for ~23 s.
+- ⛔ **FALSIFIED — "the far host was unavailable" is FALSE.** It was the one
+  measurement this entry said was owed, it was taken on the far host, and it went
+  the other way. Across 21:21:25-21:22:40 that host's trace carries **9,226
+  events, including 4,416 matched request `begin`/`end` pairs**, spread through
+  the whole 45-second gap. It was serving other callers continuously while this
+  one session received nothing. ⇒ **The gap is SPECIFIC to this session's read
+  stream, not a property of the host**, and every hypothesis in this entry that
+  blamed something global has now been wrong.
+⇒ **The measurement now owed is narrower:** identify WHICH daemon owned
+`remote-cc://dev/<id>` at 21:21:32 and read only that pid's activity in the gap.
+The host-wide answer cannot settle it — 24 daemons were alive and the busiest in
+that window were stale ones (2.11.1, 2.12.24, 3.0.77), not necessarily the owner.
+⚠ Also unexplained and possibly the same thread: **236 `live_session_birth`
+events in those 75 seconds**.
+⚖ The supersede walk (24 daemons, 23 s, serial) remains a real cost worth fixing,
+but it is now a SEPARATE finding — it is not established as the cause of this gap.
 
 ⚠ **Method note, because this entry has now had three fixes proposed and two
 retracted:** each "the fix is X" survived until one more layer was read — the
