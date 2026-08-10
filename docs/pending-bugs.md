@@ -15,7 +15,7 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔⛔ THE BOOTER KICKED A CONTEXT-DEAD SESSION EVERY 10 MINUTES FOR TEN HOURS, AND ITS OWN LOG SAID "WORKING"
 
-**Status:** OPEN
+**Status:** OPEN — defects 1, 2 and 4 FIXED 2026-08-10; defect 3 was the same fix as 1.
 
 **Reported by row 8 (practice campaign) 2026-08-10, MEASURED not theoretical**, on
 `ygg-booter` / `ygg-babysit` in `.agents/skills/yggterm-agent-fleet/` — which this
@@ -67,7 +67,27 @@ retrying is **guaranteed** to fail forever. It needs its own terminal state: sto
 booting, escalate ONCE, and say the true thing (*"this session is unrecoverable,
 relay it"*) instead of *"did not wake after 3 boots"*.
 
-### ⭐ THE SEAM IS ALREADY BUILT — do not re-derive it
+### ✅ FIXED 2026-08-10 — what shipped
+
+- **`ygg-babysit.classify()` reads the gauge BEFORE the transcript** and returns a
+  terminal **`CONTEXT_DEAD`**. That is defects 1 and 3 at once: the corpse is now
+  identified by OUTCOME, not by activity.
+- **`ygg-booter` escalates ONCE** with *"context exhausted and UNRECOVERABLE — relay
+  the campaign to a fresh session"* and then **unsubscribes**, instead of kicking a
+  grave every ten minutes. A watchdog that keeps barking at a grave teaches its owner
+  to ignore it.
+- **The anti-flap counter stopped trusting bytes.** `progress_marks()` counts only
+  turns that used a tool or spent output tokens. ⇒ Proven against the REAL incident
+  transcript: appending its 9 genuine `Prompt is too long` rows grows the file by
+  **5,640 bytes** and moves marks **79 → 79**. So `MAX_BOOTS` can finally fire for the
+  reason it exists.
+- **Defect 4 (the skill) was already fixed by row 8**; §2 now names the gauge as the
+  automatic path. Corrected further so it no longer claims babysit *must* infer from
+  mtimes — it doesn't any more.
+- ⚠ **A missing or stale gauge is NO INFORMATION, never "healthy"** — pinned by test:
+  an absent gauge falls through to the transcript classifier rather than reading clean.
+
+### ⭐ THE SEAM — already built, do not re-derive it
 
 An external watchdog cannot see a token count; it exists only inside the CLI, which is
 why it infers from mtimes. Row 8 shipped a `UserPromptSubmit` hook

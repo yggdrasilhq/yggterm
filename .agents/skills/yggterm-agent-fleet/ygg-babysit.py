@@ -173,6 +173,40 @@ def turn_state(path):
     return ("TURN_ENDED", age, text[:300])
 
 
+
+def progress_marks(path):
+    """How many turns in this transcript did REAL WORK.
+
+    ⛔ "Did the file grow" is NOT "did the agent work", and the difference is a
+    ten-hour outage. A refused turn ("Prompt is too long") writes three rows in
+    5-66 ms, so `size > last_size` is TRUE for a session that is dead — which
+    reset the booter's anti-flap counter on every tick. Fingerprint in
+    booter.log: every boot is BOOT#1, never #2, so MAX_BOOTS could never fire
+    for the real reason. Verified 2026-08-10: 8 boots in the incident window,
+    all #1 (whole log: 43x#1, 6x#2, 4x#3 — the counter only ever accumulates on
+    sessions whose file is NOT growing).
+
+    A mark is a turn that used a tool or actually spent output tokens. An error
+    reply does neither, so a corpse's marks stay flat while its bytes climb.
+    """
+    try:
+        rows = [json.loads(l) for l in Path(path).open() if l.strip()]
+    except Exception:
+        return 0
+    n = 0
+    for r in rows:
+        if r.get("type") != "assistant":
+            continue
+        msg = r.get("message") or {}
+        items = [c for c in (msg.get("content") or []) if isinstance(c, dict)]
+        if any(c.get("type") == "tool_use" for c in items):
+            n += 1
+            continue
+        if (msg.get("usage") or {}).get("output_tokens", 0):
+            n += 1
+    return n
+
+
 def row_exists(gui_host, ident):
     """Is this row still IN THE LIVE ORDER?
 
@@ -187,7 +221,49 @@ def row_exists(gui_host, ident):
     return resolve_row_path(gui_host, ident) is not None
 
 
+
+# ⭐ THE CONTEXT GAUGE — the one state a boot can never fix.
+#
+# ⛔ AN ERROR RETURNED FASTER THAN A SUCCESS LOOKS LIKE HEALTH to anything that
+# measures ACTIVITY rather than OUTCOME. A context-exhausted session answers
+# "Prompt is too long" in 5-66 ms, writing three rows, which resets the
+# transcript mtime -- so `turn_state`'s age goes to ~0 and this classifier
+# called it `WORKING 0.1m` about a session that had been dead for two hours.
+# Measured 2026-08-10: the booter kicked that corpse every ~10 min for TEN
+# HOURS and the owner found it by looking at a screen.
+#
+# An external watchdog cannot see a token count -- it exists only inside the
+# CLI -- which is why inferring from mtimes was the only option. It is not any
+# more: a UserPromptSubmit hook writes the real number on every prompt, so this
+# becomes a lookup costing one open().
+#   ~/.claude/context-gauge/<session_id>.json
+#   {"pct":98,"used":976493,"window":1000000,"verdict":"CRITICAL","dead":true}
+# `dead` means the transcript tail already carries "Prompt is too long".
+#
+# ⚠ STALENESS IS OURS TO HANDLE: the file is only as fresh as that row's LAST
+# PROMPT. So a missing or stale gauge must never be read as "healthy" -- it is
+# simply no information, and we fall through to the transcript classifier.
+CONTEXT_GAUGE = Path.home() / ".claude" / "context-gauge"
+
+
+def context_gauge(uuid):
+    """The row's own report of its context budget, or None if it never said."""
+    try:
+        return json.loads((CONTEXT_GAUGE / f"{uuid}.json").read_text())
+    except Exception:
+        return None
+
+
 def classify(uuid, host=None):
+    # ⛔ THE GAUGE BEFORE THE TRANSCRIPT, for the same reason the row list comes
+    #    before both: a corpse's transcript lies about liveness, and this is the
+    #    one state where BOOTING IS GUARANTEED TO FAIL FOREVER rather than merely
+    #    being useless. It gets its own terminal state so the caller can stop.
+    g = context_gauge(uuid)
+    if g and g.get("dead"):
+        return {"state": "CONTEXT_DEAD", "age": 0, "path": None,
+                "tail": f"context exhausted: {g.get('used')}/{g.get('window')} "
+                        f"({g.get('pct')}%) — unrecoverable, relay it"}
     t = find_transcript(uuid, host)
     if t is None:
         # ⛔ NOT "still starting" past a minute. An agent-CLI that took a brief
