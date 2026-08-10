@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The garbled terminal is now PREVENTED, not repaired after you have seen it
+  (3.0.106).** The owner sent the frame: not stray characters but the **entire
+  terminal viewport with every glyph wrong**, top to bottom, while the sidebar and
+  notifications beside it rendered perfectly — the WebGL glyph atlas indexed
+  wholesale wrong. Detection can only ever fire after such a frame has been
+  painted and seen, so it is the wrong instrument for this. The rAF gap monitor's
+  first tick after a throttle ends now clears every mounted host's glyph atlas
+  right there, before any render can paint from it, and stamps the timestamp the
+  detector reads so the repair path stands down when prevention already did the
+  work. The repair path remains as the backstop.
 - **The stale-atlas heal stops missing the case that actually happens, and stops
   claiming it worked (3.0.105).** Owner-reported: stray characters appearing in
   the TUI and clearing on scroll. Confirmed in a faithful screenshot — orphan

@@ -113571,6 +113571,48 @@ fn terminal_eval_script_with_canvas_renderer(
                         rafGapMonitor.lastGapMs = gap;
                         rafGapMonitor.lastGapEndedAtMs = now;
                         rafGapMonitor.gapCount += 1;
+                        // ⭐ PREVENT, don't repair. This tick is the first frame
+                        // after the throttle ended, so it runs BEFORE any render
+                        // can paint from the atlas that went stale during the
+                        // gap. Clearing here means the garbled frame is never
+                        // drawn at all.
+                        //
+                        // The detector further down is the repair path, and
+                        // repair is strictly worse: it can only fire once a
+                        // garbled frame has already been painted and seen. The
+                        // owner's 2026-08-11 report was a viewport where EVERY
+                        // glyph was wrong — not a few stray cells — so a frame
+                        // of that reaching the screen at all is the defect.
+                        //
+                        // Page-global on purpose: every mounted host shares this
+                        // one throttle, so every host's atlas went stale
+                        // together. Costs one clear + refresh per host per
+                        // occlusion episode; `refresh` only marks rows dirty, so
+                        // a background host pays nothing until it paints.
+                        try {{
+                            const gapHosts = window.__yggtermXtermHosts || {{}};
+                            for (const gapHostId of Object.keys(gapHosts)) {{
+                                const gapEntry = gapHosts[gapHostId];
+                                if (!gapEntry || !gapEntry.term) continue;
+                                try {{
+                                    if (typeof gapEntry.term.clearTextureAtlas === 'function') {{
+                                        gapEntry.term.clearTextureAtlas();
+                                    }}
+                                    // Stamp the SAME field the detector compares
+                                    // against, so a paint after this clear is
+                                    // correctly no longer treated as stale — the
+                                    // repair path must not also fire once the
+                                    // prevention has done the work.
+                                    gapEntry.lastAtlasClearAtMs = now;
+                                    if (typeof gapEntry.term.refresh === 'function') {{
+                                        gapEntry.term.refresh(0, Math.max(0, gapEntry.term.rows - 1));
+                                    }}
+                                }} catch (_hostError) {{}}
+                            }}
+                            rafGapMonitor.lastPreemptiveClearAtMs = now;
+                            rafGapMonitor.preemptiveClearCount =
+                                (rafGapMonitor.preemptiveClearCount || 0) + 1;
+                        }} catch (_error) {{}}
                     }}
                     rafGapMonitor.lastTickAtMs = now;
                     window.requestAnimationFrame(rafGapTick);
@@ -152715,6 +152757,25 @@ mod tests {
         assert!(
             script.contains("pattern: 'stale_atlas_heal_outcome'"),
             "the heal must trace what it actually did, separately from deciding to do it"
+        );
+        // ⭐ The atlas must be cleared when the gap ENDS, not when a garbled
+        // frame is caught. Detection can only ever fire after the bad frame has
+        // been painted and seen; the owner's report was a viewport in which
+        // every glyph was wrong, so painting one at all is the defect.
+        let gap_tick = script
+            .split("const rafGapTick = () => {")
+            .nth(1)
+            .and_then(|body| body.split("window.requestAnimationFrame(rafGapTick);").next())
+            .expect("the rAF gap monitor tick should be present");
+        assert!(
+            gap_tick.contains("clearTextureAtlas"),
+            "the gap monitor must clear every host's atlas the moment the throttle ends, \
+             before any render can paint from it"
+        );
+        assert!(
+            gap_tick.contains("gapEntry.lastAtlasClearAtMs = now;"),
+            "the pre-emptive clear must stamp the same field the detector reads, or the \
+             repair path fires again for work prevention already did"
         );
     }
 
