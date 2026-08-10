@@ -313,10 +313,37 @@ is in the same file: the Lane-A/WPE plane is answered *without* the runtime lock
 and its comment already names this exact failure — *"one `terminal_ensure` held
 this loop 30.7s on 2026-06-11 and the user watched a shadow the whole time"*.
 WPE was moved off the lock; `terminal_ensure`, the request actually named, was
-left on it. The pattern to copy is `daemon_queue_remote_machine_refresh`: take
-the lock, do the cheap record work, release, run the slow half on a worker
-thread. ⚠ Land the instrument's numbers first — with `lock_wait` on the record,
-the next session can prove the fix instead of arguing it.
+left on it.
+
+⛔ **BUT NOT BY THE PATTERN THIS ENTRY KEPT RECOMMENDING — that design is
+FALSIFIED, do not build it.** The advice was to copy
+`daemon_queue_remote_machine_refresh`: take the lock, do the cheap work, release,
+run the slow half on a worker thread and answer early. **It does not cure this.**
+The slow half here is `ensure_terminal_for_path_with_initial_size` + `persist`,
+both `&mut DaemonRuntime` methods, so the worker thread must re-acquire the very
+same global lock and holds it for exactly as long. An early `Ack` would improve
+the *reveal's own* reported latency and leave the daemon deaf for the same 34 s —
+and deafness is the defect, because the poll that carries the user's bytes is
+what gets starved. `daemon_queue_remote_machine_refresh` works only because
+`scan_remote_machine_refresh` genuinely needs no runtime; that is not true here.
+⇒ **The cure is to make the work inside the lock small, or to give the runtime
+finer-grained locks.** Everything below is the first half of that.
+
+⭐ **THE FIRST HALF IS DONE (3.0.104), AND IT MOVED THE BIGGEST TERM.** `persist()`
+was re-deriving every live Claude Code session's identity from scratch on every
+call — a `/proc` subtree walk, a scan of every `~/.claude/projects/*` dir, and a
+**full read + JSON parse of each transcript: 49.9 MB across 9 owned rows** on the
+dev fleet host, inside the lock, on every state-changing request, growing all day
+as the transcripts grow. The codex twin
+(`refresh_live_codex_runtime_identities_for_persistence`) has been memoized by pid
+since it was written; the CC one was added *as its mirror*, copied the loop, and
+did not copy the cache. Now memoized and — unlike codex — revalidated before each
+reuse against CC's own `~/.claude/sessions/<pid>.json`, because `/clear` rebinds a
+live process to a new session id and `/cd` re-homes its transcript, and a blind
+cache would point `claude -r` at the wrong one. Also landed: the 2.26 MB state
+backup is a hard link instead of a full copy (−4.5 MB of I/O per write), and the
+rename-failure fallback was fixed to stop writing *through* the state path, which
+once linked would have rewritten the backup too.
 
 **Where the 34.4 s goes** (both holes are inside the lock):
 - **+9.4 s hole** — after `local_cc_relaunch_command_rebuilt` the only
@@ -326,10 +353,27 @@ the next session can prove the fix instead of arguing it.
   changed, then `fs::copy`s the old file to `.previous.json` and writes the new
   one — ~6.8 MB of I/O per persist. Measured `daemon/persist` p50 153 ms, p99
   **2,310 ms**, max **44,833 ms**. A 9 s persist is a p99+ sample, not an anomaly.
-- **+23.9 s hole** — between `first_bytes` and `ensure_session_end`, i.e. inside
-  `ensure_session_with_size` plus a second `persist_state_only()`. No
-  `reattach_grid_resync` fired, so the grid-mismatch branch is not it. Not yet
-  attributed further.
+- **+23.9 s hole** — between `first_bytes` and `ensure_session_end`. The only
+  substantial call there is a second `persist_state_only()`: the grid-mismatch
+  branch did not fire (no `reattach_grid_resync`) and `forward_remote_pty_resize`
+  spawns a worker rather than blocking. ⚠ Still attributed by ELIMINATION, not
+  measurement — `persist_state_only` carried no perf span at all, which is the
+  gap 3.0.104 closes.
+- ⚠ **Both attributions above are pre-3.0.104 and must be re-taken.** The next
+  occurrence can be ranked instead of argued: `daemon/persist_state_only`,
+  `daemon_persist/cc_identity_refresh`, `daemon_persist/serialize` and
+  `daemon_persist/write` are now separate rows in `server perf-summary`.
+
+⭐ **A SECOND, UNRELATED LOCK HOG IS NOW ON THE RECORD — `remove_session`.** The
+3.0.103 instrument's first live harvest (dev, one daemon, 7.6 min) found five
+starvation episodes ≥300 ms; the worst outside startup was **3,913 ms held by
+`remove_session`**, with `terminal_read` parked behind it. Across the host
+`daemon_request/remove_session` is p50 **447 ms**, p99 **10,590 ms**, max
+**44,991 ms** (n=1,220) — the second-largest total of any daemon request after
+`status`, and a far worse tail. In the sampled episode ~3.6 s sat between
+`live_session_row_tombstoned` and `preserved_owner_registry_pruned`. **Not
+attributed; not started.** Every agent row claim removes a row, so this is on the
+owner's critical path too.
 
 ⛔ **FALSIFIED — "this reveal was a RELAUNCH, not a reattach" is WRONG.** The
 birth is CORRECT: the row existed in the sidebar (scanned from JSONL) but had no
