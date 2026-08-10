@@ -237,13 +237,42 @@ kernel stalled on reclaim 0.00% of the time"`) so nobody re-chases it. Pinned by
 `slow_reveal_with_stale_swap_but_free_memory_does_not_blame_memory` carrying the
 live numbers, and its opposite so a genuinely short machine is still told.
 
-### What is still open, and where to start
+### ⭐ THE SPLIT, DONE — the surface mounts fast; the WAIT FOR OUTPUT is the tail
 
-The reveal-log already records `surface_mounted_ms` and `first_output_ms` beside
-`total_ms`, and in the fast cases they nearly coincide (mount 268-488 ms, first
-output 367-653 ms). **Get those two fields for the SLOW cases** — that alone
-splits the tail into "the surface took forever to mount" versus "the surface was
-up and no output came", which are different bugs with different owners.
+`surface_mounted_ms` vs `first_output_ms` on the 22 slow reveals settles which
+half is guilty, and it is not the GUI's surface:
+
+| slow reveal | mount | then wait for first output |
+|---|---|---|
+| 6,507 ms | 166 ms | **6,110 ms** |
+| 11,104 ms | 427 ms | **10,677 ms** |
+| 35,497 ms | 244 ms | **34,516 ms** |
+| 61,983 ms | 959 ms | **59,484 ms** |
+| 12,058 ms | 153 ms | **11,673 ms** |
+
+Mount is sub-second on 13 of the 15 slow reveals that recorded it (153-959 ms).
+**Two exceptions worth their own look: 20,770 ms and 63,852 ms of mount.**
+And **all 11 failures carry the same reason: `The live terminal on dev did not
+become interactive in time.`**
+
+⇒ The GUI paints its surface promptly and then waits on the REMOTE side. That
+moves the question off the renderer and onto "why does a live terminal on the
+remote host take 6-60 s — or forever — to become interactive", which is very
+likely the same defect as § *A NEW SESSION IS ASKED FOR … AND NO PROCESS IS EVER
+BORN* (his failed `start-cc` at 13:00:40 sits between failures at 12:59 and
+13:02). **Treat them as one investigation until something separates them.**
+
+⛔ **A TRAP THAT ALREADY CAUGHT ONE PASS — do not repeat it.** Correlating these
+failures against concurrent perf spans appears to indict `render/gui` and
+`render/web_content` (15-53 s, overlapping every failure). **That correlation is
+void.** `render` spans carry **CPU milliseconds** in `duration_ms`, by design —
+`perf.rs` says so and locks it with
+`a_cpu_time_span_is_never_judged_by_the_wall_clock_rules`. Deriving a start as
+`end - duration` fabricates a timeline for them, so any overlap computed that way
+is an artefact. Only wall-clock spans may be placed on a timeline; of the ones
+that overlapped, `daemon_request/terminal_restart` (45,051 ms) and
+`daemon_request/hot_restart` (10,307 ms) are wall spans and remain real leads.
+
 ⛔ Do not start from the memory angle again; it has been measured and excluded.
 
 **Falsifier:** cold-tier p90 under 3 s and zero `reveal_failed` over a comparable
