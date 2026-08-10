@@ -15823,6 +15823,74 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
     }
 }
 
+/// Acquire the runtime lock **for a client request, measuring the wait.**
+///
+/// `handle_request` emits its `request`/`begin` trace AFTER the lock is held,
+/// so a request that is blocked here leaves NO trace record at all. `begin`
+/// therefore does not mean "a client asked" — it means "a client asked AND the
+/// daemon was free". A starved daemon and an idle one are byte-identical in the
+/// trace, and that blindness cost this campaign four wrong root causes.
+///
+/// The instance that forced this (dev, 2026-08-10, owner-reported slow row
+/// switch): `ensure_remote_runtime_cc_session` held the runtime lock from
+/// 21:21:32.222 to ~21:22:06.6 — 34.4 s in which pid 3508483 logged not one
+/// other request. The session's `first_bytes` landed at 21:21:42.421, so the
+/// daemon held the user's bytes for 24 s and could not answer the poll that
+/// would deliver them. The trace read as "nobody asked"; three
+/// `yggterm-headless server terminal resize` processes had in fact spawned
+/// (21:21:34.788, 21:21:57.275, 21:22:30.746) and were all parked right here.
+///
+/// Fast path costs nothing: `status` alone runs 620k times per fleet-day, so an
+/// uncontended acquisition traces nothing and allocates nothing. Only a request
+/// that actually has to wait pays for — and reports — its own wait.
+fn lock_daemon_runtime_for_request<'a>(
+    runtime: &'a Arc<Mutex<DaemonRuntime>>,
+    request_name: &'static str,
+) -> MutexGuard<'a, DaemonRuntime> {
+    match runtime.try_lock() {
+        Ok(guard) => return guard,
+        // Poison is handled identically to the blocking path; fall through so
+        // there is exactly one recovery site.
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return lock_daemon_runtime(runtime, "handle_request");
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+    let home = crate::resolve_yggterm_home().ok();
+    if let Some(home) = home.as_deref() {
+        append_trace_event(
+            home,
+            "daemon",
+            "request",
+            "lock_wait_begin",
+            serde_json::json!({ "request": request_name }),
+        );
+    }
+    let started = std::time::Instant::now();
+    let guard = {
+        // Drop-scoped so `perf-summary` ranks the wait per request name, beside
+        // the `daemon_request` row that measures the work itself. A request
+        // whose lock_wait dwarfs its own duration is being starved, not slow.
+        let _wait = home
+            .as_deref()
+            .map(|home| yggterm_core::PerfGuard::new(home, "daemon_lock_wait", request_name));
+        lock_daemon_runtime(runtime, "handle_request")
+    };
+    if let Some(home) = home.as_deref() {
+        append_trace_event(
+            home,
+            "daemon",
+            "request",
+            "lock_wait_end",
+            serde_json::json!({
+                "request": request_name,
+                "waited_ms": started.elapsed().as_millis() as u64,
+            }),
+        );
+    }
+    guard
+}
+
 fn lock_daemon_runtime<'a>(
     runtime: &'a Arc<Mutex<DaemonRuntime>>,
     label: &'static str,
@@ -16084,7 +16152,7 @@ fn daemon_request_response(
     if let ServerRequest::WpeAgent { action } = request {
         return daemon_wpe_agent_control(&action);
     }
-    let mut runtime = lock_daemon_runtime(runtime, "handle_request");
+    let mut runtime = lock_daemon_runtime_for_request(runtime, request_name);
     let home_dir = runtime.store.home_dir().to_path_buf();
     match panic::catch_unwind(AssertUnwindSafe(|| {
         runtime.handle_request(request, identity)
@@ -20848,6 +20916,61 @@ mod tests {
             branch.find("self.terminals.restart_session(")
                 < branch.find("spawn_force_remote_restart_daemon_cleanup("),
             "cleanup must run after the current daemon has replaced the runtime owner"
+        );
+    }
+
+    #[test]
+    fn a_request_parked_on_the_runtime_lock_is_visible_in_the_trace() {
+        let source = include_str!("daemon.rs");
+        let dispatch = source
+            .split("fn daemon_request_response(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("daemon_request_response should be present");
+        // Coverage floor: a split that matched nothing passes every assertion
+        // below without reading a line of the function.
+        assert!(
+            dispatch.contains("handle_request(request, identity)") && dispatch.len() > 800,
+            "scanner did not capture the dispatch body ({} bytes)",
+            dispatch.len()
+        );
+        assert!(
+            dispatch.contains("lock_daemon_runtime_for_request(runtime, request_name)"),
+            "the client-request lock must be taken through the MEASURED path: \
+             `handle_request` emits its request/begin trace only AFTER the lock is \
+             held, so a request parked on the mutex leaves no record and a starved \
+             daemon is byte-identical to an idle one (dev 2026-08-10, 34.4 s of \
+             silence that read as 'no client asked')"
+        );
+        // Split on the REAL signature (`<'a>` and all). Splitting on
+        // `fn lock_daemon_runtime_for_request(` matches this test's own string
+        // literal first, and the scanner then reads itself and passes on its
+        // own assertions — caught here on 2026-08-11.
+        let waiter = source
+            .split("fn lock_daemon_runtime_for_request<'a>(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("the measured lock path should be present");
+        assert!(
+            waiter.contains("MutexGuard<'a, DaemonRuntime>") && waiter.len() < 4_000,
+            "scanner did not capture the lock body ({} bytes) — it is reading \
+             something other than the function",
+            waiter.len()
+        );
+        assert!(
+            waiter.contains("try_lock()"),
+            "the UNCONTENDED path must stay free of tracing and allocation — \
+             `status` alone runs 620k times per fleet-day"
+        );
+        assert!(
+            waiter.contains("lock_wait_begin") && waiter.contains("lock_wait_end"),
+            "a contended acquisition must bracket its own wait, or the blocked \
+             request is still invisible"
+        );
+        assert!(
+            waiter.contains("\"daemon_lock_wait\""),
+            "the wait must also land in perf-summary, so contention is rankable \
+             next to the work it is being starved by"
         );
     }
 

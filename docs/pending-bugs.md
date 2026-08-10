@@ -271,15 +271,86 @@ ceiling.** The bytes existed and were not delivered. ⚠ *Why* each hole exists 
 NOT established — that is the next measurement, and it is now a delivery-path
 question (daemon→stream→client), not a reveal-path one.
 
-⭐ **Top lead: this reveal was a RELAUNCH, not a reattach.** `live_session_birth`
-fires at reveal time, beside `restored_codex_runtime_launch_repaired` and
-`local_cc_relaunch_command_rebuilt` — the row's PTY was respawned rather than
-adopted. Ask why a switch to an existing row births a session before assuming
-anything downstream is at fault.
-⚠ Related and unexplained: **236 `live_session_birth` events in 75 seconds** on
-that host.
-⚖ The supersede walk (24 daemons, 23 s, serial) remains a real cost worth fixing,
-but it is a SEPARATE finding — not established as the cause of this gap.
+### ⭐⭐⭐ ROOT CAUSE, CODE-CITED: ONE MUTEX, HELD FOR THE WHOLE REVEAL
+
+**The daemon was not slow. It was DEAF.** `daemon_request_response`
+(`crates/yggterm-server/src/daemon.rs`) takes a single global
+`Arc<Mutex<DaemonRuntime>>` and holds it for the entire `handle_request`. The
+reveal path — `ensure_remote_runtime_cc_session` → CLI provisioning → spec
+resolve → PTY spawn → `persist` — runs start to finish **inside that lock**.
+
+    21:21:32.222  ensure_remote_runtime_cc_session  begin   ← lock acquired
+    21:21:42.421  first_bytes                               ← the bytes EXIST
+    21:22:06.350  ensure_session_end
+    21:22:06.589  last event this daemon ever wrote         ← lock held 34.4 s
+
+⇒ **In those 34.4 s pid 3508483 served no other request of any kind** — and its
+`status` polls had been arriving every 10-200 ms right up to the moment the lock
+was taken. The user's bytes sat in the daemon for 24 s because the poll that
+would carry them could not be answered.
+
+⛔ **This was invisible, and that is a second defect.** `handle_request` emits its
+`request`/`begin` trace **after** acquiring the lock, so a request parked on the
+mutex leaves no record at all. `begin` does not mean *"a client asked"* — it means
+*"a client asked AND the daemon was free"*. A starved daemon and an idle one are
+byte-identical in the trace.
+
+**Falsified the obvious alternative ("no client asked"):** three
+`yggterm-headless server terminal resize` processes spawned *during* the silence
+— 21:21:34.788, 21:21:57.275, 21:22:30.746 — and **not one logged a `begin`**.
+They were all parked on the mutex. Clients were asking throughout.
+
+**Fixed in 3.0.103 (the instrument):** `lock_daemon_runtime_for_request` tries the
+lock first (uncontended stays free — `status` alone runs 620k times per
+fleet-day) and, only on contention, brackets the wait with
+`request`/`lock_wait_begin` + `lock_wait_end{waited_ms}` and a
+`daemon_lock_wait/<request>` perf row. Contention is now rankable in
+`server perf-summary` beside the work starving it. Guarded by
+`daemon::tests::a_request_parked_on_the_runtime_lock_is_visible_in_the_trace`.
+
+**STILL OPEN — the cure:** get the reveal path off the global lock. The precedent
+is in the same file: the Lane-A/WPE plane is answered *without* the runtime lock,
+and its comment already names this exact failure — *"one `terminal_ensure` held
+this loop 30.7s on 2026-06-11 and the user watched a shadow the whole time"*.
+WPE was moved off the lock; `terminal_ensure`, the request actually named, was
+left on it. The pattern to copy is `daemon_queue_remote_machine_refresh`: take
+the lock, do the cheap record work, release, run the slow half on a worker
+thread. ⚠ Land the instrument's numbers first — with `lock_wait` on the record,
+the next session can prove the fix instead of arguing it.
+
+**Where the 34.4 s goes** (both holes are inside the lock):
+- **+9.4 s hole** — after `local_cc_relaunch_command_rebuilt` the only
+  substantial call before `terminal_spec_resolved` is `persist_state_only()`.
+  `server-state.json` is **2.26 MB**; `write_persisted_state_if_changed`
+  serialises the whole state to pretty JSON *before* it can tell whether anything
+  changed, then `fs::copy`s the old file to `.previous.json` and writes the new
+  one — ~6.8 MB of I/O per persist. Measured `daemon/persist` p50 153 ms, p99
+  **2,310 ms**, max **44,833 ms**. A 9 s persist is a p99+ sample, not an anomaly.
+- **+23.9 s hole** — between `first_bytes` and `ensure_session_end`, i.e. inside
+  `ensure_session_with_size` plus a second `persist_state_only()`. No
+  `reattach_grid_resync` fired, so the grid-mismatch branch is not it. Not yet
+  attributed further.
+
+⛔ **FALSIFIED — "this reveal was a RELAUNCH, not a reattach" is WRONG.** The
+birth is CORRECT: the row existed in the sidebar (scanned from JSONL) but had no
+live PTY, so revealing it must create one — that is `claude -r <uuid>`, the
+product's core value proposition, and `--require-existing` was passed.
+⛔ **FALSIFIED — "236 `live_session_birth` in 75 s" is not phantom spawns.** They
+belong to pid **1854247**, a *successor* daemon restoring rows from the ledger
+(`live_row_order_restored_from_ledger`, then
+`pre_daemon_swap_row_order_snapshot_written{reason:"superseded_daemon_takeover",
+row_count:267}` at 21:22:49), all with `launch_now:false, activate:false`. A
+daemon handover, not a spawn storm.
+⚖ **A deploy WAS rolling** — `prepare_update_restart` walked ~24 daemons serially
+21:22:56 → 21:23:12 — but the owning daemon went deaf at 21:21:32, **84 s before
+that walk began**. The deploy did not cause this gap; it killed the daemon that
+was already stuck in it. The serial supersede walk remains a separate real cost.
+
+⚠ **Trace hygiene defect found while measuring:** unit tests write into the live
+`~/.yggterm/event-trace*.jsonl` — pids 3387039 / 3895848 emit
+`live_session_birth` for `abc123`, `kept-samplenotes`, `synthetic-runtime`. Any
+host-wide count over the trace is contaminated by test fixtures. Filter to the
+owning pid, always.
 
 ⚠ **Method note, because this entry has now had three fixes proposed and two
 retracted:** each "the fix is X" survived until one more layer was read — the
