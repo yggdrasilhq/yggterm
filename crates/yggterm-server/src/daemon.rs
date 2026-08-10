@@ -3,7 +3,8 @@ use crate::codex_cli::{
 };
 use crate::terminal::{TerminalBufferStats, terminal_data_has_scrollback_text};
 use crate::{
-    CodexRuntimeProcessIdentity, GhosttyHostSupport, ManagedSessionView, PersistedDaemonState,
+    ClaudeCodeRuntimeProcessIdentity, CodexRuntimeProcessIdentity, GhosttyHostSupport,
+    ManagedSessionView, PersistedDaemonState,
     PersistedLiveSession, PersistedStoredSession, RemoteMachineRef, RemoteMachineSnapshot,
     RemoteRuntimeRegistry, ServerUiSnapshot, SessionKind, SessionSource, SnapshotSessionView,
     SshConnectTarget, TerminalManager, WorkspaceViewMode, YggtermServer,
@@ -3318,6 +3319,21 @@ fn drop_tombstoned_live_rows(
     dropped
 }
 
+/// A memoized Claude Code runtime identity, together with the pid whose CC
+/// registry entry vouches for it.
+///
+/// `registry_pid` is NOT the PTY's root pid the cache is keyed by — the
+/// resolver walks the process subtree, so the pid that actually owns the
+/// session is usually a descendant. Revalidation must re-read THAT pid's
+/// registry entry; re-reading the root's would ask a shell whether a session
+/// moved and always get silence, which reads as "cannot confirm" and would
+/// defeat the cache entirely.
+#[derive(Debug, Clone)]
+struct CachedClaudeCodeRuntimeIdentity {
+    registry_pid: u32,
+    identity: ClaudeCodeRuntimeProcessIdentity,
+}
+
 struct DaemonRuntime {
     support: GhosttyHostSupport,
     state_path: PathBuf,
@@ -3360,6 +3376,11 @@ struct DaemonRuntime {
     profile_write_locks: crate::profile_write_lock::ProfileWriteLockTable,
     remote_machine_refreshes_in_flight: HashSet<String>,
     codex_process_identity_cache: Mutex<BTreeMap<u32, CodexRuntimeProcessIdentity>>,
+    /// The Claude Code twin of `codex_process_identity_cache`, keyed by the
+    /// PTY's root pid. Unlike the codex one it is REVALIDATED, never trusted
+    /// blind — see `claude_code_runtime_identity_for_pid` for why a CC binding
+    /// can change inside a living process while a codex one cannot.
+    claude_code_process_identity_cache: Mutex<BTreeMap<u32, CachedClaudeCodeRuntimeIdentity>>,
     restored_from_persisted_state: bool,
     restored_stored_sessions: usize,
     restored_live_sessions: usize,
@@ -3584,6 +3605,7 @@ impl DaemonRuntime {
             profile_write_locks: crate::profile_write_lock::ProfileWriteLockTable::new(),
             remote_machine_refreshes_in_flight: HashSet::new(),
             codex_process_identity_cache: Mutex::new(BTreeMap::new()),
+            claude_code_process_identity_cache: Mutex::new(BTreeMap::new()),
             restored_from_persisted_state,
             restored_stored_sessions,
             restored_live_sessions,
@@ -4326,12 +4348,77 @@ impl DaemonRuntime {
         refreshed
     }
 
+    /// The Claude Code twin of `codex_runtime_identity_for_pid` — memoized for
+    /// the same reason, but REVALIDATED, which the codex one does not need.
+    ///
+    /// ⭐ Why this exists at all. Resolving a CC identity costs a `/proc`
+    /// subtree walk, a scan of every `~/.claude/projects/*` directory, and a
+    /// full read + `serde_json` parse of the session transcript. On the dev
+    /// fleet host that last term measured **49.9 MB across 9 owned rows**, and
+    /// it ran on EVERY `persist()` — i.e. inside the global runtime lock, on
+    /// every request that mutates daemon state. The codex path has been
+    /// memoized since it was written; this one was introduced as its mirror
+    /// and copied the loop but not the cache, so CC rows paid full price
+    /// forever while codex rows paid once. That asymmetry is the bug.
+    ///
+    /// ⛔ Why it may NOT be a blind pid cache like the codex one. A codex
+    /// process owns one session for its whole life, so pid→identity is
+    /// immutable. Claude Code's is not: `/clear` starts a fresh session id in
+    /// the SAME process, and `/cd` re-homes the transcript into a different
+    /// project directory. A blind cache would pin the row to a dead session id
+    /// and the next `claude -r <uuid>` would resume the wrong transcript —
+    /// breaking the one thing this product exists to do.
+    ///
+    /// ⇒ The cache is only ever consulted behind proof that the binding still
+    /// holds, and the proof is cheap because CC publishes it: one small
+    /// `~/.claude/sessions/<pid>.json` read says whether the session id moved,
+    /// and one `is_file()` says whether the transcript is still where we left
+    /// it (a `/cd` moves it, so the old path stops existing). Both cost O(1)
+    /// syscalls against a read of up to tens of megabytes. Anything the
+    /// registry cannot vouch for — an fd-scan-derived identity, a pid the
+    /// registry has no entry for — is never cached and always re-resolved.
+    fn claude_code_runtime_identity_for_pid(
+        &self,
+        root_pid: u32,
+    ) -> Option<ClaudeCodeRuntimeProcessIdentity> {
+        let cached = self
+            .claude_code_process_identity_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&root_pid).cloned());
+        if let Some(cached) = cached
+            && crate::local_cc_registry_session_id_for_pid(cached.registry_pid).as_deref()
+                == Some(cached.identity.session_id.as_str())
+            && cached.identity.storage_path.is_file()
+        {
+            return Some(cached.identity);
+        }
+        let resolution = claude_code_runtime_process_identity_from_root_pid(root_pid)?;
+        if let Some(registry_pid) = resolution.registry_pid
+            && let Ok(mut cache) = self.claude_code_process_identity_cache.lock()
+        {
+            cache.insert(
+                root_pid,
+                CachedClaudeCodeRuntimeIdentity {
+                    registry_pid,
+                    identity: resolution.identity.clone(),
+                },
+            );
+        }
+        Some(resolution.identity)
+    }
+
     /// Mirrors `refresh_live_codex_runtime_identities_for_persistence` for
     /// Claude Code. Walks each live ClaudeCode session's PTY process tree
     /// to find the open `~/.claude/projects/.../<session-id>.jsonl` and
     /// applies the discovered identity to the live row. Closes the same
     /// UUIDv4-vs-real-id drift that the codex rebind handles.
     fn refresh_live_claude_code_runtime_identities_for_persistence(&mut self) -> usize {
+        let _perf = yggterm_core::PerfGuard::new(
+            self.store.home_dir(),
+            "daemon_persist",
+            "cc_identity_refresh",
+        );
         let keys = self
             .server
             .live_claude_code_session_keys_for_runtime_identity();
@@ -4341,7 +4428,7 @@ impl DaemonRuntime {
             let Some(pid) = self.terminals.session_process_id(&runtime_path) else {
                 continue;
             };
-            let Some(identity) = claude_code_runtime_process_identity_from_root_pid(pid) else {
+            let Some(identity) = self.claude_code_runtime_identity_for_pid(pid) else {
                 continue;
             };
             if self
@@ -7046,6 +7133,17 @@ impl DaemonRuntime {
         if self.routine_persist_muted() {
             return Ok(());
         }
+        // Measured, because it was not. The reveal path calls this TWICE while
+        // holding the global runtime lock, and when that path deafened the
+        // daemon for 34.4 s on 2026-08-10 both holes had to be attributed by
+        // ELIMINATION — `daemon/persist` covers only the other entry point.
+        // An unmeasured call inside the lock is a hole the next investigation
+        // has to argue about instead of rank.
+        let _perf = yggterm_core::PerfGuard::new(
+            self.store.home_dir(),
+            "daemon",
+            "persist_state_only",
+        );
         write_persisted_state_if_changed(
             &self.state_path,
             &self.server.persisted_state(),
@@ -16888,8 +16986,21 @@ fn write_persisted_state_if_changed(
     state: &PersistedDaemonState,
     fingerprint: &mut Option<PersistedStateFingerprint>,
 ) -> Result<()> {
-    let json = serde_json::to_string_pretty(state).context("serializing daemon state")?;
-    let content_hash = persisted_state_content_hash(&json);
+    // Split into its two phases on purpose. The serialize runs on EVERY
+    // persist — it is how the change-check learns whether anything moved, so
+    // an unchanged persist still pays for it — while the write runs only when
+    // something did. Ranking them separately is the difference between "the
+    // persist is slow" and knowing which half to attack.
+    let (json, content_hash) = {
+        let _perf = yggterm_core::PerfGuard::new(
+            path.parent().unwrap_or(path),
+            "daemon_persist",
+            "serialize",
+        );
+        let json = serde_json::to_string_pretty(state).context("serializing daemon state")?;
+        let content_hash = persisted_state_content_hash(&json);
+        (json, content_hash)
+    };
     if let Some(previous) = *fingerprint
         && previous.content_hash == content_hash
         && let Some((file_len, file_modified)) = persisted_state_file_identity(path)
@@ -16898,7 +17009,14 @@ fn write_persisted_state_if_changed(
     {
         return Ok(());
     }
-    write_persisted_state_json(path, &json)?;
+    {
+        let _perf = yggterm_core::PerfGuard::new(
+            path.parent().unwrap_or(path),
+            "daemon_persist",
+            "write",
+        );
+        write_persisted_state_json(path, &json)?;
+    }
     *fingerprint = persisted_state_file_identity(path).map(|(file_len, file_modified)| {
         PersistedStateFingerprint {
             content_hash,
@@ -16928,10 +17046,28 @@ fn write_persisted_state_json(path: &Path, json: &str) -> Result<()> {
                 .and_then(|stem| stem.to_str())
                 .unwrap_or("server-state")
         ));
-        if let Err(error) = fs::copy(path, &backup_path) {
+        // Link, don't copy. The backup only has to keep the OLD bytes
+        // reachable while the new ones are renamed over `path`, and a hard
+        // link does exactly that for two syscalls instead of reading and
+        // rewriting the whole file: after the `rename` below, `path` names the
+        // new inode and `backup_path` still names the old one, which is
+        // precisely what the copy produced.
+        //
+        // Worth the care because this file is 2.26 MB on the dev fleet host,
+        // the copy read AND wrote all of it, and it ran under the daemon's
+        // global runtime lock on every state change — 4.5 MB of avoidable I/O
+        // per persist, charged to whichever request happened to be holding the
+        // lock. Falls back to the copy when links are unavailable (a different
+        // filesystem, or one without them), so behaviour is unchanged where it
+        // cannot apply.
+        let _ = fs::remove_file(&backup_path);
+        if let Err(link_error) = fs::hard_link(path, &backup_path)
+            && let Err(error) = fs::copy(path, &backup_path)
+        {
             tracing::warn!(
                 path = %path.display(),
                 backup_path = %backup_path.display(),
+                %link_error,
                 error = %error,
                 "failed to back up daemon state before overwrite"
             );
@@ -16942,6 +17078,12 @@ fn write_persisted_state_json(path: &Path, json: &str) -> Result<()> {
         .with_context(|| format!("writing daemon state temp file {}", temp_path.display()))?;
     fs::rename(&temp_path, path)
         .or_else(|_| {
+            // `path` is hard-linked to `.previous.json` by the backup above, so
+            // copying THROUGH it would rewrite the backup's bytes as well and
+            // leave two copies of the new state and no old one. Unlink first so
+            // the copy lands on a fresh inode — which is what `rename` would
+            // have done. Only reached when rename is unavailable.
+            let _ = fs::remove_file(path);
             fs::copy(&temp_path, path)?;
             fs::remove_file(&temp_path)?;
             Ok::<(), std::io::Error>(())
@@ -20851,6 +20993,74 @@ mod tests {
         );
     }
 
+    /// Neither identity refresh may re-derive an identity it already holds,
+    /// because both run inside the daemon's global runtime lock on every
+    /// `persist()` — i.e. on every request that changes daemon state.
+    ///
+    /// The Claude Code refresh was written as a mirror of the codex one and
+    /// copied its loop but not its memoization, so every persist re-walked
+    /// `/proc`, re-scanned `~/.claude/projects/*` and re-parsed each live
+    /// session's transcript end to end: 49.9 MB across 9 owned rows on the dev
+    /// fleet host, charged to whichever request held the lock. A shape check,
+    /// because the cost is in the CALL that a future edit would casually
+    /// reintroduce — `claude_code_runtime_process_identity_from_root_pid` is
+    /// still the right function, just never straight from this loop.
+    #[test]
+    fn neither_persist_identity_refresh_resolves_an_identity_it_has_already_cached() {
+        let source = include_str!("daemon.rs");
+
+        for (refresh_fn, raw_resolver, cached_resolver) in [
+            (
+                "fn refresh_live_claude_code_runtime_identities_for_persistence(&mut self) -> usize {",
+                "claude_code_runtime_process_identity_from_root_pid(",
+                "self.claude_code_runtime_identity_for_pid(",
+            ),
+            (
+                "fn refresh_live_codex_runtime_identities_for_persistence(&mut self) -> usize {",
+                "codex_runtime_process_identity_from_root_pid(",
+                "self.codex_runtime_identity_for_pid(",
+            ),
+        ] {
+            let body = source
+                .split(refresh_fn)
+                .nth(1)
+                .and_then(|body| body.split("\n    }\n").next())
+                .unwrap_or_else(|| panic!("{refresh_fn} should be present"));
+            assert!(
+                body.contains(cached_resolver),
+                "{refresh_fn} must resolve through the memoized lookup {cached_resolver}"
+            );
+            assert!(
+                !body.contains(raw_resolver),
+                "{refresh_fn} must not call {raw_resolver} directly — that is the \
+                 uncached walk, and it runs under the global runtime lock"
+            );
+        }
+
+        // The Claude Code cache is the one that must also PROVE itself before
+        // it is reused: `/clear` rebinds a live process to a new session id and
+        // `/cd` re-homes its transcript, so a blind cache would resume the
+        // wrong transcript. The codex cache needs no such check.
+        let lookup = source
+            .split("fn claude_code_runtime_identity_for_pid(")
+            .nth(1)
+            .and_then(|body| body.split("\n    }\n").next())
+            .expect("the cached Claude Code lookup should be present");
+        assert!(
+            lookup.contains("local_cc_registry_session_id_for_pid("),
+            "a cached Claude Code identity must be revalidated against CC's own pid registry"
+        );
+        assert!(
+            lookup.contains("storage_path.is_file()"),
+            "a cached Claude Code identity must be dropped once its transcript has moved"
+        );
+        assert!(
+            lookup.contains("if let Some(registry_pid) = resolution.registry_pid"),
+            "only a registry-vouched identity may be cached; an fd-scan result has no \
+             cheap revalidation and must be re-resolved every time"
+        );
+    }
+
     /// The pre-swap receipt the user asked for by name. Two writers, both
     /// deliberate: the OUTGOING daemon captures the curated order it still
     /// holds, and the INCOMING daemon captures one too — because a predecessor
@@ -24678,6 +24888,73 @@ mod tests {
         assert!(
             backup_path.exists(),
             "a changed state must still take the backup"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The backup must hold the PREVIOUS state, not a second copy of the
+    /// current one.
+    ///
+    /// It is taken by hard link rather than by copying 2.26 MB through the
+    /// daemon's global runtime lock, and a link makes `server-state.json` and
+    /// `server-state.previous.json` the same inode until the temp file is
+    /// renamed over the first. Anything that writes THROUGH the state path
+    /// instead of replacing it therefore rewrites the backup too — which is
+    /// exactly what the rename-failure fallback used to do. Asserting the
+    /// backup's CONTENT, not merely its existence, is what separates a real
+    /// backup from an alias of the thing it is supposed to survive.
+    #[test]
+    fn the_backup_holds_the_previous_state_not_a_second_copy_of_the_current_one() {
+        let root = persist_gate_test_root("backup-content");
+        let state_path = root.join("server-state.json");
+        let backup_path = root.join("server-state.previous.json");
+        let mut gate = None;
+
+        let first = persist_gate_test_state("remote-session://dev/first");
+        write_persisted_state_if_changed(&state_path, &first, &mut gate).expect("first write");
+        let second = persist_gate_test_state("remote-session://dev/second");
+        write_persisted_state_if_changed(&state_path, &second, &mut gate).expect("second write");
+
+        let current = load_persisted_state(&state_path)
+            .expect("load state")
+            .expect("state");
+        assert_eq!(
+            current.active_session_path.as_deref(),
+            Some("remote-session://dev/second"),
+            "the state file must hold the newest state"
+        );
+        let backed_up = load_persisted_state(&backup_path)
+            .expect("load backup")
+            .expect("backup");
+        assert_eq!(
+            backed_up.active_session_path.as_deref(),
+            Some("remote-session://dev/first"),
+            "the backup must hold the state it replaced, not the one that replaced it"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(
+                fs::metadata(&state_path).expect("state file").ino(),
+                fs::metadata(&backup_path).expect("backup file").ino(),
+                "once the write completes the backup must be a separate inode — while they \
+                 share one, anything writing through the state path also rewrites the backup"
+            );
+        }
+
+        // A third write rolls the backup forward by exactly one generation —
+        // proving the stale link from the previous round is broken, not
+        // silently rewritten in place.
+        let third = persist_gate_test_state("remote-session://dev/third");
+        write_persisted_state_if_changed(&state_path, &third, &mut gate).expect("third write");
+        assert_eq!(
+            load_persisted_state(&backup_path)
+                .expect("load backup")
+                .expect("backup")
+                .active_session_path
+                .as_deref(),
+            Some("remote-session://dev/second"),
+            "each write must leave the immediately preceding state in the backup"
         );
         let _ = fs::remove_dir_all(&root);
     }

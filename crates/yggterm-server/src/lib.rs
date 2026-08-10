@@ -2225,10 +2225,32 @@ pub(crate) struct ClaudeCodeRuntimeProcessIdentity {
     pub cwd: String,
 }
 
+/// An identity resolution, plus the ONE fact a caller needs to re-validate it
+/// without redoing the work: which pid's CC registry entry produced it.
+///
+/// Resolving an identity costs a `/proc` subtree walk, a scan of every
+/// `~/.claude/projects/*` directory, and a full read + `serde_json` parse of a
+/// transcript that reaches tens of megabytes on a long session. That is far too
+/// expensive to repeat on every persist (see
+/// `DaemonRuntime::claude_code_runtime_identity_for_pid`), and the registry is
+/// what makes skipping it SAFE: `~/.claude/sessions/<pid>.json` is written by
+/// the CC process itself and is the exact pid→session binding, so re-reading
+/// that one small file proves whether the expensive answer is still current.
+///
+/// `registry_pid` is `None` when the answer came from the `/proc` fd scan
+/// instead. That branch has no cheap re-validation, so its result must never be
+/// cached — a stale fd-derived binding is precisely the foreign-transcript
+/// mis-attribution this resolver exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeCodeRuntimeIdentityResolution {
+    pub identity: ClaudeCodeRuntimeProcessIdentity,
+    pub registry_pid: Option<u32>,
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn claude_code_runtime_process_identity_from_root_pid(
     root_pid: u32,
-) -> Option<ClaudeCodeRuntimeProcessIdentity> {
+) -> Option<ClaudeCodeRuntimeIdentityResolution> {
     let registry_dir = local_cc_session_registry_dir();
     let mut queue = VecDeque::from([root_pid]);
     let mut seen = HashSet::new();
@@ -2246,19 +2268,25 @@ pub(crate) fn claude_code_runtime_process_identity_from_root_pid(
         {
             let storage_path = yggterm_core::local_cc_session_jsonl_path(&session_id)?;
             let (session_id, cwd) = read_cc_session_identity_fields(&storage_path).ok()??;
-            return Some(ClaudeCodeRuntimeProcessIdentity {
-                storage_path,
-                session_id,
-                cwd,
+            return Some(ClaudeCodeRuntimeIdentityResolution {
+                identity: ClaudeCodeRuntimeProcessIdentity {
+                    storage_path,
+                    session_id,
+                    cwd,
+                },
+                registry_pid: Some(pid),
             });
         }
         if let Some(storage_path) = claude_code_storage_path_from_process_fds(pid)
             && let Ok(Some((session_id, cwd))) = read_cc_session_identity_fields(&storage_path)
         {
-            return Some(ClaudeCodeRuntimeProcessIdentity {
-                storage_path,
-                session_id,
-                cwd,
+            return Some(ClaudeCodeRuntimeIdentityResolution {
+                identity: ClaudeCodeRuntimeProcessIdentity {
+                    storage_path,
+                    session_id,
+                    cwd,
+                },
+                registry_pid: None,
             });
         }
         queue.extend(linux_proc_child_pids(pid));
@@ -2269,8 +2297,18 @@ pub(crate) fn claude_code_runtime_process_identity_from_root_pid(
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn claude_code_runtime_process_identity_from_root_pid(
     _root_pid: u32,
-) -> Option<ClaudeCodeRuntimeProcessIdentity> {
+) -> Option<ClaudeCodeRuntimeIdentityResolution> {
     None
+}
+
+/// The registry's current session id for one pid — the cheap half of the
+/// resolution above, exposed so a cached identity can be re-validated for the
+/// cost of one small file read instead of the whole walk.
+///
+/// Returns `None` on every platform without the registry, which correctly reads
+/// as "cannot confirm" and forces a full re-resolve rather than a stale reuse.
+pub(crate) fn local_cc_registry_session_id_for_pid(pid: u32) -> Option<String> {
+    local_cc_registry_session_id_in(local_cc_session_registry_dir()?.as_path(), pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -5950,8 +5988,15 @@ impl YggtermServer {
         {
             return false;
         }
+        // TRUE means "the row MOVED", not "I wrote". The overlay is idempotent,
+        // so the old unconditional `true` reported a refresh on every persist
+        // for every live CC row — one junk `claude_code_runtime_identity_
+        // refreshed` trace record per row per persist, ~7 per persist on the
+        // dev fleet host, which made a genuine rebind unfindable among them.
+        // [[finding-a-set-is-not-a-fill]]: a write is not a change.
+        let before = session.clone();
         overlay_claude_code_runtime_managed_identity(session, identity);
-        true
+        *session != before
     }
 
     pub(crate) fn apply_codex_runtime_identity_to_live_session(

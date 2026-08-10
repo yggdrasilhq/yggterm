@@ -4,6 +4,43 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The daemon stops re-reading 49.9 MB of transcripts every time it saves state
+  (3.0.104).** Every `persist()` runs under the daemon's one global runtime
+  mutex, so whatever it does, no other client is served meanwhile. It was
+  re-deriving each live Claude Code session's identity from scratch: a `/proc`
+  subtree walk, a scan of every `~/.claude/projects/*` directory, and a full read
+  plus JSON parse of the session transcript — **49.9 MB across 9 rows** on the dev
+  fleet host, on every request that changes daemon state, and growing all day as
+  the transcripts grow. The codex path has been memoized since it was written;
+  the Claude Code one was added as its mirror and copied the loop but not the
+  cache. It is now memoized too, and — unlike the codex cache — **revalidated
+  before every reuse**, because a Claude Code binding can move inside a living
+  process: `/clear` rebinds it to a new session id and `/cd` re-homes the
+  transcript. Reuse is gated on CC's own `~/.claude/sessions/<pid>.json` still
+  naming the cached session and the transcript still being where it was, which
+  costs two syscalls; anything the registry cannot vouch for is re-resolved in
+  full, so a stale identity can never send `claude -r` at the wrong transcript.
+- **The state-file backup no longer copies the document to save it (3.0.104).**
+  `server-state.json` is 2.26 MB and every write first copied it to
+  `server-state.previous.json` — reading and rewriting all of it, 4.5 MB of I/O,
+  again inside the global lock. A hard link produces exactly the same result: after
+  the new state is renamed into place the backup still names the old bytes. Two
+  syscalls instead of a copy, with the copy kept as a fallback where links are
+  unavailable. ⚠ The rename-failure path had to be fixed to match — it wrote
+  *through* the state path, which once linked would have rewritten the backup as
+  well and left two copies of the new state and none of the old.
+- **Persist is now measured in its parts, and `persist_state_only` is measured at
+  all (3.0.104).** New `server perf-summary` rows `daemon/persist_state_only`,
+  `daemon_persist/cc_identity_refresh`, `daemon_persist/serialize` and
+  `daemon_persist/write`. The reveal path calls `persist_state_only` twice while
+  holding the runtime lock and it carried no span whatsoever, which is why both
+  holes in the owner's 34.4 s row switch had to be attributed by elimination
+  rather than ranked.
+- **A refreshed identity now means the row moved (3.0.104).** The apply returned
+  `true` unconditionally — "I wrote", not "it changed" — so every persist emitted
+  one `claude_code_runtime_identity_refreshed` trace record per live Claude Code
+  row (7 per persist on the dev host) and a genuine rebind was unfindable among
+  them.
 - **A request the daemon cannot answer yet is now on the record (3.0.103).** The
   daemon serves every client request under one global runtime mutex, and its
   `request`/`begin` trace fires only *after* that lock is acquired — so a request
