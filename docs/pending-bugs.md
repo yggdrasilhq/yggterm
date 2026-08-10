@@ -112,6 +112,81 @@ skips** — and this one skipped it for 8.5 hours. §8 step 3 already forbids th
 with no trigger is unenforceable**. §2 should point at the gauge as the automatic path
 and keep `/context` as the interactive one.
 
+## ⛔⛔ A NEW SESSION IS ASKED FOR, THE ROW APPEARS `running · idle`, AND NO PROCESS IS EVER BORN
+
+**Status:** OPEN
+
+Owner-reported 2026-08-10: *"even a new session does not want to start"*. Traced
+on the failing attempt: `start-cc 0eb607df…` at **13:00:40**, then **no birth, no
+error, no process** — while the row reported `running · idle`. A row that claims
+to be running a session that does not exist is the worst possible failure mode,
+because nothing in the UI contradicts it and the owner waits.
+
+⚠ **This entry exists BECAUSE a plausible cause was found, measured, fixed — and
+then did not fit.** A daemon used to walk the machine's whole transcript corpus
+before binding its socket, so for ~15 s after spawn it answered nothing at all;
+that is fixed and proven in 3.0.94 (15.1 s → 0.14 s). But the daemon serving that
+13:00:40 request had started at **11:19:07** and did its only corpus walk at
+**11:19:15** — 100 minutes earlier. **So the startup stall cannot be this.** Do
+not let the shipped fix close this entry; the symptom has not been reproduced
+since and its cause is unknown.
+
+Where to look next, in order:
+1. **What `start-cc` returns when it fails.** No error surfaced anywhere — so
+   either the request never reached a daemon, or a daemon accepted it and dropped
+   it silently. Those are different bugs and the trace should distinguish them;
+   if it cannot, that is the first thing to fix.
+2. **Who set the row to `running · idle`.** A row is being created optimistically
+   and never reconciled against whether a process appeared. The row's state is a
+   claim about a PID; something must check it.
+3. Whether the GUI addressed a daemon version whose socket had gone.
+
+**Falsifier:** a `start-cc` that spawns no process must leave either an error the
+user sees or a trace event naming the refusal — never a row that says `running`.
+
+## ⛔ FOUR TESTS FAIL ON `dev` AT HEAD, AND A RED TARGET HIDES EVERY TEST BEHIND IT
+
+**Status:** OPEN
+
+`cargo test -p yggterm-server --lib` on `dev` returns **1022 passed, 3 failed**,
+and it failed identically on a pristine `git worktree` at HEAD — so this is the
+state of the repo, not anyone's working tree. A fourth fails only under
+`--workspace`. Anyone running the suite to check their own change reads a red bar
+and has to decide, every time, which red is theirs.
+
+1. **`daemon_binary_is_legacy_allows_deleted_current_install_path`** — the test
+   feeds the placeholder paths `/home/user/.yggterm/bin/yggterm{,-headless}`, but
+   the function under test resolves its companion binary by asking the
+   **filesystem** (`preferred_install_headless_bootstrap_executable` → `is_file()`).
+   On a machine where `/home/user` does not exist the companion resolves to
+   `None`, so an argv0 of `…/yggterm-headless` is not in the allowed set and the
+   binary is judged legacy. ⇒ **A placeholder path cannot be fed to a predicate
+   that stats it.** The fix is a `tempdir` with both names actually created, which
+   makes the test hermetic and keeps the public repo free of a real home path.
+   ⚠ Worth fixing early: this predicate is what decides whether a deploy reaps the
+   *previous* daemon, which is the mechanism behind "a deploy mass-re-resumes every
+   agent row". A red test over that decision is the worst place to have one.
+2. **`start_remote_codex_session_uses_remote_start_codex_launch_contract`** and
+3. **`start_remote_claude_session_assigns_authoritative_session_id`** — both assert
+   the built launch command contains the cwd they passed
+   (`'/home/user/gh/yggterm'`); the command actually carries `'/home'`. Same family
+   as (1) — the test reaches a resolver that consults the real host — but the
+   truncation to `/home` has NOT been explained yet and could be a genuine defect
+   in the remote launch path rather than a test artefact. **Do not assume it is
+   cosmetic: find out which, then fix the right one.**
+
+4. **`pty_runtime_answers_default_color_query_to_child` is FLAKY, not red** — it
+   fails under `cargo test --workspace --lib` (the whole workspace running at
+   once) and passes on its own, every time. It spawns a real PTY and waits for the
+   child's reply, so it is losing a race under load. ⚠ A flaky test in the same
+   run as three deterministic ones is worse than either alone: it teaches whoever
+   reruns the suite that red means "try again", which is exactly how the three
+   real failures below stayed unfixed. Give it a deadline it can actually meet, or
+   make it not depend on scheduling.
+
+**Falsifier:** `cargo test --workspace --lib` returns 0 failures on `dev`, twice
+in a row.
+
 ## ⭐ A NEW SESSION'S ROW IS NAMED AFTER THE ROW YOU RIGHT-CLICKED
 
 **Status:** OPEN
@@ -186,65 +261,75 @@ collides head-on with the paste bug, whose fix wanted the helper upgraded alone.
 ⚠ Either way the error must name the pairing. *"No such file or directory"* on a socket
 path is a true statement that tells the reader nothing about what to do.
 
-## ⛔⛔ ONE DAEMON THREAD SPINS ON THE WHOLE TRANSCRIPT CORPUS, AND `server status` TAKES 27 SECONDS
+## ⛔ FIVE PRE-3.0 DAEMONS STILL WALK THE WHOLE TRANSCRIPT CORPUS, AND A DEPLOY CANNOT REACH THEM
 
-**Status:** OPEN
+**Status:** AWAITING A DECISION
 
-⛔ **This is very likely the headline "jank"** — owner-reported 2026-08-10:
-*"even a new session does not want to start"*, and earlier the same hour
-*"untypable for half an hour"*.
+**Decided by:** the owner — only he can say whether the sessions these daemons
+still hold may be dropped.
 
-### Measured on the live daemon (3.0.91, pid 2785975), not inferred
+⭐ **The startup half of this entry is FIXED and proven — see CHANGELOG 3.0.94**
+(daemon time-to-first-answer 15.1 s → 0.14 s). What is left is the part a
+deploy cannot fix, because the daemons in question run frozen old binaries.
 
-| probe | reading |
-|---|---|
-| daemon CPU | **0.858 cores total, 0.797 of it in ONE thread** |
-| that thread's syscalls | **9,764 `read` in 8 s, and NOTHING else** (~1,220/s) |
-| what it reads | fd 19 → `~/.codex/sessions/2026/03/17/rollout-…jsonl` — **a five-month-old transcript** |
-| `server status --endpoint <it>` | **27.2 s** (a 25 s timeout had already failed once) |
-| `perf-summary --category background` | `local_tree_scan`: **1,952 runs, p50 8.2 s, p95 9.7 s, max 32.5 s, total 16,365,190 ms ≈ 4.5 HOURS**, across ~140 distinct daemon pids |
+### What was actually wrong, and how the first diagnosis missed it
 
-⚠ **IT IS PERIODIC, NOT A PERMANENT SPIN — corrected 20 minutes later by re-measuring
-the same daemon**, and the distinction matters for diagnosis:
+The original entry accused `daemon_copy_chore_should_scan_local_tree` of failing
+to gate the walk. **That gate is correct and was never the thing running** —
+falsified against the live perf stream, not argued: across the last ~7 h of
+`perf-telemetry`, **every** `daemon/background_copy_chore` record that carries
+meta reads `local_tree_scanned: false` (8,723 of them), while
+`background/local_tree_scan` fired **385 times** in the same window at p50 8.3 s.
+A gate reporting "I did not do it" 8,723 times next to 385 walks means a
+**different caller**, and the pid field said which: 351 of those 385 walks were
+written by a process **emitting no `pid` at all** — the field was added
+2026-07-26, so the writer predates it.
 
-| | during the walk | after it finished |
-|---|---|---|
-| daemon CPU | 0.858 cores (0.797 in one thread) | **0.033 cores** |
-| `server status` | **27.2 s** | **0.68 s** |
+⇒ Sampling every daemon's open fds for 60 s named them. Five daemons hold the
+whole `~/.claude/projects` tree open for ~40-50% of wall-clock, 100-150 distinct
+files each; the current 3.0.91 daemons hold **one** file each, which is the
+legitimate per-owned-session read.
 
-⇒ So this is a **recurring multi-second stall**, not a wedge — which is exactly why the
-owner's symptoms are INTERMITTENT ("sometimes a new session does not start"), and why
-anyone checking a minute later finds a healthy daemon and concludes nothing is wrong.
-`local_tree_scan`'s own p50 8.2 s / max 32.5 s says how long each window lasts.
+| pid | socket | started | still owns |
+|---|---|---|---|
+| 1412446 | `server-2-11-1` | Jul 13 | 0 sessions |
+| 3752038 | `server-2-12-2` | Jul 22 | 0 sessions |
+| 122902 | `server-2-12-5` | Jul 23 | 25 (18 CC, 7 shell) |
+| 776952 | `server-2-12-8` | Jul 23 | 40 (31 CC, 9 shell) |
+| 219756 | `server-2-12-14` | Jul 26 09:27 | 73 (55 CC, 18 shell) |
 
-⇒ The daemon spends multi-second stretches walking the machine's ENTIRE historical
-agent-transcript corpus, and while it does, it does not answer. A `new session` needs
-that daemon (`server remote start-cc`), so **it does not start** — the row appears,
-reports `running · idle`, and no process is ever spawned. Traced on the failing
-attempt: `start-cc 0eb607df…` at 13:00:40 followed by **no birth, no error, no
-process**.
+The gate shipped in 38885207 at **2026-07-26 10:46** — 79 minutes after the
+youngest of these started. Every one of them predates it and always will.
 
-### ⚠ THE PART THAT DOES NOT ADD UP — start here, do not assume
+**The user-visible cost, measured**: polled `server status` against each once a
+second for 3 minutes. p50 is 0.01-0.02 s, but the maxima are **6.78 s, 4.26 s and
+7.79 s** — those are the windows in which that daemon holds its runtime lock
+across the walk (the lock was moved off the walk in a3f58fb7, also after they
+started). The current 3.0.91 daemon's max in the same window was **0.07 s**.
 
-`daemon_background_copy_chore_enabled_from_env` (`daemon.rs:10449`) is
-`value.is_some_and(…)` ⇒ **OFF unless explicitly set**, and the serving daemon's
-`/proc/<pid>/environ` carries no such variable. `daemon_copy_chore_should_scan_local_tree`
-is documented to gate exactly this walk on that flag. **So by the code as written, this
-scan should not be running at all — and it demonstrably is.**
+### Why it cannot be fixed by shipping
 
-Candidates, in the order worth testing:
-1. `generation_enabled` reaching `run_background_copy_chore` from a source OTHER than
-   that env var (settings? a per-tick recompute?) — find the actual argument.
-2. A different reader of the same corpus that was never gated: the CC/codex title sync,
-   `collect_local_copy_candidates`, `find_transcript`, or the remote-codex identity
-   poll. The doc comment explicitly says the per-session halves *"keep running
-   regardless"* — but a **March codex rollout is not a per-owned-session read** on a
-   daemon that owns only CC rows, so something machine-wide is loose.
-3. The scan being started once and never re-checking the gate.
+A 3.0.x client connects to `server-3-0-<n>.sock` and only falls back to an older
+daemon when its own socket is unreachable. These five are therefore **invisible
+to the current GUI** — their rows cannot be opened, resumed or reaped through the
+product, yet they keep re-reading a 17.8 GB corpus forever.
 
-**Falsifier:** with the chore disabled, a daemon must issue **no** reads against
-`~/.codex/sessions/**` or `~/.claude/projects/**` for sessions it does not own.
-Today one thread does ~1,220/s.
+⇒ **The decision that is owed:** pids 122902, 776952 and 219756 still claim 138
+sessions between them, most `keep_alive: true` — but **none of them has a live
+grandchild process**, so every agent under them has already exited and what
+survives is the registration plus an idle `bash -i`. Killing the two with **zero**
+sessions (1412446, 3752038) is free. Killing the other three drops rows the owner
+cannot see or reach anyway; it is still his call, because "unreachable" is our
+inference and the scrollback is his.
+
+**RECOMMENDATION**: reap all five, oldest first, after capturing each one's
+`server status` JSON to `~/.yggterm/manual-snapshots/`. **What was done meanwhile:**
+nothing was killed — the measurement is filed and the startup fix shipped, which
+is the half that does not need him.
+
+**Falsifier for the fix that DID ship:** a daemon started from 3.0.94 must answer
+`server status` in well under a second on this corpus. Measured: 0.14 s, three
+runs, against 15.1 s for 3.0.91 on the same machine and the same corpus.
 
 ⚠ **Do not "fix" this by widening the gate's env check** until candidate 1 is settled —
 the gate may be correct and simply not the thing running.

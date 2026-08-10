@@ -50,7 +50,9 @@ copies.
   those daemons are older binaries that will never run it, and between them they
   are the bulk of the measured 8.12 cores. Draining means terminating daemons that
   still own live rows — his sidebar, his call. → yggterm `docs/pending-bugs.md`
-  § *"I CANNOT USE YGGTERM. IT IS SO JANK"*, item 4.
+  § *"I CANNOT USE YGGTERM. IT IS SO JANK"*, item 4, and § *FIVE PRE-3.0 DAEMONS
+  STILL WALK THE WHOLE TRANSCRIPT CORPUS* for the five that are measurably
+  costing him now and are unreachable from the current GUI.
   *Meanwhile:* the pile can no longer GROW — the count held flat across a version
   bump for the first time — so it shrinks on its own as sessions end.
 

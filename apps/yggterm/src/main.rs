@@ -4751,7 +4751,7 @@ fn load_initial_server_snapshot_fast(
             };
         }
     };
-    let mut server = YggtermServer::new(browser_tree, prefer_ghostty_backend, host.clone(), theme);
+    let mut server = YggtermServer::new(prefer_ghostty_backend, host.clone(), theme);
     server.restore_persisted_state_with_launch_policy(saved, Some(store), false);
     InitialServerSnapshotLoad {
         snapshot: Some(server.snapshot()),

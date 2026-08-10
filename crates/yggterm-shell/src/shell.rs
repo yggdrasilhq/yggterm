@@ -17844,7 +17844,6 @@ impl ShellState {
             settings.selected_browser_path.as_deref(),
         );
         let mut server = YggtermServer::new(
-            &bootstrap.browser_tree,
             bootstrap.prefer_ghostty_backend,
             yggterm_server::GhosttyHostSupport::shadow(
                 bootstrap.ghostty_bridge_detail.clone(),
@@ -28292,7 +28291,6 @@ impl ShellState {
             self.search_focused = false;
         }
         self.server.show_start_page();
-        self.server.refresh_local_cc_sessions();
         self.show_start_page_when_no_live_sessions = false;
         self.active_terminal_host_id = None;
         self.context_menu_row = None;

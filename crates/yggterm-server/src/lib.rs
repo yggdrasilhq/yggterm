@@ -207,11 +207,11 @@ use uuid::Uuid;
 use yggterm_core::AppManifest;
 use yggterm_core::agent_cli::{AGENT_CLIS, agent_cli_descriptor};
 use yggterm_core::{
-    AgentLaunchOptions, PerfSpan, SessionNode, SessionStore, SessionTitleStore, TranscriptRole,
+    AgentLaunchOptions, PerfSpan, SessionStore, SessionTitleStore, TranscriptRole,
     WorkspaceDocument, WorkspaceDocumentKind, YGGTERM_DESKTOP_APP_ID, append_trace_event, detect_install_context,
     event_trace_path, follow_trace_lines, generation_context_from_messages,
     looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
-    read_cc_session_context, read_cc_session_identity_fields, read_cc_session_title,
+    read_cc_session_identity_fields, read_cc_session_title,
     read_codex_session_identity_fields, read_codex_transcript_messages,
     read_codex_transcript_messages_limited, read_codex_transcript_messages_tail_limited,
     read_trace_tail, resolve_yggterm_home,
@@ -2912,16 +2912,6 @@ pub enum RemoteMachineHealth {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocalCcSession {
-    pub session_id: String,
-    pub cwd: String,
-    pub title_hint: String,
-    pub context_hint: String,
-    pub file_path: String,
-    pub modified_epoch: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteScannedSession {
     pub session_path: String,
     pub session_id: String,
@@ -3619,7 +3609,6 @@ pub struct YggtermServer {
     apps: Vec<AppManifest>,
     remote_machines: Vec<RemoteMachineSnapshot>,
     live_session_order: Vec<String>,
-    local_cc_sessions: Vec<LocalCcSession>,
     /// Last-known PTY grid per session key, the SSOT for restoring a re-resumed
     /// session at its real grid (squish fix, Bug 10). Fed by TerminalResize via
     /// `record_session_pty_grid`; persisted in PersistedDaemonState and restored
@@ -3693,8 +3682,14 @@ pub struct SessionPayloadStats {
 }
 
 impl YggtermServer {
+    /// Construction must stay CHEAP: the daemon builds this before it binds its
+    /// socket, so anything expensive here is time the daemon answers nothing.
+    /// It used to `scan_local_claude_code_sessions()` — 689 transcripts / 1.81 GB
+    /// read three times each (identity, title, context) on the dev fleet host —
+    /// to build an index whose only reader, `open_local_cc_session`, looks up ONE
+    /// file whose path it already holds. That index is gone; the read is now the
+    /// single file. See `daemon_runtime_load_does_not_walk_the_transcript_corpus`.
     pub fn new(
-        _tree: &SessionNode,
         prefer_ghostty_backend: bool,
         ghostty_host: GhosttyHostSupport,
         theme: UiTheme,
@@ -3703,7 +3698,6 @@ impl YggtermServer {
         let backend = TerminalBackend::Xterm;
         sync_terminal_identity_env(theme);
 
-        let local_cc_sessions = scan_local_claude_code_sessions();
         let this = Self {
             sessions: BTreeMap::new(),
             active_session_path: None,
@@ -3715,7 +3709,6 @@ impl YggtermServer {
             apps: Vec::new(),
             remote_machines: Vec::new(),
             live_session_order: Vec::new(),
-            local_cc_sessions,
             session_pty_grids: HashMap::new(),
             client_viewport_grid: None,
             preview_history_budgets: HashMap::new(),
@@ -5201,13 +5194,6 @@ impl YggtermServer {
         &self.remote_machines
     }
 
-    pub fn local_cc_sessions(&self) -> &[LocalCcSession] {
-        &self.local_cc_sessions
-    }
-
-    pub fn refresh_local_cc_sessions(&mut self) {
-        self.local_cc_sessions = scan_local_claude_code_sessions();
-    }
 
     pub fn live_sessions(&self) -> Vec<ManagedSessionView> {
         let sessions = self
@@ -8096,11 +8082,14 @@ impl YggtermServer {
         if session_id.is_empty() {
             return None;
         }
-        let (cwd, title) = self
-            .local_cc_sessions
-            .iter()
-            .find(|s| s.file_path == storage_path)
-            .map(|s| (s.cwd.clone(), s.title_hint.clone()))
+        // Read the ONE transcript we are opening, not an index of all of them.
+        // This used to consult a `local_cc_sessions` vector built by walking
+        // every CC transcript on the machine at construction — an O(corpus)
+        // answer to an O(1) question, and stale by construction in the daemon,
+        // which never refreshed it: a session created after daemon start was
+        // missed and silently resumed at `local_default_cwd()` instead of its
+        // own cwd. The transcript is the SSOT for its own cwd and title.
+        let (cwd, title) = read_local_cc_session_cwd_and_title(storage_path)
             .unwrap_or_else(|| (local_default_cwd(), short_session_id(&session_id)));
         let mut live_key = local_live_runtime_key(&session_id);
         if self.sessions.contains_key(&live_key) {
@@ -16762,56 +16751,25 @@ pub(crate) fn poll_remote_local_codex_identities(
     Ok(identities)
 }
 
-pub fn scan_local_claude_code_sessions() -> Vec<LocalCcSession> {
-    let Some(projects_dir) = local_cc_projects_dir() else {
-        return Vec::new();
-    };
-    let Ok(project_entries) = fs::read_dir(&projects_dir) else {
-        return Vec::new();
-    };
-    let mut sessions = Vec::new();
-    for project_entry in project_entries.flatten() {
-        let project_path = project_entry.path();
-        if !project_path.is_dir() {
-            continue;
-        }
-        let Ok(session_entries) = fs::read_dir(&project_path) else {
-            continue;
-        };
-        for session_entry in session_entries.flatten() {
-            let file_path = session_entry.path();
-            if !is_local_claude_code_storage_session_path(&file_path.display().to_string()) {
-                continue;
-            }
-            let Some(file_path_str) = file_path.to_str().map(ToOwned::to_owned) else {
-                continue;
-            };
-            let Ok(Some((session_id, cwd))) = read_cc_session_identity_fields(&file_path) else {
-                continue;
-            };
-            let title_hint = read_cc_session_title(&file_path)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| short_session_id(&session_id));
-            let context_hint = read_cc_session_context(&file_path).unwrap_or_default();
-            let modified_epoch = fs::metadata(&file_path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            sessions.push(LocalCcSession {
-                session_id,
-                cwd,
-                title_hint,
-                context_hint,
-                file_path: file_path_str,
-                modified_epoch,
-            });
-        }
-    }
-    sessions.sort_by(|a, b| b.modified_epoch.cmp(&a.modified_epoch));
-    sessions
+/// The cwd and title of ONE local Claude Code session, read from its own
+/// transcript. Returns `None` when the file is unreadable or carries no
+/// identity, so the caller can fall back rather than seat a wrong cwd.
+///
+/// This replaced a `scan_local_claude_code_sessions()` that walked the whole
+/// `~/.claude/projects` corpus (689 files / 1.81 GB on the dev fleet host,
+/// each read three times) to build an index. Its only reader already held the
+/// path of the single session it wanted, and the index was built once at
+/// construction and never refreshed inside the daemon — so the walk was both
+/// O(corpus) for an O(1) question and stale for any session created after the
+/// daemon started. Per-CLI store semantics stay in `yggterm_core`'s readers.
+pub fn read_local_cc_session_cwd_and_title(storage_path: &str) -> Option<(String, String)> {
+    let path = std::path::Path::new(storage_path);
+    let (session_id, cwd) = read_cc_session_identity_fields(path).ok().flatten()?;
+    let title = read_cc_session_title(path)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| short_session_id(&session_id));
+    Some((cwd, title))
 }
 
 pub fn run_remote_stage_clipboard_png() -> anyhow::Result<()> {
@@ -28984,20 +28942,7 @@ mod tests {
     // a fleet where the two happen to agree.
     #[test]
     fn a_remote_row_provisions_on_the_machine_its_ssh_target_names() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -29160,7 +29105,7 @@ mod tests {
         RUNTIME_RESTORE_REASON_METADATA_LABEL, RemoteCommandCacheEntry, RemoteDeployState,
         RemoteMachineHealth, RemoteMachineRefreshScan, RemoteMachineSnapshot, RemotePreviewPayload,
         RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind,
-        SessionMetadataEntry, SessionNode, SessionPreview, SessionPreviewBlock, SessionSource,
+        SessionMetadataEntry, SessionPreview, SessionPreviewBlock, SessionSource,
         SnapshotPreview, SnapshotPreviewBlock, SnapshotRenderedSection, SnapshotSessionView,
         SshConnectTarget, StoredPreviewHydrationMode, TerminalBackend, TerminalLaunchPhase,
         UPDATE_RESTART_RESTORE_REASON, UiTheme, WorkspaceViewMode, YggtermServer,
@@ -29210,7 +29155,7 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
-    use yggterm_core::{AgentLaunchOptions, SessionNodeKind, SessionTitleStore, TranscriptRole};
+    use yggterm_core::{AgentLaunchOptions, SessionTitleStore, TranscriptRole};
 
     static CODEX_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -30479,20 +30424,7 @@ mod tests {
 
         super::preserve_missing_saved_remote_live_session(&mut session, session_id);
 
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -30982,20 +30914,7 @@ mod tests {
 
     #[test]
     fn daemon_owned_remote_runtime_keeps_codex_runtime_terminal_key() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -31199,20 +31118,7 @@ mod tests {
 
     #[test]
     fn set_view_mode_allows_live_local_runtime_in_rendered_mode() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -31230,20 +31136,7 @@ mod tests {
     }
 
     fn test_server() -> YggtermServer {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -31988,20 +31881,7 @@ mod tests {
         // key (so re-attach reconnects the persistent PTY), the kind must be a
         // plain Shell, and the launch command must be a bare login shell (the
         // daemon spawns it in the session cwd — no tmux/PROMPT_COMMAND dance).
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -32059,20 +31939,7 @@ mod tests {
 
     #[test]
     fn server_snapshot_normalizes_stored_session_terminal_view_to_rendered() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -33118,31 +32985,7 @@ mod tests {
 
     #[test]
     fn server_new_does_not_eagerly_open_first_stored_session() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: Some("root".to_string()),
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("root"),
-            children: vec![SessionNode {
-                kind: SessionNodeKind::CodexSession,
-                name: "old-session".to_string(),
-                title: Some("Old Session".to_string()),
-                document_kind: None,
-                group_kind: None,
-                path: PathBuf::from("/home/user/.codex/sessions/old.jsonl"),
-                children: Vec::new(),
-                session_id: Some("old".to_string()),
-                cwd: Some("/home/user".to_string()),
-                ..Default::default()
-            }],
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -33154,18 +32997,6 @@ mod tests {
     #[test]
     fn payload_stats_counts_preview_rendered_and_terminal_bytes() {
         let mut server = YggtermServer::new(
-            &SessionNode {
-                kind: SessionNodeKind::Group,
-                name: "root".to_string(),
-                title: Some("root".to_string()),
-                document_kind: None,
-                group_kind: None,
-                path: std::path::PathBuf::from("root"),
-                children: Vec::new(),
-                session_id: None,
-                cwd: None,
-                ..Default::default()
-            },
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -33253,18 +33084,6 @@ mod tests {
     #[test]
     fn server_snapshot_trims_inactive_live_session_payloads() {
         let mut server = YggtermServer::new(
-            &SessionNode {
-                kind: SessionNodeKind::Group,
-                name: "root".to_string(),
-                title: Some("root".to_string()),
-                document_kind: None,
-                group_kind: None,
-                path: std::path::PathBuf::from("root"),
-                children: Vec::new(),
-                session_id: None,
-                cwd: None,
-                ..Default::default()
-            },
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -34045,20 +33864,7 @@ mod tests {
         unsafe {
             std::env::set_var("CODEX_HOME", &home);
         }
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -34344,20 +34150,7 @@ terminal_window_id: None,
                 },
             );
         }
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -34629,20 +34422,7 @@ terminal_window_id: None,
 
     #[test]
     fn focus_live_session_resolves_normalized_local_session_path() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -34674,20 +34454,7 @@ terminal_window_id: None,
 
     #[test]
     fn focus_live_session_keeps_manual_live_session_order() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -34715,20 +34482,7 @@ terminal_window_id: None,
 
     /// A bare server with `count` local shell rows, in start order.
     fn row_order_test_server(count: usize) -> (YggtermServer, Vec<String>) {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -34928,20 +34682,7 @@ terminal_window_id: None,
 
     #[test]
     fn terminal_runtime_key_resolves_normalized_local_session_path() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -34963,20 +34704,7 @@ terminal_window_id: None,
 
     #[test]
     fn snapshot_resolves_active_local_session_from_normalized_path() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -35003,20 +34731,7 @@ terminal_window_id: None,
 
     #[test]
     fn snapshot_live_session_preview_projection_keeps_latest_tail_blocks() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -35094,20 +34809,7 @@ terminal_window_id: None,
 
     #[test]
     fn snapshot_does_not_export_deleted_local_active_gap() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -35140,20 +34842,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_preview_open_does_not_queue_terminal_resume() -> Result<()> {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -35208,20 +34897,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_preview_refresh_uses_cached_scan_without_remote_io_for_live_session() -> Result<()> {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -35281,20 +34957,7 @@ terminal_window_id: None,
 
     #[test]
     fn opening_existing_live_remote_runtime_as_rendered_keeps_terminal_mode() -> Result<()> {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -35330,20 +34993,7 @@ terminal_window_id: None,
 
     #[test]
     fn request_terminal_launch_promotes_stored_remote_preview_as_live_ssh() -> Result<()> {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -35381,20 +35031,7 @@ terminal_window_id: None,
 
     #[test]
     fn terminal_restart_recovery_promotes_scanned_remote_session() -> Result<()> {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -35424,20 +35061,7 @@ terminal_window_id: None,
 
     #[test]
     fn startup_prewarm_terminal_launch_preserves_active_session_and_order() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -35487,20 +35111,7 @@ terminal_window_id: None,
 
     #[test]
     fn start_ssh_session_keeps_machine_label_separate_from_session_title() -> Result<()> {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -35541,20 +35152,7 @@ terminal_window_id: None,
 
     #[test]
     fn connect_ssh_custom_uses_verified_remote_binary_before_success() -> Result<()> {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -35626,20 +35224,7 @@ terminal_window_id: None,
 
     #[test]
     fn promote_remote_machine_health_marks_cached_machine_healthy() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -35685,20 +35270,7 @@ terminal_window_id: None,
 
     #[test]
     fn cached_remote_launch_skips_cached_machine_binary_expr() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -35720,20 +35292,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_preview_open_keeps_synthesized_preview_while_loading() -> Result<()> {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36017,20 +35576,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_preview_payload_apply_filters_scaffold_from_older_remote_binaries() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36105,20 +35651,7 @@ terminal_window_id: None,
 
     #[test]
     fn passive_preview_title_hints_do_not_overwrite_user_titles() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36163,20 +35696,7 @@ terminal_window_id: None,
 
     #[test]
     fn passive_preview_for_path_does_not_promote_generated_title_to_user_title() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36214,20 +35734,7 @@ terminal_window_id: None,
     }
 
     fn outline_test_server() -> YggtermServer {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36464,20 +35971,7 @@ terminal_window_id: None,
     /// applied ORDER survived. Order was a stored fact; the title was re-derived.
     #[test]
     fn an_explicitly_renamed_row_keeps_its_name_across_a_daemon_restart() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36508,7 +36002,6 @@ terminal_window_id: None,
         // A NEW daemon restores the row and knows nothing about it; then the
         // CC transcript scan offers the conversation's own generated title.
         let mut next = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36556,20 +36049,7 @@ terminal_window_id: None,
     /// half.
     #[test]
     fn an_explicit_rename_stamps_provenance_on_the_mirror_that_outlives_the_live_row() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36638,20 +36118,7 @@ terminal_window_id: None,
     /// that projection — never the reply — is what a test must assert on.
     #[test]
     fn a_reversed_order_changes_what_the_sidebar_renders_from() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36706,20 +36173,7 @@ terminal_window_id: None,
     /// title — a row whose CLI had self-titled would have lost its number).
     #[test]
     fn an_outline_prefix_survives_a_daemon_restart_the_way_an_explicit_title_does() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36750,7 +36204,6 @@ terminal_window_id: None,
         );
 
         let mut next = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36776,20 +36229,7 @@ terminal_window_id: None,
     /// agree — so this test is the thing that keeps them honest.
     #[test]
     fn an_agent_row_is_born_keep_alive_on_every_lane_not_just_the_local_one() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36867,20 +36307,7 @@ terminal_window_id: None,
     /// auto-generated conversation title.
     #[test]
     fn a_generated_title_never_displaces_an_explicit_one() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36920,20 +36347,7 @@ terminal_window_id: None,
     /// would trade one bug for a worse one: rows stuck on `local shell`.
     #[test]
     fn a_derived_title_still_lands_on_a_row_the_user_never_named() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36948,20 +36362,7 @@ terminal_window_id: None,
 
     #[test]
     fn passive_title_hint_can_still_replace_placeholder_titles() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -36986,20 +36387,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_preview_payload_apply_filters_current_date_timezone_scaffold() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -37067,20 +36455,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_preview_payload_apply_filters_placeholder_rendered_sections() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -37605,20 +36980,7 @@ terminal_window_id: None,
 
     #[test]
     fn restore_persisted_state_filters_loopback_ssh_targets() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -37658,20 +37020,7 @@ terminal_window_id: None,
 
     #[test]
     fn restore_persisted_state_keeps_stale_remote_active_session_as_preview() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -37734,20 +37083,7 @@ terminal_window_id: None,
 
     #[test]
     fn apply_snapshot_turns_remote_scan_active_without_runtime_into_preview() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -37807,20 +37143,7 @@ terminal_window_id: None,
 
     #[test]
     fn restore_persisted_state_keeps_remote_live_sessions_missing_from_scan_as_resume_targets() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -37878,20 +37201,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_refresh_prunes_unkept_update_restored_remote_live_without_runtime() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -37971,20 +37281,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_refresh_keeps_explicit_keep_alive_remote_live_without_runtime() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38053,20 +37350,7 @@ terminal_window_id: None,
 
     #[test]
     fn persisted_state_includes_recoverable_local_live_sessions_and_skips_documents() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38178,20 +37462,7 @@ terminal_window_id: None,
         // user-close policy, not a persistence filter. The keep_alive FLAG still
         // round-trips so a genuine user GUI-close (PrepareClientClose) can drop
         // non-keep-alive rows; that close path is covered separately.
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38233,20 +37504,7 @@ terminal_window_id: None,
 
     #[test]
     fn terminal_runtime_key_representation_tracks_current_live_state() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38302,20 +37560,7 @@ terminal_window_id: None,
         // The superseded-daemon takeover imports sessions in SOURCE order and
         // anchors each after its predecessor; appended-at-end imports were the
         // "rows in weird places after restart" bug.
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38346,20 +37591,7 @@ terminal_window_id: None,
     /// four of them teleported to the extremes of the Live pane.
     #[test]
     fn import_peer_live_rows_weaves_them_in_at_their_peer_anchors() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38419,20 +37651,7 @@ terminal_window_id: None,
     /// admission predicate is the ONLY thing the two importers may differ on.
     #[test]
     fn import_peer_live_rows_honours_the_front_anchor_and_the_admit_predicate() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "root".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38489,20 +37708,7 @@ terminal_window_id: None,
 
     #[test]
     fn update_restart_persistence_temporarily_protects_unkept_live_sessions() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38570,20 +37776,7 @@ terminal_window_id: None,
         // FIRST-CLASS SESSIONS (guihost 2026-07-08): a focused unkept shell is now
         // persisted (first-class), so the active pointer stays on it — there is
         // no longer an "excluded live session" for the active pointer to avoid.
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38635,20 +37828,7 @@ terminal_window_id: None,
 
     #[test]
     fn update_restart_persistence_preserves_active_unkept_live_session() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38697,20 +37877,7 @@ terminal_window_id: None,
 
     #[test]
     fn update_restart_persistence_filters_unkept_sessions_without_runtime_truth() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38764,20 +37931,7 @@ terminal_window_id: None,
 
     #[test]
     fn temporary_update_restore_does_not_convert_session_to_keep_alive() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38826,20 +37980,7 @@ terminal_window_id: None,
 
     #[test]
     fn request_terminal_launch_for_active_skips_non_terminal_view() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38887,20 +38028,7 @@ terminal_window_id: None,
         // than being dropped on load. The daemon snapshot runtime-truth filter is
         // what hides a restored shell whose PTY did not actually survive — the
         // row itself is materialized so a surviving PTY can re-adopt it.
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -38942,20 +38070,7 @@ terminal_window_id: None,
 
     #[test]
     fn restore_persisted_state_restores_unkept_update_restart_live_sessions_first_class() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -39017,14 +38132,7 @@ terminal_window_id: None,
     /// keep-alive, restore reason) written over the top of it.
     #[test]
     fn adopting_a_live_row_that_already_exists_is_a_no_op() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            children: Vec::new(),
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -39116,14 +38224,7 @@ terminal_window_id: None,
     #[test]
     fn open_or_focus_session_births_agent_rows_keep_alive_but_never_flips_existing() {
         use super::session_keep_alive;
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            children: Vec::new(),
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -39444,15 +38545,7 @@ terminal_window_id: None,
     }
 
     fn tenancy_test_server() -> YggtermServer {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            ..Default::default()
-        };
         YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -39461,20 +38554,7 @@ terminal_window_id: None,
 
     #[test]
     fn restore_persisted_state_preserves_active_keep_alive_remote_over_update_restart_local() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -39553,20 +38633,7 @@ terminal_window_id: None,
 
     #[test]
     fn restore_persisted_state_rehydrates_recoverable_local_live_sessions_but_skips_documents() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -39668,20 +38735,7 @@ terminal_window_id: None,
 
     #[test]
     fn restore_persisted_state_preserves_multiple_local_live_sessions_of_same_kind() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -39767,20 +38821,7 @@ terminal_window_id: None,
 
     #[test]
     fn restore_persisted_state_keeps_remote_live_sessions_present_in_scan() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -39927,20 +38968,7 @@ terminal_window_id: None,
 
     #[test]
     fn request_terminal_launch_promotes_stored_codex_transcript_into_live_sessions() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40001,20 +39029,7 @@ terminal_window_id: None,
 
     #[test]
     fn restore_live_session_migrates_raw_codex_storage_key_to_local_runtime() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40060,20 +39075,7 @@ terminal_window_id: None,
 
     #[test]
     fn restore_live_session_preserves_daemon_codex_runtime_key() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40120,20 +39122,7 @@ terminal_window_id: None,
     // resume-cc wrapper lane.
     #[test]
     fn restore_live_session_puts_remote_cc_row_on_wrapper_lane() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40196,23 +39185,10 @@ terminal_window_id: None,
 
     #[test]
     fn update_restart_persists_real_codex_identity_for_synthetic_runtime_key() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let runtime_key = "codex-runtime://synthetic-runtime";
         let storage_path =
             "/home/user/.codex/sessions/2026/05/06/rollout-2026-05-06T00-00-00-real-session.jsonl";
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40261,7 +39237,6 @@ terminal_window_id: None,
         assert_eq!(live.storage_path.as_deref(), Some(storage_path));
 
         let mut restored = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40302,24 +39277,11 @@ terminal_window_id: None,
 
     #[test]
     fn keep_alive_remote_codex_identity_restores_real_session_not_fresh_start() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let synthetic_id = "54f06fff-d15d-4e79-8734-0ec9627632f2";
         let real_id = "019e3fd6-87da-7803-a4e6-f95ad0f0e687";
         let runtime_key = remote_scanned_session_path("dev", synthetic_id);
         let storage_path = "/home/user/.codex/sessions/2026/05/19/rollout-2026-05-19T16-14-44-019e3fd6-87da-7803-a4e6-f95ad0f0e687.jsonl";
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40376,7 +39338,6 @@ terminal_window_id: None,
         assert_eq!(persisted_live.remote_launch_action, None);
 
         let mut restored = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40434,21 +39395,8 @@ terminal_window_id: None,
             "manual",
             "interface-llm",
         )?;
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let runtime_key = remote_scanned_session_path("dev", synthetic_id);
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40506,23 +39454,10 @@ terminal_window_id: None,
 
     #[test]
     fn remote_copy_target_prefers_real_codex_session_metadata_over_runtime_path() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let synthetic_id = "0dce9c47-2495-4243-a658-d5162507f92e";
         let real_id = "019e0339-aed4-7993-a3fa-f3dad1388e3c";
         let runtime_key = remote_scanned_session_path("dev", synthetic_id);
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40549,23 +39484,10 @@ terminal_window_id: None,
 
     #[test]
     fn remote_shutdown_target_prefers_real_codex_identity_metadata() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let synthetic_id = "0dce9c47-2495-4243-a658-d5162507f92e";
         let real_id = "019e0339-aed4-7993-a3fa-f3dad1388e3c";
         let runtime_key = remote_scanned_session_path("dev", synthetic_id);
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40585,24 +39507,11 @@ terminal_window_id: None,
 
     #[test]
     fn closing_synthetic_remote_codex_live_promotes_real_session_to_scanned_tree() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let synthetic_id = "0dce9c47-2495-4243-a658-d5162507f92e";
         let real_id = "019e0339-aed4-7993-a3fa-f3dad1388e3c";
         let runtime_key = remote_scanned_session_path("dev", synthetic_id);
         let storage_path = "/home/user/.codex/sessions/2026/05/07/rollout-019e0339-aed4-7993-a3fa-f3dad1388e3c.jsonl";
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40670,23 +39579,10 @@ terminal_window_id: None,
 
     #[test]
     fn closing_unmaterialized_remote_start_codex_does_not_promote_to_scanned_tree() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let machine_key = "samplenotes-webapp";
         let synthetic_id = "cdb00ffb-757d-4183-9dcd-825d9d18102e";
         let runtime_key = remote_scanned_session_path(machine_key, synthetic_id);
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40742,18 +39638,6 @@ terminal_window_id: None,
 
     #[test]
     fn restore_persisted_state_drops_remote_scanned_sessions_without_storage() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let machine_key = "samplenotes-webapp";
         let phantom_id = "cdb00ffb-757d-4183-9dcd-825d9d18102e";
         let phantom_path = remote_scanned_session_path(machine_key, phantom_id);
@@ -40761,7 +39645,6 @@ terminal_window_id: None,
         machine.sessions[0].storage_path.clear();
         machine.sessions[0].title_hint = "samplenotes webapp".to_string();
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40789,23 +39672,10 @@ terminal_window_id: None,
 
     #[test]
     fn update_restart_persists_real_codex_identity_for_local_runtime_key() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let runtime_key = "local://synthetic-runtime";
         let storage_path =
             "/home/user/.codex/sessions/2026/05/06/rollout-2026-05-06T00-00-00-real-session.jsonl";
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40851,7 +39721,6 @@ terminal_window_id: None,
         assert_eq!(live.storage_path.as_deref(), Some(storage_path));
 
         let mut restored = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -40919,20 +39788,7 @@ terminal_window_id: None,
 
     #[test]
     fn apply_snapshot_does_not_resurrect_missing_previous_live_active_session() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -41014,20 +39870,7 @@ terminal_window_id: None,
     /// pass by encoding an assumption about them that later drifts.
     #[test]
     fn apply_snapshot_keeps_the_full_active_record_the_live_list_carries_capped() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -41203,20 +40046,7 @@ terminal_window_id: None,
             outline_prefix: None,
         };
 
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -41257,20 +40087,7 @@ terminal_window_id: None,
 
     #[test]
     fn apply_snapshot_preserves_durable_ssh_machine_targets_missing_from_snapshot() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -41361,20 +40178,7 @@ terminal_window_id: None,
         fs::write(&active_path, &transcript)?;
         fs::write(&inactive_path, &transcript)?;
 
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -41445,20 +40249,7 @@ terminal_window_id: None,
             .join("\n"),
         )?;
 
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -41532,20 +40323,7 @@ terminal_window_id: None,
 
     #[test]
     fn restore_live_remote_session_preserves_remote_session_path_without_cached_scan() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -41592,20 +40370,7 @@ terminal_window_id: None,
 
     #[test]
     fn restore_live_remote_session_uses_cached_fallback_binary_without_resolve() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -41674,20 +40439,7 @@ terminal_window_id: None,
 
     #[test]
     fn start_remote_codex_session_uses_remote_start_codex_launch_contract() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -41746,20 +40498,7 @@ terminal_window_id: None,
 
     #[test]
     fn start_remote_claude_session_assigns_authoritative_session_id() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -41825,20 +40564,7 @@ terminal_window_id: None,
     /// A remote row for a machine-key'd host, built the way the app-control
     /// remote arm builds one.
     fn server_with_one_remote_machine() -> YggtermServer {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -42007,20 +40733,7 @@ terminal_window_id: None,
         let previous_colorterm = std::env::var_os("COLORTERM");
 
         let result = std::panic::catch_unwind(|| {
-            let tree = SessionNode {
-                kind: SessionNodeKind::Group,
-                name: "sessions".to_string(),
-                title: None,
-                document_kind: None,
-                group_kind: None,
-                path: PathBuf::from("/"),
-                children: Vec::new(),
-                session_id: None,
-                cwd: None,
-                ..Default::default()
-            };
             let mut server = YggtermServer::new(
-                &tree,
                 false,
                 GhosttyHostSupport::shadow("test".to_string(), false, false),
                 UiTheme::ZedLight,
@@ -42083,20 +40796,7 @@ terminal_window_id: None,
         let previous_colorterm = std::env::var_os("COLORTERM");
 
         let result = std::panic::catch_unwind(|| {
-            let tree = SessionNode {
-                kind: SessionNodeKind::Group,
-                name: "sessions".to_string(),
-                title: None,
-                document_kind: None,
-                group_kind: None,
-                path: PathBuf::from("/"),
-                children: Vec::new(),
-                session_id: None,
-                cwd: None,
-                ..Default::default()
-            };
             let mut server = YggtermServer::new(
-                &tree,
                 false,
                 GhosttyHostSupport::shadow("test".to_string(), false, false),
                 UiTheme::ZedLight,
@@ -42201,20 +40901,7 @@ terminal_window_id: None,
             std::env::set_var("CODEX_HOME", &home);
         }
 
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -42297,20 +40984,7 @@ terminal_window_id: None,
             std::env::set_var("CODEX_HOME", &home);
         }
 
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -42364,20 +41038,7 @@ terminal_window_id: None,
 
     #[test]
     fn start_remote_codex_session_does_not_seed_preview_scaffold() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -42403,20 +41064,7 @@ terminal_window_id: None,
 
     #[test]
     fn restore_remote_start_codex_session_keeps_start_contract_even_when_scan_has_same_id() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -42494,20 +41142,7 @@ terminal_window_id: None,
 
     #[test]
     fn update_restart_restore_remote_start_codex_requires_existing_session() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -42581,20 +41216,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_session_stop_command_does_not_send_quit_into_attached_terminal() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -42638,20 +41260,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_shutdown_targets_carry_routing_only_never_the_machine() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -42756,20 +41365,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_shutdown_target_for_path_returns_single_machine_ref_without_session_list() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -42857,20 +41453,7 @@ terminal_window_id: None,
     /// dev pinned at 147x50.
     #[test]
     fn remote_cc_session_pty_has_a_resize_target_and_uses_the_cc_runtime_key() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -43216,20 +41799,7 @@ terminal_window_id: None,
 
     #[test]
     fn refresh_remote_preview_for_open_session_does_not_require_machine_scan() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -43260,20 +41830,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_preview_full_fetch_is_active_rendered_only() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -43310,20 +41867,7 @@ terminal_window_id: None,
 
     #[test]
     fn interactive_sessions_are_never_stopped_by_typing_into_their_prompt() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -43376,20 +41920,7 @@ terminal_window_id: None,
 
     #[test]
     fn remove_live_session_allows_live_local_runtime_sessions() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -43436,14 +41967,7 @@ terminal_window_id: None,
         // died at every swap — even though the codex transcript is durable on
         // disk. Persist → restore into a FRESH server must keep the row.
         use crate::{is_loopback_ssh_target, persisted_live_session_is_recoverable};
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            path: PathBuf::from("/"),
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -43530,7 +42054,6 @@ terminal_window_id: None,
 
         // Restore into a FRESH server (the daemon-process restart) keeps the row.
         let mut fresh = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -43556,14 +42079,7 @@ terminal_window_id: None,
         // agent rows (swap ORDERING dependence). Local agent rows re-derive
         // from the CLI's JSONL store and must ride EVERY persist; under the
         // first-class-sessions change (guihost 2026-07-08) plain shells ride too.
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            path: PathBuf::from("/"),
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -43598,7 +42114,6 @@ terminal_window_id: None,
             .expect("persisted codex row")
             .clone();
         let mut fresh = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -43635,20 +42150,7 @@ terminal_window_id: None,
         // User bug (2026-06-10 #7): context-menu "Open new terminal/CC/codex
         // here" always landed at the TOP of Live Sessions; it must land
         // directly below the right-clicked row.
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -43670,31 +42172,7 @@ terminal_window_id: None,
 
     #[test]
     fn remove_live_session_does_not_fallback_to_stored_session() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: vec![SessionNode {
-                kind: SessionNodeKind::CodexSession,
-                name: "saved".to_string(),
-                title: Some("Saved".to_string()),
-                document_kind: None,
-                group_kind: None,
-                path: PathBuf::from("/home/user/.codex/sessions/example.jsonl"),
-                children: Vec::new(),
-                session_id: Some("saved".to_string()),
-                cwd: Some("/home/user".to_string()),
-                ..Default::default()
-            }],
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -43730,20 +42208,7 @@ terminal_window_id: None,
 
     #[test]
     fn detach_live_session_view_preserves_keep_alive_runtime_metadata() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
@@ -43780,20 +42245,7 @@ terminal_window_id: None,
 
     #[test]
     fn remove_live_session_clears_active_path_for_normalized_active_alias() {
-        let tree = SessionNode {
-            kind: SessionNodeKind::Group,
-            name: "sessions".to_string(),
-            title: None,
-            document_kind: None,
-            group_kind: None,
-            path: PathBuf::from("/"),
-            children: Vec::new(),
-            session_id: None,
-            cwd: None,
-            ..Default::default()
-        };
         let mut server = YggtermServer::new(
-            &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
