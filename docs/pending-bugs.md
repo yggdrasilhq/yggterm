@@ -273,6 +273,33 @@ is an artefact. Only wall-clock spans may be placed on a timeline; of the ones
 that overlapped, `daemon_request/terminal_restart` (45,051 ms) and
 `daemon_request/hot_restart` (10,307 ms) are wall spans and remain real leads.
 
+### ⭐ AND THE 11 FAILURES ARE TWO DIFFERENT BUGS, NOT ONE
+
+First: **~60 s is the TIMEOUT, not the work.** `REMOTE_TERMINAL_RESUME_FAIL_MS`
+is 60,000, and each deferral adds one 30 s
+`REMOTE_TERMINAL_RESUME_OUTPUT_PROGRESS_GRACE_MS`. That decodes every failure
+duration exactly — 60,003 / 60,095 / 60,152 / 61,173 / 62,098 / 63,691 / 63,837 /
+68,323 are the bare ceiling, and 97,950 / 122,174 are the ceiling plus deferrals.
+⇒ **Nobody should read those numbers as "it took 60 seconds".** They mean "it
+never arrived, and this is when we stopped waiting."
+
+Split them by whether output ever came, and they are clearly two populations:
+
+| shape | n | `first_output_ms` | what it means |
+|---|---|---|---|
+| **A — silent** | 5 | `None` | the remote PTY produced NOTHING for 60 s+ |
+| **B — spoke, then never readied** | 4 | 2,279 / 3,105 / 5,004 / 27,039 | output flowed within seconds and the readiness gate still never latched |
+
+**B is the more damning of the two and the better place to start**: the data the
+gate is waiting for arrived in 2-5 seconds, and the attempt sat until a ceiling
+killed it. That is a gate that cannot see the thing it is gating on — ask what
+its release condition actually reads, and feed it the exact bytes that arrived.
+(Two more failures recorded no mount at all, which is a third shape worth
+separating rather than lumping in.)
+
+⇒ **Shape A is the one that most likely IS the owner's "new session never
+starts"**: no process, no output, no error — the same silence.
+
 ⛔ Do not start from the memory angle again; it has been measured and excluded.
 
 **Falsifier:** cold-tier p90 under 3 s and zero `reveal_failed` over a comparable
