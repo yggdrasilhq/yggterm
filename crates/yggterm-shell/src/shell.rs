@@ -557,6 +557,21 @@ const REMOTE_RESUME_GATE_CEILING_POLL_MS: u64 = 2_000;
 /// predicate measures from the attempt's FIRST output, so a single re-check
 /// already settles one attempt and this bound only covers attempt churn.
 const REMOTE_TERMINAL_RESUME_TIMEOUT_MAX_DEFERRALS: u32 = 4;
+/// How long a host bootstrap skipped for an INACTIVE session waits before the
+/// in-flight open attempt is cancelled.
+///
+/// Not zero, and the reason is the near-miss recorded on
+/// `terminal_session_should_bootstrap_host`: during a switch the server-side
+/// active path lags the click by one request round-trip, so the activeness test
+/// can read false for the session the user just clicked. That is why the
+/// predicate accepts the render snapshot as well — and why cancelling on the
+/// first false reading would cancel the very reveal it is meant to protect.
+///
+/// 1.5 s is roughly an order of magnitude above the round-trip it covers (a full
+/// `startup/initial_server_sync` measured 177.6 ms on the GUI host after 3.0.97)
+/// and 2.5% of the 60 s ceiling it replaces. ⇒ To make the cancel immediate,
+/// set this to 0; to be more forgiving of a glance-away, raise it.
+const INACTIVE_BOOTSTRAP_SKIP_CANCEL_GRACE_MS: u64 = 1_500;
 const REMOTE_TERMINAL_RESUME_RECOVERY_STALL_MS: u64 = 3_000;
 const REMOTE_TERMINAL_BLANK_RUNTIME_OUTPUT_RECOVERY_MS: u64 = 1_100;
 const REMOTE_TERMINAL_START_CODEX_RECOVERY_STALL_MS: u64 = 18_000;
@@ -24370,10 +24385,17 @@ impl ShellState {
             &trace_home,
             "ui",
             "reveal",
-            if outcome == "ready" {
-                "reveal_ready"
-            } else {
-                "reveal_failed"
+            // ⛔ THREE OUTCOMES, THREE EVENT NAMES. `reveal_failed` is what the
+            // post-mortem counts, and every question asked of it ("how many
+            // reveals never became ready", "what is the failure rate on the cold
+            // tier") is a question about the REMOTE side failing to answer. A
+            // reveal the user themselves abandoned is not that, and folding it
+            // into the same name is how 4 of 11 "failures" in the 2026-08-10
+            // sample were really switch-aways.
+            match outcome {
+                "ready" => "reveal_ready",
+                "cancelled" => "reveal_cancelled",
+                _ => "reveal_failed",
             },
             entry.to_json(),
         );
@@ -25258,6 +25280,92 @@ impl ShellState {
             "failed",
             attempt_snapshot.latched_failure_reason.clone(),
         );
+    }
+    /// Resolve the in-flight open attempt for a session whose host bootstrap was
+    /// SKIPPED because the session is no longer the one being revealed.
+    ///
+    /// ⛔ **THE SPAWN DECISION AND THE WAIT MUST SHARE AN OWNER.** The
+    /// `bootstrap_spawn_skipped_inactive_retained_host` branch in `TerminalCanvas`
+    /// used to write a trace event and nothing else, so an attempt begun by the
+    /// click went on waiting for a mount that had already been decided against,
+    /// and the only thing that could ever end it was the 60 s
+    /// `REMOTE_TERMINAL_RESUME_FAIL_MS` ceiling: a red *"did not become
+    /// interactive in time"* toast a minute later about a session the user had
+    /// already left, and a `reveal_failed` row blaming the remote host for our
+    /// own decision. Measured 2026-08-10 — 4 of the 11 never-ready reveals in the
+    /// n=106 sample, including the 15:01 burst of three at once, which is what
+    /// this shape looks like by construction: at most one session can be active,
+    /// so revealing three rows skips two of them.
+    ///
+    /// ⚠ The near-miss to not repeat: `terminal_session_should_bootstrap_host`
+    /// was once WIDENED (accept the live active path OR the render snapshot) to
+    /// make this skip rarer. Widening a predicate is not the same as closing the
+    /// hole it falls through — this is the close.
+    ///
+    /// The guard is deliberately re-asserted here rather than trusted from the
+    /// caller: a session that IS the active terminal is never cancelled, however
+    /// stale the caller's view of the world had become while it waited out the
+    /// grace window.
+    ///
+    /// Returns true when an attempt was actually cancelled.
+    fn cancel_terminal_open_attempt_for_inactive_session(
+        &mut self,
+        session_path: &str,
+        reason: &str,
+    ) -> bool {
+        if self.server.active_view_mode() == WorkspaceViewMode::Terminal
+            && self.server.active_session_path() == Some(session_path)
+        {
+            return false;
+        }
+        let Some(attempt_id) = self
+            .terminal_open_attempt_by_session
+            .get(session_path)
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) else {
+            return false;
+        };
+        // Only an attempt that is still WAITING may be cancelled. One that
+        // already reached ready, already latched a failure, or was already
+        // cancelled has an outcome, and an outcome has exactly one owner.
+        if attempt.latched_failure_reason.is_some()
+            || attempt.ready_at_ms.is_some()
+            || !matches!(
+                attempt.state,
+                TerminalOpenAttemptState::Pending | TerminalOpenAttemptState::Recovering
+            )
+        {
+            return false;
+        }
+        attempt.latched_failure_at_ms = Some(current_millis());
+        attempt.latched_failure_reason = Some(reason.to_string());
+        attempt.state = TerminalOpenAttemptState::Cancelled;
+        let attempt_snapshot = attempt.clone();
+        self.record_terminal_open_attempt_event(
+            "session_cancelled",
+            &attempt_snapshot,
+            Some(json!({ "reason": reason })),
+        );
+        self.record_reveal_outcome(
+            &attempt_snapshot.session_path,
+            &attempt_snapshot.attempt_id,
+            "cancelled",
+            Some(reason.to_string()),
+        );
+        true
+    }
+    /// True when the latest open attempt for this session was CANCELLED.
+    ///
+    /// This is the signal the resume-timeout timer stands down on: a cancelled
+    /// attempt is the one state in which nobody is waiting for a mount any more,
+    /// so raising "the live terminal did not become interactive in time" would be
+    /// a failure notice for a reveal that was never going to happen.
+    fn terminal_session_reveal_attempt_was_cancelled(&self, session_path: &str) -> bool {
+        self.latest_terminal_open_attempt_for_path(session_path)
+            .is_some_and(|attempt| matches!(attempt.state, TerminalOpenAttemptState::Cancelled))
     }
     /// Returns true when the most recent open attempt for this session
     /// observed the "saved Codex session no longer on remote machine" surface
@@ -92687,6 +92795,33 @@ fn TerminalCanvas(
                         );
                         return;
                     }
+                    // ⛔ A REVEAL THE USER WALKED AWAY FROM HAS NO FAILURE.
+                    // When the host bootstrap was skipped because this session
+                    // stopped being the active one, the attempt is CANCELLED at
+                    // that moment; this timer is the thing that would otherwise
+                    // wake a minute later and tell the user their terminal
+                    // "did not become interactive in time" — about a session
+                    // they had left, on a mount nobody ever asked us to make.
+                    let reveal_cancelled = safe_shell_read(
+                        state,
+                        "terminal_resume_timeout_check_cancelled",
+                        |shell| shell.terminal_session_reveal_attempt_was_cancelled(&session_path),
+                    )
+                    .unwrap_or(false);
+                    if reveal_cancelled {
+                        clear_terminal_resume_notification(state, &session_path);
+                        append_trace_event(
+                            &timer_trace_home,
+                            "ui",
+                            "terminal_mount",
+                            "resume_timeout_stood_down_reveal_cancelled",
+                            json!({
+                                "session_path": session_path,
+                                "bootstrap_identity": timer_bootstrap_lease_identity,
+                            }),
+                        );
+                        return;
+                    }
                     let deferred_for_output_progress = safe_shell_mut(
                         state,
                         "terminal_resume_timeout_defer_output_progress",
@@ -94176,6 +94311,46 @@ fn TerminalCanvas(
                     "mount_identity": mount_identity.clone(),
                 }),
             );
+            // ⛔ AND NOW TELL THE WAITER. Writing the trace event was the whole
+            // of this branch, so an open attempt begun by the click sat waiting
+            // for a mount we had just decided against, until the 60 s ceiling
+            // ended it with a failure toast about a session the user had left.
+            // The skip is the decision; resolving the attempt is what makes the
+            // decision reach the person waiting on it.
+            let cancel_session_path = session_path.clone();
+            let cancel_trace_home = trace_home.clone();
+            let cancel_bootstrap_identity = bootstrap_identity.clone();
+            let state = state;
+            spawn(async move {
+                sleep(Duration::from_millis(
+                    INACTIVE_BOOTSTRAP_SKIP_CANCEL_GRACE_MS,
+                ))
+                .await;
+                let cancelled = safe_shell_mut(
+                    state,
+                    "terminal_bootstrap_skip_cancel_open_attempt",
+                    |shell| {
+                        shell.cancel_terminal_open_attempt_for_inactive_session(
+                            &cancel_session_path,
+                            "the reveal was cancelled: this session stopped being the active terminal before its host could mount",
+                        )
+                    },
+                )
+                .unwrap_or(false);
+                if cancelled {
+                    append_trace_event(
+                        &cancel_trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "bootstrap_skip_cancelled_open_attempt",
+                        json!({
+                            "session_path": cancel_session_path,
+                            "bootstrap_identity": cancel_bootstrap_identity,
+                            "grace_ms": INACTIVE_BOOTSTRAP_SKIP_CANCEL_GRACE_MS,
+                        }),
+                    );
+                }
+            });
         }
     }
     let recovered_stale_startup_restore = if should_bootstrap_host {
@@ -94566,9 +94741,17 @@ fn TerminalCanvas(
                 return;
             }
             let _ = safe_shell_mut(state, "terminal_attach_begin", |shell| {
+                // A CANCELLED attempt counts as ABSENT here. It belongs to a
+                // reveal the user walked away from; leaving it mapped would hand
+                // this bootstrap an attempt that is already resolved, so the
+                // resume-timeout timer would stand down on it and THIS mount
+                // would lose its failure ceiling entirely.
+                let previous_attempt_was_cancelled =
+                    shell.terminal_session_reveal_attempt_was_cancelled(&session_path);
                 if shell
                     .latest_terminal_open_attempt_for_path(&session_path)
                     .is_none()
+                    || previous_attempt_was_cancelled
                 {
                     let synthetic_request_id = format!("startup-terminal-{}", current_millis());
                     let open_request_id = shell.latest_open_request_id.saturating_add(1);
@@ -168143,6 +168326,139 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // The latch is one-shot, so a second failure does not duplicate.
         shell.fail_terminal_open_attempt_for_session(active_session_path, "again".to_string());
         assert_eq!(shell.reveal_log.len(), 1);
+    }
+
+    /// ⛔ SHAPE B (2026-08-10): the user clicks a row, switches away before it
+    /// mounts, and 60 s later gets a red "did not become interactive in time"
+    /// toast about the session they left — plus a `reveal_failed` row blaming
+    /// the remote host for a mount WE decided not to make.
+    ///
+    /// Feed the fix the thing it must catch: an attempt in flight for a session
+    /// that is not the active terminal.
+    #[test]
+    fn a_reveal_cancelled_by_switching_away_is_resolved_and_never_counted_as_a_failure() {
+        let active_session_path = "remote-session://oc/reveal-cancel-active";
+        let left_behind_path = "remote-session://oc/reveal-cancel-left";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.in_app_notifications = true;
+        shell.settings.system_notifications = false;
+        shell.settings.notification_sound = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(left_behind_path, "req-left", 7, "open_row");
+        // Long enough that a `ready` outcome would nag about a slow reveal. A
+        // cancel must not borrow that voice either — nothing was slow, the user
+        // simply left.
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.started_at_ms = attempt.started_at_ms.saturating_sub(20_000);
+        }
+
+        assert!(
+            shell.cancel_terminal_open_attempt_for_inactive_session(
+                left_behind_path,
+                "switched away before the host could mount",
+            ),
+            "an attempt still waiting on a skipped bootstrap must be cancelled"
+        );
+
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt survives its cancellation");
+        assert_eq!(
+            attempt.state,
+            TerminalOpenAttemptState::Cancelled,
+            "the attempt must be RESOLVED, not left waiting for the 60 s ceiling"
+        );
+        assert_eq!(shell.reveal_log.len(), 1);
+        let entry = shell.reveal_log.back().expect("reveal entry");
+        assert_eq!(
+            entry.outcome, "cancelled",
+            "a switch-away is its own outcome; counting it as `failed` is what made \
+             4 of 11 never-ready reveals unfixable by construction"
+        );
+        assert!(
+            shell.notifications.is_empty(),
+            "a cancelled reveal must raise NO toast at all: {:?}",
+            shell
+                .notifications
+                .iter()
+                .map(|notification| notification.title.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            shell.terminal_session_reveal_attempt_was_cancelled(left_behind_path),
+            "the resume-timeout timer stands down on exactly this signal"
+        );
+
+        // One-shot, like the failure latch: a second skip tick cannot re-record.
+        assert!(
+            !shell.cancel_terminal_open_attempt_for_inactive_session(left_behind_path, "again"),
+            "an attempt that already has an outcome may not be given a second one"
+        );
+        assert_eq!(shell.reveal_log.len(), 1);
+    }
+
+    /// The other half of the falsifier: feed the guard the case it must NOT
+    /// catch. The bootstrap skip also fires transiently for the session the user
+    /// just clicked, because the server-side active path lags the click by one
+    /// round-trip — cancelling that one is the "session did not mount" bug this
+    /// guard is scoped to avoid.
+    #[test]
+    fn the_active_terminal_session_is_never_cancelled_by_the_bootstrap_skip() {
+        let active_session_path = "remote-session://oc/reveal-cancel-guard";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-active", 8, "open_row");
+
+        assert!(
+            !shell
+                .cancel_terminal_open_attempt_for_inactive_session(active_session_path, "too eager"),
+            "the session being revealed right now is not an abandoned one"
+        );
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt");
+        assert!(
+            matches!(attempt.state, TerminalOpenAttemptState::Pending),
+            "the active session's reveal must keep waiting, and keep its ceiling"
+        );
+        assert!(shell.reveal_log.is_empty());
+        assert!(!shell.terminal_session_reveal_attempt_was_cancelled(active_session_path));
+    }
+
+    /// A cancelled attempt stands the resume-timeout timer down, so it must not
+    /// outlive the reveal it belonged to: the next reveal begins a fresh attempt
+    /// and gets its own failure ceiling back.
+    #[test]
+    fn a_fresh_reveal_after_a_cancel_is_not_stood_down_by_the_old_attempt() {
+        let active_session_path = "remote-session://oc/reveal-cancel-rearm-active";
+        let session_path = "remote-session://oc/reveal-cancel-rearm";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.begin_terminal_open_attempt(session_path, "req-first", 9, "open_row");
+        assert!(
+            shell.cancel_terminal_open_attempt_for_inactive_session(session_path, "switched away")
+        );
+        assert!(shell.terminal_session_reveal_attempt_was_cancelled(session_path));
+
+        // The user comes back to the row.
+        shell.begin_terminal_open_attempt(session_path, "req-second", 10, "open_row");
+        assert!(
+            !shell.terminal_session_reveal_attempt_was_cancelled(session_path),
+            "a fresh attempt must clear the stand-down, or this reveal would have \
+             no failure ceiling at all"
+        );
+
+        // And a genuine failure on the fresh attempt is still recorded as one.
+        shell.fail_terminal_open_attempt_for_session(session_path, "boom".to_string());
+        let entry = shell.reveal_log.back().expect("reveal entry");
+        assert_eq!(entry.outcome, "failed");
     }
 
     #[test]

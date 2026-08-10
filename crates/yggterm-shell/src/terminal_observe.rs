@@ -7,6 +7,18 @@ pub(crate) enum TerminalOpenAttemptState {
     Recovering,
     Ready,
     Failed,
+    /// The reveal was ABANDONED BY DESIGN before it could mount — the user
+    /// switched away (or left the terminal surface) while the attempt was still
+    /// in flight, so the host bootstrap was skipped and there is nothing left to
+    /// wait for.
+    ///
+    /// ⛔ This is deliberately NOT `Failed`. Nothing failed: the decision not to
+    /// mount was ours. Recording it as a failure was the 2026-08-10 "shape B"
+    /// bug in two ways at once — it handed the user an error toast 60 s later
+    /// about a session they had already left, and it filled the reveal log with
+    /// failures that no amount of fixing the remote side could ever remove
+    /// (4 of the 11 "never became ready" reveals in the n=106 sample were this).
+    Cancelled,
 }
 
 /// Snapshot of system memory/swap pressure, sampled when a terminal reveal
@@ -1077,6 +1089,7 @@ pub(crate) fn terminal_open_attempt_state_label(state: &TerminalOpenAttemptState
         TerminalOpenAttemptState::Recovering => "recovering",
         TerminalOpenAttemptState::Ready => "ready",
         TerminalOpenAttemptState::Failed => "failed",
+        TerminalOpenAttemptState::Cancelled => "cancelled",
     }
 }
 

@@ -4,6 +4,33 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Switching away from a row that is still opening no longer earns you a red
+  error toast a minute later (3.0.98).** Click a session, change your mind,
+  click another one: sixty seconds after you had moved on, the row you left
+  raised *"The live terminal on dev did not become interactive in time."*
+  Nothing had gone wrong on dev. The GUI skips the host bootstrap for a session
+  that is no longer the active one — that is correct — but the skip branch wrote
+  a trace event and **nothing else**, so the open attempt started by the click
+  went on waiting for a mount that had already been decided against, and the
+  only thing left that could end it was the 60 s ceiling. The spawn decision and
+  the wait had no shared owner. ⇒ The skip now RESOLVES the attempt (after a
+  1.5 s grace, so the one-round-trip lag between a click and the server's own
+  idea of "active" cannot cancel the reveal it is meant to protect), the
+  resume-timeout timer stands down on that signal instead of raising the toast,
+  and a later reveal of the same row begins a fresh attempt so it keeps its own
+  failure ceiling. Measured on the GUI host 2026-08-10: this is 4 of the 11
+  reveals that never became ready in a 106-reveal sample, and the whole of the
+  15:01 burst of three failures at once — at most one session can be active, so
+  revealing three rows skips two of them by construction.
+  ⇒ **And a cancelled reveal is no longer counted as a failed one.** It gets its
+  own outcome (`reveal_cancelled`, distinct from `reveal_failed`) precisely
+  because every question anyone asks of the failure log — *how many reveals never
+  became ready, what is the cold-tier failure rate* — is a question about the
+  remote side failing to answer, and a reveal the user themselves walked away
+  from is not that. Locked by three tests, each falsified by mutation: the cancel
+  fires for an abandoned reveal, it never fires for the session being revealed
+  right now, and a fresh attempt after a cancel is not stood down by the old one.
+
 - **The `yggterm-server` test suite is green again — four red tests, all test
   hygiene, no production defect behind any of them.** They had failed at HEAD on
   `dev`, and a red bar teaches whoever runs the suite that red means "not mine".

@@ -316,15 +316,31 @@ test to accept either the live value or the render snapshot. That made the skip
 rarer; it did not make the skip tell the waiter. **Widening a predicate is not
 the same as closing the hole it falls through.**
 
-**RECOMMENDATION** (not yet implemented — it is a behaviour choice, so state it
-before taking it): when the bootstrap is skipped and an open attempt is in flight
-for that session, the attempt must be RESOLVED rather than abandoned — either
-cancelled with an honest reason, or parked in a state whose clock does not run.
-A user who switches away mid-reveal should not be handed a failure toast 60 s
-later about a session they left.
+⭐ **SHAPE B IS FIXED IN CODE (3.0.98) — see CHANGELOG; live proof still owed.**
+The skip branch now resolves the in-flight attempt instead of abandoning it, and
+the three behaviour calls that were open are settled:
+1. **Cancel, not fail.** A cancelled reveal gets its own attempt state and its
+   own trace event (`reveal_cancelled`), because the failure log's only question
+   is "did the remote side fail to answer" and a switch-away is not that.
+   ⇒ To reverse: drop the `Cancelled` variant and route the skip through
+   `fail_terminal_open_attempt_for_session` instead.
+2. **After a 1.5 s grace, not on the edge** (`INACTIVE_BOOTSTRAP_SKIP_CANCEL_GRACE_MS`).
+   The activeness test can read false transiently for the session the user JUST
+   clicked — that is the near-miss above — so cancelling on the first false
+   reading would cancel the reveal it exists to protect. The guard is re-asserted
+   inside the cancel, not trusted from the caller. ⇒ To reverse: set the constant
+   to 0 for an immediate cancel, or raise it to forgive a longer glance-away.
+3. **The toast is suppressed at the timer, not at the attempt.** The 60 s timer
+   raises the toast itself and only then latches the failure, so gating on
+   attempt state would not have stopped it; it now stands down on
+   `terminal_session_reveal_attempt_was_cancelled` and clears any stale resume
+   notice. A cancelled attempt counts as ABSENT to the next bootstrap, so the
+   next reveal begins a fresh attempt and keeps its own ceiling.
 
 ⇒ **Shape A is the one that most likely IS the owner's "new session never
-starts"**: no process, no output, no error — the same silence.
+starts"**: no process, no output, no error — the same silence. **It is
+untouched by the 3.0.98 fix** — shape A never spoke at all, so there was no
+skipped bootstrap behind it; do not read a quiet cancel as evidence about it.
 
 ⛔ Do not start from the memory angle again; it has been measured and excluded.
 
