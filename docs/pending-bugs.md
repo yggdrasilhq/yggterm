@@ -296,12 +296,49 @@ Split them by whether output ever came, and they are clearly two populations:
 | **A — silent** | 5 | `None` | the remote PTY produced NOTHING for 60 s+ |
 | **B — spoke, then never readied** | 4 | 2,279 / 3,105 / 5,004 / 27,039 | output flowed within seconds and the readiness gate still never latched |
 
-**B is the more damning of the two and the better place to start**: the data the
-gate is waiting for arrived in 2-5 seconds, and the attempt sat until a ceiling
-killed it. That is a gate that cannot see the thing it is gating on — ask what
-its release condition actually reads, and feed it the exact bytes that arrived.
-(Two more failures recorded no mount at all, which is a third shape worth
-separating rather than lumping in.)
+### ⭐⭐ SHAPE B, ROOT-CAUSED: THE SPAWN IS SKIPPED AND NOBODY TELLS THE WAITER
+
+Read from the trace, not inferred. The contrast is the whole proof:
+
+| | reveal that readied (11:19) | reveal that never readied (12:39) |
+|---|---|---|
+| +0.0 s | `bootstrap_spawn_**scheduled**` | `bootstrap_spawn_**skipped**_existing_lease` |
+| +3.8 s | — | `bootstrap_reset` → `bootstrap_spawn_**skipped**_inactive_retained_host` |
+| `js_ready` / `paint_ready` | **+0.5 s** | ⛔ **never** |
+| ends | ready | `reveal_failed` at +63.8 s |
+
+⇒ `terminal_session_should_bootstrap_host` returns false when the session is not
+the active one, and the skip branch **writes a trace event and nothing else** —
+it never touches the in-flight `terminal_open_attempt`. So the attempt waits for
+a mount that has been decided against, and the only thing that can end it is the
+60 s ceiling. **The spawn decision and the wait have no shared owner.**
+
+⚠ **`first_output_ms` on these is NOT the session speaking.** At +2.3 s the trace
+shows `forward_protocol_only_output`, and
+`mark_terminal_open_attempt_first_output_for_session` stamps `first_output_at_ms`
+**before** it looks at the `protocol_only` flag. So our own protocol chatter from
+the retained host is what made a never-mounted attempt look like it had spoken —
+the same shape as the OSC-7717 heartbeat that pinned the idle gate shut. The
+struct already carries `first_protocol_only_output_at_ms` and a separate
+meaningful-output latch, so the distinction exists and this reader ignores it.
+
+⇒ **This also explains the 15:01 burst of three simultaneous failures.** At most
+one session can be the active one; three rows revealing at once means two get
+skipped, and both then sit until the ceiling.
+
+⛔ **The near-miss worth reading before fixing:** the doc comment on
+`terminal_session_should_bootstrap_host` records that this exact class was hit
+before ("the session did not mount" bug) and fixed by WIDENING the activeness
+test to accept either the live value or the render snapshot. That made the skip
+rarer; it did not make the skip tell the waiter. **Widening a predicate is not
+the same as closing the hole it falls through.**
+
+**RECOMMENDATION** (not yet implemented — it is a behaviour choice, so state it
+before taking it): when the bootstrap is skipped and an open attempt is in flight
+for that session, the attempt must be RESOLVED rather than abandoned — either
+cancelled with an honest reason, or parked in a state whose clock does not run.
+A user who switches away mid-reveal should not be handed a failure toast 60 s
+later about a session they left.
 
 ⇒ **Shape A is the one that most likely IS the owner's "new session never
 starts"**: no process, no output, no error — the same silence.
@@ -7327,8 +7364,8 @@ exits mid-reap prints no `No such file` lines.
 
 **Status:** OPEN
 
-**Reported by row 8 (practice campaign) 2026-08-10 15:23 on guihost**, relayed via the
-vaultgraph session; observed while claiming a practice row with `--replace`:
+**Reported by another campaign row 2026-08-10 15:23 on the GUI host**, relayed via
+a third row; observed while claiming a row with `--replace`:
 
 ```
 15:23:28 ygg-claim remove: row_still_listed=False verified=False remote_runtime_survived
