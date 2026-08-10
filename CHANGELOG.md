@@ -4,6 +4,24 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A session running delegates is no longer the easiest one on the machine to
+  kill (3.0.101).** When an agent launches sub-agents and then waits for them,
+  every liveness signal yggterm had went quiet: the screen loses its `esc to
+  interrupt` footer, output stops, and `bash -c` gives the agent no separate
+  foreground process group to notice. So the daemon's cold shutdown — the path
+  that destroys PTYs — saw an idle session and was free to take it, stranding
+  every delegate: processes that outlive the interruption, hold rows, and never
+  learn their orchestrator is gone. Sessions like that are now a named blocker
+  (`orchestrating`), read from the agent's OWN record of its delegates rather
+  than guessed at from process ancestry, and the daemon waits for them **without
+  a deadline** — the owner's ruling, because a `continue` can repair a session
+  but cannot re-adopt an orphaned fleet. The wait is bounded in the way that
+  matters: it ends on its own the moment the delegates stop writing.
+  ⚠ Measured while building this, across every transcript on the build host:
+  **29.1% of 73,764 sub-agent records were written while the parent session
+  looked silent for over a minute, with a worst case of 30.6 minutes** — longer
+  than the 300 s window the gate used, and longer than the 30-minute deadline
+  that is coming.
 - **A shell that says it survives now actually has to (3.0.99).** `server attach`
   fell back to a plain, non-persistent login shell whenever the daemon could not
   be reached, and announced it with one line on **stderr**. On a desktop that is

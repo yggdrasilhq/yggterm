@@ -1939,6 +1939,31 @@ pub const HOT_RESTART_BLOCKER_RECENTLY_ACTIVE: &str = "recently_active";
 /// A session whose PTY cannot be recreated, so no amount of quiet makes a cold
 /// shutdown safe. See [`session_kind_state_survives_pty_loss`].
 pub const HOT_RESTART_BLOCKER_NOT_RESTORABLE: &str = "not_restorable";
+/// A session whose OWN transcript says a sub-agent is writing to it right now.
+///
+/// ⚖ Owner-ruled (`docs/settled-calls.md`, `docs/spec-hot-restart-relay-gate.md`
+/// §6): *"sessions running multiple agents inside should be waited for
+/// completion before hot restart (the 30 min rule does not apply here)."*
+/// The exemption is principled rather than a carve-out because **an
+/// orchestrating session's work is not its own**: interrupting it strands every
+/// delegate it launched — processes that outlive the interruption, hold rows,
+/// and never learn their orchestrator is gone. A `continue` repairs a session;
+/// it cannot re-adopt an orphaned fleet, so the blast radius is unbounded in a
+/// way a single turn's is not and no deadline can price it.
+pub const HOT_RESTART_BLOCKER_ORCHESTRATING: &str = "orchestrating";
+
+/// Is this blocker exempt from §5's 30-minute forced swap?
+///
+/// Derived from the kind rather than carried as its own field: a second
+/// encoding of one fact is how the gate and the deadline would come to disagree
+/// about which sessions may be interrupted, and disagreeing here costs a
+/// delegate fleet. §5's deadline is unbuilt; this is the predicate it must read.
+pub fn hot_restart_blocker_is_deadline_exempt(kind: &str) -> bool {
+    matches!(
+        kind,
+        HOT_RESTART_BLOCKER_ORCHESTRATING | HOT_RESTART_BLOCKER_NOT_RESTORABLE
+    )
+}
 
 /// One session holding a hot-restart open, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1983,6 +2008,10 @@ pub fn hot_restart_block_reason_summary(blockers: &[HotRestartBlocker]) -> Optio
         }
         HOT_RESTART_BLOCKER_NOT_RESTORABLE => format!(
             "{} is a plain shell with no store to resume from; a cold shutdown would destroy it",
+            first.session_key
+        ),
+        HOT_RESTART_BLOCKER_ORCHESTRATING => format!(
+            "{} is running sub-agents; interrupting it would strand them, so it is waited for without a deadline",
             first.session_key
         ),
         _ => match first.idle_ms {
@@ -3923,6 +3952,26 @@ impl DaemonRuntime {
                 });
                 continue;
             }
+            // ORCHESTRATING, and it is checked BEFORE the override on purpose.
+            // The override waives WAITING; §6's wait is not a wait for quiet, it
+            // is a refusal to strand another agent's delegates, and no deploy
+            // urgency prices that. The deploy is not blocked by it either — the
+            // PRESERVING handoff has no idle gate at all, so the successor is
+            // already serving; only THIS process's cold retire waits, which is
+            // exactly the version-coexistence the constitution asks for.
+            // ⚠ NOT `permanent`: it clears the moment the sub-agents stop
+            // writing, so `server daemons` still reads this as "deferring"
+            // rather than "lingering forever".
+            if self.session_subagents_are_writing(key, &runtime_path, threshold_ms) {
+                blockers.push(HotRestartBlocker {
+                    session_key: key.clone(),
+                    kind: HOT_RESTART_BLOCKER_ORCHESTRATING.to_string(),
+                    idle_ms: self.terminals.session_idle_for_ms(&runtime_path),
+                    threshold_ms,
+                    permanent: false,
+                });
+                continue;
+            }
             if overridden {
                 continue;
             }
@@ -3952,6 +4001,71 @@ impl DaemonRuntime {
         }
         hot_restart_blockers_actionable_first(&mut blockers);
         blockers
+    }
+
+    /// §6's positive ORCHESTRATING signal: is a sub-agent of this session
+    /// writing RIGHT NOW?
+    ///
+    /// Read from the agent's own `subagents/agent-*.jsonl`, which spec §8
+    /// demands (*"read it from the agent's own declared state, never from
+    /// process ancestry alone"*) and which is also the only place the answer
+    /// exists. Two facts, and BOTH are required:
+    ///
+    /// - **a sub-agent transcript grew inside the idle window** — otherwise a
+    ///   session whose delegates finished last week still reads as
+    ///   orchestrating, and the unbounded wait would never end;
+    /// - **its newest record is `isSidechain`** — so a stray file under that
+    ///   directory cannot pin a daemon forever.
+    ///
+    /// ⛔ `process_tree_runs_agent_cli` cannot answer this: `bash -c` has no job
+    /// control, so a delegate and an idle main loop look identical from `/proc`,
+    /// and a merely-busy session would reach the state with the unbounded wait.
+    /// ⛔ Nor can the PARENT transcript — see [`yggterm_core::TranscriptWriter`]:
+    /// `isSidechain` is `false` on all 179,392 parent records on this machine.
+    ///
+    /// ⚠ **Coverage is LOCAL transcripts only.** A `remote-cc://` row's JSONL
+    /// lives on the far host, and reaching it is an ssh hop per session per poll
+    /// on a path that runs every 20 s. Those answer "not orchestrating" — i.e.
+    /// exactly today's behaviour, so this can only ever add protection, never
+    /// take it away. The transport is the filed remainder; the SOURCE is proven.
+    fn session_subagents_are_writing(
+        &self,
+        session_key: &str,
+        runtime_path: &str,
+        threshold_ms: u64,
+    ) -> bool {
+        // ⚠ The ROW PATH, not the runtime key. `terminals.session_keys()` yields
+        // `local://<yggterm-runtime-id>`; the CC session id — the only thing that
+        // names a transcript — is in `cc-runtime://<id>`. Resolving the runtime
+        // key alone returns `None` for every live agent row on this machine,
+        // which is a detector that compiles, ships, and never fires.
+        let candidates = [
+            self.server.live_session_path(session_key),
+            Some(session_key.to_string()),
+            Some(runtime_path.to_string()),
+        ];
+        let Some(path) = candidates
+            .iter()
+            .flatten()
+            .filter_map(|candidate| {
+                crate::transcript_view::local_transcript_path_for_session(candidate)
+                    .ok()
+                    .flatten()
+            })
+            .next()
+        else {
+            return false;
+        };
+        // Freshness first: it is the cheap fact (one `stat` per sub-agent file,
+        // and most sessions have no such directory at all), and it is the one
+        // that BOUNDS the wait. Only then pay for the tail read.
+        let Some((newest, since)) = yggterm_core::newest_subagent_transcript(&path) else {
+            return false;
+        };
+        if since.as_millis() > u128::from(threshold_ms) {
+            return false;
+        }
+        yggterm_core::newest_transcript_writer(&newest) == yggterm_core::TranscriptWriter::SubAgent
     }
 
     /// The same predicate the retire loop acts on, collapsed to one line for the panel.
@@ -17371,9 +17485,10 @@ pub(crate) fn terminal_write_strategy_for_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonRuntime, HOT_RESTART_BLOCKER_NOT_RESTORABLE, HOT_RESTART_BLOCKER_RECENTLY_ACTIVE,
-        HOT_RESTART_BLOCKER_WORKING, HotRestartBlocker, hot_restart_block_reason_summary,
-        hot_update_handoff_would_refuse_binary,
+        DaemonRuntime, HOT_RESTART_BLOCKER_NOT_RESTORABLE, HOT_RESTART_BLOCKER_ORCHESTRATING,
+        HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, HOT_RESTART_BLOCKER_WORKING, HotRestartBlocker,
+        hot_restart_block_reason_summary, hot_restart_blocker_is_deadline_exempt,
+        hot_restart_blockers_actionable_first, hot_update_handoff_would_refuse_binary,
     };
     use crate::live_row_tombstones::LiveRowTombstones;
 
@@ -18088,6 +18203,60 @@ mod tests {
             reason.contains("300s"),
             "the idle window must be stated: {reason}"
         );
+    }
+
+    // §6: the reason has to say WHY there is no countdown, because "waiting"
+    // and "waiting without a deadline" are different promises to the reader.
+    #[test]
+    fn an_orchestrating_session_says_it_is_waited_for_without_a_deadline() {
+        let reason = hot_restart_block_reason_summary(&[blocker(
+            "local://abc",
+            HOT_RESTART_BLOCKER_ORCHESTRATING,
+            Some(0),
+        )])
+        .expect("a session running sub-agents defers the restart");
+        assert!(reason.contains("local://abc"), "{reason}");
+        assert!(reason.contains("sub-agents"), "{reason}");
+        assert!(
+            reason.contains("without a deadline"),
+            "the reader must learn no countdown applies: {reason}"
+        );
+    }
+
+    // The predicate §5's unbuilt deadline must read. Getting this wrong in the
+    // permissive direction strands a delegate fleet; getting it wrong in the
+    // strict direction is what the 30-minute rule exists to end.
+    #[test]
+    fn only_the_two_unwaitable_kinds_are_exempt_from_the_thirty_minute_deadline() {
+        assert!(hot_restart_blocker_is_deadline_exempt(
+            HOT_RESTART_BLOCKER_ORCHESTRATING
+        ));
+        assert!(hot_restart_blocker_is_deadline_exempt(
+            HOT_RESTART_BLOCKER_NOT_RESTORABLE
+        ));
+        assert!(
+            !hot_restart_blocker_is_deadline_exempt(HOT_RESTART_BLOCKER_WORKING),
+            "a working turn is exactly what the deadline is allowed to interrupt \
+             — it is repaired by the `continue` injection"
+        );
+        assert!(!hot_restart_blocker_is_deadline_exempt(
+            HOT_RESTART_BLOCKER_RECENTLY_ACTIVE
+        ));
+    }
+
+    // An orchestrating session is NOT permanent: it clears the moment its
+    // sub-agents stop writing. `server daemons` reads `permanent` to separate
+    // "deferring" from "lingering forever", and calling this permanent would
+    // report a daemon that is about to swap as one that never will.
+    #[test]
+    fn orchestrating_is_clearable_so_the_headline_still_names_it_first() {
+        let mut blockers = vec![
+            blocker("local://shell", HOT_RESTART_BLOCKER_NOT_RESTORABLE, Some(0)),
+            blocker("local://agent", HOT_RESTART_BLOCKER_ORCHESTRATING, Some(0)),
+        ];
+        hot_restart_blockers_actionable_first(&mut blockers);
+        assert_eq!(blockers[0].kind, HOT_RESTART_BLOCKER_ORCHESTRATING);
+        assert!(!blockers[0].permanent);
     }
 
     #[test]

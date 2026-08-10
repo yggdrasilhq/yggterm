@@ -1269,6 +1269,132 @@ pub fn read_claude_code_transcript_entries(path: &Path) -> Result<Vec<Transcript
     Ok(entries)
 }
 
+/// `isMeta` — the `<local-command-caveat>` wrappers the CLI injects. ONE reader
+/// of the field, so a second caller cannot come to disagree about what it means.
+fn record_is_meta(value: &Value) -> bool {
+    value.get("isMeta").and_then(Value::as_bool) == Some(true)
+}
+
+/// `isSidechain` — the agent's OWN declaration that this record was written by a
+/// sub-agent it launched, not by its main loop.
+///
+/// ⛔ **It is `false` on every record of the PARENT transcript**, and that is the
+/// trap this comment exists to close. Measured across every Claude Code
+/// transcript on `dev` 2026-08-10: **179,392 records carry the field and not one
+/// is `true`**, while those same sessions made **195 `Agent` and 29 `Workflow`
+/// calls**. Sub-agents write to a SEPARATE file
+/// ([`crate::local_subagent_transcript_dir`]) where every record is
+/// `isSidechain: true`. A gate that looked for the field in the parent would
+/// have compiled, shipped, read as correct, and never once fired.
+///
+/// ⚠ This is the field the hot-restart gate's ORCHESTRATING state is built on
+/// ([`newest_transcript_writer_in_tail`]), so it has exactly one reader here and
+/// the transcript view shares it. Two readers of a liveness field is how the
+/// display and the "is it safe to kill this PTY" decision silently diverge —
+/// the same failure [`crate::screen_text_shows_agent_working`] exists to prevent.
+fn record_is_sidechain(value: &Value) -> bool {
+    value.get("isSidechain").and_then(Value::as_bool) == Some(true)
+}
+
+/// Who wrote the newest record in an agent transcript — the agent's main loop,
+/// or a sub-agent it launched.
+///
+/// §3 of `docs/spec-hot-restart-relay-gate.md` asks the hot-restart gate to
+/// classify a session by what it IS rather than by how long it has been quiet,
+/// and §8 requires the sub-agent half of that classification to be POSITIVE:
+/// *"read it from the agent's own declared state, never from process ancestry
+/// alone."* `isSidechain` IS that declared state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptWriter {
+    /// Nothing in the window this reader recognises as a record — an unwritten
+    /// transcript, a codex rollout (which has no sub-agent plane), or a file
+    /// that could not be read. Never treated as sub-agent activity: ORCHESTRATING
+    /// is the one state with an UNBOUNDED wait, so a session that merely cannot
+    /// be read must not reach it (spec §8).
+    Unknown,
+    /// The newest record is the agent's own turn.
+    MainLoop,
+    /// The newest record carries `isSidechain`: a sub-agent is writing right now.
+    SubAgent,
+}
+
+/// How much of a transcript's tail the liveness read looks at.
+///
+/// Only the NEWEST decidable record decides, so this needs to be big enough to
+/// contain one record and its neighbours, not a conversation. A sub-agent's
+/// records are ordinary CC records; 64 KiB spans many of them. The gate polls
+/// this per owned session, which is why it is a bounded tail read and not
+/// [`read_agent_transcript_entries_tail_limited`]'s 2 MiB window.
+const LIVENESS_TAIL_BYTES: u64 = 64 * 1024;
+
+/// Classify the newest decidable record in a transcript tail. Pure, so the one
+/// judgement the gate acts on is testable without a filesystem.
+///
+/// Walks from the END and stops at the first record it recognises. ⛔ It does
+/// NOT ask "is there any sidechain record in the window": a session whose
+/// sub-agents finished an hour ago still has their records in its tail, and
+/// answering `SubAgent` for it would pin a daemon on work that is already done.
+/// The newest writer is the only one that says what is happening NOW.
+pub fn newest_transcript_writer_in_tail(tail: &str) -> TranscriptWriter {
+    for line in tail.lines().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        // Same admission test as the timeline reader: only user/assistant
+        // records are the conversation, and a meta wrapper is not a turn.
+        if !matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("user") | Some("assistant")
+        ) || record_is_meta(&value)
+        {
+            continue;
+        }
+        return if record_is_sidechain(&value) {
+            TranscriptWriter::SubAgent
+        } else {
+            TranscriptWriter::MainLoop
+        };
+    }
+    TranscriptWriter::Unknown
+}
+
+/// [`newest_transcript_writer_in_tail`] against a transcript on disk.
+///
+/// Unreadable → [`TranscriptWriter::Unknown`], deliberately: this answer feeds
+/// the state with an unbounded wait, so the failure direction is "do not claim
+/// sub-agents", never "assume the worst".
+pub fn newest_transcript_writer(path: &Path) -> TranscriptWriter {
+    let Ok(mut file) = fs::File::open(path) else {
+        return TranscriptWriter::Unknown;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return TranscriptWriter::Unknown;
+    };
+    let file_len = metadata.len();
+    let start = file_len.saturating_sub(LIVENESS_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return TranscriptWriter::Unknown;
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return TranscriptWriter::Unknown;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    // A window that did not start at byte 0 begins mid-record. Walking from the
+    // end means that partial line is reached LAST, but "last" is exactly where a
+    // file of undecidable lines lands — and half a record can parse as valid
+    // JSON. Drop it rather than let a truncation decide the gate.
+    let text = if start > 0 {
+        match text.find('\n') {
+            Some(index) => &text[index + 1..],
+            None => return TranscriptWriter::Unknown,
+        }
+    } else {
+        &text
+    };
+    newest_transcript_writer_in_tail(text)
+}
+
 /// Decode ONE Claude Code record into the timeline entries it carries.
 ///
 /// A CC record is one message whose `content` is a list of blocks, and the
@@ -1282,9 +1408,7 @@ fn claude_code_entries_from_record(value: &Value, out: &mut Vec<TranscriptEntry>
         Some("assistant") => TranscriptRole::Assistant,
         _ => return,
     };
-    if value.get("isMeta").and_then(Value::as_bool) == Some(true)
-        || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
-    {
+    if record_is_meta(value) || record_is_sidechain(value) {
         return;
     }
     let timestamp = value
@@ -2067,6 +2191,159 @@ mod claude_code_transcript_tests {
         assert_eq!(messages.len(), 1, "only the real user turn survives");
         assert_eq!(messages[0].lines, vec!["the real ask".to_string()]);
         let _ = fs::remove_file(&path);
+    }
+
+    // ===== the hot-restart gate's ORCHESTRATING signal (spec §3/§6/§8) =====
+
+    // The case the gate exists for, in the record shape a real
+    // `subagents/agent-<id>.jsonl` actually has: every record carries
+    // `isSidechain` and an `agentId`. Every other liveness signal on this
+    // project reads IDLE while this file grows — the screen has no `esc to
+    // interrupt` footer, output has stopped, and `bash -c` gives the agent no
+    // separate foreground process group to notice.
+    #[test]
+    fn a_live_subagent_transcript_reads_as_subagent() {
+        let tail = [
+            r#"{"parentUuid":null,"isSidechain":true,"agentId":"a0c1d2e3f4a5b601","type":"user","timestamp":"2026-08-10T12:00:00.000Z","message":{"role":"user","content":"audit the parser"}}"#,
+            r#"{"parentUuid":"u1","isSidechain":true,"agentId":"a0c1d2e3f4a5b601","type":"assistant","timestamp":"2026-08-10T12:04:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"reading the second file"}]}}"#,
+        ]
+        .join("\n");
+        assert_eq!(
+            newest_transcript_writer_in_tail(&tail),
+            TranscriptWriter::SubAgent
+        );
+    }
+
+    // ⛔ The PARENT transcript can never answer this, and a gate built on it
+    // would have shipped looking correct and never fired. Measured on `dev`
+    // 2026-08-10: 179,392 parent records carry `isSidechain` and every one is
+    // `false`, across sessions that made 195 `Agent` and 29 `Workflow` calls.
+    #[test]
+    fn the_parent_transcript_never_declares_a_sidechain_even_mid_delegation() {
+        let tail = [
+            r#"{"isSidechain":false,"type":"assistant","timestamp":"2026-08-10T12:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Agent","id":"toolu_1","input":{}}]}}"#,
+            r#"{"isSidechain":false,"type":"user","timestamp":"2026-08-10T12:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1"}]}}"#,
+        ]
+        .join("\n");
+        assert_eq!(
+            newest_transcript_writer_in_tail(&tail),
+            TranscriptWriter::MainLoop,
+            "the parent file is not where sub-agent work is recorded"
+        );
+    }
+
+    // ⛔ The mistake this test exists to forbid: "does the window contain any
+    // sidechain record". A session whose delegates finished keeps their records
+    // in its tail forever, and answering SubAgent for it would pin the daemon on
+    // work that is already done — an unbounded wait for nothing.
+    #[test]
+    fn subagent_records_that_are_no_longer_the_newest_do_not_pin_the_gate() {
+        let tail = [
+            r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-08-10T12:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"delegate finished"}]}}"#,
+            r#"{"type":"user","timestamp":"2026-08-10T12:01:00.000Z","message":{"role":"user","content":"thanks"}}"#,
+        ]
+        .join("\n");
+        assert_eq!(
+            newest_transcript_writer_in_tail(&tail),
+            TranscriptWriter::MainLoop
+        );
+    }
+
+    // A meta wrapper is not a turn, and must not mask the sub-agent record
+    // underneath it — the same admission test the timeline reader applies.
+    #[test]
+    fn meta_and_unrecognised_records_are_walked_past_not_decided_on() {
+        let tail = [
+            r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-08-10T12:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"delegate working"}]}}"#,
+            r#"{"type":"user","isMeta":true,"timestamp":"2026-08-10T12:00:01.000Z","message":{"role":"user","content":"system noise"}}"#,
+            r#"{"type":"summary","summary":"not a turn"}"#,
+            "not json at all",
+        ]
+        .join("\n");
+        assert_eq!(
+            newest_transcript_writer_in_tail(&tail),
+            TranscriptWriter::SubAgent
+        );
+    }
+
+    // Unknown is the answer that does NOT block, so everything unreadable has to
+    // land here: an empty transcript, a codex rollout (no sub-agent plane), and
+    // a file that does not exist.
+    #[test]
+    fn nothing_decidable_is_unknown_and_therefore_never_orchestrating() {
+        assert_eq!(
+            newest_transcript_writer_in_tail(""),
+            TranscriptWriter::Unknown
+        );
+        assert_eq!(
+            newest_transcript_writer_in_tail(
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant"}}"#
+            ),
+            TranscriptWriter::Unknown
+        );
+        assert_eq!(
+            newest_transcript_writer(Path::new("/nonexistent/never/written.jsonl")),
+            TranscriptWriter::Unknown
+        );
+    }
+
+    #[test]
+    fn the_disk_reader_agrees_with_the_pure_one() {
+        let path = write(&[
+            r#"{"type":"user","timestamp":"2026-08-10T12:00:00.000Z","message":{"role":"user","content":"go"}}"#,
+            r#"{"type":"assistant","isSidechain":true,"agentId":"a0c1d2e3f4a5b602","timestamp":"2026-08-10T12:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"delegate working"}]}}"#,
+        ]);
+        assert_eq!(newest_transcript_writer(&path), TranscriptWriter::SubAgent);
+        let _ = fs::remove_file(&path);
+    }
+
+    // The layout half of the signal: a session's delegates live in
+    // `<id>/subagents/agent-*.jsonl` BESIDE `<id>.jsonl`, and a session that has
+    // never launched one has no such directory at all — which is the common case
+    // and must cost nothing.
+    #[test]
+    fn the_subagent_directory_sits_beside_the_session_and_is_absent_by_default() {
+        let session = std::env::temp_dir()
+            .join("ygg-subagent-layout")
+            .join("6e5f4d3c-2b1a-4000-8000-b0c1d2e3f4a5.jsonl");
+        assert_eq!(
+            crate::local_subagent_transcript_dir(&session).unwrap(),
+            session
+                .with_file_name("6e5f4d3c-2b1a-4000-8000-b0c1d2e3f4a5")
+                .join("subagents")
+        );
+        assert!(
+            crate::newest_subagent_transcript(&session).is_none(),
+            "a session that never delegated must not read as orchestrating"
+        );
+    }
+
+    #[test]
+    fn the_newest_subagent_file_is_the_one_that_answers() {
+        let root = std::env::temp_dir().join(format!(
+            "ygg-subagent-newest-{}",
+            std::process::id()
+        ));
+        let dir = root.join("session-id").join("subagents");
+        fs::create_dir_all(&dir).unwrap();
+        let session = root.join("session-id.jsonl");
+        // A finished delegate, and a live one. Only the live one may answer, or
+        // a session whose delegates ended last week pins the daemon forever.
+        fs::write(dir.join("agent-a00000000000000aa.jsonl"), "{}\n").unwrap();
+        let live = dir.join("agent-a00000000000000bb.jsonl");
+        fs::write(
+            &live,
+            format!(
+                "{}\n",
+                r#"{"isSidechain":true,"agentId":"a00000000000000bb","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still working"}]}}"#
+            ),
+        )
+        .unwrap();
+        let (path, since) = crate::newest_subagent_transcript(&session).expect("a live delegate");
+        assert_eq!(path, live);
+        assert!(since.as_secs() < 60, "just written, so it is fresh");
+        assert_eq!(newest_transcript_writer(&path), TranscriptWriter::SubAgent);
+        let _ = fs::remove_dir_all(&root);
     }
 
     // Slash-command bookkeeping is not conversation. Caught on a REAL

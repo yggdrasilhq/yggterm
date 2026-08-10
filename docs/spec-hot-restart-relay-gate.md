@@ -111,6 +111,21 @@ turn's is not, and no deadline can price it.
 ⇒ ORCHESTRATING blocks indefinitely. If that stalls a swap for hours, that is
 the correct outcome, and §4's queue means nothing is lost.
 
+⭐ **Measured 2026-08-10 on `dev`, across every Claude Code transcript on the
+host — this is how invisible the state was.** Of **73,764 sub-agent records in 33
+sessions, 21,453 (29.1%) were written while the parent transcript was silent for
+over a minute**; the longest silence around a live sub-agent record was **30.6
+minutes**, which is past the gate's 300 s window *and* past §5's deadline. ⇒ for
+roughly a third of all delegate work, every signal the daemon had said "idle".
+
+⛔ **And the obvious instrument is the wrong file, which §8's "positive, not
+inferred" does not by itself protect you from.** `isSidechain` reads `false` on
+**all 179,392 records of the parent transcripts** on that host, across sessions
+that made **195 `Agent` and 29 `Workflow` calls**: sub-agents write to
+`<session-id>/subagents/agent-<id>.jsonl`. A detector pointed at the parent is
+positive, declared, correct-looking — and never fires. Point it at the
+sub-agent files.
+
 ## 7. Why this supersedes the standing ⛔ on deadlines
 
 The campaign memory says: *"⛔ Do not bolt a deadline onto that one — it protects
