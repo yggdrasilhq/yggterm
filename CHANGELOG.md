@@ -29,6 +29,16 @@ This file tracks user-visible changes in `yggterm`.
   ⚠ The daemons were never junk — most were holding the owner's live agent rows,
   which is version coexistence working as designed. The bug was that **nothing
   ever moved that work forward**, so the count could only grow, one per deploy.
+  ⇒ **Proven live on `dev`, 2026-08-10**, all three: a session under a 2 s OSC
+  heartbeat now accumulates idle time (5.4 s → 30.4 s → 55.4 s, in step with the
+  clock, where the ceiling used to be ~2 s); a 3.0.90 daemon superseded by 3.0.91
+  logged `superseded_self_retire_sweep AllMoved{moved:1}` and **exited**, with its
+  shell still alive on the same pid, same start time, reparented to init — the
+  first daemon on this fleet ever to retire itself; and the new daemon made **0**
+  peer socket connects in 10 s against **57** from an old one in the same window.
+  The daemon count did not grow across a version bump for the first time.
+  ⛔ The 27 daemons already running are older binaries without this code, so the
+  EXISTING pile still has to be drained by hand or as its sessions end.
 
 - **Clicking a row could hang forever on a session that was perfectly healthy.**
   Owner-reported: a row left untouchable overnight, and a second one reproducing
