@@ -208,15 +208,27 @@ underneath it is real and unexplained.
 ⇒ The median switch is fine. **The tail is the product.** A cold p90 of 35 s is
 his "18-20 s" and worse, and **11 of 106 reveals never became ready** — those sit
 at ~60-122 s, which is a user staring at nothing for two minutes.
-⚠ **A GUI restart is REPRODUCIBLY ~17 s to first answer, against the owner's 3 s
-bar** — measured twice on the same host, **18,473 ms** and **16,460 ms**, both
-`TERM` → first answered `server app state`, with ~38 rows to restore. Two samples
-a similar distance apart is a property, not an outlier.
-⇒ **The named suspect, from the same host's perf spans:**
-`startup/initial_server_sync` p90 **48,542 ms**, max **126,378 ms** (n=37) — a
-WALL-clock span, so unlike the render spans it may be placed on a timeline.
-Whether it shares a cause with the reveal tail is unknown; ask early, because if
-it does, one fix serves both.
+⚠ **A GUI restart takes 17-156 s to first answer, against the owner's 3 s bar.**
+Measured on the same host: **18,473 ms**, **16,460 ms**, and then **156,524 ms**
+— the last one bad enough that the owner intervened mid-restart (*"I had to
+restart it seeing not restarting for so long"*). Not an outlier: a property with
+a very long tail.
+⇒ **CONFIRMED OWNER: `startup/initial_server_sync`.** On that 156 s restart it
+recorded **37,297 ms** with `{"ok": true}` — it succeeds, it is just enormous.
+Across the host: p90 **48,542 ms**, max **126,378 ms** (n=37). A WALL-clock span,
+so unlike the render spans it may legitimately be placed on a timeline.
+
+⇒ ⭐ **AND THIS IS WHAT "FLAWLESS RENDERING BUT UNTYPEABLE" IS.** The GUI paints
+its restored snapshot immediately and only becomes *usable* when
+`initial_server_sync` finishes. Everything on screen is real and correct; none of
+it is connected yet. Any instrument that samples the painted surface will report
+health throughout — which is why this symptom has survived so many "looks fine to
+me" checks.
+
+⚠ **`daemon_request/hot_restart` is pinned at ~10.2 s** — 10,229 and 10,216 ms on
+this restart, against p50 10,166 / max 10,441 across the host. **A near-constant
+duration is a timeout, not work** (the constant-anomaly law). Two of them ran
+during the 156 s startup. Find the 10 s deadline and ask what it is waiting for.
 
 ### ⛔ Why this was never investigated: the instrument blamed memory, every time
 

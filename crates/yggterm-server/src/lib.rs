@@ -18665,6 +18665,31 @@ struct DaemonSpawnLockRecord {
     created_at_ms: u64,
 }
 
+/// How long a spawn lock held by a LIVE process stays valid. ONE owner for the
+/// number, because the waiter's ceiling is derived from it — see
+/// [`DAEMON_SPAWN_LOCK_WAIT_MS`].
+const DAEMON_SPAWN_LOCK_STALE_MS: u64 = 15_000;
+
+/// How long a caller waits for the lock before giving up. It MUST exceed
+/// [`DAEMON_SPAWN_LOCK_STALE_MS`]: a waiter that gives up before the lock it is
+/// waiting on can even be declared stale can never wait out a legitimate holder,
+/// and every such give-up is a spurious failure.
+///
+/// ⛔ It used to be a bare `for _ in 0..120` with a 100 ms sleep — **12 s of
+/// waiting for a lock that stays valid for 15 s.** Owner-reported 2026-08-10:
+/// *"sessions are untypeable even though I see a flawless rendering"*, with
+/// `Error: timed out waiting for daemon spawn lock` in his composer. Every
+/// session at once, because `ensure_local_daemon_running` sits on the terminal
+/// read/write path — so one slow daemon spawn locked out the whole machine while
+/// the already-painted screens looked perfect.
+///
+/// What held it that long: a daemon spawn that took ~15 s to bind its socket,
+/// which is the machine-wide transcript walk removed in 3.0.94. That fix removes
+/// the CAUSE; this one removes the guaranteed 3 s window in which the mechanism
+/// fails even when nothing is wrong. Same family as
+/// [[finding-a-deadline-shorter-than-its-release-condition]].
+const DAEMON_SPAWN_LOCK_WAIT_MS: u64 = DAEMON_SPAWN_LOCK_STALE_MS + 10_000;
+
 fn daemon_spawn_lock_is_stale(path: &Path) -> bool {
     let Ok(bytes) = fs::read(path) else {
         return true;
@@ -18673,7 +18698,7 @@ fn daemon_spawn_lock_is_stale(path: &Path) -> bool {
     let now = current_millis() as u64;
     if let Some(record) = record {
         if process_is_alive(record.pid) {
-            return now.saturating_sub(record.created_at_ms) > 15_000;
+            return now.saturating_sub(record.created_at_ms) > DAEMON_SPAWN_LOCK_STALE_MS;
         }
         return true;
     }
@@ -18682,7 +18707,7 @@ fn daemon_spawn_lock_is_stale(path: &Path) -> bool {
         .and_then(|metadata| metadata.modified().ok())
         .and_then(|modified| modified.elapsed().ok())
         .map(|elapsed| elapsed.as_millis() as u64);
-    modified_age_ms.is_none_or(|age_ms| age_ms > 15_000)
+    modified_age_ms.is_none_or(|age_ms| age_ms > DAEMON_SPAWN_LOCK_STALE_MS)
 }
 
 struct DaemonSpawnLock {
@@ -18703,7 +18728,16 @@ fn acquire_daemon_spawn_lock(endpoint: &ServerEndpoint) -> anyhow::Result<Daemon
         fs::create_dir_all(parent)
             .with_context(|| format!("creating daemon spawn lock dir {}", parent.display()))?;
     }
-    for _ in 0..120 {
+    // Wall-clock deadline, not an iteration count: the branches below sleep for
+    // different durations (25 ms after clearing a stale lock, 100 ms while
+    // waiting on a live one), so a fixed loop count does not correspond to any
+    // particular amount of waiting — which is how the ceiling silently ended up
+    // SHORTER than the staleness window it has to outlast.
+    let deadline = Instant::now() + Duration::from_millis(DAEMON_SPAWN_LOCK_WAIT_MS);
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
         match OpenOptions::new().create_new(true).write(true).open(&path) {
             Ok(mut file) => {
                 let record = DaemonSpawnLockRecord {
@@ -43359,5 +43393,55 @@ terminal_window_id: None,
         assert_eq!(scanned.len(), 4, "every fixture must be emitted");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A waiter that gives up before the thing it waits on can even be declared
+    /// stale can NEVER wait out a legitimate holder — every such give-up is a
+    /// spurious failure, and the code above it is decoration.
+    ///
+    /// The live shape (owner-reported 2026-08-10, *"sessions are untypeable even
+    /// though I see a flawless rendering"*): the lock stayed valid for 15 s while
+    /// callers waited 12 s, and `ensure_local_daemon_running` sits on the
+    /// terminal read/write path — so one slow daemon spawn made every session on
+    /// the machine refuse input at once, behind screens that had already painted.
+    #[test]
+    fn the_spawn_lock_wait_outlasts_the_staleness_window_it_waits_on() {
+        assert!(
+            super::DAEMON_SPAWN_LOCK_WAIT_MS > super::DAEMON_SPAWN_LOCK_STALE_MS,
+            "a {}ms wait cannot outlast a {}ms staleness window: a live holder \
+             would time every other caller out before its lock could be reclaimed",
+            super::DAEMON_SPAWN_LOCK_WAIT_MS,
+            super::DAEMON_SPAWN_LOCK_STALE_MS,
+        );
+        // Not merely greater — greater by enough that a holder which uses its
+        // FULL window still leaves a waiter room to acquire afterwards.
+        assert!(
+            super::DAEMON_SPAWN_LOCK_WAIT_MS - super::DAEMON_SPAWN_LOCK_STALE_MS >= 5_000,
+            "leave real margin past the staleness window, not a rounding error",
+        );
+    }
+
+    /// The counterpart: the wait must be a WALL-CLOCK deadline, not an iteration
+    /// count. The branches sleep for different durations (25 ms after clearing a
+    /// stale lock, 100 ms while waiting on a live one), so a fixed loop count
+    /// corresponds to no particular amount of waiting — which is exactly how the
+    /// ceiling silently ended up shorter than the window it had to outlast.
+    #[test]
+    fn the_spawn_lock_wait_is_a_deadline_not_a_loop_count() {
+        let source = include_str!("lib.rs");
+        let body = source
+            .split("fn acquire_daemon_spawn_lock(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("acquire_daemon_spawn_lock body should be present");
+        assert!(
+            body.contains("DAEMON_SPAWN_LOCK_WAIT_MS"),
+            "the wait must derive from the named constant, so it moves with the \
+             staleness window instead of drifting away from it"
+        );
+        assert!(
+            !body.contains("for _ in 0.."),
+            "a fixed iteration count is not a duration — use the deadline"
+        );
     }
 }
