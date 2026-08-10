@@ -410,10 +410,32 @@ should not be.
 `win=7m` is the default, `win=50m/cargo test` is a live deferral. Without it,
 *"why was it not booted at 8 minutes"* costs a code read to answer.
 
-⭐ **`ygg-claim.sh` now subscribes you automatically**, because claiming a row is
-the moment a session becomes long-running work — and an arming step you have to
-remember separately is the one skipped on the session that needed it. Pass
-`--no-booter` to opt out.
+⛔⛔ **`ygg-claim.sh` does NOT arm the booter for you — and must not.**
+Owner-directed 2026-08-10: *"When there is no relay mode the booter should not
+self arm. You should not be booted."* It had fired on him inside a session he
+opened with *"NOT like a relay. All agents should be contained in the session"*:
+the row was claimed, so the row self-armed, and a machine woke the session he had
+just ruled that out for.
+
+⚠ **The bad inference, named so nobody re-derives it: claiming a row is not
+evidence that a session is unattended.** The old rationale ("claiming a row is
+the moment a session becomes long-running work") conflated **long-running** with
+**unattended**. A session with a human in it is long-running too, and it is
+precisely the one that must never be woken by a robot. His scope was *"in a
+fleet"* — relay and delegate work — and the tool widened it to every claim.
+
+⇒ **Arm it where unattendedness is KNOWN, never where a row is merely claimed:**
+
+| case | who arms it |
+|---|---|
+| a **delegate** you spawn | **you do, explicitly, at spawn** — `ygg-booter.py subscribe --row "$ROW" …` (§9). This is the path that matters and it is unchanged |
+| a **relay** session | itself: `ygg-claim.sh --booter`, or `YGG_BOOTER=1` |
+| a session **a human is talking to** | nothing. Leave it alone |
+
+`--no-booter` is still accepted and ignored, so older call sites keep working.
+⛔ And when you *have* armed yourself, unsubscribing is **your** job the moment
+the work is done: `ygg-booter.py unsubscribe --row <path>` (note `--row` — the
+verb takes a flag, not a positional, and rejects the bare path).
 
 **The one structural fact, and it decides the whole design: anything that runs
 INSIDE the session is dead in exactly the case that matters**, because the stall
