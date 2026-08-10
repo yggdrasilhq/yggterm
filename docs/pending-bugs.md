@@ -1942,6 +1942,40 @@ would have compiled, shipped, read as correct in review, and never once fired.
 [[finding-a-set-is-not-a-fill]] shape: the field was present everywhere and
 carried no signal.
 
+⚠ **What 3.0.101 is PROVEN by, stated exactly, because the last arm is missing.**
+Proven: five mutation-falsified parser tests (scan-direction, detector-disabled
+and admission-test mutations each caught by a *different* subset); and three arms
+run through the SHIPPED functions against REAL fleet data — a genuine sub-agent
+transcript classifies `SubAgent`, its parent `MainLoop`, and a delegate that
+finished 16 days ago correctly ages out of the window rather than pinning the
+daemon. **NOT proven: the `orchestrating` blocker observed appearing in a live
+daemon's `server status`.** That needs a live session with a live sub-agent, and
+the agent doing this work operates under a standing instruction not to spawn
+sub-agents — so the input cannot be manufactured, only waited for.
+⇒ **Falsifier for whoever has one running:** on a host whose newest daemon owns a
+local `cc-runtime://` agent row, have that agent launch a delegate, then
+`yggterm-headless server status` — the row must appear with
+`kind: "orchestrating"`, `permanent: false`, and a reason saying it is *"waited
+for without a deadline"*. It must disappear within the idle window after the
+delegate finishes. ⛔ A blocker that appears and never clears is the disease, not
+the fix; check the clearing half too.
+
+⚠ **Found while trying to run that arm, and it is a separate defect — a freshly
+created row is `not_restorable` on the daemon that owns its PTY.** On guihost
+2026-08-10, `server app terminal new --kind claude-code` produced
+`local://fe774cfd-…`; the 3.0.101 daemon reported it as an owned blocker of kind
+`not_restorable` while **that same daemon's `server snapshot` did not contain the
+row at all**. So the daemon owns the runtime, cannot resolve a session record for
+it, and `live_session_kind` → `None` → the safety bias (correctly) refuses. The
+bias is right; the state it fires in is not. **A permanent blocker on every
+newly-created agent row would pin that daemon's cold shutdown for as long as the
+row lives**, which is the exact shape 3.0.81 fixed for shells.
+**Falsifier:** create a row with `server app terminal new --kind claude-code` and
+compare, on the daemon that reports it as a blocker, `hot_restart_blockers`
+against `server snapshot`. Today the key appears in the first and not the second.
+⚠ Not yet established: whether the record promotes later (making this a startup
+race) or never (making it durable). Measure before fixing.
+
 **Still unbuilt:** §2 (relay boundaries as the appointment), §4 (the queue), §5
 (the deadline + `continue` repair), and the rest of §3 — **blocked-on-human is
 not yet a state**, and an agent session's WORKING state is still inferred from
