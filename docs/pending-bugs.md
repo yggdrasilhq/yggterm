@@ -157,6 +157,19 @@ about the name chosen AT BIRTH.
 | `server status --endpoint <it>` | **27.2 s** (a 25 s timeout had already failed once) |
 | `perf-summary --category background` | `local_tree_scan`: **1,952 runs, p50 8.2 s, p95 9.7 s, max 32.5 s, total 16,365,190 ms ≈ 4.5 HOURS**, across ~140 distinct daemon pids |
 
+⚠ **IT IS PERIODIC, NOT A PERMANENT SPIN — corrected 20 minutes later by re-measuring
+the same daemon**, and the distinction matters for diagnosis:
+
+| | during the walk | after it finished |
+|---|---|---|
+| daemon CPU | 0.858 cores (0.797 in one thread) | **0.033 cores** |
+| `server status` | **27.2 s** | **0.68 s** |
+
+⇒ So this is a **recurring multi-second stall**, not a wedge — which is exactly why the
+owner's symptoms are INTERMITTENT ("sometimes a new session does not start"), and why
+anyone checking a minute later finds a healthy daemon and concludes nothing is wrong.
+`local_tree_scan`'s own p50 8.2 s / max 32.5 s says how long each window lasts.
+
 ⇒ The daemon spends multi-second stretches walking the machine's ENTIRE historical
 agent-transcript corpus, and while it does, it does not answer. A `new session` needs
 that daemon (`server remote start-cc`), so **it does not start** — the row appears,
