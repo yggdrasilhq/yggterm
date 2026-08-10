@@ -208,9 +208,15 @@ underneath it is real and unexplained.
 ⇒ The median switch is fine. **The tail is the product.** A cold p90 of 35 s is
 his "18-20 s" and worse, and **11 of 106 reveals never became ready** — those sit
 at ~60-122 s, which is a user staring at nothing for two minutes.
-⚠ A separate datapoint of the same shape: a GUI restart took **18,473 ms** from
-`TERM` to its first answered `server app state`, with 38 rows to restore. Whether
-that shares a cause with the reveal tail is unknown and worth asking early.
+⚠ **A GUI restart is REPRODUCIBLY ~17 s to first answer, against the owner's 3 s
+bar** — measured twice on the same host, **18,473 ms** and **16,460 ms**, both
+`TERM` → first answered `server app state`, with ~38 rows to restore. Two samples
+a similar distance apart is a property, not an outlier.
+⇒ **The named suspect, from the same host's perf spans:**
+`startup/initial_server_sync` p90 **48,542 ms**, max **126,378 ms** (n=37) — a
+WALL-clock span, so unlike the render spans it may be placed on a timeline.
+Whether it shares a cause with the reveal tail is unknown; ask early, because if
+it does, one fix serves both.
 
 ### ⛔ Why this was never investigated: the instrument blamed memory, every time
 
