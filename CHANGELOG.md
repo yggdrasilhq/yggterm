@@ -4,6 +4,30 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **"I cannot Ctrl+V screenshots" and "the row rename does nothing" were ONE bug,
+  and it was already fixed — just not deployed.** The GUI logged the cause
+  verbatim, twice within 40 seconds: `Rename Failed` and `clipboard_paste_failed`
+  both carrying `remote yggterm protocol mismatch for dev: expected
+  3.0.92@12072927657283082749, got 3.0.91@12072927657283082749`. **Same build_id
+  on both sides — only the version STRING differed.** Every remote row verb and
+  the image-paste staging go through the same `resolve_yggterm_binary`, so both
+  were refused by one gate; text paste does not handshake, which is why it kept
+  working and the failure read as "paste is broken" rather than "the remote is
+  stale". 854b1f20 had already fixed the gate in 3.0.93 and deliberately shipped
+  nothing.
+  ⇒ Deployed the 3.0.94 **GUI binary only**, to the one path the GUI actually runs
+  from, chosen because that host's own `install-state.json` names it
+  `active_executable` — so the 3.0.93+ check reads its neighbouring headless
+  (3.0.91) as the payload and accepts the remote's 3.0.91. **No daemon binary was
+  replaced on either host**, which is what arms the cold-shutdown cascade.
+  ⇒ **Proven, not asserted**: the remote resolve went from `protocol mismatch` to
+  `installed_path_match`; a rename that had failed twice landed and verified by
+  read-back; the superseded row retired properly instead of being killed; the
+  remote host's binaries were still 3.0.91 afterwards and all eight live
+  `resume-cc`/`start-cc` shims were still running; daemon counts unchanged on both
+  hosts.
+  ⚠ The restart itself took **18.5 s** to answer, against a 3 s bar — filed.
+
 - **A new daemon answered nothing for 15 seconds because it walked every agent
   transcript on the machine first — to fill an argument nobody has read since
   v2.1.31.** Owner-reported as *"even a new session does not want to start"*.
