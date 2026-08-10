@@ -25445,12 +25445,63 @@ impl ShellState {
         ) {
             return false;
         }
-        release_terminal_bootstrap_lease_if_current(self, session_path, bootstrap_lease_identity);
-        self.terminal_attach_in_flight.remove(session_path);
-        self.terminal_resume_ready_paths.remove(session_path);
+        self.stand_down_remote_terminal_resume_timeout(session_path, bootstrap_lease_identity);
         self.fail_terminal_open_attempt_for_session(session_path, reason);
         self.maybe_finish_terminal_surface_request_for_session(session_path);
         true
+    }
+    /// End the resume wait for a session WITHOUT declaring a failure: release the
+    /// bootstrap lease, drop the attach bookkeeping, stop treating the session as
+    /// resume-ready. This is [`Self::fail_remote_terminal_resume_timeout`] minus
+    /// the verdict, and it exists so the timer can stand down on a reveal nobody
+    /// is waiting for while still doing every scrap of cleanup it used to do at
+    /// the 60 s ceiling. ⛔ Trading a false failure for a stuck lease would not be
+    /// a fix; the two must come apart cleanly, so the cleanup has ONE owner and
+    /// both callers use it.
+    fn stand_down_remote_terminal_resume_timeout(
+        &mut self,
+        session_path: &str,
+        bootstrap_lease_identity: &str,
+    ) {
+        release_terminal_bootstrap_lease_if_current(self, session_path, bootstrap_lease_identity);
+        self.terminal_attach_in_flight.remove(session_path);
+        self.terminal_resume_ready_paths.remove(session_path);
+    }
+    /// True when the 60 s resume-timeout timer must stand down instead of telling
+    /// the user their terminal "did not become interactive in time".
+    ///
+    /// Two arms, and the second one is why this is a predicate rather than a
+    /// single `is_cancelled` check:
+    ///
+    /// 1. **The reveal was CANCELLED** — the host bootstrap was skipped because
+    ///    the session stopped being the active terminal, so the attempt was
+    ///    resolved at that moment.
+    /// 2. **There is no open attempt AT ALL and the session is not the active
+    ///    terminal.** Measured on the GUI host 2026-08-10: a session created by
+    ///    `terminal new` and immediately not-active reached the ceiling with
+    ///    nothing to fail — `resume_timeout_cleared_inflight` at exactly 60 s with
+    ///    no `reveal_failed` beside it, because the failure latch found no attempt
+    ///    to latch. The toast fired anyway. A failure notice for a reveal that
+    ///    nobody started, about a session nobody is looking at, cannot be right.
+    ///
+    /// ⚠ Both arms require the session NOT to be the active terminal. A user
+    /// staring at a terminal that never came up must still be told.
+    fn terminal_resume_timeout_should_stand_down(&self, session_path: &str) -> Option<&'static str> {
+        if self.server.active_view_mode() == WorkspaceViewMode::Terminal
+            && self.server.active_session_path() == Some(session_path)
+        {
+            return None;
+        }
+        if self.terminal_session_reveal_attempt_was_cancelled(session_path) {
+            return Some("reveal_cancelled");
+        }
+        if self
+            .latest_terminal_open_attempt_for_path(session_path)
+            .is_none()
+        {
+            return Some("no_open_attempt_on_an_inactive_session");
+        }
+        None
     }
     fn record_terminal_open_attempt_event(
         &mut self,
@@ -92802,22 +92853,37 @@ fn TerminalCanvas(
                     // wake a minute later and tell the user their terminal
                     // "did not become interactive in time" — about a session
                     // they had left, on a mount nobody ever asked us to make.
-                    let reveal_cancelled = safe_shell_read(
+                    // The cleanup still runs; only the verdict is withdrawn.
+                    let stand_down_reason = safe_shell_read(
                         state,
-                        "terminal_resume_timeout_check_cancelled",
-                        |shell| shell.terminal_session_reveal_attempt_was_cancelled(&session_path),
+                        "terminal_resume_timeout_check_stand_down",
+                        |shell| shell.terminal_resume_timeout_should_stand_down(&session_path),
                     )
-                    .unwrap_or(false);
-                    if reveal_cancelled {
+                    .flatten();
+                    if let Some(reason) = stand_down_reason {
+                        let _ = safe_shell_mut(
+                            state,
+                            "terminal_resume_timeout_stand_down",
+                            |shell| {
+                                shell.stand_down_remote_terminal_resume_timeout(
+                                    &session_path,
+                                    &timer_bootstrap_lease_identity,
+                                );
+                                shell.maybe_finish_terminal_surface_request_for_session(
+                                    &session_path,
+                                );
+                            },
+                        );
                         clear_terminal_resume_notification(state, &session_path);
                         append_trace_event(
                             &timer_trace_home,
                             "ui",
                             "terminal_mount",
-                            "resume_timeout_stood_down_reveal_cancelled",
+                            "resume_timeout_stood_down",
                             json!({
                                 "session_path": session_path,
                                 "bootstrap_identity": timer_bootstrap_lease_identity,
+                                "reason": reason,
                             }),
                         );
                         return;
@@ -168459,6 +168525,86 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.fail_terminal_open_attempt_for_session(session_path, "boom".to_string());
         let entry = shell.reveal_log.back().expect("reveal entry");
         assert_eq!(entry.outcome, "failed");
+    }
+
+    /// The 60 s timer raises its toast ITSELF and only then latches the failure,
+    /// so resolving the attempt is not enough — the timer has to be told. Both
+    /// arms of the stand-down, and both of its refusals.
+    #[test]
+    fn the_resume_timeout_stands_down_only_when_nobody_is_waiting() {
+        let active_session_path = "remote-session://oc/stand-down-active";
+        let cancelled_path = "remote-session://oc/stand-down-cancelled";
+        let no_attempt_path = "remote-session://oc/stand-down-no-attempt";
+        let waiting_path = "remote-session://oc/stand-down-waiting";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+
+        // Arm 1: the reveal was cancelled when its bootstrap was skipped.
+        shell.begin_terminal_open_attempt(cancelled_path, "req-c", 1, "open_row");
+        assert!(shell.cancel_terminal_open_attempt_for_inactive_session(cancelled_path, "left"));
+        assert_eq!(
+            shell.terminal_resume_timeout_should_stand_down(cancelled_path),
+            Some("reveal_cancelled")
+        );
+
+        // Arm 2: nothing ever began an attempt for this session, and the user is
+        // not looking at it. Measured live 2026-08-10 — the ceiling fired at
+        // exactly 60 s with no `reveal_failed` beside it, because there was
+        // nothing to fail. The toast fired anyway.
+        assert_eq!(
+            shell.terminal_resume_timeout_should_stand_down(no_attempt_path),
+            Some("no_open_attempt_on_an_inactive_session")
+        );
+
+        // Refusal 1: the session the user is actually looking at must still be
+        // told when its terminal never came up — even with no attempt recorded.
+        assert_eq!(
+            shell.terminal_resume_timeout_should_stand_down(active_session_path),
+            None,
+            "a user staring at a dead terminal must still be told"
+        );
+
+        // Refusal 2: an inactive session whose reveal is genuinely still in
+        // flight keeps its ceiling. Nothing decided against this mount.
+        shell.begin_terminal_open_attempt(waiting_path, "req-w", 2, "open_row");
+        assert_eq!(
+            shell.terminal_resume_timeout_should_stand_down(waiting_path),
+            None,
+            "a live attempt is a reveal somebody may still be waiting on"
+        );
+    }
+
+    /// Trading a false failure for a stuck lease would not be a fix. The
+    /// stand-down must do every scrap of cleanup the 60 s failure used to do.
+    #[test]
+    fn standing_down_releases_everything_the_failure_path_released() {
+        let active_session_path = "remote-session://oc/stand-down-cleanup-active";
+        let session_path = "remote-session://oc/stand-down-cleanup";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell
+            .terminal_attach_in_flight
+            .insert(session_path.to_string());
+        shell
+            .terminal_resume_ready_paths
+            .insert(session_path.to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(session_path.to_string(), "lease-1".to_string());
+
+        shell.stand_down_remote_terminal_resume_timeout(session_path, "lease-1");
+
+        assert!(!shell.terminal_attach_in_flight.contains(session_path));
+        assert!(!shell.terminal_resume_ready_paths.contains(session_path));
+        assert!(
+            !shell
+                .terminal_bootstrap_lease_by_session
+                .contains_key(session_path),
+            "the bootstrap lease must be released, or the next reveal of this row \
+             is skipped for an owner that no longer exists"
+        );
     }
 
     #[test]

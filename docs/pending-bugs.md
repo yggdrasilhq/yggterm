@@ -316,7 +316,8 @@ test to accept either the live value or the render snapshot. That made the skip
 rarer; it did not make the skip tell the waiter. **Widening a predicate is not
 the same as closing the hole it falls through.**
 
-⭐ **SHAPE B IS FIXED IN CODE (3.0.98) — see CHANGELOG; live proof still owed.**
+⭐ **SHAPE B IS FIXED IN CODE (3.0.98, completed in 3.0.100) — see CHANGELOG;
+live proof still owed.**
 The skip branch now resolves the in-flight attempt instead of abandoning it, and
 the three behaviour calls that were open are settled:
 1. **Cancel, not fail.** A cancelled reveal gets its own attempt state and its
@@ -333,9 +334,20 @@ the three behaviour calls that were open are settled:
 3. **The toast is suppressed at the timer, not at the attempt.** The 60 s timer
    raises the toast itself and only then latches the failure, so gating on
    attempt state would not have stopped it; it now stands down on
-   `terminal_session_reveal_attempt_was_cancelled` and clears any stale resume
+   `terminal_resume_timeout_should_stand_down` and clears any stale resume
    notice. A cancelled attempt counts as ABSENT to the next bootstrap, so the
    next reveal begins a fresh attempt and keeps its own ceiling.
+
+⚠ **AND THE TRACE HELD A SECOND POPULATION NOBODY HAD SPLIT OFF** — found while
+taking the before/after baseline on the GUI host, 2026-08-10 18:20:38 and
+17:00:12. A session that never had an open attempt at all (created by
+`terminal new`, never active) reaches the same ceiling: `resume_timeout_cleared_
+inflight` at exactly 60 s with **no `reveal_failed` beside it**, because the
+failure latch found nothing to latch — and the toast fires anyway, since the
+timer raises it before calling the latch. ⇒ **`reveal_failed` UNDERCOUNTS this
+bug**; grep `resume_timeout_cleared_inflight` as well, or the population is
+invisible. The stand-down covers it (no attempt + not the active terminal) and
+still runs the whole cleanup.
 
 ⇒ **Shape A is the one that most likely IS the owner's "new session never
 starts"**: no process, no output, no error — the same silence. **It is

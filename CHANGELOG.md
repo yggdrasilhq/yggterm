@@ -31,7 +31,7 @@ This file tracks user-visible changes in `yggterm`.
   holding the shared spawn lock before failing. It is now skipped exactly when it
   could not have succeeded.
 - **Switching away from a row that is still opening no longer earns you a red
-  error toast a minute later (3.0.98).** Click a session, change your mind,
+  error toast a minute later (3.0.98, completed in 3.0.100).** Click a session, change your mind,
   click another one: sixty seconds after you had moved on, the row you left
   raised *"The live terminal on dev did not become interactive in time."*
   Nothing had gone wrong on dev. The GUI skips the host bootstrap for a session
@@ -56,6 +56,18 @@ This file tracks user-visible changes in `yggterm`.
   from is not that. Locked by three tests, each falsified by mutation: the cancel
   fires for an abandoned reveal, it never fires for the session being revealed
   right now, and a fresh attempt after a cancel is not stood down by the old one.
+  ⇒ **A second population, found in the live trace while proving the first
+  (3.0.100).** A session created by `terminal new` that was never the active one
+  reached the same 60 s ceiling with *nothing to fail* —
+  `resume_timeout_cleared_inflight` at exactly 60 s with no `reveal_failed`
+  beside it, because the failure latch found no attempt to latch, and the toast
+  fired regardless. The timer now stands down for that case too (no open attempt
+  **and** not the active terminal) while still doing every scrap of cleanup the
+  failure path did: releasing the bootstrap lease, dropping the attach
+  bookkeeping, finishing the surface request. Trading a false failure for a stuck
+  lease would not have been a fix. ⚠ A user who IS looking at a terminal that
+  never came up is still told, and an inactive session whose reveal is genuinely
+  still in flight keeps its ceiling.
 
 - **The `yggterm-server` test suite is green again — four red tests, all test
   hygiene, no production defect behind any of them.** They had failed at HEAD on
