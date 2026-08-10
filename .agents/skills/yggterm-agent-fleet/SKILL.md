@@ -131,8 +131,17 @@ its own. Silent under 55%; **NOTICE 55%** (open no new plane of work), **LAND 70
 **CRITICAL 85%**. On demand: `python3 ~/.claude/hooks/context-relay-gauge.py --report`.
 ⭐ It publishes `~/.claude/context-gauge/<session_id>.json`
 (`pct`/`used`/`window`/`verdict`/`dead`) — **a watchdog cannot see a token count**,
-which is exactly why `ygg-babysit` has to infer liveness from file mtimes, and why
-a corpse answering in 5 ms reads to it as `WORKING`.
+which is why `ygg-babysit` used to infer liveness from file mtimes, and why a corpse
+answering in 5 ms read to it as `WORKING`.
+⇒ ✅ **CONSUMED, 2026-08-10.** `ygg-babysit.classify()` now reads that file BEFORE the
+transcript and returns a terminal **`CONTEXT_DEAD`**; `ygg-booter` escalates ONCE with
+*"unrecoverable, relay it"* and **unsubscribes** instead of kicking a grave. Its
+anti-flap counter also stopped trusting bytes: `progress_marks()` counts only turns
+that used a tool or spent output tokens, because a refused turn GROWS the file and was
+resetting the counter every tick (proven on the incident transcript — appending its 9
+real refusals moves 5,640 bytes and 0 marks).
+⚠ A missing or stale gauge is **no information, never "healthy"** — the file is only as
+fresh as that row's last prompt, so classification falls through to the transcript.
 
 ⚠ §8 step 3 already *forbade* dying this way. **A prohibition with no measurement
 is unenforceable** — that is why the hook exists and this section no longer relies

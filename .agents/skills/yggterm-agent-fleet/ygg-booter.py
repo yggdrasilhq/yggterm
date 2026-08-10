@@ -454,11 +454,34 @@ def tick(args):
             size = os.path.getsize(c["path"]) if (c["path"] and not rhost) else 0
         except OSError:
             size = 0
-        grew = size > s.get("last_size", 0)
+        # ⛔ PROGRESS, NOT BYTES. A refused turn grows the file, so `size >
+        #    last_size` reset the stall counter on a dead session forever. See
+        #    BB.progress_marks.
+        marks = BB.progress_marks(c["path"]) if (c["path"] and not rhost) else 0
+        grew = marks > s.get("last_marks", 0)
+        s["last_marks"] = marks
         s["last_size"] = size
         action = "-"
         state = c["state"]
 
+        if state == "CONTEXT_DEAD":
+            # ⛔ THE ONE STATE A BOOT CANNOT FIX. Booting a context-exhausted
+            #    session is not merely useless -- it is guaranteed to fail
+            #    forever, because every prompt is refused before the agent ever
+            #    runs. Say the TRUE thing ("unrecoverable, relay it") instead of
+            #    "did not wake after 3 boots", escalate ONCE, and stop watching:
+            #    a watchdog that keeps barking at a grave taught the owner to
+            #    ignore it. Measured 2026-08-10: ten hours of it.
+            action = "CONTEXT-DEAD"
+            rc = max(rc, 4)
+            if not s["escalated"]:
+                escalate(host, row, f"context exhausted and UNRECOVERABLE — {c['tail']}. "
+                                    f"No boot can clear this; relay the campaign to a "
+                                    f"fresh session.")
+                s["escalated"] = True
+            log(f"{uuid[:8]} CONTEXT-DEAD — unsubscribing (a boot cannot fix this)")
+            sub_path(uuid).unlink(missing_ok=True)
+            continue
         if state in ("WORKING", "JUST_ENDED"):
             s["boots"] = 0                     # progress clears the stall counter
             s["escalated"] = False
