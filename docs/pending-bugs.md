@@ -187,6 +187,27 @@ and has to decide, every time, which red is theirs.
 **Falsifier:** `cargo test --workspace --lib` returns 0 failures on `dev`, twice
 in a row.
 
+## ⚠ A GUI RESTART TAKES 18.5 SECONDS BEFORE IT ANSWERS
+
+**Status:** OPEN
+
+Measured on the live host 2026-08-10 while deploying the 3.0.94 GUI: from `TERM`
+on the old process to the first `server app state` the new one answers,
+**18,473 ms**. The bar the campaign has been holding itself to is **3 s**, and a
+restart is something an agent does routinely — the field guide's own rule is
+"restart it yourself rather than hand the task back", which is only true while a
+restart is cheap.
+
+⚠ Not the same thing as the daemon-side stall fixed in 3.0.94 (that was the
+daemon walking the corpus before binding; this is the GUI process, and its daemon
+was already up and answering in 10 ms throughout). Do not assume the fix carried
+over — measure the GUI's own startup and find where the 18 s goes. 38 live
+session rows were being restored, which is the obvious first suspect and
+therefore the one to falsify first rather than accept.
+
+**Falsifier:** TERM-to-first-answered-`app state` under 3 s on a host with a
+comparable row count.
+
 ## ⭐ A NEW SESSION'S ROW IS NAMED AFTER THE ROW YOU RIGHT-CLICKED
 
 **Status:** OPEN
@@ -7193,40 +7214,3 @@ skip). Not a logic change — the reaping is right.
 
 **Falsifier when fixed:** a `ygg-claim.sh --replace <uuid>` run whose predecessor
 exits mid-reap prints no `No such file` lines.
-
-### ⭐ AND THE SECOND HALF, WHICH IS NOT COSMETIC: THE CLAIM DOES NOT LAND
-
-Observed on `dev` 2026-08-10, **twice, 50 minutes apart, on the same row**. The
-script reported each step correctly and then told the truth at the end:
-
-```
-ygg-claim row      : remote-cc://dev/<mine>
-ygg-claim was      : 6. <predecessor-set title>
-ygg-claim claiming : 6. <the new title>
-ygg-claim replacing: 6. <predecessor title> (remote-cc://dev/<theirs>)
-ygg-claim: claim never verified (row reads: 6|6. <predecessor-set title>)
-```
-
-⇒ **The rename is a no-op and the `--replace` target is not retired.** Read back
-independently three seconds later, from `server app state`, both rows still carry
-their old titles and both are still listed — so this is not the read racing the
-write (the trap in `finding-...-sample-simultaneously`); the write genuinely did
-not happen. The GUI had also raised its own `Restart Failed: terminating remote
-ClaudeCode session <theirs>…` notification, so the retire half was already failing
-on the GUI side before the script asked.
-
-⭐ **Credit where due: the script's verification is what caught this.** It refuses
-to claim success it cannot see, which is why this is a filed bug and not a session
-that thought it had renamed its row. That check must not be weakened.
-
-**Consequence, and why it is worth more than a cosmetic line:** two rows both
-numbered `6.` sit in the sidebar, and the numbering scheme is the owner's index
-into a 40-row list. A relay that cannot rename its own row cannot hand over.
-
-**Start here:** which verb the rename goes through, and whether it returns
-success. A verb reporting the REQUEST rather than the EFFECT is this repo's most
-common defect shape and the most likely answer.
-
-**Falsifier:** `ygg-claim.sh --title X --replace <uuid>` followed by an
-independent `server app state` read shows title X on the claiming row and no row
-for `<uuid>`.
