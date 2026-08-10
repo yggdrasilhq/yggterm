@@ -112,6 +112,83 @@ skips** — and this one skipped it for 8.5 hours. §8 step 3 already forbids th
 with no trigger is unenforceable**. §2 should point at the gauge as the automatic path
 and keep `/context` as the interactive one.
 
+## ⭐ A NEW SESSION'S ROW IS NAMED AFTER THE ROW YOU RIGHT-CLICKED
+
+**Status:** OPEN
+
+**Owner-reported 2026-08-10, verbatim:** *"spawning a new session should say
+New {Claude, Codex, …, Terminal} Session, etc. on start instead of adding some words on
+the spawnee session row on which right click context menu was issued. They should then
+change the name as they get their first title by whatever mechanism for each entry."*
+
+**Confirmed in his screenshot:** a freshly spawned Claude Code session
+(`0eb607df-…`, its own uuid, its own PID) shows
+`Title: 6. optimization: finish the pass — guihost fan 24x7 + jank claude-code` — **my
+row's title**, because the context menu was opened on my row. Two sidebar entries then
+read almost identically, which is how a 40-row sidebar stops being a working
+instrument.
+
+**Wanted:**
+1. On birth a row is named for WHAT IT IS — `New Claude Session`, `New Codex Session`,
+   `New Terminal`, per kind — never derived from the row the menu was invoked on.
+2. It renames itself when its first real title arrives, by whichever mechanism owns
+   titles for that kind (the CC/codex title sync, the app declare, etc.).
+
+⚠ Related but NOT the same defect: the ` claude-code` suffix seen on a superseded row
+earlier the same day, and the duplicate `local://<uuid>` twin births
+(§ *the untouchable row*). All three make the sidebar unreadable; only this one is
+about the name chosen AT BIRTH.
+
+## ⛔⛔ ONE DAEMON THREAD SPINS ON THE WHOLE TRANSCRIPT CORPUS, AND `server status` TAKES 27 SECONDS
+
+**Status:** OPEN
+
+⛔ **This is very likely the headline "jank"** — owner-reported 2026-08-10:
+*"even a new session does not want to start"*, and earlier the same hour
+*"untypable for half an hour"*.
+
+### Measured on the live daemon (3.0.91, pid 2785975), not inferred
+
+| probe | reading |
+|---|---|
+| daemon CPU | **0.858 cores total, 0.797 of it in ONE thread** |
+| that thread's syscalls | **9,764 `read` in 8 s, and NOTHING else** (~1,220/s) |
+| what it reads | fd 19 → `~/.codex/sessions/2026/03/17/rollout-…jsonl` — **a five-month-old transcript** |
+| `server status --endpoint <it>` | **27.2 s** (a 25 s timeout had already failed once) |
+| `perf-summary --category background` | `local_tree_scan`: **1,952 runs, p50 8.2 s, p95 9.7 s, max 32.5 s, total 16,365,190 ms ≈ 4.5 HOURS**, across ~140 distinct daemon pids |
+
+⇒ The daemon spends multi-second stretches walking the machine's ENTIRE historical
+agent-transcript corpus, and while it does, it does not answer. A `new session` needs
+that daemon (`server remote start-cc`), so **it does not start** — the row appears,
+reports `running · idle`, and no process is ever spawned. Traced on the failing
+attempt: `start-cc 0eb607df…` at 13:00:40 followed by **no birth, no error, no
+process**.
+
+### ⚠ THE PART THAT DOES NOT ADD UP — start here, do not assume
+
+`daemon_background_copy_chore_enabled_from_env` (`daemon.rs:10449`) is
+`value.is_some_and(…)` ⇒ **OFF unless explicitly set**, and the serving daemon's
+`/proc/<pid>/environ` carries no such variable. `daemon_copy_chore_should_scan_local_tree`
+is documented to gate exactly this walk on that flag. **So by the code as written, this
+scan should not be running at all — and it demonstrably is.**
+
+Candidates, in the order worth testing:
+1. `generation_enabled` reaching `run_background_copy_chore` from a source OTHER than
+   that env var (settings? a per-tick recompute?) — find the actual argument.
+2. A different reader of the same corpus that was never gated: the CC/codex title sync,
+   `collect_local_copy_candidates`, `find_transcript`, or the remote-codex identity
+   poll. The doc comment explicitly says the per-session halves *"keep running
+   regardless"* — but a **March codex rollout is not a per-owned-session read** on a
+   daemon that owns only CC rows, so something machine-wide is loose.
+3. The scan being started once and never re-checking the gate.
+
+**Falsifier:** with the chore disabled, a daemon must issue **no** reads against
+`~/.codex/sessions/**` or `~/.claude/projects/**` for sessions it does not own.
+Today one thread does ~1,220/s.
+
+⚠ **Do not "fix" this by widening the gate's env check** until candidate 1 is settled —
+the gate may be correct and simply not the thing running.
+
 ## ⛔⛔ EVERY GUI DEPLOY BREAKS IMAGE PASTE TO EVERY HOST YOU HAVE NOT UPDATED YET
 
 **Status:** OPEN
