@@ -139,6 +139,53 @@ earlier the same day, and the duplicate `local://<uuid>` twin births
 (§ *the untouchable row*). All three make the sidebar unreadable; only this one is
 about the name chosen AT BIRTH.
 
+## ⛔⛔ THE REMOTE HELPER DIALS A SOCKET NAMED FOR ITS OWN VERSION — SO UPGRADING IT ALONE KILLS EVERY REMOTE COMMAND
+
+**Status:** OPEN
+
+**Caused by me, 2026-08-10, and it took the owner's "even a new session does not want to
+start" from a symptom to a total outage.** Recorded because the trap is structural, not
+a slip.
+
+To fix image paste I set `dev`'s `~/.yggterm/bin/yggterm` to **3.0.92** while
+deliberately leaving its daemon at **3.0.91** (replacing a running daemon's binary arms
+the cold-shutdown cascade — see the deploy entry). The remote helper then dialled the
+socket named for **its own** version:
+
+```
+remote_pty_resize_failed
+  remote yggterm command failed for dev:
+  Error: connecting to $HOME/.yggterm/server-3-0-92.sock
+  Caused by: No such file or directory (os error 2)
+```
+
+`server-3-0-92.sock` does not exist — the running daemon binds `server-3-0-91.sock`.
+⇒ **Every remote command to that host failed**: `terminal resize`, `remote start-cc`,
+everything. A new row was created, reported `queued:true` / `launch.applied:true` /
+`running · idle`, and **no process was ever spawned** — verified by the absence of ANY
+ssh bridge for it on the GUI host while three other rows had theirs.
+
+**Measured before/after the revert, same verb, same host:**
+
+| | helper 3.0.92 vs daemon 3.0.91 | helper reverted to 3.0.91 |
+|---|---|---|
+| `terminal input-check` | `consuming_input:false` after **35,000 ms** | `consuming_input:true` in **249 ms** |
+| processes on the remote | none | `start-cc` + wrapper + `claude --session-id` |
+
+⇒ **VERSION IS THE RENDEZVOUS KEY** ([[finding-version-string-as-rendezvous-key]]), and
+it binds the helper to the DAEMON, not just to the protocol. So the helper and the
+daemon on a host are a matched pair that cannot be upgraded independently — which
+collides head-on with the paste bug, whose fix wanted the helper upgraded alone.
+
+**Fix directions:**
+1. **The helper should discover the daemon**, not assume its own version's socket —
+   fall back to the newest reachable versioned socket it is compatible with. That
+   decouples the pair and makes a mixed fleet work, which the constitution requires.
+2. Failing that, **refuse to install a helper whose version has no daemon**, loudly, at
+   install time — rather than succeeding and breaking every later command.
+⚠ Either way the error must name the pairing. *"No such file or directory"* on a socket
+path is a true statement that tells the reader nothing about what to do.
+
 ## ⛔⛔ ONE DAEMON THREAD SPINS ON THE WHOLE TRANSCRIPT CORPUS, AND `server status` TAKES 27 SECONDS
 
 **Status:** OPEN
