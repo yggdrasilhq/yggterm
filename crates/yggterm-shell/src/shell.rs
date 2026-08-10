@@ -35295,6 +35295,37 @@ fn try_startup_stale_daemon_hot_swap(
 ) -> bool {
     let expected_version = current_version();
     let daemon_executable = startup_hot_swap_daemon_executable(current_exe);
+    // ⛔ ASK THE BINARY WHAT IT IS BEFORE PROMISING WHAT IT WILL BE. We promise
+    // OUR version as the handoff target but spawn whatever `yggterm-headless`
+    // sits beside us; on a split install those disagree, the child refuses the
+    // regression and exits 1, and this function then waits out every deadline
+    // in the stack before landing on the preserve path it could have taken at
+    // once. Measured on the owner's machine: 10.2 s (`hot_restart`) + 15.4 s
+    // (`wait_for_daemon`) + 11.6 s (the next GUI instance queued behind the
+    // process guard) = a ~37 s `startup/initial_server_sync` during which the
+    // screen is fully painted and nothing on it is connected — the owner's
+    // "untypeable even though I see a flawless rendering".
+    // Same shape as `local_bootstrap_payload_version` on the remote path.
+    if let Some(binary_version) =
+        yggterm_server::yggterm_executable_reported_version(&daemon_executable)
+        && yggterm_server::hot_update_handoff_would_refuse_binary(
+            expected_version.as_str(),
+            &binary_version,
+        )
+    {
+        trace_daemon_step(
+            startup_endpoint,
+            "startup_hot_swap_skipped_daemon_binary_older",
+            json!({
+                "reason": reason,
+                "daemon_executable": daemon_executable.display().to_string(),
+                "daemon_executable_version": binary_version,
+                "current_version": expected_version.as_str(),
+                "stale_version": runtime_status.server_version.as_str(),
+            }),
+        );
+        return false;
+    }
     trace_daemon_step(
         startup_endpoint,
         "startup_hot_swap_begin",

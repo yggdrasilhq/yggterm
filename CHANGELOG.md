@@ -4,6 +4,48 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The GUI took ~37 s to become usable on every start, and the whole of it was
+  a handoff that could never have worked.** This is the owner's headline
+  symptom — *"sessions are untypeable even though I see a flawless rendering of
+  the session"* — and the reason it survived so many "looks fine" checks is that
+  the painted screen is genuinely correct throughout; only the connection is
+  missing. `startup/initial_server_sync` recorded 37,297 ms with `{"ok": true}`,
+  p90 48,542 ms, max 126,378 ms (n=37).
+  ⇒ **The snapshot was never the cost.** `daemon_reuse` fires 9 ms before the
+  span ends, so 37,287 of the 37,296 ms is spent before any data is fetched, in
+  `ensure_daemon_running` → `reconcile_stale_daemon_on_startup`. The GUI at
+  3.0.96 asked the 3.0.91 daemon for a hot-update handoff and promised **its
+  own** version as the target, but the child is spawned from whatever
+  `yggterm-headless` sits beside the GUI binary — on the owner's machine, 3.0.92.
+  The child booted, found a registry expecting 3.0.96, correctly refused the
+  regression, and exited 1. **The refusal is right; asking was the bug.**
+  ⇒ The requester now asks the binary what it is before promising what it will
+  be, using the SAME predicate the child applies
+  (`hot_update_handoff_would_refuse_binary`), so the pre-flight cannot drift
+  from the gate it predicts and `YGGTERM_ALLOW_HOT_UPDATE_TARGET_DOWNGRADE`
+  still governs both at once. An impossible swap is skipped and traced
+  (`startup_hot_swap_skipped_daemon_binary_older`), landing immediately on the
+  preserve path it previously reached 37 s later with an identical outcome.
+  ⚠ **The cost was a stack of deadlines, not work** — 10.2 s for the
+  `hot_restart` request (this is the "near-constant duration" already flagged as
+  a timeout), 15.4 s in `wait_for_daemon` (`0..100` × 150 ms), and 11.6 s for
+  the *next* GUI instance queued behind the process guard while the first one
+  did all that.
+  ⭐ **Same shape as the remote-bootstrap bug fixed the same day** — *"expected
+  3.0.92, got 3.0.91 forever, because every attempt bootstrapped 3.0.91 and then
+  rejected it for not being 3.0.92"*. That fix probed the payload's real version;
+  it never travelled to the local hot-swap path. The probe is now one shared
+  owner, `yggterm_executable_reported_version`.
+
+- **The one line that explained it was being written to `/dev/null`.** The
+  hot-restart child spawn set `stderr(Stdio::null())` while its sibling
+  `spawn_daemon_process` wrote both streams to the very `daemon.log` that the
+  failure message tails back — so `refusing hot-update handoff target regression
+  from 3.0.96 to 3.0.92` was discarded, and "daemon did not become reachable"
+  instead quoted a tail left by an unrelated daemon days earlier (a 3-0-32
+  socket's idle shutdown). Two siblings doing one job, only one of them logging.
+  The hot-restart child now writes to the same file the reader quotes.
+
 - **Every session on the machine refused input at once, behind screens that had
   already painted perfectly.** Owner-reported: *"sessions are untypeable even
   though I see a flawless rendering of the session"*, with the cause sitting in

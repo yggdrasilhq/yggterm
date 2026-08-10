@@ -225,10 +225,24 @@ it is connected yet. Any instrument that samples the painted surface will report
 health throughout — which is why this symptom has survived so many "looks fine to
 me" checks.
 
+⭐ **THE STARTUP HALF IS ROOT-CAUSED AND FIXED IN CODE (3.0.97) — see CHANGELOG.**
+`daemon_reuse` fires **9 ms** before the span ends, so 37,287 of the 37,296 ms
+was spent before any data was fetched: a hot-update handoff the GUI (3.0.96)
+requested from the 3.0.91 daemon, promising its own version while the child is
+spawned from the neighbouring `yggterm-headless` — 3.0.92 on that host. The child
+refused the regression and exited 1; the requester waited out every deadline in
+the stack. **The refusal was correct; asking was the bug.** ⚠ The `daemon.log`
+tail quoted in the failure text belonged to an unrelated 3-0-32 daemon from days
+earlier, because the child's stderr went to `/dev/null` — both fixed.
+⛔ **LIVE PROOF STILL OWED on the GUI host**, and it needs a 3.0.97 GUI binary
+installed to BOTH `~/.local/bin/yggterm` and `~/.yggterm/bin/yggterm`.
+
 ⚠ **`daemon_request/hot_restart` is pinned at ~10.2 s** — 10,229 and 10,216 ms on
 this restart, against p50 10,166 / max 10,441 across the host. **A near-constant
-duration is a timeout, not work** (the constant-anomaly law). Two of them ran
-during the 156 s startup. Find the 10 s deadline and ask what it is waiting for.
+duration is a timeout, not work** (the constant-anomaly law). **Still open**: the
+3.0.97 fix stops *doomed* handoffs from being requested at all, so this no longer
+lands on the startup path — but a handoff that CAN succeed still pays the same
+10.2 s, and nobody has yet found which deadline that is.
 
 ### ⛔ Why this was never investigated: the instrument blamed memory, every time
 
