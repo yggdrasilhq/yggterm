@@ -112435,6 +112435,9 @@ fn terminal_eval_script_with_canvas_renderer(
         let lastVisiblePaintFullRefreshAtMs = 0;
         let lastVisiblePaintRefreshSkipPerfAtMs = 0;
         let recentFrameLikeWriteUntilMs = 0;
+        // See VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS at the refusal branch below.
+        let pendingVisiblePaintForceFullRefreshSinceMs = 0;
+        const VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS = 1500;
         let recentInlineStatusAnimationUntilMs = 0;
         let recentInlineStatusAnimationStartedAtMs = 0;
         const recentFrameLikeWriteHot = () => Date.now() < recentFrameLikeWriteUntilMs;
@@ -113861,6 +113864,12 @@ fn terminal_eval_script_with_canvas_renderer(
             pendingVisiblePaintForceFullRefresh = Boolean(
                 pendingVisiblePaintForceFullRefresh || forceFullRefresh
             );
+            // When the OUTSTANDING demand was first raised. A latch that can be
+            // deferred forever is not a latch, so the deadline below has to know
+            // how old this one is. Cleared only when a refresh actually runs.
+            if (pendingVisiblePaintForceFullRefresh && pendingVisiblePaintForceFullRefreshSinceMs === 0) {{
+                pendingVisiblePaintForceFullRefreshSinceMs = Date.now();
+            }}
             // Daemon handover: every repaint here is a full-window blit on a
             // software-GL host, and the frame it would present is the re-resume
             // churn behind the veil. Drop the FRAME — never the demand: the
@@ -113932,14 +113941,44 @@ fn terminal_eval_script_with_canvas_renderer(
                         lastVisiblePaintFullRefreshAtMs > 0
                         && now - lastVisiblePaintFullRefreshAtMs
                             < visiblePaintFullRefreshMinIntervalMs;
+                    // ⛔⛔ THE DEADLINE, AND IT IS THE FIX FOR
+                    // "shell sessions never break, our special sessions ONLY break".
+                    //
+                    // `recentFrameLikeWrite` is armed by ANY payload containing
+                    // `\x1b[?25l` (hide cursor) for at least 600 ms. Every TUI emits
+                    // hide-cursor before every redraw, so for an agent CLI this flag
+                    // is re-armed on every frame and is effectively ALWAYS true --
+                    // while a plain shell, which does not bracket its output that
+                    // way, almost never arms it. So `&& !recentFrameLikeWrite` is in
+                    // practice an AGENT-CLI-ONLY suppression of `term.refresh()`,
+                    // which is the ONLY thing that repairs a partial paint. The
+                    // owner's discriminator, in one boolean.
+                    //
+                    // Why a partial paint is fatal to a TUI and harmless to a shell:
+                    // a shell appends at the cursor unconditionally, so unpainted
+                    // cells are overwritten at the next prompt. A TUI redraws in
+                    // place and uses cursor-forward over runs of spaces, and
+                    // CUF-skipped cells KEEP WHATEVER WAS IN THEM -- so the holes
+                    // latch forever. Owner screenshot 2026-08-10: composer line 1
+                    // perfect, wrapped line 2 missing ~half its characters.
+                    //
+                    // ⛔ The refusal branch below DESTROYED the demand rather than
+                    // deferring it -- the same latch-loss this function's own header
+                    // says it was restructured to prevent, surviving one layer down.
+                    // THE FIX FOR A CLAIM NOBODY CLEARS IS TO MAKE IT EXPIRE.
+                    const fullRefreshOverdue =
+                        requestedForceFullRefresh
+                        && pendingVisiblePaintForceFullRefreshSinceMs > 0
+                        && now - pendingVisiblePaintForceFullRefreshSinceMs
+                            >= VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS;
                     if (
                         requestedForceFullRefresh
                         && term.refresh
                         && !inputHot
-                        && !recentFrameLikeWrite
-                        && !fullRefreshRateLimited
+                        && (fullRefreshOverdue || (!recentFrameLikeWrite && !fullRefreshRateLimited))
                     ) {{
                         lastVisiblePaintFullRefreshAtMs = now;
+                        pendingVisiblePaintForceFullRefreshSinceMs = 0;
                         forcedRefreshCount += 1;
                         if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                             window.__yggtermXtermHosts[hostId].forcedRefreshCount = forcedRefreshCount;
@@ -113974,6 +114013,42 @@ fn terminal_eval_script_with_canvas_renderer(
                             inputHot ? 'input_hot' : (recentFrameLikeWrite ? 'frame_like' : 'rate_limited'),
                             requestedForceFullRefresh
                         );
+                        // ⛔ DEFER, NEVER DROP. `pendingVisiblePaintForceFullRefresh`
+                        // was cleared at the top of this frame, so without re-arming
+                        // here the demand is GONE and those cells are never repainted
+                        // again. `input_hot` already re-arms above; these two did not.
+                        pendingVisiblePaintForceFullRefresh = true;
+                        if (pendingVisiblePaintForceFullRefreshSinceMs === 0) {{
+                            pendingVisiblePaintForceFullRefreshSinceMs = now;
+                        }}
+                        if (!inputHot) {{
+                            // Wake when the condition that refused us can have
+                            // lapsed, or at the deadline -- whichever is sooner --
+                            // so a continuously-drawing TUI cannot defer us forever.
+                            const untilFrameLike = recentFrameLikeWrite
+                                ? Math.max(0, recentFrameLikeWriteUntilMs - now)
+                                : 0;
+                            const untilRateLimit = fullRefreshRateLimited
+                                ? Math.max(
+                                    0,
+                                    visiblePaintFullRefreshMinIntervalMs
+                                        - (now - lastVisiblePaintFullRefreshAtMs)
+                                )
+                                : 0;
+                            const untilDeadline = Math.max(
+                                0,
+                                pendingVisiblePaintForceFullRefreshSinceMs
+                                    + VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS
+                                    - now
+                            );
+                            scheduleVisiblePaintRecovery(
+                                true,
+                                Math.max(16, Math.min(
+                                    Math.max(untilFrameLike, untilRateLimit),
+                                    untilDeadline
+                                ))
+                            );
+                        }}
                     }}
                 }} catch (_error) {{}}
                 emitPaint();
@@ -149273,14 +149348,41 @@ mod tests {
                 && script.contains("retainedWritePaintRepairCount < 4"),
             "only retained-session and non-frame bulk writes should schedule a bounded visible repaint repair for WebKit canvas"
         );
+        // ⚖ THIS ASSERTION USED TO PIN THE DEFECT. It required the gate to read
+        // `&& !recentFrameLikeWrite && !fullRefreshRateLimited` with no escape,
+        // and paired it with a refusal branch that only RECORDED the skip. Since
+        // `recentFrameLikeWrite` is armed by `\x1b[?25l` — which every TUI emits
+        // before every redraw — that combination silently destroyed the
+        // full-refresh demand on agent-CLI rows and only on agent-CLI rows, which
+        // is the owner's "shell sessions never break, our special sessions ONLY
+        // break". Throttling is still correct and still pinned; DROPPING is not.
         assert!(
             script.contains(
-                "requestedForceFullRefresh\n                        && term.refresh\n                        && !inputHot\n                        && !recentFrameLikeWrite\n                        && !fullRefreshRateLimited"
+                "requestedForceFullRefresh\n                        && term.refresh\n                        && !inputHot\n                        && (fullRefreshOverdue || (!recentFrameLikeWrite && !fullRefreshRateLimited))"
             )
                 && script.contains("recentFrameLikeWriteUntilMs = Date.now() + Math.max(600, writeFrameMs * 2);")
                 && script.contains("recentFrameLikeWrite ? 'frame_like' : 'rate_limited'")
                 && script.contains("xterm_forced_refresh_skipped"),
-            "input-hot and recent frame-like paint repairs must skip full-canvas refreshes"
+            "a throttled full refresh must still be throttled, but never unconditionally"
+        );
+        assert!(
+            script.contains("const VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS = 1500;")
+                && script.contains("const fullRefreshOverdue =")
+                && script.contains(
+                    "now - pendingVisiblePaintForceFullRefreshSinceMs\n                            >= VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS"
+                ),
+            "a continuously-redrawing TUI must not be able to defer the repair forever — the demand needs a deadline"
+        );
+        assert!(
+            script.contains("pendingVisiblePaintForceFullRefreshSinceMs = 0;")
+                && script.split("recentFrameLikeWrite ? 'frame_like' : 'rate_limited'")
+                    .nth(1)
+                    .is_some_and(|after| {
+                        let branch = after.split("emitPaint();").next().unwrap_or("");
+                        branch.contains("pendingVisiblePaintForceFullRefresh = true;")
+                            && branch.contains("scheduleVisiblePaintRecovery(")
+                    }),
+            "a refused full refresh must be DEFERRED, never dropped — the latch is cleared at the top of the frame, so the refusal branch has to re-arm it"
         );
         assert!(
             script.contains("scrollbackExpected: false")
