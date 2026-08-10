@@ -1952,8 +1952,45 @@ overwhelmingly declining to run:
 for**, and one firing in three only happens because a deadline forces it. That is
 THE QUIET-GATE LAW's shape again, on the render path this time.
 
+### ⭐⭐ IT IS NOT A BLANK SCREEN — IT IS A STALE ONE, AND NOTHING SAYS SO
+
+Read from the attempt payloads themselves, so no viewport was driven:
+
+| field, over the same populations | slow >10 s (n=31) | fast ≤1 s (n=231) |
+|---|---|---|
+| `last_overlay_visible` | **False, 31/31** | False, 231/231 |
+| `last_surface_problem` | **None, 31/31** | None, 231/231 |
+| `last_observed_reason` | `terminal_surface_mounted` | `terminal_surface_mounted` |
+
+⇒ **No spinner, no overlay, no reported problem — the GUI believes the terminal
+is fine for the whole 11.7 s.** And the mount is not starting from nothing:
+`bootstrap_spawn_skipped_inactive_retained_host` fires **249** times, i.e. the
+client REUSES a retained surface, so the canvas carries the row's previous
+content.
+
+⇒ **The hypothesis that now fits every number: you switch to a row and see its
+LAST-KNOWN screen, correct-looking and unlabelled, which is stale by however long
+you were away — and it only catches up when output arrives or a deferred
+reconcile finally fires.** That is exactly "much improved, but still jank": it is
+no longer blank (the old bug), it is confidently wrong. And it is worse than a
+spinner, because a spinner tells you to wait while a stale screen does not
+([[bug-class-metadata-vouches-for-clipped-content]] — the surface vouches for
+content that is not current).
+
+**The falsifier, and it needs no new code:** switch to a row whose agent produced
+output while you were away, and watch whether the visible screen jumps forward
+seconds later. If it does, the seed/reconcile gating is the bug. Alternatively,
+correlate per switch: `reveal_screen_reconcile` (153 firings) against
+`screen_reconcile_deferred_recent_output` (619) for the same session — if the
+slow population is dominated by deferrals, the gate is the mechanism.
+
+⚠ **Still a hypothesis, not a finding.** It is consistent with all six measured
+quantities, and no competing explanation now fits `overlay_visible: False` plus a
+retained host plus an 11.7 s output wait — but nobody has yet watched a screen
+and seen it happen.
+
 ⚠ **What this does NOT yet prove**, and the next session must not skip it: that
-the user's canvas is visibly empty or stale during those 11.7 s. The counts prove
+a human has WATCHED a stale screen catch up during those 11.7 s. The counts prove
 the seed did not run and the reconcile deferred; they do not prove what was on
 screen. A faithful screenshot taken on an idle row, at switch time, closes it —
 and it must be HIS row on HIS GUI, which means asking or waiting for a moment he
