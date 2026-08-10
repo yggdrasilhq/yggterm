@@ -177,24 +177,78 @@ consecutive reveals — read from `server app state` → `reveal_log`:
 | 21:22:33 | ready | **63,092 ms** | 64,004 ms |
 | 21:24:26 | ready | 36,548 ms | 45,963 ms |
 
-⭐ **The first two are the SAME reveal.** The ceiling gave up at 60.0 s and the
-terminal became interactive at 63.1 s — so the failure toast was **3.9 seconds
-early**, and the user was told a session had not come up while it was coming up.
-⇒ **A 60 s ceiling on a path whose real p90 reaches 63 s does not report failure,
-it reports impatience.** Raising it is not the fix either — the fix is the 36-63 s
-first-output itself; but until then the ceiling should not claim a failure it
-cannot distinguish from a slow success. ⚠ This is NOT the shape-B false toast
-(that one is fixed and confirmed below): here the row WAS the active terminal, so
-the stand-down correctly did not apply. Different bug, same toast.
+⭐ **The first two are the SAME reveal, and the timeout is not the observer — it
+is the CURE.** The full trace, and it changes what the fix is:
+
+    21:21:29.387  open_path_resolve                       click
+    21:21:32.260  remote_pty_resize_failed                "terminal session not
+                                                           found: local://<id>"
+    21:21:32.484  resume_recovery_begin  attempt 1, reason=no_output_stall
+    21:21:32.485  resume_recovery_end    ← 1 ms. It did nothing.
+      ……  45 SECONDS WITH NO EVENT AT ALL  ……
+    21:22:17.904  remote_pty_resize_failed  "reading daemon response … Resource
+                                             temporarily unavailable (os error 11)"
+    21:22:29.449  reveal_failed + resume_timeout_cleared_inflight   ← the 60 s ceiling
+    21:22:29.500  resume_recovery_begin  attempt 2,
+                    reason=protected_runtime_careful_restore_after_timeout
+    21:22:29.878  resume_recovery_end    ← 378 ms, and it WORKED
+    21:22:32.484  attach_ready
+    21:22:33.396  reveal_ready  first_output_ms 63,092
+
+⇒ **Recovery attempt 1 is a no-op: it begins and ends in ONE MILLISECOND and
+achieves nothing, then nothing happens for 45 s.** What actually restores the
+session is attempt 2, which only exists because the 60 s ceiling fired — and it
+takes **378 ms**. Had attempt 2's strategy run at 21:21:32 instead of attempt 1's,
+this reveal would have been ~3.5 s, not 63 s.
+
+⛔ **So the ceiling is MISLABELLED, not mistimed.** It is announced to the user as
+*"did not become interactive in time"* at the exact instant it triggers the repair
+that makes the terminal interactive 3 s later. Raising the ceiling makes the
+product SLOWER (later repair); lowering it makes it faster. **The fix is to make
+`no_output_stall` recovery actually attempt the restore that
+`protected_runtime_careful_restore_after_timeout` does, and to stop calling a
+successful repair a failure.**
+⚠ Not the shape-B false toast (fixed, confirmed below): here the row WAS the
+active terminal, so the stand-down correctly did not apply. Different bug, same
+toast.
+
+### ⛔ WHY THE FAR DAEMON WAS UNREACHABLE: A TURNOVER WALKS EVERY STALE DAEMON
+
+The three `remote_pty_resize_failed` errors in that window are three DIFFERENT
+faults, and the last two are the far host being unable to answer at all:
+
+1. `terminal session not found: local://<id>` — ⭐ **a scheme mismatch.** The row
+   is `remote-cc://dev/<id>`; the remote lookup asked for `local://<id>`. The
+   live agent runtime on the far host is keyed `cc-runtime://<id>`. Same family as
+   the resolver bug fixed in 3.0.101 — two ids, one name.
+2. `reading daemon response … Resource temporarily unavailable (os error 11)`
+3. `connecting to ~/.yggterm/server-3-0-<n>.sock … Connection refused`
+
+Measured on the far host at the same moment: **one daemon turnover serially sends
+`prepare_update_restart` to 24 stale daemons and takes 23 seconds** (21:22:49 →
+21:23:13, `superseded_daemon_takeover` `prepared: 24`), and a third daemon spawned
+into the same socket and lost the bind race (`bind_lock_busy`). While that walk
+runs, those daemons are doing swap work instead of answering — which is the
+`os error 11` above, and then a window with no listener on the version socket at
+all, which is the `Connection refused`.
+
+⇒ ⭐ **THE FAT TAIL ON REMOTE ROWS IS COUPLED TO THE STALE-DAEMON COUNT ON THE FAR
+HOST.** Every turnover costs ~23 s of degraded responsiveness there, and the cost
+scales with how many dead daemons have piled up (24 on that host). That links this
+entry to the daemon-pile-up entry, which was being tracked as unrelated. ⚠ Any
+deploy is a turnover, so an agent deploying while the owner is switching rows is
+buying him a 60 s reveal — this one was measured ~90 minutes after a deploy, with
+a second same-version supersede landing in the window.
 
 ⛔ **Memory is excluded by the instrument itself** on all three: 8,741-8,958 MB of
 15,110 MB available, PSI `full avg60` **0.00%**, reclaim posture comfortable. A
 DIFFERENT agent row in the same window took **38,135 ms** to first output, so it
 is not one sick row. All four reveals are `remote-cc://dev/*`, i.e. the reach
 into `dev` — where 24 replaced daemons were alive alongside the live one.
-⇒ **Next measurement, and it is unstarted:** split that 36-63 s into ssh-connect ·
-daemon-resolve · attach · first-byte on the `dev` side. Nothing currently
-attributes it, which is why this entry keeps being re-measured rather than fixed.
+⇒ **That measurement is now DONE — see the trace above.** The 63 s is not spread
+across ssh-connect/resolve/attach at all: it is 3 s of real work, a 45 s dead gap
+after a no-op recovery, and a 3.5 s repair that only starts when the ceiling
+fires. **Do not re-measure it; fix `no_output_stall`.**
 ⚠ **A GUI restart takes 17-156 s to first answer, against the owner's 3 s bar.**
 Measured on the same host: **18,473 ms**, **16,460 ms**, and then **156,524 ms**
 — the last one bad enough that the owner intervened mid-restart (*"I had to
