@@ -4,6 +4,22 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A request the daemon cannot answer yet is now on the record (3.0.103).** The
+  daemon serves every client request under one global runtime mutex, and its
+  `request`/`begin` trace fires only *after* that lock is acquired — so a request
+  parked on the mutex left no trace at all, and a starved daemon looked exactly
+  like an idle one. That blindness is why the owner's 64-second row switch
+  (2026-08-10) read as "no client asked": the owning daemon held the lock for
+  **34.4 s** across one reveal, produced the session's first bytes 24 s before it
+  died, and could not answer the poll that would have delivered them — while
+  three `server terminal resize` processes sat blocked, invisible. Contended
+  acquisitions now bracket themselves with `request`/`lock_wait_begin` +
+  `lock_wait_end{waited_ms}` and record a `daemon_lock_wait/<request>` row in
+  `server perf-summary`, so contention is rankable beside the work starving it.
+  The uncontended path is unchanged and untraced — `status` alone runs 620k times
+  per fleet-day, so it takes the lock with `try_lock` and pays nothing. ⚠ This is
+  the instrument, not the cure: getting the reveal path off the global lock is
+  still open (`docs/pending-bugs.md`).
 - **A phone can now be given the fleet without being given a shell (3.0.102).**
   New verb `server daemon-bridge`: newline-delimited JSON in on stdin, the
   daemon's answers out on stdout, one connection per request because that is the
