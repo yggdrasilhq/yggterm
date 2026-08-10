@@ -7322,3 +7322,46 @@ skip). Not a logic change — the reaping is right.
 
 **Falsifier when fixed:** a `ygg-claim.sh --replace <uuid>` run whose predecessor
 exits mid-reap prints no `No such file` lines.
+
+## ⭐ `ygg-claim.sh` SPILLS RAW /proc READ ERRORS DURING A SUCCESSFUL REAP — THE GUARD IS ORDERED AFTER THE REDIRECT IT GUARDS
+
+**Status:** OPEN
+
+**Reported by row 8 (practice campaign) 2026-08-10 15:23 on guihost**, relayed via the
+vaultgraph session; observed while claiming a practice row with `--replace`:
+
+```
+15:23:28 ygg-claim remove: row_still_listed=False verified=False remote_runtime_survived
+…/ygg-claim.sh: line 275: /proc/335446/cmdline: No such file or directory
+15:23:28 ygg-claim reaping surviving agent pids:2954590 2954602
+…/ygg-claim.sh: line 275: /proc/336084/cmdline: No such file or directory
+…/ygg-claim.sh: line 275: /proc/336139/cmdline: No such file or directory
+15:23:29 ygg-claim predecessor retired and reaped clean
+```
+
+The claim SUCCEEDED (`predecessor retired and reaped clean`, seat read back verified) —
+but three raw bash errors mid-run read as a partial failure, and the next agent's
+instinct is to re-run the claim or start hand-checking `/proc`: exactly the
+hand-walking the script exists to prevent. Same family as fleet skill §7 — the
+instrument must not report something other than what happened.
+
+**Root cause (diagnosed at filing; deliberately not fixed from the reporting
+session):** in `agent_pids()`:
+
+```sh
+c="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)" || continue
+```
+
+The `2>/dev/null` is a NO-OP for precisely the failure it was written for.
+Redirections apply left to right: when `< /proc/$p/cmdline` fails to OPEN — the
+EXPECTED case, since pids enumerated by pgrep exit moments later while a reap is in
+progress — the shell reports the error to whatever stderr is in force *at that
+moment*, which is still the script's own; the trailing stderr redirect is never
+reached. The `|| continue` then works, which is why the run still succeeds.
+
+Fix shape: order the stderr redirect before the input redirect
+(`tr '\0' ' ' 2>/dev/null < "/proc/$p/cmdline"`) or wrap the read in a
+`{ …; } 2>/dev/null` group so a vanished pid silently `continue`s — and sweep the
+script for the same redirect ordering on any other `/proc` read. Falsifier for the
+fix: a `--replace` claim over a predecessor with live children exits clean with no
+bash diagnostics on stderr.
