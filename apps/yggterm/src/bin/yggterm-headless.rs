@@ -175,7 +175,7 @@ fn print_server_help() {
     println!(
         "usage:
   yggterm-headless server daemon
-  yggterm-headless server attach <session> [cwd]
+  yggterm-headless server attach <session> [cwd] [--allow-plain-shell-fallback]
   yggterm-headless server ping
   yggterm-headless server status
   yggterm-headless server daemons [--json]
@@ -1331,12 +1331,8 @@ fn main() -> Result<()> {
         return run_daemon(&endpoint, host);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "attach" {
-        return run_attach(
-            &args[2],
-            args.get(3)
-                .map(String::as_str)
-                .filter(|value| !value.is_empty()),
-        );
+        let (cwd, fallback) = yggterm_server::parse_attach_args(&args[3..]);
+        return run_attach(&args[2], cwd.as_deref(), fallback);
     }
     if args.len() >= 5 && args[0] == "server" && args[1] == "terminal" && args[2] == "write" {
         ensure_local_server_ready_for_cli(&store)?;
