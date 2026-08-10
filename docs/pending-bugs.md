@@ -207,25 +207,50 @@ ran — by then the far daemon could answer. ⚠ Two trace events with different
 `reason` strings are not two mechanisms; read the callee before believing the
 label.
 
-**The real root cause is two lines, and both are code-cited:**
+**The real root cause, code-cited:**
 
-1. ⭐ **Stall recovery is capped at ONE attempt** — the guard is
-   `… && resume_recovery_attempts < 1` (`shell.rs`, the
-   `blank_remote_resume_runtime_output || stalled_remote_resume || …` branch).
-   After that single shot nothing retries until the 60 s ceiling. **That cap IS
-   the 45-second dead gap**, and the gap is structural, not a stall in any call.
-2. ⭐ **That one shot asks a question whose answer was already "yes."**
+1. ⭐ **The recovery asks a question whose answer was already "yes."**
    `terminal_ensure_async` returned Ok in **1 ms**: the daemon confirmed the
    terminal RECORD exists. Existence is not output, and the session was producing
-   none — [[finding-a-set-is-not-a-fill]] on the reveal path.
+   none — [[finding-a-set-is-not-a-fill]] on the reveal path. **A recovery whose
+   success condition is satisfied by the state that provoked it recovers nothing.**
+2. Stall recovery is also capped at one attempt (`… && resume_recovery_attempts
+   < 1`, `shell.rs`), so nothing re-tries until the 60 s ceiling — ⛔ **but see
+   below: lifting that cap is INERT**, because the thing it would repeat is the
+   1 ms no-op above.
 
-⇒ **Fix shape (unbuilt, and it needs care):** retry stall recovery on a backoff
-until the ceiling instead of once, and/or make the ensure postcondition "bytes
-arrived", not "a record exists". ⛔ Do not simply raise the cap: the far daemon in
-this incident was mid-turnover and already failing to answer (`os error 11`), so a
-tight retry loop would hammer a daemon that is struggling. Measure what
-`terminal_ensure_async` does against an unresponsive far daemon BEFORE choosing a
-cadence.
+⛔⛔ **AND LIFTING THAT CAP IS INERT — do not build it.** This entry previously
+said the fix was "retry stall recovery on a backoff instead of once", gated on
+first measuring what `terminal_ensure_async` does against an unresponsive far
+daemon. **The code answers that without a measurement, and the answer kills the
+fix.** For a remote session `terminal_ensure_with_retry_async` is ALREADY a
+bounded retry — `attempt_timeout_ms` **30,000 ms**, `max_attempts` **8** — so it
+neither hammers nor gives up early. In this incident it never entered that path
+at all: **it returned `Ok` in 1 ms** because the far daemon answered immediately
+that the record exists. ⇒ **Retrying a call that returns `Ok` in 1 ms returns
+`Ok` in 1 ms again.** Raising `resume_recovery_attempts < 1` changes nothing.
+
+⚖ **What that leaves, and the confidence on each:**
+- **HIGH — client-side retry is not the fix.** The recovery already resets the
+  read stream (`cursor = 0`, `terminal_has_visible_output = false`) and it still
+  saw nothing for 45 s. The client did the correct thing once and waiting was all
+  that was left.
+- **HIGH — `ensure` is the wrong verb for stall recovery.** Its postcondition is
+  "a record exists", which was already true. A recovery whose success condition
+  is satisfied by the state that PROVOKED it cannot recover anything.
+- **MEDIUM — the 45 s is the FAR daemon being unavailable, so the fix belongs
+  there**, not in the reveal path: the same host answered `os error 11` to a
+  different call at 21:22:17 and was walking 24 stale daemons serially for 23 s.
+  ⚠ Not proven that it was unresponsive for the whole 45 s — that is the one
+  measurement still owed, and it is taken on the FAR host, not the GUI.
+⇒ **Most promising fix, unbuilt: make the supersede walk concurrent or bounded**
+so a turnover cannot make a host unanswerable for ~23 s.
+
+⚠ **Method note, because this entry has now had three fixes proposed and two
+retracted:** each "the fix is X" survived until one more layer was read — the
+trace label (retracted), then the retry cap (retracted here). **Read the callee,
+then the callee's bounds, BEFORE proposing.** The corrections cost less than the
+implementations would have, but only because none was built.
 
 ⛔ **So the ceiling is MISLABELLED, not mistimed.** It is announced to the user as
 *"did not become interactive in time"* at the exact instant it triggers the repair
