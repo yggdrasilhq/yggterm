@@ -132,7 +132,7 @@ The next product work should stay very focused:
 1. Make remote session lifecycle bulletproof.
 2. Make preview and terminal feel like the same live object.
 3. Make search excellent across tree, preview, and active terminals.
-4. Make sluggishness unacceptable and visible through telemetry.
+4. Make sluggishness not acceptable and visible through telemetry.
 5. Make session metadata generation useful enough that people trust it.
 6. Make the workspace feel calm even when the underlying work is messy.
 

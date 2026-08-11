@@ -2,7 +2,7 @@ DREAM from another campaign row (mid-wave, per the standing instruction to alway
 list). The test is not "is this a bug" but "did an agent hand-assemble this chore from primitives
 and get it wrong?" — and today it did, and it halted a live pipeline.
 
-## The defect, owner-reported and measured 2026-08-08
+## The defect, reported and measured 2026-08-08
 
 **A FINISHED delegate row and a STALLED one are indistinguishable from the row plane.** I spawned
 two delegates. One had landed its entire subset; the other had ended its turn after acknowledging
@@ -10,7 +10,7 @@ its brief and sat idle 54 minutes. `server app rows` shows both as alive with no
 The owner saw "they both stopped" — correctly, from what the UI can tell him — and the stall was
 found only because he looked.
 
-His words: *"this is a monitor/relay system bug and should be resolved. These yggterm fleet kinks
+The requirement: *"this is a monitor/relay system bug and should be resolved. These yggterm fleet kinks
 should be seen, 'dreamt' of it and then auto-resolved whenever encountered by any agent. Otherwise
 they will stop critical agentic pipeline like now."*
 

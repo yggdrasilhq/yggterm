@@ -269,7 +269,7 @@ in the composer, as the delegate's opening message. So:
 
 ### ⛔⛔ A FINISHED DELEGATE AND A STALLED ONE LOOK IDENTICAL — run `ygg-babysit.py`
 
-**Owner-reported 2026-08-08, and it halted a live pipeline:** *"I am seeing that they both
+**Reported 2026-08-08, and it halted a live pipeline:** *"I am seeing that they both
 stopped. So this is a monitor/relay system bug and should be resolved. These yggterm fleet kinks
 should be seen, 'dreamt' of it and then auto-resolved whenever encountered by any agent."*
 
@@ -360,7 +360,7 @@ observes.
 
 ### ⛔⛔ ARM THE BOOTER — a stalled session CANNOT restart itself
 
-**Owner-directed 2026-08-09, said while he was hand-booting a stalled relay row:**
+**Recorded 2026-08-09, said while he was hand-booting a stalled relay row:**
 *"I have seen you stall sometimes, so arm a booter in a fleet. A booter is a tool
 that monitors any session that has subscribed to it, to kick it and say 'continue,
 the booter booted'. Sometimes you may feel that the work is done so you need to
@@ -376,7 +376,7 @@ unsubscribe from the booter."*
 
 #### ⛔⛔ BEFORE A LONG WAIT, `defer` — THE WATCHER CANNOT SEE THAT YOU ARE BUSY
 
-**Owner-directed 2026-08-09:** *"A waiting session on a long task should ask the
+**Recorded 2026-08-09:** *"A waiting session on a long task should ask the
 booter that for this time use a custom time (less than 55 mins) to boot."*
 
 ⭐ **Why the session must ask, rather than the watcher work it out: a session
@@ -411,7 +411,7 @@ should not be.
 *"why was it not booted at 8 minutes"* costs a code read to answer.
 
 ⛔⛔ **`ygg-claim.sh` does NOT arm the booter for you — and must not.**
-Owner-directed 2026-08-10: *"When there is no relay mode the booter should not
+recorded 2026-08-10: *"When there is no relay mode the booter should not
 self arm. You should not be booted."* It had fired on him inside a session he
 opened with *"NOT like a relay. All agents should be contained in the session"*:
 the row was claimed, so the row self-armed, and a machine woke the session he had
@@ -501,7 +501,7 @@ from `server app rows`, and no surviving process.
 
 ---
 
-### ⛔⛔ WHO A NOTIFICATION IS ADDRESSED TO — owner-caught twice in one hour
+### ⛔⛔ WHO A NOTIFICATION IS ADDRESSED TO — caught twice in one hour
 
 `notify --session <row>` makes the card **clickable through to that row**. So the `--session` is
 not bookkeeping, it is a **destination**: it decides where the human lands when they act on it.
@@ -556,7 +556,7 @@ the request and the effect are separated by a human being.
 
 ### ⛔⛔ 3b. CLAIM EVERY SESSION YOU SPAWN, AND SWEEP IT WHEN IT IS DONE
 
-**Owner-directed 2026-08-10, after finding an unswept session still holding a row's identity:**
+**Recorded 2026-08-10, after finding an unswept session still holding a row's identity:**
 
 > *"Your predecessor or its predecessor started it and did not sweep it once done. I think right
 > now you are the only one. If you spawn other related sessions, make sure to claim them otherwise
@@ -914,9 +914,9 @@ handoff is a cycle, not an ending:
    for the human. Then it kills you.
 6. **Repeat until the campaign is finished.**
 
-### ⛔⛔ IN RELAY MODE, STOPPING IS A SIN — DECIDE, RECORD, CONTINUE (owner-directed 2026-08-10)
+### ⛔⛔ IN RELAY MODE, STOPPING IS A SIN — DECIDE, RECORD, CONTINUE (recorded 2026-08-10)
 
-His words, after a relay session ended two consecutive turns by asking him a
+the requirement, after a relay session ended two consecutive turns by asking him a
 question: *"In relay mode, you should not wait or ask me any questions. All
 questions and ambiguity are to be recorded … and you simply finish all parts of
 the campaign. In your questions I almost always (99% of the time) choose your
@@ -927,10 +927,10 @@ fork and halts has converted a 99%-predictable decision into an idle row and a
 context window going cold. **Take your own recommendation, do the work, and write
 down what you chose and what would reverse it.**
 
-### ⛔⛔ AND OFF HOURS, THE ASK IS NOT EVEN AVAILABLE — IT COST HIM TWO HOURS (owner-directed 2026-08-11)
+### ⛔⛔ AND OFF HOURS, THE ASK IS NOT EVEN AVAILABLE — IT COST TWO HOURS (recorded 2026-08-11)
 
 **ON HOURS ARE 09:00–17:30 ON THE `guihost` CLOCK. Outside that window a question is
-not a slow path, it is a DEAD one.** His words, after a session asked at ~23:50
+not a slow path, it is a DEAD one.** The requirement, stated at ~23:50:
 and sat idle until he woke: *"In ygg fleet skill relay mode, you should not ask
 questions if it is off hours of guihost clock. On hours are 9AM - 5:30PM. In off
 hour times, go with your recommendation and in the end let me know of choices you
@@ -940,7 +940,7 @@ me two hours of work time."*
 - ⛔ **Off hours ⇒ NEVER `AskUserQuestion`, for anything.** Not for an intrusive
   action, not for a fork, not for a "this will disturb you" courtesy. **Take the
   recommendation you were about to offer as the first option and DO IT.**
-- ⭐ **Then tell him at the end, in the shape he asked for:** *what I chose for
+- ⭐ **Then tell him at the end, in the shape it was requested for:** *what I chose for
   you · why · and what to say to revert or modify it.* One short list, at the end
   of the turn — not a question, a receipt.
 - ⚖ **Check the clock before you even consider asking:** `TZ=Asia/Kolkata date`

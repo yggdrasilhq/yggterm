@@ -74,7 +74,7 @@ This file tracks user-visible changes in `yggterm`.
   detector reads so the repair path stands down when prevention already did the
   work. The repair path remains as the backstop.
 - **The stale-atlas heal stops missing the case that actually happens, and stops
-  claiming it worked (3.0.105).** Owner-reported: stray characters appearing in
+  claiming it worked (3.0.105).** reported: stray characters appearing in
   the TUI and clearing on scroll. Confirmed in a faithful screenshot — orphan
   glyphs past the right margin of wrapped lines, and one row painted twice — and
   proven to be **ours**: the daemon's vt100 screen, which is the source of truth
@@ -179,7 +179,7 @@ This file tracks user-visible changes in `yggterm`.
   learn their orchestrator is gone. Sessions like that are now a named blocker
   (`orchestrating`), read from the agent's OWN record of its delegates rather
   than guessed at from process ancestry, and the daemon waits for them **without
-  a deadline** — the owner's ruling, because a `continue` can repair a session
+  a deadline** — the ruling, because a `continue` can repair a session
   but cannot re-adopt an orphaned fleet. The wait is bounded in the way that
   matters: it ends on its own the moment the delegates stop writing.
   ⚠ Measured while building this, across every transcript on the build host:
@@ -310,7 +310,7 @@ This file tracks user-visible changes in `yggterm`.
   The hot-restart child now writes to the same file the reader quotes.
 
 - **Every session on the machine refused input at once, behind screens that had
-  already painted perfectly.** Owner-reported: *"sessions are untypeable even
+  already painted perfectly.** reported: *"sessions are untypeable even
   though I see a flawless rendering of the session"*, with the cause sitting in
   his own composer — `Error: timed out waiting for daemon spawn lock`.
   `acquire_daemon_spawn_lock` waited `for _ in 0..120` at 100 ms — **~12 s — for a
@@ -336,7 +336,7 @@ This file tracks user-visible changes in `yggterm`.
   are written now — the fleet audit hook has been saying "fix the deploy to write
   every copy" and it was right.
 
-- **"What is swapping, and it is probably a lie." It was.** Owner-reported: every
+- **"What is swapping, and it is probably a lie." It was.** reported: every
   row switch feels like 18-20 s and arrives with a notification telling him to
   free RAM. The notification gated on `swap_pressured()` — `swap_used_kb > 512 MB`
   — and `swap_used` is a HISTORY counter. The doc comment on the neighbouring
@@ -384,7 +384,7 @@ This file tracks user-visible changes in `yggterm`.
   remote host's binaries were still 3.0.91 afterwards and all eight live
   `resume-cc`/`start-cc` shims were still running; daemon counts unchanged on both
   hosts.
-  ⇒ **Owner-confirmed: "CTRL+V works"**, with a staged file on the remote host to
+  ⇒ **Confirmed: "CTRL+V works"**, with a staged file on the remote host to
   match — which is the end of the path, not just the gate.
   ⚠ The restart itself took **18.5 s** to answer, against a 3 s bar — filed.
   ⚠ One thing recorded as evidence and NOT as conclusion: the same GUI process
@@ -396,7 +396,7 @@ This file tracks user-visible changes in `yggterm`.
 
 - **A new daemon answered nothing for 15 seconds because it walked every agent
   transcript on the machine first — to fill an argument nobody has read since
-  v2.1.31.** Owner-reported as *"even a new session does not want to start"*.
+  v2.1.31.** reported as *"even a new session does not want to start"*.
   `run_daemon` calls `DaemonRuntime::load` **before** it binds its socket, and
   load walked the whole codex + Claude Code corpus (17.8 GB / 807 files on `dev`)
   twice over: once via `load_codex_tree`, whose result went into a
@@ -458,7 +458,7 @@ This file tracks user-visible changes in `yggterm`.
   EXISTING pile still has to be drained by hand or as its sessions end.
 
 - **Clicking a row could hang forever on a session that was perfectly healthy.**
-  Owner-reported: a row left untouchable overnight, and a second one reproducing
+  reported: a row left untouchable overnight, and a second one reproducing
   it live. The banner said *"still held by a yggterm process whose daemon exited
   without handing it over … this clears itself"* — and every clause of that was
   false. The daemon was alive and holding the PTY; nothing was going to clear;
@@ -476,7 +476,7 @@ This file tracks user-visible changes in `yggterm`.
   his morning.
 
 - **A web surface's loading light never expired, so an unobserved surface blinked
-  for the life of the row.** Owner-reported: *"on restart all my ychromes keep on
+  for the life of the row.** reported: *"on restart all my ychromes keep on
   blinking."* Measured on his GUI — 3 of 6 ychrome rows sat at
   `busy_reason: web_surface_loading` **45 minutes** after the restart that made
   them. A tab is born `loading: true`, which is correct (WebKit really did begin a
@@ -804,7 +804,7 @@ This file tracks user-visible changes in `yggterm`.
   leave a half-installed toolchain behind.
 
 - **yggterm installs and updates EVERY agent CLI, by every method — not just the
-  npm ones.** The owner's ruling: *"yggterm should auto install, update ALL clis
+  npm ones.** The ruling: *"yggterm should auto install, update ALL clis
   in all connected systems including localhost."* The provisioner asked one
   question — "does this CLI have an npm package?" — so `kimi` (a uv tool), `muse`
   (a vendor installer) and `agy` (fetchable only behind a sign-in) were never

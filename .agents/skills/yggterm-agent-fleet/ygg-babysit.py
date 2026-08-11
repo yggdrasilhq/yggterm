@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ygg-babysit — keep spawned delegate rows RUNNING, without anyone remembering to look.
 
-⛔⛔ THE DEFECT THIS EXISTS FOR (owner-reported 2026-08-08, measured the same hour):
+⛔⛔ THE DEFECT THIS EXISTS FOR (reported 2026-08-08, measured the same hour):
 
     A DELEGATE THAT HAS FINISHED AND A DELEGATE THAT HAS STALLED ARE
     INDISTINGUISHABLE FROM THE ROW PLANE. Both present as "turn ended, nothing
@@ -10,7 +10,7 @@
 
 Measured that day: two delegates spawned together. One LANDED its whole subset;
 the other ENDED ITS TURN after acknowledging the brief and sat idle for 54
-minutes. Identical from `server app rows`. His words: *"I am seeing that they
+minutes. Identical from `server app rows`. The requirement: *"I am seeing that they
 both stopped … these yggterm fleet kinks should be seen, 'dreamt' of it and then
 auto-resolved whenever encountered by any agent. Otherwise they will stop
 critical agentic pipeline like now."*
@@ -323,7 +323,7 @@ def nudge(host, row, dry):
     `server terminal write`, which addresses the PTY itself. Measured on a live
     row: submit `submitted:false`, PTY write delivered, same minute.
 
-    ⛔⛔ ALSO FIXED 2026-08-09, owner-reported while watching it fail: **the Enter
+    ⛔⛔ ALSO FIXED 2026-08-09, reported while watching it fail: **the Enter
     is a SEPARATE write of `\r`, and this sent one concatenated `\n`.** Two
     mistakes in one line. `\n` is not Enter — an agent CLI runs its tty in RAW
     mode, so Enter is CR and a bare LF is inserted as a literal newline; his
@@ -368,7 +368,7 @@ _ROWS_CACHE = {}
 def resolve_row_path(host, ident):
     """Turn ANY session identifier into a real ROW PATH, or None.
 
-    ⛔⛔ THE TRAP THIS CLOSES, owner-reported 2026-08-08: *"Clicking these delegate
+    ⛔⛔ THE TRAP THIS CLOSES, reported 2026-08-08: *"Clicking these delegate
     notification does not transfer me to the required attention session."*
 
     `notify --session` makes the card clickable through to that row — but ONLY if

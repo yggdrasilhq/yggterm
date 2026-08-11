@@ -84,6 +84,30 @@ do
   [ -n "$h" ] && { note "a private store/portal/project name is present (term withheld) — use an invented name:"; echo "$h" | head -6 >&2; }
 done
 
+# 4b. THE SHARED LIST, if this machine has one. `ygg-privacy-guard` — the thing
+#     that actually stands at the push boundary — reads its terms from
+#     ~/.config/ygg-privacy/private-terms.txt. On 2026-08-11 the two lists were
+#     found to have ZERO OVERLAP: this file enforced 12 project names the guard
+#     did not, the guard enforced 19 this file did not, and a leak only had to
+#     beat whichever checker happened to run. One private campaign name reached
+#     a PUBLIC remote through exactly that gap.
+#     ⇒ Read the shared list too, so a term added in either place is enforced in
+#     both. The encoded list above stays as the FLOOR — it is what protects a CI
+#     runner or a fresh clone where this file does not exist, and it must never
+#     be thinned on the assumption that the shared list covers it.
+#     ⛔ The file is private (mode 600) and its terms are never echoed; only the
+#     offending repo lines are shown, as above.
+shared_terms="$HOME/.config/ygg-privacy/private-terms.txt"
+if [ -r "$shared_terms" ]; then
+  while IFS= read -r term; do
+    case "$term" in ''|'#'*) continue ;; esac
+    term=$(printf '%s' "$term" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ ${#term} -ge 4 ] || continue   # too short to match without false positives
+    h=$(echo "$files" | xargs grep -nIiF -- "$term" 2>/dev/null)
+    [ -n "$h" ] && { note "a private name from the shared guard list is present (term withheld) — use an invented name:"; echo "$h" | head -6 >&2; }
+  done < "$shared_terms"
+fi
+
 if [ "$fail" -eq 0 ]; then
   echo "privacy: ok — no personal paths, LAN addresses, row taxonomy, or private names"
 fi

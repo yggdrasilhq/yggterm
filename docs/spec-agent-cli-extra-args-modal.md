@@ -46,7 +46,7 @@ compiles unchanged.
 
 ## 3. The content, measured 2026-08-08 on this fleet
 
-⛔⛔ **THE LAW OF THIS SECTION, owner-directed:** *"study each CLI's nuances and
+⛔⛔ **THE LAW OF THIS SECTION, recorded:** *"study each CLI's nuances and
 we do the bypass as they want it."* **Each CLI's bypass is expressed in that
 CLI's own idiom.** They are not the same shape and must not be flattened into
 one: two are flags, one is a config file, one is a *hidden* flag, and one CLI

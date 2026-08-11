@@ -101,9 +101,9 @@ Provenance is not optional and neither is cleanup. Agents create rows through
   (`server app session remove <path>`), rather than leaving it for the policy.
   The sweep is a backstop for what an agent forgot, not a substitute for
   clearing your own plate.
-- ⛔⛔ **AN APP SESSION IS RUBBISH THE MOMENT ITS JOB IS DONE — owner-directed
+- ⛔⛔ **AN APP SESSION IS RUBBISH THE MOMENT ITS JOB IS DONE — recorded
   2026-08-07**, after an India Post booking run left two ychrome rows behind on
-  a 38-row sidebar. His words: *"janitor work on the left our ychrome session
+  a 38-row sidebar. The requirement: *"janitor work on the left our ychrome session
   should be done … so these used app sessions do not dangle around and cause row
   noise on the yggterm GUI UX."*
   A ychrome/yRDP row is **scaffolding for ONE task, not a shared asset**: its
@@ -125,7 +125,7 @@ Provenance is not optional and neither is cleanup. Agents create rows through
   disobeyed, check whether some other doc is teaching the reverse before
   concluding the agent was careless.
 
-## The outline contract — every session names and numbers itself (owner-directed 2026-08-06)
+## The outline contract — every session names and numbers itself (recorded 2026-08-06)
 
 The user runs ~19 sessions he reads, and the sidebar is a working instrument, not a log. He
 organises it **like a book**, and the numbering also declares *which rows are under

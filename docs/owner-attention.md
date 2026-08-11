@@ -12,7 +12,7 @@ somewhere he can find in one glance instead of stalling on it.
 `docs/docs-ssot.md` is the law and it is enforced. This file **points**; it never
 copies.
 
-1. **One line per item**, in his words where they exist: what is needed, and the
+1. **One line per item**, in the requirement: what is needed, and the
    ONE link to the entry that owns the detail. No reproductions, no measurements,
    no mechanism — those live in `docs/pending-bugs.md` (yggterm) or
    `~/gh/ychrome/docs/pending-bugs.md` (ychrome).
@@ -83,7 +83,7 @@ copies.
 
 - **Whether the relay moves up the queue on the strength of ADR-0002 §9.** §3
   ruled "relay is v2" when the phone was only ever going to carry a terminal, at
-  kilobytes a second. §9 changed the subject: he asked for the phone to be a
+  kilobytes a second. §9 changed the subject: it was requested for the phone to be a
   remote SURFACE for libyggterm apps (his example — guihost runs ychrome on Khan
   Academy, he solves on the phone, guihost's page updates), and a streamed surface
   is not a terminal's bandwidth. He named it a relay priority himself, which is
