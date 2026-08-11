@@ -108810,6 +108810,75 @@ fn terminal_eval_script_with_canvas_renderer(
         const rendererPolicyReason = {renderer_policy_reason};
         window.__yggtermXtermRendererPolicyReason = String(rendererPolicyReason || '');
         let webglRendererActive = false;
+        // ⛔⛔ THE SHIPPED xterm SCORES EMOJI ONE CELL WIDE. Measured against the
+        // exact vendored bundle 2026-08-11: `activeVersion` is `6` and `["6"]` is
+        // the ONLY table registered, so `wcwidth(U+2B50 ⭐) = 1`,
+        // `U+26D4 ⛔ = 1`, `U+2705 ✅ = 1`, `U+1F680 🚀 = 1`. Every modern agent
+        // CLI writes them as TWO columns (Unicode 9+ made Emoji_Presentation
+        // characters Wide), so from the first emoji on a line the CLI and the
+        // renderer disagree about where every later cell is. A partial repaint
+        // then leaves the orphaned column holding its old glyph — the owner's
+        // "weird characters appearing here and there", which sat immediately
+        // after ⭐ and ⛔ in both frames he sent, and cleared on scroll because a
+        // full-line repaint re-lays the row out consistently.
+        //
+        // ⚠ CJK was never wrong (`中` = 2) and text-presentation symbols must STAY
+        // narrow (`⚠ U+26A0` = 1, `✻` = 1, `❯` = 1) — widening those would create
+        // the identical bug in the opposite direction. So this widens EXACTLY the
+        // Emoji_Presentation=Yes set and delegates everything else to the bundle's
+        // own v6 provider, rather than swapping in a whole new width table.
+        //
+        // `charProperties` is overridden alongside `wcwidth` on purpose: the
+        // renderer reads the packed properties, so changing only `wcwidth` would
+        // leave the paint on the old widths and fix nothing.
+        try {{
+          const uniSvc = term._core && term._core.unicodeService;
+          const uniBase = uniSvc && uniSvc._providers && uniSvc._providers['6'];
+          const UniSvc = uniSvc && uniSvc.constructor;
+          if (uniBase && UniSvc && typeof UniSvc.createPropertyValue === 'function') {{
+            // Emoji_Presentation=Yes, as [start, end] pairs, sorted — binary searched.
+            const EMOJI_WIDE = [
+            0x231A,0x231B,0x23E9,0x23EC,0x23F0,0x23F0,0x23F3,0x23F3,0x25FD,0x25FE,0x2614,0x2615,
+            0x2648,0x2653,0x267F,0x267F,0x2693,0x2693,0x26A1,0x26A1,0x26AA,0x26AB,0x26BD,0x26BE,
+            0x26C4,0x26C5,0x26CE,0x26CE,0x26D4,0x26D4,0x26EA,0x26EA,0x26F2,0x26F3,0x26F5,0x26F5,
+            0x26FA,0x26FA,0x26FD,0x26FD,0x2705,0x2705,0x270A,0x270B,0x2728,0x2728,0x274C,0x274C,
+            0x274E,0x274E,0x2753,0x2755,0x2757,0x2757,0x2795,0x2797,0x27B0,0x27B0,0x27BF,0x27BF,
+            0x2B1B,0x2B1C,0x2B50,0x2B50,0x2B55,0x2B55,0x1F004,0x1F004,0x1F0CF,0x1F0CF,0x1F18E,
+            0x1F18E,0x1F191,0x1F19A,0x1F1E6,0x1F1FF,0x1F201,0x1F201,0x1F21A,0x1F21A,0x1F22F,
+            0x1F22F,0x1F232,0x1F236,0x1F238,0x1F23A,0x1F250,0x1F251,0x1F300,0x1F320,0x1F32D,
+            0x1F335,0x1F337,0x1F37C,0x1F37E,0x1F393,0x1F3A0,0x1F3CA,0x1F3CF,0x1F3D3,0x1F3E0,
+            0x1F3F0,0x1F3F4,0x1F3F4,0x1F3F8,0x1F43E,0x1F440,0x1F440,0x1F442,0x1F4FC,0x1F4FF,
+            0x1F53D,0x1F54B,0x1F54E,0x1F550,0x1F567,0x1F57A,0x1F57A,0x1F595,0x1F596,0x1F5A4,
+            0x1F5A4,0x1F5FB,0x1F64F,0x1F680,0x1F6C5,0x1F6CC,0x1F6CC,0x1F6D0,0x1F6D2,0x1F6D5,
+            0x1F6D7,0x1F6DD,0x1F6DF,0x1F6EB,0x1F6EC,0x1F6F4,0x1F6FC,0x1F7E0,0x1F7EB,0x1F7F0,
+            0x1F7F0,0x1F90C,0x1F93A,0x1F93C,0x1F945,0x1F947,0x1F9FF,0x1FA70,0x1FA74,0x1FA78,
+            0x1FA7C,0x1FA80,0x1FA86,0x1FA90,0x1FAAC,0x1FAB0,0x1FABA,0x1FAC0,0x1FAC5,0x1FAD0,
+            0x1FAD9,0x1FAE0,0x1FAE7,0x1FAF0,0x1FAF6
+            ];
+            const isWideEmoji = (cp) => {{
+              let lo = 0, hi = (EMOJI_WIDE.length >> 1) - 1;
+              while (lo <= hi) {{
+                const mid = (lo + hi) >> 1;
+                const a = EMOJI_WIDE[mid * 2], b = EMOJI_WIDE[mid * 2 + 1];
+                if (cp < a) hi = mid - 1;
+                else if (cp > b) lo = mid + 1;
+                else return true;
+              }}
+              return false;
+            }};
+            term.unicode.register({{
+              version: '11',
+              wcwidth: (cp) => (isWideEmoji(cp) ? 2 : uniBase.wcwidth(cp)),
+              charProperties: (cp, preceding) => {{
+                const props = uniBase.charProperties(cp, preceding);
+                return isWideEmoji(cp)
+                  ? UniSvc.createPropertyValue(UniSvc.extractShouldJoin(props), 2, true)
+                  : props;
+              }},
+            }});
+            term.unicode.activeVersion = '11';
+          }}
+        }} catch (_error) {{}}
         const fitAddon = new window.FitAddon.FitAddon();
         term.loadAddon(fitAddon);
         // User bug 6: plain-text http(s) URLs — including URLs WRAPPED across
@@ -152798,6 +152867,60 @@ mod tests {
         assert!(
             script.contains("renderHealthRecoveryBackoffMs * 2"),
             "render-health recovery must escalate its cooldown when a heal does not stick"
+        );
+    }
+
+    /// The shipped xterm registers ONLY Unicode v6, where every
+    /// Emoji_Presentation character is one cell wide — while every modern agent
+    /// CLI writes it as two. Measured on the vendored bundle 2026-08-11:
+    /// `wcwidth(U+2B50 ⭐) = 1`. From the first emoji on a line the CLI and the
+    /// renderer disagree about where every later cell is, and a partial repaint
+    /// strands the old glyph in the orphaned column — the owner's "weird
+    /// characters appearing here and there".
+    ///
+    /// Behaviour is guarded against the REAL bundle in
+    /// `tools/xterm-harness/emoji_cell_width.test.js`. This only guards that the
+    /// app still installs the provider, and installs it on BOTH accessors: the
+    /// renderer reads `charProperties`, so overriding `wcwidth` alone would fix
+    /// nothing while looking correct.
+    #[test]
+    fn terminal_eval_script_widens_emoji_to_two_cells() {
+        let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
+        let script = terminal_eval_script_with_canvas_renderer(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            true,
+            "test_reason",
+        );
+        assert!(
+            script.contains("term.unicode.activeVersion = '11';"),
+            "the terminal must activate the corrected width table"
+        );
+        assert!(
+            script.contains("wcwidth: (cp) => (isWideEmoji(cp) ? 2 : uniBase.wcwidth(cp))"),
+            "wcwidth must widen the Emoji_Presentation set and delegate the rest"
+        );
+        assert!(
+            script.contains("charProperties: (cp, preceding) =>"),
+            "charProperties must be overridden too — the RENDERER reads it, so a \
+             wcwidth-only override paints the old widths and fixes nothing"
+        );
+        assert!(
+            script.contains("uniSvc._providers && uniSvc._providers['6']"),
+            "the provider must delegate to the bundle's own v6 table rather than \
+             substituting a second full width table that can drift from it"
+        );
+        // ⭐ and ⛔ are the two the owner actually saw break; ⚠ is the control —
+        // it is text-presentation, it rendered correctly in his frames, and
+        // widening it would create the same bug in the opposite direction.
+        assert!(
+            script.contains("0x2B50,0x2B50") && script.contains("0x26D4,0x26D4"),
+            "the two characters from the owner's frames must be in the wide set"
+        );
+        assert!(
+            !script.contains("0x26A0,0x26A0"),
+            "U+26A0 ⚠ is text-presentation and must stay ONE cell"
         );
     }
 

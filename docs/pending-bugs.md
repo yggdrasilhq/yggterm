@@ -172,23 +172,51 @@ one frame:
 2. **A row painted twice.** The CLI's own footer hint line rendered as two
    identical adjacent rows.
 
-⭐⭐ **AND THE ORPHANS SIT IN THE CELL AFTER A WIDE GLYPH — WHICH MAKES THEM A
-DIFFERENT BUG FROM THE DOUBLED ROW.** A second faithful frame 12 minutes later
-(same host, same session) caught three at once, and the position is the finding:
-each sits **immediately after a two-cell emoji, in the cell the emoji overhangs,
-where a blank belongs**. Rendered as `<emoji>r The two…`, `<emoji>It refuses…`,
-`<emoji>IAnd it refuses…` — in every case the space after the emoji is occupied
-by a leftover character. That is **wide-glyph second-cell residue**: xterm.js
-marks the overhang cell as a wide-char placeholder that must paint blank, and the
-renderer is leaving the previous frame's glyph there instead.
-⛔ **This entry first said "at the right margin", from the first frame alone.
-That was wrong** — the first frame's examples happened to fall near the wrap
-column and the shared trait was invisible with n=2. Right-margin position is a
-coincidence; **adjacency to a wide glyph is the signal.** ⇒ do not go looking at
-wrap/reflow handling; go to the wide-cell path.
-⚠ The doubled row and the orphans are therefore **two bugs sharing one report**,
-not one. Only the doubled row is traced to the rAF-gap atlas staleness fixed in
-3.0.105. The orphans have their own mechanism and are **untouched by that fix**.
+⭐⭐ **ROOT-CAUSED AND FIXED (3.0.108): THE SHIPPED xterm SCORES EMOJI ONE CELL
+WIDE.** Measured against the exact vendored bundle, not inferred:
+
+    activeVersion = 6 | registered = ["6"]      ← the ONLY table it has
+      wcwidth(⭐ U+2B50)  = 1     ← Unicode 9+ says 2
+      wcwidth(⛔ U+26D4)  = 1     ← 2
+      wcwidth(✅ U+2705)  = 1     ← 2
+      wcwidth(🚀 U+1F680) = 1     ← 2
+      wcwidth(中 U+4E2D)  = 2     ← CJK was never wrong
+      wcwidth(⚠ U+26A0)   = 1     ← correct: text presentation
+
+⇒ Claude Code writes `⭐` believing it consumed **two** columns; xterm advances
+**one**. From the first emoji on a line the writer and the renderer disagree
+about where every later cell is, and a partial repaint strands the old glyph in
+the orphaned column. That is the stray character — and it is why it **clears on
+scroll**: a full-line repaint re-lays the row out consistently in the renderer's
+own terms.
+
+⭐ **Every detail of the owner's two frames follows from this**, which is what
+raised it from plausible to established: the strays sat immediately after `⭐`
+and `⛔` (both Emoji_Presentation, both scored 1), while `⚠` in the same frames
+rendered correctly (text presentation, correctly 1). Agent CLIs emit emoji
+bullets constantly, so this fires all day.
+
+**Fix:** a Unicode-11 provider registered over the bundle's own v6 table,
+widening **exactly** the Emoji_Presentation=Yes set (83 ranges, binary searched)
+and delegating everything else to v6 — rather than substituting a second full
+width table that could drift. ⚠ `charProperties` is overridden alongside
+`wcwidth` because the RENDERER reads the packed properties; a `wcwidth`-only
+override would look right and paint the old widths.
+⛔ **Text-presentation symbols must stay narrow** (`⚠`, `✻`, `❯`, `✔`, `ℹ`) —
+widening those creates the identical misalignment in the opposite direction.
+Guarded against the real bundle in `tools/xterm-harness/emoji_cell_width.test.js`
+(which also pins the pre-fix widths, so a bundle upgrade that fixes this upstream
+fails the test and tells you to drop the provider) and in
+`shell::tests::terminal_eval_script_widens_emoji_to_two_cells`.
+
+⚠ **The daemon's vt100 mirror (`vt100` 0.16.2) has NOT been checked for the same
+disagreement.** It feeds `terminal_lines`, the working-indicator and the title
+heuristics — not the paint — so it cannot cause this symptom, but if it also
+scores emoji at 1 then every screen-text instrument is subtly misaligned on
+emoji rows. Unmeasured; worth one probe.
+
+⚠ The doubled row and the orphans were **two bugs sharing one report**. Only the
+doubled row belonged to the rAF-gap atlas staleness fixed in 3.0.105. The orphans have their own mechanism and are **untouched by that fix**.
 
 ⭐ **THE DUPLICATE IS NOT CONTENT — SO IT IS OURS.** The daemon's vt100 screen is
 the SSOT for what the terminal HOLDS, and it holds that row exactly **once**
@@ -556,6 +584,21 @@ rename-failure fallback was fixed to stop writing *through* the state path, whic
 once linked would have rewritten the backup too.
 
 **Where the 34.4 s goes** (both holes are inside the lock):
+⛔ **AND THE 3.0.104 INSTRUMENT HAS NOW WEAKENED BOTH ATTRIBUTIONS BELOW.**
+First numbers from 3.0.104+ daemons owning real sessions: `daemon/persist_state_only`
+**p50 7.9 ms, max 11.4 ms** · `daemon_persist/serialize` **p50 3.8 ms, max 6.3 ms**
+(for the whole 2.26 MB — so serialization was NEVER the cost this entry blamed it
+for) · `daemon_persist/write` **p50 1.1 ms** · `daemon_persist/cc_identity_refresh`
+**p50 25.0 ms, max 272.6 ms** (the memoized path; pre-fix it re-read 49.9 MB).
+⇒ On a healthy daemon the whole persist is ~30 ms, against the 153.7 ms p50 this
+entry measured before 3.0.104. **But a 9-second `persist_state_only` is nowhere in
+that distribution**, so "the +9.4 s hole is the persist" — reached by ELIMINATION,
+never by measurement — is now doubtful rather than supported. Either it needs a
+condition these samples do not contain (cold cache, disk contention, lock
+convoy), or it was never the persist. ⚠ Sample counts are small (n=18-36) and the
+daemons are young. **Re-take both holes from the ranked rows on the next
+occurrence; do not re-derive them by elimination.**
+
 - **+9.4 s hole** — after `local_cc_relaunch_command_rebuilt` the only
   substantial call before `terminal_spec_resolved` is `persist_state_only()`.
   `server-state.json` is **2.26 MB**; `write_persisted_state_if_changed`
@@ -8313,6 +8356,8 @@ bash diagnostics on stderr.
 ---
 
 ## ⛔⛔ `ygg-claim.sh` EXITS 3 ON A CLAIM THAT WORKED — and exit 3 SKIPS THE BOOTER ARM AND THE PREDECESSOR REAP
+
+**Status:** OPEN
 
 *Filed 2026-08-11 by a relay row on a private campaign. Not a duplicate of the
 `/proc` stderr entry above, nor of "`outline_prefix` DOES NOT SURVIVE" — this is

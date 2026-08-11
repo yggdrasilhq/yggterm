@@ -4,6 +4,22 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Emoji were painted one cell wide, so every line carrying one drifted (3.0.108).**
+  The owner's "weird characters appearing here and there" are not stray glyphs at
+  all — they are the *rest of the line*, one column out. Measured against the
+  exact vendored bundle: xterm registers only Unicode v6 (`["6"]`), where
+  `wcwidth(⭐)`, `wcwidth(⛔)`, `wcwidth(✅)` and `wcwidth(🚀)` are all **1**, while
+  every modern agent CLI writes them as **2**. From the first emoji onward the
+  writer and the renderer disagree about where each cell is, and a partial repaint
+  strands the old glyph in the orphaned column — which is why scrolling clears it,
+  since a full-line repaint re-lays the row out consistently. Fixed by registering
+  a Unicode-11 provider over the bundle's own v6 table, widening exactly the
+  Emoji_Presentation set and delegating everything else. ⚠ Text-presentation
+  symbols deliberately stay narrow (`⚠`, `✻`, `❯`, `✔`, `ℹ`) — widening those
+  would cause the identical drift in the opposite direction, and `⚠` rendering
+  correctly in the owner's own frames is what confirmed the boundary. CJK was
+  never affected.
+
 - **3.0.106 caused a second render bug within 13 minutes; 3.0.107 fixes it, and
   the honest trace is what caught it.** Digits eaten out of a diff's line-number
   gutter and rectangular holes through the highlight — cells *missing* glyphs,
