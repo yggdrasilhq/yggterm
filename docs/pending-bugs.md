@@ -190,6 +190,14 @@ resolve the attempt it orphans. Measured live: `input_gate_deadline_restored`,
 `denied_for_ms: 5038` and `5048`, on a row whose gate had shut and would
 previously have stayed shut until the row was closed.
 
+⭐⭐ **AND IT IS NOT RARE — 11 RESTORES IN THE FIRST 25 MINUTES**, across at
+least three different rows, every one at 5.03–5.06 s. Two declines in the same
+window, both correct (`was_ever_ready: false`, a cold resume). ⇒ before 3.0.110
+this was stranding a row roughly every other minute of ordinary use, which is
+why it reached the owner as the defect that annoys him most rather than as an
+occasional oddity. The count is also the argument for closing the window rather
+than living with it.
+
 **What is still wrong: the gate should not have shut at all.** The open that
 strands a row has a fingerprint, identical in both captures (2026-08-11 11:45 and
 12:40), read off `terminal_open_attempt/begin`:
