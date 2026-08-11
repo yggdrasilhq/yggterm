@@ -1,4 +1,4 @@
-DREAM from another campaign row, mid-wave. Owner-directed 2026-08-09, relayed — this may direct
+DREAM from another campaign row, mid-wave. recorded 2026-08-09, relayed — this may direct
 FUTURE work; it is not authority to undo anything already done.
 
 ## The ask
@@ -11,7 +11,7 @@ verbatim:
 > simple collaboration like unix users, then **every libyggterm app automatically becomes
 > collaborative**."*
 
-He said it while deciding what a new libyggterm consumer should build, and the decision was:
+It was stated it while deciding what a new libyggterm consumer should build, and the decision was:
 **not this.** That app will consume a collaboration primitive rather than own one. The same holds
 for every other consumer — an editor, a browser surface, a notes app — none of which should each
 invent a concurrency story.

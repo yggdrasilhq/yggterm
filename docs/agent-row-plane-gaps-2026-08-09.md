@@ -143,7 +143,7 @@ chore from primitives, and I only noticed because I happened to run `ygg-booter.
 `server app notify … --session <row-path>` answers `{"delivered": true, "error": null}`. That is a
 claim about the *send*, and the documented failure of this verb is not the send — it is the
 **address**: a card given `$YGGTERM_SESSION_ID` (`cc-runtime://…` rather than a row path) *"renders
-a card that looks right and does nothing when clicked"* (owner-caught, 2026-08-08).
+a card that looks right and does nothing when clicked"* (caught, 2026-08-08).
 
 So the one field that has actually been wrong in production is the one field the reply does not
 report, and `server app state` exposes nothing notification-shaped either — I looked, expecting to

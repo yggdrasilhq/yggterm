@@ -31,7 +31,7 @@ standing rule back at me:
 > *"On libyggterm and MPL. The separation was made for OUR reuse boss. It was a
 > fiasco of licences and we went through it."*
 
-He was right on both counts, and the second is the one an agent will re-derive:
+That was correct on both counts, and the second is the one an agent will re-derive:
 
 1. **It was unnecessary.** A licence is a grant to *others*; it does not bind the
    holder. He owns every GPL line in the product — verified, not assumed:
@@ -97,7 +97,7 @@ the actual mechanisms, and each needs naming because none of them feels like
 disobedience from the inside:
 
 1. ⛔ **"One deploy per session" IS A DAEMON RULE AND NEVER GATES A GUI RESTART.**
-   It is not owner-settled — it is a working note in `pending-bugs.md` and the
+   It is not settled — it is a working note in `pending-bugs.md` and the
    campaign memory, and in both places its stated reason is `daemon_self_retire`,
    the cold-shutdown cascade, and mass re-resume of live rows. **A GUI restart has
    none of that blast radius**, which is the whole basis of the ruling above.
@@ -267,7 +267,7 @@ clauses were the owner's own calls and are not to be re-litigated:
    conservative arm (incremental only) and the aggressive one (purge any debug
    tree idle 30 days), on the integrator host that regenerates ~13 GB/day.
 3. **The `emd-renderer` low-resolution webview cache stays infinite and is never
-   swept.** His words: *"I think it should stay this way."* ⚠ The cache does not
+   swept.** The requirement: *"I think it should stay this way."* ⚠ The cache does not
    exist yet; the exemption is recorded ahead of it on purpose, so that whoever
    builds it does not find it swept by an engine that shipped first.
 

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """ygg-booter — a session SUBSCRIBES, and something outside it kicks it when it stalls.
 
-⛔⛔ THE DEFECT THIS EXISTS FOR (owner-directed 2026-08-09):
+⛔⛔ THE DEFECT THIS EXISTS FOR (recorded 2026-08-09):
 
     *"I have seen you stall sometimes, so arm a booter in a fleet. A booter is a
     tool that monitors any session that has subscribed to it, to kick it and say
     'continue, the booter booted'. Sometimes you may feel that the work is done
     so you need to unsubscribe from the booter."*
 
-He was manually booting a stalled relay session when he said it. **That is the
+He was manually booting a stalled relay session when it was stated it. **That is the
 whole specification: the human should never be the watchdog.**
 
 ★ WHY THIS IS NOT `ygg-babysit.py`, and why both exist.
@@ -73,7 +73,7 @@ LOGPATH = STATE / "booter.log"
 # both to a human reading back and to the session itself, which should be able to
 # tell "a machine woke me" from "a person asked for something".
 #
-# ⭐⭐ AND IT NOW CARRIES A STEER, owner-directed 2026-08-10: *"if the booter is armed then I
+# ⭐⭐ AND IT NOW CARRIES A STEER, recorded 2026-08-10: *"if the booter is armed then I
 #   want a relay. relay and booter go hand in hand and are part of a system."*
 #
 #   His reasoning is exact, and it is the same argument as putting a refusal at the point of
@@ -111,7 +111,7 @@ BOOT_TEXT = (
 # length of the slowest thing anyone ever does.
 BOOT_AFTER_SECS = 420
 
-# ⛔⛔ THE CEILING IS A BILLING LIMIT, NOT A TUNING KNOB — owner-directed
+# ⛔⛔ THE CEILING IS A BILLING LIMIT, NOT A TUNING KNOB — recorded
 # 2026-08-09. The plan's prompt cache stays hot for ~1 hour; a session that does
 # NOTHING for an hour comes back to a COLD cache, and re-reading a large campaign
 # context at full price is the expensive failure. So no session may ever ask to
@@ -498,7 +498,7 @@ def boot(host, row, dry):
        on the same row in the same minute.
 
     3. ⛔⛔ **THE ENTER IS A SEPARATE WRITE OF `\\r`, AND THIS FUNCTION SENT ONE
-       CONCATENATED `\\n`.** Owner-reported 2026-08-09 ~19:10, watching it happen:
+       CONCATENATED `\\n`.** reported 2026-08-09 ~19:10, watching it happen:
        *"I just saw `continue, the booter booted` and an empty line. The enter key
        did not send the prompt."* Two independent mistakes in one line:
 

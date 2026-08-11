@@ -230,12 +230,12 @@ done
 log "claimed and verified by read-back: seat=$NUM title=$FINAL_TITLE"
 
 # --- ARM THE BOOTER (OPT-IN) ------------------------------------------------
-# Owner-directed 2026-08-09, said while he was hand-booting a stalled relay row:
+# recorded 2026-08-09, said while he was hand-booting a stalled relay row:
 # *"I have seen you stall sometimes, so arm a booter in a fleet."* A session that
 # stalls cannot restart itself — the stall IS its turn ending — so something
 # OUTSIDE it has to.
 #
-# ⛔ DEFAULT INVERTED 2026-08-10, owner-directed: *"When there is no relay mode
+# ⛔ DEFAULT INVERTED 2026-08-10, recorded: *"When there is no relay mode
 # the booter should not self arm. You should not be booted."* It fired on him in
 # a session he had opened with "NOT like a relay, all agents contained in the
 # session" — the row was claimed, so the row self-armed, and he was answered by a

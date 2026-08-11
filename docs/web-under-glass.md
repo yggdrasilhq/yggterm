@@ -252,7 +252,7 @@ gtk::Overlay
   moves.
 - **Covers push synchronously, not on the tick.** The `[data-ws-page]`
   geometry oracle is documented starvable (seconds, under output flood) —
-  acceptable when it only places pixels, unacceptable as the input
+  acceptable when it only places pixels, not acceptable as the input
   authority. A shell-side MutationObserver on `data-covers-web-surface`
   mount/unmount/resize pushes a region update **immediately**; the
   reconcile tick remains as idempotent self-heal only. Without this, a

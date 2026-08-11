@@ -4,7 +4,7 @@
 to the sessions it was carrying".** It replaces the absence-gate that
 `CLAUDE.md`'s ⚖ CONSTITUTION records as the project's unmet guarantee.
 
-⚖ **Owner-settled 2026-08-08.** It supersedes the standing ⛔ in the campaign
+⚖ **Settled 2026-08-08.** It supersedes the standing ⛔ in the campaign
 memory against putting a deadline on the idle gate. That prohibition was
 correct for the design it was written about and is not correct for this one;
 §7 says exactly why.

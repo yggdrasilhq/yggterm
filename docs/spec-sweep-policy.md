@@ -139,7 +139,7 @@ not licence to pick a number.
 
 ## 5. Compaction, and the rehydration contract
 
-**Owner-settled 2026-08-08** (recorded in `settled-calls.md`): yggterm **may**
+**Settled 2026-08-08** (recorded in `settled-calls.md`): yggterm **may**
 rewrite an agent CLI's transcript to externalize blobs, **provided it restores
 the file before handing off to the CLI**.
 
@@ -186,7 +186,7 @@ Whichever fires, wakes the engine; the class ladder decides what it takes. A
 timer remains only as a heartbeat for hosts under neither pressure, so that C0
 does not accumulate for a year on an idle machine.
 
-**Owner-settled budgets 2026-08-08:** `target/**/incremental/` swept **daily**
+**Settled budgets 2026-08-08:** `target/**/incremental/` swept **daily**
 (the integrator regenerates ~13 GB/day, against a weekly sweep that reclaimed
 28.7 GB in one run), and `target/debug` under a **40 GB** budget, oldest
 artifacts evicted past the cap.
@@ -211,7 +211,7 @@ spoke.
 **The `emd-renderer` low-resolution webview cache is exempt, by owner decision
 (2026-08-08): it is an infinite, never-swept cache and is to remain one.**
 
-⚠ **It does not exist on disk yet.** The owner's words are *"I proposed this. I
+⚠ **It does not exist on disk yet.** The requirement are *"I proposed this. I
 think it should stay this way"*, and no such cache is present in any checkout at
 the time of writing. The exemption is recorded **ahead of** the thing it
 protects, deliberately: the engine and the cache will be built by different
