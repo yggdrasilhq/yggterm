@@ -1081,11 +1081,9 @@ Invent every example you commit — including in tests and fixtures.
 
 ## ⛔⛔ CHOOSING THE BOOT DELAY — it is a DECISION, and the prompt cache is a first-class input
 
-**Owner-directed 2026-08-11, after a relay woke 30 minutes AFTER an event it existed to cover:**
-*"Why didn't you arm the booter at the exact time to fire once after the last boot? That would have
-saved the cache since less than 1 hour and woken you at the exact moment. This was very
-unintelligent."* He is right, and the failure had two halves that look opposite and are the same
-mistake: **several no-op wakes before the event, and then arriving late to the event itself.**
+**Recorded 2026-08-11, after a relay woke 30 minutes AFTER a scheduled event it existed to cover.**
+The failure had two halves that look opposite and are the same mistake: **several no-op wakes during
+the run-up, and then arriving late to the event itself.**
 
 **`boot_after_secs` is configurable to any agent's liking. That freedom is the point — a default
 grid is not a plan.** Two constraints govern the choice, and they are usually satisfied by the
@@ -1167,10 +1165,9 @@ the scheduler — then fix your arming anyway, because that was worth fixing on 
 
 ## ⛔⛔ A MESSAGE TO ANOTHER ROW IS A **WAKE**. PRICE IT LIKE ONE.
 
-**Owner-directed 2026-08-11, after a row sent four cross-session messages in one session — one of
-them to an unrelated, IDLE row that then spent a full turn on a COLD cache measuring a claim it had
-no stake in.** His words: *"You just woke up a cold cache session by mistake. This was a costly
-mistake. You are spamming other agents one after another. Unacceptable."*
+**Recorded 2026-08-11.** A single session sent four cross-session messages, one of them to an
+unrelated **idle** row, which then spent a full turn on a **cold** cache measuring a claim it had no
+stake in. Two of the remaining three were redundant and should have been batched into the first.
 
 ⭐ **THE ROOT CAUSE, and it generalises past messaging:** that same session had, an hour earlier,
 written a careful cost model for *its own* wakes — aim the boot at the event, never let the prompt
@@ -1221,15 +1218,11 @@ that it is a retry and why.
 
 ### ⛔⛔ THE OWNER NAMING A ROW IS AN INPUT, NOT THE DECISION — verify it, price it, then choose
 
-**Owner-directed 2026-08-11:** *"Whatever row user says, you must verify. I might say the wrong
-thing. Account for that. There can even be no yggterm agent at all. … even IF the user says to give
-it to that agent, check if it is cold, and what is the context, and weigh the worth of submitting to
-that session OR spawning a new one OR doing it yourself, and proceed like this. Your mistake burned
-me around US$4 in 1 sec."*
-
-⭐ **That is an explicit standing authorisation to override his own routing when the measurement
-disagrees** — and it is the same law as an inherited `BLOCKED`: **a named recipient is a CLAIM.**
-The row may be misremembered, retired, busy on something else, or may never have existed.
+**Recorded 2026-08-11, as a standing rule.** A routing instruction that names a recipient — from a
+human or from another agent — is an **input to a decision, not the decision**. It carries the same
+status as an inherited `BLOCKED`: **a named recipient is a CLAIM.** The row may be misremembered,
+retired, busy on unrelated work, or may never have existed. Verifying it is expected, and choosing a
+cheaper route when the measurement disagrees is the correct outcome rather than a deviation.
 
 ### The procedure — four measurements, then a choice, and the default is CHEAPEST-WARM
 
@@ -1251,7 +1244,7 @@ P
 |---|---|---|
 | **FILE IT** (campaign memory + its `MEMORY.md`, a queue doc, a repo file) | **~zero**, permanent | **the default.** Anything not actionable before their next natural wake |
 | **message a WARM row** | one interruption; no cold re-read | genuinely time-critical AND they are already awake AND it is their lane |
-| **message a COLD row** | **the expensive one — measured at ~US$4 for a ~2 MB idle row, in one second** | almost never. Only if something is on fire |
+| **message a COLD row** | **the expensive one — a full cold re-read of their context. One measured instance: a ~2 MB idle row, several US dollars, incurred in about a second** | almost never. Only if something is on fire |
 | **spawn a fresh row** | a new small context + a brief you must write | the work is substantial, ongoing, and nobody warm owns it |
 | **⭐ DO IT YOURSELF** | your context is **already warm and already paid for** | far more often than agents assume — see below |
 
@@ -1262,7 +1255,7 @@ route away are **ownership** (it is another campaign's instrument and yours to r
 **context budget** (you are near your own boundary), and **duration** (it outlives your session) —
 not mere tidiness about whose job it nominally is.
 
-⛔ **AND "THE OWNER ASKED ME TO" IS NOT A COST ARGUMENT.** If the measurement says the content is
-already filed where that row will read it, then the delivery is DONE and a message buys nothing but
-an interruption. **Say what you measured and what you chose.** He asked for the weighing, not the
-obedience.
+⛔ **AND "I WAS TOLD TO" IS NOT A COST ARGUMENT.** If the measurement says the content is already
+filed where that row will read it, then the delivery is DONE and a message buys nothing but an
+interruption. **Report what you measured and what you chose** — the weighing is the deliverable, not
+the obedience.
