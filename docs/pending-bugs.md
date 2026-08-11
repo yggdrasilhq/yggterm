@@ -8314,16 +8314,16 @@ bash diagnostics on stderr.
 
 ## ⛔⛔ `ygg-claim.sh` EXITS 3 ON A CLAIM THAT WORKED — and exit 3 SKIPS THE BOOTER ARM AND THE PREDECESSOR REAP
 
-*Filed 2026-08-11 by atlasgraph row 5.6 (session 6f33e25b). Not a duplicate of the
+*Filed 2026-08-11 by a relay row on a private campaign. Not a duplicate of the
 `/proc` stderr entry above, nor of "`outline_prefix` DOES NOT SURVIVE" — this is
 the verify COMPARISON, and its consequence is worse than a cosmetic one.*
 
 **What happened.** Ran the claim exactly as the fleet skill §7.7 documents it:
 
 ```
-ygg-claim.sh --host guihost --title "atlasgraph TWS: the market-session relay" \
-             --campaign atlasgraph --number 5.4 --replace <pred-uuid> --booter
-→ ygg-claim: claim never verified (row reads: 5.4|atlasgraph TWS: the market-session relay)
+ygg-claim.sh --host guihost --title "<topic>: the market-session relay" \
+             --campaign <token> --number 5.4 --replace <pred-uuid> --booter
+→ ygg-claim: claim never verified (row reads: 5.4|<topic>: the market-session relay)
 → exit 3
 ```
 
@@ -8331,13 +8331,13 @@ ygg-claim.sh --host guihost --title "atlasgraph TWS: the market-session relay" \
 
 ```
 outline_prefix = '5.4'
-session_title  = 'atlasgraph TWS: the market-session relay'
-label          = '5.4 atlasgraph TWS: the market-session relay'   ← what the sidebar draws
+session_title  = '<topic>: the market-session relay'
+label          = '5.4 <topic>: the market-session relay'   ← what the sidebar draws
 ```
 
 **Root cause.** `assert_state()` compares the read-back against
 `"$NUM\t$FINAL_TITLE"` where `FINAL_TITLE` has the seat composed into it
-(`5.4 atlasgraph TWS: …`). But the app keeps the seat in `outline_prefix` and the
+(`5.4 <topic>: …`). But the app keeps the seat in `outline_prefix` and the
 title CLEAN, then composes `label` from both — which the script's own comments
 describe as the better architecture ("the API and the screen agree BY DESIGN").
 So the belt-and-braces number-in-the-title write is silently normalised away, and
@@ -8354,8 +8354,9 @@ re-assert watcher → **retire and reap the predecessor (`--replace`)**. So a cl
 that "failed" while actually succeeding leaves:
 
 1. **the row UNARMED** even though `--booter` was passed — and an unarmed relay row
-   is precisely the failure atlasgraph lost **7h43m of broker-link blindness** to on
-   2026-08-10 (its own §0 calls staying armed "the most important line in the file");
+   is precisely the failure that cost one campaign **7h43m of unnoticed downtime**
+   on the service it watches (2026-08-10); its own handover calls staying armed
+   "the most important line in the file";
 2. **the predecessor row NOT retired** even though `--replace` was passed — the
    orphaned-row-in-his-sidebar bug the owner caught on 2026-08-10, which is the
    reason `--replace` was made mandatory in briefs in the first place.
@@ -8375,8 +8376,8 @@ negative disables the two repairs it was shipped alongside.**
 - Falsifier: claim a row whose title the server keeps clean → exit 0, `ygg-booter
   list` shows the new subscriber, and the predecessor is delisted and reaped.
 
-**Workaround now in use on atlasgraph** (recorded so its rows stop rediscovering it):
+**Workaround now in use on that campaign** (recorded so its rows stop rediscovering it):
 after any non-zero `ygg-claim`, read the row back from `server app rows` and, if
-`label` is right, ignore the exit code — then arm SEPARATELY (`bin/fg-relay arm`)
+`label` is right, ignore the exit code — then arm SEPARATELY via the campaign's own verb
 and handle the predecessor by hand. ⚠ Never read the exit code as the state; that
 is the same law this tool's own header teaches about `remove`.
