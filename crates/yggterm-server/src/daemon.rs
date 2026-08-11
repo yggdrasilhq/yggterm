@@ -4236,7 +4236,7 @@ impl DaemonRuntime {
                 // ⛔ AN APP ROW IS NOT "WORKING", IT IS RUNNING. The foreground
                 // test below is a fair proxy for a shell — commands start, run,
                 // finish — and flatly wrong for a row whose whole job is to hold
-                // ONE long-lived foreground process. Owner-reported 2026-08-09:
+                // ONE long-lived foreground process. reported 2026-08-09:
                 // *"on restart all my ychromes keep on blinking."* Measured: one
                 // `ychrome` per launcher shell, state `Sl+` (foreground group),
                 // hours old, so `foreground_process_active` answered `true`
@@ -6288,7 +6288,7 @@ impl DaemonRuntime {
         // is spawned, because this is the one funnel every local agent session's
         // terminal passes through. Refusing here is what makes a missing binary a
         // LAUNCH FAILURE rather than a line of scrollback inside a `/bin/bash`
-        // that outlives the CLI it was supposed to become (owner-reported
+        // that outlives the CLI it was supposed to become (reported
         // 2026-08-08, "I tried launching Muse Code and the viewport reported CLI
         // binary not found"). The ensure runs first on purpose: for an
         // npm-provisionable CLI it kicks the background install this refusal then
@@ -15966,7 +15966,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
 /// daemon was free". A starved daemon and an idle one are byte-identical in the
 /// trace, and that blindness cost this campaign four wrong root causes.
 ///
-/// The instance that forced this (dev, 2026-08-10, owner-reported slow row
+/// The instance that forced this (dev, 2026-08-10, reported slow row
 /// switch): `ensure_remote_runtime_cc_session` held the runtime lock from
 /// 21:21:32.222 to ~21:22:06.6 — 34.4 s in which pid 3508483 logged not one
 /// other request. The session's `first_bytes` landed at 21:21:42.421, so the
