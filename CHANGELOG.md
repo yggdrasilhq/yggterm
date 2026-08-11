@@ -4,6 +4,24 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A row that renders perfectly and accepts no keystrokes now repairs itself
+  (3.0.110).** Selecting a row clears its resume readiness and makes the
+  keyboard depend entirely on a fresh open attempt reaching Ready. When the
+  mount that would have marked it Ready is skipped as redundant — the host is
+  already live and leased — the only release left is fast-ready on the first
+  *meaningful* output byte, which an agent sitting idle at its prompt never
+  emits. The row then refused every keystroke for the rest of its life while
+  `document_focused`, `host_stdin_enabled` and every other instrument read
+  healthy. Two changes: the existing-lease bootstrap skip now resolves the open
+  attempt it orphans, and the gate has a deadline of its own — after 5 s (45 s
+  when an attach is genuinely in flight, past the ~35 s retained-fault recovery
+  budget) a surface that is mounted, has been Ready in this life, and whose PTY
+  the daemon owns gets its readiness back. ⚖ It restores the existing owner of
+  the answer rather than adding a bypass beside it, and a first cold resume —
+  the case the gate exists for — fails the liveness test and is left alone.
+  Live-proven on the desktop host in both directions: a stranded row restored at
+  `denied_for_ms: 5038`, and a cold resume correctly refused at 26,531 ms with
+  `was_ever_ready: false`.
 - **Closing a row stopped calling every dead daemon on the fleet first (3.0.109).**
   `remove_session` was the second-largest consumer of daemon request time after
   `status` — p50 447 ms, p99 **10,590 ms**, max **44,991 ms** over 1,220 calls —

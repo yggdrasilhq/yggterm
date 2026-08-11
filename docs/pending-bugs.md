@@ -174,85 +174,80 @@ Where to look next, in order:
 **Falsifier:** a `start-cc` that spawns no process must leave either an error the
 user sees or a trace event naming the refusal — never a row that says `running`.
 
-## ⛔⛔ A ROW RENDERS PERFECTLY AND ACCEPTS NO KEYSTROKES, FOREVER, WITH NO REASON SHOWN
+## ⛔ THE INPUT GATE STILL SHUTS FOR ~5s ON A ROW THAT WAS NEVER GOING ANYWHERE
 
 **Status:** OPEN
 
-**Owner-reported 2026-08-11:** *"stuck ... accepts no inputs"*, on a row whose
-rendering was clean. Then, sharper: *"Stopped again after I tried dragging on the
-tui"* and *"EVEN this session input is freezing in the same way after I try one
-image paste."* ⇒ **drag-selection and image paste are both triggers**, and both are
-clipboard/selection operations (there is already a `CC-DRAG-STALL` seam in
-`shell.rs`).
+The *permanent* form is fixed in 3.0.110 and live-proven twice on the desktop
+host; what remains open is the window before the deadline catches it.
 
-⭐ **He named it as the bug class that annoys him most, and he is right about why:
-every instrument reports health.** The render path never consults the input gate,
-so a gated row paints the daemon's screen flawlessly. `document_focused`,
-`helper_textarea_focused`, `host_stdin_enabled`, `raw_input_enabled`,
-`effective_input_focus` and `active_host_ready` all read `true` while the user
-cannot type.
+**What shipped.** Selecting a row registers a fresh `hot_open_row` open attempt
+and clears `terminal_resume_ready_paths`, so readiness now rides entirely on that
+new attempt reaching Ready. When nothing can make it Ready, the row renders
+perfectly and refuses every keystroke. 3.0.110 gave the gate a deadline
+(`tick_input_gate_deadline`) and taught the existing-lease bootstrap skip to
+resolve the attempt it orphans. Measured live: `input_gate_deadline_restored`,
+`denied_for_ms: 5038` and `5048`, on a row whose gate had shut and would
+previously have stayed shut until the row was closed.
 
-### ROOT CAUSE, CODE-CITED AND CONFIRMED FROM THE LIVE TRACE
+**What is still wrong: the gate should not have shut at all.** The open that
+strands a row has a fingerprint, identical in both captures (2026-08-11 11:45 and
+12:40), read off `terminal_open_attempt/begin`:
 
-`ui/input_policy` on the GUI host, sampled during the wedge — **117 denials in 190
-policy events**, across FOUR sessions:
+    terminal_bootstrap_lease:            set      <- an outstanding lease
+    terminal_bootstrap_owner:            set
+    terminal_session_has_ready_attempt:  true     <- it WAS ready
+    terminal_session_host_id:            m1       <- the host is mounted
+    terminal_attach_in_flight:           false
+    terminal_session_is_retained_live:   false    <- ...and yet
 
-    allow_input:                false
-    remote_resume_input_ready:  false     <- THE CAUSE
-    web_surface_active:         false
-    window_focused:             true      <- the user IS focused
-    app_control_backgrounded:   false
+⇒ `rearm_unready_remote_terminal_bootstrap_for_open` sees the outstanding lease
+as pending attach state, strips lease + owner + readiness and bumps the epoch;
+`terminal_session_is_retained_live` is then false, so the open clears readiness
+and registers an attempt — for a host that is mounted, daemon-owned and was
+Ready a moment ago. **Nothing needed to be reopened.** Two threads:
 
-The chain (`crates/yggterm-shell/src/shell.rs`):
-1. `terminal_runtime_input_policy` computes `allow_input`, then TWO further gates
-   override it — `if !remote_resume_input_ready { allow_input = false }` and
-   `if web_surface_active { … }`.
-2. `remote_resume_input_ready_for_snapshot`: a **remote agent row** is typeable
-   only if it is in `shell.terminal_resume_ready_paths` **or** has a Ready
-   `terminal_session_has_ready_attempt`.
-3. ~20 sites `remove()` from that set, plus `prune_terminal_resume_ready_paths()`.
-4. ⛔ **There is no deadline, no fallback and no escape hatch.** If a row leaves
-   that set and its next attempt never reaches Ready, it is untypeable **for the
-   rest of the session**, and nothing tells the user why.
+1. **Do not clear readiness for a host that is already live.** The predicate for
+   "demonstrably live" exists and is used by both 3.0.110 fixes —
+   `terminal_session_host_reusable_for_reveal` (host mounted · Ready once in this
+   life · daemon owns the PTY now). ⚠ The open attempt also drives the reveal
+   notices and watchdogs, so suppressing it is not a one-line edit.
+2. **Some attempts never receive a surface observation at all.** The stranded
+   attempts died with `observations: 0`; a healthy re-open of a different row on
+   the same GUI was marked Ready by an observation within 1 s. Until that is
+   understood, the deadline is carrying a fault it should not have to.
 
-⛔⛔ **AND THE WEBVIEW DIAGNOSES IT CORRECTLY, TO NOBODY.** It records
-`input_dead_ms` (measured live at **24,032 ms**), `input_dead_active_element`, and
-`passive_focus_recovery_state = rust_gate_closed_while_window_focused` — a
-precise, positive fault. `terminalNeedsPassiveFocusRecovery()` fires only for
-`'recoverable'`, so `passive_focus_recovery_count` stayed **0**. Its own comment
-says why: *"the webview cannot repair this one, only the rust policy can"*.
+⭐ **The trigger is ordinary.** Both captures are a plain row selection on an
+IDLE agent row. Idleness matters: the last release standing is fast-ready on the
+first MEANINGFUL output byte, and an agent at its prompt emits protocol-only
+bytes forever. The same row selected while BUSY recovers in ~700 ms, which is
+why this reads as random.
+
+**Instruments.** `ui/input_policy` is the decision reporting itself; the two new
+telemetry events name the deadline's verdict. ⛔ `app terminal input-check` will
+call a wedged row healthy — see the field guide's instrument table.
+
+## ⛔ THE WEBVIEW DIAGNOSES A SHUT INPUT GATE AND TELLS NOBODY
+
+**Status:** OPEN
+
+The terminal script measures `input_dead_ms` (caught live at **24,032 ms**),
+records `input_dead_active_element`, and sets `passive_focus_recovery_state =
+rust_gate_closed_while_window_focused` — a precise, positive fault. Then it
+declines to act, and its own comment says why: *"the webview cannot repair this
+one, only the rust policy can"*.
+
 ⇒ **`rust_gate_closed_while_window_focused` appears NOWHERE in Rust** — only in
 the JS that emits it and a test asserting the string exists. The handoff it was
-named for was never built, so the diagnosis has been reaching no one.
-⚠ The webview could not have named the real cause anyway: `remote_resume_input_ready`
-is a Rust-only signal and is invisible to it.
+named for was never built, so the diagnosis has been reaching no one. 3.0.110
+added the Rust side's own report (`input_gate_stuck_unrestorable`, fired live at
+`denied_for_ms: 26531`), which covers the case from the other end, but the JS
+signal is still inert.
 
-⭐ **The gate is provably wrong at the moment it fires.** `server app terminal
-input-check` against the wedged row answered `wedged:false, consuming_input:true,
-"the session echo-confirmed it is consuming input"` — the PTY was accepting input
-the whole time. So this refuses the user access to a terminal that is demonstrably
-ready. ⚠ That probe is also the instrument gap in miniature: it tests the
-daemon→PTY leg and is blind to the client→daemon leg, which is the one that was
-broken, so it reports health on a row the owner cannot type into.
-
-**Corroborating:** both frames the owner sent show `Status: bootstrapping` in the
-metadata panel, which is what a row stuck outside the ready set looks like.
-
-⭐⭐ **AND AN INDEPENDENT ACTOR HIT THE SAME WALL, ON A DIFFERENT ROW, THE SAME
-HOUR.** `booter.log`, 11:35 — *"ESCALATE …: a boot could not be delivered by
-either the composer or the PTY"*, `BOOT#1:NOT-DELIVERED`. The booter is not a
-human with a keyboard and it failed identically, which rules out anything about
-how the keystrokes were produced and puts the fault squarely in the gate. ⇒ the
-blast radius is wider than the owner's typing: **an ungated row cannot be booted
-either**, so a stalled relay row in this state cannot be recovered by the
-machinery built to recover it. ⚠ That evidence existed only because the booter's
-decision log was repaired in 3.0.107 — before it, this escalation went to
-`/dev/null`.
-
-⚠ **NOT established:** which of the ~20 removal sites fires on drag/paste, and
-whether the two triggers share one. That is the next measurement — and the
-`input_policy` trace already carries the denial, so it can be read rather than
-argued.
+⚠ The webview could not have named the true cause anyway: `remote_resume_input_ready`
+is a Rust-only signal and is invisible to it. So the handoff worth building is
+the reverse one — the gate telling the surface why it is shut — not the surface
+guessing.
 
 ## ⛔⛔ STRAY GLYPHS APPEAR IN THE TUI AND CLEAR ON SCROLL, AND THE HEAL CLAIMED SUCCESS EVERY TIME
 
