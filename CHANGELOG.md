@@ -4,6 +4,27 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **3.0.106 caused a second render bug within 13 minutes; 3.0.107 fixes it, and
+  the honest trace is what caught it.** Digits eaten out of a diff's line-number
+  gutter and rectangular holes through the highlight — cells *missing* glyphs,
+  the inverse of the orphan-cell bug. Cause: the heal re-fired against one
+  13-minute-old rAF gap, 18 times, wiping the glyph atlas mid-session; every wipe
+  re-rasterizes every glyph and cells painted before theirs lands come out blank.
+  ⚠ **An unnecessary atlas clear is not a harmless one.** Two latent bugs that
+  dropping the 600 ms window exposed: `atlasClearedAtMs === 0` means the atlas was
+  built fresh at mount — the *healthiest* state — and was read as the stalest, so
+  every fresh mount healed itself forever; and the latch was a per-host closure
+  variable that reset on each mount and re-armed the ancient gap. The latch now
+  lives on the page-global monitor, a never-cleared atlas only counts as stale if
+  the host existed during the gap (`mountedAtMs`), and the preventive clear skips
+  hosts that mounted after it. ⭐ Under the old hardcoded `healed: true` this
+  regression would have been invisible — the 3.0.105 instrumentation paid for
+  itself in a day.
+- **The atlas defence is finally readable (3.0.107).** `preemptive_atlas_clear_count`
+  and `stale_atlas_heal_count` now ride host health and aggregate into
+  `runtime_truth` (`active_host_preemptive_atlas_clear_count`,
+  `active_host_stale_atlas_heal_count`). Both counters existed and reached no
+  instrument, so "did the defence run?" had no answer either way.
 - **The garbled terminal is now PREVENTED, not repaired after you have seen it
   (3.0.106).** The owner sent the frame: not stray characters but the **entire
   terminal viewport with every glyph wrong**, top to bottom, while the sidebar and

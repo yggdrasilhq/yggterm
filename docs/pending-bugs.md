@@ -237,17 +237,66 @@ stamps the same `lastAtlasClearAtMs` the detector reads, so the repair path
 correctly stands down when prevention already did the work. The repair path stays
 as the backstop for staleness that arrives by some other route.
 
-⛔ **AND THE PREVENTIVE CLEAR CANNOT CURRENTLY BE OBSERVED — fix this FIRST.**
-`rafGapMonitor.preemptiveClearCount` is incremented and never surfaced anywhere:
-not in `server app state`, not in the trace, and not reachable by
-`server app web eval` (verified — that verb lands in a web *surface*, a different
-page, where `window.__yggtermRafGapMonitor` is `null`). ⇒ **there is presently no
-way to tell whether the 3.0.106 prevention ran at all**, which is the same defect
-this entry was opened about: a repair whose success nobody can measure.
-`staleAtlasHealCount` has the same problem and always has — it is stamped on the
-host entry and surfaced nowhere. Both belong in host health beside the other
-render counters. **Do this before judging whether 3.0.106 worked**, or the answer
-will again be a guess wearing a number.
+## ⛔⛔ 3.0.106 CAUSED A SECOND RENDER BUG, AND THE HONEST TRACE IS WHAT CAUGHT IT
+
+**Status:** OPEN
+
+⚠ The regression itself is fixed in 3.0.107; this stays OPEN until the fix is
+proven on the owner's screen after a real occlusion episode.
+
+**Owner-reported 2026-08-11, ~13 minutes after the 3.0.106 restart:** digits
+eaten out of a diff's line-number gutter (`152824` → `1 2824` → `1 2 26`;
+`118486` → `18486`) and **rectangular holes punched through the added-line
+highlight**. Cells MISSING glyphs and background — the inverse of the orphan-cell
+bug above, where cells held glyphs they should not.
+
+⭐ **Caused by 3.0.106, and the instrument this campaign had just taught to stop
+lying is what proved it.** The trace:
+
+    raf_gap_ms: 1794                 ← the SAME gap, every firing
+    render_lag_after_gap_ms:  483054 → 507941 → 723745 → 776131
+    atlas_age_ms: -1                 ← "never cleared"
+    atlas_cleared: true, rows_refreshed: 64   ← 18 times
+
+⇒ the heal re-fired against **one 13-minute-old rAF gap**, wiping the glyph atlas
+mid-session over and over. Every wipe re-rasterizes every glyph, and cells painted
+before their glyph lands come out **blank**. ⚠ **An unnecessary atlas clear is not
+a harmless one** — that is the whole lesson, and it is why `heal_scheduled` +
+`stale_atlas_heal_outcome` + `render_lag_after_gap_ms` (3.0.105) paid for
+themselves within a day: under the old `healed: true` literal this regression
+would have been invisible.
+
+**Two latent bugs that dropping the 600 ms window exposed, both fixed in 3.0.107:**
+1. ⛔ **`atlasClearedAtMs === 0` means the atlas was built fresh at mount and has
+   never needed clearing — the HEALTHIEST state — and `0 < gapStartedAtMs` read it
+   as the stalest.** So every freshly mounted host healed itself immediately, and
+   kept doing it. Now a never-cleared atlas only counts as stale if the host
+   actually existed during the gap (`mountedAtMs`, newly recorded on the entry).
+2. ⛔ **The latch was a per-host CLOSURE variable**, so it reset to 0 on every
+   mount and re-armed whatever ancient gap the page still held. It now lives on
+   the page-global `rafGapMonitor`, beside the gap it latches.
+3. The preventive clear also skips hosts that mounted after the gap — their atlas
+   cannot be stale, and wiping it is pure cost paid in blank cells.
+
+⚠ **Lesson for whoever touches this next:** the 600 ms proximity window was crude
+but it was *masking* both bugs. Removing a guard is only safe once you have read
+what the guard was hiding — [[finding-a-guard-that-cannot-see-the-moment-it-guards]]
+cuts both ways.
+
+⭐ **THE ATLAS DEFENCE IS NOW READABLE (3.0.107).** It was not:
+`preemptiveClearCount` lived only on the page-global monitor and
+`staleAtlasHealCount` only on the host entry, and **neither reached any
+instrument** — not `server app state`, not the trace, and not
+`server app web eval` (checked: that verb lands in a web *surface*, a different
+page, where `window.__yggtermRafGapMonitor` is `null`). So "did the defence run?"
+had no answer in either direction. Both now ride host health and aggregate into
+`runtime_truth` as **`active_host_preemptive_atlas_clear_count`** and
+**`active_host_stale_atlas_heal_count`**, with
+`last_preemptive_atlas_clear_at_ms` per host.
+**How to read them:** zero clears on a GUI that has been occluded ⇒ prevention is
+not firing. A count that climbs while garble is still reported ⇒ it fires and does
+not cure it, a different bug. A count climbing *fast* against one unchanging
+`raf_gap_ms` ⇒ the 3.0.106 regression above, which is exactly how that was caught.
 
 **Restarted and verified 2026-08-11 00:15 (owner said go).** GUI relaunched onto
 3.0.106; it answered in ~13 s (against a documented 17-156 s range), **47 rows
