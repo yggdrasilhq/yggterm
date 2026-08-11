@@ -587,6 +587,32 @@ const STARTUP_TERMINAL_RESTORE_RECOVERY_MS: u64 = 5_000;
 // startup_terminal_restore_should_recover).
 const STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES: u32 = 3;
 const RETAINED_EMPTY_SURFACE_RECOVERY_REARM_MS: u64 = 900;
+// ⛔ THE INPUT GATE HAS ~20 REMOVAL SITES AND HAD NO RELEASE OF ITS OWN.
+// `remote_resume_input_ready` is cleared on every open of a row and restored
+// only when the new open attempt reaches Ready. When the mount that would have
+// produced Ready is skipped as redundant (the host is already live), the only
+// remaining route is fast-ready on the first MEANINGFUL output byte — which an
+// agent sitting idle at its prompt never emits. The row then renders perfectly
+// and accepts no keystrokes for the rest of its life, and nothing says why.
+// This deadline is the release: past it, a surface that is demonstrably live
+// gets its readiness back. It is a restoration of the one owner
+// (`terminal_resume_ready_paths`), NOT a second answer layered over it.
+const INPUT_GATE_STUCK_RESTORE_AFTER_MS: u64 = 5_000;
+// Same deadline for a row whose `terminal_attach_in_flight` marker is the thing
+// that never cleared. An attach genuinely in flight is the gate doing its job,
+// so this waits far longer — and still only for a host that is mounted, has
+// been ready before in this life, and whose PTY the daemon owns right now.
+// ⚠ It must also sit BEYOND the retained-fault recovery budget (measured at
+// ~35 s to `retained_fault_recovery_exhausted`, which resolves the attempt
+// itself). A deadline inside that window would hand the keyboard to a session
+// whose resume was still replaying — the thing the gate is for.
+const INPUT_GATE_STUCK_INFLIGHT_RESTORE_AFTER_MS: u64 = 45_000;
+// How long the gate may refuse a row we CANNOT prove live before we say so in
+// telemetry. Reported once per stuck episode, not once per tick.
+const INPUT_GATE_STUCK_REPORT_AFTER_MS: u64 = 15_000;
+// How often the deadline looks. Fast enough that the worst case stays inside
+// "a beat", cheap enough to be free: the tick reads three sets and returns.
+const INPUT_GATE_DEADLINE_TICK_MS: u64 = 1_000;
 const RETAINED_FAULT_READY_SETTLE_GRACE_MS: u64 = 1_500;
 // HOT switch-back: when a retained host that previously reached ready (and
 // whose daemon still owns the PTY) momentarily reports "xterm surface is
@@ -15678,6 +15704,14 @@ struct ShellState {
     terminal_bootstrap_owner_by_session: HashMap<String, String>,
     terminal_bootstrap_lease_by_session: HashMap<String, String>,
     terminal_resume_ready_paths: HashSet<String>,
+    /// When the input gate first refused the ACTIVE row, per session path.
+    /// The gate has ~20 removal sites and no deadline of its own, so this is
+    /// the clock that turns "untypeable forever" into "untypeable for N
+    /// seconds". Cleared the moment the gate opens by any other route.
+    input_gate_denied_since_ms: HashMap<String, u64>,
+    /// Rows whose stuck gate has already been reported this episode, so the
+    /// tick says it once instead of once per poll.
+    input_gate_stuck_reported: HashSet<String>,
     retained_terminal_session_paths: HashSet<String>,
     terminal_mount_epochs: HashMap<String, u64>,
     active_terminal_host_id: Option<String>,
@@ -18028,6 +18062,8 @@ impl ShellState {
             terminal_bootstrap_owner_by_session: HashMap::new(),
             terminal_bootstrap_lease_by_session: HashMap::new(),
             terminal_resume_ready_paths: HashSet::new(),
+            input_gate_denied_since_ms: HashMap::new(),
+            input_gate_stuck_reported: HashSet::new(),
             retained_terminal_session_paths: HashSet::new(),
             terminal_mount_epochs: HashMap::new(),
             active_terminal_host_id: None,
@@ -24184,6 +24220,8 @@ impl ShellState {
         self.terminal_bootstrap_lease_by_session
             .remove(session_path);
         self.terminal_resume_ready_paths.remove(session_path);
+        self.input_gate_denied_since_ms.remove(session_path);
+        self.input_gate_stuck_reported.remove(session_path);
         self.terminal_busy_hint_until_ms.remove(session_path);
         self.retained_rehydrate_daemon_ready_wait_started_by_session
             .remove(session_path);
@@ -27366,6 +27404,122 @@ impl ShellState {
     fn terminal_session_has_visual_resume_reveal(&self, session_path: &str) -> bool {
         self.terminal_resume_ready_paths.contains(session_path)
             || self.terminal_session_has_ready_attempt(session_path)
+    }
+    /// Is the resume gate currently refusing this row?
+    ///
+    /// Reads the same two facts `remote_resume_input_ready_for_snapshot` reads,
+    /// so the deadline below can never disagree with the policy it nurses.
+    fn remote_resume_input_gate_is_shut(&self, session_path: &str) -> bool {
+        !self.terminal_session_has_visual_resume_reveal(session_path)
+    }
+    /// The one session the deadline may act on: the row the user is looking at
+    /// and typing into. A background row's shut gate is not a symptom.
+    fn input_gate_deadline_candidate(&self) -> Option<String> {
+        if self.server.active_view_mode() != WorkspaceViewMode::Terminal
+            || !self.window_focused
+            || self.app_control_backgrounded
+        {
+            return None;
+        }
+        self.server
+            .active_session()
+            .filter(|session| is_remote_resume_agent_session(session))
+            .map(|session| session.session_path.clone())
+    }
+    /// ⛔ THE ESCAPE HATCH THE GATE NEVER HAD. See
+    /// [`INPUT_GATE_STUCK_RESTORE_AFTER_MS`].
+    ///
+    /// Returns the restored session path when it acts. Everything it does is a
+    /// write to `terminal_resume_ready_paths` — the existing owner of the
+    /// answer — so no second source of truth is created.
+    fn tick_input_gate_deadline(&mut self, now_ms: u64) -> Option<String> {
+        let candidate = self.input_gate_deadline_candidate();
+        self.tick_input_gate_deadline_for_candidate(candidate, now_ms)
+    }
+    /// The deadline's whole decision, with the candidate handed in — the seam
+    /// tests drive, because installing a live SSH session view into the server
+    /// is not something a unit test can do.
+    fn tick_input_gate_deadline_for_candidate(
+        &mut self,
+        candidate: Option<String>,
+        now_ms: u64,
+    ) -> Option<String> {
+        let Some(session_path) = candidate else {
+            self.input_gate_denied_since_ms.clear();
+            self.input_gate_stuck_reported.clear();
+            return None;
+        };
+        if !self.remote_resume_input_gate_is_shut(&session_path) {
+            self.input_gate_denied_since_ms.remove(&session_path);
+            self.input_gate_stuck_reported.remove(&session_path);
+            return None;
+        }
+        let denied_since_ms = *self
+            .input_gate_denied_since_ms
+            .entry(session_path.clone())
+            .or_insert(now_ms);
+        let denied_for_ms = now_ms.saturating_sub(denied_since_ms);
+        // The surface must be demonstrably live before we hand it the keyboard:
+        // a host is mounted, it reached Ready at least once in this life, and
+        // the daemon owns its PTY right now. A first cold resume fails this
+        // test — which is the case the gate exists to protect.
+        if !self.terminal_session_host_reusable_for_reveal(&session_path) {
+            if denied_for_ms >= INPUT_GATE_STUCK_REPORT_AFTER_MS
+                && self.input_gate_stuck_reported.insert(session_path.clone())
+            {
+                let host_mounted = self.terminal_session_host_id(&session_path).is_some();
+                let was_ever_ready = self.terminal_session_was_ever_ready(&session_path);
+                let daemon_owns = self.daemon_owns_session_runtime(&session_path);
+                self.record_terminal_io_telemetry(
+                    "input_gate_stuck_unrestorable",
+                    "error",
+                    &session_path,
+                    "the input gate has refused the focused row for longer than the report deadline, and the surface cannot be proven live",
+                    json!({
+                        "session_path": session_path.clone(),
+                        "denied_for_ms": denied_for_ms,
+                        "host_mounted": host_mounted,
+                        "was_ever_ready": was_ever_ready,
+                        "daemon_owns_session_runtime": daemon_owns,
+                        "terminal_attach_in_flight": self
+                            .terminal_attach_in_flight
+                            .contains(&session_path),
+                    }),
+                );
+            }
+            return None;
+        }
+        let attach_in_flight = self.terminal_attach_in_flight.contains(&session_path);
+        let deadline_ms = if attach_in_flight {
+            INPUT_GATE_STUCK_INFLIGHT_RESTORE_AFTER_MS
+        } else {
+            INPUT_GATE_STUCK_RESTORE_AFTER_MS
+        };
+        if denied_for_ms < deadline_ms {
+            return None;
+        }
+        self.terminal_resume_ready_paths
+            .insert(session_path.clone());
+        if attach_in_flight {
+            // The marker outlived the attach it described; the daemon owning a
+            // live PTY for a host that was ready is the disproof.
+            self.terminal_attach_in_flight.remove(&session_path);
+        }
+        self.input_gate_denied_since_ms.remove(&session_path);
+        self.input_gate_stuck_reported.remove(&session_path);
+        self.record_terminal_io_telemetry(
+            "input_gate_deadline_restored",
+            "warn",
+            &session_path,
+            "the input gate refused a live surface past its deadline; readiness restored",
+            json!({
+                "session_path": session_path.clone(),
+                "denied_for_ms": denied_for_ms,
+                "deadline_ms": deadline_ms,
+                "cleared_stale_attach_in_flight": attach_in_flight,
+            }),
+        );
+        Some(session_path)
     }
     fn active_terminal_prefers_text_input(&self) -> bool {
         if self.server.active_view_mode() != WorkspaceViewMode::Terminal {
@@ -82386,6 +82540,31 @@ fn app() -> Element {
             }
         }
     });
+    // ⛔ THE INPUT GATE'S DEADLINE. Nothing else in the app polls "is the user
+    // still being refused?", and the gate itself is computed from state rather
+    // than driven by a timer — so without this loop a row that leaves the ready
+    // set with no attempt left to re-enter it stays untypeable for the rest of
+    // its life. See INPUT_GATE_STUCK_RESTORE_AFTER_MS.
+    use_future(move || {
+        let mut state = state;
+        async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    INPUT_GATE_DEADLINE_TICK_MS,
+                ))
+                .await;
+                let restored = state
+                    .with_mut(|shell| shell.tick_input_gate_deadline(current_millis()));
+                if restored.is_some() {
+                    // The policy is derived per render from shell state, and a
+                    // set insertion alone does not re-run it — push it now so
+                    // the keyboard comes back on this tick, not on the next
+                    // unrelated re-render.
+                    sync_active_terminal_input_policy(state);
+                }
+            }
+        }
+    });
     use_effect(move || {
         let rename_path = state.read().tree_rename_path.clone();
         let rename_depth = state.read().tree_rename_depth;
@@ -94521,6 +94700,29 @@ fn TerminalCanvas(
             *existing_lease_skip_identity.borrow_mut() = skip_key;
             let lease_context = state.with_mut(|shell| {
                 let context = shell.terminal_open_context_payload(&session_path);
+                // ⛔ AND NOW TELL THE WAITER — the same lesson the sibling
+                // `bootstrap_spawn_skipped_inactive_retained_host` branch
+                // already learned. The click that brought us here registered an
+                // open attempt and cleared `terminal_resume_ready_paths`; the
+                // mount that would have marked that attempt Ready is the one we
+                // have just decided against. Leaving it unresolved leaves the
+                // gate shut with nothing left that can open it — for an IDLE
+                // agent (no meaningful output, so no fast-ready) that is
+                // permanent, and the row renders perfectly while refusing every
+                // keystroke. Resolving it is what makes the decision reach the
+                // person waiting on it.
+                //
+                // Only for a surface we can prove live: host mounted, Ready at
+                // least once in this life, daemon owns the PTY now. A genuine
+                // cold mount held up behind someone else's lease still waits.
+                if shell.terminal_session_host_reusable_for_reveal(&session_path)
+                    && shell.remote_resume_input_gate_is_shut(&session_path)
+                {
+                    shell.mark_terminal_open_attempt_ready_for_session(
+                        &session_path,
+                        "bootstrap_skipped_existing_lease_host_already_live",
+                    );
+                }
                 shell.record_terminal_io_telemetry(
                     "terminal_bootstrap_existing_lease_skip",
                     "warn",
@@ -106585,20 +106787,38 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
         &theme,
     ));
 }
-#[cfg(test)]
-fn remote_resume_input_ready_for_snapshot(shell: &ShellState, snapshot: &RenderSnapshot) -> bool {
-    match snapshot.active_session.as_ref() {
+/// ⛔ THE ONE OWNER of "may the user type into this remote agent row yet?".
+///
+/// It was written out twice — once against the render snapshot, once against
+/// live shell state for the policy signature — so the trace could report a
+/// different answer from the one the keyboard got. Both callers now derive from
+/// here, and `remote_resume_input_gate_is_shut` (the deadline's reader) is the
+/// same predicate negated.
+fn remote_resume_input_ready_for_session(
+    shell: &ShellState,
+    session: Option<&ManagedSessionView>,
+    active_session_path: Option<&str>,
+) -> bool {
+    match session {
         Some(session) => {
             !is_remote_resume_agent_session(session)
-                || shell
-                    .terminal_resume_ready_paths
-                    .contains(&session.session_path)
-                || shell.terminal_session_has_ready_attempt(&session.session_path)
+                || shell.terminal_session_has_visual_resume_reveal(&session.session_path)
         }
-        None => snapshot.active_session_path.as_deref().is_none_or(|path| {
+        None => active_session_path.is_none_or(|path| {
             !path.starts_with("remote-session://") && !path.starts_with("ssh://")
         }),
     }
+}
+/// The snapshot-shaped reader. Test-only, and it must stay a THIN wrapper over
+/// the production predicate above: as a hand-copied twin it could go green
+/// while the keyboard's real answer drifted away from it.
+#[cfg(test)]
+fn remote_resume_input_ready_for_snapshot(shell: &ShellState, snapshot: &RenderSnapshot) -> bool {
+    remote_resume_input_ready_for_session(
+        shell,
+        snapshot.active_session.as_ref(),
+        snapshot.active_session_path.as_deref(),
+    )
 }
 /// Is the active surface's find bar holding the keyboard, as of this snapshot?
 ///
@@ -106620,18 +106840,8 @@ fn active_terminal_input_policy_signature(
     let active_session_path = shell.server.active_session_path().map(ToOwned::to_owned);
     let active_session = shell.server.active_session();
     let terminal_session_path = active_session.map(|session| session.session_path.clone());
-    let remote_resume_input_ready = match active_session {
-        Some(session) => {
-            !is_remote_resume_agent_session(session)
-                || shell
-                    .terminal_resume_ready_paths
-                    .contains(&session.session_path)
-                || shell.terminal_session_has_ready_attempt(&session.session_path)
-        }
-        None => active_session_path.as_deref().is_none_or(|path| {
-            !path.starts_with("remote-session://") && !path.starts_with("ssh://")
-        }),
-    };
+    let remote_resume_input_ready =
+        remote_resume_input_ready_for_session(shell, active_session, active_session_path.as_deref());
     let web_surface_active = terminal_session_path
         .as_deref()
         .is_some_and(|path| shell.has_live_web_surface(path, current_millis()));
@@ -166757,6 +166967,161 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .insert(active_session_path.to_string(), "lease:test".to_string());
         assert!(shell.terminal_session_is_retained_live(active_session_path));
     }
+    /// A row whose host is live but whose gate is shut: the exact state the
+    /// live trace caught on 2026-08-11, where a click registered an open
+    /// attempt, the mount that would have marked it Ready was skipped as
+    /// redundant, and the idle agent never emitted the meaningful byte the
+    /// fast-ready path waits for.
+    fn shell_with_a_live_host_behind_a_shut_gate(session_path: &str) -> ShellState {
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.window_focused = true;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path);
+        // Ready once in this host's life, then superseded by a fresh attempt
+        // that will never observe anything.
+        shell.terminal_sessions_reached_ready
+            .insert(session_path.to_string());
+        shell.begin_terminal_open_attempt(session_path, "req-open", 1, "hot_open_row");
+        shell.terminal_resume_ready_paths.remove(session_path);
+        assert!(
+            shell.remote_resume_input_gate_is_shut(session_path),
+            "scaffold must reproduce the shut gate"
+        );
+        shell
+    }
+
+    #[test]
+    fn input_gate_deadline_restores_a_live_surface_the_gate_refuses() {
+        let session_path = "remote-cc://dev/gate-test-restores-a-live-surface";
+        let mut shell = shell_with_a_live_host_behind_a_shut_gate(session_path);
+        let now = 900_000_u64;
+
+        // First look only arms the clock — nothing is restored on sight.
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(Some(session_path.to_string()), now),
+            None
+        );
+        assert!(shell.remote_resume_input_gate_is_shut(session_path));
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(
+                Some(session_path.to_string()),
+                now + INPUT_GATE_STUCK_RESTORE_AFTER_MS - 1
+            ),
+            None,
+            "one millisecond short of the deadline is still the gate's business"
+        );
+
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(
+                Some(session_path.to_string()),
+                now + INPUT_GATE_STUCK_RESTORE_AFTER_MS
+            ),
+            Some(session_path.to_string())
+        );
+        assert!(
+            !shell.remote_resume_input_gate_is_shut(session_path),
+            "the user can type again"
+        );
+        assert!(shell.input_gate_denied_since_ms.is_empty());
+    }
+
+    #[test]
+    fn input_gate_deadline_leaves_a_cold_resume_alone() {
+        // The case the gate exists for: a host that has NEVER been ready is
+        // mid-resume, and keystrokes must not reach it.
+        let session_path = "remote-cc://dev/gate-test-leaves-a-cold-resume-alone";
+        let mut shell = shell_with_a_live_host_behind_a_shut_gate(session_path);
+        shell.terminal_sessions_reached_ready.remove(session_path);
+
+        for step in 0..4 {
+            assert_eq!(
+                shell.tick_input_gate_deadline_for_candidate(
+                    Some(session_path.to_string()),
+                    900_000 + step * INPUT_GATE_STUCK_RESTORE_AFTER_MS
+                ),
+                None
+            );
+        }
+        assert!(shell.remote_resume_input_gate_is_shut(session_path));
+    }
+
+    #[test]
+    fn input_gate_deadline_waits_far_longer_on_an_attach_still_in_flight() {
+        let session_path = "remote-cc://dev/gate-test-attach-still-in-flight";
+        let mut shell = shell_with_a_live_host_behind_a_shut_gate(session_path);
+        shell
+            .terminal_attach_in_flight
+            .insert(session_path.to_string());
+        let now = 900_000_u64;
+
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(Some(session_path.to_string()), now),
+            None
+        );
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(
+                Some(session_path.to_string()),
+                now + INPUT_GATE_STUCK_RESTORE_AFTER_MS
+            ),
+            None,
+            "an attach in flight is the gate doing its job"
+        );
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(
+                Some(session_path.to_string()),
+                now + INPUT_GATE_STUCK_INFLIGHT_RESTORE_AFTER_MS
+            ),
+            Some(session_path.to_string())
+        );
+        assert!(
+            !shell.terminal_attach_in_flight.contains(session_path),
+            "the marker outlived the attach it described"
+        );
+    }
+
+    #[test]
+    fn input_gate_deadline_disarms_when_the_gate_opens_on_its_own() {
+        let session_path = "remote-cc://dev/gate-test-disarms-when-gate-opens";
+        let mut shell = shell_with_a_live_host_behind_a_shut_gate(session_path);
+        let now = 900_000_u64;
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(Some(session_path.to_string()), now),
+            None
+        );
+        assert!(shell.input_gate_denied_since_ms.contains_key(session_path));
+
+        // The ordinary route opens it: a mount reaches Ready.
+        shell.mark_terminal_open_attempt_ready_for_session(session_path, "test_ready");
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(
+                Some(session_path.to_string()),
+                now + INPUT_GATE_STUCK_RESTORE_AFTER_MS
+            ),
+            None
+        );
+        assert!(
+            shell.input_gate_denied_since_ms.is_empty(),
+            "the clock is disarmed, so a later shut gate starts a fresh episode"
+        );
+    }
+
+    #[test]
+    fn input_gate_deadline_ignores_a_row_that_is_not_the_focused_terminal() {
+        let session_path = "remote-cc://dev/gate-test-row-is-not-focused";
+        let mut shell = shell_with_a_live_host_behind_a_shut_gate(session_path);
+        shell.window_focused = false;
+        assert!(shell.input_gate_deadline_candidate().is_none());
+        assert_eq!(
+            shell.tick_input_gate_deadline(900_000 + INPUT_GATE_STUCK_RESTORE_AFTER_MS),
+            None
+        );
+        assert!(shell.remote_resume_input_gate_is_shut(session_path));
+    }
+
+    #[test]
     #[test]
     fn active_remote_bootstrap_lease_is_not_retained_live_until_ready() {
         let active_session_path = "remote-session://dev/unready";
