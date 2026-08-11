@@ -15,7 +15,9 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔⛔ `ListAgents` OMITS LIVE ROWS, SO "PICK THE PLAUSIBLE ONE FROM THE LIST" IS UNSAFE
 
-**Status:** OPEN · reported by a downstream campaign row 2026-08-11.
+**Status:** OPEN
+
+*Reported by a downstream campaign row 2026-08-11.*
 
 A row spawned minutes earlier — running, transcript growing, holding its campaign's booter
 subscription, seated and titled in `server app rows` — **did not appear in `ListAgents` at all**.
@@ -40,31 +42,6 @@ UUID as a `to:` address, so a caller holding a spawn's `session_path` never has 
 ⚠ Until then the documented workaround is in the fleet skill: resolve the recipient's UUID from
 `server app rows` or the spawn reply, address on that, and **deliver by file if it cannot be
 resolved** rather than guessing from a title.
-
-## ⛔ THE BOOTER HEARTBEATS BUT DOES NOT LOG ITS DECISIONS — a late boot cannot be audited
-
-**Status:** OPEN · reported by a downstream campaign row 2026-08-11.
-
-`~/.yggterm/relay/booter.log` was last written **2026-08-10 12:57** (final line `12:57:17 WORKING`)
-while `~/.yggterm/relay/booter.heartbeat` was live and current the next morning — **~21 hours of a
-scheduler that proves it is alive and records nothing about what it decided.** Reproduced
-independently by a second row the same hour.
-
-**Why it matters now.** A relay subscriber armed a 420 s window at 09:05:53. The watcher polls on a
-~5 minute grid, so the boot was due by ~09:12:53 and worst-case ~09:18 — which is what the tool
-prints. **The actual wake was 09:45:24**, roughly 27 minutes unexplained. With no decision log the
-boot could be neither convicted nor exonerated, and the reporting agent nearly recorded it as its
-own bad arming, which would have buried the defect.
-
-⛔ **This blocks a planned feature, not just an investigation.** Absolute wake times ("be awake at
-09:15") are specified in the campaign notes; their central safety guarantee is that a **missed alarm
-fires LATE and LOUD rather than vanishing**. That guarantee is unimplementable and unverifiable
-while the decision log is dead. ⇒ **fix the log before adding a second, more trusted scheduling
-mode** — a missed relative boot is a late nudge, a missed alarm is a missed market open the
-subscriber believed was covered.
-
-**Falsifier:** arm a short window, let the turn end, and confirm the log records the poll, the
-decision and the delivery with timestamps.
 
 ## ⛔⛔ THE BOOTER KICKED A CONTEXT-DEAD SESSION EVERY 10 MINUTES FOR TEN HOURS, AND ITS OWN LOG SAID "WORKING"
 
@@ -196,6 +173,86 @@ Where to look next, in order:
 
 **Falsifier:** a `start-cc` that spawns no process must leave either an error the
 user sees or a trace event naming the refusal — never a row that says `running`.
+
+## ⛔⛔ A ROW RENDERS PERFECTLY AND ACCEPTS NO KEYSTROKES, FOREVER, WITH NO REASON SHOWN
+
+**Status:** OPEN
+
+**Owner-reported 2026-08-11:** *"stuck ... accepts no inputs"*, on a row whose
+rendering was clean. Then, sharper: *"Stopped again after I tried dragging on the
+tui"* and *"EVEN this session input is freezing in the same way after I try one
+image paste."* ⇒ **drag-selection and image paste are both triggers**, and both are
+clipboard/selection operations (there is already a `CC-DRAG-STALL` seam in
+`shell.rs`).
+
+⭐ **He named it as the bug class that annoys him most, and he is right about why:
+every instrument reports health.** The render path never consults the input gate,
+so a gated row paints the daemon's screen flawlessly. `document_focused`,
+`helper_textarea_focused`, `host_stdin_enabled`, `raw_input_enabled`,
+`effective_input_focus` and `active_host_ready` all read `true` while the user
+cannot type.
+
+### ROOT CAUSE, CODE-CITED AND CONFIRMED FROM THE LIVE TRACE
+
+`ui/input_policy` on the GUI host, sampled during the wedge — **117 denials in 190
+policy events**, across FOUR sessions:
+
+    allow_input:                false
+    remote_resume_input_ready:  false     <- THE CAUSE
+    web_surface_active:         false
+    window_focused:             true      <- the user IS focused
+    app_control_backgrounded:   false
+
+The chain (`crates/yggterm-shell/src/shell.rs`):
+1. `terminal_runtime_input_policy` computes `allow_input`, then TWO further gates
+   override it — `if !remote_resume_input_ready { allow_input = false }` and
+   `if web_surface_active { … }`.
+2. `remote_resume_input_ready_for_snapshot`: a **remote agent row** is typeable
+   only if it is in `shell.terminal_resume_ready_paths` **or** has a Ready
+   `terminal_session_has_ready_attempt`.
+3. ~20 sites `remove()` from that set, plus `prune_terminal_resume_ready_paths()`.
+4. ⛔ **There is no deadline, no fallback and no escape hatch.** If a row leaves
+   that set and its next attempt never reaches Ready, it is untypeable **for the
+   rest of the session**, and nothing tells the user why.
+
+⛔⛔ **AND THE WEBVIEW DIAGNOSES IT CORRECTLY, TO NOBODY.** It records
+`input_dead_ms` (measured live at **24,032 ms**), `input_dead_active_element`, and
+`passive_focus_recovery_state = rust_gate_closed_while_window_focused` — a
+precise, positive fault. `terminalNeedsPassiveFocusRecovery()` fires only for
+`'recoverable'`, so `passive_focus_recovery_count` stayed **0**. Its own comment
+says why: *"the webview cannot repair this one, only the rust policy can"*.
+⇒ **`rust_gate_closed_while_window_focused` appears NOWHERE in Rust** — only in
+the JS that emits it and a test asserting the string exists. The handoff it was
+named for was never built, so the diagnosis has been reaching no one.
+⚠ The webview could not have named the real cause anyway: `remote_resume_input_ready`
+is a Rust-only signal and is invisible to it.
+
+⭐ **The gate is provably wrong at the moment it fires.** `server app terminal
+input-check` against the wedged row answered `wedged:false, consuming_input:true,
+"the session echo-confirmed it is consuming input"` — the PTY was accepting input
+the whole time. So this refuses the user access to a terminal that is demonstrably
+ready. ⚠ That probe is also the instrument gap in miniature: it tests the
+daemon→PTY leg and is blind to the client→daemon leg, which is the one that was
+broken, so it reports health on a row the owner cannot type into.
+
+**Corroborating:** both frames the owner sent show `Status: bootstrapping` in the
+metadata panel, which is what a row stuck outside the ready set looks like.
+
+⭐⭐ **AND AN INDEPENDENT ACTOR HIT THE SAME WALL, ON A DIFFERENT ROW, THE SAME
+HOUR.** `booter.log`, 11:35 — *"ESCALATE …: a boot could not be delivered by
+either the composer or the PTY"*, `BOOT#1:NOT-DELIVERED`. The booter is not a
+human with a keyboard and it failed identically, which rules out anything about
+how the keystrokes were produced and puts the fault squarely in the gate. ⇒ the
+blast radius is wider than the owner's typing: **an ungated row cannot be booted
+either**, so a stalled relay row in this state cannot be recovered by the
+machinery built to recover it. ⚠ That evidence existed only because the booter's
+decision log was repaired in 3.0.107 — before it, this escalation went to
+`/dev/null`.
+
+⚠ **NOT established:** which of the ~20 removal sites fires on drag/paste, and
+whether the two triggers share one. That is the next measurement — and the
+`input_policy` trace already carries the denial, so it can be read rather than
+argued.
 
 ## ⛔⛔ STRAY GLYPHS APPEAR IN THE TUI AND CLEAR ON SCROLL, AND THE HEAL CLAIMED SUCCESS EVERY TIME
 
