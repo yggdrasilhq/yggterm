@@ -116,7 +116,7 @@ and keep `/context` as the interactive one.
 
 **Status:** OPEN
 
-Owner-reported 2026-08-10: *"even a new session does not want to start"*. Traced
+reported 2026-08-10: *"even a new session does not want to start"*. Traced
 on the failing attempt: `start-cc 0eb607df…` at **13:00:40**, then **no birth, no
 error, no process** — while the row reported `running · idle`. A row that claims
 to be running a session that does not exist is the worst possible failure mode,
@@ -148,7 +148,7 @@ user sees or a trace event naming the refusal — never a row that says `running
 
 **Status:** OPEN
 
-**Owner-reported 2026-08-11, verbatim:** *"Renders in TUI are weird characters
+**Reported 2026-08-11, verbatim:** *"Renders in TUI are weird characters
 appearing here and there and going away on scrolll."*
 
 ⛔⛔ **AND THE SEVERITY IS FAR WORSE THAN THAT SENTENCE — HE THEN SENT THE
@@ -303,7 +303,7 @@ missing word to the guard would close this instance and leave the class open.
 ⚠ The regression itself is fixed in 3.0.107; this stays OPEN until the fix is
 proven on the owner's screen after a real occlusion episode.
 
-**Owner-reported 2026-08-11, ~13 minutes after the 3.0.106 restart:** digits
+**Reported 2026-08-11, ~13 minutes after the 3.0.106 restart:** digits
 eaten out of a diff's line-number gutter (`152824` → `1 2824` → `1 2 26`;
 `118486` → `18486`) and **rectangular holes punched through the added-line
 highlight**. Cells MISSING glyphs and background — the inverse of the orphan-cell
@@ -386,9 +386,9 @@ overwrite it in place with a shorter line, and look at the overhang cells.
 
 **Status:** OPEN
 
-**Owner-reported 2026-08-10, verbatim:** *"ALL Switches take ~18-20s time to
+**Reported 2026-08-10, verbatim:** *"ALL Switches take ~18-20s time to
 spawn with a swap message."* He also said the swap message *"is probably a lie"*.
-**He was right about the lie** — that half is fixed below — and the slowness
+**That was correct about the lie** — that half is fixed below — and the slowness
 underneath it is real and unexplained.
 
 ### Measured from every reveal on the GUI host's disk trace (n=106)
@@ -970,7 +970,7 @@ sample on the live host.
 
 **Status:** OPEN
 
-**Owner-reported 2026-08-10, verbatim:** *"spawning a new session should say
+**Reported 2026-08-10, verbatim:** *"spawning a new session should say
 New {Claude, Codex, …, Terminal} Session, etc. on start instead of adding some words on
 the spawnee session row on which right click context menu was issued. They should then
 change the name as they get their first title by whatever mechanism for each entry."*
@@ -1117,7 +1117,7 @@ the gate may be correct and simply not the thing running.
 
 **Status:** OPEN
 
-**Owner-reported 2026-08-10** — *"now I cannot ctrl+V screenshots"*. Found in the GUI's
+**Reported 2026-08-10** — *"now I cannot ctrl+V screenshots"*. Found in the GUI's
 own launch log, which names it exactly:
 
 ```
@@ -1249,7 +1249,7 @@ weakened. **To reverse:** `~/.yggterm/bin/yggterm.rollback-3.0.92-pre` is in pla
 
 **Status:** OPEN
 
-**Owner-reported 2026-08-10** — *"while you were idle, you were untypable for half an
+**Reported 2026-08-10** — *"while you were idle, you were untypable for half an
 hour"*, and a session restart he attempted came back failed. **Caused by this
 session's own deploy**, and the trace names every step:
 
@@ -1435,7 +1435,7 @@ prompts that landed. ⚠ Delivery is not wakefulness: the 2026-08-09 `\n`-vs-`\r
 defect proves a delivered boot can sit unsent in the composer. Treat *"the booter says
 it booted"* as a request, not an effect — which is exactly the caution they applied.
 
-## ⛔⛔ OWNER-REPORTED 2026-08-10: "SHELL SESSIONS NEVER BREAK, OUR SPECIAL SESSIONS ONLY BREAK — OUR PIPELINE IS BACKWARDS"
+## ⛔⛔ REPORTED 2026-08-10: "SHELL SESSIONS NEVER BREAK, OUR SPECIAL SESSIONS ONLY BREAK — OUR PIPELINE IS BACKWARDS"
 
 **Status:** OPEN
 
@@ -1473,11 +1473,11 @@ differential renderer.* Three independent verifiers refuted it:
 
 ### ⭐ WHAT SURVIVED — and the one observation that decides it is HIS
 
-**"A TUI refresh fixes it every time"** (`docs/pending-bugs.md`, his words). A
+**"A TUI refresh fixes it every time"** (`docs/pending-bugs.md`, the requirement). A
 client-side `term.refresh()` adds no bytes and changes no buffer content. **If the
 buffer had been reseeded wrongly, a refresh would repaint the WRONG content
 faithfully. It heals — therefore the BUFFER IS RIGHT AND THE PAINT IS WRONG.**
-The repo already says this twice in his words: *"the daemon's screen is right and
+The repo already says this twice in the requirement: *"the daemon's screen is right and
 the CLIENT is painting less than it holds"*.
 
 ⇒ **The discriminator is not AUTHORITY, it is RECOVERY.** A shell appends at the
@@ -1532,11 +1532,11 @@ and 3.0.29 reverted it the same hour.
 would preserve the corruption. It does not. Any candidate cause implying a wrong
 buffer is dead on arrival.
 
-## ⛔⛔ OWNER-REPORTED, LIVE 2026-08-09: "I CANNOT USE YGGTERM. IT IS SO JANK" — the tmpfs, the daemon pile, and the two hot loops
+## ⛔⛔ REPORTED, LIVE 2026-08-09: "I CANNOT USE YGGTERM. IT IS SO JANK" — the tmpfs, the daemon pile, and the two hot loops
 
 **Status:** OPEN
 
-His words: *"the daemon and switching system is infuriating and slowly becoming
+The requirement: *"the daemon and switching system is infuriating and slowly becoming
 unusable … Why switching tax is insane? Why daemon tax is insane? … Everything
 hits swap. I ONLY HAVE YGGTERM RUNNING and KDE DE. I cannot go more minimal than
 this!! I have 16GB of RAM and an extremely fast last gen SSD."*
@@ -1652,7 +1652,7 @@ its PTYs to the newest and exits.
 
 **Status:** OPEN
 
-Owner-reported 2026-08-09, alongside the performance report: *"Why we update same
+reported 2026-08-09, alongside the performance report: *"Why we update same
 client and daemon (see screenshot NO DAEMON TO UPGRADE)?"*
 
 `DaemonMetadataGroup` builds the Version line as:
@@ -2175,7 +2175,7 @@ the cliff, and the row bomb happens at whatever the new number is.
 ⚠ Until then, **never loop on a `terminal new` timeout.** Read `server app rows`
 first; the row is probably already there.
 
-## ⛔⛔ OWNER-REPORTED, LIVE: THE SESSION METADATA RAIL RENDERS ITS HEADER AND NOTHING ELSE
+## ⛔⛔ REPORTED, LIVE: THE SESSION METADATA RAIL RENDERS ITS HEADER AND NOTHING ELSE
 
 **Status:** OPEN
 
@@ -2291,11 +2291,11 @@ cheap way to force a local tree scan. `local_tree_scan` is throttled behind
 session store cannot ask the product to re-read it. A read-only
 `sessions rescan` would have made this entry unnecessary.
 
-## ⛔⛔ OWNER-REPORTED, LIVE 2026-08-09: A DEPLOY MADE HIS OWN ROW UNREACHABLE FOR 5-10 MINUTES — "the pain we go through is IMMENSELY irritating"
+## ⛔⛔ REPORTED, LIVE 2026-08-09: A DEPLOY MADE THE OPERATOR'S OWN ROW UNREACHABLE FOR 5-10 MINUTES — "the pain we go through is IMMENSELY irritating"
 
 **Status:** OPEN
 
-His words: *"The hot restart needs to be seamless. The pain that we go through is
+The requirement: *"The hot restart needs to be seamless. The pain that we go through is
 IMMENSELY irritating. YOU were stuck for ~5-10 mins and I could not communicate
 to you."*
 
@@ -2445,11 +2445,11 @@ single most common keystroke there is.
 `refused_for_draft: false` while the composer visibly holds `typed`. Measured on
 3.0.84 and still true on 3.0.85 (arm C of `draftprobe.sh`).
 
-## ⛔ OWNER-REPORTED: SWITCHING ROWS IS "STILL JANK, BUT MUCH IMPROVED" — p50 711 ms, p90 12 s, AND THE TAIL IS ONE PHASE
+## ⛔ REPORTED: SWITCHING ROWS IS "STILL JANK, BUT MUCH IMPROVED" — p50 711 ms, p90 12 s, AND THE TAIL IS ONE PHASE
 
 **Status:** OPEN
 
-His words, 2026-08-10: *"Probe the switch to active sessions. It is still jank.
+The requirement: *"Probe the switch to active sessions. It is still jank.
 But much improved."* ⇒ the recent reveal work (3.0.97/98/100) moved it, and what
 is left cannot currently be measured, only felt.
 
@@ -2477,7 +2477,7 @@ the obvious filename returns zero and reads exactly like "the event does not
 exist". ⇒ *glob the generations, and grep the emitter, before declaring an
 instrument absent.*
 
-### ⭐ MEASURED ON HIS OWN SWITCHES — "much improved" is the median, "jank" is the tail
+### ⭐ MEASURED ON THE OPERATOR'S OWN SWITCHES — "much improved" is the median, "jank" is the tail
 
 262 switches carrying a `request_to_ready_ms` on the GUI host, 2026-08-10:
 
@@ -2706,7 +2706,7 @@ exists. (The third item is retracted, not open.)
 **Status:** OPEN
 
 **This is the CONSTITUTION's unmet guarantee and the highest-value work in the
-project.** The design was owner-settled 2026-08-08 and is no longer an open
+project.** The design was settled 2026-08-08 and is no longer an open
 question: [`spec-hot-restart-relay-gate.md`](spec-hot-restart-relay-gate.md) owns
 it, [`settled-calls.md`](settled-calls.md) owns his ruling. ⛔ The former
 prohibition on deadlining the gate is SUPERSEDED; do not cite it.
@@ -2857,7 +2857,7 @@ this signal and was right throughout the
 
 **Status:** OPEN
 
-**Owner said "I say the word" 2026-08-08 and it was executed the same session.**
+**Stated "I say the word" 2026-08-08 and it was executed the same session.**
 Tool: `~/.local/bin/ygg-bak-sweep` (python3, fleet-deployed; `--dry-run`,
 `--quiet`, `--root`). It is **not in this repo** — it follows `ygg-build-sweep`'s
 precedent of living in `~/.local/bin` under fleet-binary-sync, and it is
@@ -3041,7 +3041,7 @@ request is not proof, the row must be re-read.
 ⇒ Rails shipped 3.0.64. The rail HEADER shipped 3.0.67. What is below is the
 measurement that closed the rest of the list, and it is mostly a correction.
 
-His words, 2026-08-08: *"The metadata sidebar entries or text in general (mostly
+The requirement: *"The metadata sidebar entries or text in general (mostly
 anywhere) should be selectable"*, and again the same day: *"I still cannot select
 any text on session metadata other than the connect code row."*
 
@@ -3192,7 +3192,7 @@ the screen.
 
 **Status:** OPEN
 
-Owner-directed 2026-08-08, with a live instance he noticed himself: *"the yggterm
+recorded 2026-08-08, with a live instance he noticed himself: *"the yggterm
 session stalled suddenly. Our relay system or monitor system should yank a
 continue intelligently for such edge cases (cli bug, API error, DEMOTED etc.)."*
 
@@ -3207,7 +3207,7 @@ never get one; the nudge fires ONCE per stall, not per poll (a watcher that
 re-nudges every tick is worse than one that never nudges); and it escalates if the
 row does not wake.
 
-## ⛔⛔ OWNER-REPORTED: THE RIGHT PANEL IS A GLOBAL SLOT — one app's rail renders over another app's row, and "I cannot see any files" is that same bug
+## ⛔⛔ REPORTED: THE RIGHT PANEL IS A GLOBAL SLOT — one app's rail renders over another app's row, and "I cannot see any files" is that same bug
 
 **Status:** OPEN
 
@@ -3238,7 +3238,7 @@ contradiction, and the probe simply could not see which body was up.
 `RightPanelMode::WebTabs` exactly as `AppPane` now is — **do not widen to it
 before that reading**.
 
-Owner-reported 2026-08-08, with a screenshot: *"Right click context menu ychrome
+reported 2026-08-08, with a screenshot: *"Right click context menu ychrome
 launch launches plain terminal. yedit launch opens blank viewport on libyggterm
 surface; I cannot see any files at all. Weird bugs: I see ychrome tabs sidebar in
 terminal (which is supposed to be yedit). I think the context menu wiring of the
@@ -3414,11 +3414,11 @@ silent null. libyggterm needs an app-side crate that yedit, ychrome and yrdp all
 depend on.
 
 
-## ★★ OWNER-REPORTED: THE FIRST TAB REFUSES CLOSE, DUPLICATE AND DRAG — the refusals are right, the AFFORDANCES are the bug
+## ★★ REPORTED: THE FIRST TAB REFUSES CLOSE, DUPLICATE AND DRAG — the refusals are right, the AFFORDANCES are the bug
 
 **Status:** OPEN
 
-⭐ **Owner-reported 2026-08-08:** *"the first tab of ychrome session is a diva. It
+⭐ **Reported 2026-08-08:** *"the first tab of ychrome session is a diva. It
 cannot be closed, duplicated, dragged around, etc."*
 
 Every one of those refusals is deliberate and has its own reason written at the
@@ -3493,7 +3493,7 @@ run at all.
 
 **Status:** OPEN
 
-⭐ **Load-bearing, owner-directed 2026-08-08.**
+⭐ **Load-bearing, recorded 2026-08-08.**
 
 The settings rail holds **Codex Extra Args** and **Claude Code Extra Args**: two
 free-text boxes, one helper line each. Nine CLIs are now first-class, each with
@@ -3526,7 +3526,7 @@ modal, the verb to open it is part of this work, not a follow-up.
 
 **Status:** OPEN
 
-⭐ **Owner-directed 2026-08-08.**
+⭐ **Recorded 2026-08-08.**
 
 The interface LLM — the model yggterm itself calls for titles, summaries and the
 working indicator — is fixed to an endpoint + API key + model (LiteLLM). His
@@ -3553,7 +3553,7 @@ where that CLI is installed — the setting must say which.
 
 **Status:** OPEN
 
-⭐ **Owner-directed 2026-08-08:** *"codex sessions should have an extra slider in
+⭐ **Recorded 2026-08-08:** *"codex sessions should have an extra slider in
 settings codex ↔ Anything."* This is the other half of removing `codex-anything`
 from the kind list: the capability needs a home before its CLI-hood is deleted.
 
@@ -3837,7 +3837,7 @@ carried exactly `codex`, `claude`, `agy` and **none** of the six new CLIs.
 ⚖ **The default was CORRECT when it was written** and the CHANGELOG says why:
 *"Keep background managed-Codex refresh probe-only by default, so live terminal
 recovery and remote scans cannot spawn `npm install @latest` and blow the
-fan/CPU budget."* The owner's ruling changed the component's role, so the
+fan/CPU budget."* The ruling changed the component's role, so the
 default became the bug — [[finding-our-own-policy-was-the-bug]] exactly.
 
 ### ⛔ THE CAPABILITY HAS BEEN PRESENT ALL ALONG — nothing calls it
@@ -4297,7 +4297,7 @@ the Rust compile above is what actually stops the build.
 
 **Status:** OPEN
 
-**Operator-reported 2026-08-07**, twice in one session, both halves in his words:
+**Operator-reported 2026-08-07**, twice in one session, both halves in the requirement:
 > *"I tried clicking the receipt and label from the webapp and the webapp complains popup is
 > getting blocked. So ychrome also needs a pipeline to direct popups to new tabs."*
 > *"Also agents need to know that popup has fired, like you said you cannot tell anything."*
@@ -4376,7 +4376,7 @@ site-lore `app.indiapost.gov.in` slug `drop-off-booked-and-paid-surcharge-and-in
 
 **Status:** OPEN
 
-Owner-reported 2026-08-07 with a screenshot, called an emergency: *"yedit switching
+reported 2026-08-07 with a screenshot, called an emergency: *"yedit switching
 views does not work. The edit view is not working. This is a regression."*
 
 **What he sees.** The `New Yedit` row is open. The titlebar switch reads
@@ -4453,7 +4453,7 @@ probe built on the invented name reports an empty rail over a rail that is on sc
 Listed here only so the yggterm dev agent sees it, because the operator meets it through **this**
 GUI's sidebar and will report it against yggterm.
 
-His words, 2026-08-07, while paying an India Post booking by card:
+the requirement, 2026-08-07, while paying an India Post booking by card:
 > *"ychrome-vault edit/or see details of card is broken and no detail other than note can be seen
 > in the GUI sidebar."*
 
@@ -4692,7 +4692,7 @@ the never-retire entry below (fd-handoff step 3).
 
 **Status:** OPEN
 
-⚖ **This outranks every other row-management item in this file**, on the owner's call and on the
+⚖ **This outranks every other row-management item in this file**, on the decision and on the
 arithmetic: a wedged row **silently drops every instruction sent to it**, so any orchestration
 built on the row plane is unreliable in a way nothing reports.
 
@@ -4840,7 +4840,7 @@ before and after `cargo test -p yggterm-shell`; if no mtime moves, this is wrong
 **Status:** AWAITING A DECISION
 
 *(The shape of the fix is the decision: a response-layer rule, or five separate
-patches. Owner-directed framing, 2026-08-07.)*
+patches. recorded framing, 2026-08-07.)*
 
 Owner, watching the tool calls scroll past: *"for common tasks that we are
 failing again and again like row org, we should have yggui automation supplied
@@ -4996,7 +4996,7 @@ default timeout is **15 s and a create needs more** — `--timeout-ms 90000` is 
 between a clean `seat` reply and `Error: timed out …` over a row that was in fact created; and
 piping `ssh … 2>&1` into a JSON parser corrupts the payload with stderr, so use `2>/dev/null`.
 
-Owner-directed build order 2026-08-07: *"sorts are cheap and never break, and spawnee sessions are
+recorded build order 2026-08-07: *"sorts are cheap and never break, and spawnee sessions are
 grouped as a collapseable tree with the session as the parent element."* Hardened the same night
 after he dragged a mis-seated row back into place by hand at 05:30: *"From now on, we need to spawn
 session at the exact row we want. The second 6 session looked odd. I manually dragged it."*
@@ -6758,7 +6758,7 @@ Raised 2026-08-08 · **operator-confirmed by doing it in Chromium instead**.
 
 Field report: **[`docs/agent-cobrowse-gaps-2026-08-08.md`](agent-cobrowse-gaps-2026-08-08.md)**.
 Filed from another campaign row after a third-party-portal task was driven to the
-last step four times and abandoned. His words: *"I manually removed the Anthony profile on a
+last step four times and abandoned. The requirement: *"I manually removed the Anthony profile on a
 chromium browser. It was ychrome browser shortcoming."*
 
 **The shape, and it is general — not a Google bug and not a payments bug.** Any flow of the form
@@ -8446,3 +8446,71 @@ after any non-zero `ygg-claim`, read the row back from `server app rows` and, if
 `label` is right, ignore the exit code — then arm SEPARATELY via the campaign's own verb
 and handle the predecessor by hand. ⚠ Never read the exit code as the state; that
 is the same law this tool's own header teaches about `remove`.
+
+---
+
+## ⛔ THE BOOTER WILL NOT WAKE A SESSION WHOSE TURN HAS ENDED, IF ITS TRANSCRIPT WAS WRITTEN RECENTLY — `WORKING` IS DECIDED BY FILE GROWTH
+
+**Status:** OPEN
+
+*Measured 2026-08-11 11:09–11:11 by a relay row on a private campaign. This is the
+INVERSE of "DEFECT 1 — a corpse answers faster than a worker": there a dead session
+looked alive; here a session that has **stopped taking turns** looks alive for the
+same reason — recency of transcript growth.*
+
+**The decision line, from the booter's own log:**
+
+```
+11:09:02 ygg-booter WORKING           6.8m  -            <row>  win=25m/<window-note>
+11:09:02 ygg-booter WORKING           0.8m  -            <row2> win=7m
+```
+
+**What was actually true at 11:09.** That row's turn had **ENDED** minutes earlier
+(mid-handover, having created a successor row and stopped before submitting its
+brief). It was not working; it was finished and idle. The booter saw a transcript
+last written 6.8 minutes ago, classified `WORKING`, and declined to boot — so the
+relay stayed asleep and its half-finished handover sat there, with an empty
+successor row holding nothing.
+
+⇒ **`WORKING` means "the file grew recently", which is a proxy for two very
+different states**: a session mid-turn (must NOT be interrupted) and a session
+whose turn ended seconds ago (SHOULD be booted). The one signal cannot separate
+them, and the failure is silent in the direction that matters — an unattended lane
+stays unattended.
+
+### ⭐ THIS LIKELY EXPLAINS AN EARLIER UNEXPLAINED GAP, NOW THAT THE LOG IS BACK
+
+On the morning of 2026-08-11 another relay row measured a **~27-minute** delay
+between `armed + poll interval` and its actual next wake, listed three candidate
+causes — missed polls, *"a turn not seen as ENDED"*, or a boot issued and not
+delivered — and could not choose between them **because the decision log was dead**
+(stale since 2026-08-10 12:57 while the heartbeat was live). ⇒ **The log is ALIVE
+again** (fresh entries at 11:09:02 and 11:11:39), and the surviving evidence names
+the second candidate. Worth confirming against that row's window before closing it.
+
+### ⚠ AND A SECOND, SMALLER DEFECT THAT BLOCKS EXACTLY THIS AUDIT
+
+**The `boots` counter is reset by a re-arm/defer.** Same subscriber file,
+`subscribed_at` UNCHANGED at 09:49:15 throughout:
+
+```
+10:59:34  <row>  sibling  age=1.2h  boots=1      <- a boot HAD been delivered
+11:11:44  <row>  sibling  age=1.4h  boots=0      <- after a routine defer/arm
+```
+
+A campaign that re-arms every turn therefore reports `boots=0` forever. ⇒ **the one
+field that would prove delivery is destroyed by normal operation**, which is why
+the earlier investigation had nothing to count. Keep a monotonic
+`boots_total` (or `last_boot_utc`) that a defer never touches.
+
+### Fix shape
+
+- Separate **"mid-turn"** from **"turn ended, idle"**. The CLI already knows when a
+  turn ends; if the transcript's last record type is available, an ended turn is
+  readable from it rather than inferred from mtime. Failing that, treat
+  `WORKING` as requiring growth **within the last poll interval**, not within
+  ~7 minutes, and let the deferral window govern the rest.
+- Never let a subscriber's own `arm`/`defer` clear delivery evidence.
+- Falsifier: a subscribed row whose turn has ended and whose transcript was last
+  written 5–10 minutes ago must be booted at its deferral deadline, and the log
+  must show why.
