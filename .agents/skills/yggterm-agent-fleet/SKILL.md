@@ -1076,3 +1076,63 @@ Everything above is generic. To make it yours:
 ⚠ **Do not put anything private in a repo.** Row titles, campaign contents and
 directory layouts describe how someone works and what they are working on.
 Invent every example you commit — including in tests and fixtures.
+
+---
+
+## ⛔⛔ CHOOSING THE BOOT DELAY — it is a DECISION, and the prompt cache is a first-class input
+
+**Owner-directed 2026-08-11, after a relay woke 30 minutes AFTER an event it existed to cover:**
+*"Why didn't you arm the booter at the exact time to fire once after the last boot? That would have
+saved the cache since less than 1 hour and woken you at the exact moment. This was very
+unintelligent."* He is right, and the failure had two halves that look opposite and are the same
+mistake: **several no-op wakes before the event, and then arriving late to the event itself.**
+
+**`boot_after_secs` is configurable to any agent's liking. That freedom is the point — a default
+grid is not a plan.** Two constraints govern the choice, and they are usually satisfied by the
+SAME number:
+
+### 1. ⭐ ARM TO THE NEXT EVENT, NOT TO A GRID
+
+If something happens at a known wall-clock time T, the correct delay is **`T − now`**, clamped to
+the booter's range. One wake, at the moment that matters.
+
+⛔ **The anti-pattern, and it is what he caught:** a fixed short window (say 7 min) repeatedly
+re-armed through the run-up to T. It spends N turns discovering nothing is due, and because each
+re-arm restarts from *the moment the turn ended*, the wake times drift off T entirely — so you can
+burn several turns AND still arrive late. **A short window is not "safer" than an aimed one; it is
+just noisier and it loses the aim.**
+
+```
+BAD   08:55 arm 420s → 09:02 nothing due → arm 420s → 09:09 nothing due → … → 09:45, event was 09:15
+GOOD  08:55 arm (09:15 − 08:55) = 1200s → ONE wake, at 09:15, for the event itself
+```
+
+### 2. ⭐ CACHE HOTNESS IS HIGH PRIORITY — and it sets a CEILING on the delay
+
+The prompt cache holds roughly an hour. A wake inside that window resumes on a warm cache; a wake
+outside it pays a **cold re-read of the entire context**, which on a long-running session is the
+single largest avoidable cost there is. So:
+
+- **Never let the gap exceed the cache TTL when you are going to be woken anyway.** If the next
+  event is 3 hours out, do not arm 3 hours; arm inside the TTL. A cheap turn that reads one line
+  and re-arms costs far less than one cold re-read.
+- ⚠ **But cheap turns are not free either** — each is a real turn. ⇒ **the target is the FEWEST
+  wakes that (a) hit every event on time and (b) never let the gap exceed the TTL.** That is a
+  small optimisation problem and it has a right answer; solve it, do not default.
+- ⛔ **A deliberately cold gap is a legitimate choice — but SAY SO.** "I am letting this go cold
+  because nothing is due for six hours and the re-read is cheaper than nine keepalive turns" is a
+  decision. Drifting into it is not.
+
+### Worked cases
+
+| situation | delay to arm | why |
+|---|---|---|
+| known event at T, inside the TTL | **`T − now`** | one wake, on time, cache warm |
+| known event at T, beyond the TTL | **TTL − margin**, then re-aim next turn | keeps the cache warm; the LAST hop lands exactly on T |
+| a phase/state boundary at B, then a different regime | **`B − now`** | a window must not outlive the reason it was chosen |
+| nothing due for a long stretch | TTL − margin, **or** an explicit cold gap you name | either is fine; silence is not |
+| an event whose time you do NOT know | shortest window you can justify | this is the only case a tight grid is right |
+
+⇒ **Before every re-arm ask two questions:** *what is the next thing that actually matters, and
+when is it?* and *does this delay leave the cache cold?* If you cannot name the next event, say so
+— that admission is itself information about whether the watch is aimed at anything.
