@@ -237,11 +237,30 @@ stamps the same `lastAtlasClearAtMs` the detector reads, so the repair path
 correctly stands down when prevention already did the work. The repair path stays
 as the backstop for staleness that arrives by some other route.
 
-⚠ **STILL OPEN, and this is the honest part.** The fix is shipped and unproven
-on the owner's screen: a GUI change needs a GUI restart, and his was mid-session
-with live agent work, so it was not restarted (standing directive: never whoop
-his viewport). What is owed, after his next restart:
-1. A faithful screenshot with no orphan glyphs and no doubled row.
+⛔ **AND THE PREVENTIVE CLEAR CANNOT CURRENTLY BE OBSERVED — fix this FIRST.**
+`rafGapMonitor.preemptiveClearCount` is incremented and never surfaced anywhere:
+not in `server app state`, not in the trace, and not reachable by
+`server app web eval` (verified — that verb lands in a web *surface*, a different
+page, where `window.__yggtermRafGapMonitor` is `null`). ⇒ **there is presently no
+way to tell whether the 3.0.106 prevention ran at all**, which is the same defect
+this entry was opened about: a repair whose success nobody can measure.
+`staleAtlasHealCount` has the same problem and always has — it is stamped on the
+host entry and surfaced nowhere. Both belong in host health beside the other
+render counters. **Do this before judging whether 3.0.106 worked**, or the answer
+will again be a guess wearing a number.
+
+**Restarted and verified 2026-08-11 00:15 (owner said go).** GUI relaunched onto
+3.0.106; it answered in ~13 s (against a documented 17-156 s range), **47 rows
+back**, daemon swapped to 3.0.106 as well, `7 owned · 13 total · 6 preserved`,
+nothing lost. Faithful screenshot: glyphs clean, no orphans, no doubled row.
+⚠ **That is NOT proof the fix works.** A freshly restarted GUI has a freshly
+built atlas, so clean glyphs at t+20 s prove only that the restart was clean. The
+fix can only be judged after an occlusion episode — which is exactly what the
+unobservable counter above currently prevents.
+
+⚠ **STILL OPEN.** What is owed:
+1. A faithful screenshot taken AFTER a real occlusion episode (not after a
+   restart) with no orphan glyphs and no doubled row.
 2. `stale_atlas_heal_outcome` records present with `atlas_cleared: true` — the
    first evidence in this bug's history that a heal did anything at all.
 3. ⛔ **The orphans are a SEPARATE, UNFIXED bug** — see the wide-glyph finding
