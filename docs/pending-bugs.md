@@ -227,6 +227,32 @@ why this reads as random.
 telemetry events name the deadline's verdict. ⛔ `app terminal input-check` will
 call a wedged row healthy — see the field guide's instrument table.
 
+## ⛔ A TEST'S MUTEX GUARDS IT AGAINST ITSELF, NOT AGAINST THE SUITE
+
+**Status:** OPEN
+
+`shell::tests::sidebar_search_context_memo_skips_rebuild_on_unchanged_inputs`
+fails intermittently in a full `cargo test -p yggterm-shell` run and passes every
+time in isolation. Observed 2026-08-11: one failure, then two consecutive clean
+full runs with no code change between them.
+
+Its own comment names the hazard and then does not close it — *"Serialized via a
+mutex because the function touches process-global statics shared with other
+tests"*. The mutex is a `static TEST_LOCK` **declared inside the test function**,
+so it excludes only other invocations of the same test. Every OTHER test that
+calls `set_sidebar_search_context` walks straight past it and moves
+`SIDEBAR_SEARCH_CONTEXT_REBUILD_COUNT` and
+`LAST_SIDEBAR_SEARCH_INPUT_FINGERPRINT` underneath the assertion.
+
+⇒ the assertion `after_first - before == 1` is a race, not a fact. The fix is
+either a lock shared by every test that touches those statics, or a harness that
+does not read process-global counters at all — a memo gate can be stated as a
+pure function of (inputs, last fingerprint) and tested without them.
+
+⚠ **Why this matters more than one flaky test:** it fails in the full run, which
+is the run a release gate uses, and it passes on the retry — the exact shape that
+teaches a session to re-run instead of look.
+
 ## ⛔ THE WEBVIEW DIAGNOSES A SHUT INPUT GATE AND TELLS NOBODY
 
 **Status:** OPEN
@@ -369,6 +395,34 @@ stale atlas — every mounted host's atlas is now cleared *there*, and the clear
 stamps the same `lastAtlasClearAtMs` the detector reads, so the repair path
 correctly stands down when prevention already did the work. The repair path stays
 as the backstop for staleness that arrives by some other route.
+
+⭐⭐ **RE-TESTED INDEPENDENTLY ON 3.0.110, AND THE EMOJI-WIDTH CHANGE IS NOT THE
+ORIGIN.** A previous session cleared its own 3.0.108 change with a harness run
+showing identical buffer content with and without it. ⚠ That proves the BUFFER
+is coherent, not the PAINT, and the session had an obvious motive to clear its
+own work — so it was re-tested from the other end, on a faithful pixel captured
+on the desktop host after 3.0.110 shipped (`capture_faithful: true`).
+
+**The frame still garbles, and its MORPHOLOGY settles the question.** What is
+wrong is *which glyph* is painted, never *where*:
+
+- single characters replaced in place, with the word's remaining letters on
+  their correct columns;
+- a run of line-numbers whose leading digit paints as a letter;
+- line lengths, indentation, wrapping and colour runs all intact.
+
+⇒ **substitution, not drift.** A wcwidth error can only ever produce DRIFT:
+every cell after the first mis-scored character shifts by one column, and the
+damage is confined to lines containing such a character. The observed damage is
+on lines with no emoji at all and preserves every column. The two hypotheses
+predict visibly different pictures, and the picture is the atlas one.
+
+⇒ **Test to apply before blaming any width change for a garble:** ask whether
+the text is in the WRONG CELLS or the WRONG GLYPHS. Only the first can come from
+a width table. This also means the 3.0.105/106 atlas work has NOT closed the
+family — prevention on the rAF-gap edge is not catching every route to a stale
+atlas, and the next investigation should start from which route this frame took,
+not from whether the atlas is the mechanism.
 
 ## ⛔⛔ THE PRE-PUSH PRIVACY GUARD PASSES TERMS THE REPO'S OWN CHECKER REJECTS
 
@@ -722,6 +776,32 @@ occurrence; do not re-derive them by elimination.**
   `daemon_persist/cc_identity_refresh`, `daemon_persist/serialize` and
   `daemon_persist/write` are now separate rows in `server perf-summary`.
 
+⛔⛔ **RE-TAKEN BY RANKING, 2026-08-11 — THE PERSIST IS EXONERATED AND THERE IS A
+BETTER CANDIDATE.** Every span carrying a `duration_ms` in the three newest perf
+files on `dev`, ranked by tail, and then filtered to the 8–11 s band the hole
+occupies:
+
+    daemon/persist_state_only          p50    7.5 ms   max     10 ms   n=20
+    daemon_persist/serialize           p50    4.4 ms   max      6 ms   n=21
+    background/local_tree_scan         p50 8,764 ms    max 11,155 ms   n=30
+    daemon/background_copy_chore       p50   71.3 ms   max 11,155 ms   n=807
+    daemon/runtime_load                p50 3,159 ms    max  8,494 ms   n=10
+
+⇒ `persist_state_only` is **three orders of magnitude** away from a 9 s hole and
+cannot be it under any sampling. The only spans that reach the band are
+`background/local_tree_scan` and the chore that contains it — and they share
+their durations exactly (9,379 · 9,274 · 8,931 · 8,540 · 8,509 ms appear in
+both), so the chore IS the scan. Its shape fits the hole precisely: **median
+8.76 s when it runs long, and ~19% of wall-clock time on `dev` is spent inside
+one** (396 s of scan across a 2,075 s window, 723 samples).
+
+⚠ **What this does NOT yet prove:** that a scan occupied *that* hole. A span of
+the right size that recurs often enough to be likely is a candidate, not an
+attribution — which is the exact error this re-take was ordered to undo. The
+finishing move is an OVERLAP test: take a reveal's hole interval and ask whether
+a `local_tree_scan` span was in flight across it, from the two `ts_ms` values.
+Both are timestamped, so it can be answered without a new instrument.
+
 ⭐⭐ **THE SECOND LOCK HOG IS ROOT-CAUSED AND FIXED (3.0.109): `remove_session`
 CALLS EVERY DEAD DAEMON ON THE HOST.** `close_live_session_row` →
 `prune_unrepresented_preserved_owners` issues a **blocking `status()` socket
@@ -739,8 +819,27 @@ sibling (the first: CC vs codex identity memoization, 3.0.104), so the guard
 walks BOTH probe sites.
 ⚖ Cost only, not outcome: a failed probe already yielded `None`, and skipping a
 probe known to fail yields `None`, so every prune decision is unchanged.
-⛔ **LIVE PROOF OWED** — the ranked `daemon_request/remove_session` row must be
-re-read once 3.0.109 daemons have served a while; the numbers below are pre-fix.
+⛔ **LIVE PROOF STILL OWED, AND THE ATTEMPT ON 2026-08-11 FOUND OUT WHY IT IS
+HARD.** Two things a re-measurement must do, both learned by getting them wrong:
+
+- **Measure on the right host.** The p99 blowup is a `dev` phenomenon and does
+  not exist on the GUI host at all. Every daemon generation on the desktop host,
+  before and after the fix, sits at p50 89–226 ms with a max of 531 ms across
+  nine generations — because the cause is a fleet of superseded daemons to probe,
+  and that is what `dev` has. A "no regression" reading taken there is measuring
+  a host that never had the symptom.
+- **⛔ Resolve the SERVING daemon's binary, because the sample mixes code
+  versions.** On `dev` at 12:03–12:05, after 3.0.109 shipped, `remove_session`
+  still returned 8,570 · 8,125 · 5,585 · 4,750 · 4,111 ms. Every one of those
+  pids resolves to `/proc/<pid>/exe → …/yggterm-headless (deleted)` — a
+  superseded daemon still serving pre-fix code, which is version coexistence
+  working as designed, not the fix failing. **The perf record carries no version
+  field**, so a host-wide percentile over a mixed fleet cannot attribute
+  anything to either side. Take the sample from daemons whose `exe` is NOT
+  `(deleted)`, resolved while they are alive.
+
+⇒ the honest status is UNPROVEN, not "no change". The numbers below are the
+pre-fix baseline.
 
 **The original measurement, kept as the baseline:** The
 3.0.103 instrument's first live harvest (dev, one daemon, 7.6 min) found five
