@@ -1218,3 +1218,51 @@ the send errored, and when a similarly-named row appeared the sender tried again
 is not a debt you must immediately repay.** File the content once, durably, and let the campaign's
 own door surface it. **Retry only if something is ON FIRE**, and then say plainly in the message
 that it is a retry and why.
+
+### ⛔⛔ THE OWNER NAMING A ROW IS AN INPUT, NOT THE DECISION — verify it, price it, then choose
+
+**Owner-directed 2026-08-11:** *"Whatever row user says, you must verify. I might say the wrong
+thing. Account for that. There can even be no yggterm agent at all. … even IF the user says to give
+it to that agent, check if it is cold, and what is the context, and weigh the worth of submitting to
+that session OR spawning a new one OR doing it yourself, and proceed like this. Your mistake burned
+me around US$4 in 1 sec."*
+
+⭐ **That is an explicit standing authorisation to override his own routing when the measurement
+disagrees** — and it is the same law as an inherited `BLOCKED`: **a named recipient is a CLAIM.**
+The row may be misremembered, retired, busy on something else, or may never have existed.
+
+### The procedure — four measurements, then a choice, and the default is CHEAPEST-WARM
+
+```sh
+# 1. DOES IT EXIST? Resolve to a UUID. Never accept a title, never substitute a similar name.
+ssh <gui-host> '<cli> server app rows'   # match on outline_prefix / full_path, not session_title
+
+# 2. HOW COLD?  transcript mtime = time since its last activity
+# 3. HOW BIG?   transcript bytes  = roughly what a cold wake must re-read
+python3 - <<'P'
+import os,time; p=os.path.expanduser("~/.claude/projects/<slug>/<uuid>.jsonl")
+st=os.stat(p); print(f"idle={(time.time()-st.st_mtime)/60:.1f}min size={st.st_size/1048576:.2f}MB")
+P
+```
+
+**4. Then price the options and pick the cheapest that actually achieves the goal:**
+
+| option | cost | when it wins |
+|---|---|---|
+| **FILE IT** (campaign memory + its `MEMORY.md`, a queue doc, a repo file) | **~zero**, permanent | **the default.** Anything not actionable before their next natural wake |
+| **message a WARM row** | one interruption; no cold re-read | genuinely time-critical AND they are already awake AND it is their lane |
+| **message a COLD row** | **the expensive one — measured at ~US$4 for a ~2 MB idle row, in one second** | almost never. Only if something is on fire |
+| **spawn a fresh row** | a new small context + a brief you must write | the work is substantial, ongoing, and nobody warm owns it |
+| **⭐ DO IT YOURSELF** | your context is **already warm and already paid for** | far more often than agents assume — see below |
+
+⭐ **"DO IT YOURSELF" IS SYSTEMATICALLY UNDER-CHOSEN.** The cheapest actor is usually the one
+already warm, and that is normally you. Waking a cold large-context row to do ten minutes of work is
+absurd when you could do it inside a context whose cost is already sunk. ⚠ The legitimate reasons to
+route away are **ownership** (it is another campaign's instrument and yours to report, not to fix),
+**context budget** (you are near your own boundary), and **duration** (it outlives your session) —
+not mere tidiness about whose job it nominally is.
+
+⛔ **AND "THE OWNER ASKED ME TO" IS NOT A COST ARGUMENT.** If the measurement says the content is
+already filed where that row will read it, then the delivery is DONE and a message buys nothing but
+an interruption. **Say what you measured and what you chose.** He asked for the weighing, not the
+obedience.
