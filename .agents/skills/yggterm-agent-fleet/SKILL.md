@@ -1162,3 +1162,59 @@ finding — report it.**
 merely fails in the flattering direction, and it hides the defect. When a wake lands materially
 later than `armed + poll interval`, record the gap with both numbers and route it to whoever owns
 the scheduler — then fix your arming anyway, because that was worth fixing on its own.
+
+---
+
+## ⛔⛔ A MESSAGE TO ANOTHER ROW IS A **WAKE**. PRICE IT LIKE ONE.
+
+**Owner-directed 2026-08-11, after a row sent four cross-session messages in one session — one of
+them to an unrelated, IDLE row that then spent a full turn on a COLD cache measuring a claim it had
+no stake in.** His words: *"You just woke up a cold cache session by mistake. This was a costly
+mistake. You are spamming other agents one after another. Unacceptable."*
+
+⭐ **THE ROOT CAUSE, and it generalises past messaging:** that same session had, an hour earlier,
+written a careful cost model for *its own* wakes — aim the boot at the event, never let the prompt
+cache go cold, a cold re-read of a large context is the biggest avoidable cost there is. **It applied
+none of that to wakes it inflicted on others.** A `SendMessage` to a row whose turn has ended IS a
+boot: identical cost event, charged to somebody else's budget, without their consent, and worst
+precisely when they are idle and cold. **Whatever discipline you apply to your own cadence, you owe
+to every row you address.**
+
+### The pre-send test — the DEFAULT IS NOT TO SEND
+
+1. **Is the information already durable somewhere they will read?** The campaign memory dir, its
+   `MEMORY.md` index, a repo doc, their queue file. **If yes → FILE IT AND STOP.** A message adds
+   *urgency*, never *information*. Filing is free and permanent; a message costs a turn and is gone.
+2. **Is it time-critical to THIS turn of theirs?** Not "useful", not "they'd want to know" —
+   *actionable before their next natural wake*. If no, it is not worth a wake.
+3. **Is the recipient IDLE?** Then the cost is maximal, not minimal. Idle is when the bar goes UP.
+   A busy row is already warm and already paying; an idle one is asleep and cold.
+4. **Have you already messaged them this session?** ⇒ **BATCH.** One message per recipient per
+   session unless something genuinely new AND urgent has appeared. Three sends where one would have
+   done is three wakes, and the 2nd and 3rd are pure waste.
+
+### ⛔ AND ADDRESS ON STRUCTURED IDENTITY, NEVER A DISPLAY TITLE
+
+The wrong-row wake happened because the sender picked a target out of `ListAgents` **by a title that
+looked right**, discarding the UUID its own spawn had returned moments earlier.
+
+⚠ **`ListAgents` is not a complete index of reachable rows.** In that incident the correct successor
+— demonstrably running, transcript growing, holding the campaign's booter subscription — **did not
+appear in the listing at all**, while an unrelated row with a similar name did. So "pick the
+plausible one from the list" was *guaranteed* to be wrong.
+
+⇒ **Resolve the recipient's UUID first** (the spawn's own `session_path`, or `server app rows`), and
+match on it. **If you cannot resolve a name to that UUID, DO NOT GUESS — deliver by file.** That is
+the documented fallback and it is strictly better than waking a stranger.
+
+⭐ This is the same law as [[an alarm addressed by a self-chosen title rang into an empty room]]:
+**an address is only an address if you can prove what is behind it.** A title is a label a row gave
+itself; a UUID is what the system knows.
+
+### Anxiety is not a reason to re-send
+
+The duplicate sends in that incident came from a failed delivery earlier: the target had stood down,
+the send errored, and when a similarly-named row appeared the sender tried again. ⛔ **A failed send
+is not a debt you must immediately repay.** File the content once, durably, and let the campaign's
+own door surface it. **Retry only if something is ON FIRE**, and then say plainly in the message
+that it is a retry and why.
