@@ -1136,3 +1136,29 @@ single largest avoidable cost there is. So:
 ⇒ **Before every re-arm ask two questions:** *what is the next thing that actually matters, and
 when is it?* and *does this delay leave the cache cold?* If you cannot name the next event, say so
 — that admission is itself information about whether the watch is aimed at anything.
+
+### ⚠ AND WHEN A BOOT ARRIVES LATE, MEASURE BEFORE YOU BLAME YOUR OWN ARMING
+
+The case above was written accepting that an unaimed short window caused a 30-minute-late wake.
+**Then it was measured, and the arithmetic did not support that:** `armed 420 s` at T, a watcher
+polling on a ~5-minute grid ⇒ worst case **T + 12 min**, which is exactly what the tool itself
+prints. The actual wake was **T + 40 min**. Roughly 27 minutes are unexplained by the window.
+
+⇒ **Two claims, and merging them costs someone a real defect:**
+
+- **The doctrine is independent and stands:** aim at the event, cap by the cache TTL, prefer one
+  aimed wake to several unaimed ones. That is better arming *whatever* the booter did.
+- **The lateness is a separate, UNMEASURED fact.** Candidates: missed polls; the turn not being
+  seen as ENDED; or a boot issued and never delivered — a shape this fleet has hit before, where a
+  delivery verb accepted what it never delivered.
+
+⛔ **The audit trail is the load-bearing part.** In that incident the booter's decision log had been
+stale for ~21 hours while its heartbeat was live, so the decision trace for the window in question
+**did not exist to read**. A scheduler whose decisions cannot be audited can be neither exonerated
+nor convicted. **If your scheduler writes a heartbeat but not a decision log, that gap IS the
+finding — report it.**
+
+⭐ **The general rule: accepting blame you have not verified is still an unmeasured claim.** It
+merely fails in the flattering direction, and it hides the defect. When a wake lands materially
+later than `armed + poll interval`, record the gap with both numbers and route it to whoever owns
+the scheduler — then fix your arming anyway, because that was worth fixing on its own.
