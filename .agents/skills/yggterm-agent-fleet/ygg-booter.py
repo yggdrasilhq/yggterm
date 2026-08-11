@@ -45,8 +45,8 @@ Usage:
     ygg-booter.py unsubscribe [--row <path>]        # no --row = this session
     ygg-booter.py list
     ygg-booter.py tick [--dry-run]                  # one pass over all subscribers
-    ygg-booter.py watch [--interval 300]            # the loop (usually detached)
-    ygg-booter.py status                            # is a watcher alive?
+    ygg-booter.py watch [--interval 300]            # the loop — let `subscribe` spawn it
+    ygg-booter.py status                            # alive AND audible? (MUTE is a fault)
 
 `subscribe` ARMS the watcher if none is running, so arming the booter and joining
 it are one call — a two-step arm is a step somebody skips.
@@ -67,6 +67,7 @@ STATE = Path.home() / ".yggterm" / "relay"
 SUBS = STATE / "booter"
 PIDFILE = STATE / "booter.pid"
 HEARTBEAT = STATE / "booter.heartbeat"
+LOGPATH = STATE / "booter.log"
 
 # The words he used. A boot must be recognisable AS a boot in the transcript —
 # both to a human reading back and to the session itself, which should be able to
@@ -152,8 +153,108 @@ def _load_babysit():
 BB = _load_babysit()
 
 
+def _watcher_silence_secs(beat=None):
+    """How long has the RUNNING WATCHER been silent? `None` = cannot tell.
+
+    Reads `last_log_write_ts` out of the heartbeat: both fields are written by
+    the watcher about itself, so their gap is that watcher's own silence.
+    ⛔ Do NOT substitute `booter.log`'s mtime — every `subscribe`/`list`/`status`
+    touches that file too, so on a busy fleet it stays fresh and MASKS a mute
+    watcher. That is the same wrong-subject error the bare heartbeat made.
+
+    Falls back to the file mtime only for a PRE-FIX watcher whose heartbeat has
+    no such field — the one case where the file is the only evidence there is.
+    """
+    try:
+        if beat is None:
+            beat = json.loads(HEARTBEAT.read_text())
+        if "last_log_write_ts" in beat:
+            last = float(beat["last_log_write_ts"] or 0)
+            if last <= 0:
+                # Never logged at all. The silence is its whole uptime — and a
+                # watcher with no `started_ts` either predates this field or is
+                # lying, so treat that as maximally silent rather than healthy.
+                started = float(beat.get("started_ts", 0) or 0)
+                if started <= 0:
+                    return float("inf")
+                return float(beat.get("ts", time.time())) - started
+            return float(beat.get("ts", time.time())) - last
+        return time.time() - LOGPATH.stat().st_mtime
+    except Exception:
+        return None
+
+
+def _stdout_is_the_log():
+    """Is our stdout ALREADY the log file? Then writing by path too would double
+    every line. Compared by (device, inode), not by name."""
+    try:
+        s = os.fstat(sys.stdout.fileno())
+        t = LOGPATH.stat()
+        return (s.st_dev, s.st_ino) == (t.st_dev, t.st_ino)
+    except Exception:
+        return False
+
+
+_STDOUT_IS_LOG = None
+# When THIS process last wrote a decision line successfully. The subject of the
+# mute test has to be the WATCHER's own speech: `booter.log`'s mtime is touched by
+# every `subscribe`/`list`/`status` too, so a busy fleet keeps the file fresh and
+# masks a watcher that has gone silent. Same trap the heartbeat fell into — a fact
+# about the wrong subject.
+_LAST_LOG_WRITE_TS = 0.0
+# When this watcher started. A watcher that has NEVER logged is mute, and the only
+# honest measure of that silence is its own uptime.
+_WATCH_STARTED_TS = 0.0
+
+
 def log(m):
-    print(f"{time.strftime('%H:%M:%S')} ygg-booter {m}", flush=True)
+    """Write a decision line to BOTH stdout and the log file BY PATH.
+
+    ⛔⛔ THE LOG USED TO BE `print()` ALONE — i.e. it went wherever stdout
+    happened to point, which is a property of whoever SPAWNED us. The heartbeat,
+    two functions down, writes `booter.heartbeat` by PATH. Those are different
+    mechanisms for the same subject, and one of them can die without the other
+    noticing. It did.
+
+    **Measured 2026-08-11 (reported by a sibling campaign whose relay row was
+    woken ~27 min late and could not be diagnosed):** `booter.heartbeat` was
+    current to the second while `booter.log` had not been touched for **21
+    hours**. The watcher was alive, ticking, and re-arming subscribers correctly
+    the whole time — `/proc/741787/fd/1 -> /dev/null`. Every `log()` call
+    succeeded and wrote to nothing. `ensure_watcher` had spawned an earlier
+    watcher with `stdout=logf`, but THIS one was started detached by something
+    else, and this module's own usage line invited exactly that: *"watch — the
+    loop (usually detached)"*.
+
+    ⇒ **A SCHEDULER THAT HEARTBEATS WITHOUT LOGGING ITS DECISIONS CAN BE NEITHER
+    EXONERATED NOR CONVICTED.** The default outcome is worse than silence: the
+    reporting row initially wrote a mea culpa accepting blame for its own arming,
+    then measured and retracted it. A blackout does not merely hide the defect,
+    it MISATTRIBUTES it — and it makes every future "the booter woke me late"
+    report from any campaign unfalsifiable.
+
+    Same family as a health check that ANDs facts about two different subjects
+    and passes on a corpse: liveness is not speech.
+    """
+    global _STDOUT_IS_LOG, _LAST_LOG_WRITE_TS
+    line = f"{time.strftime('%H:%M:%S')} ygg-booter {m}"
+    print(line, flush=True)
+    if _STDOUT_IS_LOG is None:
+        _STDOUT_IS_LOG = _stdout_is_the_log()
+    if _STDOUT_IS_LOG:
+        _LAST_LOG_WRITE_TS = time.time()
+        return
+    try:
+        LOGPATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOGPATH, "a") as f:
+            f.write(line + "\n")
+        _LAST_LOG_WRITE_TS = time.time()
+    except Exception:
+        # Never let a logging failure take down a scheduler tick — this is the
+        # ONE place that may swallow. It is safe to swallow only because
+        # `_LAST_LOG_WRITE_TS` is NOT updated on failure, so the heartbeat still
+        # carries the silence outward.
+        pass
 
 
 def this_host():
@@ -634,9 +735,22 @@ def watcher_alive():
 def ensure_watcher(args):
     alive = watcher_alive()
     if alive:
+        # ⛔ "already running" IS NOT "already working" — §7 of this skill, applied
+        # to this skill's own tool. For 21 hours this line reported a healthy
+        # watcher that was ticking into /dev/null, and every subscribe that
+        # followed accepted it. A live pid is the request; a written log is the
+        # effect. Say which one is missing.
+        silent_s = _watcher_silence_secs()
+        if silent_s is None or silent_s > max(3 * args.interval, 900):
+            return (f"⛔ pid {alive} is alive but MUTE — the log has not been "
+                    f"written for "
+                    f"{'ever' if silent_s is None else f'{silent_s / 60:.0f}m'}. "
+                    f"Its decisions are unrecordable, so nothing it does can be "
+                    f"diagnosed. Restart it: kill {alive} && "
+                    f"ygg-booter.py subscribe …")
         return f"already running (pid {alive})"
     STATE.mkdir(parents=True, exist_ok=True)
-    logf = open(STATE / "booter.log", "a")
+    logf = open(LOGPATH, "a")
     p = subprocess.Popen(
         [sys.executable, str(HERE / "ygg-booter.py"), "watch",
          "--host", args.host, "--interval", str(args.interval)],
@@ -647,12 +761,29 @@ def ensure_watcher(args):
 
 
 def cmd_watch(args):
+    global _WATCH_STARTED_TS
+    _WATCH_STARTED_TS = time.time()
     PIDFILE.parent.mkdir(parents=True, exist_ok=True)
     PIDFILE.write_text(str(os.getpid()))
     log(f"watcher up (pid {os.getpid()}, interval {args.interval}s, gui host {args.host})")
     try:
         while True:
-            HEARTBEAT.write_text(json.dumps({"ts": time.time(), "pid": os.getpid()}))
+            # ⛔ THE HEARTBEAT ASSERTS THE LOG IS BREATHING, NOT ONLY THAT WE ARE.
+            # A pid-and-timestamp heartbeat is a claim about the wrong subject:
+            # it proved the process lived through 21 hours in which it said
+            # nothing (see `log`). Carrying the log's own mtime/size makes the
+            # blackout visible from OUTSIDE the process — which is the only place
+            # it can be noticed, since the mute process has no way to tell.
+            HEARTBEAT.write_text(json.dumps({
+                "ts": time.time(),
+                "pid": os.getpid(),
+                # Both fields written by the SAME process about ITSELF, so the
+                # gap between them is this watcher's own silence and nobody
+                # else's. `0.0` means it has never managed to log at all.
+                "last_log_write_ts": _LAST_LOG_WRITE_TS,
+                "started_ts": _WATCH_STARTED_TS,
+                "log_path": str(LOGPATH),
+            }))
             if not load_subs():
                 log("no subscribers left — retiring")
                 break
@@ -666,14 +797,30 @@ def cmd_watch(args):
 def cmd_status(args):
     alive = watcher_alive()
     hb = "never"
+    mute = ""
     if HEARTBEAT.exists():
         try:
-            hb = f"{time.time() - json.loads(HEARTBEAT.read_text())['ts']:.0f}s ago"
+            beat = json.loads(HEARTBEAT.read_text())
+            hb = f"{time.time() - beat['ts']:.0f}s ago"
+            # ⛔ ALIVE IS NOT AUDIBLE. A watcher whose stdout was wired to
+            # /dev/null ticked for 21 hours with a perfect heartbeat and an
+            # untouched log; a status that reports only liveness called that
+            # healthy. Report the log's own silence as a FAULT, loudly, because
+            # every campaign's "the booter woke me late" is unfalsifiable while
+            # it lasts — and because the mute process cannot notice it itself.
+            silent_s = _watcher_silence_secs(beat)
+            if silent_s is None:
+                mute = " · ⛔ MUTE: no log file at all"
+            elif alive and silent_s > max(3 * args.interval, 900):
+                mute = (f" · ⛔ MUTE: heartbeat is current but the log has not "
+                        f"been written for {silent_s / 60:.0f}m — this watcher is "
+                        f"ticking silently, restart it "
+                        f"(kill {alive}; ygg-booter.py subscribe …)")
         except Exception:
             pass
     log(f"watcher: {'alive pid ' + str(alive) if alive else 'NOT RUNNING'} · "
-        f"heartbeat {hb} · subscribers {len(load_subs())}")
-    return 0 if alive else 1
+        f"heartbeat {hb} · subscribers {len(load_subs())}{mute}")
+    return 0 if (alive and not mute) else 1
 
 
 def main():
