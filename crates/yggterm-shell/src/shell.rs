@@ -55113,6 +55113,23 @@ fn enrich_runtime_truth_with_viewport(snapshot: &mut Value, viewport: &Value) {
         .iter()
         .filter_map(|host| host.get("manual_redraw_count").and_then(Value::as_u64))
         .sum::<u64>();
+    // XTERM-BUG: webgl-stale-atlas-garble — the answer to "did the glyph-atlas
+    // defence run at all", which nothing could answer before. A zero
+    // `preemptive_atlas_clear_count` on a GUI that has been occluded means the
+    // 3.0.106 prevention is NOT firing, and a garbled viewport is expected; a
+    // rising one with garble still reported means the clear runs and does not
+    // cure it, which is a different bug. Neither could be told apart until now.
+    let stale_atlas_heal_count = active_hosts
+        .iter()
+        .filter_map(|host| host.get("stale_atlas_heal_count").and_then(Value::as_u64))
+        .sum::<u64>();
+    let preemptive_atlas_clear_count = active_hosts
+        .iter()
+        .filter_map(|host| {
+            host.get("preemptive_atlas_clear_count")
+                .and_then(Value::as_u64)
+        })
+        .sum::<u64>();
     if let Some(runtime_truth) = snapshot
         .get_mut("runtime_truth")
         .and_then(Value::as_object_mut)
@@ -55157,6 +55174,14 @@ fn enrich_runtime_truth_with_viewport(snapshot: &mut Value, viewport: &Value) {
         runtime_truth.insert(
             "active_host_manual_redraw_count".to_string(),
             json!(manual_redraw_count),
+        );
+        runtime_truth.insert(
+            "active_host_stale_atlas_heal_count".to_string(),
+            json!(stale_atlas_heal_count),
+        );
+        runtime_truth.insert(
+            "active_host_preemptive_atlas_clear_count".to_string(),
+            json!(preemptive_atlas_clear_count),
         );
     }
 }
@@ -57153,6 +57178,9 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     terminal_input_hot_until_ms: mountedHost ? Number(mountedHost.terminalInputHotUntilMs || 0) : 0,
                     terminal_input_hot: mountedHost ? Date.now() < Number(mountedHost.terminalInputHotUntilMs || 0) : false,
                     forced_refresh_count: mountedHost ? Number(mountedHost.forcedRefreshCount || 0) : 0,
+                    stale_atlas_heal_count: mountedHost ? Number(mountedHost.staleAtlasHealCount || 0) : 0,
+                    preemptive_atlas_clear_count: mountedHost ? Number(mountedHost.preemptiveAtlasClearCount || 0) : 0,
+                    last_preemptive_atlas_clear_at_ms: mountedHost ? Number(mountedHost.lastPreemptiveAtlasClearAtMs || 0) : 0,
                     forced_refresh_skipped_count: mountedHost ? Number(mountedHost.forcedRefreshSkippedCount || 0) : 0,
                     activation_repaint_count: mountedHost ? Number(mountedHost.activationRepaintCount || 0) : 0,
                     last_activation_repaint_at_ms: mountedHost ? Number(mountedHost.lastActivationRepaintAtMs || 0) : 0,
@@ -58885,6 +58913,9 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         terminal_input_hot_until_ms: mountedHost ? Number(mountedHost.terminalInputHotUntilMs || 0) : 0,
                         terminal_input_hot: mountedHost ? Date.now() < Number(mountedHost.terminalInputHotUntilMs || 0) : false,
                         forced_refresh_count: mountedHost ? Number(mountedHost.forcedRefreshCount || 0) : 0,
+                    stale_atlas_heal_count: mountedHost ? Number(mountedHost.staleAtlasHealCount || 0) : 0,
+                    preemptive_atlas_clear_count: mountedHost ? Number(mountedHost.preemptiveAtlasClearCount || 0) : 0,
+                    last_preemptive_atlas_clear_at_ms: mountedHost ? Number(mountedHost.lastPreemptiveAtlasClearAtMs || 0) : 0,
                         forced_refresh_skipped_count: mountedHost ? Number(mountedHost.forcedRefreshSkippedCount || 0) : 0,
                         activation_repaint_count: mountedHost ? Number(mountedHost.activationRepaintCount || 0) : 0,
                         last_activation_repaint_at_ms: mountedHost ? Number(mountedHost.lastActivationRepaintAtMs || 0) : 0,
@@ -113594,6 +113625,15 @@ fn terminal_eval_script_with_canvas_renderer(
                             for (const gapHostId of Object.keys(gapHosts)) {{
                                 const gapEntry = gapHosts[gapHostId];
                                 if (!gapEntry || !gapEntry.term) continue;
+                                // Only hosts that EXISTED during the throttle can
+                                // have a stale atlas; one that mounted after it
+                                // built its atlas fresh, and wiping that is pure
+                                // cost — every glyph re-rasterizes, and cells
+                                // painted before their glyph lands come out BLANK.
+                                // That is the eaten-digits / holed-highlight
+                                // symptom, so an unnecessary clear is not a
+                                // harmless one.
+                                if (Number(gapEntry.mountedAtMs || 0) >= now - gap) continue;
                                 try {{
                                     if (typeof gapEntry.term.clearTextureAtlas === 'function') {{
                                         gapEntry.term.clearTextureAtlas();
@@ -113604,6 +113644,15 @@ fn terminal_eval_script_with_canvas_renderer(
                                     // repair path must not also fire once the
                                     // prevention has done the work.
                                     gapEntry.lastAtlasClearAtMs = now;
+                                    // Stamped on the HOST entry, not just the
+                                    // page-global monitor, because the host
+                                    // entry is the only thing the health report
+                                    // reads — a counter that lives anywhere else
+                                    // is a counter nobody can read, which is the
+                                    // defect this whole entry is about.
+                                    gapEntry.preemptiveAtlasClearCount =
+                                        (gapEntry.preemptiveAtlasClearCount || 0) + 1;
+                                    gapEntry.lastPreemptiveAtlasClearAtMs = now;
                                     if (typeof gapEntry.term.refresh === 'function') {{
                                         gapEntry.term.refresh(0, Math.max(0, gapEntry.term.rows - 1));
                                     }}
@@ -116590,6 +116639,11 @@ fn terminal_eval_script_with_canvas_renderer(
         window.__yggtermXtermHosts = window.__yggtermXtermHosts || {{}};
         window.__yggtermXtermHosts[hostId] = {{
             ownerToken: closureOwnerToken,
+            // When this host's glyph atlas came into existence. A gap that ended
+            // before this instant cannot have staled an atlas that did not yet
+            // exist — without this, every fresh mount healed itself against an
+            // inherited gap forever. See the stale-atlas block in `onRender`.
+            mountedAtMs: Date.now(),
             host,
             term,
             fitAddon,
@@ -118119,25 +118173,30 @@ fn terminal_eval_script_with_canvas_renderer(
             try {{
                 const rafGapMonitor = window.__yggtermRafGapMonitor;
                 const staleAtlasNowMs = Date.now();
-                // ⛔ NO PROXIMITY WINDOW. This used to also require the render to
-                // land within 600 ms of the gap ENDING, which asked the wrong
-                // question: what makes a paint garble is that the atlas has not
-                // been cleared since the gap began, and that stays true for as
-                // long as nothing clears it — 600 ms, 6 s or a minute later. The
-                // common shape on the owner's desktop is precisely the one the
-                // window excluded: the window is occluded, rAF throttles, and the
-                // terminal does not repaint again until the agent writes its next
-                // output seconds later. That paint is just as garbled and was
-                // never detected, never healed, and never traced.
-                // [[finding-a-guard-that-cannot-see-the-moment-it-guards]]
-                // The staleness test below (`atlasClearedAtMs < gapStartedAtMs`)
-                // is the real condition, and the per-episode latch already stops
-                // the heal's own refresh from re-triggering it.
+                // ⛔⛔ THE LATCH IS PAGE-GLOBAL, NOT PER-HOST. 3.0.106 dropped the
+                // old "render landed within 600 ms of the gap" precondition
+                // because a stale atlas stays stale — directionally right, but it
+                // exposed two latent bugs and made this fire in a loop, wiping the
+                // glyph atlas mid-session ~18 times and painting cells before
+                // their glyphs could re-rasterize. That is what ate digits out of
+                // the owner's line-number gutter and punched holes in his diff
+                // highlight on 2026-08-11. Caught from the trace this campaign had
+                // just taught to report honestly: the SAME `raf_gap_ms: 1794`
+                // re-triggering at `render_lag_after_gap_ms` 483s, 508s, 724s,
+                // 776s, with `atlas_age_ms: -1` throughout.
+                //
+                // Bug 1: `lastStaleAtlasHealGapEndMs` is a CLOSURE variable, so it
+                // resets to 0 on every host mount — and a remount then re-armed an
+                // ancient gap. The latch now lives on the page-global monitor,
+                // which is where the gap it latches lives.
+                //
+                // Bug 2 (below): `atlasClearedAtMs === 0` was read as maximally
+                // stale when it means the opposite.
                 if (
                     rafGapMonitor
                     && rafGapMonitor.lastGapEndedAtMs > 0
                     && rafGapMonitor.lastGapMs > 1000
-                    && rafGapMonitor.lastGapEndedAtMs !== lastStaleAtlasHealGapEndMs
+                    && rafGapMonitor.lastGapEndedAtMs !== rafGapMonitor.lastHealedGapEndedAtMs
                     && host.getAttribute('data-active-session-host') === 'true'
                 ) {{
                     const gapStartedAtMs = rafGapMonitor.lastGapEndedAtMs - rafGapMonitor.lastGapMs;
@@ -118146,7 +118205,23 @@ fn terminal_eval_script_with_canvas_renderer(
                         Number(lastAtlasClearAtMs || 0),
                         staleAtlasEntry ? Number(staleAtlasEntry.lastAtlasClearAtMs || 0) : 0
                     );
-                    if (atlasClearedAtMs < gapStartedAtMs) {{
+                    // ⛔ `atlasClearedAtMs === 0` means the atlas has NEVER been
+                    // cleared — i.e. it was built fresh when this host mounted and
+                    // nothing has invalidated it since. That is the HEALTHIEST
+                    // state there is, and `0 < gapStartedAtMs` read it as the
+                    // stalest, so every freshly mounted host healed itself
+                    // immediately and forever against whatever gap it inherited.
+                    // A host that mounted after the gap cannot have been staled by
+                    // it either: its atlas did not exist while the throttle ran.
+                    const hostMountedAtMs = staleAtlasEntry
+                        ? Number(staleAtlasEntry.mountedAtMs || 0)
+                        : 0;
+                    const atlasPredatesGap =
+                        atlasClearedAtMs > 0 && atlasClearedAtMs < gapStartedAtMs;
+                    const hostExistedDuringGap =
+                        hostMountedAtMs > 0 && hostMountedAtMs < gapStartedAtMs;
+                    if (atlasPredatesGap || (atlasClearedAtMs === 0 && hostExistedDuringGap)) {{
+                        rafGapMonitor.lastHealedGapEndedAtMs = rafGapMonitor.lastGapEndedAtMs;
                         lastStaleAtlasHealGapEndMs = rafGapMonitor.lastGapEndedAtMs;
                         staleAtlasHealCount += 1;
                         if (staleAtlasEntry) {{
@@ -118443,6 +118518,21 @@ fn terminal_eval_script_with_canvas_renderer(
                     render_health_recovery_pending: renderHealth.recovery_pending,
                     visible_nonblank_rows: Math.max(0, Math.min(65535, Math.round(visibleNonblankRows))),
                     render_anomaly: renderAnomaly,
+                    // XTERM-BUG: webgl-stale-atlas-garble — did the glyph-atlas
+                    // defence run? Both counters existed in the page and were
+                    // reported by nothing, so the owner's garbled-viewport report
+                    // could not be closed in either direction. Zero clears on a
+                    // GUI that has been occluded means prevention is not firing;
+                    // a rising count with garble still reported means it fires
+                    // and does not cure it — a different bug, and until now
+                    // indistinguishable.
+                    stale_atlas_heal_count: staleAtlasHealCount,
+                    preemptive_atlas_clear_count: entry
+                        ? Number(entry.preemptiveAtlasClearCount || 0)
+                        : 0,
+                    last_preemptive_atlas_clear_at_ms: entry
+                        ? Number(entry.lastPreemptiveAtlasClearAtMs || 0)
+                        : 0,
                 }};
                 if (entry) {{
                     entry.lastHostHealth = payload;
@@ -152723,7 +152813,7 @@ mod tests {
         );
         assert!(
             script.contains(
-                "rafGapMonitor.lastGapEndedAtMs !== lastStaleAtlasHealGapEndMs"
+                "rafGapMonitor.lastGapEndedAtMs !== rafGapMonitor.lastHealedGapEndedAtMs"
             ),
             "the stale-atlas heal must be latched per gap episode so its own refresh cannot loop"
         );
@@ -152777,6 +152867,54 @@ mod tests {
             "the pre-emptive clear must stamp the same field the detector reads, or the \
              repair path fires again for work prevention already did"
         );
+        // ⛔ AND IT MUST BE READABLE. Both counters existed in the page and were
+        // surfaced in no instrument — not app state, not the trace, not
+        // `server app web eval` (which lands in a web surface, where the monitor
+        // is null). So "did the atlas defence run?" had no answer, and a repair
+        // nobody can measure is the same defect as no repair at all. The counter
+        // has to reach the HOST ENTRY, because that is the only thing the health
+        // report reads.
+        assert!(
+            gap_tick.contains("gapEntry.preemptiveAtlasClearCount"),
+            "the pre-emptive clear must count itself on the host entry, or no instrument \
+             can ever say whether it ran"
+        );
+        // ⛔ AN UNNECESSARY ATLAS CLEAR IS NOT A HARMLESS ONE. Wiping the atlas
+        // re-rasterizes every glyph, and cells painted before their glyph lands
+        // come out BLANK — that is the eaten-digits / holed-highlight symptom
+        // 3.0.106 caused. So a host that mounted AFTER the throttle, whose atlas
+        // was therefore built fresh, must be left alone.
+        assert!(
+            gap_tick.contains("if (Number(gapEntry.mountedAtMs || 0) >= now - gap) continue;"),
+            "the pre-emptive clear must skip hosts that mounted after the gap — their \
+             atlas cannot be stale and wiping it paints blank cells"
+        );
+        assert!(
+            script.contains("mountedAtMs: Date.now(),"),
+            "the host entry must record when its atlas came into existence"
+        );
+        assert!(
+            script.contains("rafGapMonitor.lastHealedGapEndedAtMs"),
+            "the heal latch must live on the PAGE-GLOBAL monitor: a per-host closure \
+             variable resets on remount and re-arms an ancient gap forever"
+        );
+        assert!(
+            script.contains("atlasClearedAtMs > 0 && atlasClearedAtMs < gapStartedAtMs"),
+            "a never-cleared atlas (0) is the FRESHEST state, not the stalest — reading \
+             0 as stale made every fresh mount heal itself in a loop"
+        );
+        for field in [
+            "stale_atlas_heal_count:",
+            "preemptive_atlas_clear_count:",
+            "last_preemptive_atlas_clear_at_ms:",
+        ] {
+            assert!(
+                script.contains(field),
+                "the host health report must carry {field} — see docs/pending-bugs.md, \
+                 this is the field whose absence left the owner's garbled-viewport \
+                 report impossible to close either way"
+            );
+        }
     }
 
     #[test]

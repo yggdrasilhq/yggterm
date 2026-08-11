@@ -1609,6 +1609,23 @@ fn terminal_timing_for_app_control(host: Option<&Value>) -> Value {
         "forced_refresh_skipped_count": host.get("forced_refresh_skipped_count").cloned().unwrap_or(Value::Null),
         "activation_repaint_count": host.get("activation_repaint_count").cloned().unwrap_or(Value::Null),
         "manual_redraw_count": host.get("manual_redraw_count").cloned().unwrap_or(Value::Null),
+        // XTERM-BUG: webgl-stale-atlas-garble — the two counters that say whether
+        // the glyph-atlas defence ran. `preemptive_atlas_clear_count` is the
+        // 3.0.106 clear at the end of an rAF throttle (prevention, the one that
+        // should carry the load); `stale_atlas_heal_count` is the older detect-
+        // and-repair backstop. Both existed in the page and were surfaced
+        // NOWHERE, so the owner's garbled-viewport report could not be closed
+        // either way — a repair nobody can measure is the same defect as no
+        // repair. See docs/pending-bugs.md.
+        "stale_atlas_heal_count": host.get("stale_atlas_heal_count").cloned().unwrap_or(Value::Null),
+        "preemptive_atlas_clear_count": host
+            .get("preemptive_atlas_clear_count")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "last_preemptive_atlas_clear_at_ms": host
+            .get("last_preemptive_atlas_clear_at_ms")
+            .cloned()
+            .unwrap_or(Value::Null),
     })
 }
 

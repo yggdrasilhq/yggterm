@@ -927,6 +927,33 @@ fork and halts has converted a 99%-predictable decision into an idle row and a
 context window going cold. **Take your own recommendation, do the work, and write
 down what you chose and what would reverse it.**
 
+### ⛔⛔ AND OFF HOURS, THE ASK IS NOT EVEN AVAILABLE — IT COST HIM TWO HOURS (owner-directed 2026-08-11)
+
+**ON HOURS ARE 09:00–17:30 ON THE `guihost` CLOCK. Outside that window a question is
+not a slow path, it is a DEAD one.** His words, after a session asked at ~23:50
+and sat idle until he woke: *"In ygg fleet skill relay mode, you should not ask
+questions if it is off hours of guihost clock. On hours are 9AM - 5:30PM. In off
+hour times, go with your recommendation and in the end let me know of choices you
+made for me and if I will revert/modify your choices. Your question prompt costed
+me two hours of work time."*
+
+- ⛔ **Off hours ⇒ NEVER `AskUserQuestion`, for anything.** Not for an intrusive
+  action, not for a fork, not for a "this will disturb you" courtesy. **Take the
+  recommendation you were about to offer as the first option and DO IT.**
+- ⭐ **Then tell him at the end, in the shape he asked for:** *what I chose for
+  you · why · and what to say to revert or modify it.* One short list, at the end
+  of the turn — not a question, a receipt.
+- ⚖ **Check the clock before you even consider asking:** `TZ=Asia/Kolkata date`
+  (guihost's clock). ⚠ Off hours is the DEFAULT state for a relay campaign — these
+  run overnight, so in practice this clause governs almost every turn.
+- ⚠ **The instance:** a GUI restart to activate a shipped fix was offered as a
+  question at 23:50 instead of just done. The restart later took **13 seconds**
+  and lost nothing. Two hours of his working time bought a 13-second confirmation
+  he would have given anyway.
+- ⇒ **On hours, a question is merely discouraged (above). Off hours it is
+  forbidden.** The reversibility bar in clause 3 is what decides — and a GUI
+  restart, a deploy, a daemon swap and a row reshuffle are all reversible.
+
 1. ⛔ **NEVER end a relay turn on a question.** Not "shall I continue?", not
    "which of these three?", not "want me to do X next?". If you can name a
    recommendation, you can act on it.
