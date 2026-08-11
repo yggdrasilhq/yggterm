@@ -24543,6 +24543,122 @@ impl ShellState {
         })
     }
 
+    /// What a restore is ACTUALLY doing right now, and how far along it is.
+    ///
+    /// ⛔ THE TOAST USED TO SAY NOTHING. "Restoring the live terminal on dev.
+    /// The viewport will switch in once the session is truly interactive."
+    /// is the same sentence at 0.6 s and at 58 s, so the only information it
+    /// carried was that the wait had not ended — which the blank viewport
+    /// already said. Every milestone below was already timestamped on the open
+    /// attempt and fed the reveal log; the card simply never read them.
+    ///
+    /// ⭐ The bar is a MILESTONE bar, never a time estimate. Measured on the
+    /// live GUI over twelve consecutive reveals, the surface mounts in
+    /// 462–755 ms EVERY time and the whole remaining wait is the session's
+    /// silence (58,611 ms total against 57,982 ms to first output). A bar that
+    /// animated against elapsed time would be a smooth, confident lie; this one
+    /// moves only when something real happens.
+    fn terminal_restore_progress(
+        &self,
+        session_path: &str,
+        host_label: &str,
+    ) -> Option<(f32, String)> {
+        let attempt_id = self.terminal_open_attempt_by_session.get(session_path)?;
+        let attempt = self.terminal_open_attempts.get(attempt_id)?;
+        let elapsed = format!(
+            "{:.1}s",
+            current_millis().saturating_sub(attempt.started_at_ms) as f64 / 1000.0
+        );
+        let hot = !attempt.cold_at_start;
+        let progress = if attempt.ready_at_ms.is_some() {
+            (1.0, "Ready.".to_string())
+        } else if attempt.first_meaningful_output_at_ms.is_some() {
+            (0.9, format!("Painting the session ({elapsed})."))
+        } else if attempt.first_output_at_ms.is_some() {
+            (
+                0.75,
+                format!("Connected to {host_label} — waiting for the first frame ({elapsed})."),
+            )
+        } else if attempt.surface_mounted_at_ms.is_some() && hot {
+            (
+                0.5,
+                format!(
+                    "Attached to the live session on {host_label} — it has sent nothing yet ({elapsed})."
+                ),
+            )
+        } else if attempt.surface_mounted_at_ms.is_some() {
+            (
+                0.5,
+                format!("Re-resuming on {host_label} — waiting for the session to start ({elapsed})."),
+            )
+        } else {
+            (0.2, format!("Mounting the terminal surface ({elapsed})."))
+        };
+        Some(progress)
+    }
+    /// Keep a restore card's stage and bar current while the restore runs.
+    ///
+    /// ⛔ ONLY refreshes a card that is ALREADY up. The card is deliberately
+    /// withheld until the restore is slow enough to be worth mentioning, and a
+    /// ticker that raised it would put a toast on every fast reveal — trading
+    /// one annoyance for a louder one.
+    fn refresh_terminal_restore_card(&mut self) -> bool {
+        if self.server.active_view_mode() != WorkspaceViewMode::Terminal {
+            return false;
+        }
+        let Some(session_path) = self.server.active_session_path().map(ToOwned::to_owned) else {
+            return false;
+        };
+        let job_key = terminal_resume_notification_job_key(&session_path);
+        let Some(existing) = self
+            .notifications
+            .iter()
+            .find(|notification| notification.job_key.as_deref() == Some(job_key.as_str()))
+        else {
+            return false;
+        };
+        // The two recovery sites word their own situation ("remounting a blank
+        // retained surface", "waiting for a prompt-ready terminal") and that
+        // wording is more specific than anything derivable here. Only the
+        // stage-driven card is re-worded; every card still gets a live bar.
+        let owns_message = existing.title == "Restoring Remote Terminal"
+            && existing.tone == NotificationTone::Info;
+        let host_label = self
+            .server
+            .session_for_path(&session_path)
+            .map(|session| session.host_label.clone())
+            .unwrap_or_default();
+        let Some((fraction, stage)) = self.terminal_restore_progress(&session_path, &host_label)
+        else {
+            return false;
+        };
+        let (tone, title, message) = {
+            let existing = self
+                .notifications
+                .iter()
+                .find(|notification| notification.job_key.as_deref() == Some(job_key.as_str()))
+                .expect("the card was found a moment ago");
+            (
+                existing.tone,
+                existing.title.clone(),
+                if owns_message {
+                    stage
+                } else {
+                    existing.message.clone()
+                },
+            )
+        };
+        self.upsert_job_notification(
+            job_key,
+            tone,
+            title,
+            message,
+            Some(fraction),
+            false,
+            Some(session_path),
+        );
+        true
+    }
     fn mark_terminal_open_attempt_ready_for_session(
         &mut self,
         session_path: &str,
@@ -31788,6 +31904,12 @@ fn retained_remote_transcript_browser_surface_ready(
 ) -> bool {
     false
 }
+/// Raise (or update) the restore card for a session.
+///
+/// ⭐ EVERY caller gets the bar, because the bar is not the caller's business:
+/// three sites raise this card with three different sentences, and none of them
+/// knows how far along the restore is. `terminal_restore_progress` does, so the
+/// fraction is derived here once rather than passed in three times.
 fn upsert_terminal_resume_notification(
     state: Signal<ShellState>,
     session_path: &str,
@@ -31812,12 +31934,15 @@ fn upsert_terminal_resume_notification(
             shell.clear_job_notification(&job_key_for_write);
             return;
         }
+        let progress = shell
+            .terminal_restore_progress(&session_path, "")
+            .map(|(fraction, _)| fraction);
         shell.upsert_job_notification(
             job_key_for_write,
             tone,
             title_for_write,
             message_for_write,
-            None,
+            progress,
             false,
             Some(session_path.clone()),
         );
@@ -82553,8 +82678,13 @@ fn app() -> Element {
                     INPUT_GATE_DEADLINE_TICK_MS,
                 ))
                 .await;
-                let restored = state
-                    .with_mut(|shell| shell.tick_input_gate_deadline(current_millis()));
+                let restored = state.with_mut(|shell| {
+                    // Same tick: a restore card that is up must keep telling the
+                    // truth about which stage it is in, or its bar freezes at
+                    // whatever the stage was when it was raised.
+                    shell.refresh_terminal_restore_card();
+                    shell.tick_input_gate_deadline(current_millis())
+                });
                 if restored.is_some() {
                     // The policy is derived per render from shell state, and a
                     // set insertion alone does not re-run it — push it now so
@@ -92982,12 +93112,19 @@ fn TerminalCanvas(
                     // If the wrapper has already reported the session is gone
                     // from the remote machine, don't show the misleading
                     // "Restoring Remote Terminal" toast — it'll never restore.
-                    let session_no_longer_on_remote = safe_shell_read(
+                    let (session_no_longer_on_remote, restore_stage) = safe_shell_read(
                         state,
                         "terminal_resume_slow_classify_failure",
-                        |shell| shell.terminal_session_codex_no_longer_on_remote(&session_path),
+                        |shell| {
+                            (
+                                shell.terminal_session_codex_no_longer_on_remote(&session_path),
+                                shell
+                                    .terminal_restore_progress(&session_path, &session_host_label)
+                                    .map(|(_, stage)| stage),
+                            )
+                        },
                     )
-                    .unwrap_or(false);
+                    .unwrap_or((false, None));
                     let (tone, title, message) = if session_no_longer_on_remote {
                         (
                             NotificationTone::Info,
@@ -92998,13 +93135,16 @@ fn TerminalCanvas(
                             ),
                         )
                     } else {
+                        // ⛔ NAME THE STAGE, NOT THE INTENTION. The old sentence
+                        // ("the viewport will switch in once the session is
+                        // truly interactive") was identical at 0.6 s and at
+                        // 58 s and told the user nothing they could act on.
                         (
                             NotificationTone::Info,
                             "Restoring Remote Terminal",
-                            format!(
-                                "Restoring the live terminal on {}. The viewport will switch in once the session is truly interactive.",
-                                session_host_label
-                            ),
+                            restore_stage.unwrap_or_else(|| {
+                                format!("Restoring the live terminal on {session_host_label}.")
+                            }),
                         )
                     };
                     upsert_terminal_resume_notification(state, &session_path, tone, title, message);
@@ -167122,6 +167262,53 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
+    fn the_restore_card_names_the_stage_instead_of_the_intention() {
+        let session_path = "remote-cc://dev/restore-card-test-names-the-stage";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(session_path, "req-open", 1, "hot_open_row");
+
+        // Nothing mounted yet.
+        let (fraction, stage) = shell
+            .terminal_restore_progress(session_path, "dev")
+            .expect("an in-flight attempt has a stage");
+        assert!(fraction < 0.3, "the bar starts low: {fraction}");
+        assert!(stage.contains("Mounting"), "{stage}");
+
+        // Surface mounted, session silent — the state the owner screenshotted,
+        // and the one the old sentence could not distinguish from any other.
+        shell
+            .terminal_open_attempts
+            .get_mut(&attempt_id)
+            .expect("attempt")
+            .surface_mounted_at_ms = Some(current_millis());
+        let (mounted_fraction, mounted_stage) = shell
+            .terminal_restore_progress(session_path, "dev")
+            .expect("stage");
+        assert!(
+            mounted_fraction > fraction,
+            "a milestone bar only moves forward"
+        );
+        assert!(
+            mounted_stage.contains("dev") && mounted_stage.contains("sent nothing yet"),
+            "the card must say WHAT it is waiting for: {mounted_stage}"
+        );
+
+        // First frame painted.
+        shell
+            .terminal_open_attempts
+            .get_mut(&attempt_id)
+            .expect("attempt")
+            .first_meaningful_output_at_ms = Some(current_millis());
+        let (painting_fraction, painting_stage) = shell
+            .terminal_restore_progress(session_path, "dev")
+            .expect("stage");
+        assert!(painting_fraction > mounted_fraction);
+        assert!(painting_stage.contains("Painting"), "{painting_stage}");
+    }
+
     #[test]
     fn active_remote_bootstrap_lease_is_not_retained_live_until_ready() {
         let active_session_path = "remote-session://dev/unready";
