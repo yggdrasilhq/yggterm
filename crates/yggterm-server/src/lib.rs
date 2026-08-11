@@ -3697,7 +3697,7 @@ pub struct YggtermServer {
     /// it does not own; the WorkingFlags poll asks the PRESERVED OWNER and is the
     /// informed one. `apply_snapshot` rebuilds `sessions` wholesale, so each
     /// apply overwrote the polled answer — *"I don't know"* clobbering *"I asked
-    /// and was told"*. Owner-reported 2026-08-09 as working sessions showing no
+    /// and was told"*. reported 2026-08-09 as working sessions showing no
     /// blink, on a GUI whose current daemon owned 3 of 45 rows: with 42 rows
     /// proxied, the `None` stood unopposed and the dots stayed dark.
     ///
@@ -7441,7 +7441,7 @@ impl YggtermServer {
     /// Why this session's PTY must not be spawned — the CLI it would exec is not
     /// installed here — or `None` when the launch can proceed.
     ///
-    /// ⛔ Owner-reported 2026-08-08: *"All CLIs might not be installed. I tried
+    /// ⛔ reported 2026-08-08: *"All CLIs might not be installed. I tried
     /// launching Muse Code and the viewport reported CLI binary not found."* The
     /// exec fell through to `/bin/bash`, which printed `command not found` and
     /// then OUTLIVED the CLI at a prompt, so the row reported `healthy` with no
@@ -7547,7 +7547,7 @@ impl YggtermServer {
 
     /// Provision this row's CLI on the machine that will actually exec it.
     ///
-    /// The remote half of the owner's ruling that yggterm "auto install, update
+    /// The remote half of the ruling that yggterm "auto install, update
     /// ALL clis in all connected systems". The local half runs in
     /// `ensure_managed_cli_for_session_path` above; this one exists because the
     /// background machine refresh that was supposed to cover remotes is
@@ -9327,7 +9327,7 @@ impl YggtermServer {
                     // correct derivation for a row that IS a shell and a total
                     // loss for a row that is ychrome. Re-derive the app's own
                     // command from the token the row persisted, against the
-                    // CURRENT registry (owner-reported, 2026-08-08).
+                    // CURRENT registry (reported, 2026-08-08).
                     session.launch_command = app_launch
                         .as_deref()
                         .and_then(restored_app_verb_launch_command)
@@ -18945,7 +18945,7 @@ const DAEMON_SPAWN_LOCK_STALE_MS: u64 = 15_000;
 /// and every such give-up is a spurious failure.
 ///
 /// ⛔ It used to be a bare `for _ in 0..120` with a 100 ms sleep — **12 s of
-/// waiting for a lock that stays valid for 15 s.** Owner-reported 2026-08-10:
+/// waiting for a lock that stays valid for 15 s.** reported 2026-08-10:
 /// *"sessions are untypeable even though I see a flawless rendering"*, with
 /// `Error: timed out waiting for daemon spawn lock` in his composer. Every
 /// session at once, because `ensure_local_daemon_running` sits on the terminal
@@ -27840,7 +27840,7 @@ fn restored_app_verb_launch_command(token: &str) -> Option<String> {
 /// The launch command for a libyggterm APP row: run the app's verb, then hand
 /// the row the interactive shell an app row has always ended up at.
 ///
-/// ⛔ THE DEFECT THIS CLOSES (owner-reported 2026-08-08): an app row used to be
+/// ⛔ THE DEFECT THIS CLOSES (reported 2026-08-08): an app row used to be
 /// born as a plain shell with the app's command TYPED into its PTY afterwards,
 /// so the row's stored launch command was `exec '/bin/bash' -i` and **nothing on
 /// the wire said the row was ychrome**. A daemon swap re-ran that command and
@@ -27884,7 +27884,7 @@ const LOCAL_APP_VERB_SHELL_TAIL_WINDOWS: &str = " & %COMSPEC%";
 /// state is the OS fact *a foreground command is running in the tty*, which is a
 /// fair proxy for a shell: commands start, run, finish. It is WRONG for an app
 /// row, whose entire purpose is to hold one long-lived foreground process that
-/// never exits — so the dot blinks from launch until the row dies. Owner-reported
+/// never exits — so the dot blinks from launch until the row dies. reported
 /// 2026-08-09: *"on restart all my ychromes keep on blinking."* Measured on his
 /// machine: five `ychrome` children in state `Sl+` (the `+` is the foreground
 /// process group), one per launcher shell, each hours old.
@@ -31676,7 +31676,7 @@ mod tests {
         assert_eq!(targets[1].2.as_deref(), Some("exec "));
     }
 
-    /// ⛔ OWNER-REPORTED 2026-08-08: his live ychrome row came back from a
+    /// ⛔ REPORTED 2026-08-08: his live ychrome row came back from a
     /// daemon swap as a bare bash prompt, carrying `Runtime Restore Reason:
     /// update-restart`. The cause was that an app row was born a plain shell
     /// and the app's command was TYPED into its PTY afterwards, so the row's
@@ -31688,7 +31688,7 @@ mod tests {
     /// surface opened` and exits), so a launch command of the bare app verb
     /// would end the PTY seconds after birth. The row must run the app AND
     /// still be a terminal afterwards.
-    /// ⛔ Owner-reported 2026-08-09: *"on restart all my ychromes keep on
+    /// ⛔ reported 2026-08-09: *"on restart all my ychromes keep on
     /// blinking."* An app row holds ONE long-lived foreground process, so the
     /// shell's "a foreground command is running" proxy is true from launch until
     /// death. The recogniser is locked to its own builder here, because two
@@ -31800,7 +31800,7 @@ mod tests {
         }
     }
 
-    /// ⛔⛔ Owner-reported 2026-08-09: working sessions showing NO blink, on a
+    /// ⛔⛔ reported 2026-08-09: working sessions showing NO blink, on a
     /// GUI whose current daemon owned 3 of 45 rows. The snapshot writes `None`
     /// for every session its answering daemon does not own, and `apply_snapshot`
     /// rebuilds the whole map — so *"I don't know"* overwrote *"I asked the
@@ -36471,7 +36471,7 @@ terminal_window_id: None,
     /// the reply. This is the "pass a known-different order, read it BACK,
     /// assert it changed" lock — it fails if the apply is a no-op.
     ///
-    /// Owner-reported 2026-08-07, third time in one night: the app-path verb
+    /// reported 2026-08-07, third time in one night: the app-path verb
     /// answered `ok/applied` with `rendered_order` **equal to the request**, and
     /// the sidebar did not move; the SAME list reversed produced byte-different
     /// input and identical output, which is the signature of a reply composed
@@ -43803,7 +43803,7 @@ terminal_window_id: None,
     /// stale can NEVER wait out a legitimate holder — every such give-up is a
     /// spurious failure, and the code above it is decoration.
     ///
-    /// The live shape (owner-reported 2026-08-10, *"sessions are untypeable even
+    /// The live shape (reported 2026-08-10, *"sessions are untypeable even
     /// though I see a flawless rendering"*): the lock stayed valid for 15 s while
     /// callers waited 12 s, and `ensure_local_daemon_running` sits on the
     /// terminal read/write path — so one slow daemon spawn made every session on

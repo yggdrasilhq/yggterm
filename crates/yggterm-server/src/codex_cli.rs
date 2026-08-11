@@ -302,7 +302,7 @@ impl ManagedCliPaths {
     /// the managed npm bin dir, then every login-shell dir the daemon's own
     /// `PATH` lacks.
     ///
-    /// ⛔ **THE DEFECT THIS CLOSES, owner-reported 2026-08-09: `muse`, `kimi`
+    /// ⛔ **THE DEFECT THIS CLOSES, reported 2026-08-09: `muse`, `kimi`
     /// and `agy` were "not found" on a machine that HAS all three.** The PTY is
     /// spawned `$SHELL -c` — NOT `-lc` (`terminal.rs` `shell_command`) — so it
     /// inherits the daemon's stripped `PATH`, measured on the live host as
@@ -1940,7 +1940,7 @@ mod tests {
     /// silent-shell failure made the user work out for themselves: which CLI
     /// (the row said `healthy`), which executable was looked for (`command not
     /// found` was buried in scrollback), and what to do about it (nothing said
-    /// anything). Owner-reported 2026-08-08.
+    /// anything). reported 2026-08-08.
     #[test]
     fn a_missing_cli_is_refused_by_name_with_its_install_method() {
         for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
@@ -2069,7 +2069,7 @@ mod tests {
         assert!(exports.contains(":\"$PATH\""), "{exports}");
     }
 
-    /// ⛔ owner-reported 2026-08-09: `muse`, `kimi` and `agy` were "not found"
+    /// ⛔ reported 2026-08-09: `muse`, `kimi` and `agy` were "not found"
     /// on a host carrying all three. The PTY is spawned `$SHELL -c`, not
     /// `-lc`, so it sees the daemon's stripped `PATH`; this prefix was the
     /// managed npm bin dir ALONE, so the three CLIs that do not arrive by npm
@@ -2350,7 +2350,7 @@ enum ProvisionStep {
 /// What to run for `tool`, or `None` when yggterm can do nothing for it.
 ///
 /// ⭐ The self-updater WINS over the install method when the binary is already
-/// there. That ordering is the owner's ruling read literally: he asked for
+/// there. That ordering is the ruling read literally: it was requested for
 /// auto-install *and* auto-update, and a CLI that ships its own updater knows
 /// where its payload lives in a way an install method re-run does not. It is
 /// also the only thing that makes Antigravity — which yggterm cannot fetch at
@@ -3091,7 +3091,7 @@ fn join_invocation_tokens(tokens: &[String]) -> String {
 ///
 /// ⛔ The launch options are NEVER written back to settings. A delegate asking
 /// for bypass must not mutate `claude_code_extra_args`, which the user owns;
-/// that requirement is what made the pre-flag workaround unacceptable.
+/// that requirement is what made the pre-flag workaround not acceptable.
 pub(crate) fn composed_cli_extra_args(
     kind: SessionKind,
     launch: &AgentLaunchOptions,
@@ -3340,7 +3340,7 @@ fn probe_tool_existence_only(paths: &ManagedCliPaths, tool: ManagedCliTool) -> T
 /// Why a LOCAL agent-CLI PTY must be REFUSED instead of spawned — or `None`
 /// when the binary the launch will exec genuinely resolves.
 ///
-/// ⛔ The defect this closes, owner-reported 2026-08-08: a missing binary was
+/// ⛔ The defect this closes, reported 2026-08-08: a missing binary was
 /// not a launch failure ANYWHERE in the product. The launch command is
 /// `bash -lc '<exports> && muse'`; with no `muse` on the machine, bash printed
 /// `muse: command not found`, **exited that one command, and stayed alive at a

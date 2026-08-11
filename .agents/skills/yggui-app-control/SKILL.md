@@ -495,7 +495,7 @@ yggterm server app web capture-element --selector img#captcha out.png --split 6
 #   `result` is still the TOP DOCUMENT's answer (the old shape, unchanged);
 #   `frames[]` is added beside it. Nothing that read `.result` broke.
 yggterm server app web frames --session <path>
-yggterm server app web read --as forms --frame billdesk --session <path>
+yggterm server app web read --as forms --frame paygate --session <path>
 
 # Wait THROUGH a redirect chain (read from the engine, not the page).
 yggterm server app web wait --until url:matches:'^https://auth\.' --session <path>

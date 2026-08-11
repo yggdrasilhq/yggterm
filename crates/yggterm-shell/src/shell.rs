@@ -1769,7 +1769,7 @@ struct WebSurfaceTab {
     /// really did begin a load the moment it made the view — and the ONLY thing
     /// that clears it is the reconciler reading the engine's `is-loading` on a
     /// tab with a live webview. A surface whose engine is never polled therefore
-    /// keeps its birth value for the life of the row. Owner-reported 2026-08-09:
+    /// keeps its birth value for the life of the row. reported 2026-08-09:
     /// *"on restart all my ychromes keep on blinking"*; measured on his GUI, 3 of
     /// 6 ychrome rows sat at `busy_reason: web_surface_loading` 45 minutes after
     /// the restart that made them.
@@ -11335,7 +11335,7 @@ const WEB_SURFACE_GEOMETRY_EVAL_JS: &str = r#"(function(){
 
 /// F.1 synchronous cover push (T8). The tick's geometry eval samples covers
 /// too, but it is a documented-starvable oracle (seconds, under output
-/// flood) — acceptable while it only places pixels, unacceptable as the
+/// flood) — acceptable while it only places pixels, not acceptable as the
 /// INPUT authority: a dialog would be visible for one-to-several ticks while
 /// clicks on it fell through to the page (an invisible misclick). This
 /// observer pushes a cover update the instant a `data-covers-web-surface`
@@ -24422,7 +24422,7 @@ impl ShellState {
         // `reclaim_pressured`, zero had PSI `full avg60` at or above the 10%
         // thrash line (the worst was 0.23%), and the median machine had 9.4 GB of
         // 15.1 GB available. Every one of those notices sent the owner to free RAM
-        // he already had, for a slowness memory was not causing. His words:
+        // he already had, for a slowness memory was not causing. The requirement:
         // "what is swapping and it is probably a lie". It was.
         //
         // ⇒ A diagnostic that asserts an unmeasured cause is worse than silence:
@@ -67776,14 +67776,14 @@ mod web_do_verb_tests {
     #[test]
     fn url_matches_names_a_hop_of_the_recorded_redirect_chain() {
         let chain = [
-            "https://rtionline.gov.in/request/request.php",
-            "https://merchant.sbi.bank.in/merchant/initpay",
-            "https://www.billdesk.com/pgidsk/pgmerc/sbiepay",
-            "https://pay.billdesk.com/web/v1_2/payments",
+            "https://forms.example.gov/request/request.php",
+            "https://merchant.examplebank.test/merchant/initpay",
+            "https://www.paygate.test/pgidsk/pgmerc/gatewaypay",
+            "https://pay.paygate.test/web/v1_2/payments",
             "https://auth.examplebank.test/netbanking/login",
         ];
         let probe = web_wait_probe(&WebSurfaceWaitUntil::UrlMatches {
-            pattern: r"^https://auth\.examplebank\.bank\.in/".to_string(),
+            pattern: r"^https://auth\.examplebank\.test/".to_string(),
         })
         .expect("a valid pattern compiles");
         let WaitProbe::Url { pattern } = probe else {
@@ -67834,7 +67834,7 @@ mod web_do_verb_tests {
         ));
         assert!(matches!(
             web_wait_probe(&WebSurfaceWaitUntil::UrlMatches {
-                pattern: "billdesk".into()
+                pattern: "paygate".into()
             })
             .unwrap(),
             WaitProbe::Url { .. }
@@ -67928,14 +67928,14 @@ mod web_do_verb_tests {
     #[test]
     fn cookie_reporting_names_domains_and_never_values() {
         use crate::netscape_cookie_jar::parse_netscape_jar;
-        let jar = "#HttpOnly_rtionline.gov.in\tFALSE\t/\tTRUE\t0\tPHPSESSID\tq7v2n8m4k1\n\
+        let jar = "#HttpOnly_forms.example.gov\tFALSE\t/\tTRUE\t0\tPHPSESSID\tq7v2n8m4k1\n\
                    .gov.in\tTRUE\t/\tFALSE\t0\tlang\ten-IN\n\
-                   rtionline.gov.in\tFALSE\t/\tTRUE\t0\tcsrf\tabc\n";
+                   forms.example.gov\tFALSE\t/\tTRUE\t0\tcsrf\tabc\n";
         let specs = parse_netscape_jar(jar).unwrap();
         let domains = cookie_domains(&specs);
         // Deduplicated and sorted — a report a human can scan, and stable
         // across runs.
-        assert_eq!(domains, vec![".gov.in", "rtionline.gov.in"]);
+        assert_eq!(domains, vec![".gov.in", "forms.example.gov"]);
         let rendered = serde_json::to_string(&domains).unwrap();
         assert!(!rendered.contains("q7v2n8m4k1"), "a value reached the report");
         assert!(!rendered.contains("PHPSESSID"), "a cookie name reached the report");
@@ -68010,7 +68010,7 @@ mod web_do_verb_tests {
                 .is_ok()
         );
         assert!(
-            declared_web_surface_open_or_refusal(&json!({"url": "https://rtionline.gov.in/"}))
+            declared_web_surface_open_or_refusal(&json!({"url": "https://forms.example.gov/"}))
                 .is_ok()
         );
     }
@@ -68127,8 +68127,8 @@ mod web_do_verb_tests {
         assert!(by_index.contains("var path=[2]"), "{by_index}");
         let by_path = web_frame_resolver_js(&WebFrameRef::Path(vec![0, 2]));
         assert!(by_path.contains("var path=[0,2]"), "{by_path}");
-        let by_url = web_frame_resolver_js(&WebFrameRef::UrlContains("billdesk".into()));
-        assert!(by_url.contains("\"billdesk\""), "{by_url}");
+        let by_url = web_frame_resolver_js(&WebFrameRef::UrlContains("paygate".into()));
+        assert!(by_url.contains("\"paygate\""), "{by_url}");
         // A url search must skip the TOP document (path length 0), or every
         // query would "match" the page it started from.
         assert!(by_url.contains("path.length&&"), "{by_url}");
@@ -70995,7 +70995,7 @@ async fn web_surface_liveness_probe(
 /// mechanical parts on curl, hand the session to a surface for the one step
 /// that genuinely needs a browser, hand it back. It was proven both necessary
 /// and sufficient in the field: transplanting one PHPSESSID into a browser made
-/// rtionline render the applicant's name and the fee.
+/// formsportal render the applicant's name and the fee.
 ///
 /// ⚠ THE PROFILE. The cookie manager belongs to the surface's `WebContext`,
 /// which is its PROFILE, and a surface with no explicit profile is `default` —
@@ -126968,13 +126968,13 @@ fn DaemonMetadataGroup(
     // ⛔ WHICH ONE IS OLDER IS A QUESTION THIS USED TO SKIP. The arm below was
     // `(false, false) => "{version} · older than this client"`, on the bare fact
     // that the strings DIFFER — so a daemon NEWER than the window reported itself
-    // as older. Owner-reported live 2026-08-10 with the numbers on screen: client
+    // as older. reported live 2026-08-10 with the numbers on screen: client
     // 3.0.89, daemon 3.0.91, label *"3.0.91 · older than this client"*. A panel
     // that inverts the one comparison it exists to make is worse than a blank one.
     //
     // ⛔ And `hot_restart_pending` no longer outranks the comparison. It meant the
     // panel offered an upgrade whenever the daemon merely THOUGHT a swap was
-    // pending — his words, *"we daemon update when there is no daemon to update"*.
+    // pending — the requirement, *"we daemon update when there is no daemon to update"*.
     // A pending flag is only worth saying when there is somewhere newer to go.
     let daemon_rank = daemon_version_rank(&daemon.version, &daemon.client_version);
     let mut entries = vec![
@@ -129322,7 +129322,7 @@ fn row_menu_items(
                 "Open Terminal Here",
                 't',
             ));
-            // ⚖ TWO LAYERS, owner-directed 2026-08-08. Nine agent CLIs and four
+            // ⚖ TWO LAYERS, recorded 2026-08-08. Nine agent CLIs and four
             // app verbs as siblings is a list nobody can read, and it grows
             // every time a CLI ships. `Open Terminal Here` stays flat — it is
             // the one entry that is not a choice between vendors.
@@ -136780,7 +136780,7 @@ mod tests {
         shell
     }
 
-    // ⛔ OWNER-REPORTED 2026-08-08, with a screenshot: the `New Yedit` row
+    // ⛔ REPORTED 2026-08-08, with a screenshot: the `New Yedit` row
     // selected, its files nowhere, and ychrome's chrome — omnibox, Khan Academy
     // tabs, its `tables` folder — painted in the rail beside it.
     //
@@ -151534,7 +151534,7 @@ mod tests {
     // Pointer identity is the assertion because it is the one a deep copy
     // cannot satisfy: a size or timing check would pass on a fast machine with
     // a small ruleset, which is exactly the configuration nobody ships.
-    /// ⛔⛔ Owner-reported 2026-08-09: *"on restart all my ychromes keep on
+    /// ⛔⛔ reported 2026-08-09: *"on restart all my ychromes keep on
     /// blinking."* Measured on his GUI: 3 of 6 ychrome rows sat at
     /// `busy_reason: web_surface_loading` **45 minutes** after the restart that
     /// created them. A tab is born `loading: true` — correctly — and only a live

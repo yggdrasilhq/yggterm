@@ -155,7 +155,7 @@ pub enum AppControlKeyCommand {
 /// How a `do` verb names the element it wants — the ONE addressing type for
 /// every selector-shaped field on [`WebSurfaceDoAction`].
 ///
-/// Why it exists: gateway and bank UIs have no stable ids. BillDesk's bank rows
+/// Why it exists: gateway and bank UIs have no stable ids. PayGate's bank rows
 /// are anonymous `div`s; IDFC's continue button is an unnamed
 /// `<button type=submit>`. A CSS selector cannot name either, and a *coordinate*
 /// goes stale the moment the page reflows. Text and role/label are how a human
@@ -420,7 +420,7 @@ pub enum WebSurfaceDoAction {
 ///
 /// Why it exists: a top-document query against a page whose content lives in an
 /// iframe returns `[]` SILENTLY, and that silence reads as "the site does not
-/// offer this". The BillDesk case is the measurement — its iframe held 107
+/// offer this". The PayGate case is the measurement — its iframe held 107
 /// elements while the top document had 17.
 ///
 /// The top document is the frame at path `[]`, so "no frame" and "a frame" have
@@ -490,8 +490,8 @@ pub enum WebSurfaceWaitUntil {
     ///
     /// Evaluated HOST-side from the UI process's own page-state property, with
     /// no page eval at all — which is what makes it the one predicate that
-    /// survives a navigation. A 4-origin auto-submit chain (rtionline →
-    /// merchant.sbi.bank.in → billdesk.com/pgidsk → pay.billdesk.com →
+    /// survives a navigation. A 4-origin auto-submit chain (formsportal →
+    /// merchant.examplebank.test → paygate.test/pgidsk → pay.paygate.test →
     /// auth.examplebank.test) tears the content process down and rebuilds it
     /// at every hop, so any page-side predicate is unavailable exactly when the
     /// caller most needs to know where it landed.
@@ -1152,7 +1152,7 @@ pub enum AppControlCommand {
     /// This is what makes "script it on curl, hand the session to a surface for
     /// the one interactive step, hand it back" possible. It was proven both
     /// necessary AND sufficient in the field: transplanting a single PHPSESSID
-    /// into a browser made rtionline render the applicant's name and the fee.
+    /// into a browser made formsportal render the applicant's name and the fee.
     ///
     /// ⚠ The cookie manager is per-`WebContext` = per-PROFILE, and a surface
     /// with no explicit profile is `default`, i.e. the user's own browsing jar.
@@ -3055,8 +3055,8 @@ mod tests {
                 WebFrameRef::Path(vec![0, 2]),
             ),
             (
-                r#"{"kind":"web_surface_read","frame":{"url_contains":"billdesk"}}"#,
-                WebFrameRef::UrlContains("billdesk".into()),
+                r#"{"kind":"web_surface_read","frame":{"url_contains":"paygate"}}"#,
+                WebFrameRef::UrlContains("paygate".into()),
             ),
         ] {
             match serde_json::from_str::<AppControlCommand>(json).expect("deserialize frame") {

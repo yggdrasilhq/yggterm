@@ -1650,14 +1650,14 @@ true` on every ensure, so the round-12b declare ingestion removed the last revea
 ## Field findings — records filing expedition (2026-07-25)
 
 An agent sent to file seven central-government records applications on
-`rtionline.gov.in` **did not use this plane at all.** With a GUI restart announced
+`forms.example.gov` **did not use this plane at all.** With a GUI restart announced
 ten minutes out, it drove the whole application flow on `curl` and the payment leg
 on a local Playwright + Chrome-for-Testing over CDP, wrote a ~200-line driver, and
 got one application to the payment gateway's confirm screen. That decision was
 correct on every axis available to it. The findings below are why, and each carries
 the verb that would have won the work back. The chain it had to drive was
-rtionline → `merchant.sbi.bank.in` → `billdesk.com/pgidsk` →
-`pay.billdesk.com/web/v1_2/sdk` (**an iframe holding the entire payment UI**) →
+formsportal → `merchant.examplebank.test` → `paygate.test/pgidsk` →
+`pay.paygate.test/web/v1_2/sdk` (**an iframe holding the entire payment UI**) →
 `auth.examplebank.test` → `my.examplebank.test` — five origins, one of them
 inside a frame, with a session-bound captcha on every POST.
 
@@ -1666,7 +1666,7 @@ inside a frame, with a session-bound captcha on every POST.
    flow that is 90% scriptable and 10% interactive must pick one plane for all of
    it. → **`web cookies --session <s> --import <jar> | --export <jar>`**, Netscape
    jar format. Proven necessary *and* sufficient: transplanting one `PHPSESSID`
-   into Chrome made rtionline render the applicant's name and fee on its payment
+   into Chrome made formsportal render the applicant's name and fee on its payment
    page. Smallest verb on this list, largest unlock.
 2. **★★ Per-element pixels on a headless surface — the deferred item is cheaper
    than recorded.** The 2026-07-23 finding #4 above concluded that pixel proof of a
@@ -1687,12 +1687,12 @@ inside a frame, with a session-bound captcha on every POST.
    by genuine seat input. **Lock: a test that fires 20 sequential `do`s and asserts
    all 20 deliver** — today's tests only ever drive one, which is why this shipped
    broken.
-4. **★★ No frame addressing, and the failure is SILENT.** BillDesk's iframe held
+4. **★★ No frame addressing, and the failure is SILENT.** PayGate's iframe held
    107 elements while the top document held 17; a top-document query returned `[]`,
    which reads as "the site does not offer this". → **`--frame <url-substr|index>`
    on `eval`/`read`/`do`, a `web frames --session` verb (url + element count), and
    `read` searching all frames by default.**
-5. **★★ No text/role click.** BillDesk's bank rows are anonymous divs; IDFC's
+5. **★★ No text/role click.** PayGate's bank rows are anonymous divs; IDFC's
    buttons are unnamed `<button type=submit>`. `--selector` cannot address them;
    `getByText("IDFC First Bank Limited")` clicked first try. →
    **`web do click --text "..."` / `--role <r> --label "..."`**, resolved at click
@@ -1743,7 +1743,7 @@ every Bitwarden client does (user's ruling). Contract:
 `ychrome/docs/vault.md` → "The agent card path".
 
 **Two portable instrument lessons.** (i) A one-shot challenge is consumed by any
-attempt, not just a successful one — rtionline's captcha was burnt by a *failed*
+attempt, not just a successful one — formsportal's captcha was burnt by a *failed*
 POST, and two submissions were lost to re-using it while the reading was correct.
 (ii) `tesseract` is not adequate for this captcha class (5↔S, 7↔T, 8↔S, 1↔I on 3 of
 3 samples, even with a 16-way threshold×psm vote); the reliable read is to split the
