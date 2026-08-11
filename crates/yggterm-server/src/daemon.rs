@@ -5040,14 +5040,51 @@ impl DaemonRuntime {
     fn prune_unrepresented_preserved_owners(&mut self, reason: &'static str) {
         let current_endpoint = default_endpoint(self.store.home_dir());
         let mut owner_status_cache = BTreeMap::<String, Option<ServerRuntimeStatus>>::new();
+        // ⛔⛔ THIS LOOP TALKS TO OTHER DAEMONS OVER SOCKETS, INSIDE THE GLOBAL
+        // RUNTIME LOCK. `status()` is a blocking request, once per distinct
+        // preserved-owner endpoint, and a dead or hung owner costs the FULL
+        // request timeout before it answers nothing.
+        //
+        // `close_live_session_row` calls this on every row close, so the price
+        // lands on `remove_session` — which every agent row claim performs. On
+        // the dev fleet host, where deploys leave 24+ superseded daemons alive,
+        // `daemon_request/remove_session` measured p50 447 ms, p99 **10,590 ms**
+        // and max **44,991 ms** (n=1,220), the second-largest total of any
+        // daemon request after `status`, and the whole time the daemon can serve
+        // nobody else.
+        //
+        // ⭐ The mitigation already existed twenty lines up and was never applied
+        // here: `preserved_owner_for_runtime_key` keeps a negative cache with the
+        // comment *"a recently-timed-out owner socket is not re-probed (each
+        // probe costs the full request timeout while holding the loop)"*. Same
+        // shape as the CC-vs-codex memoization gap fixed in 3.0.104 — a lesson
+        // learned in one function and not carried to its sibling.
+        //
+        // ⚖ This changes COST, not outcome. A failed probe already yields
+        // `None`, and skipping a probe we know will fail yields `None` too, so
+        // every prune decision is exactly what it was.
         for (owner_endpoint, _runtime_keys) in self.preserved_terminal_owners.endpoint_groups() {
             if server_endpoints_same_target(&owner_endpoint, &current_endpoint) {
                 continue;
             }
             let label = owner_endpoint_label(&owner_endpoint);
-            owner_status_cache
-                .entry(label)
-                .or_insert_with(|| status(&owner_endpoint).ok());
+            if owner_status_cache.contains_key(&label) {
+                continue;
+            }
+            let known_unreachable = self
+                .preserved_owner_unreachable_until_ms
+                .get(&label)
+                .is_some_and(|until| (crate::app_control::current_millis() as u64) < *until);
+            if known_unreachable {
+                owner_status_cache.insert(label, None);
+                continue;
+            }
+            let probed = status(&owner_endpoint).ok();
+            if probed.is_none() {
+                // Pay the timeout once per owner per window, not once per close.
+                self.mark_preserved_owner_unreachable(&owner_endpoint);
+            }
+            owner_status_cache.insert(label, probed);
         }
         let preserved_owner_entries = self.preserved_terminal_owners.entries.clone();
         let removed = self
@@ -20990,6 +21027,54 @@ mod tests {
         assert!(
             after_restore.contains("self.persist()"),
             "the restored order must reach disk"
+        );
+    }
+
+    /// EVERY site that probes another daemon's socket from inside the runtime
+    /// lock must consult the unreachable negative cache first.
+    ///
+    /// A probe of a dead owner costs the full request timeout, and the daemon
+    /// serves nobody while it waits. `preserved_owner_for_runtime_key` has
+    /// checked the cache since the 2026-06-11 incident where one `terminal_ensure`
+    /// held the loop 30.7 s; `prune_unrepresented_preserved_owners` — reached
+    /// from `close_live_session_row`, i.e. every row close — never did, and
+    /// `remove_session` measured p99 10,590 ms / max 44,991 ms on a host carrying
+    /// 24+ superseded daemons. The lesson did not travel on its own, so this
+    /// test carries it.
+    #[test]
+    fn every_preserved_owner_probe_consults_the_unreachable_cache_first() {
+        let source = include_str!("daemon.rs");
+        for func in [
+            "    fn prune_unrepresented_preserved_owners(&mut self, reason: &'static str) {",
+            "    fn preserved_owner_endpoint_for_runtime_key(",
+        ] {
+            let Some(body) = source
+                .split(func)
+                .nth(1)
+                .and_then(|body| body.split("\n    }\n").next())
+            else {
+                continue;
+            };
+            if !body.contains("status(&owner_endpoint)") && !body.contains("owner_for_key(") {
+                continue;
+            }
+            assert!(
+                body.contains("preserved_owner_unreachable_until_ms"),
+                "{func} probes or resolves a preserved owner without consulting the \
+                 negative cache — a dead owner then costs the full request timeout \
+                 with the global runtime lock held"
+            );
+        }
+        // And the prune must RECORD a failure, or the cache it reads is never
+        // filled and the check above is decoration.
+        let prune = source
+            .split("    fn prune_unrepresented_preserved_owners(&mut self, reason: &'static str) {")
+            .nth(1)
+            .and_then(|body| body.split("\n    }\n").next())
+            .expect("prune_unrepresented_preserved_owners should be present");
+        assert!(
+            prune.contains("self.mark_preserved_owner_unreachable(&owner_endpoint);"),
+            "a probe that timed out must be recorded, or every close re-pays it"
         );
     }
 

@@ -4088,6 +4088,56 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Instant;
 
+    /// The daemon's vt100 mirror and the client's xterm must agree on how many
+    /// cells an emoji occupies. When they disagree, every line carrying one
+    /// drifts, and a partial repaint strands the old glyph in the orphaned
+    /// column — the owner's "weird characters appearing here and there"
+    /// (docs/pending-bugs.md).
+    ///
+    /// ⭐ On 2026-08-11 the two DID disagree, and it was the client that was
+    /// wrong: the vendored xterm registered only Unicode v6 and scored ⭐, ⛔,
+    /// ✅ and 🚀 at ONE cell, while this mirror — `vt100` on `unicode-width`,
+    /// a modern UAX #11 table — has always scored them at two, agreeing with
+    /// every agent CLI that writes them. 3.0.108 fixed the client side.
+    ///
+    /// This pins the daemon half so a future dependency bump cannot silently
+    /// move it and re-open the gap from the other direction. Its twin is
+    /// `tools/xterm-harness/emoji_cell_width.test.js`, which pins the client
+    /// half against the real bundle; the pair is the actual invariant, and
+    /// neither test alone can see a divergence.
+    #[test]
+    fn the_daemon_screen_gives_an_emoji_two_cells_like_the_client_does() {
+        // Written at column 0, a two-cell glyph puts the cursor at column 2.
+        for (label, glyph) in [
+            ("⭐ U+2B50", "\u{2B50}"),
+            ("⛔ U+26D4", "\u{26D4}"),
+            ("✅ U+2705", "\u{2705}"),
+            ("🚀 U+1F680", "\u{1F680}"),
+            ("中 U+4E2D", "\u{4E2D}"),
+        ] {
+            let mut parser = Vt100Parser::new(4, 40, 0);
+            parser.process(glyph.as_bytes());
+            assert_eq!(
+                parser.screen().cursor_position().1,
+                2,
+                "{label} must occupy two cells in the daemon mirror, or it \
+                 disagrees with the client and every line carrying it drifts"
+            );
+        }
+        // ⛔ The control, and it is the one that proves the boundary rather than
+        // the rule: U+26A0 is TEXT presentation. It is one cell, it rendered
+        // correctly in the owner's own frames while ⭐ and ⛔ did not, and
+        // widening it would cause the identical drift in the opposite
+        // direction. Both sides must leave it narrow.
+        let mut parser = Vt100Parser::new(4, 40, 0);
+        parser.process("\u{26A0}".as_bytes());
+        assert_eq!(
+            parser.screen().cursor_position().1,
+            1,
+            "U+26A0 ⚠ is text-presentation and must stay ONE cell on both sides"
+        );
+    }
+
     /// A child that asks the terminal for its foreground colour and reports
     /// whether the answer matched `YGG_EXPECT_FG_HEX` (hex so no escape
     /// sequence has to survive shell quoting).

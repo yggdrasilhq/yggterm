@@ -617,7 +617,27 @@ occurrence; do not re-derive them by elimination.**
   `daemon_persist/cc_identity_refresh`, `daemon_persist/serialize` and
   `daemon_persist/write` are now separate rows in `server perf-summary`.
 
-⭐ **A SECOND, UNRELATED LOCK HOG IS NOW ON THE RECORD — `remove_session`.** The
+⭐⭐ **THE SECOND LOCK HOG IS ROOT-CAUSED AND FIXED (3.0.109): `remove_session`
+CALLS EVERY DEAD DAEMON ON THE HOST.** `close_live_session_row` →
+`prune_unrepresented_preserved_owners` issues a **blocking `status()` socket
+request to every other daemon owning a preserved runtime**, inside the global
+runtime lock, once per distinct endpoint. Where deploys have left 24+ superseded
+daemons alive, each dead one costs the full request timeout and the daemon serves
+nobody meanwhile. ⇒ that is the p99 10.6 s / max 45 s, and **every agent row
+claim performs a remove**, so it is on the owner's path too.
+⭐ The negative cache that fixes it already existed twenty lines up —
+`preserved_owner_for_runtime_key` has consulted
+`preserved_owner_unreachable_until_ms` since the 2026-06-11 incident where one
+`terminal_ensure` held the loop 30.7 s — and had never been applied here. Second
+time in this campaign a mitigation failed to travel from one function to its
+sibling (the first: CC vs codex identity memoization, 3.0.104), so the guard
+walks BOTH probe sites.
+⚖ Cost only, not outcome: a failed probe already yielded `None`, and skipping a
+probe known to fail yields `None`, so every prune decision is unchanged.
+⛔ **LIVE PROOF OWED** — the ranked `daemon_request/remove_session` row must be
+re-read once 3.0.109 daemons have served a while; the numbers below are pre-fix.
+
+**The original measurement, kept as the baseline:** The
 3.0.103 instrument's first live harvest (dev, one daemon, 7.6 min) found five
 starvation episodes ≥300 ms; the worst outside startup was **3,913 ms held by
 `remove_session`**, with `terminal_read` parked behind it. Across the host
