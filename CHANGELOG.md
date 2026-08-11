@@ -4,6 +4,22 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The input gate no longer shuts on a row you have selected before (3.0.112).**
+  3.0.110 gave a stranded row a 5 s escape hatch and it fired 11 times in the
+  first 25 minutes of ordinary use, which was the case for closing the window
+  rather than living with it. The window is now closed: the branch that resolves
+  the waiting open attempt — the only thing that opens the gate when a mount is
+  skipped as redundant — was sitting behind a de-dup keyed on the bootstrap
+  identity, which does not change when the same row is selected again at the same
+  mount epoch. So the FIRST selection of a row was resolved and every later one
+  was silently dropped. The key now includes the open request, so it still
+  collapses the renders it was written for (this branch re-enters constantly
+  while a lease is held) and still separates the selections it was never asked to
+  distinguish. ⚖ The 5 s deadline stays as the floor, and the same defect in the
+  sibling inactive-host skip is fixed with it. Measured on the desktop host: of
+  33 opens, 8 stranded, and **every one was a repeat selection of a row whose
+  first selection had taken this branch and been resolved** — the begin-time
+  fingerprints of the stranded and the healthy opens were otherwise identical.
 - **A row that renders perfectly and accepts no keystrokes now repairs itself
   (3.0.110).** Selecting a row clears its resume readiness and makes the
   keyboard depend entirely on a fresh open attempt reaching Ready. When the
