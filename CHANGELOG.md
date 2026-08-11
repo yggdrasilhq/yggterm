@@ -4,6 +4,28 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Closing a row stopped calling every dead daemon on the fleet first (3.0.109).**
+  `remove_session` was the second-largest consumer of daemon request time after
+  `status` — p50 447 ms, p99 **10,590 ms**, max **44,991 ms** over 1,220 calls —
+  and every agent row claim performs one. Cause: closing a row runs
+  `prune_unrepresented_preserved_owners`, which issues a **blocking socket
+  request to every other daemon that owns a preserved runtime**, inside the
+  global runtime lock. On a host where deploys have left 24+ superseded daemons
+  alive, each dead one costs the full request timeout while the daemon can serve
+  nobody. The negative cache that fixes this already existed twenty lines away —
+  `preserved_owner_for_runtime_key` has consulted it since the 2026-06-11
+  incident where one `terminal_ensure` held the loop 30.7 s — and had simply
+  never been applied here. ⚖ Cost only, not outcome: a failed probe already
+  yielded "no status", and skipping a probe known to fail yields the same, so
+  every prune decision is unchanged. Guarded by a test that walks *both* probe
+  sites, because this is the second time a mitigation failed to travel from one
+  function to its sibling.
+- **The daemon's screen and the client now provably agree on emoji width
+  (3.0.109).** The 3.0.108 fix corrected the client; this pins the daemon half
+  (`vt100` on a modern `unicode-width`, which was right all along) so a
+  dependency bump cannot re-open the gap from the other side. The invariant is
+  the *pair* — neither test alone can see a divergence.
+
 - **Emoji were painted one cell wide, so every line carrying one drifted (3.0.108).**
   The owner's "weird characters appearing here and there" are not stray glyphs at
   all — they are the *rest of the line*, one column out. Measured against the
