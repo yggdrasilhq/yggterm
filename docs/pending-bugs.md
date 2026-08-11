@@ -13,6 +13,59 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+## ⛔⛔ `ListAgents` OMITS LIVE ROWS, SO "PICK THE PLAUSIBLE ONE FROM THE LIST" IS UNSAFE
+
+**Status:** OPEN · reported by a downstream campaign row 2026-08-11.
+
+A row spawned minutes earlier — running, transcript growing, holding its campaign's booter
+subscription, seated and titled in `server app rows` — **did not appear in `ListAgents` at all**.
+An unrelated row with a similar title did. The caller picked the visible one and messaged it.
+
+**Cost, and it is not theoretical.** Cross-session messages wake the recipient. That send woke an
+**idle** row, which paid a **cold** cache re-read of its whole context to answer a question it had
+no stake in. One such mistaken wake on a ~2 MB idle row was priced at several US dollars, incurred
+in about a second. A listing that silently omits reachable rows makes this failure the DEFAULT for
+any caller that does not already hold the recipient's UUID.
+
+**What is true and what is not:**
+- `server app rows` had the row, with `outline_prefix` and `full_path`. So the daemon knew.
+- The spawn's own reply had returned `session_path` for it moments earlier.
+- ⇒ the gap is in what `ListAgents` enumerates, not in whether the row existed.
+
+**Suggested fix, in preference order:** (1) enumerate from the same source `server app rows` uses,
+so the two cannot disagree; (2) failing that, make the omission VISIBLE — a count of rows known to
+the daemon but not listed, so a caller can tell "no such row" from "not shown here"; (3) accept a
+UUID as a `to:` address, so a caller holding a spawn's `session_path` never has to consult a list.
+
+⚠ Until then the documented workaround is in the fleet skill: resolve the recipient's UUID from
+`server app rows` or the spawn reply, address on that, and **deliver by file if it cannot be
+resolved** rather than guessing from a title.
+
+## ⛔ THE BOOTER HEARTBEATS BUT DOES NOT LOG ITS DECISIONS — a late boot cannot be audited
+
+**Status:** OPEN · reported by a downstream campaign row 2026-08-11.
+
+`~/.yggterm/relay/booter.log` was last written **2026-08-10 12:57** (final line `12:57:17 WORKING`)
+while `~/.yggterm/relay/booter.heartbeat` was live and current the next morning — **~21 hours of a
+scheduler that proves it is alive and records nothing about what it decided.** Reproduced
+independently by a second row the same hour.
+
+**Why it matters now.** A relay subscriber armed a 420 s window at 09:05:53. The watcher polls on a
+~5 minute grid, so the boot was due by ~09:12:53 and worst-case ~09:18 — which is what the tool
+prints. **The actual wake was 09:45:24**, roughly 27 minutes unexplained. With no decision log the
+boot could be neither convicted nor exonerated, and the reporting agent nearly recorded it as its
+own bad arming, which would have buried the defect.
+
+⛔ **This blocks a planned feature, not just an investigation.** Absolute wake times ("be awake at
+09:15") are specified in the campaign notes; their central safety guarantee is that a **missed alarm
+fires LATE and LOUD rather than vanishing**. That guarantee is unimplementable and unverifiable
+while the decision log is dead. ⇒ **fix the log before adding a second, more trusted scheduling
+mode** — a missed relative boot is a late nudge, a missed alarm is a missed market open the
+subscriber believed was covered.
+
+**Falsifier:** arm a short window, let the turn end, and confirm the log records the poll, the
+decision and the delivery with timestamps.
+
 ## ⛔⛔ THE BOOTER KICKED A CONTEXT-DEAD SESSION EVERY 10 MINUTES FOR TEN HOURS, AND ITS OWN LOG SAID "WORKING"
 
 **Status:** OPEN
