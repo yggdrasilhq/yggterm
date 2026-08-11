@@ -8309,3 +8309,74 @@ Fix shape: order the stderr redirect before the input redirect
 script for the same redirect ordering on any other `/proc` read. Falsifier for the
 fix: a `--replace` claim over a predecessor with live children exits clean with no
 bash diagnostics on stderr.
+
+---
+
+## ⛔⛔ `ygg-claim.sh` EXITS 3 ON A CLAIM THAT WORKED — and exit 3 SKIPS THE BOOTER ARM AND THE PREDECESSOR REAP
+
+*Filed 2026-08-11 by atlasgraph row 5.6 (session 6f33e25b). Not a duplicate of the
+`/proc` stderr entry above, nor of "`outline_prefix` DOES NOT SURVIVE" — this is
+the verify COMPARISON, and its consequence is worse than a cosmetic one.*
+
+**What happened.** Ran the claim exactly as the fleet skill §7.7 documents it:
+
+```
+ygg-claim.sh --host guihost --title "atlasgraph TWS: the market-session relay" \
+             --campaign atlasgraph --number 5.4 --replace <pred-uuid> --booter
+→ ygg-claim: claim never verified (row reads: 5.4|atlasgraph TWS: the market-session relay)
+→ exit 3
+```
+
+**The row was CORRECT at that moment.** `server app rows` for my session:
+
+```
+outline_prefix = '5.4'
+session_title  = 'atlasgraph TWS: the market-session relay'
+label          = '5.4 atlasgraph TWS: the market-session relay'   ← what the sidebar draws
+```
+
+**Root cause.** `assert_state()` compares the read-back against
+`"$NUM\t$FINAL_TITLE"` where `FINAL_TITLE` has the seat composed into it
+(`5.4 atlasgraph TWS: …`). But the app keeps the seat in `outline_prefix` and the
+title CLEAN, then composes `label` from both — which the script's own comments
+describe as the better architecture ("the API and the screen agree BY DESIGN").
+So the belt-and-braces number-in-the-title write is silently normalised away, and
+the verifier then reads a correct row as a failure. It retries 3× at 3s and exits.
+
+⇒ **The comparison asserts a representation the server has deliberately stopped
+storing.** A predecessor row on the same host still shows `session_title` WITH its
+number, so the normalisation looks like it only affects newly-titled rows.
+
+### ⛔ WHY THIS IS NOT COSMETIC — exit 3 is ABOVE both remaining side effects
+
+In the script's own order: verify → **`exit 3`** → arm the booter (`--booter`) →
+re-assert watcher → **retire and reap the predecessor (`--replace`)**. So a claim
+that "failed" while actually succeeding leaves:
+
+1. **the row UNARMED** even though `--booter` was passed — and an unarmed relay row
+   is precisely the failure atlasgraph lost **7h43m of broker-link blindness** to on
+   2026-08-10 (its own §0 calls staying armed "the most important line in the file");
+2. **the predecessor row NOT retired** even though `--replace` was passed — the
+   orphaned-row-in-his-sidebar bug the owner caught on 2026-08-10, which is the
+   reason `--replace` was made mandatory in briefs in the first place.
+
+Both mitigations that were added to prevent those failures are downstream of a
+verify that now fails on correct state. **A guard that fails closed on a false
+negative disables the two repairs it was shipped alongside.**
+
+### Fix shape
+
+- Compare against what the server actually stores: `outline_prefix == $NUM` **and**
+  `session_title == $TITLE` (no number), **or** accept the composed `label`. Treat
+  a title the server normalised as PASS, not as failure.
+- ⭐ **Do the side effects before the cosmetic verdict**, or at least do not gate
+  `--booter`/`--replace` on the title comparison. Arming and reaping are what the
+  caller came for; the seat string is presentation.
+- Falsifier: claim a row whose title the server keeps clean → exit 0, `ygg-booter
+  list` shows the new subscriber, and the predecessor is delisted and reaped.
+
+**Workaround now in use on atlasgraph** (recorded so its rows stop rediscovering it):
+after any non-zero `ygg-claim`, read the row back from `server app rows` and, if
+`label` is right, ignore the exit code — then arm SEPARATELY (`bin/fg-relay arm`)
+and handle the predecessor by hand. ⚠ Never read the exit code as the state; that
+is the same law this tool's own header teaches about `remove`.
