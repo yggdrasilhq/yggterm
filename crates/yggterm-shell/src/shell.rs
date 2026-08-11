@@ -91417,6 +91417,26 @@ fn terminal_session_bridge_read_policy(
     }
     TerminalBridgeReadPolicy::Paused
 }
+/// The de-dup key for a bootstrap-skip branch that both LOGS a decision and
+/// RESOLVES the open attempt waiting on it.
+///
+/// ⛔ **A skip branch that resolves an open request must be keyed on that
+/// request.** These branches re-enter on every render while a lease is held, so
+/// they need a de-dup; but keyed on the bootstrap identity alone, the de-dup
+/// answers *"have I logged this mount?"* while gating *"have I told the waiter?"*
+/// The identity does not move when the user selects the same row again at the
+/// same mount epoch, so the first selection was resolved and every later one was
+/// dropped — the input gate shutting on a row that was never going anywhere.
+///
+/// `latest_open_request_id` moves once per user-initiated open and is stable
+/// between them, so it collapses renders and separates selections.
+fn bootstrap_skip_dedup_key(
+    prefix: &str,
+    bootstrap_identity: &str,
+    latest_open_request_id: u64,
+) -> String {
+    format!("{prefix}:{bootstrap_identity}:{latest_open_request_id}")
+}
 fn terminal_session_should_bootstrap_host(
     shell: &ShellState,
     active_session_path: Option<&str>,
@@ -94724,7 +94744,20 @@ fn TerminalCanvas(
         if !bootstrap_task_identity.borrow().is_empty() {
             *bootstrap_task_identity.borrow_mut() = String::new();
         }
-        let skip_key = format!("inactive-skip:{bootstrap_identity}");
+        // ⛔ THE OPEN REQUEST IS PART OF THE KEY. Keyed on the bootstrap
+        // identity alone, this de-dup answered "have I logged this mount?" while
+        // gating "have I resolved this open request?" — two different questions.
+        // A second selection of the same row at the same mount epoch reuses the
+        // identity, so the branch was suppressed and the attempt that click had
+        // just registered was left with nothing to resolve it. See the sibling
+        // `existing-lease-skip` key below, where the same shape stranded the
+        // input gate. Renders between clicks still collapse: the request id only
+        // moves when the user acts.
+        let skip_key = bootstrap_skip_dedup_key(
+            "inactive-skip",
+            &bootstrap_identity,
+            latest_open_request_id,
+        );
         if *inactive_bootstrap_skip_identity.borrow() != skip_key {
             *inactive_bootstrap_skip_identity.borrow_mut() = skip_key;
             append_trace_event(
@@ -94835,7 +94868,25 @@ fn TerminalCanvas(
         && bootstrap_identity_changed
         && !should_schedule_bootstrap
     {
-        let skip_key = format!("existing-lease-skip:{bootstrap_identity}");
+        // ⛔ THE OPEN REQUEST IS PART OF THE KEY, AND THAT IS THE WHOLE FIX FOR
+        // THE GATE THAT SHUTS ON A ROW THAT WAS NEVER GOING ANYWHERE. The
+        // resolution below is the only thing that opens the gate on this path,
+        // and it was gated behind a de-dup keyed on the bootstrap identity —
+        // which does not move when the user selects the same row again at the
+        // same mount epoch. So the FIRST selection of a row was resolved and
+        // every LATER one was silently dropped, leaving a perfectly rendered row
+        // refusing every keystroke until the 5 s deadline. Measured on the live
+        // desktop: 8 stranded opens, every one a repeat selection of a row whose
+        // first selection had taken this branch and been resolved.
+        //
+        // The de-dup is still doing its real job — this block re-enters on every
+        // render while the lease is held, and `latest_open_request_id` only moves
+        // when the user acts, so the trace stays one event per selection.
+        let skip_key = bootstrap_skip_dedup_key(
+            "existing-lease-skip",
+            &bootstrap_identity,
+            latest_open_request_id,
+        );
         if *existing_lease_skip_identity.borrow() != skip_key {
             *existing_lease_skip_identity.borrow_mut() = skip_key;
             let lease_context = state.with_mut(|shell| {
@@ -167089,6 +167140,41 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(!eligible(false, false, true, true, true));
         // Not Pending/Recovering (already failed/latched) -> not eligible.
         assert!(!eligible(false, false, true, false, false));
+    }
+    #[test]
+    fn a_bootstrap_skip_dedup_key_separates_selections_and_collapses_renders() {
+        // A skip branch that RESOLVES the open attempt (marks it ready, or
+        // cancels it) must be keyed on the open request, not on the bootstrap
+        // identity alone. Selecting the same row again reuses the identity, so
+        // an identity-only key suppressed the resolution and left the row
+        // rendering perfectly while refusing every keystroke.
+        let identity = "host:epoch-1:gen-1:activation-0";
+        // Two renders inside one selection collapse to one key: the trace stays
+        // one event per selection even though this block re-enters constantly.
+        assert_eq!(
+            bootstrap_skip_dedup_key("existing-lease-skip", identity, 11),
+            bootstrap_skip_dedup_key("existing-lease-skip", identity, 11),
+        );
+        // The regression itself: the SAME row selected again at the SAME mount
+        // epoch must produce a NEW key, or nothing resolves the new attempt.
+        assert_ne!(
+            bootstrap_skip_dedup_key("existing-lease-skip", identity, 11),
+            bootstrap_skip_dedup_key("existing-lease-skip", identity, 18),
+        );
+        // A remount still separates, as it always did.
+        assert_ne!(
+            bootstrap_skip_dedup_key("existing-lease-skip", identity, 11),
+            bootstrap_skip_dedup_key(
+                "existing-lease-skip",
+                "host:epoch-2:gen-1:activation-0",
+                11
+            ),
+        );
+        // The two branches never share a cell.
+        assert_ne!(
+            bootstrap_skip_dedup_key("existing-lease-skip", identity, 11),
+            bootstrap_skip_dedup_key("inactive-skip", identity, 11),
+        );
     }
     #[test]
     fn terminal_session_is_retained_live_while_bootstrap_lease_is_active() {
