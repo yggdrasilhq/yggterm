@@ -237,6 +237,37 @@ stamps the same `lastAtlasClearAtMs` the detector reads, so the repair path
 correctly stands down when prevention already did the work. The repair path stays
 as the backstop for staleness that arrives by some other route.
 
+## ⛔⛔ THE PRE-PUSH PRIVACY GUARD PASSES TERMS THE REPO'S OWN CHECKER REJECTS
+
+**Status:** OPEN
+
+**Caught live 2026-08-11 by leaking one.** A commit touching
+`.agents/skills/yggterm-agent-fleet/ygg-booter.py` named a sibling campaign by
+its private project name, in both the file and the commit message.
+`scripts/check-privacy.sh` rejects that name (`rc=1`, *"a private
+store/portal/project name is present"*). **`ygg-privacy-guard` passed it — twice,
+to two PUBLIC remotes — with `✅ no private data found in what is being pushed`.**
+Verified afterwards: the guard's only occurrence of the term is inside its own
+docstring; it is not in its `TERMS` list.
+
+⇒ ⭐ **The two checkers have different term lists, and the WEAKER one is the one
+standing at the boundary.** `check-privacy.sh` runs when an agent remembers to run
+it; the guard runs on every push and is the last line of defence. A leak therefore
+only has to beat the weaker of the two, which is exactly backwards.
+⚠ Nothing here says the guard is broken as designed — its own docstring shows it
+was built for a specific incident (identities and hostnames). The defect is that
+**two lists exist at all**: one question, two owners, and they have already
+diverged in the direction that leaks.
+
+**Remediated for this instance:** term scrubbed from file and message, tip amended
+and force-pushed to both remotes with `--force-with-lease`. ⚠ The blob remains in
+GitHub's dangling objects until GC, same limitation as the earlier incident in
+[[finding-private-data-in-public-repos-and-the-prepush-guard]].
+
+**The fix is to collapse the lists, not to sync them** — a shared term file both
+tools read, so a term added anywhere is enforced everywhere. Adding the one
+missing word to the guard would close this instance and leave the class open.
+
 ## ⛔⛔ 3.0.106 CAUSED A SECOND RENDER BUG, AND THE HONEST TRACE IS WHAT CAUGHT IT
 
 **Status:** OPEN
