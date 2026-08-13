@@ -81,10 +81,10 @@ model: **0.864 cores against 3.468 today — 2.60 cores reclaimable, 75%.**
    by the first session". ⇒ The experiment that settles it: park a census
    daemon at zero owned sessions and re-measure. Until then the floor term is
    real but its cause is not attributed.
-2. **Daemon 219756 is excluded** (3 sessions, 0.648 cores, 0.396 of it user
-   time — 12x the user time of its peers). Including it drops R² from 0.863 to
-   0.240 on its own. It is a genuine outlier with a different shape and wants
-   its own investigation, not averaging into a fleet model.
+2. **One daemon is excluded** (3 sessions, 0.648 cores, 0.396 of it user time
+   — 12x the user time of its peers). Including it drops R² from 0.863 to 0.240
+   on its own. It is a genuine outlier with a different shape, ⇒ **now
+   attributed in §5**, and it should stay out of the fleet fit.
 
 ## 3. The mechanism: one OS thread per connection, and the CPU hides in the dead ones
 
@@ -189,7 +189,53 @@ The premise that failed is the assumption that `WouldBlock` is rare: it fires
 `serde_json::json!` allocations, and **two file appends — to report a 0 ms
 wait.** The fast path is not the path being taken.
 
-## 5. The specs this justifies
+## 5. A SHIPPED fix is not a RUNNING fix — the outlier, identified
+
+§2a excluded one daemon as a user-time outlier (3 sessions, 0.648 cores, 0.396
+of it *user* — 12x its peers). It is now attributed, and it turns out to be the
+strongest argument in this file for §S1.
+
+Its hot thread is `yggterm-perf-incident-monitor` (`daemon.rs:17016`), which
+wakes every 30 s and calls `summarize_perf_telemetry` for the last 60 s. Reading
+bytes, 30 s window:
+
+| daemon | rchar MB/s | **per 90 s** | read syscalls/s | bytes per read |
+|---|---|---|---|---|
+| **outlier, 2.12.14, 451 h** | **4.86** | **437.8 MB** | **0.6** | **8.1 MB** |
+| 2.12.17, 430 h | 0.39 | 34.9 MB | 0.5 | 780 KB |
+| 3.0.52, 137 h | 1.35 | 121.9 MB | 5,161 | 262 B |
+| 3.0.151, 3 h (live) | 2.58 | 232.4 MB | 37,064 | 70 B |
+| **0 sessions (control)** | 0.16 | 14.0 MB | 0.2 | — |
+
+⇒ **437.8 MB per 90 s, at 0.6 read syscalls per second.** That is not streaming;
+that is whole files being swallowed at 8 MB a read. It is above the **312.9 MB
+per 90 s** that the DAEMON-1 defect measured when it was found — and that defect
+was **root-caused and fixed on 2026-07-26**, by `jsonl_read_paths_since`
+(`retention.rs:141`), which decides from a generation's filename which files a
+windowed read must open at all.
+
+**This process started ~451 h ago — the same day as the fix.** It has never
+restarted, so it is still running the pre-fix behaviour: a question about the
+last 60 seconds paid for with a read of the entire retained corpus, every 30 s,
+forever. The excess is **user** time because the cost is parsing the JSON it
+just read.
+
+⛔ **The general form is the finding, not this one daemon.** Each of the 14
+legacy daemons carries every defect fixed since its own version — 2.12.14
+through 3.0.62, against a current 3.0.151. **A fix that shipped is not a fix
+that is running.** The queue and CHANGELOG record these as closed, and for 14
+processes holding 34 live sessions they are not.
+
+⇒ **This is a third independent argument for §S1**, and it is the one that does
+not saturate: cost and row-deaths are bounded by the population, but the set of
+fixes a legacy daemon is missing grows with every release.
+
+⚠ **And it interacts with §4.** `perf-telemetry.jsonl` is being filled at
+4.06 GB/day *by the lock tracer*. The retained corpus is what the incident
+monitor reads. So §4 inflates the very corpus §5 pays to parse — fixing §S2
+reduces §5's cost on every daemon, including the ones that cannot be fixed.
+
+## 6. The specs this justifies
 
 Ordered by cores returned per unit of risk. Each carries the number it should
 move and the falsifier that would show it did nothing.
@@ -260,7 +306,7 @@ The 38 ms per handler is the *work*, not the spawn. ⇒ **This is a stability an
 observability fix, not a CPU fix**; do not promise cores for it. Its real value
 is that CPU stops hiding in exited threads, so §3's instrument gap closes.
 
-## 6. What this file does NOT claim
+## 7. What this file does NOT claim
 
 - **Nothing here measures the GUI.** The GUI runs on another host; the
   12 "gui/client" processes in §1 are CLI clients, not the shell.
