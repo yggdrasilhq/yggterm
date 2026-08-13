@@ -14,7 +14,9 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔⛔ [6.4] THREE PRIVATE IDENTIFIERS REACHED origin/main AND ARE STILL IN HISTORY
 
-**Status:** OPEN — HEAD is clean; the published history is not.
+**Status:** OPEN
+
+*HEAD is clean; the published history is not.*
 
 Three private identifiers sat in this file on `origin/main` and were removed from
 HEAD 2026-08-14 (`c6720880`, reachable from `main` via `6e2d9c81`). Removal from
