@@ -4597,7 +4597,35 @@ never arms the drain at all. Measured: pid 426042 (3.0.75) logged
 `daemon_self_retire {retire_trigger: "newer_daemon_live"}` every 20 s for
 **100.6 hours** with no drain ever running.
 
-**Landed — §4, the queue, in 3.0.124.** `hot_restart_queue` is the host's durable
+⭐ **§4 IS LIVE-PROVEN END TO END, on the workshop host, 2026-08-13.** Three real
+daemons, three real deploys, one queue slot throughout:
+
+    15:52:29  pid 3795572 (3.0.125)  hot_restart_swap_queued  {decision: "queued",     target: 3.0.126}
+    15:58:27  pid 3922471 (3.0.126)  hot_restart_swap_queued  {decision: "superseded", target: 3.0.127}
+    15:58:54  pid 4009904 (3.0.127)  hot_restart_swap_queue_satisfied
+                                     {satisfied_by: "self", waited_ms: 38009}
+
+and `hot_update_handoff_prepared` now carries `expected_version: "3.0.126"` where
+it used to carry `null`. While the swap was owed, `server daemons` printed
+`swap owed → 3.0.127: queued 0m ago by disk_binary_replaced, 1 attempt(s), last:
+handoff requested; successor not yet confirmed live`; when it was satisfied the
+line went away. Supersede replaced the older target **in the same slot** rather
+than adding a second entry.
+
+⛔ **And the live proof found a defect the tests could not — the record outlived
+its own satisfaction.** On the first run the successor came up and adopted all
+NINE of the writer's sessions; the writer then had empty hands, fell through to
+the cold-shutdown gate, found nothing blocking, and exited — taking the only
+process that would ever have cleared the entry with it. `server daemons` went on
+printing `swap owed → 3.0.126` while 3.0.126 was serving every row on the host.
+⇒ **The entry is cleared by whoever SATISFIES it, never by whoever wrote it.**
+Every daemon now asks on every poll whether IT satisfies the queued swap. ⚠ That
+is not a second copy of the check inside the swap lane: that one asks *"is a
+successor live?"* on behalf of a daemon still holding PTYs, this one asks *"am I
+the successor?"* — and only the successor is guaranteed to still be running when
+the answer turns true.
+
+**Landed — §4, the queue, in 3.0.124–3.0.127.** `hot_restart_queue` is the host's durable
 record of the one swap it owes (`~/.yggterm/hot-restart-queue.json`): a single
 slot, superseded by a newer target rather than appended to, and ⛔ **a re-request
 for the target already queued must not move `requested_at_ms`**, because §5's
