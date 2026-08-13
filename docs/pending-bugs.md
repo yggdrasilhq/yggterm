@@ -55,9 +55,20 @@ identical on disk**, and the broken one emitted a wall of the guard's own text t
 like the guard running. **An installer is proven by a real push or not at all** — a syntax check and
 a successful write prove nothing about whether the hook works.
 
-⚠ **And the coverage this exists to fix is the real defect underneath:** only **2 of 34**
-github-remoted repos here carried the hook, and they are the two with known past leaks — a guard
-installed only where it has already burned someone.
+⚠ **The coverage gap this exists to fix is now CLOSED, and the first figure reported for it was
+wrong in both directions** — worth recording, because it is the same disease as the rest of this
+entry. *"2 of 34 github-remoted repos"* **understated** it by counting repos rather than checkouts
+(one hook covers 13 lane worktrees via `core.hooksPath`, which is where the lane work actually
+happens) and **overstated** it by putting 22 third-party clones in the denominator, where a leak
+gate is meaningless. **The honest figure was 8 of our own repos unguarded**, 7 of them public.
+✅ All are guarded now, each verified by invoking the hook directly rather than by observing that a
+file exists.
+
+⚠ **And the coverage detector itself lied twice:** `git rev-parse --git-common-dir` returns a path
+**relative to the repo**, so resolving it against the caller's cwd makes every lookup miss and
+answers "no hook" for repos that are guarded — use `--path-format=absolute`. ⭐ **The control that
+caught it costs nothing: point the sweep at a repo whose answer you already know.** Three were known
+and it disagreed with all three.
 
 **Fix:** collapse the two into the guard (it is the owner), taking the worktree-correct path
 resolution and the github-remote filter with it, and delete the shell copy. Blocked on the guard
