@@ -156,6 +156,21 @@ copies.
   *Meanwhile:* the guard that prevents a recurrence is shipped and enforced
   (`scripts/check-privacy.sh` + `crates/yggterm-core/tests/privacy.rs`).
 
+- **Publishing the Android app v3.2.0 is a distribution decision, so it waits.**
+  The build is done, signed with the permanent certificate (so installs upgrade
+  in place rather than being stranded), and proven: the release variant
+  authenticated over SSH and rendered a live fleet, opened a session, and ran a
+  typed command on it. Pushing it to the public channel is outward-facing and is
+  his call per action, which is the only reason it has not happened.
+  *Recommendation:* **publish.** The version now installed is a fixture demo that
+  cannot reach anything; this one is the product. There is no native code, so the
+  same bytecode that was proven on an x86_64 emulator is what an arm64 phone runs.
+  *Meanwhile:* the APK is built and verified, and nothing else is blocked by it.
+  ⚠ **Publishing alone is not enough to make it work.** The app generates its own
+  key and shows one enrolment line to paste into `authorized_keys` on a machine he
+  owns. Only he can do that — it needs the line from HIS device, and the line
+  carries a forced command so the key gets the daemon protocol and nothing else.
+
 ## Gates he set that an agent must not walk through
 
 - **He decides the licence before anything goes public** — step 0 of the launch
