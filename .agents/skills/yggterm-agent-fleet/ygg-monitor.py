@@ -360,11 +360,28 @@ def seat_audit(gui_host, subs, dry):
             findings.append(f"⛔ SEAT {seat} IS HELD BY {len(rs)} ROWS: "
                             + " | ".join((x.get('label') or '?')[:34] for x in rs))
 
-    # A number sitting in a title is the old scheme leaking back in.
+    # ⛔ SCOPE EVERY CHECK TO WHAT THIS ORCHESTRATOR OWNS, AND COUNT THE REST.
+    # The first version flagged every agent on the machine, so seven other
+    # campaigns' healthy rows arrived as warnings addressed to me. A watcher that
+    # reports other people's business is one whose output stops being read —
+    # which is how the escalation that started all this ended up in a log nobody
+    # opened. Mine = a seat under my own top-level number, or an explicit
+    # subscription. Everything else is a COUNT, so it stays visible without
+    # becoming noise.
+    mine_tops = {str(s.get("seat") or "").split(".")[0] for s in subs if s.get("seat")}
+    mine_tops.discard("")
+
+    def is_mine(seat, uuid):
+        return uuid in {s["uuid"] for s in subs} or str(seat).split(".")[0] in mine_tops
+
+    foreign_numbered_titles = 0
     for r in rows:
         t = r.get("session_title") or ""
         if re.match(r"^\d+(\.\d+)*\.?\s", t):
-            findings.append(f"⚠ TITLE CARRIES ITS OWN NUMBER (renders twice): {t[:52]}")
+            if is_mine(r.get("outline_prefix") or "", (r.get("full_path") or "").rsplit("/", 1)[-1]):
+                findings.append(f"⚠ TITLE CARRIES ITS OWN NUMBER (renders twice): {t[:52]}")
+            else:
+                foreign_numbered_titles += 1
 
     # Every subscribed row must still exist; a subscription to a vanished row is a
     # watcher watching nothing and reporting healthy.
@@ -374,15 +391,30 @@ def seat_audit(gui_host, subs, dry):
             findings.append(f"⚠ SUBSCRIBED BUT NO ROW: {s['uuid'][:8]} (seat {s.get('seat') or '-'}) "
                             "— unsubscribe it or restore the row")
 
-    # And the reverse: an agent process nothing is supervising.
+    # And the reverse: an agent process nothing is supervising. ⭐ THIS IS THE ONE
+    # THAT CAUGHT A REAPED ROW BACK FROM THE DEAD holding a live CLI in a worktree
+    # its own successor was editing — so it is worth keeping even though most hits
+    # are other campaigns minding their own business.
+    seat_of = {(r.get("full_path") or "").rsplit("/", 1)[-1]: (r.get("outline_prefix") or "")
+               for r in rows}
     known = {s["uuid"] for s in subs}
+    unsupervised_foreign = 0
     r = _run(None, ["pgrep", "-af", "claude|codex|gemini|amp|opencode"])
     if r:
         for line in r.stdout.splitlines():
             m = re.search(r"--resume\s+([0-9a-f-]{36})|--session-id\s+([0-9a-f-]{36})", line)
             u = (m.group(1) or m.group(2)) if m else None
-            if u and u not in known and any(u in (p or "") for p in live_paths):
-                findings.append(f"⚠ LIVE AGENT UNSUPERVISED: {u[:8]} — nothing is watching it")
+            if not u or u in known or u not in seat_of:
+                continue
+            if is_mine(seat_of[u], u):
+                findings.append(f"⛔ LIVE AGENT IN MY NUMBER SPACE, UNSUPERVISED: {u[:8]} "
+                                f"(seat {seat_of[u] or 'NONE'}) — subscribe it or reap it")
+            else:
+                unsupervised_foreign += 1
+
+    if foreign_numbered_titles or unsupervised_foreign:
+        log(f"  AUDIT (other campaigns, FYI: {foreign_numbered_titles} numbered titles, "
+            f"{unsupervised_foreign} unsupervised agents — not mine to fix)")
 
     for f in findings:
         log(f"  AUDIT {f}")

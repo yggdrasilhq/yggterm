@@ -943,6 +943,50 @@ window is not the addressed client.
 window was foregrounded first, and foregrounding the operator's GUI is its own
 prohibition.
 
+## ⛔⛔ A REAPED ROW COMES BACK HOLDING A LIVE AGENT, INTO A WORKTREE ITS SUCCESSOR IS EDITING
+
+**Status:** OPEN
+
+*Measured 2026-08-13 by the orchestrator, on its own reap.*
+
+A row was retired with `session remove`, which answered `row_still_listed: false`,
+`verified: true`, `live_processes: []` — the clean verdict. Roughly an hour later
+the row was **back in the sidebar**, and it was not a stale entry: it held a live
+process pair, `yggterm server remote resume-cc <uuid> --require-existing` and a
+running agent CLI, frozen at the sentence it had been writing when it was reaped.
+
+⛔ **The danger is not the row, it is the tree.** The resurrected row and its own
+successor were both live in the **same git worktree** — two agents editing one
+checkout, which is precisely the clobber that separate worktrees exist to prevent.
+It went unnoticed because every liveness instrument reported the fleet healthy:
+the successor was working, the orchestrator was working, and nothing anywhere asks
+*"is this row supposed to exist?"*
+
+**The likely path in**, and it needs confirming rather than assuming: a handover
+killed several rows (tracked separately as agent rows dying across a handover),
+and a `sessions restore` / `app open` recovery re-opened the **tombstoned
+predecessor** rather than the live successor. `sessions restore` is already known
+to refuse rows as `declined_closed` because the tombstone plane cannot tell a
+deletion from a GUI death — this is the same seam, failing in the opposite
+direction: it cannot tell a deletion from a *recoverable* row either.
+
+**Second defect, in the same reap:** the verdict was wrong twice, in opposite
+directions. The first removal answered `verified: true, live_processes: []` while
+the CLI was alive; the second answered `verified: false, live_processes: []` while
+a `terminate-cc` was still running and did eventually succeed. ⇒ **`live_processes`
+was empty in both the false-positive and the false-negative case**, so it is not
+carrying the signal its name promises, and a caller cannot use it to decide
+anything.
+
+**Falsifier:** reap a row, then attempt every recovery path the GUI offers
+(`sessions restore`, `app open`, a daemon handover). None may produce a live
+process for a tombstoned session. And `session remove` must not answer
+`verified: true` while a process it named survives.
+
+⭐ **Detection shipped meanwhile**, in `ygg-monitor.py`'s seat audit: a live agent
+process whose session is in the orchestrator's number space but subscribed to
+nothing is now reported every tick. That is what caught this one.
+
 ## ⛔⛔ `ListAgents` OMITS LIVE ROWS, SO "PICK THE PLAUSIBLE ONE FROM THE LIST" IS UNSAFE
 
 **Status:** OPEN
