@@ -1550,6 +1550,49 @@ removing that file once consumption is confirmed.
 guarantee, and this is a live counter-example: our own deploys are degrading other agents' rows.
 ⇒ It belongs with the hot-restart/daemon-lifecycle work, not with the deploy-identity work.
 
+## ⛔⛔ ROW-SET NESTING IS INVERTED — A LEADING DISCLOSURE CONTROL OCCUPIES THE INDENT COLUMN
+
+**Status:** OPEN  *(6.3 — sidebar truth)*
+
+*Owner-reported 2026-08-13 on the shipped build, from the live sidebar.*
+
+A group head renders `⌄ ● ▣ label`; its members render `● ▣ label` with no chevron slot. The
+disclosure control is inserted **before** the head's content, so it pushes that head's dot, icon and
+label to the right — **and the members, having no chevron, sit further LEFT than their own head.**
+
+⇒ **This is not a wrong indent value. A leading control is occupying the indent column**, which is
+why it produces two defects at once:
+
+- **members appear less nested than the head they belong to** — the outline reads inside out;
+- **the status dot no longer has one x position.** A head's dot and a member's dot are at different
+  offsets, because whether a row is a head decides how much sits to the left of its dot.
+
+**The specification, owner-directed, five clauses:**
+
+1. A member row is indented **more** than its head.
+2. The disclosure control moves to the **trailing** edge, beside the close button — explicitly to
+   save horizontal space.
+3. It is visible **only on hover**, as the close button already is.
+4. Clicking it opens the contained rows, **slightly** indented.
+5. ⛔ **THE STATUS DOTS OF ALL ROWS ARE NEVER INDENTED.** One fixed leading gutter, identical x at
+   every depth, for every row. **Only the text indents.**
+
+⭐ **Clauses 2 and 5 are one fix and clause 1 falls out of it.** Moving the disclosure to the
+trailing edge makes the leading gutter uniform, after which the indent belongs to the label alone
+and can grow with depth without ever moving a dot.
+
+⛔ **Do not satisfy clause 1 by adding a matching left-pad to members.** That leaves clause 5
+broken and spends the horizontal space clause 2 exists to reclaim.
+
+⚠ **A row with no seat is not part of any set and must not be moved, grouped, re-described or
+tidied by this work** — grouping makes the tree legible *without* renaming anything, which is the
+whole point of it. See the standing row-hygiene law in
+`.agents/skills/yggterm-agent-fleet/SKILL.md`.
+
+**Falsifier:** a screenshot in which a head and each of its members are sampled for dot-x — all
+equal — and label-x — strictly increasing with depth — with the disclosure control absent until the
+row is hovered.
+
 ## ⛔⛔ NOTHING PREVENTS A LOCAL TAG FROM REPUBLISHING A PRE-SCRUB LINEAGE
 
 **Status:** OPEN
