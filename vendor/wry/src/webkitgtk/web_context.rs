@@ -18,7 +18,7 @@ use std::{
 use webkit2gtk::{
   ApplicationInfo, AutomationSessionExt, CacheModel, CookiePersistentStorage, DownloadExt,
   MemoryPressureSettings, SecurityManagerExt, URIRequest, URIRequestExt, URISchemeRequest,
-  URISchemeRequestExt, URISchemeResponse, URISchemeResponseExt, WebContext,
+  URISchemeRequestExt, URISchemeResponse, URISchemeResponseExt, WebContext, WebContextBuilder,
   WebContextExt as Webkit2gtkContextExt, WebView, WebViewExt,
 };
 
@@ -32,14 +32,7 @@ pub struct WebContextImpl {
 impl WebContextImpl {
   pub fn new(data_directory: Option<&Path>) -> Self {
     use webkit2gtk::{CookieManagerExt, WebsiteDataManager, WebsiteDataManagerExt};
-    let mut context_builder = WebContext::builder();
-    let mut memory_pressure_settings = configured_memory_pressure_settings();
-    if let Some(settings) = memory_pressure_settings.as_ref() {
-      context_builder = context_builder.memory_pressure_settings(settings);
-    }
-    if let Some(settings) = memory_pressure_settings.as_mut() {
-      WebsiteDataManager::set_memory_pressure_settings(settings);
-    }
+    let mut context_builder = context_builder_with_memory_policy();
     if let Some(data_directory) = data_directory {
       let data_manager = WebsiteDataManager::builder()
         // TODO: Consider taking a cache_directory so this can be in XDG_CACHE_HOME.
@@ -63,7 +56,16 @@ impl WebContextImpl {
   }
 
   pub fn new_ephemeral() -> Self {
-    let context = WebContext::new_ephemeral();
+    use webkit2gtk::WebsiteDataManager;
+    // `webkit_web_context_new_ephemeral()` is defined as "a context whose
+    // website data manager is ephemeral", so composing it here loses nothing —
+    // and it is the ONLY way to also carry the memory policy, which is a
+    // CONSTRUCT-ONLY property with no setter. Ephemerality still comes from
+    // WebKit's own `new_ephemeral()` constructor rather than a property this
+    // file sets, so the jar-less guarantee is not this file's to get wrong.
+    let context = context_builder_with_memory_policy()
+      .website_data_manager(&WebsiteDataManager::new_ephemeral())
+      .build();
     if let Some(cache_model) = configured_cache_model() {
       context.set_cache_model(cache_model);
     }
@@ -121,6 +123,29 @@ fn configured_cache_model() -> Option<CacheModel> {
     "web-browser" | "web_browser" | "web" => Some(CacheModel::WebBrowser),
     _ => None,
   }
+}
+
+/// A `WebContext` builder already carrying the configured memory policy.
+///
+/// ⛔ EVERY `WebContext` built in this file MUST come from here. The memory
+/// limit and its conservative/strict/kill thresholds are CONSTRUCT-ONLY
+/// properties on `WebKitWebContext` — there is no setter — so a context built
+/// any other way is a web process with no configured bound at all, and nothing
+/// reports that at runtime. `new_ephemeral` was built the other way and gave
+/// every jar-less (temp/incognito) surface an unbounded engine while every
+/// persistent-profile surface got the policy.
+fn context_builder_with_memory_policy() -> WebContextBuilder {
+  let mut context_builder = WebContext::builder();
+  let mut memory_pressure_settings = configured_memory_pressure_settings();
+  if let Some(settings) = memory_pressure_settings.as_ref() {
+    context_builder = context_builder.memory_pressure_settings(settings);
+  }
+  // Separate call, NOT a duplicate of the line above: this static configures
+  // the NETWORK process, the builder property configures the WEB processes.
+  if let Some(settings) = memory_pressure_settings.as_mut() {
+    webkit2gtk::WebsiteDataManager::set_memory_pressure_settings(settings);
+  }
+  context_builder
 }
 
 fn configured_memory_pressure_settings() -> Option<MemoryPressureSettings> {
