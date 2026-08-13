@@ -10,7 +10,19 @@
 # An agent's discipline resets every session; a verb's does not.
 #
 #   scripts/deploy-fleet.sh [--from <dir>] [--hosts "dev guihost oc"] [--dry-run]
-#                           [--allow-behind]
+#                           [--allow-behind] [--preflight]
+#
+# ⭐ `--preflight` runs ONLY the ancestry check and exits, without needing build
+# products. Run it BEFORE the release build. The ancestry gate is correct and is
+# not weakened, but it used to be asked only after the caller had already paid
+# 2-3 minutes for a build — so on a busy evening main advances mid-build and the
+# deploy refuses on a race that did not exist when the build began. One lane lost
+# it SIX TIMES IN A ROW, about fifteen minutes of pure rebuild, and succeeded on
+# the seventh only because main happened to go quiet. ⚠ The failure rate scales
+# with how busy the fleet is, so it is worst exactly when the most lanes are
+# shipping, and a single-lane evening never sees it.
+#
+#   scripts/deploy-fleet.sh --preflight && cargo build --release && scripts/deploy-fleet.sh
 #
 # `--from` defaults to target/release. The tree it was built from must be a
 # DESCENDANT OF `origin/main` — see the refusal below — and a dirty checkout is
@@ -38,12 +50,14 @@ if [ "$(printf '%s\n' $HOSTS | awk 'NF' | wc -l)" -lt 3 ]; then
 fi
 DRY=0
 ALLOW_BEHIND=0
+PREFLIGHT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from) FROM="$2"; shift 2;;
     --hosts) HOSTS="$2"; shift 2;;
     --dry-run) DRY=1; shift;;
     --allow-behind) ALLOW_BEHIND=1; shift;;
+    --preflight) PREFLIGHT=1; shift;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -86,11 +100,21 @@ if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     echo "   correct in the census and in --version. Missing:" >&2
     git -C "$REPO" log --oneline "HEAD..$UPSTREAM" | head -20 | sed 's/^/     /' >&2
     echo "   Fix: git pull --rebase origin main && rebuild && re-run this." >&2
+    echo "   ⭐ To not pay for a doomed build again: run --preflight BEFORE building." >&2
     echo "   (--allow-behind exists for bisecting an old build onto a host, and" >&2
     echo "    for nothing else; the census names the commit either way.)" >&2
     [ "$ALLOW_BEHIND" = 1 ] || exit 1
     echo "⚠ --allow-behind: proceeding with a build that is behind origin/main" >&2
   fi
+fi
+
+# ⭐ --preflight answers the ancestry question and stops, so a caller can ask it
+#    in one second instead of after a three-minute build. Deliberately BEFORE the
+#    build-product check: at preflight time those products do not exist yet, and
+#    requiring them is what forced the question to be asked too late.
+if [ "$PREFLIGHT" = 1 ]; then
+  echo "deploy-fleet: preflight ok — HEAD ($BUILD_COMMIT) is a descendant of origin/main; safe to build."
+  exit 0
 fi
 
 GUI="$FROM/yggterm"

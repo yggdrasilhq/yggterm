@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# ygg-build-sweep — keep Rust build artifacts from eating the disk.
+#
+# ⭐ THIS FILE IS THE SOURCE. `~/.local/bin/ygg-build-sweep` is an installed
+# copy, and the fleet's binary sync replicates that copy newest-wins across
+# every host — so an edit made THERE spreads to three machines with no history,
+# no review and no privacy scan. Edit here, then install.
+#
+# WHY THIS EXISTS. Measured 2026-07-31: one checkout's `target/` had grown to
+# 370 GB, and 285 GB of that was ONE directory: target/debug/incremental.
+# Cargo creates a per-crate incremental cache keyed on a session hash and does
+# not garbage-collect the old ones, so a repo built a few times a day for
+# months accumulates hundreds of stale caches that will never be read again.
+#
+# Incremental caches are the ideal thing to sweep: deleting one costs exactly
+# one slower rebuild and cannot corrupt anything, because cargo simply
+# recreates it. That is why this script defaults to incremental-only. It does
+# NOT touch target/debug/deps — those are real build outputs and deleting them
+# forces a full rebuild, which is a much bigger bill for a much smaller win.
+#
+# THE ONE SAFETY RULE: never delete a cache a running build is writing.
+# A build in flight has its incremental dir open and mtime-fresh, so anything
+# touched inside the grace window is skipped. Default grace is 2h, which is
+# longer than any build in this fleet.
+#
+# Usage:
+#   ygg-build-sweep                 # sweep incremental caches under the default roots
+#   ygg-build-sweep --dry-run       # show what would go, delete nothing
+#   ygg-build-sweep --grace 30      # minutes of protection for in-flight builds
+#   ygg-build-sweep --root DIR      # repeatable; overrides the defaults
+#   ygg-build-sweep --report        # also list the biggest surviving target dirs
+#
+# Exit status is 0 on a clean sweep even when nothing was found — this runs
+# from a timer and "nothing to do" is a success, not a fault.
+
+set -uo pipefail
+
+GRACE_MIN=120
+DRY_RUN=0
+REPORT=0
+ROOTS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --report)  REPORT=1; shift ;;
+    --grace)   GRACE_MIN="${2:?--grace needs minutes}"; shift 2 ;;
+    --root)    ROOTS+=("${2:?--root needs a directory}"); shift 2 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    *) echo "ygg-build-sweep: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ ${#ROOTS[@]} -eq 0 ]; then
+  ROOTS=("$HOME/gh")
+fi
+
+human_gb() { awk -v k="$1" 'BEGIN { printf "%.1f", k/1048576 }'; }
+
+total_kb=0
+swept=0
+skipped=0
+
+for root in "${ROOTS[@]}"; do
+  [ -d "$root" ] || continue
+  # -path */target/* is the load-bearing filter: it means we only ever match a
+  # cargo build directory, never a source tree that happens to be called
+  # "incremental".
+  while IFS= read -r -d '' dir; do
+    # An in-flight build is protected by mtime, not by process inspection:
+    # inspecting /proc for open fds races with a build that starts one second
+    # later, whereas a grace window cannot.
+    if [ -n "$(find "$dir" -maxdepth 0 -mmin "-$GRACE_MIN" 2>/dev/null)" ]; then
+      echo "skip (active within ${GRACE_MIN}m): $dir"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    kb=$(du -sk "$dir" 2>/dev/null | cut -f1)
+    kb=${kb:-0}
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "would sweep $(human_gb "$kb") GB  $dir"
+    else
+      rm -rf -- "$dir" && echo "swept $(human_gb "$kb") GB  $dir"
+    fi
+    total_kb=$((total_kb + kb))
+    swept=$((swept + 1))
+  done < <(find "$root" -type d -name incremental -path '*/target/*' -print0 2>/dev/null)
+done
+
+verb="reclaimed"
+[ "$DRY_RUN" -eq 1 ] && verb="would reclaim"
+echo "ygg-build-sweep: $verb $(human_gb "$total_kb") GB from $swept cache(s); $skipped skipped as active"
+
+if [ "$REPORT" -eq 1 ]; then
+  echo
+  echo "largest surviving target dirs (these are real build output — sweeping"
+  echo "them forces a full rebuild, so they are deliberately left alone):"
+  for root in "${ROOTS[@]}"; do
+    [ -d "$root" ] || continue
+    find "$root" -maxdepth 4 -type d -name target -prune 2>/dev/null | while read -r d; do
+      kb=$(du -sk "$d" 2>/dev/null | cut -f1)
+      [ "${kb:-0}" -gt 1048576 ] && echo "  $(human_gb "$kb") GB  $d"
+    done
+  done | sort -rn | head -10
+fi
+
+exit 0

@@ -30,6 +30,31 @@ copies.
 
 ## Decisions only he makes
 
+- **Where should the leak gate's own source live?** It is currently tracked in **no repository at
+  all** — a loose file in `~/.local/bin`, replicated newest-wins across three hosts, unversioned and
+  unreviewed, while being the thing that stops private data reaching public GitHub. A weakening edit
+  on any host would win that race, spread silently, and every later push would go out unguarded
+  while still printing its reassuring pass. ⛔ **It cannot go in this repo: it was tried and the
+  guard refused its own push, correctly** — its source must know which remotes are private in order
+  to decide when to scan, so that knowledge is in the code. **Recommendation: give it a private
+  Forgejo repo** and keep the wordlist where it already is, outside every repo. **Done meanwhile:**
+  the tracked installer is landed (`scripts/install-privacy-guard.sh`), so the untrackable
+  `.git/hooks` shim is at least generated from something versioned, and the gate is unchanged and
+  working — it refused a real push tonight. **To reverse:** delete one repo.
+  *Meanwhile:* nothing waits on this; the relay installs the hook from the tracked installer.
+
+- **Two fleet-sync bugs are in his `~/.claude/hooks/`, which an agent does not rewrite on a peer's
+  report — may we fix them?** (1) The roster's exclusion glob is `*.old` **anchored at the end**, so
+  a rollback snapshot named `.old.<pid>` slips through and **~100 MB of dead binary is replicated to
+  three hosts**; the fix is one character, `*.old*`. (2) The roster discovers apps by globbing
+  `~/.local/bin/y*`, which silently strands **every app whose name does not begin with `y`** — the
+  convention is real, but a convention is not a membership test, and it fails the same way the
+  hardcoded list it replaced did, now for a whole class instead of forgotten individuals.
+  **Recommendation: take both** — the glob fix outright, and discovery by **manifest** rather than
+  by spelling, since an app that has written its launcher manifest has declared itself.
+  *Meanwhile:* both are recorded and nothing is blocked; the affected app was installed by hand on
+  all three hosts at one hash.
+
 - **The fleet unpushed-audit snippet in his own global instructions is blind to worktrees — may we
   replace it?** In a git worktree `.git` is a FILE, so the snippet's `[ -d "$r/.git" ]` test is
   false and the repo is never examined: no row, no error, just a clean-looking all-clear. On this
