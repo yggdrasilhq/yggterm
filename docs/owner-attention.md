@@ -40,23 +40,28 @@ copies.
   syscalls per second — which is the real defect either way.
 
 - **Should the desktop host's *AC* power profile be `balanced` instead of
-  `performance`?** Its `platform_profile` tracks the power source — `performance`
-  whenever plugged in, `balanced` on battery — and the fan he reported is the
-  plugged-in state. Thermals there are uncorrelated with our CPU (**Pearson
-  r=0.071, n=1,170**; 57 of 80 hot rounds happened under one core of load), so no
-  code change can touch this. Across five windows **every `performance` arm
-  exceeded 94°C and every `balanced` arm stayed under 79°C, with identical means**
-  — a ceiling effect, which is what capping a firmware power limit does.
-  **Recommendation: set the AC profile to `balanced`.** ⚠ Honest caveat: the one
-  controlled pair is n=29, **p≈0.08 — suggestive, not proven**; a one-hour
-  mains-power run settles it and is queued. It is his call because it is a
-  persistent preference about his machine's responsiveness, not a defect.
-  → `docs/pending-bugs.md` § *THE HOST RUNS AT 90+°C WITH 14 OF ITS 16 CORES
-  IDLE*. ⛔ Nothing is left applied: the profile is whatever the power source
-  dictates, and this campaign changed nothing that survives a plug event.
-  *Meanwhile:* the relay is on the half that is genuinely ours and is not about
-  heat — ~366 MB/h of web-process growth whose bound cannot fire, and a daemon
-  leaking a thread per dead PTY.
+  `performance`? It is pinned to `balanced` right now and that needs his ruling.**
+  Owner-reported the machine "very hot" while charging; an interleaved A/B
+  (arms alternating every 5 min, mains throughout, both arms sharing the same
+  charge drift) settles it:
+
+  | arm | n | mean | peak | **>85°C** |
+  |---|---|---|---|---|
+  | `performance` | 90 | 71.9°C | 92°C | **10.0%** |
+  | `balanced` | 71 | 65.2°C | 83°C | **0.0%** |
+
+  **`balanced` eliminates the >85°C band entirely (0/71 vs 9/90, Fisher exact
+  p≈0.004)**, cuts >80°C from 27.8% to 2.8%, and drops the peak 9°C. Thermals
+  there are uncorrelated with our CPU (r=0.071, n=1,170), so **no code change can
+  substitute for this.** **Recommendation: keep `balanced` on AC.** ⚠ It is his
+  call because it caps sustained power and he may want the headroom.
+  ⛔ **What is in force now:** `balanced`, set at 19:54 after he reported the
+  heat. It is a runtime setting — **any power-source transition rewrites it**, and
+  `echo performance | sudo tee /sys/firmware/acpi/platform_profile` restores it.
+  Nothing persists across a reboot. → `docs/pending-bugs.md` § *THE HOST RUNS AT
+  90+°C WITH 14 OF ITS 16 CORES IDLE*.
+  *Meanwhile:* the relay is on the half that is ours — the web process growing
+  ~366 MB/h whose bound cannot fire, and a daemon leaking a thread per dead PTY.
 
 - **The response-layer rule, or five separate patches?** — five verbs report the
   request rather than the effect, and he framed the fix's SHAPE as the open
