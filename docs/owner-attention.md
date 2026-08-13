@@ -30,6 +30,18 @@ copies.
 
 ## Decisions only he makes
 
+- **The fleet unpushed-audit snippet in his own global instructions is blind to worktrees — may we
+  replace it?** In a git worktree `.git` is a FILE, so the snippet's `[ -d "$r/.git" ]` test is
+  false and the repo is never examined: no row, no error, just a clean-looking all-clear. On this
+  fleet that silently skips ~12 `yggterm--*` worktrees, which is where nearly all campaign work
+  happens — the backstop is blind exactly where the divergence it exists to catch would occur. It
+  was not edited because it lives in his private instruction files, which an agent does not rewrite
+  on a peer's report. **Recommendation: paste this one-liner over the old test and count**, which
+  is correct for plain checkouts, worktrees, and lane branches with no remote ref of their own:
+  `[ -e "$r/.git" ]` and `git -C "$r" rev-list --count HEAD --not --remotes=origin`.
+  *Meanwhile:* the corrected form was run across all 17 checkouts — everything is pushed, nothing
+  is outstanding, and the relay will keep running the corrected version by hand each session.
+
 - **The public lore corpus maps which services he uses, even after every listed private term is
   scrubbed — remove the corpus, or keep the feature?** The term-list rewrite catches the names on
   the guard list; it cannot catch the COLLECTION, and a set of site-lore entries for portals and
