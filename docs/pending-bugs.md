@@ -977,6 +977,51 @@ the same class as every other entry in the field guide's instrument table: *the
 verb answers a different question than its name suggests.*
 
 
+## ⛔ `deploy-fleet.sh` CANNOT RECOGNISE AN ALIAS FOR THE HOST IT IS RUNNING ON
+
+**Status:** OPEN
+
+*Reported 2026-08-13 by cluster 6.2, which lost a deploy to it.*
+
+The script takes `--hosts "a b c"` and ssh-es to each. When one of those names is
+an **alias for the machine the script is already running on**, the ssh fails and
+every copy in that run fails with it — because `hostname -s` returns the machine's
+own name, not the alias the fleet addresses it by.
+
+⇒ A host can be reachable by a name the script cannot recognise as *itself*. The
+fix is a self-alias check: resolve each target and, when it resolves to this
+machine, copy locally instead of dialling out.
+
+**Falsifier:** run the deploy on each fleet member naming every member including
+itself. All copies must land, on every host, with no ssh attempt to self.
+
+## ⛔ `server app screenshot` VOUCHES FOR THE PIXELS AND SAYS NOTHING ABOUT THE SUBJECT
+
+**Status:** OPEN
+
+*Reported 2026-08-13 by cluster 6.2; independently hit by the orchestrator the
+same day, which received a photograph of a text editor while trying to capture
+the app.*
+
+On a **non-terminal** view the verb returns `capture_faithful: true` while
+photographing **whatever window currently holds focus**. The flag is true about
+the pixels and silent about the subject, so a caller that checks it — which is
+exactly what the field guide instructs — is told the frame is trustworthy when it
+is a picture of something else entirely.
+
+⇒ This is the instrument family's signature shape: *the field answers a different
+question than its name suggests.* `capture_faithful` answers "were these pixels
+composited honestly", not "is this the thing you addressed".
+
+**Fix, in preference order:** (1) `--pid` implies window targeting, so the
+addressed client is what is photographed; (2) failing that, return
+`faithful: false` — or a separate `subject_verified` — whenever the captured
+window is not the addressed client.
+
+⚠ Until then, a screenshot of a non-terminal view proves nothing unless the
+window was foregrounded first, and foregrounding the operator's GUI is its own
+prohibition.
+
 ## ⛔⛔ `ListAgents` OMITS LIVE ROWS, SO "PICK THE PLAUSIBLE ONE FROM THE LIST" IS UNSAFE
 
 **Status:** OPEN
