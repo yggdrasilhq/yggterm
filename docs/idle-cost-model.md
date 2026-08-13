@@ -134,17 +134,32 @@ control for the whole mechanism.
 
 | | |
 |---|---|
-| `event-trace.jsonl` growth | **95.0 KB/s** |
-| events parsed | 13,091 |
+| `event-trace.jsonl` growth | **95.3 KB/s** → 8.43 GB/day |
+| `perf-telemetry.jsonl` growth | **45.9 KB/s** → 4.06 GB/day |
+| **combined** | **141.1 KB/s** → **12.49 GB/day** |
+| events parsed (event-trace) | 13,091 |
 | `lock_wait_begin` / `lock_wait_end` | 6,456 / 6,456 |
 | **failed `try_lock()` per second** | **322.8** |
-| share of trace volume that is lock_wait | **98.8%** |
-| projected | **8.3 GB/day, from this one file** |
+| share of event-trace that is lock_wait | **98.8%** |
+| share of perf-telemetry that is `terminal_read` | **96.4%** |
 | `~/.yggterm` on this host today | **9.5 GB** |
 
 Contention by request kind: `terminal_read` 12,736 · `status` 164 · `snapshot` 12.
 ⇒ **98.6% of all lock contention in the daemon is `terminal_read`** — reading a
 PTY serializes against every other operation through one mutex.
+
+### It is ONE code path, and the arithmetic closes exactly
+
+`perf-telemetry.jsonl` records `terminal_read` **322/s** — the same rate as the
+failed `try_lock()`. That is not a coincidence: the `PerfGuard` is constructed
+**inside the contended branch**, beside the two `append_trace_event` calls. So a
+single contention writes three records across two files:
+
+    141.1 KB/s ÷ 322.8 contentions/s = 437 bytes written per contention
+
+⇒ **All 12.49 GB/day is attributable to the contended branch of one function.**
+Both files, both instruments, one cause. A fix that treats them as two problems
+will fix one and leave 4 GB/day behind.
 
 ### ⛔ And the field that would have shown this reads zero
 
@@ -191,15 +206,36 @@ can be migrated, and make the retirement path converge without a quiet window
 6.7. This spec is the *justification* for that work, priced. It is not a licence
 to reap daemons holding other agents' live sessions.
 
+⭐ **SECOND, INDEPENDENT AXIS — the same population is what has been killing
+rows.** Established separately from this cost work, by measurement of the row
+deaths themselves: two daemon releases each cut live rows against the 300 s
+idle-deferral window (10 rows across 4 campaigns at 402 s; one seat cut
+mid-`tool_use` at ~272 s). The standing hazard is exactly the population priced
+above — **the daemons predating the settle window, holding 34 live sessions**.
+Because the settle window ships in the *predecessor*, those cannot be
+retrofitted; they can only be drained.
+
+⇒ **Consolidation is justified twice over, on two arguments that do not depend
+on each other:** 2.60 cores of continuous cost, and the row deaths. Two
+independent cases for one action are worth more than either alone, so neither
+should be argued alone.
+
+⛔ **And the second axis sharpens the boundary rather than loosening it.**
+Killing a daemon that holds live sessions is *precisely* the failure mode above.
+The action is a **drain** — move sessions off, then let the emptied daemon
+retire — never an eviction.
+
 ### S2 — Give `waited_ms` microsecond resolution, and stop appending per event
 
 **Change:** (a) record `waited_us`, not `waited_ms`; (b) replace the two
-per-event `append_trace_event` calls with an in-memory counter flushed once per
-interval, carrying count + percentiles.
-**Expected effect:** trace write load **95 KB/s → <1 KB/s, ~8.3 GB/day → ~90 MB/day**,
-and the contention becomes visible instead of rounding to zero.
-**Falsifier:** if `event-trace.jsonl` growth does not fall by ≥90x, lock_wait was
-not 98.8% of the volume and the reduction in §4 is wrong.
+per-event `append_trace_event` calls **and the `PerfGuard` beside them** with an
+in-memory counter flushed once per interval, carrying count + percentiles.
+**Expected effect:** combined write load **141 KB/s → <2 KB/s, 12.49 GB/day →
+~150 MB/day**, and the contention becomes visible instead of rounding to zero.
+**Falsifier:** if combined growth does not fall by ≥90x, the 437-bytes-per-
+contention attribution in §4 is wrong.
+⛔ **Fix both files in one change.** They are one code path; treating them as two
+problems fixes 8.4 GB/day and leaves 4.1 GB/day behind.
 ⭐ **Do this before S3** — S3 changes contention, and right now there is no
 instrument that can measure whether it helped.
 
