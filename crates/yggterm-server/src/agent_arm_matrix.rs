@@ -364,10 +364,15 @@ const ARMS: &[Arm] = &[
         // `-r, --resume [<SESSION_ID_OR_TITLE>]`.
         resume_selector_token: "--resume",
         re_roots_with_cwd: false,
-        // Empty by DECLARATION, not omission: `~/.grok/sessions` exists but its
-        // shape needs a signed-in host to observe. See the descriptor's
-        // `store_scan_gap`.
-        store_globs: &[],
+        // ⭐ MEASURED 2026-08-13 against real sessions — this arm previously said
+        // "empty by DECLARATION, needs a signed-in host to observe", and that
+        // premise was falsified when a fleet host turned out to be signed in
+        // already. The registry was updated and this side was not, which is what
+        // `every_arm_scans_the_store_its_descriptor_declares` is for. ⚠ Keep it
+        // byte-identical to `agent_cli.rs`: `summary.json` ALONE, because the
+        // session directory also holds `chat_history.jsonl`, `events.jsonl` and
+        // `updates.jsonl`, and globbing those yields three entries per session.
+        store_globs: &[".grok/sessions/*/*/summary.json"],
     },
     Arm {
         kind: SessionKind::GrokBuild,
@@ -380,7 +385,9 @@ const ARMS: &[Arm] = &[
         binary: "grok",
         resume_selector_token: "--resume",
         re_roots_with_cwd: false,
-        store_globs: &[],
+        // Same layout as the Local twin by construction — the transport differs,
+        // the store does not. The matrix asserts this pair agrees.
+        store_globs: &[".grok/sessions/*/*/summary.json"],
     },
 ];
 
