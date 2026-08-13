@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A session that stopped accepting typing now recovers itself (3.0.128).**
+  Once in a while a row would stop responding to input — no typing, no
+  scrolling, a blank viewport, and nothing on screen saying why. It never came
+  back on its own. The guard that decides whether a row is safe to type into
+  refused rows it could not confirm were ready, and the escape hatch meant to
+  release such a row sat behind the very check it could not pass, so the refusal
+  was permanent. Measured before the fix: 11 episodes across 8 different
+  sessions, one refused for nearly three minutes. A row whose terminal is
+  demonstrably alive now gets its keyboard back after a last-resort wait, even
+  when the app never saw it announce itself as ready. A row with no live
+  terminal behind it is still refused, because typing into one would silently
+  discard the keystrokes.
+
 - **A daemon swap that cannot happen right now is remembered instead of
   forgotten (3.0.124).** A host that had a newer binary on disk asked its daemon
   to hand off exactly once, and if that one attempt did not produce a successor,
