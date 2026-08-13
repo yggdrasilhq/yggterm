@@ -833,7 +833,9 @@ is usually another cluster's deploy, not your own doing.
 
 ## ⛔⛔ A PRIVATE INFRASTRUCTURE NAME SITS IN THE PUBLIC REPO AS A TEST FIXTURE
 
-**Status:** OPEN — working tree is clean; the PUBLISHED HISTORY is not.
+**Status:** OPEN
+
+⚠ The working tree is clean; the PUBLISHED HISTORY is not.
 
 ⚠ **Scope corrected 2026-08-13 by a full-object sweep** (every blob from every
 ref plus unreachable objects, every path name, every commit message, across all
