@@ -32,10 +32,89 @@
 //! placeholder: a set's head is an ordinary session row, and a synthetic one
 //! could not be clicked, closed or driven.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use crate::row_set::RowSets;
+use crate::row_set::{RowSetRefusal, RowSets};
 use crate::session_outline::{parse_outline_key, OutlineKey};
+
+/// The arrangement the USER built by hand — what a drag or a verb said.
+///
+/// ⛔ **THIS IS NOT A SECOND KIND OF GROUP.** There is one model of what a group
+/// IS — [`RowSets`], a containment relation over row paths — and two inputs that
+/// can produce an edge in it: this, and the seats. `DESIGN.md` §"Row sets"
+/// settles the precedence in the sentence that has been there since the noun was
+/// chosen: *membership is arbitrary and the user may put any rows together — the
+/// outline numbers are the DEFAULT arrangement, never a restriction on it.*
+/// So the seats fill in for rows nobody has arranged, and a hand-arranged row
+/// keeps the answer its owner gave it.
+///
+/// ⭐ **A DRAG WRITES MEMBERSHIP AND NEVER A SEAT.** Forming a set by
+/// renumbering would rewrite `outline_prefix` on rows the user created, which
+/// the row-hygiene law forbids outright — and it would fail anyway on the rows
+/// he most needs to group, since an un-numbered head has no number for a member
+/// to inherit. Membership needs no seat, so a set of un-numbered rows is
+/// ordinary rather than a special case.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowArrangement {
+    /// The containment the user built.
+    #[serde(default)]
+    pub sets: RowSets,
+    /// Rows the user pulled OUT to the top level.
+    ///
+    /// ⚠ **A THIRD STATE, AND IT HAS TO EXIST.** "No entry in `sets`" cannot
+    /// mean both *never arranged* and *deliberately loose*: without this, a row
+    /// dragged out of `6.0` would be silently re-adopted by its seat on the very
+    /// next frame, and the user's gesture would appear to do nothing.
+    #[serde(default)]
+    pub detached: HashSet<String>,
+}
+
+impl RowArrangement {
+    /// Has the user given this row an answer of their own — either a head, or a
+    /// deliberate place at the top level?
+    pub fn answered(&self, path: &str) -> bool {
+        self.sets.parent_of(path).is_some() || self.detached.contains(path)
+    }
+
+    /// Put `member` under `head` by hand.
+    pub fn attach(
+        &mut self,
+        head: &str,
+        member: &str,
+        index: Option<usize>,
+    ) -> Result<(), RowSetRefusal> {
+        self.sets.insert_member(head, member, index)?;
+        self.detached.remove(member);
+        Ok(())
+    }
+
+    /// Take `member` out to the top level by hand, and REMEMBER that it was a
+    /// choice — see the note on [`Self::detached`].
+    pub fn detach(&mut self, member: &str) {
+        self.sets.detach(member);
+        self.detached.insert(member.to_string());
+    }
+
+    /// Forget every answer about rows that are no longer on the sidebar.
+    ///
+    /// Returns true when anything changed, so a caller can skip a persist it
+    /// does not need.
+    pub fn retain_live(&mut self, live: &HashSet<String>) -> bool {
+        let mut changed = self.sets.retain_live(live);
+        let departed: Vec<String> = self
+            .detached
+            .iter()
+            .filter(|path| !live.contains(*path))
+            .cloned()
+            .collect();
+        for path in departed {
+            self.detached.remove(&path);
+            changed = true;
+        }
+        changed
+    }
+}
 
 /// The arrangement the sidebar draws, derived from the seats the rows hold.
 ///
@@ -44,15 +123,19 @@ use crate::session_outline::{parse_outline_key, OutlineKey};
 /// `collapsed_heads` is the user's own state — which sets they shut — and is the
 /// one half of an arrangement that CANNOT be derived, so it is passed in.
 ///
-/// ⚖ When an explicit arrangement exists (the `row-set` verb and the inside-band
-/// drag, both still to be built), it becomes a third argument here and wins
-/// per-row over the derived edge: this function stays the single answer to
-/// "what does the sidebar draw", rather than the caller merging two of them.
-pub fn sidebar_row_sets<'a, I>(rows: I, collapsed_heads: &HashSet<String>) -> RowSets
+/// `arrangement` is what the user said by hand, and it WINS per row: a row they
+/// have arranged keeps their answer, and every other row falls to its seat. One
+/// function is the single answer to "what does the sidebar draw", rather than a
+/// caller merging two of them.
+pub fn sidebar_row_sets<'a, I>(
+    rows: I,
+    arrangement: &RowArrangement,
+    collapsed_heads: &HashSet<String>,
+) -> RowSets
 where
     I: IntoIterator<Item = (&'a str, Option<&'a str>)>,
 {
-    let mut sets = outline_row_sets(rows);
+    let mut sets = outline_row_sets_with(rows, arrangement);
     for head in collapsed_heads {
         // A flag on a row that heads nothing is kept OUT of the model rather
         // than carried in it: `is_collapsed` would then answer true for a row
@@ -74,6 +157,19 @@ pub fn outline_row_sets<'a, I>(rows: I) -> RowSets
 where
     I: IntoIterator<Item = (&'a str, Option<&'a str>)>,
 {
+    outline_row_sets_with(rows, &RowArrangement::default())
+}
+
+/// The same, starting from what the user arranged by hand.
+///
+/// The seats fill in only where the user has said nothing — see
+/// [`RowArrangement`] for why "said nothing" and "said top level" have to be
+/// distinguishable.
+pub fn outline_row_sets_with<'a, I>(rows: I, arrangement: &RowArrangement) -> RowSets
+where
+    I: IntoIterator<Item = (&'a str, Option<&'a str>)>,
+{
+    let mut sets = arrangement.sets.clone();
     let seated: Vec<(&str, Vec<u64>)> = rows
         .into_iter()
         .filter_map(|(path, prefix)| match parse_outline_key(prefix) {
@@ -89,8 +185,12 @@ where
     for (path, segments) in &seated {
         head_by_seat.entry(segments.as_slice()).or_insert(path);
     }
-    let mut sets = RowSets::default();
     for (path, segments) in &seated {
+        // The user's own answer stands. A seat may fill a hole; it may not
+        // overrule a hand.
+        if arrangement.answered(path) {
+            continue;
+        }
         let Some(head) = head_seat_candidates(segments)
             .into_iter()
             .find_map(|candidate| {
@@ -338,6 +438,7 @@ mod tests {
             .collect();
         let sets = sidebar_row_sets(
             rows(&[("orch", "6.0"), ("gate", "6.1"), ("ux", "6.3")]),
+            &RowArrangement::default(),
             &collapsed,
         );
         assert!(sets.is_collapsed("orch"));
@@ -352,9 +453,114 @@ mod tests {
         );
     }
 
+    /// ⭐ THE ANSWER TO "HOW DO I MAKE A GROUP?" — a hand can collect rows that
+    /// carry no number at all, because membership needs no seat.
+    #[test]
+    fn a_hand_can_group_rows_that_have_no_seats() {
+        let mut arrangement = RowArrangement::default();
+        arrangement.attach("shell-a", "shell-b", None).expect("attachable");
+        arrangement.attach("shell-a", "shell-c", None).expect("attachable");
+        let sets = sidebar_row_sets(
+            rows(&[("shell-a", ""), ("shell-b", ""), ("shell-c", "")]),
+            &arrangement,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            visible(&sets, &["shell-a", "shell-b", "shell-c"]),
+            vec![
+                ("shell-a".into(), 0),
+                ("shell-b".into(), 1),
+                ("shell-c".into(), 1),
+            ],
+            "no seat was invented, and no row was renumbered, to make this set"
+        );
+    }
+
+    /// A hand outranks a seat, per row, and only per row: the rows the user
+    /// never touched keep falling to their numbers.
+    #[test]
+    fn a_hand_arranged_row_keeps_its_answer_and_the_rest_still_follow_their_seats() {
+        let mut arrangement = RowArrangement::default();
+        // Moved out of its own book and into another one, by hand.
+        arrangement.attach("nine", "gate", None).expect("attachable");
+        let sets = sidebar_row_sets(
+            rows(&[
+                ("orch", "6.0"),
+                ("gate", "6.1"),
+                ("ux", "6.3"),
+                ("nine", "9.0"),
+            ]),
+            &arrangement,
+            &HashSet::new(),
+        );
+        assert_eq!(sets.parent_of("gate"), Some("nine"), "the hand wins");
+        assert_eq!(sets.parent_of("ux"), Some("orch"), "the untouched row still follows its seat");
+    }
+
+    /// ⛔ THE ONE A DERIVED DEFAULT GETS WRONG. A row dragged OUT must stay out;
+    /// re-adopting it from its seat on the next frame makes the gesture look
+    /// like it did nothing.
+    #[test]
+    fn a_row_dragged_out_of_its_set_is_not_re_adopted_by_its_seat() {
+        let mut arrangement = RowArrangement::default();
+        arrangement.detach("gate");
+        let sets = sidebar_row_sets(
+            rows(&[("orch", "6.0"), ("gate", "6.1"), ("ux", "6.3")]),
+            &arrangement,
+            &HashSet::new(),
+        );
+        assert_eq!(sets.parent_of("gate"), None, "it stays where it was dropped");
+        assert_eq!(sets.parent_of("ux"), Some("orch"));
+        assert_eq!(
+            visible(&sets, &["orch", "gate", "ux"]),
+            vec![("orch".into(), 0), ("ux".into(), 1), ("gate".into(), 0)]
+        );
+    }
+
+    /// A hand cannot tie a knot the model refuses, and the refusal costs the
+    /// rest of the arrangement nothing.
+    #[test]
+    fn a_hand_arrangement_that_would_cycle_is_refused_and_changes_nothing() {
+        let mut arrangement = RowArrangement::default();
+        arrangement.attach("a", "b", None).expect("attachable");
+        assert!(arrangement.attach("b", "a", None).is_err());
+        assert_eq!(arrangement.sets.parent_of("b"), Some("a"));
+    }
+
+    /// The user's answers are forgotten when their rows leave, so a path that
+    /// comes back is not silently filed under a set it never joined.
+    #[test]
+    fn answers_about_departed_rows_are_forgotten() {
+        let mut arrangement = RowArrangement::default();
+        arrangement.attach("head", "member", None).expect("attachable");
+        arrangement.detach("loose");
+        let live: HashSet<String> = ["head".to_string()].into_iter().collect();
+        assert!(arrangement.retain_live(&live));
+        assert!(!arrangement.answered("member"));
+        assert!(!arrangement.answered("loose"));
+        assert!(!arrangement.retain_live(&live), "a second pass changes nothing");
+    }
+
+    /// The hand-built half survives a restart, and the derived half is rebuilt
+    /// rather than stored — so a reseated row moves and an arranged row does not.
+    #[test]
+    fn only_the_hand_built_half_goes_to_disk() {
+        let mut arrangement = RowArrangement::default();
+        arrangement.attach("head", "member", None).expect("attachable");
+        arrangement.detach("loose");
+        let json = serde_json::to_string(&arrangement).expect("serializable");
+        let back: RowArrangement = serde_json::from_str(&json).expect("loadable");
+        assert_eq!(back, arrangement);
+        assert!(back.answered("member") && back.answered("loose"));
+    }
+
     #[test]
     fn no_seats_at_all_costs_nothing() {
-        let sets = sidebar_row_sets(rows(&[("a", ""), ("b", "")]), &HashSet::new());
+        let sets = sidebar_row_sets(
+            rows(&[("a", ""), ("b", "")]),
+            &RowArrangement::default(),
+            &HashSet::new(),
+        );
         assert!(sets.is_empty());
     }
 }

@@ -227,6 +227,24 @@ pub const SESSION_PATH_SCHEMES: &[SchemeDescriptor] = &[
         legacy: false,
         example: "agy-runtime://00000000-0000-4000-8000-000000000031",
     },
+    SchemeDescriptor {
+        prefix: "remote-grok://",
+        role: SchemeRole::RowIdentity,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::GrokBuild),
+        agent: true,
+        legacy: false,
+        example: "remote-grok://devhost/00000000-0000-4000-8000-0000000000cd",
+    },
+    SchemeDescriptor {
+        prefix: "grok-runtime://",
+        role: SchemeRole::RuntimeKey,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::GrokBuild),
+        agent: true,
+        legacy: false,
+        example: "grok-runtime://00000000-0000-4000-8000-0000000000ce",
+    },
     // ── Non-agent (registered so shared predicates can be locked too) ──────
     SchemeDescriptor {
         prefix: "live::",

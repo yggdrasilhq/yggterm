@@ -724,6 +724,49 @@ fn spectacle_may_shoot(verdict: &CompositorVerdict, toolkit_focused: bool) -> bo
     }
 }
 
+/// One line saying WHICH AUTHORITY decided and WHAT IT SAW, for the attempt log.
+///
+/// ⛔ NAME WHAT HELD FOCUS — on an allow as well as on a refusal. The original
+/// defect was a reply that said nothing about its SUBJECT; reporting only the
+/// refusals reproduces it one level down, because the two allow paths
+/// (compositor confirmed us / probe failed and the toolkit was believed) are
+/// then indistinguishable, and only one of them is trustworthy.
+#[cfg(target_os = "linux")]
+fn spectacle_gate_report(
+    verdict: &CompositorVerdict,
+    probe_error: Option<&anyhow::Error>,
+    toolkit_focused: bool,
+    allowed: bool,
+) -> String {
+    let decision = if allowed { "allow" } else { "refuse" };
+    let subject = match verdict {
+        CompositorVerdict::Names(active) => {
+            format!("authority=compositor active_window={active:?}")
+        }
+        CompositorVerdict::Unavailable => match probe_error {
+            Some(error) => format!(
+                "authority=toolkit toolkit_focused={toolkit_focused} \
+                 (KWin probe failed: {error:#})"
+            ),
+            None => format!(
+                "authority=toolkit toolkit_focused={toolkit_focused} \
+                 (KWin probe unavailable)"
+            ),
+        },
+        CompositorVerdict::NotAsked => format!(
+            "authority=toolkit toolkit_focused={toolkit_focused} (not a KDE session)"
+        ),
+    };
+    if allowed {
+        format!("linux_wayland_spectacle: gate={decision} {subject}")
+    } else {
+        format!(
+            "linux_wayland_spectacle: gate={decision} {subject} — it captures \
+             whatever the compositor calls active, and that is not this window"
+        )
+    }
+}
+
 #[cfg(target_os = "linux")]
 async fn platform_capture_visible_app_surface(
     desktop: &DesktopContext,
@@ -777,7 +820,24 @@ async fn platform_capture_visible_app_surface(
             Some(Err(_)) => CompositorVerdict::Unavailable,
             None => CompositorVerdict::NotAsked,
         };
-        if spectacle_may_shoot(&verdict, desktop.is_focused()) {
+        // ⛔ REPORT THE VERDICT IN BOTH DIRECTIONS. Recording the gate only when
+        // it REFUSES leaves an agent unable to tell a shot the compositor
+        // authorised from one the toolkit waved through after the KWin probe
+        // failed — and those are the two cases whose difference this gate exists
+        // to create. Live 2026-08-13: a run designed to force a refusal came back
+        // with an empty attempt list, which is equally consistent with "the gate
+        // allowed it correctly" and "the gate never ran", so the run proved
+        // nothing. A verification instrument that is silent about its own
+        // decision cannot be used to verify itself.
+        let toolkit_focused = desktop.is_focused();
+        let allowed = spectacle_may_shoot(&verdict, toolkit_focused);
+        attempts.push(spectacle_gate_report(
+            &verdict,
+            kwin.as_ref().and_then(|probe| probe.as_ref().err()),
+            toolkit_focused,
+            allowed,
+        ));
+        if allowed {
             match capture_linux_wayland_window_screenshot(output_path) {
                 Ok(()) => {
                     return Ok(SurfaceCapture::new(output_path, "linux_wayland_spectacle")
@@ -785,25 +845,6 @@ async fn platform_capture_visible_app_surface(
                 }
                 Err(error) => attempts.push(format!("linux_wayland_spectacle: {error:#}")),
             }
-        } else {
-            // ⛔ NAME WHAT HELD FOCUS. A refusal that cannot say what it would
-            // have photographed sends the agent to re-derive it, and the whole
-            // defect was a reply that said nothing about its SUBJECT.
-            let subject = match &verdict {
-                CompositorVerdict::Names(active) => format!("the active window is {active:?}"),
-                CompositorVerdict::Unavailable => match &kwin {
-                    Some(Err(error)) => format!("KWin probe failed: {error:#}"),
-                    _ => "KWin probe unavailable".to_string(),
-                },
-                CompositorVerdict::NotAsked => format!(
-                    "not KDE; toolkit focus flag is {}",
-                    desktop.is_focused()
-                ),
-            };
-            attempts.push(format!(
-                "linux_wayland_spectacle: skipped — it captures whatever the \
-                 compositor calls active, and that is not this window ({subject})"
-            ));
         }
     }
     // X11 session: faithful window grab (xwd + convert).
@@ -1025,7 +1066,7 @@ async fn platform_record_visible_app_surface(
 #[cfg(test)]
 mod overlay_tests {
     #[cfg(target_os = "linux")]
-    use super::{CompositorVerdict, spectacle_may_shoot};
+    use super::{CompositorVerdict, spectacle_gate_report, spectacle_may_shoot};
     use super::overlay_dest_rect;
 
     fn approx(a: f64, b: f64) {
@@ -1094,5 +1135,53 @@ mod overlay_tests {
             assert!(spectacle_may_shoot(&verdict, true), "{verdict:?}");
             assert!(!spectacle_may_shoot(&verdict, false), "{verdict:?}");
         }
+    }
+
+    /// ⛔ THE TWO ALLOWS MUST NOT READ ALIKE. A frame the compositor confirmed
+    /// and a frame the toolkit was believed for (because the KWin probe failed)
+    /// are worth different amounts, and reporting the gate only on refusal makes
+    /// them identical in the reply — which is how a run built to force a refusal
+    /// came back with an empty attempt list that proved nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gate_says_which_authority_decided_on_an_allow_too() {
+        let ours = spectacle_gate_report(
+            &CompositorVerdict::Names("yggterm|main window".to_string()),
+            None,
+            false,
+            true,
+        );
+        assert!(ours.contains("gate=allow"), "{ours}");
+        assert!(ours.contains("authority=compositor"), "{ours}");
+        assert!(ours.contains("yggterm|main window"), "{ours}");
+
+        let blind = spectacle_gate_report(
+            &CompositorVerdict::Unavailable,
+            Some(&anyhow::anyhow!("KWin loadScript returned no script id")),
+            true,
+            true,
+        );
+        assert!(blind.contains("gate=allow"), "{blind}");
+        assert!(
+            blind.contains("authority=toolkit") && blind.contains("no script id"),
+            "an allow granted because the compositor could not be asked must say \
+             so, and say why: {blind}"
+        );
+        assert_ne!(
+            ours, blind,
+            "the trustworthy allow and the fallback allow must be tellable apart"
+        );
+
+        let refusal = spectacle_gate_report(
+            &CompositorVerdict::Names("kate|untitled document".to_string()),
+            None,
+            true,
+            false,
+        );
+        assert!(refusal.contains("gate=refuse"), "{refusal}");
+        assert!(
+            refusal.contains("kate|untitled document"),
+            "a refusal still names what it would have photographed: {refusal}"
+        );
     }
 }

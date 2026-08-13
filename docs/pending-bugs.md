@@ -116,130 +116,52 @@ per-daemon (five of the daemons on that host are older than the current binary
 open must emit a trace event naming the refusal. Silence here is itself the bug —
 the reporter had no way to tell "this row is gone" from "this row is slow".
 
-## ⛔ A SCREENSHOT OF A NON-TERMINAL VIEW PHOTOGRAPHS WHATEVER HOLDS FOCUS
+## ⛔ deploy-fleet CANNOT RECOGNISE ITSELF UNDER AN ALIAS IT CANNOT RESOLVE
 
 **Status:** OPEN
 
-*found 2026-08-13 while taking start-page proof, and it nearly published a false one*
+*narrowed 2026-08-13: the ⛔-storm and the "three-quarters success" misread are
+fixed; a host whose alias does not resolve from itself still needs one word*
 
-`server app screenshot /tmp/out.png` answered
-`capture_faithful: true, capture_backend: linux_wayland_spectacle` — and the
-PNG was **a picture of a text editor**, not yggterm at all. The Spectacle
-backend shoots the focused window, and the GUI did not hold focus.
+**What was wrong.** The local-host test was `[ "$host" = "$(hostname -s)" ]`, and
+on this fleet the ssh alias and the kernel hostname differ — so a deploy run on a
+host tried to ssh to itself, failed all four copies with `Could not resolve
+hostname`, and printed ⛔ for the very machine doing the deploying while the
+other two landed. The operator reads three-quarters success and moves on.
 
-⇒ **The flag was true about the pixels and silent about the SUBJECT.** It is
-documented as meaning "this frame is not canvas-blind", which is a claim about
-terminal fidelity only; nothing in the reply says *which window* was captured.
-An agent following the field guide reads `faithful:true` and reasons from a
-frame of another application.
+**What shipped.** Identity is no longer a string comparison. The script drops a
+unique token in `$HOME` — the filesystem the four copies land in — and asks each
+candidate channel whether it can see it. An unreachable host is now reported
+**once, by name**, with the remedy, and its copies are marked SKIPPED rather than
+failed; the census prints `(unreachable — nothing was written here, and nothing
+is claimed about it)` instead of a row that looks like a reading.
 
-⚠ Passing `--pid <gui>` did NOT fix it either: it then returned
-`capture_faithful: false, capture_backend: linux_webkit_snapshot`. That frame
-IS correct for a start page (DOM, no xterm canvas) — so on a non-terminal view
-the honest frame is the one flagged unfaithful, and the dishonest one is
-flagged faithful. Exactly inverted for this surface.
+⛔⛔ **AND THE OBVIOUS IDENTITY IS THE WRONG ONE — it nearly shipped.**
+`/etc/machine-id` answers *"is this the same machine image?"*, and the question a
+deploy depends on is *"do these two paths name the same FILE?"*. Two hosts on
+this fleet report a **byte-identical** `/etc/machine-id` and have **different
+filesystems**. A machine-id test called the second host "self", which would have
+written its four copies into the first host's disk, read them back through the
+same wrong door, and printed four ✅ for a host that was never touched — a total
+deploy failure wearing a green census, strictly worse than the ⛔ storm it was
+replacing. It was caught by falsifying a positive result rather than accepting
+it: the probe was made to say SELF and NOT-SELF in one run, and the pair it had
+to tell apart was exactly the pair that fooled the earlier design.
 
-**Wanted:** `--pid` implies window-targeted capture, and a shot that is not of
-the addressed client reports `faithful:false` with a reason naming what it
-photographed. A capture verb that cannot say what it captured is not a
-verification instrument.
+**What remains.** When a host's alias cannot be resolved *from that host*, no
+local signal can bridge the two names — the alias belongs to the fleet, the
+kernel name belongs to the machine, and neither knows about the other. The run
+now says so and names `export YGG_FLEET_SELF=<alias>` as the permanent fix, but
+until that is set on such a host, its own four copies are still skipped.
 
-⚠ **Second sighting, 2026-08-13 at 3.0.116, and it is the more dangerous one
-because the frame was RIGHT.** With `force-foreground on` set first, the same
-call answered `capture_faithful: true, capture_backend:
-linux_wayland_spectacle` and returned a correct picture of the start page. The
-reply is byte-identical in shape to the one that photographed a text editor.
-⇒ **The flag did not become trustworthy; the FOCUS happened to be correct.** An
-agent cannot tell the two cases apart from the reply, which is exactly the
-defect — a verification instrument whose output is the same whether or not it
-verified anything. Reading the PNG remains the only check.
+⚠ **Rejected as unsound:** inferring self by elimination ("every other host in
+the list probed REMOTE, so the unreachable one must be me"). It is wrong the
+moment the deploy runs from a machine that is not in the list, and its failure
+mode is the catastrophic one above — writing this machine's disk under another
+host's name and reporting success.
 
-⭐ **THIRD SIGHTING NARROWS THE FIX — 2026-08-13 at 3.0.120, cluster 6.2.** With
-`force-foreground on` and `--pid <gui>` on a **terminal** view, the same call
-answered `capture_backend: xterm_canvas_composite_over_dom`, and the PNG was the
-addressed GUI: sidebar, viewport and metadata rail, `--crop`/`--scale` applied
-correctly. ⇒ **The in-process composite backend cannot photograph the wrong
-window — it composites the client it was addressed to.** Only
-`linux_wayland_spectacle` can, because it shoots whatever the compositor says is
-focused, and it is the fallback chosen when the view is not a terminal. So the
-fix is not "make `faithful` honest" in general: it is that the **spectacle
-fallback must report which window it got, or refuse when the addressed pid does
-not hold focus**. The composite path is already the trustworthy one.
-
-⏳ **IN CODE, LIVE PROOF OWED — 2026-08-13, cluster 6.2.** Root-caused to two
-instruments answering different questions with nothing arbitrating between them.
-Spectacle photographs whatever the **compositor** calls active; the gate in
-`app_capture.rs` asked the **toolkit** (`desktop.is_focused()`), which is not
-reliably updated on KDE Wayland. When they disagreed the toolkit won, and the
-shot was of another application. `capture_os_compositor_screenshot` — the
-`--backend os` path — had already learned to ask KWin and cross-check; the path
-every plain `server app screenshot` takes had not.
-
-⇒ The fallback now asks KWin and **believes it over the toolkit**, and a refusal
-**names what held focus** rather than refusing blankly. The identity was always
-available: `kde_wayland_active_window_matches` computed the active window's class
-and caption and returned a bare `bool`, discarding the one fact a caller needs;
-it is now `kde_wayland_active_window_identity`, with the predicate as a thin
-wrapper. The toolkit is still used where KWin cannot be reached, because refusing
-every screenshot on a desktop with no such probe is worse than the bug.
-
-Locked by two tests over the extracted arbitration (`spectacle_may_shoot`), so
-the disagreement is testable without a compositor: the measured case — toolkit
-says focused, compositor names another application — must refuse, and the
-converse case (compositor names this window while the toolkit's flag lags) must
-still shoot, so the gate cannot be the toolkit in either direction.
-
-**Owed:** the live check, which needs the GUI unfocused on the desktop host.
-
-**Falsifier:** with the GUI unfocused, `screenshot --pid <gui>` returns a frame
-of that GUI, or refuses **naming what it would have photographed**.
-
-## ⛔ THE CENSUS STILL CANNOT ASK A DEPLOYED BINARY WHICH SOURCE IT IS
-
-**Status:** OPEN
-
-*residual of the version-collision entry, which closed 2026-08-13 once the stamp
-was live-proven: `--build-commit` on the desktop host answered `e8d765c7e6ba`,
-equal to the deploying tree's HEAD, with the deployed md5 identical to the build
-product's. The guard, the stamp and the allocation verb all shipped.*
-
-`deploy-fleet.sh`'s census prints **the deploying build's** commit and md5s, and
-compares each host's copy by md5 alone. It does not ask each copy
-`yggterm --build-commit`, which is the direct question.
-
-⛔ **It cannot yet, and the reason is the trap:** `--build-commit` on a binary
-built before the flag existed **falls through to LAUNCHING THE GUI** on whatever
-host it is asked. A census that interrogated every copy would open windows across
-the fleet on exactly the machines that are behind — the ones it exists to find.
-
-**Wanted:** once every host is at or past the first version carrying the flag,
-switch the census from md5 comparison to asking each copy directly, so it reports
-the source each binary was built from rather than inferring it. Until then md5 is
-the honest instrument, and the census already prints what to compare against.
-
-**Falsifier:** the census names the commit of a copy it did not itself deploy.
-
-## ⛔ deploy-fleet SSHes TO THE HOST IT IS ALREADY RUNNING ON
-
-**Status:** OPEN
-
-*found 2026-08-13 deploying 3.0.113*
-
-`scripts/deploy-fleet.sh --hosts "dev guihost oc"` run **on** the `oc` host tried to
-`ssh oc` and failed all four copies with `Could not resolve hostname oc`. Its
-local-host test is `[ "$host" = "$(hostname -s)" ]`, and that machine's
-`hostname -s` is not `oc` — the fleet name and the kernel hostname differ.
-
-⇒ A deploy that reports ⛔ for the host doing the deploying, while the other two
-hosts land correctly, invites exactly the split the script exists to prevent:
-the operator reads three-quarters success and moves on. Worked around by a
-second run with `--hosts local`.
-
-**Wanted:** resolve each host name against the fleet's own alias table (or
-compare resolved addresses) rather than against `hostname -s`.
-
-**Falsifier:** `deploy-fleet.sh --hosts "dev guihost oc"` run on any of the three
-lands twelve copies and reports no ⛔.
+**Falsifier:** a deploy run on a host whose alias does not resolve there writes
+that host's four copies, or refuses in a way no reader can mistake for success.
 
 ## ⛔⛔ [6.3] yedit's VIEWPORT PAINTS NOTHING WHILE ITS FILE RAIL IS FULL
 
@@ -262,6 +184,110 @@ external editor rather than in yedit.
 
 **Falsifier:** a viewport reporting a non-zero line and character count must
 paint at least one glyph. If it cannot, it must say so rather than render black.
+
+⭐⭐ **A CHEAP, DETERMINISTIC REPRO — 2026-08-13, deploy-identity cluster.** The
+original sighting needed a 61,018-character document, which makes every check
+expensive and every difference arguable. The same state reproduces with a
+**152-character** file authored for the purpose, in four commands, provided the
+shell is ON THE GUI HOST (see the loopback entry below — a surface driven from
+another machine reads a daemon that does not exist there, which is what made
+this look unreproducible):
+
+```sh
+# on the GUI host
+printf '# probe\n\nOne paragraph.\n\n- a\n- b\n' > /tmp/<probe>.md
+yggterm server app terminal new --kind shell --cwd /tmp --purpose '<why>' --pid $GUI
+yggterm server app terminal send <row> --data 'yedit /tmp/<probe>.md' --pid $GUI
+# then a LONE carriage return — the text alone sits at the prompt unsubmitted
+yggterm server terminal write <row> --data "$(printf '\r')"
+```
+
+Measured result: the FILES rail fills, the probe appears **selected and
+highlighted**, and the status bar reads **30 words · 10 lines · 152 chars** —
+the file's true measurement. So the loading half is sound and the discrepancy is
+downstream of it, on a document small enough to hold in the head.
+
+⚠ **A clean document-VIEW frame is still owed** and was not taken here: another
+lane held a modal over the viewport at capture time, and closing another
+session's dialog mid-flight is not a thing to do for a screenshot. One
+`server app open <row> --view preview --pid $GUI` plus one screenshot completes
+it from the state above.
+
+⭐ **THE APP PLANE ITSELF PAINTS ON THE REAL GUI — measured 2026-08-13 by the
+deploy-identity cluster at 3.0.133, on the desktop host, faithful frame.** A
+freshly launched yedit surface rendered its whole rail: the toolbar icons, the
+regex search field, the Markdown/Split/Text toggle, the FILES heading with its
+`+` control, the empty-state line, and the Wrap control. ⇒ **Whatever is wrong
+here is not "a document surface cannot render on a real GUI"**, which is worth
+knowing before anyone spends a session on the widget layer.
+
+⚠ **AND THE LOADED STATE COULD NOT BE REACHED, for a reason that turned out to
+be neither the CLI nor the paint** (own entry below): the shell driving that
+surface was on a different machine from the GUI, and a surface declares a
+**loopback** control URL — so the GUI resolved it on its own host, found nothing
+listening, and rendered *No files open* with every widget healthy. The file had
+been stored correctly the whole time, in the other host's daemon.
+
+⇒ So this sighting says nothing about the black viewport: an EMPTY rail pointed
+at the wrong daemon is a different state from the full rail above. **Recorded
+so the next reader does not mistake it for one**, and because the first version
+of that entry blamed the CLI for dropping the path, which it does not do.
+
+## ⛔⛔ A DOCUMENT SURFACE DECLARES A LOOPBACK URL, SO A CROSS-MACHINE SURFACE RENDERS EMPTY AND HEALTHY
+
+**Status:** OPEN
+
+*found 2026-08-13; supersedes this entry's own first diagnosis, which was wrong*
+
+⛔ **CORRECTION FIRST, because the wrong version of this entry was published and
+would send a reader into the wrong file.** It said `yedit <path>` accepts the
+path, reports `document surface opened`, and drops it. **It does not drop it.**
+Asked directly, the daemon takes the file and says so:
+
+```
+POST /open {"path":"/tmp/<probe>.md"}  →  {"ok":true,"id":"…","document_version":"8:false"}
+/ping before → "document_version":"7:false"   /ping after → "8:false"
+```
+
+The client resolves the path against its own cwd and posts it; the route stores
+it; the version advances. Every link in that chain works.
+
+**What is actually wrong.** The control endpoint a surface declares is a
+**loopback address with no host in it** — `http://127.0.0.1:<port>`. The declare
+rides the PTY byte stream to the GUI, and the GUI then resolves that address on
+**its own** machine. Measured across two hosts:
+
+| | |
+|---|---|
+| daemon on the host running the shell | `http://127.0.0.1:46219` |
+| daemon on the host running the GUI | `http://127.0.0.1:46335` |
+| listeners on `46219` on the GUI host | **none** |
+
+⇒ The GUI was pointed at a port nothing on it has ever bound. **And the surface
+rendered as EMPTY rather than as unreachable:** full rail — toolbar, regex
+search, Markdown/Split/Text toggle, FILES heading with its `+`, *No files open*,
+Wrap. Every widget healthy, describing a daemon that does not exist on that
+machine.
+
+⚠ **This is why the campaign-wide document-body comparison has stayed open.**
+Two lanes tried to compare a shadow-rendered body against a real-GUI one and
+recorded it blocked, because nothing would load a document into a surface. The
+loading was never the problem — **the GUI was reading a different daemon.** A
+surface driven from a shell ON the GUI host does not take this path.
+
+⛔ **It is a distinct defect from a libyggterm app launching on the wrong
+machine, and fixing that one does not fix this.** Any manual `ssh <host>` into a
+yggterm PTY — which the OSC declare explicitly supports via `LC_*` forwarding —
+lands the same way. A declare that crosses a machine boundary must carry an
+address the GUI can resolve, or the surface must refuse and say the endpoint is
+unreachable.
+
+**Wanted:** the declare carries a reachable endpoint, or the surface reports the
+endpoint it could not reach. Either is fine; rendering an empty document with
+healthy widgets is not.
+
+**Falsifier:** a surface declared from a shell on another machine either shows
+that machine's open documents, or names the endpoint it failed to reach.
 
 ## ⛔⛔ [6.3] EVERY SIDEBAR BUTTON OPENS THE NOTIFICATION SIDEBAR
 
@@ -299,6 +325,135 @@ nothing else is already tracked below. Same family: **a rail whose content comes
 over a bridge shows its chrome and never its payload.** Check whether one dead
 bridge explains all three before writing three fixes.
 
+## ⛔ [6.3] A COLLAPSED SET REMOVED ITS MEMBERS FROM EVERY VERB THAT READS ROWS
+
+**Status:** OPEN
+
+*Owner-visible 2026-08-13 as nine live agent rows missing from the sidebar and from
+`server app rows`. The listing half is FIXED at 3.0.140 and verified live; this entry stays open for
+the render-side question below.*
+
+**The mechanism, proven by controlled intervention rather than inferred.** `server app rows` answered
+from the RENDERED row list, so folding a row set removed its members from the answer given to every
+consumer — the booter, the supervision plane, seat audits, orchestration scripts. With all five books
+folded, only the five heads were reported.
+
+```
+  rows, 5 books all folded  → 5 seats
+  expand exactly ONE set
+  rows, immediately after   → 14 seats, the nine members back
+```
+
+The persisted collapse set held exactly five session paths at that moment, one per book — a 1:1 match
+with the five surviving seats. ⇒ It cost real state: the booter reaped nine subscriptions in six
+seconds, each a working session, having been handed an honest answer to a question it was not asking.
+
+**Fixed at 3.0.140:** the verb builds its own list with every row set OPEN and reports
+`hidden_by_collapsed_set` per row. Verified live — 31 seated rows reported, 14 visible, 17 flagged
+folded, where those 17 were previously absent entirely. The collapse itself is untouched and still
+persists; three of those folds are the owner's own.
+
+⚠ **A trap on the way, and the reason this entry names it:** the first attempt reached for the search
+path's force-expansion to open the row sets and opened every folder and machine with them. 47 rows
+became 1454, every session doubled through its dual presence, and `resolve_app_control_row` began
+matching the cwd-tree copy of a row — which heads no set — so `row-expanded` started refusing.
+⇒ **Widening a data verb means showing what a FOLD hides, not unfolding the tree.**
+
+**What is still open.** Only the app-control verb was corrected. `snapshot.rows` is still the rendered
+list, so any OTHER consumer reading it inherits the same defect. ⇒ Decide whether the snapshot itself
+should carry every row with collapse as a field and let each renderer hide what it likes — which is
+the general form of the rule — or whether the verb is the only consumer that needs it. **Do not answer
+it by making collapse stop persisting: that is the user's state and he sets it deliberately.**
+
+## ⛔⛔ [6.3] THE DOT READS THE SNAPSHOT, AND ONLY THE OTHER REQUEST ASKS THE OWNING DAEMON
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-13: "only one or two are blinking. So are all the relay rows sitting and the
+orchestrator chilling?" They were not — eight rows were mid-turn.*
+
+**The mechanism, and it is a wiring gap rather than a missing capability:**
+
+| request | working state | who reads it |
+|---|---|---|
+| `ServerRequest::WorkingFlags` | `working_flags_including_proxied()` — **asks the owning daemon**, has a passing test (`a_proxied_rows_working_flag_is_taken_from_its_owner`) | not the dot |
+| `ServerRequest::Snapshot` | the raw screen scrape, no proxy | **the sidebar dot** |
+
+⇒ **The proxied answer is built, tested, and the surface that needs it asks the other question.** Same
+family as a verb implemented at every layer with no dispatch arm: complete, correct, and not reachable
+from the one caller that wanted it.
+
+**Why the scrape has nothing to say.** `working` is `screen_text.map(|s| descriptor.screen_shows_working(s))`,
+so no screen ⇒ `None` ⇒ the GUI correctly declines to blink. Measured on the GUI host's own daemon
+(⚠ NOT the one a CLI resolves — a first pass on the wrong daemon reported 254 of 260 unknown and meant
+nothing), the two groups separate perfectly:
+
+| | `launch_phase` | `terminal_process_id` | count |
+|---|---|---|---|
+| has a value | `Running` | a pid | 11 |
+| **`working: null`** | **`RemoteBootstrap`** | **`None`** | **15** |
+
+Every null row also carries `status_line: "… waiting for terminal host …"` and five `terminal_lines` of
+launch preamble rather than a screen. **Six daemons were coexisting on that host**, and the ssh clients
+holding the agent PTYs were spread across them (`TERM_PROGRAM_VERSION` 3.0.76 on one, 3.0.132 on
+others) — so the dark rows are sessions owned by an OLDER daemon, which is the version-coexistence case
+the constitution explicitly promises to keep first-class.
+
+⇒ **The gap in the proxy itself:** `working_flags_including_proxied` skips any row where
+`preserved_owner_endpoint_for_request` yields no owner, so a row whose owner this daemon does not know
+is never asked about.
+
+⚠ **The obvious cost question, which the fix has to answer:** snapshots are frequent and proxying is
+network I/O to sibling daemons. Do not put an unbounded per-snapshot fan-out on that path — cache the
+proxied flags with a short TTL, or have the owner push them.
+
+### ⚠ PARTLY FIXED AT 3.0.134, AND MEASURED NOT TO BE ENOUGH
+
+The snapshot now merges the proxied flags (it previously answered from the raw
+scrape alone), and that is deployed and running. **It did not close the defect.**
+Falsifier re-run on the live host at 3.0.135, 31 seated rows, transcript growth
+over 30s against `working` in the same run:
+
+```
+  agree 26 · missed 3 · false positives 2
+  rows still reporting working=None: 21 of 31
+```
+
+⇒ **The wiring was necessary and not sufficient.** `working_flags_including_proxied`
+skips any row where `preserved_owner_endpoint_for_request` yields no owner, so a
+row whose owner this daemon has no record of is still never asked about — and
+that is most of them. Wiring the proxy into the snapshot cannot widen the
+proxy's own coverage.
+
+⇒ **The remaining step is discovery, not transport:** a daemon must be able to
+find the owner of a row it holds no preserved-owner record for — asking its live
+siblings rather than only endpoints it already knows. ⚠ Bound the fan-out; the
+TTL cache is already in place for the asking half.
+
+⚠ **And the ground truth got coarser as the fleet grew.** Two rows now read as
+false positives against the growth test, which the earlier 21-row sample did not
+show. A row mid-turn inside one long tool call appends nothing for 30s, so
+"grew" under-reports work — **the growth test is a floor on activity, not a
+census**, and a small disagreement in that direction is the instrument, not
+necessarily the dot.
+
+⛔ **TWO DIRECTIONS ALREADY REFUTED — do not spend a session re-deriving them:**
+
+1. **"The owning daemon knows, propagate over the remote-session index."** Measured on both daemons for
+   the same session ids: the other host reports `None` for essentially every row too, including rows
+   where the GUI host has a real answer. The GUI host is the better-informed side.
+2. **"Fall back to transcript freshness (`modified_epoch` / `last_used_epoch_by_session_id`)."** That map
+   lags roughly twenty minutes: a row measured mid-turn showed a scan age of 1262s, and nothing in the
+   sample was under ~1000s. It orders "recent work"; it cannot signal activity, and using it would
+   produce a stale blink — worse than a missing one, because a blink that should not be there cannot be
+   noticed.
+
+**Falsifier — and it must run against rows you did NOT start.** A row that begins working while you watch
+is the case that already works. Sample seated rows for transcript growth over ~25s (a file that grows is
+a session mid-turn) against the dot state in the same run: every growing row blinks, every still row does
+not. ⛔ Keep `None` meaning *nobody knows*: collapsing the tri-state to a bool trades a missing blink for
+a permanent one.
+
 ## ⭐ [6.3] ROW SETS CANNOT BE ARRANGED BY HAND OR BY A VERB
 
 **Status:** OPEN
@@ -313,21 +468,20 @@ means NOTHING but arrangement; a split is a view and a row set is an
 arrangement, and **neither may relocate the other**; each set keeps its own
 collapsed flag through an outer collapse.
 
-What is left is the ARRANGING, both halves of it — the default arrangement (the
-outline's own nesting) is drawn, so this entry is now only about overriding it:
+The model, the inside-band drag and the persistence are built. **What is left is
+the rest of the vocabulary the owner asked for**, and the entry closes when all of
+it is live-proven together:
 
-1. ⚠ **THE INSIDE BAND ON A SESSION ROW DOES NOT EXIST — do not plan around
-   reusing it.** Measured 2026-08-13 by reading the resolver:
-   `row_drop_placement_for_offset` returns `Into` only when the target row
-   `is_group`, and a live-session row is not a group, so a row dropped on another
-   row can only land Before or After it. `live_session_drop_target` then passes
-   that straight to the reorder. ⇒ Dragging one live row onto another REORDERS it
-   and forms nothing.
-2. **The CLI verb** (`server app row-set …`), so a delegate can arrange rows as
-   easily as a hand can. Both halves exist or neither is real.
-3. **Where an explicit arrangement is kept.** The derived one needs no storage;
-   an explicit one does, and `row_set_outline::sidebar_row_sets` is shaped to
-   take it as a third argument that wins per row.
+1. **Right-click → ungroup**, both halves in one menu: on a HEAD it dissolves the
+   set and its members become top level; on a MEMBER it removes just that row.
+2. **The verb twin.** `DESIGN.md`: *both halves exist or neither is real* — a
+   delegate must be able to group and ungroup rows as a hand can. ⛔ Build it
+   with its dispatch arm and exercise it end to end: this cluster has just been
+   bitten by a verb that existed at every layer with **no caller at all**, and a
+   gesture with no verb is the same defect mirrored.
+3. **Live proof of all three gestures** on the GUI host, plus the un-numbered
+   case — grouping rows that carry no seat is the whole point, since those are
+   the rows an agent may never renumber.
 
 **Falsifier for the finished feature:** arrange an outer set holding a collapsed
 inner set and an expanded one, collapse the outer, expand it again, and find both
@@ -392,73 +546,71 @@ screen last looked like**.
 list of hostnames, and it answers "which machine was I on" the way the eye
 answers it.
 
-## ⭐⭐ [6.5] THE BOOTER HAS NO MANUAL DISARM AND NO RATE-LIMIT AWARENESS
+## ⛔⛔ [6.5] A DOCUMENT SURFACE'S BODY DOES NOT PAINT, AND ITS CONTRACT SAYS TWO DIFFERENT THINGS
 
 **Status:** OPEN
 
-*reported 2026-08-13*
+*measured 2026-08-13 on a real GUI (an isolated sandbox, not the owner's)*
 
-Reported symptom: during a rate-limited window, subscribers kept being booted.
-A boot into an exhausted quota cannot do work — it spends the wake, fails, and
-leaves the row no further forward.
+Reported symptom: an app's viewport pane renders its top bar and leaves the body
+blank, while every telemetry field reads healthy — `has_schema: true`,
+`stale: false`, `error: null`. Two lanes have now spent time on it. It has been
+attributed to the read-only shadow client; **it is not the shadow.**
 
-⚠ **Correction to the premise, measured 2026-08-13 11:22 across all three
-hosts:** the booter is **not armed anywhere right now**. `~/.yggterm/relay/booter/`
-holds zero subscriptions on each host, no watcher process is alive, and the
-newest heartbeat is two days stale. So the kicking described is not ongoing.
-**This does not retire the item** — it narrows it to the two real gaps:
+**Half of it is a contract that disagrees with itself, and that half is
+actionable now.** yggterm's own deserialiser says:
 
-1. **There is no disarm surface.** Disarming today means reaching each host and
-   running the skill's Python by hand. There is no way to see who is armed,
-   when they are due, or to stand one down without a shell. ⇒ the reporter had
-   no instrument to answer *"is the booter what is hurting me right now"*, which
-   is why the premise could not be checked from the GUI.
-2. **The booter does not know about quota.** It has a rule for a context-dead
-   session (tracked above) but none for an account-level rate limit, which is a
-   different state: the session is fine, the *account* cannot spend. A boot in
-   that state should defer to the window reset, not retry on its grid.
+> Chrome widgets (tabs, buttons, toggles, labels) form a top bar; `markdown` and
+> multiline `text-input` widgets are the scrolling body.
 
-**Both are answered by the same thing** — see the yggtopo entry below, which is
-where the disarm surface belongs.
+`.agents/skills/libyggterm-surfaces/SKILL.md` says multiline `text-input` **and
+`list-row`** "render at document scale". ⇒ **`list-row` is chrome in a viewport
+pane.** An app that believes the prose declares a list of rows as its document
+body, gets a blank page, and has no way to find out why — nothing failed. The
+host is the SSOT; the prose is wrong and should be corrected.
 
-## ⭐⭐ [6.5] THERE IS NO libyggterm APP FOR THE FLEET ITSELF — BUILD `yggtopo`
+**The other half is a real defect and is NOT explained by the above.** With the
+rows replaced by a `markdown` widget the body is *still* blank:
 
-**Status:** OPEN
+| what was checked | result |
+|---|---|
+| the schema actually served | `markdown` widget, `id` + `source`, **928 chars** of real content over HTTP |
+| the same schema in the RAIL, same app, same minute | renders **completely** — cards, sections, status dots, rows, tabs, search box, footer |
+| the field names | `section.text`, `tabs.active`, `markdown.source` — all matched against the host's enum |
+| "the refetch is racing the re-stamp" | **falsified** — same blank with the app re-stamping every 120 s |
 
-*requested 2026-08-13*
+⇒ The same-app rail control is what separates this from an app bug: the schema
+is good, and the viewport placement is not painting a widget it says it paints.
 
-**What it is:** `lstopo` + `htop`, for the fleet. An `lstopo`-style topology view
-as the primary visual, with `htop`-style live process data layered onto it, and
-LXC containers as first-class citizens of that topology rather than processes
-that happen to be running.
+⚠ **Falsifier, not yet run:** drive the shipped pilot editor through the
+identical path in the same sandbox and confirm ITS markdown body paints. That
+attempt stalled on the editor's own daemon (`Loading…` in the rail, control
+endpoint never answered) and was not retried. If its body is blank too, this is
+the document-surface body path for every app, not one widget.
 
-**Why it is being built now, and it is not the diagram:** it is the surface that
-lets the booter be disarmed, deferred and reconfigured by hand. A second tab
-carries **fleet statistics — who is armed, and when they are due**.
-
-**What makes it a milestone for the project, independent of its own usefulness:**
-it is the first libyggterm GUI app of this shape ever built. It behaves like a
-Windows/Qt/GTK application inside the viewport, composed from yggui components —
-sliders, list views, panels — with the gradient flowing over it the way the start
-page has it. ⇒ **the app is also the proof that the app tier can carry a real
-desktop-class UI**, which is the claim `libyggterm` is being licensed and
-positioned on. Build the htop-like view first: it is the densest widget exercise
-and it is the half the booter tab depends on.
-
-⛔ **No context-menu integration** — see the context-menu entry above.
-⭐ **Reuse yggui components; do not invent** — standing rule, and this app is
-where the temptation is highest because nothing quite like it exists yet.
-
-## ⭐ [6.5] `yggdrasil-maker` WANTS THE SAME REMAKE
+## ⚠ [6.5] THE APP SCAFFOLDING HAS THREE HAND-COPIES AND ONE OF THEM FAILED SILENTLY
 
 **Status:** OPEN
 
-*requested 2026-08-13*
+*measured 2026-08-13*
 
-Same treatment as yggtopo: a real app in the viewport built from yggui
-components, and **no context menu**. Sequenced after yggtopo deliberately —
-yggtopo establishes the component vocabulary and yggdrasil-maker consumes it.
-If the second app needs new primitives, that is a finding about the first.
+The platform's migration order calls for the widget schema to be lifted into a
+typed contract crate once a second consumer exists. There are now three, each
+carrying its own hand-written copy of the same ~200 lines, and the third one
+paid the predicted price on its first live render:
+
+- `section` was given `title`; the field is `text`. **The whole pane refused**,
+  and said so — the loud failure, and the survivable one.
+- `tabs` was given `selected`; the field is `active`. **Silently defaulted.** The
+  pane rendered with no tab highlighted and nothing anywhere said why.
+
+⇒ **The silent-default half is the argument, not the loud half.** A refused pane
+sends you to the contract; a defaulted field sends you nowhere. A typed schema
+turns both into compile errors.
+
+⚠ A field-name test now pins every name against the host's enum, in the third
+consumer. **That is a second encoding of the contract and should be deleted the
+day the typed one lands** — it is a splint, not a fix.
 
 ## ⛔⛔ [6.7] AT REST THE GUI BURNS 93% OF A CORE, AND TWO THIRDS OF IT IS THE KERNEL ANSWERING `clock_gettime`
 
@@ -1239,40 +1391,88 @@ to store.
 processes that never finished, oldest dating to boot) and the crashes
 themselves. The crash *rate* is the more valuable of the two and is unowned.
 
-## ⛔ [6.6] `AGY` LAUNCHES A PLAIN SHELL, AND NO CLI GETS ITS PERMISSION FLAG
+## ⚠ [6.6] `agy` HAS TWO GATES IN SERIES, AND ITS BYPASS FLAG RELEASES ONLY ONE
 
 **Status:** OPEN
 
-*re-reported 2026-08-13*
+*Measured 2026-08-13 on the live GUI host, BOTH ARMS IN ONE RUN.*
 
-Two halves, reported together because they are felt together:
+A row launched `agy --dangerously-skip-permissions` and a row launched with no
+flags at all produced the **identical screen**: agy's workspace-trust prompt,
+*"Do you trust the contents of this project?"*, waiting on a keypress.
 
-1. **AGY launches a plain shell** rather than its CLI. This is the same symptom
-   already tracked below for six new agent CLIs — *a remote row for any of the
-   six new agent CLIs is born a plain shell, six for six, and every field says
-   healthy*. AGY is a seventh instance; the existing entry owns the narrative.
-2. **Every CLI needs its dangerous-skip-permissions equivalent passed.** Each
-   agent CLI spells this differently, and none of them currently receive it, so
-   every spawned row stops on a permission prompt the spawner cannot answer.
+`agy --help` documents that flag as *"Auto-approve all tool permission requests
+without prompting"*, and it does exactly that — the trust gate is a **different,
+earlier gate**, per folder, and agy offers no flag for it. Muse is the contrast:
+its `--yolo` disables approval AND sandboxing AND trusts the workspace.
 
-⇒ Both are answered by the **settings work already queued below** — *the
-extra-args settings are two text boxes and there are nine CLIs; build the
-modal*. This batch's contribution is priority: it is a small change with an
-outsized effect on daily use, and it was named as such.
+⇒ **What this most likely explains, stated as a hypothesis and not a cause:** a
+row parked on a full-screen prompt is, from the sidebar, indistinguishable from
+one whose CLI never launched. The falsifier is to read the row's SCREEN rather
+than its phase — `launch_phase: Running` and a healthy `machine_health` are true
+of both.
 
-## ⭐ [6.6] ADD THE GROK BUILD CLI TO THE ARSENAL
+**What is NOT true any more:** the launcher carrying no permission flag. Every
+registered CLI now has a stored box, and it reaches the launch on both lanes —
+proven by `qwen '--yolo'` locally and `qwen --yolo` in `/proc/<pid>/cmdline` on
+the far host, with the reset case producing a bare `qwen` in the same run.
+
+**Falsifier for what remains:** find a flag, config key or state file that makes
+agy skip the trust prompt for a folder it has not seen. If one exists it belongs
+in the descriptor's Skip-checks tier; if none does, this entry closes as a fact
+about agy rather than a defect in yggterm, and the tier's explanation (which
+already says so) is the whole fix.
+
+## ⚠ [6.6] GROK BUILD'S STORE AND ITS AUTO-PROVISIONING ARE BOTH UNPROVEN
 
 **Status:** OPEN
 
-*requested 2026-08-13*
+*Landed 2026-08-13; these are the two halves that could not be proven with it.*
 
-Add Grok Build as a first-class agent CLI kind alongside the existing ones,
-including its own permission flag per the entry above and its brand colour per
-the start-page entry.
+Grok Build is a registered kind and launches: a row opened on the live host
+exec'd `grok` and drew its own TUI. Two things are declared rather than measured.
 
-⚠ Sequence it **after** the settings modal and the per-CLI permission flags,
-not before: adding a tenth CLI to a surface with two text boxes for nine of them
-makes the surface worse, and adding it to the fixed surface is a config edit.
+1. **The session store.** `~/.grok/sessions` is a path constant in the shipped
+   executable and `grok sessions list` is a real verb, but the on-disk SHAPE is
+   unread, because creating even one session needs `grok login` — an owner gate
+   (`owner-attention.md`). `title_authority` is `Generated` for the same reason:
+   the help says grok owns session titles, and declaring `Store` while unable to
+   READ one would leave every row with no name at all. **Both flip in one commit
+   once a signed-in host exists.**
+2. **Auto-provisioning.** The launch succeeded on a host that ALREADY had `grok`
+   — the owner installed it at `~/.grok/bin/grok` before this work started, and
+   the launch PATH found it there. So `CliInstall::Npm("@xai-official/grok")` is
+   correct by inspection (the npm launcher fetches the platform binary into
+   `~/.grok/downloads`, which is exactly what is on disk) and **untested on a
+   host that lacks it**.
+
+**Falsifier:** on a host with no `grok`, launch `--kind grok-build` and check
+that `~/.yggterm/npm/lib/node_modules/@xai-official` appears and the row draws
+grok's TUI rather than `grok: command not found`.
+
+## ⛔ [6.6] `server app` IS DISPATCHED IN TWO FILES, SO A NEW VERB IS ABSENT FROM THE ONE AGENTS CALL
+
+**Status:** OPEN
+
+*Found 2026-08-13 by shipping a verb into one of them.*
+
+`apps/yggterm/src/main.rs` and `apps/yggterm/src/bin/yggterm-headless.rs` each
+carry their own `match args[2]` over the whole `server app` verb surface. They
+are not a shared function with two entry points; they are two copies.
+
+**The failure is silent and every instrument agrees with it.** A verb added to
+the GUI binary alone answers `unsupported app control command: <verb>` from the
+headless CLI — which is the copy agents actually drive — while the deployed
+binary's `--build-commit` matches the deploy, the arm is visibly in the source,
+and the running GUI's `/proc/<pid>/exe` md5 matches the disk.
+
+⭐ **What settled it was two controls in one `strings` run:** the binary carried
+`unsupported app theme-editor action` (so the probe worked) and **zero**
+occurrences of the new verb (so it was genuinely absent). The positive control
+alone would have proven nothing.
+
+⇒ Collapse the two onto one dispatcher. Until then a new verb must be added to
+both, and the headless copy carries a comment saying so.
 
 ## ⛔ A READER THAT FINDS NOTHING LOOKS EXACTLY LIKE A THING THAT HAS NOTHING
 
@@ -1618,6 +1818,47 @@ and the count the writer sees change.
 ⛔ **Still not claimed: the document BODY**, for the reason in the entry above.
 The rail is what the available instrument can prove, and it is what is claimed.
 
+### Progress, 2026-08-13 — the engine, and what its proof does and does not cover
+
+**Done, and pushed to the app repo.** A single binary; a corpus manifest that
+carries every corpus's vocabulary; two fixture corpora invented end to end with
+no collection id in common; 32 tests. The scope's build order is at step 5.
+
+**The falsifier's first half is met, twice over.** One binary, checked by hash,
+renders both fixtures from their manifests alone — and the test that asserts it
+fails loudly if the two fixtures ever grow a shared collection id, because then
+it would prove nothing. The second half is met with both controls: the app
+repo's privacy checker reports clean, reports DIRTY on a planted leak, and
+reports clean again once the plant is removed.
+
+⚠ **The checker was reporting clean for the wrong reason until this session.**
+It scans untracked files deliberately, and the repo had no `.gitignore` because
+it had no code — so the first build buried every real finding under hundreds of
+dependency paths, which is the "cries wolf, gets switched off" failure its own
+comments warn about. Fixed there; worth knowing wherever else that checker is
+ported, because the defect arrives with the first line of code and not before.
+
+**Live-proven on the GUI host** — built there from the pushed commit, run in a
+backgrounded session, opened on a shadow so no operator viewport moved:
+
+- the app declares as a contribution with both panes, one of them a viewport
+  pane, and the host reaches its control endpoint;
+- the **rail pane renders the fiction corpus** — the corpus name, an Overview
+  button, and every collection with its node count;
+- the **document bar renders and re-renders**: a route change posted straight to
+  the app's own endpoint moved the bar's headings, which proves the refetch path
+  end to end without touching the GUI at all.
+
+⛔ **NOT proven, and not claimed: the document BODY.** It rendered blank — and so
+did the shipped pilot editor's, through the identical path in the same sitting.
+That control is why this is filed as its own entry above rather than carried
+here as a kasten defect. The body remains unproven either way until someone
+captures a document surface on a real GUI.
+
+**Next:** the private side — one manifest per corpus that fits, committed in that
+corpus's own repository, never here. Four of the five; the fifth is a pipeline
+rather than a corpus and gets no node overview.
+
 ## ⛔ [6.4] `server app start-page` IS A NAVIGATION VERB SHELVED AMONG THE READ VERBS
 
 **Status:** OPEN
@@ -1637,6 +1878,23 @@ verb surface made that directive impossible to follow from the name alone.
 noun that groups it with `open`) puts it in the family it belongs to. This is
 the same class as every other entry in the field guide's instrument table: *the
 verb answers a different question than its name suggests.*
+
+✅ **RE-CONFIRMED BY MEASUREMENT, 2026-08-13 at 3.0.139**, during a sweep for
+entries filed off a single field. It navigates:
+
+```
+PRE-CALL:  Terminal | local://<uuid>      ← a live row, the operator's view
+AFTER:     Rendered | None                ← the start page
+```
+
+⭐ **And the sweep caught the reverse error in its own auditor, which is the part
+worth keeping.** The sweeping cluster had recorded in its own notes that this
+verb *reads and does not navigate* — inferred from one call made while the GUI
+was **already on the start page**, where a navigating verb and a reading verb are
+indistinguishable. A single observation taken in the one state that cannot
+discriminate became a durable "instrument fact" and was nearly used to retract a
+correct entry. ⇒ **Test a state-changing verb from a state it would have to
+change**, and the viewport was restored immediately afterwards.
 
 
 ## ⛔ `deploy-fleet.sh` CANNOT RECOGNISE AN ALIAS FOR THE HOST IT IS RUNNING ON
@@ -1824,19 +2082,75 @@ answering for exactly the ancient versions nobody runs.
 
 ### Fixes — and the ranking below was INVERTED once the above was known
 
-1. ⭐⭐ **PRIMARY: a caller that cannot reach its pinned socket falls back to the CURRENT daemon.**
-   This is correctness and it deletes the whole class. The argument is already in the symptom —
-   **a version-pinned path is an optimisation, not an identity.**
-   ⚠ **But "same host, same home" must be CHECKED, not assumed.** Installs across `~/.local/bin`
-   and `~/.yggterm/bin` have been observed disagreeing, and if those resolve different
-   `$YGGTERM_HOME` values a fallback could silently attach a caller to a daemon owning none of its
-   sessions — **worse than the honest error, because it would succeed.**
+1. ⛔⛔ **ALREADY BUILT — DO NOT BUILD IT AGAIN. Measured 2026-08-13, and the ranking below was
+   written without checking.** "A caller that cannot reach its pinned socket falls back to the
+   current daemon" is `resolve_client_daemon_endpoint`, and it works **in both version
+   directions**. Reproduced against real binaries in an isolated `YGGTERM_HOME`, with the pinned
+   socket not merely dead but NON-EXISTENT:
+
+       daemon 3.0.132 live, no 3-0-128 socket at all   → the 3.0.128 CLI's `server status` answers,
+                                                          and its `server attach` gets a session the
+                                                          3.0.132 daemon owns (`local://…` in its
+                                                          `owned_terminal_session_keys`)
+       daemon 3.0.128 live, no 3-0-132 socket at all   → the 3.0.132 CLI answers and attaches too,
+                                                          reporting the mismatch rather than failing
+       both directions                                  → NOTHING on stderr, so neither can be what
+                                                          lands in an agent's composer
+
+   ⇒ **The ENOENT could not be reproduced from a CLI in either direction.** What remains is the
+   state the fallback is *correct* to fail in: **no reachable daemon at ANY version**, which is
+   exactly where the GUI host sat for 5.5 hours — the newest daemon twelve versions behind every
+   client, and no successor because nothing on the host could drain the swap queue. ⇒ **The cure
+   was a daemon at the current version EXISTING, not a cleverer client**, so the primary fix is
+   the queue-consumer one (§"A QUEUE WHOSE CONSUMER CAN BE OLDER THAN ITS PRODUCER" in the
+   hot-restart entry), and this line is closed.
+   ⚠ **Still unexplained, and it is the honest remainder:** whether any non-CLI caller bypasses
+   the resolver. The GUI's recovery walk has its own fallback
+   (`runtime_status_can_serve_current_app`, which deliberately refuses a daemon BEHIND the client
+   so an owed deploy is not hidden). **Reproduce before building anything here.**
+   ⚠ The old caveat still applies to whatever is built next: **"same host, same home" must be
+   CHECKED, not assumed** — installs across `~/.local/bin` and `~/.yggterm/bin` have been observed
+   disagreeing, and a fallback that attached a caller to a daemon owning none of its sessions
+   would be **worse than the honest error, because it would succeed.**
 2. **SECONDARY: make the alias set durable** (a ledger of bound versions, or a writer for
    `client-instances/`). ⛔ **This was ranked first and should not be**: it means reinstating the
    component whose silent disappearance caused this, then depending on it again. **The alias table
    is a CACHE, and repairing a cache leaves you depending on the cache** — one whose writer vanished
    unnoticed for forty-eight versions. With fix 1 in place this is a latency nicety and an inert
    table stops being an outage.
+   ⭐ **PARTLY LANDED, 3.0.132 — a retiring daemon bequeaths its own name.** Not a ledger and not
+   a sweep: `alias_own_socket_to_successor` runs on both handover exits, immediately before the
+   process releases its socket, and symlinks this version's socket at the successor's. It needs no
+   durable table because **it is the one instant when both names are known at once** — the
+   successor is bound and answering, the predecessor is about to unlink — and a pass run at daemon
+   START structurally cannot know it.
+   ⚠ **The gap it closes is the one a gap-filling pass cannot: its own predecessor.** A live socket
+   is invisible to a pass that only fills gaps, so **every handover orphaned exactly one version —
+   whichever was serving.** Measured twice in one evening on two hosts under two different numbers,
+   each time naming the version that had just retired; a manual alias sweep therefore re-broke
+   itself once per deploy. Traced as `retiring_daemon_aliased_own_socket` with the successor's
+   socket and an `aliased` flag, so a handover that could not bequeath its name says so.
+   ⭐⭐ **LIVE-PROVEN IN THE WILD at the very next handover (3.0.132 → 3.0.133), on TWO hosts:**
+
+       retiring_daemon_aliased_own_socket {aliased: true, server_version: "3.0.132",
+           successor_version: "3.0.133", successor_socket: ".../server-3-0-133.sock"}
+
+   and on both hosts `server-3-0-132.sock` is now a SYMLINK to `server-3-0-133.sock`, with
+   `server status --endpoint .../server-3-0-132.sock` answering **3.0.133**. ⇒ a client pinned to
+   the version that just retired reaches a live daemon instead of an ENOENT. **Survived 535 s and
+   counting.** Contrast the generation before it, which had no bequest: after 3.0.131 → 3.0.132 the
+   131 name went ABSENT and had to be re-aliased by hand.
+   ⚠ **This also FALSIFIES the sweeper hypothesis in its strong form, and the earlier measurement
+   stands unexplained rather than being quietly dropped.** A HAND-MADE alias at the just-retired
+   version was deleted three times within seconds-to-100 s, while aliases created in the same
+   command at three other versions survived; the DAEMON-WRITTEN one at the same kind of path
+   survives fine. So whatever deleted the manual symlinks does not delete these, and the guess that
+   `classify_socket_entry` condemns a name on a stale dead sighting is **not confirmed and no
+   longer load-bearing**. It is left recorded because an unexplained deletion is worth more written
+   down than forgotten.
+   ⇒ Still owed here: fix 1, which deletes the class rather than the instance; and 6.7's line for
+   whatever sweep remains — **enumerate an alias set from the versions that EXIST, never from the
+   files that happen to REMAIN.**
 3. ⛔ **INDEPENDENT, DO IT REGARDLESS: a CLI's stderr must never reach an agent row's PTY.** It is
    the blast-radius fix — the difference between *"a call failed"* and *"a row became unreachable
    and looked busy for forty minutes"* — and it is orthogonal to whichever of 1 or 2 lands.
@@ -2034,6 +2348,32 @@ sensible and is NOT taken yet, because this defect makes the sort's behaviour un
 reason about. **Fix the dry run first**, then the claim script's new duty can be verified rather
 than assumed.
 
+
+⚠ **A NAIVE RE-TEST WILL "FALSIFY" THIS ENTRY AND BE WRONG — recorded 2026-08-13
+after walking into it twice.** On an already-sorted list, `changed:false` is the
+CORRECT answer, and a dry run that reports reality and one that reports its own
+computed order are **indistinguishable there**. Two attempts to build the
+discriminating condition both collapsed back to sorted:
+
+1. Sampling `rows` and `sessions sort --dry-run` simultaneously on the live
+   sidebar — the list was in order, so `changed:false` carried no information.
+2. Creating a row via `--insert-after <last row>` and then numbering it `0.1` to
+   put its POSITION and its NUMBER in disagreement. ⛔ **`server app session
+   outline` RE-SEATS the row as it numbers it** (its help says so), so the list
+   was sorted again before the dry run could see otherwise.
+
+⇒ **The precondition is a row whose position disagrees with its number, and no
+read-only door creates one.** The remaining route is `server app sessions
+reorder` with a deliberately wrong order — which rewrites the WHOLE rendered
+order, including rows belonging to other sessions, so it is not a probe to fire
+casually on a live sidebar.
+
+⛔ **Do not retract this entry on a `changed:false` observed over a sorted
+list.** The original measurement was taken while the order was genuinely wrong,
+with both verbs launched from one shell so the difference could not be time.
+
+**Falsifier:** with a row whose position and number disagree, the dry run reports
+`changed:true`.
 ## ⛔⛔ A ROW-TABLE WRITE IS INVISIBLE TO THE NEXT READ, AND `rename`+`outline` CORRUPTS THE TITLE
 
 **Status:** OPEN
@@ -2084,6 +2424,15 @@ confirmed to be **the correct behaviour** — the request concerns only the rend
 `claude-code → Claude Code`, `codex → Codex`, `kimi → Kimi`. A naive transform gets `Claude Code`
 right by luck and will get later kinds wrong. ⛔ **The kind slug stays the SSOT** — this is a
 presentation layer over it, and the slug must not be renamed to make the label easier.
+
+⛔⛔ **DO NOT BUILD THE MAPPING — IT ALREADY EXISTS** (checked 2026-08-13 by the lane that would
+otherwise have built a second one). `AgentCliDescriptor::display_name` is that field, and three
+things already read it: `new_session_label()` composes `New Claude Code Session` for the menu
+entries, `terminal_kind_title_suffix()` uses it for row titles, and `session_metadata_label` is
+locked to `"<display_name> Session"` by a test. ⇒ **This entry is a CALLSITE that is not reading
+it**, not a missing mapping — find the one composing the title from `session_kind_label()` (the
+SLUG accessor) and hand it the descriptor instead. A second mapping is the defect the slug-as-SSOT
+rule exists to prevent.
 
 ## ⚠ A ROW ADOPTED BY A CAMPAIGN MAY HAVE BEEN THE OWNER'S, AND THE FIELD THAT WOULD SETTLE IT IS UNKNOWN
 
@@ -4829,6 +5178,31 @@ cheap way to force a local tree scan. `local_tree_scan` is throttled behind
 session store cannot ask the product to re-read it. A read-only
 `sessions rescan` would have made this entry unnecessary.
 
+
+✅ **ROOT-CAUSED AT SOURCE 2026-08-13, without firing a single LLM call** — the
+live repro would have burned a rate-limited endpoint other campaigns share, and
+a zero-means-unset bug is settleable from the code. It is two halves, and only
+both together produce the surprise:
+
+```
+apps/yggterm/src/bin/yggterm-headless.rs   .unwrap_or(0)      ← absent flag becomes 0
+apps/yggterm/src/main.rs                   .unwrap_or(0)      ← same, in the other binary
+crates/yggterm-core/src/lib.rs             let limit = if budget == 0 { usize::MAX } else { budget };
+```
+
+⇒ **`--budget 0` is byte-identical to passing no flag at all, and zero is the
+encoding for UNLIMITED.** The flag that reads as *"generate nothing"* is the flag
+for *"generate everything"*, and no caller can express the first at all.
+
+⚠ **The fix is NOT flipping the `== 0` arm.** Absent-flag currently relies on
+`0 ⇒ unlimited`, so changing the core's reading silently caps every caller that
+passes nothing. The shape that works is to distinguish ABSENT from EXPLICIT ZERO
+at the CLI — parse to `Option<usize>`, keep absent ⇒ unlimited, and give explicit
+`0` a path that generates nothing — which is a change to a shared contract with
+two call sites, not a one-line patch.
+
+**Falsifier:** `--budget 0` scans and generates nothing, while omitting the flag
+still generates without a cap.
 ## ⛔⛔ REPORTED, LIVE 2026-08-09: A DEPLOY MADE THE OPERATOR'S OWN ROW UNREACHABLE FOR 5-10 MINUTES — "the pain we go through is IMMENSELY irritating"
 
 **Status:** OPEN
@@ -5497,11 +5871,24 @@ rediscovering it. What was measured, and why none of it is a corpus:
   compile, review as correct, and fire on the wrong screens — the exact shape
   that made `isSidechain` read `false` on all 179,392 records.
 
-⇒ **What has to exist first, and it is the smaller job:** a way to read the
-screen the GATE reads — either a verb that exposes
-`session_screen_snapshot` per owned key, or the blocker list carrying a screen
-excerpt. **Then** harvest real parked-at-a-question screens from the fleet, and
-only then write the recognizer against them. ⚠ The recognizer also cannot be
+⭐ **THE PREREQUISITE IS BUILT — `server gate-screen`, 3.0.132.**
+`yggterm-headless server gate-screen [<session-key>] [--tail <n>] [--json]`
+answers, per owned session, with the screen
+`hot_update_idle_gate_blockers` classified from AND the blocker that
+classification produced — the blocker taken from the gate's own function rather
+than re-derived, so a session this verb calls unblocked is unblocked in the
+gate's eyes. Escape sequences are kept: a parked-at-a-permission-prompt screen
+is told apart partly by how it is DRAWN, and a reading stripped for legibility
+would hand the recognizer a corpus the gate never sees.
+⛔ **Read-only, on demand, and the screen never reaches a trace event** — pinned
+by `the_gate_screen_verb_never_writes_a_screen_to_the_trace`, because
+`event-trace*.jsonl` is durable, is copied around in bundles, and a session's
+screen carries whatever the person typed.
+⛔ **Denied to a shadow client, and the reason is SCOPE, not read-only-ness**
+(`a_shadow_client_may_not_read_every_session_on_the_host`): a shadow is a viewer
+of ONE session, and this answers with every session the daemon owns.
+⇒ **What is left of §3, in order:** harvest real parked-at-a-question screens
+from the fleet with this verb, and only then write the recognizer against them. ⚠ The recognizer also cannot be
 manufactured on demand without driving a live session into a permission prompt,
 which is not something to do to another agent's row.
 
@@ -5595,27 +5982,49 @@ interrupted record naming that key and a foreign `recorded_by_pid`:
 PTY, it was **submitted as a line**, which is the thing a concatenated `\r` does
 not do. The record was cleared on dispatch, so the next poll took nothing.
 
-⚠ **STILL NOT PROVEN: the deadline itself firing (`Force`), and it must not be
-manufactured.** Not for want of trying — the reason is structural and worth
-recording so nobody spends the hours again. `Force` requires a blocker set that
-is entirely interruptible, i.e. at least one AGENT-kind session and no plain
-shell beside it, and **there is no headless way to mint an agent-kind session**:
-`server attach` mints a shell by design (→ `not_restorable` → exempt → the veto
-fires first and hides the state under test), and `automation run --kind
-claude-code` routes through app-control and refuses on a host with no GUI
-(*"no live Yggterm GUI client is registered for app control on this host"*).
-The remaining honest routes are (a) catch it in the wild, or (b) a full GUI in
-`scripts/underglass-sandbox.sh`'s private sway + private `YGGTERM_HOME`, mint the
-row there, and force the deadline against a host that owns nothing real.
-⛔ Driving a live daemon that holds other agents' rows into a forced cold
-shutdown to watch the mechanism work is not a test, and is not to be done.
-**Falsifier, unchanged, and both halves must be checked:** a
-`hot_restart_forced_past_deadline` trace event naming its `interrupted` list,
-followed within the repair window by one `hot_restart_repair_continue
-{outcome: "submitted"}` per session on the daemon that adopted them — and
-`server daemons` printing `repair owed:` in between. ⛔ A forced swap whose
-repair never lands is the deadline shipping alone, which is the thing the old
-prohibition forbade.
+⭐⭐ **§5 IS NOW LIVE-PROVEN END TO END, BOTH HALVES — and the proof found a real
+defect in the second one, which is what it was for.** Run in
+`scripts/underglass-sandbox.sh`'s private sway with a private `YGGTERM_HOME` and
+a sandbox-owned binary pair, so nothing of the fleet's was touched:
+
+    hot_restart_forced_past_deadline {
+        retire_trigger: "disk_binary_replaced", owed_for_ms: 1862006,
+        reason: "local://<row> was active 44s ago (idle window 300s)",
+        interrupted: ["local://<row>"], repair_recorded: true }
+    …the daemon cold-shuts-down; a successor comes up and adopts the key…
+    hot_restart_repair_continue { session_key: "local://<row>", outcome: "not_ready" }
+
+⭐ **The recipe, because the entry said for days that this could not be built:**
+a full GUI in the private sandbox, `server app terminal new --kind claude-code`
+for a genuine agent row, `YGGTERM_DISABLE_SELF_RETIRE_HANDOFF=1` so the lane
+reaches the cold gate, a queue entry stamped 31 minutes old (the file's own
+documented clock), and a `mv` over the SANDBOX copy of the binary.
+⛔ **And the belief that blocked it was stale.** The entry recorded that a freshly
+created agent row is `not_restorable` — permanent, exempt, vetoing the force.
+Measured now: it classifies **`recently_active`, `permanent: false`**, i.e. an
+ordinary interruptible blocker. That defect was fixed at some point and the note
+outlived it, which is why `owed_for_ms: 1862006` reached a `Force` at all.
+
+⛔⛔ **THE DEFECT THE FALSIFIER FOUND: `outcome: "not_ready"`, and the record was
+already spent.** A just-re-resumed agent CLI had not brought its input loop up
+inside `HOT_RESTART_REPAIR_SUBMIT_TIMEOUT` (20 s) — exactly the hazard the code's
+own comment predicts — so the session was **interrupted by the deadline and never
+repaired**. That is the deadline shipping alone.
+**Fixed (3.0.136+): a `NotReady` key goes back on the record**
+(`requeue_unsubmitted`). It does not weaken at-most-once: `NotReady` is *proof
+nothing was written* — the probe never echoed and the submit clears the composer
+on its way out — so a retry cannot double-type, where a `Submitted`, `NoSession`
+or `Err` outcome stays spent because it is ambiguous.
+⛔ **The requeue never restamps.** `REPAIR_WINDOW_MS` is measured from the
+interruption; a requeue that moved the stamp would keep a failing repair owed for
+ever and eventually type into a session that has been back for an hour — the
+never-converging clock this project has already fixed once. Pinned by
+`a_continue_that_was_never_written_goes_back_on_the_record` and
+`a_requeue_never_drags_a_newer_interruption_backwards`.
+⇒ **Still owed on this half:** a `hot_restart_repair_continue {outcome:
+"submitted"}` observed after a real forced swap — the requeue makes it reachable
+but has not been watched converging.
+
 ⚠ **And the deadline's clock only starts where the swap lane gives up.** The cold
 gate is reached from `SwapStep::Failed`, and a host with a queue entry it keeps
 retrying returns `Lingering` instead — so on that host the deadline is never
@@ -5696,11 +6105,36 @@ shells. ⇒ **A second daemon does not disturb a pending hot-restart handshake, 
 completes it**, which is the constitution's version-coexistence clause behaving
 exactly as written.
 
-**What is still owed here:** the GUI's startup decline must **start a coexisting
-successor**, not merely record that one is owed. It is the only component on a
-stale host guaranteed to be current, and it already knows the target version and
-the daemon executable — it writes both into the queue entry. Until that ships,
-every host in this state needs a human or an agent to run the snippet above.
+⭐ **LANDED, 3.0.135 — the GUI's startup decline now STANDS THE SUCCESSOR UP.**
+`start_successor_for_declined_swap` runs beside `queue_startup_swap_intent`, and
+the outcome rides in the same `startup_hot_swap_declined_swap_queued` event
+(`successor: spawned | already_live | floored | spawn_failed`) so one line tells
+the whole story. **The GUI is the right process to do it**: it is the only
+component on a stale host guaranteed to be current, it already knows the target
+version and the daemon executable, and a daemon it spawns inherits ITS
+environment — which is the load-bearing half of the manual recipe above, got for
+free instead of reconstructed from `/proc`.
+⛔ **Two guards, and they fail differently** (`successor_spawn_verdict`, pure and
+unit-tested): a liveness check at-or-above the target, or every decline spawns a
+peer beside a successor that already exists; and a five-minute process-local
+floor, because the startup reconcile was measured re-running **three times in
+ninety seconds** and three daemons is a fork bomb wearing a repair. Neither is a
+one-shot — a repair that fired once and failed is gone rather than slow, so the
+floor retries.
+**Still owed, and an attempt to close it narrowed the scope instead.** The call
+is source-pinned and the guards are unit-tested, but **the spawn has not been
+watched happening.** A full GUI was run in `scripts/underglass-sandbox.sh`'s
+private sway against a private home holding exactly the failing shape — a
+3.0.128 daemon owning a live runtime, no newer socket, a 3.0.135 GUI — and the
+GUI **did not decline**: it took the ordinary `startup_hot_swap_requested` path
+and a 3.0.135 daemon came up that way. ⇒ the decline branch needs an
+**unaccounted** runtime key specifically, not merely a version gap, and an
+attached session is accounted for. That is worth knowing: the branch this fix
+guards is the rarer one, and reproducing it means creating a runtime the stale
+daemon has not yet persisted.
+**Falsifier, unchanged:** `successor: "spawned"` in
+`startup_hot_swap_declined_swap_queued`, followed by a daemon at the GUI's
+version appearing in `server daemons`.
 ⚠ **Do NOT reach for a socket alias instead.** Aliasing an absent version onto a
 live daemon is only sound in the older-client → newest-daemon direction; pointing
 a current client at an older daemon is the backwards cross-version proxy that has
@@ -6006,6 +6440,17 @@ payload in `{data: {...}}`. So the obvious parser reads `data.clients`, finds
 nothing, and concludes there is no GUI on any host — **indistinguishable from a
 real "GUI not running"**. Either one envelope for every app verb, or `clients`
 says plainly in its own `--help` that it is special.
+
+✅ **STILL TRUE AT 3.0.139**, measured on the GUI host in one call each:
+
+```
+clients → ['clients', 'count']
+state   → ['completed_at_ms', 'data', 'error', 'handled_by_pid', 'output_path', 'request_id']
+rows    → ['completed_at_ms', 'data', 'error', 'handled_by_pid', 'output_path', 'request_id']
+```
+
+**Falsifier:** every app verb answers in one envelope, or `clients --help` says
+it is the exception.
 
 ## ⛔ `session remove` ORPHANS THE FAR-SIDE RUNTIME AND REPORTS IT IN A FIELD NOBODY READS
 
@@ -6368,39 +6813,6 @@ using the trace to decide whether a daemon code path fired will read a zero and
 believe it. That is worth its own look; it made this fix briefly appear not to
 run at all.
 
-## ★★★ THE EXTRA-ARGS SETTINGS ARE TWO TEXT BOXES AND THERE ARE NINE CLIs — build the modal
-
-**Status:** OPEN
-
-⭐ **Load-bearing, recorded 2026-08-08.**
-
-The settings rail holds **Codex Extra Args** and **Claude Code Extra Args**: two
-free-text boxes, one helper line each. Nine CLIs are now first-class, each with
-its own permission vocabulary — codex has `-a/--sandbox` policies, Claude has
-six `--permission-mode` values, opencode has one `--auto` flag and puts denials
-in a config file, qwen has a sandbox and **no bypass flag at all**, and pi has no
-blanket bypass but does have tool allow/deny lists. Nine more boxes in a rail
-would be nine chances to type the wrong CLI's flag.
-
-**Owner directive:** *"since we have so many CLIs now, the settings extra args
-system needs to be a modal … pre-populate the same type of least-permission-
-checks input box populated, and the explanations for each of the CLIs."*
-
-**The design and the per-CLI content are written and measured:**
-[`spec-agent-cli-extra-args-modal.md`](spec-agent-cli-extra-args-modal.md) — a
-descriptor-generated modal, three tiers per CLI (`Ask each time` · `Sandboxed` ·
-`Skip checks`), each tier's exact flags and its one-sentence explanation read off
-that CLI's own `--help` on this fleet, with kimi and muse declared **unmeasured**
-rather than guessed.
-
-⛔ Two things that would make this a regression rather than a feature: **resetting
-the two values the owner has already set** (migrate them verbatim), and
-**hand-writing nine rows of `rsx!`** instead of generating from the descriptor —
-the exact defect the titlebar `+` menu is filed for two entries below.
-
-⚠ It also inherits the row menu's proof problem: if app control cannot open the
-modal, the verb to open it is part of this work, not a follow-up.
-
 ## THE INTERFACE LLM IS HARD-WIRED TO ONE HTTP PROVIDER — it needs a provider dropdown
 
 **Status:** OPEN
@@ -6509,82 +6921,27 @@ comparing **hashes**, that either self-heals or reports which host is behind —
 and it must survive the case it exists for, a host where the hot-restart gate
 never opens.
 
-## ⛔⛔ A REMOTE ROW FOR ANY OF THE SIX NEW AGENT CLIs IS BORN A PLAIN SHELL — six for six, and every field says healthy
+## THE `--kind` REPLY OVER-REPORTS AND DOES NOT ROUND-TRIP
 
 **Status:** OPEN
 
-Measured 2026-08-08 12:15–12:35 IST on the live fleet (GUI guihost 3.0.52, remote
-host `dev`), by launching all six new kinds twice: once remote, once local.
+Found 2026-08-08; the `--help` half closed 2026-08-13.
 
-**Remote (`--kind <cli> --machine-key dev`)** — `terminal new` answers
-`session_kind:"pi"`, `launch.applied:true`, `seat.honoured:true`, and the row
-renders with `machine_health:"healthy"`, `remote_deploy_state:"Ready"`. The
-process that actually appears on `dev` is:
+`--kind opencode` answers `session_kind:"open_code"`; `--kind qwen-code` answers
+`"qwen_code"`; `--kind grok-build` answers `"grok_build"`. Feeding any of them
+back is refused: `unsupported app-control terminal kind "open_code"`. **A caller
+that reads a row's kind and launches another like it fails on exactly the kinds
+whose slug carries a hyphen** — three of ten now, and every future hyphenated
+slug joins them.
 
-```
-3841329  /bin/bash -i      <- kind=pi
-3846866  /bin/bash -i      <- kind=opencode
-3847130  /bin/bash -i      <- kind=qwen-code
-3847507  /bin/bash -i      <- kind=kimi
-3847985  /bin/bash -i      <- kind=muse
-3848634  /bin/bash -i      <- kind=antigravity
-```
+The kind vocabulary has three encodings — flag token, enum debug name, help text
+— and no owner. Collapse them onto the descriptor's `slug`, which is already the
+SSOT the intake built.
 
-No CLI is exec'd, and nothing fails: there is no `command not found`, because
-the CLI was never invoked. The row's path is `live::<uuid>` — a generic remote
-shell — not an agent scheme, and its icon is `$_`. **The `$_` icon is not an
-icon bug; it is the truth about a row that really is a shell.**
-
-**Local control (same kinds, no `--machine-key`)** — the CLI is exec'd
-(`… && pi`, `node …/qwen-code/cli.js`, opencode's TUI on screen) and the row
-carries its own `icon_kind`/`icon_text`: `π_ OC_ Q_ K_ M_ A_`. So the
-descriptors, the registry, the icon pipeline and the auto-provisioner are all
-correct. **Only the remote launch path is deaf to the new kinds.**
-
-**Root cause, in the code:** `crates/yggterm-core/src/agent_scheme.rs:347` —
-*"Current remote AGENT ROW schemes — `remote-session://` and `remote-cc://`"*.
-There are exactly two, minted for codex and Claude Code. A kind with no remote
-scheme falls through to the plain live-shell path, which is why the request is
-accepted and the row is wrong.
-
-**What it costs:** the handoff *is* the product — click a row, get
-`ssh <machine> "cd <cwd> && <cli> resume <uuid>"`. For six of the nine
-first-class CLIs that handoff does not exist on any machine but the GUI's own,
-and it fails **silently**, which is worse than refusing.
-
-**Fix shape:** carry the descriptor's slug across the hop — either one generic
-`remote-agent://<host>/<slug>/<uuid>` scheme (so the tenth CLI stays data) or a
-per-CLI scheme minted from the descriptor. ⛔ Until it lands, `terminal new
---machine-key` must **refuse by name** any kind it cannot carry. A launch that
-degrades to a shell while reporting `applied:true` is the response-layer defect
-this repo already has an entry for, in its most expensive form.
-
-**Falsifier:** launch `--kind pi --machine-key dev`, then read
-`/proc/<pid>/cmdline` of the process the remote daemon spawned. `pi` means
-fixed; `bash -i` means this entry stands.
-
-## THE `--kind` VOCABULARY IS WRONG IN TWO DIRECTIONS AT ONCE
-
-**Status:** OPEN
-
-Found 2026-08-08 while probing the six-CLI intake on 3.0.52.
-
-1. **`--help` under-reports.** Both usage blocks for `server app terminal new`
-   still read `--kind <shell|codex|claude-code>`. The parser accepts nine:
-   `codex, codex-litellm, claude-code, pi, opencode, qwen-code, kimi, muse,
-   antigravity`. An agent that reads the help cannot discover six of them.
-   ⭐ The *refusal* string already lists all nine correctly — the help is the
-   only surface that lies, so this is a one-line drift with a ready source of
-   truth.
-2. **The reply over-reports, and does not round-trip.** `--kind opencode`
-   answers `session_kind:"open_code"`; `--kind qwen-code` answers
-   `"qwen_code"`. Feeding either back is refused:
-   `unsupported app-control terminal kind "open_code"`. **A caller that reads a
-   row's kind and launches another like it fails on exactly two of nine kinds.**
-
-Both halves are the same defect — the kind vocabulary has three encodings (flag
-token, enum debug name, help text) and no owner. Collapse them onto the
-descriptor's `slug`, which is already the SSOT the intake built.
+✅ The help half is fixed: both usage blocks said `--kind <shell|codex|claude-code>`
+while the parser accepted nine, and they now say `<shell|<agent-cli>>` and point
+at the refusal string, which is generated from the registry and has always been
+correct.
 
 ## TESTS ARE FLAKY UNDER PARALLEL EXECUTION — they pass alone and fail in the suite
 
@@ -7702,9 +8059,32 @@ Reported by row 5.1, untouched here. On **guihost**, `ygg-unwedge` answers *"no 
 running"* — with and without `DISPLAY=:1` — while `server app clients` on that same host lists a
 live client on display `:1`. **The remedy tool is blind on the one machine it exists to remedy.**
 
-Same family as the two entries above: a resolver fails, says nothing useful, and the caller is left
-to invent a theory. Start by comparing what `ygg-unwedge` looks for against what
-`client-instances` actually records.
+✅ **ROOT-CAUSED 2026-08-13 at 3.0.139, and it is two defects in one line.** The
+tool opens with `sup=$(pgrep -f "yggterm --supervise" | head -1)` and exits on
+empty.
+
+1. ⛔ **NOTHING SUPERVISES THE GUI ANY MORE.** On the GUI host the process is
+   `/home/…/yggterm` with **PPID 1** — `server app launch` detaches it and init
+   adopts it, so no `--supervise` process exists to find. The tool's premise is
+   stale, not its resolver. Verified in both directions: a clean run prints the
+   filed symptom verbatim (*"no yggterm GUI supervisor running"*) while
+   `server app clients` lists a live client on that same host.
+
+2. ⛔⛔ **`pgrep -f <pattern>` MATCHES THE CALLER'S OWN COMMAND LINE, so the tool
+   can "find" a supervisor that is the shell asking the question** — and then
+   walks `pgrep -P` to an unrelated child and reports a confident verdict about
+   it. Hit live while measuring this: a diagnostic run whose command line
+   contained the pattern answered *"GUI <pid> has no edit socket; not the
+   flush-gate freeze"* — a specific, plausible, entirely wrong diagnosis about a
+   pid that was not the GUI. The clean run needs the pattern kept out of the
+   caller's argv (build it at runtime, or invoke through a script file).
+
+⇒ The fix is to find the GUI the way everything else does — the client-instances
+record — not to repair the supervisor search. ⚠ And the `pgrep -f` half is
+generic: any fleet tool that discovers a process this way can diagnose the shell
+that asked.
+
+**Falsifier:** on a host with a live GUI client, the tool names that GUI's pid.
 
 ## UNIT TESTS WRITE TRACE EVENTS INTO THE DEVELOPER'S REAL `~/.yggterm`
 
@@ -8270,6 +8650,12 @@ That is a discovery cost paid by every future caller: the honest answer is a
 usage error naming the missing argument. ⚠ Same shape as any parser that treats
 "wrong number of arguments" as "no such thing" — worth a scan for siblings while
 fixing it.
+
+✅ **STILL TRUE AT 3.0.139:** `server sessions reorder` →
+`Error: unsupported server sessions action: reorder`, verbatim.
+
+**Falsifier:** the arity miss names the missing argument instead of denying the
+verb exists.
 
 ## ★★ WHO OWNS "IS THIS ROW WORKING?" — three tools, three answers
 
@@ -9388,18 +9774,21 @@ instrument — the gutter's `document_wrap_gutters` had to be proven through
 `dom-eval` instead. **Fix the timeout, or `app state` quietly stops being the
 probe the field guide says it is.**
 
+✅ **STILL TRUE AT 3.0.139** — `degraded_reason: dom_debug_snapshot_timeout` on
+the live GUI, with `document_editor_count` absent.
 
-## ⚠ TOOLING: server app dom-eval ignores --client / --pid placed before
+⚠ **BUT THE TITLE OVERSTATES IT, AND THAT MATTERS MORE THAN THE CONFIRMATION.**
+*Every* DOM probe field is NOT unreadable: **66 `dom` keys came back in the same
+reply**. The snapshot degrades and drops NAMED fields; it does not go dark. An
+agent reading the headline abandons a working instrument and goes to `dom-eval`
+for things `app state` would have answered — which is a second cost the entry
+was creating rather than describing.
 
-**Status:** OPEN
+⇒ Read `degraded_reason` and then **check for the field you actually want**; its
+absence is the signal, not the presence of the timeout.
 
-**⚠ TOOLING: `server app dom-eval` ignores `--client` / `--pid` placed before
-the script.** It takes the script positionally at `args[3]`, so
-`dom-eval --client shadow '<script>'` silently evaluates the STRING
-`--client` — a successful-looking eval of the wrong thing, which is the
-lie-of-success shape. The global override works only with the script FIRST.
-Either parse the flags or refuse a script that looks like a flag; the skill's
-example should be reordered either way.
+**Falsifier:** with `degraded_reason` set, count the `dom` keys — if it is not
+near zero, the loss is specific and can be named.
 
 
 ## ★★ THE APP ACTION POST DOES NOT NAME ITS SESSION, AND THE DOCUMENT CHANNEL IS
@@ -9966,6 +10355,28 @@ addressable route that reveals a picker surface (the rail/strip badge opens
 the profile SWITCHER menu, `webprofile:<name>` entries only), after which the
 existing `app screenshot --client <shadow>` does the rest.
 
+⚠ **NARROWED 2026-08-13 — "nothing an agent can drive" is too strong, and the
+difference changes who can fix it.** The route IS addressable: `server app open
+webprofile:<name>` is accepted, sets `active_session_path: "webprofile:<name>"`
+and `active_view_mode: "Rendered"`, and then fails with a NAMED reason:
+
+```
+timed out waiting for app open to settle for webprofile:<name>:
+  {"active_session_path":"webprofile:<name>","active_view_mode":"Rendered",
+   "ready":false,"reason":"preview surface not mounted"}
+```
+
+⇒ The missing piece is the **surface mount**, not an addressable route, and the
+verb already says so in its own words. That is a much smaller thing than
+"nothing exists", and it means the screenshot half may be one fix away rather
+than one feature away.
+
+⚠ **The probe moves the operator's view** — it sets the active session before it
+fails — so restore the previous row immediately after. Done here.
+
+**Falsifier:** `open webprofile:<name>` settles, and `app screenshot` returns the
+picker card.
+
 
 ## A WebKitNetworkProcess OUTLIVES the WebContext that started it, and
 
@@ -10225,6 +10636,14 @@ so the filing agent had to fall back to the user's live GUI host. Fresh
 evidence for settled call #6 (drive shadow surfaces with the GUI closed /
 server-side rendering, docs/optimization-pass.md WS2): today agent browsing
 physically requires the user's GUI host.
+
+✅ **STILL TRUE 2026-08-13**: `server app clients` on that headless host answers
+`{"clients": [], "count": 0}`. Re-measured during a sweep, and it is a
+state-of-the-world claim rather than a defect report — it stays true until
+server-side rendering lands, so it should be re-read as a standing constraint,
+not as a bug awaiting a fix.
+
+**Falsifier:** a headless host answers `count > 0` without the user's GUI running.
 
 
 ## ★★ THE DAEMONS CHAIN, AND ONE IDLE bash -i IS WHY (root-caused
@@ -11336,3 +11755,119 @@ the earlier investigation had nothing to count. Keep a monotonic
 - Falsifier: a subscribed row whose turn has ended and whose transcript was last
   written 5–10 minutes ago must be booted at its deferral deadline, and the log
   must show why.
+
+# THE 6.9 BATCH — found while building the phone's transport
+
+Four tooling defects, none of which blocked the phone lane, all found by using
+the CLI as an instrument rather than by reading it. Each is filed against the
+thing that owns it, not against the lane that tripped over it.
+
+## ⛔⛔ [6.9] `server status --json` IS NOT A FLAG, AND IT FAILS BY GOING QUIET
+
+**Status:** OPEN
+
+*found 2026-08-13 while measuring response weights for the phone*
+
+`server status` already emits JSON. Passing `--json` — which every neighbouring
+verb accepts (`server daemons --json`, `server gate-screen --json`,
+`server perf-summary --json`) — prints usage and leaves **stdout empty**.
+
+**Why this is worse than a plain error.** The natural way to measure a response
+is `server status --json | wc -c`. That returns `0`. A previous session did
+exactly this, got `0` for both `status` and `snapshot`, and wrote the conclusion
+into a design document as a measured fact: *"no daemon is running on the host
+this session sits on."* A daemon was running, with hundreds of sessions. The
+document then carried that as the reason a load-bearing number could not be
+obtained.
+
+⇒ **A flag a tool does not have is indistinguishable from a service that is not
+there, if the only thing you look at is the byte count.**
+
+**Fix:** accept `--json` as a no-op on the verbs that already emit JSON, *or*
+write the usage to stderr and exit non-zero. Either removes the silent-empty
+path. The first is friendlier, because the flag is guessable precisely because
+its neighbours take it.
+
+**Falsifier:** `server status --json | wc -c` returns a number greater than zero,
+or the command exits non-zero.
+
+## ⛔ [6.9] THE ROW-CLEANUP VERB IS NAMED IN THREE PLACES AND EXISTS IN NONE OF THEM
+
+**Status:** OPEN
+
+*found 2026-08-13 cleaning up a throwaway session*
+
+The documented cleanup step for a probe row is written as `session remove`. That
+is not a verb. Three separate corrections are needed before it works:
+
+1. `server session remove …` answers `unsupported server command: session`. The
+   real verb is **`server app session remove`**.
+2. It is app-control, so it only answers **on the host where the GUI runs**. ⭐
+   The error for this is genuinely good — it names the candidate hosts and the
+   exact command to identify the right one. That message is the model the rest of
+   this entry should be held to.
+3. It removes the row **from the GUI**, and the owning daemon still lists the
+   session afterwards. Ending the process took writing `exit` and then a lone
+   carriage return into the PTY.
+
+⇒ Three different questions — *what is the verb*, *where does it answer*, *what
+does it actually remove* — and the documented name answers none of them. This is
+the standing pattern: **a row verb reports the request, not the effect.**
+
+**Fix:** correct the name wherever the cleanup step is written, and say both the
+GUI-host constraint and the fact that removal is a GUI-side operation. If a
+caller wants the runtime gone, that needs to be a separate, named thing.
+
+**Falsifier:** the documented cleanup line, copied verbatim, removes a probe row
+and its runtime.
+
+## ⚠ [6.9] `server attach` DOUBLE-PREFIXES A KEY THAT ALREADY CARRIES A SCHEME
+
+**Status:** OPEN
+
+*found 2026-08-13 creating a throwaway session*
+
+Creating a session with a key of the form `local://<name>` produces a session
+whose key is `local://local://<name>`. It is then addressable only by the
+doubled form, so every later call has to repeat the mistake to work.
+
+**Fix:** strip an existing scheme, or refuse the argument. Silently concatenating
+is the one option that makes the caller carry the error forward.
+
+**Falsifier:** attaching with a scheme-qualified key yields a session listed
+under exactly that key.
+
+## ⛔⛔ [6.9] A REPOSITORY THAT HAS NEVER HOSTED AN AGENT SESSION CANNOT HOST A ROW
+
+**Status:** OPEN
+
+⚠ Root cause NOT found. The inherited explanation is wrong and is falsified
+below; do not build around it.
+
+*reported by the orchestrator 2026-08-13: three attempts to create a row with a
+cwd in one particular repository, three failures to ever consume input, against
+five contemporaneous launches into sibling worktrees that came up normally —
+same host, same verb, same model, same minute*
+
+**What is falsified.** The claim as stated — that this repository cannot host a
+row — is not about the repository and not about the agent CLI. Run directly in
+that directory, the CLI answers a prompt normally and exits zero; the identical
+control in a working worktree behaves the same. So the failure is in the
+**row-launch path**, not in the destination.
+
+**The one hard datum.** No project namespace directory existed for that cwd
+despite three launch attempts, so those launches never reached session
+initialisation at all. A row appeared; nothing behind it started.
+
+**A hypothesis tested and rejected**, recorded so it is not re-derived: the
+obvious candidate is a first-run trust gate on an unseen directory. It does not
+hold. None of the sibling worktrees that host working rows has a trust entry
+either, so the presence or absence of one does not separate the failures from
+the successes.
+
+⚠ **RE-TESTING THAT CWD IS NOW CONTAMINATED.** Probing it created the namespace
+that was previously absent, so it no longer starts from the original condition. A
+clean reproduction needs a cwd that has never hosted an agent session.
+
+**Falsifier:** a row created with a cwd that has never hosted an agent session
+reaches a composer and consumes input.

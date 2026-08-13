@@ -30,6 +30,18 @@ copies.
 
 ## Decisions only he makes
 
+- **The fleet unpushed-audit snippet in his own global instructions is blind to worktrees — may we
+  replace it?** In a git worktree `.git` is a FILE, so the snippet's `[ -d "$r/.git" ]` test is
+  false and the repo is never examined: no row, no error, just a clean-looking all-clear. On this
+  fleet that silently skips ~12 `yggterm--*` worktrees, which is where nearly all campaign work
+  happens — the backstop is blind exactly where the divergence it exists to catch would occur. It
+  was not edited because it lives in his private instruction files, which an agent does not rewrite
+  on a peer's report. **Recommendation: paste this one-liner over the old test and count**, which
+  is correct for plain checkouts, worktrees, and lane branches with no remote ref of their own:
+  `[ -e "$r/.git" ]` and `git -C "$r" rev-list --count HEAD --not --remotes=origin`.
+  *Meanwhile:* the corrected form was run across all 17 checkouts — everything is pushed, nothing
+  is outstanding, and the relay will keep running the corrected version by hand each session.
+
 - **The public lore corpus maps which services he uses, even after every listed private term is
   scrubbed — remove the corpus, or keep the feature?** The term-list rewrite catches the names on
   the guard list; it cannot catch the COLLECTION, and a set of site-lore entries for portals and
@@ -99,6 +111,15 @@ copies.
   him; see `settled-calls.md`. What remains his: authenticating Muse once it
   is installed, since the credential is his.
 
+- **Grok Build needs one sign-in, and two descriptor fields are waiting on it.**
+  The CLI is registered, installed and launching; `grok login --device-code`
+  prints a code that can be completed on a phone, or `XAI_API_KEY` in the
+  environment does the same job. Until one session exists on a signed-in host,
+  its on-disk session store cannot be READ, so yggterm cannot list past Grok
+  sessions and generates row titles rather than respecting the ones grok writes.
+  Both flip in one commit the moment a session exists — the queue entry names
+  the falsifier. ⚠ Nothing else is blocked: launch and resume work now.
+
 - **The two-app split for phone superpowers is a product call, not a build
   call.** A clean `yggterm` for the stores, versus a sideload-only
   `yggterm-agent` carrying accessibility, SMS and overlay permissions. It is his
@@ -163,6 +184,16 @@ copies.
 - **Windows and macOS builds are 3.x milestones and are not to be opened
   unprompted** (user directive). Listed here only so a session that trips over a
   cross-platform failure knows it is parked on purpose rather than forgotten.
+- **`yggtopo` is published PRIVATE and the flip to public is his.** The new
+  fleet app is built, tested and pushed to its own repo under the org, with the
+  org-wide platform licence already settled (GPL-3.0-or-later, so nothing is
+  owed on that question). It was NOT made public: publishing indexes a repo and
+  is not reversible by deleting it, and the sibling apps' visibility was his
+  call each time. **Recommendation: make it public, matching the other platform
+  apps** — nothing in it is private, the guard passes, and every example in it is
+  invented. **Done meanwhile:** the repo is private with full history and the
+  binary is on the fleet, so the app is usable now either way. **To reverse:**
+  one visibility change; nothing else depends on it.
 
 ---
 

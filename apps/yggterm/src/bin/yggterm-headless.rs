@@ -49,7 +49,8 @@ use yggterm_server::{
     run_app_control_app_pane_action, run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded,
     run_app_control_set_search, run_app_control_set_session_keep_alive,
-    run_app_control_set_split_group_ratio, run_app_control_set_theme_editor_open,
+    run_app_control_set_launch_flags, run_app_control_set_split_group_ratio,
+    run_app_control_set_theme_editor_open,
     run_app_control_set_theme_editor_values, run_app_control_set_tree_selection,
     run_app_control_set_window_chrome_hover, run_app_control_show_start_page,
     run_app_control_split_web_tab, run_app_control_start_action,
@@ -191,6 +192,11 @@ fn print_server_help() {
   yggterm-headless server status
   yggterm-headless server daemons [--json]
   yggterm-headless server relay-boundary [--by <who>] [--wait-secs <n>] [--json]
+  yggterm-headless server gate-screen [<session-key>] [--tail <n>] [--json]
+    what the hot-restart idle gate is CLASSIFYING FROM, per owned session — the
+    live in-daemon screen plus the blocker it produced. This is not
+    `server snapshot`'s terminal_lines, which is usually a stored summary line
+    rather than screen text. Read-only, on demand, never written to the trace.
   yggterm-headless server <status|snapshot> --endpoint <socket-path|version|pid>
   yggterm-headless server snapshot
   yggterm-headless server shutdown
@@ -1311,6 +1317,15 @@ fn main() -> Result<()> {
     // the live host. Children inherit whatever we resolve here.
     let _session_bus = yggterm_core::session_bus::adopt_or_refuse_session_bus();
 
+    // This process becomes a DAEMON that outlives the file it was loaded from,
+    // so it publishes the source it was built from while it still can. See
+    // `yggterm_server::build_identity` for why nothing outside can recover it.
+    //
+    // ⚠ AFTER the bus resolve, not before — same reason as the GUI binary's:
+    // "first statement in main()" is the whole guarantee the lock enforces, and
+    // nothing here needs the identity declared first.
+    yggterm_server::build_identity::declare_build_commit(build_identity::build_commit());
+
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_target(false)
@@ -1415,6 +1430,60 @@ fn main() -> Result<()> {
                 "message": message,
             }))?
         );
+        return Ok(());
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "gate-screen" {
+        // §3's audit instrument. Read-only, on demand, and connected directly
+        // like the other read-only diagnostics — a verb that spawned a daemon
+        // in order to ask what a daemon is looking at would answer about a
+        // process that did not exist when the question was asked.
+        //
+        // ⛔ NOT WRITTEN ANYWHERE. The screens go to this stdout and nowhere
+        // else — see `HotRestartGateScreen`. A caller harvesting a corpus owns
+        // where it lands and how long it lives.
+        let endpoint = cli_server_endpoint(store.home_dir());
+        let path = args.get(2).filter(|arg| !arg.starts_with("--"));
+        let tail_lines = cli_flag_value(&args, "--tail").and_then(|value| value.parse().ok());
+        let sessions = yggterm_server::hot_restart_gate_screens(
+            &endpoint,
+            path.map(String::as_str),
+            tail_lines,
+        )?;
+        if args.iter().any(|arg| arg == "--json") {
+            println!("{}", serde_json::to_string_pretty(&sessions)?);
+            return Ok(());
+        }
+        if sessions.is_empty() {
+            println!("no sessions owned by this daemon match");
+            return Ok(());
+        }
+        for session in &sessions {
+            let verdict = match session.blocker.as_ref() {
+                Some(blocker) => format!(
+                    "{kind}{permanent}, idle {idle}",
+                    kind = blocker.kind,
+                    permanent = if blocker.permanent { " (permanent)" } else { "" },
+                    idle = blocker
+                        .idle_ms
+                        .map(|ms| format!("{}s", ms / 1000))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+                None => "not blocking".to_string(),
+            };
+            println!(
+                "== {key}\n   gate verdict: {verdict}\n   screen_text_shows_agent_working: {working}\n   screen: {screen}",
+                key = session.session_key,
+                working = session.shows_agent_working,
+                screen = if session.screen_available {
+                    "readable"
+                } else {
+                    "UNREADABLE — the gate is classifying this one blind"
+                },
+            );
+            for line in session.screen_tail.iter().flatten() {
+                println!("   | {line}");
+            }
+        }
         return Ok(());
     }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "app-declares"
@@ -2325,6 +2394,42 @@ fn main() -> Result<()> {
                     other => anyhow::bail!(
                         "unsupported app command action: {other} (try list|invoke <id>)"
                     ),
+                }
+            }
+            // ⛔ THE SAME ARM EXISTS IN `apps/yggterm/src/main.rs`, AND THAT IS
+            // THE DEFECT, NOT THE DUPLICATION. `server app` is dispatched twice
+            // — once in the GUI binary, once here — so a verb added to one is
+            // ABSENT from the other while every instrument agrees the code
+            // shipped: the binary carried the arm, `--build-commit` matched the
+            // deploy, and `server app launch-flags` still answered "unsupported
+            // app control command". Filed in pending-bugs; until the two
+            // dispatchers become one, a new verb must be added HERE too, and
+            // this is the copy agents actually call.
+            "launch-flags" => {
+                let positional = cli_positional_args(&args, 3);
+                let action = positional.first().copied().unwrap_or("open");
+                let slug = cli_flag_value(&args, "--cli").map(str::to_string);
+                let flags = cli_flag_value(&args, "--args").map(str::to_string);
+                match action {
+                    "open" | "show" | "on" | "true" | "1" => {
+                        run_app_control_set_launch_flags(Some(true), slug, flags, timeout_ms)
+                    }
+                    "close" | "hide" | "off" | "false" | "0" => {
+                        run_app_control_set_launch_flags(Some(false), slug, flags, timeout_ms)
+                    }
+                    "set" => {
+                        let slug = slug.context(
+                            "server app launch-flags set needs --cli <slug> (and --args to \
+                             store; omit --args to reset that CLI to its default)",
+                        )?;
+                        run_app_control_set_launch_flags(None, Some(slug), flags, timeout_ms)
+                    }
+                    "reset" => {
+                        let slug = slug
+                            .context("server app launch-flags reset needs --cli <slug>")?;
+                        run_app_control_set_launch_flags(None, Some(slug), None, timeout_ms)
+                    }
+                    other => anyhow::bail!("unsupported app launch-flags action: {other}"),
                 }
             }
             "theme-editor" => {
