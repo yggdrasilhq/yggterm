@@ -48,6 +48,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ygg_host import resolve_gui_host  # noqa: E402
+
 STATE = Path.home() / ".yggterm" / "relay"
 PROJECTS = Path.home() / ".claude" / "projects"
 
@@ -217,7 +220,17 @@ def row_exists(gui_host, ident):
     was a corpse.
     ⇒ **A transcript cannot distinguish KILLED from WEDGED.** Only the row list
       can, and it must be consulted FIRST. (It also explains a `submitted:false`
-      that looked like a busy row refusing input: there was no row.)"""
+      that looked like a busy row refusing input: there was no row.)
+
+    ⛔ TRI-STATE, AND THE THIRD VALUE IS THE IMPORTANT ONE. True = listed.
+    False = the plane answered and this row was not in it. **None = the plane did
+    not answer at all**, which is a fact about US and must never be rendered as a
+    verdict about the row."""
+    if not gui_host:
+        return None
+    reply = ygg(gui_host, "server", "app", "rows")
+    if not isinstance(reply, dict) or "data" not in reply:
+        return None
     return resolve_row_path(gui_host, ident) is not None
 
 
@@ -413,7 +426,7 @@ def main():
     ap = argparse.ArgumentParser(description="keep delegate rows running")
     ap.add_argument("--row", action="append", default=[])
     ap.add_argument("--spawned-by", default="")
-    ap.add_argument("--host", default=os.environ.get("YGG_GUI_HOST", "guihost"))
+    ap.add_argument("--host", default=None)   # ⛔ resolved, never a placeholder
     ap.add_argument("--notify-session", default=os.environ.get("YGGTERM_SESSION_ID", ""))
     ap.add_argument("--watch", type=int, default=0,
                     help="seconds to keep watching; 0 = one pass")
@@ -421,6 +434,11 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
+    # ⛔ Resolve the GUI host OUT LOUD before any row is judged. App control
+    # only answers where the GUI runs; an unresolved host makes every
+    # `row_exists` call fail, and this tool renders that as GONE/RETIRED —
+    # a TERMINAL verdict about live rows, which stops the supervision.
+    args.host = resolve_gui_host(args.host)
 
     rows = list(args.row)
     if args.spawned_by:
@@ -441,7 +459,21 @@ def main():
             rhost = row_host(row, args.host)
             if rhost and rhost == os.uname().nodename:
                 rhost = None                      # it is this machine after all
-            if not row_exists(args.host, row):
+            exists = row_exists(args.host, row)
+            if exists is None:
+                # ⛔⛔ BLIND, NOT GONE — and the difference is the whole point.
+                # `GONE`/`RETIRED` is terminal: a supervisor that reaches it stops
+                # supervising. Measured 2026-08-13 from two campaigns in one hour:
+                # an unresolvable GUI host made this report live, subscribed,
+                # working rows as retired, and a wave was one step from being
+                # treated as finished. A watchdog that cannot tell "I could not
+                # look" from "it is dead", and resolves that toward standing down,
+                # is worse than no watchdog. BLIND is non-terminal: keep watching.
+                report.append({"row": row, "state": "BLIND", "age_min": 0,
+                               "action": "STILL-WATCHING", "tail":
+                               "row plane unreachable — this says nothing about the row"})
+                continue
+            if not exists:
                 # ⛔ Ask the ROW LIST before the transcript. A retired row's
                 #    transcript is frozen mid-turn and is indistinguishable from
                 #    a live wedge.

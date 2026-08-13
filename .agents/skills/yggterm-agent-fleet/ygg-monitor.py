@@ -61,6 +61,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ygg_host import resolve_gui_host  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 STATE = Path.home() / ".yggterm" / "relay"
 SUBS = STATE / "monitor"
@@ -98,15 +101,63 @@ def _babysit():
     return mod
 
 
+#: Returned instead of a reply when the CALL ITSELF failed. ⛔ It is not an
+#: empty answer, and no caller may read it as one — see ygg_host.py for the
+#: afternoon this distinction cost.
+UNREACHABLE = {"__unreachable__": True}
+
+
 def ygg(host, *args):
-    cmd = ["ssh", host, "~/.local/bin/yggterm-headless " + " ".join(
+    if not host:
+        return dict(UNREACHABLE)
+    cmd = ["ssh", "-n", host, "~/.local/bin/yggterm-headless " + " ".join(
         f"'{a}'" if " " in str(a) else str(a) for a in args)]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         out = r.stdout
-        return json.loads(out[out.find("{"):]) if "{" in out else {}
+        if "{" not in out:
+            return dict(UNREACHABLE)
+        # ⛔ NOT `json.loads(out[out.find("{"):])`. At least one verb replies with
+        # TWO concatenated JSON objects, and that idiom reads the first and
+        # discards the rest WITHOUT RAISING — a truncated answer the watchdog
+        # then acts on confidently. `raw_decode` stops at the first document and
+        # tells us there was more.
+        obj, end = json.JSONDecoder().raw_decode(out[out.find("{"):])
+        rest = out[out.find("{") + end:].strip()
+        if rest.startswith("{"):
+            obj.setdefault("__trailing_documents__", True)
+        return obj
     except Exception:
-        return {}
+        return dict(UNREACHABLE)
+
+
+
+def _same_uuid(a, b):
+    """⛔ AN IDENTIFIER STORED AT TWO LENGTHS CANNOT BE COMPARED BY EQUALITY.
+
+    Subscriptions may hold a short uuid (whatever a brief happened to quote);
+    the row plane always answers with the full one. Equality between those is a
+    false negative that reads as a dead row. Prefix-match, with a floor long
+    enough that a collision is not a practical concern."""
+    a, b = (a or "").lower(), (b or "").lower()
+    if not a or not b:
+        return False
+    n = min(len(a), len(b))
+    return n >= 8 and a[:n] == b[:n]
+
+def live_rows(host):
+    """(rows, ok). ⛔ `ok=False` means WE ARE BLIND, not that there are no rows.
+
+    Every conclusion of the form *"this row no longer exists"* must be gated on
+    `ok`, because the failure mode this guards is a supervisor rendering its own
+    blindness as a terminal verdict about somebody else's live session."""
+    reply = ygg(host, "server", "app", "rows")
+    if reply.get("__unreachable__"):
+        return [], False
+    data = reply.get("data")
+    if not isinstance(data, dict) or "rows" not in data:
+        return [], False
+    return (data.get("rows") or []), True
 
 
 def _ep_load(uuid):
@@ -524,7 +575,7 @@ def fishy_audit(subs, dry):
     COLD_MINS = 25                # long enough that the cache is likely gone
     findings = []
     now = time.time()
-    live_rows = None
+    live_row_set = None
     for s in subs:
         uuid = s["uuid"]
         tag = f"{uuid[:8]} (seat {s.get('seat') or '-'})"
@@ -542,11 +593,19 @@ def fishy_audit(subs, dry):
         # A stale escalate_to re-enters through frozen briefs, so re-check it here.
         to = _bare_uuid(s.get("escalate_to") or "")
         if to:
-            if live_rows is None:
-                live_rows = {(r.get("full_path") or "").rsplit("/", 1)[-1]
-                             for r in (ygg(os.environ.get("YGG_GUI_HOST", "***"),
-                                           "server", "app", "rows").get("data") or {}).get("rows", [])}
-            if live_rows and to not in live_rows:
+            if live_row_set is None:
+                _rows, _ok = live_rows(resolve_gui_host())
+                # ⛔ Blind means blind. An unanswered row plane must not be
+                # allowed to say a live escalation target is dead — that would
+                # send the orchestrator to repoint a subscription that is fine.
+                live_row_set = ({(r.get("full_path") or "").rsplit("/", 1)[-1]
+                                 for r in _rows} if _ok else None)
+            # ⛔ TWO LENGTHS OF THE SAME IDENTIFIER, COMPARED BY EQUALITY.
+            # `escalate_to` is stored verbatim, so a subscription made with a
+            # short uuid holds 8 chars while the row plane speaks full ones —
+            # and this check then reported a live orchestrator row as dead.
+            # Measured on the row of the seat running the check, 2026-08-13.
+            if live_row_set is not None and not any(_same_uuid(to, r) for r in live_row_set):
                 findings.append(f"⛔ {tag} escalates to {to[:8]}, which is NOT a live row — its cries go nowhere")
     if findings:
         log("FISHY — the orchestrator should look at these:")
@@ -603,7 +662,10 @@ def seat_audit(gui_host, subs, dry):
     while work is being silently overwritten. These checks are cheap, they run on
     every tick, and they are the half that was missing."""
     findings = []
-    rows = (ygg(gui_host, "server", "app", "rows").get("data") or {}).get("rows", [])
+    rows, plane_ok = live_rows(gui_host)
+    if not plane_ok:
+        log("  AUDIT ⛔ THE ROW PLANE DID NOT ANSWER — every check below that would "
+            "conclude a row is GONE is SKIPPED. This is blindness, not absence.")
     seats = {}
     for r in rows:
         p = str(r.get("outline_prefix") or "")
@@ -640,7 +702,10 @@ def seat_audit(gui_host, subs, dry):
     # Every subscribed row must still exist; a subscription to a vanished row is a
     # watcher watching nothing and reporting healthy.
     live_paths = {r.get("full_path") for r in rows}
-    for s in subs:
+    # ⛔ ONLY WHEN THE PLANE ACTUALLY ANSWERED. An unreachable GUI host once made
+    # this report every subscriber as vanished — including the orchestrator's own
+    # live row — which is a supervisor describing its own blindness as six deaths.
+    for s in (subs if plane_ok else []):
         if not any(s["uuid"] in (p or "") for p in live_paths):
             findings.append(f"⚠ SUBSCRIBED BUT NO ROW: {s['uuid'][:8]} (seat {s.get('seat') or '-'}) "
                             "— unsubscribe it or restore the row")
@@ -693,7 +758,11 @@ def prune_dead(gui_host, subs, dry):
 
     Prunes only when BOTH are true — no row AND no process. A row that is merely
     absent from the listing is not proof of death; listings have omitted live rows."""
-    rows = (ygg(gui_host, "server", "app", "rows").get("data") or {}).get("rows", [])
+    rows, plane_ok = live_rows(gui_host)
+    if not plane_ok:
+        log("  PRUNE ⛔ SKIPPED ENTIRELY — the row plane did not answer. An empty "
+            "listing is an instrument failure, never evidence that a row died.")
+        return
     live = {r.get("full_path") or "" for r in rows}
     for s in subs:
         u = s["uuid"]
@@ -714,6 +783,9 @@ def prune_dead(gui_host, subs, dry):
 
 def tick(a):
     bs = _babysit()
+    # ⛔ Resolve ONCE, out loud. An unresolved host is not a quiet default —
+    # it is a blind tick, and every verb below must know that before it runs.
+    a.gui_host = resolve_gui_host(a.gui_host)
     prune_dead(a.gui_host, load_subs(), a.dry_run)
     seat_audit(a.gui_host, load_subs(), a.dry_run)
     # ⛔ Runs over PARKED and PINNED rows too — a hold silences a verdict, not an
@@ -829,7 +901,9 @@ def main():
 
     for name, fn in (("tick", tick), ("watch", cmd_watch)):
         p = sub.add_parser(name)
-        p.add_argument("--gui-host", default=os.environ.get("YGG_GUI_HOST", "guihost"))
+        # ⛔ NO PLACEHOLDER DEFAULT. A name that does not resolve fails at the far
+        # end of the call, where the failure arrives looking like data.
+        p.add_argument("--gui-host", default=None)
         p.add_argument("--dry-run", action="store_true")
         p.add_argument("--interval", type=int, default=180)
         if name == "watch":
