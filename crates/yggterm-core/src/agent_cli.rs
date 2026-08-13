@@ -1828,7 +1828,7 @@ fn read_qwen_store_entry(path: &Path) -> Option<AgentStoreEntry> {
 ///
 /// `name` is the CLI's own title, and on a conversation that has not been named
 /// yet it is still the working directory. Handing that back as a title would
-/// make every fresh row read `/home/user`, so a name equal to the cwd is treated
+/// make every fresh row read as the home directory, so a name equal to the cwd is treated
 /// as absent — the same judgement the cwd-derived placeholder gets elsewhere.
 fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     let raw = std::fs::read_to_string(path).ok()?;

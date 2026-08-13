@@ -50,8 +50,25 @@ hits() { echo "$files" | xargs grep -nIE "$1" 2>/dev/null; }
 #    ⚠ Invented placeholders are the DESIRED form, so they are allowlisted here.
 #    A checker that flags the correct answer gets switched off, and then it
 #    protects nothing — so keep this list generous and the failure rare.
-PLACEHOLDER='/home/(user|u|x|y|z|operator|gui-host|example|someone|test|alice|bob|dev|dev-host|build)(/|\b)'
-h=$(hits '/home/[a-z][a-z0-9_-]*/' | grep -vE "$PLACEHOLDER")
+#    ⛔ THE DETECTOR MUST NOT REQUIRE A TRAILING SLASH. It used to read
+#    `/home/[a-z][a-z0-9_-]*/`, so a bare `/home/<name>` at a word boundary —
+#    in prose, in a heading, at the end of a sentence — went straight through.
+#    Measured 2026-08-13: five such occurrences sat on the public `main` while
+#    this checker reported "ok". The allowlist below already handles the
+#    unslashed form via `(/|\b)`, so only the detector was wrong.
+#    `runner`/`ubuntu`/`ci` are CI home dirs and are placeholders by nature.
+PLACEHOLDER='/home/(user|u|x|y|z|operator|gui-host|example|someone|test|alice|bob|dev|dev-host|build|runner|ubuntu|ci)(/|\b)'
+#    ⚠ ANCHORED so `/home/` must begin a path, not sit mid-URL: dropping the
+#    trailing slash made `https://host/gp/w/home/activity` read as a home path.
+#    ⛔⛔ AND THE ALLOWLIST IS APPLIED PER MATCH, NOT PER LINE. `grep -v` drops
+#    the whole line, so a line carrying BOTH a real path and a placeholder —
+#    `(\`/home/<real>\` → \`/home/user\` in ...)`, i.e. every line documenting a
+#    scrub — was laundered clean by the placeholder sitting next to it. That is
+#    a guard discarding the payload to save the wrapper: the one line most
+#    likely to quote a real path was the one line guaranteed to pass. So blank
+#    the placeholders out FIRST, then ask whether any home path is still there.
+HOMEPATH='(^|[^a-zA-Z0-9_.-])/home/[a-z][a-z0-9_-]*'
+h=$(hits "$HOMEPATH" | sed -E "s#$PLACEHOLDER#<placeholder>#g" | grep -E "$HOMEPATH")
 [ -n "$h" ] && { note "absolute personal home paths — use /home/user or an invented placeholder:"; echo "$h" | head -12 >&2; }
 
 # 2. RFC1918 addresses. Real topology is a signpost to live attack surface;
@@ -66,7 +83,13 @@ h=$(hits '\b(192\.168\.[0-9]+\.[0-9]+|10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[
 #    exist without it — so this flags the shape only when the LABEL is not an
 #    obviously invented one. Testing outline parsing is fine; naming his actual
 #    lanes is not. Add new synthetic labels here rather than weakening the rule.
-SYNTHETIC='"[0-9]+(\.[0-9]+)? (widgets|gadgets|sprockets|cogs|levers|spindles|yggterm|demo|sample|project|alpha|beta|gamma|thing|probe|foo|bar)(:|\b)'
+#    ⚠ Keep this list AHEAD of the fixtures. On 2026-08-13 a full-history sweep
+#    returned 22 row-taxonomy hits on the public branch and every single one was
+#    an invented label this list simply did not name yet — the checker was
+#    flagging exactly the behaviour it exists to encourage. That is the failure
+#    the paragraph above predicts, so: when you invent a label, add it here in
+#    the same commit.
+SYNTHETIC='"[0-9]+(\.[0-9]+)? (widgets|gadgets|sprockets|cogs|levers|spindles|yggterm|demo|sample|project|alpha|beta|gamma|thing|probe|foo|bar|atlasstore|lumenstore|topic[a-z]*|records|word)(:|\b)'
 h=$(hits '"[0-9]+(\.[0-9]+)? [a-z][a-z0-9_-]{2,}: ' | grep -vE "$SYNTHETIC")
 [ -n "$h" ] && { note "numbered row-taxonomy fixture names a real lane — use an invented label:"; echo "$h" | head -12 >&2; }
 
