@@ -12,6 +12,131 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔⛔ [6.9→6.7] THE LOCK-CONTENTION INSTRUMENT IS THE LARGEST WRITER IN THE SYSTEM, AND IT REPORTS ZERO
+
+**Status:** OPEN
+
+*measured 2026-08-14; derivation and controls in [`idle-cost-model.md`](idle-cost-model.md) §4*
+
+`lock_daemon_runtime_for_request` (`crates/yggterm-server/src/daemon.rs:17628`)
+traces only when `try_lock()` returns `WouldBlock`. Its doc comment states the
+fast path therefore costs nothing. **`WouldBlock` fires 322.8 times per second**
+on a live daemon, so the fast path is not the path being taken. Each firing
+costs a `resolve_yggterm_home()`, two `serde_json::json!` allocations and **two
+file appends**.
+
+- `event-trace.jsonl` grows at **95.3 KB/s** and `perf-telemetry.jsonl` at
+  **45.9 KB/s** — **12.49 GB/day combined**. `~/.yggterm` is already 9.5 GB.
+- ⭐ **It is ONE code path and the arithmetic closes exactly.** The `PerfGuard`
+  sits inside the same contended branch, so one contention writes three records
+  across two files: 141.1 KB/s ÷ 322.8/s = **437 bytes per contention**. A fix
+  treating them as two problems leaves 4.1 GB/day behind.
+- **93.9% of the lock_wait events report `waited_ms: 0`.** The field is integer
+  milliseconds and nearly every wait is sub-millisecond, so **the instrument
+  built to measure contention prints zero on almost all the contention it is
+  recording.** The count is the signal; the value is blind.
+- **98.6% of the contention is `terminal_read`** — reading a PTY serializes
+  against every other request through one global `Mutex<DaemonRuntime>`.
+
+⭐ **Fix the resolution and the flush BEFORE touching the lock** (`idle-cost-model.md`
+§S2 then §S3): changing contention while the only instrument that can see it
+rounds to zero would leave the result unmeasurable.
+
+**Falsifier:** if `event-trace.jsonl` growth does not fall ≥90x after S2,
+lock_wait was not 98.8% of the volume.
+
+## ⛔⛔ [6.9→6.1] THE DAEMON POPULATION IS 83% OF THE IDLE FOOTPRINT, AND ITS COST IS PER-DAEMON
+
+**Status:** OPEN
+
+*measured 2026-08-14; model, controls and limits in [`idle-cost-model.md`](idle-cost-model.md) §1–§3*
+
+15 census daemons and 57 sessions on one host: **daemons are 3.468 of the
+4.167 total cores (83%)**, 74% of it kernel time. Joint model
+(**R² = 0.939**): `cores = 0.116 + 0.0104·sessions + 0.000337·rows`.
+
+⛔ **Age explains nothing and its slope is NEGATIVE** (R² 0.323). Older daemons
+cost slightly *less*. **This is the opposite of the GUI's shape**, whose idle
+cost climbs 7.4x over its life. Two different defects behind one hot machine —
+leak-hunting in the daemon is aimed at nothing.
+
+| | daemons | sessions | cores | cores/session |
+|---|---|---|---|---|
+| legacy (pre-3.0.149) | 14 | 34 | 3.012 | **0.0886** |
+| current (3.0.151) | 1 | 23 | 0.456 | **0.0198** |
+
+⇒ **A session costs 4.5x more on a near-empty daemon than on a shared one.**
+Consolidating all 57 onto one daemon models at **0.864 cores — 2.60 reclaimable
+(75%)**.
+
+⚠ **Two honest limits, both in the model doc:** no census daemon owns zero
+sessions, so the floor term is real but **unattributed** between "per-daemon"
+and "paid by the first session"; and one outlier daemon is excluded and wants
+its own look.
+
+⛔ **This is a priced justification for the lifecycle work, NOT a licence to reap
+daemons holding other agents' live sessions.** The constitution's guarantee
+governs how they retire.
+
+**Falsifier:** consolidate and re-measure. If daemon cores do not fall ≥2.0, the
+per-daemon model is wrong.
+
+## ⛔⛔ [6.9→6.1] 14 LEGACY DAEMONS STILL RUN THE DEFECTS THEIR VERSION PREDATES
+
+**Status:** OPEN
+
+*measured 2026-08-14; attribution in [`idle-cost-model.md`](idle-cost-model.md) §5*
+
+The `DAEMON-1` full-corpus-read defect — `summarize_perf_telemetry` answering a
+question about the last 60 s by reading the whole retained corpus every 30 s —
+was root-caused and **fixed on 2026-07-26** by `jsonl_read_paths_since`
+(`retention.rs:141`). It is **still running in production right now**, in a
+daemon that started the same day the fix landed and has never restarted:
+
+| | rchar per 90 s | read syscalls/s | bytes per read |
+|---|---|---|---|
+| the 2.12.14 daemon (451 h old) | **437.8 MB** | 0.6 | **8.1 MB** |
+| a daemon owning 0 sessions (control) | 14.0 MB | 0.2 | — |
+
+437.8 MB/90 s is **above the 312.9 MB/90 s the defect measured when it was
+found**. The excess shows as *user* time (0.396 cores, 12x its peers) because
+the cost is parsing what it just read.
+
+⛔ **The general form is the defect.** Each of the 14 legacy daemons carries
+every fix landed since its own version — 2.12.14 through 3.0.62, against a
+current 3.0.151. **The queue and CHANGELOG record these as closed; for 14
+processes holding 34 live sessions they are not.** No surface reports which
+fixes a running daemon is missing.
+
+⇒ **A third independent argument for consolidation, and the only one that does
+not saturate:** cost and row-deaths are bounded by the population size, but the
+set of missing fixes grows with every release.
+
+⚠ **Interacts with the lock-tracer entry above:** that tracer fills
+`perf-telemetry.jsonl` at 4.06 GB/day, and the retained corpus is exactly what
+this monitor parses. Fixing the tracer reduces this cost on every daemon —
+including the ones that cannot themselves be fixed.
+
+## ⛔ [6.9→6.7] DAEMON CPU HIDES IN EXITED THREADS — ONE OS THREAD PER CONNECTION
+
+**Status:** OPEN
+
+*derivation in [`idle-cost-model.md`](idle-cost-model.md) §3*
+
+`spawn_unix_client_handler` (`daemon.rs:785`) spawns a **fresh OS thread per
+accepted connection**. Measured churn: **4.23 threads/s** on a 1-session daemon,
+**25.2/s** on a 23-session daemon, **exactly 0.00 on a daemon owning nothing** —
+a clean negative control.
+
+⇒ **Process-level CPU exceeds the sum over live threads by ~5x** (0.202 vs
+0.041 cores), across six flat windows, because `/proc/<pid>/stat` counts exited
+threads and `/proc/<pid>/task` cannot. **Any per-thread profile of a daemon is
+currently missing ~80% of its CPU.**
+
+⚠ **Do not promise cores for the pool fix.** Thread spawn is ~50 µs, so 4/s is
+~0.0002 cores. The **38 ms per handler is the work, not the spawn.** The value
+is that CPU stops being invisible to per-thread instruments.
+
 
 # THE 2026-08-13 BATCH — reported after a restart lost the campaign rows
 
@@ -9650,10 +9775,10 @@ broken and does nothing."* ⇒ **This entry did not decay into "probably fixed b
 it is live at 3.0.148.** Recording that explicitly, because an entry sitting a hundred versions
 behind its last measurement invites exactly that assumption.
 
-**His terminal, read from the daemon's own screen — he ran it three times:**
+**The owner's terminal, read from the daemon's own screen — run three times:**
 
 ```
-pi@jojo:~$ yedit
+user@host:~$ yedit
 yedit: document surface opened — `yedit --close` to close it.      (×3)
 ```
 
@@ -12002,7 +12127,7 @@ followed by a relaunch.
 (2026-07-28).** Full field report:
 **[`docs/agent-passkey-gap-2026-07-28.md`](agent-passkey-gap-2026-07-28.md)**.
 Written from a real deadline job (minting a Cloudflare DNS-01 token to renew
-the expiring `*.gour.top` wildcard). The passkey machinery is built and
+an expiring wildcard certificate). The passkey machinery is built and
 correct; it is simply **never wired to a surface an agent makes**:
 1. **Surface policy is bound ONCE, at `open_web_surface` time**
    (`crates/yggterm-shell/src/shell.rs:8715`). A surface built while
@@ -12372,9 +12497,9 @@ that bg video. There is no way to stop it unless I close the session row."*
 Confirmed in the trace, twice, and **we caused it ourselves**:
 
 ```
-1785964054633  pid 1510425 (the user's GUI)  native_open  y.gour.top/watch?v=j1Vk6Y-23CY
-1785964154970  pid 1690716 (an AGENT shadow) native_open  youtube.com/watch?v=j1Vk6Y-23CY   ← the phantom, +100.3 s
-1785964425582  pid 1699947 (another shadow)  native_open  youtube.com/watch?v=j1Vk6Y-23CY   ← again
+1785964054633  pid 1510425 (the user's GUI)  native_open  media.example.invalid/watch?v=VIDEOID0001
+1785964154970  pid 1690716 (an AGENT shadow) native_open  video.example.invalid/watch?v=VIDEOID0001   ← the phantom, +100.3 s
+1785964425582  pid 1699947 (another shadow)  native_open  video.example.invalid/watch?v=VIDEOID0001   ← again
 ```
 
 ⚠ **There is no ~60s timer** — the user's "after ~1min" is the agent's own shadow
