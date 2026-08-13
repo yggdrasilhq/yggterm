@@ -1446,6 +1446,57 @@ for ~11 s, which is already tracked and would produce exactly this.
 **Falsifier:** time both verbs against the same GUI at several row counts. `state`
 must not diverge from `clients` by more than the work it genuinely does more of.
 
+## ⛔⛔ `terminal send` SPLICES INTO A HUMAN'S HALF-TYPED SENTENCE, AND THE `\r` SUBMITS THE FUSION AS THEIR OWN TURN
+
+**Status:** OPEN
+
+*Reported by a campaign row 2026-08-13, with the cost already incurred. **Confirmed from the
+target's own transcript before filing** — the fused turn is present at the reported timestamp,
+286 characters, one `user` record.*
+
+**An agent row can have a human typing in it, and `send` shares that one input buffer with their
+keystrokes with no interlock.** The documented two-write rule — text, pause, then a bare `\r` —
+becomes a splice-and-commit when the owner is mid-sentence:
+
+1. The agent's text is **inserted into the middle of a word** the human is typing.
+2. The bare `\r` **submits the fusion as a single human turn.**
+3. ⇒ **The agent's words end up in the transcript attributed to the human.** That is provenance
+   corruption in an orchestrator's own context, and the exact inverse of the standing rule that a
+   relay of the owner's words is not the owner's ruling.
+
+⛔ **Every field reported success.** `send` answered `accepted: true`, a byte count, a chunk count
+and an accepted read-nudge, while the effect was a splice into a person's keyboard buffer. This is
+the *verb reports the request, not the effect* family, and it is a new member.
+
+⚠ **The repair is itself unsafe, and there is no safe clear.** Removing the spliced text needs more
+keystrokes written into the live box: a kill-line ate a partial sentence of the human's outright,
+and the alternative was ~177 backspaces. **Escape is not available** — on an agent row mid-turn it
+interrupts the turn, and the row in question was nine minutes into an expensive one. So every
+clearing tool also eats human text.
+
+⚠ **And oversized pastes vanish instead of splicing.** Two multi-kilobyte single-line sends never
+reached the box or the transcript, `accepted: true` both times. **Both failure modes report
+success**, in opposite directions, which is why neither is visible to a caller.
+
+**Fixes, in the reporter's preference order and it is the right order:**
+
+1. **`send` refuses, or warns loudly, when the target's input buffer is non-empty** —
+   `--expect-empty-input` as the DEFAULT for agent rows with an explicit override. Cheapest, and it
+   catches the whole class rather than this instance.
+2. **An `--enter` flag** making text-and-submit one atomic act that cannot interleave a human's
+   keystrokes between the two writes. ⭐ This also retires the two-write rule, which exists only
+   because the one-write form does not submit.
+3. **Expose `input_buffer_len` / `human_typing_since_ms`** on `terminal read-buffer` or on `send`'s
+   own reply, so a caller can check before writing.
+4. **Refuse or chunk oversized pastes** rather than dropping them silently.
+
+⭐ **The doc fix matters more than the feature, because it is the layer an agent actually reads.**
+The messaging sections of the fleet skill and the data-fabric skill both present `terminal send` as
+the normal way to reach another row. **Neither says that a row with a human at it is not addressable
+this way at all.** The reporter read both before sending and still walked into it. ⇒ Crossings to
+such a row go **by file** — dropping the brief into the target's own scratchpad worked and cost
+nothing. ⚠ A file drop leaves litter; the sender owns removing it.
+
 ## ⛔⛔ `ListAgents` OMITS LIVE ROWS, SO "PICK THE PLAUSIBLE ONE FROM THE LIST" IS UNSAFE
 
 **Status:** OPEN
