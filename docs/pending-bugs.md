@@ -9194,6 +9194,48 @@ without them, this class is diagnosed by guessing selectors. ⚠ And `data-app-p
 does NOT exist — the real hooks are `data-app-pane-toolbar` / `-tab` / `-input`; a
 probe built on the invented name reports an empty rail over a rail that is on screen.
 
+### ⛔ STILL OPEN AT 3.0.148 — RE-REPORTED BY THE OPERATOR, 100 VERSIONS LATER, AND THE SHAPE HAS CHANGED
+
+Re-reported 2026-08-13 in his own words: *"sidebars are broken once I launch yedit. yedit is badly
+broken and does nothing."* ⇒ **This entry did not decay into "probably fixed by a later version";
+it is live at 3.0.148.** Recording that explicitly, because an entry sitting a hundred versions
+behind its last measurement invites exactly that assumption.
+
+**His terminal, read from the daemon's own screen — he ran it three times:**
+
+```
+pi@***:~$ yedit
+yedit: document surface opened — `yedit --close` to close it.      (×3)
+```
+
+⚠ **The measurement has MOVED since the 3.0.48 table above, and the new reading is worse:**
+
+| probe | 3.0.48 (original) | **3.0.148 (now)** |
+|---|---|---|
+| the declare / contribution | declare fires, **rail ALIVE and on screen**, 278×1200 | ⛔ **no rail — the right pane is blank** |
+| `server app state` `active_surface_requests` | (not captured) | ⛔ **`[]`** |
+| `document_surface` records in the daemon snapshot | (not captured) | ⛔ **zero** |
+
+⇒ At 3.0.48 the contribution existed and only the BODY failed to mount. **At 3.0.148 the GUI holds
+no surface record at all**, while `yedit` still reports `document surface opened` each time. ⚠ Whether
+that is the same defect progressing or a second one layered on it is **not established** — it is a
+different reading of the same probe family, taken on a host that had just been through a daemon
+handover, and that confound is real.
+
+⭐ **A REMEDY THAT WORKED, where the three above are recorded as falsified — but note what it fixed.**
+His main viewport was painting **nothing** (a different row was active, not the yedit row). One
+`server app open <the already-active row> --view terminal` restored it fully, verified by faithful
+screenshot. ⚠ **That clears a PAINT STALL; it is untested against the document surface itself**, and
+the yedit row was deliberately not opened because doing so takes over the operator's viewport. ⇒
+Worth trying as a fourth remedy, and worth NOT recording as one until someone runs it on the yedit
+row.
+
+⛔ **AND A SCOPING DEFECT THAT MAKES THIS WORSE TO LIVE WITH:** `yedit --close` closes *"this
+terminal session's"* surface. So phantom surfaces can only be cleared **from the exact terminal that
+opened them** — an agent cannot clear them for the operator from any other shell, and typing into a
+terminal a human is sitting at splices into whatever they are mid-way through. **A surface an agent
+can open but only the person at that one terminal can close.**
+
 ## ⭐ OPERATOR-REPORTED, LIVES IN ychrome: a vault CARD item is unreadable and uneditable in the sidebar
 
 **Status:** OPEN
