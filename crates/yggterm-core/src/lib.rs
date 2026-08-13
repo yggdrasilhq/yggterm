@@ -49,10 +49,16 @@ mod retention;
 /// 2026-07-30.
 pub mod session_bus;
 mod session_kind;
+/// HOW ROWS ARE ARRANGED — the containment relation behind collapsible sets of
+/// live rows. Knows nothing about seats; see `row_set_outline` for the bridge.
+pub mod row_set;
+/// THE DEFAULT ARRANGEMENT — the row sets the seats themselves imply (`6.1`
+/// under `6.0`, `6.1.1` under `6.1`). The one place a seat may produce a
+/// containment edge.
+pub mod row_set_outline;
 /// WHERE A ROW SITS — the owner's `0 / 1 / 1.1 / 2` sidebar outline, parsed and
 /// compared as integers per dotted segment. One owner for the sort key, so a
 /// verb can never report an order the sidebar does not draw.
-pub mod row_set;
 pub mod session_outline;
 mod telemetry;
 /// How a text payload reaches a terminal composer — and why an agent CLI needs
@@ -476,8 +482,29 @@ pub struct AppSettings {
     pub litellm_endpoint: String,
     pub litellm_api_key: String,
     pub interface_llm_model: String,
-    pub codex_extra_args: String,
-    pub claude_code_extra_args: String,
+    /// Per-CLI launch flags, keyed by [`agent_cli::AgentCliDescriptor::extra_args_slug`].
+    ///
+    /// ⚖ ONE map rather than a field per CLI, because a field per CLI is what
+    /// forced `configured_cli_extra_arg_tokens` to carry a hand-written match on
+    /// `SessionKind` whose only honest answer for seven of nine CLIs was `None`
+    /// — so seven first-class agent CLIs had no way to receive a permission flag
+    /// at all, which is the defect the launch-flags modal exists to close. A
+    /// tenth CLI now needs no field and no arm.
+    ///
+    /// Absent key ⇒ that CLI has no configured flags. ⛔ NOT the same as an
+    /// empty string, which is a user who deliberately cleared the box; the modal
+    /// pre-populates the descriptor's default tier only for an ABSENT key.
+    ///
+    /// ⚠ **There is deliberately no `codex_extra_args` FIELD beside this.** The
+    /// two legacy keys survive in the stored JSON as a compatibility mirror
+    /// ([`legacy_extra_args_mirror`]) so a pre-3.0.133 reader on this
+    /// multi-version fleet still finds the codex and Claude Code flags, and they
+    /// are migrated INTO this map on load. Keeping them as struct fields too
+    /// would be a second in-memory encoding of one question, which is exactly
+    /// the shape the SSOT law forbids — and the round-trip lock caught the first
+    /// draft doing it.
+    #[serde(default)]
+    pub agent_cli_extra_args: BTreeMap<String, String>,
     pub default_agent_profile: AgentSessionProfile,
     pub in_app_notifications: bool,
     pub system_notifications: bool,
@@ -500,6 +527,13 @@ pub struct AppSettings {
     /// so a built workspace reopens as an intentional artifact; members resume
     /// via the normal per-pane handoff on restore.
     pub split_groups: Vec<SplitGroup>,
+    /// Row sets the USER built by hand — `DESIGN.md` §"Row sets". Only the hand
+    /// half lives here: the arrangement the seats imply is derived every frame
+    /// and would go stale on disk the moment a delegate is reseated. Sits beside
+    /// `split_groups` because it is the same class of fact — a GUI-level
+    /// arrangement over live rows, which is the user's layout and not the
+    /// daemon's session state.
+    pub row_arrangement: crate::row_set_outline::RowArrangement,
     /// Which member of the start page's SESSION family the split button last
     /// ran (`codex` · `claude-code` · `terminal`).
     ///
@@ -540,8 +574,7 @@ impl Default for AppSettings {
             litellm_endpoint: String::new(),
             litellm_api_key: String::new(),
             interface_llm_model: String::new(),
-            codex_extra_args: String::new(),
-            claude_code_extra_args: String::new(),
+            agent_cli_extra_args: BTreeMap::new(),
             default_agent_profile: AgentSessionProfile::Codex,
             in_app_notifications: true,
             system_notifications: false,
@@ -552,6 +585,7 @@ impl Default for AppSettings {
             expanded_browser_paths: Vec::new(),
             collapsed_synthetic_paths: Vec::new(),
             split_groups: Vec::new(),
+            row_arrangement: crate::row_set_outline::RowArrangement::default(),
             start_page_session_choice: None,
             start_page_app_choice: None,
         }
@@ -1240,13 +1274,28 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.interface_llm_model =
             serde_json::from_value(value.clone()).context("failed to parse interface_llm_model")?;
     }
-    if let Some(value) = object.get("codex_extra_args") {
-        settings.codex_extra_args =
-            serde_json::from_value(value.clone()).context("failed to parse codex_extra_args")?;
+    if let Some(value) = object.get("agent_cli_extra_args") {
+        settings.agent_cli_extra_args = serde_json::from_value(value.clone())
+            .context("failed to parse agent_cli_extra_args")?;
     }
-    if let Some(value) = object.get("claude_code_extra_args") {
-        settings.claude_code_extra_args = serde_json::from_value(value.clone())
-            .context("failed to parse claude_code_extra_args")?;
+    // The two legacy keys are read ONLY here, and only to seed a slug the map
+    // does not already answer for.
+    for (key, slug) in [
+        ("codex_extra_args", "codex"),
+        ("claude_code_extra_args", "claude-code"),
+    ] {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        let legacy: String = serde_json::from_value(value.clone())
+            .with_context(|| format!("failed to parse {key}"))?;
+        if legacy.trim().is_empty() {
+            continue;
+        }
+        settings
+            .agent_cli_extra_args
+            .entry(slug.to_string())
+            .or_insert(legacy);
     }
     if let Some(value) = object.get("default_agent_profile") {
         settings.default_agent_profile = serde_json::from_value(value.clone())
@@ -1284,6 +1333,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.collapsed_synthetic_paths = serde_json::from_value(value.clone())
             .context("failed to parse collapsed_synthetic_paths")?;
     }
+    if let Some(value) = object.get("row_arrangement") {
+        settings.row_arrangement = serde_json::from_value(value.clone())
+            .context("failed to parse row_arrangement")?;
+    }
     if let Some(value) = object.get("split_groups") {
         settings.split_groups = serde_json::from_value::<Vec<SplitGroup>>(value.clone())
             .context("failed to parse split_groups")?
@@ -1314,6 +1367,24 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
     Ok(settings)
 }
 
+/// The stored key a session kind's launch flags live under, or `None` for a
+/// kind that is not an agent CLI.
+///
+/// One owner for the question, so no caller re-derives it as a `match`.
+pub fn agent_cli_extra_args_key(kind: SessionKind) -> Option<&'static str> {
+    agent_cli::agent_cli_descriptor(kind).map(|descriptor| descriptor.extra_args_slug)
+}
+
+/// Mirror the two legacy keys off the map, so a pre-3.0.133 reader still sees
+/// the codex and Claude Code flags. See [`AppSettings::codex_extra_args`].
+fn legacy_extra_args_mirror(settings: &AppSettings, slug: &str) -> String {
+    settings
+        .agent_cli_extra_args
+        .get(slug)
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn serialize_settings_value(settings: &AppSettings) -> Value {
     serde_json::json!({
         "theme_mode": settings.theme,
@@ -1334,8 +1405,11 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "litellm_endpoint": settings.litellm_endpoint,
         "litellm_api_key": settings.litellm_api_key,
         "interface_llm_model": settings.interface_llm_model,
-        "codex_extra_args": settings.codex_extra_args,
-        "claude_code_extra_args": settings.claude_code_extra_args,
+        "agent_cli_extra_args": settings.agent_cli_extra_args,
+        // DERIVED from the map above, never read back into it while the map has
+        // its own entry. One writer, so the pair cannot drift.
+        "codex_extra_args": legacy_extra_args_mirror(settings, "codex"),
+        "claude_code_extra_args": legacy_extra_args_mirror(settings, "claude-code"),
         "default_agent_profile": settings.default_agent_profile,
         "in_app_notifications": settings.in_app_notifications,
         "system_notifications": settings.system_notifications,
@@ -1344,6 +1418,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "perf_profiling_enabled": settings.perf_profiling_enabled,
         "selected_browser_path": settings.selected_browser_path,
         "expanded_browser_paths": settings.expanded_browser_paths,
+        "row_arrangement": settings.row_arrangement,
         "collapsed_synthetic_paths": settings.collapsed_synthetic_paths,
         "split_groups": settings.split_groups,
         // The start page's two sticky split buttons. Their own doc comments say
@@ -3326,8 +3401,14 @@ mod tests {
         original.litellm_endpoint = "https://litellm.example.test".to_string();
         original.litellm_api_key = "sk-test-1234".to_string();
         original.interface_llm_model = "gpt-test-5".to_string();
-        original.codex_extra_args = "-s danger-full-access".to_string();
-        original.claude_code_extra_args = "--dangerously-skip-permissions".to_string();
+        original.agent_cli_extra_args = BTreeMap::from([
+            ("codex".to_string(), "-s danger-full-access".to_string()),
+            (
+                "claude-code".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ),
+            ("qwen-code".to_string(), "--yolo".to_string()),
+        ]);
         original.in_app_notifications = false;
         original.system_notifications = true;
         original.notification_sound = true;
@@ -3612,25 +3693,87 @@ mod tests {
         );
     }
 
+    /// ⛔ THE MIGRATION THE MODAL MUST NOT BREAK: the two values the user has
+    /// already set are preserved VERBATIM into the per-CLI map, quoting and all.
+    /// A modal that resets `-s danger-full-access` to a "helpful" default is a
+    /// settings-destroying bug, and this is the test that would catch it.
     #[test]
-    fn settings_parse_codex_extra_args() {
+    fn a_legacy_extra_args_pair_migrates_into_the_per_cli_map_verbatim() {
         let parsed = parse_settings_value(&serde_json::json!({
-            "codex_extra_args": "-s danger-full-access --profile \"field test\""
+            "codex_extra_args": "-s danger-full-access --profile \"field test\"",
+            "claude_code_extra_args": "--dangerously-skip-permissions"
         }))
         .expect("settings should parse");
         assert_eq!(
-            parsed.codex_extra_args,
-            "-s danger-full-access --profile \"field test\""
+            parsed.agent_cli_extra_args.get("codex").map(String::as_str),
+            Some("-s danger-full-access --profile \"field test\"")
+        );
+        assert_eq!(
+            parsed
+                .agent_cli_extra_args
+                .get("claude-code")
+                .map(String::as_str),
+            Some("--dangerously-skip-permissions")
         );
     }
 
+    /// The map WINS. A stored file that carries both — which is exactly what an
+    /// older GUI writing back over a newer one produces on this fleet — must not
+    /// let the mirror overwrite the value the current build owns.
     #[test]
-    fn settings_serialize_codex_extra_args() {
-        let mut settings = AppSettings::default();
-        settings.codex_extra_args = "-s danger-full-access".to_string();
+    fn the_map_wins_over_a_legacy_key_that_disagrees_with_it() {
+        let parsed = parse_settings_value(&serde_json::json!({
+            "agent_cli_extra_args": { "codex": "-s workspace-write" },
+            "codex_extra_args": "-s danger-full-access"
+        }))
+        .expect("settings should parse");
         assert_eq!(
-            serialize_settings_value(&settings).get("codex_extra_args"),
+            parsed.agent_cli_extra_args.get("codex").map(String::as_str),
+            Some("-s workspace-write"),
+        );
+    }
+
+    /// ⚠ A CLEARED box is not an absent one. The migration seeds only slugs the
+    /// map does not answer for, so a user who deliberately emptied codex's box
+    /// does not get the old value back on the next load.
+    #[test]
+    fn an_empty_map_entry_is_not_refilled_from_the_legacy_key() {
+        let parsed = parse_settings_value(&serde_json::json!({
+            "agent_cli_extra_args": { "codex": "" },
+            "codex_extra_args": "-s danger-full-access"
+        }))
+        .expect("settings should parse");
+        assert_eq!(
+            parsed.agent_cli_extra_args.get("codex").map(String::as_str),
+            Some(""),
+        );
+    }
+
+    /// The compatibility mirror an older reader on this fleet still finds. It is
+    /// DERIVED — one writer — so it can never disagree with the map.
+    #[test]
+    fn the_two_legacy_keys_are_serialized_as_mirrors_of_the_map() {
+        let mut settings = AppSettings::default();
+        settings.agent_cli_extra_args = BTreeMap::from([
+            ("codex".to_string(), "-s danger-full-access".to_string()),
+            ("qwen-code".to_string(), "--yolo".to_string()),
+        ]);
+        let value = serialize_settings_value(&settings);
+        assert_eq!(
+            value.get("codex_extra_args"),
             Some(&serde_json::json!("-s danger-full-access"))
+        );
+        // A CLI with no legacy key of its own is simply absent from the mirror —
+        // it is not silently folded into codex's.
+        assert_eq!(
+            value.get("claude_code_extra_args"),
+            Some(&serde_json::json!(""))
+        );
+        assert_eq!(
+            value
+                .get("agent_cli_extra_args")
+                .and_then(|map| map.get("qwen-code")),
+            Some(&serde_json::json!("--yolo"))
         );
     }
 

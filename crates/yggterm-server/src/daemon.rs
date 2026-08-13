@@ -2,6 +2,7 @@ use crate::codex_cli::{
     TerminalIdentityColorProfile, sync_terminal_identity_appearance_with_profile,
 };
 use crate::hot_restart_queue;
+use crate::hot_restart_repair;
 use crate::terminal::{TerminalBufferStats, terminal_data_has_scrollback_text};
 use crate::{
     ClaudeCodeRuntimeProcessIdentity, CodexRuntimeProcessIdentity, GhosttyHostSupport,
@@ -1955,6 +1956,21 @@ pub struct ServerRuntimeStatus {
     pub running_build_id: u64,
     #[serde(default)]
     pub on_disk_build_id: u64,
+    /// The commit THIS PROCESS was built from, compiled in.
+    ///
+    /// ⛔ IT IS NOT DERIVABLE FROM OUTSIDE, which is the whole reason it is on
+    /// the wire. `running_build_id` says only *"the running and on-disk builds
+    /// differ"*; it cannot name either one, so a daemon that is behind reports a
+    /// mismatch without saying what it is running. Once a deploy has replaced
+    /// the file, the path, its md5 and `--build-commit` all describe the NEW
+    /// binary while this process keeps executing the old code, and on the
+    /// desktop host a running exe has already hashed to a value matching no file
+    /// on the machine.
+    ///
+    /// Empty on a daemon older than this field, and `unstamped` on one that
+    /// never declared itself — both are reported, never guessed at.
+    #[serde(default)]
+    pub server_build_commit: String,
     #[serde(default)]
     pub hot_restart_pending: bool,
     /// Why a hot-restart is being DEFERRED right now, in the daemon's own words —
@@ -2012,6 +2028,68 @@ pub fn hot_restart_blocker_is_deadline_exempt(kind: &str) -> bool {
     )
 }
 
+/// §5's deadline: how long a cold retire may be held by interruptible sessions
+/// before it stops asking.
+///
+/// ⚖ Owner-ruled: *"after 30 minutes of waiting, force the swap, stalling the
+/// working sessions"* — and the other half of the same ruling, the `continue`
+/// repair, is [`crate::hot_restart_repair`]. Neither half ships alone.
+pub const HOT_RESTART_FORCED_SWAP_DEADLINE_MS: u64 = 1_800_000;
+
+/// What §5's deadline says about a blocked cold retire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotRestartDeadlineVerdict {
+    /// Still inside the 30 minutes, or nothing is blocking. Keep waiting.
+    KeepWaiting,
+    /// The deadline has passed, and an EXEMPT blocker holds it anyway.
+    ///
+    /// §6: an orchestrating session is waited for without a deadline, and a
+    /// plain shell can never be cold-killed safely at all. §8 demands the wait
+    /// be nameable, so the reason travels with the verdict rather than the
+    /// reader inferring it from a silent refusal.
+    ExemptBlocker { kind: String, session_key: String },
+    /// The deadline has passed and every blocker is interruptible. These are the
+    /// sessions the shutdown is about to interrupt — and therefore exactly the
+    /// sessions owed a `continue`.
+    Force { interrupted: Vec<String> },
+}
+
+/// Apply §5's deadline to a blocked cold retire.
+///
+/// ⛔ **The interrupted list is produced HERE, before the shutdown**, because
+/// spec §8 says it cannot be re-derived afterwards: *"after the swap every
+/// interrupted session looks idle"*. A verdict that only answered yes/no would
+/// force the caller to ask a second time, after the answer had changed.
+///
+/// ⛔ **One exempt blocker vetoes the whole force**, and it is not a per-session
+/// decision. A cold shutdown kills every PTY this daemon owns, so there is no
+/// way to interrupt the working session while sparing the shell next to it —
+/// the choice is all or nothing, and §6 prices the "all" at an orphaned
+/// delegate fleet.
+pub fn hot_restart_deadline_verdict(
+    blockers: &[HotRestartBlocker],
+    owed_for_ms: u64,
+) -> HotRestartDeadlineVerdict {
+    if blockers.is_empty() || owed_for_ms < HOT_RESTART_FORCED_SWAP_DEADLINE_MS {
+        return HotRestartDeadlineVerdict::KeepWaiting;
+    }
+    if let Some(exempt) = blockers
+        .iter()
+        .find(|blocker| hot_restart_blocker_is_deadline_exempt(&blocker.kind))
+    {
+        return HotRestartDeadlineVerdict::ExemptBlocker {
+            kind: exempt.kind.clone(),
+            session_key: exempt.session_key.clone(),
+        };
+    }
+    HotRestartDeadlineVerdict::Force {
+        interrupted: blockers
+            .iter()
+            .map(|blocker| blocker.session_key.clone())
+            .collect(),
+    }
+}
+
 /// One session holding a hot-restart open, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HotRestartBlocker {
@@ -2033,6 +2111,69 @@ pub struct HotRestartBlocker {
     /// clearable, which is exactly what they were.
     #[serde(default)]
     pub permanent: bool,
+}
+
+/// §3's missing instrument: what the idle gate ACTUALLY LOOKED AT for one
+/// session, answered on demand.
+///
+/// ⭐ **Why this exists.** The gate classifies from
+/// `terminals.session_screen_snapshot(runtime_path)` — the live in-daemon vt100
+/// screen — and until now no shipped verb exposed it, so the gate's input could
+/// not be audited from outside the daemon. `server snapshot`'s
+/// `live_sessions[].terminal_lines` is a DIFFERENT field: measured on one host,
+/// **205 of 225 agent sessions' last lines were a stored summary line rather
+/// than screen text at all**, so a corpus harvested from it describes something
+/// the gate never reads. That is why blocked-on-human (§3's remainder) is
+/// unbuilt: a recognizer has nothing to be validated against.
+///
+/// ⛔ **THIS IS ON-DEMAND AND READ-ONLY, AND THE SCREEN MUST NEVER REACH A TRACE
+/// EVENT.** `~/.yggterm/event-trace*.jsonl` is durable, is copied around in
+/// bundles and is read by every later session; session screen text in it is a
+/// standing leak surface — an agent's screen carries whatever the person typed.
+/// Pinned by `the_gate_screen_verb_never_writes_a_screen_to_the_trace`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotRestartGateScreen {
+    pub session_key: String,
+    /// The blocker this session contributes right now, or `None` when it is not
+    /// holding the gate at all.
+    ///
+    /// ⛔ Produced by [`DaemonRuntime::hot_update_idle_gate_blockers`], the
+    /// gate's own function — never re-derived here. A second classifier would
+    /// be a second encoding of the one question this verb exists to answer
+    /// faithfully, and the first time the two disagreed the audit would be
+    /// describing a gate that does not exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<HotRestartBlocker>,
+    /// `false` when the screen could not be read — an unowned key, a runtime
+    /// that has gone. Distinguished from an empty screen on purpose: "I could
+    /// not look" and "I looked and it was blank" are different findings, and
+    /// collapsing them is how a corpus fills with silence that means nothing.
+    pub screen_available: bool,
+    /// The tail of that screen, newest last. `None` when unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_tail: Option<Vec<String>>,
+    /// What `screen_text_shows_agent_working` said about the WHOLE screen — not
+    /// about the tail returned above, which is a display convenience.
+    pub shows_agent_working: bool,
+}
+
+/// How much of the screen a gate-screen reading returns when the caller does not
+/// say. Enough to see a composer, a permission prompt and the line above them.
+const HOT_RESTART_GATE_SCREEN_DEFAULT_TAIL_LINES: usize = 24;
+
+/// The last `tail_lines` lines of a screen, newest last.
+///
+/// ⛔ **Escape sequences are kept.** A "blocked on a permission prompt" screen is
+/// told apart from a working one partly by how it is DRAWN — a boxed prompt, a
+/// cursor parked on a numbered choice — and a reading stripped for legibility
+/// would hand a recognizer a corpus the gate never sees
+/// ([[finding-normalization-destroys-the-discriminator]]).
+fn gate_screen_tail(screen: &str, tail_lines: usize) -> Vec<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    lines[lines.len().saturating_sub(tail_lines)..]
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect()
 }
 
 /// Order blockers so the headline names something the reader can act on.
@@ -2425,6 +2566,13 @@ pub enum ServerRequest {
         initial_cols: Option<u16>,
         #[serde(default)]
         initial_rows: Option<u16>,
+        /// The CLIENT machine's configured launch flags for this CLI.
+        ///
+        /// `#[serde(default)]` so an older daemon on this fleet simply ignores
+        /// it rather than failing to deserialize the whole request — the same
+        /// additive contract every other field here follows.
+        #[serde(default)]
+        configured_extra_args: Option<String>,
     },
     StartRemoteRuntimeAgentSession {
         session_kind: SessionKind,
@@ -2441,6 +2589,12 @@ pub enum ServerRequest {
         /// them.
         #[serde(default)]
         launch_options: Option<AgentLaunchOptions>,
+        /// The CLIENT machine's configured launch flags for this CLI. A
+        /// different question from `launch_options`: that is what ONE launch
+        /// asked for abstractly, this is a string the user typed which no
+        /// descriptor can re-derive.
+        #[serde(default)]
+        configured_extra_args: Option<String>,
     },
     /// Daemon-owned resumable plain-shell session (tmux replacement for
     /// `server attach`). The host daemon owns/persists the shell PTY.
@@ -2504,6 +2658,16 @@ pub enum ServerRequest {
     TerminalTenants {
         #[serde(default)]
         path: Option<String>,
+    },
+    /// §3's audit instrument: the screen the hot-restart idle gate classifies
+    /// from, per owned session, plus the blocker that classification produced.
+    /// On demand only, nothing on a timer, and ⛔ never traced. `path: None` =
+    /// every session this daemon owns. See [`HotRestartGateScreen`].
+    HotRestartGateScreens {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        tail_lines: Option<usize>,
     },
     /// Record who created a row, and (opt-in) that the creator declared it
     /// ephemeral. Write-once per row — see
@@ -2656,6 +2820,10 @@ pub enum ServerResponse {
         /// Individual rows carry their own reasons.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         degraded: Option<String>,
+    },
+    HotRestartGateScreens {
+        #[serde(default)]
+        sessions: Vec<HotRestartGateScreen>,
     },
     Ack {
         message: Option<String>,
@@ -2889,7 +3057,14 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         // ---- everything else: ownership, input, lifecycle, or shared-view
         // mutation. Default-deny, listed explicitly (no wildcard) so a newly
         // added variant cannot silently inherit Allow. ----
-        ServerRequest::PrepareUpdateRestart
+        // ⛔ DENIED although it is read-only, and the reason is the SCOPE, not
+        // the verb. A shadow is a read-only viewer of ONE session; this answers
+        // with the screen of every session the daemon owns, which would turn a
+        // single-session viewer into a whole-host screen reader on the strength
+        // of "it only reads". An agent that wants this runs the CLI on the host
+        // and is unaffected.
+        ServerRequest::HotRestartGateScreens { .. }
+        | ServerRequest::PrepareUpdateRestart
         | ServerRequest::PrepareClientClose
         | ServerRequest::HotRestart { .. }
         | ServerRequest::RetireDaemon { .. }
@@ -3377,6 +3552,12 @@ struct CachedClaudeCodeRuntimeIdentity {
     identity: ClaudeCodeRuntimeProcessIdentity,
 }
 
+/// How often a daemon asks its siblings for the working state of rows it does
+/// not own. Short enough that the dot tracks a turn starting and stopping;
+/// long enough that a sidebar of rows never costs a round trip per row per
+/// frame.
+const PROXIED_WORKING_REFRESH_MS: u128 = 1_500;
+
 struct DaemonRuntime {
     support: GhosttyHostSupport,
     state_path: PathBuf,
@@ -3388,6 +3569,25 @@ struct DaemonRuntime {
     /// every order change through the persist chokepoint and answers "where
     /// does this row go when it comes back?" — see `row_order_ledger.rs`.
     row_order_ledger: crate::row_order_ledger::RowOrderLedger,
+    /// Working flags for rows this daemon does NOT own, as their owning daemon
+    /// last reported them, with the moment they were fetched.
+    ///
+    /// ⛔ **THE SNAPSHOT IS WHAT THE SIDEBAR DOT READS, and it had no way to
+    /// see a proxied answer.** `ServerRequest::WorkingFlags` has asked the
+    /// owning daemon for a long time; `ServerRequest::Snapshot` answered from
+    /// the raw screen scrape, so a row owned by an older coexisting daemon —
+    /// `RemoteBootstrap`, no PTY, five lines of launch preamble instead of a
+    /// screen — reported `None` forever and never blinked, however hard its
+    /// agent was working. The capability existed; the surface that needed it
+    /// asked the other question.
+    ///
+    /// ⚠ **CACHED, because snapshots are frequent and proxying is network I/O
+    /// to sibling daemons.** An unbounded per-snapshot fan-out would make the
+    /// dot cost a round trip per row per frame. Refreshed on the request path
+    /// (which holds `&mut self`) at most once per
+    /// [`PROXIED_WORKING_REFRESH_MS`]; the snapshot only reads it.
+    proxied_working_flags: HashMap<String, bool>,
+    proxied_working_refreshed_ms: u128,
     /// The shared-scope ledger order AS THIS DAEMON BOOTED — the arrangement the
     /// user left behind on the daemon we are succeeding.
     ///
@@ -3642,6 +3842,8 @@ impl DaemonRuntime {
             terminals: TerminalManager::new(),
             preserved_terminal_owners,
             row_order_ledger,
+            proxied_working_flags: HashMap::new(),
+            proxied_working_refreshed_ms: 0,
             booted_with_row_order,
             live_row_tombstones,
             live_row_identities_seen: HashSet::new(),
@@ -3823,6 +4025,31 @@ impl DaemonRuntime {
     /// One request per distinct OWNER, not per row, and an owner that fails is
     /// marked unreachable so a dead peer cannot slow the 2.5 s poll for the
     /// rest of its cache window.
+    /// Ask each owning daemon at most this often. Short enough that the dot
+    /// tracks a turn starting and stopping; long enough that a sidebar of rows
+    /// does not cost a round trip per row per frame.
+    fn refresh_proxied_working_flags(&mut self) {
+        let now = current_millis() as u128;
+        if now.saturating_sub(self.proxied_working_refreshed_ms) < PROXIED_WORKING_REFRESH_MS {
+            return;
+        }
+        self.proxied_working_refreshed_ms = now;
+        let owned: HashSet<String> = self
+            .working_flags()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        // Only the rows this daemon cannot answer for itself. A row it owns has
+        // a screen, and that answer is fresher than any round trip.
+        let mut proxied = HashMap::new();
+        for (path, working) in self.working_flags_including_proxied() {
+            if !owned.contains(&path) {
+                proxied.insert(path, working);
+            }
+        }
+        self.proxied_working_flags = proxied;
+    }
+
     fn working_flags_including_proxied(&mut self) -> Vec<(String, bool)> {
         let mut flags = self.working_flags();
         let mut answered: HashSet<String> =
@@ -3942,6 +4169,7 @@ impl DaemonRuntime {
             daemon_uptime_ms: current_millis_u64().saturating_sub(started_at_ms),
             running_build_id,
             on_disk_build_id,
+            server_build_commit: crate::build_identity::build_commit().to_string(),
             // A build id of 0 means the exe mtime was unreadable; "pending" would then be
             // a coin flip, so report no pending update rather than a confident wrong one.
             hot_restart_pending: running_build_id != 0
@@ -4514,6 +4742,17 @@ impl DaemonRuntime {
         for session in &mut snapshot.live_sessions {
             self.overlay_terminal_runtime_snapshot_session(session);
             self.overlay_codex_runtime_snapshot_session(session, yggterm_home.as_deref());
+            // ⛔ ONLY where this daemon has no answer of its own. A scrape of a
+            // screen we own is the freshest truth there is; a proxied flag may
+            // be up to one refresh old, so it fills a hole and never overwrites.
+            // `None` still survives both — a row nobody can see must stay
+            // unknown rather than be asserted idle, or a stale blink becomes
+            // possible, and a blink that should not be there cannot be noticed.
+            if session.working.is_none()
+                && let Some(working) = self.proxied_working_flags.get(&session.session_path)
+            {
+                session.working = Some(*working);
+            }
         }
         ServerResponse::Snapshot { snapshot, message }
     }
@@ -5988,6 +6227,54 @@ impl DaemonRuntime {
         }
     }
 
+    /// Answer what the idle gate saw, for the sessions this daemon owns.
+    ///
+    /// ⛔ **No `append_trace_event` anywhere on this path, and that is a
+    /// requirement rather than an omission** — see [`HotRestartGateScreen`].
+    /// The one place this reading may land is the reply to the caller that
+    /// asked for it.
+    ///
+    /// ⭐ The blockers come from the gate's OWN function, called once for the
+    /// whole owned set, so a session that this verb reports as unblocked is
+    /// unblocked in the gate's eyes and not merely in this verb's.
+    fn hot_restart_gate_screens_response(
+        &self,
+        path: Option<String>,
+        tail_lines: Option<usize>,
+    ) -> ServerResponse {
+        let owned = self.terminals.session_keys();
+        let blockers = self.hot_update_idle_gate_blockers(&owned);
+        let tail_lines = tail_lines.unwrap_or(HOT_RESTART_GATE_SCREEN_DEFAULT_TAIL_LINES);
+        let sessions = owned
+            .iter()
+            // A named session that this daemon does not own answers with an
+            // EMPTY list rather than an unavailable row: "ask a different
+            // daemon" is a topology the caller should not have to learn, and a
+            // row invented here would vouch for a reading nobody took.
+            .filter(|key| path.as_deref().is_none_or(|wanted| wanted == key.as_str()))
+            .map(|key| {
+                let runtime_path = self.terminal_runtime_key_for_path(key);
+                let screen = self.terminals.session_screen_snapshot(&runtime_path);
+                HotRestartGateScreen {
+                    session_key: key.clone(),
+                    blocker: blockers
+                        .iter()
+                        .find(|blocker| &blocker.session_key == key)
+                        .cloned(),
+                    screen_available: screen.is_some(),
+                    // ⛔ The predicate is asked of the WHOLE screen, exactly as
+                    // the gate asks it. Asking it of the tail would answer a
+                    // question about this verb's formatting.
+                    shows_agent_working: screen
+                        .as_deref()
+                        .is_some_and(yggterm_core::screen_text_shows_agent_working),
+                    screen_tail: screen.map(|screen| gate_screen_tail(&screen, tail_lines)),
+                }
+            })
+            .collect();
+        ServerResponse::HotRestartGateScreens { sessions }
+    }
+
     /// Ask the daemon that actually owns this row's PTY what is running in it,
     /// and answer as if we had walked it ourselves.
     ///
@@ -7365,7 +7652,14 @@ impl DaemonRuntime {
             ServerRequest::WorkingFlags => ServerResponse::WorkingFlags {
                 flags: self.working_flags_including_proxied(),
             },
-            ServerRequest::Snapshot => self.snapshot_response(None),
+            ServerRequest::Snapshot => {
+                // The dot's answer for rows an older coexisting daemon owns.
+                // Refreshed HERE because the request path holds `&mut self` and
+                // `snapshot_response` deliberately does not — a snapshot must
+                // stay a read.
+                self.refresh_proxied_working_flags();
+                self.snapshot_response(None)
+            }
             ServerRequest::PrepareUpdateRestart => {
                 // The snapshot write is BEST-EFFORT: it lets the relaunched GUI
                 // restore its session view, but a failed write must NOT abort the
@@ -7759,6 +8053,33 @@ impl DaemonRuntime {
                             }),
                         );
                         if let HandoffSweep::AllMoved { .. } = sweep {
+                            // ⭐ The same bequest as the superseded-retire sweep,
+                            // and for the same reason: this daemon's version name
+                            // is about to stop answering, and the successor is the
+                            // only thing that can carry it.
+                            // `default_endpoint` IS this daemon's version-named
+                            // socket — the one owner of "which socket am I", so
+                            // the bequest cannot name a different file from the
+                            // one we are about to release.
+                            let aliased = alias_own_socket_to_successor(
+                                self.store.home_dir(),
+                                &default_endpoint(self.store.home_dir()),
+                            );
+                            append_trace_event(
+                                self.store.home_dir(),
+                                "daemon",
+                                "lifecycle",
+                                "retiring_daemon_aliased_own_socket",
+                                serde_json::json!({
+                                    "successor_version": successor,
+                                    "successor_socket": aliased
+                                        .as_ref()
+                                        .map(|path| path.display().to_string()),
+                                    "aliased": aliased.is_some(),
+                                    "server_version": SERVER_PROTOCOL_VERSION,
+                                    "pid": std::process::id(),
+                                }),
+                            );
                             // The successor holds every descriptor now. The ONLY
                             // safe way to release ours is to EXIT: dropping
                             // runtimes individually leaves their reader threads
@@ -8726,6 +9047,7 @@ impl DaemonRuntime {
                 terminal_appearance,
                 initial_cols,
                 initial_rows,
+                configured_extra_args,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.ensure_remote_runtime_agent_session_public(
@@ -8734,6 +9056,7 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     require_existing,
                     terminal_appearance.as_deref(),
+                    configured_extra_args.as_deref(),
                 )?;
                 let _ = self.ensure_terminal_for_path_with_initial_size(
                     &key,
@@ -8750,6 +9073,7 @@ impl DaemonRuntime {
                 initial_cols,
                 initial_rows,
                 launch_options,
+                configured_extra_args,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_remote_runtime_agent_session_public(
@@ -8758,6 +9082,7 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     terminal_appearance.as_deref(),
                     &launch_options.unwrap_or_default(),
+                    configured_extra_args.as_deref(),
                 )?;
                 let _ = self.ensure_terminal_for_path_with_initial_size(
                     &key,
@@ -9130,6 +9455,9 @@ impl DaemonRuntime {
                 }
             }
             ServerRequest::TerminalTenants { path } => self.terminal_tenants_response(path),
+            ServerRequest::HotRestartGateScreens { path, tail_lines } => {
+                self.hot_restart_gate_screens_response(path, tail_lines)
+            }
             ServerRequest::DeclareSessionTenancy {
                 path,
                 created_by,
@@ -10985,6 +11313,21 @@ pub(crate) fn parse_daemon_version_triple(version: &str) -> Option<(u64, u64, u6
 /// file is a claim, and a stale one from a dead daemon must not count.
 #[cfg(unix)]
 fn live_newer_daemon_version(home_dir: &Path, own_endpoint: &ServerEndpoint) -> Option<String> {
+    live_newer_daemon_socket(home_dir, own_endpoint).map(|(version, _)| version)
+}
+
+/// The same question as [`live_newer_daemon_version`], answered with the SOCKET
+/// as well as the version — because the one caller that needs the path is the
+/// one about to unlink its own.
+///
+/// ⛔ One prober, not two. The version-only form delegates here; a second walk
+/// of `$YGGTERM_HOME` would be a second answer to "who supersedes me" that could
+/// disagree with the first, and this walk is the one that was optimised from 26
+/// probes down to 0-2.
+fn live_newer_daemon_socket(
+    home_dir: &Path,
+    own_endpoint: &ServerEndpoint,
+) -> Option<(String, PathBuf)> {
     let my_version = parse_daemon_version_triple(SERVER_PROTOCOL_VERSION)?;
     let mut own_sockets = Vec::new();
     for endpoint in [&default_endpoint(home_dir), own_endpoint] {
@@ -11016,11 +11359,58 @@ fn live_newer_daemon_version(home_dir: &Path, own_endpoint: &ServerEndpoint) -> 
     // Newest first, so the first confirmation is also the best handoff target.
     candidates.sort_by(|left, right| right.0.cmp(&left.0));
     candidates.into_iter().find_map(|(_, path)| {
-        let status = status(&ServerEndpoint::UnixSocket(path)).ok()?;
+        let status = status(&ServerEndpoint::UnixSocket(path.clone())).ok()?;
         parse_daemon_version_triple(&status.server_version)
             .is_some_and(|peer| peer > my_version)
-            .then(|| status.server_version.trim().to_string())
+            .then(|| (status.server_version.trim().to_string(), path))
     })
+}
+
+/// ⭐ **A RETIRING DAEMON ALIASES ITS OWN VERSION TO ITS SUCCESSOR, as part of
+/// retiring.** Called immediately before the exit that releases this daemon's
+/// socket.
+///
+/// ⛔ **Why it can only be done HERE.** A gap-filling pass run at daemon START
+/// cannot cover the version that is LIVE while it runs — a real socket is
+/// invisible to a pass that only fills gaps — so **every handover orphans
+/// exactly one version: whichever one was serving.** Any client pinned to it
+/// then gets `connecting to …/server-<that>.sock: No such file or directory`,
+/// and on an agent CLI that error lands in the composer and leaves the row with
+/// no PTY. Measured twice on one evening, on two hosts, under two different
+/// version numbers, each time naming the version that had just retired.
+///
+/// This is the single moment in the system's life when **both names are known at
+/// once**: the successor is bound and answering, and the predecessor's socket is
+/// about to disappear. Nothing run later can reconstruct the pairing, which is
+/// why every attempt so far has had to guess it from whichever socket files
+/// happened to survive — a candidate set that inherits the sweeper's retention
+/// policy rather than describing the fleet
+/// ([[finding-a-fallback-derived-from-survivors-protects-nobody]]).
+///
+/// ⚠ Direction matters and only one direction is sound: this points an OLDER
+/// version's name at a NEWER daemon. The reverse — a current client proxied to
+/// an older daemon — has already returned nothing silently on this project, and
+/// is never what this writes, because the successor is by construction newer.
+#[cfg(unix)]
+fn alias_own_socket_to_successor(home_dir: &Path, own_endpoint: &ServerEndpoint) -> Option<PathBuf> {
+    let (_, successor_socket) = live_newer_daemon_socket(home_dir, own_endpoint)?;
+    let ServerEndpoint::UnixSocket(mine) = own_endpoint else {
+        return None;
+    };
+    // Only a real, version-named socket of our own. A daemon on a custom
+    // endpoint has no version name to bequeath, and aliasing an arbitrary path
+    // would put a name in the tree that no client ever looks for.
+    parse_versioned_server_socket_name(mine)?;
+    if fs::canonicalize(mine).ok()? == fs::canonicalize(&successor_socket).ok()? {
+        // Already the same file — we are looking at our own alias.
+        return None;
+    }
+    // Unlink-then-symlink while still bound: established connections are
+    // unaffected by the unlink, and a client that connects during the ~250 ms
+    // before exit reaches the successor rather than a socket about to die.
+    let _ = fs::remove_file(mine);
+    std::os::unix::fs::symlink(&successor_socket, mine).ok()?;
+    Some(successor_socket)
 }
 
 /// Per [[bug-class-old-daemon-never-retires]]: in the managed-versions install
@@ -11168,6 +11558,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::DropTerminalRuntime { .. } => "drop_terminal_runtime",
         ServerRequest::SetSessionKeepAlive { .. } => "set_session_keep_alive",
         ServerRequest::TerminalTenants { .. } => "terminal_tenants",
+        ServerRequest::HotRestartGateScreens { .. } => "hot_restart_gate_screens",
         ServerRequest::DeclareSessionTenancy { .. } => "declare_session_tenancy",
         ServerRequest::Wpe { .. } => "wpe",
         ServerRequest::WpeAgent { .. } => "wpe_agent",
@@ -11899,6 +12290,25 @@ fn spawn_superseded_self_retire_sweep(
                     }),
                 );
                 if let HandoffSweep::AllMoved { .. } = sweep {
+                    // ⭐ Bequeath our NAME before we stop answering to it, or
+                    // every client pinned to this version strands the moment we
+                    // exit. This is the only place both names are known.
+                    let aliased = alias_own_socket_to_successor(&home_dir, &endpoint);
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "lifecycle",
+                        "retiring_daemon_aliased_own_socket",
+                        serde_json::json!({
+                            "successor_version": successor,
+                            "successor_socket": aliased
+                                .as_ref()
+                                .map(|path| path.display().to_string()),
+                            "aliased": aliased.is_some(),
+                            "server_version": SERVER_PROTOCOL_VERSION,
+                            "pid": std::process::id(),
+                        }),
+                    );
                     // The successor holds every descriptor. Exiting is the only
                     // way to release ours — dropping runtimes individually
                     // leaves reader threads on cloned masters, and two daemons
@@ -12147,6 +12557,16 @@ pub struct DaemonCensusRow {
     pub pid: u32,
     pub version: String,
     pub build_id: u64,
+    /// The commit this daemon PROCESS is executing, as it reported it.
+    ///
+    /// ⛔ THE VERSION COLUMN CANNOT IDENTIFY A BUILD and [`Self::exe`] cannot
+    /// either — a deploy replaces the file, so the path names a build this
+    /// process never ran, and `(deleted)` says only *that* it was replaced. Two
+    /// clusters spend one version number routinely, which is why the fleet
+    /// census compares md5s on disk; the running plane had no equivalent, so a
+    /// host could read "current" everywhere while every daemon on it executed
+    /// something else. Empty on a daemon predating the field.
+    pub build_commit: String,
     /// The socket this daemon answered on.
     pub endpoint: String,
     /// `/proc/<pid>/exe` verbatim, INCLUDING Linux's " (deleted)" suffix.
@@ -12281,6 +12701,7 @@ pub fn daemon_census(home_dir: &Path) -> Vec<DaemonCensusRow> {
                 pid: status.server_pid,
                 version: status.server_version.clone(),
                 build_id: status.server_build_id,
+                build_commit: status.server_build_commit.clone(),
                 is_default_endpoint: owner_endpoint_label(&endpoint) == default_label,
                 endpoint: owner_endpoint_label(&endpoint),
                 exe_deleted: exe.as_deref().is_some_and(|link| link.ends_with(" (deleted)")),
@@ -12324,6 +12745,22 @@ pub fn format_daemon_census(rows: &[DaemonCensusRow]) -> String {
     format_daemon_census_with_queued_swap(rows, None, 0)
 }
 
+/// What the BUILD column shows for a daemon that did not give a commit.
+///
+/// ⛔ THE TWO SILENCES ARE DIFFERENT FACTS AND THE TABLE MUST NOT MERGE THEM.
+/// A daemon older than the field cannot answer — expected, and it dates the
+/// process. A daemon that CAN answer and says `unstamped` was built without the
+/// stamp, which means the census cannot identify a build that is running right
+/// now. Printing one symbol for both would hide the second inside the first,
+/// which is exactly how a version number came to stand for two builds.
+fn running_build_label(build_commit: &str) -> &str {
+    if build_commit.is_empty() {
+        "(pre-field)"
+    } else {
+        build_commit
+    }
+}
+
 /// The same table, plus §4's host-level answer to *"is a swap owed here?"*.
 ///
 /// ⚠ The queued swap is a HOST fact and deliberately not a column: it outlives
@@ -12344,15 +12781,16 @@ pub fn format_daemon_census_with_queued_swap(
     }
     let mut out = String::new();
     out.push_str(
-        "  PID       VERSION   UPTIME   OWNED  PRESV  ROWS  BINARY\n",
+        "  PID       VERSION   BUILD          UPTIME   OWNED  PRESV  ROWS  BINARY\n",
     );
     for row in rows {
         let hours = row.uptime_ms as f64 / 3_600_000.0;
         let marker = if row.is_default_endpoint { '*' } else { ' ' };
         out.push_str(&format!(
-            "{marker} {pid:<9} {version:<9} {hours:>5.1}h {owned:>6} {presv:>6} {rows:>5}  {exe}{deleted}\n",
+            "{marker} {pid:<9} {version:<9} {build:<14} {hours:>5.1}h {owned:>6} {presv:>6} {rows:>5}  {exe}{deleted}\n",
             pid = row.pid,
             version = row.version,
+            build = running_build_label(&row.build_commit),
             owned = row.owned_terminal_session_count,
             presv = row.preserved_terminal_owner_count,
             rows = row.live_terminal_session_count,
@@ -13283,6 +13721,7 @@ pub fn start_remote_runtime_codex_session(
 }
 
 /// The kind-parameterized lane, for every CLI without a bespoke request pair.
+#[allow(clippy::too_many_arguments)]
 pub fn ensure_remote_runtime_agent_session(
     endpoint: &ServerEndpoint,
     kind: SessionKind,
@@ -13291,6 +13730,7 @@ pub fn ensure_remote_runtime_agent_session(
     require_existing: bool,
     initial_size: Option<(u16, u16)>,
     terminal_appearance: Option<&str>,
+    configured_extra_args: Option<&str>,
 ) -> Result<String> {
     expect_ack(send_request(
         endpoint,
@@ -13302,11 +13742,13 @@ pub fn ensure_remote_runtime_agent_session(
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             initial_cols: initial_size.map(|(cols, _)| cols),
             initial_rows: initial_size.map(|(_, rows)| rows),
+            configured_extra_args: configured_extra_args.map(ToOwned::to_owned),
         },
     )?)?
     .with_context(|| format!("missing runtime session key for {session_id}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn start_remote_runtime_agent_session(
     endpoint: &ServerEndpoint,
     kind: SessionKind,
@@ -13315,6 +13757,7 @@ pub fn start_remote_runtime_agent_session(
     initial_size: Option<(u16, u16)>,
     terminal_appearance: Option<&str>,
     launch: &AgentLaunchOptions,
+    configured_extra_args: Option<&str>,
 ) -> Result<String> {
     expect_ack(send_request(
         endpoint,
@@ -13326,6 +13769,7 @@ pub fn start_remote_runtime_agent_session(
             initial_cols: initial_size.map(|(cols, _)| cols),
             initial_rows: initial_size.map(|(_, rows)| rows),
             launch_options: (!launch.is_empty()).then(|| launch.clone()),
+            configured_extra_args: configured_extra_args.map(ToOwned::to_owned),
         },
     )?)?
     .with_context(|| format!("missing runtime session key for {session_id}"))
@@ -13642,6 +14086,29 @@ pub fn terminal_tenants(
         ServerResponse::TerminalTenants { rows, degraded } => Ok((rows, degraded)),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal tenants response: {:?}", other),
+    }
+}
+
+/// What the hot-restart idle gate is looking at, right now, per owned session.
+///
+/// `path: None` asks about every session the daemon owns. A daemon that owns
+/// nothing answers with an empty list, which is the honest answer to "what is
+/// holding your gate" — not an error.
+pub fn hot_restart_gate_screens(
+    endpoint: &ServerEndpoint,
+    path: Option<&str>,
+    tail_lines: Option<usize>,
+) -> Result<Vec<HotRestartGateScreen>> {
+    match send_request(
+        endpoint,
+        &ServerRequest::HotRestartGateScreens {
+            path: path.map(ToOwned::to_owned),
+            tail_lines,
+        },
+    )? {
+        ServerResponse::HotRestartGateScreens { sessions } => Ok(sessions),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected hot restart gate screens response: {:?}", other),
     }
 }
 
@@ -14476,6 +14943,11 @@ fn spawn_disk_binary_version_poll(
                 );
                 hot_restart_queue::clear(&home_dir);
             }
+            // §5's second half, and it runs on EVERY daemon's poll — including
+            // the daemon that is otherwise current and `continue`s out below,
+            // which is precisely the one most likely to have adopted the
+            // sessions a forced swap interrupted.
+            dispatch_interrupted_session_repairs(&home_dir, &runtime);
             // Retire trigger 1: our on-disk binary was replaced by an update.
             let exe_link = fs::read_link("/proc/self/exe")
                 .map(|link| link.to_string_lossy().into_owned())
@@ -14670,6 +15142,49 @@ fn spawn_disk_binary_version_poll(
                     let owned = rt.terminals.session_keys();
                     rt.hot_update_idle_gate_blockers(&owned)
                 };
+                // §5: after 30 minutes this stops being a wait and becomes the
+                // stale daemon the constitution exists to abolish. The verdict
+                // also PRODUCES the interrupted list, because §8 says it cannot
+                // be re-derived once the PTYs are gone.
+                let owed_for_ms = hot_restart_retire_owed_for_ms(&home_dir, current_millis_u64());
+                let deadline = hot_restart_deadline_verdict(&blockers, owed_for_ms);
+                if let HotRestartDeadlineVerdict::Force { interrupted } = &deadline {
+                    // ⛔ RECORD BEFORE SHUTTING DOWN. The process that knows who
+                    // is about to be interrupted is the one that is about to
+                    // stop existing.
+                    let recorded = hot_restart_repair::record(
+                        &home_dir,
+                        &hot_restart_repair::InterruptedSessions {
+                            recorded_at_ms: current_millis_u64(),
+                            recorded_by_pid: std::process::id(),
+                            recorded_by_version: SERVER_PROTOCOL_VERSION.to_string(),
+                            reason: reason.clone(),
+                            sessions: interrupted.clone(),
+                        },
+                    );
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "lifecycle",
+                        "hot_restart_forced_past_deadline",
+                        serde_json::json!({
+                            "retire_trigger": retire_trigger,
+                            "owed_for_ms": owed_for_ms,
+                            "deadline_ms": HOT_RESTART_FORCED_SWAP_DEADLINE_MS,
+                            "reason": reason,
+                            "interrupted": interrupted,
+                            // A forced swap whose repair was not recorded owes a
+                            // `continue` nobody will send. It still proceeds —
+                            // the deadline is the ruling — but the gap is named.
+                            "repair_recorded": recorded,
+                            "blockers": blockers,
+                            "current_version": SERVER_PROTOCOL_VERSION,
+                            "current_pid": std::process::id(),
+                        }),
+                    );
+                    // Fall THROUGH to the shutdown below. This is the one path
+                    // that does not `continue`.
+                } else {
                 let settled = !blockers.is_empty()
                     && blockers.iter().all(|blocker| blocker.permanent);
                 deferred_polls = deferred_polls.saturating_add(1);
@@ -14718,6 +15233,7 @@ fn spawn_disk_binary_version_poll(
                 }
                 deferred_reason_last = Some(reason);
                 continue;
+                }
             }
             // B4: make it loud if this cold shutdown would strand rows a
             // reachable successor does not cover (observation only).
@@ -15195,6 +15711,181 @@ static HOT_RESTART_SWAP_LANE_SETTLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 static HOT_RESTART_SWAP_LAST_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
 
+/// §5's clock: when this daemon's retire was FIRST held by a blocker. Zero = never.
+///
+/// Set at the gate, not at the retire trigger, because that is what the ruling
+/// measures — *"after 30 minutes of waiting"* is thirty minutes of being held,
+/// not thirty minutes of existing while superseded.
+///
+/// ⛔ **One clock, and it never moves.** It is seeded from the HOST's queue entry
+/// when there is one — that record survives process deaths and is the older, truer
+/// answer to *"how long has this been owed"* — and from the current moment when
+/// there is not (the `newer_daemon_live` shape queues nothing, because a successor
+/// already exists; what is stalled there is this daemon's own exit). Reading the
+/// queue on every poll instead would re-derive the clock from a file a peer can
+/// rewrite, which is how the deadline would quietly restart forever.
+#[cfg(target_os = "linux")]
+static HOT_RESTART_RETIRE_OWED_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// How long this daemon has been trying to retire, for §5's deadline.
+#[cfg(target_os = "linux")]
+fn hot_restart_retire_owed_for_ms(home_dir: &Path, now_ms: u64) -> u64 {
+    let mut since_ms = HOT_RESTART_RETIRE_OWED_SINCE_MS.load(Ordering::Relaxed);
+    if since_ms == 0 {
+        since_ms = hot_restart_queue::load(home_dir)
+            .map(|queued| queued.requested_at_ms)
+            // A stamp from the future (a clock change, a hand-edited file) would
+            // make the deadline unreachable, and a zero stamp would make it
+            // instant. Neither is a reason to interrupt anybody.
+            .filter(|stamp| *stamp > 0 && *stamp <= now_ms)
+            .unwrap_or(now_ms);
+        HOT_RESTART_RETIRE_OWED_SINCE_MS.store(since_ms, Ordering::Relaxed);
+    }
+    now_ms.saturating_sub(since_ms)
+}
+
+/// A repair batch is already being typed; a second one would double-`continue`.
+#[cfg(target_os = "linux")]
+static HOT_RESTART_REPAIR_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Clears [`HOT_RESTART_REPAIR_IN_FLIGHT`] however the batch ends.
+///
+/// ⛔ **A trailing `store(false)` is not enough, and the failure is silent and
+/// permanent.** The repair thread takes the daemon's runtime lock; if anything
+/// on that path panics, a flag reset written as the last statement never runs,
+/// and this daemon then declines every future repair forever while reporting
+/// nothing at all — [[finding-a-release-condition-unreachable-in-the-state-that-closes-it]].
+/// `Drop` runs during unwinding, so the guard closes what the statement cannot.
+#[cfg(target_os = "linux")]
+struct HotRestartRepairInFlight;
+
+#[cfg(target_os = "linux")]
+impl Drop for HotRestartRepairInFlight {
+    fn drop(&mut self) {
+        HOT_RESTART_REPAIR_IN_FLIGHT.store(false, Ordering::Relaxed);
+    }
+}
+
+/// How long the repair waits for a re-resumed agent to start consuming input.
+///
+/// The echo-verified submit is what makes this safe: a just-resumed agent CLI
+/// draws its composer seconds before its input loop is live, so a `continue`
+/// written at "prompt shown" is silently swallowed. Twenty seconds is past the
+/// measured re-resume; a session slower than that keeps its repair unspent
+/// rather than getting a `continue` typed into a menu.
+#[cfg(target_os = "linux")]
+const HOT_RESTART_REPAIR_SUBMIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(20);
+
+/// §5's other half: type `continue` into the sessions a forced swap interrupted.
+///
+/// Runs on EVERY daemon's poll, including the current one, because the daemon
+/// that owes the repair is by construction not the daemon that recorded it —
+/// [`crate::hot_restart_repair`] owns that rule and spends the record as it
+/// answers, so this can be called freely without risking a second `continue`.
+#[cfg(target_os = "linux")]
+fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<DaemonRuntime>>) {
+    // Cheapest instrument first: the record is absent on every host that has
+    // never forced a swap, which is nearly all of them, and this must not take
+    // the daemon's runtime lock 4,320 times a day to learn that.
+    if hot_restart_repair::load(home_dir).is_none()
+        || HOT_RESTART_REPAIR_IN_FLIGHT.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    let now_ms = current_millis_u64();
+    let (owned, runtime_paths) = {
+        let rt = lock_daemon_runtime(runtime, "hot_restart_repair_owned");
+        let owned = rt.terminals.session_keys();
+        let paths = owned
+            .iter()
+            .map(|key| (key.clone(), rt.terminal_runtime_key_for_path(key)))
+            .collect::<Vec<_>>();
+        (owned, paths)
+    };
+    match hot_restart_repair::take_repairable(home_dir, now_ms, std::process::id(), &owned) {
+        hot_restart_repair::RepairVerdict::Nothing => {}
+        hot_restart_repair::RepairVerdict::Expired { age_ms, sessions } => {
+            // ⛔ Loud, never silent. A repair that aged out is a `continue` the
+            // owner was promised and did not get, and the only way anyone learns
+            // that is here.
+            append_trace_event(
+                home_dir,
+                "daemon",
+                "lifecycle",
+                "hot_restart_repair_expired",
+                serde_json::json!({
+                    "age_ms": age_ms,
+                    "window_ms": hot_restart_repair::REPAIR_WINDOW_MS,
+                    "sessions": sessions,
+                    "current_version": SERVER_PROTOCOL_VERSION,
+                    "current_pid": std::process::id(),
+                }),
+            );
+        }
+        hot_restart_repair::RepairVerdict::Repair { sessions } => {
+            HOT_RESTART_REPAIR_IN_FLIGHT.store(true, Ordering::Relaxed);
+            let home_dir = home_dir.to_path_buf();
+            let runtime = Arc::clone(runtime);
+            let targets = sessions
+                .iter()
+                .filter_map(|key| {
+                    runtime_paths
+                        .iter()
+                        .find(|(session_key, _)| session_key == key)
+                        .map(|(session_key, path)| (session_key.clone(), path.clone()))
+                })
+                .collect::<Vec<_>>();
+            // Off the poll thread: the echo-verified submit sleeps between
+            // probes, and the poll it runs on is the same one that would notice
+            // the next daemon becoming stale.
+            std::thread::spawn(move || {
+                let _in_flight = HotRestartRepairInFlight;
+                for (session_key, runtime_path) in targets {
+                    let write_runtime = Arc::clone(&runtime);
+                    let write_path = runtime_path.clone();
+                    let snapshot_runtime = Arc::clone(&runtime);
+                    let snapshot_path = runtime_path.clone();
+                    let outcome = crate::terminal::submit_prompt_echo_verified_with(
+                        move |text| {
+                            // Locked per WRITE, released before every sleep —
+                            // the whole reason this is not the registry method.
+                            lock_daemon_runtime(&write_runtime, "hot_restart_repair_write")
+                                .terminals
+                                .write(&write_path, text)
+                        },
+                        move || {
+                            lock_daemon_runtime(&snapshot_runtime, "hot_restart_repair_snapshot")
+                                .terminals
+                                .session_screen_snapshot(&snapshot_path)
+                        },
+                        "continue",
+                        HOT_RESTART_REPAIR_SUBMIT_TIMEOUT,
+                    );
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "lifecycle",
+                        "hot_restart_repair_continue",
+                        serde_json::json!({
+                            "session_key": session_key,
+                            "outcome": match &outcome {
+                                Ok(crate::terminal::PromptSubmitOutcome::Submitted { .. }) => "submitted",
+                                Ok(crate::terminal::PromptSubmitOutcome::NotReady { .. }) => "not_ready",
+                                Ok(crate::terminal::PromptSubmitOutcome::NoSession) => "no_session",
+                                Err(_) => "error",
+                            },
+                            "error": outcome.as_ref().err().map(|error| error.to_string()),
+                            "current_version": SERVER_PROTOCOL_VERSION,
+                            "current_pid": std::process::id(),
+                        }),
+                    );
+                }
+            });
+        }
+    }
+}
+
 /// One poll of §4's lane: is the owed swap satisfied, waiting, or due?
 #[cfg(target_os = "linux")]
 fn hot_restart_swap_step(
@@ -15243,8 +15934,21 @@ fn hot_restart_swap_step(
     }
     // The process-local floor, checked whatever the file says — including when
     // the file is absent, which is the state a peer's convergence leaves behind.
+    //
+    // ⭐ §2: A RELAY BOUNDARY RELEASES THIS FLOOR TOO, and it has to, because
+    // releasing only the file's floor would leave the swap held by the other one
+    // — a bypass that reports success and changes nothing
+    // ([[finding-a-verb-that-reports-failure-on-success]] inverted). The
+    // comparison is against THIS process's own last attempt, so one boundary
+    // still buys each drainer exactly one attempt.
     let last_attempt_ms = HOT_RESTART_SWAP_LAST_ATTEMPT_MS.load(Ordering::Relaxed);
-    if last_attempt_ms != 0
+    let boundary_releases_this_process = queued.as_ref().is_some_and(|queued| {
+        queued
+            .relay_boundary_at_ms
+            .is_some_and(|boundary_ms| boundary_ms > last_attempt_ms)
+    });
+    if !boundary_releases_this_process
+        && last_attempt_ms != 0
         && now_ms.saturating_sub(last_attempt_ms) < HOT_RESTART_SWAP_RETRY_INTERVAL_MS
     {
         return SwapStep::Lingering;
@@ -15257,7 +15961,11 @@ fn hot_restart_swap_step(
         hot_restart_queue::record_attempt(
             home_dir,
             now_ms,
-            "no daemon at or above the target version is live yet; retrying the handoff",
+            if boundary_releases_this_process {
+                "a relay boundary was declared; retrying the handoff at it"
+            } else {
+                "no daemon at or above the target version is live yet; retrying the handoff"
+            },
         );
     }
     match attempt_self_retire_preserving_handoff(endpoint, home_dir, exe_link, owned) {
@@ -15334,6 +16042,10 @@ fn queue_self_retire_swap(
         attempts: 1,
         last_attempt_ms: Some(now_ms),
         last_outcome: Some("handoff requested; successor not yet confirmed live".to_string()),
+        // §2: a boundary is declared by a relay hand-off, never by the daemon
+        // that is queuing the swap — it would be declaring its own quiet point.
+        relay_boundary_at_ms: None,
+        relay_boundary_by: None,
     };
     let decision = hot_restart_queue::enqueue(home_dir, &request);
     append_trace_event(
@@ -18238,9 +18950,11 @@ pub(crate) fn terminal_write_strategy_for_path(
 mod tests {
     use super::{
         DaemonRuntime, HOT_RESTART_BLOCKER_NOT_RESTORABLE, HOT_RESTART_BLOCKER_ORCHESTRATING,
-        HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, HOT_RESTART_BLOCKER_WORKING, HotRestartBlocker,
+        HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, HOT_RESTART_BLOCKER_WORKING,
+        HOT_RESTART_FORCED_SWAP_DEADLINE_MS, HotRestartBlocker, HotRestartDeadlineVerdict,
         hot_restart_block_reason_summary, hot_restart_blocker_is_deadline_exempt,
-        hot_restart_blockers_actionable_first, hot_update_handoff_would_refuse_binary,
+        ServerRequest, ShadowAccess, gate_screen_tail, hot_restart_blockers_actionable_first,
+        hot_restart_deadline_verdict, hot_update_handoff_would_refuse_binary, role_gate,
     };
     use crate::live_row_tombstones::LiveRowTombstones;
 
@@ -19079,6 +19793,157 @@ mod tests {
         ));
     }
 
+    /// §5, the ruling itself: at 30 minutes the wait ends, and the sessions it
+    /// ends on are named so they can be repaired.
+    #[test]
+    fn the_deadline_forces_the_swap_and_names_who_it_interrupts() {
+        let blockers = vec![
+            blocker("local://a", HOT_RESTART_BLOCKER_WORKING, Some(0)),
+            blocker("local://b", HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, Some(0)),
+        ];
+        assert_eq!(
+            hot_restart_deadline_verdict(&blockers, HOT_RESTART_FORCED_SWAP_DEADLINE_MS - 1),
+            HotRestartDeadlineVerdict::KeepWaiting,
+            "inside the window this must behave exactly as it did before §5"
+        );
+        assert_eq!(
+            hot_restart_deadline_verdict(&blockers, HOT_RESTART_FORCED_SWAP_DEADLINE_MS),
+            HotRestartDeadlineVerdict::Force {
+                interrupted: vec!["local://a".to_string(), "local://b".to_string()],
+            },
+            "the interrupted list is produced HERE — after the swap every one of \
+             these sessions looks idle and the list cannot be rebuilt"
+        );
+    }
+
+    /// ⛔ §6 outranks §5, and one exempt blocker vetoes the whole force.
+    ///
+    /// A cold shutdown kills every PTY this daemon owns, so there is no version
+    /// of "interrupt the working one but spare the shell beside it". Getting
+    /// this wrong strands a delegate fleet or destroys a plain shell — the two
+    /// outcomes the exemption exists to prevent.
+    #[test]
+    fn one_exempt_blocker_holds_the_deadline_open_forever() {
+        for exempt_kind in [
+            HOT_RESTART_BLOCKER_ORCHESTRATING,
+            HOT_RESTART_BLOCKER_NOT_RESTORABLE,
+        ] {
+            let blockers = vec![
+                blocker("local://working", HOT_RESTART_BLOCKER_WORKING, Some(0)),
+                blocker("local://exempt", exempt_kind, Some(0)),
+            ];
+            assert_eq!(
+                hot_restart_deadline_verdict(&blockers, HOT_RESTART_FORCED_SWAP_DEADLINE_MS * 10),
+                HotRestartDeadlineVerdict::ExemptBlocker {
+                    kind: exempt_kind.to_string(),
+                    session_key: "local://exempt".to_string(),
+                },
+                "§8: the wait must be nameable, not a silent refusal"
+            );
+        }
+    }
+
+    /// An unblocked gate is not a forced swap. The deadline must not manufacture
+    /// an interruption out of a daemon that was free to go all along — that
+    /// record would owe a `continue` to nobody and fire into a healthy session.
+    #[test]
+    fn a_gate_with_no_blockers_is_never_a_forced_swap() {
+        assert_eq!(
+            hot_restart_deadline_verdict(&[], HOT_RESTART_FORCED_SWAP_DEADLINE_MS * 10),
+            HotRestartDeadlineVerdict::KeepWaiting
+        );
+    }
+
+    /// §5's two halves ship together or not at all: the deadline may only fire
+    /// from a branch that has already written down who it is about to interrupt.
+    ///
+    /// Source-level because the defect is an ORDERING — a `shutdown()` that runs
+    /// before the record is written type-checks, passes every unit test, and
+    /// loses the list forever, since the process that holds it is the one
+    /// exiting.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_forced_swap_records_its_interrupted_set_before_shutting_down() {
+        let source = include_str!("daemon.rs");
+        let gate = source
+            .split("let deadline = hot_restart_deadline_verdict(&blockers, owed_for_ms);")
+            .nth(1)
+            .and_then(|suffix| suffix.split("// B4: make it loud").next())
+            .expect("the deadline branch should be present");
+        let record_at = gate
+            .find("hot_restart_repair::record(")
+            .expect("a forced swap must record the sessions it interrupts");
+        let trace_at = gate
+            .find("hot_restart_forced_past_deadline")
+            .expect("a forced swap must say so in the trace");
+        assert!(
+            record_at < trace_at,
+            "the interrupted set must be recorded before anything else in the branch — \
+             it cannot be re-derived once the PTYs are gone"
+        );
+        assert!(
+            !gate.contains("let _ = shutdown(&endpoint);"),
+            "the shutdown belongs to the shared exit below the gate, so a forced swap \
+             cannot acquire its own copy that skips the row-coverage check"
+        );
+    }
+
+    #[test]
+    fn the_gate_screen_verb_never_writes_a_screen_to_the_trace() {
+        // ⛔ The whole reason this verb is on-demand. `event-trace*.jsonl` is
+        // durable, is collected into bundles and is read by every later
+        // session; a session's screen carries whatever the person typed into
+        // it. The reading may go to the caller that asked and nowhere else.
+        let source = include_str!("daemon.rs");
+        let handler = source
+            .split("fn hot_restart_gate_screens_response(")
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split("ServerResponse::HotRestartGateScreens { sessions }")
+                    .next()
+            })
+            .expect("the gate-screen handler should be present");
+        assert!(
+            !handler.contains("append_trace_event"),
+            "the gate-screen reading must never reach a trace event — it is a \
+             durable, widely-copied file and this is session screen text"
+        );
+    }
+
+    #[test]
+    fn the_gate_screen_tail_keeps_the_newest_lines_and_their_escapes() {
+        // Newest LAST, because that is the order a reader's eye expects and the
+        // order every other screen dump on this project uses.
+        let screen = "one\ntwo\n\u{1b}[32mthree\u{1b}[m\nfour";
+        assert_eq!(
+            gate_screen_tail(screen, 2),
+            vec!["\u{1b}[32mthree\u{1b}[m".to_string(), "four".to_string()],
+        );
+        // A screen shorter than the window is returned whole rather than
+        // padded — a padded reading would put lines in a corpus that were never
+        // on the screen.
+        assert_eq!(gate_screen_tail("only", 24), vec!["only".to_string()]);
+        // ⚠ Empty is empty, and it must not panic: an agent session between a
+        // clear and its first repaint really does read as no lines at all.
+        assert!(gate_screen_tail("", 24).is_empty());
+        assert!(gate_screen_tail("anything", 0).is_empty());
+    }
+
+    #[test]
+    fn a_shadow_client_may_not_read_every_session_on_the_host() {
+        // Read-only is not the test; SCOPE is. A shadow is a viewer of ONE
+        // session, and this verb answers with the screen of every session the
+        // daemon owns.
+        assert_eq!(
+            role_gate(&ServerRequest::HotRestartGateScreens {
+                path: None,
+                tail_lines: None,
+            }),
+            ShadowAccess::Deny,
+        );
+    }
+
     // An orchestrating session is NOT permanent: it clears the moment its
     // sub-agents stop writing. `server daemons` reads `permanent` to separate
     // "deferring" from "lingering forever", and calling this permanent would
@@ -19118,6 +19983,7 @@ mod tests {
             pid,
             version: "3.0.81".to_string(),
             build_id: 1,
+            build_commit: "abc123def456".to_string(),
             endpoint: format!("sock-{pid}"),
             exe: Some("/home/user/.yggterm/bin/yggterm-headless".to_string()),
             exe_deleted: false,
@@ -19131,6 +19997,39 @@ mod tests {
             permanent_blocker_count: 0,
             is_default_endpoint: false,
         }
+    }
+
+    /// ⛔ BOTH CONTROLS. A census column that has collapsed to one answer looks
+    /// exactly like a census column that is working, so proving it can name a
+    /// commit is only half the check — it must also be shown to say something
+    /// ELSE, and to say it differently for the two silences.
+    #[test]
+    fn the_census_names_the_running_build_and_admits_when_it_cannot() {
+        let named = super::format_daemon_census(&[census_row(11, 60_000)]);
+        assert!(named.contains("BUILD"), "{named}");
+        assert!(
+            named.contains("abc123def456"),
+            "the running build must appear in the table: {named}"
+        );
+
+        let mut old = census_row(12, 60_000);
+        old.build_commit = String::new();
+        let mut unstamped = census_row(13, 60_000);
+        unstamped.build_commit = crate::build_identity::UNSTAMPED.to_string();
+        let rendered = super::format_daemon_census(&[old, unstamped]);
+        assert!(
+            rendered.contains("(pre-field)"),
+            "a daemon too old to answer is dated, not blanked: {rendered}"
+        );
+        assert!(
+            rendered.contains(crate::build_identity::UNSTAMPED),
+            "a daemon that answers 'no identity' is a live gap and must be \
+             visible as one, not merged with the old daemons: {rendered}"
+        );
+        assert!(
+            !rendered.contains("abc123def456"),
+            "the column must not be showing a constant: {rendered}"
+        );
     }
 
     #[test]
@@ -19664,6 +20563,54 @@ mod tests {
             flags.contains(&("remote-cc://dev/theirs".to_string(), true)),
             "a row this daemon only proxies must still get a flag, or its dot \
              can never blink; got {flags:?}"
+        );
+    }
+
+    /// ⛔ THE SNAPSHOT IS WHAT THE SIDEBAR DOT READS, and for a long time it was
+    /// the one request that never consulted a proxied answer.
+    ///
+    /// `ServerRequest::WorkingFlags` has asked the owning daemon since the proxy
+    /// was built and is covered by the two tests around this one — but a row
+    /// owned by an older coexisting daemon reported `working: None` in every
+    /// SNAPSHOT and so never blinked, however hard its agent was working. The
+    /// owner read that as his fleet being idle while eight rows were mid-turn.
+    /// The capability existed; the surface that needed it asked a different
+    /// question, which is the same shape as a verb wired at every layer with no
+    /// dispatch arm.
+    #[test]
+    fn the_snapshot_fills_a_working_flag_it_cannot_measure_and_never_overwrites_one_it_can() {
+        let source = include_str!("daemon.rs");
+        let snapshot_fn = source
+            .split("fn snapshot_response(")
+            .nth(1)
+            .expect("snapshot_response exists");
+        let body = &snapshot_fn[..snapshot_fn.find("\n    }").expect("body ends")];
+        assert!(
+            body.contains("self.proxied_working_flags.get(&session.session_path)"),
+            "the snapshot must consult the proxied flags, or a row owned by \
+             another daemon can never blink"
+        );
+        assert!(
+            body.contains("session.working.is_none()"),
+            "and only where it has no answer of its own: a scrape of a screen \
+             this daemon owns is fresher than any round trip"
+        );
+        // ⛔ The refresh may not live in the snapshot itself — a snapshot is a
+        // read, taken often, and an unbounded fan-out to sibling daemons on
+        // that path would cost a round trip per row per frame.
+        assert!(
+            !body.contains("refresh_proxied_working_flags"),
+            "the refresh belongs on the request path that holds `&mut self`, \
+             not inside the snapshot"
+        );
+        let dispatch = source
+            .split("ServerRequest::Snapshot =>")
+            .nth(1)
+            .expect("the snapshot request is dispatched");
+        assert!(
+            dispatch[..500].contains("self.refresh_proxied_working_flags()"),
+            "and the request path must actually refresh it, or the cache is \
+             written once and read forever"
         );
     }
 
@@ -21348,6 +22295,41 @@ mod tests {
         );
     }
 
+    /// §2: BOTH floors must yield to a declared relay boundary, not just the one
+    /// in the file.
+    ///
+    /// Source-level because the defect is a MISSING CONDITION on a second gate,
+    /// and the shape has already cost this project a day: the boundary would be
+    /// declared, `attempt_is_due` would answer true, `server relay-boundary`
+    /// would print success — and the process-local floor would return
+    /// `Lingering` anyway, so nothing would happen and every instrument would
+    /// say it had.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_relay_boundary_releases_the_process_local_floor_too() {
+        let source = include_str!("daemon.rs");
+        let step = source
+            .split("fn hot_restart_swap_step(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("the swap step should be present");
+        assert!(
+            step.contains("boundary_releases_this_process"),
+            "the process-local floor must consult the declared boundary; releasing only the \
+             file's floor is a bypass that reports success and changes nothing"
+        );
+        let floor = step
+            .split("let last_attempt_ms = HOT_RESTART_SWAP_LAST_ATTEMPT_MS.load")
+            .nth(1)
+            .and_then(|suffix| suffix.split("return SwapStep::Lingering;").next())
+            .expect("the process-local floor should be present");
+        assert!(
+            floor.contains("!boundary_releases_this_process"),
+            "the boundary check must be part of the floor's own condition, not merely \
+             computed near it"
+        );
+    }
+
     /// The successor clears the entry, because the writer does not survive to.
     ///
     /// Live-proven defect, 2026-08-13: the daemon that queued a swap handed its
@@ -21412,6 +22394,8 @@ mod tests {
             attempts: 3,
             last_attempt_ms: Some(600_000),
             last_outcome: Some("successor never bound the target socket".to_string()),
+            relay_boundary_at_ms: None,
+            relay_boundary_by: None,
         };
         let rendered = super::format_daemon_census_with_queued_swap(&[], Some(&queued), 1_800_000);
         assert!(rendered.contains("swap owed → 9.9.9"), "{rendered}");
@@ -26583,8 +27567,15 @@ mod tests {
         // version-ordered compatibility gate looking at two builds of one
         // version with different shapes — the lost-PTY latch storm of
         // 2026-07-17.
-        const STAMPED_AT_VERSION: &str = "3.0.90";
-        const STAMPED_SHAPE_HASH: u64 = 0xa69ad1bbd1767587;
+        // Re-stamped for 3.0.132: `HotRestartGateScreens` arrived — §3's audit
+        // instrument, the first verb that exposes the screen the hot-restart
+        // idle gate actually classifies from. An older daemon has never heard
+        // of it and errors on it, which is the loud failure this split is for:
+        // a gate-screen reading is only meaningful from the daemon that OWNS
+        // the session, so silently answering from the wrong one would produce a
+        // corpus describing nothing.
+        const STAMPED_AT_VERSION: &str = "3.0.132";
+        const STAMPED_SHAPE_HASH: u64 = 0x9d92c7118ca5cb96;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

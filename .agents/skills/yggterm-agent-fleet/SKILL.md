@@ -74,6 +74,80 @@ rather than disagreement.** This generalises well past this one field, and it is
 the failure §7's own advice ("read state back") walks you straight into if you
 read it back *later*.
 
+### ⛔⛔ A WRITE TO THE ROW TABLE IS NOT VISIBLE TO YOUR VERY NEXT READ — measured 2026-08-13
+
+**`session rename` answers `accepted: true` synchronously. The row table does not carry the new
+title on the next call.** Six rows were renamed in one batch; the `rows` read issued immediately
+afterwards showed **all six unchanged**. A second read moments later showed **all six correct.
+Nothing was re-sent in between.**
+
+⇒ **AN IMMEDIATE READ-BACK IS A FALSE NEGATIVE, and it is the most dangerous kind, because §7 has
+just finished telling you to read state back.** Reading back is still right; reading back *in the
+same breath* measures the lag, not the write. **Put a round trip between the write and the check**
+— and if the check fails, **read again before you write again.**
+
+**⛔ AND THE COROLLARY IS A REAL CORRUPTION, NOT JUST A WASTED CALL: NEVER ISSUE `rename` AND
+`outline` BACK TO BACK.** `outline` composes the prefix onto the title **it can currently see** —
+which, inside the lag window, is the OLD one — and writes the composed string back into
+`session_title`. Reproduced live, in exactly two calls:
+
+```
+rename  → "ychrome: the vendor-console surface for row 4.2"   accepted: true
+outline → 4.2.1                                              (composes onto the STALE title)
+rows    → session_title = "4.2.1 Agent unnamed shell"    ⛔ the number is now IN the title,
+                                                            and the rename is gone
+```
+
+That is the **double-numbering** hazard `ygg-claim.sh` documents in its own comments, arriving by a
+route the comments do not name: not from an author writing the seat into the title on purpose, but
+from **two correct writes racing each other**. The composed string is now the stored title, so the
+sidebar renders `3.4.1 3.4.1 …` the moment the prefix is composed again.
+
+⇒ **rename, read back until it holds, THEN outline.** `ygg-claim.sh` gets this right by accident —
+it re-asserts the title on a watch loop, which absorbs the lag. **Hand-driving the two verbs does
+not.**
+
+### ⛔⛔ `sessions sort --dry-run` REPORTS `changed:false` ON A LIST THAT IS NOT SORTED
+
+**Measured 2026-08-13, twice, and it is a FALSE NEGATIVE in the one instrument that exists to
+answer "is the sidebar order right?".**
+
+An orchestrator's cluster row sat visibly out of place — seat `3.2` rendered *above* `3.0` and
+`3.1`. Sampled **simultaneously** (both verbs launched in one shell, per the warning above about
+comparing reads taken at different moments):
+
+| instrument | answer |
+|---|---|
+| `server app rows` | `2.0 2.1` **`3.2`** `3.0 3.1 3.3 3.4` — wrong, and it matches the screen |
+| `sessions sort --dry-run` | `changed: false`, and a `rendered_order` listing `3.2` **in the right place** |
+| `sessions sort` (apply) | **`changed: true`** — and the row moved. Order correct afterwards |
+
+⇒ **The dry run reports the order it WOULD PRODUCE as though it were the order that EXISTS**, so it
+can answer "already sorted" about a sidebar it is looking straight at being wrong. This is §7's law
+in its purest form — *the verb answered about the request, not the effect* — and the verb's own
+help text closes the trap: *"sorting a sorted list reports `changed:false` — which is the success
+case, not a no-op to chase."* **That sentence is true of a real sort and false of the dry run**, and
+it instructs you to stop looking at precisely the moment you should look harder.
+
+**⇒ THE RULES:**
+- ⛔ **Never diagnose row order with `--dry-run`.** For this verb the dry run cannot report a
+  disagreement it is itself the source of. **Compare `rows` against the numbering yourself**, or
+  just run the apply — it is idempotent and it tells the truth.
+- ⭐ **RUN `sessions sort` (the APPLY) AS THE LAST ACT OF ANY SPAWN BATCH.** §1 already says a new
+  row lands at the head and *"repair it in the same breath as the spawn — never later, never
+  leaving it for the human."* This is the verb that does it, and until 2026-08-13 nothing in this
+  skill named it for that job — so every orchestrator re-derived the repair by hand, or skipped it.
+  ⚠ **Unless a human has dragged a row themselves** (§1) — a manual placement outranks the numbers,
+  and a blind sort will silently undo it.
+
+⚠ **AND THE ORIGINAL DISPLACEMENT IS STILL UNEXPLAINED — say so rather than inventing a cause.**
+The create reported `seat.honoured: true` and the row was wrong anyway. The obvious hypothesis —
+that an *unnumbered* row sitting above the numbered block shifts the insert index — was **tested
+and REFUTED**: with an unnumbered row deliberately parked at the head, a probe created with
+`--outline 3.8` landed exactly where it belonged (`seated_after` correct, `live_index` correct).
+So the seat arithmetic handles that case. **What moved the row remains unmeasured**, and it belongs
+to whoever owns sidebar truth — route it, do not guess it.
+
 ### ⛔ CLAIM YOUR ROW AS YOUR FIRST ACT ON A CAMPAIGN — do not wait to be asked
 
 **A session that starts long-lived work owns its own identity.** A row born with
@@ -695,6 +769,74 @@ The delegate's own later claim is then a harmless no-op — a row that already h
 instead of `5.2.5`, one of them colliding with a live row. Pass `5.2.5` literally and read the seat
 back.
 
+**①b ⛔⛔ "EVERY SESSION YOU SPAWN" INCLUDES THE ONES THAT ARE NOT AGENTS — libyggterm APP ROWS AND
+BARE SHELLS TOO.** Owner-directed 2026-08-13, and it was never written down before, which is why
+the sidebar kept filling with rows called **`New Ychrome`**, **`New Yedit`** and **`Agent unnamed
+shell`**.
+
+**A row is a row.** When a working row opens a browser surface, a document surface or a helper
+shell, that surface **gets a sub-seat under its owner and a title that says what it is for** —
+exactly like a delegate:
+
+```sh
+# row 4.2 opens the browser surface it is going to drive:
+ygg server app session rename  "$APP_ROW" "ychrome: the vendor-console surface for row 4.2"
+#  … read the title back (see the write-visibility lag above) …
+ygg server app session outline "$APP_ROW" 4.2.1
+```
+
+⭐ **The seat is `N.x.y` — the owner's seat plus a sub-number**, so the surface sits under the row
+that opened it and a human can see at a glance *whose browser that is*. Same law as everywhere
+else: **the number lives in `outline_prefix` ONLY, never in the title.**
+
+**Why this is not cosmetic.** Measured on one sidebar the day this was written: **five rows named
+`New Ychrome`, one `New Yedit`, one `Agent unnamed shell`** — and reading their screens showed they
+were *not interchangeable at all*: one was a live browser part-way through a multi-step form on a
+vendor console, one was a search engine open under a different browser profile, and four were bare
+`/bin/bash` at `~` with nothing typed into them.
+⇒ **the default label names the LAUNCH VERB, not the JOB**, so
+every one of them reads as the same row. The one you must not close and the four that are litter
+are visually identical, and the only way to tell them apart is to read seven screens.
+
+⚠ **A default title is worse than no title**, because it looks deliberate. `New Ychrome` claims to
+describe the row and does not, and it is *stable across every launch* — so a human scanning the
+sidebar cannot even use novelty as a signal.
+
+⇒ **The duty is the spawner's, at spawn, in the same breath** — not the app's, and not "later".
+A surface opened and left unnamed is the same defect as a delegate left unclaimed (①), and it fires
+far more often because opening a browser does not feel like spawning a session.
+
+### ⛔⛔⛔ AND THE HARD LIMIT ON ALL OF THE ABOVE: NAME YOUR OWN ROWS. NEVER THE OWNER'S.
+
+**Owner-reported 2026-08-13, within the hour, and the harm was immediate and visible on his
+screen.** An orchestrator applied ①b to six rows it had not spawned. It read their screens, found
+four of them holding a bare shell with nothing typed in, titled them *"abandoned launch, safe to
+close"* — **and they were the owner's own browser stack, tagged by him, which he navigates by.**
+
+> **⭐ AN AGENT MAY NAME ITS OWN ROWS AND ITS DELEGATES' ROWS. ROWS THE OWNER CREATED ARE HIS —
+> never rename, never re-describe, never "improve".**
+
+⛔ **AND THE TELL WAS AVAILABLE BEFORE ACTING, POINTING THE OTHER WAY: A ROW YOU CANNOT ACCOUNT FOR
+IS MORE LIKELY TO BE A HUMAN'S THAN TO BE LITTER.** The orchestrator had exactly that evidence — it
+could not attribute six rows to any spawner — and **read it backwards**, concluding *abandoned*
+where it should have concluded *not mine*. **Inability to attribute a row is positive evidence that
+you did not create it.**
+
+⚠ **Every description it wrote was ACCURATE**, and that is the trap: the shells really were unused
+and really were closable. **Accuracy about a row is not authority over it.** Being right about what
+a thing is grants nothing about whose it is.
+
+⛔ **AN EMPTY ROW IS THE ONE WHOSE PURPOSE LIVES ENTIRELY OUTSIDE IT.** A row a human is holding
+open *for later* is indistinguishable, from the inside, from one nobody wants — the intent is in
+the human, not in the PTY. ⇒ **emptiness is never evidence of abandonment.**
+
+**⇒ Before renaming any row, answer: did I spawn this, or did a row I own spawn it?** If you cannot
+say yes, **leave it exactly as it is** and, if it genuinely confuses the sidebar, say so to its
+owner instead. ⚖ Recovery is only cheap if you captured the old value: **read the current title
+back and keep it before you write** — that is what made the restoration above take one call instead
+of an unconvergent search, and `detail_label`/profile chips are **not** recoverable from
+`row-order-ledger.json` or `removed-rows.json`.
+
 **② ⛔ RETIRING THE ROW DOES NOT KILL THE PROCESS — and a finished delegate does not exit.** An
 agent CLI sits at its prompt forever after its last turn. `session remove` can answer
 `row_still_listed:false` while the process runs on. Measured 2026-08-10: three delegates had
@@ -1193,12 +1335,21 @@ pattern, the only new parts are the clustering rule and the confirm gate.
 
 | row | what it does |
 |---|---|
-| **`N`** — the orchestrator | clusters the work, writes the briefs, launches, monitors, merges, reaps. It does **not** fix bugs. |
+| **`N.0`** — the orchestrator | clusters the work, writes the briefs, launches, monitors, merges, reaps. It does **not** fix bugs. |
 | **`N.1` … `N.k`** — the clusters | each owns one cluster and relays *within* it: a cluster session hands off to its own successor until its cluster is done, then reports up. |
 
-Seat them as a book — `6`, `6.1`, `6.2` — so the sidebar reads as the plan. The
-orchestrator takes the bare integer; a cluster that spawns its own successor
-keeps the same seat.
+Seat them as a book — `6.0`, `6.1`, `6.2` — so the sidebar reads as the plan. The
+orchestrator takes **`N.0`, never the bare integer** (the reasoning is below, under
+*AN ORCHESTRATOR SITS AT `N.0`*); a cluster that spawns its own successor keeps the
+same seat.
+
+⚠ **This paragraph said "the bare integer" until 2026-08-13, contradicting its own
+section three screens further down, and a fresh orchestrator followed it and
+claimed `7`.** The owner corrected it on sight — the bare integer reads as a
+different KIND of thing from its own children, so the head of the book stops
+looking like part of the book. ⇒ **A document that disagrees with itself is worse
+than one that is merely wrong**, because each half looks authoritative where it is
+read, and the half a newcomer meets first is the one at the top.
 
 ### ⭐ CLUSTER ON TWO AXES AT ONCE, NOT ONE
 
@@ -1300,9 +1451,91 @@ survives every future change to how labels are composed.
 ⚠ **A childless top-level row is a different case** and still wants `N.` from the
 renderer — that one has no sub-seats to be consistent with.
 
+### ⛔⛔⛔ NEVER RENAME A ROW THE OWNER CREATED. HYGIENE APPLIES TO **YOUR** ROWS ONLY.
+
+**Owner-reported 2026-08-13.** A row doing routine row-hygiene sanitization renamed **six working
+sessions it had not created** — a browser stack and an editor shell — into accurate, descriptive,
+and entirely unwanted titles:
+
+```
+  'shell: bare /bin/bash at ~, never used — abandoned launch, safe to close'   ×4
+  'shell: launched yedit, idle — unattributed'
+  'ychrome [<profile>]: web surface on <site> — unseated, owner looks like the 7.x campaign'
+```
+
+⇒ **The descriptions were TRUE.** Those rows really were idle, really were unseated, really were
+bare shells. **Accuracy about a row is not authority over it.**
+
+⛔ **AND THE LOSS IS NOT THE TITLE — IT IS THE IDENTITY.** Each carried a short chip naming which
+profile it was, and that is how their owner told six near-identical rows apart. The rename
+overwrote `detail_label` with generic boilerplate too, so the distinguishing information was
+destroyed rather than replaced. ⚠ **It proved unrecoverable**: no running process carried the
+profile (the rows had never been launched), and the persisted ledgers contained **zero** occurrences
+of any of the original names.
+
+**THE LAW, and it is absolute:**
+
+> **An agent may name its OWN row and the rows it spawned. Every other row belongs to the human.
+> Do not rename it, do not re-describe it, do not "improve" it, do not tidy it away.**
+
+⭐ **The tell is available BEFORE you act, and it inverts the natural instinct: a row you cannot
+account for is more likely to be a HUMAN'S than to be litter.** An agent's rows are the ones with
+seats, briefs and campaign titles — the ones you can explain. **An unexplained row is evidence of a
+person, not of mess.**
+
+⚠ **If a row genuinely looks like a stray**, the safe actions are: leave it, or report it. ⛔ Never
+rename and never remove — `session remove` records a DELETION, so tidying someone's row files it as
+a thing they chose to delete, and a later restore will correctly refuse to bring it back.
+
+⇒ **And if you must touch one anyway, CAPTURE THE PREVIOUS VALUE FIRST.** A rename with no recorded
+prior state is unreversible in practice, whatever the intent — which is precisely how this one
+became permanent.
+
+### ⭐⭐ THE STANDING ROW-HYGIENE PRINCIPLE: GROUP `N.x` UNDER `N.0`, AND `N.x.y` UNDER `N.x`
+
+**Owner-directed 2026-08-13, and it supersedes ad-hoc row tidying as the default.**
+**Group `N.x` sessions under `N.0` as the header, and `N.x.y` sessions under their
+`N.x` header where applicable.** That is the standing agent-aided row-hygiene
+sanitization principle from here on, not one session's preference.
+
+⇒ The sidebar reads as a genuine **outline**: `6.0` is the head of its book with
+`6.1 … 6.7` nested beneath it, and a cluster that orchestrates its own sub-units
+has `6.1.1`, `6.1.2` nested under `6.1`. **The scheme was already recursive**
+(*ORCHESTRATION IS RECURSIVE*, below); this makes the sidebar show it.
+
+**Why it is a principle and not a preference:** a flat list of numbered rows
+stops being navigable at exactly the size where the numbers start to matter, and
+several campaigns share one sidebar. **Grouping is how the fleet's structure
+becomes legible at a glance** — and legibility is what lets an owner find the one
+row they need among dozens.
+
+⇒ **Sanitizing rows now means making the tree TRUE**, not just renaming things:
+every row seated, every seat under its head, no orphan at top level that belongs
+in a book.
+
+⛔ **Do not change the seat scheme to make grouping easier to build.** `N.0` for
+the head is settled, and the renderer is built to the scheme rather than the
+other way round. ⚠ And the seat lives in `outline_prefix` alone — the sidebar
+composes the label at render time, so grouping must read the prefix and never a
+number parsed back out of a title.
+
 **The seat lives in `outline_prefix` and nowhere else.** The sidebar composes
 `label = "<outline_prefix> <title>"` at render time, so a title that also carries
 the number gets it twice.
+
+⚠ **A SESSION HAS TWO NAMES AND THE CLAIM ONLY SETS ONE.** `ygg-claim.sh` sets the
+ROW title and re-asserts it for `--watch-secs` against the CLI's self-titling —
+the right defence for the row. **Nothing propagates the claimed title INTO the
+CLI**, so the agent goes on calling itself whatever it composed from its first
+turn while the sidebar shows the claimed name. Two names for one session, and the
+one the human reads is not the one the session answers to.
+
+⇒ Reported by an orchestrator whose row read as its campaign seat while the CLI
+still called it by a first-turn phrase. **Live question, not settled:** either the
+claim should also drive the CLI's own title, or this file should state plainly
+that the two are separate and why. ⛔ Until it is decided, **do not identify a row
+by either name** — resolve to a UUID, which is the only identifier here that
+belongs to exactly one namespace.
 
 ⚠ **This was learned expensively, and it is the same defect twice.** `ygg-claim.sh`
 used to write the seat into the title *as well*, as belt-and-braces against a
@@ -1349,6 +1582,41 @@ nothing to do with willingness:
 2. **The successor reaps as its FIRST act**, inside the claim:
    `ygg-claim.sh --title "<category>: <what for>" --number <n> --replace <pred-uuid> --booter`
    One call takes the seat, arms the booter, and retires the predecessor.
+
+   ⛔⛔ **AND BEFORE THAT VERB RUNS: COMPARE THE UUID YOU WERE TOLD TO KILL AGAINST
+   YOUR OWN `$YGGTERM_SESSION_ID`. IF THEY MATCH, REFUSE AND SAY SO.** One
+   comparison, costs nothing, and it converts an unrecoverable self-kill into a
+   sentence. ⚠ The existing checks do not cover this: they prove the brief was
+   DELIVERED, not that the recipient is a ROW.
+
+   **The trap it guards, reported by another campaign 2026-08-13 and caught twice
+   by luck rather than by design.** *"Spawn the successor"* has two mechanisms and
+   only one of them is a relay:
+
+   | | app-control `terminal new` | the coding CLI's own subagent tool |
+   |---|---|---|
+   | session id | **its own** | ⛔ **INHERITS THE PARENT'S** |
+   | row / seat / booter | yes | none |
+   | lifetime | independent | dies with the parent |
+   | is it a relay? | **yes** | ⛔ **never — it is a helper** |
+
+   An in-process subagent **is the same session**, so a brief whose first act is
+   *"kill your predecessor, uuid X"* hands it **its own uuid**. The spawn
+   succeeds, a transcript appears, and the ACK token is present — **every check
+   this section prescribes passes**, because the brief really was delivered, to
+   something that could not act on it.
+
+   ⭐ **It was survived only because the kill was the FIRST act**: the subagent
+   read `$YGGTERM_SESSION_ID`, recognised the uuid as its own, and refused.
+   **Later in the same brief — after files had been edited — the identical
+   instruction takes a live row down with uncommitted work.**
+
+   ⇒ The general form is worth more than the mechanism note: **§8's standing
+   worry is two sessions grinding at once; this is the mirror — one session
+   killing itself believing it is two.** Any verb that acts destructively on an
+   identifier from a document must check that identifier against the executor
+   before it runs, because **a brief is a frozen snapshot and the executor is the
+   only thing that knows who it actually is.**
 3. **Read both fields back** (§7): `session remove` answers `row_still_listed`
    and `verified` separately, and a row can leave the order while its processes
    live on. `verified: true` with an empty `live_processes` is the only clean reap.
@@ -1402,6 +1670,56 @@ the campaign memory, the files it wrote. A transcript says what a session
 ✅ **A message is the right instrument when you are DELIVERING, not enquiring** —
 a brief, a correction, a warning that changes what they should do next. Then it
 earns its cost. Batch several into one send rather than paying per finding.
+
+### ⚠ A BRIEF DROPPED AS A FILE LITTERS THE TREE IT IS DROPPED IN
+
+Writing a brief into a delegate's working directory is a legitimate fallback when
+the row plane cannot be reached. **It also leaves an untracked file behind**, and
+two things follow that nobody intends:
+
+1. ⛔ **Every audit reads that tree as DIRTY.** Measured 2026-08-13: three lane
+   worktrees reported uncommitted work, and in all three the entire diff was one
+   dropped brief. An orchestrator reading that — the same one that dropped it —
+   nearly extended a fleet-wide hold on the strength of *"the lanes still have
+   uncommitted work"*. **The tool's own litter became evidence about the lanes.**
+2. ⛔ **A `git add -A` sweeps it into the repo**, and on a public one that is a
+   brief published to strangers.
+3. ⛔⛔ **AND IT CORRUPTS THE BUILD IDENTITY OF ANYTHING BUILT FROM THAT TREE.**
+   The same day, a release built in a briefed worktree stamped itself
+   **`<sha>-dirty`**, so a deployed binary could no longer be traced to a commit.
+   `deploy-fleet` **detected it and warned in exactly the right words**, then
+   deployed anyway, because a dirty checkout is a WARNING and not a refusal.
+   ⚠ **The orchestrator then misrouted it** as a deploy-identity defect to the
+   cluster that owns *"one version must mean one build"* — which was innocent,
+   and whose guards had worked correctly. The cluster that had actually been
+   briefed supplied the cause. ⇒ **Three distinct failures, one untracked file,
+   and the third one landed on a shipped artefact.**
+
+⚖ **A real design question falls out of it, and it is the orchestrator's:**
+should a dirty checkout **refuse** a release build rather than warn, the way the
+ancestry guard already refuses? The ancestry half earns its keep by refusing; the
+dirty half warned and was overridden by the same agent that had dirtied the tree.
+⭐ Recommendation on file: **refuse for a release build, warn for a local one.**
+
+⇒ **Prefer the peer plane**, which leaves nothing behind. If you must drop a
+file, put it **outside the repo** or in an ignored path, and **remove it once it
+has been read** — the sender owns the cleanup, because the recipient has no way
+to know the message is spent.
+
+⛔⛔ **BUT CONFIRM CONSUMPTION FIRST — "the sender cleans up" is a data-loss rule
+without it.** Deleting a dropped brief before the recipient has read it converts
+a working channel into a silent failure, and neither side ever learns. The check
+is cheap and it is the same instrument as the ACK-token grep: look for a
+`tool_use`/`tool_result` pair reading that path in the recipient's transcript, or
+grep the transcript for a distinctive string from the file.
+
+⚠ **Measured both ways on 2026-08-13.** One row correctly removed its own drop
+only after finding the Read in the target's transcript, sixteen seconds after the
+pointer. Another — an orchestrator clearing three stale briefs from three lanes —
+verified consumption on **one** of the three and reasoned about the other two;
+re-checked afterwards, all three had read it (30, 22 and 33 references), so
+nothing was lost. **The reasoning was sound and it was still not a measurement.**
+⇒ Check each recipient, not a representative one.
 
 ### ⛔⛔ A BRIEF MAY CARRY FACTS. IT MUST NOT CARRY YOUR CAUSAL THEORY.
 
@@ -1584,6 +1902,23 @@ classification the moment it lapses, and **a lapsed park announces itself**
 the human's switch; park means *I blocked this row and here is what releases
 it*, and is the orchestrator's bookkeeping about its own decisions.
 
+⛔⛔ **AND THE RUNNING WATCHER WILL NOT HONOUR YOUR FIX UNTIL YOU RESTART IT.**
+`watch` is a long-running process that imported its module once, at launch. Edit
+the script, land it, pull it on every host — **the running loop still executes
+the code it started with.**
+
+⇒ Measured immediately after `park` shipped: a correctly parked row escalated
+anyway. The state file said `parked: true` with 34 minutes left, the script on
+disk had the park code, and the watcher had been running since **before the
+feature existed**. Nothing was wrong except that the process was old.
+
+⚠ **The tell is a fix that tests green by hand and does nothing in production**,
+which reads as "my fix is wrong" and sends you back into code that is fine.
+⇒ **Restart the watcher as the last step of any change to it**, and confirm from
+a fresh tick — not from the script — that the new behaviour appears. This is the
+same class as a stale daemon serving old behaviour after a deploy, and the
+supervision plane is *more* prone to it because nothing ever restarts it.
+
 ⛔ **AND PARK DOES NOT REACH THE BOOTER — same two-planes trap as demote.** The
 dumb net is a separate subscription and knows nothing about parks, so a parked
 row that is also booter-subscribed still gets booted for being quiet, which is
@@ -1591,6 +1926,59 @@ precisely the wake the park exists to prevent. ⇒ Either leave a parked row off
 the booter, or `ygg-booter.py defer --secs` it across the same window. **Two
 planes, two switches** — and the split is the design, so do not "fix" it by
 teaching one plane about the other.
+
+### ⛔⛔ A HOLD SILENCES A VERDICT, NEVER AN AUDIT — AND THE ORCHESTRATOR'S OWN HOLDS BLIND IT
+
+**Owner-directed 2026-08-13**, after a relay sat at **6.1 MB and 37 minutes cold**
+while its orchestrator believed the fleet was healthy. The orchestrator had parked
+it itself, for a push hold. Two causes, and the first is self-inflicted:
+
+1. ⛔ **`park` suppresses the IDLE verdict — correctly** (a row blocked on purpose
+   is not finished) — **but IDLE was the ONLY line that ever mentioned that row.**
+   Silencing the wrong verdict silenced the health report with it.
+2. ⛔ **Nothing measured what a wake would COST.** Every verb asked *is it
+   working*; none asked *what would it cost me to find out*. A cold
+   multi-megabyte row is priced at dollars per wake, **charged before it answers a
+   word** — so the cheapest question was the one nobody was asking.
+
+⇒ **`fishy_audit()` runs on every tick over EVERY subscriber — parked and pinned
+included — and reports only anomalies.** It never nudges, wakes or reaps. It
+exists so the orchestrator sees the fishy row *before* it costs something:
+
+| finding | why it matters |
+|---|---|
+| **≥2 MB and ≥25 min cold** | a wake re-reads all of it first ⇒ **succeed by harvesting, never by asking** |
+| **no transcript at all** | the brief was probably never delivered |
+| **silent ≥3 h** | confirm it is meant to be idle |
+| **`escalate_to` is not a live row** | its cries go nowhere, and briefs reintroduce stale uuids |
+
+⚠ **Prove it can FIRE before trusting a clean run**, and note the trap its own
+first run hit: `_run` wraps each argv element in single quotes, so a command
+containing `'…'` arrives malformed and returns nothing — which the audit read as
+*"NO TRANSCRIPT"* about a perfectly healthy remote row. **Silence from a broken
+probe is not a negative result.**
+
+### ⛔⛔ CHECK YOUR OWN CONTEXT AND RELAY YOURSELF — THE ORCHESTRATOR IS NOT EXEMPT
+
+**Owner-directed 2026-08-13**, and stated as a requirement on this seat
+specifically: check your own context budget the way it is checked manually, and
+spawn a newer version of yourself whose successor despawns you.
+
+⇒ **The seat that relays everyone else is the one most likely to forget it needs
+relaying.** It has no cluster watching it, its work feels like coordination rather
+than a lane, and it is the row whose silent death costs the most.
+
+- **Watch your own budget on a schedule, not on a feeling.** Silent below 55%;
+  **LAND at 70%.** The only fleet session ever to hit the context wall did so
+  because that check was manual.
+- **Then run the standard succession on yourself** (§10): write the door memory so
+  the successor needs no brief, put **your own UUID in the brief as `PREDECESSOR TO
+  REAP`**, spawn, verify the ACK token in its transcript, and **let the successor
+  reap you** — `ygg-claim.sh … --replace <your-uuid> --booter`, which also moves
+  every subscriber with the seat.
+- ⛔ **Do not hand a successor a running window.** Land or explicitly transfer any
+  hold, freeze or promise you are carrying, and name each one in the brief — a
+  promise nobody knows about is not inherited, it is dropped.
 
 ### ⛔⛔ PROMOTION AND DEMOTION ARE THE OWNER'S, ALWAYS
 
@@ -1811,7 +2199,22 @@ still stops a row on another.
   is **in a menu**…"* · **no transcript file is ever created** · `submit`
   answers `submitted:false`.
 - **Fix:** read the screen (`server snapshot` → `live_sessions[].terminal_lines`),
-  confirm the `❯` sits on *"1. Yes, I trust this folder"*, send a lone `\r`.
+  confirm the `❯` sits on *"1. Yes, I trust this folder"*, then send a lone `\r`
+  **with `terminal send`, NOT `terminal submit`.**
+- ⛔⛔ **`submit` DOES NOT DELIVER A BARE `\r`, AND IT REPORTS SUCCESS ANYWAY.**
+  Measured 2026-08-13 on two delegates spawned into fresh clone directories:
+  `terminal submit … --stdin` with a lone carriage return answered `bytes: 1` and
+  `read_nudge.accepted: true` — **and the gate did not move**; re-reading the
+  screen showed it still on the trust prompt. The identical byte through
+  `terminal send … --stdin` answered `accepted: true, bytes: 1` and **both gates
+  cleared instantly.**
+  ⇒ **`submit` is the composer path and normalises its payload** (it reported
+  `reason: "app_control_send_multiline"`), and a lone carriage return does not
+  survive that normalisation. **`send` writes to the PTY, which is what a menu
+  reads.** ⚠ This is the file's own law again — *the verb reports the request,
+  not the effect* — and it bites hardest here, because a trust gate holds the row
+  **before its composer**, which is precisely where a composer-shaped verb cannot
+  work while all of its success fields read healthy.
 - ⭐ **Answering it once persists it for that directory**, so every later row in
   the same cwd walks straight to its composer. **Answer it; never respawn
   elsewhere to dodge it** — dodging leaves the wall standing for the next agent.

@@ -37,6 +37,9 @@ mod browser_import_cli;
 pub use browser_import_cli::{browser_import_usage_block, run_browser_import_cli};
 pub mod app_declare;
 mod attach;
+/// Where a running process publishes the source it was built from — the plane
+/// `--build-commit` cannot reach, because it can only ask a file.
+pub mod build_identity;
 mod clipboard_sweep;
 // The clipboard sweeper's sibling: autoclean for `$YGGTERM_HOME/server-*.sock`
 // (docs/pending-bugs.md: ~700 of them on the GUI host). Unix-only because the
@@ -52,6 +55,7 @@ pub mod grid_overlay;
 // swap" record. PUBLIC because the intent outlives the daemon being replaced:
 // the GUI forms it, a daemon poll drains it, and `server daemons` reports it.
 pub mod hot_restart_queue;
+pub mod hot_restart_repair;
 mod host;
 mod live_row_tombstones;
 mod profile_write_lock;
@@ -164,7 +168,7 @@ pub use daemon::{
     sync_external_window, sync_terminal_identity, sync_terminal_identity_with_profile, sync_theme,
     declare_session_tenancy,
     terminal_app_declares, terminal_ensure, terminal_history, terminal_read, terminal_resize,
-    terminal_restart, terminal_tenants,
+    hot_restart_gate_screens, terminal_restart, terminal_tenants,
     terminal_restart_with_size,
     terminal_retained_snapshot, terminal_snapshot, terminal_write, toggle_preview_block,
     update_session_copy,
@@ -8477,6 +8481,7 @@ impl YggtermServer {
             cwd,
             require_existing,
             terminal_appearance,
+            None,
         )
     }
 
@@ -8493,12 +8498,17 @@ impl YggtermServer {
             cwd,
             require_existing,
             terminal_appearance,
+            // ⚠ CC keeps its historical `YGGTERM_CC_EXTRA_ARGS` lane, which the
+            // composer still prefers. Passing the value twice would be two
+            // encodings of one question, so this arm passes none.
+            None,
         )
     }
 
     /// The kind-parameterized entry the generic daemon request calls. The
     /// codex/cc wrappers above are the same call with the kind baked in — one
     /// lane, never a fork ([[spec-unify-local-remote]]).
+    #[allow(clippy::too_many_arguments)]
     pub fn ensure_remote_runtime_agent_session_public(
         &mut self,
         kind: SessionKind,
@@ -8506,6 +8516,7 @@ impl YggtermServer {
         cwd: Option<&str>,
         require_existing: bool,
         terminal_appearance: Option<&str>,
+        configured_extra_args: Option<&str>,
     ) -> anyhow::Result<String> {
         self.ensure_remote_runtime_agent_session(
             kind,
@@ -8513,9 +8524,11 @@ impl YggtermServer {
             cwd,
             require_existing,
             terminal_appearance,
+            configured_extra_args,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start_remote_runtime_agent_session_public(
         &mut self,
         kind: SessionKind,
@@ -8523,8 +8536,16 @@ impl YggtermServer {
         cwd: Option<&str>,
         terminal_appearance: Option<&str>,
         launch: &AgentLaunchOptions,
+        configured_extra_args: Option<&str>,
     ) -> anyhow::Result<String> {
-        self.start_remote_runtime_agent_session(kind, session_id, cwd, terminal_appearance, launch)
+        self.start_remote_runtime_agent_session(
+            kind,
+            session_id,
+            cwd,
+            terminal_appearance,
+            launch,
+            configured_extra_args,
+        )
     }
 
     fn ensure_remote_runtime_agent_session(
@@ -8534,6 +8555,7 @@ impl YggtermServer {
         cwd: Option<&str>,
         require_existing: bool,
         terminal_appearance: Option<&str>,
+        configured_extra_args: Option<&str>,
     ) -> anyhow::Result<String> {
         let display = remote_runtime_agent_display(kind);
         let saved_session_exists = remote_saved_agent_session_exists(kind, session_id)?;
@@ -8713,6 +8735,7 @@ impl YggtermServer {
             cwd,
             terminal_appearance,
             &AgentLaunchOptions::default(),
+            None,
         )
     }
 
@@ -8728,9 +8751,11 @@ impl YggtermServer {
             cwd,
             terminal_appearance,
             &AgentLaunchOptions::default(),
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_remote_runtime_agent_session(
         &mut self,
         kind: SessionKind,
@@ -8738,6 +8763,7 @@ impl YggtermServer {
         cwd: Option<&str>,
         terminal_appearance: Option<&str>,
         launch: &AgentLaunchOptions,
+        configured_extra_args: Option<&str>,
     ) -> anyhow::Result<String> {
         let display = remote_runtime_agent_display(kind);
         let key = remote_runtime_agent_session_key(kind, session_id)
@@ -8785,12 +8811,13 @@ impl YggtermServer {
         // `agent_launch_command_with_options` does: it exists for a host whose
         // managed layout cannot be resolved at all, and a command that silently
         // ran on the wrong model would be worse than one visibly missing flags.
-        let composed = managed_cli_shell_command_full(
+        let composed = codex_cli::managed_cli_shell_command_configured(
             kind,
             cwd,
             ManagedCliAction::Launch,
             terminal_appearance,
             launch,
+            configured_extra_args,
         );
         let launch_command = if kind == SessionKind::ClaudeCode {
             composed
@@ -11274,6 +11301,7 @@ fn remote_runtime_agent_registry_kind(kind: SessionKind) -> RemoteRuntimeKind {
         SessionKind::Kimi => RemoteRuntimeKind::Kimi,
         SessionKind::Muse => RemoteRuntimeKind::Muse,
         SessionKind::Antigravity => RemoteRuntimeKind::Antigravity,
+        SessionKind::GrokBuild => RemoteRuntimeKind::GrokBuild,
         SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => {
             RemoteRuntimeKind::Shell
         }
@@ -12628,11 +12656,7 @@ fn claude_extra_args_remote_exports() -> Vec<String> {
 /// about `--model`. Composition (strip-then-append) happens client-side because
 /// this is the only side that can see both the configured args and the request.
 fn claude_extra_args_remote_exports_with_launch(launch: &AgentLaunchOptions) -> Vec<String> {
-    let raw = SessionStore::open_or_init()
-        .and_then(|store| store.load_settings())
-        .ok()
-        .map(|settings| settings.claude_code_extra_args)
-        .unwrap_or_default();
+    let raw = configured_extra_args_for_kind(SessionKind::ClaudeCode);
     let configured = codex_cli::split_extra_args(&raw);
     let tokens = if launch.is_empty() {
         configured
@@ -12661,16 +12685,44 @@ fn claude_extra_args_remote_exports_with_launch(launch: &AgentLaunchOptions) -> 
 /// The ssh exports a remote `start-<slug>` needs to honour ONE launch's model /
 /// permission mode.
 ///
-/// ⚠ Claude Code keeps its own lane, and the fork is real rather than tidy: CC's
-/// remote start also carries the user's configured `claude_code_extra_args` from
-/// the settings store, which is not a launch option and has no equivalent for
-/// any other CLI. Collapsing the two would either drop that setting or invent it
-/// for eight CLIs that have no such field.
+/// ⭐ **The CC-only fork is gone, and that fork was the bug.** It was justified
+/// by "the user's configured extra args have no equivalent for any other CLI" —
+/// true when the settings store held two named fields, and the reason eight
+/// first-class CLIs launched REMOTELY with no permission flag while the same
+/// eight got one locally. The store now keys flags by descriptor slug, so every
+/// CLI has the equivalent and the general lane carries it.
+///
+/// ⚠ Claude Code still ALSO gets its historical export. A remote host running an
+/// older binary reads only `YGGTERM_CC_EXTRA_ARGS`, and this fleet holds several
+/// versions at once — dropping it would disarm CC's flags on exactly the hosts
+/// that have not been deployed yet. It costs one duplicated export line and it
+/// retires when no pre-3.0.133 remote binary is left.
 fn remote_agent_start_exports(kind: SessionKind, launch: &AgentLaunchOptions) -> Vec<String> {
-    if kind == SessionKind::ClaudeCode {
-        return claude_extra_args_remote_exports_with_launch(launch);
+    let mut exports = if kind == SessionKind::ClaudeCode {
+        claude_extra_args_remote_exports_with_launch(launch)
+    } else {
+        agent_launch_options_remote_exports(launch)
+    };
+    exports.extend(configured_extra_args_remote_exports(kind));
+    exports
+}
+
+/// Export the CLIENT's configured flags for `kind`, so the remote CLI is
+/// launched with what the user actually set rather than with nothing.
+///
+/// Empty configured args export nothing at all: a CLI the user has not
+/// configured must leave the remote command byte-for-byte what it was, so an
+/// unasked-for variable can never change a session's behaviour.
+fn configured_extra_args_remote_exports(kind: SessionKind) -> Vec<String> {
+    let configured = configured_extra_args_for_kind(kind);
+    if configured.trim().is_empty() {
+        return Vec::new();
     }
-    agent_launch_options_remote_exports(launch)
+    vec![format!(
+        "export {}={}",
+        codex_cli::ENV_YGGTERM_AGENT_EXTRA_ARGS,
+        shell_single_quote(&configured)
+    )]
 }
 
 /// `--model` / `--permission-mode` as JSON in one export, for the machine that
@@ -17449,6 +17501,10 @@ pub fn run_remote_resume_agent(
         require_existing,
         initial_size,
         Some(&terminal_appearance),
+        // The client's configured flags, handed to THIS wrapper on the ssh line.
+        // The composing daemon is a different, long-lived process and never sees
+        // this variable, which is why it travels as a request field from here.
+        forwarded_configured_extra_args().as_deref(),
     )?;
     bridge_remote_runtime_session_stdio(&endpoint, &key)
 }
@@ -17496,8 +17552,23 @@ pub fn run_remote_start_agent(
         initial_size,
         Some(&terminal_appearance),
         &launch,
+        forwarded_configured_extra_args().as_deref(),
     )?;
     bridge_remote_runtime_session_stdio(&endpoint, &key)
+}
+
+/// The CLIENT's configured launch flags, as handed to this wrapper over ssh.
+///
+/// ⚠ Read HERE, in the wrapper, and passed on as a request field — never left
+/// for the daemon to read out of its own environment. Measured 2026-08-13 on a
+/// live remote launch: the wrapper process carried
+/// `YGGTERM_AGENT_EXTRA_ARGS=--yolo` and the daemon that composed the PTY
+/// command did not, so the flag crossed the ssh hop and was lost at the daemon
+/// boundary while every layer reported success.
+fn forwarded_configured_extra_args() -> Option<String> {
+    std::env::var(codex_cli::ENV_YGGTERM_AGENT_EXTRA_ARGS)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// The launch options this wrapper invocation was handed over ssh.
@@ -20134,6 +20205,17 @@ pub struct ClientInstanceRecord {
     pub process_start_ticks: Option<u64>,
     #[serde(default)]
     pub executable_path: Option<String>,
+    /// The commit this GUI process was built from, published by the process
+    /// itself at registration.
+    ///
+    /// ⛔ `executable_path` CANNOT ANSWER THIS AND NEITHER CAN THE FILE IT NAMES.
+    /// A deploy replaces the binary under the running window, so the path then
+    /// describes a build this process never executed — measured 2026-08-13, when
+    /// the live GUI's `/proc/<pid>/exe` hashed to a value matching no file on the
+    /// host, leaving the running build unnameable while the on-disk copy answered
+    /// confidently. `None` on a client older than this field.
+    #[serde(default)]
+    pub build_commit: Option<String>,
     #[serde(default)]
     pub display: Option<String>,
     #[serde(default)]
@@ -21845,6 +21927,38 @@ pub fn run_app_control_set_theme_editor_open(open: bool, timeout_ms: u64) -> any
     let response = request_app_control(
         &home,
         AppControlCommand::SetThemeEditorOpen { open },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_set_launch_flags(
+    open: Option<bool>,
+    slug: Option<String>,
+    args: Option<String>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    if let Some(slug) = slug.as_deref() {
+        // Refuse an unknown slug BY NAME rather than silently storing flags
+        // under a key nothing reads — the response-layer defect this repo
+        // already has an entry for, in its cheapest form.
+        anyhow::ensure!(
+            yggterm_core::agent_cli::AGENT_CLIS
+                .iter()
+                .any(|descriptor| descriptor.slug == slug),
+            "{slug:?} is not an agent CLI yggterm knows. Try one of: {}",
+            yggterm_core::agent_cli::AGENT_CLIS
+                .iter()
+                .map(|descriptor| descriptor.slug)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetLaunchFlags { open, slug, args },
         timeout_ms,
     )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
@@ -28237,22 +28351,28 @@ fn legacy_agent_launch_command(
     }
 }
 
-fn legacy_codex_extra_args() -> String {
-    let raw = SessionStore::open_or_init()
+/// The user's configured launch flags for `kind`, raw, off the ONE per-CLI map.
+///
+/// Every caller that used to reach into a named settings field goes through
+/// here, so "which box does this CLI read" has a single answer and a tenth CLI
+/// needs no new reader.
+pub(crate) fn configured_extra_args_for_kind(kind: SessionKind) -> String {
+    let Some(slug) = yggterm_core::agent_cli_extra_args_key(kind) else {
+        return String::new();
+    };
+    SessionStore::open_or_init()
         .and_then(|store| store.load_settings())
         .ok()
-        .map(|settings| settings.codex_extra_args)
-        .unwrap_or_default();
-    shell_join_extra_args(&raw)
+        .and_then(|settings| settings.agent_cli_extra_args.get(slug).cloned())
+        .unwrap_or_default()
+}
+
+fn legacy_codex_extra_args() -> String {
+    shell_join_extra_args(&configured_extra_args_for_kind(SessionKind::Codex))
 }
 
 fn legacy_claude_code_extra_args() -> String {
-    let raw = SessionStore::open_or_init()
-        .and_then(|store| store.load_settings())
-        .ok()
-        .map(|settings| settings.claude_code_extra_args)
-        .unwrap_or_default();
-    shell_join_extra_args(&raw)
+    shell_join_extra_args(&configured_extra_args_for_kind(SessionKind::ClaudeCode))
 }
 
 fn shell_join_extra_args(raw: &str) -> String {
@@ -30139,6 +30259,7 @@ mod tests {
     #[test]
     fn desktop_identity_uses_client_record_app_id_when_trace_rotated_away() {
         let record = ClientInstanceRecord {
+            build_commit: None,
             pid: 123,
             started_at_ms: 456,
             client_id: None,
@@ -31117,6 +31238,7 @@ mod tests {
         terminal_session_keys: Vec<String>,
     ) -> ServerRuntimeStatus {
         ServerRuntimeStatus {
+            server_build_commit: String::new(),
             daemon_started_at_ms: 0,
             daemon_uptime_ms: 0,
             running_build_id: 0,
@@ -43114,6 +43236,7 @@ terminal_window_id: None,
 
     fn client_record(pid: u32, started_at_ms: u128, display: &str) -> ClientInstanceRecord {
         ClientInstanceRecord {
+            build_commit: None,
             pid,
             started_at_ms,
             client_id: None,
@@ -43600,6 +43723,7 @@ terminal_window_id: None,
         let legacy_dir = client_instances_dir(&home, &legacy_endpoint);
         fs::create_dir_all(&legacy_dir).expect("create legacy dir");
         let live_record = serde_json::to_vec(&ClientInstanceRecord {
+            build_commit: None,
             pid: std::process::id(),
             started_at_ms: 42,
             client_id: None,
@@ -43642,6 +43766,7 @@ terminal_window_id: None,
         let legacy_dir = client_instances_dir(&home, &legacy_endpoint);
         fs::create_dir_all(&legacy_dir).expect("create legacy dir");
         let live_record = serde_json::to_vec(&ClientInstanceRecord {
+            build_commit: None,
             pid: std::process::id(),
             started_at_ms: 42,
             client_id: None,
@@ -43771,6 +43896,7 @@ terminal_window_id: None,
         std::os::unix::fs::symlink(&legacy_socket, &current_socket).expect("link current socket");
         let endpoint = ServerEndpoint::UnixSocket(current_socket.clone());
         let status = ServerRuntimeStatus {
+            server_build_commit: String::new(),
             daemon_started_at_ms: 0,
             daemon_uptime_ms: 0,
             running_build_id: 0,

@@ -61,7 +61,8 @@ use yggterm_server::{
     run_app_control_app_pane_action, run_app_control_set_preview_layout,
     run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded, run_app_control_set_search,
-    run_app_control_set_session_keep_alive, run_app_control_set_theme_editor_open,
+    run_app_control_set_launch_flags, run_app_control_set_session_keep_alive,
+    run_app_control_set_theme_editor_open,
     run_app_control_set_theme_editor_values, run_app_control_set_tree_selection,
     run_app_control_set_ui_theme, run_app_control_set_window_chrome_hover,
     run_app_control_start_action, run_app_control_check_terminal_input, run_app_control_submit_terminal_prompt,
@@ -930,7 +931,15 @@ fn print_server_app_help() {
     what the widget would carry: a row id for a row_action, a tab id
     for tabs, absent for a plain button
   yggterm server app terminal <new|send|input-check|focus|scroll|probe-type|probe-scroll|probe-select|probe-context-menu> ...
-  yggterm server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|codex|claude-code>] [--title <title>] [--purpose <what-for>] [--no-activate]
+  yggterm server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|<agent-cli>>] [--title <title>] [--purpose <what-for>] [--no-activate]
+    --kind takes `shell` or any registered agent CLI slug. The refusal message
+    lists them all, and it is generated from the registry — so it is the surface
+    to read, never this line.
+  yggterm server app launch-flags <open|close|set|reset> [--cli <slug>] [--args <flags>]
+    opens the agent-CLI launch-flags modal, or writes one CLI's flags without
+    opening it. `set --cli codex --args '-s danger-full-access'` stores; `reset
+    --cli codex` forgets the stored value so the box falls back to that CLI's
+    default tier. Answers with `open` read BACK off the shell, not echoed.
       [--outline <prefix> | --insert-after <session-path>]
     with no --title the row is named for the driving agent and its purpose.
     --outline seats the row at a stored number that survives restarts and
@@ -955,7 +964,7 @@ fn print_server_app_help() {
     become queued messages. Use `terminal submit` for a brief, or
     --allow-multiline to fire N separate submits deliberately. Shell rows are
     unaffected — there N lines are N commands.
-  yggterm server app terminal new [--kind <shell|codex|claude-code>] [--cwd <dir>] [--title <t>]
+  yggterm server app terminal new [--kind <shell|<agent-cli>>] [--cwd <dir>] [--title <t>]
       [--machine-key <k>] [--no-activate] [--purpose <text>]
       [--model <id>] [--permission-mode <default|plan|accept-edits|bypass>]
       [--prompt <text>|--prompt-stdin]
@@ -1419,6 +1428,19 @@ fn main() -> Result<()> {
     // Must run before any thread exists (`set_var` is unsound afterwards) and
     // before GLib caches the address on first use.
     let _session_bus = yggterm_core::session_bus::adopt_or_refuse_session_bus();
+
+    // Hand this build's identity to the library crates that answer questions
+    // about a RUNNING process — the daemon's status and this window's client
+    // record. `--build-commit` can only ever describe a file, and a deploy
+    // replaces the file under a live process, so a process that does not say
+    // what it is becomes unnameable the moment it matters.
+    //
+    // ⚠ AFTER the bus resolve, not before. It landed above it and turned the
+    // `every_entry_point_refuses_autolaunch_before_it_can_happen` lock red:
+    // GLib caches the D-Bus address on FIRST USE and `set_var` is unsound once
+    // a thread exists, so "first statement in main()" is the whole guarantee.
+    // Nothing here needs the identity declared first.
+    yggterm_server::build_identity::declare_build_commit(build_identity::build_commit());
 
     let entry_args = std::env::args().skip(1).collect::<Vec<_>>();
     // FIRST, ahead of even the supervisor: this process may have been re-exec'd for
@@ -2513,6 +2535,40 @@ fn main() -> Result<()> {
                     other => anyhow::bail!("unsupported app theme: {other}"),
                 };
                 run_app_control_set_ui_theme(theme, timeout_ms)
+            }
+            // The launch-flags modal. `spec-agent-cli-extra-args-modal.md` §7
+            // makes this verb part of the modal's work rather than a follow-up:
+            // a settings surface app control cannot open is one that ships with
+            // no pixel of proof, which has already happened once here.
+            "launch-flags" => {
+                let positional = cli_positional_args(&args, 3);
+                let action = positional.first().copied().unwrap_or("open");
+                let slug = cli_flag_value(&args, "--cli").map(str::to_string);
+                let flags = cli_flag_value(&args, "--args").map(str::to_string);
+                match action {
+                    "open" | "show" | "on" | "true" | "1" => {
+                        run_app_control_set_launch_flags(Some(true), slug, flags, timeout_ms)
+                    }
+                    "close" | "hide" | "off" | "false" | "0" => {
+                        run_app_control_set_launch_flags(Some(false), slug, flags, timeout_ms)
+                    }
+                    // `set` writes without touching whether the modal is up, so
+                    // a headless caller can configure a CLI and a human caller
+                    // can watch it change in an already-open modal.
+                    "set" => {
+                        let slug = slug.context(
+                            "server app launch-flags set needs --cli <slug> (and --args to \
+                             store; omit --args to reset that CLI to its default)",
+                        )?;
+                        run_app_control_set_launch_flags(None, Some(slug), flags, timeout_ms)
+                    }
+                    "reset" => {
+                        let slug = slug
+                            .context("server app launch-flags reset needs --cli <slug>")?;
+                        run_app_control_set_launch_flags(None, Some(slug), None, timeout_ms)
+                    }
+                    other => anyhow::bail!("unsupported app launch-flags action: {other}"),
+                }
             }
             "theme-editor" => {
                 let action = cli_positional_args(&args, 3)
@@ -7188,6 +7244,12 @@ mod tests {
             client_id: None,
             linux_desktop_app_id: None,
             client_role: None,
+            // Upstream's build-identity field, which these three fixtures were
+            // not given when it landed — so `cargo test --workspace` could not
+            // compile this bin at all. `None` is the honest fixture value: these
+            // records describe a PRIOR client, and a record written before the
+            // field existed carries nothing.
+            build_commit: None,
             process_start_ticks: Some(77),
             executable_path: Some(
                 "/home/user/.local/share/yggterm/direct/versions/2.1.49/yggterm".to_string(),
@@ -7221,6 +7283,12 @@ mod tests {
             client_id: None,
             linux_desktop_app_id: None,
             client_role: None,
+            // Upstream's build-identity field, which these three fixtures were
+            // not given when it landed — so `cargo test --workspace` could not
+            // compile this bin at all. `None` is the honest fixture value: these
+            // records describe a PRIOR client, and a record written before the
+            // field existed carries nothing.
+            build_commit: None,
             process_start_ticks: Some(77),
             executable_path: Some(current_text),
             display: Some(":1".to_string()),
@@ -7240,6 +7308,12 @@ mod tests {
             client_id: None,
             linux_desktop_app_id: None,
             client_role: None,
+            // Upstream's build-identity field, which these three fixtures were
+            // not given when it landed — so `cargo test --workspace` could not
+            // compile this bin at all. `None` is the honest fixture value: these
+            // records describe a PRIOR client, and a record written before the
+            // field existed carries nothing.
+            build_commit: None,
             process_start_ticks: Some(88),
             executable_path: Some(
                 "/home/user/.local/share/yggterm/direct/versions/2.1.49/yggterm".to_string(),

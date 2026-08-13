@@ -1286,14 +1286,64 @@ rewrite it as a side effect.
 `N.x.y.z…`. The model is a containment relation — a set holds rows *and other
 sets* — never a boolean or a single non-recursive parent field.
 
+**THE DEFAULT ARRANGEMENT IS THE OUTLINE ITSELF, and it is not decoration.** The
+owner's rule, and the standing principle he settled it as: *group `N.x` rows
+under `N.0` as the header, and `N.x.y` rows under their `N.x` header where
+applicable* — this replaces ad-hoc row tidying as the way a fleet's structure is
+made legible. So a head is found by looking, in order, for the **`.0` seat of the
+row's own level** (`6.1` and `6.2` sit under `6.0`; `6.1.1` sits under `6.1.0`
+when a sub-orchestrator holds that seat), and failing that the **bare parent
+seat** (`6.1.1` under `6.1`). One rule at every depth, which is what makes the
+nesting recursive rather than two hard-coded levels.
+
+- ⛔ **Derived every frame from `outline_prefix`, never stored and never parsed
+  out of a title.** The seats already carry this; a written-down copy would go
+  stale the moment a delegate is reseated or reaped, and a seat read back out of
+  prose is destroyed by the next re-title. `row_set_outline` is the ONE place a
+  seat may produce a containment edge.
+- ⛔ **A head is a ROW, not a heading.** If nobody holds `6.0`, then `6.1` and
+  `6.2` stay top level rather than collecting under an invented placeholder: a
+  synthetic head could not be clicked, closed or driven.
+- **Membership stays arbitrary.** This is the *default*, so an explicit
+  arrangement — the verb and the drag — overrides it per row and never has to
+  fight it.
+
 - **Each set owns its own collapsed flag**, and collapsing an outer set hides
   everything beneath it without touching the inner flags. Re-expanding restores
   each inner set exactly as it was. ⛔ Flattening the inner sets open on expand
   is the failure users notice, and it is the one that gets skipped.
+**⛔ THE TRAFFIC LIGHTS ARE A COLUMN OF THEIR OWN, FAR LEFT, IN A FIXED AREA.**
+Owner-directed, and it is a layout MODEL rather than a rule about padding. A
+live row has two zones, and they are SIBLINGS in the markup:
+
+| zone | holds | behaviour |
+|---|---|---|
+| **gutter** | the status dot, nothing else | fixed width, flush to the row's own left edge, identical on every row at every depth — including rows in no set |
+| **content** | icon, title, trailing controls | begins after the gutter, and is the only thing nesting moves |
+
+Structural separation is the point: a shared leading pad that merely happens to
+be equal on every row is one zone pretending to be two, and the dots move again
+the moment anything needs to sit before the icon. That is not hypothetical — the
+first build of row sets put the disclosure control at the head's leading edge,
+which pushed that row's dot, icon and label right, so **a header drew further
+right than its own members** and dots stood in two columns.
+
+⇒ **The disclosure control lives at the TRAILING edge beside the ✕, and shares
+its hover reveal.** That is where the reclaimed width comes from: the gutter is
+the row's own horizontal padding rather than a `base + step` leading run, so
+every live row's title starts further left than before. Measured on the live
+host, light theme, 2026-08-13: the dot column moved from x=40 to x=25 and became
+a single value for every row; a top-level row's first text pixel moved from
+x=82 to x=65, and a nested row's to x=77 — still left of where the flat list
+started. ⭐ With a real gutter the dots form one unbroken vertical line down the
+sidebar, so **a kink at any row means the zones were never separated.**
+
 - **Indentation is budgeted.** The sidebar runs out of horizontal room before
   the outline runs out of levels. Indent the first two levels; past that, hold
   the indent and let the head's own number carry the depth — a title clipped to
-  nothing is worse than a column that stops stepping.
+  nothing is worse than a column that stops stepping. ⚠ The rows past the budget
+  are still fully NESTED — drawn under their head and hidden with it; only the
+  left edge stops moving.
 
 #### Row sets and splits are orthogonal, and neither may relocate the other
 

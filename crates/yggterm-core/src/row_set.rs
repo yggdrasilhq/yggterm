@@ -139,6 +139,16 @@ impl RowSets {
         self.members.get(path).map_or(&[], Vec::as_slice)
     }
 
+    /// Every row that heads a set, in no particular order.
+    ///
+    /// ⚠ **Unordered, so a caller that needs determinism must sort.** The
+    /// containment is a map; the sidebar's draw order comes from the caller's
+    /// own list, never from here. The one caller today hashes this into a cache
+    /// key and sorts for exactly that reason.
+    pub fn heads(&self) -> impl Iterator<Item = &str> {
+        self.members.keys().map(String::as_str)
+    }
+
     /// Does `path` head a set? A head with an empty member list is not a set:
     /// the last member leaving dissolves it, so an empty husk can never linger
     /// and offer a disclosure control that opens onto nothing.
@@ -148,6 +158,30 @@ impl RowSets {
 
     pub fn is_collapsed(&self, head: &str) -> bool {
         self.collapsed.contains(head)
+    }
+
+    /// How many rows sit beneath `path`, however deep, and whether or not it is
+    /// collapsed.
+    ///
+    /// ⚖ Deliberately blind to the collapsed flags: this is the number a shut
+    /// set puts next to its disclosure control, and a count that fell to zero
+    /// the moment it was needed would be worse than no count at all.
+    pub fn descendant_count(&self, path: &str) -> usize {
+        let mut count = 0usize;
+        let mut seen = HashSet::new();
+        let mut stack = vec![path.to_string()];
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current.clone()) {
+                // Only reachable from a hand-edited file; `insert_member`
+                // refuses cycles. Counting must still terminate.
+                continue;
+            }
+            for member in self.members_of(&current) {
+                count += 1;
+                stack.push(member.clone());
+            }
+        }
+        count
     }
 
     /// Collapse or expand ONE set. Touches no other set's flag — that is the

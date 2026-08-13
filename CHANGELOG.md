@@ -4,6 +4,93 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Folding a group no longer hides its sessions from everything else (3.0.140).**
+  Collapsing a group is meant to tidy the sidebar, and it did — but the same
+  fold also removed those rows from the answer every background tool gets when
+  it asks which sessions exist. With every group folded, nine live agent
+  sessions became invisible to the supervision machinery at once, and one of
+  those tools retired all nine on the strength of it while the sessions were
+  healthy and working. The list now always reports every row and says
+  separately which ones the sidebar is currently folding away, so tidying the
+  screen can no longer make a session disappear. Folds still persist exactly as
+  you set them.
+
+- **A stale machine now fixes itself when you open yggterm (3.0.135).** If the
+  running background service is too old and yggterm decides it cannot safely take
+  it over, it used to write down that an update was owed and leave it there — and
+  the only thing that ever reads that note is the old service itself, which on a
+  machine far enough behind does not understand the note at all. One machine sat
+  twelve versions behind for five and a half hours that way, and what the person
+  at the keyboard saw was sessions they could not type into. yggterm now starts
+  the up-to-date service itself, alongside the old one, and lets the old one hand
+  its sessions over at its own pace. Nothing is closed, nothing is interrupted,
+  and no terminal is lost.
+
+- **A running yggterm can now say which source it was built from (3.0.133).**
+  `yggterm --build-commit` could only ever answer for a file, and installing a
+  new version replaces that file underneath the copy already running — so the
+  question *"is the thing in front of me the build I just installed?"* had no
+  answer. Now the running process says: the background service reports it in
+  `yggterm-headless server status`, the window reports it in `server app
+  clients`, and `server daemons` shows a BUILD column. A fleet deploy prints
+  both planes side by side, so a machine whose files are current while its
+  services are still finishing older work reads as exactly that, instead of
+  reading as fully up to date.
+
+- **A fleet deploy now names the source of every copy it finds, not just
+  whether it matches (3.0.137).** The report used to say a version and a
+  checksum, so two different builds sharing a version number showed up only as
+  "these differ" — with no way to say which was which. Each copy is now asked
+  directly, and copies too old to answer say so rather than being asked a
+  question that would open a window on them.
+
+- **A screenshot now says which authority decided it was safe to take
+  (3.0.133).** The capture path asks the compositor whether this window is the
+  one that would be photographed, and falls back to yggterm's own drawing when
+  it is not. Previously it recorded that decision only when it refused, so a
+  frame the compositor confirmed and a frame taken because the compositor could
+  not be reached looked identical in the reply — and only one of those is
+  trustworthy.
+
+- **A daemon handing its sessions over now leaves its name behind (3.0.132).**
+  Every yggterm version answers on a socket of its own, and a CLI started
+  against one keeps asking for that exact name for as long as it lives. When a
+  daemon retired, its name vanished with it — so an agent session pinned to the
+  version that had just handed over got `No such file or directory` instead of a
+  terminal, and on an agent CLI that error lands in the composer and leaves the
+  row with nothing to type into. A retiring daemon now points its own name at
+  its successor before it goes, which is the only moment both names are known at
+  once. Nothing else changes: the successor was already serving.
+
+- **You can now see what the update gate is looking at (3.0.132).** When yggterm
+  holds an update back because a session is busy, `yggterm-headless server
+  gate-screen` shows the screen it read and the verdict it reached, per session.
+  It is read-only, it runs only when asked, and nothing it shows is written
+  anywhere.
+
+- **The status dots line up, and every title got wider (3.0.131).** The dots
+  now sit in a fixed column of their own at the far left, identical on every
+  row whatever its nesting — one unbroken line down the sidebar instead of a
+  staircase. Nesting moves the title and nothing else. The disclosure control
+  moved to the right, beside the close button, and appears on hover the way that
+  button does; reclaiming its old slot is what gives every row's title more
+  room, including rows that belong to no group at all. Titles start 17px
+  further left than before.
+
+- **The sidebar draws the outline it always knew about (3.0.129).** Rows have
+  carried a seat number for a while — `6.0`, `6.1`, `6.1.1` — but the list drew
+  every row flat and left you to rebuild the structure in your head from the
+  numbers. Now a book collects under its head: `6.1` and `6.2` sit under `6.0`,
+  `6.1.1` sits under `6.1`, as deep as the numbering goes, and several books can
+  run side by side without knowing about one another. A head carries a
+  disclosure control and a count; collapsing one folds its rows away and leaves
+  the head where it was. Nesting is derived from the numbers themselves rather
+  than stored, so renumbering a row moves it immediately and nothing can drift
+  out of step. Indentation steps two levels and then holds — past that the row's
+  own number carries the depth, because a title squeezed to nothing is worse
+  than a column that stops stepping. A row with no number, or whose head is not
+  on the list, stays exactly where it was.
+
 - **A session that stopped accepting typing now recovers itself (3.0.128).**
   Once in a while a row would stop responding to input — no typing, no
   scrolling, a blank viewport, and nothing on screen saying why. It never came
