@@ -254,6 +254,11 @@ def run(args):
     clk = os.sysconf("SC_CLK_TCK")
     while True:
         t0 = time.time()
+        # ONE timestamp per round, taken before the walk. Stamping each process
+        # as it is read makes every row's ts unique, so "group by round" — the
+        # natural way to ask what the machine was doing at an instant — silently
+        # returns one row per process instead.
+        now_ms = int(t0 * 1000)
         rows = []
         for entry in os.scandir("/proc"):
             if not entry.name.isdigit():
@@ -271,7 +276,6 @@ def run(args):
                 continue
             utime, stime, starttime = st
             key = (pid, starttime)  # pid alone is reused; starttime disambiguates
-            now_ms = int(time.time() * 1000)
             if key in prev:
                 pu, ps_, pt = prev[key]
                 dt = (now_ms - pt) / 1000.0
