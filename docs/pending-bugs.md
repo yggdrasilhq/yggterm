@@ -1293,6 +1293,20 @@ and it is what a reader should carry away:**
 | a corpus reader looking for the wrong facts filename | two populated collections holding nothing |
 | an editor handed a path it accepted and dropped | a rendering bug — exit 0, empty surface |
 | a viewer painting no document body | an app that declared no content |
+| **a shadow client that had died** | **a rail stuck on "Loading…" — a slow fetch, then a regression** |
+
+⚠ **That last row was measured 2026-08-13 and nearly published as a false
+finding.** A rail that had rendered fully an hour earlier came back reading
+*Loading…* on two different corpora. The app was serving its schema correctly
+throughout — `curl` proved it — so the obvious reading was a host regression
+between 3.0.132 and 3.0.140, and there was even a plausible culprit (a widget
+added in between). **The shadow had simply died**, and `--client <name>` answered
+*no live client by that name* the moment anything asked. ⇒ **A dead instrument
+does not return an error; it returns a plausible picture.** The only thing that
+caught it was checking the instrument's own health **in the same run** as the
+measurement — and the control that exonerated the new widget (a corpus without
+it, stalling identically) was itself taken through the dead instrument and
+proved nothing either.
 
 ⇒ **When adding any reader, ask what its silence would look like** — and if the
 answer is "the same as success on empty input", give it a way to say *I looked
@@ -1570,11 +1584,39 @@ nothing — they are queues, logs and a work area. It is a pipeline; a
 job-and-run view is a different program and this lane does not pretend to
 deliver one.
 
-**Still open in this entry:** the journalling half. The overview serves
-*retrieval*, which is one of the two hot paths; **capture is not built.** That
-is the next load-bearing piece, and it is the one the design value actually
-ranks — a system judged on journalling that cannot yet take an entry is a
-reader, not a journal.
+### Capture is built, and live-proven end to end
+
+*2026-08-13, later the same session.*
+
+The overview served retrieval only, which made the app a reader rather than a
+journal. **Both hot paths now exist.** A thought lands in today's dated entry in
+a declared collection with **one command and no decisions** — no title, no
+folder, no tag. The entry opens with its own date as a heading, which is what a
+note collection reads its title from, so the writer never names one; each
+thought gets a time marker they never type, which costs nothing on the hot path
+and is the only way to recover the order of a day's thinking later.
+
+**One declaration, and everything else is derived rather than restated.** The
+capture target names a collection; the file name, the heading and the ordering
+all come from what that collection already says about itself. Three
+misconfigurations are refused at manifest LOAD rather than at capture time,
+because a corpus set up to file thoughts somewhere that will never show them
+would fail silently and the writer would find out late or never.
+
+**Live proof on the GUI host, before and after, on one rail:**
+
+- the capture box renders at the top of the rail, above navigation, identical on
+  every route — a thought arriving three collections deep must not require the
+  reader to go anywhere;
+- the rail read **Journal 3**; the capture action was posted exactly as the rail
+  posts it; the rail read **Journal 4**, and the day's entry was on disk with
+  its date heading and time marker.
+
+That is the surface path, not just the CLI — box, action, write, re-index,
+and the count the writer sees change.
+
+⛔ **Still not claimed: the document BODY**, for the reason in the entry above.
+The rail is what the available instrument can prove, and it is what is claimed.
 
 ## ⛔ [6.4] `server app start-page` IS A NAVIGATION VERB SHELVED AMONG THE READ VERBS
 
