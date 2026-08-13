@@ -1552,9 +1552,10 @@ guarantee, and this is a live counter-example: our own deploys are degrading oth
 
 ## ⛔⛔ ROW-SET NESTING IS INVERTED — A LEADING DISCLOSURE CONTROL OCCUPIES THE INDENT COLUMN
 
-**Status:** OPEN  *(6.3 — sidebar truth)*
+**Status:** OPEN
 
-*Owner-reported 2026-08-13 on the shipped build, from the live sidebar.*
+*Owner-reported 2026-08-13 on the shipped build, from the live sidebar. Owned by the sidebar-truth
+cluster.*
 
 A group head renders `⌄ ● ▣ label`; its members render `● ▣ label` with no chevron slot. The
 disclosure control is inserted **before** the head's content, so it pushes that head's dot, icon and
