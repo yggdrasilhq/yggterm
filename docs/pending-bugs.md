@@ -115,15 +115,66 @@ and the body's first child is an unconditional `RailHeader`. Every one of those
 is true and the rail is still empty, which is the shape of a reading that is
 answering a different question than its name suggests.
 
-⭐ **Falsifier, and it needs an instrument that does not exist yet:** read the
-rail content div's CHILD COUNT and computed geometry from the live DOM. If the
-children are absent, the body never rendered and the fault is upstream of the
-styles; if they are present with zero size, it is layout.
+⭐ **THE FALSIFIER HAS BEEN RUN — THE CHILDREN ARE ABSENT.** Read-only walk of
+the live DOM: `[data-yggui-side-rail-content]` holds **exactly one child**, the
+8 px `[data-rail-resize-handle]`, and there is no `[data-yggui-rail-header]` or
+`[data-yggui-rail-scroll]` anywhere in the document. ⇒ the body never rendered,
+and the fault is **upstream of the styles**. The three style-side exclusions
+above stand and none of them is resurrected by this.
 
-⚠ **There is no DOM-read verb to run that falsifier with.** `server app chrome`
-offers only `type`, whose `--assert <selector>@<attribute>` is the sole DOM read
-in the surface and cannot be used here because it types first. Getting a
-read-only chrome query is the prerequisite for settling this.
+⛔ **CORRECTION — the instrument was never missing.** This entry previously said
+no DOM-read verb existed and made that the prerequisite. False: **`server app
+dom-eval`** runs JS in the GUI webview and returns the serialized result without
+typing, and it shipped long before this entry was written. `chrome type
+--assert` is the one that types. An inherited "that instrument does not exist"
+is a CLAIM; it cost a seat's launch.
+*(Positive control, because an instrument collapsed to a constant answers
+confidently and wrongly: the same walk reports 291 descendants under the left
+tree, which is measured to draw.)*
+
+⭐ **IT IS A REGRESSION, NOT A STRUCTURAL DEFECT — proven by A/B against a
+second live GUI.** A second instance running an **older build** renders the same
+rail correctly (`kids:4` — header, section, scroll body, handle). The body
+dispatch chain itself is unchanged since 2026-07-09, and the rail code path is
+**byte-identical between the build that fails and current `main`** ⇒ the defect
+is live on main and nothing has fixed it. Regression window: the older build
+(≤ 14:25) → 3.0.148 (22:25) on 2026-08-13.
+
+⛔ **NOT mode-specific and NOT data-dependent.** Sampling state and DOM
+*together* (a reading taken at a different moment proves nothing) across all
+four built-in modes:
+
+| mode | `server app state` | DOM |
+|---|---|---|
+| connect | `requested=rendered=connect docked=True` | `vis=1 kids=1 hdr=0` |
+| metadata | `requested=rendered=metadata docked=True` | `vis=1 kids=1 hdr=0` |
+| settings | `requested=rendered=settings docked=True` | `vis=1 kids=1 hdr=0` |
+| notifications | `requested=rendered=notifications docked=True` | `vis=1 kids=1 hdr=0` |
+
+`connect` is a static form touching neither notifications nor contributed
+panes, so a data-dependent failure in the body is excluded.
+
+⚠ **AND THE CHROME IS LIVE, NOT FROZEN** — the obvious next suspect, killed
+before it could be believed: `data-yggui-side-rail-visible` tracks `docked`
+exactly (1 → 0 → 1) as the mode is driven, so renders ARE happening and the
+attribute half of the very same render is correct.
+
+⇒ **What that leaves, stated as the contradiction it is.** `visible` and the
+body are stamped by ONE render from ONE `rail_render_view` destructure, where
+`docked == true` forces `rendered_mode == requested_mode != Hidden`, and every
+non-`Hidden` variant has an arm whose first child is an unconditional
+`RailHeader`. So `visible=1` with `hdr=0` **cannot both be products of the same
+render** under the source as written. The next seat should treat that as the
+finding: either the `body: Element` prop is not being rendered by
+`SideRailShell` in this build, or the child subtree fails at render time and
+Dioxus swallows it, leaving the parent's container and handle intact. Bisect the
+window above rather than re-reading the dispatch chain, which is not where it
+changed.
+
+⚠ **A second, independent anomaly, unexplained and worth its own look:**
+`right_panel.raw_mode` stays pinned at `app_pane` through every mode change,
+while `requested_mode` moves. Every contributed pane on that instance also
+reports `in_snapshot_map: false`.
 
 ### ⇒ WHAT IT COSTS, AND WHAT THE USER CAN DO TODAY
 
