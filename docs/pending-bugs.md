@@ -92,11 +92,33 @@ add or drop keys here (Dioxus applies `style` property-by-property and does not
 clear dropped keys — that lingering was the docked-rail-ghost bug)."*
 
 ⇒ a style property emitted in one mode and **absent** from another is not
-cleared, it LINGERS. That is the documented failure family for this exact
-element, it would survive every later mode change (which matches "hours"), and
-it would leave the card painting while its contents collapse.
-⛔ Not confirmed. Falsifier: read the rail content div's computed style and
-child geometry, and compare the key SET emitted across all four modes.
+cleared, it LINGERS. This symptom is a VERBATIM recurrence of the one that
+trap first produced (*"the right sidebar cannot be opened, nothing draws on the
+right"*), which is why it was the obvious next suspect.
+
+⛔ **AND IT DOES NOT HOLD — checked, in the code, and recorded so nobody walks
+it again.** `sidebar_panel_outer_style` and `sidebar_panel_card_style` each
+build ONE `format!` with a fixed key set and vary only the values, which is
+exactly the fix that trap was closed with. The key sets cannot differ by mode.
+
+⛔ **Zoom does not hold either.** The card is transparent in-flow by design
+(`background-color:transparent`, the app background paints behind it), so the
+pale band is the app background — and the tree and the rail pass **byte-identical**
+zoom arguments (`zoom_percent_f32(settings.ui_font_size, 14.0)`) to the same
+helper. A zoom collapse would have taken the tree with it, and the tree draws.
+
+⇒ **What is left is the body itself, and every reading says it should draw.**
+`rail_render_view` is the single owner of "what is the rail drawing" and the
+probe reads that same value; it reports `docked:true` + a `rendered_mode` the
+dispatch has an arm for; `SideRailShell` interpolates `{body}` unconditionally;
+and the body's first child is an unconditional `RailHeader`. Every one of those
+is true and the rail is still empty, which is the shape of a reading that is
+answering a different question than its name suggests.
+
+⭐ **Falsifier, and it needs an instrument that does not exist yet:** read the
+rail content div's CHILD COUNT and computed geometry from the live DOM. If the
+children are absent, the body never rendered and the fault is upstream of the
+styles; if they are present with zero size, it is layout.
 
 ⚠ **There is no DOM-read verb to run that falsifier with.** `server app chrome`
 offers only `type`, whose `--assert <selector>@<attribute>` is the sole DOM read
