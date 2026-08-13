@@ -4,6 +4,40 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The start page can be used to find a session again (3.0.113).** It is the
+  surface reached when the sidebar has failed, and it could not do that job.
+  Four things changed. **It is ordered most-recently-used first, and it says so
+  beside the heading** — the previous order was alphabetical by session uuid,
+  because the rank key was the row path's file mtime and *none* of the 41
+  session rows on a real host is a file path (they are `remote-cc://`,
+  `local://`, `remote-session://`, `live::`), so the key was constant zero and
+  every comparison fell through to a tie-break on the path text. The key is now
+  resolved by session id against the scans that already timestamp these
+  sessions. **It is searchable, over contents as well as titles** — the query
+  runs against each session's generated summary, title, folder, host and id,
+  using the same predicate the cwd tree searches with, so the two surfaces
+  cannot disagree about what a query matches. **libyggterm app rows are gone
+  from it** — ychrome and yedit rows are not sessions anyone resumes; they are
+  identified by their persisted `Source` stamp rather than by their title.
+  **Each card's button names its CLI and wears its brand colour** — *Open this
+  Codex Session*, *Open this Claude Code Session* — from the agent-CLI registry,
+  so a tenth CLI is a table row rather than a new branch. The verb and the
+  colour were previously two `match`es that between them knew three of the nine
+  registered CLIs and painted the rest identically.
+- **Agent CLI brand colours are a design vocabulary, and they are legible
+  (3.0.113).** Each registered CLI now owns a colour on its registry
+  descriptor, recorded in `DESIGN.md`. Every value clears WCAG AA (≥4.5:1)
+  against the white label it carries, enforced by a test — the amber the start
+  page painted before this sat at 3.19:1 and failed AA at the size it actually
+  rendered.
+- **A new session is named for what it IS, not for whatever you right-clicked
+  (3.0.113).** Starting a session from a row's context menu used to name the
+  new row after *that row's* title plus the CLI slug, so two sidebar entries
+  read almost identically until the CLI titled itself. A new row is now born
+  `New Codex Session` / `New Claude Code Session` / `New Terminal`, per its own
+  kind, and still renames itself when its first real title arrives. (A plain
+  shell is still titled by its working directory, which is a separate rule.)
+
 - **The input gate no longer shuts on a row you have selected before (3.0.112).**
   3.0.110 gave a stranded row a 5 s escape hatch and it fired 11 times in the
   first 25 minutes of ordinary use, which was the case for closing the window
