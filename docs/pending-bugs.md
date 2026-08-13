@@ -3203,6 +3203,24 @@ and it is one line.
 single parse is safe on this verb — that idiom reads the first object and discards the rest
 without error, which is worse than failing.
 
+
+### ⚠ NOT REFUTED, BUT BOUNDED — 2026-08-13 sweep
+
+Seven `session remove` calls across 3.0.133–3.0.146, every one parsed by a plain
+`json.load` with no exception, and every one carried a `verified` that matched
+reality (the row really left the census, `live_processes: []`).
+
+⛔ **That is not a refutation and must not be read as one.** The entry says the
+verb **CAN** answer this way; an intermittent fault is not disproved by clean
+samples, and seven is a small number. What the run does is **bound the rate**:
+this is not the ordinary reply shape, so a caller hitting it is hitting something
+conditional — most likely a second write racing the first, which is where a
+re-test should look rather than at the happy path I just exercised seven times.
+
+⚠ **And the unsafe idiom the entry names is still the one to fix regardless of
+frequency.** `json.loads(out[out.find("{"):])` reads the first object and never
+learns a second existed, so a caller using it cannot even detect the fault it is
+victim to. That half needs no reproduction to justify.
 ## ⛔⛔ A SCRUB'S VERIFIER ASKS WHETHER THE STRING IS GONE, NEVER WHETHER THE REPLACEMENT IS VALID
 
 **Status:** OPEN
