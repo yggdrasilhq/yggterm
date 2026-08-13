@@ -163,6 +163,16 @@ copies.
 - **Windows and macOS builds are 3.x milestones and are not to be opened
   unprompted** (user directive). Listed here only so a session that trips over a
   cross-platform failure knows it is parked on purpose rather than forgotten.
+- **`yggtopo` is published PRIVATE and the flip to public is his.** The new
+  fleet app is built, tested and pushed to its own repo under the org, with the
+  org-wide platform licence already settled (GPL-3.0-or-later, so nothing is
+  owed on that question). It was NOT made public: publishing indexes a repo and
+  is not reversible by deleting it, and the sibling apps' visibility was his
+  call each time. **Recommendation: make it public, matching the other platform
+  apps** — nothing in it is private, the guard passes, and every example in it is
+  invented. **Done meanwhile:** the repo is private with full history and the
+  binary is on the fleet, so the app is usable now either way. **To reverse:**
+  one visibility change; nothing else depends on it.
 
 ---
 

@@ -546,74 +546,71 @@ screen last looked like**.
 list of hostnames, and it answers "which machine was I on" the way the eye
 answers it.
 
-## ⭐⭐ [6.5] THE BOOTER HAS NO MANUAL DISARM AND NO RATE-LIMIT AWARENESS
+## ⛔⛔ [6.5] A DOCUMENT SURFACE'S BODY DOES NOT PAINT, AND ITS CONTRACT SAYS TWO DIFFERENT THINGS
 
 **Status:** OPEN
 
-*reported 2026-08-13*
+*measured 2026-08-13 on a real GUI (an isolated sandbox, not the owner's)*
 
-Reported symptom: during a rate-limited window, subscribers kept being booted.
-A boot into an exhausted quota cannot do work — it spends the wake, fails, and
-leaves the row no further forward.
+Reported symptom: an app's viewport pane renders its top bar and leaves the body
+blank, while every telemetry field reads healthy — `has_schema: true`,
+`stale: false`, `error: null`. Two lanes have now spent time on it. It has been
+attributed to the read-only shadow client; **it is not the shadow.**
 
-⚠ **Correction to the premise, measured 2026-08-13 11:22 across all three
-hosts:** the booter is **not armed anywhere right now**. `~/.yggterm/relay/booter/`
-holds zero subscriptions on each host, no watcher process is alive, and the
-newest heartbeat is two days stale. So the kicking described is not ongoing.
-**This does not retire the item** — it narrows it to the two real gaps:
+**Half of it is a contract that disagrees with itself, and that half is
+actionable now.** yggterm's own deserialiser says:
 
-1. **There is no disarm surface.** Disarming today means reaching each host and
-   running the skill's Python by hand. There is no way to see who is armed,
-   when they are due, or to stand one down without a shell. ⇒ the reporter had
-   no instrument to answer *"is the booter what is hurting me right now"*, which
-   is why the premise could not be checked from the GUI.
-2. **The booter does not know about quota.** It has a rule for a context-dead
-   session (tracked above) but none for an account-level rate limit, which is a
-   different state: the session is fine, the *account* cannot spend. A boot in
-   that state should defer to the window reset, not retry on its grid.
+> Chrome widgets (tabs, buttons, toggles, labels) form a top bar; `markdown` and
+> multiline `text-input` widgets are the scrolling body.
 
-### What is left, after the mechanism landed
+`.agents/skills/libyggterm-surfaces/SKILL.md` says multiline `text-input` **and
+`list-row`** "render at document scale". ⇒ **`list-row` is chrome in a viewport
+pane.** An app that believes the prose declares a list of rows as its document
+body, gets a blank page, and has no way to find out why — nothing failed. The
+host is the SSOT; the prose is wrong and should be corrected.
 
-The MECHANISM for both is in `ygg-booter.py` / `ygg-babysit.py` (`disarm` ·
-`arm` · `RATE_LIMITED` · a fleet-wide quota hold · `--json` for a surface to
-render and drive). What remains is **gap 1's surface**: a human still needs a
-shell to press the switch, which was the actual complaint. That is the yggtopo
-booter tab, tracked in the entry below, and this entry closes when that tab can
-disarm a host and show who is armed.
+**The other half is a real defect and is NOT explained by the above.** With the
+rows replaced by a `markdown` widget the body is *still* blank:
 
-⚠ **Quota detection has no reset time, by construction.** The refusal says only
-"try again later"; the CLI keeps no quota state file and there is no API to ask.
-So the hold expires on a timer (30 min) and the next tick spends ONE boot as a
-probe, which re-arms the hold if the account is still dry. Anything claiming to
-know when the window resets would be inventing it.
+| what was checked | result |
+|---|---|
+| the schema actually served | `markdown` widget, `id` + `source`, **928 chars** of real content over HTTP |
+| the same schema in the RAIL, same app, same minute | renders **completely** — cards, sections, status dots, rows, tabs, search box, footer |
+| the field names | `section.text`, `tabs.active`, `markdown.source` — all matched against the host's enum |
+| "the refetch is racing the re-stamp" | **falsified** — same blank with the app re-stamping every 120 s |
 
-## ⭐⭐ [6.5] THERE IS NO libyggterm APP FOR THE FLEET ITSELF — BUILD `yggtopo`
+⇒ The same-app rail control is what separates this from an app bug: the schema
+is good, and the viewport placement is not painting a widget it says it paints.
+
+⚠ **Falsifier, not yet run:** drive the shipped pilot editor through the
+identical path in the same sandbox and confirm ITS markdown body paints. That
+attempt stalled on the editor's own daemon (`Loading…` in the rail, control
+endpoint never answered) and was not retried. If its body is blank too, this is
+the document-surface body path for every app, not one widget.
+
+## ⚠ [6.5] THE APP SCAFFOLDING HAS THREE HAND-COPIES AND ONE OF THEM FAILED SILENTLY
 
 **Status:** OPEN
 
-*requested 2026-08-13*
+*measured 2026-08-13*
 
-**What it is:** `lstopo` + `htop`, for the fleet. An `lstopo`-style topology view
-as the primary visual, with `htop`-style live process data layered onto it, and
-LXC containers as first-class citizens of that topology rather than processes
-that happen to be running.
+The platform's migration order calls for the widget schema to be lifted into a
+typed contract crate once a second consumer exists. There are now three, each
+carrying its own hand-written copy of the same ~200 lines, and the third one
+paid the predicted price on its first live render:
 
-**Why it is being built now, and it is not the diagram:** it is the surface that
-lets the booter be disarmed, deferred and reconfigured by hand. A second tab
-carries **fleet statistics — who is armed, and when they are due**.
+- `section` was given `title`; the field is `text`. **The whole pane refused**,
+  and said so — the loud failure, and the survivable one.
+- `tabs` was given `selected`; the field is `active`. **Silently defaulted.** The
+  pane rendered with no tab highlighted and nothing anywhere said why.
 
-**What makes it a milestone for the project, independent of its own usefulness:**
-it is the first libyggterm GUI app of this shape ever built. It behaves like a
-Windows/Qt/GTK application inside the viewport, composed from yggui components —
-sliders, list views, panels — with the gradient flowing over it the way the start
-page has it. ⇒ **the app is also the proof that the app tier can carry a real
-desktop-class UI**, which is the claim `libyggterm` is being licensed and
-positioned on. Build the htop-like view first: it is the densest widget exercise
-and it is the half the booter tab depends on.
+⇒ **The silent-default half is the argument, not the loud half.** A refused pane
+sends you to the contract; a defaulted field sends you nowhere. A typed schema
+turns both into compile errors.
 
-⛔ **No context-menu integration** — see the context-menu entry above.
-⭐ **Reuse yggui components; do not invent** — standing rule, and this app is
-where the temptation is highest because nothing quite like it exists yet.
+⚠ A field-name test now pins every name against the host's enum, in the third
+consumer. **That is a second encoding of the contract and should be deleted the
+day the typed one lands** — it is a splint, not a fix.
 
 ## ⭐ [6.5] `yggdrasil-maker` WANTS THE SAME REMAKE
 
@@ -625,6 +622,16 @@ Same treatment as yggtopo: a real app in the viewport built from yggui
 components, and **no context menu**. Sequenced after yggtopo deliberately —
 yggtopo establishes the component vocabulary and yggdrasil-maker consumes it.
 If the second app needs new primitives, that is a finding about the first.
+
+**What yggtopo established, for this app to consume:** the rail placement paints
+the full vocabulary (`section` with `card`, `label`, `search-box`, `tabs`,
+`toggle`, `button`, `list-row` with `status` and `actions`) and is where an
+interactive app should live today; the viewport placement paints only `markdown`
+and multiline `text-input`, and see the entry above before relying on it. The
+one widget yggtopo wanted and did not get is a **proportion bar** for a
+percentage — drawn as text instead, because the tier rules admit a new
+declarative widget only once a SECOND app wants one. ⇒ **If yggdrasil-maker
+wants a bar too, that is the second consumer, and it is a host change.**
 
 ## ⛔⛔ [6.7] AT REST THE GUI BURNS 93% OF A CORE, AND TWO THIRDS OF IT IS THE KERNEL ANSWERING `clock_gettime`
 
