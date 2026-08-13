@@ -1618,6 +1618,23 @@ classification the moment it lapses, and **a lapsed park announces itself**
 the human's switch; park means *I blocked this row and here is what releases
 it*, and is the orchestrator's bookkeeping about its own decisions.
 
+⛔⛔ **AND THE RUNNING WATCHER WILL NOT HONOUR YOUR FIX UNTIL YOU RESTART IT.**
+`watch` is a long-running process that imported its module once, at launch. Edit
+the script, land it, pull it on every host — **the running loop still executes
+the code it started with.**
+
+⇒ Measured immediately after `park` shipped: a correctly parked row escalated
+anyway. The state file said `parked: true` with 34 minutes left, the script on
+disk had the park code, and the watcher had been running since **before the
+feature existed**. Nothing was wrong except that the process was old.
+
+⚠ **The tell is a fix that tests green by hand and does nothing in production**,
+which reads as "my fix is wrong" and sends you back into code that is fine.
+⇒ **Restart the watcher as the last step of any change to it**, and confirm from
+a fresh tick — not from the script — that the new behaviour appears. This is the
+same class as a stale daemon serving old behaviour after a deploy, and the
+supervision plane is *more* prone to it because nothing ever restarts it.
+
 ⛔ **AND PARK DOES NOT REACH THE BOOTER — same two-planes trap as demote.** The
 dumb net is a separate subscription and knows nothing about parks, so a parked
 row that is also booter-subscribed still gets booted for being quiet, which is
