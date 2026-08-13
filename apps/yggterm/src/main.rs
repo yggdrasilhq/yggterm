@@ -4,6 +4,7 @@
 /// WebKitGTK's autoplay gate streams silent samples without a user gesture,
 /// which an agent cannot produce.
 mod audio_cli;
+mod build_identity;
 mod supervisor;
 
 use anyhow::{Context, Result};
@@ -819,6 +820,7 @@ fn print_main_help() {
   yggterm
   yggterm --help
   yggterm --version
+  yggterm --build-commit
   yggterm install
   yggterm doc <subcommand>
   yggterm server <subcommand>
@@ -3397,6 +3399,17 @@ fn main() -> Result<()> {
         Some("--version" | "-V" | "version")
     ) {
         println!("{}", current_version());
+        return Ok(());
+    }
+    // ⛔ SEPARATE FROM `--version` ON PURPOSE — see `build_identity`. The version
+    // is a rendezvous key two clusters can spend on the same day; the commit is
+    // the identity, and it is what tells a live probe whether the binary in
+    // front of it carries the fix being probed for.
+    if matches!(
+        args.first().map(String::as_str),
+        Some("--build-commit" | "build-commit")
+    ) {
+        println!("{}", build_identity::build_commit());
         return Ok(());
     }
     if let Some(command) = args.first()

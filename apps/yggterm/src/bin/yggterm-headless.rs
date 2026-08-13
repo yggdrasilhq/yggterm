@@ -61,6 +61,8 @@ use yggterm_server::{
     terminal_restart, terminal_write, try_run_remote_server_command,
 };
 
+#[path = "../build_identity.rs"]
+mod build_identity;
 #[path = "../headless_monitor.rs"]
 mod headless_monitor;
 
@@ -80,6 +82,10 @@ fn app_control_close_preserve_flag(args: &[String]) -> bool {
 enum BuiltinCliCommand {
     MainHelp,
     Version,
+    /// ⛔ NOT A SYNONYM FOR `Version` — see `build_identity`. Two clusters can
+    /// spend the same version number in the same minute; only the commit says
+    /// which source is in front of you.
+    BuildCommit,
     ServerHelp,
     ServerAppHelp,
     ServerSessionsHelp,
@@ -91,6 +97,7 @@ fn builtin_cli_command_is_pure(command: BuiltinCliCommand) -> bool {
         command,
         BuiltinCliCommand::MainHelp
             | BuiltinCliCommand::Version
+            | BuiltinCliCommand::BuildCommit
             | BuiltinCliCommand::ServerHelp
             | BuiltinCliCommand::ServerAppHelp
             | BuiltinCliCommand::ServerSessionsHelp
@@ -105,6 +112,9 @@ fn classify_builtin_cli_command(args: &[String]) -> Option<BuiltinCliCommand> {
         }
         [arg] if matches!(arg.as_str(), "--version" | "version") => {
             Some(BuiltinCliCommand::Version)
+        }
+        [arg] if matches!(arg.as_str(), "--build-commit" | "build-commit") => {
+            Some(BuiltinCliCommand::BuildCommit)
         }
         [command] if command == "server" => Some(BuiltinCliCommand::ServerHelp),
         [command, arg]
@@ -151,6 +161,7 @@ fn print_main_help() {
   yggterm-headless
   yggterm-headless --help
   yggterm-headless --version
+  yggterm-headless --build-commit
   yggterm-headless server <subcommand>
 
 common server commands:
@@ -1323,6 +1334,10 @@ fn main() -> Result<()> {
                 println!("{}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
+            BuiltinCliCommand::BuildCommit => {
+                println!("{}", build_identity::build_commit());
+                return Ok(());
+            }
             BuiltinCliCommand::ServerHelp => {
                 print_server_help();
                 return Ok(());
@@ -1780,6 +1795,10 @@ fn main() -> Result<()> {
             }
             BuiltinCliCommand::Version => {
                 println!("{}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            BuiltinCliCommand::BuildCommit => {
+                println!("{}", build_identity::build_commit());
                 return Ok(());
             }
             BuiltinCliCommand::ServerHelp => {

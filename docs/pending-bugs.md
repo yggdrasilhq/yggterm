@@ -116,89 +116,6 @@ per-daemon (five of the daemons on that host are older than the current binary
 open must emit a trace event naming the refusal. Silence here is itself the bug —
 the reporter had no way to tell "this row is gone" from "this row is slow".
 
-## ⛔ [6.2] A NEW CLI ROW IS BORN NAMED AFTER WHOEVER SPAWNED IT
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-*re-reported 2026-08-13*
-
-Already tracked further down this file as *"a new session's row is named after
-the row you right-clicked"*. Re-reported in this batch with the generalised
-symptom: a freshly spawned row reads `{whatever the spawner is called}
-{claude-code,codex,…}` until the CLI self-titles. Kept as one entry — see the
-existing narrative for the detail; this line exists so the 6.2 delegate knows it
-is in scope.
-
-**Live proof attempted 2026-08-13 on the desktop host, GUI + daemon both
-3.0.116 — and it came back TWO THIRDS green, which is why this stays open.**
-Three ephemeral `claude-code` rows created back to back by one command, same
-cwd, each with `--purpose`:
-
-| row | rendered title |
-|---|---|
-| probe A (created 1st) | `Agent unnamed claude-code` |
-| probe B (created 2nd) | `Agent unnamed claude-code: 6.2 sidebar order probe B` |
-| probe C (created 3rd) | `Agent unnamed claude-code: 6.2 sidebar order probe C` |
-
-B and C are the fixed form: named for the agent and its PURPOSE, not for the row
-that spawned them. **A is not, and the purpose is not missing — it is recorded
-and unrendered.** `server terminal tenants` carries
-`created_by.purpose = "6.2 sidebar order probe A"` for that exact row. So the
-create kept it and the title composition dropped it.
-
-⚠ **Three explanations were tried and killed before filing, because "one row out
-of three" invites a guess:**
-
-- **Not time decay.** B still rendered its purpose six minutes later.
-- **Not "only the newest row shows it".** Creating C did not take B's purpose
-  away; both held it side by side.
-- **Not lost at create.** The daemon's own tenancy record has A's purpose.
-
-⇒ What is left is a divergence between the stored purpose and the composed
-title, on the FIRST row of a batch. Not root-caused, and deliberately not
-guessed at.
-
-**ROOT-CAUSED 2026-08-13 (3.0.120), and "the FIRST row of a batch" was a
-coincidence of the probe.** The three purposes ended `A`, `B` and `C`. The copy
-layer's dangling-fragment rule (`ends_with_syntax_fragment` in
-`looks_like_low_signal_generated_title`, `yggterm-core/src/titles.rs`) treats a
-title whose last word is `the`/`a`/`an`/`to`/`for`/… as a generated fragment —
-right for `ship the logs to`, and it reads a trailing **`A`** as the English
-article. `agent_plane_session_title` (`yggterm-server/src/app_control.rs`) asks
-that same judge whether the composed title would survive downstream, and on
-`true` **drops the purpose and returns the bare base**, by design: the title
-survives by losing the only part that says what the row is for. Probe A was
-both the first row created and the one whose purpose ended in `A`; the ordering
-was the confound. Reproduced as a unit fact before any fix —
-`agent_plane_session_title(None, Some("6.2 sidebar order probe A"), …)`
-answered `Agent unnamed shell`, and the same call with `probe B` did not.
-
-**Fixed:** the judge now recognises an agent-plane title —
-`Agent <identity> <kind>`, optionally `: <purpose>` — as **authored**, not
-generated (`is_agent_plane_composed_title`), so none of the machine-copy
-heuristics apply to it. The exemption matches the whole shape, never the
-opening word, or it would be a hatch wide enough to drive every heuristic in
-that file through. `session_kind_label` moved to `yggterm-core` beside the
-slugs it is built from, so the copy layer reads the same vocabulary the
-composer writes rather than a second copy of it. Tests:
-`a_legible_purpose_is_never_amputated_from_an_agent_plane_title` (red before
-the fix, on the probe strings verbatim) and
-`an_agent_plane_title_is_authored_copy_and_is_never_judged_generated`.
-
-⚠ **The pre-existing test could not see this.**
-`an_agent_plane_title_is_never_thrown_away_as_generated_junk` asks only whether
-the TITLE survived, and amputation satisfies it — a bare
-`Agent unnamed claude-code` sails through. A test that asks "did the output
-survive" cannot catch an output that survived by discarding its payload.
-
-**Falsifier:** create three rows in one command with `--purpose`, and all three
-titles carry their purpose; or `created_by.purpose` is absent for the one that
-does not.
-
-**What live proof is owed:** three `claude-code` rows created back to back on
-the desktop host at 3.0.120+, purposes ending `A`, `B`, `C`, and all three
-sidebar titles carrying their purpose.
-
 ## ⛔ A SCREENSHOT OF A NON-TERMINAL VIEW PHOTOGRAPHS WHATEVER HOLDS FOCUS
 
 **Status:** OPEN
@@ -282,14 +199,29 @@ build you produced can. That check is documented in the yggui skill as a
 case but the **normal** state of a parallel campaign.
 
 **Wanted, in order of cost:**
-1. `deploy-fleet.sh` REFUSES a deploy whose `git rev-parse HEAD` is not a
-   descendant of `origin/main`, so a pre-rebase build cannot land at all. This
-   alone closes the reverting half.
-2. The build stamps its commit, and the census prints `version + short sha`, so
-   one number that means two builds is visible rather than silent.
+1. ✅ **SHIPPED** — `deploy-fleet.sh` refuses a deploy whose HEAD is not a
+   descendant of `origin/main`, and NAMES the commits the build would revert.
+   Proven red/green against the pre-fix script: with build products present and
+   the tree one commit behind, the old script deployed it and printed a version;
+   the new one refuses. Locked by `deploy_fleet_guard.rs` (two tests: the
+   refusal names the missing commit, and a rebased tree clears the gate and
+   reaches the next check — so the gate is a gate, not a blanket refusal).
+2. ⏳ **IN CODE, LIVE PROOF OWED** — `build.rs` stamps the commit and both bins
+   answer `--build-commit`; the census prints the build's commit and both md5s
+   with the line *any other md5 is another build*. ⛔ `--version` is deliberately
+   unchanged: it is a rendezvous key (socket names, the daemon version gate, and
+   `yggterm_executable_reported_version`'s token scan resolve against it).
+   ⚠ The census does NOT ask a deployed binary for its commit, because
+   `yggterm --build-commit` on a binary predating this change falls through to
+   LAUNCHING THE GUI on every host it is asked. Once ≥ this version is fleet-wide
+   that probe becomes safe and the census should switch to it.
+   **Owed:** a release build, deployed, and `yggterm --build-commit` on the
+   desktop host matching `git rev-parse --short=12 HEAD`.
 3. Allocating a version is a verb (`scripts/bump-version.sh`) that fetches,
    takes the next number **after** `origin/main`'s, and pushes the bump alone —
-   a number taken from a stale file is the whole defect.
+   a number taken from a stale file is the whole defect. **Still open, and it is
+   now the only unbuilt half of the collision itself** — the guard stops a stale
+   build from LANDING, but two clusters can still spend one number.
 
 ⭐ **AND `3.0.120` JOINED THEM WITHIN THE HOUR.** The build cut to end the
 collision was itself deployed over ~15 minutes later: on the desktop host
@@ -321,14 +253,30 @@ sessions run on `dev`/`oc`, never on the desktop host — so the hosts that need
 to be *told* which host is live are precisely the ones that cannot read it, and
 the one host that could read it is the one that does not need to.
 
-**Wanted:** the skill resolves the live host through something every checkout
-has — `$YGG_GUI_HOST`, then the host with a live GUI client (which
-`ygg-claim.sh` already discovers for itself), and the ignored file only as an
-override. A recipe whose first line fails on every machine but one is not a
-recipe.
+⚠ **MEASURED 2026-08-13, AND IT IS WORSE THAN FILED: the recipe resolves on NO
+headless checkout at all.** `.agents/config/` is absent on both, `$YGG_GUI_HOST`
+is unset on all three, and **discovery cannot fill the gap** — `server app rows`
+on a headless host answers *"this daemon knows no remote machines, so it cannot
+name a candidate"*, and `server snapshot` agrees with `remote_machines: []`. So
+`ygg-claim.sh`'s own discovery has the same hole; it only ever worked because
+callers pass `--host` explicitly. The app plane has no candidate list to offer
+off the GUI host, and the candidates have to come from the machine's own private
+ssh configuration.
 
-**Falsifier:** run any `LIVE_HOST=` recipe from a fresh checkout on `dev` and it
-resolves.
+⏳ **PART SHIPPED:** `scripts/ygg-live-host.sh` is the one resolver —
+`$YGG_GUI_HOST` → a GUI on this machine → the cached alias VERIFIED by one probe
+→ parallel discovery over daemon + ssh candidates, writing the winner back to
+the cache → the cached alias UNVERIFIED (the case where the GUI is DOWN and that
+name is how you reach the host to start it). Exits 2 with the sources it tried,
+because an empty `$LIVE_HOST` makes `ssh "$LIVE_HOST" cmd` run cmd LOCALLY.
+
+**Still open:** the 15 `LIVE_HOST=$(cat …)` recipes in
+`.agents/skills/yggui-app-control/SKILL.md`, the one in `yggterm-deeptest`, and
+`scripts/live_mode_cycle_check.py` all still read the file directly — they must
+call the resolver, or the SSOT is two.
+
+**Falsifier:** run any `LIVE_HOST=` recipe from a fresh checkout on a headless
+host and it resolves.
 
 ## ⛔ deploy-fleet SSHes TO THE HOST IT IS ALREADY RUNNING ON
 
