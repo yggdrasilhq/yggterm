@@ -386,6 +386,30 @@ def cmd_subscribe(a):
     if not uuid:
         log("subscribe: need --uuid (or $YGGTERM_SESSION_ID)")
         return 64
+    # ⛔⛔ AN IDENTIFIER STORED AT TWO LENGTHS BECOMES TWO SUBSCRIBERS. Subscriptions
+    # are keyed by FILE NAME, so subscribing `bb5b4358` when `bb5b4358-b83a-…` is
+    # already subscribed does not update it — it creates a SECOND watcher for one
+    # row, which then double-escalates. Caught 2026-08-14 by the orchestrator doing
+    # it to three rows at once, an hour after re-reading its own note about this
+    # exact trap: the guard belongs in the tool, because discipline resets every
+    # session and a check does not.
+    # ⇒ Resolve a short uuid against what is already subscribed rather than
+    #   refusing it, so the convenient form keeps working and stops forking state.
+    if len(uuid) < 36:
+        matches = [p.stem for p in SUBS.glob("*.json") if p.stem.startswith(uuid)]
+        if len(matches) == 1:
+            log(f"⚠ '{uuid}' is a PREFIX — resolved to the subscribed row {matches[0]}")
+            uuid = matches[0]
+        elif len(matches) > 1:
+            log(f"⛔ '{uuid}' is ambiguous across {len(matches)} subscriptions — pass the full uuid:")
+            for m in matches:
+                log(f"     {m}")
+            return 64
+        else:
+            log(f"⛔ REFUSING a short uuid '{uuid}' that matches no existing subscription.")
+            log("   Subscriptions are keyed by uuid, so a truncated one silently creates a")
+            log("   SECOND subscriber for the same row and both escalate. Pass the full uuid.")
+            return 64
     rec = {"uuid": uuid, "host": a.machine, "role": a.role,
            "escalate_to": a.escalate_to, "escalate_host": a.escalate_host,
            "campaign": a.campaign, "seat": a.seat,
