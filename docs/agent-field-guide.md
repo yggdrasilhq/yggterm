@@ -447,6 +447,37 @@ until its own disk-binary poll retires it, which can be ~20 minutes later.
 Each of these produced a CONFIDENT WRONG ANSWER, which is worse than an error.
 They are ordered by how much time they burned.
 
+### 7.0 Ask where a USER loses their work — a suite of green tests will not
+
+**A test asks whether the good path works, and data loss is never on the good
+path.** Two data-loss defects in a journal's capture surface survived a 49-test
+suite that passed, because every test exercised a successful capture:
+
+- **The write was read-modify-write** — read today's entry, append, write the
+  whole file back. That puts *everything already captured today* inside the blast
+  radius of one interrupted write, and loses a note outright when two captures
+  land at once: each writer writes back what it read, so the slower one erases the
+  faster one's words **and reports success.** Fixed to an append that syncs before
+  reporting success, so the worst case is the tail it was adding — the item whose
+  loss the user is present to notice — and never a byte that was already safe.
+- **The surface discarded the input on failure.** The box cleared and looked
+  exactly as it does on success while the reason went to stderr, in a terminal
+  nobody was looking at — so from where the user sits the words simply vanished
+  and nothing said anything. A failed capture now re-declares the box **holding
+  their text**, with the reason above it.
+
+⇒ **The question that finds these is not "does it work" but "where does a writer
+lose an entry".** It generalises past journals: this project's whole product is
+session persistence, so *"where does a user lose a session"* is the same question
+pointed at yggterm, and neither failure above would appear in any suite that only
+asserts success.
+
+⭐ **And the concurrency fix was verified the only way that means anything:**
+reverted to read-modify-write, watched the test fail with *the first thought was
+erased*, restored, watched it pass. **A green test that cannot be made red proves
+nothing** — the same law as the dead-instrument row in §1, applied to your own
+test rather than to someone else's code.
+
 ### 7.1 A lock that mutates the new helper is not a lock
 
 **Five could-only-pass locks shipped in two rounds.** Every one tested a
