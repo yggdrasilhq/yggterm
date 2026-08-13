@@ -410,6 +410,37 @@ nothing else is already tracked below. Same family: **a rail whose content comes
 over a bridge shows its chrome and never its payload.** Check whether one dead
 bridge explains all three before writing three fixes.
 
+## ⭐ [6.3] LIVE ROWS CANNOT BE COLLECTED INTO COLLAPSIBLE, NESTABLE SETS
+
+**Status:** OPEN
+
+*asked 2026-08-13; extended twice the same day*
+
+A **row set** is a set of live-session rows collected under one of them and
+collapsible as a unit — `6.0` heading `6.1`, `6.2`, `6.3`, hidden until it is
+expanded. Sets must NEST arbitrarily deep, because orchestration is recursive
+and seats now go `N.x.y.z…`. An agent must be able to arrange rows from a verb
+as easily as a hand can by dragging.
+
+⛔ **The whole rule, including the noun and the collision with splits, is in
+`DESIGN.md` §"Row sets".** It is settled and it is not re-opened here: the noun
+is **`row set`** (`section` collides with `AppPaneWidget::Section`; `group` is
+splits and `folder` is the cwd tree); a set means NOTHING but arrangement; a
+split is a view and a row set is an arrangement, and **neither may relocate the
+other**; each set keeps its own collapsed flag through an outer collapse.
+
+⚠ **THE DRAG HALF DOES NOT EXIST — do not plan around reusing it.** Measured
+2026-08-13 by reading the resolver: `row_drop_placement_for_offset` returns
+`Into` only when the target row `is_group`, and a live-session row is not a
+group, so a row dropped on another row can only land Before or After it.
+`live_session_drop_target` then passes that straight to the reorder. ⇒ Dragging
+one live row onto another REORDERS it today and forms nothing. Giving session
+rows an inside band is new behaviour, and it is the first thing to build.
+
+**Falsifier for the finished feature:** collapse an outer set that contains a
+collapsed inner set and an expanded one, expand the outer again, and find both
+inner sets exactly as they were.
+
 ## ⛔⛔ [6.4] A libyggterm APP SPAWNED FOR A ROW RUNS ON THE WRONG MACHINE
 
 **Status:** OPEN
@@ -3528,6 +3559,21 @@ on the flicker theory would be shipped on nothing. Measure the dropout window
 first (sub-second sampling of the `data-sidebar-live-session-working` attribute,
 or trace the apply), or go straight for the part that IS user-visible: the
 permanent dark dot once the owner is unreachable.
+
+⛔ **SECOND NEGATIVE RESULT, measured 2026-08-13 — the clobber did not show up
+on a whole afternoon of live sampling, and the symptom it was blamed for had a
+different cause.** The dot's failure that day was reported as *"the 6.x rows are
+not blinking, I cannot tell if they are working"*, and this entry was the
+standing suspect. It was not the cause: the blink had not painted **at all**
+since 2026-07-21, for every row, working or not (fixed in 3.0.122 — see the
+CHANGELOG). Separately, `busy` was sampled against the owning daemon's own
+screen for every seated row, correlated in the same moment, and **they agreed on
+every sample** — including on rows the GUI's daemon does not own. ⇒ The
+mechanism below is still real in the code, but it has now failed to produce an
+observable twice. **Before spending a session on it, get a reproduction.** The
+cheapest one is still the falsifier below; the second-cheapest is to compare
+`server app rows` against `server terminal screen` for the same row in one
+command, which is what was run here and what came back clean.
 
 **Falsifier:** with a row's owning daemon retired and the agent mid-turn, the
 row's indicator still blinks. **Cheaper intermediate falsifier for the mechanism

@@ -1260,6 +1260,81 @@ launch shell script, backend internals) is implementation detail and stays out.
 - Normal app close prunes non-Keep-Alive live rows and gracefully closes their runtimes with a one-hour force-cleanup deadline.
 - Update restart protection temporarily treats all recoverable live runtimes as restorable. It must not silently turn unkept sessions into durable Keep Alive sessions.
 
+### Row sets (collapsible arrangements of live rows)
+
+A **row set** is a set of live-session rows collected under one of them and
+collapsible as a unit. The head is an ordinary session row; the members hide
+under it until it is expanded.
+
+⛔ **THE NOUN IS `row set`, and the two words next to it are already taken.**
+Terminal splits are **groups**. The cwd tree has **folders**. A third meaning of
+either word makes every future bug report ambiguous, which the owner flagged
+before any of this was built. `section` was the first suggestion and it is also
+taken — `AppPaneWidget::Section` is a contributed-pane widget and "section
+cards" are a form pattern in this document. Code says `RowSet` / `row_set_id`;
+the CLI verb is `row-set`; the sidebar shows no noun at all, only a disclosure
+control on the head.
+
+**A row set means NOTHING but arrangement.** No ownership, no lifecycle, no
+supervision, no effect on what any session is or does. Membership is arbitrary
+and the user may put any rows together — the outline numbers (`6`, `6.1`, `6.2`)
+are the *default* arrangement, never a restriction on it. ⇒ Nothing else in the
+app may read set membership to decide behaviour, and nothing else in the app may
+rewrite it as a side effect.
+
+**Sets NEST, arbitrarily deep**, because orchestration is recursive and seats go
+`N.x.y.z…`. The model is a containment relation — a set holds rows *and other
+sets* — never a boolean or a single non-recursive parent field.
+
+- **Each set owns its own collapsed flag**, and collapsing an outer set hides
+  everything beneath it without touching the inner flags. Re-expanding restores
+  each inner set exactly as it was. ⛔ Flattening the inner sets open on expand
+  is the failure users notice, and it is the one that gets skipped.
+- **Indentation is budgeted.** The sidebar runs out of horizontal room before
+  the outline runs out of levels. Indent the first two levels; past that, hold
+  the indent and let the head's own number carry the depth — a title clipped to
+  nothing is worse than a column that stops stepping.
+
+#### Row sets and splits are orthogonal, and neither may relocate the other
+
+A **split is a VIEW** — what is painted in the viewport. A **row set is an
+ARRANGEMENT** — where a row sits in the sidebar. They answer different questions
+and may overlap freely, including the case that prompted this rule: splitting a
+set's head with a member of a different set.
+
+⇒ **A split never moves a row and never changes its membership.** Participants
+are shown in place, each under its own set, with an affordance saying the row is
+currently sharing a viewport. Not by pulling rows together, not by lifting a row
+out of its set. The rationale is the one above: a structure that means nothing
+must not be silently rewritten by an action about something else, and a row that
+moves when you split it is a row the user can no longer find.
+
+The edge cases, each with a rule, because "undefined" is how two structures
+start disagreeing:
+
+- **Collapsing a set whose head is live in a split** — the split keeps painting.
+  Collapsing hides *rows*, not viewports. A hidden row is still a live session.
+- **Removing the head of a non-empty set** — the set DISSOLVES and its members
+  are promoted to where the head sat, in order. Not refused (the user asked to
+  close a session, not to be told about bookkeeping) and not silently deleting
+  the members with it.
+- **Dropping a row into a collapsed set** — the set spring-loads open under the
+  pointer, exactly as a shut folder does in the cwd tree ("Drag and drop", the
+  `ROW_DRAG_SPRING_MS` rule). One gesture, one grammar.
+- **A member dragged out** — it leaves the set and lands where it was dropped.
+  Leaving a set is an ordinary reorder.
+
+#### An agent arranges rows as easily as a hand does
+
+Both halves exist or neither is real: the user drags, and a delegate calls a
+verb. ⚠ **The drag half does not exist yet** — measured 2026-08-13:
+`row_drop_placement_for_offset` returns `Into` only when the target row
+`is_group`, and a live-session row is not a group, so today a row dropped on
+another row can only land Before or After it. Dragging one live row onto another
+REORDERS; it forms nothing. Building row sets therefore means giving session
+rows an inside band, which is new behaviour rather than an existing gesture to
+reuse.
+
 ### Status indicator vocabulary (traffic signal + blue/orange)
 
 One coherent light vocabulary for session state, used by Live Sessions today and Automated Sessions later. The status dot in the live-session rail is the canonical instance; any future surface that signals session state reuses these meanings and colors rather than inventing new ones.
@@ -1282,7 +1357,9 @@ A contributed row names the CLASS (`"durable"` / `"transient"` on `list-row`'s `
 
 **Status never lives in the title.** Apps that had no status slot were prefixing the row title with a literal `●`, which paints in the row's text colour (near-black in the light theme, so "the traffic dot is black") and shifts the name sideways relative to rows without it. If a row needs to signal something, it needs a slot — not a glyph in its name. "This row is the one in use" is `selected`, not a dot.
 
-**One clock for every blink.** All blinking indicators — live-session dots, machine dots, group dots, web-tab loading lights — flip on the *same* tick. The app owns exactly ONE blink animation, on `:root`, which publishes the current phase as the inherited custom property `--yggterm-status-dot-blink`; an indicator blinks by reading that phase (`opacity: var(--yggterm-status-dot-blink, 1)`), never by declaring an animation of its own. This is both a design rule (a sidebar of dots pulsing in unison reads as one system; dots blinking at random phases read as noise) and a hard performance constraint: on a software-GL host every opacity flip costs a full-window CPU blit, so N independently-phased indicators cost N times the frames of one. Any new indicator MUST join the shared clock.
+**One clock for every blink.** All blinking indicators — live-session dots, machine dots, group dots, web-tab loading lights — flip on the *same* tick. The app owns exactly ONE clock: a timer parks the class `yggterm-blink-off` on the document element for half of each 2400 ms cycle, and one stylesheet rule stamps every marked indicator to `opacity: 0 !important` while it is there. An indicator joins by carrying the marker `--yggterm-status-dot-blink` in its inline style, never by declaring an animation of its own. This is both a design rule (a sidebar of dots pulsing in unison reads as one system; dots blinking at random phases read as noise) and a hard performance constraint: on a software-GL host every opacity flip costs a full-window CPU blit, so N independently-phased indicators cost N times the frames of one. Any new indicator MUST join the shared clock.
+
+⛔ **The clock may not be a CSS animation of a custom property.** That was the shape from 2026-07-21 to 2026-08-13 and it did not blink at all: WebKitGTK advances such an animation in the style system — `getComputedStyle` returns a perfect square wave — but never marks the `var()` consumers dirty for paint, so every working dot froze at whatever phase its last unrelated re-render sampled, usually the invisible one. Registering the property with `@property` does not change it. Whatever drives the phase must be a change the paint path cannot ignore. ⭐ **The period is 2400 ms and that is a verdict, not a default.** 1100 ms was chosen while the blink did not paint, so nobody had watched it; the first sight of it running drew *"they blink waaay too fast"*. A hard square wave that takes the dot fully dark reads as a strobe near 0.9 Hz and as a heartbeat near 0.4 Hz. The shape stays settled — full off, full on, no fade — and only the period moved. ⚠ And a blink is proved with a burst of screenshots, never with `getComputedStyle`: reading the computed value forces the very style recalculation whose absence is the bug, so that probe can only ever answer yes.
 
 ### Agent CLI brand colours
 
