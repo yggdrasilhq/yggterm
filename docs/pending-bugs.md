@@ -1806,20 +1806,50 @@ show a curve** (per-pid lifetime buckets, so no restart straddles it):
 threshold is 1,416 MB *of RSS*; RSS never leaves the 586–714 MB band. The
 footprint doubles past the threshold while the number WebKit reads does not move.
 
-⚠ **What is still NOT settled is the fix, and it must not be guessed.** Both
-candidates — derive the limit from a swap-inclusive figure, or lower the
-fractions — are a constant fitted to one host, which is the exact trap this
-lane has already paid for twice (*a ratio that fits is not a mechanism that
-holds*). A third option exists and is better-founded because it removes the
-inference rather than tuning against it: **give the process a cgroup bound**, so
-the kernel enforces the footprint and, with swap denied to that scope, RSS
-becomes the true footprint again and the existing thresholds start meaning what
-they say. ⛔ Not yet measured, and it changes the failure mode (reclaim/OOM
-rather than unbounded growth), so it needs its own falsifier before anyone
-builds it.
-
 ⭐ **The original falsifier is now answerable on paper**: a plateau near 1,888 MB
 committed was never possible, because nothing compares committed to 1,888 MB.
+
+### ⭐⭐ THE FORK WAS FALSE — NO CONSTANT CAN FIX THIS, AND THE CURRENT ONE IS NOT THE DEFECT
+
+This entry previously said the fix was "blocked on a choice" between a
+swap-inclusive limit and lower fractions. **That framing was wrong and is
+withdrawn.** Both candidates try to fix a *metric* problem with a *number*, and
+that cannot work in principle: the threshold is compared against RSS, and the
+kernel can push RSS arbitrarily far below any threshold by swapping the cache
+out. **There is no constant that bounds a footprint through an RSS-valued
+comparison.**
+
+⇒ **`(MemTotal_MB / 8).clamp(768, 3072)` is already a derived rule, not a fitted
+constant.** It is a function of what the machine supplies, it is deterministic,
+and it travels across hosts. Read as what it actually is — *"this process may
+hold an eighth of RAM **resident**"* — it is defensible and should stay.
+
+**The reductio, from this lane's own measurement.** For conservative (0.75 ×
+limit) to trip against the observed 586–714 MB RSS band, the limit would have to
+be ≤ ~781 MB — i.e. a 15 GB host would have to be given the **768 MB floor the
+policy reserves for the smallest machines it supports.** Tuning the constant
+until it fires means abolishing the rule that derives it. That is the whole
+argument against the tuning route, and it needs no new measurement.
+
+⇒ **This is therefore NOT an owner item.** The open question is not *"what
+number"* — which would be his guesswork substituted for engineering — it is
+*"which mechanism"*, which is ours. Two honest options remain:
+
+1. **Change what the metric means.** Scope the process with a cgroup
+   (`memory.high`, not `memory.max` — throttle and reclaim, never OOM-kill) and
+   deny swap to that scope, so RSS becomes the true footprint again and the
+   existing thresholds start meaning what they say. This is the only option that
+   makes the *already-correct* derived limit work as written. ⛔ Unmeasured; it
+   changes the failure mode, so it needs its own falsifier before anyone builds
+   it, and `memory.max` would trade unbounded growth for a killed tab.
+2. **Accept the bound as a residency cap and say so.** Fix the comment in
+   `configure_linux_webkit_memory_policy`, which currently claims the policy
+   means "caching more does not mean growing without end". It does not, and a
+   comment asserting a guarantee the code cannot make is how two relays came to
+   treat a working knob as a broken one.
+
+⭐ **Option 2 is owed regardless of whether anyone builds option 1** — it costs
+nothing and removes the false belief that caused this entry.
 
 ## ⛔ [6.7] THE JAR-LESS WEB CONTEXT GOT NO MEMORY BOUND AT ALL — FIXED IN CODE, LIVE PROOF OWED
 
