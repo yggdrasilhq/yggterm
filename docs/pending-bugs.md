@@ -7041,8 +7041,37 @@ screen carries whatever the person typed.
 ⛔ **Denied to a shadow client, and the reason is SCOPE, not read-only-ness**
 (`a_shadow_client_may_not_read_every_session_on_the_host`): a shadow is a viewer
 of ONE session, and this answers with every session the daemon owns.
-⇒ **What is left of §3, in order:** harvest real parked-at-a-question screens
-from the fleet with this verb, and only then write the recognizer against them. ⚠ The recognizer also cannot be
+⇒ **THE HARVEST WAS RUN, AND IT ARGUES AGAINST BUILDING THE RECOGNIZER YET.**
+`server gate-screen` was swept across all three hosts: **52 sessions, 51 with a
+readable screen** — the corpus that did not exist before (the old instrument gave
+205-of-225 stored summary lines rather than screen text).
+
+    esc-to-interrupt      10 / 51        blocker kinds: working 10 · recently_active 12
+    numbered-choice        2 / 51                       not_restorable 13 · none 17
+    trailing '?'           2 / 51        shows_agent_working: 10
+    permission wording     1 / 51
+
+⛔ **Zero validated parked-at-a-question screens, and the two pattern hits are
+FALSE POSITIVES.** Inspected structurally: 3 numbered lines among 11 and 36, **no
+line ending in `?`, and no selection caret on any numbered line** — ordinary
+numbered output, not a prompt. Both were also already `blocker: none`, i.e. the
+gate was not holding anything for them.
+⇒ **A recognizer written today would be validated against nothing and would fire
+on ordinary output** — precisely the asymmetric failure this entry warned about,
+where a false BLOCKED-ON-HUMAN gets a mid-turn session cold-killed.
+
+⭐ **And one structural measurement changes what a recognizer should look at:
+50 of 51 screens end MID-OUTPUT**, while 37 of 51 show a composer glyph somewhere
+in the tail. So "is the last line a prompt" is the wrong shape of question. ⇒ The
+discriminator worth testing when real samples arrive is **the selection caret on
+a choice line** — a structural mark, not a phrase — which is exactly what both
+false positives lacked. That also explains why stripping escapes for legibility
+would destroy the signal, and why `gate-screen` keeps them.
+
+⇒ **What is left of §3, in order:** keep sampling until real prompts are caught
+(a periodic harvest is cheap, bounded and risks nothing), then write the
+recognizer against the caret hypothesis. **Do not write it from invented prompt
+strings** — the corpus says the strings are not there to be guessed at. ⚠ The recognizer also cannot be
 manufactured on demand without driving a live session into a permission prompt,
 which is not something to do to another agent's row.
 
