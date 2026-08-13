@@ -250,6 +250,70 @@ type and failing. **The sidebar should say WEDGED, not `idle`**, and a row that
 looks idle with a composer shown is exactly the cheap trigger for an automatic
 `input-check`.
 
+### ✅ THE PASSIVE DETECTOR NOW EXISTS — and it found a second defect on the way
+
+⛔⛔ **`last_activity_ms` was stamped by the WRITER as well as the reader**, so a
+row that has stopped reading its PTY looks **maximally active for exactly as long
+as a human keeps typing into it**. The daemon could not tell a live session from
+a wedged one, *and the owner's own keystrokes were what kept the dead row looking
+alive.* ⇒ that is why the hot-restart gate listed the unusable row
+`recently_active` **and let it block a deploy**.
+
+**Shipped:** `last_output_ms`, stamped only on the reader side (5 reader sites +
+`seed_snapshot`), never by `write()`. From the pair:
+`input_unanswered_ms()` — how long the row has been written to without answering
+— and `wedge_suspected(threshold)`, on both the runtime and the manager.
+
+⭐ **It writes nothing into anyone's session**, needs no marker, and needs no
+human to notice. It is the passive form of what `input-check` establishes by
+typing and waiting for an echo. ⚠ **A trigger, never a verdict**: a child may
+legitimately take input and stay silent (password prompt, echo off), so this
+points at a row and `input-check` settles it.
+
+**Locked by** `input_that_goes_unanswered_is_visible_without_typing_a_marker`,
+which asserts the invariant the split exists for — **a write moves the input
+clock and must NOT move the output clock** — plus both threshold directions, so
+a detector wired to a constant cannot pass.
+
+⇒ **Still open:** nothing yet CONSUMES the signal. The sidebar still says `idle`,
+and `recent_activity` still reads the conflated field, so a wedged row can still
+block hot-restart. Wiring those two is the remaining work and is now a small change.
+
+## ⛔⛔ [6.7] THE GUI IS BURNING A WHOLE CORE, AND IT IS USER-TIME, NOT SYSCALLS
+
+**Status:** OPEN
+
+*Measured on the live desktop host 2026-08-13, windowed `/proc/<pid>/stat`.*
+
+| | |
+|---|---|
+| total | **99.9% of one core** |
+| user | **88.3%** |
+| kernel | 11.6% |
+| GUI age | 3,599 s |
+
+Recorder agrees independently: `gui total=99.4% user=87.9` over 30 samples /
+5 min, against `web_content` 24.1%. Earlier the same evening the same GUI read
+**13.9%**.
+
+⛔ **This is a DIFFERENT shape from the regression this lane already documented.**
+That one was kernel-dominant (58.8% kernel, `clock_gettime` at 95.8% of syscall
+time, amplified 45.8× by an `hpet` clocksource). This is **user-dominant by 7.6×**
+— compute, not syscalls — so the clock-price finding does not explain it and the
+established fix does not apply.
+
+The busiest thread by lifetime context switches is the **main `yggterm` thread**
+(744,729), ahead of `ReceiveQueue` (511,777) and the tokio workers.
+
+⚠ **No mechanism claimed.** ⛔ Do not reach for the render-rate story without
+reading the probe: `app_render_rate` is always on and emits into
+`event-trace.jsonl`, and a first look did not return recent samples — establish
+whether the probe is still emitting *before* concluding anything from its
+silence, because an empty result from an instrument that stopped running is not
+a measurement. ⭐ Quote which REGIME any render figure came from: ~2/s is rest,
+the 20–33/s storm autopsies arm at ≥20/s **by construction** and can never
+sample rest.
+
 ## ⛔ [6.7] A RESTART THAT RESOLVES NO RUNTIME SHUTS NOTHING DOWN AND REPORTS SUCCESS — FIXED IN CODE
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED

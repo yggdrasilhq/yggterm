@@ -1106,6 +1106,21 @@ impl TerminalManager {
             .is_some_and(|session| session.recent_activity(within))
     }
 
+    /// Milliseconds this row has been written to without answering, or `None`
+    /// when it is answering normally (or is not held here).
+    pub fn input_unanswered_ms(&self, key: &str) -> Option<u64> {
+        self.sessions.get(key)?.input_unanswered_ms()
+    }
+
+    /// A row that has been written to and has said nothing back for longer than
+    /// `threshold`. ⚠ A trigger for the definitive check, not a verdict — see
+    /// `PtySessionRuntime::wedge_suspected`.
+    pub fn wedge_suspected(&self, key: &str, threshold: Duration) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.wedge_suspected(threshold))
+    }
+
     pub fn restart_session(
         &mut self,
         key: &str,
@@ -1268,6 +1283,16 @@ struct PtySessionRuntime {
     seq: Arc<AtomicU64>,
     started_at_ms: u64,
     last_activity_ms: Arc<AtomicU64>,
+    /// When the CHILD last produced output — stamped only on the reader side.
+    ///
+    /// ⛔ `last_activity_ms` cannot answer this: the writer stamps it too, so
+    /// input alone refreshes it. A row that has stopped reading its PTY while a
+    /// human types into it therefore looks MAXIMALLY ACTIVE on that field — which
+    /// is how a wedged row was listed `recently_active` by the hot-restart gate
+    /// and blocked a deploy while being completely unusable.
+    /// ⇒ input-versus-output is the only pair that can tell a live session from
+    /// a wedged one, and it costs one atomic store on a path that already stores.
+    last_output_ms: Arc<AtomicU64>,
     // Sticky "the current input line holds typed-but-unsent text" flag,
     // reconstructed from forwarded input bytes in `write()` via
     // `yggterm_core::input_line_has_unsent_draft_after`. Protects a drafted
@@ -1966,6 +1991,7 @@ impl PtySessionRuntime {
         let seq = Arc::new(AtomicU64::new(0));
         let started_at_ms = now_millis();
         let last_activity_ms = Arc::new(AtomicU64::new(started_at_ms));
+        let last_output_ms = Arc::new(AtomicU64::new(started_at_ms));
         let pending_input_draft = Arc::new(AtomicBool::new(false));
         let runtime_output_seen = Arc::new(AtomicBool::new(false));
         let eof_without_output = Arc::new(AtomicBool::new(false));
@@ -1997,6 +2023,7 @@ impl PtySessionRuntime {
         let reader_retained_bytes = Arc::clone(&retained_bytes);
         let reader_seq = Arc::clone(&seq);
         let reader_activity = Arc::clone(&last_activity_ms);
+        let reader_output = Arc::clone(&last_output_ms);
         let reader_runtime_output_seen = Arc::clone(&runtime_output_seen);
         let reader_eof_without_output = Arc::clone(&eof_without_output);
         let reader_attach_ready_seen = Arc::clone(&attach_ready_seen);
@@ -2058,6 +2085,7 @@ impl PtySessionRuntime {
                                 }
                                 reader_runtime_output_seen.store(true, Ordering::SeqCst);
                                 reader_activity.store(now_millis(), Ordering::SeqCst);
+                                reader_output.store(now_millis(), Ordering::SeqCst);
                                 let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
                                 let mut retained =
                                     reader_retained_bytes.load(Ordering::SeqCst);
@@ -2083,6 +2111,7 @@ impl PtySessionRuntime {
                                 decode_terminal_utf8_chunk(&mut pending_utf8, &buffer[..bytes]);
                             if raw_data.is_empty() {
                                 reader_activity.store(now_millis(), Ordering::SeqCst);
+                                reader_output.store(now_millis(), Ordering::SeqCst);
                                 continue;
                             }
                             let (data, stripped_attach_ready_marker) =
@@ -2110,6 +2139,7 @@ impl PtySessionRuntime {
                             if data.is_empty() {
                                 if stripped_attach_ready_marker || answered_terminal_protocol {
                                     reader_activity.store(now_millis(), Ordering::SeqCst);
+                                reader_output.store(now_millis(), Ordering::SeqCst);
                                 }
                                 continue;
                             }
@@ -2159,6 +2189,7 @@ impl PtySessionRuntime {
                             // See [`crate::app_declare::chunk_is_only_app_declares`].
                             if !crate::app_declare::chunk_is_only_app_declares(&data) {
                                 reader_activity.store(now_millis(), Ordering::SeqCst);
+                                reader_output.store(now_millis(), Ordering::SeqCst);
                             }
                             let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
                             let mut retained = reader_retained_bytes.load(Ordering::SeqCst);
@@ -2183,6 +2214,7 @@ impl PtySessionRuntime {
                             }
                             reader_runtime_output_seen.store(true, Ordering::SeqCst);
                             reader_activity.store(now_millis(), Ordering::SeqCst);
+                            reader_output.store(now_millis(), Ordering::SeqCst);
                             let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
                             let mut chunks = reader_chunks.lock().expect("pty chunk lock poisoned");
                             let mut retained = reader_retained_bytes.load(Ordering::SeqCst);
@@ -2230,6 +2262,7 @@ impl PtySessionRuntime {
             seq,
             started_at_ms,
             last_activity_ms,
+            last_output_ms,
             pending_input_draft,
             runtime_output_seen,
             eof_without_output,
@@ -2813,6 +2846,7 @@ impl PtySessionRuntime {
         }
         self.runtime_output_seen.store(true, Ordering::SeqCst);
         self.last_activity_ms.store(now_millis(), Ordering::SeqCst);
+        self.last_output_ms.store(now_millis(), Ordering::SeqCst);
         let seq_value = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let mut retained = self.retained_bytes.load(Ordering::SeqCst);
         chunks.push_back(TerminalChunk {
@@ -2828,6 +2862,34 @@ impl PtySessionRuntime {
         let now = now_millis();
         let last = self.last_activity_ms.load(Ordering::SeqCst);
         now.saturating_sub(last) <= within.as_millis() as u64
+    }
+
+    /// How long input has gone UNANSWERED: the gap between the last byte written
+    /// toward the child and the last byte it produced. `None` when the child has
+    /// answered at least as recently as it was written to — the healthy case.
+    ///
+    /// ⭐ This is the passive form of what `terminal input-check` establishes by
+    /// typing a marker and waiting for the echo. It costs nothing, writes nothing
+    /// into anyone's session, and needs no human to notice a row has gone deaf.
+    /// A wedged row is otherwise INVISIBLE: it renders `idle`, holds a composer,
+    /// and its process sits in `epoll_wait` exactly as a healthy one does.
+    fn input_unanswered_ms(&self) -> Option<u64> {
+        let input = self.last_activity_ms.load(Ordering::SeqCst);
+        let output = self.last_output_ms.load(Ordering::SeqCst);
+        (input > output).then(|| input.saturating_sub(output))
+    }
+
+    /// Input has gone unanswered for longer than `threshold` — the row has been
+    /// written to and has said nothing back.
+    ///
+    /// ⚠ SUSPECTED, never asserted: a child may legitimately take input and stay
+    /// silent (a password prompt, a long-running command with echo off). This is
+    /// the cheap trigger for the definitive check, not the verdict — the verdict
+    /// costs a marker and an echo, and is worth paying only once something points
+    /// at a row.
+    fn wedge_suspected(&self, threshold: Duration) -> bool {
+        self.input_unanswered_ms()
+            .is_some_and(|gap| gap > threshold.as_millis() as u64)
     }
 
     fn trim_idle_buffer(&self, within: Duration) -> usize {
@@ -5918,6 +5980,95 @@ line-two on the real screen\r\n\
         manager
             .remove_session(key, None)
             .expect("shutdown resize fence session");
+    }
+
+    /// Input and output must be timed SEPARATELY, or a wedged row reads as busy.
+    ///
+    /// `last_activity_ms` is stamped by the writer as well as the reader, so a
+    /// row that has stopped reading its PTY looks MAXIMALLY ACTIVE for exactly as
+    /// long as a human keeps typing into it. That is not hypothetical: a wedged
+    /// agent row was listed `recently_active` by the hot-restart gate — and so
+    /// blocked a deploy — while being completely unusable, and the owner's own
+    /// keystrokes were what kept it looking alive.
+    ///
+    /// ⛔ Asserts BOTH halves: a row that answers is not suspected, and a row
+    /// written to that stays silent is — otherwise a detector wired to a
+    /// constant would pass.
+    #[test]
+    fn input_that_goes_unanswered_is_visible_without_typing_a_marker() {
+        let mut manager = TerminalManager::new();
+        let key = "wedge-signal-probe";
+        manager
+            .restart_session(key, "sh -lc 'sleep 30'", None, None)
+            .expect("spawn wedge-signal session");
+        manager
+            .seed_session(key, "boot banner\n")
+            .expect("seed initial output");
+
+        // Half 1 — HEALTHY. Output is at least as recent as input, so nothing
+        // is outstanding. Reporting a gap here would make every live row look
+        // wedged.
+        assert_eq!(manager.input_unanswered_ms(key), None);
+        assert!(!manager.wedge_suspected(key, Duration::from_millis(0)));
+
+        // ⭐ THE INVARIANT THE SPLIT EXISTS FOR: a write must move the INPUT
+        // clock and must NOT move the output clock. While both lived in one
+        // field, typing into a deaf row refreshed the very timestamp used to
+        // decide the row was alive.
+        let output_before_write = {
+            let session = manager.sessions.get(key).expect("session held here");
+            session.last_output_ms.load(Ordering::SeqCst)
+        };
+        manager.write(key, "x").expect("write to the session");
+        let (activity_after, output_after) = {
+            let session = manager.sessions.get(key).expect("session held here");
+            (
+                session.last_activity_ms.load(Ordering::SeqCst),
+                session.last_output_ms.load(Ordering::SeqCst),
+            )
+        };
+        assert_eq!(
+            output_after, output_before_write,
+            "a write must not stamp the OUTPUT clock — that conflation is the \
+             whole defect: it makes a row that says nothing back look busy"
+        );
+        assert!(
+            activity_after >= output_after,
+            "a write must stamp the input clock"
+        );
+
+        // Half 2 — WEDGED. Drive the runtime's own clocks to the shape a deaf
+        // row has: written to AFTER its last output. This is the state the
+        // single conflated timestamp cannot represent at all.
+        {
+            let session = manager
+                .sessions
+                .get(key)
+                .expect("session is held by this manager");
+            let output_at = session.last_output_ms.load(Ordering::SeqCst);
+            session
+                .last_activity_ms
+                .store(output_at + 5_000, Ordering::SeqCst);
+        }
+        assert_eq!(
+            manager.input_unanswered_ms(key),
+            Some(5_000),
+            "input newer than output IS the wedge signal, and its size is how \
+             long the row has been deaf"
+        );
+        assert!(
+            manager.wedge_suspected(key, Duration::from_millis(2_000)),
+            "5s of unanswered input must trip a 2s threshold"
+        );
+        assert!(
+            !manager.wedge_suspected(key, Duration::from_secs(30)),
+            "and must NOT trip a 30s one — a threshold that always fires is not \
+             a detector"
+        );
+
+        manager
+            .remove_session(key, None)
+            .expect("shutdown wedge-signal probe");
     }
 
     /// A restart must say whether it SHUT ANYTHING DOWN.
