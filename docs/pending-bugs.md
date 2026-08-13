@@ -192,7 +192,7 @@ of three" invites a guess:**
 title, on the FIRST row of a batch. Not root-caused, and deliberately not
 guessed at.
 
-**ROOT-CAUSED 2026-08-13 (3.0.117), and "the FIRST row of a batch" was a
+**ROOT-CAUSED 2026-08-13 (3.0.118), and "the FIRST row of a batch" was a
 coincidence of the probe.** The three purposes ended `A`, `B` and `C`. The copy
 layer's dangling-fragment rule (`ends_with_syntax_fragment` in
 `looks_like_low_signal_generated_title`, `yggterm-core/src/titles.rs`) treats a
@@ -230,7 +230,7 @@ titles carry their purpose; or `created_by.purpose` is absent for the one that
 does not.
 
 **What live proof is owed:** three `claude-code` rows created back to back on
-the desktop host at 3.0.117+, purposes ending `A`, `B`, `C`, and all three
+the desktop host at 3.0.118+, purposes ending `A`, `B`, `C`, and all three
 sidebar titles carrying their purpose.
 
 ## ⛔ A SCREENSHOT OF A NON-TERMINAL VIEW PHOTOGRAPHS WHATEVER HOLDS FOCUS
