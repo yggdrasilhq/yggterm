@@ -1476,36 +1476,64 @@ which is a different bug entirely.
 **Falsifier:** let one web process run several hours. Plateau near 1,888 MB
 committed ⇒ the bound works and this entry is wrong. Sail past it ⇒ confirmed.
 
-## ⛔ [6.7] A DEAD PTY LEAVES ITS WRITER THREAD RUNNING FOREVER
+## ⛔ [6.7] A DEAD PTY'S WRITER THREAD — FIXED IN CODE, LIVE PROOF OWED
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*thread census on the desktop host 2026-08-13*
+*Falsified by: a daemon that has served and closed sessions for hours showing
+`pty-writer-*` and `pty-reader-*` thread counts that disagree. They are created
+in pairs, so equal counts is the whole claim.*
 
-The live daemon carried **58 threads** against **12** on an idle daemon of the
-same build. The census names the population:
+**The leak.** `spawn_terminal_writer_thread` (`terminal.rs`) is called from
+inside the reader-spawn path, one writer and one reader per terminal. The reader
+exits on `Ok(0)` (PTY EOF); the writer runs `while let Ok(request) = rx.recv()`,
+which ends only when **every** `SyncSender` clone has dropped. The reader's clone
+drops at EOF — but the clone the terminal entry holds does not, so a PTY that
+dies while its entry survives **parks its writer on `recv()` forever**, holding a
+thread and its stack.
+
+⇒ A writer whose PTY died *does* exit if anything writes to it (the write fails
+and it breaks). It only leaks when **nothing ever writes again**, which is
+exactly the state a closed row is in.
+
+**Measured before the fix**, live daemon vs an idle one of the same build:
 
 | thread | live daemon | idle daemon |
 |---|---|---|
 | `pty-writer-remote…` | **22** | 1 |
 | `pty-reader-remote…` | **19** | 1 |
-| `pty-writer-local…` | 4 | 1 |
-| `pty-reader-local…` | 4 | 1 |
 
-⭐ **Readers and writers are born in pairs** — `spawn_terminal_writer_thread`
-(`crates/yggterm-server/src/terminal.rs:1653`) is called from inside the
-reader-spawning path (`terminal.rs:1947`), one of each per terminal. **So 22
-writers against 19 readers is three writers that outlived their reader**, and it
-only grows.
+**Three writers outliving their readers**, and it only grows. Alongside it, on
+the same daemon: threads **31 → 59 over 3 h with CPU 4.0% → 9.8% and memory
+flat** — the campaign's predicted "hot loop proportional to accumulated state",
+with the accumulating population named.
 
-**Root cause, from the two loops.** The reader exits on `Ok(0)` (PTY EOF). The
-writer runs `while let Ok(request) = rx.recv()`, which ends only when *every*
-`SyncSender` clone has dropped. The reader holds `reader_writer_tx`, a clone,
-which drops at EOF — but the original `writer_tx` is returned to the caller and
-retained by the terminal entry. **A PTY that dies while its entry survives leaks
-its writer thread permanently**, blocked on a channel nothing will ever send to.
+**The fix.** `TerminalWriteRequest` gains a `shutdown` flag; the reader sends one
+**after its loop, so EOF and the read-error path are both covered**, and the
+writer breaks on it. ⛔ **Deliberately not a timeout poll** — a writer that wakes
+periodically to check a flag is precisely the idle cost this lane exists to
+remove, so the writer still blocks on `recv()` and is woken by a message. The
+shutdown uses `try_send`: if the queue is full the writer is mid-write against a
+dead PTY and will fail and break by itself, and blocking there would strand the
+reader instead.
 
-### It is not free, and it is the "hot loop proportional to accumulated state"
+**Locked by** `a_writer_retires_on_shutdown_even_while_another_sender_is_alive`,
+which asserts **both halves** — that a surviving sender alone leaves the thread
+parked (so the test cannot pass trivially), and that the shutdown retires it with
+that sender still alive. 86 `terminal::` tests pass.
+
+⚠ **Not claimed: that this is the whole thread growth.** The GUI shows the same
+family — threads 63 → 76 in 2 h with memory flat, including **29
+`tokio-rt-worker`** where one multi-thread runtime on a 16-core host spawns 16 —
+and that is a different population in a different process. This fix is the
+daemon's `pty-writer` half only.
+
+⚠ **Suspected, NOT proven:** that the retained entry is the same orphaned-key
+family as the restore bug — a close that resolves to a key nothing holds removes
+nothing and leaves the entry behind. If so, this fix stops the thread leaking
+while the orphaned entry itself remains.
+
+## It is not free, and it is the "hot loop proportional to accumulated state"
 
 Same daemon, own lifetime:
 
