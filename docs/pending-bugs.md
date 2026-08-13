@@ -407,6 +407,36 @@ is never asked about.
 network I/O to sibling daemons. Do not put an unbounded per-snapshot fan-out on that path — cache the
 proxied flags with a short TTL, or have the owner push them.
 
+### ⚠ PARTLY FIXED AT 3.0.134, AND MEASURED NOT TO BE ENOUGH
+
+The snapshot now merges the proxied flags (it previously answered from the raw
+scrape alone), and that is deployed and running. **It did not close the defect.**
+Falsifier re-run on the live host at 3.0.135, 31 seated rows, transcript growth
+over 30s against `working` in the same run:
+
+```
+  agree 26 · missed 3 · false positives 2
+  rows still reporting working=None: 21 of 31
+```
+
+⇒ **The wiring was necessary and not sufficient.** `working_flags_including_proxied`
+skips any row where `preserved_owner_endpoint_for_request` yields no owner, so a
+row whose owner this daemon has no record of is still never asked about — and
+that is most of them. Wiring the proxy into the snapshot cannot widen the
+proxy's own coverage.
+
+⇒ **The remaining step is discovery, not transport:** a daemon must be able to
+find the owner of a row it holds no preserved-owner record for — asking its live
+siblings rather than only endpoints it already knows. ⚠ Bound the fan-out; the
+TTL cache is already in place for the asking half.
+
+⚠ **And the ground truth got coarser as the fleet grew.** Two rows now read as
+false positives against the growth test, which the earlier 21-row sample did not
+show. A row mid-turn inside one long tool call appends nothing for 30s, so
+"grew" under-reports work — **the growth test is a floor on activity, not a
+census**, and a small disagreement in that direction is the instrument, not
+necessarily the dot.
+
 ⛔ **TWO DIRECTIONS ALREADY REFUTED — do not spend a session re-deriving them:**
 
 1. **"The owning daemon knows, propagate over the remote-session index."** Measured on both daemons for
