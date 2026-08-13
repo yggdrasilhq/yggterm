@@ -1148,6 +1148,119 @@ Then, per §8 and §3b:
   ⛔ Delegates cannot always reach the row plane; when they cannot, the
   orchestrator is the switchboard.
 
+### ⛔⛔ THE ROW NAME IS `N.x [category]: what it is for` — AND THE NUMBER IS NOT PART OF THE TITLE
+
+```
+        6.2   start page: sidebar tie-break and the chrome-type verb
+        ───   ──────────  ─────────────────────────────────────────
+         │         │                        └── what this row is for
+         │         └── the CATEGORY — the cluster's subject, stable across successors
+         └── outline_prefix, STORED SEPARATELY and composed on at render time
+```
+
+**The seat lives in `outline_prefix` and nowhere else.** The sidebar composes
+`label = "<outline_prefix> <title>"` at render time, so a title that also carries
+the number gets it twice.
+
+⚠ **This was learned expensively, and it is the same defect twice.** `ygg-claim.sh`
+used to write the seat into the title *as well*, as belt-and-braces against a
+prefix once observed to evaporate. Two consequences, and the second is the one
+nobody connected to the first for days:
+
+1. **Double numbering** — the sidebar drew `6.1 6.1 restore lifecycle: …`. Once
+   several rows wear two numbers, a seat is indistinguishable from a name, and
+   the outline stops being navigable at exactly the size it starts to matter.
+2. ⛔ **A claim that WORKED reported failure, and the failure skipped the reap.**
+   The server normalises the seat back out of the title, so the verifier compared
+   its own composed string against a correctly-stored clean one, called a good row
+   bad, and exited 3 — **above the booter arm and above `--replace`.** Every
+   successor that ran the script therefore left its predecessor alive and itself
+   unarmed. Fixed 2026-08-13: the title is stored clean, a caller-composed number
+   is stripped defensively, and the verifier normalises the read-back before
+   comparing.
+
+⇒ **The lesson generalises past this script:** *a verifier must assert the
+representation the server actually stores.* Assert what you sent instead, and a
+correct system reports failure — then whatever you put after the check silently
+stops running. **Put side effects that matter BEFORE a verification gate, or make
+the gate report precisely what it skipped.**
+
+### ⛔⛔ SUCCESSION IS ONE CALL, AND THE REAP IS THE SUCCESSOR'S FIRST ACT
+
+A predecessor asking its successor in prose to *"despawn me when you're up"* is
+the shape that keeps producing duplicate seats. It fails for reasons that have
+nothing to do with willingness:
+
+- The successor cannot tell **which** row is the predecessor when both wear the
+  same seat and near-identical titles. Facing two indistinguishable rows, killing
+  neither is the correct choice, and it is the one it will make.
+- Prose is not a handle. **`--replace` takes a UUID**; "the row above me" does not
+  resolve to anything.
+- Left to the end of a turn, the reap competes with the work — and a turn that
+  ends early takes the reap with it.
+
+**⇒ The protocol, and it is not optional:**
+
+1. **The predecessor puts its OWN UUID in the brief**, as a literal, labelled
+   `PREDECESSOR TO REAP`. Not its title, not its seat — those are ambiguous by
+   construction at exactly the moment of handover.
+2. **The successor reaps as its FIRST act**, inside the claim:
+   `ygg-claim.sh --title "<category>: <what for>" --number <n> --replace <pred-uuid> --booter`
+   One call takes the seat, arms the booter, and retires the predecessor.
+3. **Read both fields back** (§7): `session remove` answers `row_still_listed`
+   and `verified` separately, and a row can leave the order while its processes
+   live on. `verified: true` with an empty `live_processes` is the only clean reap.
+4. **Harvest before you retire** (§6) — confirm the predecessor's findings reached
+   the brief or a commit. Grep the successor's transcript for the predecessor's
+   distinctive terms; if they are absent, the handoff dropped them and the reap
+   would destroy them.
+
+⚠ **If a claim exits non-zero, assume the reap did NOT happen and do it by hand.**
+That is the failure mode above, and it is silent by design.
+
+### ⭐⭐ READ ANOTHER SESSION INTELLIGENTLY — never by asking it, never by reading it whole
+
+**The default is to read a row's artefacts, not its context, and never to wake it.**
+Waking a session to ask what it is doing is the most expensive possible way to find
+out and usually the least accurate: it pays a cold re-read of the whole context to
+produce a summary you could have derived from bytes already on disk. One mistaken
+wake on an idle multi-megabyte row has been priced at several dollars, incurred in
+about a second. **Reading a 500 KB transcript into your own context is the same
+mistake wearing a different hat** — you now carry it for the rest of your session.
+
+**What "intelligently" means, cheapest instrument first:**
+
+| question | instrument | cost |
+|---|---|---|
+| Is it alive, and how cold? | transcript **mtime** | free |
+| How big a wake would cost | transcript **bytes** | free |
+| What was it TOLD? | the **human turns** — highest signal per byte in the file | ~10 lines |
+| What did it CONCLUDE? | its **last prose turn** — a working row's last message is its own status report | ~1 line |
+| What did it DO? | its `Write`/`Edit` targets, and `git log` for its lane | seconds |
+| Does it know X? | **grep the transcript for X's distinctive terms**, and count hits | seconds |
+
+⇒ **Extract, do not ingest.** Pull the tail, the instructions, and the targeted
+greps into a few lines; leave the rest on disk. Two rows were told apart, their
+roles established and one safely reaped, from six extracted lines out of 3.4 MB.
+
+**Then cross-check against what does not lie:** the queue entry, the commit log,
+the campaign memory, the files it wrote. A transcript says what a session
+*believed*; a commit says what it *did*. When they disagree, the artefact wins.
+
+⛔ **The three anti-patterns, in descending order of harm:**
+1. **Messaging a row to ask what it is doing.** Costs a cold wake, interrupts real
+   work, and returns a self-report you cannot verify. There is almost no question
+   this is the right answer to.
+2. **Reading a whole transcript.** Poisons your own context with someone else's,
+   and the signal you needed was in the last 1%.
+3. **Trusting a row's title or a listing.** Titles collide during handover and
+   listings have been observed to omit live rows. **Resolve to a UUID and address
+   on that.**
+
+✅ **A message is the right instrument when you are DELIVERING, not enquiring** —
+a brief, a correction, a warning that changes what they should do next. Then it
+earns its cost. Batch several into one send rather than paying per finding.
+
 ### ⭐ REAP A CLUSTER THE MOMENT ITS WORK IS DONE — do not let a small one relay on
 
 A cluster that exists for a small, terminal piece of work — add a CLI kind, wire
@@ -1169,6 +1282,52 @@ does not know which kind it is will guess, and the guess is always *keep going*.
 ⚠ **Reap with §7's discipline.** `session remove` reports the request, not the
 effect: read back both `row_still_listed` and `verified`, and identify the
 process rather than counting.
+
+### ⛔⛔ THE ORCHESTRATION SYSTEM IS THE ORCHESTRATOR'S OWN WORK — mend it as you run it
+
+**You are not a dispatcher. You are the lead of your category, and systemic
+execution reliability is your job.** The clusters own their bugs; **you own the
+machinery that runs clusters** — the claim script, the seat scheme, the watchers,
+the succession protocol, the briefs, the steers in this file and in the root
+instructions. When that machinery is faulty, no cluster will fix it: to a cluster
+it is background weather, and each one routes around it privately and silently.
+
+⇒ **Dream while you monitor.** Every time you read a row, ask *what did the SYSTEM
+get wrong here?* — a verb that lied, a chore you hand-assembled from primitives, a
+handover that dropped something, a watcher that watched the wrong thing. Those are
+yours to fix **in the same session**, not to file for later. This is the one place
+where the usual "route the dream to the owner, do not fix it inline" rule inverts:
+**you are the owner.**
+
+**Three that were found exactly this way, and each had been silently costing the
+fleet for days:**
+
+- A claim script **exiting 3 on success**, which skipped the booter arm and the
+  predecessor reap — read as agents "declining to despawn" for as long as nobody
+  read the exit path.
+- **Watchers pinned to a stale spawn set.** A relay hands off, the successor's
+  UUID is never added, and the watcher goes on faithfully watching retired rows.
+  It reports healthy because the rows it names *are* fine; they are simply not the
+  ones doing the work. ⇒ **Re-derive the watch set from the live seats after every
+  handover**, never from the file you wrote at launch.
+- **Seat and title carrying the same number**, which made every row ambiguous at
+  the moment succession most needed them distinct.
+
+**The pattern they share, and it is what to look for:** *the failure is invisible
+from inside a cluster and obvious from above.* A cluster sees one confusing
+afternoon; you see the same confusing afternoon in three clusters and can name the
+cause. That view is the whole reason the role exists.
+
+**⭐ Monitor on an interval, not on hope.** Between reports, sample the live seats
+and each row's transcript mtime. A relay's dominant failure is a turn that ends
+with work unfinished and no error, and that is invisible unless someone looks. When
+a report lands, that is also the moment to ask what the *system* did to make that
+report harder to produce than it needed to be.
+
+**⛔ And write the fix down where the next session will find it** — this file, the
+root instructions, or the onboarding skill. A repair that lives only in a running
+session's context is lost at the handover, which is the failure it was meant to
+prevent.
 
 ---
 
