@@ -1,5 +1,25 @@
 # Spec — the agent-CLI extra-args modal
 
+> **⚙ BUILT 2026-08-13.** The modal, the descriptor fields, the per-slug storage
+> and the app-control verb all shipped; the queue owns what is still open, per
+> `docs-ssot.md`. Three things in §3 below were CORRECTED by re-measuring on the
+> installed binaries, and the corrections are the interesting part:
+>
+> - **kimi and muse are no longer `documented` / `unmeasured`.** Both are now
+>   installed on every fleet host, so their tiers were read off real `--help`
+>   output. Muse turned out to have an approval-mode ladder AND a `--yolo` that
+>   releases approval, sandbox and workspace trust together.
+> - **codex needed a FOURTH tier.** `-s danger-full-access` and
+>   `--dangerously-bypass-approvals-and-sandbox` are two different postures, and
+>   a lock caught the modal offering only the first — so the posture a delegate
+>   launch can ask for by name was unreachable from the UI.
+> - **pi's `--tools <names>` row could not ship as written.** A placeholder in a
+>   tier's args is a launch that dies at the PTY; the tier offers `--no-tools`
+>   and names the narrower flags in prose. There is now a lock for that too.
+>
+> ⛔ And one measured fact this spec did not anticipate: **antigravity's bypass
+> flag does not release its workspace-trust prompt.** See the queue.
+
 **Owner question:** *where does a user set the launch flags for each agent CLI,
 now that there are nine of them?*
 

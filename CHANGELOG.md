@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **An interrupted session is no longer left un-nudged (3.0.142).** When yggterm
+  has waited half an hour to update and finally goes ahead anyway, it owes a
+  `continue` to each session it interrupted. If that session's agent had not
+  finished coming back up, the nudge was thrown away and never retried — the
+  session got the interruption and none of the repair. It is now put back and
+  tried again, within the same ten-minute window as before, and only when nothing
+  was typed at all: a nudge that did land is still never sent twice.
+
 - **Folding a group no longer hides its sessions from everything else (3.0.140).**
   Collapsing a group is meant to tidy the sidebar, and it did — but the same
   fold also removed those rows from the answer every background tool gets when

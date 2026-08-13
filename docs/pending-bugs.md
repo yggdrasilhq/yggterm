@@ -2045,87 +2045,88 @@ under the same webview workload and compare crash counts. If the software arm
 crashes at the same rate, the GL path is incidental and the abort cluster is the
 real story.
 
-## ⛔ [6.6] `AGY` LAUNCHES A PLAIN SHELL, AND NO CLI GETS ITS PERMISSION FLAG
+## ⚠ [6.6] `agy` HAS TWO GATES IN SERIES, AND ITS BYPASS FLAG RELEASES ONLY ONE
 
 **Status:** OPEN
 
-*re-reported 2026-08-13*
+*Measured 2026-08-13 on the live GUI host, BOTH ARMS IN ONE RUN.*
 
-Two halves, reported together because they are felt together:
+A row launched `agy --dangerously-skip-permissions` and a row launched with no
+flags at all produced the **identical screen**: agy's workspace-trust prompt,
+*"Do you trust the contents of this project?"*, waiting on a keypress.
 
-1. **AGY launches a plain shell** rather than its CLI. This is the same symptom
-   already tracked below for six new agent CLIs — *a remote row for any of the
-   six new agent CLIs is born a plain shell, six for six, and every field says
-   healthy*. AGY is a seventh instance; the existing entry owns the narrative.
-2. **Every CLI needs its dangerous-skip-permissions equivalent passed.** Each
-   agent CLI spells this differently, and none of them currently receive it, so
-   every spawned row stops on a permission prompt the spawner cannot answer.
+`agy --help` documents that flag as *"Auto-approve all tool permission requests
+without prompting"*, and it does exactly that — the trust gate is a **different,
+earlier gate**, per folder, and agy offers no flag for it. Muse is the contrast:
+its `--yolo` disables approval AND sandboxing AND trusts the workspace.
 
-⇒ Both are answered by the **settings work already queued below** — *the
-extra-args settings are two text boxes and there are nine CLIs; build the
-modal*. This batch's contribution is priority: it is a small change with an
-outsized effect on daily use, and it was named as such.
+⇒ **What this most likely explains, stated as a hypothesis and not a cause:** a
+row parked on a full-screen prompt is, from the sidebar, indistinguishable from
+one whose CLI never launched. The falsifier is to read the row's SCREEN rather
+than its phase — `launch_phase: Running` and a healthy `machine_health` are true
+of both.
 
-## ⭐ [6.6] ADD THE GROK BUILD CLI TO THE ARSENAL
+**What is NOT true any more:** the launcher carrying no permission flag. Every
+registered CLI now has a stored box, and it reaches the launch on both lanes —
+proven by `qwen '--yolo'` locally and `qwen --yolo` in `/proc/<pid>/cmdline` on
+the far host, with the reset case producing a bare `qwen` in the same run.
 
-**Status:** OPEN
+**Falsifier for what remains:** find a flag, config key or state file that makes
+agy skip the trust prompt for a folder it has not seen. If one exists it belongs
+in the descriptor's Skip-checks tier; if none does, this entry closes as a fact
+about agy rather than a defect in yggterm, and the tier's explanation (which
+already says so) is the whole fix.
 
-*requested 2026-08-13*
-
-Add Grok Build as a first-class agent CLI kind alongside the existing ones,
-including its own permission flag per the entry above and its brand colour per
-the start-page entry.
-
-⚠ Sequence it **after** the settings modal and the per-CLI permission flags,
-not before: adding a tenth CLI to a surface with two text boxes for nine of them
-makes the surface worse, and adding it to the fixed surface is a config edit.
-
-## ⛔ THE SHADOW CLIENT DOES NOT PAINT A DOCUMENT SURFACE'S BODY
+## ⚠ [6.6] GROK BUILD'S STORE AND ITS AUTO-PROVISIONING ARE BOTH UNPROVEN
 
 **Status:** OPEN
 
-*Measured 2026-08-13 by seat 6.8, with a control, while trying to obey two rules
-at once.*
+*Landed 2026-08-13; these are the two halves that could not be proven with it.*
 
-The shadow-probe law says probe through the shadow, never the operator's GUI.
-The field guide says a visual symptom needs a faithful pixel. **For a document
-surface those two rules point at an instrument that cannot answer**: the shadow
-paints the surface's BAR and the app's RAIL pane, and leaves the BODY blank.
+Grok Build is a registered kind and launches: a row opened on the live host
+exec'd `grok` and drew its own TUI. Two things are declared rather than measured.
 
-What was measured, on one shadow, in one sitting:
+1. **The session store.** `~/.grok/sessions` is a path constant in the shipped
+   executable and `grok sessions list` is a real verb, but the on-disk SHAPE is
+   unread, because creating even one session needs `grok login` — an owner gate
+   (`owner-attention.md`). `title_authority` is `Generated` for the same reason:
+   the help says grok owns session titles, and declaring `Store` while unable to
+   READ one would leave every row with no name at all. **Both flip in one commit
+   once a signed-in host exists.**
+2. **Auto-provisioning.** The launch succeeded on a host that ALREADY had `grok`
+   — the owner installed it at `~/.grok/bin/grok` before this work started, and
+   the launch PATH found it there. So `CliInstall::Npm("@xai-official/grok")` is
+   correct by inspection (the npm launcher fetches the platform binary into
+   `~/.grok/downloads`, which is exactly what is on disk) and **untested on a
+   host that lacks it**.
 
-| surface | declared | painted on the shadow |
-|---|---|---|
-| an app's rail pane | button, section, three rows | ✅ every row, with live content |
-| the document surface's **bar** | two `section` widgets | ✅ and it re-rendered on a route change |
-| the document surface's **body** | six `list-row`, then a `markdown` | ⛔ nothing |
-| the pilot editor's document body | one multiline `text-input`, 3,625 chars | ⛔ nothing |
+**Falsifier:** on a host with no `grok`, launch `--kind grok-build` and check
+that `~/.yggterm/npm/lib/node_modules/@xai-official` appears and the row draws
+grok's TUI rather than `grok: command not found`.
 
-⇒ **The control is what makes this a finding rather than a guess.** A new app
-rendering an empty body is a new app's bug until the SHIPPED pilot renders an
-equally empty body through the identical path — same shadow, same verbs, same
-minute. It did. Two independent apps, both declaring body-class widgets with
-real content, both blank; and the same shadow painting bar and rail correctly,
-which is the positive control that it can paint an app's widgets at all.
+## ⛔ [6.6] `server app` IS DISPATCHED IN TWO FILES, SO A NEW VERB IS ABSENT FROM THE ONE AGENTS CALL
 
-**Why it misleads rather than merely limiting.** Every telemetry field agrees the
-surface is fine — `has_schema: true`, `stale: false`, `error: null`,
-`visible: true` — and the bar visibly updates when the route changes, so the
-surface is demonstrably live and refetching. An author following the two laws
-correctly is handed a blank frame with a clean bill of health and no reason to
-suspect the instrument. The shadow's own documentation says its terminal
-viewport was fixed and its screenshots are valid pixel proof for a terminal bug;
-nothing says the document body is exempt, so the exemption reads as an app bug.
+**Status:** OPEN
 
-**Falsifier:** open any document-surface app on a shadow and capture. The body
-must contain what the app declared. Until then, treat a blank document body on a
-shadow as unproven rather than broken — and note that the honest alternative,
-foregrounding the operator's GUI, is forbidden by the law that sent you here, so
-this gap has no workaround that does not break a different rule.
+*Found 2026-08-13 by shipping a verb into one of them.*
 
-⚠ Not yet established: whether the body paints on a real GUI and only fails on a
-shadow (the documented pilot proof suggests so), or whether both are affected.
-That needs one capture on a real GUI, which this seat did not take.
+`apps/yggterm/src/main.rs` and `apps/yggterm/src/bin/yggterm-headless.rs` each
+carry their own `match args[2]` over the whole `server app` verb surface. They
+are not a shared function with two entry points; they are two copies.
+
+**The failure is silent and every instrument agrees with it.** A verb added to
+the GUI binary alone answers `unsupported app control command: <verb>` from the
+headless CLI — which is the copy agents actually drive — while the deployed
+binary's `--build-commit` matches the deploy, the arm is visibly in the source,
+and the running GUI's `/proc/<pid>/exe` md5 matches the disk.
+
+⭐ **What settled it was two controls in one `strings` run:** the binary carried
+`unsupported app theme-editor action` (so the probe worked) and **zero**
+occurrences of the new verb (so it was genuinely absent). The positive control
+alone would have proven nothing.
+
+⇒ Collapse the two onto one dispatcher. Until then a new verb must be added to
+both, and the headless copy carries a comment saying so.
 
 ## ⭐⭐ [6.8] THE KASTEN APPS ARE WAITING TO BE BUILT
 
@@ -2682,6 +2683,32 @@ sensible and is NOT taken yet, because this defect makes the sort's behaviour un
 reason about. **Fix the dry run first**, then the claim script's new duty can be verified rather
 than assumed.
 
+
+⚠ **A NAIVE RE-TEST WILL "FALSIFY" THIS ENTRY AND BE WRONG — recorded 2026-08-13
+after walking into it twice.** On an already-sorted list, `changed:false` is the
+CORRECT answer, and a dry run that reports reality and one that reports its own
+computed order are **indistinguishable there**. Two attempts to build the
+discriminating condition both collapsed back to sorted:
+
+1. Sampling `rows` and `sessions sort --dry-run` simultaneously on the live
+   sidebar — the list was in order, so `changed:false` carried no information.
+2. Creating a row via `--insert-after <last row>` and then numbering it `0.1` to
+   put its POSITION and its NUMBER in disagreement. ⛔ **`server app session
+   outline` RE-SEATS the row as it numbers it** (its help says so), so the list
+   was sorted again before the dry run could see otherwise.
+
+⇒ **The precondition is a row whose position disagrees with its number, and no
+read-only door creates one.** The remaining route is `server app sessions
+reorder` with a deliberately wrong order — which rewrites the WHOLE rendered
+order, including rows belonging to other sessions, so it is not a probe to fire
+casually on a live sidebar.
+
+⛔ **Do not retract this entry on a `changed:false` observed over a sorted
+list.** The original measurement was taken while the order was genuinely wrong,
+with both verbs launched from one shell so the difference could not be time.
+
+**Falsifier:** with a row whose position and number disagree, the dry run reports
+`changed:true`.
 ## ⛔⛔ A ROW-TABLE WRITE IS INVISIBLE TO THE NEXT READ, AND `rename`+`outline` CORRUPTS THE TITLE
 
 **Status:** OPEN
@@ -2732,6 +2759,15 @@ confirmed to be **the correct behaviour** — the request concerns only the rend
 `claude-code → Claude Code`, `codex → Codex`, `kimi → Kimi`. A naive transform gets `Claude Code`
 right by luck and will get later kinds wrong. ⛔ **The kind slug stays the SSOT** — this is a
 presentation layer over it, and the slug must not be renamed to make the label easier.
+
+⛔⛔ **DO NOT BUILD THE MAPPING — IT ALREADY EXISTS** (checked 2026-08-13 by the lane that would
+otherwise have built a second one). `AgentCliDescriptor::display_name` is that field, and three
+things already read it: `new_session_label()` composes `New Claude Code Session` for the menu
+entries, `terminal_kind_title_suffix()` uses it for row titles, and `session_metadata_label` is
+locked to `"<display_name> Session"` by a test. ⇒ **This entry is a CALLSITE that is not reading
+it**, not a missing mapping — find the one composing the title from `session_kind_label()` (the
+SLUG accessor) and hand it the descriptor instead. A second mapping is the defect the slug-as-SSOT
+rule exists to prevent.
 
 ## ⚠ A ROW ADOPTED BY A CAMPAIGN MAY HAVE BEEN THE OWNER'S, AND THE FIELD THAT WOULD SETTLE IT IS UNKNOWN
 
@@ -5477,6 +5513,31 @@ cheap way to force a local tree scan. `local_tree_scan` is throttled behind
 session store cannot ask the product to re-read it. A read-only
 `sessions rescan` would have made this entry unnecessary.
 
+
+✅ **ROOT-CAUSED AT SOURCE 2026-08-13, without firing a single LLM call** — the
+live repro would have burned a rate-limited endpoint other campaigns share, and
+a zero-means-unset bug is settleable from the code. It is two halves, and only
+both together produce the surprise:
+
+```
+apps/yggterm/src/bin/yggterm-headless.rs   .unwrap_or(0)      ← absent flag becomes 0
+apps/yggterm/src/main.rs                   .unwrap_or(0)      ← same, in the other binary
+crates/yggterm-core/src/lib.rs             let limit = if budget == 0 { usize::MAX } else { budget };
+```
+
+⇒ **`--budget 0` is byte-identical to passing no flag at all, and zero is the
+encoding for UNLIMITED.** The flag that reads as *"generate nothing"* is the flag
+for *"generate everything"*, and no caller can express the first at all.
+
+⚠ **The fix is NOT flipping the `== 0` arm.** Absent-flag currently relies on
+`0 ⇒ unlimited`, so changing the core's reading silently caps every caller that
+passes nothing. The shape that works is to distinguish ABSENT from EXPLICIT ZERO
+at the CLI — parse to `Option<usize>`, keep absent ⇒ unlimited, and give explicit
+`0` a path that generates nothing — which is a change to a shared contract with
+two call sites, not a one-line patch.
+
+**Falsifier:** `--budget 0` scans and generates nothing, while omitting the flag
+still generates without a cap.
 ## ⛔⛔ REPORTED, LIVE 2026-08-09: A DEPLOY MADE THE OPERATOR'S OWN ROW UNREACHABLE FOR 5-10 MINUTES — "the pain we go through is IMMENSELY irritating"
 
 **Status:** OPEN
@@ -6256,27 +6317,49 @@ interrupted record naming that key and a foreign `recorded_by_pid`:
 PTY, it was **submitted as a line**, which is the thing a concatenated `\r` does
 not do. The record was cleared on dispatch, so the next poll took nothing.
 
-⚠ **STILL NOT PROVEN: the deadline itself firing (`Force`), and it must not be
-manufactured.** Not for want of trying — the reason is structural and worth
-recording so nobody spends the hours again. `Force` requires a blocker set that
-is entirely interruptible, i.e. at least one AGENT-kind session and no plain
-shell beside it, and **there is no headless way to mint an agent-kind session**:
-`server attach` mints a shell by design (→ `not_restorable` → exempt → the veto
-fires first and hides the state under test), and `automation run --kind
-claude-code` routes through app-control and refuses on a host with no GUI
-(*"no live Yggterm GUI client is registered for app control on this host"*).
-The remaining honest routes are (a) catch it in the wild, or (b) a full GUI in
-`scripts/underglass-sandbox.sh`'s private sway + private `YGGTERM_HOME`, mint the
-row there, and force the deadline against a host that owns nothing real.
-⛔ Driving a live daemon that holds other agents' rows into a forced cold
-shutdown to watch the mechanism work is not a test, and is not to be done.
-**Falsifier, unchanged, and both halves must be checked:** a
-`hot_restart_forced_past_deadline` trace event naming its `interrupted` list,
-followed within the repair window by one `hot_restart_repair_continue
-{outcome: "submitted"}` per session on the daemon that adopted them — and
-`server daemons` printing `repair owed:` in between. ⛔ A forced swap whose
-repair never lands is the deadline shipping alone, which is the thing the old
-prohibition forbade.
+⭐⭐ **§5 IS NOW LIVE-PROVEN END TO END, BOTH HALVES — and the proof found a real
+defect in the second one, which is what it was for.** Run in
+`scripts/underglass-sandbox.sh`'s private sway with a private `YGGTERM_HOME` and
+a sandbox-owned binary pair, so nothing of the fleet's was touched:
+
+    hot_restart_forced_past_deadline {
+        retire_trigger: "disk_binary_replaced", owed_for_ms: 1862006,
+        reason: "local://<row> was active 44s ago (idle window 300s)",
+        interrupted: ["local://<row>"], repair_recorded: true }
+    …the daemon cold-shuts-down; a successor comes up and adopts the key…
+    hot_restart_repair_continue { session_key: "local://<row>", outcome: "not_ready" }
+
+⭐ **The recipe, because the entry said for days that this could not be built:**
+a full GUI in the private sandbox, `server app terminal new --kind claude-code`
+for a genuine agent row, `YGGTERM_DISABLE_SELF_RETIRE_HANDOFF=1` so the lane
+reaches the cold gate, a queue entry stamped 31 minutes old (the file's own
+documented clock), and a `mv` over the SANDBOX copy of the binary.
+⛔ **And the belief that blocked it was stale.** The entry recorded that a freshly
+created agent row is `not_restorable` — permanent, exempt, vetoing the force.
+Measured now: it classifies **`recently_active`, `permanent: false`**, i.e. an
+ordinary interruptible blocker. That defect was fixed at some point and the note
+outlived it, which is why `owed_for_ms: 1862006` reached a `Force` at all.
+
+⛔⛔ **THE DEFECT THE FALSIFIER FOUND: `outcome: "not_ready"`, and the record was
+already spent.** A just-re-resumed agent CLI had not brought its input loop up
+inside `HOT_RESTART_REPAIR_SUBMIT_TIMEOUT` (20 s) — exactly the hazard the code's
+own comment predicts — so the session was **interrupted by the deadline and never
+repaired**. That is the deadline shipping alone.
+**Fixed (3.0.136+): a `NotReady` key goes back on the record**
+(`requeue_unsubmitted`). It does not weaken at-most-once: `NotReady` is *proof
+nothing was written* — the probe never echoed and the submit clears the composer
+on its way out — so a retry cannot double-type, where a `Submitted`, `NoSession`
+or `Err` outcome stays spent because it is ambiguous.
+⛔ **The requeue never restamps.** `REPAIR_WINDOW_MS` is measured from the
+interruption; a requeue that moved the stamp would keep a failing repair owed for
+ever and eventually type into a session that has been back for an hour — the
+never-converging clock this project has already fixed once. Pinned by
+`a_continue_that_was_never_written_goes_back_on_the_record` and
+`a_requeue_never_drags_a_newer_interruption_backwards`.
+⇒ **Still owed on this half:** a `hot_restart_repair_continue {outcome:
+"submitted"}` observed after a real forced swap — the requeue makes it reachable
+but has not been watched converging.
+
 ⚠ **And the deadline's clock only starts where the swap lane gives up.** The cold
 gate is reached from `SwapStep::Failed`, and a host with a queue entry it keeps
 retrying returns `Lingering` instead — so on that host the deadline is never
@@ -7065,39 +7148,6 @@ using the trace to decide whether a daemon code path fired will read a zero and
 believe it. That is worth its own look; it made this fix briefly appear not to
 run at all.
 
-## ★★★ THE EXTRA-ARGS SETTINGS ARE TWO TEXT BOXES AND THERE ARE NINE CLIs — build the modal
-
-**Status:** OPEN
-
-⭐ **Load-bearing, recorded 2026-08-08.**
-
-The settings rail holds **Codex Extra Args** and **Claude Code Extra Args**: two
-free-text boxes, one helper line each. Nine CLIs are now first-class, each with
-its own permission vocabulary — codex has `-a/--sandbox` policies, Claude has
-six `--permission-mode` values, opencode has one `--auto` flag and puts denials
-in a config file, qwen has a sandbox and **no bypass flag at all**, and pi has no
-blanket bypass but does have tool allow/deny lists. Nine more boxes in a rail
-would be nine chances to type the wrong CLI's flag.
-
-**Owner directive:** *"since we have so many CLIs now, the settings extra args
-system needs to be a modal … pre-populate the same type of least-permission-
-checks input box populated, and the explanations for each of the CLIs."*
-
-**The design and the per-CLI content are written and measured:**
-[`spec-agent-cli-extra-args-modal.md`](spec-agent-cli-extra-args-modal.md) — a
-descriptor-generated modal, three tiers per CLI (`Ask each time` · `Sandboxed` ·
-`Skip checks`), each tier's exact flags and its one-sentence explanation read off
-that CLI's own `--help` on this fleet, with kimi and muse declared **unmeasured**
-rather than guessed.
-
-⛔ Two things that would make this a regression rather than a feature: **resetting
-the two values the owner has already set** (migrate them verbatim), and
-**hand-writing nine rows of `rsx!`** instead of generating from the descriptor —
-the exact defect the titlebar `+` menu is filed for two entries below.
-
-⚠ It also inherits the row menu's proof problem: if app control cannot open the
-modal, the verb to open it is part of this work, not a follow-up.
-
 ## THE INTERFACE LLM IS HARD-WIRED TO ONE HTTP PROVIDER — it needs a provider dropdown
 
 **Status:** OPEN
@@ -7206,82 +7256,27 @@ comparing **hashes**, that either self-heals or reports which host is behind —
 and it must survive the case it exists for, a host where the hot-restart gate
 never opens.
 
-## ⛔⛔ A REMOTE ROW FOR ANY OF THE SIX NEW AGENT CLIs IS BORN A PLAIN SHELL — six for six, and every field says healthy
+## THE `--kind` REPLY OVER-REPORTS AND DOES NOT ROUND-TRIP
 
 **Status:** OPEN
 
-Measured 2026-08-08 12:15–12:35 IST on the live fleet (GUI guihost 3.0.52, remote
-host `dev`), by launching all six new kinds twice: once remote, once local.
+Found 2026-08-08; the `--help` half closed 2026-08-13.
 
-**Remote (`--kind <cli> --machine-key dev`)** — `terminal new` answers
-`session_kind:"pi"`, `launch.applied:true`, `seat.honoured:true`, and the row
-renders with `machine_health:"healthy"`, `remote_deploy_state:"Ready"`. The
-process that actually appears on `dev` is:
+`--kind opencode` answers `session_kind:"open_code"`; `--kind qwen-code` answers
+`"qwen_code"`; `--kind grok-build` answers `"grok_build"`. Feeding any of them
+back is refused: `unsupported app-control terminal kind "open_code"`. **A caller
+that reads a row's kind and launches another like it fails on exactly the kinds
+whose slug carries a hyphen** — three of ten now, and every future hyphenated
+slug joins them.
 
-```
-3841329  /bin/bash -i      <- kind=pi
-3846866  /bin/bash -i      <- kind=opencode
-3847130  /bin/bash -i      <- kind=qwen-code
-3847507  /bin/bash -i      <- kind=kimi
-3847985  /bin/bash -i      <- kind=muse
-3848634  /bin/bash -i      <- kind=antigravity
-```
+The kind vocabulary has three encodings — flag token, enum debug name, help text
+— and no owner. Collapse them onto the descriptor's `slug`, which is already the
+SSOT the intake built.
 
-No CLI is exec'd, and nothing fails: there is no `command not found`, because
-the CLI was never invoked. The row's path is `live::<uuid>` — a generic remote
-shell — not an agent scheme, and its icon is `$_`. **The `$_` icon is not an
-icon bug; it is the truth about a row that really is a shell.**
-
-**Local control (same kinds, no `--machine-key`)** — the CLI is exec'd
-(`… && pi`, `node …/qwen-code/cli.js`, opencode's TUI on screen) and the row
-carries its own `icon_kind`/`icon_text`: `π_ OC_ Q_ K_ M_ A_`. So the
-descriptors, the registry, the icon pipeline and the auto-provisioner are all
-correct. **Only the remote launch path is deaf to the new kinds.**
-
-**Root cause, in the code:** `crates/yggterm-core/src/agent_scheme.rs:347` —
-*"Current remote AGENT ROW schemes — `remote-session://` and `remote-cc://`"*.
-There are exactly two, minted for codex and Claude Code. A kind with no remote
-scheme falls through to the plain live-shell path, which is why the request is
-accepted and the row is wrong.
-
-**What it costs:** the handoff *is* the product — click a row, get
-`ssh <machine> "cd <cwd> && <cli> resume <uuid>"`. For six of the nine
-first-class CLIs that handoff does not exist on any machine but the GUI's own,
-and it fails **silently**, which is worse than refusing.
-
-**Fix shape:** carry the descriptor's slug across the hop — either one generic
-`remote-agent://<host>/<slug>/<uuid>` scheme (so the tenth CLI stays data) or a
-per-CLI scheme minted from the descriptor. ⛔ Until it lands, `terminal new
---machine-key` must **refuse by name** any kind it cannot carry. A launch that
-degrades to a shell while reporting `applied:true` is the response-layer defect
-this repo already has an entry for, in its most expensive form.
-
-**Falsifier:** launch `--kind pi --machine-key dev`, then read
-`/proc/<pid>/cmdline` of the process the remote daemon spawned. `pi` means
-fixed; `bash -i` means this entry stands.
-
-## THE `--kind` VOCABULARY IS WRONG IN TWO DIRECTIONS AT ONCE
-
-**Status:** OPEN
-
-Found 2026-08-08 while probing the six-CLI intake on 3.0.52.
-
-1. **`--help` under-reports.** Both usage blocks for `server app terminal new`
-   still read `--kind <shell|codex|claude-code>`. The parser accepts nine:
-   `codex, codex-litellm, claude-code, pi, opencode, qwen-code, kimi, muse,
-   antigravity`. An agent that reads the help cannot discover six of them.
-   ⭐ The *refusal* string already lists all nine correctly — the help is the
-   only surface that lies, so this is a one-line drift with a ready source of
-   truth.
-2. **The reply over-reports, and does not round-trip.** `--kind opencode`
-   answers `session_kind:"open_code"`; `--kind qwen-code` answers
-   `"qwen_code"`. Feeding either back is refused:
-   `unsupported app-control terminal kind "open_code"`. **A caller that reads a
-   row's kind and launches another like it fails on exactly two of nine kinds.**
-
-Both halves are the same defect — the kind vocabulary has three encodings (flag
-token, enum debug name, help text) and no owner. Collapse them onto the
-descriptor's `slug`, which is already the SSOT the intake built.
+✅ The help half is fixed: both usage blocks said `--kind <shell|codex|claude-code>`
+while the parser accepted nine, and they now say `<shell|<agent-cli>>` and point
+at the refusal string, which is generated from the registry and has always been
+correct.
 
 ## TESTS ARE FLAKY UNDER PARALLEL EXECUTION — they pass alone and fail in the suite
 
@@ -10694,6 +10689,28 @@ answer covers the contract that had no proof at all. Fix when convenient: an
 addressable route that reveals a picker surface (the rail/strip badge opens
 the profile SWITCHER menu, `webprofile:<name>` entries only), after which the
 existing `app screenshot --client <shadow>` does the rest.
+
+⚠ **NARROWED 2026-08-13 — "nothing an agent can drive" is too strong, and the
+difference changes who can fix it.** The route IS addressable: `server app open
+webprofile:<name>` is accepted, sets `active_session_path: "webprofile:<name>"`
+and `active_view_mode: "Rendered"`, and then fails with a NAMED reason:
+
+```
+timed out waiting for app open to settle for webprofile:<name>:
+  {"active_session_path":"webprofile:<name>","active_view_mode":"Rendered",
+   "ready":false,"reason":"preview surface not mounted"}
+```
+
+⇒ The missing piece is the **surface mount**, not an addressable route, and the
+verb already says so in its own words. That is a much smaller thing than
+"nothing exists", and it means the screenshot half may be one fix away rather
+than one feature away.
+
+⚠ **The probe moves the operator's view** — it sets the active session before it
+fails — so restore the previous row immediately after. Done here.
+
+**Falsifier:** `open webprofile:<name>` settles, and `app screenshot` returns the
+picker card.
 
 
 ## A WebKitNetworkProcess OUTLIVES the WebContext that started it, and

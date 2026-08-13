@@ -31,6 +31,16 @@
 //! unasked-for turn in someone's session, and the second is worse. So the keys
 //! leave the record the moment a repair is dispatched for them.
 //!
+//! ⭐ **With ONE exception, and it is not a weakening of that rule.** A submit
+//! that reports [`crate::terminal::PromptSubmitOutcome::NotReady`] is proof that
+//! *nothing was written*: the readiness probe never echoed, and the submit path
+//! clears the composer on its way out. Those keys go back via
+//! [`requeue_unsubmitted`], under their ORIGINAL window. Without it a session
+//! the deadline interrupted is never repaired at all — measured live, where a
+//! just-re-resumed agent CLI had not brought its input loop up inside the submit
+//! timeout, and the record had already been spent. **That is the deadline
+//! shipping alone, which is the thing the ruling forbids.**
+//!
 //! ⛔ **And the record EXPIRES.** A repair that arrives long after the
 //! interruption is not a repair — the session has been back for half an hour and
 //! a `continue` is then exactly the unprompted nudge §5 forbids. Past
@@ -136,7 +146,13 @@ pub enum RepairVerdict {
     /// happened.
     Expired { age_ms: u64, sessions: Vec<String> },
     /// These keys are owed a `continue` from this daemon, right now.
-    Repair { sessions: Vec<String> },
+    ///
+    /// `origin` travels with them so a key whose submit reports NotReady can be
+    /// put back under the SAME window — see [`requeue_unsubmitted`].
+    Repair {
+        origin: RepairOrigin,
+        sessions: Vec<String>,
+    },
 }
 
 /// Decide what this daemon owes, and SPEND it in the same step.
@@ -184,6 +200,12 @@ pub fn take_repairable(
         .filter(|key| !mine.contains(key))
         .cloned()
         .collect();
+    let origin = RepairOrigin {
+        recorded_at_ms: record.recorded_at_ms,
+        recorded_by_pid: record.recorded_by_pid,
+        recorded_by_version: record.recorded_by_version.clone(),
+        reason: record.reason.clone(),
+    };
     if remaining.is_empty() {
         clear(home_dir);
     } else {
@@ -195,7 +217,63 @@ pub fn take_repairable(
             },
         );
     }
-    RepairVerdict::Repair { sessions: mine }
+    RepairVerdict::Repair {
+        origin,
+        sessions: mine,
+    }
+}
+
+/// Put back keys whose `continue` was **never written**.
+///
+/// ⛔ **This does not weaken at-most-once, and the distinction is the whole
+/// reason it is safe.** The rule protects against a `continue` that LANDED being
+/// sent again. [`crate::terminal::PromptSubmitOutcome::NotReady`] is the one
+/// outcome that is *proof nothing landed*: the readiness probe never echoed, so
+/// the program was not consuming input, and the submit path clears the composer
+/// on its way out rather than leaving text behind. Returning that key is a
+/// retry of something that did not happen.
+///
+/// ⛔ **The stamp NEVER moves forward.** [`REPAIR_WINDOW_MS`] is measured from
+/// the interruption, and a requeue that restamped would rebuild the
+/// never-converging clock this project has already fixed once — a repair that
+/// keeps failing would then stay owed for ever and eventually fire a `continue`
+/// into a session that has been working for an hour. Past the window it expires
+/// exactly as it would have.
+///
+/// ⭐ Found by §5's own falsifier: a forced swap's repair came back `not_ready`
+/// because a just-re-resumed agent CLI had not brought its input loop up within
+/// the submit timeout. The record had already been spent, so that session was
+/// interrupted and never repaired — **the deadline shipping alone**, which is
+/// precisely what the ruling forbids.
+pub fn requeue_unsubmitted(home_dir: &Path, origin: &RepairOrigin, sessions: &[String]) -> bool {
+    if sessions.is_empty() {
+        return false;
+    }
+    let existing = load(home_dir);
+    let incoming = InterruptedSessions {
+        // max(), so a NEWER interruption recorded while we were submitting keeps
+        // its own window rather than being dragged back by our older one.
+        recorded_at_ms: existing
+            .as_ref()
+            .map(|existing| existing.recorded_at_ms.max(origin.recorded_at_ms))
+            .unwrap_or(origin.recorded_at_ms),
+        recorded_by_pid: origin.recorded_by_pid,
+        recorded_by_version: origin.recorded_by_version.clone(),
+        reason: origin.reason.clone(),
+        sessions: sessions.to_vec(),
+    };
+    save(home_dir, &merge_for_write(existing.as_ref(), &incoming)).is_ok()
+}
+
+/// Who recorded a repair, and when — carried out of [`take_repairable`] so an
+/// unsubmitted key can be put back under its ORIGINAL window rather than a
+/// fresh one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairOrigin {
+    pub recorded_at_ms: u64,
+    pub recorded_by_pid: u32,
+    pub recorded_by_version: String,
+    pub reason: String,
 }
 
 /// One line for `server daemons`, so a repair still owed says so where a human
@@ -252,6 +330,12 @@ mod tests {
         assert_eq!(
             take_repairable(&home, 2_000, 222, &["local://a".to_string()]),
             RepairVerdict::Repair {
+                origin: RepairOrigin {
+                    recorded_at_ms: 1_000,
+                    recorded_by_pid: 111,
+                    recorded_by_version: "1.2.3".to_string(),
+                    reason: "unit test".to_string(),
+                },
                 sessions: vec!["local://a".to_string()]
             }
         );
@@ -304,6 +388,12 @@ mod tests {
         assert_eq!(
             take_repairable(&home, 2_000, 222, &["local://b".to_string()]),
             RepairVerdict::Repair {
+                origin: RepairOrigin {
+                    recorded_at_ms: 1_000,
+                    recorded_by_pid: 111,
+                    recorded_by_version: "1.2.3".to_string(),
+                    reason: "unit test".to_string(),
+                },
                 sessions: vec!["local://b".to_string()]
             }
         );
@@ -344,6 +434,71 @@ mod tests {
             stored.recorded_at_ms, 2_000,
             "the window follows the most recent interruption"
         );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_continue_that_was_never_written_goes_back_on_the_record() {
+        // ⭐ Found by §5's own falsifier: a forced swap's repair came back
+        // `not_ready` because a just-re-resumed agent CLI had not brought its
+        // input loop up inside the submit timeout. The record was already spent,
+        // so that session was interrupted and never repaired — the deadline
+        // shipping alone, which is exactly what the ruling forbids.
+        let home = scratch_home("requeue");
+        record(&home, &interrupted(1_000, 111, &["local://a"]));
+        let RepairVerdict::Repair { origin, sessions } =
+            take_repairable(&home, 2_000, 222, &["local://a".to_string()])
+        else {
+            panic!("the key should have been taken");
+        };
+        assert!(load(&home).is_none(), "spent on dispatch, as before");
+        assert!(requeue_unsubmitted(&home, &origin, &sessions));
+        let back = load(&home).expect("an unwritten continue is still owed");
+        assert_eq!(back.sessions, vec!["local://a".to_string()]);
+        assert_eq!(
+            back.recorded_at_ms, 1_000,
+            "⛔ the window is measured from the INTERRUPTION — a requeue that \
+             restamped would keep a failing repair owed for ever"
+        );
+        // And it still expires on the original clock rather than a fresh one.
+        assert!(matches!(
+            take_repairable(&home, 1_000 + REPAIR_WINDOW_MS + 1, 222, &["local://a".to_string()]),
+            RepairVerdict::Expired { .. }
+        ));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_requeue_never_drags_a_newer_interruption_backwards() {
+        // Two forced swaps can overlap. The window follows the most recent one,
+        // so putting an older key back must not shorten the newer one's.
+        let home = scratch_home("requeue-newer");
+        let origin = RepairOrigin {
+            recorded_at_ms: 1_000,
+            recorded_by_pid: 111,
+            recorded_by_version: "1.2.3".to_string(),
+            reason: "older".to_string(),
+        };
+        record(&home, &interrupted(9_000, 333, &["local://newer"]));
+        assert!(requeue_unsubmitted(&home, &origin, &["local://older".to_string()]));
+        let merged = load(&home).expect("both are owed");
+        assert_eq!(merged.recorded_at_ms, 9_000);
+        assert!(merged.sessions.contains(&"local://older".to_string()));
+        assert!(merged.sessions.contains(&"local://newer".to_string()));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn nothing_to_requeue_writes_nothing() {
+        let home = scratch_home("requeue-empty");
+        let origin = RepairOrigin {
+            recorded_at_ms: 1_000,
+            recorded_by_pid: 111,
+            recorded_by_version: "1.2.3".to_string(),
+            reason: "none".to_string(),
+        };
+        assert!(!requeue_unsubmitted(&home, &origin, &[]));
+        assert!(load(&home).is_none());
         let _ = fs::remove_dir_all(&home);
     }
 
