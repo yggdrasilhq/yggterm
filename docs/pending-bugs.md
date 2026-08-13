@@ -1752,24 +1752,24 @@ answering for exactly the ancient versions nobody runs.
    each time naming the version that had just retired; a manual alias sweep therefore re-broke
    itself once per deploy. Traced as `retiring_daemon_aliased_own_socket` with the successor's
    socket and an `aliased` flag, so a handover that could not bequeath its name says so.
-   ⚠⚠ **AND THE BEQUEST IS NOT YET PROVEN TO SURVIVE — measured 2026-08-13, immediately after
-   shipping it, and it is the reason to check rather than to celebrate.** A hand-made alias at the
-   just-retired version was **deleted three times within seconds-to-100 s** of being created, in
-   the minutes after that version's daemon retired — while aliases created in the same command at
-   three OTHER versions survived untouched, and while the same alias at the same path, recreated
-   about seven minutes later, **survived 150 s**. So the deleter is transient and fires in a window
-   around a retirement, and it targets exactly the name a bequest writes.
-   ⚠ **The mechanism below is a HYPOTHESIS and has not been proven:** `classify_socket_entry`
-   condemns an entry by NAME on a re-proved dead sighting (rule 7), and the sighting that condemned
-   `server-3-0-<retiring>.sock` was taken while it was still a dead real socket. Its keep-rules
-   should save an alias — rule 4 keeps anything whose `canonicalize` resolves to something
-   listening — unless the census taken by one of the host's many older daemons had not yet seen the
-   brand-new successor as listening. That would make it: **a name condemned as a dead socket, and
-   unlinked later as a live alias.**
-   ⇒ **Falsifier for whoever takes this:** at the next handover, watch
-   `server-3-0-<retiring>.sock` for two minutes. If the bequest disappears, the sweeper must
-   re-check liveness at the moment of unlink rather than trusting a sighting taken before the
-   entry's identity changed — a stale death sentence executed against a different file.
+   ⭐⭐ **LIVE-PROVEN IN THE WILD at the very next handover (3.0.132 → 3.0.133), on TWO hosts:**
+
+       retiring_daemon_aliased_own_socket {aliased: true, server_version: "3.0.132",
+           successor_version: "3.0.133", successor_socket: ".../server-3-0-133.sock"}
+
+   and on both hosts `server-3-0-132.sock` is now a SYMLINK to `server-3-0-133.sock`, with
+   `server status --endpoint .../server-3-0-132.sock` answering **3.0.133**. ⇒ a client pinned to
+   the version that just retired reaches a live daemon instead of an ENOENT. **Survived 535 s and
+   counting.** Contrast the generation before it, which had no bequest: after 3.0.131 → 3.0.132 the
+   131 name went ABSENT and had to be re-aliased by hand.
+   ⚠ **This also FALSIFIES the sweeper hypothesis in its strong form, and the earlier measurement
+   stands unexplained rather than being quietly dropped.** A HAND-MADE alias at the just-retired
+   version was deleted three times within seconds-to-100 s, while aliases created in the same
+   command at three other versions survived; the DAEMON-WRITTEN one at the same kind of path
+   survives fine. So whatever deleted the manual symlinks does not delete these, and the guess that
+   `classify_socket_entry` condemns a name on a stale dead sighting is **not confirmed and no
+   longer load-bearing**. It is left recorded because an unexplained deletion is worth more written
+   down than forgotten.
    ⇒ Still owed here: fix 1, which deletes the class rather than the instance; and 6.7's line for
    whatever sweep remains — **enumerate an alias set from the versions that EXIST, never from the
    files that happen to REMAIN.**
@@ -5645,11 +5645,27 @@ shells. ⇒ **A second daemon does not disturb a pending hot-restart handshake, 
 completes it**, which is the constitution's version-coexistence clause behaving
 exactly as written.
 
-**What is still owed here:** the GUI's startup decline must **start a coexisting
-successor**, not merely record that one is owed. It is the only component on a
-stale host guaranteed to be current, and it already knows the target version and
-the daemon executable — it writes both into the queue entry. Until that ships,
-every host in this state needs a human or an agent to run the snippet above.
+⭐ **LANDED, 3.0.135 — the GUI's startup decline now STANDS THE SUCCESSOR UP.**
+`start_successor_for_declined_swap` runs beside `queue_startup_swap_intent`, and
+the outcome rides in the same `startup_hot_swap_declined_swap_queued` event
+(`successor: spawned | already_live | floored | spawn_failed`) so one line tells
+the whole story. **The GUI is the right process to do it**: it is the only
+component on a stale host guaranteed to be current, it already knows the target
+version and the daemon executable, and a daemon it spawns inherits ITS
+environment — which is the load-bearing half of the manual recipe above, got for
+free instead of reconstructed from `/proc`.
+⛔ **Two guards, and they fail differently** (`successor_spawn_verdict`, pure and
+unit-tested): a liveness check at-or-above the target, or every decline spawns a
+peer beside a successor that already exists; and a five-minute process-local
+floor, because the startup reconcile was measured re-running **three times in
+ninety seconds** and three daemons is a fork bomb wearing a repair. Neither is a
+one-shot — a repair that fired once and failed is gone rather than slow, so the
+floor retries.
+**Still owed:** the source-level test pins the call, and the guards are pinned by
+unit tests, but **the spawn itself has not been watched happening in the wild** —
+it needs a host whose newest daemon is older than a freshly launched GUI, which
+is the state this fix exists to end. Falsifier: `successor: "spawned"` in that
+event, followed by a daemon at the GUI's version appearing in `server daemons`.
 ⚠ **Do NOT reach for a socket alias instead.** Aliasing an absent version onto a
 live daemon is only sound in the older-client → newest-daemon direction; pointing
 a current client at an older daemon is the backwards cross-version proxy that has

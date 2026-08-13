@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A stale machine now fixes itself when you open yggterm (3.0.135).** If the
+  running background service is too old and yggterm decides it cannot safely take
+  it over, it used to write down that an update was owed and leave it there — and
+  the only thing that ever reads that note is the old service itself, which on a
+  machine far enough behind does not understand the note at all. One machine sat
+  twelve versions behind for five and a half hours that way, and what the person
+  at the keyboard saw was sessions they could not type into. yggterm now starts
+  the up-to-date service itself, alongside the old one, and lets the old one hand
+  its sessions over at its own pace. Nothing is closed, nothing is interrupted,
+  and no terminal is lost.
+
 - **A running yggterm can now say which source it was built from (3.0.133).**
   `yggterm --build-commit` could only ever answer for a file, and installing a
   new version replaces that file underneath the copy already running — so the
