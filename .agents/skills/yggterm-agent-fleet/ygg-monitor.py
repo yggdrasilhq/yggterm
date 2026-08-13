@@ -619,19 +619,40 @@ def report_escalation_gap(subs):
     silently re-arm every deliberately disarmed row. **Reporting a gap is
     read-only and safe; closing it automatically is not yet.**
     """
-    booter = HERE / "ygg-booter.py"
-    if not booter.exists():
-        return
+    # Read the booter's STATE DIRECTORY, not its `list` output. The state dir is
+    # shared by every checkout; the script is not (a guard living only in one
+    # copy of a script is the failure this fleet already paid for). It also
+    # carries `gone_sightings`, which the printed roster does not.
+    booter_subs = STATE / "booter"
+    armed, dying = set(), set()
     try:
-        r = subprocess.run([sys.executable, str(booter), "list"],
-                           capture_output=True, text=True, timeout=45)
+        files = sorted(booter_subs.glob("*.json"))
     except Exception:
-        return
-    armed = set(re.findall(r"ygg-booter ([0-9a-f]{8})\s", r.stdout or ""))
-    if not armed:
+        files = []
+    if not files:
         # ⛔ An empty result is a tool that never ran, not a clean bill of health.
-        log("⚠ could not read the booter roster — coverage NOT verified")
+        log(f"⚠ no booter roster at {booter_subs} — coverage NOT verified")
         return
+    for p in files:
+        try:
+            rec = json.loads(p.read_text())
+        except Exception:
+            continue
+        u = (rec.get("uuid") or p.stem)[:8]
+        # ⛔ A CORPSE IS NOT AN UNCOVERED ROW, AND CONFLATING THEM KILLS THE
+        #    WARNING. A retired row stays on the booter until GONE_SIGHTINGS
+        #    confirms it — deliberate slowness that exists because a fast
+        #    unsubscribe once deleted nine LIVE subscriptions in six seconds. So
+        #    every reaped row would be reported here as a gap, every time, until
+        #    it aged out.
+        #    ⚠ The cost is asymmetric and that is the trap: a false alarm merely
+        #    looks like diligence, so it survives, and the warning is trained
+        #    into background noise right up until the one that mattered. The
+        #    booter has already begun counting these down; they need no human.
+        if rec.get("gone_sightings", 0) > 0:
+            dying.add(u)
+        else:
+            armed.add(u)
     watched = {s["uuid"][:8] for s in subs}
     gap = sorted(armed - watched)
     if gap:
@@ -641,6 +662,9 @@ def report_escalation_gap(subs):
             log(f"   {u}  ⇒ subscribe it with --escalate-to <its campaign's orchestrator>")
         log("   ⚠ cwd is a PRIOR, not the answer: a row can work in a checkout that has")
         log("     nothing to do with its subject. Confirm against its last prose turn.")
+    if dying:
+        log(f"   ({len(dying)} retired row(s) on the booter are being counted down "
+            f"by GONE_SIGHTINGS — not a gap, no action)")
 
 
 def fishy_audit(subs, dry):
