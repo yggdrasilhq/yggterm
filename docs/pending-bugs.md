@@ -68,7 +68,11 @@ costs a `resolve_yggterm_home()`, two `serde_json::json!` allocations and **two
 file appends**.
 
 - `event-trace.jsonl` grows at **95.3 KB/s** and `perf-telemetry.jsonl` at
-  **45.9 KB/s** — **12.49 GB/day combined**. `~/.yggterm` is already 9.5 GB.
+  **45.9 KB/s** — **12.49 GB/day combined**. ⛔ **A write rate, not disk: both
+  streams rotate and hold ~20 MB.** The win is CPU, IO and SSD wear; nothing is
+  reclaimed. ⚠ And it is **22x smaller on the desktop host** (6 KB/s vs
+  133 KB/s), tracking session count — so it is a fleet-host defect, **not the
+  answer to the fan**.
 - ⭐ **It is ONE code path and the arithmetic closes exactly.** The `PerfGuard`
   sits inside the same contended branch, so one contention writes three records
   across two files: 141.1 KB/s ÷ 322.8/s = **437 bytes per contention**. A fix
