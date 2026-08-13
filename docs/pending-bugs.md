@@ -63,6 +63,41 @@ commit and re-stamp with it, or revert the shape change.
 clean `origin/main` checkout. It must pass; today it does not.
 
 
+## ⛔⛔ MAIN IS RED A SECOND WAY: THE DOCS-SSOT GATE FAILS ON `origin/main` ITSELF
+
+**Status:** OPEN
+
+*Found 2026-08-13 by 6.7 while gating its own commit. Not 6.7's entry to fix.*
+
+`scripts/check-docs-ssot.sh` — the law every status document is enforced by,
+and the gate every lane is required to pass before committing — **fails on
+`origin/main` with nothing else applied**, proven in a detached worktree of
+`origin/main` alone:
+
+```
+docs-ssot: 201 entries but 200 valid status lines — every entry needs exactly one
+6415:**Status:** OPEN — but the open question is a SPEC question, not a bug.
+MAIN_SSOT_EXIT=1
+```
+
+The offending line is the status of **THE WORKING DOT — the discovery half**,
+added by `bb224843`. The checker requires exactly one *valid* status line per
+entry; this one qualifies `OPEN` with prose on the same line, so it parses as
+zero valid statuses and the entry count and status count diverge by one.
+
+⛔ **Deliberately NOT fixed here, and the reason is not politeness.** The
+mechanical remedy is obvious — put `OPEN` alone on the status line and move the
+qualifier into the body — but the prose itself says *"the open question is a
+SPEC question, not a bug"*, which raises whether the entry belongs in this file
+at all rather than in a spec document. Reformatting it would silently cement it
+in the queue and answer that question by accident. **The lane that wrote it owns
+which of the two it is.**
+
+⚠ **Consequence while it stands:** every lane that honours the "gate the commit
+on `check-docs-ssot.sh`" rule now sees a RED that is not its own, and the
+documented failure mode is that someone reads it as their breakage and either
+chases it or overrides the gate out of habit. Both are worse than the entry.
+
 ## ⛔⛔ [6.7→6.1] EVERY DAEMON BUMP ORPHANS EXACTLY ONE VERSION — THE ONE THAT WAS SERVING
 
 **Status:** OPEN
