@@ -220,6 +220,10 @@ fn print_server_app_help() {
   yggterm-headless server app desktop-identity
   yggterm-headless server app state [--pid <pid>]
   yggterm-headless server app rows [--pid <pid>]
+  yggterm-headless server app row-expanded <row-path> <true|false>
+    opens or shuts a container — a folder, a machine, or a ROW SET's head — the
+    way clicking its disclosure control does. Row-set heads are ordinary session
+    rows: `server app rows` marks one with a `child_count` above 1.
   yggterm-headless server app sessions reorder <order.json>
     sets the order on the GUI — the process that RENDERS it — and answers with
     the resulting `rendered_order`. `server sessions reorder` writes to whichever
@@ -1912,6 +1916,32 @@ fn main() -> Result<()> {
                 run_app_control_dump_state(output_path, timeout_ms)
             }
             "rows" => run_app_control_describe_rows(timeout_ms),
+            // `server app row-expanded <row-path> <true|false>` — open or shut a
+            // container from a verb, the way a click does it.
+            //
+            // ⛔ THE PROTOCOL COMMAND AND THE SHELL HANDLER BOTH EXISTED AND
+            // NOTHING CALLED THEM. `run_app_control_set_row_expanded` had no
+            // caller at all, so `server app rows` reported an `expanded` field
+            // that no verb on the command line could change — the half of
+            // "an agent arranges rows as easily as a hand does" that was
+            // written and then never wired to a name a caller could type.
+            "row-expanded" => {
+                let positional = cli_positional_args(&args, 3);
+                let row_path = positional.first().ok_or_else(|| {
+                    anyhow::anyhow!("usage: server app row-expanded <row-path> <true|false>")
+                })?;
+                let expanded = match positional.get(1).copied() {
+                    Some("true") => true,
+                    Some("false") => false,
+                    // Named rather than defaulted: guessing here would silently
+                    // do the opposite of what the caller meant.
+                    other => anyhow::bail!(
+                        "server app row-expanded needs `true` or `false`, got {}",
+                        other.unwrap_or("nothing")
+                    ),
+                };
+                run_app_control_set_row_expanded(row_path, expanded, timeout_ms)
+            }
             "sessions" if args.get(3).map(String::as_str) == Some("reorder") => {
                 // `server app sessions reorder <order.json>` — the APP-path twin
                 // of `server sessions reorder`. Same file format; the difference
