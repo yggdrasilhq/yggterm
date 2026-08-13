@@ -166,8 +166,33 @@ fix is not "make `faithful` honest" in general: it is that the **spectacle
 fallback must report which window it got, or refuse when the addressed pid does
 not hold focus**. The composite path is already the trustworthy one.
 
+⏳ **IN CODE, LIVE PROOF OWED — 2026-08-13, cluster 6.2.** Root-caused to two
+instruments answering different questions with nothing arbitrating between them.
+Spectacle photographs whatever the **compositor** calls active; the gate in
+`app_capture.rs` asked the **toolkit** (`desktop.is_focused()`), which is not
+reliably updated on KDE Wayland. When they disagreed the toolkit won, and the
+shot was of another application. `capture_os_compositor_screenshot` — the
+`--backend os` path — had already learned to ask KWin and cross-check; the path
+every plain `server app screenshot` takes had not.
+
+⇒ The fallback now asks KWin and **believes it over the toolkit**, and a refusal
+**names what held focus** rather than refusing blankly. The identity was always
+available: `kde_wayland_active_window_matches` computed the active window's class
+and caption and returned a bare `bool`, discarding the one fact a caller needs;
+it is now `kde_wayland_active_window_identity`, with the predicate as a thin
+wrapper. The toolkit is still used where KWin cannot be reached, because refusing
+every screenshot on a desktop with no such probe is worse than the bug.
+
+Locked by two tests over the extracted arbitration (`spectacle_may_shoot`), so
+the disagreement is testable without a compositor: the measured case — toolkit
+says focused, compositor names another application — must refuse, and the
+converse case (compositor names this window while the toolkit's flag lags) must
+still shoot, so the gate cannot be the toolkit in either direction.
+
+**Owed:** the live check, which needs the GUI unfocused on the desktop host.
+
 **Falsifier:** with the GUI unfocused, `screenshot --pid <gui>` returns a frame
-of that GUI, or refuses.
+of that GUI, or refuses **naming what it would have photographed**.
 
 ## ⛔ THE CENSUS STILL CANNOT ASK A DEPLOYED BINARY WHICH SOURCE IT IS
 
