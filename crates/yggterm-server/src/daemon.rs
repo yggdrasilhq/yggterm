@@ -15823,7 +15823,7 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
                 }),
             );
         }
-        hot_restart_repair::RepairVerdict::Repair { sessions } => {
+        hot_restart_repair::RepairVerdict::Repair { origin, sessions } => {
             HOT_RESTART_REPAIR_IN_FLIGHT.store(true, Ordering::Relaxed);
             let home_dir = home_dir.to_path_buf();
             let runtime = Arc::clone(runtime);
@@ -15841,6 +15841,12 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
             // the next daemon becoming stale.
             std::thread::spawn(move || {
                 let _in_flight = HotRestartRepairInFlight;
+                // ⛔ Keys whose `continue` was never WRITTEN go back on the
+                // record. `NotReady` is proof nothing landed — the readiness
+                // probe never echoed — so a retry cannot double-type, and
+                // without this a session the deadline interrupted is never
+                // repaired at all, which is the deadline shipping alone.
+                let mut unsubmitted: Vec<String> = Vec::new();
                 for (session_key, runtime_path) in targets {
                     let write_runtime = Arc::clone(&runtime);
                     let write_path = runtime_path.clone();
@@ -15876,6 +15882,29 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
                                 Err(_) => "error",
                             },
                             "error": outcome.as_ref().err().map(|error| error.to_string()),
+                            "current_version": SERVER_PROTOCOL_VERSION,
+                            "current_pid": std::process::id(),
+                        }),
+                    );
+                    if matches!(
+                        outcome,
+                        Ok(crate::terminal::PromptSubmitOutcome::NotReady { .. })
+                    ) {
+                        unsubmitted.push(session_key);
+                    }
+                }
+                // ⚠ Under the ORIGINAL window, never a fresh one: a requeue that
+                // restamped would keep a failing repair owed for ever and
+                // eventually type into a session that has been back for an hour.
+                if hot_restart_repair::requeue_unsubmitted(&home_dir, &origin, &unsubmitted) {
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "lifecycle",
+                        "hot_restart_repair_requeued",
+                        serde_json::json!({
+                            "sessions": unsubmitted,
+                            "recorded_at_ms": origin.recorded_at_ms,
                             "current_version": SERVER_PROTOCOL_VERSION,
                             "current_pid": std::process::id(),
                         }),
