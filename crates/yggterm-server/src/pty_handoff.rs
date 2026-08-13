@@ -103,7 +103,7 @@ pub(crate) fn send_session(
     socket_path: &Path,
     metadata: &HandoffMetadata,
     master_fd: RawFd,
-) -> std::result::Result<(), HandoffError> {
+) -> std::result::Result<HandoffAck, HandoffError> {
     let mut stream = UnixStream::connect(socket_path).map_err(|error| HandoffError {
         committed: false,
         message: format!(
@@ -111,6 +111,11 @@ pub(crate) fn send_session(
             socket_path.display()
         ),
     })?;
+    // ⛔ Never wait on a successor for ever. The caller parks every reader
+    // before the first send, so a hung ack is not merely a slow retirement —
+    // it is a host on which nobody is draining any pty. A timeout turns that
+    // into a reported failure, which the sweep already knows how to survive.
+    let _ = stream.set_read_timeout(Some(ACK_TIMEOUT));
 
     let mut line = serde_json::to_string(metadata).map_err(|error| HandoffError {
         committed: false,
@@ -158,8 +163,13 @@ pub(crate) fn send_session(
             ),
         });
     }
-    Ok(())
+    Ok(ack)
 }
+
+/// How long a predecessor waits for the successor's ack before calling the
+/// handoff failed. Generous — the successor has to seat the pty and persist —
+/// but finite, because every reader on the host is parked while this blocks.
+const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Whether a failed handoff left the descriptor behind or took it.
 #[derive(Debug, Clone)]
@@ -191,6 +201,45 @@ pub(crate) struct HandoffAck {
     pub adopted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Who is holding it now — so the predecessor can wait for this successor
+    /// to *survive* rather than merely to *accept*, and can tell it apart from
+    /// any other daemon that later answers to the same version name.
+    ///
+    /// ⛔ **A bare pid is not an identity** (the rule this crate already applies
+    /// to adopted children): pid plus start time, or nothing. Optional in both
+    /// directions, so a build that predates it simply does not name itself and
+    /// the predecessor falls back to asking the socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopter_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopter_start_time: Option<u64>,
+}
+
+impl HandoffAck {
+    /// This daemon, named the way [`crate::pty_adoption`] names a process.
+    pub(crate) fn adopted_here() -> Self {
+        let pid = std::process::id();
+        Self {
+            adopted: true,
+            error: None,
+            adopter_pid: Some(pid),
+            adopter_start_time: crate::pty_adoption::process_start_time(pid),
+        }
+    }
+
+    pub(crate) fn refused(error: String) -> Self {
+        Self {
+            adopted: false,
+            error: Some(error),
+            adopter_pid: None,
+            adopter_start_time: None,
+        }
+    }
+
+    /// The `(pid, start_time)` pair, present only when both halves are.
+    pub(crate) fn adopter_identity(&self) -> Option<(u32, u64)> {
+        Some((self.adopter_pid?, self.adopter_start_time?))
+    }
 }
 
 /// Read one handoff from an accepted connection: the metadata line, then the

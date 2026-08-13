@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Updating no longer risks every session on the machine for two seconds.** When
+  a new background service took over the running terminals, the old one handed
+  them across and immediately quit — so for a couple of seconds the only process
+  holding those terminals open was one that had just started. Anything that
+  stopped it in that moment took every session with it, unrecoverably; seven
+  agent sessions were lost that way. The old service now keeps holding the
+  terminals open, without reading them, until the new one has proved it can stay
+  alive — and if it cannot, the old service simply picks them all back up and
+  carries on. Nothing is closed and nothing is retyped. Measured: an ordinary
+  handover loses no output at all, and one where the new service is killed
+  mid-swap keeps every session running.
+
 - **An interrupted session is no longer left un-nudged (3.0.142).** When yggterm
   has waited half an hour to update and finally goes ahead anyway, it owes a
   `continue` to each session it interrupted. If that session's agent had not
