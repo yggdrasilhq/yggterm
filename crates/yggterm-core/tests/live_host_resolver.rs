@@ -1,7 +1,7 @@
 //! "Which host is the live GUI on?" has exactly one owner.
 //!
-//! ⛔ WHY THIS IS A TEST. Sixteen recipes across the agent skills and one python
-//! script opened with `LIVE_HOST=$(cat .agents/config/live-host)`. That path is
+//! ⛔ WHY THIS IS A TEST. Fifteen recipes — fourteen across the agent skills and
+//! one python default — read `.agents/config/live-host` directly. That path is
 //! gitignored — correctly, the alias is infrastructure and this repo is public —
 //! so the file exists **only on the machine whose name it holds**, which is the
 //! one machine that never needs telling. Sessions run headless by standing
