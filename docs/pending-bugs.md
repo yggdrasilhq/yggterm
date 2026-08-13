@@ -6410,90 +6410,65 @@ But the cheap fix is guidance, not code: *invent test ids with letters in them.*
 resulting row reports a non-permanent blocker set; `server sessions classify`
 exists. (The third item is retracted, not open.)
 
-## ⚖ THE WORKING DOT IS BLIND WHERE IT MATTERS MOST — the discovery half
+## ⚖ THE WORKING DOT — the discovery half, and it is NOT a detector defect
 
-**Status:** OPEN
+**Status:** OPEN — but the open question is a SPEC question, not a bug.
 
 The owner asked for a working indicator. 6.3 owns the RENDER half; this entry
 owns the prior question — **what makes a session's working-state knowable at
 all**, and why `working` is `None` on most rows.
 
-### There is exactly ONE producer, and it reads a live PTY's screen
+⛔⛔ **THIS ENTRY WAS FILED TWICE WITH A WRONG PREMISE AND IS REWRITTEN FROM
+MEASUREMENT. Both retractions are kept, because the retracted versions were
+circulated to another lane before they were checked.**
 
-`DaemonRuntime::working_flags` is the whole supply. For an agent CLI it reads
-the live in-daemon vt100 screen and asks THAT CLI's own matcher
-(`descriptor.screen_shows_working`); for a plain shell it asks whether a
-foreground process is active. **Both require a daemon to be holding the
-session's PTY.** There is no transcript source and no other signal.
+### The answer: a live PTY is the discriminator, and `None` is honest
 
-⚠ **CORRECTION, made within the hour by reading further rather than leaving it
-to harden.** A first version of this entry said a row whose PTY this daemon does
-not hold is *unaskable*. **That is wrong.** `refresh_proxied_working_flags` +
-`working_flags_including_proxied` already ask the OWNING daemon for exactly the
-rows this one cannot answer, and cache the result (`proxied_working_flags`,
-refreshed at most once per `PROXIED_WORKING_REFRESH_MS`) because an unbounded
-per-snapshot fan-out would cost a round trip per row per frame. That capability
-was added precisely because the snapshot — *"what the sidebar dot reads"* — used
-to answer from the raw screen scrape and so reported `None` forever for a row
-owned by an older coexisting daemon.
-⇒ **The real coverage is: owned locally ∪ owned by a reachable sibling daemon
-whose preserved-owner endpoint resolves.** What is genuinely outside it is a row
-whose PTY lives on ANOTHER HOST, and a row that is not running at all — and for
-the second of those, `None` is the honest answer.
+Measured on the GUI host, agent rows only:
 
-### ⛔ AND "I COULD NOT LOOK" IS ENCODED AS "NOTHING TO REPORT"
+    live PTY present  →  7 answered / 7      (100%)
+    no live PTY       →  2 answered / 43     (the 2 are proxy-filled)
+    by locus:  local 9/9 answered · remote 9 answered, 41 None
 
-The match ends in `}?;` — so a session whose source is unreadable is **dropped
-from the returned list entirely**, rather than reported as unknown. Downstream
-nothing distinguishes *"the screen says this agent is idle"* from *"there was no
-screen to read"*. That is the same conflation `server gate-screen` had to split
-apart explicitly with `screen_available`, in the same subsystem, for the same
-reason: **a blind instrument and a negative reading must not share an encoding**
-([[finding-a-constant-anomaly-is-a-measurement-bug]]).
-⇒ **This is the fix worth making first**, because every downstream consumer —
-including whatever the dot falls back to — is currently reasoning from a value
-that cannot say "ask someone else".
+⇒ **Every row with a live PTY has a working answer.** A row with no PTY is not
+open — nothing is running for any daemon to observe — and `None` is the correct
+report, exactly as the snapshot's own code says: *"`None` = no live screen
+(preserved/foreign-owned) so the GUI must NOT blink it."*
+⇒ **The "21 of 31 rows report None" count is dominated by rows that are not
+open.** There is no detector to fix.
 
-### What was measured, on the workshop host, 271 live-session records
+### ⛔ RETRACTED #1 — "a row this daemon does not own is unaskable"
 
-    working = None   232      False  27      True  12
-    by kind:  shell        36 answered / 36     ← 100%
-              claude_code   3 answered / 229    ← 1.3%
-              codex         0 answered / 5
-              open_code     0 answered / 1
+False. `refresh_proxied_working_flags` + `working_flags_including_proxied`
+already ask the OWNING daemon for exactly the rows this one cannot answer, and
+cache the result because a per-snapshot fan-out would cost a round trip per row
+per frame. That capability was added for this very symptom.
 
-⇒ The indicator is present almost exactly where it is not needed (shells) and
-absent almost everywhere it is (agent rows).
+### ⛔ RETRACTED #2 — "the `}?;` drop conflates unknown with idle"
 
-### ⚠ AND THE OBVIOUS INFERENCE IS NOT ESTABLISHED — the join is across two key namespaces
+Also false, and this one nearly shipped as a code change. `working_flags` ends in
+`?`, so an unreadable session is absent rather than reported — and **absent is
+the right encoding for both of its consumers**: the proxy refresh uses it to
+decide which rows still need fetching (a session reported as unknown would mark
+its own hole as covered), and the 2.5 s poll only wants definite answers to stamp
+freshness with. Meanwhile the SNAPSHOT — which is what the dot actually reads —
+computes its own three-state `Option<bool>` separately and documents each state.
+⇒ **Two paths, two correct encodings.** A change making `working_flags` return
+`Option<bool>` was written, compiled, and reverted unshipped once the premise
+collapsed: nothing consumed the new information, and unused churn in this
+subsystem is worse than none.
 
-The tempting conclusion is *"None ⇔ no live PTY here, so None is honest"*. **It is
-not proven and the first attempt to prove it was wrong.** `live_sessions[]` is
-keyed by ROW path (`cc-runtime://<cc-session-id>`), while
-`owned_terminal_session_keys` is keyed by RUNTIME (`local://<runtime-id>`); they
-are different namespaces on purpose, and joining them from outside silently
-matches nothing — a daemon reporting **38 owned keys** matched **0** of its own
-live sessions. `snapshot`'s copy of that field also came back EMPTY where
-`status`'s was populated, so the two verbs disagree about the same question.
-⇒ **The correlation needs a daemon-side instrument**, because only the daemon can
-call `terminal_runtime_key_for_path`. That is the same shape as the gate-screen
-verb, and the same answer: **expose what the producer saw**, alongside what it
-concluded.
+### ⇒ WHAT IS ACTUALLY OPEN, and it belongs to the owner, not to a fix
 
-**Falsifier for whoever takes this:** a verb (or an added field) that reports,
-per row, whether a working reading was POSSIBLE and what it read. Then `None`
-splits into "not running here" and "running and idle", and the dot can stop
-standing in for attachment.
-
-⇒ **The order of work, given the correction above.** The proxy already extends
-coverage, so the first job is NOT another source — it is making the existing one
-able to say *"I could not look"*, because a proxy that returns nothing and a
-screen that says idle are today the same value. Concretely: `working_flags`
-returns `Vec<(String, bool)>` and drops the unreadable, so
-`refresh_proxied_working_flags` cannot tell "the owner said not-working" from
-"the owner never answered" either — **the conflation is inherited by the very
-mechanism meant to repair it.** Fixing the encoding is therefore upstream of
-both the proxy's correctness and anything the render can do.
+The dot can only mean "working" for rows that are OPEN — **16 of 50 on the GUI
+host**. For the other 34 the honest states are "not running" and "closed", which
+is a design question: *what should a closed row's dot say, and should it be the
+same shape as a running-but-idle one?* Until that is answered, any render is
+guessing, and the guess it makes today is attachment — which is what the owner is
+reading as activity.
+⚠ **Not a third state invented at the view layer.** If a new distinction is
+wanted, its source is the snapshot's existing three-valued `working` plus
+whether a PTY exists; both are already on the wire.
 
 ## ⚖⚖ THE HOT-RESTART GATE IS UNBUILT — THE DESIGN IS NOW SETTLED
 
