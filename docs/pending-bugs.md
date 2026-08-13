@@ -29,6 +29,88 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⛔⛔⛔ [6.3] THE RIGHT RAIL RESERVES ITS WIDTH AND DRAWS NOTHING INSIDE IT — IN EVERY MODE
+
+**Status:** OPEN
+
+The symptom is measured on the live desktop host; the cause is NOT established.
+
+*Owner-reported: the right sidebar has been absent for hours. Measured 2026-08-14.*
+
+A docked right rail paints its card and renders **no body at all**. The user
+reads that as "there is no right sidebar", because a 272 px band of flat
+background is not a sidebar.
+
+### ⛔ WHAT IS ESTABLISHED
+
+One scanline, `y=600`, same window (1920×1200), rail docked vs hidden:
+
+| x | rail docked | rail hidden |
+|---|---|---|
+| 1600 | `#262A33` terminal | `#262A33` terminal |
+| 1660 → 1900 | `#D3E7ED` flat | `#262A33` terminal |
+
+⇒ the band is **inside the window** and it **is** the rail: hiding the rail
+gives those 270 px back to the terminal, and 270 px is `rail_width` (272).
+
+Band statistics, 265×1100 each, from the same frames:
+
+| band | distinct colours | ink (px darker than 0.35) | edge energy |
+|---|---|---|---|
+| LEFT tree | 4,959 | **0.79 %** | 0.129 |
+| RIGHT rail | **10** | **0.00 %** | 0.0066 |
+
+⇒ the left tree draws text, so the DOM chrome is alive and this is not a dead
+webview. The rail has **zero** dark pixels — not faint content, none.
+
+⭐ **The ink measurement is also what kills the tempting alternative.** The
+window is composited transparent, so "both bands are wallpaper showing through"
+had to be excluded before anything else meant anything; wallpaper does not
+contain near-black text pixels, and the left band does.
+
+### ⛔ WHAT THIS IS NOT — three candidates, each excluded by measurement
+
+- **Not mode pinning.** `raw_mode` sits at `app_pane` and never moves, which
+  looks like a rail pinned to a dead contributed pane with no exit. But
+  `rendered_mode` tracks every command (`settings` → `metadata` → `hidden`),
+  and `rendered_mode` is what the body dispatch switches on. The tenancy
+  resolver is doing its job; the body still does not draw.
+- **Not a contributed-pane fault, so it does NOT belong on the yedit entry.**
+  `metadata` and `settings` are built-in rails that never involve a declared
+  pane, and both are equally blank. `document_surfaces: []` is a true reading
+  and a real defect, but it cannot explain a blank *metadata* rail.
+- **Not an empty body.** `MetadataRailBody` renders `RailHeader { title:
+  "Session Metadata" }` **unconditionally** — before any session, daemon or
+  pane lookup — and `SideRailShell` interpolates `{body}` with no conditional
+  around it. A rendered body cannot be blank; it would carry that header.
+
+### ⭐ THE SHAPE WORTH TESTING FIRST — named by the code's own warning
+
+`sidebar_panel_card_style` is documented in `SideRailShell`'s own signature:
+*"The host emits a FIXED property key set across every mode; the rail must not
+add or drop keys here (Dioxus applies `style` property-by-property and does not
+clear dropped keys — that lingering was the docked-rail-ghost bug)."*
+
+⇒ a style property emitted in one mode and **absent** from another is not
+cleared, it LINGERS. That is the documented failure family for this exact
+element, it would survive every later mode change (which matches "hours"), and
+it would leave the card painting while its contents collapse.
+⛔ Not confirmed. Falsifier: read the rail content div's computed style and
+child geometry, and compare the key SET emitted across all four modes.
+
+⚠ **There is no DOM-read verb to run that falsifier with.** `server app chrome`
+offers only `type`, whose `--assert <selector>@<attribute>` is the sole DOM read
+in the surface and cannot be used here because it types first. Getting a
+read-only chrome query is the prerequisite for settling this.
+
+### ⇒ WHAT IT COSTS, AND WHAT THE USER CAN DO TODAY
+
+No cure was found that he can run himself: **every docked mode is blank**, so
+`server app panel <mode>` cannot recover it. Hidden is left as the better of two
+bad states — it returns 272 px to the terminal instead of spending them on a
+blank band — and `server app panel settings` puts it back whenever the fix
+lands. ⛔ A GUI restart was NOT attempted and must not be: he has an unsent
+half-typed draft in a live composer, and that is his work.
 ## ⛔⛔⛔ [6.7] THE READINESS PROBE TYPES OVER THE HUMAN — THIS IS THE "I CANNOT TYPE" BUG, ROOT-CAUSED
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -93,6 +175,32 @@ behaviour), while the "still submits normally" control passed.
 do not `terminal submit` to a row that is not consuming input. A row reading
 `busy: agent_working_daemon` will not echo, so the submit will hammer it for the
 full timeout. Check first, and never retry a `submitted:false` by sending again.
+
+### ⚠ "BLINKING" NOW HAS TWO UNRELATED CAUSES — TELL THEM APART BEFORE FILING HERE
+
+The handover settle window (6.1, `40cbcaf0` + `07218756`) widened the
+double-claim window from 250 ms to **~10 s, and it is untested under a live
+GUI**. Its predicted falsifier is *rows flickering or doubling for the length of
+`YGGTERM_HANDOFF_SETTLE_MS` during a handover* — which a reporter will also call
+"blinking", and this entry is what a search for that word finds.
+
+**They are distinguishable on sight, and the difference is the SURFACE:**
+
+| | this bug (the probe) | the settle-window residual |
+|---|---|---|
+| what blinks | the **VIEWPORT** — composer text appearing and being wiped | the **SIDEBAR ROWS** — entries flickering or appearing twice |
+| you can see | literal `yggterm_ready_probe` in the text | row identity/count wobbling, text intact |
+| when | any submit to a row that is not echoing | **only during a handover**, for ~10 s |
+| typing | broken (Ctrl+U erases your line) | unaffected |
+
+⇒ **Row flicker during a handover is 6.1's falsifier firing: RECORD IT against
+the settle window, do not file it here and do not fix it silently.** Composer
+text being wiped is this bug.
+
+⚠ **And a deploy of this fix cannot prove the settle window.** The settle fix
+lives in the PREDECESSOR, so installed 3.0.148 hands over the old way — the next
+bump still runs the old path and the guarantee starts from the one after. Do not
+read a clean handover during that bump as evidence for either fix.
 
 ## ⛔ [6.7] `main` IS RED IN ANY CHECKOUT WITHOUT THE LIVE-HOST CACHE — THE DEPLOY GUARD TESTS NEED A HOST TO EXIST
 
