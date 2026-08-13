@@ -4859,6 +4859,31 @@ cheap way to force a local tree scan. `local_tree_scan` is throttled behind
 session store cannot ask the product to re-read it. A read-only
 `sessions rescan` would have made this entry unnecessary.
 
+
+✅ **ROOT-CAUSED AT SOURCE 2026-08-13, without firing a single LLM call** — the
+live repro would have burned a rate-limited endpoint other campaigns share, and
+a zero-means-unset bug is settleable from the code. It is two halves, and only
+both together produce the surprise:
+
+```
+apps/yggterm/src/bin/yggterm-headless.rs   .unwrap_or(0)      ← absent flag becomes 0
+apps/yggterm/src/main.rs                   .unwrap_or(0)      ← same, in the other binary
+crates/yggterm-core/src/lib.rs             let limit = if budget == 0 { usize::MAX } else { budget };
+```
+
+⇒ **`--budget 0` is byte-identical to passing no flag at all, and zero is the
+encoding for UNLIMITED.** The flag that reads as *"generate nothing"* is the flag
+for *"generate everything"*, and no caller can express the first at all.
+
+⚠ **The fix is NOT flipping the `== 0` arm.** Absent-flag currently relies on
+`0 ⇒ unlimited`, so changing the core's reading silently caps every caller that
+passes nothing. The shape that works is to distinguish ABSENT from EXPLICIT ZERO
+at the CLI — parse to `Option<usize>`, keep absent ⇒ unlimited, and give explicit
+`0` a path that generates nothing — which is a change to a shared contract with
+two call sites, not a one-line patch.
+
+**Falsifier:** `--budget 0` scans and generates nothing, while omitting the flag
+still generates without a cap.
 ## ⛔⛔ REPORTED, LIVE 2026-08-09: A DEPLOY MADE THE OPERATOR'S OWN ROW UNREACHABLE FOR 5-10 MINUTES — "the pain we go through is IMMENSELY irritating"
 
 **Status:** OPEN
