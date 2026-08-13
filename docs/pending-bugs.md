@@ -4985,6 +4985,38 @@ and passes its version.
 an agent session's WORKING state is still inferred from silence rather than from
 a positive signal.
 
+⛔ **AND BLOCKED-ON-HUMAN MUST NOT BE BUILT BLIND — there is currently no
+instrument that can validate the recognizer it needs.** Attempted 2026-08-13 and
+stopped deliberately, so the next session does not spend the same time
+rediscovering it. What was measured, and why none of it is a corpus:
+
+- **The gate reads a source no external agent can audit.**
+  `hot_update_idle_gate_blockers` classifies from
+  `terminals.session_screen_snapshot(runtime_path)` — the live in-daemon vt100
+  screen. `server snapshot`'s `live_sessions[].terminal_lines` is a DIFFERENT
+  field: of 225 agent sessions on one host, **205 last lines were a stored
+  summary line, not screen text at all**, and only ~20 carried real
+  escape-bearing screen tails. Auditing the gate's input from outside is
+  therefore not possible today with any shipped verb.
+- **The obvious sample says nothing.** Across those same 225 sessions,
+  **0 matched any question / permission / numbered-choice pattern** and 10
+  contained `esc to interrupt`. That is not evidence that agents never park at a
+  question — it is [[finding-a-set-is-not-a-fill]] again: the field was present
+  on every record and carried no signal, because most of it was never a screen.
+- **The failure mode is asymmetric and expensive.** A false BLOCKED-ON-HUMAN
+  means a session that is genuinely mid-turn is classified as not-working and
+  cold-killed. A recognizer written against invented prompt strings would
+  compile, review as correct, and fire on the wrong screens — the exact shape
+  that made `isSidechain` read `false` on all 179,392 records.
+
+⇒ **What has to exist first, and it is the smaller job:** a way to read the
+screen the GATE reads — either a verb that exposes
+`session_screen_snapshot` per owned key, or the blocker list carrying a screen
+excerpt. **Then** harvest real parked-at-a-question screens from the fleet, and
+only then write the recognizer against them. ⚠ The recognizer also cannot be
+manufactured on demand without driving a live session into a permission prompt,
+which is not something to do to another agent's row.
+
 **Landed in code, LIVE PROOF OWED — §2, the relay boundary as the appointment.**
 `server relay-boundary [--by <who>] [--wait-secs <n>] [--json]` declares that a
 hand-off just happened, and the queued swap is then attempted on the next 20 s

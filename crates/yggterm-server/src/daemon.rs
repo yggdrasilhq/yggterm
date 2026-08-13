@@ -15344,6 +15344,24 @@ fn hot_restart_retire_owed_for_ms(home_dir: &Path, now_ms: u64) -> u64 {
 #[cfg(target_os = "linux")]
 static HOT_RESTART_REPAIR_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// Clears [`HOT_RESTART_REPAIR_IN_FLIGHT`] however the batch ends.
+///
+/// ⛔ **A trailing `store(false)` is not enough, and the failure is silent and
+/// permanent.** The repair thread takes the daemon's runtime lock; if anything
+/// on that path panics, a flag reset written as the last statement never runs,
+/// and this daemon then declines every future repair forever while reporting
+/// nothing at all — [[finding-a-release-condition-unreachable-in-the-state-that-closes-it]].
+/// `Drop` runs during unwinding, so the guard closes what the statement cannot.
+#[cfg(target_os = "linux")]
+struct HotRestartRepairInFlight;
+
+#[cfg(target_os = "linux")]
+impl Drop for HotRestartRepairInFlight {
+    fn drop(&mut self) {
+        HOT_RESTART_REPAIR_IN_FLIGHT.store(false, Ordering::Relaxed);
+    }
+}
+
 /// How long the repair waits for a re-resumed agent to start consuming input.
 ///
 /// The echo-verified submit is what makes this safe: a just-resumed agent CLI
@@ -15418,6 +15436,7 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
             // probes, and the poll it runs on is the same one that would notice
             // the next daemon becoming stale.
             std::thread::spawn(move || {
+                let _in_flight = HotRestartRepairInFlight;
                 for (session_key, runtime_path) in targets {
                     let write_runtime = Arc::clone(&runtime);
                     let write_path = runtime_path.clone();
@@ -15458,7 +15477,6 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
                         }),
                     );
                 }
-                HOT_RESTART_REPAIR_IN_FLIGHT.store(false, Ordering::Relaxed);
             });
         }
     }
