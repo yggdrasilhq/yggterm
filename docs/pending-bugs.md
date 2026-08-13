@@ -1446,6 +1446,84 @@ for ~11 s, which is already tracked and would produce exactly this.
 **Falsifier:** time both verbs against the same GUI at several row counts. `state`
 must not diverge from `clients` by more than the work it genuinely does more of.
 
+## ⛔⛔ EVERY VERSION BUMP ORPHANS ITS IN-FLIGHT CLI CALLERS, AND THEIR STDERR LANDS IN AN AGENT'S COMPOSER
+
+**Status:** OPEN
+
+*Observed by a downstream campaign on two of its rows, 2026-08-13. Root cause confirmed in code and
+against the live filesystem before filing.*
+
+**The symptom.** Two `claude-code` rows, both mid-turn, each carrying this **inside the composer
+box** — not in scrollback:
+
+```
+Error: connecting to <YGGTERM_HOME>/server-3-0-122.sock
+Caused by: No such file or directory (os error 2)
+```
+
+⭐ **The two rows named DIFFERENT versions (122 and 126), and that is the whole tell.** The daemon
+socket name is version-pinned, so a CLI caller resolves a path that exists only while that exact
+daemon version is listening.
+
+⛔ **THE CONSEQUENCE IS A REACHABILITY FAILURE, NOT A COSMETIC ONE.** A row whose composer holds
+that text is **not addressable by `terminal submit`** — it answers `composer_shown:false`, *"the row
+is mid-output, in a menu, or is not an agent CLI"*. Messages to both rows were refused for **over
+forty minutes across ~40 attempts each** while both were alive and working normally. ⇒ **From the
+outside, a poisoned composer is indistinguishable from a busy row.** And since a deploy campaign
+generates this condition, **a deploy can make unreachable the very rows needed to coordinate a
+deploy.**
+
+### ROOT CAUSE — the back-alias mechanism can only preserve a version whose file still exists
+
+The design already intends old callers to keep working: `refresh_legacy_server_socket_aliases`
+(`crates/yggterm-server/src/daemon.rs:434`) re-points legacy version sockets at the running daemon
+on every bind. It draws candidates from **two** sources
+(`versioned_server_socket_alias_candidates`, same file, line 384):
+
+1. **files already present in `$YGGTERM_HOME`** that parse as a versioned server socket name;
+2. **scope directories under `$YGGTERM_HOME/client-instances/`.**
+
+⇒ **Source 1 is self-erasing.** A retiring daemon's socket file goes away, and once it is gone the
+version is no longer a candidate, so the *next* daemon never aliases it. Source 2 is the only
+durable one — and it is not being populated for current versions.
+
+**Measured on a live host, and the correlation is exact:**
+
+```
+client-instances scope dirs      24   (a historical set; the newest is 3-0-80)
+server-3-0-80.sock               SYMLINK -> server-3-0-128.sock   ← has a scope dir, so it was aliased
+server-3-0-118 … 3-0-127.sock    ABSENT, every one, no alias      ← no scope dir, file already gone
+server-3-0-128.sock              real socket (the live daemon)
+```
+
+⇒ A caller pinned to 3.0.80 still resolves **today**. A caller pinned to any version from 3.0.118
+onward is orphaned the moment its daemon retires. The mechanism is faithfully aliasing a museum
+while every modern version falls through it.
+
+⚠ **What is measured vs what is inferred.** The two sources, the self-erasing property and the
+filesystem census above are all confirmed. **What writes `client-instances/` scope dirs, and why it
+stopped covering versions after 3-0-80, is NOT yet established** — that is the first thing to find,
+and it is where the fix probably lives.
+
+### Fixes, and the first is not the obvious one
+
+1. ⭐ **Make the alias set durable rather than derived from surviving files.** A version's alias must
+   not depend on its own socket file outliving its daemon, which is the property that guarantees
+   failure. Recording each bound version in a ledger — or restoring whatever populated
+   `client-instances/` — removes the whole class.
+2. **A caller that cannot reach its pinned socket should fall back to the CURRENT daemon**, not
+   die. It is the same host and the same `$YGGTERM_HOME`; a version-pinned path is an optimisation,
+   not an identity.
+3. ⛔ **A CLI's stderr must never reach an agent row's PTY.** Whatever invokes the CLI inside a
+   session must capture it. This is the half that turns a recoverable miss into an unreachable row,
+   and it is worth fixing even if 1 and 2 land.
+4. ⚠ **Ruled out already, so nobody repeats it:** the claim script's title watcher is innocent (it
+   is already fully redirected), and the booter's run path captures output. The writer is elsewhere.
+
+⚖ **Relation to the constitution.** *"Other agents' sessions survive our restarts"* is the standing
+guarantee, and this is a live counter-example: our own deploys are degrading other agents' rows.
+⇒ It belongs with the hot-restart/daemon-lifecycle work, not with the deploy-identity work.
+
 ## ⛔ A DIRTY CHECKOUT ONLY WARNS, SO A RELEASED BINARY STAMPS ITSELF `-dirty`
 
 **Status:** OPEN
