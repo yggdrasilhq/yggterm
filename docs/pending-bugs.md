@@ -5661,11 +5661,20 @@ floor, because the startup reconcile was measured re-running **three times in
 ninety seconds** and three daemons is a fork bomb wearing a repair. Neither is a
 one-shot — a repair that fired once and failed is gone rather than slow, so the
 floor retries.
-**Still owed:** the source-level test pins the call, and the guards are pinned by
-unit tests, but **the spawn itself has not been watched happening in the wild** —
-it needs a host whose newest daemon is older than a freshly launched GUI, which
-is the state this fix exists to end. Falsifier: `successor: "spawned"` in that
-event, followed by a daemon at the GUI's version appearing in `server daemons`.
+**Still owed, and an attempt to close it narrowed the scope instead.** The call
+is source-pinned and the guards are unit-tested, but **the spawn has not been
+watched happening.** A full GUI was run in `scripts/underglass-sandbox.sh`'s
+private sway against a private home holding exactly the failing shape — a
+3.0.128 daemon owning a live runtime, no newer socket, a 3.0.135 GUI — and the
+GUI **did not decline**: it took the ordinary `startup_hot_swap_requested` path
+and a 3.0.135 daemon came up that way. ⇒ the decline branch needs an
+**unaccounted** runtime key specifically, not merely a version gap, and an
+attached session is accounted for. That is worth knowing: the branch this fix
+guards is the rarer one, and reproducing it means creating a runtime the stale
+daemon has not yet persisted.
+**Falsifier, unchanged:** `successor: "spawned"` in
+`startup_hot_swap_declined_swap_queued`, followed by a daemon at the GUI's
+version appearing in `server daemons`.
 ⚠ **Do NOT reach for a socket alias instead.** Aliasing an absent version onto a
 live daemon is only sound in the older-client → newest-daemon direction; pointing
 a current client at an older daemon is the backwards cross-version proxy that has
