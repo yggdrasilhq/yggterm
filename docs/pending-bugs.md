@@ -150,162 +150,6 @@ not propagated to every store is a delete that a peer undoes.
 must not reappear, and the restore must be able to *name* how many rows it
 declined to restore because they were deleted.
 
-## ⛔⛔ [6.2] THE START PAGE CANNOT BE USED TO FIND A SESSION
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-*reported 2026-08-13*
-
-The start page is the surface a user falls back to when the sidebar has failed
-them, which is exactly when it was reached for. It could not do the job. Four
-separate gaps, reported together:
-
-1. **No recency order.** It does not list most-recently-used first. The observed
-   order was described as "weird" — meaning it is neither recency nor anything
-   the reader could name. Whatever it currently sorts by, the ordering rule is
-   not discoverable from the output.
-2. **No search.** There is no search box. A user cannot find a session by
-   anything in its title, and cannot find one by anything in its *contents*
-   either. With 44 rows across three machines, scanning is not a substitute.
-3. **It lists libyggterm app rows.** ychrome and the other app rows appear
-   alongside agent sessions. An app row is not a session anyone resumes, so it
-   is noise on the one surface whose job is picking a session.
-4. **The open verb does not name the CLI.** The action reads `Open in Claude` /
-   `Open`. It should name the actual CLI the session belongs to — *Open this
-   Codex Session*, *Open this Claude Session*, *Open this Antigravity Session* —
-   and each entry should be colour-coded to that CLI's brand identity (nearest
-   available colour is fine).
-
-**Why 2 is the load-bearing one.** Searching session *contents* is what turns
-the start page from a list into a recovery tool: after a restore failure the user
-knows what the session was doing, not what it was called.
-
-⚠ **Check both surfaces together.** Any ordering or filtering rule decided here
-applies to the CWD-tree sidebar as well — see the standing rule in `CLAUDE.md`
-about applying a spec across every surface that touches the concept.
-
-**What was found, and what shipped (3.0.113):**
-
-1. **The order was alphabetical by session uuid.** The rank key was
-   `fs::metadata(row.full_path)`, which answers 0 for anything that is not a
-   local `.jsonl` file — and of the 41 session rows on the live host, **not one
-   was**: they are `remote-cc://` (32), `local://` (6), `remote-session://` and
-   `live::`. The key was therefore CONSTANT ZERO over the whole corpus, every
-   comparison fell through to the `full_path` tie-break, and the result is an
-   order nobody can name because a uuid means nothing. The key is now resolved
-   by session id against the scans that already carry `modified_epoch`, and the
-   page prints its own rule beside the heading. ⚠ The stat also ran per row per
-   render, which `AGENTS.md` names as a bug in its own right; it is now a
-   documented last resort, memoized per build.
-2. **Search** reuses `row_matches_search` / `row_search_blob` — the predicate the
-   cwd tree already searches with, which covers the generated summary, title,
-   cwd, host, session id and transcript context. One predicate, so the two
-   surfaces cannot disagree. No indexer was built: the corpus was already there.
-3. **App rows** are dropped by their persisted `Source` stamp
-   (`app:<name>:<verb>`), never by their title — an app row is a
-   `SessionKind::Shell` on a `local://` path, so the title is the only other
-   signal and titles change.
-4. **The open verb and its colour come from the CLI registry.** Both were
-   `match`es that between them knew three of the nine registered CLIs; a tenth
-   is now a table row. ⚠ The amber the button painted (`#d97706`) failed WCAG AA
-   at 3.19:1 under its own white label — every replacement clears 4.5:1, locked
-   by a test.
-
-⚖ **THE HOLISTIC CHECK AGAINST THE CWD-TREE SIDEBAR — all three ordering paths
-read, not assumed.** Two agree with the start page; one does not, and it is the
-sidebar's own instance of this entry's defect:
-
-| sidebar path | orders by | verdict |
-|---|---|---|
-| local agent sessions in a cwd folder (`build_local_cwd_tree`) | `modified_epoch_ms` desc | ✅ recency, real scanner epochs |
-| remote scanned sessions (`sort_remote_scanned_sessions_by_recency`) | `modified_epoch` desc, then `started_at` | ✅ recency, real scan epochs |
-| **local LIVE session rows** (`inject_cc_sessions_into_stored_rows`) | **the REVERSE of the Live Sessions order** | ⚠ **fixed 3.0.116, live proof owed** |
-
-⇒ **The third was the same shape as the bug this entry opened with — but not in
-the place this table first named, and the correction is the interesting part.**
-
-The row above used to read `synthetic_local_live_session_rows` / `cwd, then
-session_path` / *uuid within a group*. **That function emits GROUP HEADERS
-ONLY.** Two sessions sharing a cwd produce identical group paths and the second
-is swallowed by `emitted_groups`, so its `session_path` tie-break was
-unobservable in its own output and had never decided an order at all. It read
-exactly like the cause, which is why it was filed as one; a reader who fixed
-that line would have changed nothing and believed the entry closed. It is now
-deleted, with a comment at the site saying why, so the next reader is not sent
-back to it.
-
-The order was decided one function over, in `inject_cc_sessions_into_stored_rows`.
-Every row destined for the SAME cwd group gets the SAME insert point, and the
-loop inserts back-to-front so earlier indices survive later insertions — but the
-tie ran FORWARD. So the first row was inserted first and each successor pushed it
-down: **the folder came out in exactly reverse order.** Not uuid order — the
-user's own Live Sessions outline, upside down, which reads as no order at all.
-
-⭐ **Measured, not reasoned.** With the fix reverted, the new test
-`live_rows_in_a_cwd_group_order_by_recency_then_live_sessions_order` answers
-`["three","two","one"]` for an input of one, two, three. Its fixture makes all
-four candidate orders disagree — input, uuid-alphabetical, reversed-input and
-recency are four different sequences — so whichever appears is diagnostic on its
-own, and the expected answer can never be what the bug happens to produce.
-
-**Fixed in 3.0.116.** Rows sort most-recently-used first, over the SAME epoch map
-the start page orders by (`scanned_last_used_epochs_by_session_id`, one
-implementation, two callers, so the surfaces cannot disagree about what recent
-means). The tie-break is the Live Sessions order. ⚠ **That tie-break is
-load-bearing, not decoration:** a purely local live row has no scan to timestamp
-it, so the epoch is 0 for every row in the folder and the TIE-BREAK is what
-actually orders it — see [[finding-an-unknown-default-sorts-as-a-value]]. It must
-stay something a reader can name.
-
-**Found while fixing it:** the synthetic branch emitted the folder scaffolding
-and stopped, projecting a live session's cwd folder into the tree **with nothing
-inside it** — the session was reachable under Live Sessions only. It now fills
-that scaffolding through the same injector the stored-row path uses, so live
-session rows have ONE owner and a fresh profile cannot order a folder differently
-from an established one. The existing test asserted the row appeared once and was
-pinning that gap; two is what [[spec-active-sessions-dual-presence]] asks for.
-
-⚠ **Scope note, so the next reader does not "fix" the wrong thing:** the **Live
-Sessions group** is ordered by the user's own outline numbers (`server app
-sessions sort` re-derives it from them, segments comparing as integers). That is
-a MANUAL order by design and recency must never be imposed on it. The defect
-above is in the **cwd-tree** projection of live local sessions, not in the Live
-Sessions group.
-
-**The app-row filter is deliberately start-page-only** — the sidebar is where app
-rows are managed, and the report scopes the complaint to "the one surface whose
-job is picking a session".
-
-**Live proof taken on the desktop host, GUI + daemon both 3.0.113:**
-
-- ✅ **Order.** The heading reads `RECENT WORK — most recently used first`, and
-  the card order begins `d6f7653a · ebf6c53e · abee5005 · efe51740 · 23b20d7c`.
-  That is not the alphabetical-by-uuid sequence the page produced before, and
-  the first card is the session that was active when the page was opened.
-- ✅ **App rows are gone from it.** The sidebar carries six app rows at the time
-  of the capture (one `New Yedit`, five `New Ychrome`); none appears in Recent
-  work.
-- ✅ **The open verb and the brand colour.** Every card reads `Open this Claude
-  Code Session` on Claude's clay; the `New Codex Session` control is on OpenAI's
-  teal, where before it took the theme accent like six other CLIs.
-- ✅ **The search box renders**, placeholder `Search title, summary, path`.
-
-⚠ **What is still owed, and it is narrow:** a LIVE keystroke into that box, and
-the live proof of the sidebar ordering above. The matching itself is the
-sidebar's already-shipped `row_matches_search` and the wiring is unit-tested.
-The verb that was missing — nothing in app-control could type into a shell DOM
-field — **is built in 3.0.116**: `server app chrome type <selector> --data
-<text> [--assert <selector>@<attribute>]`. It writes through the native value
-setter and dispatches a bubbling `input` event, then samples the assertion
-before the keystroke and again after the render settles **inside one
-evaluation**, because two reads taken at two different moments cannot prove a
-field drove a re-render — the difference between them may be time rather than
-the typing.
-
-**Falsifier for the remainder:** type a word that appears ONLY in a session's
-generated summary — never in its title, cwd or host — and that session is the
-one card left standing.
-
 ## ⛔ [6.2] A NEW CLI ROW IS BORN NAMED AFTER WHOEVER SPAWNED IT
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -318,6 +162,39 @@ symptom: a freshly spawned row reads `{whatever the spawner is called}
 {claude-code,codex,…}` until the CLI self-titles. Kept as one entry — see the
 existing narrative for the detail; this line exists so the 6.2 delegate knows it
 is in scope.
+
+**Live proof attempted 2026-08-13 on the desktop host, GUI + daemon both
+3.0.116 — and it came back TWO THIRDS green, which is why this stays open.**
+Three ephemeral `claude-code` rows created back to back by one command, same
+cwd, each with `--purpose`:
+
+| row | rendered title |
+|---|---|
+| probe A (created 1st) | `Agent unnamed claude-code` |
+| probe B (created 2nd) | `Agent unnamed claude-code: 6.2 sidebar order probe B` |
+| probe C (created 3rd) | `Agent unnamed claude-code: 6.2 sidebar order probe C` |
+
+B and C are the fixed form: named for the agent and its PURPOSE, not for the row
+that spawned them. **A is not, and the purpose is not missing — it is recorded
+and unrendered.** `server terminal tenants` carries
+`created_by.purpose = "6.2 sidebar order probe A"` for that exact row. So the
+create kept it and the title composition dropped it.
+
+⚠ **Three explanations were tried and killed before filing, because "one row out
+of three" invites a guess:**
+
+- **Not time decay.** B still rendered its purpose six minutes later.
+- **Not "only the newest row shows it".** Creating C did not take B's purpose
+  away; both held it side by side.
+- **Not lost at create.** The daemon's own tenancy record has A's purpose.
+
+⇒ What is left is a divergence between the stored purpose and the composed
+title, on the FIRST row of a batch. Not root-caused, and deliberately not
+guessed at.
+
+**Falsifier:** create three rows in one command with `--purpose`, and all three
+titles carry their purpose; or `created_by.purpose` is absent for the one that
+does not.
 
 ## ⛔ A SCREENSHOT OF A NON-TERMINAL VIEW PHOTOGRAPHS WHATEVER HOLDS FOCUS
 
@@ -346,6 +223,16 @@ flagged faithful. Exactly inverted for this surface.
 the addressed client reports `faithful:false` with a reason naming what it
 photographed. A capture verb that cannot say what it captured is not a
 verification instrument.
+
+⚠ **Second sighting, 2026-08-13 at 3.0.116, and it is the more dangerous one
+because the frame was RIGHT.** With `force-foreground on` set first, the same
+call answered `capture_faithful: true, capture_backend:
+linux_wayland_spectacle` and returned a correct picture of the start page. The
+reply is byte-identical in shape to the one that photographed a text editor.
+⇒ **The flag did not become trustworthy; the FOCUS happened to be correct.** An
+agent cannot tell the two cases apart from the reply, which is exactly the
+defect — a verification instrument whose output is the same whether or not it
+verified anything. Reading the PNG remains the only check.
 
 **Falsifier:** with the GUI unfocused, `screenshot --pid <gui>` returns a frame
 of that GUI, or refuses.
@@ -3323,6 +3210,32 @@ token and no session id to resume, rather than at whether the record was written
 handover, and read `server app rows` back. Three rows with the same paths is a
 pass; the reply's own `preserved_terminal_owner_keys` echoing them is NOT — that
 is precisely the field that was already true while they died.
+
+⛔⛔ **AGENT ROWS ARE NOT SAFE EITHER, AND THE LOSS IS RECORDED AS THE USER'S
+DOING — measured 2026-08-13, 3.0.114 → 3.0.116 on the desktop host.** The table
+above says every numbered agent row survived; that is no longer the whole story.
+`server app update restart` reported the request and did nothing — the GUI sat
+at `hot_update_handoff_active` for four minutes with the same pid, never
+swapping — so the GUI was terminated and relaunched by hand. Rows went **48 →
+46**, and the two that did not come back were both **`remote-cc://` agent
+rows**: another cluster's live 6.7 row, and a 6.2 row.
+
+⚠ **The second half is worse than the loss.** `server app sessions restore` —
+the verb built for exactly this — refused both, answering `declined_closed` with
+`restorable: 0`. Nobody closed them. The tombstone plane cannot tell *the user
+deleted this row* from *this row was lost when its GUI died*, so it files an
+involuntary loss under the one heading that makes it unrecoverable, and the
+recovery verb then declines by design. `server app open` restored the 6.7 row in
+one call, which is the tell: the row was perfectly openable, and only the
+deny-list stood in the way.
+
+⇒ Two owners: the handover half belongs here; **the tombstone half belongs with
+the restore lifecycle** — see *"[6.1] SOME ROWS WILL NOT RESTORE"* above, whose
+deny-list this is.
+
+**Falsifier for this half:** kill a GUI holding agent rows, relaunch, and every
+row returns; or `sessions restore` accepts the ones that did not, rather than
+naming them `declined_closed`.
 
 ⭐ **A SECOND, SIMPLER CANDIDATE CAUSE — measured 2026-08-09, and it fits every
 column of the table above.** Look at *when* the shells died rather than at the
