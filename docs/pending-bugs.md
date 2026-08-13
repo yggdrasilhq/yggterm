@@ -211,11 +211,41 @@ about applying a spec across every surface that touches the concept.
    at 3.19:1 under its own white label — every replacement clears 4.5:1, locked
    by a test.
 
-⚖ **The sidebar needed no ordering change**: `build_local_cwd_tree` already sorts
-each folder's sessions by `modified_epoch_ms` descending, so the two surfaces now
-agree. The app-row filter is deliberately start-page-only — the sidebar is where
-app rows are managed, and the report scopes the complaint to "the one surface
-whose job is picking a session".
+⚖ **THE HOLISTIC CHECK AGAINST THE CWD-TREE SIDEBAR — all three ordering paths
+read, not assumed.** Two agree with the start page; one does not, and it is the
+sidebar's own instance of this entry's defect:
+
+| sidebar path | orders by | verdict |
+|---|---|---|
+| local agent sessions in a cwd folder (`build_local_cwd_tree`) | `modified_epoch_ms` desc | ✅ recency, real scanner epochs |
+| remote scanned sessions (`sort_remote_scanned_sessions_by_recency`) | `modified_epoch` desc, then `started_at` | ✅ recency, real scan epochs |
+| **local LIVE session rows** (`synthetic_local_live_session_rows`) | **`cwd`, then `session_path`** | ⚠ **uuid within a group** |
+
+⇒ **The third is the same shape as the bug this entry opened with.** Its PRIMARY
+sort by cwd is structural and must stay — the function emits a group header each
+time the cwd changes, so sorting by anything else first would shatter the
+grouping. But the tie-break INSIDE one cwd group is `session_path.cmp()`, which
+for `local://<uuid>` rows is alphabetical by uuid. A folder holding several live
+local sessions therefore lists them in an order that means nothing, exactly as
+the start page did.
+
+**Not fixed here, and deliberately so:** the fix needs a last-used epoch for a
+live row, which is the `start_page_scanned_last_used_epochs` lookup — and
+`synthetic_local_live_session_rows` is not handed the snapshot that lookup reads.
+Threading it through is a real change to the sidebar row builder, not a tweak,
+and it wants its own build-and-prove cycle rather than being tacked onto this
+one.
+
+⚠ **Scope note, so the next reader does not "fix" the wrong thing:** the **Live
+Sessions group** is ordered by the user's own outline numbers (`server app
+sessions sort` re-derives it from them, segments comparing as integers). That is
+a MANUAL order by design and recency must never be imposed on it. The defect
+above is in the **cwd-tree** projection of live local sessions, not in the Live
+Sessions group.
+
+**The app-row filter is deliberately start-page-only** — the sidebar is where app
+rows are managed, and the report scopes the complaint to "the one surface whose
+job is picking a session".
 
 **Live proof taken on the desktop host, GUI + daemon both 3.0.113:**
 
