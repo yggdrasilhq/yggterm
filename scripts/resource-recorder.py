@@ -93,11 +93,22 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 def classify(comm, cmdline):
     """Role, not just comm. `comm` truncates at 15 chars and several distinct
     processes collapse onto the same string there, which is how a daemon and a
-    GUI end up looking like one population."""
+    GUI end up looking like one population.
+
+    ⛔ AND THE TRUNCATION MUST BE MATCHED EXPLICITLY, not just tolerated.
+    `/proc/<pid>/cmdline` reads back EMPTY whenever the process is mid-exec or
+    being reaped, and under load that happens often enough to matter. When it
+    does, the only evidence left is `comm` — which the kernel has already cut to
+    "WebKitWebProces" (no trailing 's'). Matching the full spelling then falls
+    through to the generic branch and invents a SECOND role for the same
+    process. Caught live: `web_content` at 20.5% sitting beside a phantom
+    `webkitwebproces` at 14.3%, i.e. a third of the web process's cost filed
+    under a name nobody would think to add up.
+    """
     c = (cmdline or "") + " " + comm
-    if "WebKitWebProcess" in c:
+    if "WebKitWebProces" in c:  # truncated spelling is a prefix of the full one
         return "web_content"
-    if "WebKitNetworkProcess" in c:
+    if "WebKitNetworkPr" in c:
         return "web_network"
     if "yggterm-headless" in c:
         return "daemon"
