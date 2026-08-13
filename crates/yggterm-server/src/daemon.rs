@@ -9744,7 +9744,7 @@ impl DaemonRuntime {
                 let initial_size = initial_cols
                     .zip(initial_rows)
                     .or_else(|| self.server.session_pty_grid(&path));
-                self.terminals.restart_session_with_size(
+                let restart_outcome = self.terminals.restart_session_with_size(
                     &runtime_path,
                     &launch_command,
                     cwd.as_deref(),
@@ -9764,8 +9764,14 @@ impl DaemonRuntime {
                         self.preserved_terminal_owners.entries.is_empty(),
                     );
                 }
+                // `replaced_existing=false` says the restart shut NOTHING down —
+                // the row's real owner is elsewhere (another daemon, or an
+                // orphaned key), so the process that was serving it is still
+                // alive. Without this the reply reads "restarted" either way,
+                // which is what let a wedged row survive its own remedy.
                 self.snapshot_response(Some(format!(
-                    "restarted {path}; launch_refreshed={launch_refreshed}; recovered_remote_scan={recovered_remote_scan}; force_remote={force_remote}"
+                    "restarted {path}; launch_refreshed={launch_refreshed}; recovered_remote_scan={recovered_remote_scan}; force_remote={force_remote}; replaced_existing={}",
+                    restart_outcome.replaced_existing
                 )))
             }
             ServerRequest::SyncExternalWindow => {

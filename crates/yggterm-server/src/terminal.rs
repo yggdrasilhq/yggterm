@@ -1112,7 +1112,7 @@ impl TerminalManager {
         launch_command: &str,
         cwd: Option<&str>,
         stop_command: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<TerminalRestartOutcome> {
         self.restart_session_with_size(key, launch_command, cwd, stop_command, None)
     }
 
@@ -1123,7 +1123,7 @@ impl TerminalManager {
         cwd: Option<&str>,
         stop_command: Option<&str>,
         initial_size: Option<(u16, u16)>,
-    ) -> Result<()> {
+    ) -> Result<TerminalRestartOutcome> {
         // PRESERVE the outgoing session's grid across a restart. Without an explicit
         // initial_size, re-creating the PTY at the DEFAULT 120x36 left the new PTY
         // narrower than the client's real grid (e.g. 159x63). The client would then
@@ -1153,12 +1153,33 @@ impl TerminalManager {
                 "preserved_size": preserved_size.is_some() && initial_size.is_none(),
             }),
         );
-        if let Some(runtime) = self.sessions.remove(key) {
+        // ⛔ WHETHER ANYTHING WAS SHUT DOWN IS THE ANSWER, NOT A DETAIL.
+        // `remove` returns None whenever the key does not resolve — an orphaned
+        // key, or a session whose runtime is owned by a DIFFERENT daemon (every
+        // `remote-*` row is served by the daemon on its own host). The restart
+        // then shuts nothing down and spawns a replacement anyway, so the
+        // process that was serving this key is still alive and now orphaned
+        // beside its successor. That is not a restart, and reporting it as one
+        // is how a wedged row survives the remedy that claims to clear it:
+        // `input-check` names the wedge correctly, recommends this verb, and
+        // the verb answered "restarted" while the wedged CLI kept its PTY.
+        let replaced_existing = if let Some(runtime) = self.sessions.remove(key) {
             runtime.shutdown(stop_command)?;
-        }
+            true
+        } else {
+            trace_terminal_event(
+                "restart_replaced_nothing",
+                serde_json::json!({
+                    "path": key,
+                    "reason": "no runtime under this key — nothing was shut down, and any \
+                               process still serving it is now orphaned beside the replacement",
+                }),
+            );
+            false
+        };
         let runtime = PtySessionRuntime::spawn(key, launch_command, cwd, effective_initial_size)?;
         self.sessions.insert(key.to_string(), runtime);
-        Ok(())
+        Ok(TerminalRestartOutcome { replaced_existing })
     }
 
     pub fn remove_session(&mut self, key: &str, stop_command: Option<&str>) -> Result<bool> {
@@ -1273,6 +1294,18 @@ struct PtySessionRuntime {
     app_declares: Arc<Mutex<AppDeclareLog>>,
     launch_command: String,
     cwd: Option<String>,
+}
+
+/// What a restart actually DID, as opposed to what it was asked to do.
+///
+/// ⛔ `replaced_existing: false` means the restart shut NOTHING down: no runtime
+/// resolved under that key, so whatever was serving it is still alive and is now
+/// orphaned beside the freshly spawned replacement. A caller that reports such a
+/// call as "restarted" is telling the operator their wedged row was cleared when
+/// it was not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalRestartOutcome {
+    pub replaced_existing: bool,
 }
 
 struct TerminalWriteRequest {
@@ -5885,6 +5918,52 @@ line-two on the real screen\r\n\
         manager
             .remove_session(key, None)
             .expect("shutdown resize fence session");
+    }
+
+    /// A restart must say whether it SHUT ANYTHING DOWN.
+    ///
+    /// `sessions.remove(key)` answers `None` for a key this manager does not
+    /// hold — an orphaned key, or a `remote-*` row whose runtime belongs to the
+    /// daemon on its own host. The restart then shuts nothing down and spawns a
+    /// replacement anyway, leaving the process that was serving that key alive
+    /// and orphaned beside its successor.
+    ///
+    /// Observed live: a wedged agent row was told to restart, the reply said
+    /// `restarted …`, and the wedged CLI kept its PTY and its wedge. The remedy
+    /// that `input-check` recommends for a wedge could not clear one.
+    ///
+    /// ⛔ Asserts BOTH halves, so it cannot pass by always reporting one value.
+    #[test]
+    fn a_restart_reports_whether_it_replaced_anything() {
+        let mut manager = TerminalManager::new();
+        let key = "restart-outcome-probe";
+
+        // Half 1: nothing under this key — the restart replaces NOTHING, and
+        // must say so rather than reporting a restart it did not perform.
+        let fresh = manager
+            .restart_session(key, "sh -lc 'sleep 30'", None, None)
+            .expect("restart with no prior runtime still spawns");
+        assert!(
+            !fresh.replaced_existing,
+            "a restart that found no runtime under its key shut nothing down; \
+             reporting it as a restart is what let a wedged row survive its own \
+             remedy"
+        );
+
+        // Half 2: now a runtime IS held under the key, so the restart genuinely
+        // replaces it. Without this half the test would pass on a constant false.
+        let replaced = manager
+            .restart_session(key, "sh -lc 'sleep 30'", None, None)
+            .expect("restart over a live runtime");
+        assert!(
+            replaced.replaced_existing,
+            "a restart over a runtime this manager holds must report that it \
+             shut the old one down"
+        );
+
+        manager
+            .remove_session(key, None)
+            .expect("shutdown restart-outcome probe");
     }
 
     #[test]
