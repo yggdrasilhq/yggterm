@@ -178,27 +178,47 @@ print("PRED_LABEL="+((pred.get("session_title") or pred.get("label") or "") if p
 case "$PLAN" in ERR*) echo "ygg-claim: ${PLAN#ERR }" >&2; exit 2 ;; esac
 eval "$(printf '%s\n' "$PLAN" | grep -E '^(MINE|MINE_LABEL|NUM|PRED|PRED_LABEL)=' | sed 's/=/="/; s/$/"/')"
 
-# THE SEAT GOES IN THE TITLE **AS WELL AS** IN `outline` — belt and braces.
+# ⛔⛔ THE SEAT NEVER GOES IN THE TITLE. It lives in `outline_prefix` and NOWHERE ELSE.
 #
-# The sidebar builder re-composes `outline_prefix` onto the row's label as its
-# last act, precisely so a CLI re-titling itself cannot drop the number, and the
-# sidebar draws that composed label. So the API and the screen agree BY DESIGN,
-# and seat/title separation is the better architecture.
+# The row's name is composed at RENDER time:  label = "<outline_prefix> <title>",
+# and the shape the sidebar must read is:
 #
-# ⚠ But a stored prefix has been observed to VANISH between two reads (2026-08-08),
-# leaving the row unnumbered. Until that durability defect is closed, also compose
-# the number into the title — the field the watch below defends.
+#        N.x  [category]: what this row is for
+#        ───  ────────────────────────────────
+#         │                    └── the stored title, exactly as passed to --title
+#         └── outline_prefix, stored apart and composed on
 #
-# ⛔ A CORRECTION WORTH KEEPING: I first read a composed label from the API, saw an
-# unnumbered row in a screenshot taken 40 minutes later, and concluded the field
-# was lying about what the sidebar renders. FALSE — the seat had evaporated in
-# between. An API read taken at a DIFFERENT MOMENT from the screenshot is not a
-# verification of the screen: sample both at once, or the difference you find may
-# be TIME rather than disagreement.
-case "$NUM" in
-  *.*) FINAL_TITLE="${NUM} ${TITLE}" ;;   # sub-seat: "5.1 topic"
-  *)   FINAL_TITLE="${NUM}. ${TITLE}" ;;  # top-level: "4. topic"
+# ⚠ THIS USED TO WRITE THE NUMBER INTO THE TITLE AS WELL — "belt and braces" against
+# a prefix observed to evaporate (2026-08-08). That belt caused TWO defects at once
+# and is removed:
+#
+#   1. DOUBLE NUMBERING. The builder composes the prefix onto a title that already
+#      carried it, so the sidebar drew "6.1 6.1 restore lifecycle: …". Once several
+#      rows are wearing two numbers, nobody can tell a seat from a name.
+#   2. ⛔ A CLAIM THAT WORKED REPORTED FAILURE, AND THE FAILURE SKIPPED THE REAP.
+#      The server normalises the seat back out of the title, so the verifier below
+#      compared its own composed string against a correctly-stored clean one, called
+#      a good row bad, and `exit 3`-ed — ABOVE the booter arm and ABOVE `--replace`.
+#      ⇒ every successor that ran this script left its predecessor alive and itself
+#      unarmed, which is why duplicate seats kept appearing and were mistaken for
+#      an agent declining to reap. The agent never got the chance.
+#
+# The durability worry the belt existed for is answered by the WATCH below, which
+# re-asserts the prefix — the right instrument, because it defends the field that
+# actually stores the seat instead of hiding a copy somewhere it must not be.
+#
+# ⛔ A CORRECTION WORTH KEEPING: an API read taken at a DIFFERENT MOMENT from a
+# screenshot is not a verification of the screen. Sample both at once, or the
+# difference you find may be TIME rather than disagreement.
+
+# Defensive: strip a seat the caller composed in by hand. Callers keep doing this
+# because the sidebar SHOWS a number, so a number looks like part of the name.
+TITLE="$(printf '%s' "$TITLE" | sed -E 's/^[0-9]+(\.[0-9]+)*\.?[[:space:]]+//')"
+case "$TITLE" in
+  *:*) ;;
+  *) log "note: --title has no '<category>: ' prefix; the scheme is \"N.x [category]: what it is for\"" ;;
 esac
+FINAL_TITLE="$TITLE"
 log "row      : $MINE"
 log "was      : $MINE_LABEL"
 log "claiming : $FINAL_TITLE"
@@ -219,14 +239,26 @@ assert_state() {
   ygg server app session rename  "$MINE" "$FINAL_TITLE"  >/dev/null 2>&1
   read_state
 }
+# ⛔ COMPARE AGAINST WHAT THE SERVER STORES, NOT AGAINST WHAT WE SENT.
+# The seat lives in `outline_prefix`; the title is stored CLEAN. A comparison that
+# expects the seat inside the title asserts a representation the server deliberately
+# stopped keeping — it calls a correct row wrong, and the exit it takes is above the
+# booter arm and above the predecessor reap. Normalise a legacy numbered title out of
+# the read-back so an old row verifies too (and gets rewritten clean on the way).
+matches() {
+  local got_num="${1%%	*}" got_title="${1#*	}"
+  got_title="$(printf '%s' "$got_title" | sed -E 's/^[0-9]+(\.[0-9]+)*\.?[[:space:]]+//')"
+  [ "$got_num" = "$NUM" ] && [ "$got_title" = "$FINAL_TITLE" ]
+}
 GOT=""
 for attempt in 1 2 3; do
   GOT="$(assert_state)"
-  [ "$GOT" = "$(printf '%s\t%s' "$NUM" "$FINAL_TITLE")" ] && break
+  matches "$GOT" && break
   sleep 3
 done
-[ "$GOT" = "$(printf '%s\t%s' "$NUM" "$FINAL_TITLE")" ] || {
-  echo "ygg-claim: claim never verified (row reads: $(printf '%s' "$GOT" | tr '\t' '|'))" >&2; exit 3; }
+matches "$GOT" || {
+  echo "ygg-claim: claim never verified (row reads: $(printf '%s' "$GOT" | tr '\t' '|'))" >&2
+  echo "ygg-claim: ⛔ the booter arm and the --replace reap below did NOT run" >&2; exit 3; }
 log "claimed and verified by read-back: seat=$NUM title=$FINAL_TITLE"
 
 # --- ARM THE BOOTER (OPT-IN) ------------------------------------------------
