@@ -56560,15 +56560,15 @@ fn append_viewport_session_contract_violations(
 /// consumer can see what exists. Same call the row resolver and the search path
 /// already make, for the same reason.
 fn app_control_rows_with_every_set_open(shell: &ShellState) -> Vec<BrowserRow> {
+    // ⚠ THE TREE'S OWN EXPANSION, UNCHANGED — only the ROW-SET collapse is
+    // overridden. Reaching for the search path's force-expansion here instead
+    // opened every folder and machine as well: the answer went from 47 rows to
+    // 1454, every session listed twice through its dual presence, and
+    // `resolve_app_control_row` began matching the cwd-tree copy of a row —
+    // which heads no set — so `row-expanded` started refusing. Widening a data
+    // verb means showing the rows a FOLD hides, not unfolding the whole tree.
     let stored_rows = shell.browser.search_rows();
     let stored_projection_rows = shell.browser.all_rows();
-    let expanded_paths = search_expanded_paths(
-        &stored_rows,
-        shell.server.remote_machines(),
-        shell.server.ssh_targets(),
-        &shell.server.live_sessions(),
-        &shell.browser.expanded_path_set(),
-    );
     let mut rows = merged_sidebar_rows_traced(
         &shell.bootstrap.settings_path,
         "app_control_rows",
@@ -56577,7 +56577,7 @@ fn app_control_rows_with_every_set_open(shell: &ShellState) -> Vec<BrowserRow> {
         shell.server.remote_machines(),
         shell.server.ssh_targets(),
         &shell.server.live_sessions(),
-        &expanded_paths,
+        &shell.browser.expanded_path_set(),
         &HashSet::new(),
         &shell.row_arrangement,
     );
