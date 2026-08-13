@@ -329,8 +329,71 @@ def cmd_list(a):
     return 0
 
 
+def seat_audit(gui_host, subs, dry):
+    """⛔ IDENTITY FAULTS ARE INVISIBLE TO A LIVENESS WATCHER, AND THEY ARE WORSE.
+
+    Every classifier in this file asks "is this row still working". None of them
+    can see a row that is working PERFECTLY and should not exist. Measured
+    2026-08-13, all three in one sidebar while every subscribed row read WORKING:
+
+      · TWO ROWS SHARING A SEAT — a relay took a number already held, so the
+        sidebar had two 6.1s and the pair could only be told apart by grepping
+        their transcripts.
+      · A REAPED ROW BACK FROM THE DEAD, holding a LIVE agent process, sharing a
+        worktree with its own successor. Two agents, one tree — the exact clobber
+        that separate worktrees exist to prevent. The reap had answered
+        verified:true with live_processes:[] and was wrong.
+      · A LIVE AGENT PROCESS SUBSCRIBED TO NOTHING, so no plane was watching it.
+
+    ⇒ A supervision plane that only measures liveness will report a green fleet
+    while work is being silently overwritten. These checks are cheap, they run on
+    every tick, and they are the half that was missing."""
+    findings = []
+    rows = (ygg(gui_host, "server", "app", "rows").get("data") or {}).get("rows", [])
+    seats = {}
+    for r in rows:
+        p = str(r.get("outline_prefix") or "")
+        if p:
+            seats.setdefault(p, []).append(r)
+    for seat, rs in sorted(seats.items()):
+        if len(rs) > 1:
+            findings.append(f"⛔ SEAT {seat} IS HELD BY {len(rs)} ROWS: "
+                            + " | ".join((x.get('label') or '?')[:34] for x in rs))
+
+    # A number sitting in a title is the old scheme leaking back in.
+    for r in rows:
+        t = r.get("session_title") or ""
+        if re.match(r"^\d+(\.\d+)*\.?\s", t):
+            findings.append(f"⚠ TITLE CARRIES ITS OWN NUMBER (renders twice): {t[:52]}")
+
+    # Every subscribed row must still exist; a subscription to a vanished row is a
+    # watcher watching nothing and reporting healthy.
+    live_paths = {r.get("full_path") for r in rows}
+    for s in subs:
+        if not any(s["uuid"] in (p or "") for p in live_paths):
+            findings.append(f"⚠ SUBSCRIBED BUT NO ROW: {s['uuid'][:8]} (seat {s.get('seat') or '-'}) "
+                            "— unsubscribe it or restore the row")
+
+    # And the reverse: an agent process nothing is supervising.
+    known = {s["uuid"] for s in subs}
+    r = _run(None, ["pgrep", "-af", "claude|codex|gemini|amp|opencode"])
+    if r:
+        for line in r.stdout.splitlines():
+            m = re.search(r"--resume\s+([0-9a-f-]{36})|--session-id\s+([0-9a-f-]{36})", line)
+            u = (m.group(1) or m.group(2)) if m else None
+            if u and u not in known and any(u in (p or "") for p in live_paths):
+                findings.append(f"⚠ LIVE AGENT UNSUPERVISED: {u[:8]} — nothing is watching it")
+
+    for f in findings:
+        log(f"  AUDIT {f}")
+    if not findings:
+        log("  AUDIT seats unique · titles clean · subscriptions match rows")
+    return findings
+
+
 def tick(a):
     bs = _babysit()
+    seat_audit(a.gui_host, load_subs(), a.dry_run)
     for s in load_subs():
         uuid = s["uuid"]
         if s.get("owner_pinned"):

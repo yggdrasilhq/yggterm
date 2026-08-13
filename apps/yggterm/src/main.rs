@@ -881,7 +881,7 @@ fn print_server_app_help() {
     sets the order on the GUI — the process that RENDERS it — and answers with
     the resulting `rendered_order`. `server sessions reorder` writes to whichever
     daemon the CLI resolved, which is not always the one the GUI reads.
-  yggterm server app sessions restore <session-path>... [--dry-run]
+  yggterm server app sessions restore <session-path>... [--dry-run] [--include-closed]
     puts NAMED rows back through the same open a click takes, one at a time, and
     REFUSES any the user closed — the deny-list is consulted once for the batch
     and the reply carries `declined_closed_count` plus the paths.
@@ -2224,6 +2224,12 @@ fn main() -> Result<()> {
             // hands back the rows the user deliberately deleted.
             "sessions" if args.get(3).map(String::as_str) == Some("restore") => {
                 let dry_run = args.iter().any(|arg| arg == "--dry-run");
+                // ⚖ The override is NAMED, not implied. A relay legitimately
+                // retires its predecessor's row with `session remove`, so a
+                // deliberately-closed row is sometimes exactly the one someone
+                // wants back — but the default must stay the deny-list, or the
+                // verb is back to being the loop it replaced.
+                let include_closed = args.iter().any(|arg| arg == "--include-closed");
                 let session_paths = cli_positional_args(&args, 4)
                     .into_iter()
                     .map(str::to_string)
@@ -2231,6 +2237,7 @@ fn main() -> Result<()> {
                 yggterm_server::run_app_control_restore_sessions(
                     session_paths,
                     dry_run,
+                    include_closed,
                     timeout_ms,
                 )
             }
