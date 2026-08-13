@@ -61,6 +61,61 @@ deaths. It is temporally adjacent and it is the anomaly in the sequence, but not
 causation, and this campaign has had six causal stories collapse in a single evening. **Both daemons
 were still alive afterwards**, so this is not a simple "old daemon evicted".
 
+### ⭐ ANSWERED FROM THE TRACE, 6.1: IT WAS AN ORDINARY INSTALLED-BINARY HANDOVER, AND THE SUCCESSOR WAS SIGNALLED
+
+Falsifier 2 below is already settled by the real home's own trace, so nobody
+needs to run it. The lane-build daemon was **isolated** — its
+`/proc/<pid>/environ` carries a private `YGGTERM_HOME` under another lane's
+sandbox, so it could not bind or serve the row plane at all. The sequence that
+actually killed the rows is the installed binary handing over to itself:
+
+    22:30:59  pid A  hot_update_handoff_prepared   expected_version 3.0.148, installed binary
+    22:31:04  pid A  spawned_daemon_exit           child …291, signal 15 (SIGTERM), success false
+    22:31:16  pid B  pty_handoff_listener_bound + run_begin
+    22:31:26  pid B  superseded_daemon_takeover
+    22:31:40  pid A  pty_fd_handoff_sweep          outcome "AllMoved { moved: 38 }"
+    22:31:40  pid A  retiring_daemon_aliased_own_socket   3.0.146 → 3.0.148, aliased true
+    22:31:42  pid B  spawned_daemon_exit           signal 15 (SIGTERM), success false   ← THE DEATH SECOND
+
+⛔⛔ **The predecessor released all 38 descriptors at 22:31:40 and the process
+now holding them was signalled at 22:31:42.** Both holders were then gone, which
+is exactly why the uuids resolve to nothing: there is no survivor to resume from.
+⇒ The count matching the earlier incident is not a coincidence of size — **it is
+the whole owned set of whichever daemon was mid-handover.**
+
+**Who sent the signal is NOT established, and the daemon's own code is largely
+cleared.** The only process-tree terminator in the codebase
+(`terminate_linux_process_tree`, which SIGTERMs a root *and every descendant*) is
+reached solely from `run_remote_terminate_agent`, scoped to one explicit session
+id — not a sibling daemon. **16 such SIGTERM'd spawns appear between 21:07 and
+22:33**, i.e. the pattern ran for ninety minutes before the incident, so it is a
+standing external source rather than one event.
+⚠ **Declared, because this session ran kill loops in that window:** mine were
+`pkill -f` patterns matching only `…/scratchpad/sbin/…`, `…/yggterm--<lane>/…`
+and a `.old.` binary, plus an environ-matched loop that killed only processes
+naming this session's own sandbox. **None can match
+`~/.yggterm/bin/yggterm-headless`**, and nine of the sixteen SIGTERMs predate the
+first of them. Not mine — but stated rather than omitted, because a broad
+`pkill -f` on a shared host is precisely the shape that would do this.
+
+### ⛔⛔ AND THE DESIGN GAP IS REAL WHOEVER SENT THE SIGNAL: THE HANDOVER HAS NO CONFIRMATION STEP
+
+`hand_off_all_runtimes` is all-or-nothing and the predecessor then **exits** —
+because exiting is the only way to release its own copies of the masters. So the
+predecessor releases on the successor's *acceptance*, never on its *survival*,
+and between "successor holds the fds" and "successor is stable" there is a window
+in which killing the successor destroys **every session on the host**,
+unrecoverably, with no process left holding anything.
+⇒ **That is obligation 2 of the constitution with a stopwatch on it**: two
+seconds wide here, and it does not require a bug in the handover to fire — only
+something else killing a young process.
+⇒ **Fix directions, cheapest first:** (a) the predecessor lingers until the
+successor has been observed alive for a settle interval rather than exiting on
+`AllMoved` — it still holds nothing it can serve, but it holds the fds; (b) an
+adopting daemon records its adopted set durably on arrival, so a recovery spawn
+can re-resume them, which is exactly what the manual
+`server remote resume-cc <uuid> --require-existing` did by hand.
+
 **The falsifiers, in the order that costs least:**
 1. Start a daemon from a lane's `target/release` on a host with live agent rows, in a sandbox, and
    see whether rows die ~80 s later. If they do, the mechanism is *which binary* rather than *a
