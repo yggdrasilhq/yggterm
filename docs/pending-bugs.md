@@ -25,9 +25,13 @@ on a live daemon, so the fast path is not the path being taken. Each firing
 costs a `resolve_yggterm_home()`, two `serde_json::json!` allocations and **two
 file appends**.
 
-- `event-trace.jsonl` grows at **95.0 KB/s** — **98.8% of it is lock_wait**, a
-  projected **8.3 GB/day from one file**.
-- **93.9% of those events report `waited_ms: 0`.** The field is integer
+- `event-trace.jsonl` grows at **95.3 KB/s** and `perf-telemetry.jsonl` at
+  **45.9 KB/s** — **12.49 GB/day combined**. `~/.yggterm` is already 9.5 GB.
+- ⭐ **It is ONE code path and the arithmetic closes exactly.** The `PerfGuard`
+  sits inside the same contended branch, so one contention writes three records
+  across two files: 141.1 KB/s ÷ 322.8/s = **437 bytes per contention**. A fix
+  treating them as two problems leaves 4.1 GB/day behind.
+- **93.9% of the lock_wait events report `waited_ms: 0`.** The field is integer
   milliseconds and nearly every wait is sub-millisecond, so **the instrument
   built to measure contention prints zero on almost all the contention it is
   recording.** The count is the signal; the value is blind.
