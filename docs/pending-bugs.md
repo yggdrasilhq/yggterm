@@ -198,6 +198,29 @@ do not `terminal submit` to a row that is not consuming input. A row reading
 `busy: agent_working_daemon` will not echo, so the submit will hammer it for the
 full timeout. Check first, and never retry a `submitted:false` by sending again.
 
+### ⛔⛔ THE FIX CANNOT BE DEPLOYED WHILE AN UNSENT DRAFT IS OPEN — AND THAT IS NOT A PARADOX, IT IS THE ORDERING
+
+**A daemon handover TYPES.** §5's hot-restart repair submits `continue` to rows
+after a handover (`hot_restart_repair_continue`), through the very function this
+entry is about. On any build that does not yet carry the guard — **including
+every build installed right now** — that submit has no draft check, so a deploy
+can splice `continue` plus its retry barrage into a half-typed sentence.
+
+⇒ **Deploying the fix runs the unfixed path one last time.** The protection
+begins at the handover AFTER the one that installs it.
+
+⛔ **So while a human has an unsent draft in a live composer, do not deploy a
+daemon** — not even this fix, and not "quickly". The correct order is: the draft
+is sent or cleared, THEN the daemon is bumped, THEN the guard is live for every
+handover after that.
+
+⚠ **This generalises past this entry.** "Do not relaunch the GUI, the owner has
+an unsent draft" is the right instinct applied to the wrong process — the GUI
+relaunch does not type, and the DAEMON handover does. **A daemon bump is the more
+dangerous of the two for a draft**, which is the opposite of how it is usually
+treated. Same reasoning as the settle-window asymmetry above: a fix that lives in
+the predecessor cannot protect the handover that installs it.
+
 ### ⚠ "BLINKING" NOW HAS TWO UNRELATED CAUSES — TELL THEM APART BEFORE FILING HERE
 
 The handover settle window (6.1, `40cbcaf0` + `07218756`) widened the
@@ -349,6 +372,39 @@ row grows; an unreachable one is frozen. Sample twice a few seconds apart.
 
 **Fix:** name the two states in the reply. The daemon endpoint the submit resolved to is already known
 at that point, so "the row I addressed is served by a socket nothing has bound" is answerable.
+
+## ⛔ A DAEMON THAT TAKES ITS SESSIONS BACK IS STILL MUTED — NOTHING ON THE HOST WRITES THEIR STATE
+
+**Status:** OPEN
+
+Found while building the settle window, 2026-08-14. Not caused by it — made
+reachable by it, and it is the same shape as the bug the immediate-persist fix
+already closed from the other side.
+
+`superseded_routine_persist_muted` is a **hard, permanent latch**
+(`daemon.rs`, `routine_persist_should_mute`): once a strictly newer daemon is
+seen, this daemon never writes `server-state.json` again. That is right while the
+successor is alive — a stale predecessor must not clobber the successor's file.
+
+⛔ **It is wrong the moment the successor dies.** The settle window now hands the
+sessions back: the predecessor wakes its readers and is once again the only
+process serving them. It is also still muted, and the successor that DID write
+the state file is gone. ⇒ **No process on the host will record those sessions
+again.** If the predecessor is then killed, they are unrecoverable — exactly the
+condition the immediate-persist-on-adoption fix was written to end.
+
+**The fix, and why it is not a one-liner.** Clearing the latch is only safe when
+no live newer daemon exists — another one may have arrived meanwhile — so the
+test is `live_newer_daemon_version(...).is_none()`, the existing single owner of
+that question. The obstacle is reach, not logic: `spawn_handoff_settle_watch`
+holds no runtime handle. The superseded-retire caller has the
+`Arc<Mutex<DaemonRuntime>>`; the hot-update caller has only `&mut self`.
+
+⚠ **Do not solve it by passing an `Option<Arc<…>>`** — "a handle that is
+sometimes there" is a fork wearing a table's clothes, and this crate has paid for
+that shape before. Either give both callers the same handle, or make the mute a
+DERIVED fact (ask whether a newer daemon is live) rather than a latch, which is
+what it actually means.
 
 ## ⚠ A HANDOVER THAT LOSES ITS SUCCESSOR STILL LOSES THE SECONDS THAT SUCCESSOR ALREADY READ
 
@@ -2393,6 +2449,79 @@ a measurement.
 ## ⛔⛔ [6.7] THE WEB PROCESS'S MEMORY BOUND CANNOT HOLD, BECAUSE SWAP MAKES ITS FOOTPRINT LIE
 
 **Status:** OPEN
+
+### ✅ CONFIRMED LIVE 2026-08-14 — THE BOUND IS ALREADY BEING EXCEEDED, INVISIBLY
+
+Previously this was settled from `strings` on the shipped `.so` (the bound polls
+`VmRSS`). It is now measured on the running host, and the process has **already
+crossed the limit without the limit noticing**:
+
+| yggterm's web process (child of the GUI) | |
+|---|---|
+| `VmRSS` — **what the bound compares against** | **947 MB** |
+| `VmSwap` | 1,118 MB |
+| **committed (`RSS + swap`)** | **2,065 MB** |
+| the configured bound (`MemTotal/8`) | **1,889 MB** |
+
+⇒ **176 MB over the bound, and the bound reads 947 MB — barely half.** The
+overage is not merely unseen, it is unseeable *by construction*: the amount by
+which the process exceeds its budget is precisely the amount the kernel swapped
+out, which is exactly what an RSS-valued comparison stops counting. **The metric
+subtracts the evidence of the thing it is measuring.**
+
+⛔ **This is why "tune the constant" is the wrong instinct and remains refused.**
+No value of `MemTotal/8` fixes a comparison whose left side shrinks as the
+problem grows — lowering it does nothing once the excess is in swap. Either the
+comparison becomes swap-inclusive (a cgroup, which counts what the machine
+actually committed) or the bound stays decorative.
+
+### ✅ THE CGROUP OPTION IS CONFIRMED REACHABLE — SPEC'D, WITH THE NUMBERS THAT SETTLE IT
+
+*Live on the desktop host 2026-08-14, read-only.* The kernel is **already
+measuring the exact quantity WebKit cannot**:
+
+```
+GUI cgroup      /user.slice/user-1000.slice/session-<id>.scope
+controllers     cpu memory pids          <- memory controller present
+memory.current        1,029 MB
+memory.swap.current   2,307 MB           <- the half an RSS poll cannot see
+                    = 3,336 MB committed
+memory.high           max                <- no bound at all
+```
+
+⇒ **Everything the honest fix needs is present**: the controller is enabled, and
+`memory.current` + `memory.swap.current` is precisely the committed figure that
+`VmRSS` structurally under-reports. There is nothing to invent — only to bound.
+
+**Two facts block doing it in place, and they define the shape of the fix:**
+
+1. ⛔ **The scope is not ours.** It is the login `session-<id>.scope`, shared with
+   ~15 unrelated processes, so a bound set there would police the desktop rather
+   than yggterm.
+2. ⛔ **`memory.high` is not writable** by the process — systemd owns it.
+
+⇒ **THE FIX: launch the GUI in its OWN systemd user scope**, e.g.
+`systemd-run --user --scope -p MemoryHigh=… -p MemorySwapMax=…`, which every
+WebKit child inherits — one bound covering the whole family, enforced by the
+kernel against committed memory instead of by WebKit against residency.
+⭐ Use **`MemoryHigh` (reclaim pressure), not `MemoryMax` (OOM-kill)**: the goal is
+frugality, and a hard cap on a browser engine turns a memory spike into a dead
+web surface.
+
+⚠ **NOT YET IMPLEMENTED, and deliberately so.** The change is in the LAUNCH path,
+whose failure mode is *the GUI does not start* — and it cannot be verified
+without relaunching the GUI, which is an owner gate. ⛔ Shipping an unverifiable
+launcher change is the one move here with a worse downside than the bug: the bug
+costs memory, a bad launcher costs the whole app. Land it behind a default-off
+switch and turn it on inside a relaunch window.
+
+⚠ **Scope, stated honestly so nobody over-claims it.** The whole yggterm family
+(GUI + 4 WebKit children) commits **≈3.5 GB, of which ≈2.0 GB is swapped**, on a
+14.8 GB host carrying **12.3 GB of swap in use**. So yggterm is a significant
+share of the swap pressure, **not the cause of it** — the rest is spread across
+many unrelated desktop processes. ⇒ Fixing this bound makes yggterm frugal; it
+will not by itself bring the machine out of swap, and claiming otherwise would
+set up a measurement that is guaranteed to disappoint.
 
 *single-pid lifetime measurement, desktop host 2026-08-13, restart-free*
 
