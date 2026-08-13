@@ -611,6 +611,51 @@ also live.
 **Falsifier:** spawn and tear down N remote sessions on a fresh daemon and count
 zombies. It must stay at zero.
 
+## ⛔⛔ [6.7] THE PRIVACY GUARD SCANS ALL OF HISTORY ON A NEW BRANCH, SO EVERY LANE PUSH FAILS AND TEACHES THE OVERRIDE
+
+**Status:** OPEN
+
+*found 2026-08-13 while pushing a lane branch; affects every cluster in this batch*
+
+`ygg-privacy-guard hook` derives its scan range from the pre-push stdin line:
+
+```python
+rng = f"{rsha}..{lsha}" if not rsha.startswith("0000") else lsha
+```
+
+**On a new branch `rsha` IS `0000…`**, so the range collapses to `lsha` — the
+branch tip — and the guard scans **every commit reachable from it**, i.e. the
+whole repository history, rather than the commits actually being pushed.
+
+⇒ Pushing `lane/dev/6.7-resource` (one commit, 247 added lines) was refused for
+private terms sitting in **commit messages that are already ancestors of
+`origin/main` and have been public for weeks**. Verified: `origin/main..HEAD`
+contained exactly one commit, and the guard's own `scan --rev-range
+origin/main..HEAD` returned *"✅ no private data found in what is being pushed."*
+
+**Why this is ⛔⛔ and not a nuisance.** The only escape is
+`YGG_PRIVACY_ALLOW=1`. A guard that refuses **every** new branch regardless of
+content trains every agent to set that variable reflexively, and the override is
+a single environment variable that suppresses the whole scan — so the guard
+stops working precisely when someone finally does push something private. **A
+check that cries wolf on every lane branch is worse than no check**, because it
+manufactures the habit that defeats it. All eight clusters in this batch push
+lane branches.
+
+**The fix:** for a new branch, ask what the remote does not already have —
+`git rev-list <lsha> --not --remotes=origin` — instead of walking the tip's
+entire ancestry. Failing closed is right; failing closed on already-published
+history is not failing closed, it is failing blind.
+
+**Falsifier:** create a branch with one innocuous commit and push it. The guard
+must pass without an override.
+
+⇒ **Separately, and this one is owner-gated:** the terms it caught are real and
+they are *already public* in `origin/main` commit messages (a graph name, a bank
+hostname). Removing them means rewriting published history, which has been done
+once before on a sibling repo and orphaned 34 commits. Not a relay action.
+→ `docs/owner-attention.md`.
+
 ## ⛔ [6.7] SIXTEEN STUCK CRASH HANDLERS, THE OLDEST DATING TO BOOT
 
 **Status:** OPEN
