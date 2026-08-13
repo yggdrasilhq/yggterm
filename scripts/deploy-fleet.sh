@@ -170,19 +170,40 @@ done
 # Two clusters spend the same version number routinely, so a copy whose md5 is
 # not one of the two below is a DIFFERENT build wearing the same string, and
 # that is the whole defect this verb was taught to see.
+# ⛔⛔ A HOST HAS TWO PLANES AND THIS DEPLOY ONLY TOUCHES ONE OF THEM. The four
+# copies above are files; the daemons are PROCESSES that keep executing the code
+# they were loaded with until each one retires on its own terms — which is the
+# constitution working, not a fault. Reporting only the disk therefore prints a
+# host as fully current while every daemon on it runs something else: measured on
+# the desktop host 2026-08-13, where the GUI was ten versions ahead of the daemon
+# serving it, and the running GUI's own build could not be named at all because a
+# deploy had already replaced the file its `/proc/<pid>/exe` pointed at.
+#
+# ⇒ Census BOTH planes, side by side, and let the running one name its commit
+# rather than inferring it: a running process is the only party that still knows.
+# ⚠ Asking a running daemon is also the one interrogation that is SAFE to make
+# fleet-wide — `--build-commit` on a binary built before that flag existed falls
+# through to LAUNCHING THE GUI, so a census that ran it on every copy would open
+# windows on exactly the hosts that are behind.
 echo "deploy-fleet: census — this build is $VERSION from commit $BUILD_COMMIT"
 echo "              gui=${GUI_SUM:0:10}  headless=${HL_SUM:0:10}  (any other md5 is another build)"
 for host in $HOSTS; do
   echo "  == $host =="
   cen='for p in $HOME/.local/bin/yggterm $HOME/.local/bin/yggterm-headless \
                 $HOME/.yggterm/bin/yggterm $HOME/.yggterm/bin/yggterm-headless; do
-         printf "    %-42s %-9s %s\n" "$p" "$($p --version 2>/dev/null || echo ERR)" "$(md5sum "$p" 2>/dev/null | cut -c1-10)"
-       done'
+         printf "    on disk  %-42s %-9s %s\n" "$p" "$($p --version 2>/dev/null || echo ERR)" "$(md5sum "$p" 2>/dev/null | cut -c1-10)"
+       done
+       $HOME/.yggterm/bin/yggterm-headless server daemons 2>/dev/null |
+         sed "s/^/    running  /" || echo "    running  <no census: this host has no reachable daemon>"'
   if [ "$host" = "$(hostname -s)" ] || [ "$host" = "local" ]; then bash -c "$cen"; else ssh "$host" bash -c "'$cen'"; fi
 done
 
 if [ "$FAILED" != 0 ]; then echo "⛔ deploy-fleet: at least one copy did not read back"; exit 1; fi
 echo "deploy-fleet: every copy on every host reads back at $VERSION ($BUILD_COMMIT)"
-echo "  On the host, ask a binary which source it is: yggterm --build-commit"
+echo "  Ask a FILE which source it is:    yggterm --build-commit"
+echo "  Ask the RUNNING processes:        yggterm-headless server daemons   (BUILD column)"
 echo "⚠ The daemons do NOT swap here. Each retires onto the new binary on its own"
 echo "  poll once its own sessions allow it — that is the constitution, not a bug."
+echo "  ⇒ The running plane is EXPECTED to trail the disk for a while. What must"
+echo "    never happen is being unable to say by how much, which is why the BUILD"
+echo "    column names a commit instead of leaving a version to stand for two."

@@ -16119,6 +16119,12 @@ struct ClientInstanceRecord {
     process_start_ticks: Option<u64>,
     #[serde(default)]
     executable_path: Option<String>,
+    /// The commit this GUI process was built from. Written here by the process
+    /// itself because nothing outside it can recover the answer once a deploy
+    /// has replaced the file at `executable_path`. Read back by
+    /// `yggterm_server::ClientInstanceRecord::build_commit` from this same JSON.
+    #[serde(default)]
+    build_commit: Option<String>,
     #[serde(default)]
     display: Option<String>,
     #[serde(default)]
@@ -80573,6 +80579,9 @@ fn build_client_instance_record(
         linux_desktop_app_id: linux_desktop_app_id.map(str::to_string),
         process_start_ticks: process_start_ticks(pid),
         executable_path: current_client_executable_path(),
+        // The one thing about this process that no outside reader can recover
+        // once a deploy has moved the file underneath it.
+        build_commit: Some(yggterm_server::build_identity::build_commit().to_string()),
         display: env_var("DISPLAY"),
         wayland_display: env_var("WAYLAND_DISPLAY"),
         xdg_session_id: env_var("XDG_SESSION_ID"),
@@ -80643,6 +80652,7 @@ fn register_client_instance(
             "client_id": record.client_id,
             "linux_desktop_app_id": record.linux_desktop_app_id,
             "executable_path": record.executable_path,
+            "build_commit": record.build_commit,
             "display": record.display,
             "wayland_display": record.wayland_display,
             "xdg_session_id": record.xdg_session_id,
@@ -157987,6 +157997,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("create temp dir");
         let live_path = dir.join(format!("{}-1.json", std::process::id()));
         let live_record = serde_json::to_vec(&ClientInstanceRecord {
+            build_commit: None,
             pid: std::process::id(),
             started_at_ms: 1,
             client_id: None,
@@ -158092,6 +158103,7 @@ mod tests {
         fs::create_dir_all(&legacy_dir).expect("create legacy client dir");
         let legacy_path = legacy_dir.join(format!("{}-1.json", std::process::id()));
         let legacy_record = serde_json::to_vec(&ClientInstanceRecord {
+            build_commit: None,
             pid: std::process::id(),
             started_at_ms: 1,
             client_id: None,

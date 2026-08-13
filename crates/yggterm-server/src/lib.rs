@@ -37,6 +37,9 @@ mod browser_import_cli;
 pub use browser_import_cli::{browser_import_usage_block, run_browser_import_cli};
 pub mod app_declare;
 mod attach;
+/// Where a running process publishes the source it was built from — the plane
+/// `--build-commit` cannot reach, because it can only ask a file.
+pub mod build_identity;
 mod clipboard_sweep;
 // The clipboard sweeper's sibling: autoclean for `$YGGTERM_HOME/server-*.sock`
 // (docs/pending-bugs.md: ~700 of them on the GUI host). Unix-only because the
@@ -20077,6 +20080,17 @@ pub struct ClientInstanceRecord {
     pub process_start_ticks: Option<u64>,
     #[serde(default)]
     pub executable_path: Option<String>,
+    /// The commit this GUI process was built from, published by the process
+    /// itself at registration.
+    ///
+    /// ⛔ `executable_path` CANNOT ANSWER THIS AND NEITHER CAN THE FILE IT NAMES.
+    /// A deploy replaces the binary under the running window, so the path then
+    /// describes a build this process never executed — measured 2026-08-13, when
+    /// the live GUI's `/proc/<pid>/exe` hashed to a value matching no file on the
+    /// host, leaving the running build unnameable while the on-disk copy answered
+    /// confidently. `None` on a client older than this field.
+    #[serde(default)]
+    pub build_commit: Option<String>,
     #[serde(default)]
     pub display: Option<String>,
     #[serde(default)]
@@ -30082,6 +30096,7 @@ mod tests {
     #[test]
     fn desktop_identity_uses_client_record_app_id_when_trace_rotated_away() {
         let record = ClientInstanceRecord {
+            build_commit: None,
             pid: 123,
             started_at_ms: 456,
             client_id: None,
@@ -31060,6 +31075,7 @@ mod tests {
         terminal_session_keys: Vec<String>,
     ) -> ServerRuntimeStatus {
         ServerRuntimeStatus {
+            server_build_commit: String::new(),
             daemon_started_at_ms: 0,
             daemon_uptime_ms: 0,
             running_build_id: 0,
@@ -43052,6 +43068,7 @@ terminal_window_id: None,
 
     fn client_record(pid: u32, started_at_ms: u128, display: &str) -> ClientInstanceRecord {
         ClientInstanceRecord {
+            build_commit: None,
             pid,
             started_at_ms,
             client_id: None,
@@ -43538,6 +43555,7 @@ terminal_window_id: None,
         let legacy_dir = client_instances_dir(&home, &legacy_endpoint);
         fs::create_dir_all(&legacy_dir).expect("create legacy dir");
         let live_record = serde_json::to_vec(&ClientInstanceRecord {
+            build_commit: None,
             pid: std::process::id(),
             started_at_ms: 42,
             client_id: None,
@@ -43580,6 +43598,7 @@ terminal_window_id: None,
         let legacy_dir = client_instances_dir(&home, &legacy_endpoint);
         fs::create_dir_all(&legacy_dir).expect("create legacy dir");
         let live_record = serde_json::to_vec(&ClientInstanceRecord {
+            build_commit: None,
             pid: std::process::id(),
             started_at_ms: 42,
             client_id: None,
@@ -43709,6 +43728,7 @@ terminal_window_id: None,
         std::os::unix::fs::symlink(&legacy_socket, &current_socket).expect("link current socket");
         let endpoint = ServerEndpoint::UnixSocket(current_socket.clone());
         let status = ServerRuntimeStatus {
+            server_build_commit: String::new(),
             daemon_started_at_ms: 0,
             daemon_uptime_ms: 0,
             running_build_id: 0,

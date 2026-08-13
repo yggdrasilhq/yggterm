@@ -1407,6 +1407,13 @@ fn run_server_connect_list(endpoint: &yggterm_server::ServerEndpoint) -> Result<
 }
 
 fn main() -> Result<()> {
+    // Hand this build's identity to the library crates that answer questions
+    // about a RUNNING process — the daemon's status and this window's client
+    // record. `--build-commit` can only ever describe a file, and a deploy
+    // replaces the file under a live process, so a process that does not say
+    // what it is becomes unnameable the moment it matters.
+    yggterm_server::build_identity::declare_build_commit(build_identity::build_commit());
+
     // ⭐ BEFORE EVERYTHING, including the GL probe and the supervisor: resolve the
     // D-Bus session bus, because GLib autolaunches a PRIVATE one the moment
     // anything in this process touches GTK without an address to inherit, and

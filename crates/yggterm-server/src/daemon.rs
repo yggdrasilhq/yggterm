@@ -1956,6 +1956,21 @@ pub struct ServerRuntimeStatus {
     pub running_build_id: u64,
     #[serde(default)]
     pub on_disk_build_id: u64,
+    /// The commit THIS PROCESS was built from, compiled in.
+    ///
+    /// ⛔ IT IS NOT DERIVABLE FROM OUTSIDE, which is the whole reason it is on
+    /// the wire. `running_build_id` says only *"the running and on-disk builds
+    /// differ"*; it cannot name either one, so a daemon that is behind reports a
+    /// mismatch without saying what it is running. Once a deploy has replaced
+    /// the file, the path, its md5 and `--build-commit` all describe the NEW
+    /// binary while this process keeps executing the old code, and on the
+    /// desktop host a running exe has already hashed to a value matching no file
+    /// on the machine.
+    ///
+    /// Empty on a daemon older than this field, and `unstamped` on one that
+    /// never declared itself — both are reported, never guessed at.
+    #[serde(default)]
+    pub server_build_commit: String,
     #[serde(default)]
     pub hot_restart_pending: bool,
     /// Why a hot-restart is being DEFERRED right now, in the daemon's own words —
@@ -4089,6 +4104,7 @@ impl DaemonRuntime {
             daemon_uptime_ms: current_millis_u64().saturating_sub(started_at_ms),
             running_build_id,
             on_disk_build_id,
+            server_build_commit: crate::build_identity::build_commit().to_string(),
             // A build id of 0 means the exe mtime was unreadable; "pending" would then be
             // a coin flip, so report no pending update rather than a confident wrong one.
             hot_restart_pending: running_build_id != 0
@@ -12454,6 +12470,16 @@ pub struct DaemonCensusRow {
     pub pid: u32,
     pub version: String,
     pub build_id: u64,
+    /// The commit this daemon PROCESS is executing, as it reported it.
+    ///
+    /// ⛔ THE VERSION COLUMN CANNOT IDENTIFY A BUILD and [`Self::exe`] cannot
+    /// either — a deploy replaces the file, so the path names a build this
+    /// process never ran, and `(deleted)` says only *that* it was replaced. Two
+    /// clusters spend one version number routinely, which is why the fleet
+    /// census compares md5s on disk; the running plane had no equivalent, so a
+    /// host could read "current" everywhere while every daemon on it executed
+    /// something else. Empty on a daemon predating the field.
+    pub build_commit: String,
     /// The socket this daemon answered on.
     pub endpoint: String,
     /// `/proc/<pid>/exe` verbatim, INCLUDING Linux's " (deleted)" suffix.
@@ -12588,6 +12614,7 @@ pub fn daemon_census(home_dir: &Path) -> Vec<DaemonCensusRow> {
                 pid: status.server_pid,
                 version: status.server_version.clone(),
                 build_id: status.server_build_id,
+                build_commit: status.server_build_commit.clone(),
                 is_default_endpoint: owner_endpoint_label(&endpoint) == default_label,
                 endpoint: owner_endpoint_label(&endpoint),
                 exe_deleted: exe.as_deref().is_some_and(|link| link.ends_with(" (deleted)")),
@@ -12631,6 +12658,22 @@ pub fn format_daemon_census(rows: &[DaemonCensusRow]) -> String {
     format_daemon_census_with_queued_swap(rows, None, 0)
 }
 
+/// What the BUILD column shows for a daemon that did not give a commit.
+///
+/// ⛔ THE TWO SILENCES ARE DIFFERENT FACTS AND THE TABLE MUST NOT MERGE THEM.
+/// A daemon older than the field cannot answer — expected, and it dates the
+/// process. A daemon that CAN answer and says `unstamped` was built without the
+/// stamp, which means the census cannot identify a build that is running right
+/// now. Printing one symbol for both would hide the second inside the first,
+/// which is exactly how a version number came to stand for two builds.
+fn running_build_label(build_commit: &str) -> &str {
+    if build_commit.is_empty() {
+        "(pre-field)"
+    } else {
+        build_commit
+    }
+}
+
 /// The same table, plus §4's host-level answer to *"is a swap owed here?"*.
 ///
 /// ⚠ The queued swap is a HOST fact and deliberately not a column: it outlives
@@ -12651,15 +12694,16 @@ pub fn format_daemon_census_with_queued_swap(
     }
     let mut out = String::new();
     out.push_str(
-        "  PID       VERSION   UPTIME   OWNED  PRESV  ROWS  BINARY\n",
+        "  PID       VERSION   BUILD          UPTIME   OWNED  PRESV  ROWS  BINARY\n",
     );
     for row in rows {
         let hours = row.uptime_ms as f64 / 3_600_000.0;
         let marker = if row.is_default_endpoint { '*' } else { ' ' };
         out.push_str(&format!(
-            "{marker} {pid:<9} {version:<9} {hours:>5.1}h {owned:>6} {presv:>6} {rows:>5}  {exe}{deleted}\n",
+            "{marker} {pid:<9} {version:<9} {build:<14} {hours:>5.1}h {owned:>6} {presv:>6} {rows:>5}  {exe}{deleted}\n",
             pid = row.pid,
             version = row.version,
+            build = running_build_label(&row.build_commit),
             owned = row.owned_terminal_session_count,
             presv = row.preserved_terminal_owner_count,
             rows = row.live_terminal_session_count,
@@ -19846,6 +19890,7 @@ mod tests {
             pid,
             version: "3.0.81".to_string(),
             build_id: 1,
+            build_commit: "abc123def456".to_string(),
             endpoint: format!("sock-{pid}"),
             exe: Some("/home/user/.yggterm/bin/yggterm-headless".to_string()),
             exe_deleted: false,
@@ -19859,6 +19904,39 @@ mod tests {
             permanent_blocker_count: 0,
             is_default_endpoint: false,
         }
+    }
+
+    /// ⛔ BOTH CONTROLS. A census column that has collapsed to one answer looks
+    /// exactly like a census column that is working, so proving it can name a
+    /// commit is only half the check — it must also be shown to say something
+    /// ELSE, and to say it differently for the two silences.
+    #[test]
+    fn the_census_names_the_running_build_and_admits_when_it_cannot() {
+        let named = super::format_daemon_census(&[census_row(11, 60_000)]);
+        assert!(named.contains("BUILD"), "{named}");
+        assert!(
+            named.contains("abc123def456"),
+            "the running build must appear in the table: {named}"
+        );
+
+        let mut old = census_row(12, 60_000);
+        old.build_commit = String::new();
+        let mut unstamped = census_row(13, 60_000);
+        unstamped.build_commit = crate::build_identity::UNSTAMPED.to_string();
+        let rendered = super::format_daemon_census(&[old, unstamped]);
+        assert!(
+            rendered.contains("(pre-field)"),
+            "a daemon too old to answer is dated, not blanked: {rendered}"
+        );
+        assert!(
+            rendered.contains(crate::build_identity::UNSTAMPED),
+            "a daemon that answers 'no identity' is a live gap and must be \
+             visible as one, not merged with the old daemons: {rendered}"
+        );
+        assert!(
+            !rendered.contains("abc123def456"),
+            "the column must not be showing a constant: {rendered}"
+        );
     }
 
     #[test]
