@@ -535,6 +535,7 @@ impl ShellArm {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,

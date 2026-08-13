@@ -4500,6 +4500,13 @@ impl DaemonRuntime {
         session.terminal_foreground_active = self
             .terminals
             .session_foreground_process_active(&runtime_path);
+        // ⛔ EVERY KIND, and deliberately ABOVE the screen-scraping branch below.
+        // Going deaf is a property of the PTY, not of the screen — a row that has
+        // stopped reading is exactly the row whose screen has stopped changing, so
+        // gating this on "has a screen worth scraping" would hide it precisely
+        // when it matters. It is also the cheapest read here: two atomics, no
+        // screen snapshot, no process walk.
+        session.input_unanswered_ms = self.terminals.input_unanswered_ms(&runtime_path);
         // Observability (grid-squish): the PTY grid the running program sees, so a
         // squish (PTY grid < client xterm grid) is directly measurable in `server snapshot`.
         if let Some((cols, rows)) = self.terminals.session_size(&runtime_path) {

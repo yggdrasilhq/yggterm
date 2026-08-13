@@ -3184,6 +3184,25 @@ pub struct SnapshotSessionView {
     // serde(default) keeps back-compat with older snapshots.
     #[serde(default)]
     pub working: Option<bool>,
+    /// How long this session has been WRITTEN TO without answering, when that is
+    /// outstanding at all — the gap between the last byte written toward the
+    /// child and the last byte it produced. `None` = the child has answered at
+    /// least as recently as it was written to (the healthy case), or the daemon
+    /// holds no runtime for this row.
+    ///
+    /// **On the snapshot because a deaf row is otherwise INVISIBLE.** It renders
+    /// `idle`, holds a composer and sits in `epoll_wait` exactly as a healthy one
+    /// does, so the only thing that distinguishes it is this gap — and the gap is
+    /// knowable only inside the daemon that owns the PTY.
+    ///
+    /// ⚠ A TRIGGER, NEVER A VERDICT. Read it through
+    /// [`yggterm_core::input_unanswered_suggests_wedge`], which owns the
+    /// threshold; `terminal input-check` settles it by marker and echo.
+    ///
+    /// serde(default) = `None`, so an older daemon simply does not carry the
+    /// signal rather than claiming every row is answering.
+    #[serde(default)]
+    pub input_unanswered_ms: Option<u64>,
     /// The row's per-launch model / permission mode.
     ///
     /// On the SNAPSHOT because a snapshot is how a row's facts cross a daemon
@@ -3578,6 +3597,10 @@ pub struct ManagedSessionView {
     /// Daemon-authoritative working state — see [`SnapshotSessionView::working`].
     /// `Some(true)` working, `Some(false)` confirmed idle, `None` unknown.
     pub working: Option<bool>,
+    /// Input written with nothing said back — see
+    /// [`SnapshotSessionView::input_unanswered_ms`]. `None` = answering, or not
+    /// reported. ⚠ A trigger, never a verdict.
+    pub input_unanswered_ms: Option<u64>,
     /// What this row's launch asked of its agent CLI: `--model`,
     /// `--permission-mode`.
     ///
@@ -26670,6 +26693,7 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
         pty_cols: None,
         pty_rows: None,
         working: session.working,
+        input_unanswered_ms: session.input_unanswered_ms,
         agent_launch_options: session.agent_launch_options,
         title_is_explicit: session.title_is_explicit,
         outline_prefix: session.outline_prefix.clone(),
@@ -26785,6 +26809,7 @@ fn snapshot_live_session_view(session: &ManagedSessionView) -> SnapshotSessionVi
         pty_cols: None,
         pty_rows: None,
         working: session.working,
+        input_unanswered_ms: session.input_unanswered_ms,
         agent_launch_options: session.agent_launch_options.clone(),
         title_is_explicit: session.title_is_explicit,
         outline_prefix: session.outline_prefix.clone(),
@@ -26982,6 +27007,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
         ssh_prefix: session.ssh_prefix,
         stored_preview_hydrated: true,
         working: session.working,
+        input_unanswered_ms: session.input_unanswered_ms,
         agent_launch_options: session.agent_launch_options,
     }
 }
@@ -27361,6 +27387,9 @@ terminal_window_id: None,
         ssh_prefix: None,
         stored_preview_hydrated: should_hydrate_stored_preview,
         working: None,
+        // A row being built has no runtime yet; the daemon's snapshot overlay is
+        // the only thing that can answer this, and it does so every snapshot.
+        input_unanswered_ms: None,
         agent_launch_options: AgentLaunchOptions::default(),
     }
 }
@@ -27707,6 +27736,9 @@ fn build_live_session_with_launch_options(
         ssh_prefix: target.prefix.clone(),
         stored_preview_hydrated: true,
         working: None,
+        // A row being built has no runtime yet; the daemon's snapshot overlay is
+        // the only thing that can answer this, and it does so every snapshot.
+        input_unanswered_ms: None,
         agent_launch_options: AgentLaunchOptions::default(),
     }
 }
