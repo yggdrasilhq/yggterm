@@ -501,6 +501,88 @@ def cmd_list(a):
     return 0
 
 
+def fishy_audit(subs, dry):
+    """⛔⛔ AN ORCHESTRATOR'S OWN HOLDS BLIND IT TO ITS ROWS GOING COLD.
+
+    Owner-directed 2026-08-13, after a relay sat at **6.1 MB and 37 minutes
+    cold** while its orchestrator believed the fleet was healthy. Two causes, and
+    the first is the orchestrator's own doing:
+
+    1. **`park` suppresses the IDLE verdict** — correctly, because a row blocked
+       on purpose is not finished. But IDLE was the ONLY signal that ever
+       mentioned that row, so parking it silenced the health report along with
+       the wrong verdict. **A hold must silence a VERDICT, never an AUDIT.**
+    2. **Nothing here ever measured what a wake would COST.** Every verb asked
+       "is it working"; none asked "what would it cost me to find out". A cold
+       multi-megabyte row is priced at dollars per wake, charged before it
+       answers a word — so the cheapest question is the one nobody was asking.
+
+    ⇒ This runs over EVERY subscriber, parked and pinned included, and reports
+    only anomalies. It never nudges, wakes or reaps — it exists so the
+    orchestrator sees the fishy row BEFORE it costs something."""
+    WAKE_EXPENSIVE_KB = 2048      # a wake re-reads this much context, cold
+    COLD_MINS = 25                # long enough that the cache is likely gone
+    findings = []
+    now = time.time()
+    live_rows = None
+    for s in subs:
+        uuid = s["uuid"]
+        tag = f"{uuid[:8]} (seat {s.get('seat') or '-'})"
+        f = _transcript_for(uuid, s.get("host"))
+        if f:
+            kb, age_m = f[1] // 1024, int((now - f[2]) // 60)
+            if kb >= WAKE_EXPENSIVE_KB and age_m >= COLD_MINS:
+                findings.append(
+                    f"⚠ {tag} is {kb//1024}.{(kb%1024)*10//1024} MB and {age_m}m COLD — "
+                    f"a wake re-reads it all before answering. SUCCEED IT BY HARVESTING, never by asking.")
+            elif age_m >= 180:
+                findings.append(f"⚠ {tag} silent {age_m}m — confirm it is meant to be idle")
+        else:
+            findings.append(f"⚠ {tag} has NO TRANSCRIPT — its brief may never have been delivered")
+        # A stale escalate_to re-enters through frozen briefs, so re-check it here.
+        to = _bare_uuid(s.get("escalate_to") or "")
+        if to:
+            if live_rows is None:
+                live_rows = {(r.get("full_path") or "").rsplit("/", 1)[-1]
+                             for r in (ygg(os.environ.get("YGG_GUI_HOST", "***"),
+                                           "server", "app", "rows").get("data") or {}).get("rows", [])}
+            if live_rows and to not in live_rows:
+                findings.append(f"⛔ {tag} escalates to {to[:8]}, which is NOT a live row — its cries go nowhere")
+    if findings:
+        log("FISHY — the orchestrator should look at these:")
+        for x in findings:
+            log(f"  {x}")
+    return findings
+
+
+def _transcript_for(uuid, host=None):
+    """(path, bytes, mtime) for a row's transcript, local or over ssh."""
+    if host and host not in ("", "local", "dev"):
+        # ⛔ NO SINGLE QUOTES IN THIS COMMAND. `_run` wraps every argv element in
+        # single quotes, and shell single-quotes cannot nest — so a `stat -c '%s
+        # %Y'` here arrives malformed and returns nothing. The audit then read
+        # that silence as "NO TRANSCRIPT — the brief may never have been
+        # delivered", a false alarm about a healthy row on its very first run.
+        # ⇒ A space-free format needs no quoting and cannot be broken this way.
+        r = _run(host, ["sh", "-c",
+                        f"ls -t ~/.claude/projects/*/{uuid}.jsonl 2>/dev/null | head -1 | "
+                        f"xargs -r stat -c %s..%Y"], timeout=20)
+        if r and r.stdout.strip():
+            try:
+                sz, mt = r.stdout.strip().split("..")[:2]
+                return ("remote", int(sz), int(mt))
+            except Exception:
+                return None
+        return None
+    import glob
+    hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl"))
+    if not hits:
+        return None
+    p = max(hits, key=os.path.getmtime)
+    st = os.stat(p)
+    return (p, st.st_size, int(st.st_mtime))
+
+
 def seat_audit(gui_host, subs, dry):
     """⛔ IDENTITY FAULTS ARE INVISIBLE TO A LIVENESS WATCHER, AND THEY ARE WORSE.
 
@@ -634,6 +716,10 @@ def tick(a):
     bs = _babysit()
     prune_dead(a.gui_host, load_subs(), a.dry_run)
     seat_audit(a.gui_host, load_subs(), a.dry_run)
+    # ⛔ Runs over PARKED and PINNED rows too — a hold silences a verdict, not an
+    # audit. This is the check that would have surfaced a 6.1 MB row going cold
+    # while its orchestrator believed the fleet was healthy.
+    fishy_audit(load_subs(), a.dry_run)
     for s in load_subs():
         uuid = s["uuid"]
         if s.get("owner_pinned"):

@@ -1309,6 +1309,74 @@ survives every future change to how labels are composed.
 ⚠ **A childless top-level row is a different case** and still wants `N.` from the
 renderer — that one has no sub-seats to be consistent with.
 
+### ⛔⛔⛔ NEVER RENAME A ROW THE OWNER CREATED. HYGIENE APPLIES TO **YOUR** ROWS ONLY.
+
+**Owner-reported 2026-08-13.** A row doing routine row-hygiene sanitization renamed **six working
+sessions it had not created** — a browser stack and an editor shell — into accurate, descriptive,
+and entirely unwanted titles:
+
+```
+  'shell: bare /bin/bash at ~, never used — abandoned launch, safe to close'   ×4
+  'shell: launched yedit, idle — unattributed'
+  'ychrome [<profile>]: web surface on <site> — unseated, owner looks like the 7.x campaign'
+```
+
+⇒ **The descriptions were TRUE.** Those rows really were idle, really were unseated, really were
+bare shells. **Accuracy about a row is not authority over it.**
+
+⛔ **AND THE LOSS IS NOT THE TITLE — IT IS THE IDENTITY.** Each carried a short chip naming which
+profile it was, and that is how their owner told six near-identical rows apart. The rename
+overwrote `detail_label` with generic boilerplate too, so the distinguishing information was
+destroyed rather than replaced. ⚠ **It proved unrecoverable**: no running process carried the
+profile (the rows had never been launched), and the persisted ledgers contained **zero** occurrences
+of any of the original names.
+
+**THE LAW, and it is absolute:**
+
+> **An agent may name its OWN row and the rows it spawned. Every other row belongs to the human.
+> Do not rename it, do not re-describe it, do not "improve" it, do not tidy it away.**
+
+⭐ **The tell is available BEFORE you act, and it inverts the natural instinct: a row you cannot
+account for is more likely to be a HUMAN'S than to be litter.** An agent's rows are the ones with
+seats, briefs and campaign titles — the ones you can explain. **An unexplained row is evidence of a
+person, not of mess.**
+
+⚠ **If a row genuinely looks like a stray**, the safe actions are: leave it, or report it. ⛔ Never
+rename and never remove — `session remove` records a DELETION, so tidying someone's row files it as
+a thing they chose to delete, and a later restore will correctly refuse to bring it back.
+
+⇒ **And if you must touch one anyway, CAPTURE THE PREVIOUS VALUE FIRST.** A rename with no recorded
+prior state is unreversible in practice, whatever the intent — which is precisely how this one
+became permanent.
+
+### ⭐⭐ THE STANDING ROW-HYGIENE PRINCIPLE: GROUP `N.x` UNDER `N.0`, AND `N.x.y` UNDER `N.x`
+
+**Owner-directed 2026-08-13, and it supersedes ad-hoc row tidying as the default.**
+**Group `N.x` sessions under `N.0` as the header, and `N.x.y` sessions under their
+`N.x` header where applicable.** That is the standing agent-aided row-hygiene
+sanitization principle from here on, not one session's preference.
+
+⇒ The sidebar reads as a genuine **outline**: `6.0` is the head of its book with
+`6.1 … 6.7` nested beneath it, and a cluster that orchestrates its own sub-units
+has `6.1.1`, `6.1.2` nested under `6.1`. **The scheme was already recursive**
+(*ORCHESTRATION IS RECURSIVE*, below); this makes the sidebar show it.
+
+**Why it is a principle and not a preference:** a flat list of numbered rows
+stops being navigable at exactly the size where the numbers start to matter, and
+several campaigns share one sidebar. **Grouping is how the fleet's structure
+becomes legible at a glance** — and legibility is what lets an owner find the one
+row they need among dozens.
+
+⇒ **Sanitizing rows now means making the tree TRUE**, not just renaming things:
+every row seated, every seat under its head, no orphan at top level that belongs
+in a book.
+
+⛔ **Do not change the seat scheme to make grouping easier to build.** `N.0` for
+the head is settled, and the renderer is built to the scheme rather than the
+other way round. ⚠ And the seat lives in `outline_prefix` alone — the sidebar
+composes the label at render time, so grouping must read the prefix and never a
+number parsed back out of a title.
+
 **The seat lives in `outline_prefix` and nowhere else.** The sidebar composes
 `label = "<outline_prefix> <title>"` at render time, so a title that also carries
 the number gets it twice.
@@ -1681,6 +1749,59 @@ precisely the wake the park exists to prevent. ⇒ Either leave a parked row off
 the booter, or `ygg-booter.py defer --secs` it across the same window. **Two
 planes, two switches** — and the split is the design, so do not "fix" it by
 teaching one plane about the other.
+
+### ⛔⛔ A HOLD SILENCES A VERDICT, NEVER AN AUDIT — AND THE ORCHESTRATOR'S OWN HOLDS BLIND IT
+
+**Owner-directed 2026-08-13**, after a relay sat at **6.1 MB and 37 minutes cold**
+while its orchestrator believed the fleet was healthy. The orchestrator had parked
+it itself, for a push hold. Two causes, and the first is self-inflicted:
+
+1. ⛔ **`park` suppresses the IDLE verdict — correctly** (a row blocked on purpose
+   is not finished) — **but IDLE was the ONLY line that ever mentioned that row.**
+   Silencing the wrong verdict silenced the health report with it.
+2. ⛔ **Nothing measured what a wake would COST.** Every verb asked *is it
+   working*; none asked *what would it cost me to find out*. A cold
+   multi-megabyte row is priced at dollars per wake, **charged before it answers a
+   word** — so the cheapest question was the one nobody was asking.
+
+⇒ **`fishy_audit()` runs on every tick over EVERY subscriber — parked and pinned
+included — and reports only anomalies.** It never nudges, wakes or reaps. It
+exists so the orchestrator sees the fishy row *before* it costs something:
+
+| finding | why it matters |
+|---|---|
+| **≥2 MB and ≥25 min cold** | a wake re-reads all of it first ⇒ **succeed by harvesting, never by asking** |
+| **no transcript at all** | the brief was probably never delivered |
+| **silent ≥3 h** | confirm it is meant to be idle |
+| **`escalate_to` is not a live row** | its cries go nowhere, and briefs reintroduce stale uuids |
+
+⚠ **Prove it can FIRE before trusting a clean run**, and note the trap its own
+first run hit: `_run` wraps each argv element in single quotes, so a command
+containing `'…'` arrives malformed and returns nothing — which the audit read as
+*"NO TRANSCRIPT"* about a perfectly healthy remote row. **Silence from a broken
+probe is not a negative result.**
+
+### ⛔⛔ CHECK YOUR OWN CONTEXT AND RELAY YOURSELF — THE ORCHESTRATOR IS NOT EXEMPT
+
+**Owner-directed 2026-08-13**, and stated as a requirement on this seat
+specifically: check your own context budget the way it is checked manually, and
+spawn a newer version of yourself whose successor despawns you.
+
+⇒ **The seat that relays everyone else is the one most likely to forget it needs
+relaying.** It has no cluster watching it, its work feels like coordination rather
+than a lane, and it is the row whose silent death costs the most.
+
+- **Watch your own budget on a schedule, not on a feeling.** Silent below 55%;
+  **LAND at 70%.** The only fleet session ever to hit the context wall did so
+  because that check was manual.
+- **Then run the standard succession on yourself** (§10): write the door memory so
+  the successor needs no brief, put **your own UUID in the brief as `PREDECESSOR TO
+  REAP`**, spawn, verify the ACK token in its transcript, and **let the successor
+  reap you** — `ygg-claim.sh … --replace <your-uuid> --booter`, which also moves
+  every subscriber with the seat.
+- ⛔ **Do not hand a successor a running window.** Land or explicitly transfer any
+  hold, freeze or promise you are carrying, and name each one in the brief — a
+  promise nobody knows about is not inherited, it is dropped.
 
 ### ⛔⛔ PROMOTION AND DEMOTION ARE THE OWNER'S, ALWAYS
 
