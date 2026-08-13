@@ -1422,6 +1422,21 @@ file, put it **outside the repo** or in an ignored path, and **remove it once it
 has been read** — the sender owns the cleanup, because the recipient has no way
 to know the message is spent.
 
+⛔⛔ **BUT CONFIRM CONSUMPTION FIRST — "the sender cleans up" is a data-loss rule
+without it.** Deleting a dropped brief before the recipient has read it converts
+a working channel into a silent failure, and neither side ever learns. The check
+is cheap and it is the same instrument as the ACK-token grep: look for a
+`tool_use`/`tool_result` pair reading that path in the recipient's transcript, or
+grep the transcript for a distinctive string from the file.
+
+⚠ **Measured both ways on 2026-08-13.** One row correctly removed its own drop
+only after finding the Read in the target's transcript, sixteen seconds after the
+pointer. Another — an orchestrator clearing three stale briefs from three lanes —
+verified consumption on **one** of the three and reasoned about the other two;
+re-checked afterwards, all three had read it (30, 22 and 33 references), so
+nothing was lost. **The reasoning was sound and it was still not a measurement.**
+⇒ Check each recipient, not a representative one.
+
 ### ⛔⛔ A BRIEF MAY CARRY FACTS. IT MUST NOT CARRY YOUR CAUSAL THEORY.
 
 **Measured on this campaign: one orchestrator handed one cluster a wrong cause

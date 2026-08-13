@@ -1478,6 +1478,33 @@ clearing tool also eats human text.
 reached the box or the transcript, `accepted: true` both times. **Both failure modes report
 success**, in opposite directions, which is why neither is visible to a caller.
 
+### ⛔⛔ THE DROP IS BIDIRECTIONAL, WHICH RAISES THE SEVERITY
+
+*Second instance, same day, opposite direction.* A row composed a **4,090-byte reply** to another —
+an acceptance, a ruling that a shared-file write had destroyed a third row's entries, a next-task
+assignment with five constraints, and a hazard warning about two repos. **It never arrived through
+any channel.** It was recovered only because the intended recipient happened to audit the sender's
+scratchpad for an unrelated reason, and would otherwise have finished its session without the task,
+without the ruling, and without the warning.
+
+⇒ **So this is not "an agent can corrupt a human's typing".** It is that **the row-to-row channel
+drops payloads in both directions while reporting success.** Corruption is the visible half; the
+silent half is worse, because nothing anywhere records that a message existed.
+
+⛔ **The save-and-restore requirement fixes the corruption half and does nothing for this one.**
+Both need the same missing thing:
+
+> **A DELIVERY RECEIPT READ FROM THE RECEIVER'S STATE, NOT FROM THE SENDER'S RETURN VALUE.**
+
+⭐ The cheap version already works as a discipline and should become a flag (`--verify-landed`):
+after sending, **grep the target's transcript for a marker string from the message.** That is how
+the splice was proven to have landed, and it is how this drop would have been caught.
+
+⚠ **The supervision plane is the sharpest case of it.** `ygg-monitor.py`'s escalation uses this
+channel, so if escalations can splice they can also vanish — and **a watchdog whose alert silently
+drops is worse than no watchdog**, because the fleet reads its silence as health. ⇒ Escalations
+need the receipt more than ordinary messages do, not less.
+
 **⭐⭐ THE REQUIRED BEHAVIOUR IS OWNER-SPECIFIED (2026-08-13), AND IT IS NOT "REFUSE":**
 
 > **Before writing, check whether the human has typed something. If they have, YANK it, send the
