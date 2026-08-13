@@ -482,10 +482,19 @@ export class NativeInterpreter extends JSChannel_ {
   // hidden page but, unlike rAF, they still run.
   rafEdits(bytes: ArrayBuffer) {
     // In headless mode, the requestAnimationFrame callback is never called, so we need to run the bytes directly
+    //
+    // ⚠ "headless" is not the rare case it sounds like. It is baked into the
+    // page at load time from `!cfg.window.window.visible`, so a host that
+    // builds its window hidden and shows it afterwards takes THIS branch for
+    // the entire life of the process — measured true on every yggterm webview,
+    // including the visible desktop one. ⇒ a guard that protects only the
+    // branch below protects nothing in production. Both go through
+    // `flushQueuedBytes` so there is ONE place where an edit batch is applied,
+    // and therefore one place where a failure can be caught and reported.
     if (this.headless) {
+      this.enqueueBytes(bytes);
       try {
-        // @ts-ignore
-        this.run_from_bytes(bytes);
+        this.flushQueuedBytes();
       } finally {
         this.markEditsFinished();
       }

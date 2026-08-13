@@ -29,191 +29,132 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
-## ⛔⛔⛔ [6.3] THE RIGHT RAIL RESERVES ITS WIDTH AND DRAWS NOTHING INSIDE IT — IN EVERY MODE
+## ⛔⛔⛔ [6.3] A SUBTREE STOPS TRACKING ITS STATE FOREVER — THE BLANK RIGHT RAIL, ROOT-CAUSED
 
 **Status:** OPEN
 
-The symptom is measured on the live desktop host; the cause is NOT established.
+⇒ Recurrence is fixed in code and sandbox-proven. What keeps this OPEN is that a
+GUI which has already taken a fault stays damaged — the owner's has — and no
+code change reaches it. Repair, or his next restart, is the cure.
 
-*Owner-reported: the right sidebar has been absent for hours. Measured 2026-08-14.*
+*Owner-reported: the right sidebar has been absent for hours (2026-08-14). It is
+his #1 item. The rail is where the damage happened to land; it is not a rail bug
+and the next surface it eats will look nothing like this one.*
 
-A docked right rail paints its card and renders **no body at all**. The user
-reads that as "there is no right sidebar", because a 272 px band of flat
-background is not a sidebar.
+### ⭐ THE CAUSE, IN ONE PARAGRAPH
 
-### ⛔ WHAT IS ESTABLISHED
+Edits reach the webview as batches over a websocket, and the webview
+acknowledges each one. If applying a batch **throws partway through**, the
+acknowledgement was sent anyway (deliberately — a withheld ack starves the whole
+VirtualDom, which is the freeze `vendor/dioxus-desktop` already fixed once). So
+the host records those mutations as landed. **Nothing re-sends them, ever** —
+the next diff compares against a model in which they arrived. From that instant
+one subtree is frozen at whatever it happened to contain, every later patch aimed
+at it addresses nodes that were never inserted, and every field in
+`server app state` keeps confidently reporting what it *should* be showing.
 
-One scanline, `y=600`, same window (1920×1200), rail docked vs hidden:
+⇒ The trade was made knowingly and priced wrong. The commit that introduced the
+unconditional ack called the cost *"one stale frame"*. It is not one frame; it
+is permanent, silent, and unbounded.
 
-| x | rail docked | rail hidden |
+### ⛔ THE CONTRADICTION THAT PROVES IT, BEFORE ANY MECHANISM IS ARGUED
+
+`[data-yggui-side-rail-content]` holds exactly two nodes: a Dioxus
+`<!--placeholder-->` and the 8 px resize handle. No `[data-yggui-rail-header]`
+or `[data-yggui-rail-scroll]` exists anywhere in the document, while
+`data-yggui-side-rail-visible` reads `1`.
+
+`visible` and the body are stamped by ONE render from ONE `rail_render_view`
+destructure. `docked == true` forces `rendered_mode == requested_mode != Hidden`,
+`RightPanelMode` has six variants, the dispatch chain has an arm for all five
+non-`Hidden` ones, and every arm opens with an unconditional `RailHeader`. So
+`visible=1` with `hdr=0` **cannot both be products of the same render.** They are
+not: the attribute landed and the body's mutation did not.
+
+### ⇒ REPRODUCED ON DEMAND, AND IT IS THE 2026-08-08 SIGHTING TOO
+
+In a clean sandbox at the current build, make exactly one edit throw — patch
+`Element.prototype.replaceWith` to throw once — then drive the panel:
+
+| | before the fix | after the fix |
 |---|---|---|
-| 1600 | `#262A33` terminal | `#262A33` terminal |
-| 1660 → 1900 | `#D3E7ED` flat | `#262A33` terminal |
+| host learns of the fault | **never** | `webview_edit_faults: 1` + an `ERROR` log line |
+| uncaught errors that follow | 2, rising to 5 while cycling modes | **0** |
+| operands abandoned on the interpreter stack | 4 (depth 1 → 5) | **0** (depth 1 → 1) |
+| the faulted subtree | frozen permanently | frozen permanently |
 
-⇒ the band is **inside the window** and it **is** the rail: hiding the rail
-gives those 270 px back to the terminal, and 270 px is `rail_width` (272).
+With one fault induced, the rail body froze on one mode's header and **never
+changed again** through every subsequent `server app panel` command, while
+`server app state` reported each new mode correctly. That is verbatim the
+discriminator recorded on 2026-08-08 for *"the session metadata rail renders its
+header and nothing else"* — **same bug, earlier truncation point.** That entry is
+folded into this one; do not re-open it separately.
 
-Band statistics, 265×1100 each, from the same frames:
+⇒ The escalation is the abandoned operands. A faulted batch leaves its operands
+on the interpreter stack, and every later `replace_with` / `append_children`
+splices `stack.length - n` — so one abandoned operand silently mis-addresses
+**every batch that follows**, which is how "the header survived" (2026-08-08)
+becomes "the whole body is a placeholder" (2026-08-14).
 
-| band | distinct colours | ink (px darker than 0.35) | edge energy |
-|---|---|---|---|
-| LEFT tree | 4,959 | **0.79 %** | 0.129 |
-| RIGHT rail | **10** | **0.00 %** | 0.0066 |
+### ⛔ WHAT SHIPPED
 
-⇒ the left tree draws text, so the DOM chrome is alive and this is not a dead
-webview. The rail has **zero** dark pixels — not faint content, none.
+- **The ack no longer lies.** It carries a fault byte and the JS error text. The
+  host counts it, logs it at `ERROR` with the webview id, and exposes
+  `webview_edit_faults` at the top level of `server app state`.
+- **A faulted batch no longer poisons its successors.** Operands are popped back
+  to the depth the batch started at.
+- **One bad buffer no longer eats its siblings.** The drain empties the queue
+  before applying it, so an escaping exception used to destroy every buffer
+  behind the failing one — batches the host had already been told were delivered.
+- ⚠ **The guard had to move branches to be worth anything.** `rafEdits` has a
+  `headless` path and a `requestAnimationFrame` path, and `headless` is baked
+  into the page from `!window.visible` at load — **it is `true` on every yggterm
+  webview, including the visible desktop one.** The first version of this fix
+  guarded only the rAF branch and changed nothing in production; the counter
+  stayed at 0 through an induced fault. Both branches now share one apply.
 
-⭐ **The ink measurement is also what kills the tempting alternative.** The
-window is composited transparent, so "both bands are wallpaper showing through"
-had to be excluded before anything else meant anything; wallpaper does not
-contain near-black text pixels, and the left band does.
+### ⚠ WHAT IS *NOT* FIXED, STATED PLAINLY
 
-### ⛔ WHAT THIS IS NOT — three candidates, each excluded by measurement
+**A GUI that has already taken a fault stays damaged.** The mutations are gone
+and nothing can re-derive them; the host's model is self-consistent and wrong.
+Only a restart rebuilds the DOM from scratch. So the owner's rail is still blank
+and no code change reaches it — ⛔ and a restart must not be taken from under
+him: he has an unsent half-typed draft in a live composer (`owner-attention.md`).
 
-- **Not mode pinning.** `raw_mode` sits at `app_pane` and never moves, which
-  looks like a rail pinned to a dead contributed pane with no exit. But
-  `rendered_mode` tracks every command (`settings` → `metadata` → `hidden`),
-  and `rendered_mode` is what the body dispatch switches on. The tenancy
-  resolver is doing its job; the body still does not draw.
-- **Not a contributed-pane fault, so it does NOT belong on the yedit entry.**
-  `metadata` and `settings` are built-in rails that never involve a declared
-  pane, and both are equally blank. `document_surfaces: []` is a true reading
-  and a real defect, but it cannot explain a blank *metadata* rail.
-- **Not an empty body.** `MetadataRailBody` renders `RailHeader { title:
-  "Session Metadata" }` **unconditionally** — before any session, daemon or
-  pane lookup — and `SideRailShell` interpolates `{body}` with no conditional
-  around it. A rendered body cannot be blank; it would carry that header.
+⇒ **What he can do today:** nothing that restores the body — every docked mode is
+blank, so `server app panel <mode>` cannot recover it. `hidden` returns the
+272 px to the terminal instead of spending them on a blank band, and
+`server app panel settings` puts it back after his next restart.
 
-### ⭐ THE SHAPE WORTH TESTING FIRST — named by the code's own warning
+**The open work is repair, not detection:** a resync that rebuilds a diverged
+subtree without dropping the page. A `key` bump on the top-level chrome regions
+would force Dioxus to tear down and re-create them, which is the shape to try
+first. ⚠ Falsifier before building it: the tear-down's own `replace_with` targets
+nodes that were never inserted, so prove the repair does not fault on the very
+damage it is repairing.
 
-`sidebar_panel_card_style` is documented in `SideRailShell`'s own signature:
-*"The host emits a FIXED property key set across every mode; the rail must not
-add or drop keys here (Dioxus applies `style` property-by-property and does not
-clear dropped keys — that lingering was the docked-rail-ghost bug)."*
+### ⛔ DEAD ENDS — MEASURED, DO NOT RE-DERIVE
 
-⇒ a style property emitted in one mode and **absent** from another is not
-cleared, it LINGERS. This symptom is a VERBATIM recurrence of the one that
-trap first produced (*"the right sidebar cannot be opened, nothing draws on the
-right"*), which is why it was the obvious next suspect.
+- **Not a build regression, and the bisect is retracted.** 4338 changed lines
+  across the suspected window touch `rail_render_view`, the `*RailBody`
+  components, `SideRailShell`, `RailHeader`, `RailScrollBody`, `rendered_mode`
+  and `right_panel_mode` **zero** times, and a clean sandbox at a NEWER build
+  draws the rail correctly.
+- **Not mode pinning, not data-dependent.** All four built-in modes sampled with
+  state and DOM *together* give `requested = rendered = <mode>`, `docked=True`,
+  and a placeholder body. `connect` is a static form touching neither
+  notifications nor contributed panes.
+- **Not a dead webview and not a frozen VirtualDom.** The left tree paints text
+  in the same frame, and `data-yggui-side-rail-visible` tracks `docked` exactly
+  (1 → 0 → 1) as the mode is driven.
+- **Not "the rail is per-selected-session and nothing is selected"** — a clean
+  sandbox reports `active_session_path` absent too and still draws its body.
+- ⛔ **Detached-node counts are NOT the instrument, and a control says so.** A
+  damaged instance had 84 % of its registered nodes detached from the document,
+  which reads as decisive until a *clean* instance measures 41 % — Dioxus retains
+  entries for removed nodes as a matter of course. Neither is the interpreter
+  stack depth: clean sits at 1, not 0. **Read `webview_edit_faults`.**
 
-⛔ **AND IT DOES NOT HOLD — checked, in the code, and recorded so nobody walks
-it again.** `sidebar_panel_outer_style` and `sidebar_panel_card_style` each
-build ONE `format!` with a fixed key set and vary only the values, which is
-exactly the fix that trap was closed with. The key sets cannot differ by mode.
-
-⛔ **Zoom does not hold either.** The card is transparent in-flow by design
-(`background-color:transparent`, the app background paints behind it), so the
-pale band is the app background — and the tree and the rail pass **byte-identical**
-zoom arguments (`zoom_percent_f32(settings.ui_font_size, 14.0)`) to the same
-helper. A zoom collapse would have taken the tree with it, and the tree draws.
-
-⇒ **What is left is the body itself, and every reading says it should draw.**
-`rail_render_view` is the single owner of "what is the rail drawing" and the
-probe reads that same value; it reports `docked:true` + a `rendered_mode` the
-dispatch has an arm for; `SideRailShell` interpolates `{body}` unconditionally;
-and the body's first child is an unconditional `RailHeader`. Every one of those
-is true and the rail is still empty, which is the shape of a reading that is
-answering a different question than its name suggests.
-
-⭐ **THE FALSIFIER HAS BEEN RUN — THE CHILDREN ARE ABSENT.** Read-only walk of
-the live DOM: `[data-yggui-side-rail-content]` holds **exactly one child**, the
-8 px `[data-rail-resize-handle]`, and there is no `[data-yggui-rail-header]` or
-`[data-yggui-rail-scroll]` anywhere in the document. ⇒ the body never rendered,
-and the fault is **upstream of the styles**. The three style-side exclusions
-above stand and none of them is resurrected by this.
-
-⛔ **CORRECTION — the instrument was never missing.** This entry previously said
-no DOM-read verb existed and made that the prerequisite. False: **`server app
-dom-eval`** runs JS in the GUI webview and returns the serialized result without
-typing, and it shipped long before this entry was written. `chrome type
---assert` is the one that types. An inherited "that instrument does not exist"
-is a CLAIM; it cost a seat's launch.
-*(Positive control, because an instrument collapsed to a constant answers
-confidently and wrongly: the same walk reports 291 descendants under the left
-tree, which is measured to draw.)*
-
-⭐⭐ **IT IS INSTANCE STATE, NOT THE BUILD, AND NOT THE CODE. NOBODY SHOULD
-BISECT THIS.** Stood the CURRENT build up in a clean private sandbox
-(`scripts/underglass-sandbox.sh`, under-glass **off**, `gdk_backend=wayland`
-asserted, XWayland impossible) and ran the same probe: **`kids:4`,
-`rail_header:1`, `rail_scroll:1`** — header, section, scroll body, handle. The
-rail renders correctly on code NEWER than the build that fails.
-
-⛔ **A RETRACTION, RECORDED BECAUSE IT NEARLY COST A NIGHT'S BISECT.** This entry
-briefly claimed a regression with a window to bisect. That was wrong twice over:
-
-- **The A/B was confounded.** The working instance differed from the failing one
-  in THREE ways at once — older build, *and* a different rendering configuration
-  (`YGGTERM_WEB_SURFACE_UNDER_GLASS=1`), *and* an empty session set. Only the
-  build was credited. ⇒ **Count the variables before naming the cause.**
-- **The window was invented from the wrong instrument.** Its vintage was inferred
-  from the process START TIME; the binary itself answers `--version` in one call
-  and said **3.0.112** (08-11), not the same-afternoon build that had been
-  assumed. ⭐ **Ask the binary, never the clock.**
-
-And the measurement that should have killed it before any sandbox ran: across
-the whole range 3.0.112 → 3.0.148 there are 4338 changed lines in `shell.rs` and
-**ZERO** touching `rail_render_view`, any `*RailBody`, `SideRailShell`,
-`RailHeader`, `RailScrollBody`, `rendered_mode` or `right_panel_mode`. A bisect
-cannot land on a rail change when there is no rail change in the range.
-
-⇒ **The specimen is the owner's long-lived GUI instance, and it is the only
-place the bug exists.** What that instance has and a clean one does not: ~385
-rows, ~306 notifications, four contributed panes all reporting
-`in_snapshot_map:false`, and a `right_panel.raw_mode` pinned at `app_pane`
-through every mode change while `requested_mode` moves. **That pin is the prime
-suspect** — on a clean instance `raw_mode` tracks the mode exactly.
-
-⛔ **Two explanations are now excluded, both of which looked strong.** *"The rail
-is per-selected-session and nothing is selected"* — the clean sandbox reports
-`active_session_path` **absent** too and still draws `kids:4`. And *"the fault is
-in the body dispatch chain"* — that chain is unchanged since 2026-07-09 and is
-byte-identical between the failing build and current `main`.
-
-⛔ **NOT mode-specific and NOT data-dependent.** Sampling state and DOM
-*together* (a reading taken at a different moment proves nothing) across all
-four built-in modes:
-
-| mode | `server app state` | DOM |
-|---|---|---|
-| connect | `requested=rendered=connect docked=True` | `vis=1 kids=1 hdr=0` |
-| metadata | `requested=rendered=metadata docked=True` | `vis=1 kids=1 hdr=0` |
-| settings | `requested=rendered=settings docked=True` | `vis=1 kids=1 hdr=0` |
-| notifications | `requested=rendered=notifications docked=True` | `vis=1 kids=1 hdr=0` |
-
-`connect` is a static form touching neither notifications nor contributed
-panes, so a data-dependent failure in the body is excluded.
-
-⚠ **AND THE CHROME IS LIVE, NOT FROZEN** — the obvious next suspect, killed
-before it could be believed: `data-yggui-side-rail-visible` tracks `docked`
-exactly (1 → 0 → 1) as the mode is driven, so renders ARE happening and the
-attribute half of the very same render is correct.
-
-⇒ **What that leaves, stated as the contradiction it is.** `visible` and the
-body are stamped by ONE render from ONE `rail_render_view` destructure, where
-`docked == true` forces `rendered_mode == requested_mode != Hidden`, and every
-non-`Hidden` variant has an arm whose first child is an unconditional
-`RailHeader`. So `visible=1` with `hdr=0` **cannot both be products of the same
-render** under the source as written. The next seat should treat that as the
-finding: either the `body: Element` prop is not being rendered by
-`SideRailShell` in this build, or the child subtree fails at render time and
-Dioxus swallows it, leaving the parent's container and handle intact. Bisect the
-window above rather than re-reading the dispatch chain, which is not where it
-changed.
-
-⚠ **A second, independent anomaly, unexplained and worth its own look:**
-`right_panel.raw_mode` stays pinned at `app_pane` through every mode change,
-while `requested_mode` moves. Every contributed pane on that instance also
-reports `in_snapshot_map: false`.
-
-### ⇒ WHAT IT COSTS, AND WHAT THE USER CAN DO TODAY
-
-No cure was found that he can run himself: **every docked mode is blank**, so
-`server app panel <mode>` cannot recover it. Hidden is left as the better of two
-bad states — it returns 272 px to the terminal instead of spending them on a
-blank band — and `server app panel settings` puts it back whenever the fix
-lands. ⛔ A GUI restart was NOT attempted and must not be: he has an unsent
-half-typed draft in a live composer, and that is his work.
 ## ⛔⛔⛔ [6.7] THE READINESS PROBE TYPES OVER THE HUMAN — THIS IS THE "I CANNOT TYPE" BUG, ROOT-CAUSED
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -6922,65 +6863,15 @@ the cliff, and the row bomb happens at whatever the new number is.
 ⚠ Until then, **never loop on a `terminal new` timeout.** Read `server app rows`
 first; the row is probably already there.
 
-## ⛔⛔ REPORTED, LIVE: THE SESSION METADATA RAIL RENDERS ITS HEADER AND NOTHING ELSE
+## ⛔⛔ TWO TOASTS AT TWO ANCHORS AT ONCE — AND THE TOP-RIGHT ONE IS NOT A TOAST
 
 **Status:** OPEN
 
-Reported 2026-08-08 with two screenshots: *"The entire session metadata sidebar
-is borked … and showing double notifications somehow."*
+Reported 2026-08-08 alongside a blank session-metadata rail. ⛔ **The rail half
+of that report is the same defect as the [6.3] entry above and is folded into
+it** — a lost edit batch, root-caused and reproduced 2026-08-14. Only the toast
+half is still its own question, and it was never explained.
 
-**Reproduced on 3.0.62, and it is NOT transient.** A faithful screenshot taken
-with no toast in flight, on a different active row than his, shows the identical
-thing: the rail draws `Session Metadata` and an empty body.
-
-### ⛔ IT IS NOT A BUILD REGRESSION — SETTLED 2026-08-08 20:47 BY RESTART
-**A freshly restarted GUI on the SAME 3.0.62 bytes renders the rail correctly**
-(`div[data-yggui-rail-scroll]` present, 7 entry rows, real content). The GUI that
-was broken had been launched CLEANLY at 20:04:56 against a binary written at
-20:04, with zero hot-restarts in its log, and the owner reported the empty rail
-six minutes later. ⇒ **the GUI FALLS INTO this state at runtime.** The 3.0.59
-bisect this entry used to demand is NOT the measurement that settles it, and
-`git log -S` was already the wrong instrument: the rail code is materially
-unchanged since 3.0.59, and libyggterm's `rails.rs` is byte-identical across the
-pinned checkouts (v0.12.1 predates 3.0.59).
-
-### The failure is STRUCTURAL, and the DOM names it exactly
-Read with `server app dom-eval` (a function BODY — it needs `return`; without one
-it answers `result:null`, which is not a negative result). Broken rail:
-
-    card children = [ DIV[data-yggui-rail-header], STYLE, <!--placeholder-->, DIV[data-rail-resize-handle] ]
-    document.querySelectorAll('[data-yggui-rail-scroll]').length === 0
-
-`RailScrollBody` emits TWO roots — a `<style>` and the scroll `div`. **The
-`<style>` mounted and the scroll `div` did not**; a Dioxus placeholder comment
-sits in its slot, so every metadata group is absent because its CONTAINER is.
-⇒ The old "the `content:` Element is empty/Err" reading is FALSIFIED: an empty
-`content` would still leave the scroll `div` in the DOM.
-
-Second, and it is the discriminator for whoever fixes this: **once broken, the
-rail's BODY subtree never updates again** — the header stays `Session Metadata`
-while `server app panel settings|notifications|connect` flips
-`rendered_mode` correctly in `server app state`. Meanwhile the rail's OUTER
-element keeps patching normally (`data-yggui-side-rail-visible` flips 0↔1, width
-6↔272). So one subtree is dead while its parent is live. The sidebar keeps
-repainting throughout (proven by renaming a row and seeing it change), so this is
-not a frozen webview and not a frozen VirtualDom.
-
-⛔ Do NOT re-derive these dead ends: memoisation is not the cause (`VNode`'s
-`PartialEq` is `Rc::ptr_eq`, so freshly built `rsx!` props are never equal, and
-`SharedSnapshot` is `Arc<RenderSnapshot>`, which compares structurally); the
-card's flex geometry is correct (`sidebar_panel_card_style` already emits
-`display:flex; flex-direction:column; min-height:0`); there is no ghost root
-(`shell_root_count == 1`); and there is no panic in the GUI's launch log.
-
-### What does NOT reproduce it on a fresh GUI
-Cycling `hidden|metadata|settings|notifications|connect`, scrolling the rail, and
-switching the active session onto a ychrome web-surface row and back — the rail
-stayed live through all of it and its content tracked the row correctly. The
-trigger is still OPEN; a watcher that polls the rail DOM every 30s is the way to
-timestamp the transition rather than guess at it.
-
-### Second, separate symptom in the same report: TWO toasts, two anchors
 His second screenshot has `Restoring Remote Terminal` at top-CENTRE and
 `Image Staged` at top-RIGHT at the same time, the right-hand one painted OVER the
 rail's header. Two live toast surfaces at two anchors is the "double
