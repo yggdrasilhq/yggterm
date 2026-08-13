@@ -4641,12 +4641,19 @@ and passes its version.
 **Still unbuilt:** §2 (relay boundaries as the appointment), §5
 (the deadline + `continue` repair), and the rest of §3 — **blocked-on-human is
 not yet a state**, and an agent session's WORKING state is still inferred from
-silence rather than from a positive signal. §4's queue is built but has only ONE
-producer (the daemon's own retire poll); the GUI's startup reconcile still
-declines silently and leaves nothing behind — see the next paragraph.
+silence rather than from a positive signal.
 
-⚠ **The GUI's startup reconcile drops the intent too, and one unrecognised
-session key is enough to do it.** `startup_daemon_hot_swap_reason_with_authorized_keys`
+⚠ **§4's second producer is built and pushed but NOT yet live-proven, because it
+only runs in the GUI.** `queue_startup_swap_intent` records the intent when
+`reconcile_stale_daemon_on_startup` declines; a source-level test pins the call
+site (`the_startup_reconcile_queues_the_swap_it_declines_to_take`), which is the
+right shape because the defect is a missing call on an early return. **Falsifier
+for whoever restarts the GUI next:** grep the GUI's trace for
+`startup_hot_swap_declined_swap_queued`, and check that the host's
+`hot-restart-queue.json` names `requested_by: "gui_startup_reconcile_declined"`.
+
+⚠ **What that producer exists for: the GUI's startup reconcile drops the intent,
+and one unrecognised session key is enough to do it.** `startup_daemon_hot_swap_reason_with_authorized_keys`
 answers `None` — silently, with no trace — when the stale daemon owns terminal
 runtimes whose keys are not ALL in the authorized set
 (`server-state.json` live sessions ∪ `hot-update-terminal-owners.json` entries),
@@ -4656,8 +4663,8 @@ authorized and 1 was not** — `local://6b91a415-…`, a row created since the l
 state persist. `runtime_status_owned_runtime_is_authorized` requires `all()`, so
 one such key vetoes the whole host's daemon upgrade for as long as it lives.
 ⇒ **Do not relax the predicate** — it guards against handing off runtimes nobody
-can account for. Queue the intent instead and let the retry find the moment when
-the key has been persisted. **Falsifier:** compare a stale daemon's
+can account for. The intent is queued instead, so the daemon's own retry finds
+the moment when that key has been persisted. **Falsifier:** compare a stale daemon's
 `owned_terminal_session_keys` against those two files; the swap is declined iff
 any key is missing from the union.
 ⚠ Two known gaps in what landed, both in the safe direction (they answer "not
