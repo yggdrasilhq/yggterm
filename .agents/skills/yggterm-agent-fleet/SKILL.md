@@ -1416,6 +1416,22 @@ two things follow that nobody intends:
    uncommitted work"*. **The tool's own litter became evidence about the lanes.**
 2. ⛔ **A `git add -A` sweeps it into the repo**, and on a public one that is a
    brief published to strangers.
+3. ⛔⛔ **AND IT CORRUPTS THE BUILD IDENTITY OF ANYTHING BUILT FROM THAT TREE.**
+   The same day, a release built in a briefed worktree stamped itself
+   **`<sha>-dirty`**, so a deployed binary could no longer be traced to a commit.
+   `deploy-fleet` **detected it and warned in exactly the right words**, then
+   deployed anyway, because a dirty checkout is a WARNING and not a refusal.
+   ⚠ **The orchestrator then misrouted it** as a deploy-identity defect to the
+   cluster that owns *"one version must mean one build"* — which was innocent,
+   and whose guards had worked correctly. The cluster that had actually been
+   briefed supplied the cause. ⇒ **Three distinct failures, one untracked file,
+   and the third one landed on a shipped artefact.**
+
+⚖ **A real design question falls out of it, and it is the orchestrator's:**
+should a dirty checkout **refuse** a release build rather than warn, the way the
+ancestry guard already refuses? The ancestry half earns its keep by refusing; the
+dirty half warned and was overridden by the same agent that had dirtied the tree.
+⭐ Recommendation on file: **refuse for a release build, warn for a local one.**
 
 ⇒ **Prefer the peer plane**, which leaves nothing behind. If you must drop a
 file, put it **outside the repo** or in an ignored path, and **remove it once it

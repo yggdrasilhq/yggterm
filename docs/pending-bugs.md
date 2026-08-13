@@ -1446,6 +1446,30 @@ for ~11 s, which is already tracked and would produce exactly this.
 **Falsifier:** time both verbs against the same GUI at several row counts. `state`
 must not diverge from `clients` by more than the work it genuinely does more of.
 
+## ⛔ A DIRTY CHECKOUT ONLY WARNS, SO A SHIPPED BINARY STAMPED ITSELF `-dirty`
+
+**Status:** OPEN
+
+*Found 2026-08-13 when a released build could not be traced to a commit.*
+
+`deploy-fleet.sh` **detected the dirty checkout and warned in exactly the right words**, naming the
+modified lockfile and the untracked file — then deployed anyway, because a dirty tree is a WARNING
+while the ancestry check is a REFUSAL. The binary that reached the desktop host carries
+`<sha>-dirty`, so *"one version must mean one build"* holds in the code and not in the artefact.
+
+⚠ **The untracked file was an orchestrator's dropped brief**, so the agent best placed to override
+the warning was the one that had caused it. ⇒ A warning is worth little against a caller who
+already believes the tree is fine.
+
+⛔ **And the misdiagnosis is part of the entry.** It was first routed to the deploy-identity cluster
+as a stamping defect. That cluster was innocent and its guards had worked correctly; the briefed
+cluster supplied the real cause. **A `-dirty` stamp is evidence about the TREE, not about the
+stamping code.**
+
+**Recommendation:** refuse for a release build, warn for a local one — mirroring the ancestry guard,
+which earns its keep precisely by refusing. ⭐ Cheaper still, and it removes the cause rather than
+the symptom: briefs must not be written into a build checkout (see the fleet skill on file drops).
+
 ## ⛔⛔ `terminal send` SPLICES INTO A HUMAN'S HALF-TYPED SENTENCE, AND THE `\r` SUBMITS THE FUSION AS THEIR OWN TURN
 
 **Status:** OPEN
