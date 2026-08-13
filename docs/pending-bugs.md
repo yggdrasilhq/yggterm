@@ -5638,27 +5638,49 @@ interrupted record naming that key and a foreign `recorded_by_pid`:
 PTY, it was **submitted as a line**, which is the thing a concatenated `\r` does
 not do. The record was cleared on dispatch, so the next poll took nothing.
 
-⚠ **STILL NOT PROVEN: the deadline itself firing (`Force`), and it must not be
-manufactured.** Not for want of trying — the reason is structural and worth
-recording so nobody spends the hours again. `Force` requires a blocker set that
-is entirely interruptible, i.e. at least one AGENT-kind session and no plain
-shell beside it, and **there is no headless way to mint an agent-kind session**:
-`server attach` mints a shell by design (→ `not_restorable` → exempt → the veto
-fires first and hides the state under test), and `automation run --kind
-claude-code` routes through app-control and refuses on a host with no GUI
-(*"no live Yggterm GUI client is registered for app control on this host"*).
-The remaining honest routes are (a) catch it in the wild, or (b) a full GUI in
-`scripts/underglass-sandbox.sh`'s private sway + private `YGGTERM_HOME`, mint the
-row there, and force the deadline against a host that owns nothing real.
-⛔ Driving a live daemon that holds other agents' rows into a forced cold
-shutdown to watch the mechanism work is not a test, and is not to be done.
-**Falsifier, unchanged, and both halves must be checked:** a
-`hot_restart_forced_past_deadline` trace event naming its `interrupted` list,
-followed within the repair window by one `hot_restart_repair_continue
-{outcome: "submitted"}` per session on the daemon that adopted them — and
-`server daemons` printing `repair owed:` in between. ⛔ A forced swap whose
-repair never lands is the deadline shipping alone, which is the thing the old
-prohibition forbade.
+⭐⭐ **§5 IS NOW LIVE-PROVEN END TO END, BOTH HALVES — and the proof found a real
+defect in the second one, which is what it was for.** Run in
+`scripts/underglass-sandbox.sh`'s private sway with a private `YGGTERM_HOME` and
+a sandbox-owned binary pair, so nothing of the fleet's was touched:
+
+    hot_restart_forced_past_deadline {
+        retire_trigger: "disk_binary_replaced", owed_for_ms: 1862006,
+        reason: "local://<row> was active 44s ago (idle window 300s)",
+        interrupted: ["local://<row>"], repair_recorded: true }
+    …the daemon cold-shuts-down; a successor comes up and adopts the key…
+    hot_restart_repair_continue { session_key: "local://<row>", outcome: "not_ready" }
+
+⭐ **The recipe, because the entry said for days that this could not be built:**
+a full GUI in the private sandbox, `server app terminal new --kind claude-code`
+for a genuine agent row, `YGGTERM_DISABLE_SELF_RETIRE_HANDOFF=1` so the lane
+reaches the cold gate, a queue entry stamped 31 minutes old (the file's own
+documented clock), and a `mv` over the SANDBOX copy of the binary.
+⛔ **And the belief that blocked it was stale.** The entry recorded that a freshly
+created agent row is `not_restorable` — permanent, exempt, vetoing the force.
+Measured now: it classifies **`recently_active`, `permanent: false`**, i.e. an
+ordinary interruptible blocker. That defect was fixed at some point and the note
+outlived it, which is why `owed_for_ms: 1862006` reached a `Force` at all.
+
+⛔⛔ **THE DEFECT THE FALSIFIER FOUND: `outcome: "not_ready"`, and the record was
+already spent.** A just-re-resumed agent CLI had not brought its input loop up
+inside `HOT_RESTART_REPAIR_SUBMIT_TIMEOUT` (20 s) — exactly the hazard the code's
+own comment predicts — so the session was **interrupted by the deadline and never
+repaired**. That is the deadline shipping alone.
+**Fixed (3.0.136+): a `NotReady` key goes back on the record**
+(`requeue_unsubmitted`). It does not weaken at-most-once: `NotReady` is *proof
+nothing was written* — the probe never echoed and the submit clears the composer
+on its way out — so a retry cannot double-type, where a `Submitted`, `NoSession`
+or `Err` outcome stays spent because it is ambiguous.
+⛔ **The requeue never restamps.** `REPAIR_WINDOW_MS` is measured from the
+interruption; a requeue that moved the stamp would keep a failing repair owed for
+ever and eventually type into a session that has been back for an hour — the
+never-converging clock this project has already fixed once. Pinned by
+`a_continue_that_was_never_written_goes_back_on_the_record` and
+`a_requeue_never_drags_a_newer_interruption_backwards`.
+⇒ **Still owed on this half:** a `hot_restart_repair_continue {outcome:
+"submitted"}` observed after a real forced swap — the requeue makes it reachable
+but has not been watched converging.
+
 ⚠ **And the deadline's clock only starts where the swap lane gives up.** The cold
 gate is reached from `SwapStep::Failed`, and a host with a queue entry it keeps
 retrying returns `Lingering` instead — so on that host the deadline is never
