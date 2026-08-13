@@ -11353,6 +11353,32 @@ only thing left to attach to was an orphan. Agents should create ONE session
 per run and LEAVE IT UP; visibility beats tidiness.
 
 
+
+⚠ **RE-CHECKED 2026-08-13 AND THE RESULT IS INCONCLUSIVE — recorded so the zero
+is not banked as a fix.** On the live GUI host: `agent_leases: 0`,
+`web surface entries: 0`, orphans found: **none**. But **there were no leased
+surfaces at all**, so "no orphan" is the answer this check gives in a world where
+the bug is impossible to observe. It discriminates nothing. (The matching logic
+was positive-controlled first — it can find a row that exists — so the zero is a
+real zero, just an uninformative one.)
+
+**The decisive test, and the two reasons I did not run it here:**
+
+```
+create a row → remove it (tombstoning it) → web ensure --session <dead path>
+             → does a live surface now exist with no row?
+```
+
+1. ⛔ **Never on the default profile.** The original incident drove a payment
+   gateway on the user's own cookie jar; an unqualified surface IS `default`.
+   Use an `agent-<n>` profile.
+2. ⚠ **It creates a real web surface on the shared GUI host**, which is the
+   subject matter of the open idle-cost investigation — a surface appearing
+   mid-A/B corrupts someone else's measurement. It wants a window, not an
+   opportunistic run.
+
+**Falsifier:** after `web ensure` on a tombstoned session path, either no surface
+is alive, or a row exists for it.
 ## ★★★ web do FIDELITY ON RE-RENDERING DOMs
 
 **Status:** OPEN
