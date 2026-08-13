@@ -546,6 +546,50 @@ looks exactly like "worse the longer it runs".**
 touching it.** The restart hides the growth; it does not reach the floor, and
 the floor is what the Apple-grade standard is actually about.
 
+### ⛔⛔ THE INSTRUMENT ALREADY EXISTED, IT RECORDED ALL OF THIS, AND NOTHING READ IT
+
+`crates/yggterm-core/src/render_probe.rs` samples every role every 60 s with
+`core_fraction`, `mem_kb` and a GPU gauge, and it already encodes both traps
+this investigation re-derived from scratch (`ps %CPU` is a lifetime average;
+RSS undercounts against swap). **It was running the whole time.** Reduced from
+`~/.yggterm/perf-telemetry*.jsonl`, hour-averaged over the GUI's 22 h life:
+
+| hour | `core_fraction` | `mem_kb` |
+|---|---|---|
+| 0 | 0.123 | 151 MB |
+| 4 | 0.128 | 164 MB |
+| 5 | 0.176 | 199 MB |
+| 7 | 0.202 | 556 MB |
+| 9 | 0.243 | 922 MB |
+| 10 | 0.255 | **962 MB** |
+| 13 | 0.475 | 956 MB |
+| 16 | 0.584 | 955 MB |
+| 19 | 0.755 | 954 MB |
+| 20 | **0.910** | 955 MB |
+| *(restart)* | **0.181** | **285 MB** |
+
+⇒ **The regression was fully instrumented, faithfully recorded, and invisible
+for 22 hours because nothing reads this file and nothing alarms on it.** The
+telemetry gap in this mandate is therefore NOT a missing sampler — building
+another one would have been the wrong deliverable. It is that **no idle-cost
+budget exists**: no threshold, no alarm, no surface. That is the thing to build.
+
+⭐ **And the curve corrects the mechanism — including as first written in this
+entry.** CPU and memory growth are **decoupled**:
+
+- **Memory saturates at ~955 MB by hour 10 and is then FLAT for eleven hours.**
+- **CPU keeps climbing long after it — 0.255 at h10 to 0.910 at h20, a 3.6×
+  rise against flat memory**, and 7.4× over the process's life.
+
+⇒ **Swap pressure is not what makes the loop slow.** An earlier reading in this
+entry — that accumulated memory makes a constant loop feel worse by pushing its
+working set into swap — does not survive the curve. Whatever the main loop walks
+**keeps growing after the heap stops growing**, so it is a population of *cheap*
+objects, not bytes: sources attached to the main context, timers, subscriptions,
+tasks, listener registrations. **Look for something that grows in COUNT while
+costing almost no memory.** The 11 `WebsiteDataStore` / 13 `ReceiveQueue` threads
+are one confirmed instance of exactly that shape.
+
 ⚠ **Honest note on how that restart happened.** It was intended and measured,
 but it was triggered by running the *GUI* binary with an unrecognised subcommand
 (`yggterm update --help`) instead of `yggterm-headless`. The GUI binary does not
