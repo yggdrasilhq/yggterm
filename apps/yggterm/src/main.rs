@@ -1416,13 +1416,6 @@ fn run_server_connect_list(endpoint: &yggterm_server::ServerEndpoint) -> Result<
 }
 
 fn main() -> Result<()> {
-    // Hand this build's identity to the library crates that answer questions
-    // about a RUNNING process — the daemon's status and this window's client
-    // record. `--build-commit` can only ever describe a file, and a deploy
-    // replaces the file under a live process, so a process that does not say
-    // what it is becomes unnameable the moment it matters.
-    yggterm_server::build_identity::declare_build_commit(build_identity::build_commit());
-
     // ⭐ BEFORE EVERYTHING, including the GL probe and the supervisor: resolve the
     // D-Bus session bus, because GLib autolaunches a PRIVATE one the moment
     // anything in this process touches GTK without an address to inherit, and
@@ -1435,6 +1428,19 @@ fn main() -> Result<()> {
     // Must run before any thread exists (`set_var` is unsound afterwards) and
     // before GLib caches the address on first use.
     let _session_bus = yggterm_core::session_bus::adopt_or_refuse_session_bus();
+
+    // Hand this build's identity to the library crates that answer questions
+    // about a RUNNING process — the daemon's status and this window's client
+    // record. `--build-commit` can only ever describe a file, and a deploy
+    // replaces the file under a live process, so a process that does not say
+    // what it is becomes unnameable the moment it matters.
+    //
+    // ⚠ AFTER the bus resolve, not before. It landed above it and turned the
+    // `every_entry_point_refuses_autolaunch_before_it_can_happen` lock red:
+    // GLib caches the D-Bus address on FIRST USE and `set_var` is unsound once
+    // a thread exists, so "first statement in main()" is the whole guarantee.
+    // Nothing here needs the identity declared first.
+    yggterm_server::build_identity::declare_build_commit(build_identity::build_commit());
 
     let entry_args = std::env::args().skip(1).collect::<Vec<_>>();
     // FIRST, ahead of even the supervisor: this process may have been re-exec'd for
@@ -7238,6 +7244,12 @@ mod tests {
             client_id: None,
             linux_desktop_app_id: None,
             client_role: None,
+            // Upstream's build-identity field, which these three fixtures were
+            // not given when it landed — so `cargo test --workspace` could not
+            // compile this bin at all. `None` is the honest fixture value: these
+            // records describe a PRIOR client, and a record written before the
+            // field existed carries nothing.
+            build_commit: None,
             process_start_ticks: Some(77),
             executable_path: Some(
                 "/home/user/.local/share/yggterm/direct/versions/2.1.49/yggterm".to_string(),
@@ -7271,6 +7283,12 @@ mod tests {
             client_id: None,
             linux_desktop_app_id: None,
             client_role: None,
+            // Upstream's build-identity field, which these three fixtures were
+            // not given when it landed — so `cargo test --workspace` could not
+            // compile this bin at all. `None` is the honest fixture value: these
+            // records describe a PRIOR client, and a record written before the
+            // field existed carries nothing.
+            build_commit: None,
             process_start_ticks: Some(77),
             executable_path: Some(current_text),
             display: Some(":1".to_string()),
@@ -7290,6 +7308,12 @@ mod tests {
             client_id: None,
             linux_desktop_app_id: None,
             client_role: None,
+            // Upstream's build-identity field, which these three fixtures were
+            // not given when it landed — so `cargo test --workspace` could not
+            // compile this bin at all. `None` is the honest fixture value: these
+            // records describe a PRIOR client, and a record written before the
+            // field existed carries nothing.
+            build_commit: None,
             process_start_ticks: Some(88),
             executable_path: Some(
                 "/home/user/.local/share/yggterm/direct/versions/2.1.49/yggterm".to_string(),

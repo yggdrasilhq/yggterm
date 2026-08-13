@@ -2566,6 +2566,13 @@ pub enum ServerRequest {
         initial_cols: Option<u16>,
         #[serde(default)]
         initial_rows: Option<u16>,
+        /// The CLIENT machine's configured launch flags for this CLI.
+        ///
+        /// `#[serde(default)]` so an older daemon on this fleet simply ignores
+        /// it rather than failing to deserialize the whole request — the same
+        /// additive contract every other field here follows.
+        #[serde(default)]
+        configured_extra_args: Option<String>,
     },
     StartRemoteRuntimeAgentSession {
         session_kind: SessionKind,
@@ -2582,6 +2589,12 @@ pub enum ServerRequest {
         /// them.
         #[serde(default)]
         launch_options: Option<AgentLaunchOptions>,
+        /// The CLIENT machine's configured launch flags for this CLI. A
+        /// different question from `launch_options`: that is what ONE launch
+        /// asked for abstractly, this is a string the user typed which no
+        /// descriptor can re-derive.
+        #[serde(default)]
+        configured_extra_args: Option<String>,
     },
     /// Daemon-owned resumable plain-shell session (tmux replacement for
     /// `server attach`). The host daemon owns/persists the shell PTY.
@@ -9034,6 +9047,7 @@ impl DaemonRuntime {
                 terminal_appearance,
                 initial_cols,
                 initial_rows,
+                configured_extra_args,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.ensure_remote_runtime_agent_session_public(
@@ -9042,6 +9056,7 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     require_existing,
                     terminal_appearance.as_deref(),
+                    configured_extra_args.as_deref(),
                 )?;
                 let _ = self.ensure_terminal_for_path_with_initial_size(
                     &key,
@@ -9058,6 +9073,7 @@ impl DaemonRuntime {
                 initial_cols,
                 initial_rows,
                 launch_options,
+                configured_extra_args,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_remote_runtime_agent_session_public(
@@ -9066,6 +9082,7 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     terminal_appearance.as_deref(),
                     &launch_options.unwrap_or_default(),
+                    configured_extra_args.as_deref(),
                 )?;
                 let _ = self.ensure_terminal_for_path_with_initial_size(
                     &key,
@@ -13704,6 +13721,7 @@ pub fn start_remote_runtime_codex_session(
 }
 
 /// The kind-parameterized lane, for every CLI without a bespoke request pair.
+#[allow(clippy::too_many_arguments)]
 pub fn ensure_remote_runtime_agent_session(
     endpoint: &ServerEndpoint,
     kind: SessionKind,
@@ -13712,6 +13730,7 @@ pub fn ensure_remote_runtime_agent_session(
     require_existing: bool,
     initial_size: Option<(u16, u16)>,
     terminal_appearance: Option<&str>,
+    configured_extra_args: Option<&str>,
 ) -> Result<String> {
     expect_ack(send_request(
         endpoint,
@@ -13723,11 +13742,13 @@ pub fn ensure_remote_runtime_agent_session(
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             initial_cols: initial_size.map(|(cols, _)| cols),
             initial_rows: initial_size.map(|(_, rows)| rows),
+            configured_extra_args: configured_extra_args.map(ToOwned::to_owned),
         },
     )?)?
     .with_context(|| format!("missing runtime session key for {session_id}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn start_remote_runtime_agent_session(
     endpoint: &ServerEndpoint,
     kind: SessionKind,
@@ -13736,6 +13757,7 @@ pub fn start_remote_runtime_agent_session(
     initial_size: Option<(u16, u16)>,
     terminal_appearance: Option<&str>,
     launch: &AgentLaunchOptions,
+    configured_extra_args: Option<&str>,
 ) -> Result<String> {
     expect_ack(send_request(
         endpoint,
@@ -13747,6 +13769,7 @@ pub fn start_remote_runtime_agent_session(
             initial_cols: initial_size.map(|(cols, _)| cols),
             initial_rows: initial_size.map(|(_, rows)| rows),
             launch_options: (!launch.is_empty()).then(|| launch.clone()),
+            configured_extra_args: configured_extra_args.map(ToOwned::to_owned),
         },
     )?)?
     .with_context(|| format!("missing runtime session key for {session_id}"))

@@ -8423,6 +8423,7 @@ impl YggtermServer {
             cwd,
             require_existing,
             terminal_appearance,
+            None,
         )
     }
 
@@ -8439,12 +8440,17 @@ impl YggtermServer {
             cwd,
             require_existing,
             terminal_appearance,
+            // ⚠ CC keeps its historical `YGGTERM_CC_EXTRA_ARGS` lane, which the
+            // composer still prefers. Passing the value twice would be two
+            // encodings of one question, so this arm passes none.
+            None,
         )
     }
 
     /// The kind-parameterized entry the generic daemon request calls. The
     /// codex/cc wrappers above are the same call with the kind baked in — one
     /// lane, never a fork ([[spec-unify-local-remote]]).
+    #[allow(clippy::too_many_arguments)]
     pub fn ensure_remote_runtime_agent_session_public(
         &mut self,
         kind: SessionKind,
@@ -8452,6 +8458,7 @@ impl YggtermServer {
         cwd: Option<&str>,
         require_existing: bool,
         terminal_appearance: Option<&str>,
+        configured_extra_args: Option<&str>,
     ) -> anyhow::Result<String> {
         self.ensure_remote_runtime_agent_session(
             kind,
@@ -8459,9 +8466,11 @@ impl YggtermServer {
             cwd,
             require_existing,
             terminal_appearance,
+            configured_extra_args,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start_remote_runtime_agent_session_public(
         &mut self,
         kind: SessionKind,
@@ -8469,8 +8478,16 @@ impl YggtermServer {
         cwd: Option<&str>,
         terminal_appearance: Option<&str>,
         launch: &AgentLaunchOptions,
+        configured_extra_args: Option<&str>,
     ) -> anyhow::Result<String> {
-        self.start_remote_runtime_agent_session(kind, session_id, cwd, terminal_appearance, launch)
+        self.start_remote_runtime_agent_session(
+            kind,
+            session_id,
+            cwd,
+            terminal_appearance,
+            launch,
+            configured_extra_args,
+        )
     }
 
     fn ensure_remote_runtime_agent_session(
@@ -8480,6 +8497,7 @@ impl YggtermServer {
         cwd: Option<&str>,
         require_existing: bool,
         terminal_appearance: Option<&str>,
+        configured_extra_args: Option<&str>,
     ) -> anyhow::Result<String> {
         let display = remote_runtime_agent_display(kind);
         let saved_session_exists = remote_saved_agent_session_exists(kind, session_id)?;
@@ -8659,6 +8677,7 @@ impl YggtermServer {
             cwd,
             terminal_appearance,
             &AgentLaunchOptions::default(),
+            None,
         )
     }
 
@@ -8674,9 +8693,11 @@ impl YggtermServer {
             cwd,
             terminal_appearance,
             &AgentLaunchOptions::default(),
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_remote_runtime_agent_session(
         &mut self,
         kind: SessionKind,
@@ -8684,6 +8705,7 @@ impl YggtermServer {
         cwd: Option<&str>,
         terminal_appearance: Option<&str>,
         launch: &AgentLaunchOptions,
+        configured_extra_args: Option<&str>,
     ) -> anyhow::Result<String> {
         let display = remote_runtime_agent_display(kind);
         let key = remote_runtime_agent_session_key(kind, session_id)
@@ -8731,12 +8753,13 @@ impl YggtermServer {
         // `agent_launch_command_with_options` does: it exists for a host whose
         // managed layout cannot be resolved at all, and a command that silently
         // ran on the wrong model would be worse than one visibly missing flags.
-        let composed = managed_cli_shell_command_full(
+        let composed = codex_cli::managed_cli_shell_command_configured(
             kind,
             cwd,
             ManagedCliAction::Launch,
             terminal_appearance,
             launch,
+            configured_extra_args,
         );
         let launch_command = if kind == SessionKind::ClaudeCode {
             composed
@@ -17420,6 +17443,10 @@ pub fn run_remote_resume_agent(
         require_existing,
         initial_size,
         Some(&terminal_appearance),
+        // The client's configured flags, handed to THIS wrapper on the ssh line.
+        // The composing daemon is a different, long-lived process and never sees
+        // this variable, which is why it travels as a request field from here.
+        forwarded_configured_extra_args().as_deref(),
     )?;
     bridge_remote_runtime_session_stdio(&endpoint, &key)
 }
@@ -17467,8 +17494,23 @@ pub fn run_remote_start_agent(
         initial_size,
         Some(&terminal_appearance),
         &launch,
+        forwarded_configured_extra_args().as_deref(),
     )?;
     bridge_remote_runtime_session_stdio(&endpoint, &key)
+}
+
+/// The CLIENT's configured launch flags, as handed to this wrapper over ssh.
+///
+/// ⚠ Read HERE, in the wrapper, and passed on as a request field — never left
+/// for the daemon to read out of its own environment. Measured 2026-08-13 on a
+/// live remote launch: the wrapper process carried
+/// `YGGTERM_AGENT_EXTRA_ARGS=--yolo` and the daemon that composed the PTY
+/// command did not, so the flag crossed the ssh hop and was lost at the daemon
+/// boundary while every layer reported success.
+fn forwarded_configured_extra_args() -> Option<String> {
+    std::env::var(codex_cli::ENV_YGGTERM_AGENT_EXTRA_ARGS)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// The launch options this wrapper invocation was handed over ssh.

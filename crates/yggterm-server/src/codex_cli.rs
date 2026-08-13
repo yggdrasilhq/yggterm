@@ -3034,6 +3034,27 @@ pub(crate) fn managed_cli_shell_command_full(
     terminal_appearance: Option<&str>,
     launch: &AgentLaunchOptions,
 ) -> Result<String> {
+    managed_cli_shell_command_configured(kind, cwd, action, terminal_appearance, launch, None)
+}
+
+/// As above, with the CLIENT's configured flags supplied EXPLICITLY.
+///
+/// ⚖ A parameter, not a process env var. The remote lane's flags arrive on the
+/// ssh line into the WRAPPER, and the daemon that composes the PTY command is a
+/// different, long-lived process — measured 2026-08-13: the wrapper had
+/// `YGGTERM_AGENT_EXTRA_ARGS` and the composing daemon did not, so the flag
+/// crossed the hop and died at the daemon boundary. Claude Code's lane solves
+/// that with `set_var` inside the daemon; doing the same for nine CLIs would
+/// multiply a process-global write whose failure mode is one session's flags
+/// leaking into the next. `None` ⇒ read the local settings store as before.
+pub(crate) fn managed_cli_shell_command_configured(
+    kind: SessionKind,
+    cwd: Option<&str>,
+    action: ManagedCliAction<'_>,
+    terminal_appearance: Option<&str>,
+    launch: &AgentLaunchOptions,
+    configured_override: Option<&str>,
+) -> Result<String> {
     let Some(tool) = ManagedCliTool::from_session_kind(kind) else {
         anyhow::bail!("session kind does not use a managed Codex CLI");
     };
@@ -3044,7 +3065,7 @@ pub(crate) fn managed_cli_shell_command_full(
         parts.push(preamble);
     }
     parts.push(paths.shell_exports_with_terminal_appearance(tool, terminal_appearance));
-    let extra_args = composed_cli_extra_args(kind, launch)?;
+    let extra_args = composed_cli_extra_args_with(kind, launch, configured_override)?;
     // Invocation SHAPE is descriptor data now (harness spec §3, phase 1): which
     // CLI takes `--resume <id>` vs `resume <id>`, and which re-roots with
     // `-C "$PWD"`, is answered once in `yggterm_core::agent_cli` instead of by
@@ -3120,7 +3141,18 @@ pub(crate) fn composed_cli_extra_args(
     kind: SessionKind,
     launch: &AgentLaunchOptions,
 ) -> Result<String> {
-    let configured = configured_cli_extra_arg_tokens(kind);
+    composed_cli_extra_args_with(kind, launch, None)
+}
+
+pub(crate) fn composed_cli_extra_args_with(
+    kind: SessionKind,
+    launch: &AgentLaunchOptions,
+    configured_override: Option<&str>,
+) -> Result<String> {
+    let configured = match configured_override {
+        Some(raw) => split_extra_args(raw),
+        None => configured_cli_extra_arg_tokens(kind),
+    };
     if launch.is_empty() {
         // Byte-identical to the pre-flag path for every human door.
         return Ok(shell_join_tokens(&configured));
