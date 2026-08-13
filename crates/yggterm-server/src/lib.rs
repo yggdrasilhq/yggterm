@@ -22345,6 +22345,7 @@ pub const RESTORE_OPEN_TIMEOUT_MS: u64 = 90_000;
 pub fn run_app_control_restore_sessions(
     session_paths: Vec<String>,
     dry_run: bool,
+    include_closed: bool,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
@@ -22355,15 +22356,19 @@ pub fn run_app_control_restore_sessions(
         );
     }
 
-    let declined: Vec<String> = live_row_closes_remembered_among(
-        &home,
-        session_paths.iter().map(String::as_str),
-    );
-    let declined_set: std::collections::HashSet<&str> =
-        declined.iter().map(String::as_str).collect();
+    // Asked ALWAYS, even under `--include-closed`, because the override's job is
+    // to proceed knowingly rather than blindly: a caller that overrides still
+    // gets told which rows it overrode, in the same field.
+    let remembered: Vec<String> =
+        live_row_closes_remembered_among(&home, session_paths.iter().map(String::as_str));
+    let vetoed: std::collections::HashSet<&str> = if include_closed {
+        std::collections::HashSet::new()
+    } else {
+        remembered.iter().map(String::as_str).collect()
+    };
     let candidates: Vec<&String> = session_paths
         .iter()
-        .filter(|path| !declined_set.contains(path.as_str()))
+        .filter(|path| !vetoed.contains(path.as_str()))
         .collect();
 
     let mut restored = Vec::<String>::new();
@@ -22410,9 +22415,23 @@ pub fn run_app_control_restore_sessions(
 
     write_stdout_payload(&serde_json::to_string_pretty(&json!({
         "dry_run": dry_run,
+        "include_closed": include_closed,
         "requested": session_paths.len(),
-        "declined_closed_count": declined.len(),
-        "declined_closed": declined,
+        // Under the override these are the rows restored ANYWAY, not the rows
+        // refused — same set, and the flag beside it says which reading applies.
+        // One field rather than two, because two would let a caller read the
+        // wrong one and never know.
+        "declined_closed_count": if include_closed { 0 } else { remembered.len() },
+        "declined_closed": if include_closed {
+            Vec::<String>::new()
+        } else {
+            remembered.clone()
+        },
+        "overridden_closed": if include_closed {
+            remembered
+        } else {
+            Vec::<String>::new()
+        },
         "restorable": candidates.len(),
         "restored": restored,
         "failed": failed,

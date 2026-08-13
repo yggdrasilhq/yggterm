@@ -53,6 +53,14 @@ This file tracks user-visible changes in `yggterm`.
   still cannot serve emits `daemon/terminal_runtime/request_refused` naming
   which map held what — because the row list, the summary and the reveal log all
   reported that row as healthy, and there was no way to tell *gone* from *slow*.
+- **A restore can be told to bring back a row that was closed on purpose
+  (3.0.117).** The deny-list stays the default and stays authoritative — that is
+  the whole of the previous entry — but a relay retiring its predecessor's row
+  uses the same `session remove` a person does, so a deliberately-closed row is
+  sometimes exactly the one someone wants back. `--include-closed` restores them
+  and reports them under `overridden_closed`, so the override is a named,
+  visible act rather than a caller quietly going back to the loop this verb
+  replaced.
 - **A restore waits long enough for a cold open (3.0.115).** `sessions restore`
   inherited the 15 s app-control default, and restoring is the cold case by
   definition — the row is not live, so its open pays an ssh, a remote bootstrap
