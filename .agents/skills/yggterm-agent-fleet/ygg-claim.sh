@@ -29,10 +29,11 @@
 #     --inherit-number   take the predecessor's number instead of deriving one
 #     --session UUID     claim a row other than your own (default: $YGGTERM_SESSION_ID)
 #     --watch-secs N     keep re-asserting the title for N seconds (default 240)
-#     --booter           subscribe this row to the booter, so that a STALL is
-#                        woken from outside. ⛔ OFF by default — arm it only for
-#                        relay/unattended work (see "ARM THE BOOTER" below)
-#     --no-booter        accepted and ignored; kept so older call sites still run
+#     --booter           NO-OP. Every row is armed by default (owner policy
+#                        2026-08-13: "AUTO ARM AND DISARM WITH REASON")
+#     --no-booter REASON opt OUT, and the reason is recorded. Refuses without one.
+#                        ⭐ For "busy for a while" use `ygg-booter.py defer` instead —
+#                        a defer stays ARMED, a disarm does not
 #     --host H           GUI host; default: auto-detect, then $YGG_GUI_HOST
 #     --dry-run          print what would happen, change nothing
 #
@@ -43,9 +44,21 @@ STATE_DIR="$HOME/.yggterm/relay"
 
 TITLE=""; NUMBER=""; CAMPAIGN=""; REPLACE=""; INHERIT=0
 SESSION="${YGGTERM_SESSION_ID:-}"; WATCH=240; HOST="${YGG_GUI_HOST:-}"; DRY=0
-# ⛔ OFF unless asked. A session that claims a row is not thereby unattended —
-# see "ARM THE BOOTER" below for why this default was inverted 2026-08-10.
-BOOTER="${YGG_BOOTER:-0}"
+# ⛔⛔ AUTO-ARM. OWNER RULING 2026-08-13, and it REPLACES the 2026-08-10 inversion
+# outright — do not reconcile the two, the newer ruling wins:
+#   "This is a serious bug as our last line of defence was never armed to save us.
+#    THE POLICY IS AUTO ARM AND DISARM WITH REASON."
+# His grounds are the ones that matter: a defence that depends on an orchestrator
+# REMEMBERING to arm it is not a defence. Measured the day of the ruling: 47 agent
+# rows on the fleet, 5 subscribed — ~11% coverage, and 4 of the 5 belonged to the
+# campaign that wrote the tool. A last line of defence at 11% is a local
+# convention, not a defence.
+# ⇒ Armed by the act of existing. `--booter` is now a no-op kept for old call
+#   sites; opting OUT is `--no-booter <reason>` and the reason is RECORDED,
+#   because a row that quietly unsubscribed is indistinguishable from one that was
+#   never armed — the exact ambiguity that cost a campaign three rows.
+BOOTER="${YGG_BOOTER:-1}"
+NO_BOOTER_REASON=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -54,8 +67,18 @@ while [ $# -gt 0 ]; do
     --campaign)       CAMPAIGN="${2:-}"; shift 2 ;;
     --replace)        REPLACE="${2:-}"; shift 2 ;;
     --inherit-number) INHERIT=1; shift ;;
-    --booter)         BOOTER=1; shift ;;
-    --no-booter)      BOOTER=0; shift ;;
+    --booter)         BOOTER=1; shift ;;   # no-op: armed by default since 2026-08-13
+    --no-booter)
+      # ⛔ A REASON IS REQUIRED. Disarming silently is what produced 42 unwatched
+      # rows; an unexplained opt-out reads identically to never having armed.
+      NO_BOOTER_REASON="${2:-}"
+      case "$NO_BOOTER_REASON" in
+        ""|--*) echo "ygg-claim: ⛔ --no-booter REQUIRES A REASON — owner policy 2026-08-13 is" >&2
+                echo "  AUTO ARM AND DISARM WITH REASON. Usage: --no-booter '<why this row is not watched>'" >&2
+                echo "  ⭐ If you mean 'busy for a while', you want ygg-booter.py defer, NOT a disarm." >&2
+                exit 64 ;;
+      esac
+      BOOTER=0; shift 2 ;;
     --session)        SESSION="${2:-}"; shift 2 ;;
     --watch-secs)     WATCH="${2:-}"; shift 2 ;;
     --host)           HOST="${2:-}"; shift 2 ;;
@@ -69,6 +92,39 @@ done
 [ -n "$SESSION" ] || { echo "ygg-claim: no session id (\$YGGTERM_SESSION_ID unset, and no --session)" >&2; exit 64; }
 UUID="${SESSION##*/}"
 [ -n "$CAMPAIGN" ] || CAMPAIGN="$(printf '%s' "$TITLE" | awk '{print $1}' | tr -d ':' )"
+
+# ⛔⛔ THIS SCRIPT RUNS FROM THE LANE'S OWN WORKTREE, WHICH IS NORMALLY BEHIND MAIN
+# — and claiming is necessarily a lane's FIRST act, so the copy that claims is
+# always the pre-merge one. A brief that says "the booter arms by default" is
+# describing the ORCHESTRATOR's checkout, not the lane's.
+#
+# Measured 2026-08-14: a lane claimed with a copy 23 commits stale, whose
+# `BOOTER` default was the OPPOSITE of the current one, and ran completely
+# unwatched. There was no warning line, and there could not be: **a tool cannot
+# announce the absence of a feature it does not have.** The only version that can
+# raise the alarm is a CURRENT one, so the check has to live here and it has to
+# describe the skew rather than any single feature.
+#
+# ⚠ A warning, never a refusal: a lane being behind main is ordinary, and a lane
+#   that is deliberately editing this tool must still be able to claim.
+# ⚠ Compares against whatever `origin/main` this checkout last fetched — a stale
+#   REF can still say "current". It is a smoke alarm, not a proof.
+claim_self_staleness_warning() {
+  local here root rel behind
+  here="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || return 0
+  root="$(git -C "$here" rev-parse --show-toplevel 2>/dev/null)" || return 0
+  rel="$(git -C "$here" ls-files --full-name "$(basename "$0")" 2>/dev/null)" || return 0
+  [ -n "$rel" ] || return 0
+  git -C "$root" cat-file -e "origin/main:$rel" 2>/dev/null || return 0
+  git -C "$root" diff --quiet "origin/main" -- "$rel" 2>/dev/null && return 0
+  behind="$(git -C "$root" rev-list --count HEAD..origin/main 2>/dev/null || echo '?')"
+  log "⛔ STALE TOOL — this copy of $(basename "$0") differs from origin/main's."
+  log "   This checkout is $behind commit(s) behind main, so DEFAULTS HERE MAY NOT"
+  log "   MATCH WHAT YOUR BRIEF DESCRIBES. Merge origin/main, then verify the arm"
+  log "   yourself — it is the part that fails silently:"
+  log "     ygg-booter.py list | grep ${UUID:0:8}"
+}
+claim_self_staleness_warning
 
 # ⛔⛔ NEVER REAP YOURSELF. A brief hands the successor a `PREDECESSOR TO REAP`
 # uuid as a literal — and if the "successor" was started as an in-process helper
@@ -392,9 +448,31 @@ log "claimed and verified by read-back: seat=$NUM title=$FINAL_TITLE"
 # (`ygg-booter.py unsubscribe --row <path>`); the booter retires a row only on
 # facts it can see for itself — the row is gone, or the subscription expired.
 if [ "${BOOTER:-0}" = 1 ] && [ -x "$(dirname "$0")/ygg-booter.py" ]; then
-  "$(dirname "$0")/ygg-booter.py" subscribe \
-      ${CAMPAIGN:+--campaign "$CAMPAIGN"} --note "$FINAL_TITLE" 2>&1 \
-    | sed 's/^/  /' || log "⚠ booter subscribe failed — this row is NOT watched"
+  # ⛔ `cmd | sed || log` CANNOT DETECT A FAILED ARM — the pipeline's exit status
+  # is `sed`'s, which succeeds on any input. Same family as the documented
+  # "`| tail` eats the exit code". And an exit code is the wrong question anyway:
+  # this seat's own law is that a verb reports the REQUEST, not the EFFECT.
+  # ⇒ capture, print, then assert on the booter's own READ-BACK line.
+  _arm_out="$("$(dirname "$0")/ygg-booter.py" subscribe \
+      ${CAMPAIGN:+--campaign "$CAMPAIGN"} --note "$FINAL_TITLE" 2>&1)"
+  _arm_rc=$?
+  printf '%s\n' "$_arm_out" | sed 's/^/  /'
+  if [ "$_arm_rc" -ne 0 ] || ! printf '%s' "$_arm_out" | grep -q 'read-back: present'; then
+    log "⛔ THIS ROW IS NOT WATCHED — the booter did not confirm the arm."
+    log "   Arm it by hand, then read it back; do not assume the silence is success:"
+    log "     ygg-booter.py subscribe --row \"$SESSION\" --campaign \"$CAMPAIGN\""
+    log "     ygg-booter.py list | grep ${UUID:0:8}"
+  fi
+elif [ -n "${NO_BOOTER_REASON:-}" ]; then
+  # ⛔ RECORD THE DISARM WHERE THE NEXT SESSION READS IT. A row that quietly opted
+  # out is indistinguishable from one that was never armed, and that ambiguity is
+  # what let 42 of 47 rows run unwatched without anyone noticing. Same family as
+  # absent-vs-stalled and withheld-vs-blocked: the silence has two causes.
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  printf '%s\t%s\t%s\t%s\n' "$(date -Is)" "$UUID" "$FINAL_TITLE" "$NO_BOOTER_REASON" \
+    >> "$STATE_DIR/booter-disarmed.tsv" 2>/dev/null
+  log "⚠ NOT watched by the booter, by explicit request: $NO_BOOTER_REASON"
+  log "  recorded in $STATE_DIR/booter-disarmed.tsv — ⭐ if you meant 'busy for a while', use \`ygg-booter.py defer\` instead"
 fi
 
 # The CLI composes its own title when its first turn ends and will clobber this.
