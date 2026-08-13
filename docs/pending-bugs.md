@@ -156,10 +156,30 @@ agree. The app-row filter is deliberately start-page-only — the sidebar is whe
 app rows are managed, and the report scopes the complaint to "the one surface
 whose job is picking a session".
 
-**Falsifier:** on the live host, the start page's first card is the
-most-recently-used session and not the alphabetically-first uuid; a query
-matching only a session's generated summary finds it; no ychrome/yedit row
-appears; each card's button names its CLI.
+**Live proof taken on the desktop host, GUI + daemon both 3.0.113:**
+
+- ✅ **Order.** The heading reads `RECENT WORK — most recently used first`, and
+  the card order begins `d6f7653a · ebf6c53e · abee5005 · efe51740 · 23b20d7c`.
+  That is not the alphabetical-by-uuid sequence the page produced before, and
+  the first card is the session that was active when the page was opened.
+- ✅ **App rows are gone from it.** The sidebar carries six app rows at the time
+  of the capture (one `New Yedit`, five `New Ychrome`); none appears in Recent
+  work.
+- ✅ **The open verb and the brand colour.** Every card reads `Open this Claude
+  Code Session` on Claude's clay; the `New Codex Session` control is on OpenAI's
+  teal, where before it took the theme accent like six other CLIs.
+- ✅ **The search box renders**, placeholder `Search title, summary, path`.
+
+⚠ **What is still owed, and it is narrow:** a LIVE keystroke into that box. The
+matching itself is the sidebar's already-shipped `row_matches_search`, and the
+wiring is unit-tested, but app-control has no verb that types into a shell DOM
+field — only `server app terminal probe-type`, which targets a PTY. ⇒ **This is
+the entry's remaining work**, and it wants either that verb or a Dioxus-level
+test that drives the signal.
+
+**Falsifier for the remainder:** type a word that appears ONLY in a session's
+generated summary — never in its title, cwd or host — and that session is the
+one card left standing.
 
 ## ⛔ [6.2] A NEW CLI ROW IS BORN NAMED AFTER WHOEVER SPAWNED IT
 
