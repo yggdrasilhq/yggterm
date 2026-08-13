@@ -105,16 +105,25 @@ def classify(comm, cmdline):
     `webkitwebproces` at 14.3%, i.e. a third of the web process's cost filed
     under a name nobody would think to add up.
     """
-    c = (cmdline or "") + " " + comm
-    if "WebKitWebProces" in c:  # truncated spelling is a prefix of the full one
+    # ⛔ KEY ON `comm`, WHICH IS THE EXECUTABLE, NOT ON THE COMMAND LINE.
+    # Every agent row is launched by an `ssh … $HOME/.yggterm/bin/yggterm server
+    # remote resume-cc …` wrapper, so a dozen ssh and bash processes carry the
+    # GUI's path in their cmdline. Matching that filed them all as "gui": 71
+    # samples across 30 rounds for a role with exactly one process, the extras
+    # being near-idle wrappers that dragged the GUI's mean DOWN. An instrument
+    # that understates the thing it was built to watch is worse than none.
+    # `comm` is the kernel's name for what is actually executing; it cannot be
+    # spoofed by an argument. It is truncated to 15 chars, hence the short
+    # spellings.
+    if comm.startswith("WebKitWebProces"):
         return "web_content"
-    if "WebKitNetworkPr" in c:
+    if comm.startswith("WebKitNetworkPr"):
         return "web_network"
-    if "yggterm-headless" in c:
+    if comm.startswith("yggterm-headles"):
         return "daemon"
-    if re.search(r"/yggterm($|\s)", c) or comm == "yggterm":
+    if comm == "yggterm":
         return "gui"
-    if "ychrome" in c:
+    if comm.startswith("ychrome"):
         return "ychrome"
     return comm.lower()
 
@@ -329,18 +338,29 @@ def status(args):
     if not n:
         return 0
     print(f"span={(hi-lo)/3600000:.1f} h  last={time.strftime('%H:%M:%S', time.localtime(hi/1000))}")
-    print("\nlast 5 min, by role — % of ONE core (mean), and the growth counters:")
+    # ⛔ `n` IS NOT DECORATION. A mean hides how many samples it stands on, so a
+    # single stale or misclassified row renders as a full-blown role: one
+    # leftover sample showed up here as a 14.3%-of-a-core "webkitwebproces"
+    # sitting next to a 102-sample web_content, and read as a third of the cost
+    # hiding under a second name. It was one row. Print the count next to every
+    # mean, and distrust any role whose n is far below its neighbours'.
+    rounds = db.execute(
+        "SELECT COUNT(DISTINCT ts_ms) FROM samples WHERE ts_ms > ?", (hi - 300000,)
+    ).fetchone()[0]
+    print(f"\nlast 5 min ({rounds} rounds), by role — % of ONE core (mean over n samples):")
     for r in db.execute(
         """SELECT role, ROUND(AVG(cpu_user_pct),1), ROUND(AVG(cpu_kernel_pct),1),
                   ROUND(AVG(cpu_user_pct+cpu_kernel_pct),1),
                   ROUND(AVG(rss_kb)/1024.0), MAX(threads),
-                  MAX(webkit_datastore_threads), MAX(receive_queue_threads)
+                  MAX(webkit_datastore_threads), MAX(receive_queue_threads),
+                  COUNT(*)
            FROM samples WHERE ts_ms > ? GROUP BY role
            ORDER BY 4 DESC LIMIT 10""",
         (hi - 300000,),
     ):
+        flag = "  ⚠thin" if rounds and r[8] < rounds * 0.5 else ""
         print(f"  {r[0]:14s} total={r[3]:6}%  user={r[1]:6}  kern={r[2]:6}  "
-              f"rss={r[4] or 0:6.0f}MB  thr={r[5]}  wds={r[6]} rq={r[7]}")
+              f"rss={r[4] or 0:6.0f}MB  thr={r[5]}  wds={r[6]} rq={r[7]}  n={r[8]}{flag}")
     s = db.execute("SELECT load1, mem_used_mb, swap_used_mb, temp_max_c, temp_alarm "
                    "FROM system ORDER BY ts_ms DESC LIMIT 1").fetchone()
     if s:
