@@ -56544,9 +56544,64 @@ fn append_viewport_session_contract_violations(
         ));
     }
 }
+/// Every sidebar row, with **every row set drawn OPEN**.
+///
+/// ⛔ **A PRESENTATION STATE MAY NOT REMOVE ROWS FROM A DATA VERB.** The
+/// rendered list omits the members of a collapsed set — that is what collapsing
+/// means, and it is right for the screen. `server app rows` is not the screen:
+/// the booter, the supervision plane, seat audits and every orchestration script
+/// read it to answer *"which rows exist"*, and folding a set silently deleted
+/// nine live agent rows from all of them at once. On 2026-08-13 the booter
+/// reaped nine subscriptions in six seconds, each one a working session, having
+/// been handed an honest answer to a question it was not asking.
+///
+/// ⚖ The collapse still persists and is still the user's — it is reported as a
+/// FIELD (`hidden_by_collapsed_set`) so a renderer can hide what it likes and a
+/// consumer can see what exists. Same call the row resolver and the search path
+/// already make, for the same reason.
+fn app_control_rows_with_every_set_open(shell: &ShellState) -> Vec<BrowserRow> {
+    let stored_rows = shell.browser.search_rows();
+    let stored_projection_rows = shell.browser.all_rows();
+    let expanded_paths = search_expanded_paths(
+        &stored_rows,
+        shell.server.remote_machines(),
+        shell.server.ssh_targets(),
+        &shell.server.live_sessions(),
+        &shell.browser.expanded_path_set(),
+    );
+    let mut rows = merged_sidebar_rows_traced(
+        &shell.bootstrap.settings_path,
+        "app_control_rows",
+        &stored_rows,
+        &stored_projection_rows,
+        shell.server.remote_machines(),
+        shell.server.ssh_targets(),
+        &shell.server.live_sessions(),
+        &expanded_paths,
+        &HashSet::new(),
+        &shell.row_arrangement,
+    );
+    enrich_sidebar_rows_with_live_titles(
+        &mut rows,
+        &shell.server.live_sessions(),
+        shell.server.remote_machines(),
+        &shell.session_title_overrides,
+        &shell.generated_summaries,
+    );
+    rows
+}
+
 fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
     let shell = state.read();
-    let snapshot = shell.snapshot();
+    let mut snapshot = shell.snapshot();
+    // The rows the SCREEN is showing, so a row can still report whether the
+    // user has it folded away.
+    let rendered: std::collections::HashSet<String> = snapshot
+        .rows
+        .iter()
+        .map(|row| row.full_path.clone())
+        .collect();
+    snapshot.rows = app_control_rows_with_every_set_open(&shell);
     // **"THIS ROW IS GONE" MADE VISIBLE.** The tombstone plane is the one
     // record that the user CLOSED a row, and until now it could only be
     // consulted from inside the daemon. Everything that rebuilds a set of rows
@@ -56600,6 +56655,13 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "depth": row.depth,
                 "host_label": row.host_label,
                 "expanded": row.expanded,
+                // ⛔ THE ROW IS REPORTED EITHER WAY — this says only whether the
+                // SCREEN is currently folding it away. A consumer asking "which
+                // rows exist" gets them all; one that wants to mirror the
+                // sidebar can filter on this. Collapsing a set must never
+                // delete rows from the answer: it did, and the booter reaped
+                // nine live sessions on the strength of it.
+                "hidden_by_collapsed_set": !rendered.contains(&row.full_path),
                 "selected": shell.selected_tree_paths.contains(&row.full_path),
                 "session_id": row.session_id,
                 "session_cwd": row.session_cwd,
@@ -157882,6 +157944,51 @@ mod tests {
         .filter(|row| row.kind == BrowserRowKind::Session)
         .map(|row| (row.full_path, row.depth))
         .collect()
+    }
+
+    /// ⛔⛔ A PRESENTATION STATE MAY NOT REMOVE ROWS FROM A DATA VERB.
+    ///
+    /// Collapsing a row set hides its members — that is what collapsing means,
+    /// and it is right for the screen. `server app rows` is not the screen: the
+    /// booter, the supervision plane, seat audits and orchestration scripts all
+    /// read it to answer "which rows exist". While it answered from the rendered
+    /// list, folding the five books deleted every member from all of them at
+    /// once: 2026-08-13, nine live agent rows invisible to every consumer, and a
+    /// booter that reaped nine subscriptions in six seconds on the strength of
+    /// it — each one a working session, each logged `GONE (retired)`.
+    ///
+    /// Proven on the live host the same night: expanding ONE set brought exactly
+    /// the nine rows back, seats visible going from 5 to 14.
+    #[test]
+    fn the_rows_verb_reports_rows_a_collapsed_set_hides_from_the_screen() {
+        let source = include_str!("shell.rs");
+        let describer = source
+            .split("fn describe_app_rows_snapshot(")
+            .nth(1)
+            .expect("the describer exists");
+        let body = &describer[..describer.find("\n}").expect("body ends")];
+        assert!(
+            body.contains("app_control_rows_with_every_set_open(&shell)"),
+            "the data verb must build its own list with every set OPEN, not read \
+             the rendered one — a fold is a fact about the screen"
+        );
+        assert!(
+            body.contains("hidden_by_collapsed_set"),
+            "and it must still say which rows the screen is folding away, or a \
+             consumer that wants to mirror the sidebar cannot"
+        );
+        // The one that would quietly undo it: reading `snapshot.rows` for the
+        // payload again would restore the old behaviour while the helper sat
+        // there looking correct.
+        let payload = body
+            .split("\"rows\":")
+            .nth(1)
+            .expect("the rows payload exists");
+        assert!(
+            payload.starts_with(" snapshot.rows.iter()"),
+            "the payload must iterate the list this function built; got: {}",
+            &payload[..payload.len().min(60)]
+        );
     }
 
     /// ⭐ THE GESTURE THAT DID NOT EXIST. Owner, on the shipped build: *"I tried
