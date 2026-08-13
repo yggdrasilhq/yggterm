@@ -350,6 +350,39 @@ row grows; an unreachable one is frozen. Sample twice a few seconds apart.
 **Fix:** name the two states in the reply. The daemon endpoint the submit resolved to is already known
 at that point, so "the row I addressed is served by a socket nothing has bound" is answerable.
 
+## ⛔ A DAEMON THAT TAKES ITS SESSIONS BACK IS STILL MUTED — NOTHING ON THE HOST WRITES THEIR STATE
+
+**Status:** OPEN
+
+Found while building the settle window, 2026-08-14. Not caused by it — made
+reachable by it, and it is the same shape as the bug the immediate-persist fix
+already closed from the other side.
+
+`superseded_routine_persist_muted` is a **hard, permanent latch**
+(`daemon.rs`, `routine_persist_should_mute`): once a strictly newer daemon is
+seen, this daemon never writes `server-state.json` again. That is right while the
+successor is alive — a stale predecessor must not clobber the successor's file.
+
+⛔ **It is wrong the moment the successor dies.** The settle window now hands the
+sessions back: the predecessor wakes its readers and is once again the only
+process serving them. It is also still muted, and the successor that DID write
+the state file is gone. ⇒ **No process on the host will record those sessions
+again.** If the predecessor is then killed, they are unrecoverable — exactly the
+condition the immediate-persist-on-adoption fix was written to end.
+
+**The fix, and why it is not a one-liner.** Clearing the latch is only safe when
+no live newer daemon exists — another one may have arrived meanwhile — so the
+test is `live_newer_daemon_version(...).is_none()`, the existing single owner of
+that question. The obstacle is reach, not logic: `spawn_handoff_settle_watch`
+holds no runtime handle. The superseded-retire caller has the
+`Arc<Mutex<DaemonRuntime>>`; the hot-update caller has only `&mut self`.
+
+⚠ **Do not solve it by passing an `Option<Arc<…>>`** — "a handle that is
+sometimes there" is a fork wearing a table's clothes, and this crate has paid for
+that shape before. Either give both callers the same handle, or make the mute a
+DERIVED fact (ask whether a newer daemon is live) rather than a latch, which is
+what it actually means.
+
 ## ⚠ A HANDOVER THAT LOSES ITS SUCCESSOR STILL LOSES THE SECONDS THAT SUCCESSOR ALREADY READ
 
 **Status:** OPEN
