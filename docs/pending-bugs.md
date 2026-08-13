@@ -435,6 +435,41 @@ unnoticed.
 **Falsifier:** spawn a row with `terminal new` and read `ygg-booter.py list` — it must appear without
 anyone having typed a second command.
 
+### ⭐ DESIGN SETTLED 2026-08-14 (6.1), AND IT IS NOT THE VERB — WITH A PREREQUISITE NOBODY HAS WRITTEN DOWN
+
+Measured before deciding, so the next session need not re-derive any of it:
+
+- ⛔ **The product binary has NO dependency on the relay plane today.** Nothing under `crates/` or
+  `apps/` mentions `.agents/skills`, `ygg-booter`, or `~/.yggterm/relay` (grepped). Teaching
+  `terminal new` to arm makes **yggterm the product** depend on an agent-fleet convention that ships
+  in a skills directory — a new coupling in the wrong direction, and a second encoding of the
+  booter's subscription record if the Rust side writes it directly.
+- ⚖ **The owner's ruling is "armed by the act of EXISTING", and the verb cannot deliver that.** A
+  verb arms only what *it* spawned. Rows created by any other path — `ygg-claim.sh`, a restore, a
+  future surface — stay unarmed, and coverage again depends on which door was used. **Enumeration
+  satisfies the ruling; a verb approximates it.**
+- ⇒ **The fix belongs in `ygg-booter.py`: enumerate live rows and arm the unarmed ones**, on `list`,
+  on `tick`, and on `status`. That passes the falsifier above (a `list` right after a spawn absorbs
+  it), needs no product change, keeps the record schema with its owner, and retroactively covers
+  rows that already exist.
+
+⛔⛔ **THE PREREQUISITE, AND IT IS LOAD-BEARING: `booter-disarmed.tsv` IS WRITE-ONLY TODAY.**
+`ygg-claim.sh` appends to it (`--no-booter <reason>`); **nothing reads it** (grepped across the whole
+skill directory). ⇒ **Auto-arm shipped without a reader would silently re-arm every row that was
+deliberately disarmed with a stated reason, one tick later** — turning the owner's "disarm WITH
+REASON" into a no-op while appearing to honour it. **Write the reader first, and test the
+disarm→enumerate→still-disarmed path before the arming path.**
+
+⛔ **AND THE SAFETY CONSTRAINT THAT MAKES BLANKET AUTO-ARM DANGEROUS:** the booter's whole function
+is to TYPE INTO a stalled session. The owner's own interactive rows must never be armed — "never
+whoop his viewport" — so the enumerator needs a positive test for *agent* rows rather than "every row
+I can see". ⚠ `ygg-babysit.py` exposes only `resolve_row_path` / `row_exists` / `row_host`, no
+metadata, so that filter has to come from the raw `server app rows` JSON (kind, tenancy provenance),
+not from the existing helpers.
+
+⇒ **Order of work:** (1) read the disarm ledger, (2) agent-row filter with a proven negative case
+against a human row, (3) enumerate-and-arm on `list`/`tick`/`status`, (4) run the falsifier above.
+
 ## ⚠ `terminal submit`'s "no agent composer row appeared" HAS TWO OPPOSITE CAUSES AND ONE MESSAGE
 
 **Status:** OPEN
