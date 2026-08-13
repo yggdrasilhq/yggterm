@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The status dots line up, and every title got wider (3.0.131).** The dots
+  now sit in a fixed column of their own at the far left, identical on every
+  row whatever its nesting — one unbroken line down the sidebar instead of a
+  staircase. Nesting moves the title and nothing else. The disclosure control
+  moved to the right, beside the close button, and appears on hover the way that
+  button does; reclaiming its old slot is what gives every row's title more
+  room, including rows that belong to no group at all. Titles start 17px
+  further left than before.
+
 - **The sidebar draws the outline it always knew about (3.0.129).** Rows have
   carried a seat number for a while — `6.0`, `6.1`, `6.1.1` — but the list drew
   every row flat and left you to rebuild the structure in your head from the
