@@ -96,6 +96,56 @@ model: **0.864 cores against 3.468 today — 2.60 cores reclaimable, 75%.**
    on its own. It is a genuine outlier with a different shape, ⇒ **now
    attributed in §5**, and it should stay out of the fleet fit.
 
+### 2b. The per-ROW term is REAL and ROBUST — and NOT yet attributed
+
+**Robustness, because n=14 with 3 parameters deserves it.** Leave-one-out over
+all 14 census daemons:
+
+| coefficient | min | max | sign stable |
+|---|---|---|---|
+| per-row | +0.000293 | +0.000390 | yes |
+| per-session | +0.0076 | +0.0108 | yes |
+| floor | +0.110 | +0.124 | — |
+
+`corr(OWNED, ROWS) = +0.48` — moderate, not collinear enough to make the joint
+fit meaningless. Dropping the highest-leverage point entirely (the 23-session
+daemon) moves per-row only to **0.000322**. ⇒ **The term survives every single
+deletion.**
+
+**What it is worth.** Rows summed over the 15 census daemons = **1,953**, at
+0.000337 cores/row ⇒ **≈0.66 cores spent on row-scaled work**. ⛔ **And each
+daemon's ROWS is frozen at its birth** (the bequest carries the list forward), so
+a 261-row daemon owning 23 sessions is carrying 238 rows it does not own.
+
+### ⛔ A HYPOTHESIS TESTED AND REFUTED — do not re-run it
+
+`run_background_copy_chore` (`BACKGROUND_COPY_CHORE_MS = 12_000`) runs in every
+daemon and its own comment says it walks *"every codex + Claude Code transcript
+on this machine"*. That is exactly the right shape — host-scaled work paid by
+every daemon — so it was the obvious candidate.
+
+**It is not the driver.** Sampling `rchar` at 1 Hz for 48 s (four full chore
+cycles), the read spikes on the 246-row daemon land at **~5–6 s intervals, not
+12 s**, at a suspiciously constant ~655 KB each:
+
+| daemon | reads over 48 s | spike period |
+|---|---|---|
+| 1 session, **246 rows** | 7.8 MB | **~5–6 s** |
+| 1 session, **100 rows** | 1.0 MB | none (one isolated spike) |
+| **0 sessions (control)** | 4.5 MB | none (one isolated spike) |
+
+⇒ **The period does not match, so the 12 s chore is not what the per-row term is
+buying.** Two further cautions from the same run: the **control read 4.5 MB
+while costing 0.001 cores**, so reads are *not* a proxy for this cost; and the
+gap between the 100-row and 246-row daemons is far larger than 2.5x, so whatever
+scales with rows is **not linear in reads** even though the cost term fits
+linearly.
+
+⇒ **Next probe, and it is a period hunt, not a byte hunt:** find what fires
+every ~5–6 s per daemon and re-reads a constant ~655 KB. ⭐ Take the rate over
+the whole window rather than off the first few timestamps — three clustered
+samples are not a period, a mistake this campaign has already paid for once.
+
 ## 3. The mechanism: one OS thread per connection, and the CPU hides in the dead ones
 
 **The instrument disagreement that found it.** Sampled over the *identical*
