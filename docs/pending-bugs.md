@@ -4588,7 +4588,7 @@ never arms the drain at all. Measured: pid 426042 (3.0.75) logged
 `daemon_self_retire {retire_trigger: "newer_daemon_live"}` every 20 s for
 **100.6 hours** with no drain ever running.
 
-**Landed — §4, the queue, in 3.0.123.** `hot_restart_queue` is the host's durable
+**Landed — §4, the queue, in 3.0.124.** `hot_restart_queue` is the host's durable
 record of the one swap it owes (`~/.yggterm/hot-restart-queue.json`): a single
 slot, superseded by a newer target rather than appended to, and ⛔ **a re-request
 for the target already queued must not move `requested_at_ms`**, because §5's
