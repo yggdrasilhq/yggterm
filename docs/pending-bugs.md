@@ -358,6 +358,21 @@ diagnostics, and pattern research into how yggterm spends CPU, memory and power
 at rest. The standard named is Apple-grade — an idle app should cost nothing
 measurable.
 
+⭐ **Escalated the same day, and the escalation contains the diagnosis:** the app
+is *"barely usable now, behaving more and more jank as it hogs more resources by
+just doing nothing."* Two claims there, and the second is the one to design
+around:
+
+- **Monotonic.** It gets worse over uptime, not worse under load. That is a
+  leak or an unbounded accumulation, not a hot loop — a hot loop costs the same
+  in hour 36 as in hour 1.
+- **At rest.** The cost is incurred while doing nothing, which rules out the
+  work itself and points at whatever runs on a timer, subscribes without
+  unsubscribing, or retains per-event state that is never released.
+
+⇒ **Growth-over-time is the measurement that matters**, not a point sample.
+A single RSS reading names a symptom; RSS plotted against uptime names a class.
+
 ## ⛔ [6.7] A DAEMON LEAVES ITS `ssh` CHILDREN UNREAPED
 
 **Status:** OPEN
