@@ -15259,6 +15259,33 @@ fn queue_self_retire_swap(
         );
         return;
     };
+    // ⛔ A TARGET THAT IS NOT AHEAD OF US CAN NEVER BE SATISFIED, so queuing it
+    // would print "swap owed" in the census forever and retry every five
+    // minutes for the life of the process. Satisfaction is "a live daemon at or
+    // above the target", and the only daemon at OUR version that we can see is
+    // ourselves. This is reachable in ordinary work: a rebuild at the same
+    // version replaces the binary on disk without advancing the number
+    // ([[finding-a-version-can-mean-two-builds-and-the-probe-reads-false-red]]),
+    // and the handoff below is still worth doing — it is only the durable
+    // "still owed" record that would be a lie.
+    let target_is_ahead = parse_daemon_version_triple(target_version)
+        .zip(parse_daemon_version_triple(SERVER_PROTOCOL_VERSION))
+        .is_some_and(|(target, mine)| target > mine);
+    if !target_is_ahead {
+        append_trace_event(
+            home_dir,
+            "daemon",
+            "lifecycle",
+            "hot_restart_swap_queue_skipped",
+            serde_json::json!({
+                "reason": "the replacement binary is not ahead of this daemon, so no swap can be owed",
+                "target_version": target_version,
+                "current_version": SERVER_PROTOCOL_VERSION,
+                "current_pid": std::process::id(),
+            }),
+        );
+        return;
+    }
     let request = hot_restart_queue::QueuedHotRestart {
         target_version: target_version.to_string(),
         daemon_executable: handoff.daemon_executable.display().to_string(),
@@ -21278,6 +21305,30 @@ mod tests {
         assert!(
             lane.contains("continue"),
             "a lingering preserved owner keeps polling so the queued swap can be retried"
+        );
+    }
+
+    /// A queue entry whose target is not AHEAD of the daemon that wrote it can
+    /// never be satisfied, so it must never be written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_replacement_that_is_not_ahead_is_not_queued() {
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("fn queue_self_retire_swap(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\n/// What an accepted").next())
+            .expect("the queue writer should be present");
+        assert!(
+            body.contains("let target_is_ahead"),
+            "a same-version rebuild replaces the binary without advancing the number, and \
+             queuing that target would print 'swap owed' forever — satisfaction is 'a live \
+             daemon at or above the target', and at our own version that is only us"
+        );
+        // And the guard must not swallow the handoff itself — only the record.
+        assert!(
+            body.contains("hot_restart_swap_queue_skipped"),
+            "a skipped queue write must say why; §8 forbids a silent decline"
         );
     }
 
