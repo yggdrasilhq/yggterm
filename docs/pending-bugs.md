@@ -8937,7 +8937,7 @@ field, and the owner finding the truth by looking at his screen:**
 
 | verb | reply | read-back |
 |---|---|---|
-| `session rename` | `accepted: true` | label reads `ygg-sweep-rename-probe` — the change is real |
+| `session rename` | `accepted: true` | label reads `ygg-sweep-rename-probe` — the change is real **for a row that EXISTS**; see the rename entry below, where the same reply is returned for a path that does not |
 | `session remove` | `verified: true`, `live_processes: []` | row absent from the census; 6th consecutive clean sample that day |
 
 ⚠ **THREE WERE NOT RE-TESTED, AND THE REASONS ARE PART OF THE RESULT.**
@@ -9432,6 +9432,28 @@ the slot: `reason` is `null` on a call the daemon had a named reason to reject.
 No row is created (`server app rows` holds 35 before and after), so this is a
 silent no-op rather than corruption. That is also what makes it expensive to
 catch: the only way an agent learns the truth today is to re-read the table.
+
+✅ **STILL TRUE AT 3.0.141, and now with BOTH HALVES MEASURED IN ONE SESSION,
+which states the defect more sharply than the original report could:**
+
+```
+rename <a row that exists>      → accepted: true, reason: null   … and the label really changes
+rename <a path that does not>   → accepted: true, reason: null   … and nothing happens
+```
+
+⇒ **The two replies are identical in every field a caller reads.** The defect is
+not that a failure is reported as a success — it is that **success and no-op are
+indistinguishable from the reply**, so no amount of careful checking on the
+caller's side can tell them apart. `reason` is `null` in both, and it is the slot
+that was built to hold the difference.
+
+⚠ **The toast half was NOT re-observed** and I am not claiming it is gone: I
+looked for `notifications` / `toasts` in `app state` and found neither key
+populated, which says my probe did not find them, not that the daemon stopped
+raising them.
+
+**Falsifier:** a rename of a path that does not exist answers with `accepted:
+false`, or a `reason` a caller can read.
 
 ⚖ **Same family as the neighbouring `session remove` entry, one layer up.**
 There the lesson was *`accepted` is the request being understood, not the work
