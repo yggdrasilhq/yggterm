@@ -1762,41 +1762,73 @@ hostname). Removing them means rewriting published history, which has been done
 once before on a sibling repo and orphaned 34 commits. Not a relay action.
 → `docs/owner-attention.md`.
 
-## ⛔ [6.7] SIXTEEN STUCK CRASH HANDLERS, THE OLDEST DATING TO BOOT
+## ⛔ [6.7] THE GUI SEGFAULTS IN THE HARDWARE-GL DRAW PATH — AND THE STUCK HANDLERS ARE NOT OURS
 
 **Status:** OPEN
 
-*measured 2026-08-13*
+*re-measured 2026-08-13 evening; this entry previously conflated two things*
 
-Sixteen `drkonqi-coredump-launcher` processes are resident on the desktop host,
-ages ranging from 4.7 days to **11 days — i.e. since the machine booted**. Each
-one is a crash whose handler never finished.
+### ⛔ THE STUCK HANDLERS ARE KDE'S, AND THEY ARE RESIDUE
 
-**ATTRIBUTED 2026-08-13 — they are ours, and the entry does not retire.**
-`coredumpctl` holds **353 crashes**; by executable:
+Sixteen `drkonqi-coredump-launcher` processes are resident, **all parented to the
+KDE session manager**, ages **5.1 to 11.5 days — and nothing newer than 5.1
+days.** They are KDE's crash-reporter UI failing to exit, one per crash, days
+ago. **Not a yggterm process, not accumulating, and not ours to fix.** They are a
+symptom of our crash COUNT, and they vanish with a session restart.
 
-| executable | crashes |
+⇒ **What is ours is the crashing, not the handler.**
+
+### ⭐ A CONFIRMED SIGSEGV TODAY, WITH NO YGGTERM FRAME IN IT
+
+`coredumpctl` on the GUI that died at **19:03:42**, core present, 48.2 MB:
+
+```
+#0-1    libEGL_mesa.so.0
+#2-13   libgallium-26.1.5
+#14     gdk_cairo_draw_from_gl        (libgdk-3)
+#15-17  libwebkit2gtk-4.1
+#18+    gtk_container_propagate_draw  (libgtk-3)
+```
+
+**Every frame is Mesa, GTK or WebKit — none is ours.** The GUI dies inside GTK's
+GL→cairo bridge while compositing the webview, on the **hardware** GL path.
+
+⚠ **Correction to a claim made in this session:** that GUI restart was attributed
+to another cluster taking the host for a deploy. **It was not a restart — it was
+a segfault**, and the core says so. A process that vanishes and comes back is not
+evidence of who restarted it.
+
+### What the census does and does not support
+
+Top frame across the 12 most recent `yggterm`/`WebKit` cores:
+
+| top frame | count |
 |---|---|
-| `open-webui` (a flatpak, **not ours**) | 182 |
-| **`yggterm`** (`~/.local/bin`, `~/.yggterm/bin`, versioned + debug builds) | **~75** |
-| **`WebKitWebProcess`** (ours — the GUI's webviews) | **35** |
-| **`WebKitNetworkProcess`** (ours) | **13** |
-| everything else (plasmashell, dash, spectacle, rustfmt, …) | ~48 |
+| `libgallium` / `libgdk-3` (the GL path) | **4** |
+| `libc` (aborts, not this signature) | 6 |
+| unresolved | 2 |
 
-⇒ **~123 of 353 are yggterm's**, second only to a single unrelated flatpak, and
-the GUI's own signal mix is **`SIGSEGV`** while the web processes abort. Recent
-ones are not historical: `2026-08-11 16:11` yggterm SIGSEGV (81.6 MB),
-`2026-08-09 10:07` yggterm SIGSEGV (443.8 MB), `2026-08-08 23:07`
-WebKitWebProcess SIGABRT (**552.4 MB**).
+⇒ **The GL cluster is real but it is not all of them.** One backtrace is
+confirmed end to end; the rest are a crude top-frame sample and must not be
+quoted as though they were full traces.
 
-**And they are charged to the laptop's disk: `/var/lib/systemd/coredump` is
-2.6 GB across 41 files.** A 552 MB core is a direct consequence of the memory
-growth in the entry above — the bigger the process gets, the more a crash costs
-to store.
+### ⛔ THE FIX IS A TABLE CHANGE, NOT A FLAG FLIP
 
-⇒ Two separable jobs: the stuck handlers (16 `drkonqi-coredump-launcher`
-processes that never finished, oldest dating to boot) and the crashes
-themselves. The crash *rate* is the more valuable of the two and is unowned.
+`docs/presentation-policy.md` is the SSOT and the standing law is explicit:
+**never set `WEBKIT_DISABLE_DMABUF_RENDERER`, `LIBGL_ALWAYS_SOFTWARE` or any
+`PRESENTATION_VARS` entry against the owner's running GUI.** So nothing here is
+to be "tried" on his machine.
+
+⭐ **The case to answer is already half-written in `optimization-pass.md` §9f/§1a:
+the live host runs `YGGTERM_WEBKIT_GL_POLICY=hardware_gl_probed`, and hardware GL
+measured NO BETTER than software there.** ⇒ If hardware GL buys nothing
+measurable and crashes the GUI in Mesa's draw path, the policy TABLE should carry
+a different default for this host — with this core as the measurement in the row.
+
+**Falsifier:** run the sandbox (`scripts/underglass-sandbox.sh`) on both GL arms
+under the same webview workload and compare crash counts. If the software arm
+crashes at the same rate, the GL path is incidental and the abort cluster is the
+real story.
 
 ## ⛔ [6.6] `AGY` LAUNCHES A PLAIN SHELL, AND NO CLI GETS ITS PERMISSION FLAG
 
