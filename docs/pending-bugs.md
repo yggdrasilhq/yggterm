@@ -29,36 +29,6 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
-## ⛔ `terminal new --kind shell` SILENTLY IGNORES `--machine-key` AND MAKES A LOCAL ROW
-
-**Status:** OPEN
-
-*Measured 2026-08-13 while running a discriminator for a different defect.*
-
-```
-terminal new --kind shell --machine-key <remote> --cwd <path>
-  → session_path: live::<uuid>          ⛔ a LOCAL row
-  → launch.applied: true,  error: null
-```
-
-An agent-CLI kind with the same flag yields `remote-cc://<host>/<uuid>`. The shell kind answers
-`applied: true` and `error: null` while placing the session on **the wrong machine entirely** — the
-caller asked for a remote host and got a local one, with every field reporting success.
-
-⛔ **This is the verb family that reports the REQUEST rather than the EFFECT**, and it is worse than
-usual here because the wrong answer is a *working row*: it comes up, it accepts input, and nothing
-about it looks wrong until something depends on which machine it is on. A caller checking `applied`
-learns nothing.
-
-⚠ **It also silently invalidates any experiment that compares a shell row against an agent row**,
-because the two are then not on the same host. That is how it was found: a discriminator meant to
-separate *"this cwd cannot host a row"* from *"this CLI kind cannot launch here"* produced a local
-shell and a remote agent, so the comparison answered a question nobody asked. **The discriminator is
-still unrun.**
-
-**Fix:** honour `--machine-key` for every kind, or refuse the combination by name. ⛔ Do not let it
-keep succeeding quietly — a refusal costs a retry, a silent downgrade costs a wrong conclusion.
-
 ## ⚠ NOTHING CALLS `sync-terms`, SO THE PRIVACY GUARD'S WORDLIST CAN DRIFT AGAIN BETWEEN RUNS
 
 **Status:** OPEN
