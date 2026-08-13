@@ -592,7 +592,79 @@ def cmd_list(a):
                     if left > 0 else f"  ⏸ PARK LAPSED: {s.get('parked_reason','')[:44]}")
         log(f"{s['uuid'][:8]}  {s.get('role','relay'):<13} seat={str(s.get('seat') or '-'):<5} "
             f"→{(s.get('escalate_to') or 'human')[:8]}  {(s.get('intent') or '')[:44]}{pin}")
+    report_escalation_gap(subs)
     return 0
+
+
+def report_escalation_gap(subs):
+    """⛔⛔ CROSS THE TWO PLANES — EACH ONE ALONE LOOKS COMPLETE.
+
+    A row armed on the BOOTER but absent from the MONITOR is watched by a timer
+    that can wake it and by **nobody who would notice it had stopped**: if it
+    stalls, the escalation rings into an empty room. Nothing anywhere reported
+    that asymmetry, because each roster is internally consistent — the booter
+    listed the row, the monitor listed a complete-looking set without it.
+
+    Measured 2026-08-14: **nine** live relays in that state at one crossing, and
+    **four more two hours later** — one of them the successor of a row that had
+    relayed *during* the first sweep. ⇒ **A manual backfill is a SNAPSHOT, and a
+    relay invalidates it silently**, which is precisely why this belongs in the
+    tool and not in an orchestrator's discipline. (Reported by a sibling
+    orchestrator that hit the same trap from the other side.)
+
+    ⚠ This REPORTS; it does not arm and does not subscribe. That restraint is
+    deliberate: auto-arming is a separate, blocked item — the booter's function is
+    to TYPE INTO a stalled session, so arming the wrong row types into a human's
+    terminal, and `booter-disarmed.tsv` has no reader yet, so an eager arm would
+    silently re-arm every deliberately disarmed row. **Reporting a gap is
+    read-only and safe; closing it automatically is not yet.**
+    """
+    # Read the booter's STATE DIRECTORY, not its `list` output. The state dir is
+    # shared by every checkout; the script is not (a guard living only in one
+    # copy of a script is the failure this fleet already paid for). It also
+    # carries `gone_sightings`, which the printed roster does not.
+    booter_subs = STATE / "booter"
+    armed, dying = set(), set()
+    try:
+        files = sorted(booter_subs.glob("*.json"))
+    except Exception:
+        files = []
+    if not files:
+        # ⛔ An empty result is a tool that never ran, not a clean bill of health.
+        log(f"⚠ no booter roster at {booter_subs} — coverage NOT verified")
+        return
+    for p in files:
+        try:
+            rec = json.loads(p.read_text())
+        except Exception:
+            continue
+        u = (rec.get("uuid") or p.stem)[:8]
+        # ⛔ A CORPSE IS NOT AN UNCOVERED ROW, AND CONFLATING THEM KILLS THE
+        #    WARNING. A retired row stays on the booter until GONE_SIGHTINGS
+        #    confirms it — deliberate slowness that exists because a fast
+        #    unsubscribe once deleted nine LIVE subscriptions in six seconds. So
+        #    every reaped row would be reported here as a gap, every time, until
+        #    it aged out.
+        #    ⚠ The cost is asymmetric and that is the trap: a false alarm merely
+        #    looks like diligence, so it survives, and the warning is trained
+        #    into background noise right up until the one that mattered. The
+        #    booter has already begun counting these down; they need no human.
+        if rec.get("gone_sightings", 0) > 0:
+            dying.add(u)
+        else:
+            armed.add(u)
+    watched = {s["uuid"][:8] for s in subs}
+    gap = sorted(armed - watched)
+    if gap:
+        log(f"⛔ {len(gap)} ROW(S) ARMED ON THE BOOTER BUT ESCALATING TO NOBODY — "
+            f"a stall would ring into an empty room:")
+        for u in gap:
+            log(f"   {u}  ⇒ subscribe it with --escalate-to <its campaign's orchestrator>")
+        log("   ⚠ cwd is a PRIOR, not the answer: a row can work in a checkout that has")
+        log("     nothing to do with its subject. Confirm against its last prose turn.")
+    if dying:
+        log(f"   ({len(dying)} retired row(s) on the booter are being counted down "
+            f"by GONE_SIGHTINGS — not a gap, no action)")
 
 
 def fishy_audit(subs, dry):
