@@ -198,6 +198,29 @@ do not `terminal submit` to a row that is not consuming input. A row reading
 `busy: agent_working_daemon` will not echo, so the submit will hammer it for the
 full timeout. Check first, and never retry a `submitted:false` by sending again.
 
+### ⛔⛔ THE FIX CANNOT BE DEPLOYED WHILE AN UNSENT DRAFT IS OPEN — AND THAT IS NOT A PARADOX, IT IS THE ORDERING
+
+**A daemon handover TYPES.** §5's hot-restart repair submits `continue` to rows
+after a handover (`hot_restart_repair_continue`), through the very function this
+entry is about. On any build that does not yet carry the guard — **including
+every build installed right now** — that submit has no draft check, so a deploy
+can splice `continue` plus its retry barrage into a half-typed sentence.
+
+⇒ **Deploying the fix runs the unfixed path one last time.** The protection
+begins at the handover AFTER the one that installs it.
+
+⛔ **So while a human has an unsent draft in a live composer, do not deploy a
+daemon** — not even this fix, and not "quickly". The correct order is: the draft
+is sent or cleared, THEN the daemon is bumped, THEN the guard is live for every
+handover after that.
+
+⚠ **This generalises past this entry.** "Do not relaunch the GUI, the owner has
+an unsent draft" is the right instinct applied to the wrong process — the GUI
+relaunch does not type, and the DAEMON handover does. **A daemon bump is the more
+dangerous of the two for a draft**, which is the opposite of how it is usually
+treated. Same reasoning as the settle-window asymmetry above: a fix that lives in
+the predecessor cannot protect the handover that installs it.
+
 ### ⚠ "BLINKING" NOW HAS TWO UNRELATED CAUSES — TELL THEM APART BEFORE FILING HERE
 
 The handover settle window (6.1, `40cbcaf0` + `07218756`) widened the
