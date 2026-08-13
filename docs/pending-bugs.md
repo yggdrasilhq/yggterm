@@ -939,6 +939,69 @@ empty) yet the push was refused, so the only way forward was
 did nothing wrong.** That is how an override becomes reflex, and the next
 genuine hit gets waved through. The scan range must be the push's own commits.
 
+## ⛔⛔ [6.7] THE WEB PROCESS IS THE LARGER HALF OF THE IDLE COST AND NOTHING EXPLAINS IT YET
+
+**Status:** OPEN
+
+*measured on the desktop host 2026-08-13, 40 s window, build identity checked in
+the same command*
+
+The owner reports the fan still running. On the desktop host, on a GUI **29 min
+old** with the visible row sitting at a bare prompt:
+
+| process | total | user | kernel |
+|---|---|---|---|
+| `WebKitWebProcess` (the GUI's own UI webview) | **25.0%** of a core | 16.3% | 8.7% |
+| the GUI | 14.0% | 9.1% | 4.8% |
+
+⚠ **Sample over a WINDOW.** A 2 s sample of the same machine read 49% + 20%;
+40 s reads 25% + 14%. Short windows catch spikes — quote the window or the
+number is not comparable to anything.
+
+⚠ **There is exactly ONE `WebKitWebProcess`, and it is the shell's own UI
+webview** (parent = the GUI), not a web surface. So this is our own chrome:
+the sidebar DOM, the xterm canvas, and the JS we inject.
+
+### What is ruled OUT, each by measurement
+
+- **The `hpet` clock penalty does not explain it.** This load is
+  **user-dominant** (16.3 user vs 8.7 kernel). The 45.8× penalty is a
+  *kernel-time* effect on `clock_gettime`; it cannot inflate user compute.
+- **Not terminal streaming.** The active row was at a prompt with 8 terminal
+  lines — nothing to paint.
+- **Not app-level work.** `ui-telemetry.jsonl` recorded **zero events in
+  300 s**. The webview burns a quarter of a core while the app reports nothing
+  at all, so the cost is *below* the event layer: style, layout, paint, or a
+  timer that emits nothing.
+- **Not the status-dot blink on its own.** The `:root { animation: … 1100ms
+  step-end infinite }` is injected unconditionally and therefore also runs in a
+  sandbox GUI — where the web process costs **1.7%**. (⚠ Not fully cleared: the
+  blink animates an **inherited custom property** on `:root`, and the sandbox
+  has ~0 dependent rows against the desktop host's ~45. A cost that is O(rows)
+  would be invisible in the sandbox by construction. Refuted as a *whole*
+  explanation, still live as an O(N) one.)
+
+### What that leaves, and it is the shape to hunt
+
+| | web process | GUI |
+|---|---|---|
+| sandbox, **zero sessions** | **1.7%** | 1.2% |
+| desktop host, ~45 rows | **25.0%** | 14.0% |
+
+⇒ **~15× on the web process, in USER time, and it tracks CONTENT rather than
+uptime.** Whatever it is, it is proportional to what is on screen or in the
+tree, and it runs with no events, no output and no user present. **This is now
+the larger half of the idle cost and the least explained** — bigger than the
+app-root re-render that this cluster has already fixed.
+
+**Next instrument, and the gap that blocks it:** there is no way to evaluate JS
+in the shell's own webview — `server app web eval` and `web devtools` both
+target *session surfaces*, not the chrome. So "which JS timer / which style
+invalidation" cannot currently be asked at all on a live GUI. **Either add a
+shell-webview eval/devtools verb, or reproduce the row count in the sandbox**
+(spawn N probe rows, watch whether the web process cost scales with N — that
+also settles the O(rows) blink question above).
+
 ## ⛔ [6.7] THE WEB-CONTEXT SHARING INSTRUMENT IS BLIND TO THE CASE IT EXISTS TO CATCH
 
 **Status:** OPEN
