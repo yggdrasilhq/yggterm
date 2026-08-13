@@ -9,6 +9,25 @@ and referenced from here.
 says the answer changed.
 
 
+## ⛔⛔ A WRITE INTO A ROW SOMEONE IS TYPING IN SAVES AND RESTORES THEIR TEXT (2026-08-13)
+
+**Settled by the owner**, after an agent's message spliced into a half-typed sentence and the
+confirming carriage return submitted the fusion as that person's own turn. The required behaviour:
+
+> **Check whether the human has typed something. If they have, yank it, send the message, then
+> paste it back into the next prompt as if nothing had happened.**
+
+⇒ **Both things are preserved — the delivery and the keystrokes.** ⛔ **This rules OUT the obvious
+fix**, which was to refuse writing while the input buffer is non-empty: that protects the person by
+dropping the message, so a row with someone sitting at it becomes unreachable precisely when a
+delivery may matter most. ⚠ And a yank whose restore fails is worse than the original splice,
+because the loss is silent.
+
+Mechanism, affected callers — including the supervision plane's own escalation path — and the
+supporting pieces this needs (an atomic text-and-submit, a readable buffer-length field, and a
+clear that is not a kill-line) are in
+[`pending-bugs.md`](pending-bugs.md) § *`terminal send` SPLICES INTO A HUMAN'S HALF-TYPED SENTENCE*.
+
 ## ⛔⛔ A PUBLISHED LEAK IS THE RELAY'S PROBLEM, NOT AN OWNER GATE (2026-08-13)
 
 **Settled by the owner.** Private terms already public in a repo's history are
