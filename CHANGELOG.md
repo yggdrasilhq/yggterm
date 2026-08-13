@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Folding a group no longer hides its sessions from everything else (3.0.140).**
+  Collapsing a group is meant to tidy the sidebar, and it did — but the same
+  fold also removed those rows from the answer every background tool gets when
+  it asks which sessions exist. With every group folded, nine live agent
+  sessions became invisible to the supervision machinery at once, and one of
+  those tools retired all nine on the strength of it while the sessions were
+  healthy and working. The list now always reports every row and says
+  separately which ones the sidebar is currently folding away, so tidying the
+  screen can no longer make a session disappear. Folds still persist exactly as
+  you set them.
+
 - **A stale machine now fixes itself when you open yggterm (3.0.135).** If the
   running background service is too old and yggterm decides it cannot safely take
   it over, it used to write down that an update was owed and leave it there — and
