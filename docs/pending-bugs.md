@@ -330,14 +330,82 @@ established fix does not apply.
 The busiest thread by lifetime context switches is the **main `yggterm` thread**
 (744,729), ahead of `ReceiveQueue` (511,777) and the tokio workers.
 
-⚠ **No mechanism claimed.** ⛔ Do not reach for the render-rate story without
-reading the probe: `app_render_rate` is always on and emits into
-`event-trace.jsonl`, and a first look did not return recent samples — establish
-whether the probe is still emitting *before* concluding anything from its
-silence, because an empty result from an instrument that stopped running is not
-a measurement. ⭐ Quote which REGIME any render figure came from: ~2/s is rest,
-the 20–33/s storm autopsies arm at ≥20/s **by construction** and can never
-sample rest.
+### ✅ THE PROBE IS ALIVE, AND IT RECORDED A 21-MINUTE STORM WITH NO CAUSE
+
+*Answered on the live host 2026-08-13 23:18–23:46. `app_render_rate` is emitting
+normally — the earlier silence was a query fault, not a dead probe.*
+
+The whole life of one GUI process, one sample per minute:
+
+| window | renders/s | what it is |
+|---|---|---|
+| the long middle | **1.0 – 3.0** | rest, and it agrees with the ~2/s already on record |
+| brief spikes | 40 – 50 | transient, self-clearing within one sample |
+| **23:18:23 → ~23:39:40** | **69.3 – 79.6, unbroken for 21 min** | the storm |
+| after | 1.6 / 4.6 / 2.6 | rest again |
+
+⛔ **IT LATCHES, AND IT LETS GO ON ITS OWN.** This is not a slow climb and not a
+spike — it is a step change into a stable high regime and a step back out, with
+no deploy, no restart and no operator action at either edge (the offset preceded
+the session's first command on the host by ~80 s). A *rate* that is flat while
+it is wrong is the signature of a self-sustaining loop running at whatever a
+full-tree re-render costs (~13 ms), not of a leak and not of a growing backlog.
+
+⇒ **The regime table above is the answer to the REGIME warning, not a bypass of
+it:** rest and storm were sampled by the same always-on probe in one unbroken
+series, so the two figures are comparable. The ≥20/s autopsy arm is what cannot
+sample rest; `app_render_rate` can and does.
+
+### ⛔⛔ THE STORM IS INVISIBLE TO EVERY INSTRUMENT WE HAVE — THAT IS THE FINDING
+
+Three autopsies inside the storm (23:09:34, 23:27:15, 23:37:30) each report the
+same thing, and it is not nothing — it is a very specific nothing:
+
+```
+renders_observed: 512   unattributed: 511   forced_wakes: 0
+changed_fields: {}      shellstate_mut: {}
+```
+
+**512 consecutive full re-renders in ~6 s during which not one of the 26 watched
+`ShellState` fields changed hash, no attributed write occurred, and our own
+`schedule_update()` was never called.**
+
+And an every-event-kind correlation over the storm against the rest windows
+either side finds **no cause there either**:
+
+| event kind | pre /s | STORM /s | post /s | ratio |
+|---|---|---|---|---|
+| `render_fail_pattern/detected` | 0.00 | 0.02 | 0.00 | 4.1× |
+| `app_control/request_stage` | 0.54 | 0.71 | 0.56 | 1.3× |
+| `terminal_io/dispatch` | 2.14 | 2.61 | 1.24 | 1.2× |
+| `app_declare/daemon_declare_absent` | 0.85 | 0.84 | 0.59 | 1.0× |
+
+The only kind that rises is **the storm detector reporting the storm** — self-
+referential, not a cause. Nothing else moves. A 35× step in render rate is
+accompanied by no change in any traced activity whatsoever.
+
+⇒ **Read against the autopsy's own documented rule** (`forced_wakes` ≈ 0 beside a
+high `unattributed` count ⇒ *the wakes come from inside Dioxus, a future or eval
+resolving, not from us*), the evidence points at a Dioxus-internal waker. ⚠ Held
+as the leading hypothesis, not a verdict: the fingerprint cannot yet separate it
+from **a raw `state.with_mut()` write to an unwatched field**, which would print
+exactly the same empty autopsy. `SHELLSTATE_MUT_TOTAL` is in the watched set but
+is bumped only by `safe_shell_mut` — and `crates/yggterm-shell/src/shell.rs`
+holds **516 raw `.with_mut(` sites against 130 `safe_shell_mut`**, so the
+attributed path covers ~20% of the writers.
+
+⇒ **The next deliverable is the discriminator, not another measurement.** Until a
+write to `state` is unmissable, both hypotheses print `{}` and a fourth autopsy
+will die exactly as the first three did. ⛔ Do not "fix" this by capping the
+render rate: that hides a loop whose cause is still unnamed.
+
+⚠ **A falsified guess, recorded so it is not re-run.** `daemon_declare_absent`
+looked like the engine — 112 events in the onset window, and the first three are
+~24 ms apart, which matches the render period. It is not: across the storm it is
+**flat at 0.8/s**, identical before, during and after. Three clustered samples
+are not a rate. ⭐ *Take the rate over the window, never off the first few
+timestamps.* (It is separately worth asking why a declare against an absent
+daemon retries forever at 0.8/s for one `remote-cc` session, but it is not this.)
 
 ## ⛔ [6.7] A RESTART THAT RESOLVES NO RUNTIME SHUTS NOTHING DOWN AND REPORTS SUCCESS — FIXED IN CODE
 
