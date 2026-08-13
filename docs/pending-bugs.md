@@ -91,7 +91,7 @@ declined to restore because they were deleted.
 
 ## ⛔⛔ [6.2] THE START PAGE CANNOT BE USED TO FIND A SESSION
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 *reported 2026-08-13*
 
@@ -123,9 +123,47 @@ knows what the session was doing, not what it was called.
 applies to the CWD-tree sidebar as well — see the standing rule in `CLAUDE.md`
 about applying a spec across every surface that touches the concept.
 
+**What was found, and what shipped (3.0.113):**
+
+1. **The order was alphabetical by session uuid.** The rank key was
+   `fs::metadata(row.full_path)`, which answers 0 for anything that is not a
+   local `.jsonl` file — and of the 41 session rows on the live host, **not one
+   was**: they are `remote-cc://` (32), `local://` (6), `remote-session://` and
+   `live::`. The key was therefore CONSTANT ZERO over the whole corpus, every
+   comparison fell through to the `full_path` tie-break, and the result is an
+   order nobody can name because a uuid means nothing. The key is now resolved
+   by session id against the scans that already carry `modified_epoch`, and the
+   page prints its own rule beside the heading. ⚠ The stat also ran per row per
+   render, which `AGENTS.md` names as a bug in its own right; it is now a
+   documented last resort, memoized per build.
+2. **Search** reuses `row_matches_search` / `row_search_blob` — the predicate the
+   cwd tree already searches with, which covers the generated summary, title,
+   cwd, host, session id and transcript context. One predicate, so the two
+   surfaces cannot disagree. No indexer was built: the corpus was already there.
+3. **App rows** are dropped by their persisted `Source` stamp
+   (`app:<name>:<verb>`), never by their title — an app row is a
+   `SessionKind::Shell` on a `local://` path, so the title is the only other
+   signal and titles change.
+4. **The open verb and its colour come from the CLI registry.** Both were
+   `match`es that between them knew three of the nine registered CLIs; a tenth
+   is now a table row. ⚠ The amber the button painted (`#d97706`) failed WCAG AA
+   at 3.19:1 under its own white label — every replacement clears 4.5:1, locked
+   by a test.
+
+⚖ **The sidebar needed no ordering change**: `build_local_cwd_tree` already sorts
+each folder's sessions by `modified_epoch_ms` descending, so the two surfaces now
+agree. The app-row filter is deliberately start-page-only — the sidebar is where
+app rows are managed, and the report scopes the complaint to "the one surface
+whose job is picking a session".
+
+**Falsifier:** on the live host, the start page's first card is the
+most-recently-used session and not the alphabetically-first uuid; a query
+matching only a session's generated summary finds it; no ychrome/yedit row
+appears; each card's button names its CLI.
+
 ## ⛔ [6.2] A NEW CLI ROW IS BORN NAMED AFTER WHOEVER SPAWNED IT
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 *re-reported 2026-08-13*
 
@@ -1591,7 +1629,7 @@ sample on the live host.
 
 ## ⭐ A NEW SESSION'S ROW IS NAMED AFTER THE ROW YOU RIGHT-CLICKED
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 **Reported 2026-08-10, verbatim:** *"spawning a new session should say
 New {Claude, Codex, …, Terminal} Session, etc. on start instead of adding some words on
@@ -1615,6 +1653,25 @@ instrument.
 earlier the same day, and the duplicate `local://<uuid>` twin births
 (§ *the untouchable row*). All three make the sidebar unreadable; only this one is
 about the name chosen AT BIRTH.
+
+**The cause, and the fix (3.0.113).** One composer:
+`group_session_title_hint` returned `format!("{} {}", row.label, slug)` — the
+label of whichever row the context menu was opened on, plus the CLI slug. It was
+written for a *group* row, where `row.label` is a folder name and
+`"widgets codex"` reads sensibly, and nothing stopped it being handed a session
+row — which is what the menu people actually use does. The naming rule is now
+`new_session_birth_title` in `yggterm-core`, beside the registry that knows every
+CLI's display name, and it is derived from the new row's own kind: `New Codex
+Session`, `New Claude Code Session`, `New Terminal`. Wanted-2 (rename on first
+real title) already held — the placeholder is replaced by whichever mechanism
+owns titles for that kind (`TitleAuthority`), which is why this only ever showed
+for the few seconds before the CLI titled itself.
+
+⚠ **A shell keeps being titled by its cwd**, which is a separate deliberate rule
+(`live_session_default_title`) and not spawner-derived, so it is untouched.
+
+**Falsifier:** right-click a *session* row, start a session of any CLI, and the
+new row reads `New <CLI> Session` — never a variant of the clicked row's title.
 
 ## ⛔⛔ THE REMOTE HELPER DIALS A SOCKET NAMED FOR ITS OWN VERSION — SO UPGRADING IT ALONE KILLS EVERY REMOTE COMMAND
 

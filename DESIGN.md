@@ -1284,6 +1284,55 @@ A contributed row names the CLASS (`"durable"` / `"transient"` on `list-row`'s `
 
 **One clock for every blink.** All blinking indicators — live-session dots, machine dots, group dots, web-tab loading lights — flip on the *same* tick. The app owns exactly ONE blink animation, on `:root`, which publishes the current phase as the inherited custom property `--yggterm-status-dot-blink`; an indicator blinks by reading that phase (`opacity: var(--yggterm-status-dot-blink, 1)`), never by declaring an animation of its own. This is both a design rule (a sidebar of dots pulsing in unison reads as one system; dots blinking at random phases read as noise) and a hard performance constraint: on a software-GL host every opacity flip costs a full-window CPU blit, so N independently-phased indicators cost N times the frames of one. Any new indicator MUST join the shared clock.
 
+### Agent CLI brand colours
+
+Every registered agent CLI owns a colour, and a solid control belonging to a
+session paints in its CLI's colour with a white label. The canonical instance is
+the start page's *Open this … Session* button; the "New … Session" split-button
+family uses the same values.
+
+**The colour is a CLI's identity, so the CLI declares it once.** The values live
+on `AgentCliDescriptor::brand_color` in
+`crates/yggterm-core/src/agent_cli.rs`, and every surface reads them from there —
+`session_kind_primary_bg` is the shell's one accessor. This table is the prose
+record of *why* each value is what it is; the registry is what the code reads.
+A tenth CLI adds a row to the registry and a line here, and needs no new branch
+anywhere.
+
+| CLI | Colour | Contrast vs white | Source of the hue |
+|---|---|---|---|
+| Codex | `#0f766e` | 5.47:1 | OpenAI's teal, darkened to clear AA |
+| Codex-LiteLLM | `#0369a1` | 5.93:1 | a cool sibling of Codex — same family, separable at a glance |
+| Claude Code | `#c2410c` | 5.18:1 | Claude's clay, at the darkest step that still reads as the brand |
+| Pi | `#be185d` | 6.04:1 | nearest available |
+| OpenCode | `#4338ca` | 7.90:1 | nearest available |
+| Qwen Code | `#6d28d9` | 7.10:1 | Qwen's violet |
+| Kimi | `#1e40af` | 8.72:1 | Moonshot's deep blue |
+| Muse Code | `#86198f` | 8.24:1 | nearest available |
+| Antigravity | `#1557b0` | 6.95:1 | Google's blue, darkened one step |
+
+Three rules, and the first is not negotiable:
+
+- **A brand colour clears WCAG AA (≥4.5:1) against white**, because it always
+  carries a white label at 12px — a size that is *not* WCAG "large text", so the
+  3:1 large-text allowance does not apply. `#d97706`, the amber this vocabulary
+  replaced, sat at **3.19:1** and failed AA for the label it carried. "Nearest
+  available brand colour" is licensed for the HUE; it is never licensed for the
+  contrast. The test `the_brand_colours_clear_wcag_aa_against_white` enforces
+  this and a new entry must pass it.
+- **No two CLIs share a colour.** A shared colour identifies neither, which is
+  the same defect as having no colour — enforced by
+  `no_two_clis_share_a_brand_colour`.
+- **A kind with no CLI keeps the theme accent on a panel background** (a plain
+  shell, a terminal recipe, a document). The solid brand fill is what says "this
+  is an agent session", so it must not be spent on things that are not.
+
+These are deliberately dark, mid-saturation values rather than the brighter
+marketing hues. They sit on `panel_alt` cards in both themes and must stay
+legible against each; the accessibility floor is what keeps them theme-agnostic,
+since a value that clears AA against white is dark enough to hold its own shape
+on a light card and bright enough not to vanish into a dark one.
+
 ### Stage-curtain loading rule
 
 Session loads must look like a stage production: the audience never sees the mess. Concretely:
@@ -1299,6 +1348,33 @@ Startpage is a re-entry and scoped creation surface, not a connection-settings s
 
 - It may offer recent sessions, new Codex session, local terminal, folder creation, rename, and title/summary editing.
 - It should not show `Connect SSH`. SSH connection belongs in titlebar/right-rail/context controls where connection state and settings are available.
+
+**Startpage is also the RECOVERY surface, and that governs the list.** It is
+what a user falls back to when the sidebar has failed them, so the recent list
+is an instrument for *finding a session again*, not a decorative history:
+
+- **Most recently used leads, and the page SAYS SO.** The rule is printed beside
+  the "Recent work" heading. An ordering the reader cannot name is one they
+  cannot trust — the list was once ordered alphabetically by session uuid, which
+  looks like no order at all, and the report that found it could only call it
+  "weird".
+- **The list is searchable, over contents as well as titles.** After a failed
+  restore a user knows what a session was *doing*, not what it was called, so
+  the query runs against each row's generated summary, title, folder, host and
+  session id — the same `row_search_blob` the cwd tree's search uses. **One
+  predicate serves both surfaces**; a query that matches in the sidebar and not
+  here (or the reverse) is a bug, not a feature of scope.
+- **Only sessions.** libyggterm app rows (ychrome, yedit) are excluded: an app
+  row is not something anyone resumes, so on the one surface for picking a
+  session it is noise. The discriminator is the row's persisted `Source` stamp,
+  never its title.
+- **The open verb names its CLI and wears its colour** — *Open this Codex
+  Session*, *Open this Claude Code Session* — per § *Agent CLI brand colours*.
+  A bare "Open" is reserved for rows that genuinely have no CLI.
+- **A search that finds nothing says so in its own words.** "No saved sessions
+  yet" is a sentence about the store; shown to someone whose query simply missed,
+  on the surface they reached *because* work went missing, it reads as the page
+  having lost their sessions.
 - Selecting a folder opens a scoped Startpage without closing or hiding live runtimes.
 - Startpage must never be used as a terminal recovery fallback for a closed or broken runtime; it is chosen only by explicit folder/startpage focus or by the close-navigation fallback contract.
 

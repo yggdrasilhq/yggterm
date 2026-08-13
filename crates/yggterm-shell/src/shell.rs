@@ -40790,12 +40790,19 @@ fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
     }
 }
 
+/// The solid-control background for a session of `kind` — its CLI's brand
+/// colour, or the theme accent for a kind that has no CLI (a plain shell).
+///
+/// ⛔ **This reads the registry; it does not decide.** It used to be a
+/// three-arm `match` naming ONE colour (`#d97706`, Claude Code) and answering
+/// `accent` for the other eight registered CLIs — so a Qwen row, an OpenCode
+/// row and a Kimi row painted identically, and the colour carried no
+/// information on the one surface whose job is telling sessions apart. The
+/// values and the WCAG floor they must clear now live on
+/// [`AgentCliDescriptor::brand_color`], which is also where CLI ten adds its
+/// own. See `DESIGN.md` § *Agent CLI brand colours*.
 fn session_kind_primary_bg<'a>(kind: SessionKind, accent: &'a str) -> &'a str {
-    match kind {
-        SessionKind::ClaudeCode => "#d97706",
-        SessionKind::Codex | SessionKind::CodexLiteLlm => accent,
-        _ => accent,
-    }
+    yggterm_core::agent_cli::agent_cli_brand_color(kind).unwrap_or(accent)
 }
 
 fn is_hot_terminal_sidebar_path(path: &str) -> bool {
@@ -53413,27 +53420,23 @@ fn ensure_home_scoped_workspace_dir(path: &str) -> Result<bool> {
         .with_context(|| format!("failed to create workspace cwd {}", path.display()))?;
     Ok(true)
 }
-fn group_session_title_hint(row: &BrowserRow, kind: SessionKind) -> String {
-    // The CLI's slug — the same token `--kind` takes and `session_kind_label`
-    // reports, so a row's placeholder title names the CLI the same way every
-    // other surface does.
-    let suffix = match yggterm_core::agent_cli::agent_cli_descriptor(kind) {
-        Some(descriptor) => descriptor.slug,
-        None => match kind {
-            SessionKind::Shell => "shell",
-            SessionKind::SshShell => "ssh",
-            SessionKind::Document => "document",
-            _ => "shell",
-        },
-    };
-    format!("{} {}", row.label, suffix)
+/// The placeholder title a session is BORN with.
+///
+/// ⛔ **It names the new row's own kind, never the row the menu was opened
+/// on.** This used to be `format!("{} {}", row.label, slug)`, so spawning from
+/// a session's context menu minted a near-duplicate of THAT session's title —
+/// two sidebar entries reading almost identically until the CLI self-titled.
+/// The naming rule is [`new_session_birth_title`], in core, beside the registry
+/// that knows every CLI's display name.
+fn group_session_title_hint(kind: SessionKind) -> String {
+    yggterm_core::agent_cli::new_session_birth_title(kind)
 }
 fn group_session_launch_context(
     shell: &ShellState,
     row: &BrowserRow,
     kind: SessionKind,
 ) -> TerminalLaunchContext {
-    let title_hint = Some(group_session_title_hint(row, kind));
+    let title_hint = Some(group_session_title_hint(kind));
     // Single source of truth for the launch cwd, local and remote alike:
     // `sidebar_row_launch_cwd` (the row's own `session_cwd`, else the remote
     // folder's path, else the live/active session's `Cwd` metadata), falling back
@@ -54072,7 +54075,7 @@ fn terminal_launch_context_for_row(shell: &ShellState, row: &BrowserRow) -> Term
     let context_row = resolve_creation_context_row(&snapshot.rows, row);
     TerminalLaunchContext::Local {
         cwd: group_session_cwd(&context_row),
-        title_hint: Some(group_session_title_hint(&context_row, SessionKind::Shell)),
+        title_hint: Some(group_session_title_hint(SessionKind::Shell)),
     }
 }
 fn workspace_view_mode_from_app_control(mode: AppControlViewMode) -> WorkspaceViewMode {
@@ -122142,11 +122145,73 @@ fn start_page_recent_rows_from_browser_rows(
     snapshot: &RenderSnapshot,
     browser_rows: &[BrowserRow],
 ) -> Vec<BrowserRow> {
+    // The scanned last-used times, resolved ONCE per build rather than per row
+    // per render — see [`start_page_scanned_last_used_epochs`].
+    let scanned = start_page_scanned_last_used_epochs(snapshot);
     start_page_recent_rows_from_browser_rows_with_modified_epochs(
         snapshot,
         browser_rows,
-        start_page_browser_row_modified_epoch,
+        |row| start_page_row_last_used_epoch(row, &scanned),
     )
+}
+
+/// Last-used time, by session id, for every session a SCAN has timestamped.
+///
+/// ⛔ **This map is the reason the page can be ordered at all.** The rank key
+/// used to be read off the row's own path — `std::fs::metadata` on
+/// `row.full_path`, returning 0 for anything that was not a local `.jsonl`
+/// file. Measured against the live host's 41 session rows on 2026-08-13:
+/// **not one of them was a `.jsonl` path.** They are `remote-cc://` (32),
+/// `local://` (6), `remote-session://` and `live::` — so the sort key was
+/// CONSTANT ZERO across the entire corpus, every comparison fell through to the
+/// tie-breaks, and the page came out ordered by scheme-then-uuid. That is what
+/// "the order is weird" was: alphabetical by UUID, which is unnameable by
+/// construction because a UUID means nothing.
+///
+/// A row and the scan that timestamped it agree on exactly one thing — the
+/// SESSION ID — which is the same key [`start_page_recent_identity_keys`]
+/// already dedups on. So the epoch is looked up by id, and a live `remote-cc://`
+/// row inherits the mtime of the transcript it is a running instance of.
+fn start_page_scanned_last_used_epochs(snapshot: &RenderSnapshot) -> HashMap<String, i64> {
+    let mut epochs = HashMap::<String, i64>::new();
+    for machine in &snapshot.remote_machines {
+        for session in &machine.sessions {
+            let session_id = session.session_id.trim();
+            if session_id.is_empty() || session.modified_epoch <= 0 {
+                continue;
+            }
+            // A session id can be scanned by more than one machine entry; the
+            // NEWEST sighting is the one that describes when it was last used.
+            epochs
+                .entry(session_id.to_string())
+                .and_modify(|existing| *existing = (*existing).max(session.modified_epoch))
+                .or_insert(session.modified_epoch);
+        }
+    }
+    epochs
+}
+
+/// When this row was last used, in epoch seconds; `0` when nothing knows.
+///
+/// Two sources, in order, and **both are explicit** — a silent mtime fallback
+/// is the shape this project has already been bitten by:
+///
+/// 1. the scan that timestamped this session id (the answer for live rows,
+///    remote rows, and anything whose row path is a scheme rather than a file);
+/// 2. the stored transcript's own mtime, for a local `.jsonl` row that no scan
+///    covered.
+///
+/// ⚠ Source 2 stats the filesystem, which is why it is LAST and why the result
+/// is memoized per build by the caller: `AGENTS.md` names render-path
+/// filesystem IO as a bug, and this used to run for every row on every render.
+fn start_page_row_last_used_epoch(row: &BrowserRow, scanned: &HashMap<String, i64>) -> i64 {
+    if let Some(session_id) = row.session_id.as_deref().map(str::trim)
+        && !session_id.is_empty()
+        && let Some(epoch) = scanned.get(session_id)
+    {
+        return *epoch;
+    }
+    start_page_browser_row_modified_epoch(row)
 }
 
 fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
@@ -122162,6 +122227,10 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
     let scope = start_page_recent_scope(snapshot);
     let live_projection_paths = start_page_live_projection_paths(snapshot);
     let live_paths_for_rank = &live_projection_paths;
+    // An app row is not a session anyone resumes — dropped in `push_candidate`
+    // so that all three candidate sources are covered by one gate rather than
+    // three filters that can drift apart.
+    let app_surface_paths = start_page_app_surface_paths(snapshot);
     // ⛔ THE SCOPE RANKS, IT DOES NOT DROP. (Root-caused 2026-08-08.)
     //
     // These predicates used to FILTER, and the header said only "N shown" — so
@@ -122188,6 +122257,12 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
             if active_path
                 .as_deref()
                 .is_some_and(|active| active == normalize_live_session_path(&row.full_path))
+            {
+                return;
+            }
+            // Gap 3: a libyggterm app row is not a resumable session.
+            if app_surface_paths.contains(&row.full_path)
+                || app_surface_paths.contains(&normalize_live_session_path(&row.full_path))
             {
                 return;
             }
@@ -122529,6 +122604,44 @@ fn start_page_recent_identity_keys(row: &BrowserRow) -> Vec<String> {
     }
 }
 
+/// Every row path that is a libyggterm APP rather than a session.
+///
+/// ⛔ **The start page's job is picking a session to resume, and an app row is
+/// not something anyone resumes** — ychrome and yedit rows sat among the agent
+/// sessions as pure noise on the one surface whose whole purpose is finding
+/// work again.
+///
+/// The discriminator is the row's persisted `Source` stamp, which an app launch
+/// writes as the `app:<name>:<verb>` token — by its own documentation "the one
+/// place a row says WHICH app it is", and the same token the daemon re-derives
+/// the row's command from across a restart. Parsed with
+/// [`yggterm_server::app_verb_token_parts`], the token's ONE parser.
+///
+/// ⚠ It is deliberately NOT the label. An app row is a `SessionKind::Shell` on
+/// a `local://` path, so kind and scheme cannot separate it from a plain shell,
+/// and the only other visible signal is that its title happens to read
+/// "New Ychrome" — which is a string an app or a user may change at any moment.
+/// Sniffing that would be a second encoding of a fact the `Source` stamp
+/// already owns.
+fn start_page_app_surface_paths(snapshot: &RenderSnapshot) -> HashSet<String> {
+    snapshot
+        .live_sessions
+        .iter()
+        .filter(|session| {
+            session.metadata.iter().any(|entry| {
+                entry.label == "Source"
+                    && yggterm_server::app_verb_token_parts(&entry.value).is_some()
+            })
+        })
+        .flat_map(|session| {
+            [
+                session.session_path.clone(),
+                normalize_live_session_path(&session.session_path),
+            ]
+        })
+        .collect()
+}
+
 fn start_page_live_projection_paths(snapshot: &RenderSnapshot) -> HashSet<String> {
     snapshot
         .live_sessions
@@ -122770,9 +122883,40 @@ fn start_page_row_context(row: &BrowserRow) -> String {
 fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
     let palette = snapshot.palette;
     let all_sidebar_rows = state.read().all_sidebar_rows_for_selection();
-    let recent_rows =
+    let ordered_rows =
         start_page_recent_rows_from_browser_rows(snapshot.as_ref(), &all_sidebar_rows);
+    let ordered_count = ordered_rows.len();
+    // Gap 2, and the load-bearing one: the page is reached WHEN THE SIDEBAR HAS
+    // FAILED, and at that moment the reader knows what a session was DOING, not
+    // what it was called. So the filter runs over the same blob the sidebar's
+    // search does — `row_search_blob`, which already carries the generated
+    // summary, the title, the cwd, the host, the session id and the transcript
+    // context — rather than over the label alone.
+    //
+    // ⭐ ONE predicate, deliberately: reusing `row_matches_search` means the
+    // start page and the cwd tree cannot disagree about what a query matches,
+    // which is the failure mode the holistic-spec rule exists to prevent. It is
+    // also already memoized (an LRU over rows+query, and a fingerprint-gated
+    // transcript context store), so it is safe to run on every keystroke — an
+    // unbounded re-scan of the session stores is exactly what this must not be.
+    let mut start_page_query = use_signal(String::new);
+    let query = start_page_query();
+    let terms = search_terms(&query);
+    let recent_rows = if terms.is_empty() {
+        ordered_rows
+    } else {
+        ordered_rows
+            .into_iter()
+            .filter(|row| row_matches_search(row, &terms))
+            .collect::<Vec<_>>()
+    };
     let recent_count = recent_rows.len();
+    let searching = !terms.is_empty();
+    let search_field_style = format!(
+        "min-width:0; width:220px; height:28px; padding:0 10px; border:none; border-radius:7px; \
+         background:{}; color:{}; font-size:12px; box-shadow:inset 0 0 0 1px rgba(120,142,166,0.20);",
+        palette.panel, palette.text
+    );
     let selected_action_row = snapshot.selected_row.clone();
     let selected_agent_action_row = selected_action_row.clone();
     let selected_app_action_row = selected_action_row.clone();
@@ -122919,14 +123063,44 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                 div {
                     style: "display:flex; flex-direction:column; gap:10px; min-width:0;",
                     div {
-                        style: "display:flex; align-items:center; justify-content:space-between; gap:16px;",
+                        style: "display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;",
                         div {
-                            style: format!("font-size:12px; font-weight:800; color:{}; text-transform:uppercase; letter-spacing:0;", palette.muted),
-                            "Recent work"
+                            style: "display:flex; align-items:baseline; gap:8px; min-width:0;",
+                            div {
+                                style: format!("font-size:12px; font-weight:800; color:{}; text-transform:uppercase; letter-spacing:0;", palette.muted),
+                                "Recent work"
+                            }
+                            // ⭐ THE ORDERING RULE, SAID OUT LOUD. The page was
+                            // reported as ordered "weird" — and the reporter
+                            // could not name the rule, which is the finding: an
+                            // order nobody can name cannot be trusted or used.
+                            // Naming it makes it falsifiable by the person
+                            // reading the page.
+                            div {
+                                "data-yggterm-start-page-order-rule": "most-recently-used",
+                                style: format!("font-size:11px; color:{}; text-transform:none;", palette.muted),
+                                "most recently used first"
+                            }
                         }
                         div {
-                            style: format!("font-size:12px; color:{};", palette.muted),
-                            "{recent_count} shown"
+                            style: "display:flex; align-items:center; gap:10px;",
+                            input {
+                                "data-yggterm-start-page-search": "1",
+                                r#type: "search",
+                                value: "{query}",
+                                placeholder: "Search title, summary, path",
+                                style: "{search_field_style}",
+                                oninput: move |evt| start_page_query.set(evt.value()),
+                            }
+                            div {
+                                "data-yggterm-start-page-recent-count": "{recent_count}",
+                                style: format!("font-size:12px; color:{}; white-space:nowrap;", palette.muted),
+                                if searching {
+                                    "{recent_count} of {ordered_count}"
+                                } else {
+                                    "{recent_count} shown"
+                                }
+                            }
                         }
                     }
                     if recent_rows.is_empty() {
@@ -122937,7 +123111,17 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                  background:{}; color:{}; box-shadow:inset 0 0 0 1px rgba(120,142,166,0.14); font-size:13px;",
                                 palette.panel_alt, palette.muted
                             ),
-                            "No saved sessions yet. Start a session or create work in this scope."
+                            // A search that found nothing is a different state
+                            // from having no sessions, and saying "no saved
+                            // sessions yet" to someone with 44 of them reads as
+                            // the page having lost their work — which, on the
+                            // surface reached BECAUSE work went missing, is the
+                            // worst sentence available.
+                            if searching {
+                                "No session matches that. The search covers each session's title, its generated summary, its folder and its host."
+                            } else {
+                                "No saved sessions yet. Start a session or create work in this scope."
+                            }
                         }
                     }
                     for row in recent_rows.into_iter() {
@@ -122954,22 +123138,30 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                             } else {
                                 row.host_label.clone()
                             };
-                            let open_button_label: &'static str =
-                                match row_session_kind(&row) {
-                                    Some(SessionKind::ClaudeCode) => "Open in Claude",
-                                    Some(SessionKind::Codex | SessionKind::CodexLiteLlm) => {
-                                        "Open in Codex"
-                                    }
-                                    _ => "Open",
-                                };
-                            let open_button_style = match row_session_kind(&row) {
-                                Some(kind @ (SessionKind::ClaudeCode | SessionKind::Codex | SessionKind::CodexLiteLlm)) => format!(
+                            // NAME THE CLI, and paint it. Both come from the
+                            // agent-CLI registry, so a tenth CLI arrives with a
+                            // verb and a colour already correct — this used to
+                            // be two parallel `match`es that between them knew
+                            // about three of the nine registered CLIs and
+                            // answered a bare grey "Open" for the rest.
+                            //
+                            // ⚠ The generic arm is NOT dead: a plain shell and a
+                            // terminal recipe have no CLI to name, and they keep
+                            // the accent-on-panel treatment precisely so the
+                            // solid brand fill continues to mean "this is an
+                            // agent session".
+                            let row_kind = row_session_kind(&row);
+                            let open_button_label =
+                                yggterm_core::agent_cli::agent_cli_open_session_label(row_kind);
+                            let open_button_style = match row_kind
+                                .and_then(yggterm_core::agent_cli::agent_cli_brand_color)
+                            {
+                                Some(brand) => format!(
                                     "display:inline-flex; align-items:center; justify-content:center; \
                                      min-height:28px; padding:0 10px; border:none; border-radius:7px; \
-                                     background:{}; color:white; font-size:12px; font-weight:800;",
-                                    session_kind_primary_bg(kind, &palette.accent)
+                                     background:{brand}; color:white; font-size:12px; font-weight:800;",
                                 ),
-                                _ => format!(
+                                None => format!(
                                     "display:inline-flex; align-items:center; justify-content:center; \
                                      min-height:28px; padding:0 10px; border:none; border-radius:7px; \
                                      background:{}; color:{}; font-size:12px; font-weight:800;",
@@ -160773,7 +160965,10 @@ mod tests {
                 assert_eq!(ssh_target, "pi@dev");
                 assert_eq!(prefix.as_deref(), Some("cd /srv"));
                 assert_eq!(cwd.as_deref(), Some("/home/user/gh/yggterm"));
-                assert_eq!(title_hint.as_deref(), Some("yggterm shell"));
+                // The birth name says WHAT THE NEW ROW IS. It used to be
+                // `"{spawner label} shell"`, which named the row the context
+                // menu was opened on.
+                assert_eq!(title_hint.as_deref(), Some("New Terminal"));
             }
             other => panic!("expected remote launch context, got {other:?}"),
         }
@@ -160975,7 +161170,11 @@ mod tests {
                 assert_eq!(ssh_target, "pi@dev");
                 assert_eq!(prefix.as_deref(), Some("cd /srv"));
                 assert_eq!(cwd.as_deref(), Some("/home/user/git/samplenotes"));
-                assert_eq!(title_hint.as_deref(), Some("Samplenotes Shell codex"));
+                // ⛔ The exact defect: the anchor row is titled "Samplenotes
+                // Shell", and the session spawned from it used to be born
+                // "Samplenotes Shell codex" — a near-copy of its spawner's
+                // title, two rows apart in the sidebar and barely separable.
+                assert_eq!(title_hint.as_deref(), Some("New Codex Session"));
             }
             other => panic!("expected remote Codex launch context, got {other:?}"),
         }
@@ -178415,6 +178614,190 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 .iter()
                 .any(|row| row.full_path == session_path)
         );
+    }
+
+    /// A LIVE row is ordered by when its session was last used — not by the
+    /// text of its uuid.
+    ///
+    /// ⛔ **The defect, measured on the live host 2026-08-13.** The rank key was
+    /// `fs::metadata(row.full_path)`, which answers 0 for anything that is not a
+    /// local `.jsonl` file. Of the 41 session rows on that host, **none** was:
+    /// they were `remote-cc://` (32), `local://` (6), `remote-session://` and
+    /// `live::`. So every comparison saw 0 == 0 and fell through to the
+    /// `full_path` tie-break — leaving the page in alphabetical-by-uuid order,
+    /// which is why the reporter could see it was wrong and could not name the
+    /// rule.
+    ///
+    /// The two uuids below are chosen so the two orders DISAGREE: `aaaa…` sorts
+    /// FIRST alphabetically and is the OLDER session, `ffff…` sorts last and is
+    /// the newer one. A regression to path ordering therefore fails this test
+    /// rather than passing it by luck — which a fixture whose recency happened
+    /// to match its spelling would do.
+    #[test]
+    fn start_page_recent_rows_order_live_rows_by_scanned_last_used_not_uuid() {
+        let older_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let newer_id = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        let older_path = format!("remote-cc://dev/{older_id}");
+        let newer_path = format!("remote-cc://dev/{newer_id}");
+
+        let scanned = |id: &str, path: &str, modified_epoch: i64| RemoteScannedSession {
+            session_path: path.to_string(),
+            session_id: id.to_string(),
+            cwd: "/home/user/gh/widgets".to_string(),
+            started_at: String::new(),
+            modified_epoch,
+            event_count: 1,
+            user_message_count: 1,
+            assistant_message_count: 0,
+            title_hint: id.to_string(),
+            recent_context: String::new(),
+            cached_precis: None,
+            cached_summary: None,
+            live_runtime: true,
+            title_is_explicit: false,
+            storage_path: String::new(),
+        };
+
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
+        let mut older_live = test_live_shell_session(&older_path);
+        older_live.id = older_id.to_string();
+        older_live.kind = SessionKind::ClaudeCode;
+        let mut newer_live = test_live_shell_session(&newer_path);
+        newer_live.id = newer_id.to_string();
+        newer_live.kind = SessionKind::ClaudeCode;
+
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Rendered,
+            remote_machines: vec![RemoteMachineSnapshot {
+                apps: Vec::new(),
+                machine_key: "dev".to_string(),
+                label: "dev".to_string(),
+                ssh_target: "pi@dev".to_string(),
+                prefix: None,
+                remote_binary_expr: None,
+                remote_deploy_state: RemoteDeployState::Ready,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![
+                    scanned(older_id, &older_path, 100),
+                    scanned(newer_id, &newer_path, 900),
+                ],
+            }],
+            ssh_targets: Vec::new(),
+            live_sessions: vec![
+                snapshot_session_view_for_ui(older_live),
+                snapshot_session_view_for_ui(newer_live),
+            ],
+        });
+
+        let mut snapshot = shell.snapshot();
+        snapshot.selected_row = None;
+        snapshot.rows = vec![
+            test_browser_session_row(&older_path, "older work", "dev", Some("/home/user/gh/widgets")),
+            test_browser_session_row(&newer_path, "newer work", "dev", Some("/home/user/gh/widgets")),
+        ];
+
+        let paths = start_page_recent_rows(&snapshot)
+            .into_iter()
+            .map(|row| row.full_path)
+            .collect::<Vec<_>>();
+
+        let newer_ix = paths.iter().position(|path| path == &newer_path);
+        let older_ix = paths.iter().position(|path| path == &older_path);
+        assert!(
+            newer_ix.is_some() && older_ix.is_some(),
+            "both live rows belong on the page: {paths:?}"
+        );
+        assert!(
+            newer_ix < older_ix,
+            "the recently-used session must lead; got {paths:?} — which is \
+             alphabetical-by-uuid order, the exact defect this locks out"
+        );
+    }
+
+    /// A libyggterm app row is not a session, so it is not on the surface whose
+    /// job is picking a session to resume.
+    ///
+    /// The discriminator is the persisted `Source` stamp (`app:<name>:<verb>`),
+    /// NOT the row's label — an app row is a `SessionKind::Shell` on a
+    /// `local://` path, so its title is the only other signal and titles change.
+    #[test]
+    fn start_page_recent_rows_drop_libyggterm_app_rows() {
+        let app_path = "local://cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let shell_path = "local://dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
+        let mut app_session = test_live_shell_session(app_path);
+        app_session.id = "app-row".to_string();
+        app_session.title = "New Ychrome".to_string();
+        app_session.metadata = vec![SessionMetadataEntry {
+            label: "Source",
+            value: "app:ychrome:open".to_string(),
+        }];
+        let mut plain_shell = test_live_shell_session(shell_path);
+        plain_shell.id = "plain-shell".to_string();
+        plain_shell.title = "widgets".to_string();
+        plain_shell.metadata = vec![SessionMetadataEntry {
+            label: "Source",
+            value: "local-shell".to_string(),
+        }];
+
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Rendered,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![
+                snapshot_session_view_for_ui(app_session),
+                snapshot_session_view_for_ui(plain_shell),
+            ],
+        });
+
+        let mut snapshot = shell.snapshot();
+        snapshot.selected_row = None;
+        snapshot.rows = vec![
+            test_browser_session_row(app_path, "New Ychrome", "local", Some("/home/user")),
+            test_browser_session_row(shell_path, "widgets", "local", Some("/home/user")),
+        ];
+
+        let paths = start_page_recent_rows(&snapshot)
+            .into_iter()
+            .map(|row| row.full_path)
+            .collect::<Vec<_>>();
+
+        assert!(
+            !paths.iter().any(|path| path == app_path),
+            "an app row is not a resumable session: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|path| path == shell_path),
+            "a plain shell IS a session and must survive the app filter: {paths:?}"
+        );
+    }
+
+    /// The open verb names the CLI and paints its brand, straight off the
+    /// registry — so a tenth CLI is a table row, not a new `match` arm.
+    #[test]
+    fn the_start_page_open_verb_and_colour_come_from_the_cli_registry() {
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            assert_eq!(
+                yggterm_core::agent_cli::agent_cli_open_session_label(Some(descriptor.kind)),
+                format!("Open this {} Session", descriptor.display_name),
+            );
+            assert_eq!(
+                session_kind_primary_bg(descriptor.kind, "#ffffff"),
+                descriptor.brand_color,
+                "{:?}: the button must paint its own brand, not the theme accent",
+                descriptor.kind,
+            );
+        }
+        // A kind with no CLI keeps the accent — the solid brand fill is what
+        // says "this is an agent session".
+        assert_eq!(session_kind_primary_bg(SessionKind::Shell, "#123456"), "#123456");
     }
 
     #[test]

@@ -522,6 +522,23 @@ pub struct AgentCliDescriptor {
     /// Two characters render pixel-identical to the shipped three; three still
     /// fit the rect but are drawn a point smaller (see `TreeIcon`).
     pub icon_glyph: &'static str,
+    /// The CLI's brand colour, as the background of a solid control carrying
+    /// WHITE text (the start page's "Open this … Session" button is the
+    /// canonical instance). `DESIGN.md` § *Agent CLI brand colours* is the
+    /// prose SSOT; this field is the one the code reads.
+    ///
+    /// **Data, because it was a two-arm `match` that answered `accent` for
+    /// seven of the nine registered CLIs** — so a Qwen row and an OpenCode row
+    /// painted identically and the colour carried no information at all. A
+    /// tenth CLI is now a line in this table, not a new branch.
+    ///
+    /// ⛔ **Every value clears WCAG AA (≥4.5:1) against white**, which is the
+    /// constraint that picked the exact shades — the amber this replaced sat at
+    /// 3.19:1 and failed AA for normal text at the size the button actually
+    /// renders. "Nearest available brand colour" is explicitly acceptable; an
+    /// inaccessible one is not. Check a new entry with
+    /// `the_brand_colours_clear_wcag_aa_against_white` before adding it.
+    pub brand_color: &'static str,
     /// The letter this CLI's "New … Session Here" menu entry WANTS. A
     /// preference, never a guarantee — the KeyTip ladder may deny it.
     pub menu_hint: char,
@@ -1036,6 +1053,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         install: CliInstall::Npm("@openai/codex"),
         update: CliUpdate::Reinstall,
         icon_glyph: ">_",
+        // OpenAI's teal, darkened to clear AA against white (5.47:1).
+        brand_color: "#0f766e",
         menu_hint: 'c',
         // Codex records no title of its own; yggterm's LLM chore writes one.
         title_authority: TitleAuthority::Generated,
@@ -1137,6 +1156,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         install: CliInstall::Npm("@avikalpa/codex-litellm"),
         update: CliUpdate::Reinstall,
         icon_glyph: ">_",
+        // A cool sibling of Codex's teal — same family, because it IS codex
+        // behind a proxy, but separable at a glance (5.93:1).
+        brand_color: "#0369a1",
         menu_hint: 'z',
         title_authority: TitleAuthority::Generated,
         id_assigned_at_birth: false,
@@ -1220,6 +1242,10 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         install: CliInstall::Npm("@anthropic-ai/claude-code"),
         update: CliUpdate::Reinstall,
         icon_glyph: "*_",
+        // Claude's clay, at the darkest step that still reads as the brand.
+        // Replaces `#d97706`, which was the shipped value and failed AA at
+        // 3.19:1 against the white label it carried (5.18:1).
+        brand_color: "#c2410c",
         menu_hint: 'l',
         // CC does the hard work of titling its own sessions and yggterm must
         // RESPECT that, writing back only on an explicit user rename
@@ -1312,6 +1338,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         update: CliUpdate::Reinstall,
         // The mathematical constant is pi's own mark.
         icon_glyph: "\u{3c0}_",
+        // Nearest available: Pi ships no published brand hex (6.04:1).
+        brand_color: "#be185d",
         menu_hint: 'p',
         // No auto-title anywhere in the source; `/name` and `--name` are the
         // only writers, so an untitled pi session has nothing for yggterm to
@@ -1372,6 +1400,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         install: CliInstall::Npm("opencode-ai"),
         update: CliUpdate::Reinstall,
         icon_glyph: "OC_",
+        // Nearest available (7.90:1).
+        brand_color: "#4338ca",
         menu_hint: 'o',
         // A title agent EXISTS in the tree but is not wired into the v2 runner
         // (an explicit TODO there), and creation writes the placeholder
@@ -1424,6 +1454,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         install: CliInstall::Npm("@qwen-code/qwen-code"),
         update: CliUpdate::Reinstall,
         icon_glyph: "Q_",
+        // Qwen's violet (7.10:1).
+        brand_color: "#6d28d9",
         menu_hint: 'q',
         // Qwen generates and PERSISTS its own title as a `custom_title` record
         // and re-appends it near EOF as the file grows, so a tail scan finds
@@ -1474,6 +1506,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         install: CliInstall::Uv("kimi-cli"),
         update: CliUpdate::Reinstall,
         icon_glyph: "K_",
+        // Moonshot's deep blue (8.72:1).
+        brand_color: "#1e40af",
         menu_hint: 'k',
         // `state.json` carries `custom_title` with a `title_generated` flag and
         // a 3-attempt cap — the CLI owns it.
@@ -1563,6 +1597,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         install: CliInstall::VendorScript("https://dev.meta.ai/install.sh"),
         update: CliUpdate::Reinstall,
         icon_glyph: "M_",
+        // Nearest available (8.24:1).
+        brand_color: "#86198f",
         menu_hint: 'm',
         title_authority: TitleAuthority::Generated,
         id_assigned_at_birth: false,
@@ -1631,6 +1667,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // itself is the thing that knows how to replace it.
         update: CliUpdate::SelfCommand(&["update"]),
         icon_glyph: "A_",
+        // Google's blue, darkened one step to clear AA (6.95:1).
+        brand_color: "#1557b0",
         menu_hint: 'a',
         // The conversation file carries a `name` field, which is the CLI's own
         // title; on a fresh conversation it is still the cwd.
@@ -1845,6 +1883,68 @@ fn read_claude_code_store_entry(path: &Path) -> Option<AgentStoreEntry> {
 /// The descriptor for `kind`, or `None` for a non-agent kind.
 pub fn agent_cli_descriptor(kind: SessionKind) -> Option<&'static AgentCliDescriptor> {
     AGENT_CLIS.iter().find(|descriptor| descriptor.kind == kind)
+}
+
+/// The brand colour for `kind`, or `None` for a non-agent kind (a plain shell,
+/// a document) which paints in the theme accent instead.
+///
+/// See [`AgentCliDescriptor::brand_color`] for the accessibility constraint on
+/// the values.
+pub fn agent_cli_brand_color(kind: SessionKind) -> Option<&'static str> {
+    agent_cli_descriptor(kind).map(|descriptor| descriptor.brand_color)
+}
+
+/// What the start page's open control on a row of `kind` should SAY.
+///
+/// **The CLI is named because the page is a recovery surface**: it is reached
+/// when the sidebar has failed, and at that moment "Open" tells the reader
+/// nothing about which of nine CLIs they are about to resume. The verb used to
+/// be a three-arm `match` that named two CLIs and answered a bare `"Open"` for
+/// the other seven.
+///
+/// `None` — a plain shell or a document — keeps the generic verb, because there
+/// is no CLI to name.
+pub fn agent_cli_open_session_label(kind: Option<SessionKind>) -> String {
+    match kind.and_then(agent_cli_descriptor) {
+        Some(descriptor) => format!("Open this {} Session", descriptor.display_name),
+        None => "Open".to_string(),
+    }
+}
+
+/// What a row of `kind` is CALLED AT BIRTH, before its CLI has titled itself.
+///
+/// ⛔ **A birth name describes WHAT THE ROW IS, and nothing else.** It used to
+/// be `format!("{} {}", row.label, slug)` — the label of whichever row the
+/// context menu happened to be opened on, plus the CLI slug — which is a name
+/// for the SPAWNER, not the spawned. Right-clicking a session to start a
+/// neighbour therefore minted a near-copy of that session's title, and two
+/// sidebar rows read almost identically until the CLI got around to titling
+/// itself. On a forty-row sidebar that is the difference between an instrument
+/// and a wall of text.
+///
+/// The composer that did it was named for the case it was written for — a
+/// GROUP row, where `row.label` is a folder name and `"widgets codex"` reads
+/// sensibly. Nothing stopped it being handed a session row, and the menu that
+/// does so is the one people actually use.
+///
+/// ⚠ This is a PLACEHOLDER by contract. The row renames itself the moment its
+/// first real title arrives, by whichever mechanism owns titles for that kind
+/// ([`TitleAuthority`]) — so this string's job is to be unmistakable for the
+/// few seconds it is on screen, not to be durable.
+pub fn new_session_birth_title(kind: SessionKind) -> String {
+    match agent_cli_descriptor(kind) {
+        Some(descriptor) => descriptor.new_session_label(),
+        None => match kind {
+            SessionKind::Shell => "New Terminal".to_string(),
+            SessionKind::SshShell => "New SSH Terminal".to_string(),
+            SessionKind::Document => "New Document".to_string(),
+            // Unreachable while every agent kind has a descriptor, which
+            // `SessionKind::is_agent` derives from this very registry — so a
+            // new kind reaching here is a missing registration, not a name to
+            // invent. Stay generic rather than guess a product name.
+            _ => "New Session".to_string(),
+        },
+    }
 }
 
 /// Which CLI's store `path` lives under, if any. The store roots are mutually
@@ -2441,6 +2541,84 @@ mod tests {
                 descriptor.kind,
             );
         }
+    }
+
+    /// Relative luminance, per WCAG 2.1.
+    fn relative_luminance(hex: &str) -> f64 {
+        let hex = hex.trim_start_matches('#');
+        let channel = |offset: usize| {
+            let raw = u8::from_str_radix(&hex[offset..offset + 2], 16)
+                .expect("a brand colour must be six hex digits") as f64
+                / 255.0;
+            if raw <= 0.03928 {
+                raw / 12.92
+            } else {
+                ((raw + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4)
+    }
+
+    /// Every brand colour carries WHITE text, so every brand colour owes AA.
+    ///
+    /// ⛔ **The failure this locks out has already shipped once.** The start
+    /// page's open button painted Claude Code `#d97706` under a white label —
+    /// 3.19:1, which fails AA for normal text — and nothing in the codebase
+    /// could notice, because the colour was a literal inside a `match` arm and
+    /// contrast was nobody's field. A brand colour is a legibility decision
+    /// before it is a decorative one; "nearest available" is licensed for the
+    /// HUE, never for the contrast.
+    #[test]
+    fn the_brand_colours_clear_wcag_aa_against_white() {
+        let white = relative_luminance("#ffffff");
+        for descriptor in AGENT_CLIS {
+            assert_eq!(
+                descriptor.brand_color.len(),
+                7,
+                "{:?}: a brand colour is a `#rrggbb` literal",
+                descriptor.kind,
+            );
+            let brand = relative_luminance(descriptor.brand_color);
+            let ratio = (white + 0.05) / (brand + 0.05);
+            assert!(
+                ratio >= 4.5,
+                "{:?}: {} contrasts {ratio:.2}:1 against white, below the 4.5:1 \
+                 AA floor for normal text — darken it and keep the hue",
+                descriptor.kind,
+                descriptor.brand_color,
+            );
+        }
+    }
+
+    /// Two CLIs painting the same colour is the same defect as no colour at
+    /// all: the mark stops carrying information the moment it is ambiguous.
+    #[test]
+    fn no_two_clis_share_a_brand_colour() {
+        for (ix, descriptor) in AGENT_CLIS.iter().enumerate() {
+            for other in AGENT_CLIS.iter().skip(ix + 1) {
+                assert_ne!(
+                    descriptor.brand_color, other.brand_color,
+                    "{:?} and {:?} both paint {} — a shared colour identifies neither",
+                    descriptor.kind, other.kind, descriptor.brand_color,
+                );
+            }
+        }
+    }
+
+    /// The open verb NAMES the CLI, for every registered CLI, with no arm that
+    /// falls back to a bare "Open" — that fallback is reserved for the rows
+    /// that genuinely have no CLI.
+    #[test]
+    fn the_open_verb_names_every_registered_cli() {
+        for descriptor in AGENT_CLIS {
+            assert_eq!(
+                agent_cli_open_session_label(Some(descriptor.kind)),
+                format!("Open this {} Session", descriptor.display_name),
+                "{:?}: the open verb must name the CLI",
+                descriptor.kind,
+            );
+        }
+        assert_eq!(agent_cli_open_session_label(None), "Open");
     }
 
     /// A launch refused for a missing binary shows this sentence, so every CLI
