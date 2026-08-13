@@ -19,6 +19,13 @@
 #   scroll   <dy> [dx] [reps] [gap_ms]  real wheel axis events through the seat
 #   backend  what windowing backend the GUI ACTUALLY got (not what env asked for)
 #   env      print the sandbox env exports for ad-hoc commands
+#            ⛔ `eval "$(… env)"` EXPORTS `HOME` TOO, so every later `~/…` path
+#            resolves INTO the sandbox home: `~/.yggterm/bin/yggterm-headless`
+#            becomes a file that does not exist, and the first probe fails with
+#            "No such file or directory" — which reads as "the harness is
+#            broken" rather than "your path moved". Use ABSOLUTE paths for the
+#            real binaries after eval-ing this. Reported 2026-08-14 by the
+#            second session to use the harness, having cost it a false start.
 #   stop     tear everything down (sandbox home is preserved for inspection)
 #
 # start options:
