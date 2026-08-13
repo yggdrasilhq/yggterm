@@ -81,6 +81,42 @@ governs how they retire.
 **Falsifier:** consolidate and re-measure. If daemon cores do not fall ≥2.0, the
 per-daemon model is wrong.
 
+## ⛔⛔ [6.9→6.1] 14 LEGACY DAEMONS STILL RUN THE DEFECTS THEIR VERSION PREDATES
+
+**Status:** OPEN
+
+*measured 2026-08-14; attribution in [`idle-cost-model.md`](idle-cost-model.md) §5*
+
+The `DAEMON-1` full-corpus-read defect — `summarize_perf_telemetry` answering a
+question about the last 60 s by reading the whole retained corpus every 30 s —
+was root-caused and **fixed on 2026-07-26** by `jsonl_read_paths_since`
+(`retention.rs:141`). It is **still running in production right now**, in a
+daemon that started the same day the fix landed and has never restarted:
+
+| | rchar per 90 s | read syscalls/s | bytes per read |
+|---|---|---|---|
+| the 2.12.14 daemon (451 h old) | **437.8 MB** | 0.6 | **8.1 MB** |
+| a daemon owning 0 sessions (control) | 14.0 MB | 0.2 | — |
+
+437.8 MB/90 s is **above the 312.9 MB/90 s the defect measured when it was
+found**. The excess shows as *user* time (0.396 cores, 12x its peers) because
+the cost is parsing what it just read.
+
+⛔ **The general form is the defect.** Each of the 14 legacy daemons carries
+every fix landed since its own version — 2.12.14 through 3.0.62, against a
+current 3.0.151. **The queue and CHANGELOG record these as closed; for 14
+processes holding 34 live sessions they are not.** No surface reports which
+fixes a running daemon is missing.
+
+⇒ **A third independent argument for consolidation, and the only one that does
+not saturate:** cost and row-deaths are bounded by the population size, but the
+set of missing fixes grows with every release.
+
+⚠ **Interacts with the lock-tracer entry above:** that tracer fills
+`perf-telemetry.jsonl` at 4.06 GB/day, and the retained corpus is exactly what
+this monitor parses. Fixing the tracer reduces this cost on every daemon —
+including the ones that cannot themselves be fixed.
+
 ## ⛔ [6.9→6.7] DAEMON CPU HIDES IN EXITED THREADS — ONE OS THREAD PER CONNECTION
 
 **Status:** OPEN
