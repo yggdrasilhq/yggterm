@@ -1582,6 +1582,41 @@ nothing to do with willingness:
 2. **The successor reaps as its FIRST act**, inside the claim:
    `ygg-claim.sh --title "<category>: <what for>" --number <n> --replace <pred-uuid> --booter`
    One call takes the seat, arms the booter, and retires the predecessor.
+
+   ⛔⛔ **AND BEFORE THAT VERB RUNS: COMPARE THE UUID YOU WERE TOLD TO KILL AGAINST
+   YOUR OWN `$YGGTERM_SESSION_ID`. IF THEY MATCH, REFUSE AND SAY SO.** One
+   comparison, costs nothing, and it converts an unrecoverable self-kill into a
+   sentence. ⚠ The existing checks do not cover this: they prove the brief was
+   DELIVERED, not that the recipient is a ROW.
+
+   **The trap it guards, reported by another campaign 2026-08-13 and caught twice
+   by luck rather than by design.** *"Spawn the successor"* has two mechanisms and
+   only one of them is a relay:
+
+   | | app-control `terminal new` | the coding CLI's own subagent tool |
+   |---|---|---|
+   | session id | **its own** | ⛔ **INHERITS THE PARENT'S** |
+   | row / seat / booter | yes | none |
+   | lifetime | independent | dies with the parent |
+   | is it a relay? | **yes** | ⛔ **never — it is a helper** |
+
+   An in-process subagent **is the same session**, so a brief whose first act is
+   *"kill your predecessor, uuid X"* hands it **its own uuid**. The spawn
+   succeeds, a transcript appears, and the ACK token is present — **every check
+   this section prescribes passes**, because the brief really was delivered, to
+   something that could not act on it.
+
+   ⭐ **It was survived only because the kill was the FIRST act**: the subagent
+   read `$YGGTERM_SESSION_ID`, recognised the uuid as its own, and refused.
+   **Later in the same brief — after files had been edited — the identical
+   instruction takes a live row down with uncommitted work.**
+
+   ⇒ The general form is worth more than the mechanism note: **§8's standing
+   worry is two sessions grinding at once; this is the mirror — one session
+   killing itself believing it is two.** Any verb that acts destructively on an
+   identifier from a document must check that identifier against the executor
+   before it runs, because **a brief is a frozen snapshot and the executor is the
+   only thing that knows who it actually is.**
 3. **Read both fields back** (§7): `session remove` answers `row_still_listed`
    and `verified` separately, and a row can leave the order while its processes
    live on. `verified: true` with an empty `live_processes` is the only clean reap.

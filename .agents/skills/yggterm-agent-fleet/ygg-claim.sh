@@ -70,6 +70,23 @@ done
 UUID="${SESSION##*/}"
 [ -n "$CAMPAIGN" ] || CAMPAIGN="$(printf '%s' "$TITLE" | awk '{print $1}' | tr -d ':' )"
 
+# ⛔⛔ NEVER REAP YOURSELF. A brief hands the successor a `PREDECESSOR TO REAP`
+# uuid as a literal — and if the "successor" was started as an in-process helper
+# rather than as its own PTY session, it INHERITS the parent's session id, so
+# that literal is its own. The spawn succeeds, the transcript appears and the ACK
+# token is present, because the brief really was delivered; it was simply
+# delivered to something that is not a separate row. Reported by another campaign
+# 2026-08-13 and survived only because the kill happened to be the first act.
+# ⇒ The guard belongs in the TOOL, not in the operator: discipline resets every
+#    session and a check does not.
+if [ -n "${REPLACE:-}" ] && [ "${REPLACE##*/}" = "$UUID" ]; then
+  echo "ygg-claim: ⛔ REFUSING — --replace names THIS session (${UUID}). A brief handed you" >&2
+  echo "  your own uuid as its predecessor, which means you were spawned as an in-process" >&2
+  echo "  helper rather than as a row. A helper is never a relay: it has no seat, no booter" >&2
+  echo "  subscription, and dies with its parent. Spawn the successor as its own session." >&2
+  exit 64
+fi
+
 log() { printf '%s ygg-claim %s\n' "$(date +%H:%M:%S)" "$*"; }
 
 # --- locate a binary that can talk to the GUI ------------------------------
