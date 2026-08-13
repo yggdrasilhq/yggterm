@@ -56011,6 +56011,22 @@ fn describe_app_state_snapshot(
                 "root_render_count": APP_ROOT_RENDER_COUNT.load(Ordering::SeqCst),
             },
         },
+        // ⛔ IS THE DOM STILL A FAITHFUL RENDERING OF THE STATE ABOVE?
+        // Everything else in this payload describes what the shell BELIEVES.
+        // That belief is only worth reading while the webview is still applying
+        // what it is sent, and it silently stops: a batch that throws partway
+        // through is acknowledged anyway (a withheld ack starves the whole
+        // VirtualDom — see `edits.rs`), the host's model records those
+        // mutations as landed, and nothing ever re-sends them. From that
+        // moment one subtree is frozen while every field here keeps reporting
+        // the mode it should be showing.
+        //
+        // ⇒ NON-ZERO INVALIDATES THE SCREENSHOT, NOT THE STATE. Before
+        // reporting that the app is drawing the wrong thing, read this: it is
+        // the difference between a bug in the code and a webview that stopped
+        // listening, and those have opposite fixes. Only a GUI restart clears
+        // it. Zero on every healthy instance, by construction.
+        "webview_edit_faults": dioxus_desktop::edit_faults(),
         "shell": {
             "sidebar_open": shell.sidebar_open,
             "sidebar_width": shell.sidebar_width,
