@@ -75,6 +75,153 @@ were still alive afterwards**, so this is not a simple "old daemon evicted".
 --require-existing` brought a row back and it is still running. **Recovery exists; it is just not
 automatic.**
 
+## ⛔⛔⛔ [6.7] A ROW CAN BE ALIVE, IDLE-LOOKING, AND NOT READING ITS PTY — THE "I CANNOT TYPE" BUG
+
+**Status:** OPEN
+
+The instance was recovered live; the cause is NOT established.
+
+*Owner-reported and diagnosed live 2026-08-13: "Why cant I type on 2.0 row for over
+7m18sec". Owner's ruling: this is not a one-off, fix the root cause.*
+
+An agent row was **wedged**: its CLI process alive, its composer drawn on
+screen, and it had stopped reading its PTY. Typing into it did nothing, for
+tens of minutes, with no error anywhere.
+
+### ⛔⛔ EVERY STATE FIELD SAID IT WAS HEALTHY. ALL OF THEM WERE TRUE AND ALL OF THEM WERE USELESS
+
+Checked while the row was unusable, and each one said "fine":
+
+| instrument | reading |
+|---|---|
+| sidebar row | `busy: false`, `busy_reason: idle`, `remote_deploy_state: Ready` |
+| CLI process | alive, `state=S`, parked in `epoll_wait` on its PTY — *the normal state for a CLI awaiting keys* |
+| daemon PTY masters | held, 3 fds for that tty-index, same as every healthy session |
+| `host_stdin_enabled` / `foreground_input_ready` | `true` |
+| daemon hot-restart blockers | listed the row as `recently_active`, 82 s |
+| transcript | **static for 29 minutes**, last record `system` |
+
+⇒ **`server app terminal input-check` answered it in 6 seconds**, and is the only
+instrument that did: `wedged: true`, *"session never echo-confirmed it was
+consuming input within the timeout (composer is displayed, so the row is WEDGED:
+alive, idle-looking, and not reading its PTY)"*. It **writes a marker and waits
+for the echo** — it tests the thing the user does, instead of asking a field.
+⭐ A control row in the SAME run answered `wedged: false` with its own named
+refusal (it held an unsent draft), so the instrument was not collapsed to a
+constant.
+
+### ⛔ WHAT IS ESTABLISHED, AND WHAT IS NOT
+
+**Established:** `FIONREAD` on the session's PTY slave read **0 pending bytes**
+while the row was unusable. Had the daemon been writing keystrokes that the CLI
+was not reading, they would be queued there. **The bytes never reached the PTY.**
+So the break is upstream of the CLI, not inside it.
+
+⚠ **NOT established: where upstream.** This is a `remote-cc` row, so the path is
+GUI → its daemon → ssh → the session host's daemon → PTY, and this entry does
+**not** name which hop dropped the bytes. ⛔ Six causal stories have collapsed on
+this campaign in one evening; this is not the seventh.
+
+⭐ **The shape worth testing first**, because the code says it is possible:
+`enqueue_terminal_write` (`terminal.rs`) returns `Ok(())` as soon as
+`try_send` succeeds, for every non-`Flushed` write. **It reports the REQUEST,
+not the EFFECT.** A keystroke accepted into a queue whose consumer is not
+draining is indistinguishable from a delivered one until the queue fills — and
+only then does it report backpressure. That is the same family as
+[the queue whose consumer is older than its producer]. Falsifier: instrument
+queue depth against the writer's drain marker on a wedged row.
+
+**Recovery that WORKED, in order** — worth automating, since today it is manual:
+1. `input-check` to confirm the wedge (6 s, non-destructive, submits nothing).
+2. Confirm the transcript is **static** — proof the agent is not mid-turn, so
+   nothing is lost. ⛔ Do not skip this: killing a working agent destroys a turn.
+3. Kill the wedged CLI **by PID** (`--resume` replays the transcript from disk).
+4. `server app open` the row — it re-resumes clean.
+5. `input-check` again: `consuming_input: true`. **That is the proof, not the render.**
+
+### ⇒ WHAT THIS COSTS UNTIL IT IS FIXED
+
+A wedged row is **invisible**: it reads `idle · Ready` in the sidebar. Nothing
+runs `input-check` on a quiet row, so the only detector is a human trying to
+type and failing. **The sidebar should say WEDGED, not `idle`**, and a row that
+looks idle with a composer shown is exactly the cheap trigger for an automatic
+`input-check`.
+
+## ⛔ [6.7] A RESTART THAT RESOLVES NO RUNTIME SHUTS NOTHING DOWN AND REPORTS SUCCESS — FIXED IN CODE
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Found by using the remedy above and watching it fail, 2026-08-13.*
+
+`input-check` diagnoses a wedge and recommends
+`server terminal restart '<session>'` as the remedy. **That verb could not clear
+a wedge**, and said it had:
+
+```
+{"accepted":true,"message":"restarted remote-cc://dev/…; launch_refreshed=false; …"}
+```
+
+After it: the wedged `claude` was **still alive at the same pid**, still owning
+`/dev/pts/5`, still wedged — and a **second** wrapper had been spawned beside it.
+
+**The mechanism**, `restart_session_with_size` (`terminal.rs`):
+
+```rust
+if let Some(runtime) = self.sessions.remove(key) {
+    runtime.shutdown(stop_command)?;   // skipped entirely when the key does not resolve
+}
+let runtime = PtySessionRuntime::spawn(...)?;   // replacement spawned regardless
+```
+
+`remove` answers `None` for any key this manager does not hold — an orphaned
+key, or a `remote-*` row whose runtime belongs to **the daemon on its own host**.
+The restart then shuts nothing down, spawns a replacement, and the process that
+was serving the key is left alive and orphaned beside its successor. ⇒ **It is
+not a restart, and calling it one is why a wedged row survives its own remedy.**
+
+**The fix.** `restart_session*` now returns `TerminalRestartOutcome
+{ replaced_existing }`, the daemon's reply carries `replaced_existing=<bool>`,
+and a `restart_replaced_nothing` trace event fires on the empty case. The verb
+still spawns — recovery legitimately promotes a scanned remote session that has
+no local runtime yet — but it can no longer *claim* to have restarted something
+it never touched.
+
+**Locked by** `a_restart_reports_whether_it_replaced_anything`, which asserts
+**both halves**: an unheld key reports `false`, and a restart over a runtime the
+manager holds reports `true`. Without the second half the test would pass on a
+constant.
+
+⚠ **Not claimed:** that this fixes the wedge. It fixes the *remedy's honesty* —
+the operator is no longer told a wedged row was cleared when it was not, and the
+`false` case now names the real question: **which daemon owns this row.**
+
+## ⛔ [6.7] AN AGENT OPENING A ROW STEALS THE OWNER'S KEYBOARD
+
+**Status:** OPEN
+
+*Observed 2026-08-13 while diagnosing the entry above.*
+
+The owner reported he could not type into a row. The row was fine: the GUI's
+`active_session_path` had moved to **a different agent's row**, so his
+keystrokes were being delivered to another session with no visible sign of it.
+
+⇒ Two things are separate and are treated as one: **the row the sidebar shows as
+selected** and **the session that receives the keyboard.** They drift apart, and
+nothing surfaces the disagreement.
+
+**What moves it:** `server app open` re-targets the keyboard, and every agent
+row can call it — the diagnosis above did it twice to the owner's own session,
+and `server terminal restart` moved it a third time as a side effect.
+
+⚠ **Measured, so this is not folklore:** with no agent touching rows, the active
+session held steady across 16 samples over 64 s. It moves when agents act.
+
+⇒ **An agent-initiated activation must not take the keyboard from a human.**
+`terminal new` already has `--no-activate`; `open` has no such affordance, and
+the side-effecting verbs do not declare that they steal focus at all. This is
+the plainest form of the standing "never take his viewport" rule, and the row
+plane currently cannot honour it.
+
 ## ⛔ THE HOOK INSTALLER EXISTS TWICE, THE TWO COPIES DISAGREE, AND ONE CRASHES ON A WORKTREE
 
 **Status:** OPEN
