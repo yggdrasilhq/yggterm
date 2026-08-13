@@ -39770,18 +39770,25 @@ fn hot_session_paths_sorted(shell: &ShellState) -> Vec<String> {
     hot
 }
 fn set_app_control_row_expanded(shell: &mut ShellState, row: &BrowserRow, expanded: bool) {
-    if row.expanded == expanded {
-        return;
-    }
     // A row set's head is an ordinary session row, so it collapses through the
     // one store that already answers "which containers has the user shut?" —
     // the same set a machine root or the Live Sessions group uses, persisted the
     // same way, and outranking the auto-reveal seeding the same way. A second
     // store keyed on a different kind of path would be two answers to one
     // question.
+    //
+    // ⛔ AHEAD OF THE `row.expanded` SHORT-CIRCUIT, and that is the whole
+    // correctness of the verb. A row reaching this from app control was
+    // resolved with every set drawn OPEN — deliberately, so a verb never
+    // depends on what a human collapsed — so its `expanded` reads true even for
+    // a set that is shut, and the short-circuit would silently swallow every
+    // request to re-open one. Writing the store is already idempotent.
     if row_heads_a_row_set(row) {
         shell.update_synthetic_group_collapse_state(&row.full_path, expanded);
         shell.sync_browser_settings();
+        return;
+    }
+    if row.expanded == expanded {
         return;
     }
     if row.kind != BrowserRowKind::Group {
@@ -79473,7 +79480,10 @@ async fn process_pending_app_control_requests(
         AppControlCommand::SetRowExpanded { row_path, expanded } => {
             let maybe_row = state.with(|shell| resolve_app_control_row(shell, &row_path));
             match maybe_row {
-                Some(row) if row.kind == BrowserRowKind::Group => {
+                // A row set's head opens and shuts too — `DESIGN.md` §"An agent
+                // arranges rows as easily as a hand does". A disclosure a hand
+                // can click and a verb cannot reach is half a feature.
+                Some(row) if row.kind == BrowserRowKind::Group || row_heads_a_row_set(&row) => {
                     state.with_mut(|shell| {
                         set_app_control_row_expanded(shell, &row, expanded);
                     });
