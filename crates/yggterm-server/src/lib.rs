@@ -11220,6 +11220,7 @@ fn remote_runtime_agent_registry_kind(kind: SessionKind) -> RemoteRuntimeKind {
         SessionKind::Kimi => RemoteRuntimeKind::Kimi,
         SessionKind::Muse => RemoteRuntimeKind::Muse,
         SessionKind::Antigravity => RemoteRuntimeKind::Antigravity,
+        SessionKind::GrokBuild => RemoteRuntimeKind::GrokBuild,
         SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => {
             RemoteRuntimeKind::Shell
         }
@@ -12574,11 +12575,7 @@ fn claude_extra_args_remote_exports() -> Vec<String> {
 /// about `--model`. Composition (strip-then-append) happens client-side because
 /// this is the only side that can see both the configured args and the request.
 fn claude_extra_args_remote_exports_with_launch(launch: &AgentLaunchOptions) -> Vec<String> {
-    let raw = SessionStore::open_or_init()
-        .and_then(|store| store.load_settings())
-        .ok()
-        .map(|settings| settings.claude_code_extra_args)
-        .unwrap_or_default();
+    let raw = configured_extra_args_for_kind(SessionKind::ClaudeCode);
     let configured = codex_cli::split_extra_args(&raw);
     let tokens = if launch.is_empty() {
         configured
@@ -12607,16 +12604,44 @@ fn claude_extra_args_remote_exports_with_launch(launch: &AgentLaunchOptions) -> 
 /// The ssh exports a remote `start-<slug>` needs to honour ONE launch's model /
 /// permission mode.
 ///
-/// ⚠ Claude Code keeps its own lane, and the fork is real rather than tidy: CC's
-/// remote start also carries the user's configured `claude_code_extra_args` from
-/// the settings store, which is not a launch option and has no equivalent for
-/// any other CLI. Collapsing the two would either drop that setting or invent it
-/// for eight CLIs that have no such field.
+/// ⭐ **The CC-only fork is gone, and that fork was the bug.** It was justified
+/// by "the user's configured extra args have no equivalent for any other CLI" —
+/// true when the settings store held two named fields, and the reason eight
+/// first-class CLIs launched REMOTELY with no permission flag while the same
+/// eight got one locally. The store now keys flags by descriptor slug, so every
+/// CLI has the equivalent and the general lane carries it.
+///
+/// ⚠ Claude Code still ALSO gets its historical export. A remote host running an
+/// older binary reads only `YGGTERM_CC_EXTRA_ARGS`, and this fleet holds several
+/// versions at once — dropping it would disarm CC's flags on exactly the hosts
+/// that have not been deployed yet. It costs one duplicated export line and it
+/// retires when no pre-3.0.133 remote binary is left.
 fn remote_agent_start_exports(kind: SessionKind, launch: &AgentLaunchOptions) -> Vec<String> {
-    if kind == SessionKind::ClaudeCode {
-        return claude_extra_args_remote_exports_with_launch(launch);
+    let mut exports = if kind == SessionKind::ClaudeCode {
+        claude_extra_args_remote_exports_with_launch(launch)
+    } else {
+        agent_launch_options_remote_exports(launch)
+    };
+    exports.extend(configured_extra_args_remote_exports(kind));
+    exports
+}
+
+/// Export the CLIENT's configured flags for `kind`, so the remote CLI is
+/// launched with what the user actually set rather than with nothing.
+///
+/// Empty configured args export nothing at all: a CLI the user has not
+/// configured must leave the remote command byte-for-byte what it was, so an
+/// unasked-for variable can never change a session's behaviour.
+fn configured_extra_args_remote_exports(kind: SessionKind) -> Vec<String> {
+    let configured = configured_extra_args_for_kind(kind);
+    if configured.trim().is_empty() {
+        return Vec::new();
     }
-    agent_launch_options_remote_exports(launch)
+    vec![format!(
+        "export {}={}",
+        codex_cli::ENV_YGGTERM_AGENT_EXTRA_ARGS,
+        shell_single_quote(&configured)
+    )]
 }
 
 /// `--model` / `--permission-mode` as JSON in one export, for the machine that
@@ -21808,6 +21833,38 @@ pub fn run_app_control_set_theme_editor_open(open: bool, timeout_ms: u64) -> any
     Ok(())
 }
 
+pub fn run_app_control_set_launch_flags(
+    open: Option<bool>,
+    slug: Option<String>,
+    args: Option<String>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    if let Some(slug) = slug.as_deref() {
+        // Refuse an unknown slug BY NAME rather than silently storing flags
+        // under a key nothing reads — the response-layer defect this repo
+        // already has an entry for, in its cheapest form.
+        anyhow::ensure!(
+            yggterm_core::agent_cli::AGENT_CLIS
+                .iter()
+                .any(|descriptor| descriptor.slug == slug),
+            "{slug:?} is not an agent CLI yggterm knows. Try one of: {}",
+            yggterm_core::agent_cli::AGENT_CLIS
+                .iter()
+                .map(|descriptor| descriptor.slug)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetLaunchFlags { open, slug, args },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_reset_theme_editor(timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(&home, AppControlCommand::ResetThemeEditor, timeout_ms)?;
@@ -28194,22 +28251,28 @@ fn legacy_agent_launch_command(
     }
 }
 
-fn legacy_codex_extra_args() -> String {
-    let raw = SessionStore::open_or_init()
+/// The user's configured launch flags for `kind`, raw, off the ONE per-CLI map.
+///
+/// Every caller that used to reach into a named settings field goes through
+/// here, so "which box does this CLI read" has a single answer and a tenth CLI
+/// needs no new reader.
+pub(crate) fn configured_extra_args_for_kind(kind: SessionKind) -> String {
+    let Some(slug) = yggterm_core::agent_cli_extra_args_key(kind) else {
+        return String::new();
+    };
+    SessionStore::open_or_init()
         .and_then(|store| store.load_settings())
         .ok()
-        .map(|settings| settings.codex_extra_args)
-        .unwrap_or_default();
-    shell_join_extra_args(&raw)
+        .and_then(|settings| settings.agent_cli_extra_args.get(slug).cloned())
+        .unwrap_or_default()
+}
+
+fn legacy_codex_extra_args() -> String {
+    shell_join_extra_args(&configured_extra_args_for_kind(SessionKind::Codex))
 }
 
 fn legacy_claude_code_extra_args() -> String {
-    let raw = SessionStore::open_or_init()
-        .and_then(|store| store.load_settings())
-        .ok()
-        .map(|settings| settings.claude_code_extra_args)
-        .unwrap_or_default();
-    shell_join_extra_args(&raw)
+    shell_join_extra_args(&configured_extra_args_for_kind(SessionKind::ClaudeCode))
 }
 
 fn shell_join_extra_args(raw: &str) -> String {
