@@ -3980,17 +3980,43 @@ impl DaemonRuntime {
     /// than pressing on, so a broken successor costs one session's worth of
     /// risk instead of all of them.
     #[cfg(target_os = "linux")]
-    fn hand_off_all_runtimes(&mut self, successor_version: &str) -> HandoffSweep {
+    fn hand_off_all_runtimes(&mut self, successor_version: &str) -> HandoffSweepOutcome {
         let keys = self.terminals.session_keys();
         let total = keys.len();
         if total == 0 {
-            return HandoffSweep::NoneMoved {
-                reason: "this daemon owns no live PTYs".to_string(),
-            };
+            return HandoffSweepOutcome::nothing_to_do("this daemon owns no live PTYs");
         }
+        // ⭐ STAND EVERY READER DOWN BEFORE THE FIRST DESCRIPTOR MOVES.
+        //
+        // Two things depend on this and they pull in opposite directions:
+        //
+        // - **Nothing is stolen.** Both processes hold the master for as long
+        //   as this daemon lives, and reads race: every chunk goes to exactly
+        //   one of them. A parked reader consumes nothing, so the bytes the
+        //   shell writes from here on wait in the kernel for the successor's
+        //   reader — they are not lost, and they are not raced for.
+        // - **We may therefore take our time.** Waiting for a successor to
+        //   survive is only safe once waiting costs the user nothing. Before
+        //   the park, a settle interval WAS a double-read interval, which is
+        //   why the old code could do no better than exit 250 ms after the
+        //   sweep.
+        //
+        // The screen each session carries as its seed is snapshotted after the
+        // park, so everything this daemon ever consumed travels with it.
+        let parked: Vec<(String, Arc<crate::terminal::ReaderPark>)> = keys
+            .iter()
+            .filter_map(|key| {
+                self.terminals
+                    .park_reader(key)
+                    .map(|park| (key.clone(), park))
+            })
+            .collect();
+        let stood_down = wait_for_parked_readers(&parked, READER_PARK_QUIESCE_MS);
         let socket =
             crate::pty_handoff::handoff_socket_path(self.store.home_dir(), successor_version);
         let mut moved = 0usize;
+        let mut moved_keys: Vec<String> = Vec::new();
+        let mut successor_identity = None::<(u32, u64)>;
         let mut first_failure = None::<String>;
         for key in keys {
             let Some(takeout) = self.terminals.handoff_takeout(&key) else {
@@ -4009,14 +4035,33 @@ impl DaemonRuntime {
                 screen: takeout.screen,
             };
             match crate::pty_handoff::send_session(&socket, &metadata, takeout.master_fd) {
-                Ok(()) => moved += 1,
+                Ok(ack) => {
+                    moved += 1;
+                    moved_keys.push(key.clone());
+                    successor_identity = ack.adopter_identity().or(successor_identity);
+                }
                 Err(error) => {
                     first_failure = Some(format!("{key}: {error}"));
                     break;
                 }
             }
         }
-        classify_handoff_sweep(total, moved, first_failure)
+        // Whatever did NOT move is still ours to serve, and a session nobody
+        // reads is a session that has stopped painting. Only the runtimes the
+        // successor now holds stay parked.
+        let (held, released): (Vec<_>, Vec<_>) = parked
+            .into_iter()
+            .partition(|(key, _)| moved_keys.contains(key));
+        for (_, park) in &released {
+            park.unpark();
+        }
+        HandoffSweepOutcome {
+            sweep: classify_handoff_sweep(total, moved, first_failure),
+            parked: held.into_iter().map(|(_, park)| park).collect(),
+            successor_identity,
+            stood_down,
+            resumed: released.len(),
+        }
     }
 
     /// Working flags for every live row, INCLUDING the ones this daemon only
@@ -8073,7 +8118,7 @@ impl DaemonRuntime {
                     if pty_fd_handoff_enabled()
                         && let Some(successor) = live_successor_version.as_deref()
                     {
-                        let sweep = self.hand_off_all_runtimes(successor);
+                        let outcome = self.hand_off_all_runtimes(successor);
                         append_trace_event(
                             self.store.home_dir(),
                             "daemon",
@@ -8081,53 +8126,30 @@ impl DaemonRuntime {
                             "pty_fd_handoff_sweep",
                             serde_json::json!({
                                 "successor_version": successor,
-                                "outcome": format!("{sweep:?}"),
+                                "outcome": format!("{:?}", outcome.sweep),
+                                "readers_stood_down": outcome.stood_down,
+                                "readers_resumed": outcome.resumed,
                                 "pid": std::process::id(),
                             }),
                         );
-                        if let HandoffSweep::AllMoved { .. } = sweep {
-                            // ⭐ The same bequest as the superseded-retire sweep,
-                            // and for the same reason: this daemon's version name
-                            // is about to stop answering, and the successor is the
-                            // only thing that can carry it.
+                        if !outcome.parked.is_empty() {
+                            // ⛔ Accepting is not surviving. The watch holds our
+                            // descriptors — parked, serving nothing — until the
+                            // successor has lived out its settle window, and
+                            // wakes every reader again if it has not. Its own
+                            // thread, so this request's response still reaches
+                            // the caller.
+                            //
                             // `default_endpoint` IS this daemon's version-named
                             // socket — the one owner of "which socket am I", so
-                            // the bequest cannot name a different file from the
-                            // one we are about to release.
-                            let aliased = alias_own_socket_to_successor(
-                                self.store.home_dir(),
-                                &default_endpoint(self.store.home_dir()),
+                            // the bequest it eventually makes cannot name a
+                            // different file from the one we release.
+                            spawn_handoff_settle_watch(
+                                self.store.home_dir().to_path_buf(),
+                                default_endpoint(self.store.home_dir()),
+                                successor.to_string(),
+                                outcome,
                             );
-                            append_trace_event(
-                                self.store.home_dir(),
-                                "daemon",
-                                "lifecycle",
-                                "retiring_daemon_aliased_own_socket",
-                                serde_json::json!({
-                                    "successor_version": successor,
-                                    "successor_socket": aliased
-                                        .as_ref()
-                                        .map(|path| path.display().to_string()),
-                                    "aliased": aliased.is_some(),
-                                    "server_version": SERVER_PROTOCOL_VERSION,
-                                    "pid": std::process::id(),
-                                }),
-                            );
-                            // The successor holds every descriptor now. The ONLY
-                            // safe way to release ours is to EXIT: dropping
-                            // runtimes individually leaves their reader threads
-                            // holding cloned masters, and two daemons reading one
-                            // PTY means the shell never sees EOF. Exiting does not
-                            // signal the children — they re-parent to init, which
-                            // is what the spike proved.
-                            //
-                            // Delayed so this request's response still reaches the
-                            // caller; the descriptors are already gone, so nothing
-                            // is racing for them.
-                            std::thread::spawn(|| {
-                                std::thread::sleep(std::time::Duration::from_millis(250));
-                                std::process::exit(0);
-                            });
                         }
                     }
                     return Ok(ServerResponse::HotUpdateHandoff {
@@ -12307,7 +12329,7 @@ fn spawn_superseded_self_retire_sweep(
                 let Some(successor) = live_newer_daemon_version(&home_dir, &endpoint) else {
                     continue;
                 };
-                let sweep = {
+                let outcome = {
                     let mut rt = lock_daemon_runtime(&runtime, "superseded_self_retire");
                     // Nothing to move: the idle-shutdown path owns that case,
                     // and it can reach it now that we hold no sessions.
@@ -12323,39 +12345,273 @@ fn spawn_superseded_self_retire_sweep(
                     "superseded_self_retire_sweep",
                     serde_json::json!({
                         "successor_version": successor,
-                        "outcome": format!("{sweep:?}"),
+                        "outcome": format!("{:?}", outcome.sweep),
+                        "readers_stood_down": outcome.stood_down,
+                        "readers_resumed": outcome.resumed,
                         "server_version": SERVER_PROTOCOL_VERSION,
                         "pid": std::process::id(),
                     }),
                 );
-                if let HandoffSweep::AllMoved { .. } = sweep {
-                    // ⭐ Bequeath our NAME before we stop answering to it, or
-                    // every client pinned to this version strands the moment we
-                    // exit. This is the only place both names are known.
-                    let aliased = alias_own_socket_to_successor(&home_dir, &endpoint);
-                    append_trace_event(
-                        &home_dir,
-                        "daemon",
-                        "lifecycle",
-                        "retiring_daemon_aliased_own_socket",
-                        serde_json::json!({
-                            "successor_version": successor,
-                            "successor_socket": aliased
-                                .as_ref()
-                                .map(|path| path.display().to_string()),
-                            "aliased": aliased.is_some(),
-                            "server_version": SERVER_PROTOCOL_VERSION,
-                            "pid": std::process::id(),
-                        }),
+                if !outcome.parked.is_empty() {
+                    // ⛔ We do NOT exit here. The descriptors moved, but the
+                    // successor has only ACCEPTED them — see
+                    // [`spawn_handoff_settle_watch`], which lets go once it has
+                    // also SURVIVED, and wakes our readers if it has not.
+                    //
+                    // Watched on a PARTIAL sweep too: those runtimes are parked
+                    // whether or not the rest moved, and a park nobody watches
+                    // is a session that has silently stopped painting.
+                    spawn_handoff_settle_watch(
+                        home_dir.clone(),
+                        endpoint.clone(),
+                        successor.clone(),
+                        outcome,
                     );
-                    // The successor holds every descriptor. Exiting is the only
-                    // way to release ours — dropping runtimes individually
-                    // leaves reader threads on cloned masters, and two daemons
-                    // reading one PTY means the shell never sees EOF.
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                    std::process::exit(0);
+                    // Keep polling rather than returning: a settle that FAILS
+                    // leaves this daemon serving every session again, and a
+                    // daemon that has stopped asking whether it may retire is
+                    // exactly the immortal daemon this thread exists to end.
+                    continue;
                 }
             }
+        });
+}
+
+/// Everything one sweep leaves behind: what it concluded, the readers it stood
+/// down, and who it handed them to.
+///
+/// The parks are the load-bearing half. They are the predecessor's only way
+/// back: if the successor named here does not survive its settle interval,
+/// waking them restores a fully serving daemon, because nothing was ever
+/// dropped — only silenced.
+#[cfg(target_os = "linux")]
+pub(crate) struct HandoffSweepOutcome {
+    pub sweep: HandoffSweep,
+    /// One per runtime the successor now holds. Empty on every path that moved
+    /// nothing, so releasing them is unconditional and cannot be forgotten.
+    pub parked: Vec<Arc<crate::terminal::ReaderPark>>,
+    /// The adopting process, as `(pid, start_time)`. `None` from a successor
+    /// too old to name itself — the settle then falls back to asking whether a
+    /// daemon of that version still answers.
+    pub successor_identity: Option<(u32, u64)>,
+    /// How many readers were observed standing down before the first fd moved.
+    /// Not necessarily all of them: a session whose pty already died has no
+    /// reader left to answer, and blocking for one would hang the sweep.
+    pub stood_down: usize,
+    /// Readers woken again because their runtime did not move.
+    pub resumed: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl HandoffSweepOutcome {
+    fn nothing_to_do(reason: &str) -> Self {
+        Self {
+            sweep: HandoffSweep::NoneMoved {
+                reason: reason.to_string(),
+            },
+            parked: Vec::new(),
+            successor_identity: None,
+            stood_down: 0,
+            resumed: 0,
+        }
+    }
+
+    fn all_moved(&self) -> bool {
+        matches!(self.sweep, HandoffSweep::AllMoved { .. })
+    }
+
+    /// Bytes consumed after the park was requested, across every reader that
+    /// moved. Expected to be zero; reported rather than trusted.
+    fn stolen_after_park(&self) -> u64 {
+        self.parked.iter().map(|park| park.stolen_after_park()).sum()
+    }
+}
+
+/// How long a sweep waits for its readers to reach the gate before it starts
+/// moving descriptors. A reader blocked in `poll` answers in microseconds; this
+/// is the allowance for a machine under load, and it is an upper bound rather
+/// than a sleep — the wait returns as soon as every live reader has stood down.
+#[cfg(target_os = "linux")]
+const READER_PARK_QUIESCE_MS: u64 = 100;
+
+/// Poll the parked readers until they have all stood down, or the allowance
+/// runs out. Returns how many were observed.
+///
+/// ⛔ **Never waits for a reader that cannot answer.** A runtime whose pty
+/// already exited has no reader thread left, so "all of them" is not a
+/// reachable condition and a wait keyed to it would hang the whole retirement.
+#[cfg(target_os = "linux")]
+fn wait_for_parked_readers(
+    parked: &[(String, Arc<crate::terminal::ReaderPark>)],
+    allowance_ms: u64,
+) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(allowance_ms);
+    loop {
+        let stood_down = parked
+            .iter()
+            .filter(|(_, park)| park.has_stood_down())
+            .count();
+        if stood_down == parked.len() || std::time::Instant::now() >= deadline {
+            return stood_down;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// How long a successor must stay alive before the predecessor lets go.
+///
+/// ⛔ **This interval is the fix for a two-second window that destroyed seven
+/// agent sessions on 2026-08-13.** The predecessor used to exit 250 ms after
+/// the last descriptor moved, so it released on the successor's ACCEPTANCE and
+/// never on its SURVIVAL: anything that killed the young successor left no
+/// process holding anything, and the sessions were unrecoverable rather than
+/// merely stale.
+///
+/// It can afford to be generous only because the readers are parked
+/// ([`crate::terminal::ReaderPark`]). Before that, waiting meant two daemons
+/// reading one pty for the whole interval.
+#[cfg(target_os = "linux")]
+fn handoff_settle_window() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("YGGTERM_HANDOFF_SETTLE_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(10_000),
+    )
+}
+
+/// Whether the process that took our descriptors is still there.
+///
+/// Identity, not liveness-by-name: a pid alone can be reused, and "some daemon
+/// answers on that version's socket" can be a DIFFERENT daemon that does not
+/// hold our sessions. The `(pid, start_time)` pair is the same identity rule
+/// [`crate::pty_adoption`] applies to an adopted child.
+#[cfg(target_os = "linux")]
+fn successor_still_holding(identity: Option<(u32, u64)>, server_socket: &Path) -> bool {
+    match identity {
+        Some((pid, start_time)) => {
+            crate::pty_adoption::process_start_time(pid) == Some(start_time)
+        }
+        // A successor too old to name itself. Weaker — it proves only that a
+        // daemon of that version is answering, not that it is the same one —
+        // but it still catches what this mechanism exists for: the successor
+        // is gone.
+        //
+        // ⛔ Asked of the REQUEST socket, never the handoff socket. A bare
+        // connect to the handoff listener is an empty handoff, which the
+        // successor dutifully refuses and TRACES — one `pty_handoff_refused`
+        // per probe, an error line per second for a daemon that is healthy.
+        None => status(&ServerEndpoint::UnixSocket(server_socket.to_path_buf())).is_ok(),
+    }
+}
+
+/// The version-named request socket a daemon of `version` answers on.
+#[cfg(target_os = "linux")]
+fn versioned_server_socket_path(home_dir: &Path, version: &str) -> PathBuf {
+    home_dir.join(format!("server-{}.sock", version.replace('.', "-")))
+}
+
+/// Hold the descriptors until the successor has SURVIVED, then let go.
+///
+/// Runs on its own thread because both callers hold the daemon runtime lock and
+/// one of them is answering a request. Exits the process on success — that is
+/// still the only way to release our copies of the masters — and on failure
+/// wakes every parked reader, which turns this daemon back into a fully serving
+/// one with nothing lost.
+#[cfg(target_os = "linux")]
+fn spawn_handoff_settle_watch(
+    home_dir: PathBuf,
+    own_endpoint: ServerEndpoint,
+    successor_version: String,
+    outcome: HandoffSweepOutcome,
+) {
+    let _ = std::thread::Builder::new()
+        .name("yggterm-handoff-settle".to_string())
+        .spawn(move || {
+            let successor_socket = versioned_server_socket_path(&home_dir, &successor_version);
+            let window = handoff_settle_window();
+            let started = std::time::Instant::now();
+            let mut died_after_ms = None::<u128>;
+            while started.elapsed() < window {
+                if !successor_still_holding(outcome.successor_identity, &successor_socket) {
+                    died_after_ms = Some(started.elapsed().as_millis());
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            let settled = died_after_ms.is_none();
+            append_trace_event(
+                &home_dir,
+                "daemon",
+                "lifecycle",
+                "handoff_settle_window",
+                serde_json::json!({
+                    "successor_version": successor_version,
+                    "successor_pid": outcome.successor_identity.map(|(pid, _)| pid),
+                    "successor_identified": outcome.successor_identity.is_some(),
+                    "settled": settled,
+                    "window_ms": window.as_millis(),
+                    "waited_ms": started.elapsed().as_millis(),
+                    "died_after_ms": died_after_ms,
+                    "runtimes_held": outcome.parked.len(),
+                    "readers_stood_down": outcome.stood_down,
+                    // The park's own race, measured. Nonzero means a chunk that
+                    // belonged to the successor was consumed here instead, and
+                    // is a hole in that session's transcript.
+                    "bytes_stolen_after_park": outcome.stolen_after_park(),
+                    "all_moved": outcome.all_moved(),
+                    "server_version": SERVER_PROTOCOL_VERSION,
+                    "pid": std::process::id(),
+                }),
+            );
+            if !settled {
+                // ⭐ THE WHOLE POINT: nothing was dropped, only silenced. Waking
+                // the readers restores a daemon that owns and serves every one
+                // of these sessions, which is what the seven destroyed rows of
+                // 2026-08-13 needed and did not have.
+                for park in &outcome.parked {
+                    park.unpark();
+                }
+                return;
+            }
+            if !outcome.all_moved() {
+                // ⛔ A PARTIAL sweep that settles. The successor is alive and
+                // holds part of this daemon's sessions, so those readers stay
+                // parked — but this daemon still owns the rest and MUST NOT
+                // exit, because exiting would close their masters. It keeps
+                // serving what it kept, split across two owners, exactly as
+                // [`HandoffSweep::Partial`] requires.
+                //
+                // The watch exists for these runtimes too: without it, a
+                // successor that died would leave them parked for ever, which
+                // is a live session that has silently stopped painting.
+                return;
+            }
+            // ⭐ Bequeath our NAME before we stop answering to it, or every
+            // client pinned to this version strands the moment we exit. Done
+            // here rather than before the settle: while we might still have to
+            // come back, our own socket has to keep pointing at us.
+            let aliased = alias_own_socket_to_successor(&home_dir, &own_endpoint);
+            append_trace_event(
+                &home_dir,
+                "daemon",
+                "lifecycle",
+                "retiring_daemon_aliased_own_socket",
+                serde_json::json!({
+                    "successor_version": successor_version,
+                    "successor_socket": aliased.as_ref().map(|path| path.display().to_string()),
+                    "aliased": aliased.is_some(),
+                    "server_version": SERVER_PROTOCOL_VERSION,
+                    "pid": std::process::id(),
+                }),
+            );
+            // The successor holds every descriptor and has proved it can keep
+            // them. Exiting is the only way to release ours — dropping runtimes
+            // individually leaves reader threads on cloned masters, and two
+            // daemons reading one PTY means the shell never sees EOF. Exiting
+            // does not signal the children: they re-parent to init.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            std::process::exit(0);
         });
 }
 
@@ -12519,10 +12775,18 @@ fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntim
                         serde_json::json!({ "error": reason }),
                     );
                 }
-                let _ = crate::pty_handoff::send_ack(
-                    &stream,
-                    &crate::pty_handoff::HandoffAck { adopted, error },
-                );
+                // ⭐ The ack NAMES this daemon when it adopts. The predecessor
+                // is about to wait for a successor to survive, and "a live
+                // daemon of the right version" is not the same claim as "the
+                // process that took my descriptors is still there".
+                let ack = if adopted {
+                    crate::pty_handoff::HandoffAck::adopted_here()
+                } else {
+                    crate::pty_handoff::HandoffAck::refused(
+                        error.unwrap_or_else(|| "no reason given".to_string()),
+                    )
+                };
+                let _ = crate::pty_handoff::send_ack(&stream, &ack);
             }
         })
         .ok();
@@ -20623,6 +20887,76 @@ mod tests {
             super::classify_handoff_sweep(3, 2, None),
             super::HandoffSweep::Partial { moved: 2, .. }
         ));
+    }
+
+    /// ⛔ THE SETTLE WINDOW'S IDENTITY RULE. "A daemon answers on that version's
+    /// socket" is a WEAKER claim than "the process that took my descriptors is
+    /// still there", and a predecessor that lets go on the weaker one repeats
+    /// the bug this whole mechanism exists to close. A pid whose start time has
+    /// moved is a different process wearing a reused number.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_successor_is_identified_by_pid_and_start_time_together() {
+        let me = std::process::id();
+        let start = crate::pty_adoption::process_start_time(me)
+            .expect("this process must have a start time");
+        let unused_socket = std::path::Path::new("/nonexistent/server-0-0-0.sock");
+
+        assert!(
+            super::successor_still_holding(Some((me, start)), unused_socket),
+            "the live process must read as still holding"
+        );
+        assert!(
+            !super::successor_still_holding(Some((me, start.wrapping_add(1))), unused_socket),
+            "a pid whose start time disagrees is a DIFFERENT process — a reused \
+             number must never read as the successor"
+        );
+        assert!(
+            !super::successor_still_holding(None, unused_socket),
+            "with no identity the fallback asks the socket, and nothing is \
+             listening on that path"
+        );
+    }
+
+    /// The wait for readers to stand down is an upper bound, never a condition
+    /// that can hang. A runtime whose pty already exited has no reader thread
+    /// left to answer, so "wait until all of them" would stall the retirement of
+    /// a daemon holding one dead session.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn waiting_for_parked_readers_gives_up_rather_than_hanging() {
+        let silent = crate::terminal::ReaderPark::detached_for_test();
+        let started = std::time::Instant::now();
+        let stood_down =
+            super::wait_for_parked_readers(&[("local://never-answers".to_string(), silent)], 60);
+        assert_eq!(stood_down, 0, "a reader that cannot answer is not counted");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the wait must be bounded by its allowance, not by the reader"
+        );
+    }
+
+    /// The settle window's default has to outlive a young successor being
+    /// signalled — the incident's own window was two seconds — and has to be
+    /// shortenable, or every test that exercises it costs ten seconds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_settle_window_defaults_to_ten_seconds() {
+        assert_eq!(
+            super::handoff_settle_window(),
+            std::time::Duration::from_millis(10_000),
+        );
+    }
+
+    /// The socket a settle probe asks is the daemon's REQUEST socket, named the
+    /// same way the daemon names its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_settle_probe_asks_the_versioned_request_socket() {
+        assert_eq!(
+            super::versioned_server_socket_path(std::path::Path::new("/home/user/.yggterm"), "3.0.30"),
+            std::path::Path::new("/home/user/.yggterm/server-3-0-30.sock"),
+        );
     }
 
     /// The gate is ON unless explicitly disarmed.
