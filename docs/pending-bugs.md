@@ -11380,7 +11380,7 @@ create a row → remove it (tombstoning it) → web ensure --session <dead path>
 **Falsifier:** after `web ensure` on a tombstoned session path, either no surface
 is alive, or a row exists for it.
 
-## ✅ THE NAMED SEQUENCE IS NOW REFUSED — fix (b) shipped, measured 2026-08-13
+### ✅ THE NAMED SEQUENCE IS NOW REFUSED — fix (b) shipped, measured 2026-08-13
 
 Ran the entry's own sequence on the live host under a granted window: create a
 row → `session remove` it (tombstoning it) → `web ensure --session <dead path>`.
