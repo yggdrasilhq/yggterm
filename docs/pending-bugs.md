@@ -361,6 +361,46 @@ nothing else is already tracked below. Same family: **a rail whose content comes
 over a bridge shows its chrome and never its payload.** Check whether one dead
 bridge explains all three before writing three fixes.
 
+## ⛔ [6.3] A COLLAPSED SET REMOVED ITS MEMBERS FROM EVERY VERB THAT READS ROWS
+
+**Status:** OPEN
+
+*Owner-visible 2026-08-13 as nine live agent rows missing from the sidebar and from
+`server app rows`. The listing half is FIXED at 3.0.140 and verified live; this entry stays open for
+the render-side question below.*
+
+**The mechanism, proven by controlled intervention rather than inferred.** `server app rows` answered
+from the RENDERED row list, so folding a row set removed its members from the answer given to every
+consumer — the booter, the supervision plane, seat audits, orchestration scripts. With all five books
+folded, only the five heads were reported.
+
+```
+  rows, 5 books all folded  → 5 seats
+  expand exactly ONE set
+  rows, immediately after   → 14 seats, the nine members back
+```
+
+The persisted collapse set held exactly five session paths at that moment, one per book — a 1:1 match
+with the five surviving seats. ⇒ It cost real state: the booter reaped nine subscriptions in six
+seconds, each a working session, having been handed an honest answer to a question it was not asking.
+
+**Fixed at 3.0.140:** the verb builds its own list with every row set OPEN and reports
+`hidden_by_collapsed_set` per row. Verified live — 31 seated rows reported, 14 visible, 17 flagged
+folded, where those 17 were previously absent entirely. The collapse itself is untouched and still
+persists; three of those folds are the owner's own.
+
+⚠ **A trap on the way, and the reason this entry names it:** the first attempt reached for the search
+path's force-expansion to open the row sets and opened every folder and machine with them. 47 rows
+became 1454, every session doubled through its dual presence, and `resolve_app_control_row` began
+matching the cwd-tree copy of a row — which heads no set — so `row-expanded` started refusing.
+⇒ **Widening a data verb means showing what a FOLD hides, not unfolding the tree.**
+
+**What is still open.** Only the app-control verb was corrected. `snapshot.rows` is still the rendered
+list, so any OTHER consumer reading it inherits the same defect. ⇒ Decide whether the snapshot itself
+should carry every row with collapse as a field and let each renderer hide what it likes — which is
+the general form of the rule — or whether the verb is the only consumer that needs it. **Do not answer
+it by making collapse stop persisting: that is the user's state and he sets it deliberately.**
+
 ## ⛔⛔ [6.3] THE DOT READS THE SNAPSHOT, AND ONLY THE OTHER REQUEST ASKS THE OWNING DAEMON
 
 **Status:** OPEN
