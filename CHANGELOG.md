@@ -4,6 +4,23 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A daemon swap that cannot happen right now is remembered instead of
+  forgotten (3.0.124).** A host that had a newer binary on disk asked its daemon
+  to hand off exactly once, and if that one attempt did not produce a successor,
+  nothing anywhere remembered a swap was still owed. On one machine that left
+  the app running a newer build than the daemon serving it for the whole
+  session; on another it had quietly stacked eighteen coexisting daemons, the
+  oldest alive for twenty days. Two causes, both now fixed: the handoff never
+  told the successor which version to come up as — so under a managed install
+  the new process started, re-execed back to the old version, found the socket
+  taken and exited, while the log recorded a successful spawn — and the loop
+  that could have noticed and retried stopped after the first attempt. The host
+  now keeps one durable record of the swap it owes, a newer build replaces that
+  record rather than queueing behind it, and the retry runs on a five-minute
+  floor until a daemon at or past the target is actually serving.
+  `yggterm-headless server daemons` prints the owed swap and what the last
+  attempt is waiting for, so a stale host says so instead of looking healthy.
+
 - **The working dot blinks again, and it never did (3.0.122).** Every live
   session's status dot is meant to pulse while its agent is mid-turn — that is
   the only signal telling a human which of their sessions is actually working.
