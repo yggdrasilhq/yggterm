@@ -2065,6 +2065,32 @@ sensible and is NOT taken yet, because this defect makes the sort's behaviour un
 reason about. **Fix the dry run first**, then the claim script's new duty can be verified rather
 than assumed.
 
+
+⚠ **A NAIVE RE-TEST WILL "FALSIFY" THIS ENTRY AND BE WRONG — recorded 2026-08-13
+after walking into it twice.** On an already-sorted list, `changed:false` is the
+CORRECT answer, and a dry run that reports reality and one that reports its own
+computed order are **indistinguishable there**. Two attempts to build the
+discriminating condition both collapsed back to sorted:
+
+1. Sampling `rows` and `sessions sort --dry-run` simultaneously on the live
+   sidebar — the list was in order, so `changed:false` carried no information.
+2. Creating a row via `--insert-after <last row>` and then numbering it `0.1` to
+   put its POSITION and its NUMBER in disagreement. ⛔ **`server app session
+   outline` RE-SEATS the row as it numbers it** (its help says so), so the list
+   was sorted again before the dry run could see otherwise.
+
+⇒ **The precondition is a row whose position disagrees with its number, and no
+read-only door creates one.** The remaining route is `server app sessions
+reorder` with a deliberately wrong order — which rewrites the WHOLE rendered
+order, including rows belonging to other sessions, so it is not a probe to fire
+casually on a live sidebar.
+
+⛔ **Do not retract this entry on a `changed:false` observed over a sorted
+list.** The original measurement was taken while the order was genuinely wrong,
+with both verbs launched from one shell so the difference could not be time.
+
+**Falsifier:** with a row whose position and number disagree, the dry run reports
+`changed:true`.
 ## ⛔⛔ A ROW-TABLE WRITE IS INVISIBLE TO THE NEXT READ, AND `rename`+`outline` CORRUPTS THE TITLE
 
 **Status:** OPEN
@@ -9998,6 +10024,28 @@ answer covers the contract that had no proof at all. Fix when convenient: an
 addressable route that reveals a picker surface (the rail/strip badge opens
 the profile SWITCHER menu, `webprofile:<name>` entries only), after which the
 existing `app screenshot --client <shadow>` does the rest.
+
+⚠ **NARROWED 2026-08-13 — "nothing an agent can drive" is too strong, and the
+difference changes who can fix it.** The route IS addressable: `server app open
+webprofile:<name>` is accepted, sets `active_session_path: "webprofile:<name>"`
+and `active_view_mode: "Rendered"`, and then fails with a NAMED reason:
+
+```
+timed out waiting for app open to settle for webprofile:<name>:
+  {"active_session_path":"webprofile:<name>","active_view_mode":"Rendered",
+   "ready":false,"reason":"preview surface not mounted"}
+```
+
+⇒ The missing piece is the **surface mount**, not an addressable route, and the
+verb already says so in its own words. That is a much smaller thing than
+"nothing exists", and it means the screenshot half may be one fix away rather
+than one feature away.
+
+⚠ **The probe moves the operator's view** — it sets the active session before it
+fails — so restore the previous row immediately after. Done here.
+
+**Falsifier:** `open webprofile:<name>` settles, and `app screenshot` returns the
+picker card.
 
 
 ## A WebKitNetworkProcess OUTLIVES the WebContext that started it, and
