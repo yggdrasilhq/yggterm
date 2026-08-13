@@ -29,6 +29,52 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⛔⛔⛔ SEVEN AGENT ROWS DIED IN ONE SECOND DURING A DAEMON HANDOVER — the constitution's core guarantee, failing with a timestamp
+
+**Status:** OPEN
+
+Measured 2026-08-13 22:31–22:47, live, on the integrator host.
+
+**What happened, as measurement only:**
+
+| time | event |
+|---|---|
+| 22:30:21 | a daemon starts from **a lane's own build tree** — `/home/pi/gh/yggterm--<lane>/target/release/yggterm-headless server daemon` |
+| **22:31:42** | **seven agent CLIs write their last transcript byte. Byte-identical mtimes, to the second.** |
+| 22:31:49 | a second daemon starts, this one the installed `~/.yggterm/bin/yggterm-headless` |
+| 22:36:33 | one row is re-resumed by hand (`server remote resume-cc <uuid> --require-existing`) and survives |
+
+⛔ **They were CUT MID-TURN, not exited.** Every dead transcript ends on a `tool_result` record —
+the agent received a tool result and was killed before it could produce the next turn. **That is
+work destroyed, not work finished.**
+
+⛔ **The sessions are NOT recoverable.** A dead row's uuid returns **zero** occurrences from
+`server sessions`; there is nothing to resume. Peer sockets fell **33 → 8** in the same window.
+
+⇒ **This is exactly the guarantee `CLAUDE.md` names as the highest-value work in the project:**
+*"Other agents' sessions survive our restarts"* and *"a restart of ours must not interrupt, reset, or
+destroy what another agent is doing."* ⚠ **And the count is the same as the previously recorded
+incident — ~7 agent PTYs** — which suggests a mechanism that has not moved rather than a new one.
+
+⚠⚠ **WHAT IS NOT ESTABLISHED, AND MUST NOT BE ASSUMED:** that the lane-build daemon *caused* the
+deaths. It is temporally adjacent and it is the anomaly in the sequence, but nothing here proves
+causation, and this campaign has had six causal stories collapse in a single evening. **Both daemons
+were still alive afterwards**, so this is not a simple "old daemon evicted".
+
+**The falsifiers, in the order that costs least:**
+1. Start a daemon from a lane's `target/release` on a host with live agent rows, in a sandbox, and
+   see whether rows die ~80 s later. If they do, the mechanism is *which binary* rather than *a
+   handover*, and the fix is that a lane build must never be able to take over the row plane.
+2. Perform an ordinary installed-binary handover with live rows and see whether they survive. If
+   they die too, the lane build is irrelevant and the defect is the handover itself.
+3. Check whether the dying rows were owned by the retiring daemon or the new one — a reply that
+   cannot name **which daemon served it** is the instrument gap that makes this hard, and it is
+   already filed separately.
+
+⭐ **The one thing that DID work, and it is the seed of the repair:** `server remote resume-cc <uuid>
+--require-existing` brought a row back and it is still running. **Recovery exists; it is just not
+automatic.**
+
 ## ⛔ THE HOOK INSTALLER EXISTS TWICE, THE TWO COPIES DISAGREE, AND ONE CRASHES ON A WORKTREE
 
 **Status:** OPEN
