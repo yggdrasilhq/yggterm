@@ -27542,6 +27542,61 @@ impl ShellState {
             .filter(|session| is_remote_resume_agent_session(session))
             .map(|session| session.session_path.clone())
     }
+    /// Would a deadline tick write nothing at all?
+    ///
+    /// ⛔ The deadline loop runs once a second for the life of the process, and
+    /// `Signal::with_mut` marks the shell dirty ON DROP whether or not the
+    /// closure wrote anything. So an unconditional tick re-renders the whole
+    /// app root every second forever, even on a GUI with no sessions in it —
+    /// measured at rest, zero sessions: 1.67 renders/s with 95% of the renders
+    /// reporting no watched field changed. This predicate lets the loop ask,
+    /// under `peek()` (a read that neither subscribes nor dirties), whether the
+    /// write is worth taking.
+    ///
+    /// It enumerates the arms of [`Self::tick_input_gate_deadline_for_candidate`]
+    /// that only ever REMOVE, and answers `true` only when there is nothing
+    /// left for them to remove:
+    ///
+    /// - no candidate ⇒ the arm clears both maps, inert once both are empty;
+    /// - a candidate whose gate is **open** ⇒ the arm removes that path from
+    ///   both maps, inert once both are empty.
+    ///
+    /// A candidate behind a **shut** gate inserts, so it answers `false` and
+    /// the loop takes the write. ⚠ The first version of this predicate tested
+    /// only the no-candidate arm, which is nearly worthless in practice: at
+    /// rest the user is normally focused on a terminal row, so the candidate is
+    /// `Some` and the open-gate arm is the one that actually runs. Locked by
+    /// `an_inert_input_gate_tick_really_writes_nothing`.
+    fn input_gate_deadline_tick_is_inert(&self) -> bool {
+        if !self.input_gate_denied_since_ms.is_empty()
+            || !self.input_gate_stuck_reported.is_empty()
+        {
+            return false;
+        }
+        match self.input_gate_deadline_candidate() {
+            None => true,
+            Some(session_path) => !self.remote_resume_input_gate_is_shut(&session_path),
+        }
+    }
+    /// The same question for the restore card the deadline tick refreshes
+    /// alongside itself. Mirrors the early returns at the top of
+    /// [`Self::refresh_terminal_restore_card`] — not in a terminal view, no
+    /// active session, or no card under this session's job key means there is
+    /// nothing to re-word or re-bar. A card that IS up answers `false` and
+    /// takes the write, because its bar must keep moving.
+    fn restore_card_refresh_is_inert(&self) -> bool {
+        if self.server.active_view_mode() != WorkspaceViewMode::Terminal {
+            return true;
+        }
+        let Some(session_path) = self.server.active_session_path() else {
+            return true;
+        };
+        let job_key = terminal_resume_notification_job_key(session_path);
+        !self
+            .notifications
+            .iter()
+            .any(|notification| notification.job_key.as_deref() == Some(job_key.as_str()))
+    }
     /// ⛔ THE ESCAPE HATCH THE GATE NEVER HAD. See
     /// [`INPUT_GATE_STUCK_RESTORE_AFTER_MS`].
     ///
@@ -82966,6 +83021,21 @@ fn app() -> Element {
                     INPUT_GATE_DEADLINE_TICK_MS,
                 ))
                 .await;
+                // ⛔ A tick with nothing to do must not take `with_mut`, which
+                // dirties the shell signal on drop whether or not the closure
+                // wrote — one full app-root re-render per second, forever, on
+                // an app that is doing nothing. `peek()` neither subscribes nor
+                // dirties, and both predicates answer "inert" only when the
+                // work below is PROVABLY a no-op, so this can never skip a tick
+                // that would have changed something.
+                let inert = {
+                    let shell = state.peek();
+                    shell.input_gate_deadline_tick_is_inert()
+                        && shell.restore_card_refresh_is_inert()
+                };
+                if inert {
+                    continue;
+                }
                 let restored = state.with_mut(|shell| {
                     // Same tick: a restore card that is up must keep telling the
                     // truth about which stage it is in, or its bar freezes at
@@ -167727,6 +167797,64 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "scaffold must reproduce the shut gate"
         );
         shell
+    }
+
+    /// The gate that keeps the once-a-second deadline tick from re-rendering
+    /// the whole app root while it has nothing to do. It is only safe if
+    /// "inert" really does imply "writes nothing", and if it never answers
+    /// inert while the escape hatch still has a clock running — a gate that got
+    /// the second half wrong would strand exactly the sessions the deadline
+    /// exists to rescue.
+    #[test]
+    fn an_inert_input_gate_tick_really_writes_nothing() {
+        let session_path = "remote-cc://dev/gate-test-inert-tick-writes-nothing";
+        let mut shell = shell_with_a_live_host_behind_a_shut_gate(session_path);
+        let now = 900_000_u64;
+
+        // At rest with the window unfocused: no candidate, and no clock left
+        // over from an earlier refusal.
+        shell.input_gate_denied_since_ms.clear();
+        shell.input_gate_stuck_reported.clear();
+        shell.window_focused = false;
+        assert!(
+            shell.input_gate_deadline_tick_is_inert(),
+            "no candidate and no armed clock is the at-rest case the gate is for"
+        );
+
+        // Running the real tick anyway must change nothing observable — that is
+        // what earns the right to skip it.
+        let ready_before = shell.terminal_resume_ready_paths.clone();
+        assert_eq!(shell.tick_input_gate_deadline_for_candidate(None, now), None);
+        assert!(shell.input_gate_denied_since_ms.is_empty());
+        assert!(shell.input_gate_stuck_reported.is_empty());
+        assert_eq!(
+            shell.terminal_resume_ready_paths, ready_before,
+            "an inert tick must not touch the readiness set"
+        );
+
+        // And the converse, which is the half that could strand a session: a
+        // candidate behind a SHUT gate must never read as inert, or the loop
+        // stops taking the write and the escape hatch never fires.
+        shell.window_focused = true;
+        assert!(
+            !shell.input_gate_deadline_tick_is_inert(),
+            "a focused row behind a shut gate is the deadline's whole job — \
+             skipping it would strand the surface the hatch exists to restore"
+        );
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(Some(session_path.to_string()), now),
+            None,
+            "first look only arms the clock"
+        );
+        assert!(
+            !shell.input_gate_denied_since_ms.is_empty(),
+            "scaffold must leave a running clock for the next assertion to mean anything"
+        );
+        assert!(
+            !shell.input_gate_deadline_tick_is_inert(),
+            "a session already being refused must keep ticking — skipping it here \
+             would strand the surface the escape hatch exists to restore"
+        );
     }
 
     #[test]
