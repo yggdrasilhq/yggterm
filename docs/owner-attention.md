@@ -135,6 +135,15 @@ copies.
   him; see `settled-calls.md`. What remains his: authenticating Muse once it
   is installed, since the credential is his.
 
+- **Grok Build needs one sign-in, and two descriptor fields are waiting on it.**
+  The CLI is registered, installed and launching; `grok login --device-code`
+  prints a code that can be completed on a phone, or `XAI_API_KEY` in the
+  environment does the same job. Until one session exists on a signed-in host,
+  its on-disk session store cannot be READ, so yggterm cannot list past Grok
+  sessions and generates row titles rather than respecting the ones grok writes.
+  Both flip in one commit the moment a session exists — the queue entry names
+  the falsifier. ⚠ Nothing else is blocked: launch and resume work now.
+
 - **The two-app split for phone superpowers is a product call, not a build
   call.** A clean `yggterm` for the stores, versus a sideload-only
   `yggterm-agent` carrying accessibility, SMS and overlay permissions. It is his
