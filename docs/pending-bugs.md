@@ -573,27 +573,6 @@ turns both into compile errors.
 consumer. **That is a second encoding of the contract and should be deleted the
 day the typed one lands** — it is a splint, not a fix.
 
-## ⭐ [6.5] `yggdrasil-maker` WANTS THE SAME REMAKE
-
-**Status:** OPEN
-
-*requested 2026-08-13*
-
-Same treatment as yggtopo: a real app in the viewport built from yggui
-components, and **no context menu**. Sequenced after yggtopo deliberately —
-yggtopo establishes the component vocabulary and yggdrasil-maker consumes it.
-If the second app needs new primitives, that is a finding about the first.
-
-**What yggtopo established, for this app to consume:** the rail placement paints
-the full vocabulary (`section` with `card`, `label`, `search-box`, `tabs`,
-`toggle`, `button`, `list-row` with `status` and `actions`) and is where an
-interactive app should live today; the viewport placement paints only `markdown`
-and multiline `text-input`, and see the entry above before relying on it. The
-one widget yggtopo wanted and did not get is a **proportion bar** for a
-percentage — drawn as text instead, because the tier rules admit a new
-declarative widget only once a SECOND app wants one. ⇒ **If yggdrasil-maker
-wants a bar too, that is the second consumer, and it is a host change.**
-
 ## ⛔⛔ [6.7] AT REST THE GUI BURNS 93% OF A CORE, AND TWO THIRDS OF IT IS THE KERNEL ANSWERING `clock_gettime`
 
 **Status:** OPEN
