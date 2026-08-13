@@ -1403,6 +1403,25 @@ the campaign memory, the files it wrote. A transcript says what a session
 a brief, a correction, a warning that changes what they should do next. Then it
 earns its cost. Batch several into one send rather than paying per finding.
 
+### ⚠ A BRIEF DROPPED AS A FILE LITTERS THE TREE IT IS DROPPED IN
+
+Writing a brief into a delegate's working directory is a legitimate fallback when
+the row plane cannot be reached. **It also leaves an untracked file behind**, and
+two things follow that nobody intends:
+
+1. ⛔ **Every audit reads that tree as DIRTY.** Measured 2026-08-13: three lane
+   worktrees reported uncommitted work, and in all three the entire diff was one
+   dropped brief. An orchestrator reading that — the same one that dropped it —
+   nearly extended a fleet-wide hold on the strength of *"the lanes still have
+   uncommitted work"*. **The tool's own litter became evidence about the lanes.**
+2. ⛔ **A `git add -A` sweeps it into the repo**, and on a public one that is a
+   brief published to strangers.
+
+⇒ **Prefer the peer plane**, which leaves nothing behind. If you must drop a
+file, put it **outside the repo** or in an ignored path, and **remove it once it
+has been read** — the sender owns the cleanup, because the recipient has no way
+to know the message is spent.
+
 ### ⛔⛔ A BRIEF MAY CARRY FACTS. IT MUST NOT CARRY YOUR CAUSAL THEORY.
 
 **Measured on this campaign: one orchestrator handed one cluster a wrong cause
