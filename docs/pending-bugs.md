@@ -217,11 +217,19 @@ case but the **normal** state of a parallel campaign.
    that probe becomes safe and the census should switch to it.
    **Owed:** a release build, deployed, and `yggterm --build-commit` on the
    desktop host matching `git rev-parse --short=12 HEAD`.
-3. Allocating a version is a verb (`scripts/bump-version.sh`) that fetches,
-   takes the next number **after** `origin/main`'s, and pushes the bump alone —
-   a number taken from a stale file is the whole defect. **Still open, and it is
-   now the only unbuilt half of the collision itself** — the guard stops a stale
-   build from LANDING, but two clusters can still spend one number.
+3. ✅ **SHIPPED** — `scripts/bump-version.sh` allocates the number from
+   `origin/main` (never from the working file, which is exactly as stale as this
+   checkout's last pull) and **claims it by pushing the bump alone, before the
+   build**. That shrinks the race window from the length of a build-and-deploy to
+   the length of one push, and a lost race is now *detected*: the push is
+   rejected, the script undoes its own commit by path — never `reset --hard`,
+   which would take another session's uncommitted work with it — and takes the
+   next number. Locked by `version_allocation.rs` (three tests; the first
+   reproduces the collision — a working file at `3.0.9` over an origin at
+   `3.0.5` allocates `3.0.6`, and the pre-fix reading returns `3.0.10`).
+   ⚠ It refuses a checkout carrying unpushed commits, because "alone" is the
+   whole mechanism: a number that rides along with the work it releases is only
+   claimed when that work lands, which is the race.
 
 ⭐ **AND `3.0.120` JOINED THEM WITHIN THE HOUR.** The build cut to end the
 collision was itself deployed over ~15 minutes later: on the desktop host
@@ -234,49 +242,6 @@ answering a different question.
 
 **Falsifier:** two clusters bump and deploy in the same minute, and the fleet
 census can name which build is on the host.
-
-## ⛔ THE FILE THAT NAMES THE LIVE HOST EXISTS ONLY ON THE LIVE HOST
-
-**Status:** OPEN
-
-*Found 2026-08-13 by cluster 6.2, on `oc`.*
-
-`.agents/skills/yggui-app-control/SKILL.md` opens three of its recipes with
-`LIVE_HOST=$(cat .agents/config/live-host)`. `.gitignore` line 21 excludes
-`.agents/config/`, which is right — the alias is infrastructure and the repo is
-public — but the consequence is that the file is present **only on the machine
-whose name it holds**. Every other checkout gets `cat: .agents/config/live-host:
-No such file or directory`, and the recipe dies on its first line.
-
-⚠ **It is backwards exactly where it matters.** The standing directive is that
-sessions run on `dev`/`oc`, never on the desktop host — so the hosts that need
-to be *told* which host is live are precisely the ones that cannot read it, and
-the one host that could read it is the one that does not need to.
-
-⚠ **MEASURED 2026-08-13, AND IT IS WORSE THAN FILED: the recipe resolves on NO
-headless checkout at all.** `.agents/config/` is absent on both, `$YGG_GUI_HOST`
-is unset on all three, and **discovery cannot fill the gap** — `server app rows`
-on a headless host answers *"this daemon knows no remote machines, so it cannot
-name a candidate"*, and `server snapshot` agrees with `remote_machines: []`. So
-`ygg-claim.sh`'s own discovery has the same hole; it only ever worked because
-callers pass `--host` explicitly. The app plane has no candidate list to offer
-off the GUI host, and the candidates have to come from the machine's own private
-ssh configuration.
-
-⏳ **PART SHIPPED:** `scripts/ygg-live-host.sh` is the one resolver —
-`$YGG_GUI_HOST` → a GUI on this machine → the cached alias VERIFIED by one probe
-→ parallel discovery over daemon + ssh candidates, writing the winner back to
-the cache → the cached alias UNVERIFIED (the case where the GUI is DOWN and that
-name is how you reach the host to start it). Exits 2 with the sources it tried,
-because an empty `$LIVE_HOST` makes `ssh "$LIVE_HOST" cmd` run cmd LOCALLY.
-
-**Still open:** the 15 `LIVE_HOST=$(cat …)` recipes in
-`.agents/skills/yggui-app-control/SKILL.md`, the one in `yggterm-deeptest`, and
-`scripts/live_mode_cycle_check.py` all still read the file directly — they must
-call the resolver, or the SSOT is two.
-
-**Falsifier:** run any `LIVE_HOST=` recipe from a fresh checkout on a headless
-host and it resolves.
 
 ## ⛔ deploy-fleet SSHes TO THE HOST IT IS ALREADY RUNNING ON
 

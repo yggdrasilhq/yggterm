@@ -245,12 +245,25 @@ answer belongs in a modal the shell owns.
 
 ## Live Host
 
-The live desktop host SSH alias is stored in `.agents/config/live-host` (one line, e.g. `guihost`).
+**`scripts/ygg-live-host.sh` is the one answer to "which host is the live GUI on?"**
+Every recipe below opens with it, and nothing else may answer that question. It
+resolves in order: `$YGG_GUI_HOST` → a GUI on this machine → the cached alias
+*verified by one probe* → parallel discovery over ssh/daemon candidates → the
+cached alias unverified (the GUI is down, and that name is still how you reach
+the host to start it). It exits non-zero naming the sources it tried rather than
+printing an empty string, because an empty `$LIVE_HOST` makes
+`ssh "$LIVE_HOST" cmd` run cmd **locally** — hence the `|| exit 1`.
+
+⛔ **Do NOT `cat .agents/config/live-host`.** That path is gitignored, so it
+exists only on the machine whose name it holds — which is the one machine that
+never has to be told. Every headless checkout died on the recipe's first line
+with `No such file or directory`, and sessions run headless. The file is the
+resolver's **cache**, not the source of truth.
+
 The yggterm binary on that host is `~/.local/bin/yggterm`.
 
-Read it:
-```
-LIVE_HOST=$(cat .agents/config/live-host)
+```bash
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 ```
 
 ## ★★★★ WHY THE SHADOW SESSION EXISTS — it is a DEVELOPMENT SURFACE, not just a probe
@@ -643,7 +656,7 @@ than silently querying the top document.
 ## Screenshot
 
 ```bash
-LIVE_HOST=$(cat .agents/config/live-host)
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 SHOT=/tmp/yggui-shot-$(date +%s).png
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app screenshot /tmp/yggui-shot.png" \
   && scp "$LIVE_HOST:/tmp/yggui-shot.png" "$SHOT" \
@@ -764,7 +777,7 @@ is too small to use."
 ## App State
 
 ```bash
-LIVE_HOST=$(cat .agents/config/live-host)
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app state" | python3 -m json.tool 2>/dev/null || true
 ```
 
@@ -833,7 +846,7 @@ reads 412 however many of them wrap.
 ### `pending_media_capture` — a page is waiting on the CAMERA, and you can answer it
 
 ```bash
-LIVE_HOST=$(cat .agents/config/live-host)
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app state" | jq .pending_media_capture
 # null, or:
 # { "request_id": 1, "native_id": 3, "session_path": "local://…",
@@ -899,7 +912,7 @@ GUI and no click. A session that exists but is not in **Live Sessions** — aliv
 its host, reachable only from the CWD tree — is *stranded* ("in the void").
 
 ```bash
-LIVE_HOST=$(cat .agents/config/live-host)
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 
 # What exists but is NOT live? (remote scans minus the live set, NEWEST FIRST)
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server connect --list"
@@ -994,7 +1007,7 @@ The GUI resolves cells to coordinates server-side; never read pixel coordinates
 off a screenshot yourself.
 
 ```bash
-LIVE_HOST=$(cat .agents/config/live-host)
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 # 1. Draw the grid (default 12×8, auto-targets ychrome page if one is live)
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app grid show --cols 12 --rows 8"
 # 2. Screenshot to choose (grid over a ychrome page needs --backend os)
@@ -1035,7 +1048,7 @@ buffer is corrupt, so a daemon-only probe proves nothing (CLAUDE.md misstep
 viewport rows directly via dom-eval, focus-independent:
 
 ```bash
-LIVE_HOST=$(cat .agents/config/live-host)
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 # 1. Client xterm viewport rows (the ACTIVE host), via translateToString
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app dom-eval '
   const hosts = window.__yggtermXtermHosts || {};
@@ -1144,7 +1157,7 @@ its value.
 ## Split groups (viewport panes — terminal, document, pinned web tab)
 
 ```bash
-LIVE_HOST=$(cat .agents/config/live-host)
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 # Group two sessions into co-visible panes (forces keep-alive on members)
 ssh "$LIVE_HOST" "~/.local/bin/yggterm-headless server app split create [--axis side-by-side|stacked] <path> <path>"
 # SPLIT-TABS (2.11.4+, libyggterm Phase 3): pin ONE web tab of a session's
@@ -1180,7 +1193,7 @@ working state, resume — and are **born keep-alive**. The shell workaround thro
 all of that away, and every reason it used to exist is now closed:
 
 ```bash
-LIVE_HOST=$(cat .agents/config/live-host)
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 ssh "$LIVE_HOST" "~/.local/bin/yggterm-headless server app terminal new \
   --kind claude-code --cwd /home/user/gh/yggterm --no-activate \
   --purpose 'what this row is for' --title 'delegate-<job>' \
@@ -1212,7 +1225,7 @@ never became ready), not an error.
 ## Terminal Probe (type text into live terminal)
 
 ```bash
-LIVE_HOST=$(cat .agents/config/live-host)
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal probe-type --mode xterm --data '__PROBE__'"
 ```
 
@@ -1233,7 +1246,7 @@ RENDER and never proven to WORK, which is the state the start page's search box
 shipped in.
 
 ```bash
-LIVE_HOST=$(cat .agents/config/live-host)
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 GUI=$(ssh "$LIVE_HOST" 'pgrep -x yggterm | head -1')
 ssh "$LIVE_HOST" "~/.local/bin/yggterm-headless server app chrome type \
   '[data-yggterm-start-page-search]' --data 'cooker' --clear \
@@ -1277,7 +1290,7 @@ different tools:
   `send` to actually drive, then read state to confirm.
 
 ```bash
-LIVE_HOST=$(cat .agents/config/live-host)
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 S="remote-session://dev/<uuid>"   # a granted session
 # PREFERRED for prompt insertion: `terminal submit` is readiness-gated — it WAITS
 # until the session is at an idle interactive codex prompt, then sends; it refuses
@@ -1372,7 +1385,7 @@ the binary did), the daemon's auto-restart never fires — see the
 that preserves live sessions through a same-version handoff:
 
 ```bash
-LIVE_HOST=$(cat .agents/config/live-host)
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 ssh "$LIVE_HOST" "~/.local/bin/yggterm-headless server monitor \
     --scenario hot-restart \
     --daemon-exe /home/user/.local/share/yggterm/direct/versions/<VERSION>/yggterm-headless \
