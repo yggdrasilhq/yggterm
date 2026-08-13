@@ -1060,7 +1060,119 @@ demotion mid-turn.
 
 ---
 
-## 10. Adapting this to your own setup
+## 10. ⭐⭐ THE N.x ORCHESTRATOR — cluster the remaining work, then run the clusters in parallel
+
+**When a campaign's queue stops being a list and becomes a backlog, one relay row
+grinding it in order is the wrong shape.** The relay is serial by construction:
+each session hands to its successor, so throughput is one item at a time no
+matter how much of the queue is independent. The orchestrator pattern replaces
+that with **one routing row and N grinding rows**, and it is what to reach for
+when a batch of reports arrives together.
+
+⚠ This is the same instrument as the graph router's lobe fan-out, applied
+*inside* one campaign instead of across campaigns. If you already know that
+pattern, the only new parts are the clustering rule and the confirm gate.
+
+### The shape
+
+| row | what it does |
+|---|---|
+| **`N`** — the orchestrator | clusters the work, writes the briefs, launches, monitors, merges, reaps. It does **not** fix bugs. |
+| **`N.1` … `N.k`** — the clusters | each owns one cluster and relays *within* it: a cluster session hands off to its own successor until its cluster is done, then reports up. |
+
+Seat them as a book — `6`, `6.1`, `6.2` — so the sidebar reads as the plan. The
+orchestrator takes the bare integer; a cluster that spawns its own successor
+keeps the same seat.
+
+### ⭐ CLUSTER ON TWO AXES AT ONCE, NOT ONE
+
+Group the open work the way k-means would — by distance — but the distance is
+**two-dimensional**, and using only the first axis is the common failure:
+
+1. **Subject matter.** Items a single reader would hold in their head at once:
+   one surface, one subsystem, one user-visible promise.
+2. **⛔ Code locality — the axis that is actually load-bearing.** Two clusters
+   that edit the same files will clobber each other in a shared checkout, and a
+   whole-file rewrite by one is silent data loss for the other. **A cluster
+   boundary that does not also separate the files is not a boundary.**
+
+⇒ When the two axes disagree, **code locality wins** and the subject-matter
+oddity goes in the brief as a note. A cluster that owns one file set and an
+awkward mix of topics is workable; two clusters fighting over one file set is
+not.
+
+**Three more rules that decide clusters in practice:**
+
+- **Order by upstreamness, not by severity.** If fixing A is what lets the
+  reporter even *observe* B, A is cluster 1 regardless of which hurts more.
+- **Size to a relay, not to a session.** A cluster is right-sized when it is too
+  big for one session and small enough that its successor needs no re-briefing
+  beyond the queue entry.
+- **Clusters may live on different hosts**, and should when the work is
+  host-shaped — deploy surfaces, GUI proof, container topology. Say which host
+  and *why* in the brief; a cluster on the wrong host proves nothing.
+
+### ⛔⛔ THE CONFIRM GATE — do NOT launch the whole set unasked
+
+**Clustering is the orchestrator's call. How many clusters run at once is not.**
+Present the clusters, then wait for a launch set: all of them, or one, or two.
+
+This is the **one sanctioned exception** to *in relay mode, stopping is a sin*.
+The reason is arithmetic, not caution: k parallel relay rows burn tokens at
+roughly k times the rate, each carries its own context, and a campaign launched
+at full width during a constrained window is how a quota is spent on work nobody
+asked to happen today.
+
+⇒ **Ask once, at the plan, with a recommendation attached.** Then never ask
+again — every fork *inside* a cluster is decided by the cluster and recorded, per
+§8. An orchestrator that returns for permission per cluster has turned one gate
+into k gates and defeated its own purpose.
+
+### Running them
+
+Launch per §3 — create, wait for `consuming_input`, submit, **verify by
+transcript content**. The verification is not optional at k rows; a silently
+dropped brief is invisible in a fan-out because the row still looks alive.
+
+Then, per §8 and §3b:
+
+- **Monitor for STALLED, not for dead.** A delegate's dominant failure is
+  ending its turn with the work unfinished and no error. `ygg-babysit.py` finds
+  these; a finished cluster and a stalled one look identical from outside.
+- **Arm the booter on every cluster row**, and defer it when a cluster is
+  legitimately in a long build.
+- **Merge upward, notify once.** Cluster findings that need the human batch into
+  a single window; k clusters must not become k interruptions.
+- **Cross-cluster findings go to the OWNING cluster**, by row message if it is
+  live and by queue entry if it is not — never fixed in place by the finder.
+  ⛔ Delegates cannot always reach the row plane; when they cannot, the
+  orchestrator is the switchboard.
+
+### ⭐ REAP A CLUSTER THE MOMENT ITS WORK IS DONE — do not let a small one relay on
+
+A cluster that exists for a small, terminal piece of work — add a CLI kind, wire
+one flag, build one modal — is **finished when that work ships**, and the
+orchestrator despawns it rather than letting it hand off to a successor that
+will go looking for more to do.
+
+**Why this is a rule and not tidiness:** the relay's default is *hand off, never
+end*, which is correct for a campaign and wrong for a task. A small cluster left
+running will find work — usually by widening its own scope into a neighbour's
+files, which is exactly what the clustering was for.
+
+⇒ **The orchestrator decides a cluster is terminal at clustering time**, says so
+in the brief (*"this cluster ends; report and stand by for reaping"*), and reaps
+on the report. Long-lived clusters — a whole subsystem, an optimisation mandate —
+are told the opposite, explicitly. ⛔ Never leave it implicit: a cluster that
+does not know which kind it is will guess, and the guess is always *keep going*.
+
+⚠ **Reap with §7's discipline.** `session remove` reports the request, not the
+effect: read back both `row_still_listed` and `verified`, and identify the
+process rather than counting.
+
+---
+
+## 11. Adapting this to your own setup
 
 Everything above is generic. To make it yours:
 
