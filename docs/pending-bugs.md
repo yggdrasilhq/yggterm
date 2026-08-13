@@ -1533,28 +1533,6 @@ family as the restore bug — a close that resolves to a key nothing holds remov
 nothing and leaves the entry behind. If so, this fix stops the thread leaking
 while the orphaned entry itself remains.
 
-## It is not free, and it is the "hot loop proportional to accumulated state"
-
-Same daemon, own lifetime:
-
-| age | threads | CPU |
-|---|---|---|
-| 1.6 h | 35 | 5.7% |
-| 3.0 h | 40 | 6.4% |
-| 4.5 h | **59** | **9.8%** |
-
-Memory flat at ~67 MB; **+28 threads in 3 h with CPU up 2.4× against it.** The
-campaign memory predicted this shape — *a hot loop whose iteration count is
-proportional to accumulated state* — and the accumulating population now has a
-name. The GUI shows the same family: **threads 63 → 76 in 2 h** with memory
-flat, including **29 `tokio-rt-worker`** where one multi-thread runtime on a
-16-core host would spawn 16.
-
-⚠ **Suspected, NOT proven:** that the retained entry is the same orphaned-key
-family as the 6.1 restore bug — a close that resolves to a key nothing holds
-removes nothing and leaves the entry behind. **Check whether leaked writers
-correlate with orphaned session keys before fixing either.**
-
 ## ⛔ [6.7] THE WEB-CONTEXT SHARING INSTRUMENT IS BLIND TO THE CASE IT EXISTS TO CATCH
 
 **Status:** OPEN
