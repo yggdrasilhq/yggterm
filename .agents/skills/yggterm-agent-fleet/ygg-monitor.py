@@ -455,8 +455,44 @@ def seat_audit(gui_host, subs, dry):
     return findings
 
 
+def prune_dead(gui_host, subs, dry):
+    """⛔ A REAP DOES NOT UNSUBSCRIBE, SO THE WATCHER ESCALATES A CORPSE.
+
+    Measured 2026-08-13: two rows were retired hours earlier — row gone, processes
+    gone, verified — and this plane went on classifying them and escalating them by
+    seat, because retiring a row and unsubscribing it are two different acts and
+    only one of them happened. Meanwhile their successors were never subscribed, so
+    the set being watched and the set doing the work had drifted apart entirely.
+
+    ⭐ That is the SAME failure the babysit spawn-set had, reappearing in its
+    replacement: a watcher pinned to a list captured at one moment reports
+    faithfully about rows that no longer matter. ⇒ **Re-derive from live state on
+    every tick**, never from the file you wrote at launch.
+
+    Prunes only when BOTH are true — no row AND no process. A row that is merely
+    absent from the listing is not proof of death; listings have omitted live rows."""
+    rows = (ygg(gui_host, "server", "app", "rows").get("data") or {}).get("rows", [])
+    live = {r.get("full_path") or "" for r in rows}
+    for s in subs:
+        u = s["uuid"]
+        if any(u in p for p in live):
+            continue
+        host = None if s.get("host") in ("", None, "local") else s.get("host")
+        if cli_process(u, host):
+            log(f"  PRUNE skip {u[:8]} — no row, but a process is alive (orphan; investigate)")
+            continue
+        if dry:
+            log(f"  DRY would unsubscribe {u[:8]} (seat {s.get('seat') or '-'}) — row and process both gone")
+            continue
+        p = sub_path(u)
+        if p.exists():
+            p.unlink()
+        log(f"  PRUNED {u[:8]} (seat {s.get('seat') or '-'}) — reaped elsewhere, no longer watched")
+
+
 def tick(a):
     bs = _babysit()
+    prune_dead(a.gui_host, load_subs(), a.dry_run)
     seat_audit(a.gui_host, load_subs(), a.dry_run)
     for s in load_subs():
         uuid = s["uuid"]
