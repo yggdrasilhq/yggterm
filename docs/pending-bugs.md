@@ -221,27 +221,52 @@ described rather than merely detected.
 **Falsifier:** the census names the commit of an on-disk copy it did not itself
 deploy, on a host that is behind, without launching anything.
 
-## ⛔ deploy-fleet SSHes TO THE HOST IT IS ALREADY RUNNING ON
+## ⛔ deploy-fleet CANNOT RECOGNISE ITSELF UNDER AN ALIAS IT CANNOT RESOLVE
 
 **Status:** OPEN
 
-*found 2026-08-13 deploying 3.0.113*
+*narrowed 2026-08-13: the ⛔-storm and the "three-quarters success" misread are
+fixed; a host whose alias does not resolve from itself still needs one word*
 
-`scripts/deploy-fleet.sh --hosts "dev guihost oc"` run **on** the `oc` host tried to
-`ssh oc` and failed all four copies with `Could not resolve hostname oc`. Its
-local-host test is `[ "$host" = "$(hostname -s)" ]`, and that machine's
-`hostname -s` is not `oc` — the fleet name and the kernel hostname differ.
+**What was wrong.** The local-host test was `[ "$host" = "$(hostname -s)" ]`, and
+on this fleet the ssh alias and the kernel hostname differ — so a deploy run on a
+host tried to ssh to itself, failed all four copies with `Could not resolve
+hostname`, and printed ⛔ for the very machine doing the deploying while the
+other two landed. The operator reads three-quarters success and moves on.
 
-⇒ A deploy that reports ⛔ for the host doing the deploying, while the other two
-hosts land correctly, invites exactly the split the script exists to prevent:
-the operator reads three-quarters success and moves on. Worked around by a
-second run with `--hosts local`.
+**What shipped.** Identity is no longer a string comparison. The script drops a
+unique token in `$HOME` — the filesystem the four copies land in — and asks each
+candidate channel whether it can see it. An unreachable host is now reported
+**once, by name**, with the remedy, and its copies are marked SKIPPED rather than
+failed; the census prints `(unreachable — nothing was written here, and nothing
+is claimed about it)` instead of a row that looks like a reading.
 
-**Wanted:** resolve each host name against the fleet's own alias table (or
-compare resolved addresses) rather than against `hostname -s`.
+⛔⛔ **AND THE OBVIOUS IDENTITY IS THE WRONG ONE — it nearly shipped.**
+`/etc/machine-id` answers *"is this the same machine image?"*, and the question a
+deploy depends on is *"do these two paths name the same FILE?"*. Two hosts on
+this fleet report a **byte-identical** `/etc/machine-id` and have **different
+filesystems**. A machine-id test called the second host "self", which would have
+written its four copies into the first host's disk, read them back through the
+same wrong door, and printed four ✅ for a host that was never touched — a total
+deploy failure wearing a green census, strictly worse than the ⛔ storm it was
+replacing. It was caught by falsifying a positive result rather than accepting
+it: the probe was made to say SELF and NOT-SELF in one run, and the pair it had
+to tell apart was exactly the pair that fooled the earlier design.
 
-**Falsifier:** `deploy-fleet.sh --hosts "dev guihost oc"` run on any of the three
-lands twelve copies and reports no ⛔.
+**What remains.** When a host's alias cannot be resolved *from that host*, no
+local signal can bridge the two names — the alias belongs to the fleet, the
+kernel name belongs to the machine, and neither knows about the other. The run
+now says so and names `export YGG_FLEET_SELF=<alias>` as the permanent fix, but
+until that is set on such a host, its own four copies are still skipped.
+
+⚠ **Rejected as unsound:** inferring self by elimination ("every other host in
+the list probed REMOTE, so the unreachable one must be me"). It is wrong the
+moment the deploy runs from a machine that is not in the list, and its failure
+mode is the catastrophic one above — writing this machine's disk under another
+host's name and reporting success.
+
+**Falsifier:** a deploy run on a host whose alias does not resolve there writes
+that host's four copies, or refuses in a way no reader can mistake for success.
 
 ## ⛔⛔ [6.3] yedit's VIEWPORT PAINTS NOTHING WHILE ITS FILE RAIL IS FULL
 

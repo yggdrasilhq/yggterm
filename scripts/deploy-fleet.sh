@@ -135,16 +135,75 @@ declare -A COPY=(
 # `awk '{print $1}'` through two shells, and both get mangled — which on the
 # first run of this script made it print ⛔ for twelve copies that had all landed
 # correctly. A deploy verb that cries failure on success is worse than no verb.
+# ⛔⛔ "IS THIS HOST ME?" IS NOT A STRING COMPARISON. The test used to be
+# `[ "$host" = "$(hostname -s)" ]`, and on this fleet the ssh alias and the
+# kernel hostname differ — so a deploy run ON a host tried to ssh to itself,
+# failed all four copies with `Could not resolve hostname`, and printed ⛔ for
+# the very machine doing the deploying while the other two landed. The operator
+# reads three-quarters success and moves on, which is exactly the split this
+# script exists to prevent.
+#
+# ⛔⛔ AND `/etc/machine-id` IS THE WRONG IDENTITY — it nearly shipped here.
+# It answers *"is this the same machine image?"*, and this deploy's real
+# question is *"do these two paths name the same FILE?"*. Measured 2026-08-13
+# on this fleet: two hosts report a byte-identical `/etc/machine-id` (cloned
+# from one image) and have **different filesystems**. Using it would have
+# written the second host's four copies into the first host's disk, read them
+# back through the same wrong door, and printed four ✅ for a host that was
+# never touched — a total deploy failure wearing a green census, which is
+# strictly worse than the ⛔ storm being fixed.
+#
+# ⇒ Ask the question the writes actually depend on: drop a unique token in
+# `$HOME` — the filesystem the four copies land in — and see whether the
+# candidate channel can see it. That is self-verifying, it cannot be fooled by
+# a shared image, and when it says "self" the four copies skip ssh entirely, so
+# the probe pays for itself.
+#
+# ⚠ And when the alias cannot be reached AT ALL, that is reported ONCE, by name,
+# with the remedy — never as four identical failures that look like a partial
+# deploy. An unreachable name may well BE this machine (that is the reported
+# case), and no local signal can tell: the alias is the fleet's, `hostname -s`
+# is the kernel's, and neither knows about the other. `$YGG_FLEET_SELF` is how
+# an operator settles it permanently, in one word, without this public repo ever
+# naming a machine.
+SELF_TOKEN=$(mktemp "$HOME/.ygg-deploy-self-XXXXXX" 2>/dev/null || true)
+[ -n "$SELF_TOKEN" ] && trap 'rm -f "$SELF_TOKEN"' EXIT
+declare -A HOST_IS_SELF=()
+declare -A HOST_UNREACHABLE=()
+
+classify_host() {  # host
+  local host="$1" probe
+  if [ "$host" = "local" ] || [ "$host" = "$(hostname -s)" ] ||
+     { [ -n "${YGG_FLEET_SELF:-}" ] && [ "$host" = "$YGG_FLEET_SELF" ]; }; then
+    HOST_IS_SELF["$host"]=1
+    return 0
+  fi
+  [ -n "$SELF_TOKEN" ] || return 0  # no token: treat every named host as remote
+  probe=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" \
+    "test -e '$SELF_TOKEN' && echo SELF || echo REMOTE" 2>/dev/null < /dev/null)
+  case "$probe" in
+    SELF) HOST_IS_SELF["$host"]=1;;
+    REMOTE) ;;
+    # No answer at all: the alias did not resolve, the host is down, or ssh was
+    # refused. ⛔ Never guess "remote" here — that is the path that produced the
+    # four-⛔ storm; and never guess "self" either, which would write this
+    # machine's copies twice and call the fleet current.
+    *) HOST_UNREACHABLE["$host"]=1;;
+  esac
+}
+
+is_self() { [ "${HOST_IS_SELF[$1]:-0}" = 1 ]; }
+
 run_on() {  # host, command…  (stdin is NOT forwarded)
   local host="$1"; shift
-  if [ "$host" = "$(hostname -s)" ] || [ "$host" = "local" ]; then bash -c "$*" < /dev/null
+  if is_self "$host"; then bash -c "$*" < /dev/null
   else ssh "$host" "$*" < /dev/null; fi
 }
 
 push_one() {  # host, local_file, remote_path, expected_md5
   local host="$1" src="$2" dest="$3" want="$4" got
   local write="d=\$(eval echo $dest); mkdir -p \$(dirname \$d); cat > \$d.new && chmod 755 \$d.new && mv -f \$d.new \$d"
-  if [ "$host" = "$(hostname -s)" ] || [ "$host" = "local" ]; then bash -c "$write" < "$src"
+  if is_self "$host"; then bash -c "$write" < "$src"
   else ssh "$host" "$write" < "$src"; fi
   got=$(run_on "$host" "md5sum \$(eval echo $dest)")
   got=${got%% *}
@@ -153,10 +212,29 @@ push_one() {  # host, local_file, remote_path, expected_md5
 }
 
 FAILED=0
+for host in $HOSTS; do classify_host "$host"; done
+
+# ⛔ SAY IT ONCE, AND SAY WHAT IT MIGHT MEAN. Four identical copy failures read
+# as a partial deploy; one named refusal reads as what it is.
 for host in $HOSTS; do
+  [ "${HOST_UNREACHABLE[$host]:-0}" = 1 ] || continue
+  echo "  ⛔ $host: cannot be reached over ssh, so its four copies are SKIPPED, not failed." >&2
+  echo "     If this is the machine you are standing on, its fleet alias and its" >&2
+  echo "     kernel hostname ($(hostname -s)) differ and nothing local can bridge them." >&2
+  echo "     Fix it for good with:  export YGG_FLEET_SELF=$host" >&2
+  echo "     Or for this run:       --hosts local" >&2
+  FAILED=1
+done
+
+for host in $HOSTS; do
+  [ "${HOST_UNREACHABLE[$host]:-0}" = 1 ] && continue
   for dest in "${!COPY[@]}"; do
     if [ "${COPY[$dest]}" = "GUI" ]; then src="$GUI"; want="$GUI_SUM"; else src="$HL"; want="$HL_SUM"; fi
-    if [ "$DRY" = 1 ]; then printf "  · %-14s %s ← %s\n" "$host" "$dest" "$(basename "$src")"; continue; fi
+    if [ "$DRY" = 1 ]; then
+      printf "  · %-14s %s ← %s%s\n" "$host" "$dest" "$(basename "$src")" \
+        "$(is_self "$host" && echo "  (this machine — no ssh)")"
+      continue
+    fi
     push_one "$host" "$src" "$dest" "$want" || FAILED=1
   done
 done
@@ -188,6 +266,10 @@ done
 echo "deploy-fleet: census — this build is $VERSION from commit $BUILD_COMMIT"
 echo "              gui=${GUI_SUM:0:10}  headless=${HL_SUM:0:10}  (any other md5 is another build)"
 for host in $HOSTS; do
+  if [ "${HOST_UNREACHABLE[$host]:-0}" = 1 ]; then
+    echo "  == $host ==  (unreachable — nothing was written here, and nothing is claimed about it)"
+    continue
+  fi
   echo "  == $host =="
   cen='for p in $HOME/.local/bin/yggterm $HOME/.local/bin/yggterm-headless \
                 $HOME/.yggterm/bin/yggterm $HOME/.yggterm/bin/yggterm-headless; do
@@ -195,7 +277,7 @@ for host in $HOSTS; do
        done
        $HOME/.yggterm/bin/yggterm-headless server daemons 2>/dev/null |
          sed "s/^/    running  /" || echo "    running  <no census: this host has no reachable daemon>"'
-  if [ "$host" = "$(hostname -s)" ] || [ "$host" = "local" ]; then bash -c "$cen"; else ssh "$host" bash -c "'$cen'"; fi
+  if is_self "$host"; then bash -c "$cen"; else ssh "$host" bash -c "'$cen'"; fi
 done
 
 if [ "$FAILED" != 0 ]; then echo "⛔ deploy-fleet: at least one copy did not read back"; exit 1; fi
