@@ -1278,6 +1278,13 @@ struct PtySessionRuntime {
 struct TerminalWriteRequest {
     data: Vec<u8>,
     completion_tx: Option<mpsc::Sender<std::result::Result<(), String>>>,
+    /// Set only by the reader thread as it exits, to retire the writer that
+    /// pairs with it. The writer's `rx.recv()` returns `Err` when every
+    /// `SyncSender` clone has dropped — but the clone the terminal entry holds
+    /// outlives a dead PTY, so without this the writer parks on `recv()`
+    /// forever. It cannot be a timeout poll: a writer that wakes to check a
+    /// flag is exactly the idle cost this thread must not add.
+    shutdown: bool,
 }
 
 /// Unique id per PTY spawn: time-based so it stays unique across daemon
@@ -1688,6 +1695,12 @@ fn spawn_terminal_writer_thread(
         .spawn(move || {
             let mut writer = writer;
             while let Ok(request) = rx.recv() {
+                if request.shutdown {
+                    // The PTY is gone. Retiring here is what frees the thread;
+                    // a shutdown is not activity, so it must not touch
+                    // `last_activity_ms` — an idle-window gate reads that field.
+                    break;
+                }
                 last_activity_ms.store(now_millis(), Ordering::SeqCst);
                 let byte_count = request.data.len();
                 let write_result = writer
@@ -1735,6 +1748,7 @@ fn enqueue_terminal_write(
     let request = TerminalWriteRequest {
         data: bytes,
         completion_tx,
+        shutdown: false,
     };
     match writer_tx.try_send(request) {
         Ok(()) => {
@@ -2150,6 +2164,15 @@ impl PtySessionRuntime {
                         }
                     }
                 }
+                // Past the loop, so this covers EOF *and* the read-error exit.
+                // `try_send` rather than `send`: if the queue is full the writer
+                // is mid-write against a dead PTY, will fail and break on its
+                // own, and blocking here would strand the reader instead.
+                let _ = reader_writer_tx.try_send(TerminalWriteRequest {
+                    data: Vec::new(),
+                    completion_tx: None,
+                    shutdown: true,
+                });
                 if !saw_any_output {
                     reader_eof_without_output.store(true, Ordering::SeqCst);
                     trace_terminal_event(
@@ -6354,6 +6377,79 @@ line-two on the real screen\r\n\
         assert!(combined.contains("Done. Added these in the ThinkBook x layer."));
         assert!(!combined.contains("^[[?1;2c"));
         assert!(!combined.contains("^[]10;rgb:cccc/cccc/cccc"));
+    }
+
+    /// Signals on drop. The writer is MOVED into the writer thread, so this
+    /// fires exactly when that thread's closure ends — the only observable that
+    /// separates "the thread retired" from "the thread is parked on `recv()`".
+    struct SignalOnDrop {
+        dropped: mpsc::Sender<()>,
+    }
+
+    impl Write for SignalOnDrop {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for SignalOnDrop {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(());
+        }
+    }
+
+    /// A dead PTY used to leak its writer thread: the reader's clone drops at
+    /// EOF, but the clone the terminal entry holds does not, so `rx.recv()`
+    /// never returns `Err` and the thread parks forever. Measured on the GUI
+    /// host as 22 `pty-writer-*` threads against 19 `pty-reader-*`.
+    ///
+    /// Both halves are asserted, because only the pair proves the shutdown flag
+    /// is what retires the thread rather than the send that carries it.
+    #[test]
+    fn a_writer_retires_on_shutdown_even_while_another_sender_is_alive() {
+        // Half 1: a surviving sender alone must NOT retire the writer.
+        let (idle_tx, idle_rx) = mpsc::channel();
+        let idle_writer_tx = spawn_terminal_writer_thread(
+            "local://retire-idle".to_string(),
+            Box::new(SignalOnDrop { dropped: idle_tx }),
+            Arc::new(AtomicU64::new(0)),
+            4,
+        )
+        .expect("spawn idle writer");
+        let idle_entry_clone = idle_writer_tx.clone();
+        drop(idle_writer_tx);
+        assert!(
+            idle_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "a writer whose entry still holds a sender must stay parked — if this \
+             passes trivially the second half proves nothing"
+        );
+
+        // Half 2: the shutdown the reader sends at exit DOES retire it, with
+        // that same sender still alive.
+        let (tx, rx) = mpsc::channel();
+        let writer_tx = spawn_terminal_writer_thread(
+            "local://retire".to_string(),
+            Box::new(SignalOnDrop { dropped: tx }),
+            Arc::new(AtomicU64::new(0)),
+            4,
+        )
+        .expect("spawn writer");
+        let entry_clone = writer_tx.clone();
+        writer_tx
+            .send(TerminalWriteRequest {
+                data: Vec::new(),
+                completion_tx: None,
+                shutdown: true,
+            })
+            .expect("send shutdown");
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("writer must retire on shutdown while a sender is still alive");
+
+        drop(entry_clone);
+        drop(idle_entry_clone);
     }
 
     #[test]

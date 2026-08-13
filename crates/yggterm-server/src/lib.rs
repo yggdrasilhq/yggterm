@@ -3644,6 +3644,59 @@ pub struct ManagedSessionView {
 /// instead of blinking forever.
 const WORKING_CARRY_FORWARD_MS: u128 = 8_000;
 
+/// True if this exact `(key, reason)` drop has already been traced.
+///
+/// The persist pass re-judges every live session several times a second, and
+/// traced each unrecoverable one on every pass — the same two keys forever.
+/// Measured on one daemon: **92 events in 30 s**, 15% of all trace lines, and
+/// ~13.8 MB/h of `event-trace.jsonl` growth on an idle machine, with several
+/// daemon generations each writing their own.
+///
+/// ⛔ The DIAGNOSTIC is the first occurrence — it names which gate dropped which
+/// key, which is what the 2026-06-11 incident needed. The repetitions carry no
+/// information the first line does not, so they are pure I/O.
+///
+/// Deliberately keyed on `(key, reason)` and not on `key`: a session dropped for
+/// a *different* reason later is a new fact and must still be logged. Bounded by
+/// the number of session keys, so it cannot grow without limit.
+fn persist_drop_already_traced(key: &str, reason: &str) -> bool {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = match seen.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    !guard.insert(format!("{key}\u{1}{reason}"))
+}
+
+#[cfg(test)]
+mod persist_drop_trace_tests {
+    use super::persist_drop_already_traced;
+
+    /// The persist pass re-judges every live session several times a second and
+    /// traced each unrecoverable one on every pass — the same keys forever.
+    /// All three halves are asserted: the first drop IS traced (the diagnostic
+    /// the 2026-06-11 incident needed), the repeat is NOT, and a different
+    /// reason for the same key IS, because that is a new fact not a repetition.
+    #[test]
+    fn a_repeated_persist_drop_is_traced_once_but_a_new_reason_is_traced_again() {
+        let key = "live::persist-dedup-probe-9f13";
+        assert!(
+            !persist_drop_already_traced(key, "not_recoverable"),
+            "the first drop must be traced — it names which gate dropped which key"
+        );
+        assert!(
+            persist_drop_already_traced(key, "not_recoverable"),
+            "the same key and reason must not be traced twice: that repetition was \
+             92 events in 30 s and 15% of all trace lines"
+        );
+        assert!(
+            !persist_drop_already_traced(key, "some_other_gate"),
+            "a different reason for the same key is a new fact and must be traced"
+        );
+    }
+}
+
 fn working_flag_differs(session: &ManagedSessionView, working: bool) -> bool {
     session.working != Some(working)
 }
@@ -6328,6 +6381,11 @@ impl YggtermServer {
         // passed while the live path failed). Every live key that does NOT
         // make it into the persisted state traces WHICH gate dropped it.
         let trace_drop = |key: &str, reason: &str, detail: serde_json::Value| {
+            // Log the first occurrence, never the repetitions — see
+            // `persist_drop_already_traced`.
+            if persist_drop_already_traced(key, reason) {
+                return;
+            }
             if let Ok(home) = resolve_yggterm_home() {
                 append_trace_event(
                     &home,
@@ -36647,6 +36705,11 @@ terminal_window_id: None,
     /// The owner's sidebar outline (`0` / `1` / `1.1` / …) is his session
     /// management system, and it evaporated at every daemon restart while the
     /// applied ORDER survived. Order was a stored fact; the title was re-derived.
+    /// The persist pass runs several times a second and re-judged every live
+    /// session each time, re-tracing the same unrecoverable keys forever.
+    /// Asserts all three halves: the first drop IS logged (the diagnostic the
+    /// 2026-06-11 incident needed), the repeat is NOT, and a different reason
+    /// for the same key IS — because that is a new fact, not a repetition.
     #[test]
     fn an_explicitly_renamed_row_keeps_its_name_across_a_daemon_restart() {
         let mut server = YggtermServer::new(

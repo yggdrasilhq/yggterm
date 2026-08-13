@@ -29,6 +29,201 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⛔⛔ MAIN IS RED: THE PROTOCOL SHAPE-STAMP GUARD FAILS ON `origin/main` ITSELF
+
+**Status:** OPEN
+
+*found 2026-08-13 while merging a lane; **not caused by that lane***
+
+`daemon::tests::protocol_shape_stamp_forces_version_bump` fails on `origin/main`:
+
+```
+computed 0x967609ee5ac9a131   stamped 0x9d92c7118ca5cb96 (STAMPED_AT_VERSION 3.0.132)
+workspace version is now 3.0.144
+```
+
+⇒ **`ServerRequest`/`ServerResponse` changed after 3.0.132 and the stamp was not
+updated in the same commit** — which is the exact thing this guard exists to
+prevent. Its own comment names the incident it was built for: a wire change
+shipping under an unchanged version left the fleet's version-ordered
+compatibility gate looking at two builds of one version with different shapes.
+
+**Proved not to be the merging lane's doing:** that lane's diff touches only
+`lib.rs`, `terminal.rs` and `shell.rs`, never `daemon.rs`; and the
+`ServerRequest`/`ServerResponse` blocks extracted from `origin/main` are
+**byte-identical** to the merged tree's, so main computes the same failing hash.
+
+⛔ **Do NOT simply re-stamp it to make the suite green.** The stamp is a forcing
+function: it demands a **workspace version bump in the same commit as the wire
+change**. Re-stamping alone silences the guard and ships the very condition it
+was written to catch. **Whoever changed the enums owns the bump** — find that
+commit and re-stamp with it, or revert the shape change.
+
+**Falsifier:** `cargo test -p yggterm-server --lib protocol_shape_stamp` on a
+clean `origin/main` checkout. It must pass; today it does not.
+
+
+## ⛔⛔ [6.7→6.1] EVERY DAEMON BUMP ORPHANS EXACTLY ONE VERSION — THE ONE THAT WAS SERVING
+
+**Status:** OPEN
+
+*owner-reported 2026-08-13 19:15 ("I can't type in many sessions"). The outage
+itself is over; the mechanism that caused it is untouched and recurs on every
+deploy. Filed from 6.7, belongs with the daemon-lifecycle work.*
+
+### The defect
+
+Sessions address the daemon by a **version-keyed socket path**
+(`server-3-0-<n>.sock`) — the version string is a rendezvous key, already a filed
+bug class. `refresh_legacy_server_socket_aliases` (`socket_sweep.rs`) keeps older
+versions reachable by **aliasing every version that has no socket** to the live
+one.
+
+⛔ **A gap-filling pass cannot cover its own predecessor, because a REAL SOCKET
+IS INVISIBLE TO A PASS THAT ONLY FILLS GAPS.** The version serving at the moment
+aliases are written is correctly skipped — it is not a gap. Then it retires, its
+real socket is unlinked, and nothing ever replaces it.
+
+⇒ **Every bump orphans exactly one version: whichever was serving.** Any client
+pinned to it strands, and **a snapshot mitigation re-breaks itself once per
+deploy, forever.**
+
+**Observed end to end on the desktop host, 2026-08-13:**
+
+| | |
+|---|---|
+| 22 aliases written while **3.0.130 was live** | 130 correctly skipped — it was real |
+| 130 retired, socket unlinked | nothing replaced it |
+| clients pinned to 130 | `Error: connecting to …/server-3-0-130.sock` |
+| slots 126–129 | all aliased and healthy |
+| slot **130** | **missing** — the one that had been serving |
+
+⭐ **This also falsifies the hope that the aliases carry themselves forward**: the
+written symlinks *are* surviving files, so the next sweep should inherit them —
+but the bump was watched and **130 was orphaned within minutes anyway**, because
+its slot was never a gap when the pass ran.
+
+### The fix
+
+**A retiring daemon must alias its own version to its successor as part of
+retiring** — that is the only moment the system holds both names. Anything done
+later is a sweep guessing from whatever files remain.
+
+⛔ **And the enumeration defect underneath stays open regardless:** the candidate
+set is derived from **surviving socket files**, so it inherits the sweeper's
+retention policy — ancient sockets were never cleaned and get aliases, recent
+ones are deleted on each bump and get none. **The museum stays addressable while
+the current generation is orphaned.** ⇒ **Enumerate from the versions that
+EXIST, never from the files that happen to REMAIN.**
+
+### ⭐⭐ THE ARROW RULE — which alias is legitimate
+
+**An alias pointing at a NEWER daemon is the design. An alias pointing at an
+OLDER one is a proxy wearing the design's clothes.** Both directions were live on
+the fleet within one hour and the same rule decides them opposite ways:
+
+| | daemon | clients want | alias arrow | verdict |
+|---|---|---|---|---|
+| desktop host, 19:15 | 3.0.118 | `…-128.sock` | → **older** | ⛔ **refused** |
+| build host | 3.0.130 | `…-128.sock` | → **newer** | ✅ created (30) |
+| desktop host, 19:45 | 3.0.131 | `…-130.sock` | → **newer** | ✅ created |
+
+⇒ **Same rule, opposite answers, because the FACT changed and not the rule** —
+which is the argument for stating rules as directions rather than as verdicts
+about particular versions. Refusing the first was right: a current-client →
+older-daemon proxy has already returned nothing silently here, and it would have
+converted loudly-broken rows into possibly-silently-wrong ones while hiding the
+defect. Guard every such alias with an abort unless the live daemon has a **real,
+non-symlink** socket.
+
+### ⛔⛔ TWO INSTRUMENTS MISREAD IN ONE EVENING, BY TWO SESSIONS, IN OPPOSITE DIRECTIONS
+
+Both readings were published before either was checked against the code:
+
+1. **A socket-error count of zero** was taken ~70 s after a daemon swap and read
+   as *"the outage is over"*. It was a **transient before clients reconnected**;
+   the errors returned minutes later.
+2. **`launch_phase == RemoteBootstrap`** on 39 of 49 rows was read as *"39 rows
+   are stranded"*. ⛔ **It does not mean stranded.** It is the resting state of a
+   row **not yet attached in this GUI generation** — `daemon.rs` asserts a fresh
+   shell row carries it, and the open path sets it on rows nobody has clicked.
+   With ~46 sidebar rows and ~10 open, 39 is the expected number.
+
+⭐ **The decisive check was a self-counterexample, not an argument:** rows
+*demonstrably executing work* — including the session writing this entry — read
+`RemoteBootstrap`, and one still displayed the stale socket error in its
+scrollback while fully functional. **The error text is buffer residue, not
+state.** ⇒ **The only instrument that stayed correct throughout is whether a row
+RESPONDS.** Prefer it to any status field, and read the code that sets a field
+before quoting it in either direction.
+
+### ⚠ THE OBSERVER JOINS THE SET IT IS MEASURING
+
+`hot_restart_blockers` listed the diagnosing session itself, `kind: working`,
+idle_ms 119. That is a property of the measurement: any session able to run the
+probe is by definition active, and therefore extends the window whose failure to
+close it is investigating. **A quiet-window drain cannot be observed from inside
+the host it gates.** Sample off-host, or account for your own contribution.
+
+### ⛔ A CAUSAL STORY THIS ENTRY CARRIED AND WITHDREW
+
+It previously said the drain *"can never converge"* because it defers while any
+session was active in the last 300 s, and that the agents making the host busy
+were the ones resetting the window. **The measurements were sound**
+(`hot_restart_blockers`, `kind: recently_active`, `threshold_ms: 300000`,
+`attempts: 0`) — **the mechanism bolted onto them was not.** The idle gate was
+innocent; the daemon converged by a deliberate version-coexistence route while
+that story predicted it could not.
+
+⇒ **The real cause is narrower and better: the swap queue's only drainer is a
+daemon's retire poll, and the newest daemon was twelve versions older than the
+code that reads the queue.** Producer (the current GUI) and consumer (a stale
+daemon) sit on opposite sides of the very version skew the queue exists to fix.
+`attempts: 0` for 17 minutes was **nobody reading**, not deferral. ⇒ **A queue
+whose consumer can be older than its producer has no floor**, and no amount of
+correctness in the gate can help it — the third time on this project a suspected
+gate turned out to be a bystander.
+
+⚠ **The general shape, since two sessions hit it within one hour:** *when two
+readings both fit the data, test the one that licenses the action you already
+wanted to take* — and a brief may carry MEASUREMENTS, never a causal theory
+dressed as fact.
+## ⚠ NOTHING CALLS `sync-terms`, SO THE PRIVACY GUARD'S WORDLIST CAN DRIFT AGAIN BETWEEN RUNS
+
+**Status:** OPEN
+
+*Opened 2026-08-13 as the residue of a fixed defect: the drift itself was measured, repaired and
+made self-reporting, but only a hand-typed verb reconciles it.*
+
+The pre-push privacy guard is a fleet-synced binary whose **answer key is not synced with it** — the
+wordlist deliberately lives outside every repo, so no repo sync carries it and the binary sync does
+not know it exists. It had silently diverged: one host held the full list, the others a strict
+subset three days stale, so a set of names was unguarded on most of the fleet while every scan there
+printed a green tick.
+
+**What already shipped** (so this entry is only about the residue): the list is reconciled and
+identical everywhere; every scan now prints a wordlist **fingerprint** beside the count, so two
+hosts are comparable at a glance and a same-size-but-different list is still visible; a missing or
+empty wordlist is now a **refusal** rather than a warning followed by a tick; and the chore is a
+verb, `sync-terms`, which merges by **union** and reads every host back.
+
+**What is open:** nothing invokes that verb. Between manual runs the lists can diverge again, and
+the fingerprint only reveals it to someone who compares two terminals. ⇒ Wire it into whatever
+already reconciles per-host tooling across the fleet, so the reconciliation happens on the same
+schedule as everything else.
+
+⛔ **The trap to preserve for whoever wires it up: the merge must stay a UNION.** Newest-mtime-wins
+is correct for a binary and catastrophic for a wordlist — it lets a host whose file is merely newer
+(touched, restored from an old backup, written by a session that never had the full list) delete
+terms everywhere, which is exactly the failure the guard exists to prevent, arriving dressed as a
+successful sync. A union cannot lose a term; deliberate removal is a separate explicit flag.
+
+⭐ **And the general law this is an instance of, which is why it was worth the detour:** *a verifier
+reports CLEAN for a term it does not have for exactly the same reason it reports CLEAN for a term
+that is genuinely absent.* Printing the count was already there and was not enough, because nobody
+compares a number on one terminal against a number on another. An absence has to describe its own
+boundary in a form that is **comparable**, not merely present.
+
 ## ⛔⛔ [6.1] SOME ROWS WILL NOT RESTORE, AND A RESTART DOES NOT RECOVER THEM
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -1094,6 +1289,11 @@ long enough to be reported as routine.
 *measured on the desktop host 2026-08-13, 40 s window, build identity checked in
 the same command*
 
+⚠ **The fan is NOT this entry's question and is not answered by these numbers** —
+see § *THE HOST RUNS AT 90+°C WITH 14 OF ITS 16 CORES IDLE*, which owns it. The
+heat is a TLB-shootdown storm that CPU percentage cannot see. This entry owns
+only the CPU share itself.
+
 The owner reports the fan still running. On the desktop host, on a GUI **29 min
 old** with the visible row sitting at a bare prompt:
 
@@ -1200,6 +1400,388 @@ shell-webview eval/devtools verb, or reproduce the row count in the sandbox**
 (spawn N probe rows, watch whether the web process cost scales with N — that
 also settles the O(rows) blink question above).
 
+## ⛔⛔ [6.7] THE HOST RUNS AT 90+°C WITH 14 OF ITS 16 CORES IDLE, AND THE HEAT IS NOT CPU
+
+**Status:** OPEN
+
+*measured on the desktop host 2026-08-13 18:15–18:30, windows quoted per figure*
+
+The entry above opens with "the owner reports the fan still running" and then
+measures CPU percentage. **CPU percentage does not explain the fan, and chasing
+it cannot.** Over a 30 s window the machine was **9.96% busy — 1.59 cores of
+16** — while two independent sensors read **k10temp 93.6°C / acpitz 91.0°C**.
+Across 1,204 recorder rounds spanning 3.3 h: min 49.0°C, **mean 69.6°C, max
+97.1°C, 28 alarm rounds**, 6.6% of rounds above 85°C.
+
+### ⭐ THE HEAT IS NOT CORRELATED WITH OUR CPU AT ALL, AND THAT IS THE FINDING
+
+Temperature against concurrent whole-machine CPU, joined on 10 s buckets over
+the recorder's full span:
+
+| CPU band | n | mean temp | max temp |
+|---|---|---|---|
+| 25–50% of a core | 395 | 69.3°C | 93.6°C |
+| 50–100% | 590 | 69.4°C | 95.0°C |
+| 100–200% | 180 | 71.2°C | 97.1°C |
+
+**Pearson r = 0.071 across n=1,170.** Mean temperature moves 1.9°C across a 4×
+range of CPU, and the machine reaches 93.6°C inside its *lowest* band. **57 of
+the 80 hot rounds (>85°C) happened while the entire machine was under one core
+of load.**
+
+⇒ **No optimisation in the 0.5–2 core range can move the thermals on this host.**
+That does not retire the efficiency mandate — the CPU, memory and thread findings
+below stand on their own merits — but it does mean **the fan is not a scoreboard
+for this campaign's code work**, and treating it as one will burn sessions.
+
+### ⛔⛔ A MECHANISM THIS ENTRY ASSERTED, AND THE EXPERIMENT THAT KILLED IT
+
+**The claim, filed here earlier the same session and now withdrawn:** that the
+heat was a TLB-shootdown storm from page migration keeping cores out of C3. It
+had everything a good hypothesis has, which is exactly why it is recorded:
+
+- 78% of all interrupts were software IPIs (**CAL 12,084/s, TLB 7,831/s**)
+  against ~1,100/s for every hardware IRQ combined.
+- The arithmetic fit almost exactly: **3,858 migrations/s × 2 shootdowns each =
+  7,716 predicted vs 7,831 measured.**
+
+**The experiment:** `vm.compaction_proactiveness=0` + `vm.watermark_boost_factor=0`
+at runtime, which halts proactive compaction on demand.
+
+| | before | after |
+|---|---|---|
+| `pgmigrate_success` | 3,858/s | **0.0/s** |
+| `compact_migrate_scanned` | 1,436,800/s | **6,397/s** |
+| TLB irq/s | 7,831 | 3,602 |
+| C-state idle | 90.60% | 90.12% |
+| **k10temp** | **93.6°C** | **92.6°C** |
+
+**Migrations went to exactly zero and the temperature did not move.** Three
+lessons, each of which cost a wrong claim:
+
+1. ⛔ **The clean arithmetic fit was a coincidence of one window.** With
+   migrations at zero, TLB still ran **3,602/s** — so a second, larger shootdown
+   source was always there and the tidy 2× ratio hid it. **A ratio that fits is
+   not a mechanism that holds.**
+2. ⛔ **The TLB "improvement" is not claimable either.** Before-change windows
+   ranged **1,210–7,831/s**; 3,602 sits inside that. Only `pgmigrate=0` and the
+   225× scan drop are outside burst variance — because those are *mechanically
+   forced* by the sysctl, not inferred from a rate.
+3. ⚠ **Cores were ~90% C-state idle in BOTH arms.** A story about C-state exits
+   should have been checked against C-state residency before it was written.
+
+### ⚠ THE COUNTERS ARE BURSTY — SINGLE-WINDOW RATES PROVE NOTHING HERE
+
+Two windows minutes apart, same build, same idle machine, **no change between
+them**: TLB 7,831 → 1,210/s, migrations 3,858 → 809/s, compaction scanning
+1,436,800 → 453,916/s. **6.5× between adjacent samples.** Any before/after on
+these rates produces a confident number meaning nothing. Use a monotonic proxy
+(cumulative `pgmigrate_success` per unit of `pgalloc_normal`) or many alternating
+windows.
+
+### What actually remains as a heat candidate — and WHO OWNS IT
+
+**`/sys/firmware/acpi/platform_profile` tracks the POWER SOURCE, and the fan is
+an AC-power phenomenon.** Observed directly:
+
+| time | power source | profile |
+|---|---|---|
+| 18:15–18:39 | mains (USB-C charging) | `performance` |
+| 19:06 | battery, discharging | `balanced` |
+
+⛔ **CORRECTION TO THIS ENTRY'S OWN EARLIER CLAIM.** It said *"nothing owns this
+setting"* on the strength of `systemctl is-active power-profiles-daemon tuned`
+returning `inactive`. **That was a true answer to the wrong question.**
+`org_kde_powerdevil` is running as a **KDE session process started by `kded6`,
+not by systemd**, so systemd correctly reports it inactive while it is very much
+alive. Something — PowerDevil's built-in default or the EC itself; neither
+`powerdevilrc` nor `powermanagementprofilesrc` declares a per-source power
+profile, so it is not yet distinguished — switches the profile on AC↔battery.
+⇒ **Ask the process table, not the service manager, whether a desktop component
+is running.**
+
+⇒ The machine sits in `performance` **whenever it is plugged in**, which is the
+desk state in which the fan was reported.
+
+### ⭐ THE PROFILE ARMS — SETTLED BY AN INTERLEAVED A/B
+
+⛔ **The earlier sequential windows were replaced, not extended.** The machine
+went from mains to battery mid-session, which changes power source *and* profile
+together, and the battery then charged — so any sequential arm comparison
+straddles a moving thermal load. **Arms alternating every 5 minutes** put that
+drift on both arms equally. Interleaving was unaffordable for the build A/B
+(every swap cost a GUI restart); here a swap is one write and no restart, so the design
+that was correct-but-impossible there is correct-and-free.
+
+| arm | n | mean | p50 | peak | **>85°C** | >80°C |
+|---|---|---|---|---|---|---|
+| `performance` | 90 | 71.9°C | 70 | **92°C** | **9 (10.0%)** | 25 (27.8%) |
+| `balanced` | 71 | 65.2°C | 65 | **83°C** | **0 (0.0%)** | 2 (2.8%) |
+
+**`balanced` eliminates the >85°C band entirely — 0/71 against 9/90, Fisher
+exact p≈0.004.** Mains throughout, `arm_overridden=0`, `off_mains=0`, verified
+per sample rather than assumed.
+
+⭐ **The mean moved this time (−6.7°C) where five earlier windows said it did
+not.** The earlier windows were uncontrolled; this is what a controlled
+comparison bought, and it is the direct answer to *"why does a 90%-idle machine
+run hot"* — because the firmware profile, not the workload, sets the ceiling.
+
+⚠ **An owner report arrived mid-trial and matched the schedule he could not
+see:** "very hot … cooled down just now" at ~19:54, against a `performance`
+block running 19:48–19:53 (peaks 91, 92°C) and a `balanced` block beginning
+19:53:03 (62–74°C). ⛔ **The trial was then STOPPED EARLY and the profile pinned
+to `balanced`** — it was 60 seconds from deliberately reproducing a condition the
+owner had just reported as unusable. **An experiment does not outrank the
+machine's owner using the machine.**
+
+⛔ **AND THE HEAT DID NOT CAUSE THE TYPING FAILURE, though they resolved minutes
+apart.** The same report said he could not type; the cause was a **poisoned
+composer** — `Error: connecting to …/server-3-0-130.sock` sitting *inside* the
+`❯` box of the row he was typing into — cleared by the socket alias at ~19:45,
+not by the cooling at ~19:53. **Two faults, two fixes, one coincidence.** The
+tempting single-cause story would have been wrong in both directions.
+
+**What the trial changes and how to revert it:** `platform_profile` is a runtime
+firmware setting; writing it caps the sustained power limit and fan curve and
+changes nothing about software. `echo performance | sudo tee
+/sys/firmware/acpi/platform_profile` restores it, and **a power-source
+transition rewrites it regardless of what any agent set**. Nothing was left
+applied by this campaign: the 19:06 write was a no-op because the machine had
+already switched itself to `balanced` on unplugging.
+
+⇒ **Owner gate**, in `owner-attention.md`: whether the *AC* profile should be
+`balanced` rather than `performance`. That is a persistent preference about his
+machine's power behaviour, not a defect fix.
+
+### The compaction waste is real, but it is a separate and much smaller item
+
+Independent of the heat: `/proc/buddyinfo` zone Normal holds **2 free order-9
+blocks** (the 2 MB huge-page order) against 5,652 at order-7, and kcompactd was
+scanning 1.4M pages/s at a **100% failure rate** (`compact_stall` 4.1/s ==
+`compact_fail` 4.1/s) chasing blocks that do not exist. Stopping that removed
+genuine waste and cost nothing observable. ⛔ **But do not file it as CPU** —
+kcompactd measures **0.93% of a core**, kswapd 0.87%. It is worth stopping
+because it is pointless, not because it is expensive.
+
+⚠ Swap keeps growing regardless (`pswpout` 963/s, `pgmajfault` 1,469/s after the
+change), which is the web-process entry below and is the item with real value in
+it.
+
+## ⛔ [6.7] THE RESOURCE RECORDER'S `temp_alarm` IS THE RAM SENSOR, NOT THE CPU
+
+**Status:** OPEN
+
+*found 2026-08-13 while reading the recorder's own history*
+
+`scripts/resource-recorder.py::temps()` sets `alarm = 1` when **any** sensor
+under `/sys/class/hwmon` reaches its own `temp*_max`. On the desktop host exactly
+one sensor has a ceiling low enough to matter:
+
+```
+nvme     temp1 = 59C   max = 79C
+spd5118  temp1 = 56C   max = 55C   <== the only one ever alarming
+```
+
+⇒ **`temp_alarm` reports "the DIMM sensor is 1°C over nominal", a near-permanent
+condition, while reading as a CPU thermal alarm.** It fired in 29 of 29 rounds
+during a window in which the CPU ran *cooler* than baseline (64–75.6°C), which is
+how it was caught — the flag went **up** as the machine got colder.
+
+⛔ This is the field-guide family: *the probe answers a different question than
+its name suggests*, in the campaign's own first-act instrument (`ygg-resource
+-recorder status`, the monitoring ritual). Anyone quoting an alarm count is
+quoting the RAM.
+
+**Fix:** record WHICH sensor alarmed, not a bare bit — the sample that is one
+degree over a DIMM's nominal is not the sample that matters, and a count with no
+source cannot be triaged. Not done in-session on purpose: the service was mid-
+trial and collecting the data the entries above rest on, so restarting it would
+have destroyed the measurement.
+
+## ⛔⛔ [6.7] THE DESKTOP-HOST IDLE-CPU A/B CANNOT RESOLVE ITS OWN EFFECT — STOP SCHEDULING IT
+
+**Status:** AWAITING A DECISION
+
+*Decided by whoever owns cluster sequencing: the orchestrator holds a granted
+window for this A/B, and this entry argues it should not be spent here.*
+
+*measured 2026-08-13 from the recorder's own history; no new instrument needed*
+
+Three attempts at a desktop-host before/after have now come out confounded. The
+reason is not workload discipline, it is arithmetic: **the quantity being
+measured has a noise floor an order of magnitude larger than the effect.**
+
+### The do-nothing floor, same pid, same build, nothing changed
+
+| | windows | min | mean | max | **sd** |
+|---|---|---|---|---|---|
+| GUI, 5-min windows | 33 | 11.5% | 31.1% | 57.9% | **12.65** |
+| GUI, 30-min windows | 5 | 12.2% | 31.6% | 47.7% | **11.65** |
+| web_content, 5-min | 33 | 17.0% | 27.1% | 38.1% | 5.29 |
+
+**The GUI's idle CPU swings 11.5% → 57.9% of a core on ONE build with no change
+of any kind.** ⭐ **And lengthening the window does not help: sd falls only
+12.65 → 11.65 from 5 to 30 minutes.** That is the whole finding — the variance is
+**low-frequency workload drift, not sampling noise**, so it does not average out
+and a longer window buys almost nothing.
+
+### The power calculation, stated BEFORE any arm is run
+
+At sd = 11.65, 80% power, α = 0.05, `n ≈ 16·(sd/effect)²` per arm:
+
+| effect | windows/arm | wall-clock at 30 min/window |
+|---|---|---|
+| **3 pp** (the plausible effect) | **241** | **~10 days per arm** |
+| 10 pp | 22 | ~22 h per arm |
+
+**The fix's measured effect is 0.1 pp on the build host** (1.5% → 1.4%). Even
+scaling generously for the `hpet` clock penalty the arm difference is ~1–3 pp —
+**below what this design can resolve, by roughly 10×.**
+
+⇒ **A "result" from a handful of windows here is noise with a sign.** That is how
+three prior attempts produced confident, contradictory numbers, including one in
+which the *older* process was the cheaper one.
+
+### What to do instead
+
+1. ⭐ **The fix is ALREADY attributed by the instrument that can attribute it.**
+   The sandbox gap fingerprint is deterministic, not statistical: idle renders
+   **1.65 → 0.65/s (61%)**, with the 1001 ms gap population going **31.3% → 0%**.
+   Killing a timer removes its period from the histogram — that is causation, and
+   it needed no quiet host at all.
+2. **If a host-level number is genuinely wanted, the only valid design is
+   INTERLEAVED, not sequential** — alternate arms every ~10 min for many hours so
+   drift lands on both arms equally, and compare *adjacent* pairs. Sequential
+   arms cannot beat a drifting confound at any sample size. ⚠ That means a GUI
+   restart every 10 minutes for hours on the owner's daily driver, which is a
+   far larger intrusion than the number is worth.
+3. **Spend a quiet host on something whose signal exceeds its noise instead** —
+   e.g. the web-process plateau test, where the quantity grows ~366 MB/h
+   monotonically against a much smaller variance.
+
+⛔ **The general rule this entry exists to install:** *state the do-nothing floor
+before designing the comparison.* One query against the recorder answers it, and
+it would have saved three attempts. A perf number quoted without its floor is not
+a measurement.
+
+## ⛔⛔ [6.7] THE WEB PROCESS'S MEMORY BOUND CANNOT HOLD, BECAUSE SWAP MAKES ITS FOOTPRINT LIE
+
+**Status:** OPEN
+
+*single-pid lifetime measurement, desktop host 2026-08-13, restart-free*
+
+`configure_linux_webkit_memory_policy` (`apps/yggterm/src/main.rs`) sets
+`YGGTERM_WEBKIT_CACHE_MODEL=web-browser` and a limit of
+`(MemTotal_MB / 8).clamp(768, 3072)` — **1,888 MB** on this 15 GB host — with
+conservative/strict thresholds at 0.75/0.90 (**1,416 / 1,699 MB**). The code
+comment states the intended contract outright: *"the bound on it is not this
+knob but the memory policy below … so caching more does not mean growing
+without end."*
+
+⛔ **That contract is not holding, and the cache model is NOT the defect.**
+`docs/optimization-pass.md` §9f settled `web-browser` deliberately — a cacheless
+model made every navigation refetch every byte. **Do not reach for that knob.**
+
+### The measurement
+
+One `WebKitWebProcess`, one pid, tracked across its own lifetime (so no restart
+straddles the samples):
+
+| age | RSS | swap | **committed** |
+|---|---|---|---|
+| 0.0 h | 516 MB | 11 MB | **526 MB** |
+| 1.0 h | 776 MB | 243 MB | **1,019 MB** |
+| 2.0 h | 604 MB | 655 MB | **1,259 MB** |
+| 2.2 h (`smaps_rollup`) | 588 MB | 931 MB | **1,519 MB** |
+
+**+733 MB in two hours, monotonic, no plateau — ~366 MB/h.**
+
+⚠ **RSS peaks at hour 1 and then FALLS while the total keeps climbing.** Watching
+RSS alone would have shown this leak *reversing*. The campaign's own rule earns
+itself again: the number that must fit in the machine is `rss + swap`.
+
+### Why the bound cannot fire
+
+At 2.2 h the process holds **1,519 MB committed — already past the 1,416 MB
+conservative threshold — and no reclaim has occurred.** Its RSS is 588 MB, 31%
+of the limit, and would have to *more than double* before a resident-based
+threshold could trip.
+
+⇒ **Empirically WebKit is not reacting to committed memory.** The loop is
+self-reinforcing and gets worse exactly when it should get better: swap pressure
+evicts the cache → RSS falls → WebKit reads more headroom → it caches more →
+more swap pressure.
+
+⚠ **Stated honestly: this is inferred from behaviour, not from reading WebKit's
+footprint implementation.** What is established is that committed memory passed
+conservative without reclaim. What is NOT established is which quantity
+WebKitGTK actually polls. **Settle it before fixing**, because the two fixes are
+different: if the metric is resident, the limit must be derived from a figure
+that includes swap (or the thresholds lowered so they trip before the kernel
+evicts); if the metric already includes swap, the bound is firing and failing,
+which is a different bug entirely.
+
+**Falsifier:** let one web process run several hours. Plateau near 1,888 MB
+committed ⇒ the bound works and this entry is wrong. Sail past it ⇒ confirmed.
+
+## ⛔ [6.7] A DEAD PTY'S WRITER THREAD — FIXED IN CODE, LIVE PROOF OWED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Falsified by: a daemon that has served and closed sessions for hours showing
+`pty-writer-*` and `pty-reader-*` thread counts that disagree. They are created
+in pairs, so equal counts is the whole claim.*
+
+**The leak.** `spawn_terminal_writer_thread` (`terminal.rs`) is called from
+inside the reader-spawn path, one writer and one reader per terminal. The reader
+exits on `Ok(0)` (PTY EOF); the writer runs `while let Ok(request) = rx.recv()`,
+which ends only when **every** `SyncSender` clone has dropped. The reader's clone
+drops at EOF — but the clone the terminal entry holds does not, so a PTY that
+dies while its entry survives **parks its writer on `recv()` forever**, holding a
+thread and its stack.
+
+⇒ A writer whose PTY died *does* exit if anything writes to it (the write fails
+and it breaks). It only leaks when **nothing ever writes again**, which is
+exactly the state a closed row is in.
+
+**Measured before the fix**, live daemon vs an idle one of the same build:
+
+| thread | live daemon | idle daemon |
+|---|---|---|
+| `pty-writer-remote…` | **22** | 1 |
+| `pty-reader-remote…` | **19** | 1 |
+
+**Three writers outliving their readers**, and it only grows. Alongside it, on
+the same daemon: threads **31 → 59 over 3 h with CPU 4.0% → 9.8% and memory
+flat** — the campaign's predicted "hot loop proportional to accumulated state",
+with the accumulating population named.
+
+**The fix.** `TerminalWriteRequest` gains a `shutdown` flag; the reader sends one
+**after its loop, so EOF and the read-error path are both covered**, and the
+writer breaks on it. ⛔ **Deliberately not a timeout poll** — a writer that wakes
+periodically to check a flag is precisely the idle cost this lane exists to
+remove, so the writer still blocks on `recv()` and is woken by a message. The
+shutdown uses `try_send`: if the queue is full the writer is mid-write against a
+dead PTY and will fail and break by itself, and blocking there would strand the
+reader instead.
+
+**Locked by** `a_writer_retires_on_shutdown_even_while_another_sender_is_alive`,
+which asserts **both halves** — that a surviving sender alone leaves the thread
+parked (so the test cannot pass trivially), and that the shutdown retires it with
+that sender still alive. 86 `terminal::` tests pass.
+
+⚠ **Not claimed: that this is the whole thread growth.** The GUI shows the same
+family — threads 63 → 76 in 2 h with memory flat, including **29
+`tokio-rt-worker`** where one multi-thread runtime on a 16-core host spawns 16 —
+and that is a different population in a different process. This fix is the
+daemon's `pty-writer` half only.
+
+⚠ **Suspected, NOT proven:** that the retained entry is the same orphaned-key
+family as the restore bug — a close that resolves to a key nothing holds removes
+nothing and leaves the entry behind. If so, this fix stops the thread leaking
+while the orphaned entry itself remains.
+
 ## ⛔ [6.7] THE WEB-CONTEXT SHARING INSTRUMENT IS BLIND TO THE CASE IT EXISTS TO CATCH
 
 **Status:** OPEN
@@ -1248,148 +1830,254 @@ it does not, only the counter is.
 shared ones. A reader cannot currently tell the healthy reading from the worst
 one.
 
-## ⛔ [6.7] A DAEMON RE-DROPS THE SAME UNRECOVERABLE SESSIONS THREE TIMES A SECOND, FOREVER
+## ⛔ [6.7] A DAEMON RE-DROPPED THE SAME UNRECOVERABLE SESSIONS 3×/s — FIXED IN CODE, LIVE PROOF OWED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Falsified by: `grep -c live_session_persist_dropped` on a fresh daemon's
+`event-trace.jsonl` after an hour at rest. It must equal the number of DISTINCT
+unrecoverable keys, not grow with time.*
+
+**Measured before the fix.** `live_session_persist_dropped` fired **92 times in
+30 s (184/min)** from one daemon — the same two keys, always
+`"reason":"not_recoverable"`. **15% of all trace lines.** `event-trace.jsonl`
+grew **13.8 MB/hour** and all `~/.yggterm/*.jsonl` together **28 MB/hour**, at
+rest, with several daemon generations each writing their own.
+
+**Root cause.** `persisted_state_with_update_protection` runs on every persist
+pass and calls `trace_drop` for each live session that fails
+`managed_live_session_is_recoverable`. There was no dedup, so a permanently
+unrecoverable session was re-judged, re-dropped and **re-logged forever**.
+
+⭐ **The compute was never the cost — the WRITE was.** The recoverability check
+is cheap; the trace is disk I/O on a machine with nothing running. A fix aimed at
+the loop rather than at the logging would have optimised the wrong half.
+
+**The fix.** `persist_drop_already_traced(key, reason)` keeps the **first**
+occurrence and drops the repetitions. The first line is the whole diagnostic —
+it names which gate dropped which key, which is what the 2026-06-11 incident
+needed — and the repetitions carry no information it does not.
+
+⛔ **Keyed on `(key, reason)`, not on `key`.** A session later dropped for a
+*different* reason is a new fact and must still be logged. Bounded by the number
+of session keys, so the set cannot grow without limit.
+
+**Locked by** `a_repeated_persist_drop_is_traced_once_but_a_new_reason_is_traced_again`,
+which asserts all three halves — first traced, repeat not traced, new reason
+traced again. Full suite: 1069 pass.
+
+⚠ **Checked, because the dedup is a process-global static and a test binary is
+one process:** no test anywhere asserts on persist-drop traces, so this
+introduces no order-dependence in the suite. (Two tests failed on one run and
+passed on the next; both manipulate process-global env vars — `TERM`,
+`COLORFGBG` — behind a guard, a pre-existing parallel-execution flake unrelated
+to this change.)
+
+⚠ **Not claimed: that this removes the 28 MB/hour.** It removes the largest
+single contributor (15% of lines) from *one* event. Several daemon generations
+each holding their own trace open is a separate item.
+
+## ⛔ [6.7] UNEXPLAINED: HAND-MADE SOCKET ALIASES AT A JUST-RETIRED NAME WERE DELETED, SIBLINGS WERE NOT
 
 **Status:** OPEN
 
-*measured 2026-08-13*
+*observation retained after the hypothesis built on it was falsified — the
+hypothesis is dead, the data is not*
 
-`live_session_persist_dropped` fires **92 times in 30 s (184/min)** from one
-daemon, and it is the same two keys over and over, always with
-`"reason":"not_recoverable"`:
+**What was seen**, on the GUI host in the minutes after 3.0.131 retired:
 
-```
-{"name":"live_session_persist_dropped","payload":{
-  "detail":{"kind":"SshShell","source":"LiveSsh","ssh_target":"…"},
-  "key":"live::<uuid>","protect_all_live":false,"reason":"not_recoverable"}}
-```
-
-A session judged permanently unrecoverable is re-judged, re-dropped and re-logged
-on every persist pass instead of being dropped once. It accounts for **15% of all
-trace lines** and is the visible half of the daemons' 13.9% idle CPU.
-
-**It also writes.** At rest `~/.yggterm/event-trace.jsonl` grows **13.8 MB/hour**
-and all `~/.yggterm/*.jsonl` together grow **28 MB/hour** — continuous disk I/O
-on a laptop with nothing running, from several daemon generations each keeping
-its own trace open. Twelve `event-trace.g*.jsonl` files of ~20 MB each were
-resident, three of them being written concurrently.
-
-**Falsifier:** a session that reports `not_recoverable` must be logged once and
-never re-examined; the event rate on an idle daemon must go to zero.
-
-## ⛔ [6.7] A DAEMON LEAVES ITS `ssh` CHILDREN UNREAPED
-
-**Status:** OPEN
-
-*measured 2026-08-13*
-
-Twelve `[ssh] <defunct>` zombies on the desktop host, **all parented to one
-`yggterm-headless server daemon`** (a 4-day-old process). A thirteenth zombie,
-`[xdg-open]`, is parented to the GUI.
-
-⇒ **New, 2026-08-13: all twelve were spawned inside ONE second**, in two bursts
-(`10:21:39` ×8, `10:21:40` ×4) four days before they were found, and none since.
-That is not per-session leakage — it is **one fan-out that spawns `ssh` per
-target and waits for none of them**, which narrows the search a long way from
-"the daemon's child handling" to the code that probes every machine at once.
-
-⇒ Something spawns `ssh`, the child exits, and nobody calls `wait`. Zombies cost
-almost no memory, so this is not the fan — but it is an unambiguous
-lifecycle defect and it is the cheapest possible entry point into the daemon's
-child handling, which is where the more expensive leaks in this cluster probably
-also live.
-
-**Falsifier:** spawn and tear down N remote sessions on a fresh daemon and count
-zombies. It must stay at zero.
-
-## ⛔ [6.7] YGGTERM HOLDS AN UNCORKED AUDIO STREAM OPEN FOREVER, WHICH IS THE DISTORTED NOTIFICATION AND A POWER DRAW
-
-**Status:** OPEN
-
-*measured 2026-08-13 — this REFUTES the swap-pressure explanation offered above*
-
-The batch attributed the lagged, distorted notification audio to swap pressure
-("the analog signal is not lagging, the machine is"). That is not what is
-happening. On a GUI relaunched **11 minutes** earlier, with 8 GB of RAM free and
-the GUI at 17% of a core — no pressure condition of any kind:
-
-```
-Sink Input #86796
-        Corked: no
-                application.name         = "Yggterm"
-                application.process.binary = "WebKitWebProcess"
-                media.name               = "Playback Stream"
-```
-
-**`Corked: no` is the finding.** The webview holds an **uncorked — actively
-streaming — playback stream open permanently**, with nothing playing. The
-WebAudio threads that serve it (`webaudioSrc:src`, `webaudioSrcTask`,
-`queue0:src`) are present on a fresh process and never go away.
-
-**Two costs, and they explain both reported symptoms:**
-
-1. **Power.** An uncorked stream keeps the audio graph running, so the pipeline
-   never suspends. The hardware sink does reach `SUSPENDED`, but the filter sink
-   in front of it reads `RUNNING` for as long as yggterm holds the stream. On a
-   laptop that is a continuous, entirely avoidable draw — and this cluster's
-   mandate names power explicitly.
-2. **The distortion.** Audio glitching is a missed real-time deadline, not a
-   memory condition. A stream held uncorked for hours and fed nothing will
-   underrun; when a notification finally arrives it plays through a pipeline
-   that has been starving, which is exactly "lagged and distorted". A pegged
-   main thread (92.6% of a core, see the entry above) makes the missed deadline
-   near-certain.
-
-⇒ **The audio item does NOT retire as a symptom of the memory bug.** It is a
-lifecycle defect of the same family as the unreaped `ssh` children and the
-never-released web contexts: a resource acquired and never given back.
-
-**The fix:** cork the stream when idle, or `suspend()` the `AudioContext`
-between notifications, or build it per notification and drop it after. Whichever
-— the steady state must be no stream.
-
-**Falsifier:** with no notification playing, `pactl list sink-inputs` must show
-no uncorked yggterm stream, and the filter sink must reach `SUSPENDED`.
-
-⚠ **Owner-verifiable half:** whether the notification *sounds* right after the
-fix needs an ear, not an instrument. The measurable half above is sufficient to
-build against and does not wait on that.
-
-## ⛔ [6.7] SIXTEEN STUCK CRASH HANDLERS, THE OLDEST DATING TO BOOT
-
-**Status:** OPEN
-
-*measured 2026-08-13*
-
-Sixteen `drkonqi-coredump-launcher` processes are resident on the desktop host,
-ages ranging from 4.7 days to **11 days — i.e. since the machine booted**. Each
-one is a crash whose handler never finished.
-
-**ATTRIBUTED 2026-08-13 — they are ours, and the entry does not retire.**
-`coredumpctl` holds **353 crashes**; by executable:
-
-| executable | crashes |
+| alias | outcome |
 |---|---|
-| `open-webui` (a flatpak, **not ours**) | 182 |
-| **`yggterm`** (`~/.local/bin`, `~/.yggterm/bin`, versioned + debug builds) | **~75** |
-| **`WebKitWebProcess`** (ours — the GUI's webviews) | **35** |
-| **`WebKitNetworkProcess`** (ours) | **13** |
-| everything else (plasmashell, dash, spectacle, rustfmt, …) | ~48 |
+| at `server-3-0-131.sock` (the just-retired name) | **deleted 3×**, within seconds to ~100 s of creation |
+| at 3 other versions, created in the **same command** | survived untouched |
+| the same alias at the same path, 7 min later | survived 150 s |
 
-⇒ **~123 of 353 are yggterm's**, second only to a single unrelated flatpak, and
-the GUI's own signal mix is **`SIGSEGV`** while the web processes abort. Recent
-ones are not historical: `2026-08-11 16:11` yggterm SIGSEGV (81.6 MB),
-`2026-08-09 10:07` yggterm SIGSEGV (443.8 MB), `2026-08-08 23:07`
-WebKitWebProcess SIGABRT (**552.4 MB**).
+⇒ Whatever deleted them is **transient, fires in a window around a retirement,
+and targets exactly the name a retiring daemon writes.** Siblings born in the
+same syscall batch were spared, so it is not a blanket sweep.
 
-**And they are charged to the laptop's disk: `/var/lib/systemd/coredump` is
-2.6 GB across 41 files.** A 552 MB core is a direct consequence of the memory
-growth in the entry above — the bigger the process gets, the more a crash costs
-to store.
+⛔ **The mechanism proposed for it is FALSIFIED and must not be repeated:** that
+`classify_socket_entry` condemns an entry by NAME on a re-proved dead sighting
+and executes that sentence later against a different file. At the next handover
+the falsifier ran in the wild on two hosts — `retiring_daemon_aliased_own_socket`
+fired, the alias at the retiring name resolved to the live successor, and it
+**survived 535 s**. The case that mattered is not affected.
 
-⇒ Two separable jobs: the stuck handlers (16 `drkonqi-coredump-launcher`
-processes that never finished, oldest dating to boot) and the crashes
-themselves. The crash *rate* is the more valuable of the two and is unowned.
+⚠ **So this is a curiosity, not a blocker** — nothing is sequenced behind it and
+the daemon-written bequest is not being eaten. It is recorded because **a
+hypothesis dying does not kill the observation that prompted it**, and an
+unexplained deletion in the socket lifecycle is worth having on file the next
+time something goes missing there.
+
+**Falsifier for the remaining question:** create an alias at a just-retired
+version's name and watch it for two minutes, with the sweep's own trace on. It
+either dies again — and the deleter is findable — or it does not, and this was
+tied to a condition that no longer exists.
+
+## ⛔ [6.7] AN UNCORKED AUDIO STREAM HELD FOREVER — FIXED IN CODE, LIVE PROOF OWED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Falsified by: with no notification playing and the GUI idle past the awake
+window, `pactl list sink-inputs` must show no uncorked yggterm stream and the
+filter sink must reach `SUSPENDED`. ⛔ **The running GUI does NOT carry this
+fix** — it is in the lane, not deployed.*
+
+**What was wrong.** The shell kept ONE long-lived `AudioContext` and left it
+**running forever**, so the webview held an uncorked playback stream with
+nothing in it: `Corked: no` on a GUI 11 minutes old, 8 GB free, no pressure of
+any kind. Two costs — a pipeline that never suspends (continuous laptop draw),
+and a stream fed nothing for hours that underruns, so the chime that finally
+arrives plays through a starving pipeline. That is the "lagged and distorted"
+notification, and it is a missed real-time deadline, not a memory condition.
+
+### ⛔ THE OBVIOUS FIX IS THE ONE ALREADY TRIED AND REVERTED
+
+This entry previously suggested "build it per notification and drop it after".
+**That was the original design and it produced a defect the owner reported by
+ear:** a context closed shortly after the last note while a Bluetooth sink still
+held 100–300 ms of buffered audio — the **clipped ending**. A second prior fix
+resumes the context because WebKitGTK starts one SUSPENDED until a user gesture,
+and without it every chime scheduled while the user was away was dropped
+**silently**. ⇒ **Any fix here has to keep both of those intact**, which rules
+out `close()` and rules out per-chime construction.
+
+### The fix, and why the deadline is not a new number
+
+`suspend()` — never `close()` — on an idle timer, reset by each chime. The
+context object is kept and reused, so the clipped-ending fix stands; the
+existing `resume()` path already wakes a suspended context, so the silent-drop
+fix stands.
+
+⭐ **The suspend deadline IS `NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS`**, the
+constant the Bluetooth pre-roll decision already uses — not a second tunable
+beside it. That makes the two agree *by construction*: while the context is
+running, the next chime falls inside the awake window and correctly skips the
+pre-roll; once it suspends, the next chime falls outside it and correctly
+pre-rolls a cold link. A separate constant could drift and give a chime that
+skips the pre-roll onto a link that has gone to sleep — the clipping defect,
+reintroduced by disagreement rather than by design.
+
+**Locked by** three assertions on the generated script: that it suspends, that
+it contains no `close()`, and that the deadline is literally the awake-window
+constant. 13 notification tests pass.
+
+⚠ **The acoustic half needs an ear, not an instrument** — whether the chime still
+sounds right after a suspend/resume cycle is owner-verifiable only. The
+measurable half above stands on its own and does not wait on it.
+
+## ⛔⛔ [6.7] THE PRIVACY GUARD SCANS ALL OF HISTORY ON A NEW BRANCH, SO EVERY LANE PUSH FAILS AND TEACHES THE OVERRIDE
+
+**Status:** OPEN
+
+*found 2026-08-13 while pushing a lane branch; affects every cluster in this batch*
+
+`ygg-privacy-guard hook` derives its scan range from the pre-push stdin line:
+
+```python
+rng = f"{rsha}..{lsha}" if not rsha.startswith("0000") else lsha
+```
+
+**On a new branch `rsha` IS `0000…`**, so the range collapses to `lsha` — the
+branch tip — and the guard scans **every commit reachable from it**, i.e. the
+whole repository history, rather than the commits actually being pushed.
+
+⇒ Pushing `lane/dev/6.7-resource` (one commit, 247 added lines) was refused for
+private terms sitting in **commit messages that are already ancestors of
+`origin/main` and have been public for weeks**. Verified: `origin/main..HEAD`
+contained exactly one commit, and the guard's own `scan --rev-range
+origin/main..HEAD` returned *"✅ no private data found in what is being pushed."*
+
+**Why this is ⛔⛔ and not a nuisance.** The only escape is
+`YGG_PRIVACY_ALLOW=1`. A guard that refuses **every** new branch regardless of
+content trains every agent to set that variable reflexively, and the override is
+a single environment variable that suppresses the whole scan — so the guard
+stops working precisely when someone finally does push something private. **A
+check that cries wolf on every lane branch is worse than no check**, because it
+manufactures the habit that defeats it. All eight clusters in this batch push
+lane branches.
+
+**The fix:** for a new branch, ask what the remote does not already have —
+`git rev-list <lsha> --not --remotes=origin` — instead of walking the tip's
+entire ancestry. Failing closed is right; failing closed on already-published
+history is not failing closed, it is failing blind.
+
+**Falsifier:** create a branch with one innocuous commit and push it. The guard
+must pass without an override.
+
+⇒ **Separately, and this one is owner-gated:** the terms it caught are real and
+they are *already public* in `origin/main` commit messages (a graph name, a bank
+hostname). Removing them means rewriting published history, which has been done
+once before on a sibling repo and orphaned 34 commits. Not a relay action.
+→ `docs/owner-attention.md`.
+
+## ⛔ [6.7] THE GUI SEGFAULTS IN THE HARDWARE-GL DRAW PATH — AND THE STUCK HANDLERS ARE NOT OURS
+
+**Status:** OPEN
+
+*re-measured 2026-08-13 evening; this entry previously conflated two things*
+
+### ⛔ THE STUCK HANDLERS ARE KDE'S, AND THEY ARE RESIDUE
+
+Sixteen `drkonqi-coredump-launcher` processes are resident, **all parented to the
+KDE session manager**, ages **5.1 to 11.5 days — and nothing newer than 5.1
+days.** They are KDE's crash-reporter UI failing to exit, one per crash, days
+ago. **Not a yggterm process, not accumulating, and not ours to fix.** They are a
+symptom of our crash COUNT, and they vanish with a session restart.
+
+⇒ **What is ours is the crashing, not the handler.**
+
+### ⭐ A CONFIRMED SIGSEGV TODAY, WITH NO YGGTERM FRAME IN IT
+
+`coredumpctl` on the GUI that died at **19:03:42**, core present, 48.2 MB:
+
+```
+#0-1    libEGL_mesa.so.0
+#2-13   libgallium-26.1.5
+#14     gdk_cairo_draw_from_gl        (libgdk-3)
+#15-17  libwebkit2gtk-4.1
+#18+    gtk_container_propagate_draw  (libgtk-3)
+```
+
+**Every frame is Mesa, GTK or WebKit — none is ours.** The GUI dies inside GTK's
+GL→cairo bridge while compositing the webview, on the **hardware** GL path.
+
+⚠ **Correction to a claim made in this session:** that GUI restart was attributed
+to another cluster taking the host for a deploy. **It was not a restart — it was
+a segfault**, and the core says so. A process that vanishes and comes back is not
+evidence of who restarted it.
+
+### What the census does and does not support
+
+Top frame across the 12 most recent `yggterm`/`WebKit` cores:
+
+| top frame | count |
+|---|---|
+| `libgallium` / `libgdk-3` (the GL path) | **4** |
+| `libc` (aborts, not this signature) | 6 |
+| unresolved | 2 |
+
+⇒ **The GL cluster is real but it is not all of them.** One backtrace is
+confirmed end to end; the rest are a crude top-frame sample and must not be
+quoted as though they were full traces.
+
+### ⛔ THE FIX IS A TABLE CHANGE, NOT A FLAG FLIP
+
+`docs/presentation-policy.md` is the SSOT and the standing law is explicit:
+**never set `WEBKIT_DISABLE_DMABUF_RENDERER`, `LIBGL_ALWAYS_SOFTWARE` or any
+`PRESENTATION_VARS` entry against the owner's running GUI.** So nothing here is
+to be "tried" on his machine.
+
+⭐ **The case to answer is already half-written in `optimization-pass.md` §9f/§1a:
+the live host runs `YGGTERM_WEBKIT_GL_POLICY=hardware_gl_probed`, and hardware GL
+measured NO BETTER than software there.** ⇒ If hardware GL buys nothing
+measurable and crashes the GUI in Mesa's draw path, the policy TABLE should carry
+a different default for this host — with this core as the measurement in the row.
+
+**Falsifier:** run the sandbox (`scripts/underglass-sandbox.sh`) on both GL arms
+under the same webview workload and compare crash counts. If the software arm
+crashes at the same rate, the GL path is incidental and the abort cluster is the
+real story.
 
 ## ⚠ [6.6] `agy` HAS TWO GATES IN SERIES, AND ITS BYPASS FLAG RELEASES ONLY ONE
 
@@ -2246,6 +2934,36 @@ removing that file once consumption is confirmed.
 guarantee, and this is a live counter-example: our own deploys are degrading other agents' rows.
 ⇒ It belongs with the hot-restart/daemon-lifecycle work, not with the deploy-identity work.
 
+
+✅ **THE BEQUEST HOLDS — measured 2026-08-13 across at least eight version moves,
+which is the observation this entry was waiting for.** A retiring daemon
+re-points its own version name at its successor (shipped 3.0.132); the open
+question was whether that survives the NEXT bump, and it did. On the GUI host,
+after 3.0.133 → 3.0.141:
+
+```
+server-3-0-133.sock → answers: server_version 3.0.141, build a0c782b013d5
+server-3-0-137.sock → answers: server_version 3.0.141, build a0c782b013d5
+server-3-0-134.sock → no socket        server-3-0-136.sock → no socket
+```
+
+⇒ A CLI pinned to 3.0.133 still resolves a live path, and it reaches the CURRENT
+daemon. Both controls are in the same run: names that answer, and versions that
+never ran a daemon here and correctly have no socket, so the probe is not
+returning a constant.
+
+⚠ **What this does NOT close.** The bequest is performed BY a retiring daemon, so
+it can only cover a handover the daemon lives through. A daemon that is killed,
+crashes, or is evicted leaves no successor pointer, and the poisoned-composer
+symptom would return exactly there — which is the case worth testing next, and
+it is not this measurement.
+
+⭐ **Read the daemon's BUILD, not its version, when checking this.** Both surviving
+names answer `3.0.141`, and that string alone cannot say whether one is a stale
+listener; the build commit is what makes them provably the same process.
+
+**Falsifier:** after a bump, a socket named for a version whose daemon retired
+gracefully fails to connect.
 ## ⛔⛔ NOTHING PREVENTS A LOCAL TAG FROM REPUBLISHING A PRE-SCRUB LINEAGE
 
 **Status:** OPEN
@@ -8214,6 +8932,30 @@ field, and the owner finding the truth by looking at his screen:**
 | `terminal new --prompt-stdin` | `delivered: true` | `submitted:true, waited_ms:19802` — and the transcript never gained a user row, twice in one minute |
 | `terminal send` | `accepted: true` | bytes written; into an agent row that is one Enter PER LINE |
 
+✅ **TWO OF THE FIVE RE-TESTED AT 3.0.141 AND BOTH NOW REPORT THE EFFECT**
+(2026-08-13 sweep, on a row created for the purpose and removed after):
+
+| verb | reply | read-back |
+|---|---|---|
+| `session rename` | `accepted: true` | label reads `ygg-sweep-rename-probe` — the change is real |
+| `session remove` | `verified: true`, `live_processes: []` | row absent from the census; 6th consecutive clean sample that day |
+
+⚠ **THREE WERE NOT RE-TESTED, AND THE REASONS ARE PART OF THE RESULT.**
+`sessions reorder` rewrites the WHOLE rendered order including rows owned by
+other sessions, so it is not a probe to fire on a live sidebar;
+`terminal new --prompt-stdin` and `terminal send` need a live agent row, and the
+`terminal send` row is documented behaviour now (one Enter per line) rather than
+a false success. **Do not read the two ✅ as four.**
+
+⛔ **AND THE FIRST ATTEMPT AT THIS RE-TEST PRODUCED A FALSE RESULT, which is the
+part worth carrying.** The read-back interpolated the session path through two
+shells into a python comparison; it matched nothing, and reported
+`<row not in census>` for a row that was plainly there — a check that FAILS OPEN
+and reads exactly like a real finding. It was caught only by adding a positive
+control: *can this comparison find a row I know exists?* ⇒ **A verification
+harness needs its own positive control before its negatives mean anything**,
+which is the same rule as the entries it is verifying, one level up.
+
 ### ⛔ THE ROW PLANE WAS UNREACHABLE FROM EVERY NON-GUI HOST, AND THE REFUSAL DID NOT SAY SO
 
 Measured by a delegate, 2026-08-07: row 5.1 (on dev) tried to message row 5.2
@@ -10011,6 +10753,33 @@ relaunched; only a supervisor-addressed TERM is a shutdown order. Recovery
 recipe that works, verbatim: read WAYLAND/XDG/DBUS env off a live desktop
 process → `setsid ~/.local/bin/yggterm --supervise </dev/null &`.
 
+⚠ **CONDITIONALLY LIVE — and the condition is HOW THE GUI WAS STARTED, which
+this entry never states. Measured 2026-08-13.** There are **two** desktop entries
+on the GUI host with different Exec lines:
+
+```
+dev.yggterm.Yggterm.desktop   Exec=…/yggterm --supervise      ← supervised
+yggterm.desktop               Exec=…/yggterm                  ← not
+```
+
+and the GUI actually running was started by neither: `server app launch` detaches
+it, so it has **PPID 1** and **zero** processes match the supervise pattern. ⇒ On
+an agent-launched GUI there is no supervisor to die, and the recovery recipe
+above would put the host into a mode it was not in.
+
+⛔ **Do not read this as "fixed".** A desktop-icon launch still takes the
+supervised path, so the child-exit policy question is real for that half — it is
+simply not reachable from the state an agent finds the host in. **Say which
+launch path a measurement was taken on**, because the two produce different
+process trees and the entry's symptom only exists in one of them.
+
+⇒ Same stale premise as [`ygg-unwedge` being blind on the GUI host](#): that
+tool searches for the `--supervise` parent, which an agent-launched GUI does not
+have. One fact, two entries.
+
+**Falsifier:** on a desktop-launched (supervised) GUI, `kill -TERM <child>` is
+followed by a relaunch.
+
 
 ## ★★ WEBAUTHN / PASSKEYS ARE UNREACHABLE ON AN AGENT-CREATED SURFACE
 
@@ -10627,6 +11396,71 @@ only thing left to attach to was an orphan. Agents should create ONE session
 per run and LEAVE IT UP; visibility beats tidiness.
 
 
+
+⚠ **RE-CHECKED 2026-08-13 AND THE RESULT IS INCONCLUSIVE — recorded so the zero
+is not banked as a fix.** On the live GUI host: `agent_leases: 0`,
+`web surface entries: 0`, orphans found: **none**. But **there were no leased
+surfaces at all**, so "no orphan" is the answer this check gives in a world where
+the bug is impossible to observe. It discriminates nothing. (The matching logic
+was positive-controlled first — it can find a row that exists — so the zero is a
+real zero, just an uninformative one.)
+
+**The decisive test, and the two reasons I did not run it here:**
+
+```
+create a row → remove it (tombstoning it) → web ensure --session <dead path>
+             → does a live surface now exist with no row?
+```
+
+1. ⛔ **Never on the default profile.** The original incident drove a payment
+   gateway on the user's own cookie jar; an unqualified surface IS `default`.
+   Use an `agent-<n>` profile.
+2. ⚠ **It creates a real web surface on the shared GUI host**, which is the
+   subject matter of the open idle-cost investigation — a surface appearing
+   mid-A/B corrupts someone else's measurement. It wants a window, not an
+   opportunistic run.
+
+**Falsifier:** after `web ensure` on a tombstoned session path, either no surface
+is alive, or a row exists for it.
+
+### ✅ THE NAMED SEQUENCE IS NOW REFUSED — fix (b) shipped, measured 2026-08-13
+
+Ran the entry's own sequence on the live host under a granted window: create a
+row → `session remove` it (tombstoning it) → `web ensure --session <dead path>`.
+
+```
+accepted: false
+detail: "…'s row was closed by the user and its runtime is gone, so reviving a
+         web surface under it would give you a live page with no row the user
+         can see or click into. Create your own session … and drive its surface
+         instead"
+```
+
+⇒ **The refusal restates this entry's own justification**, so option (b) was the
+one taken. ⭐ **No surface came into being at all** — `agent_leases: 0`,
+`active_surface_requests: 0` after the attempt — so the check cost nothing and
+touched no profile.
+
+**Control, same run:** a session path that never existed refuses with a
+*different* reason (`the daemon has no web-surface declare for …`), so the verb
+is discriminating between cases rather than refusing everything by default.
+
+⚠ **TWO THINGS THIS DOES NOT CLOSE, and the entry stays open for them.**
+
+1. **Option (a) was not implemented.** A surface holding a lease does not keep or
+   resurrect a row; the orphan is prevented at one door rather than made
+   unrepresentable. The constitution's UX test — the user can SEE an agent's
+   session and click in to co-browse it — is met here by refusal, not by the row
+   surviving.
+2. **The other sequence is untested:** removing a row that ALREADY has a live
+   surface. `web ensure` refuses a dead path, but nothing here shows what happens
+   to a live surface when its row is removed underneath it. That needs a
+   web-capable row (a plain shell has no declare at all — the control above says
+   so), so it creates a real browser surface and wants its own window and an
+   `agent-<n>` profile.
+
+**Falsifier for what remains:** remove a row whose surface is live, and no
+surface survives without a row.
 ## ★★★ web do FIDELITY ON RE-RENDERING DOMs
 
 **Status:** OPEN
