@@ -92,11 +92,33 @@ add or drop keys here (Dioxus applies `style` property-by-property and does not
 clear dropped keys — that lingering was the docked-rail-ghost bug)."*
 
 ⇒ a style property emitted in one mode and **absent** from another is not
-cleared, it LINGERS. That is the documented failure family for this exact
-element, it would survive every later mode change (which matches "hours"), and
-it would leave the card painting while its contents collapse.
-⛔ Not confirmed. Falsifier: read the rail content div's computed style and
-child geometry, and compare the key SET emitted across all four modes.
+cleared, it LINGERS. This symptom is a VERBATIM recurrence of the one that
+trap first produced (*"the right sidebar cannot be opened, nothing draws on the
+right"*), which is why it was the obvious next suspect.
+
+⛔ **AND IT DOES NOT HOLD — checked, in the code, and recorded so nobody walks
+it again.** `sidebar_panel_outer_style` and `sidebar_panel_card_style` each
+build ONE `format!` with a fixed key set and vary only the values, which is
+exactly the fix that trap was closed with. The key sets cannot differ by mode.
+
+⛔ **Zoom does not hold either.** The card is transparent in-flow by design
+(`background-color:transparent`, the app background paints behind it), so the
+pale band is the app background — and the tree and the rail pass **byte-identical**
+zoom arguments (`zoom_percent_f32(settings.ui_font_size, 14.0)`) to the same
+helper. A zoom collapse would have taken the tree with it, and the tree draws.
+
+⇒ **What is left is the body itself, and every reading says it should draw.**
+`rail_render_view` is the single owner of "what is the rail drawing" and the
+probe reads that same value; it reports `docked:true` + a `rendered_mode` the
+dispatch has an arm for; `SideRailShell` interpolates `{body}` unconditionally;
+and the body's first child is an unconditional `RailHeader`. Every one of those
+is true and the rail is still empty, which is the shape of a reading that is
+answering a different question than its name suggests.
+
+⭐ **Falsifier, and it needs an instrument that does not exist yet:** read the
+rail content div's CHILD COUNT and computed geometry from the live DOM. If the
+children are absent, the body never rendered and the fault is upstream of the
+styles; if they are present with zero size, it is layout.
 
 ⚠ **There is no DOM-read verb to run that falsifier with.** `server app chrome`
 offers only `type`, whose `--assert <selector>@<attribute>` is the sole DOM read
@@ -175,6 +197,29 @@ behaviour), while the "still submits normally" control passed.
 do not `terminal submit` to a row that is not consuming input. A row reading
 `busy: agent_working_daemon` will not echo, so the submit will hammer it for the
 full timeout. Check first, and never retry a `submitted:false` by sending again.
+
+### ⛔⛔ THE FIX CANNOT BE DEPLOYED WHILE AN UNSENT DRAFT IS OPEN — AND THAT IS NOT A PARADOX, IT IS THE ORDERING
+
+**A daemon handover TYPES.** §5's hot-restart repair submits `continue` to rows
+after a handover (`hot_restart_repair_continue`), through the very function this
+entry is about. On any build that does not yet carry the guard — **including
+every build installed right now** — that submit has no draft check, so a deploy
+can splice `continue` plus its retry barrage into a half-typed sentence.
+
+⇒ **Deploying the fix runs the unfixed path one last time.** The protection
+begins at the handover AFTER the one that installs it.
+
+⛔ **So while a human has an unsent draft in a live composer, do not deploy a
+daemon** — not even this fix, and not "quickly". The correct order is: the draft
+is sent or cleared, THEN the daemon is bumped, THEN the guard is live for every
+handover after that.
+
+⚠ **This generalises past this entry.** "Do not relaunch the GUI, the owner has
+an unsent draft" is the right instinct applied to the wrong process — the GUI
+relaunch does not type, and the DAEMON handover does. **A daemon bump is the more
+dangerous of the two for a draft**, which is the opposite of how it is usually
+treated. Same reasoning as the settle-window asymmetry above: a fix that lives in
+the predecessor cannot protect the handover that installs it.
 
 ### ⚠ "BLINKING" NOW HAS TWO UNRELATED CAUSES — TELL THEM APART BEFORE FILING HERE
 
@@ -328,6 +373,39 @@ row grows; an unreachable one is frozen. Sample twice a few seconds apart.
 **Fix:** name the two states in the reply. The daemon endpoint the submit resolved to is already known
 at that point, so "the row I addressed is served by a socket nothing has bound" is answerable.
 
+## ⛔ A DAEMON THAT TAKES ITS SESSIONS BACK IS STILL MUTED — NOTHING ON THE HOST WRITES THEIR STATE
+
+**Status:** OPEN
+
+Found while building the settle window, 2026-08-14. Not caused by it — made
+reachable by it, and it is the same shape as the bug the immediate-persist fix
+already closed from the other side.
+
+`superseded_routine_persist_muted` is a **hard, permanent latch**
+(`daemon.rs`, `routine_persist_should_mute`): once a strictly newer daemon is
+seen, this daemon never writes `server-state.json` again. That is right while the
+successor is alive — a stale predecessor must not clobber the successor's file.
+
+⛔ **It is wrong the moment the successor dies.** The settle window now hands the
+sessions back: the predecessor wakes its readers and is once again the only
+process serving them. It is also still muted, and the successor that DID write
+the state file is gone. ⇒ **No process on the host will record those sessions
+again.** If the predecessor is then killed, they are unrecoverable — exactly the
+condition the immediate-persist-on-adoption fix was written to end.
+
+**The fix, and why it is not a one-liner.** Clearing the latch is only safe when
+no live newer daemon exists — another one may have arrived meanwhile — so the
+test is `live_newer_daemon_version(...).is_none()`, the existing single owner of
+that question. The obstacle is reach, not logic: `spawn_handoff_settle_watch`
+holds no runtime handle. The superseded-retire caller has the
+`Arc<Mutex<DaemonRuntime>>`; the hot-update caller has only `&mut self`.
+
+⚠ **Do not solve it by passing an `Option<Arc<…>>`** — "a handle that is
+sometimes there" is a fork wearing a table's clothes, and this crate has paid for
+that shape before. Either give both callers the same handle, or make the mute a
+DERIVED fact (ask whether a newer daemon is live) rather than a latch, which is
+what it actually means.
+
 ## ⚠ A HANDOVER THAT LOSES ITS SUCCESSOR STILL LOSES THE SECONDS THAT SUCCESSOR ALREADY READ
 
 **Status:** OPEN
@@ -350,15 +428,20 @@ successor died holding them.
 session.** The same run measured `bytes_stolen_after_park: 0`, and the ordinary
 handover — successor lives — showed **no gap at all** across the swap.
 
-**Also unmeasured, and widened by the same change:** the predecessor now lives
+**Partly measured, and widened by the same change:** the predecessor now lives
 ~10 s longer while both daemons hold the same runtimes, where before it was
-250 ms. Both answer for those sessions during that window. No row duplication
-was observed, but the sandbox has no GUI, so the row layer's behaviour over a
-10 s double-claim is **untested rather than proven fine**.
+250 ms. Both answer for those sessions during that window.
 
-**Falsifier for the residual:** run a handover under a live GUI with rows on
-screen, and watch the sidebar for duplicate or flickering rows for the length of
-`YGGTERM_HANDOFF_SETTLE_MS`.
+⭐ **Probed one layer under the sidebar, mid-window:** a client snapshot taken
+while both daemons held all three runtimes reported **three distinct session
+paths — no duplicate identity.** That is where a duplicated row would have to
+come from, so the mechanism most likely to break is measured, not assumed.
+
+⛔ **It is still not a pixel.** The sandbox has no GUI, so what the sidebar
+RENDERS over a 10 s double-claim is untested. **Falsifier:** run a handover under
+a live GUI with rows on screen and watch for duplicate or flickering rows for the
+length of `YGGTERM_HANDOFF_SETTLE_MS` — the one check that needs the GUI host and
+cannot be done headlessly.
 
 ## ⛔⛔⛔ [6.7] A ROW CAN BE ALIVE, IDLE-LOOKING, AND NOT READING ITS PTY — THE "I CANNOT TYPE" BUG
 
@@ -2366,6 +2449,39 @@ a measurement.
 ## ⛔⛔ [6.7] THE WEB PROCESS'S MEMORY BOUND CANNOT HOLD, BECAUSE SWAP MAKES ITS FOOTPRINT LIE
 
 **Status:** OPEN
+
+### ✅ CONFIRMED LIVE 2026-08-14 — THE BOUND IS ALREADY BEING EXCEEDED, INVISIBLY
+
+Previously this was settled from `strings` on the shipped `.so` (the bound polls
+`VmRSS`). It is now measured on the running host, and the process has **already
+crossed the limit without the limit noticing**:
+
+| yggterm's web process (child of the GUI) | |
+|---|---|
+| `VmRSS` — **what the bound compares against** | **947 MB** |
+| `VmSwap` | 1,118 MB |
+| **committed (`RSS + swap`)** | **2,065 MB** |
+| the configured bound (`MemTotal/8`) | **1,889 MB** |
+
+⇒ **176 MB over the bound, and the bound reads 947 MB — barely half.** The
+overage is not merely unseen, it is unseeable *by construction*: the amount by
+which the process exceeds its budget is precisely the amount the kernel swapped
+out, which is exactly what an RSS-valued comparison stops counting. **The metric
+subtracts the evidence of the thing it is measuring.**
+
+⛔ **This is why "tune the constant" is the wrong instinct and remains refused.**
+No value of `MemTotal/8` fixes a comparison whose left side shrinks as the
+problem grows — lowering it does nothing once the excess is in swap. Either the
+comparison becomes swap-inclusive (a cgroup, which counts what the machine
+actually committed) or the bound stays decorative.
+
+⚠ **Scope, stated honestly so nobody over-claims it.** The whole yggterm family
+(GUI + 4 WebKit children) commits **≈3.5 GB, of which ≈2.0 GB is swapped**, on a
+14.8 GB host carrying **12.3 GB of swap in use**. So yggterm is a significant
+share of the swap pressure, **not the cause of it** — the rest is spread across
+many unrelated desktop processes. ⇒ Fixing this bound makes yggterm frugal; it
+will not by itself bring the machine out of swap, and claiming otherwise would
+set up a measurement that is guaranteed to disappoint.
 
 *single-pid lifetime measurement, desktop host 2026-08-13, restart-free*
 
