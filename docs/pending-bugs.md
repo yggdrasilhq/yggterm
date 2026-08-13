@@ -29,6 +29,36 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⛔ THE PRIVACY GUARD MATCHES SHORT TERMS INSIDE UNRELATED IDENTIFIERS, AND REFUSES A PUSH EVERY TIME
+
+**Status:** OPEN
+
+*Surfaced 2026-08-13 while cry-wolf-testing an unrelated guard change. Filed here because the only
+other record of it is a runbook with a stated expiry three days out.*
+
+The term check is a **case-insensitive substring** match, so a short alphabetic term matches inside
+an ordinary identifier that has nothing to do with it. A common `use` statement in one repo trips
+it and the push is refused **every time, deterministically**.
+
+⛔ **WHY THIS IS URGENT OUT OF PROPORTION TO ITS SIZE.** A guard that refuses a push a developer
+knows is clean, on every attempt, teaches exactly one lesson: reach for the override. And the
+override suppresses the **entire** scan. ⇒ A permanent false positive is not a nuisance; it is a
+pipeline that manufactures the habit a real leak ships on. It is the same defect as a refusal that
+scans a dead lineage — both spend the guard's credibility until nobody reads it.
+
+**Fix:** require a word boundary for short alphabetic terms.
+
+⚠ **AND THE REASON IT WAS NOT DONE WHEN IT WAS FOUND, which is a judgement worth preserving:**
+changing term-matching semantics **risks introducing a false NEGATIVE, which is strictly worse than
+a noisy false positive**. It was found at the very end of a context budget and deliberately left
+rather than rushed. ⇒ **Do not take this one in a hurry, and land it with both controls in the same
+run: a known-private string must still refuse, and the innocent identifier must pass.**
+
+⭐ **The generalisation, third sighting of the shape in one evening:** the guard's substitution-side
+law and its detection-side law are one law seen from two ends — *a replacement must be legal in
+every syntactic position the original occupies*, and *identity does not live only in whole tokens*.
+Both are the mismatch between a flat term list and the syntax a term actually sits in.
+
 ## ⛔⛔ [6.1] SOME ROWS WILL NOT RESTORE, AND A RESTART DOES NOT RECOVER THEM
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
