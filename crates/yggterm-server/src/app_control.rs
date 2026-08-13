@@ -1139,6 +1139,23 @@ pub enum AppControlCommand {
         row_path: String,
         expanded: bool,
     },
+    /// Arrange a live row into, or out of, a row set — the verb twin of the
+    /// inside-band drag and the right-click un-group.
+    ///
+    /// ⛔ Writes MEMBERSHIP, never a seat. Forming a group by renumbering would
+    /// rewrite `outline_prefix` on rows the user created, and would not work at
+    /// all on un-numbered rows, which are exactly the ones a hand most needs to
+    /// group.
+    ArrangeRowSet {
+        row_path: String,
+        /// The head to file it under. `None` with `dissolve` false takes the
+        /// row OUT of whatever holds it.
+        #[serde(default)]
+        into_path: Option<String>,
+        /// Dissolve the set this row HEADS, promoting its members.
+        #[serde(default)]
+        dissolve: bool,
+    },
     SetTreeSelection {
         paths: Vec<String>,
         #[serde(default)]
@@ -1687,6 +1704,7 @@ impl AppControlCommand {
             Self::SetSplitGroupRatio { .. } => "set_split_group_ratio",
             Self::FocusSplitPane { .. } => "focus_split_pane",
             Self::SetRowExpanded { .. } => "set_row_expanded",
+            Self::ArrangeRowSet { .. } => "arrange_row_set",
             Self::SetTreeSelection { .. } => "set_tree_selection",
             Self::WebSurfaceEval { .. } => "web_surface_eval",
             Self::WebSurfaceScreenshot { .. } => "web_surface_screenshot",

@@ -47,7 +47,7 @@ use yggterm_server::{
     run_app_control_set_clipboard_text, run_app_control_set_force_foreground,
     run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_app_pane_action, run_app_control_set_right_panel_mode,
-    run_app_control_set_row_expanded,
+    run_app_control_arrange_row_set, run_app_control_set_row_expanded,
     run_app_control_set_search, run_app_control_set_session_keep_alive,
     run_app_control_set_launch_flags, run_app_control_set_split_group_ratio,
     run_app_control_set_theme_editor_open,
@@ -226,6 +226,12 @@ fn print_server_app_help() {
   yggterm-headless server app desktop-identity
   yggterm-headless server app state [--pid <pid>]
   yggterm-headless server app rows [--pid <pid>]
+  yggterm-headless server app row-set <row-path> [--into <head-path>|--out|--dissolve]
+    arranges a live row into or out of a ROW SET — the verb twin of dragging a
+    row onto another and of right-click un-group. `--into` files it under that
+    head, `--out` takes it to the top level, `--dissolve` breaks up the set this
+    row heads and promotes its members. ⛔ It writes MEMBERSHIP, never a seat:
+    grouping never renumbers a row, so un-numbered rows group like any other.
   yggterm-headless server app row-expanded <row-path> <true|false>
     opens or shuts a container — a folder, a machine, or a ROW SET's head — the
     way clicking its disclosure control does. Row-set heads are ordinary session
@@ -1994,6 +2000,32 @@ fn main() -> Result<()> {
             // that no verb on the command line could change — the half of
             // "an agent arranges rows as easily as a hand does" that was
             // written and then never wired to a name a caller could type.
+            // `server app row-set <row-path> [--into <head>|--out|--dissolve]`
+            // — the verb twin of the inside-band drag and the right-click
+            // un-group. DESIGN.md: both halves exist or neither is real.
+            "row-set" => {
+                let positional = cli_positional_args(&args, 3);
+                let row_path = positional.first().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "usage: server app row-set <row-path> [--into <head-path>|--out|--dissolve]"
+                    )
+                })?;
+                let into = cli_flag_value(&args, "--into");
+                let dissolve = args.iter().any(|arg| arg == "--dissolve");
+                let out = args.iter().any(|arg| arg == "--out");
+                // Named rather than defaulted: guessing between "file this
+                // under something" and "take it out" would silently do the
+                // opposite of what the caller meant half the time.
+                if into.is_none() && !dissolve && !out {
+                    anyhow::bail!(
+                        "server app row-set needs one of --into <head-path>, --out or --dissolve"
+                    );
+                }
+                if into.is_some() && (dissolve || out) {
+                    anyhow::bail!("--into cannot be combined with --out or --dissolve");
+                }
+                run_app_control_arrange_row_set(row_path, into, dissolve, timeout_ms)
+            }
             "row-expanded" => {
                 let positional = cli_positional_args(&args, 3);
                 let row_path = positional.first().ok_or_else(|| {
