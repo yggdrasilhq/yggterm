@@ -788,9 +788,82 @@ print help for an unknown verb — it **launches a client instance**, which then
 took the running GUI down with it and left a `SIGABRT` coredump of its own. Use
 `yggterm-headless` for every control verb; see `docs/agent-field-guide.md`.
 
-**Still to attribute (this cluster's next load):** which of the 162 `spawn`
-sites and three `use_future` loops produce the spurious wakeups, and what
-retains the web contexts.
+### ⛔ THE RE-RENDER IS NOT WHAT GROWS — measured 2026-08-13, and it redirects the fix
+
+The reading this entry was about to act on — *the app root re-renders several
+times a second at rest, so stopping the unconditional re-render is the win* — is
+**refuted by the app's own always-on probe.** `app_render_rate` (shell.rs, no
+`render_trace_enabled()` gate, emits `renders_per_sec` once a minute) had already
+recorded the regression's whole render history. Reduced from the aged GUI's
+trace, the one that reached 0.910 core:
+
+| hour | renders/sec |
+|---|---|
+| 1 | 3.0 |
+| 3 | 2.1 |
+| 5 | 1.9 |
+| 7 | 2.0 |
+| 9 | 1.9 |
+| 11 | 2.1 |
+
+⇒ **739 samples over 12.3 h: the render rate is FLAT at ~2/s while CPU climbs
+3.6×.** A constant-rate loop cannot be the thing that grows, so **capping the
+render rate cannot recover the regression** — it is worth a slice of the fresh
+floor and nothing of the climb.
+
+**The `utime`/`stime` split says the same thing and says where to go instead.**
+Fresh process measured today, against the aged split already in this entry:
+
+| | fresh (5 min) | aged (36.9 h) | growth |
+|---|---|---|---|
+| user | 13.9% | 33.5% | **2.4×** |
+| kernel | 7.9% | 58.8% | **7.4×** |
+| total | **21.8%** | 92.6% | 4.2× |
+
+Rendering is user time; the clock-syscall storm is kernel time. **The kernel half
+grows three times faster than the user half** ⇒ the growth lives in the wake/poll
+path, not in Dioxus. This agrees with the 1,554 `clock_gettime` per `ppoll`
+ratio already recorded above, and it is what "a population of cheap objects"
+predicts: more live futures/sources per wake, each priced at 1222 ns on `hpet`.
+
+⚠ **A note on the two figures, because they are not in conflict and reading them
+as one number loses the diagnosis.** ~2/s is the rate **at rest**; the 20–33/s in
+the storm autopsies is a different regime, and the autopsy arms only at ≥20/s by
+construction, so it can never sample rest. Quote which regime a render figure
+came from or it means nothing.
+
+**Reproduced minimally, so the shape is not session-scale.** A GUI with **zero
+sessions** in the sandbox (`scripts/underglass-sandbox.sh start --env
+YGGTERM_TRACE_RENDER=1`, `YGGTERM_GUI_BIN` pointed at a GUI build — the installed
+binary on a headless host is not one) renders **1.67/s at rest** and reports
+**246 of 258 renders `unattributed`** with `forced_wakes` unchanged: the root
+re-renders while no watched field changed and nothing of ours scheduled it. The
+inter-render gaps name the drivers exactly — **56 gaps of 1001–1002 ms**
+(`INPUT_GATE_DEADLINE_TICK_MS`), and a 350–699 ms population that **pairs to
+~1001 ms** (419+587, 424+577, 441+560, 464+538, 473+528, 491+510), which is the
+beat of a *second* independent 1 Hz timer against the first. So the idle render
+load is two 1 Hz timers, each calling `state.with_mut(...)` whose closure
+early-returns without mutating — and `with_mut` marks the signal dirty on drop
+regardless. Worth fixing on its own terms; **not** the regression.
+
+⚠ **And it explains why three storm autopsies in a row died undiagnosed.** They
+all reported "unattributed, empty histogram", which reads as *nothing wrote* —
+but `shell_mut_hist` counts only `safe_shell_mut`, and **raw `state.with_mut` is
+invisible to it**. A no-op raw `with_mut` produces exactly that signature. The
+instrument was not saying "nothing wrote"; it was saying "nothing I can see
+wrote". Closing that blind spot is a prerequisite for the next autopsy meaning
+anything.
+
+**Still to attribute (this cluster's next load):** what grows in COUNT in the
+wake path — the 162 `spawn` sites, glib sources on the main context, and what
+retains the web contexts. Baseline census for the diff, live GUI at 220 s:
+**59 threads, 49 fds, 3 timerfd, 10 eventfd, 2 `ReceiveQueue`, 1
+`WebsiteDataStore`** (aged: 13 and 11).
+
+⚠ **guihost is a moving target while the batch runs** — three GUI pids inside one
+hour on 2026-08-13, other clusters deploying. Growth measurements over hours
+need either a quiet host or the sandbox on `dev`; a GUI that vanishes mid-sample
+is usually another cluster's deploy, not your own doing.
 
 ## ⛔ [6.7] A DAEMON RE-DROPS THE SAME UNRECOVERABLE SESSIONS THREE TIMES A SECOND, FOREVER
 
