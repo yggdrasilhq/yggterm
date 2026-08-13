@@ -4536,10 +4536,93 @@ one thing that would complete the arm is a session actually running a delegate.
 whose `blockers[].kind` is `orchestrating`. Neither existed before 3.0.101, so
 the first occurrence is the proof.
 
-**Still unbuilt:** §2 (relay boundaries as the appointment), §4 (the queue), §5
+### ⭐ THE ROOT CAUSE OF THE VERSION SKEW, FOUND 2026-08-13 — ONE SHOT, NO TARGET
+
+The gate was never what kept the hosts stale. **The swap intent was, and it was
+being thrown away twice on every host.**
+
+**(a) The self-retire handoff never named its target.**
+`attempt_self_retire_preserving_handoff` called `hot_restart_detailed(…,
+expected_version: None, …)` on the stated reasoning that *"we cannot cheaply read
+the successor's version here (the on-disk binary already IS the new version, so
+the spawned successor comes up correct)"*. Both halves were false:
+`yggterm_executable_reported_version` is one `--version` on the very binary about
+to be spawned — and `try_startup_stale_daemon_hot_swap` **already paid it, on its
+own lane, for this exact decision** ([[finding-a-claim-proven-on-one-lane-is-not-proven]]).
+With `None` the handler never promotes install-state, so under a managed Direct
+install the spawned child re-execs back to the OLD active version, finds the
+socket bound and exits 0; and the handler's "a live daemon at or above the target
+IS the successor" shortcut cannot evaluate, so the doomed spawn is the only path.
+
+**(b) The retire poll `break`s after the first accepted handoff.** The one thread
+that could notice the swap had not landed, and retry, exited.
+
+**Live trace, GUI host, 2026-08-13** — daemon 2232011 (3.0.118), whose on-disk
+binary was 3.0.120 and whose GUI was 3.0.120:
+
+    13:45:52  daemon_self_retire            {retire_trigger: "disk_binary_replaced"}
+    13:46:02  hot_update_handoff_prepared   {spawn_ok: true, expected_version: null}
+    13:46:02  daemon_self_retire_handoff_ok {outcome: "preserved_owner_handoff"}
+              …and nothing further, ever.
+
+⭐ **`daemon_self_retire` fired exactly ONCE in that daemon's lifetime.** Forty-five
+minutes later the host still had no daemon at the GUI's version, and nothing
+anywhere recorded that one was owed. The workshop host had stacked **eighteen
+coexisting daemons the same way, the oldest alive 20.6 days**; the GUI host five,
+the oldest 193.9 h. `spawn_ok: true` is the tell — it records that the *spawn*
+worked, which is a different question from whether a successor exists.
+
+⛔ **And the daemons already stacked cannot be reached by any of this.** The GUI
+host's four lingerers run 3.0.29/3.0.70/3.0.75/3.0.76 — all pre-3.0.81, so they
+have neither `not_restorable` nor `permanent` and never will. A gate change
+reaches the NEXT generation of daemons only; the standing pile is residue, and on
+the GUI host it is pinned by ychrome shells whose PTYs may not be destroyed, so
+lingering is the correct end state for them.
+
+⚠ **A second, narrower defect found beside it, not yet fixed:** the progressive
+migration drain is started only from a handoff (`retire_trigger ==
+"disk_binary_replaced"`, or a `HotRestart` RPC). A daemon retiring under
+`retire_trigger == "newer_daemon_live"` — the deploy shape that RENAMES the old
+binary aside rather than unlinking it, so `/proc/self/exe` is not `(deleted)` —
+never arms the drain at all. Measured: pid 426042 (3.0.75) logged
+`daemon_self_retire {retire_trigger: "newer_daemon_live"}` every 20 s for
+**100.6 hours** with no drain ever running.
+
+**Landed — §4, the queue, in 3.0.123.** `hot_restart_queue` is the host's durable
+record of the one swap it owes (`~/.yggterm/hot-restart-queue.json`): a single
+slot, superseded by a newer target rather than appended to, and ⛔ **a re-request
+for the target already queued must not move `requested_at_ms`**, because §5's
+deadline is measured from it and a clock that resets on every poll is the
+never-converging gate rebuilt one layer up. The retire poll no longer `break`s: it
+queues, lingers, and retries on a five-minute floor that is enforced
+process-locally as well as in the file, so a peer's write cannot hand this process
+a fresh allowance to spawn another successor. `server daemons` prints the owed
+swap and the reason the last attempt gave (§8: *"something must be nameable as the
+thing it waits for"*). The self-retire handoff now probes the replacement binary
+and passes its version.
+
+**Still unbuilt:** §2 (relay boundaries as the appointment), §5
 (the deadline + `continue` repair), and the rest of §3 — **blocked-on-human is
 not yet a state**, and an agent session's WORKING state is still inferred from
-silence rather than from a positive signal.
+silence rather than from a positive signal. §4's queue is built but has only ONE
+producer (the daemon's own retire poll); the GUI's startup reconcile still
+declines silently and leaves nothing behind — see the next paragraph.
+
+⚠ **The GUI's startup reconcile drops the intent too, and one unrecognised
+session key is enough to do it.** `startup_daemon_hot_swap_reason_with_authorized_keys`
+answers `None` — silently, with no trace — when the stale daemon owns terminal
+runtimes whose keys are not ALL in the authorized set
+(`server-state.json` live sessions ∪ `hot-update-terminal-owners.json` entries),
+and `reconcile_stale_daemon_on_startup` then returns `false` and forgets.
+Measured on the GUI host: of the 3.0.118 daemon's **9 owned keys, 8 were
+authorized and 1 was not** — `local://6b91a415-…`, a row created since the last
+state persist. `runtime_status_owned_runtime_is_authorized` requires `all()`, so
+one such key vetoes the whole host's daemon upgrade for as long as it lives.
+⇒ **Do not relax the predicate** — it guards against handing off runtimes nobody
+can account for. Queue the intent instead and let the retry find the moment when
+the key has been persisted. **Falsifier:** compare a stale daemon's
+`owned_terminal_session_keys` against those two files; the swap is declined iff
+any key is missing from the union.
 ⚠ Two known gaps in what landed, both in the safe direction (they answer "not
 orchestrating", which is exactly the pre-3.0.101 behaviour, so nothing regressed):
 a `remote-cc://` row's transcript lives on the FAR host and reading it is an ssh

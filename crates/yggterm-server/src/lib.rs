@@ -48,6 +48,10 @@ mod codex_cli;
 mod daemon;
 pub mod daemon_bridge;
 pub mod grid_overlay;
+// §4 of docs/spec-hot-restart-relay-gate.md — the durable "this host owes a
+// swap" record. PUBLIC because the intent outlives the daemon being replaced:
+// the GUI forms it, a daemon poll drains it, and `server daemons` reports it.
+pub mod hot_restart_queue;
 mod host;
 mod live_row_tombstones;
 mod profile_write_lock;
@@ -123,7 +127,7 @@ pub use daemon::{
     current_client_identity, parse_client_role, set_client_identity,
     verify_shadow_client_can_attach,
     DRAFT_REFUSAL_MESSAGE, DaemonCensusRow, DaemonSelectorKind, daemon_census,
-    format_daemon_census, resolve_daemon_endpoint_selector,
+    format_daemon_census, format_daemon_census_with_queued_swap, resolve_daemon_endpoint_selector,
     terminal_write_guarded, terminal_write_was_refused_for_draft,
     HOT_RESTART_BLOCKER_NOT_RESTORABLE, HOT_RESTART_BLOCKER_RECENTLY_ACTIVE,
     HOT_RESTART_BLOCKER_WORKING,
