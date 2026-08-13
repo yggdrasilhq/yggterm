@@ -6410,6 +6410,68 @@ But the cheap fix is guidance, not code: *invent test ids with letters in them.*
 resulting row reports a non-permanent blocker set; `server sessions classify`
 exists. (The third item is retracted, not open.)
 
+## ⚖ THE WORKING DOT IS BLIND WHERE IT MATTERS MOST — the discovery half
+
+**Status:** OPEN
+
+The owner asked for a working indicator. 6.3 owns the RENDER half; this entry
+owns the prior question — **what makes a session's working-state knowable at
+all**, and why `working` is `None` on most rows.
+
+### There is exactly ONE producer, and it needs a locally-owned live PTY
+
+`DaemonRuntime::working_flags` is the whole supply. For an agent CLI it reads
+the live in-daemon vt100 screen and asks THAT CLI's own matcher
+(`descriptor.screen_shows_working`); for a plain shell it asks whether a
+foreground process is active. **Both require this daemon to be holding the
+session's PTY.** There is no transcript source, no remote source, and no
+fallback — so for any row whose PTY this daemon does not hold, the working state
+is not merely unknown, it is unaskable.
+
+### ⛔ AND "I COULD NOT LOOK" IS ENCODED AS "NOTHING TO REPORT"
+
+The match ends in `}?;` — so a session whose source is unreadable is **dropped
+from the returned list entirely**, rather than reported as unknown. Downstream
+nothing distinguishes *"the screen says this agent is idle"* from *"there was no
+screen to read"*. That is the same conflation `server gate-screen` had to split
+apart explicitly with `screen_available`, in the same subsystem, for the same
+reason: **a blind instrument and a negative reading must not share an encoding**
+([[finding-a-constant-anomaly-is-a-measurement-bug]]).
+⇒ **This is the fix worth making first**, because every downstream consumer —
+including whatever the dot falls back to — is currently reasoning from a value
+that cannot say "ask someone else".
+
+### What was measured, on the workshop host, 271 live-session records
+
+    working = None   232      False  27      True  12
+    by kind:  shell        36 answered / 36     ← 100%
+              claude_code   3 answered / 229    ← 1.3%
+              codex         0 answered / 5
+              open_code     0 answered / 1
+
+⇒ The indicator is present almost exactly where it is not needed (shells) and
+absent almost everywhere it is (agent rows).
+
+### ⚠ AND THE OBVIOUS INFERENCE IS NOT ESTABLISHED — the join is across two key namespaces
+
+The tempting conclusion is *"None ⇔ no live PTY here, so None is honest"*. **It is
+not proven and the first attempt to prove it was wrong.** `live_sessions[]` is
+keyed by ROW path (`cc-runtime://<cc-session-id>`), while
+`owned_terminal_session_keys` is keyed by RUNTIME (`local://<runtime-id>`); they
+are different namespaces on purpose, and joining them from outside silently
+matches nothing — a daemon reporting **38 owned keys** matched **0** of its own
+live sessions. `snapshot`'s copy of that field also came back EMPTY where
+`status`'s was populated, so the two verbs disagree about the same question.
+⇒ **The correlation needs a daemon-side instrument**, because only the daemon can
+call `terminal_runtime_key_for_path`. That is the same shape as the gate-screen
+verb, and the same answer: **expose what the producer saw**, alongside what it
+concluded.
+
+**Falsifier for whoever takes this:** a verb (or an added field) that reports,
+per row, whether a working reading was POSSIBLE and what it read. Then `None`
+splits into "not running here" and "running and idle", and the dot can stop
+standing in for attachment.
+
 ## ⚖⚖ THE HOT-RESTART GATE IS UNBUILT — THE DESIGN IS NOW SETTLED
 
 **Status:** OPEN
