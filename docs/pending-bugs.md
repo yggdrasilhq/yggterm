@@ -969,9 +969,26 @@ the sidebar DOM, the xterm canvas, and the JS we inject.
 
 ⇒ **~15× on the web process, in USER time, and it tracks CONTENT rather than
 uptime.** Whatever it is, it is proportional to what is on screen or in the
-tree, and it runs with no events, no output and no user present. **This is now
-the larger half of the idle cost and the least explained** — bigger than the
-app-root re-render that this cluster has already fixed.
+tree, and it runs with no events, no output and no user present.
+
+⚠ **CORRECTION 2026-08-13, from the continuous recorder — the web process is
+NOT twice the GUI, and the earlier reading here said so because the GUI's own
+number was diluted.** The first recorder build classified processes by command
+line, and every agent row is launched by an `ssh … /yggterm server remote
+resume-cc …` wrapper, so a dozen near-idle ssh and bash processes were averaged
+in as "gui". Keyed on `comm` instead, over a 10-minute window:
+
+| role | corrected | as first reported |
+|---|---|---|
+| `web_content` | **32.5%** (n=56, 767 MB) | 28.3% |
+| `gui` | **25.7%** (n=63, 152 MB) | 13.2% |
+
+⇒ **~1.26×, not 2×.** Both halves are large and the GUI half is NOT a rounding
+error next to the web half. Any plan that treats the webview as the only target
+is working from the diluted number. ⛔ The instrument built to find this bug had
+to be debugged twice before its numbers could be quoted — see the commits; the
+lesson is that a role's SAMPLE COUNT must be printed beside its mean, because a
+single stale row renders as a full role.
 
 **Next instrument, and the gap that blocks it:** there is no way to evaluate JS
 in the shell's own webview — `server app web eval` and `web devtools` both
