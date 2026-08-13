@@ -3539,6 +3539,12 @@ struct CachedClaudeCodeRuntimeIdentity {
     identity: ClaudeCodeRuntimeProcessIdentity,
 }
 
+/// How often a daemon asks its siblings for the working state of rows it does
+/// not own. Short enough that the dot tracks a turn starting and stopping;
+/// long enough that a sidebar of rows never costs a round trip per row per
+/// frame.
+const PROXIED_WORKING_REFRESH_MS: u128 = 1_500;
+
 struct DaemonRuntime {
     support: GhosttyHostSupport,
     state_path: PathBuf,
@@ -3550,6 +3556,25 @@ struct DaemonRuntime {
     /// every order change through the persist chokepoint and answers "where
     /// does this row go when it comes back?" — see `row_order_ledger.rs`.
     row_order_ledger: crate::row_order_ledger::RowOrderLedger,
+    /// Working flags for rows this daemon does NOT own, as their owning daemon
+    /// last reported them, with the moment they were fetched.
+    ///
+    /// ⛔ **THE SNAPSHOT IS WHAT THE SIDEBAR DOT READS, and it had no way to
+    /// see a proxied answer.** `ServerRequest::WorkingFlags` has asked the
+    /// owning daemon for a long time; `ServerRequest::Snapshot` answered from
+    /// the raw screen scrape, so a row owned by an older coexisting daemon —
+    /// `RemoteBootstrap`, no PTY, five lines of launch preamble instead of a
+    /// screen — reported `None` forever and never blinked, however hard its
+    /// agent was working. The capability existed; the surface that needed it
+    /// asked the other question.
+    ///
+    /// ⚠ **CACHED, because snapshots are frequent and proxying is network I/O
+    /// to sibling daemons.** An unbounded per-snapshot fan-out would make the
+    /// dot cost a round trip per row per frame. Refreshed on the request path
+    /// (which holds `&mut self`) at most once per
+    /// [`PROXIED_WORKING_REFRESH_MS`]; the snapshot only reads it.
+    proxied_working_flags: HashMap<String, bool>,
+    proxied_working_refreshed_ms: u128,
     /// The shared-scope ledger order AS THIS DAEMON BOOTED — the arrangement the
     /// user left behind on the daemon we are succeeding.
     ///
@@ -3804,6 +3829,8 @@ impl DaemonRuntime {
             terminals: TerminalManager::new(),
             preserved_terminal_owners,
             row_order_ledger,
+            proxied_working_flags: HashMap::new(),
+            proxied_working_refreshed_ms: 0,
             booted_with_row_order,
             live_row_tombstones,
             live_row_identities_seen: HashSet::new(),
@@ -3985,6 +4012,31 @@ impl DaemonRuntime {
     /// One request per distinct OWNER, not per row, and an owner that fails is
     /// marked unreachable so a dead peer cannot slow the 2.5 s poll for the
     /// rest of its cache window.
+    /// Ask each owning daemon at most this often. Short enough that the dot
+    /// tracks a turn starting and stopping; long enough that a sidebar of rows
+    /// does not cost a round trip per row per frame.
+    fn refresh_proxied_working_flags(&mut self) {
+        let now = current_millis() as u128;
+        if now.saturating_sub(self.proxied_working_refreshed_ms) < PROXIED_WORKING_REFRESH_MS {
+            return;
+        }
+        self.proxied_working_refreshed_ms = now;
+        let owned: HashSet<String> = self
+            .working_flags()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        // Only the rows this daemon cannot answer for itself. A row it owns has
+        // a screen, and that answer is fresher than any round trip.
+        let mut proxied = HashMap::new();
+        for (path, working) in self.working_flags_including_proxied() {
+            if !owned.contains(&path) {
+                proxied.insert(path, working);
+            }
+        }
+        self.proxied_working_flags = proxied;
+    }
+
     fn working_flags_including_proxied(&mut self) -> Vec<(String, bool)> {
         let mut flags = self.working_flags();
         let mut answered: HashSet<String> =
@@ -4677,6 +4729,17 @@ impl DaemonRuntime {
         for session in &mut snapshot.live_sessions {
             self.overlay_terminal_runtime_snapshot_session(session);
             self.overlay_codex_runtime_snapshot_session(session, yggterm_home.as_deref());
+            // ⛔ ONLY where this daemon has no answer of its own. A scrape of a
+            // screen we own is the freshest truth there is; a proxied flag may
+            // be up to one refresh old, so it fills a hole and never overwrites.
+            // `None` still survives both — a row nobody can see must stay
+            // unknown rather than be asserted idle, or a stale blink becomes
+            // possible, and a blink that should not be there cannot be noticed.
+            if session.working.is_none()
+                && let Some(working) = self.proxied_working_flags.get(&session.session_path)
+            {
+                session.working = Some(*working);
+            }
         }
         ServerResponse::Snapshot { snapshot, message }
     }
@@ -7576,7 +7639,14 @@ impl DaemonRuntime {
             ServerRequest::WorkingFlags => ServerResponse::WorkingFlags {
                 flags: self.working_flags_including_proxied(),
             },
-            ServerRequest::Snapshot => self.snapshot_response(None),
+            ServerRequest::Snapshot => {
+                // The dot's answer for rows an older coexisting daemon owns.
+                // Refreshed HERE because the request path holds `&mut self` and
+                // `snapshot_response` deliberately does not — a snapshot must
+                // stay a read.
+                self.refresh_proxied_working_flags();
+                self.snapshot_response(None)
+            }
             ServerRequest::PrepareUpdateRestart => {
                 // The snapshot write is BEST-EFFORT: it lets the relaunched GUI
                 // restore its session view, but a failed write must NOT abort the
@@ -20470,6 +20540,54 @@ mod tests {
             flags.contains(&("remote-cc://dev/theirs".to_string(), true)),
             "a row this daemon only proxies must still get a flag, or its dot \
              can never blink; got {flags:?}"
+        );
+    }
+
+    /// ⛔ THE SNAPSHOT IS WHAT THE SIDEBAR DOT READS, and for a long time it was
+    /// the one request that never consulted a proxied answer.
+    ///
+    /// `ServerRequest::WorkingFlags` has asked the owning daemon since the proxy
+    /// was built and is covered by the two tests around this one — but a row
+    /// owned by an older coexisting daemon reported `working: None` in every
+    /// SNAPSHOT and so never blinked, however hard its agent was working. The
+    /// owner read that as his fleet being idle while eight rows were mid-turn.
+    /// The capability existed; the surface that needed it asked a different
+    /// question, which is the same shape as a verb wired at every layer with no
+    /// dispatch arm.
+    #[test]
+    fn the_snapshot_fills_a_working_flag_it_cannot_measure_and_never_overwrites_one_it_can() {
+        let source = include_str!("daemon.rs");
+        let snapshot_fn = source
+            .split("fn snapshot_response(")
+            .nth(1)
+            .expect("snapshot_response exists");
+        let body = &snapshot_fn[..snapshot_fn.find("\n    }").expect("body ends")];
+        assert!(
+            body.contains("self.proxied_working_flags.get(&session.session_path)"),
+            "the snapshot must consult the proxied flags, or a row owned by \
+             another daemon can never blink"
+        );
+        assert!(
+            body.contains("session.working.is_none()"),
+            "and only where it has no answer of its own: a scrape of a screen \
+             this daemon owns is fresher than any round trip"
+        );
+        // ⛔ The refresh may not live in the snapshot itself — a snapshot is a
+        // read, taken often, and an unbounded fan-out to sibling daemons on
+        // that path would cost a round trip per row per frame.
+        assert!(
+            !body.contains("refresh_proxied_working_flags"),
+            "the refresh belongs on the request path that holds `&mut self`, \
+             not inside the snapshot"
+        );
+        let dispatch = source
+            .split("ServerRequest::Snapshot =>")
+            .nth(1)
+            .expect("the snapshot request is dispatched");
+        assert!(
+            dispatch[..500].contains("self.refresh_proxied_working_flags()"),
+            "and the request path must actually refresh it, or the cache is \
+             written once and read forever"
         );
     }
 
