@@ -251,6 +251,34 @@ external editor rather than in yedit.
 **Falsifier:** a viewport reporting a non-zero line and character count must
 paint at least one glyph. If it cannot, it must say so rather than render black.
 
+⭐⭐ **A CHEAP, DETERMINISTIC REPRO — 2026-08-13, deploy-identity cluster.** The
+original sighting needed a 61,018-character document, which makes every check
+expensive and every difference arguable. The same state reproduces with a
+**152-character** file authored for the purpose, in four commands, provided the
+shell is ON THE GUI HOST (see the loopback entry below — a surface driven from
+another machine reads a daemon that does not exist there, which is what made
+this look unreproducible):
+
+```sh
+# on the GUI host
+printf '# probe\n\nOne paragraph.\n\n- a\n- b\n' > /tmp/<probe>.md
+yggterm server app terminal new --kind shell --cwd /tmp --purpose '<why>' --pid $GUI
+yggterm server app terminal send <row> --data 'yedit /tmp/<probe>.md' --pid $GUI
+# then a LONE carriage return — the text alone sits at the prompt unsubmitted
+yggterm server terminal write <row> --data "$(printf '\r')"
+```
+
+Measured result: the FILES rail fills, the probe appears **selected and
+highlighted**, and the status bar reads **30 words · 10 lines · 152 chars** —
+the file's true measurement. So the loading half is sound and the discrepancy is
+downstream of it, on a document small enough to hold in the head.
+
+⚠ **A clean document-VIEW frame is still owed** and was not taken here: another
+lane held a modal over the viewport at capture time, and closing another
+session's dialog mid-flight is not a thing to do for a screenshot. One
+`server app open <row> --view preview --pid $GUI` plus one screenshot completes
+it from the state above.
+
 ⭐ **THE APP PLANE ITSELF PAINTS ON THE REAL GUI — measured 2026-08-13 by the
 deploy-identity cluster at 3.0.133, on the desktop host, faithful frame.** A
 freshly launched yedit surface rendered its whole rail: the toolbar icons, the
