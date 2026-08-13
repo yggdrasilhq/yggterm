@@ -61,14 +61,20 @@ hand that specific step to the user with a precise "do X, then tell me Y" instru
 ## Host (never hardcode the private name — public repo)
 
 ```bash
-LIVE_HOST=$(cat .agents/config/live-host)   # gitignored; holds the private SSH alias
+LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
 BIN="~/.local/bin/yggterm"
 HBIN="~/.local/bin/yggterm-headless"
 ```
 
-Pass `--host "$LIVE_HOST"` to every script explicitly. (`scripts/live_mode_cycle_check.py`
-still defaults `--host` to a baked-in private name — a leak; always override it, and
-fix that default when convenient.)
+`scripts/ygg-live-host.sh` is the one resolver for "which host is the live GUI
+on"; ⛔ do not `cat .agents/config/live-host`, which is gitignored and therefore
+present only on the host it names — never on the headless machine you are
+running this from. The `|| exit 1` is load-bearing: an empty `$LIVE_HOST` makes
+`ssh "$LIVE_HOST" cmd` run cmd locally.
+
+Pass `--host "$LIVE_HOST"` to every script explicitly.
+`scripts/live_mode_cycle_check.py` resolves through the same script when
+`--host` is omitted, so the two cannot disagree.
 
 ## Preconditions (cheap, do every run)
 

@@ -5,7 +5,7 @@ durable half of what agent sessions keep re-learning; the volatile half (current
 queue, this week's findings) lives in the agent's own notes, not here.
 
 **Scope note.** This file is public. Describe hosts by role — "the live desktop
-host", `$LIVE_HOST` (read from `.agents/config/live-host`), "a remote machine" —
+host", `$LIVE_HOST` (resolved by `scripts/ygg-live-host.sh`), "a remote machine" —
 never by address, and never paste session ids, transcripts, credentials, or
 anything that resolves on the public internet. See `SECURITY.md`.
 

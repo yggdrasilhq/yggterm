@@ -175,7 +175,7 @@ If a default is wrong, change the TABLE and put the measurement in the row.
 
 For any UI change — button color, icon, layout, start page content, sidebar rows — take a live screenshot before and after using `/yggui` (see `.agents/skills/yggui-app-control/SKILL.md`). Do not mark a UI fix done until the live screenshot confirms it. App state and screenshot together are the proof; code review alone is not.
 
-The live desktop host is defined in `.agents/config/live-host`. The yggterm binary on that host is `~/.local/bin/yggterm`. This is the only running instance of the app that matters for UI proof.
+The live desktop host is resolved by `scripts/ygg-live-host.sh` — the one owner of that question, and the only thing a recipe may ask (`.agents/config/live-host` is its gitignored cache, present only on the host it names, so reading it directly fails on every headless checkout). The yggterm binary on that host is `~/.local/bin/yggterm`. This is the only running instance of the app that matters for UI proof.
 
 ### Recurring self-verification missteps — READ before you type "healthy" / "fixed" / "verified"
 

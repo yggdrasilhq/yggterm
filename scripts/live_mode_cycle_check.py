@@ -8,16 +8,33 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-def _default_live_host() -> str | None:
-    # Resolve the live host from the gitignored config so the private SSH alias is
-    # never baked into this public repo. Override with --host. (.agents/config/ is
-    # in .gitignore; the file holds one line, e.g. the host alias.)
-    cfg = Path(__file__).resolve().parents[1] / ".agents" / "config" / "live-host"
+def _resolve_live_host() -> str | None:
+    """Ask the one resolver which host the live GUI is on.
+
+    ⛔ This used to read `.agents/config/live-host` directly, which is
+    gitignored — so the file exists only on the machine whose name it holds,
+    and that is the one machine that never needs telling. Every headless
+    checkout got `None` here and the run died on a missing host. The resolver
+    owns the whole order (env → this machine → cached alias verified by probe →
+    discovery → cached alias unverified); the config file is its cache, not a
+    second source of truth.
+
+    Called lazily from `main`, never as an argparse default: it makes ssh
+    probes, and an argparse default is evaluated even for `--help`.
+    """
+    script = Path(__file__).resolve().parents[1] / "scripts" / "ygg-live-host.sh"
     try:
-        value = cfg.read_text(encoding="utf-8").strip()
-        return value or None
-    except OSError:
+        done = subprocess.run(
+            [str(script)], capture_output=True, text=True, timeout=90, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"error: could not run {script}: {error}", file=sys.stderr)
         return None
+    if done.stderr:
+        sys.stderr.write(done.stderr)
+    if done.returncode != 0:
+        return None
+    return done.stdout.strip() or None
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,8 +43,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--host",
-        default=_default_live_host(),
-        help="Live host SSH alias; defaults to .agents/config/live-host (gitignored).",
+        default=None,
+        help="Live host SSH alias; resolved by scripts/ygg-live-host.sh when omitted.",
     )
     parser.add_argument("--bin", default="~/.local/bin/yggterm")
     parser.add_argument("--out-dir", default="~/.tmp/yggterm/live-mode-cycle")
@@ -367,9 +384,11 @@ def safe_name(value: str) -> str:
 def main() -> int:
     args = parse_args()
     if not args.host:
+        args.host = _resolve_live_host()
+    if not args.host:
         print(
-            "error: no live host — pass --host, or write the SSH alias to "
-            ".agents/config/live-host",
+            "error: no live host — pass --host, or set $YGG_GUI_HOST; "
+            "scripts/ygg-live-host.sh named the sources it tried above",
             file=sys.stderr,
         )
         return 2
