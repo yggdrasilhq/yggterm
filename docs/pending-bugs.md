@@ -29,6 +29,43 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⛔ THE HOOK INSTALLER EXISTS TWICE, THE TWO COPIES DISAGREE, AND ONE CRASHES ON A WORKTREE
+
+**Status:** OPEN
+
+Measured 2026-08-13, both directions, one run.
+
+The pre-push leak gate can be installed two ways and they are different code:
+
+| | `ygg-privacy-guard install` | `scripts/install-privacy-guard.sh` |
+|---|---|---|
+| normal checkout | works, and reports PUBLIC/private | works |
+| **git worktree** | ⛔ **raises** — it builds `<repo>/.git/hooks`, and in a worktree **`.git` is a FILE** | works — resolves via `git rev-parse --git-common-dir` |
+| non-github remote | installs anyway | skips |
+
+⇒ **This is a second encoding of one chore and it diverged immediately.** The shell copy was written
+without checking that the guard already owned the job, and its first version invoked the guard as
+`pre-push` — a subcommand the guard does not accept — so the guard printed its usage text and exited
+non-zero, **which git reads as "the hook refuses". Every repo it touched could no longer push at
+all.** Fixed within minutes, but the shape is the point.
+
+⚠ **It failed CLOSED, which is the correct direction for a leak gate**, so this was an availability
+fault and never an exposure. ⭐ **The tell worth keeping: an inert hook and a working one are
+identical on disk**, and the broken one emitted a wall of the guard's own text that looked exactly
+like the guard running. **An installer is proven by a real push or not at all** — a syntax check and
+a successful write prove nothing about whether the hook works.
+
+⚠ **And the coverage this exists to fix is the real defect underneath:** only **2 of 34**
+github-remoted repos here carried the hook, and they are the two with known past leaks — a guard
+installed only where it has already burned someone.
+
+**Fix:** collapse the two into the guard (it is the owner), taking the worktree-correct path
+resolution and the github-remote filter with it, and delete the shell copy. Blocked on the guard
+getting a tracked home — see `owner-attention.md`.
+
+**Falsifier:** run each installer against a git worktree and against a plain checkout in the same
+run, then push from both.
+
 ## ⛔⛔ MAIN IS RED: THE PROTOCOL SHAPE-STAMP GUARD FAILS ON `origin/main` ITSELF
 
 **Status:** OPEN
@@ -6412,7 +6449,9 @@ exists. (The third item is retracted, not open.)
 
 ## ⚖ THE WORKING DOT — the discovery half, and it is NOT a detector defect
 
-**Status:** OPEN — but the open question is a SPEC question, not a bug.
+**Status:** OPEN
+
+⚠ The open question is a SPEC question, not a bug — see the bottom of this entry.
 
 The owner asked for a working indicator. 6.3 owns the RENDER half; this entry
 owns the prior question — **what makes a session's working-state knowable at
