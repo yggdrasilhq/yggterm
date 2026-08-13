@@ -854,9 +854,31 @@ instrument was not saying "nothing wrote"; it was saying "nothing I can see
 wrote". Closing that blind spot is a prerequisite for the next autopsy meaning
 anything.
 
+### ⭐ AN IDLE GUI DOES NOT GROW — the accumulation is per-EVENT, not per-second
+
+The obvious next hypothesis after the above — *something is attached to the main
+loop every second and never released* — is **refuted**, and cheaply. A GUI with
+**zero sessions** left alone in the sandbox for **66 minutes**:
+
+| | 2 min | 66 min |
+|---|---|---|
+| CPU | 1.5% of a core | **1.5%** |
+| render rate | 1.67/s | **1.6/s** |
+| threads | 59 | **59** |
+| RSS | — | 174 MB |
+
+⇒ **Time alone accumulates nothing.** Whatever grows is created by *work* —
+a surface opening, a session attaching, a tab — and never released. That kills
+the whole "a timer/source leaks per tick" family and redirects the hunt to
+per-event registrations. It also matches the one confirmed instance: a
+`WebsiteDataStore` thread is born with a web context, not with a clock tick.
+
+⇒ **The next experiment is therefore a CYCLE, not a wait:** open and close the
+same surface/session N times in the sandbox and watch the population ratchet.
+A vigil on an idle GUI cannot reproduce this and will read as "no bug".
+
 **Still to attribute (this cluster's next load):** what grows in COUNT in the
-wake path — the 162 `spawn` sites, glib sources on the main context, and what
-retains the web contexts. Baseline census for the diff, live GUI at 220 s:
+wake path, hunted per-event. Baseline census for the diff, live GUI at 220 s:
 **59 threads, 49 fds, 3 timerfd, 10 eventfd, 2 `ReceiveQueue`, 1
 `WebsiteDataStore`** (aged: 13 and 11).
 
@@ -864,6 +886,54 @@ retains the web contexts. Baseline census for the diff, live GUI at 220 s:
 hour on 2026-08-13, other clusters deploying. Growth measurements over hours
 need either a quiet host or the sandbox on `dev`; a GUI that vanishes mid-sample
 is usually another cluster's deploy, not your own doing.
+
+## ⛔ [6.7] THE WEB-CONTEXT SHARING INSTRUMENT IS BLIND TO THE CASE IT EXISTS TO CATCH
+
+**Status:** OPEN
+
+*found by code inspection 2026-08-13, against the live reading in the entry above*
+
+`web_surface_contexts` read **0** while 5 surfaces and 36 tabs were live. That
+looks like a broken counter. It is worse: it is an accurate count of the wrong
+population.
+
+`WebSurfaceHost::web_context_count()` returns `self.contexts.borrow().len()` —
+the **keyed** map only (`vendor/dioxus-desktop/src/web_surface.rs`). Its own
+doc-comment states the invariant it is for: *"with N tabs open on one session
+this must read 1, not N."* But the key is
+`web_context_key(profile_dir, socks_port, signer_base)`, which returns `None`
+the moment `profile_dir` is `None`, and that arm takes
+
+```rust
+None => (Rc::new(RefCell::new(WebContext::new_ephemeral())), true),
+```
+
+— **a fresh `WebContext` per surface, never inserted into the map.** So an
+ephemeral surface gets its own `WebsiteDataManager` and process pool, and is
+counted **zero** times. ⇒ *0 contexts with 41 surfaces live* does not mean "no
+contexts"; it is exactly what **41 unshared contexts** looks like, which is the
+failure the instrument was built to detect. It cannot distinguish "sharing is
+working" from "sharing is not happening at all".
+
+⚠ **And the ephemeral arm is reached in normal operation, not just for temp
+profiles.** `shell.rs` hands a surface `profile_dir: None` whenever the
+profile's **write-lock is held elsewhere** — another GUI, a shadow client, a
+second cluster. On this fleet that is routine, so a long-lived GUI accumulates
+unshared contexts through ordinary use. That is a per-event population that
+grows with work and not with time, which is the shape the entry above says to
+hunt.
+
+⚠ **Not yet proven to be the leak.** The surface *retains* its context
+(`_ctx: Some(ctx_cell)`, line ~5199), so a context should die with its surface;
+this is a confirmed **measurement** defect and a strong lead, not a confirmed
+leak. What settles it: cycle a jar-less surface open/closed N times and watch
+`WebsiteDataStore` thread count — if it ratchets, the retention is the bug; if
+it does not, only the counter is.
+
+**The fix for the instrument half is not optional either way:** count every live
+`WebContext`, keyed and ephemeral alike, or rename the field to say it counts
+shared ones. A reader cannot currently tell the healthy reading from the worst
+one.
 
 ## ⛔ [6.7] A DAEMON RE-DROPS THE SAME UNRECOVERABLE SESSIONS THREE TIMES A SECOND, FOREVER
 
