@@ -94,6 +94,32 @@ do not `terminal submit` to a row that is not consuming input. A row reading
 `busy: agent_working_daemon` will not echo, so the submit will hammer it for the
 full timeout. Check first, and never retry a `submitted:false` by sending again.
 
+### ⚠ "BLINKING" NOW HAS TWO UNRELATED CAUSES — TELL THEM APART BEFORE FILING HERE
+
+The handover settle window (6.1, `40cbcaf0` + `07218756`) widened the
+double-claim window from 250 ms to **~10 s, and it is untested under a live
+GUI**. Its predicted falsifier is *rows flickering or doubling for the length of
+`YGGTERM_HANDOFF_SETTLE_MS` during a handover* — which a reporter will also call
+"blinking", and this entry is what a search for that word finds.
+
+**They are distinguishable on sight, and the difference is the SURFACE:**
+
+| | this bug (the probe) | the settle-window residual |
+|---|---|---|
+| what blinks | the **VIEWPORT** — composer text appearing and being wiped | the **SIDEBAR ROWS** — entries flickering or appearing twice |
+| you can see | literal `yggterm_ready_probe` in the text | row identity/count wobbling, text intact |
+| when | any submit to a row that is not echoing | **only during a handover**, for ~10 s |
+| typing | broken (Ctrl+U erases your line) | unaffected |
+
+⇒ **Row flicker during a handover is 6.1's falsifier firing: RECORD IT against
+the settle window, do not file it here and do not fix it silently.** Composer
+text being wiped is this bug.
+
+⚠ **And a deploy of this fix cannot prove the settle window.** The settle fix
+lives in the PREDECESSOR, so installed 3.0.148 hands over the old way — the next
+bump still runs the old path and the guarantee starts from the one after. Do not
+read a clean handover during that bump as evidence for either fix.
+
 ## ⛔ [6.7] `main` IS RED IN ANY CHECKOUT WITHOUT THE LIVE-HOST CACHE — THE DEPLOY GUARD TESTS NEED A HOST TO EXIST
 
 **Status:** OPEN
