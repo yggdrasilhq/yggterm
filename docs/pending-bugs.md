@@ -299,6 +299,50 @@ nothing else is already tracked below. Same family: **a rail whose content comes
 over a bridge shows its chrome and never its payload.** Check whether one dead
 bridge explains all three before writing three fixes.
 
+## ⛔⛔ [6.3] THE WORKING DOT ANSWERS "IS THIS ROW ATTACHED HERE", NOT "IS THIS AGENT WORKING"
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-13: "take a look at all the traffic lights of the N.x rows — only one or
+two are blinking. So are all the relay rows sitting and the orchestrator chilling?" They were not.
+Eight rows were mid-turn.*
+
+**The measurement, on the GUI host's OWN daemon** (⚠ not the one a CLI resolves — see the field
+guide; a first pass on the wrong daemon reported 254 of 260 rows unknown and meant nothing):
+
+| | seated rows |
+|---|---|
+| `working: true` | 3 |
+| `working: false` | 9 |
+| **`working: null`** | **13** |
+
+⭐ **The 13 nulls are not a detector gap, and the discriminator is in the row itself.** Every null
+row carries `status_line: "xterm.js · … waiting for terminal host · daemon ready"` and exactly five
+`terminal_lines` — the launch preamble, not a screen. Every non-null row carries six to eight lines
+of real vt100 with the CLI's own footer in it.
+
+⇒ **Mechanism.** `working` is scraped from the live screen
+(`session.working = screen_text.map(|s| descriptor.screen_shows_working(s))`). No screen ⇒ `None` ⇒
+the GUI correctly declines to blink. A row whose terminal this daemon has never attached has no
+screen, so **a row that has not been opened in this GUI can never blink, however hard it is
+working.** The failure is purely one-directional, which fits: there is no false positive anywhere in
+the sample, because the flag never invents work — it only fails to see it.
+
+⛔ **So the dot currently reports ATTACHMENT and is read as ACTIVITY.** `DESIGN.md`'s status
+vocabulary promises the opposite: colour encodes durability, **blink encodes activity**. This is the
+signal the owner supervises the fleet by, and he read it and got the wrong answer.
+
+**The direction:** the OWNING daemon knows. A remote row's title and summary already reach the GUI
+host over the remote-session index; working state has to ride the same path instead of being derived
+only where a PTY happens to be attached. ⚠ Whatever carries it must keep `None` meaning *nobody
+knows* — the tri-state is what stops a stale frame blinking forever, and collapsing it to a bool
+would trade a missing blink for a permanent one.
+
+**Falsifier — and it must be run against rows you did NOT start.** A row that begins working while
+you watch is the case that already works. Sample seated rows for transcript growth over ~25s (a file
+that grows is a session mid-turn) and compare against `working` from the GUI host's daemon in the
+same run: every growing row blinks, every still row does not.
+
 ## ⭐ [6.3] ROW SETS CANNOT BE ARRANGED BY HAND OR BY A VERB
 
 **Status:** OPEN
@@ -313,21 +357,20 @@ means NOTHING but arrangement; a split is a view and a row set is an
 arrangement, and **neither may relocate the other**; each set keeps its own
 collapsed flag through an outer collapse.
 
-What is left is the ARRANGING, both halves of it — the default arrangement (the
-outline's own nesting) is drawn, so this entry is now only about overriding it:
+The model, the inside-band drag and the persistence are built. **What is left is
+the rest of the vocabulary the owner asked for**, and the entry closes when all of
+it is live-proven together:
 
-1. ⚠ **THE INSIDE BAND ON A SESSION ROW DOES NOT EXIST — do not plan around
-   reusing it.** Measured 2026-08-13 by reading the resolver:
-   `row_drop_placement_for_offset` returns `Into` only when the target row
-   `is_group`, and a live-session row is not a group, so a row dropped on another
-   row can only land Before or After it. `live_session_drop_target` then passes
-   that straight to the reorder. ⇒ Dragging one live row onto another REORDERS it
-   and forms nothing.
-2. **The CLI verb** (`server app row-set …`), so a delegate can arrange rows as
-   easily as a hand can. Both halves exist or neither is real.
-3. **Where an explicit arrangement is kept.** The derived one needs no storage;
-   an explicit one does, and `row_set_outline::sidebar_row_sets` is shaped to
-   take it as a third argument that wins per row.
+1. **Right-click → ungroup**, both halves in one menu: on a HEAD it dissolves the
+   set and its members become top level; on a MEMBER it removes just that row.
+2. **The verb twin.** `DESIGN.md`: *both halves exist or neither is real* — a
+   delegate must be able to group and ungroup rows as a hand can. ⛔ Build it
+   with its dispatch arm and exercise it end to end: this cluster has just been
+   bitten by a verb that existed at every layer with **no caller at all**, and a
+   gesture with no verb is the same defect mirrored.
+3. **Live proof of all three gestures** on the GUI host, plus the un-numbered
+   case — grouping rows that carry no seat is the whole point, since those are
+   the rows an agent may never renumber.
 
 **Falsifier for the finished feature:** arrange an outer set holding a collapsed
 inner set and an expanded one, collapse the outer, expand it again, and find both
