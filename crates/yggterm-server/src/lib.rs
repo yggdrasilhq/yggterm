@@ -22392,7 +22392,18 @@ pub fn run_app_control_restore_sessions(
                 },
                 open_timeout_ms,
             )
-            .and_then(|_| {
+            .and_then(|response| {
+                // ⛔ FAIL FAST ON A ROW THAT IS NOT THERE. `open` answers
+                // immediately — and by NAME — when the path resolves to no row,
+                // which is the ordinary outcome for a plain shell whose runtime
+                // was destroyed: nothing is left to restore. Dropping that
+                // answer and waiting for a readiness that can never arrive spent
+                // the full cold-open budget PER ROW before reporting a timeout
+                // that named nothing. Measured taking this verb's own proof: two
+                // unresolvable rows, three minutes, no information.
+                if let Some(error) = response.error {
+                    anyhow::bail!(error);
+                }
                 wait_for_app_control_open_path_ready(
                     &home,
                     path,
