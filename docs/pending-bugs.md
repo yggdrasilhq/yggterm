@@ -96,6 +96,53 @@ rows into 37 possibly-silently-wrong ones**, which is worse, and it would hide
 the livelock that is the actual defect. If it is ever done as an emergency
 unstick it must be logged, time-boxed and removed, never left in place.
 
+### ⭐⭐ THE RULE THAT SETTLES IT: THE ARROW IS THE WHOLE ARGUMENT
+
+**An alias pointing at a NEWER daemon is the design. An alias pointing at an
+OLDER one is a proxy wearing the design's clothes.**
+
+Both directions were live on the fleet within the same hour, and the same rule
+decides them opposite ways:
+
+| | GUI host | build host |
+|---|---|---|
+| live daemon | 3.0.118 | 3.0.130 |
+| what clients ask for | `server-3-0-128.sock` | `server-3-0-128.sock` |
+| would-be alias | 128 → **118** (older) | 128 → **130** (newer) |
+| verdict | ⛔ **refused** — cross-version proxy | ✅ **created** — the mechanism's own job |
+
+⇒ On the build host the *same* orphaning had appeared with the arrow reversed:
+**twelve consecutive recent versions had no socket and no alias, while ancient
+ones from two major versions back were still perfectly aliased.** Restoring the
+missing recent aliases to the live newest daemon is exactly what
+`refresh_legacy_server_socket_aliases` exists to do; 30 were created and
+`server-3-0-128.sock` answers there now. **Verified independently from that host,
+not taken on report.**
+
+⛔ **And the root defect underneath is a bug class already filed here: a fallback
+whose candidate set is enumerated from SURVIVING FILES inherits the deleter's
+retention policy.** Ancient sockets were never swept so they got aliases; recent
+ones are deleted on each bump so they got none. **The museum stays addressable
+while the current generation is orphaned** — which is the same shape as the
+earlier instance, now with a second victim. ⇒ Enumerate an alias set from the
+versions that *exist*, never from the files that *happen to remain*.
+
+⚠ **On the GUI host this is a MITIGATION at best and was not applied there
+anyway** — sessions that already have the error in their scrollback keep showing
+it until they reconnect, and forcing reconnection means opening rows and moving
+the owner's viewport while he is working.
+
+### ⚠ THE OBSERVER JOINS THE SET IT IS MEASURING
+
+`hot_restart_blockers` listed the diagnosing session itself, `kind: working`,
+idle_ms 119. **That is a property of the measurement, not a nuisance to note and
+move past:** any session capable of running the probe is by definition active,
+and therefore extends the very window whose failure to close it is investigating.
+⇒ **A quiet-window drain cannot be observed from inside the host it gates**, and
+an agent checking whether the drain is stuck makes it slightly more stuck. Any
+future instrument here must either sample from off-host or account for its own
+contribution explicitly.
+
 ⚠ **There is no sanctioned force-verb.** `server monitor --scenario hot-restart`
 observes the drain; nothing commands it. That absence *is* the unbuilt gate.
 
