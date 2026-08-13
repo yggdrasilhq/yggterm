@@ -562,6 +562,46 @@ def cmd_subscribe(args):
     return 0 if back else 1
 
 
+def update_sub(uuid, rec):
+    """⛔ WRITE A SUBSCRIPTION BACK ONLY IF IT STILL EXISTS — never recreate it.
+
+    `tick()` loads the subscription set once, then writes each record back as it
+    advances counters (gone_sightings, boots, rate-limit holds). A row that
+    unsubscribed DURING that tick had its file deleted after the load, so a plain
+    `write_text` CREATED IT AGAIN — carrying the original `subscribed_at`, which
+    is what makes this hard to see: the row reappears with a continuous age, so
+    it reads as "never unsubscribed" rather than "resurrected".
+
+    Measured 2026-08-14 and reported by a sibling campaign: unsubscribe at
+    00:56:48, verified ABSENT at 00:56:50, tracked again at 00:57:10 with its age
+    continuous from the original 00:13 subscription.
+
+    ⛔ THE DOCUMENTED DEFENCE DOES NOT CATCH THIS, AND THAT IS THE POINT. This
+    fleet's standing law is "a verb reports the REQUEST, not the EFFECT — assert
+    on the read-back". That session DID assert on the read-back and the read-back
+    was correct; the state reverted twenty seconds later. A value that is right
+    when you look and wrong afterwards is a strictly harder failure than a lying
+    verb, because the defence passes on its way to being wrong.
+
+    ⇒ Consequence this removes: `AUTO ARM AND DISARM WITH REASON` (owner ruling,
+    2026-08-13) had only half of it working. If a delete cannot persist, the
+    subscriber cannot perform the disarm the ruling assigns it, and every row
+    that correctly stands down pays a wake on the next idle window.
+
+    `O_WRONLY` WITHOUT `O_CREAT` is the whole fix: an update that is incapable of
+    creating. It also closes the window rather than narrowing it — an
+    `exists()` check followed by a write is the same race, just shorter.
+    """
+    try:
+        fd = os.open(sub_path(uuid), os.O_WRONLY | os.O_TRUNC)
+    except FileNotFoundError:
+        log(f"{uuid[:8]} unsubscribed during this tick — not resurrecting it")
+        return False
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(rec, indent=1))
+    return True
+
+
 def boot_after_for(s):
     """This subscriber's boot window RIGHT NOW, and why.
 
@@ -770,13 +810,18 @@ def cmd_list(args):
     if rl:
         log(f"⏸ QUOTA HOLD {(rl['until'] - time.time()) / 60:.0f}m left "
             f"(429 seen on {rl['seen_on'][:8]})")
+    # ⭐ Name the directory this reads. A sibling campaign lost minutes concluding
+    #   "no subscription file exists" while looking in the relay root — which also
+    #   holds per-uuid .json files of a DIFFERENT kind, so the wrong directory
+    #   looks like the right one with the answer missing.
     if not subs:
-        log("no subscribers")
+        log(f"no subscribers (reading {SUBS})")
         return 0
     for s in subs:
         age_h = (time.time() - s["subscribed_at"]) / 3600
         log(f"{s['uuid'][:8]}  {s.get('campaign') or '-':<12} "
             f"age={age_h:4.1f}h boots={s['boots']} {s['row']}")
+    log(f"{len(subs)} subscription(s) in {SUBS}")
     return 0
 
 
@@ -952,7 +997,7 @@ def tick(args):
             log(f"{uuid[:8]} absent from the row list "
                 f"({s['gone_sightings']}/{GONE_SIGHTINGS}) — waiting for confirmation")
             if not args.dry_run:
-                sub_path(uuid).write_text(json.dumps(s, indent=1))
+                update_sub(uuid, s)
             continue
         if presence is None:
             # ⛔ Say "I could not look", never "it is not there" — and change
@@ -1046,7 +1091,7 @@ def tick(args):
                 log(f"{'RATE-HOLD':<14} {c['age'] / 60:>6.1f}m  {action:<12} {uuid[:8]}  "
                     f"quota hold {held_m:.0f}m left (seen on {rl['seen_on'][:8]})")
                 if not args.dry_run:
-                    sub_path(uuid).write_text(json.dumps(s, indent=1))
+                    update_sub(uuid, s)
                 continue
             if s["boots"] >= MAX_BOOTS:
                 action = "ESCALATE"
@@ -1089,7 +1134,7 @@ def tick(args):
         # ⛔ A dry run must not mutate state — an instrument whose observation
         #    changes what it observes is not an instrument.
         if not args.dry_run:
-            sub_path(uuid).write_text(json.dumps(s, indent=1))
+            update_sub(uuid, s)
         # Print the WINDOW this row is being judged against, not just its age.
         # Without it a deferred row and a default one look the same in the log,
         # and "why was it not booted at 8 minutes" costs a code read to answer.
