@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The working dot blinks again, and it never did (3.0.122).** Every live
+  session's status dot is meant to pulse while its agent is mid-turn — that is
+  the only signal telling a human which of their sessions is actually working.
+  Since 2026-07-21 none of them blinked: the phase was published as a CSS
+  custom property animated on the root element, and WebKitGTK advances such an
+  animation in the style system without ever repainting the elements that read
+  it, so a working dot froze at whatever phase its last unrelated re-render
+  sampled — usually invisible, while the idle dot beside it stayed solid. The
+  clock is now a timer toggling one class, which is a change the paint path
+  cannot ignore; there is still exactly one clock for the whole app, so the
+  cost stays flat in the number of dots. The period is also slower, 2400 ms
+  rather than 1100 ms: the old value was chosen while the blink did not paint,
+  and the first sight of it running was too fast to read as a heartbeat.
+- **A lone top-level session number reads as a number (3.0.122).** A
+  childless top-level row now renders `4. gadgets: …` the way a book chapter
+  does, instead of `4 gadgets: …` where the digit ran into the title. A row
+  that heads a group keeps the bare number, and sub-rows always did — so a
+  group's own rows still line up with one another. The dot is drawn, never
+  stored, so no title can end up carrying two numbers.
 - **An idle app stops re-rendering itself once a second for no reason
   (3.0.121).** The input gate's deadline tick ran every second for the life of
   the process and took a mutable borrow of the whole shell state to do it — and

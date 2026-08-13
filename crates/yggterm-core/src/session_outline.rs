@@ -259,6 +259,66 @@ mod tests {
     }
 }
 
+/// Does a seat have members numbered beneath it — is `6` the head of `6.1`?
+///
+/// A live property, derived from the seats that exist right now, never stored.
+/// Storing it would be a second encoding of a fact the prefixes already carry,
+/// and it would go stale the moment a delegate is seated or reaped.
+pub fn outline_prefix_heads_a_group<'a>(
+    prefix: &str,
+    all_prefixes: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let OutlineKey::Numbered(head) = parse_outline_key(Some(prefix)) else {
+        return false;
+    };
+    all_prefixes.into_iter().any(|other| {
+        matches!(
+            parse_outline_key(Some(other)),
+            OutlineKey::Numbered(segments)
+                if segments.len() > head.len() && segments.starts_with(&head)
+        )
+    })
+}
+
+/// How a seat is DRAWN. The stored prefix says WHERE a row sits; this says what
+/// the reader sees, and the two are deliberately different facts.
+///
+/// A **childless top-level** seat wears a trailing dot the way a book chapter
+/// does — `4. gadgets: …` — because a lone `4` beside a title reads as part of
+/// the prose rather than as a number. A seat that heads a group does not, and
+/// neither does any sub-seat: `6.0`, `6.1`, `6.2` already read unmistakably as
+/// an outline, and a dot on the head alone would make the group's own rows
+/// disagree with one another.
+///
+/// ⚠ **"Childless" is live, so the dot comes and goes** as delegates are seated
+/// and reaped. That is deliberate: the alternative is storing a flag that
+/// duplicates what the prefixes already say and goes stale on the first reap,
+/// and the change is information rather than noise — a `4.` becoming `4` is the
+/// sidebar reporting that the row now heads a group. It moves at most once per
+/// spawn or reap, never per frame.
+///
+/// ⛔ **The dot is a RENDER, never a stored prefix.** `normalize_outline_prefix`
+/// strips a trailing dot on the way in, so `6.` cannot be stored — and this
+/// strips one again before deciding, so a hand-set or legacy value can never
+/// compose `6..`. That idempotence is why the two halves are separate at all:
+/// the claim script once wrote the number into the title, which produced
+/// doubly-numbered rows where nobody could tell a seat from a name.
+pub fn render_outline_prefix(prefix: &str, heads_a_group: bool) -> Option<String> {
+    let trimmed = prefix.trim().trim_end_matches('.').trim();
+    let OutlineKey::Numbered(segments) = parse_outline_key(Some(trimmed)) else {
+        return None;
+    };
+    let canonical = segments
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    if segments.len() == 1 && !heads_a_group {
+        return Some(format!("{canonical}."));
+    }
+    Some(canonical)
+}
+
 /// The seat a row's TITLE claims, for rows that predate `outline_prefix`.
 ///
 /// ⚖ **This does not weaken the law at the top of this module — read it

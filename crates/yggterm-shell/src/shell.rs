@@ -906,12 +906,46 @@ const TREE_SPINNER_CSS: &str = ".yggterm-tree-spinner { animation: none !importa
 // between (the dot snaps off/on). Paired with `step-end` timing on the
 // animation so the keyframe values jump instead of interpolating (user
 // decision 2026-06-26: "blinking means full off and full on, no fading").
-/// ONE animation drives every blinking dot in the app: `:root` runs the blink and
-/// publishes the current phase as an inherited custom property; each dot merely
-/// reads it (`opacity: var(--yggterm-status-dot-blink)`). No dot owns an
+/// ONE clock drives every blinking dot in the app: [`STATUS_DOT_BLINK_JS`]
+/// toggles a single class on the document element, and ONE stylesheet rule
+/// stamps every working indicator off while that class is set. No dot owns an
 /// animation of its own.
 ///
-/// Why the SHAPE is the fix (this is a performance bug, not a style choice).
+/// ⛔⛔ THE CLOCK IS A TIMER, NOT A CSS ANIMATION, AND THAT IS THE FIX
+/// (2026-08-13). It used to be `@keyframes` on `:root` publishing the phase as
+/// the inherited custom property `--yggterm-status-dot-blink`, which every dot
+/// read with `opacity: var(…)`. **That animated the STYLE and never repainted
+/// the PIXELS**, so no working dot in the app blinked — a session mid-turn was
+/// indistinguishable from an idle one, which is the whole signal.
+///
+/// Measured live on the desktop host (WebKitGTK 2.52.5), two instruments, same
+/// minute:
+///
+/// - `getComputedStyle` on `:root`, 12 samples 150 ms apart, returned a clean
+///   1100 ms square wave — `1 0 0 0 0 1 1 1 0 0 0 0` — and every working dot's
+///   computed `opacity` followed it exactly. The style system was perfect.
+/// - Ten consecutive faithful full-window screenshots caught those same dots
+///   PIXEL-IDENTICAL and simply absent, while regions elsewhere in the frame
+///   changed between captures — so the capture was live and the dot was not.
+///
+/// WebKitGTK advances a custom-property animation in the style system but never
+/// marks its `var()` consumers dirty for paint, so a dot holds whatever phase
+/// its last *unrelated* re-render happened to sample — usually the off one, so
+/// the working dot is invisible and the idle dot beside it is not. Registering
+/// the property (`@property { syntax: "<number>"; inherits: true }`) does NOT
+/// help: injected into the live page, the pixels stayed frozen.
+///
+/// ⚠ **The way the original verification missed it is the durable lesson.** It
+/// read the phase back with `getComputedStyle` — *which forces the style
+/// recalculation the paint path never performs*. The instrument supplied the
+/// very invalidation whose absence was the bug, so the probe could only ever
+/// answer yes. The CPU number it celebrated says the same thing read the other
+/// way: presented frames fell 9.4/s → 2.1/s, i.e. to the idle baseline, because
+/// the blink had stopped painting at all. A blink that costs nothing to draw is
+/// not being drawn.
+///
+/// Why the SHAPE is unchanged (this half was right, and it is a performance
+/// constraint, not a style choice).
 /// A CSS animation's phase is anchored to the moment its element was created, so
 /// N dots created at N different times blink at N different phases. On a
 /// software-GL host every opacity flip costs a FULL-WINDOW cairo/pixman blit on
@@ -922,24 +956,56 @@ const TREE_SPINNER_CSS: &str = ".yggterm-tree-spinner { animation: none !importa
 /// still stands on its own, and the shape is right on a hardware host too; it is
 /// simply no longer paying for a premise that was never true.) Measured live on
 /// guihost with 5 working dots: per-dot animations = 9.4 presented frames/s and
-/// 10.8% GUI CPU; this root-driven variable = 2.1 frames/s and 5.0% GUI CPU —
-/// flat in the number of dots. Isolating the dots (`contain:paint` /
-/// `will-change`) and dropping `backdrop-filter` were both tried live and did NOT
-/// help; cutting the frame COUNT is the only lever.
+/// 10.8% GUI CPU. One shared phase means every dot flips in the same tick, so
+/// the flips coalesce into ONE blit per half-cycle — about 2/s — no matter how
+/// many dots are lit. Isolating the dots (`contain:paint` / `will-change`) and
+/// dropping `backdrop-filter` were both tried live and did NOT help; cutting the
+/// frame COUNT is the only lever.
 ///
 /// Why not per-dot animations with a phase-locking negative `animation-delay`:
 /// changing `animation-delay` does not restart an animation, so a row that
 /// re-renders keeps its original anchor while picking up a freshly computed
 /// delay, and the dots silently drift back apart (caught live — three dots ended
-/// up half a cycle out of step). `:root` never re-renders, so there is nothing to
-/// drift.
-const STATUS_DOT_BLINK_PERIOD_MS: u64 = 1_100;
+/// up half a cycle out of step). The document element never re-renders, so a
+/// clock hung there has nothing to drift against.
+///
+/// Why the class and not a custom property the timer writes: setting an
+/// inherited custom property on the document element invalidates EVERY element
+/// in the document for style recalculation, twice a second. A class toggle is
+/// scoped by the selector below to the handful of elements that actually carry
+/// the blink marker.
+/// ⭐ 2400 ms, not the 1100 ms this carried until 2026-08-13, and the change is
+/// a verdict rather than a tuning. 1100 ms was chosen while the blink did not
+/// paint at all (see above), so nobody had ever watched it; the first sight of
+/// it running, on the live host, was *"they blink waaay too fast"*. A hard
+/// square wave that takes the dot fully dark reads as a strobe at ~0.9 Hz and
+/// as a heartbeat at ~0.4 Hz. The SHAPE is untouched — full off, full on, no
+/// fade — because that is a settled call (2026-06-26); only the period moved.
+const STATUS_DOT_BLINK_PERIOD_MS: u64 = 2_400;
 const STATUS_DOT_BLINK_VAR: &str = "--yggterm-status-dot-blink";
-const STATUS_DOT_BLINK_CSS: &str =
-    "@keyframes yggterm-status-dot-blink { 0%, 100% { --yggterm-status-dot-blink: 1; } 50% { --yggterm-status-dot-blink: 0; } } \
-     :root { animation: yggterm-status-dot-blink 1100ms step-end infinite; }";
-/// The opacity a status dot renders at. `working` reads the shared blink phase;
-/// idle pins a steady dot.
+/// The class the clock parks on `<html>` for the OFF half of each cycle.
+const STATUS_DOT_BLINK_OFF_CLASS: &str = "yggterm-blink-off";
+/// ⛔ `!important` is load-bearing, not shouting: the working arm's `opacity`
+/// is an INLINE declaration (Dioxus writes `style` attributes), and an ordinary
+/// author rule loses to inline. This is the one place in the shell where the
+/// stylesheet must outrank the element.
+const STATUS_DOT_BLINK_CSS: &str = ":root.yggterm-blink-off \
+     [style*=\"--yggterm-status-dot-blink\"] { opacity: 0 !important; }";
+/// Installs the one blink clock, once per webview. Idempotent by the window
+/// flag, because the rule above is emitted by three different surfaces and any
+/// of them may mount first.
+const STATUS_DOT_BLINK_JS: &str = "(() => { if (window.__yggtermBlinkClock) { return 'already'; } \
+     const root = document.documentElement; \
+     window.__yggtermBlinkClock = setInterval(() => { root.classList.toggle('yggterm-blink-off'); }, 1200); \
+     return 'installed'; })();";
+/// The opacity a status dot renders at. `working` marks the dot for the shared
+/// clock; idle pins a steady dot.
+///
+/// ⚠ The `var()` in the working arm is a MARKER, not a value — it resolves to
+/// its fallback `1` for ever, and [`STATUS_DOT_BLINK_CSS`] matches on the text
+/// of the inline style to find the dots the clock owns. Keeping the marker
+/// inside the `opacity` declaration is what makes the two arms interchangeable
+/// at every call site without touching one of them.
 ///
 /// Both arms emit the SAME property key on purpose: Dioxus applies `style`
 /// property-by-property and never clears a key that a later render drops, so an
@@ -39263,7 +39329,8 @@ fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<
                     .cloned()
             })
             .unwrap_or_else(|| {
-                live_session_label_with_index(&remote_session_index, &session, &short_ids)
+                let seats = live_session_seats(shell.server.live_sessions().iter());
+                live_session_label_with_index(&remote_session_index, &session, &short_ids, &seats)
             });
         let detail_label = live_session_summary_with_index(&remote_session_index, &session);
         return Some(BrowserRow {
@@ -49468,9 +49535,11 @@ fn push_live_session_rows(
             .map(|session| (session.session_path.clone(), session.id.clone()))
             .collect::<Vec<_>>(),
     );
+    let seats = live_session_seats(sessions.iter().copied());
     for session in sessions {
         let cwd = metadata_value(session, "Cwd");
-        let label = live_session_label_with_index(remote_session_index, session, &short_ids);
+        let label =
+            live_session_label_with_index(remote_session_index, session, &short_ids, &seats);
         let detail_label = {
             let summary = live_session_summary_with_index(remote_session_index, session);
             live_session_detail_label(summary, live_session_keep_alive(session))
@@ -49795,6 +49864,7 @@ fn inject_cc_sessions_into_stored_rows(
         .iter()
         .filter_map(|row| row.session_id.clone())
         .collect();
+    let seats = live_session_seats(sessions.iter().copied());
     // ⛔ THE ORDER OF THESE ROWS IS PART OF THE CONTRACT — see
     // `docs/pending-bugs.md`, "the start page cannot be used to find a session".
     //
@@ -49834,7 +49904,8 @@ fn inject_cc_sessions_into_stored_rows(
             continue;
         }
         let insert_idx = find_child_insert_point(stored_rows, group_idx, group_depth);
-        let label = live_session_label_with_index(remote_session_index, session, &short_ids);
+        let label =
+            live_session_label_with_index(remote_session_index, session, &short_ids, &seats);
         let summary = live_session_summary_with_index(remote_session_index, session);
         let keep_alive = live_session_keep_alive(session);
         let detail_label = live_session_detail_label(summary, keep_alive);
@@ -49899,11 +49970,38 @@ fn live_session_label_with_index(
     remote_session_index: &RemoteSessionIndex,
     session: &ManagedSessionView,
     short_ids: &HashMap<String, String>,
+    seats: &[String],
 ) -> String {
+    let heads_a_group = session.outline_prefix.as_deref().is_some_and(|prefix| {
+        yggterm_core::session_outline::outline_prefix_heads_a_group(
+            prefix,
+            seats.iter().map(String::as_str),
+        )
+    });
     compose_outline_prefix(
         session.outline_prefix.as_deref(),
         &live_session_derived_label(remote_session_index, session, short_ids),
+        heads_a_group,
     )
+}
+
+/// Every seat currently on the live list — the input the group-head question is
+/// answered from.
+///
+/// ⚠ The row builders below see only the SUBSET they are drawing, so their
+/// answer is a first cut. `enrich_sidebar_rows_with_live_titles` re-composes
+/// every row from the WHOLE list and is the documented last writer of a label,
+/// so the authoritative answer is always its own. That is why the composer
+/// accepts both spellings of a seat as already-composed: the two passes may
+/// legitimately disagree for one frame, and the second must be able to redraw
+/// the first rather than number it twice.
+fn live_session_seats<'a>(
+    live_sessions: impl IntoIterator<Item = &'a ManagedSessionView>,
+) -> Vec<String> {
+    live_sessions
+        .into_iter()
+        .filter_map(|session| session.outline_prefix.clone())
+        .collect()
 }
 
 /// `prefix + " " + label`, and the ONE place the two are joined.
@@ -49912,17 +50010,47 @@ fn live_session_label_with_index(
 /// the CLI rewrites the title whenever it likes, the prefix says where the row
 /// sits. Composing them here means a CLI rename can never destroy a number,
 /// which is what made the user's sidebar outline decay on every session.
-fn compose_outline_prefix(prefix: Option<&str>, label: &str) -> String {
-    let prefix = prefix.map(str::trim).filter(|value| !value.is_empty());
-    match prefix {
-        // Idempotent: re-composing a label that already carries its prefix
-        // must not stutter (`2. cogs: 2. cogs: …`), because a row is
-        // relabelled on every snapshot.
-        Some(prefix) if !label.trim_start().starts_with(prefix) => {
-            format!("{prefix} {}", label.trim_start())
-        }
-        _ => label.to_string(),
+///
+/// `heads_a_group` decides only how the number is DRAWN — see
+/// [`yggterm_core::session_outline::render_outline_prefix`]. It is derived from
+/// the seats that exist right now, never stored.
+fn compose_outline_prefix(prefix: Option<&str>, label: &str, heads_a_group: bool) -> String {
+    let Some(prefix) = prefix.map(str::trim).filter(|value| !value.is_empty()) else {
+        return label.to_string();
+    };
+    // A prefix the outline cannot parse is composed VERBATIM. The setter
+    // refuses those today, but a row stored before it existed may still carry
+    // one (`2. cogs:`), and dropping its number to punish its spelling would
+    // lose the only thing the user put there by hand.
+    let rendered = yggterm_core::session_outline::render_outline_prefix(prefix, heads_a_group)
+        .unwrap_or_else(|| prefix.to_string());
+    // Idempotent: re-composing a label that already carries its seat must not
+    // stutter (`2. cogs: 2. cogs: …`), because a row is relabelled on every
+    // snapshot. Both spellings of the same seat count as already-composed — the
+    // trailing dot appears and disappears as the group gains and loses members,
+    // and a row caught mid-change must be RE-drawn, not double-numbered.
+    //
+    // ⛔ The remainder must begin with WHITESPACE or be empty. A bare
+    // `starts_with` reads seat `1` off the label `10 things` and would hand
+    // back `1. 0 things` — the number eating a digit of the title.
+    let label = label.trim_start();
+    let canonical = rendered.trim_end_matches('.');
+    let dotted = format!("{canonical}.");
+    // BOTH spellings, whichever way this render happens to be going: the seat
+    // already on the label may be the one the previous pass drew.
+    let body = [rendered.as_str(), dotted.as_str(), canonical]
+        .into_iter()
+        .find_map(|seat| {
+            label
+                .strip_prefix(seat)
+                .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        })
+        .unwrap_or(label)
+        .trim_start();
+    if body.is_empty() {
+        return rendered;
     }
+    format!("{rendered} {body}")
 }
 
 fn live_session_derived_label(
@@ -50078,7 +50206,8 @@ fn live_session_label(
     short_ids: &HashMap<String, String>,
 ) -> String {
     let remote_session_index = build_remote_session_index(remote_machines);
-    live_session_label_with_index(&remote_session_index, session, short_ids)
+    let seats = live_session_seats(std::iter::once(session));
+    live_session_label_with_index(&remote_session_index, session, short_ids, &seats)
 }
 fn is_local_tree_live_session(session: &ManagedSessionView) -> bool {
     // Every agent CLI, derived. The hand-listed triple silently answered
@@ -50285,12 +50414,17 @@ fn enrich_sidebar_rows_with_live_titles(
         })
         .collect();
     if !outline_by_path.is_empty() {
+        let seats = live_session_seats(live_sessions);
         for row in rows.iter_mut() {
             if let Some(prefix) = outline_by_path
                 .get(row.full_path.as_str())
                 .or_else(|| outline_by_path.get(normalize_live_session_path(&row.full_path).as_str()))
             {
-                row.label = compose_outline_prefix(Some(prefix), &row.label);
+                let heads_a_group = yggterm_core::session_outline::outline_prefix_heads_a_group(
+                    prefix,
+                    seats.iter().map(String::as_str),
+                );
+                row.label = compose_outline_prefix(Some(prefix), &row.label, heads_a_group);
             }
         }
     }
@@ -81581,6 +81715,16 @@ fn app() -> Element {
             left_sidebar_autohide,
             right_rail_autohide,
         ));
+    }
+    // The one blink clock (see `STATUS_DOT_BLINK_CSS`). It lives here rather
+    // than beside the stylesheet because the rule is emitted by three surfaces
+    // and the clock must exist exactly once per webview; the installer is
+    // idempotent anyway, so a second mount is harmless.
+    let status_dot_blink_clock_started = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
+    if !status_dot_blink_clock_started.swap(true, Ordering::SeqCst) {
+        spawn_forever(async move {
+            let _ = document::eval(STATUS_DOT_BLINK_JS).await;
+        });
     }
     let keytip_alt_tap_loop_started = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
     if !keytip_alt_tap_loop_started.swap(true, Ordering::SeqCst) {
@@ -153256,24 +153400,93 @@ mod tests {
     /// unnecessary — so these are the properties that delete that chore.
     #[test]
     fn an_outline_prefix_survives_the_cli_retitling_its_own_session() {
-        // The CLI's title changes underneath; the number does not move.
+        // The CLI's title changes underneath; the number does not move. A
+        // prose prefix the outline cannot parse composes verbatim — the setter
+        // refuses those now, but a row stored before it existed still has one.
         assert_eq!(
-            compose_outline_prefix(Some("2. cogs:"), "panels + research"),
+            compose_outline_prefix(Some("2. cogs:"), "panels + research", false),
             "2. cogs: panels + research"
         );
         assert_eq!(
-            compose_outline_prefix(Some("2. cogs:"), "Initialize cogs panels research lobe"),
+            compose_outline_prefix(Some("2. cogs:"), "Initialize cogs panels research lobe", false),
             "2. cogs: Initialize cogs panels research lobe"
         );
 
         // Idempotent — a row is relabelled on every snapshot, so composing a
         // label that already carries its prefix must not stutter.
-        let once = compose_outline_prefix(Some("2. cogs:"), "panels");
-        assert_eq!(compose_outline_prefix(Some("2. cogs:"), &once), once);
+        let once = compose_outline_prefix(Some("2. cogs:"), "panels", false);
+        assert_eq!(compose_outline_prefix(Some("2. cogs:"), &once, false), once);
 
         // No prefix set is the untouched case: the label is the CLI's, whole.
-        assert_eq!(compose_outline_prefix(None, "Some CC Title"), "Some CC Title");
-        assert_eq!(compose_outline_prefix(Some("   "), "Some CC Title"), "Some CC Title");
+        assert_eq!(compose_outline_prefix(None, "Some CC Title", false), "Some CC Title");
+        assert_eq!(compose_outline_prefix(Some("   "), "Some CC Title", false), "Some CC Title");
+    }
+
+    /// A CHILDLESS top-level seat wears the chapter dot; a seat with members
+    /// below it does not, and neither does a sub-seat. The dot lives in the
+    /// RENDER — `normalize_outline_prefix` strips it on the way in, so a stored
+    /// prefix can never carry one, and this must never be able to draw two.
+    #[test]
+    fn a_childless_top_level_seat_wears_the_chapter_dot_and_nobody_else_does() {
+        // Childless top level: the dot separates the number from the prose.
+        assert_eq!(
+            compose_outline_prefix(Some("4"), "gadgets: quarterly returns", false),
+            "4. gadgets: quarterly returns"
+        );
+        // The same seat once it heads a group: the members already read as an
+        // outline, so a dot on the head alone would break the column.
+        assert_eq!(
+            compose_outline_prefix(Some("6"), "orchestration", true),
+            "6 orchestration"
+        );
+        // Sub-seats never wear it, group head or not.
+        assert_eq!(
+            compose_outline_prefix(Some("6.3"), "sidebar truth", false),
+            "6.3 sidebar truth"
+        );
+        assert_eq!(
+            compose_outline_prefix(Some("6.0"), "orchestration", false),
+            "6.0 orchestration"
+        );
+
+        // ⛔ NEVER `4..`, whatever anyone stores or hand-types.
+        assert_eq!(
+            compose_outline_prefix(Some("4."), "gadgets", false),
+            "4. gadgets"
+        );
+        assert_eq!(
+            compose_outline_prefix(Some("4"), "4. gadgets", false),
+            "4. gadgets"
+        );
+
+        // The dot appears and disappears as members come and go, and BOTH
+        // spellings must re-draw cleanly — the two label writers can disagree
+        // for a frame, and the second must redraw rather than double-number.
+        let childless = compose_outline_prefix(Some("6"), "orchestration", false);
+        assert_eq!(childless, "6. orchestration");
+        assert_eq!(
+            compose_outline_prefix(Some("6"), &childless, true),
+            "6 orchestration"
+        );
+        let heading = compose_outline_prefix(Some("6"), "orchestration", true);
+        assert_eq!(
+            compose_outline_prefix(Some("6"), &heading, false),
+            "6. orchestration"
+        );
+
+        // ⛔ The seat may not eat a digit of the title: `1` is not the head of
+        // the label `10 things`, and a bare `starts_with` says it is.
+        assert_eq!(
+            compose_outline_prefix(Some("1"), "10 things to do", false),
+            "1. 10 things to do"
+        );
+
+        // And the live derivation that answers `heads_a_group`.
+        let seats = ["6".to_string(), "6.1".to_string(), "4".to_string()];
+        let all = || seats.iter().map(String::as_str);
+        assert!(yggterm_core::session_outline::outline_prefix_heads_a_group("6", all()));
+        assert!(!yggterm_core::session_outline::outline_prefix_heads_a_group("4", all()));
+        assert!(!yggterm_core::session_outline::outline_prefix_heads_a_group("6.1", all()));
     }
 
     #[test]
@@ -155721,13 +155934,12 @@ mod tests {
         let kept_working = live_session_status_dot_style(dark, true, true);
         assert!(kept_working.contains("#22c55e"));
         assert!(kept_working.contains("yggterm-status-dot-blink"));
-        // HARD on/off blink (2026-06-26): step-end timing (no fade) + plain
-        // circle (no halo ring). The keyframes snap the shared phase to a full 0,
-        // and the dot reads that phase as its opacity.
-        assert!(STATUS_DOT_BLINK_CSS.contains("step-end"));
+        // HARD on/off blink (2026-06-26): the off half snaps the dot to a full
+        // `opacity: 0` — no transition, no fade, no halo ring.
+        assert!(STATUS_DOT_BLINK_CSS.contains("opacity: 0 !important;"));
+        assert!(!STATUS_DOT_BLINK_CSS.contains("transition"));
         assert!(!STATUS_DOT_BLINK_CSS.contains("ease-in-out"));
         assert!(!kept_working.contains("box-shadow"));
-        assert!(STATUS_DOT_BLINK_CSS.contains("--yggterm-status-dot-blink: 0;"));
         let transient_idle = live_session_status_dot_style(dark, false, false);
         assert!(transient_idle.contains("#3b82f6"));
         let transient_working = live_session_status_dot_style(dark, false, true);
@@ -155739,20 +155951,46 @@ mod tests {
             live_session_status_dot_style(dark, true, false)
         );
     }
-    // The whole point of the shape: exactly ONE animation exists (on `:root`), and
-    // no dot owns one. N dots blinking at N phases cost N full-window blits per
-    // cycle on a software-GL host; a shared inherited phase costs one, forever,
-    // no matter how many dots blink.
+    // ⛔ THE DEFECT CLASS THIS TEST EXISTS FOR: a blink phase that only the
+    // STYLE system can see. The shipped design animated the inherited custom
+    // property `--yggterm-status-dot-blink` from `@keyframes` on `:root`;
+    // `getComputedStyle` read a perfect square wave off it while the pixels
+    // never moved, because WebKitGTK does not mark a custom property's `var()`
+    // consumers dirty for paint. So the rule is stated where it can be checked:
+    // the stylesheet declares NO animation at all — the phase comes from a
+    // timer whose class toggle is an ordinary style change, the kind the paint
+    // path cannot ignore.
+    //
+    // The other half of the shape survives unchanged: exactly ONE clock, and no
+    // dot owns a phase. N dots blinking at N phases cost N full-window blits per
+    // cycle on a software-GL host; one shared phase costs one, no matter how
+    // many dots blink.
     #[test]
-    fn only_the_root_animates_and_dots_merely_read_the_shared_phase() {
+    fn exactly_one_clock_drives_every_dot_and_it_is_one_the_paint_path_can_see() {
         let dark = palette(UiTheme::ZedDark);
-        assert!(STATUS_DOT_BLINK_CSS.contains(":root { animation: yggterm-status-dot-blink"));
-        assert_eq!(STATUS_DOT_BLINK_CSS.matches("animation:").count(), 1);
-        // The declared cadence and the documented constant stay one fact.
-        assert!(STATUS_DOT_BLINK_CSS.contains(&format!("{STATUS_DOT_BLINK_PERIOD_MS}ms")));
-        assert!(STATUS_DOT_BLINK_CSS.contains(&format!("{STATUS_DOT_BLINK_VAR}: 0;")));
-        // Every dot style in the app reads the phase; none declares an animation,
-        // so none can acquire a phase of its own.
+        assert!(
+            !STATUS_DOT_BLINK_CSS.contains("@keyframes"),
+            "a keyframe animation of a custom property updates style and not \
+             pixels — the phase must come from the clock: {STATUS_DOT_BLINK_CSS}"
+        );
+        assert!(
+            !STATUS_DOT_BLINK_CSS.contains("animation:"),
+            "no animation anywhere in the blink stylesheet: {STATUS_DOT_BLINK_CSS}"
+        );
+        // The rule and the clock agree on one class name, and the clock's
+        // half-cycle and the documented period stay one fact.
+        assert!(STATUS_DOT_BLINK_CSS.contains(&format!(":root.{STATUS_DOT_BLINK_OFF_CLASS} ")));
+        assert!(STATUS_DOT_BLINK_CSS.contains(STATUS_DOT_BLINK_VAR));
+        assert!(STATUS_DOT_BLINK_JS.contains(&format!("'{STATUS_DOT_BLINK_OFF_CLASS}'")));
+        assert!(
+            STATUS_DOT_BLINK_JS.contains(&format!(", {});", STATUS_DOT_BLINK_PERIOD_MS / 2)),
+            "the clock ticks every half period: {STATUS_DOT_BLINK_JS}"
+        );
+        // Installing twice must not start a second clock — three surfaces emit
+        // the rule and any of them may mount first.
+        assert!(STATUS_DOT_BLINK_JS.contains("if (window.__yggtermBlinkClock)"));
+        // Every dot style in the app carries the shared marker; none declares an
+        // animation, so none can acquire a phase of its own.
         let dot_styles = [
             live_session_status_dot_style(dark, true, true),
             live_session_status_dot_style(dark, false, true),
