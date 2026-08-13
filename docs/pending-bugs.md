@@ -1547,6 +1547,39 @@ removing that file once consumption is confirmed.
 guarantee, and this is a live counter-example: our own deploys are degrading other agents' rows.
 ⇒ It belongs with the hot-restart/daemon-lifecycle work, not with the deploy-identity work.
 
+## ⚠ ~1700 COMMITS LIVE ONLY IN ONE CLONE'S REMOTE-TRACKING REFS — KEEP OR DROP?
+
+**Status:** OPEN
+
+*A decision, not a defect. Nothing is broken and nothing is at risk today.*
+
+Five branches are reachable from one host's `refs/remotes/<peer>/*` and from **no origin ref**:
+two `fix/*` lanes, a first-launch overflow fix, and two hardware-experiment lanes. **They no longer
+exist on the peer they name** — that host now carries only `main`. So the remote-tracking refs are
+stale pointers to branches that are gone, and **that one object store is the only place ~1700
+commits live.**
+
+**Measured, because the urgency was initially overstated as "one `gc` from gone":**
+
+- `git gc` collects only **unreachable** objects, and `refs/remotes/*` **are refs**, so those
+  objects are reachable (5,983 from all refs on that clone).
+- Neither `remote.<peer>.prune` nor `fetch.prune` is set, so nothing prunes automatically.
+
+⇒ **The hazard is a deliberate `git remote prune` / `fetch --prune`, not background maintenance.**
+Lower urgency, and a much more specific thing to warn people away from.
+
+⛔⛔ **AND THE OBVIOUS WAY TO PRESERVE THEM IS THE ONE THING THAT MUST NOT HAPPEN.** These are
+**pre-rewrite lineage**: they carry the private strings the history rewrite exists to remove.
+**Pushing them to origin to save them would republish, at scale, exactly what was just scrubbed —
+and do it after the rewrite reported success.** Anyone thinking *"let's not lose 1700 commits"*
+reaches for precisely that. ⇒ They stay local and unpushed. If they are ever judged worth keeping,
+they are **scrubbed first and pushed second**, never the reverse.
+
+**Recommendation:** leave them in place and decide deliberately later. They cost nothing where they
+are, no work is blocked, and destroying another agent's abandoned lanes is not a call to make in
+passing. ⚠ Whoever decides should check whether the work landed by another route first — an
+abandoned branch whose content is already on `main` is a different question from one that is not.
+
 ## ⛔ A DIRTY CHECKOUT ONLY WARNS, SO A RELEASED BINARY STAMPS ITSELF `-dirty`
 
 **Status:** OPEN
