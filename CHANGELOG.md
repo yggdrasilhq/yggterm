@@ -26,6 +26,13 @@ This file tracks user-visible changes in `yggterm`.
   services are still finishing older work reads as exactly that, instead of
   reading as fully up to date.
 
+- **A fleet deploy now names the source of every copy it finds, not just
+  whether it matches (3.0.137).** The report used to say a version and a
+  checksum, so two different builds sharing a version number showed up only as
+  "these differ" — with no way to say which was which. Each copy is now asked
+  directly, and copies too old to answer say so rather than being asked a
+  question that would open a window on them.
+
 - **A screenshot now says which authority decided it was safe to take
   (3.0.133).** The capture path asks the compositor whether this window is the
   one that would be photographed, and falls back to yggterm's own drawing when

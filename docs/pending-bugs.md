@@ -182,45 +182,6 @@ per-daemon (five of the daemons on that host are older than the current binary
 open must emit a trace event naming the refusal. Silence here is itself the bug —
 the reporter had no way to tell "this row is gone" from "this row is slow".
 
-## ⛔ THE CENSUS STILL CANNOT ASK AN ON-DISK BINARY WHICH SOURCE IT IS
-
-**Status:** OPEN
-
-*narrowed 2026-08-13 at 3.0.133: the RUNNING plane now answers directly, and the
-disk plane is what remains*
-
-**What shipped.** A process publishes the commit it was built from while it still
-can: the daemon on `server status` (`server_build_commit`), the GUI in its client
-record (`build_commit`), and `server daemons` grew a BUILD column that
-`deploy-fleet.sh` now prints for every host beside the four on-disk copies. Live
-on the desktop host: the new daemon read `690bb64bbb07` — equal to the deploying
-tree's HEAD — while four coexisting older daemons read `(pre-field)`, so the
-column was shown to say two different things in one run rather than a constant.
-The running GUI answered the same commit with `/proc/<pid>/exe` md5 equal to the
-deployed binary's, read in the same command as the version probe.
-
-⇒ That half was the more urgent one and it was invisible: `--build-commit` can
-only ever interrogate a FILE, and a deploy replaces the file under a live
-process. Measured before the fix, the running GUI's exe hashed to a value
-matching **no file on the host**, so its build could not be named at all.
-
-**What remains.** The census still compares the four on-disk copies by md5 rather
-than asking each one `--build-commit`. The trap is unchanged: that flag on a
-binary built before it existed **falls through to LAUNCHING THE GUI**, so a
-census that interrogated every copy would open windows across the fleet on
-exactly the machines that are behind — the ones it exists to find.
-
-⚠ And "the fleet is past that version now" is not the answer it looks like. The
-copies a census interrogates are the ones a deploy just wrote, so they are new by
-construction; the dangerous case is precisely the host where a copy did NOT land,
-which is where the old binary still is. Until an older binary can be asked and
-refuse safely, md5 is the honest instrument for the disk — and it now sits beside
-a running plane that names its own commit, so a divergence can at last be
-described rather than merely detected.
-
-**Falsifier:** the census names the commit of an on-disk copy it did not itself
-deploy, on a host that is behind, without launching anything.
-
 ## ⛔ deploy-fleet CANNOT RECOGNISE ITSELF UNDER AN ALIAS IT CANNOT RESOLVE
 
 **Status:** OPEN
