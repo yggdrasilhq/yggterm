@@ -404,11 +404,20 @@ while both daemons held all three runtimes reported **three distinct session
 paths — no duplicate identity.** That is where a duplicated row would have to
 come from, so the mechanism most likely to break is measured, not assumed.
 
-⛔ **It is still not a pixel.** The sandbox has no GUI, so what the sidebar
-RENDERS over a 10 s double-claim is untested. **Falsifier:** run a handover under
-a live GUI with rows on screen and watch for duplicate or flickering rows for the
-length of `YGGTERM_HANDOFF_SETTLE_MS` — the one check that needs the GUI host and
-cannot be done headlessly.
+✅ **AND THE PIXEL WAS TAKEN — the falsifier ran, 2026-08-14.** A full GUI under a
+private headless compositor (`scripts/underglass-sandbox.sh`), four rows on a
+3.0.150 daemon, handed over to a 3.0.151 successor. Frames captured before, four
+times across the window, and after: **the sidebar rendered the same four rows
+throughout — no duplicate row, no flicker, no change in the count.** The
+predecessor exited only after `settled: true`, the successor then owned all four,
+and `successor_identified: true` — the first live exercise of the pid +
+start-time identity path rather than the fallback.
+
+⚠ **One instrument in those frames is NOT evidence and must not be cited:** the
+Session Metadata panel showed an identical daemon uptime in the mid-window and
+post-window captures, so that panel does not repoll on its own. The row list is
+what was measured; the panel's daemon fields say nothing about which daemon was
+serving.
 
 ## ⛔⛔⛔ [6.7] A ROW CAN BE ALIVE, IDLE-LOOKING, AND NOT READING ITS PTY — THE "I CANNOT TYPE" BUG
 
