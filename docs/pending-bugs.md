@@ -1478,17 +1478,36 @@ clearing tool also eats human text.
 reached the box or the transcript, `accepted: true` both times. **Both failure modes report
 success**, in opposite directions, which is why neither is visible to a caller.
 
-**Fixes, in the reporter's preference order and it is the right order:**
+**⭐⭐ THE REQUIRED BEHAVIOUR IS OWNER-SPECIFIED (2026-08-13), AND IT IS NOT "REFUSE":**
 
-1. **`send` refuses, or warns loudly, when the target's input buffer is non-empty** —
-   `--expect-empty-input` as the DEFAULT for agent rows with an explicit override. Cheapest, and it
-   catches the whole class rather than this instance.
-2. **An `--enter` flag** making text-and-submit one atomic act that cannot interleave a human's
-   keystrokes between the two writes. ⭐ This also retires the two-write rule, which exists only
-   because the one-write form does not submit.
-3. **Expose `input_buffer_len` / `human_typing_since_ms`** on `terminal read-buffer` or on `send`'s
-   own reply, so a caller can check before writing.
-4. **Refuse or chunk oversized pastes** rather than dropping them silently.
+> **Before writing, check whether the human has typed something. If they have, YANK it, send the
+> message, then PASTE it back into the next prompt as if nothing had happened.**
+
+⇒ **Preserve the delivery AND the keystrokes.** The reporter's first preference — refuse while the
+buffer is non-empty — was the obvious fix and is the wrong one: it protects the human by dropping
+the message, so a row with someone sitting at it becomes unreachable exactly when a delivery may
+matter most. **Save-and-restore keeps both.** ⛔ The restore is not optional decoration; a yank that
+fails to put the text back is strictly worse than the splice, because the loss is then silent.
+
+**The supporting pieces, re-ranked against that requirement:**
+
+1. **An atomic text-and-submit** (`--enter`), so nothing can interleave between the write and the
+   submit. Save-and-restore needs this: a non-atomic version has a window where the human resumes
+   typing into a box the caller believes it owns. ⭐ It also retires the two-write rule, which
+   exists only because the one-write form does not submit.
+2. **Expose `input_buffer_len` / `human_typing_since_ms`** on `terminal read-buffer` or on `send`'s
+   reply. The check the requirement opens with needs a field to read, and there is none today.
+3. **Refuse or chunk oversized pastes** rather than dropping them silently — save-and-restore does
+   nothing for a message that never arrives.
+4. ⚠ **The clear must not be a kill-line.** The repair path that ate a human's sentence used one.
+   Whatever performs the yank has to capture the buffer first and be reversible, and **Escape is not
+   available** as a clear on an agent row mid-turn.
+
+⛔ **THE SUPERVISION PLANE IS ITSELF A CALLER OF THIS VERB.** `ygg-monitor.py`'s `escalate()` writes
+text and then a bare `\r` to an orchestrator's row — the exact splice path — and an orchestrator's
+row is among the likeliest places for a human to be typing. Two escalations took that path on
+2026-08-13. ⇒ Whoever implements the requirement must fix the monitor's send with it, or the
+supervision plane keeps the defect after the verb is repaired.
 
 ⭐ **The doc fix matters more than the feature, because it is the layer an agent actually reads.**
 The messaging sections of the fleet skill and the data-fabric skill both present `terminal send` as
