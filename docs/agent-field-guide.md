@@ -33,10 +33,14 @@ Every entry below cost a session at least once.
 | `web_surface_contexts` | A surface has no profile dir. It counts only the KEYED map, and `WebContext::new_ephemeral()` is never inserted — so `0 contexts, 41 surfaces live` is indistinguishable from 41 UNSHARED contexts, the exact failure its own doc says it catches. Reached in ordinary operation: the shell passes `profile_dir: None` whenever another client holds the profile write-lock | Count surfaces and contexts together and compare; a zero count beside live surfaces is a BLIND instrument, not a clean result |
 | `app_render_rate` | Never — and that is the point. It is **always on** (no env gate) and had already recorded 739 samples over 12.3 h showing the rate FLAT at ~2/s while CPU climbed 3.6×. Nobody read it, and a cluster was briefed to chase the re-render as the growth | Read the always-on probes BEFORE forming a hypothesis. A constant-rate loop cannot be what grows |
 | `yggterm --version` | You need the **protocol** version. It reports the `yggterm` package; the daemon uses `yggterm-server`'s, which a version-only bump may not recompile | The daemon's own socket name, `server-<v>.sock` |
+| A `FAILED` / `test result:` grep over `cargo test --workspace` | **The workspace does not COMPILE.** A build error yields no failures *and no results*, so every "is it green?" grep reads clean — an empty set wearing a pass. Reached in ordinary operation: a struct gained a field and three test fixtures were not updated, and the suite was unbuildable until someone tried to run one specific test. Every workspace run between that commit and the fix was reading a non-result as a pass | Assert the run HAPPENED before reading its silence: require a non-zero `test result: ok. N passed` with **N > 0**, and check the exit status. A grep that can only ever find bad news cannot distinguish "no bad news" from "no news" |
+| A shadow client (`--client <name>`) that worked earlier in the session | **A deploy restarted the GUI and stranded it.** This is the most dangerous entry in the table, because it fails in the opposite direction to the rest: a dead shadow does not return an error, it returns a **plausible picture**. A rail stuck on `Loading…` reads first as a slow fetch and then as a regression in whatever you last changed — and the CONTROL runs through the same dead instrument, so two measurements agree completely and both are worthless. It manufactures a false accusation against someone else's code rather than a false absence | Check the instrument's OWN health in the same run as the measurement (`--client <name>` answers *"no live client by that name"* the moment anything asks). ⛔ A shadow that worked an hour ago is not evidence it works now — the GUI moved **eight versions in one session** (3.0.132 → 3.0.140); never assume the build you measured on is the build you are on |
+| Ordering inside `main()` when a guard's contract is "first statement" | **Anything is inserted above it.** `adopt_or_refuse_session_bus()` guards against orphaned session buses, and *being first* is its entire guarantee — GLib caches the D-Bus address on first use, so one earlier call permanently disarms it. A later commit added a build-identity declaration above it and the lock went quietly red in both binaries; nothing about the new line looked dangerous | Keep an executable assertion that the guard is first (the test exists — `every_entry_point_refuses_autolaunch_before_it_can_happen`), and treat "this line is harmless, it only records something" as the exact shape that breaks a first-statement contract |
 | **`mtime` on an agent session store** | **Always, on any store a fleet copy has touched.** Measured 2026-08-08: **575 of 618** codex rollouts on the GUI host share a single mtime *minute*. `rsync`/`cp` stamps the copy, so "least recently touched" reads as "all touched at once", which is false for every file. It will also report a decade-old session as fresh | **Birth** = the store's own path/filename convention (`.../<yyyy>/<mm>/<dd>/rollout-<iso>-<uuid>.jsonl`). **Last touch** = the `timestamp` field on the file's **final record** (top-level, ISO-8601, on every record). Both survive a copy; `mtime` does not |
 | `du` vs `find -printf %s` on a compressed dataset | Always, and they will not agree. The fleet's pools run `compression=zstd` at `compressratio=1.54x`, so `du` reports **compressed** bytes and `find`/`stat` report **logical** ones. 3.2 GB of swept files returned ~2.0 GB of disk. Nearly filed as a bug | Say which you mean. Report reclaim in **disk** bytes (`du`, or logical ÷ `zfs get compressratio`); size a budget in the same units it will be measured in |
 | A **byte** comparison as proof that two transcripts are the same conversation | The CLI has migrated its own format. Codex re-serialised its whole store on 2026-03-14 with a different JSON **key order**, so a `.bak.` and its live rollout hold identical records in different bytes. A byte-prefix proof refused **624 of 753** genuinely-redundant copies | Canonical JSON per record (`json.dumps(..., sort_keys=True)`), compared as a sequence, streamed in lockstep — these files reach 5.5 GB. Policy: [`spec-sweep-policy.md`](spec-sweep-policy.md) §9.6 |
 | A file's **size** as a proxy for its importance | You are ranking conversations. Measured on the same store: the largest rollout puts **96.4% of its bytes in 388 of 36,288 lines** (pasted `data:image` blobs). Size tracks attachments, not reasoning, so a byte-weighted rank calls an image dump important and a long argument trivial | Count **user turns**, and count **distinct days appended to** for how often it was returned to. Policy: [`spec-sweep-policy.md`](spec-sweep-policy.md) §4 |
+| A session **path scheme** as a statement of WHERE a row runs | **Always.** `live::<uuid>` reads like "local" and is what a REMOTE ssh shell gets; a genuinely local shell is `local://<uuid>`. Measured 2026-08-13: a report concluded `--kind shell --machine-key <remote>` was placing rows on the wrong machine, from the path prefix alone. The row was on the named machine — `kind: ssh_shell`, `host_label: <remote>`, and `exec ssh -tt … <remote>` in its own launch command. The entry was retracted; the flag had never been ignored | `host_label` / `machine_key`, **and** the launch command's ssh hop. The scheme says how a row is ADDRESSED, not where it runs. And a flag that reaches the GUI can be shown to: pass a nonsense key and watch it be refused BY NAME (`unknown remote machine key: …`) — a dropped flag cannot produce that refusal |
 | `server reorder`'s response | The rows have no live runtime. It reports `"requested": N` and echoes your list even when it reordered nothing | Re-read `server app rows` |
 | `--help` for any `server app` verb | Often — the help text goes stale while the parser gains verbs | The match arm in `apps/yggterm/src/main.rs` |
 | A `#[serde(default)]` telemetry field reading `0` | The peer predates the field entirely — absent and zero are the same wire value | Ask whether the KEY exists, not its value |
@@ -83,6 +87,103 @@ does what you assume** — and when the primitive belongs to a vendored library,
 prove it in `tools/xterm-harness/` (jsdom + the EXACT shipped bundle, minutes to
 write) instead of arguing from a live symptom. The harness turns
 "upstream probably does X" into a test that fails when a version bump changes X.
+
+**⛔⛔ A READER THAT FINDS NOTHING LOOKS EXACTLY LIKE A THING THAT HAS NOTHING (2026-08-13).** An
+empty result and a broken reader are the same picture: nothing errors, every count is plausible, and
+the failure hides *precisely because* the system survives emptiness gracefully. Four independent
+instances landed in one evening — a collection reader keyed on the wrong filename reading two
+populated collections as empty; an editor CLI that accepts a path, reports success and drops it, so
+`exit 0` plus an empty editor reads as a paint bug; a surface declaring thousands of characters and
+painting none; and a subject-comparison whose normalizer returned empty, so every subject "missed"
+and it reported sixteen losses that did not exist.
+
+⇒ **THE ACTIONABLE HALF, which is what makes it a rule rather than an epigram: if a reader's silence
+looks the same as success on empty input, give it a way to say *"I looked and found nothing"* apart
+from *"there was nothing."*** ⭐ And when you add any reader, ask what its silence would look like
+**before** you trust its first clean run. Pairs with the both-controls rule below: a positive control
+alone cannot detect an instrument that has collapsed to a constant answer.
+
+*The open defects in this family live in `docs/pending-bugs.md`; this entry owns the durable rule and
+does not duplicate them.*
+
+**⛔⛔ `launch_phase: RemoteBootstrap` IS NOT A FAULT STATE, AND COUNTING IT PRODUCED A FALSE OUTAGE
+(2026-08-13).** During a real socket outage, two sessions independently read `RemoteBootstrap 41 /
+Running 10` as *"41 rows are stranded with no PTY"*. It is the ordinary resting state of a row.
+**The counterexample is direct, not inferred:** an orchestrator sampled the field while mid-turn and
+found **its own row** in `RemoteBootstrap` — along with three other rows that had each sent a
+message minutes earlier.
+
+⇒ **Do not infer health, or its absence, from a phase census.** Two samples 45 s apart were
+byte-identical, so it was not even a settling system; the field simply does not answer the question
+its name suggests. ⭐ **Through the whole incident the only instrument that was right in either
+direction was WHETHER ROWS RESPOND** — a delivered message, an accepted submit, a commit appearing.
+
+⚠ **The trap has a specific shape worth naming: during a genuine incident, any alarming-looking
+field acquires a causal story for free.** Both readings above were published — one as *"the outage
+is over"*, one as *"not resolved"* — and the disputed field was load-bearing in neither. **Before a
+count becomes evidence, find one entity you already know the answer for and check the field against
+it.**
+
+**⛔⛔ A PRE-PUSH PRIVACY REFUSAL WITH HUNDREDS OF HITS IS USUALLY A STALE BRANCH, NOT A LEAK — AND
+THE ONLY LEVER IT OFFERS IS THE ONE THAT SHIPS ONE (2026-08-13).** The guard scans
+`<tip> --not --remotes=origin`. That range is the right one — but it is enormous whenever the local
+branch is on a lineage `origin` no longer has, which is the normal state of every checkout after a
+history rewrite, a force-push, or a long-lived lane that was reset upstream. Measured on one lane,
+same repo, same command, before and after reconciling, with nothing about the commits changed:
+
+```
+  diverged branch    1,211,081 added lines scanned →  259 hits → REFUSED
+  reconciled branch      1,559 added lines scanned →    0 hits → clean
+```
+
+Every one of those 259 was mined out of history that had been public for weeks. ⛔ **And the
+refusal text names `YGG_PRIVACY_ALLOW=1` as the way forward, which suppresses the WHOLE scan** — so
+a session that knows its own commit is clean is steered straight at the override that would ship a
+real leak past the guard.
+
+⇒ **Run this BEFORE believing any guard refusal:**
+
+```sh
+git rev-list --left-right --count origin/main...HEAD    # left = behind, right = ahead
+```
+
+**If the left number is in the thousands, the branch is the problem and the hits are not yours.**
+Reconcile (**replay onto the new lineage — never a plain `rebase origin/main`, which duplicates the
+whole history, and never a merge, which reinstates the lineage a scrub removed**) and re-run the
+scan. It collapses to your own commits. ⛔ Reach for the override only when the scan is already
+scoped to what you actually wrote and you have read every hit.
+
+⭐ **The guard now says this itself.** When a refusal arrives on a branch that is behind its
+upstream, it reports the ahead/behind counts, names `git fetch && git rebase <upstream>` as the
+next step, and **omits the override line entirely** — replacing it with a warning that the
+override suppresses the whole scan. The obvious implementation of that check does not work: keying
+it on *"the scanned range is much larger than what I am ahead by"* stays silent in exactly the case
+it is for, because after a force-push `ahead` inflates in lockstep with the range and the ratio
+stays about 1. **Being BEHIND is the signal; the ratio measures nothing.**
+
+⚠ **The guard's wordlist holds whole tokens, and identity does not live only in tokens.** An
+enumeration that names several private things by their short stems and supplies the shared suffix
+*once* matches no term and passes clean, while a human reassembles it without effort. The guard now
+carries a narrow structural check for that one shape — a suffix shared by two or more known terms,
+appearing on a line with two or more of their distinct stems as whole words — derived from the
+wordlist itself. Deliberately narrow: a general natural-language leak detector is a hole with no
+bottom, and a check that cries wolf manufactures the override habit that defeats the tool.
+Measured across three repositories' entire published histories: zero hits.
+
+### ⛔ AN EXIT CODE AFTER A PIPELINE ANSWERS A DIFFERENT QUESTION THAN YOU ASKED
+
+```sh
+git show <ref>:<file> | grep -c '<pattern>' ; echo $?     # ⛔ this is grep's status ONLY by luck
+```
+
+`$?` is the **last** command's status, so a check written this way asks *"did the final stage
+succeed"* rather than *"did the match succeed"* — and the two diverge exactly when an earlier stage
+fails, which is when you most need the answer. Same family as `cargo test … | tail`, which reports
+`tail`'s status and turns a red suite green. ⇒ use `${PIPESTATUS[0]}`, or drop the pipe.
+
+⭐ **And the discipline that catches it: run both controls in the same command.** The instance that
+produced this line was only recognised because a negative control returned 0 and a positive control
+returned 168 side by side — a single reading of either would have looked like an answer.
 
 ## 2. Profiling recipes that work
 

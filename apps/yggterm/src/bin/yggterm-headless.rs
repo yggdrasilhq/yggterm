@@ -49,7 +49,8 @@ use yggterm_server::{
     run_app_control_app_pane_action, run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded,
     run_app_control_set_search, run_app_control_set_session_keep_alive,
-    run_app_control_set_split_group_ratio, run_app_control_set_theme_editor_open,
+    run_app_control_set_launch_flags, run_app_control_set_split_group_ratio,
+    run_app_control_set_theme_editor_open,
     run_app_control_set_theme_editor_values, run_app_control_set_tree_selection,
     run_app_control_set_window_chrome_hover, run_app_control_show_start_page,
     run_app_control_split_web_tab, run_app_control_start_action,
@@ -190,6 +191,12 @@ fn print_server_help() {
   yggterm-headless server ping
   yggterm-headless server status
   yggterm-headless server daemons [--json]
+  yggterm-headless server relay-boundary [--by <who>] [--wait-secs <n>] [--json]
+  yggterm-headless server gate-screen [<session-key>] [--tail <n>] [--json]
+    what the hot-restart idle gate is CLASSIFYING FROM, per owned session — the
+    live in-daemon screen plus the blocker it produced. This is not
+    `server snapshot`'s terminal_lines, which is usually a stored summary line
+    rather than screen text. Read-only, on demand, never written to the trace.
   yggterm-headless server <status|snapshot> --endpoint <socket-path|version|pid>
   yggterm-headless server snapshot
   yggterm-headless server shutdown
@@ -219,6 +226,10 @@ fn print_server_app_help() {
   yggterm-headless server app desktop-identity
   yggterm-headless server app state [--pid <pid>]
   yggterm-headless server app rows [--pid <pid>]
+  yggterm-headless server app row-expanded <row-path> <true|false>
+    opens or shuts a container — a folder, a machine, or a ROW SET's head — the
+    way clicking its disclosure control does. Row-set heads are ordinary session
+    rows: `server app rows` marks one with a `child_count` above 1.
   yggterm-headless server app sessions reorder <order.json>
     sets the order on the GUI — the process that RENDERS it — and answers with
     the resulting `rendered_order`. `server sessions reorder` writes to whichever
@@ -1306,6 +1317,15 @@ fn main() -> Result<()> {
     // the live host. Children inherit whatever we resolve here.
     let _session_bus = yggterm_core::session_bus::adopt_or_refuse_session_bus();
 
+    // This process becomes a DAEMON that outlives the file it was loaded from,
+    // so it publishes the source it was built from while it still can. See
+    // `yggterm_server::build_identity` for why nothing outside can recover it.
+    //
+    // ⚠ AFTER the bus resolve, not before — same reason as the GUI binary's:
+    // "first statement in main()" is the whole guarantee the lock enforces, and
+    // nothing here needs the identity declared first.
+    yggterm_server::build_identity::declare_build_commit(build_identity::build_commit());
+
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_target(false)
@@ -1410,6 +1430,60 @@ fn main() -> Result<()> {
                 "message": message,
             }))?
         );
+        return Ok(());
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "gate-screen" {
+        // §3's audit instrument. Read-only, on demand, and connected directly
+        // like the other read-only diagnostics — a verb that spawned a daemon
+        // in order to ask what a daemon is looking at would answer about a
+        // process that did not exist when the question was asked.
+        //
+        // ⛔ NOT WRITTEN ANYWHERE. The screens go to this stdout and nowhere
+        // else — see `HotRestartGateScreen`. A caller harvesting a corpus owns
+        // where it lands and how long it lives.
+        let endpoint = cli_server_endpoint(store.home_dir());
+        let path = args.get(2).filter(|arg| !arg.starts_with("--"));
+        let tail_lines = cli_flag_value(&args, "--tail").and_then(|value| value.parse().ok());
+        let sessions = yggterm_server::hot_restart_gate_screens(
+            &endpoint,
+            path.map(String::as_str),
+            tail_lines,
+        )?;
+        if args.iter().any(|arg| arg == "--json") {
+            println!("{}", serde_json::to_string_pretty(&sessions)?);
+            return Ok(());
+        }
+        if sessions.is_empty() {
+            println!("no sessions owned by this daemon match");
+            return Ok(());
+        }
+        for session in &sessions {
+            let verdict = match session.blocker.as_ref() {
+                Some(blocker) => format!(
+                    "{kind}{permanent}, idle {idle}",
+                    kind = blocker.kind,
+                    permanent = if blocker.permanent { " (permanent)" } else { "" },
+                    idle = blocker
+                        .idle_ms
+                        .map(|ms| format!("{}s", ms / 1000))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+                None => "not blocking".to_string(),
+            };
+            println!(
+                "== {key}\n   gate verdict: {verdict}\n   screen_text_shows_agent_working: {working}\n   screen: {screen}",
+                key = session.session_key,
+                working = session.shows_agent_working,
+                screen = if session.screen_available {
+                    "readable"
+                } else {
+                    "UNREADABLE — the gate is classifying this one blind"
+                },
+            );
+            for line in session.screen_tail.iter().flatten() {
+                println!("   | {line}");
+            }
+        }
         return Ok(());
     }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "app-declares"
@@ -1911,6 +1985,32 @@ fn main() -> Result<()> {
                 run_app_control_dump_state(output_path, timeout_ms)
             }
             "rows" => run_app_control_describe_rows(timeout_ms),
+            // `server app row-expanded <row-path> <true|false>` — open or shut a
+            // container from a verb, the way a click does it.
+            //
+            // ⛔ THE PROTOCOL COMMAND AND THE SHELL HANDLER BOTH EXISTED AND
+            // NOTHING CALLED THEM. `run_app_control_set_row_expanded` had no
+            // caller at all, so `server app rows` reported an `expanded` field
+            // that no verb on the command line could change — the half of
+            // "an agent arranges rows as easily as a hand does" that was
+            // written and then never wired to a name a caller could type.
+            "row-expanded" => {
+                let positional = cli_positional_args(&args, 3);
+                let row_path = positional.first().ok_or_else(|| {
+                    anyhow::anyhow!("usage: server app row-expanded <row-path> <true|false>")
+                })?;
+                let expanded = match positional.get(1).copied() {
+                    Some("true") => true,
+                    Some("false") => false,
+                    // Named rather than defaulted: guessing here would silently
+                    // do the opposite of what the caller meant.
+                    other => anyhow::bail!(
+                        "server app row-expanded needs `true` or `false`, got {}",
+                        other.unwrap_or("nothing")
+                    ),
+                };
+                run_app_control_set_row_expanded(row_path, expanded, timeout_ms)
+            }
             "sessions" if args.get(3).map(String::as_str) == Some("reorder") => {
                 // `server app sessions reorder <order.json>` — the APP-path twin
                 // of `server sessions reorder`. Same file format; the difference
@@ -2294,6 +2394,42 @@ fn main() -> Result<()> {
                     other => anyhow::bail!(
                         "unsupported app command action: {other} (try list|invoke <id>)"
                     ),
+                }
+            }
+            // ⛔ THE SAME ARM EXISTS IN `apps/yggterm/src/main.rs`, AND THAT IS
+            // THE DEFECT, NOT THE DUPLICATION. `server app` is dispatched twice
+            // — once in the GUI binary, once here — so a verb added to one is
+            // ABSENT from the other while every instrument agrees the code
+            // shipped: the binary carried the arm, `--build-commit` matched the
+            // deploy, and `server app launch-flags` still answered "unsupported
+            // app control command". Filed in pending-bugs; until the two
+            // dispatchers become one, a new verb must be added HERE too, and
+            // this is the copy agents actually call.
+            "launch-flags" => {
+                let positional = cli_positional_args(&args, 3);
+                let action = positional.first().copied().unwrap_or("open");
+                let slug = cli_flag_value(&args, "--cli").map(str::to_string);
+                let flags = cli_flag_value(&args, "--args").map(str::to_string);
+                match action {
+                    "open" | "show" | "on" | "true" | "1" => {
+                        run_app_control_set_launch_flags(Some(true), slug, flags, timeout_ms)
+                    }
+                    "close" | "hide" | "off" | "false" | "0" => {
+                        run_app_control_set_launch_flags(Some(false), slug, flags, timeout_ms)
+                    }
+                    "set" => {
+                        let slug = slug.context(
+                            "server app launch-flags set needs --cli <slug> (and --args to \
+                             store; omit --args to reset that CLI to its default)",
+                        )?;
+                        run_app_control_set_launch_flags(None, Some(slug), flags, timeout_ms)
+                    }
+                    "reset" => {
+                        let slug = slug
+                            .context("server app launch-flags reset needs --cli <slug>")?;
+                        run_app_control_set_launch_flags(None, Some(slug), None, timeout_ms)
+                    }
+                    other => anyhow::bail!("unsupported app launch-flags action: {other}"),
                 }
             }
             "theme-editor" => {
@@ -3541,6 +3677,10 @@ fn main() -> Result<()> {
         // is a host fact, so it rides the host-wide census rather than any one
         // daemon's status.
         let queued = yggterm_server::hot_restart_queue::load(store.home_dir());
+        // §5's other half is a host fact too: a forced swap that has interrupted
+        // somebody and not yet made it good is a state a reader must be able to
+        // see, and this is the one place they are already looking.
+        let interrupted = yggterm_server::hot_restart_repair::load(store.home_dir());
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis() as u64)
@@ -3551,6 +3691,7 @@ fn main() -> Result<()> {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "daemons": rows,
                     "queued_hot_restart": queued,
+                    "interrupted_sessions": interrupted,
                 }))?
             );
         } else {
@@ -3562,6 +3703,100 @@ fn main() -> Result<()> {
                     now_ms
                 )
             );
+            if let Some(interrupted) = interrupted.as_ref() {
+                print!(
+                    "{}",
+                    yggterm_server::hot_restart_repair::format_pending_repair(interrupted, now_ms)
+                );
+            }
+        }
+        return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "server")
+        && args.get(1).is_some_and(|arg| arg == "relay-boundary")
+    {
+        // §2 of docs/spec-hot-restart-relay-gate.md — *"a relay hand-off is a
+        // genuine, declared, zero-cost quiet point … the gate stops being a
+        // search and becomes an appointment."*
+        //
+        // ⛔ It does NOT spawn a daemon (no `ensure_local_server_ready_for_cli`)
+        // and it does not talk to one. The queue is a HOST fact in a file, and
+        // making the verb reach a daemon would mean choosing which of the
+        // several a stale host is running — the exact question §4 moved out of
+        // any one daemon's status. A drainer picks the boundary up on its next
+        // 20 s poll.
+        let json = args.iter().any(|arg| arg == "--json");
+        let declared_by = args
+            .iter()
+            .position(|arg| arg == "--by")
+            .and_then(|index| args.get(index + 1))
+            .cloned()
+            .unwrap_or_else(|| "relay_boundary".to_string());
+        let wait_secs = args
+            .iter()
+            .position(|arg| arg == "--wait-secs")
+            .and_then(|index| args.get(index + 1))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        let outcome = yggterm_server::hot_restart_queue::declare_relay_boundary(
+            store.home_dir(),
+            now_ms,
+            &declared_by,
+        );
+        let (owed, target_version, waiting_ms) = match &outcome {
+            yggterm_server::hot_restart_queue::RelayBoundaryOutcome::Declared {
+                target_version,
+                waiting_ms,
+            } => (true, Some(target_version.clone()), Some(*waiting_ms)),
+            yggterm_server::hot_restart_queue::RelayBoundaryOutcome::NothingOwed => {
+                (false, None, None)
+            }
+        };
+        // ⚠ The drainer polls every 20 s, so a wait shorter than that can only
+        // ever time out — say so rather than reporting a converged host as
+        // still-owing. Waiting is opt-in because the common case is a converged
+        // host with nothing to wait for.
+        let mut converged = !owed;
+        if owed && wait_secs > 0 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if yggterm_server::hot_restart_queue::load(store.home_dir()).is_none() {
+                    converged = true;
+                    break;
+                }
+            }
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "declared_by": declared_by,
+                    "swap_owed": owed,
+                    "target_version": target_version,
+                    "waiting_ms": waiting_ms,
+                    "waited_for_secs": wait_secs,
+                    "converged": converged,
+                }))?
+            );
+        } else if let Some(target_version) = target_version {
+            let waiting_min = waiting_ms.unwrap_or(0) / 60_000;
+            if converged {
+                println!(
+                    "relay boundary declared by {declared_by}; swap to {target_version} converged"
+                );
+            } else {
+                println!(
+                    "relay boundary declared by {declared_by}; swap to {target_version} \
+                     (owed {waiting_min}m) is due at the next drainer poll"
+                );
+            }
+        } else {
+            println!("relay boundary declared by {declared_by}; no swap is owed on this host");
         }
         return Ok(());
     }

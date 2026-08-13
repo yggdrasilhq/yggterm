@@ -15726,6 +15726,10 @@ struct ShellState {
     keymap_editor_error: Option<String>,
     selected_tree_paths: HashSet<String>,
     user_collapsed_synthetic_paths: HashSet<String>,
+    /// Row sets the USER built by hand (`DESIGN.md` §"Row sets"). The SSOT for
+    /// the hand half of an arrangement; the seats supply the rest, derived, and
+    /// this outranks them per row. Persisted beside the split groups.
+    row_arrangement: yggterm_core::row_set_outline::RowArrangement,
     /// GUI-level split-view groups ([[campaign-split-view-groups]]). The single
     /// source of truth for splits: the compound sidebar row, the viewport pane
     /// layout, keep-alive, and persistence all derive from this list. No
@@ -15974,6 +15978,14 @@ struct ShellState {
     theme_editor_draft: YgguiThemeSpec,
     theme_editor_selected_stop: Option<usize>,
     theme_editor_drag_stop: Option<usize>,
+    /// Is the agent-CLI launch-flags modal up?
+    ///
+    /// No DRAFT beside it, unlike the theme editor: a flags box writes straight
+    /// through to `settings.agent_cli_extra_args`, exactly as the two text boxes
+    /// it replaces wrote straight through to their fields. A draft would add a
+    /// second in-memory copy of the values and an apply/cancel contract the
+    /// owner never asked for.
+    launch_flags_open: bool,
     background_copy_scan_in_flight: bool,
     next_background_copy_scan_after_ms: u64,
     browser_tree_loading_in_flight: bool,
@@ -16115,6 +16127,12 @@ struct ClientInstanceRecord {
     process_start_ticks: Option<u64>,
     #[serde(default)]
     executable_path: Option<String>,
+    /// The commit this GUI process was built from. Written here by the process
+    /// itself because nothing outside it can recover the answer once a deploy
+    /// has replaced the file at `executable_path`. Read back by
+    /// `yggterm_server::ClientInstanceRecord::build_commit` from this same JSON.
+    #[serde(default)]
+    build_commit: Option<String>,
     #[serde(default)]
     display: Option<String>,
     #[serde(default)]
@@ -16749,6 +16767,7 @@ struct RenderSnapshot {
     theme_editor_open: bool,
     theme_editor_draft: YgguiThemeSpec,
     theme_editor_selected_stop: Option<usize>,
+    launch_flags_open: bool,
     theme_accent: String,
     shell_tint: String,
     chrome_material_tint: String,
@@ -17963,6 +17982,7 @@ impl ShellState {
         // Captured before `settings` is moved into the ShellState struct below
         // ([[campaign-split-view-groups]] persistence restore).
         let restored_split_groups = settings.split_groups.clone();
+        let restored_row_arrangement = settings.row_arrangement.clone();
         let mut browser = SessionBrowserState::new(bootstrap.browser_tree.clone());
         // A persisted user collapse outranks a stale expanded entry for the
         // same synthetic path (the two can disagree when an auto-reveal
@@ -18106,6 +18126,9 @@ impl ShellState {
             // Live Sessions group survives GUI restarts (the auto-reveal
             // lanes consult this set before re-expanding).
             user_collapsed_synthetic_paths: restored_collapsed_synthetic_paths,
+            // Restored so a group the user built by dragging is still there
+            // after a restart — the same promise the split groups make.
+            row_arrangement: restored_row_arrangement,
             // Restored from settings so a built split-view workspace reopens as
             // the intentional artifact the user shaped ([[campaign-split-view-groups]]).
             // Normalized on parse; a group whose members no longer exist is
@@ -18233,6 +18256,7 @@ impl ShellState {
             theme_editor_draft: initial_yggui_theme,
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
+            launch_flags_open: false,
             background_copy_scan_in_flight: false,
             next_background_copy_scan_after_ms: 0,
             browser_tree_loading_in_flight: !browser_tree_loaded,
@@ -18713,6 +18737,11 @@ impl ShellState {
             self.server.ssh_targets(),
             &sidebar_hot_sessions,
             &merged_expanded_paths,
+            // The rendered sidebar is the ONE surface that draws a shut row set;
+            // every other consumer of the merge asks a question a collapse
+            // cannot change.
+            &self.user_collapsed_synthetic_paths,
+            &self.row_arrangement,
         );
         enrich_sidebar_rows_with_live_titles(
             &mut merged_rows,
@@ -19209,6 +19238,7 @@ impl ShellState {
             theme_editor_open: self.theme_editor_open,
             theme_editor_draft: self.theme_editor_draft.clone(),
             theme_editor_selected_stop: self.theme_editor_selected_stop,
+            launch_flags_open: self.launch_flags_open,
             theme_accent: dominant_accent(&active_theme_spec, palette.accent),
             shell_tint: shell_tint(self.settings.theme, &active_theme_spec),
             chrome_material_tint: chrome_material_tint(self.settings.theme, &active_theme_spec),
@@ -20680,6 +20710,7 @@ impl ShellState {
             // opened a dialog the ALT layer could not operate.
             self.keymap_editor_open,
             self.theme_editor_open,
+            self.launch_flags_open,
             self.pending_media_capture.is_some(),
             self.pending_fido2.is_some(),
             self.pending_delete.is_some(),
@@ -22366,6 +22397,12 @@ impl ShellState {
             self.server.ssh_targets(),
             &live_sessions,
             &search_expanded,
+            // Search reaches INTO shut containers — that is what
+            // `search_expanded_paths` above is for — so a row set is opened
+            // here for the same reason a folder is. A match the user cannot be
+            // shown is not a match.
+            &HashSet::new(),
+            &self.row_arrangement,
         );
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -28327,6 +28364,48 @@ impl ShellState {
         self.browser
             .set_collapsed_paths(self.user_collapsed_synthetic_paths.clone());
     }
+    /// Every live row the arrangement may speak about, by the path its row
+    /// carries.
+    fn live_row_paths_for_arrangement(&self) -> HashSet<String> {
+        self.server
+            .live_sessions()
+            .iter()
+            .filter(|session| is_promoted_live_session(session))
+            .map(live_session_row_path)
+            .collect()
+    }
+
+    /// Who holds `path` on the drawn sidebar — the hand's answer if there is
+    /// one, and the seat's otherwise.
+    ///
+    /// ⚠ Asks the SAME function the sidebar draws from rather than reading
+    /// `row_arrangement` directly: a drop beside a row must join whatever the
+    /// user can SEE holding it, and most rows are held by their seat rather
+    /// than by anything a hand has said.
+    fn row_set_effective_parent(&self, path: &str) -> Option<String> {
+        let sessions = self.server.live_sessions();
+        let promoted = sessions
+            .iter()
+            .filter(|session| is_promoted_live_session(session))
+            .collect::<Vec<_>>();
+        let paths = promoted
+            .iter()
+            .map(|session| live_session_row_path(session))
+            .collect::<Vec<_>>();
+        let sets = yggterm_core::row_set_outline::sidebar_row_sets(
+            paths
+                .iter()
+                .zip(promoted.iter())
+                .map(|(path, session)| (path.as_str(), session.outline_prefix.as_deref())),
+            &self.row_arrangement,
+            // Collapse is irrelevant to WHO HOLDS a row, and passing the real
+            // set here would make a drop's meaning depend on what is folded
+            // away — the arrangement must not change because something is shut.
+            &HashSet::new(),
+        );
+        sets.parent_of(path).map(str::to_string)
+    }
+
     fn update_synthetic_group_collapse_state(&mut self, path: &str, expanded: bool) {
         if expanded {
             self.user_collapsed_synthetic_paths.remove(path);
@@ -28963,16 +29042,6 @@ impl ShellState {
         self.persist_settings();
         self.last_action = "updated interface llm".to_string();
     }
-    fn update_codex_extra_args(&mut self, value: String) {
-        self.settings.codex_extra_args = value;
-        self.persist_settings();
-        self.last_action = "updated Codex extra args".to_string();
-    }
-    fn update_claude_code_extra_args(&mut self, value: String) {
-        self.settings.claude_code_extra_args = value;
-        self.persist_settings();
-        self.last_action = "updated Claude Code extra args".to_string();
-    }
     fn update_notification_delivery(&mut self, mode: NotificationDeliveryMode) {
         apply_notification_delivery_mode(&mut self.settings, mode);
         self.persist_settings();
@@ -29327,6 +29396,33 @@ impl ShellState {
         self.theme_editor_drag_stop = None;
         self.last_action = "theme editor opened".to_string();
     }
+    /// Open or shut the launch-flags modal.
+    ///
+    /// ⛔ It does NOT pre-fill anything on open. The descriptor's default tier
+    /// pre-populates a box the user has never set, and that decision belongs to
+    /// the RENDER — writing it into settings here would turn merely LOOKING at
+    /// the modal into a settings change for nine CLIs at once.
+    fn set_launch_flags_open(&mut self, open: bool) {
+        if self.launch_flags_open == open {
+            return;
+        }
+        self.launch_flags_open = open;
+    }
+
+    /// Store one CLI's launch flags, keyed by its descriptor slug.
+    fn update_agent_cli_extra_args(&mut self, slug: String, value: String) {
+        self.settings.agent_cli_extra_args.insert(slug, value);
+        self.persist_settings();
+    }
+
+    /// Forget a CLI's stored flags entirely, so the modal's box falls back to
+    /// the descriptor's default tier. ⚠ NOT the same as storing an empty string,
+    /// which is a user who deliberately wants no flags at all.
+    fn reset_agent_cli_extra_args(&mut self, slug: &str) {
+        self.settings.agent_cli_extra_args.remove(slug);
+        self.persist_settings();
+    }
+
     fn set_theme_editor_open(&mut self, open: bool) {
         if open {
             self.open_theme_editor();
@@ -30666,6 +30762,7 @@ impl ShellState {
             .collect::<Vec<_>>();
         collapsed.sort();
         self.settings.collapsed_synthetic_paths = collapsed;
+        self.settings.row_arrangement = self.row_arrangement.clone();
         self.persist_settings();
     }
     fn toggle_titlebar_new_menu(&mut self) {
@@ -36050,13 +36147,22 @@ fn queue_startup_swap_intent(
             runtime_status.server_version,
             runtime_status.owned_terminal_session_count,
         )),
+        // §2: only a relay hand-off declares a boundary. A producer recording an
+        // intent is not a quiet point, and saying so here would spend the very
+        // first attempt of every queued swap the instant it is written.
+        relay_boundary_at_ms: None,
+        relay_boundary_by: None,
     };
     let decision = yggterm_server::hot_restart_queue::enqueue(&home, &request);
+    // ⭐ AND STAND THE SUCCESSOR UP. Recording the intent is only half of it —
+    // see the function's own comment for why the queue alone cannot converge.
+    let successor = start_successor_for_declined_swap(endpoint, &home, expected_version.as_str());
     trace_daemon_step(
         endpoint,
         "startup_hot_swap_declined_swap_queued",
         json!({
             "decision": decision.word(),
+            "successor": successor,
             "target_version": expected_version.as_str(),
             "stale_version": runtime_status.server_version,
             "stale_pid": runtime_status.server_pid,
@@ -36065,6 +36171,97 @@ fn queue_startup_swap_intent(
             "daemon_executable": daemon_executable.display().to_string(),
         }),
     );
+}
+
+/// How long this process waits before trying to stand a successor up again.
+///
+/// The startup reconcile re-runs while the GUI settles — measured three times in
+/// ninety seconds on one launch — and a spawn per decline is a fork bomb wearing
+/// a repair. Mirrors the daemon lane's own retry floor for the same reason.
+const STARTUP_SUCCESSOR_SPAWN_FLOOR_MS: u64 = 300_000;
+
+/// Set to the last time THIS GUI tried to stand a successor up.
+static STARTUP_SUCCESSOR_LAST_SPAWN_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// ⭐ **§4's missing consumer: a declined swap must STAND THE SUCCESSOR UP, not
+/// only record that one is owed.**
+///
+/// ⛔ **Why the queue alone cannot converge.** The queue's only reader is a
+/// daemon's own retire poll — so on a host whose newest daemon predates the
+/// queue, the intent is written by something current (this GUI, which the user
+/// just launched) and read by nothing at all. Measured 2026-08-13: a host held
+/// **twelve versions behind for 5.5 hours** with the entry at `attempts: 0`.
+/// That is not the idle gate deferring; it is nobody reading. A record whose
+/// only reader is the component being superseded needs a reader that is not.
+///
+/// ⭐ **And the GUI is the right process to do it, for a reason that is easy to
+/// lose:** a daemon FREEZES its launch environment, and every session it ever
+/// spawns inherits it. A successor started by hand from an ssh shell has no
+/// display, no session bus and the wrong PATH, and poisons that host silently
+/// ([[finding-daemon-frozen-env-poisons-sessions]]). Spawned from here it
+/// inherits the GUI's own environment, which is exactly the environment the
+/// sessions want — the manual repair has to reconstruct that from
+/// `/proc/<gui>/environ`; this gets it for free.
+///
+/// ⚠ **Additive, never an eviction.** The new daemon owns nothing when it
+/// starts; the stale one keeps its sessions and converges on its own terms,
+/// handing PTYs over alive. Proven live on the GUI host: seven adopted PTYs, the
+/// superseded daemon retiring by itself, the host's ancient lingerers untouched.
+fn start_successor_for_declined_swap(
+    endpoint: &ServerEndpoint,
+    home: &Path,
+    target_version: &str,
+) -> &'static str {
+    let live: Vec<(u64, u64, u64)> = reachable_versioned_daemon_statuses(home)
+        .into_iter()
+        .filter_map(|(_, status)| version_triple(status.server_version.as_str()))
+        .collect();
+    let now_ms = current_millis() as u64;
+    let verdict = successor_spawn_verdict(
+        target_version,
+        &live,
+        STARTUP_SUCCESSOR_LAST_SPAWN_MS.load(std::sync::atomic::Ordering::Relaxed),
+        now_ms,
+    );
+    if verdict != "spawn" {
+        return verdict;
+    }
+    STARTUP_SUCCESSOR_LAST_SPAWN_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    match spawn_daemon_process(endpoint) {
+        Ok(()) => "spawned",
+        Err(_) => "spawn_failed",
+    }
+}
+
+/// Should this decline stand a successor up? Pure, so the two guards can be
+/// tested without a daemon census or a clock.
+///
+/// ⛔ **Both guards are load-bearing and they fail differently.** Without the
+/// liveness check every decline spawns a peer beside a successor that already
+/// exists; without the floor, a startup reconcile that re-runs three times in
+/// ninety seconds spawns three daemons. The first is a wasted process, the
+/// second is a fork bomb wearing a repair.
+fn successor_spawn_verdict(
+    target_version: &str,
+    live_versions: &[(u64, u64, u64)],
+    last_spawn_ms: u64,
+    now_ms: u64,
+) -> &'static str {
+    let Some(target) = version_triple(target_version) else {
+        return "target_version_unparsed";
+    };
+    // ⭐ At OR ABOVE, not equal. A daemon ahead of the target already serves
+    // this client, and spawning beside it would add a process to a host that
+    // has just been observed collecting them.
+    if live_versions.iter().any(|live| *live >= target) {
+        return "already_live";
+    }
+    if last_spawn_ms != 0 && now_ms.saturating_sub(last_spawn_ms) < STARTUP_SUCCESSOR_SPAWN_FLOOR_MS
+    {
+        return "floored";
+    }
+    "spawn"
 }
 
 fn reconcile_stale_daemon_on_startup(endpoint: &ServerEndpoint, current_exe: &Path) -> bool {
@@ -39411,6 +39608,12 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
         shell.server.ssh_targets(),
         &shell.server.live_sessions(),
         &expanded_paths,
+        // ⛔ EVERY SET OPEN, deliberately. This resolves the row an agent named;
+        // whether the user has shut the set it sits in is a fact about the
+        // screen, and a verb that stopped working because a human collapsed
+        // something would be the row plane leaking the sidebar's state.
+        &HashSet::new(),
+        &shell.row_arrangement,
     );
     enrich_sidebar_rows_with_live_titles(
         &mut merged_rows,
@@ -39751,10 +39954,28 @@ fn hot_session_paths_sorted(shell: &ShellState) -> Vec<String> {
     hot
 }
 fn set_app_control_row_expanded(shell: &mut ShellState, row: &BrowserRow, expanded: bool) {
-    if row.kind != BrowserRowKind::Group {
+    // A row set's head is an ordinary session row, so it collapses through the
+    // one store that already answers "which containers has the user shut?" —
+    // the same set a machine root or the Live Sessions group uses, persisted the
+    // same way, and outranking the auto-reveal seeding the same way. A second
+    // store keyed on a different kind of path would be two answers to one
+    // question.
+    //
+    // ⛔ AHEAD OF THE `row.expanded` SHORT-CIRCUIT, and that is the whole
+    // correctness of the verb. A row reaching this from app control was
+    // resolved with every set drawn OPEN — deliberately, so a verb never
+    // depends on what a human collapsed — so its `expanded` reads true even for
+    // a set that is shut, and the short-circuit would silently swallow every
+    // request to re-open one. Writing the store is already idempotent.
+    if row_heads_a_row_set(row) {
+        shell.update_synthetic_group_collapse_state(&row.full_path, expanded);
+        shell.sync_browser_settings();
         return;
     }
     if row.expanded == expanded {
+        return;
+    }
+    if row.kind != BrowserRowKind::Group {
         return;
     }
     if is_synthetic_sidebar_row(row) {
@@ -41467,6 +41688,7 @@ fn modal_key_hints(top: TopModal) -> &'static [(&'static str, &'static str)] {
             ("Space", "pick"),
             ("Esc", "close"),
         ],
+        TopModal::LaunchFlags => &[("Tab", "move"), ("Enter", "apply"), ("Esc", "close")],
         TopModal::CopyEdit => &[
             ("Tab", "move"),
             ("Enter", "save"),
@@ -41513,6 +41735,12 @@ fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
         TopModal::ThemeEditor => {
             if dismiss {
                 state.with_mut(|shell| shell.set_theme_editor_open(false));
+            }
+            true
+        }
+        TopModal::LaunchFlags => {
+            if dismiss {
+                state.with_mut(|shell| shell.set_launch_flags_open(false));
             }
             true
         }
@@ -43295,6 +43523,11 @@ enum TopModal {
     KeymapEditor,
     /// The theme editor, raised over the whole window from Settings.
     ThemeEditor,
+    /// The agent-CLI launch-flags modal, raised over the whole window from
+    /// Settings. Sits beside the theme editor for the same reason: it is opened
+    /// BY the user from a rail they are already in, so it outranks the dialogs a
+    /// page can raise underneath it.
+    LaunchFlags,
     /// A page asking for the camera or the microphone. Above `Fido2` in the
     /// stack for the same reason `Fido2` is above `Delete`: it is raised by a
     /// PAGE, at a moment the user did not choose, and the keys must belong to
@@ -43359,7 +43592,9 @@ impl TopModal {
         match self {
             // Editing surfaces: fields to type in, chips to pick, a slider to
             // nudge. Landing on the control is the beginning of the work.
-            TopModal::ThemeEditor | TopModal::CopyEdit => ModalKeyboardMode::Form,
+            TopModal::ThemeEditor | TopModal::CopyEdit | TopModal::LaunchFlags => {
+                ModalKeyboardMode::Form
+            }
             // Command surfaces: pick one of a few actions and be done.
             TopModal::KeymapEditor
             | TopModal::MediaCapture
@@ -43379,6 +43614,7 @@ impl TopModal {
         match self {
             TopModal::KeymapEditor => "keymap-editor",
             TopModal::ThemeEditor => "theme-editor",
+            TopModal::LaunchFlags => "launch-flags",
             TopModal::MediaCapture => "media-capture",
             TopModal::Fido2 => "fido2",
             TopModal::Delete => "delete",
@@ -43395,6 +43631,7 @@ impl TopModal {
         match self {
             TopModal::KeymapEditor => "KeyTips",
             TopModal::ThemeEditor => "Theme",
+            TopModal::LaunchFlags => "Launch Flags",
             TopModal::MediaCapture => "Camera",
             TopModal::Fido2 => "Passkey",
             TopModal::Delete => "Confirm",
@@ -43428,6 +43665,7 @@ fn strip_dropdown_over_viewport(
 fn top_modal_of(
     keymap_editor: bool,
     theme_editor: bool,
+    launch_flags: bool,
     media_capture: bool,
     fido2: bool,
     delete: bool,
@@ -43443,6 +43681,9 @@ fn top_modal_of(
     }
     if theme_editor {
         return Some(TopModal::ThemeEditor);
+    }
+    if launch_flags {
+        return Some(TopModal::LaunchFlags);
     }
     // A capture ask outranks a passkey ceremony: both are page-initiated, and
     // the one that hands over a microphone must be the one the keys reach.
@@ -43472,6 +43713,7 @@ fn render_top_modal(snapshot: &RenderSnapshot) -> Option<TopModal> {
     top_modal_of(
         snapshot.keymap_editor_open,
         snapshot.theme_editor_open,
+        snapshot.launch_flags_open,
         snapshot.pending_media_capture.is_some(),
         snapshot.pending_fido2.is_some(),
         snapshot.pending_delete.is_some(),
@@ -44562,6 +44804,8 @@ fn sidebar_merge_cache_key(
     ssh_targets: &[SshConnectTarget],
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
+    collapsed_row_set_heads: &HashSet<String>,
+    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
 ) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for row in stored_rows {
@@ -44664,6 +44908,13 @@ fn sidebar_merge_cache_key(
         session.host_label.hash(&mut hasher);
         session.ssh_target.hash(&mut hasher);
         session.ssh_prefix.hash(&mut hasher);
+        // ⛔ THE SEAT DECIDES SHAPE, NOT ONLY TEXT. Before row sets it only
+        // reached the label, which `enrich_sidebar_rows_with_live_titles`
+        // re-composes AFTER this cache — so a missing hash here cost nothing.
+        // The seat now decides which rows nest under which, and that is built
+        // inside the cached merge: leave it out and reseating a delegate would
+        // leave the outline drawn the old way until some unrelated field moved.
+        session.outline_prefix.hash(&mut hasher);
         for entry in &session.metadata {
             entry.label.hash(&mut hasher);
             entry.value.hash(&mut hasher);
@@ -44676,6 +44927,31 @@ fn sidebar_merge_cache_key(
     for path in expanded {
         path.hash(&mut hasher);
         0xf9_u8.hash(&mut hasher);
+    }
+    let mut collapsed = collapsed_row_set_heads.iter().collect::<Vec<_>>();
+    collapsed.sort();
+    for path in collapsed {
+        path.hash(&mut hasher);
+        0xf7_u8.hash(&mut hasher);
+    }
+    // ⛔ THE HAND-BUILT ARRANGEMENT IS AN INPUT TO THE ROW LIST, so a drag that
+    // forms a set must miss this cache. Same lesson the seat taught an hour
+    // earlier: anything that decides SHAPE has to be in the key, and a
+    // containment map is only a stable key once it is sorted.
+    let mut heads = row_arrangement.sets.heads().collect::<Vec<_>>();
+    heads.sort_unstable();
+    for head in heads {
+        head.hash(&mut hasher);
+        for member in row_arrangement.sets.members_of(head) {
+            member.hash(&mut hasher);
+        }
+        0xf6_u8.hash(&mut hasher);
+    }
+    let mut detached = row_arrangement.detached.iter().collect::<Vec<_>>();
+    detached.sort();
+    for path in detached {
+        path.hash(&mut hasher);
+        0xf5_u8.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -49012,6 +49288,13 @@ fn schedule_terminal_focus_after_activation(state: Signal<ShellState>, session_p
         "#
     ));
 }
+/// The merged sidebar with every row set drawn OPEN.
+///
+/// The shape questions this answers — is a row present, where does it sit, what
+/// is it called — are all independent of whether a set is shut, so the callers
+/// that ask them (drag targeting, reorder planning, restore telemetry) need no
+/// collapse state and do not carry one. Only the rendered snapshot does, and it
+/// calls [`merged_sidebar_rows_traced`] with the user's own set.
 fn merged_sidebar_rows(
     stored_rows: &[BrowserRow],
     remote_machines: &[RemoteMachineSnapshot],
@@ -49026,6 +49309,8 @@ fn merged_sidebar_rows(
         ssh_targets,
         live_sessions,
         expanded_paths,
+        &HashSet::new(),
+        &yggterm_core::row_set_outline::RowArrangement::default(),
     )
 }
 fn merged_sidebar_rows_with_projection_rows(
@@ -49035,6 +49320,8 @@ fn merged_sidebar_rows_with_projection_rows(
     ssh_targets: &[SshConnectTarget],
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
+    collapsed_row_set_heads: &HashSet<String>,
+    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
 ) -> Vec<BrowserRow> {
     let remote_session_count = remote_machines
         .iter()
@@ -49049,6 +49336,8 @@ fn merged_sidebar_rows_with_projection_rows(
         ssh_targets,
         live_sessions,
         expanded_paths,
+        collapsed_row_set_heads,
+        row_arrangement,
     );
     let key_ms = key_started_at.elapsed().as_secs_f64() * 1000.0;
     let cache_lookup_started_at = Instant::now();
@@ -49085,6 +49374,8 @@ fn merged_sidebar_rows_with_projection_rows(
         ssh_targets,
         live_sessions,
         expanded_paths,
+        collapsed_row_set_heads,
+        row_arrangement,
     );
     let uncached_ms = uncached_started_at.elapsed().as_secs_f64() * 1000.0;
     if let Ok(mut cache) = sidebar_merge_cache().lock() {
@@ -49138,6 +49429,8 @@ fn merged_sidebar_rows_traced(
     ssh_targets: &[SshConnectTarget],
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
+    collapsed_row_set_heads: &HashSet<String>,
+    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
 ) -> Vec<BrowserRow> {
     let remote_session_count = remote_machines
         .iter()
@@ -49156,6 +49449,8 @@ fn merged_sidebar_rows_traced(
             ssh_targets,
             live_sessions,
             expanded_paths,
+            collapsed_row_set_heads,
+            row_arrangement,
         );
     }
     let perf_home = perf_home_dir(settings_path);
@@ -49167,6 +49462,8 @@ fn merged_sidebar_rows_traced(
         ssh_targets,
         live_sessions,
         expanded_paths,
+        collapsed_row_set_heads,
+        row_arrangement,
     );
     let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     if duration_ms >= 4.0 || remote_session_count >= 500 {
@@ -49228,6 +49525,8 @@ fn merged_sidebar_rows_uncached(
     ssh_targets: &[SshConnectTarget],
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
+    collapsed_row_set_heads: &HashSet<String>,
+    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
 ) -> Vec<BrowserRow> {
     let stored_rows = filter_stored_rows_for_expansion(stored_rows, expanded_paths);
     let stored_projection_rows = filter_remote_workspace_projection_rows(stored_projection_rows);
@@ -49377,6 +49676,8 @@ fn merged_sidebar_rows_uncached(
         &display_promoted_sessions,
         &remote_session_index,
         expanded_paths,
+        collapsed_row_set_heads,
+        row_arrangement,
     );
     let push_live_ms = push_live_started_at.elapsed().as_secs_f64() * 1000.0;
     let push_remote_started_at = Instant::now();
@@ -49624,11 +49925,31 @@ fn build_remote_session_index(remote_machines: &[RemoteMachineSnapshot]) -> Remo
     }
     index
 }
+/// Does this row head a row set — is it drawn with a disclosure control?
+///
+/// ⭐ **The count IS the answer, and that is not a shortcut.** A row's
+/// `descendant_sessions` has always meant "sessions beneath me": 1 for a leaf,
+/// N for a folder. A Live-Sessions head counts its members in the same field, so
+/// the disclosure control, the count badge and the folder rows all read one
+/// number rather than a second flag that could disagree with it.
+///
+/// The split compound row is excluded BY PATH: it also counts (its panes), but a
+/// split is a VIEW and a row set is an ARRANGEMENT — `DESIGN.md` §"Row sets and
+/// splits are orthogonal" — and giving it a disclosure control would offer to
+/// collapse rows it does not hold.
+fn row_heads_a_row_set(row: &BrowserRow) -> bool {
+    matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
+        && row.descendant_sessions > 1
+        && !row.full_path.starts_with("split://")
+}
+
 fn push_live_session_rows(
     rows: &mut Vec<BrowserRow>,
     sessions: &[&ManagedSessionView],
     remote_session_index: &RemoteSessionIndex,
     expanded_paths: &HashSet<String>,
+    collapsed_row_set_heads: &HashSet<String>,
+    arrangement: &yggterm_core::row_set_outline::RowArrangement,
 ) {
     if sessions.is_empty() {
         return;
@@ -49661,46 +49982,97 @@ fn push_live_session_rows(
             .collect::<Vec<_>>(),
     );
     let seats = live_session_seats(sessions.iter().copied());
-    for session in sessions {
-        let cwd = metadata_value(session, "Cwd");
-        let label =
-            live_session_label_with_index(remote_session_index, session, &short_ids, &seats);
-        let detail_label = {
-            let summary = live_session_summary_with_index(remote_session_index, session);
-            live_session_detail_label(summary, live_session_keep_alive(session))
-        };
-        let full_path = if session.kind == SessionKind::Document {
-            session
-                .metadata
-                .iter()
-                .find(|entry| entry.label == "Path")
-                .map(|entry| entry.value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| normalize_live_session_path(&session.session_path))
-        } else {
-            normalize_live_session_path(&session.session_path)
-        };
-        rows.push(BrowserRow {
-            kind: if session.kind == SessionKind::Document {
-                BrowserRowKind::Document
-            } else {
-                BrowserRowKind::Session
-            },
-            full_path,
-            label: label.clone(),
-            detail_label,
-            document_kind: (session.kind == SessionKind::Document)
-                .then_some(WorkspaceDocumentKind::Note),
-            group_kind: None,
-            session_title: Some(label),
-            depth: 1,
-            host_label: session.host_label.clone(),
-            descendant_sessions: 1,
-            expanded: true,
-            session_id: Some(session.id.clone()),
-            session_cwd: (!cwd.trim().is_empty()).then_some(cwd),
-            session_kind: Some(session.kind),
-        });
+    // ⭐ ROW SETS. The seats the rows already hold say which of them belong
+    // together — `6.1` under `6.0`, `6.1.1` under `6.1` — and
+    // `row_set_outline` is the one place that reading happens. Built here, from
+    // the paths the rows are ABOUT to carry, so a Document row is arranged by
+    // the file path it will show rather than by its session path.
+    //
+    // ⛔ Derived, never stored: a saved copy would disagree with the seats the
+    // moment a delegate is reseated or reaped.
+    let row_paths: Vec<String> = sessions
+        .iter()
+        .map(|session| live_session_row_path(session))
+        .collect();
+    let row_sets = yggterm_core::row_set_outline::sidebar_row_sets(
+        row_paths
+            .iter()
+            .zip(sessions.iter())
+            .map(|(path, session)| (path.as_str(), session.outline_prefix.as_deref())),
+        arrangement,
+        collapsed_row_set_heads,
+    );
+    // Two live rows CAN name one path (a document open twice over). The
+    // arrangement holds each path once, so the emit walks the sessions AT a
+    // path rather than assuming one — otherwise nesting would silently drop a
+    // row the flat list used to draw.
+    let mut sessions_at_path: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, path) in row_paths.iter().enumerate() {
+        sessions_at_path.entry(path.as_str()).or_default().push(index);
+    }
+    for (path, nesting) in row_sets.visible_rows(row_paths.iter().map(String::as_str)) {
+        for index in sessions_at_path.get(path.as_str()).into_iter().flatten() {
+            let session = sessions[*index];
+            let cwd = metadata_value(session, "Cwd");
+            let label =
+                live_session_label_with_index(remote_session_index, session, &short_ids, &seats);
+            let detail_label = {
+                let summary = live_session_summary_with_index(remote_session_index, session);
+                live_session_detail_label(summary, live_session_keep_alive(session))
+            };
+            rows.push(BrowserRow {
+                kind: if session.kind == SessionKind::Document {
+                    BrowserRowKind::Document
+                } else {
+                    BrowserRowKind::Session
+                },
+                full_path: path.clone(),
+                label: label.clone(),
+                detail_label,
+                document_kind: (session.kind == SessionKind::Document)
+                    .then_some(WorkspaceDocumentKind::Note),
+                group_kind: None,
+                session_title: Some(label),
+                // Live Sessions rows sit at depth 1; a set adds its own.
+                // ⚠ INDENTATION IS BUDGETED (`DESIGN.md` §"Row sets"): step two
+                // levels, then hold and let the head's own number carry the
+                // depth. A title clipped to nothing is worse than a column that
+                // stops stepping.
+                depth: 1 + nesting.min(ROW_SET_MAX_INDENT_LEVELS),
+                host_label: session.host_label.clone(),
+                descendant_sessions: 1 + row_sets.descendant_count(&path),
+                expanded: !row_sets.is_collapsed(&path),
+                session_id: Some(session.id.clone()),
+                session_cwd: (!cwd.trim().is_empty()).then_some(cwd),
+                session_kind: Some(session.kind),
+            });
+        }
+    }
+}
+
+/// How many levels of a row set's nesting the sidebar actually indents.
+///
+/// `DESIGN.md` §"Row sets": the sidebar runs out of horizontal room long before
+/// the outline runs out of levels, so past this the indent holds and the head's
+/// own number carries the depth.
+const ROW_SET_MAX_INDENT_LEVELS: usize = 2;
+
+/// The sidebar path a live session's own row carries.
+///
+/// A Document row is addressed by the FILE it shows — that is the path the tree,
+/// the selection and the arrangement all key on — and every other session by its
+/// normalized session path.
+fn live_session_row_path(session: &ManagedSessionView) -> String {
+    if session.kind == SessionKind::Document {
+        session
+            .metadata
+            .iter()
+            .find(|entry| entry.label == "Path")
+            .map(|entry| entry.value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| normalize_live_session_path(&session.session_path))
+    } else {
+        normalize_live_session_path(&session.session_path)
     }
 }
 /// A synthetic compound sidebar row for a split group — a miniature map of the
@@ -51995,7 +52367,101 @@ fn gui_row_order_scope() -> String {
     format!("gui:{host}")
 }
 
+/// A drop that ARRANGES rather than reorders: what the pointer's band means for
+/// the hand-built half of a row set.
+///
+/// ⭐ **THE ONE RULE, and it is why Before/After needs no second gesture: a
+/// dropped row takes the TARGET's place in the arrangement.** Dropped INTO a
+/// row, it joins that row's set. Dropped beside a row, it joins whatever holds
+/// that row — which is nothing when the target is top level, and that is how a
+/// member leaves a set. One rule covers joining, moving between sets, and
+/// leaving, so none of them is a special case anybody can forget to build.
+///
+/// ⛔ **It writes MEMBERSHIP and never a seat.** Renumbering to form a group
+/// would rewrite `outline_prefix` on rows the user created — forbidden — and
+/// would not work anyway on the un-numbered rows he most needs to group.
+///
+/// Returns true when the arrangement changed.
+fn apply_row_set_drop(
+    shell: &mut ShellState,
+    target: &DragDropTarget,
+    drag_paths: &[String],
+) -> bool {
+    let target_path = normalize_live_session_path(&target.path);
+    let head = match target.placement {
+        DragDropPlacement::Into => Some(target_path.clone()),
+        // Beside a row: take that row's own head, whatever it is.
+        DragDropPlacement::Before | DragDropPlacement::After => {
+            shell.row_set_effective_parent(&target_path)
+        }
+    };
+    let mut changed = false;
+    for path in drag_paths {
+        let member = normalize_live_session_path(path);
+        if member == target_path {
+            continue;
+        }
+        match &head {
+            Some(head) if head != &member => {
+                if shell.row_arrangement.attach(head, &member, None).is_ok() {
+                    changed = true;
+                }
+            }
+            // Dropped beside a top-level row — it leaves whatever held it, and
+            // that choice is REMEMBERED, or its seat would re-adopt it on the
+            // next frame and the gesture would look like it did nothing.
+            _ => {
+                if shell.row_set_effective_parent(&member).is_some() {
+                    shell.row_arrangement.detach(&member);
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
 fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
+    // An INTO drop is an arrangement, not an order: it forms or joins a row
+    // set and leaves the live-session order untouched. Handled before the
+    // reorder path because the two answer different questions about the same
+    // gesture.
+    let arrangement_drop = {
+        let shell = state.read();
+        shell
+            .drag_hover_target
+            .clone()
+            .filter(|target| {
+                target.path != "__live_sessions__"
+                    && shell.live_row_paths_for_arrangement().contains(&normalize_live_session_path(&target.path))
+            })
+            .map(|target| (target, shell.drag_paths.clone()))
+    };
+    if let Some((target, drag_paths)) = arrangement_drop {
+        let mut changed = false;
+        state.with_mut(|shell| {
+            changed = apply_row_set_drop(shell, &target, &drag_paths);
+            if changed {
+                shell.record_ui_telemetry(
+                    "row_set_arranged",
+                    json!({
+                        "target": target.path,
+                        "placement": format!("{:?}", target.placement).to_ascii_lowercase(),
+                        "drag_paths": drag_paths,
+                    }),
+                );
+                shell.last_action = match target.placement {
+                    DragDropPlacement::Into => format!("grouped {} row(s)", drag_paths.len()),
+                    _ => format!("moved {} row(s)", drag_paths.len()),
+                };
+                shell.sync_browser_settings();
+            }
+        });
+        if changed {
+            state.with_mut(ShellState::clear_drag_state);
+            return;
+        }
+    }
     let live_reorder = {
         let shell = state.read();
         shell.drag_hover_target.clone().and_then(|target| {
@@ -52986,8 +53452,11 @@ fn live_session_drop_target(
         });
     }
     let row_path = normalize_live_session_path(&row.full_path);
+    // ⚠ `depth >= 1`, not `== 1`. A row set's members are drawn deeper than
+    // their head, and a member that could not be dropped onto was a row you
+    // could put into a set and never take out again.
     if row.kind == BrowserRowKind::Session
-        && row.depth == 1
+        && row.depth >= 1
         && live_paths.contains(&row_path)
         && !drag_paths
             .iter()
@@ -53093,10 +53562,27 @@ fn context_menu_drop_placement(row: &BrowserRow) -> Option<WorkspaceDropPlacemen
         BrowserRowKind::Group | BrowserRowKind::Session => None,
     }
 }
-fn drag_drop_placement_from_pointer(row: &BrowserRow, y: f64) -> DragDropPlacement {
+/// Where in a row's height the pointer is, and therefore what a drop would mean.
+///
+/// ⭐ **A LIVE-SESSION ROW HAS AN INSIDE BAND — that is what makes a row set
+/// formable by hand.** Until this existed, dropping one live row onto another
+/// could only land Before or After it, so the gesture reordered and formed
+/// nothing, and a set could be created by numbering rows and by no other means:
+/// **agent-createable and not human-createable**, on a feature whose own spec
+/// says both halves exist or neither is real.
+///
+/// `in_live_region` rather than "is a Session": the cwd tree draws session rows
+/// too, and they are files in folders — an inside band there would offer a drop
+/// that means nothing and swallow the middle of every row.
+fn drag_drop_placement_from_pointer(
+    row: &BrowserRow,
+    y: f64,
+    in_live_region: bool,
+) -> DragDropPlacement {
     let y = y.max(0.0);
-    let can_drop_inside =
-        row.kind == BrowserRowKind::Group && row.group_kind != Some(WorkspaceGroupKind::Separator);
+    let can_drop_inside = (row.kind == BrowserRowKind::Group
+        && row.group_kind != Some(WorkspaceGroupKind::Separator))
+        || (in_live_region && row.kind == BrowserRowKind::Session);
     if can_drop_inside {
         if y <= 12.0 {
             DragDropPlacement::Before
@@ -56058,9 +56544,64 @@ fn append_viewport_session_contract_violations(
         ));
     }
 }
+/// Every sidebar row, with **every row set drawn OPEN**.
+///
+/// ⛔ **A PRESENTATION STATE MAY NOT REMOVE ROWS FROM A DATA VERB.** The
+/// rendered list omits the members of a collapsed set — that is what collapsing
+/// means, and it is right for the screen. `server app rows` is not the screen:
+/// the booter, the supervision plane, seat audits and every orchestration script
+/// read it to answer *"which rows exist"*, and folding a set silently deleted
+/// nine live agent rows from all of them at once. On 2026-08-13 the booter
+/// reaped nine subscriptions in six seconds, each one a working session, having
+/// been handed an honest answer to a question it was not asking.
+///
+/// ⚖ The collapse still persists and is still the user's — it is reported as a
+/// FIELD (`hidden_by_collapsed_set`) so a renderer can hide what it likes and a
+/// consumer can see what exists. Same call the row resolver and the search path
+/// already make, for the same reason.
+fn app_control_rows_with_every_set_open(shell: &ShellState) -> Vec<BrowserRow> {
+    // ⚠ THE TREE'S OWN EXPANSION, UNCHANGED — only the ROW-SET collapse is
+    // overridden. Reaching for the search path's force-expansion here instead
+    // opened every folder and machine as well: the answer went from 47 rows to
+    // 1454, every session listed twice through its dual presence, and
+    // `resolve_app_control_row` began matching the cwd-tree copy of a row —
+    // which heads no set — so `row-expanded` started refusing. Widening a data
+    // verb means showing the rows a FOLD hides, not unfolding the whole tree.
+    let stored_rows = shell.browser.search_rows();
+    let stored_projection_rows = shell.browser.all_rows();
+    let mut rows = merged_sidebar_rows_traced(
+        &shell.bootstrap.settings_path,
+        "app_control_rows",
+        &stored_rows,
+        &stored_projection_rows,
+        shell.server.remote_machines(),
+        shell.server.ssh_targets(),
+        &shell.server.live_sessions(),
+        &shell.browser.expanded_path_set(),
+        &HashSet::new(),
+        &shell.row_arrangement,
+    );
+    enrich_sidebar_rows_with_live_titles(
+        &mut rows,
+        &shell.server.live_sessions(),
+        shell.server.remote_machines(),
+        &shell.session_title_overrides,
+        &shell.generated_summaries,
+    );
+    rows
+}
+
 fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
     let shell = state.read();
-    let snapshot = shell.snapshot();
+    let mut snapshot = shell.snapshot();
+    // The rows the SCREEN is showing, so a row can still report whether the
+    // user has it folded away.
+    let rendered: std::collections::HashSet<String> = snapshot
+        .rows
+        .iter()
+        .map(|row| row.full_path.clone())
+        .collect();
+    snapshot.rows = app_control_rows_with_every_set_open(&shell);
     // **"THIS ROW IS GONE" MADE VISIBLE.** The tombstone plane is the one
     // record that the user CLOSED a row, and until now it could only be
     // consulted from inside the daemon. Everything that rebuilds a set of rows
@@ -56114,6 +56655,13 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "depth": row.depth,
                 "host_label": row.host_label,
                 "expanded": row.expanded,
+                // ⛔ THE ROW IS REPORTED EITHER WAY — this says only whether the
+                // SCREEN is currently folding it away. A consumer asking "which
+                // rows exist" gets them all; one that wants to mirror the
+                // sidebar can filter on this. Collapsing a set must never
+                // delete rows from the answer: it did, and the booter reaped
+                // nine live sessions on the strength of it.
+                "hidden_by_collapsed_set": !rendered.contains(&row.full_path),
                 "selected": shell.selected_tree_paths.contains(&row.full_path),
                 "session_id": row.session_id,
                 "session_cwd": row.session_cwd,
@@ -75534,6 +76082,64 @@ async fn process_pending_app_control_requests(
                 error: None,
             }
         }
+        AppControlCommand::SetLaunchFlags { open, slug, args } => {
+            // ⚠ The WRITE happens before the open, so a caller that sets a value
+            // and raises the modal in one call sees the value it just stored —
+            // not the frame before it.
+            let applied = safe_shell_mut(state, "app_control_set_launch_flags", |shell| {
+                if let Some(slug) = slug.clone() {
+                    match args.clone() {
+                        Some(value) => shell.update_agent_cli_extra_args(slug, value),
+                        // No `args` beside a slug means RESET — forget the
+                        // stored value so the box falls back to the descriptor's
+                        // default tier. Storing an empty string instead would
+                        // mean "the user wants no flags", which is a different
+                        // thing the modal renders differently.
+                        None => shell.reset_agent_cli_extra_args(&slug),
+                    }
+                }
+                if let Some(open) = open {
+                    shell.set_launch_flags_open(open);
+                }
+                shell
+                    .settings
+                    .agent_cli_extra_args
+                    .iter()
+                    .map(|(key, value)| (key.clone(), json!(value)))
+                    .collect::<serde_json::Map<String, serde_json::Value>>()
+            });
+            sleep(Duration::from_millis(40)).await;
+            let dom_snapshot =
+                capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
+            let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
+            let viewport = describe_viewport_snapshot(&state_snapshot, &dom_snapshot);
+            enrich_runtime_truth_with_viewport(&mut state_snapshot, &viewport);
+            if let Some(map) = state_snapshot.as_object_mut() {
+                map.insert("dom".to_string(), dom_snapshot.clone());
+                map.insert("viewport".to_string(), viewport);
+            }
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "command": "set_launch_flags",
+                    // ⛔ Read BACK, never echoed: `open` here is the shell's own
+                    // state after the write, so this reports the EFFECT rather
+                    // than the request. Five verbs in this repo are filed for
+                    // getting that backwards.
+                    "open": state.read().launch_flags_open,
+                    "stored": applied.ok().map(serde_json::Value::Object),
+                    "window": describe_window(&desktop),
+                    "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
+                    "active_session_path": state.read().server.active_session_path(),
+                    "dom": dom_snapshot,
+                    "state": state_snapshot,
+                })),
+                error: None,
+            }
+        }
         AppControlCommand::SetThemeEditorOpen { open } => {
             let _ = safe_shell_mut(state, "app_control_set_theme_editor_open", |shell| {
                 shell.set_theme_editor_open(open);
@@ -79344,7 +79950,10 @@ async fn process_pending_app_control_requests(
         AppControlCommand::SetRowExpanded { row_path, expanded } => {
             let maybe_row = state.with(|shell| resolve_app_control_row(shell, &row_path));
             match maybe_row {
-                Some(row) if row.kind == BrowserRowKind::Group => {
+                // A row set's head opens and shuts too — `DESIGN.md` §"An agent
+                // arranges rows as easily as a hand does". A disclosure a hand
+                // can click and a verb cannot reach is half a feature.
+                Some(row) if row.kind == BrowserRowKind::Group || row_heads_a_row_set(&row) => {
                     state.with_mut(|shell| {
                         set_app_control_row_expanded(shell, &row, expanded);
                     });
@@ -80235,6 +80844,9 @@ fn build_client_instance_record(
         linux_desktop_app_id: linux_desktop_app_id.map(str::to_string),
         process_start_ticks: process_start_ticks(pid),
         executable_path: current_client_executable_path(),
+        // The one thing about this process that no outside reader can recover
+        // once a deploy has moved the file underneath it.
+        build_commit: Some(yggterm_server::build_identity::build_commit().to_string()),
         display: env_var("DISPLAY"),
         wayland_display: env_var("WAYLAND_DISPLAY"),
         xdg_session_id: env_var("XDG_SESSION_ID"),
@@ -80305,6 +80917,7 @@ fn register_client_instance(
             "client_id": record.client_id,
             "linux_desktop_app_id": record.linux_desktop_app_id,
             "executable_path": record.executable_path,
+            "build_commit": record.build_commit,
             "display": record.display,
             "wayland_display": record.wayland_display,
             "xdg_session_id": record.xdg_session_id,
@@ -85016,8 +85629,7 @@ fn app() -> Element {
                             on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
                             on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
                             on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
-                            on_codex_extra_args_change: move |value: String| state.with_mut(|shell| shell.update_codex_extra_args(value)),
-                            on_claude_code_extra_args_change: move |value: String| state.with_mut(|shell| shell.update_claude_code_extra_args(value)),
+                            on_open_launch_flags: move |_| state.with_mut(|shell| shell.set_launch_flags_open(true)),
                             on_focus_input: move |field_key: String| {
                                 focus_settings_field(state, &field_key);
                             },
@@ -85429,6 +86041,20 @@ fn app() -> Element {
                                 )
                             }
                         },
+                    }
+                }
+                if snapshot.launch_flags_open {
+                    LaunchFlagsOverlay {
+                        snapshot: snapshot.clone(),
+                        on_close: move |_| state.with_mut(|shell| shell.set_launch_flags_open(false)),
+                        on_change: move |(slug, value): (String, String)| state.with_mut(|shell| shell.update_agent_cli_extra_args(slug, value)),
+                        on_reset: move |slug: String| state.with_mut(|shell| shell.reset_agent_cli_extra_args(&slug)),
+                        // Same two handlers the settings rail's fields use, so
+                        // typing in the modal releases the terminal's key grab
+                        // and blurring hands it back — a modal that invented its
+                        // own focus contract is how a dialog swallows keystrokes.
+                        on_focus_input: move |_| focus_settings_field(state, "launch-flags"),
+                        on_blur_input: move |_| reclaim_active_terminal_input_after_settings_blur(state),
                     }
                 }
                 if snapshot.theme_editor_open {
@@ -88374,6 +89000,48 @@ fn session_row_status_badge_style(over_icon: bool) -> String {
     )
 }
 
+/// A sidebar row's two indents: the row's own left padding, and how far its
+/// CONTENT is pushed inside that.
+///
+/// ⛔ **THE TRAFFIC LIGHTS ARE A COLUMN OF THEIR OWN, FAR LEFT, IN A FIXED
+/// AREA.** Owner-directed, and it is a layout MODEL rather than a rule about
+/// padding. A live row has two zones:
+///
+/// | zone | holds | behaviour |
+/// |---|---|---|
+/// | gutter | the status dot, nothing else | fixed width, flush to the row's own left edge, identical on every row at every depth |
+/// | content | icon, title, trailing controls | starts after the gutter, and is the only thing nesting moves |
+///
+/// The zones are SIBLINGS in the markup, not a convention about who pads what,
+/// so "something else sits before the dot and the column kinks" is not a state
+/// this row can be in. His three reasons, and each one is a consequence:
+/// **more room for titles** — the gutter is the row's own horizontal padding
+/// rather than the old `base + step` leading run, so every live row's title
+/// starts further left than it used to, including rows in no set at all;
+/// **nesting costs no gutter** — depth is spent out of the content zone, so the
+/// only thing that narrows is the title, from a wider start; and **it looks
+/// better** — the dots form one unbroken vertical line, which is checkable: if
+/// that line kinks at any row, the zone separation is not real.
+///
+/// Everywhere else (the cwd tree) the whole row indents as it always has: a
+/// folder has no dot in that gutter, so there is nothing to hold still, and
+/// stepping the row is what makes a tree readable.
+fn sidebar_row_indents(depth: usize, in_live_region: bool) -> (u32, u32) {
+    let metrics = session_row_metrics(SessionRowDensity::Sidebar);
+    if in_live_region {
+        // Flush to the row's own edge — the same padding its right side wears,
+        // so the gutter is the row's margin and not a column of its own width.
+        return (
+            metrics.pad_h_px,
+            depth.saturating_sub(1) as u32 * metrics.indent_step_px,
+        );
+    }
+    (
+        depth as u32 * metrics.indent_step_px + metrics.indent_base_px,
+        0,
+    )
+}
+
 fn session_row_icon_box_style(density: SessionRowDensity, color: &str) -> String {
     let m = session_row_metrics(density);
     format!(
@@ -88877,8 +89545,7 @@ fn SidebarRow(
     // Indent math from the SHARED row engine — the cwdtree is the vocabulary's
     // reference consumer, so its numbers and the engine's are one definition.
     let sidebar_row_metrics = session_row_metrics(SessionRowDensity::Sidebar);
-    let indent =
-        row.depth as u32 * sidebar_row_metrics.indent_step_px + sidebar_row_metrics.indent_base_px;
+    let (indent, label_indent) = sidebar_row_indents(row.depth, show_live_close);
     let draggable = is_tree_drag_source_row(&row);
     let row_kind_label = format!("{:?}", row.kind);
     let drop_hovered = drop_target.is_some();
@@ -88951,9 +89618,11 @@ fn SidebarRow(
                 },
                 onmouseenter: move |evt| {
                     if drag_active {
+                        // A separator is never a live row and never holds one.
                         let placement = drag_drop_placement_from_pointer(
                             &row_for_enter,
                             evt.element_coordinates().y,
+                            false,
                         );
                         on_drag_hover.call((placement, evt));
                     }
@@ -88966,6 +89635,7 @@ fn SidebarRow(
                         let placement = drag_drop_placement_from_pointer(
                             &row_for_move,
                             evt.element_coordinates().y,
+                            false,
                         );
                         on_drag_hover.call((placement, evt));
                     }
@@ -89088,6 +89758,11 @@ fn SidebarRow(
     let icon_focus_path = row.full_path.clone();
     let label_focus_path = row.full_path.clone();
     let row_is_group = row.kind == BrowserRowKind::Group;
+    // A row set's head. `DESIGN.md` §"Row sets": the sidebar shows no noun at
+    // all for a set, only a disclosure control on the head — so this is the ONE
+    // thing the head looks different by.
+    let row_is_row_set_head = row_heads_a_row_set(&row);
+    let row_set_member_count = row.descendant_sessions.saturating_sub(1);
     let row_expanded = row.expanded;
     let row_toggle_target_expanded = !row.expanded;
     rsx! {
@@ -89181,7 +89856,7 @@ fn SidebarRow(
             onmouseenter: move |evt| {
                 if drag_active {
                     let placement =
-                        drag_drop_placement_from_pointer(&row_for_enter, evt.element_coordinates().y);
+                        drag_drop_placement_from_pointer(&row_for_enter, evt.element_coordinates().y, show_live_close);
                     on_drag_hover.call((placement, evt));
                 }
             },
@@ -89191,7 +89866,7 @@ fn SidebarRow(
                 }
                 if drag_active {
                     let placement =
-                        drag_drop_placement_from_pointer(&row_for_move, evt.element_coordinates().y);
+                        drag_drop_placement_from_pointer(&row_for_move, evt.element_coordinates().y, show_live_close);
                     on_drag_hover.call((placement, evt));
                 }
             },
@@ -89215,10 +89890,14 @@ fn SidebarRow(
                 on_end_drag.call(());
             },
             onkeydown: move |evt| {
-                if !row_is_group {
+                // Arrows open and shut anything that HOLDS rows — a folder, a
+                // machine, or a row set's head. Enter stays a group's alone: on
+                // a session row it belongs to opening the session.
+                let holds_rows = row_is_group || row_is_row_set_head;
+                if !holds_rows {
                     return;
                 }
-                if evt.key() == Key::Enter {
+                if row_is_group && evt.key() == Key::Enter {
                     evt.prevent_default();
                     evt.stop_propagation();
                     on_select.call(TreeSelectionMode::Replace);
@@ -89258,12 +89937,12 @@ fn SidebarRow(
                 }
                 div {
                     style: "display:flex; align-items:center; justify-content:space-between; gap:6px;",
-                    // `flex:1 1 auto` is the tree's half of "the title gets the
-                    // width": with the ✕ out of flow there is nothing left to
-                    // share the line with, so the label cluster takes all of it
-                    // and truncates at the row's own edge instead of 24px short.
-                    div {
-                    style: "display:flex; align-items:center; gap:8px; min-width:0; flex:1 1 auto;",
+                    // ⛔ THE GUTTER — zone one, and a SIBLING of the content
+                    // rather than its first child. That structure is the rule:
+                    // a dot inside the content cluster moves whenever anything
+                    // is inserted ahead of it or the cluster is indented, which
+                    // is exactly how the first build of row sets put a header's
+                    // dot to the right of its own members'. Out here it cannot.
                     if show_live_close {
                         span {
                             "data-sidebar-live-session-status-rail": "1",
@@ -89285,11 +89964,26 @@ fn SidebarRow(
                             }
                         }
                     }
+                    // `flex:1 1 auto` is the tree's half of "the title gets the
+                    // width": with the ✕ out of flow there is nothing left to
+                    // share the line with, so the label cluster takes all of it
+                    // and truncates at the row's own edge instead of 24px short.
+                    div {
+                    style: "display:flex; align-items:center; gap:8px; min-width:0; flex:1 1 auto;",
                     div {
                         "data-tree-icon": "1",
                         "data-tree-icon-kind": icon_kind.as_str(),
                         "data-sidebar-row-toggle-target": if row_is_group { "icon" } else { "none" },
-                        style: session_row_icon_box_style(SessionRowDensity::Sidebar, icon_color),
+                        // The nesting lands HERE, inside the content zone — see
+                        // `sidebar_row_indents`. `margin-left` rather than the
+                        // row's padding is the whole point: everything from the
+                        // icon rightwards steps, and the gutter, being a
+                        // sibling of this cluster, cannot.
+                        style: format!(
+                            "{}margin-left:{}px;",
+                            session_row_icon_box_style(SessionRowDensity::Sidebar, icon_color),
+                            label_indent
+                        ),
                         onmousedown: move |evt| {
                             if row_for_icon_mousedown.kind == BrowserRowKind::Group {
                                 claim_sidebar_focus_by_path(Some(&icon_focus_path));
@@ -89472,6 +90166,45 @@ fn SidebarRow(
                     span {
                     "data-session-row-actions": "1",
                     style: session_row_actions_style(5, 9),
+                    // THE DISCLOSURE CONTROL ON A ROW SET'S HEAD — trailing,
+                    // beside the ✕, and revealed by the same hover.
+                    //
+                    // ⛔ IT WAS LEADING FOR ONE BUILD AND THE OWNER CAUGHT IT
+                    // IMMEDIATELY: a control inserted before the head's content
+                    // pushes that row's dot, icon and label right, so a header
+                    // sat FURTHER right than the rows nested under it, and the
+                    // status dots stood in two different columns depending on
+                    // whether a row happened to head a set. Sitting in the
+                    // trailing actions costs the leading gutter nothing, which
+                    // is what lets the dot column be identical at every depth.
+                    if row_is_row_set_head {
+                        button {
+                            "data-sidebar-row-set-disclosure": "1",
+                            "data-sidebar-row-set-expanded": if row_expanded { "true" } else { "false" },
+                            "data-sidebar-row-set-members": "{row_set_member_count}",
+                            // Per-element (§12.1), reason "list-item": one per
+                            // head of an unbounded list (§8), exactly as the
+                            // group expander is exempted.
+                            "data-keytip-exempt": "list-item",
+                            "data-sidebar-row-toggle-target": "expander",
+                            title: if row_expanded { "Collapse this group of rows" } else { "Expand this group of rows" },
+                            style: live_session_close_button_style(palette, selected),
+                            onmousedown: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onmouseup: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onclick: move |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                                on_set_expanded.call(row_toggle_target_expanded);
+                            },
+                            RowDisclosureChevron { expanded: row_expanded }
+                        }
+                    }
                     button {
                         "data-sidebar-live-session-close": "1",
                         // Per-element (§12.1), reason "list-item": a per-row
@@ -124071,8 +124804,7 @@ fn RightRail(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
-    on_codex_extra_args_change: EventHandler<String>,
-    on_claude_code_extra_args_change: EventHandler<String>,
+    on_open_launch_flags: EventHandler<MouseEvent>,
     on_focus_input: EventHandler<String>,
     on_blur_input: EventHandler<()>,
     on_set_ui_theme: EventHandler<UiTheme>,
@@ -124196,8 +124928,7 @@ fn RightRail(
                     on_endpoint_change,
                     on_api_key_change,
                     on_model_change,
-                    on_codex_extra_args_change,
-                    on_claude_code_extra_args_change,
+                    on_open_launch_flags,
                     on_focus_input,
                     on_blur_input,
                     on_set_ui_theme,
@@ -128564,8 +129295,7 @@ fn SettingsRailBody(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
-    on_codex_extra_args_change: EventHandler<String>,
-    on_claude_code_extra_args_change: EventHandler<String>,
+    on_open_launch_flags: EventHandler<MouseEvent>,
     on_focus_input: EventHandler<String>,
     on_blur_input: EventHandler<()>,
     on_set_ui_theme: EventHandler<UiTheme>,
@@ -128690,37 +129420,10 @@ fn SettingsRailBody(
                 on_blur_input: on_blur_input.clone(),
                 on_change: on_model_change,
             }
-            SettingsField {
-                field_key: "codex-extra-args".to_string(),
-                label: "Codex Extra Args".to_string(),
-                value: snapshot.settings.codex_extra_args.clone(),
-                placeholder: "-s danger-full-access".to_string(),
-                secret: false,
-                autofocus: false,
+            LaunchFlagsSettingsSection {
                 palette: snapshot.palette,
-                on_focus_input: on_focus_input.clone(),
-                on_blur_input: on_blur_input.clone(),
-                on_change: on_codex_extra_args_change,
-            }
-            div {
-                style: format!("font-size:11px; line-height:1.45; color:{}; margin-top:-6px;", snapshot.palette.muted),
-                "Optional advanced CLI flags appended to new and resumed Codex sessions. Example: -s danger-full-access"
-            }
-            SettingsField {
-                field_key: "claude-code-extra-args".to_string(),
-                label: "Claude Code Extra Args".to_string(),
-                value: snapshot.settings.claude_code_extra_args.clone(),
-                placeholder: "--dangerously-skip-permissions".to_string(),
-                secret: false,
-                autofocus: false,
-                palette: snapshot.palette,
-                on_focus_input: on_focus_input.clone(),
-                on_blur_input: on_blur_input.clone(),
-                on_change: on_claude_code_extra_args_change,
-            }
-            div {
-                style: format!("font-size:11px; line-height:1.45; color:{}; margin-top:-6px;", snapshot.palette.muted),
-                "Optional CLI flags appended to new Claude Code sessions. Example: --dangerously-skip-permissions"
+                summary: launch_flags_rail_summary(&snapshot.settings.agent_cli_extra_args),
+                on_open: on_open_launch_flags,
             }
             ThemeSettingsSection {
                 palette: snapshot.palette,
@@ -132399,6 +133102,283 @@ fn MediaCapturePresenceOverlay(
         }
     }
 }
+/// The agent-CLI launch-flags modal.
+///
+/// ⛔ **GENERATED, one row per descriptor** — the law of
+/// `docs/spec-agent-cli-extra-args-modal.md` §1. There is no per-CLI `rsx!` here
+/// and there must never be: nine hand-written rows is what the titlebar `+` menu
+/// is filed for, and adding the tenth CLI must remain a line in a table.
+#[component]
+fn LaunchFlagsOverlay(
+    snapshot: SharedSnapshot,
+    on_close: EventHandler<MouseEvent>,
+    on_change: EventHandler<(String, String)>,
+    on_reset: EventHandler<String>,
+    on_focus_input: EventHandler<()>,
+    on_blur_input: EventHandler<()>,
+) -> Element {
+    let overlay_wash = match snapshot.settings.theme {
+        UiTheme::ZedLight => "rgba(228,237,245,0.03)",
+        UiTheme::ZedDark => "rgba(10,14,18,0.05)",
+    };
+    let editor_surface = match snapshot.settings.theme {
+        UiTheme::ZedLight => "rgb(248,252,255)",
+        UiTheme::ZedDark => "rgb(28,34,41)",
+    };
+    let editor_shadow = match snapshot.settings.theme {
+        UiTheme::ZedLight => {
+            "0 0 0 1px rgba(215,229,243,0.96), 0 0 0 10px rgba(129,188,255,0.18), 0 26px 60px rgba(55,83,112,0.20), inset 0 0 0 1px rgba(214,223,232,0.92)"
+        }
+        UiTheme::ZedDark => {
+            "0 0 0 1px rgba(59,87,112,0.90), 0 0 0 10px rgba(124,200,255,0.16), 0 26px 60px rgba(0,0,0,0.42), inset 0 0 0 1px rgba(68,84,99,0.94)"
+        }
+    };
+    let palette = snapshot.palette;
+    let stored = snapshot.settings.agent_cli_extra_args.clone();
+    let rows = launch_flags_rows().collect::<Vec<_>>();
+    rsx! {
+        div {
+            "data-launch-flags-overlay": "1",
+            "data-yggterm-modal-root": "launch-flags",
+            style: format!(
+                "position:fixed; inset:0; z-index:98; display:flex; align-items:center; justify-content:center; background:{};",
+                overlay_wash
+            ),
+            onmousedown: move |evt| on_close.call(evt),
+            onclick: move |evt| on_close.call(evt),
+            div {
+                "data-launch-flags-shell": "1",
+                style: format!(
+                    "width:min(660px, calc(100vw - 44px)); max-height:calc(100vh - 56px); overflow:auto; \
+                     display:flex; flex-direction:column; gap:12px; padding:16px; \
+                     border-radius:22px; background:{}; color:{}; box-shadow:{}; font-family:{};",
+                    editor_surface,
+                    palette.text,
+                    editor_shadow,
+                    interface_font_family()
+                ),
+                onmousedown: |evt| evt.stop_propagation(),
+                onclick: |evt| evt.stop_propagation(),
+                div {
+                    style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px;",
+                    div {
+                        style: "display:flex; flex-direction:column; gap:3px;",
+                        div {
+                            style: format!("font-size:15px; font-weight:800; letter-spacing:-0.01em; color:{};", palette.text),
+                            "Agent CLI launch flags"
+                        }
+                        div {
+                            style: format!("font-size:11px; line-height:1.45; color:{};", palette.muted),
+                            "Each CLI expresses its permission checks in its own vocabulary. Pick a tier or type your own — typing always wins."
+                        }
+                    }
+                    button {
+                        "data-launch-flags-close": "1",
+                        style: format!(
+                            "border:none; background:transparent; color:{}; font-size:16px; font-weight:700; cursor:pointer;",
+                            palette.muted
+                        ),
+                        onclick: move |evt| on_close.call(evt),
+                        "✕"
+                    }
+                }
+                for descriptor in rows {
+                    LaunchFlagsRow {
+                        key: "{descriptor.slug}",
+                        palette,
+                        slug: descriptor.slug.to_string(),
+                        display_name: descriptor.display_name.to_string(),
+                        icon_glyph: descriptor.icon_glyph.to_string(),
+                        brand_color: descriptor.brand_color.to_string(),
+                        value: launch_flags_box_value(descriptor, &stored),
+                        customised: stored.contains_key(descriptor.extra_args_slug),
+                        presets: descriptor.permission_presets,
+                        provenance_note: launch_flags_provenance_note(descriptor),
+                        disabled: matches!(
+                            descriptor.permission_provenance,
+                            yggterm_core::agent_cli::PermissionProvenance::Unmeasured(_)
+                        ),
+                        on_change,
+                        on_reset,
+                        on_focus_input: on_focus_input.clone(),
+                        on_blur_input: on_blur_input.clone(),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The marker a row wears for where its flags came from — spec §5.
+///
+/// Provenance is part of the UI, not a footnote: a row read off a running binary
+/// and a row taken from a vendor doc must not look the same.
+fn launch_flags_provenance_note(
+    descriptor: &yggterm_core::agent_cli::AgentCliDescriptor,
+) -> String {
+    match descriptor.permission_provenance {
+        yggterm_core::agent_cli::PermissionProvenance::Measured => String::new(),
+        yggterm_core::agent_cli::PermissionProvenance::Documented => {
+            "documented, not verified here".to_string()
+        }
+        yggterm_core::agent_cli::PermissionProvenance::Unmeasured(reason) => reason.to_string(),
+    }
+}
+
+#[component]
+#[allow(clippy::too_many_arguments)]
+fn LaunchFlagsRow(
+    palette: Palette,
+    slug: String,
+    display_name: String,
+    icon_glyph: String,
+    brand_color: String,
+    value: String,
+    customised: bool,
+    presets: &'static [yggterm_core::agent_cli::PermissionPreset],
+    provenance_note: String,
+    disabled: bool,
+    on_change: EventHandler<(String, String)>,
+    on_reset: EventHandler<String>,
+    on_focus_input: EventHandler<()>,
+    on_blur_input: EventHandler<()>,
+) -> Element {
+    // Which tier the current text corresponds to, by exact match. Anything else
+    // is Custom — the free text is authoritative and a preset button never
+    // silently rewrites it.
+    let active_preset = presets
+        .iter()
+        .find(|preset| preset.args.trim() == value.trim())
+        .map(|preset| preset.id);
+    let explanation = active_preset
+        .and_then(|id| presets.iter().find(|preset| preset.id == id))
+        .map(|preset| preset.explanation.to_string())
+        .unwrap_or_else(|| {
+            if disabled {
+                provenance_note.clone()
+            } else {
+                "Custom flags — not one of this CLI's named tiers.".to_string()
+            }
+        });
+    let row_slug = slug.clone();
+    let reset_slug = slug.clone();
+    rsx! {
+        div {
+            "data-launch-flags-row": "{slug}",
+            style: format!(
+                "display:flex; flex-direction:column; gap:7px; padding:10px; border-radius:14px; \
+                 background:{}; box-shadow: inset 0 0 0 1px {};",
+                if palette_is_dark(palette) { "rgba(255,255,255,0.04)" } else { "rgba(255,255,255,0.22)" },
+                if palette_is_dark(palette) { "rgba(141,160,178,0.16)" } else { "rgba(198,212,224,0.32)" }
+            ),
+            div {
+                style: "display:flex; align-items:center; gap:8px;",
+                span {
+                    style: format!(
+                        "display:inline-flex; align-items:center; justify-content:center; width:22px; height:18px; \
+                         border-radius:5px; background:{}; color:#ffffff; font-family:'JetBrains Mono', ui-monospace, monospace; \
+                         font-size:8px; font-weight:800;",
+                        brand_color
+                    ),
+                    "{icon_glyph}"
+                }
+                span {
+                    style: format!("font-size:12px; font-weight:800; color:{};", palette.text),
+                    "{display_name}"
+                }
+                if !provenance_note.is_empty() {
+                    span {
+                        style: format!(
+                            "font-size:9px; font-weight:700; padding:1px 6px; border-radius:999px; color:{}; \
+                             box-shadow: inset 0 0 0 1px {};",
+                            palette.muted,
+                            if palette_is_dark(palette) { "rgba(141,160,178,0.30)" } else { "rgba(198,212,224,0.70)" }
+                        ),
+                        if disabled { "unmeasured" } else { "documented" }
+                    }
+                }
+                span { style: "flex:1;" }
+                if customised {
+                    button {
+                        "data-launch-flags-reset": "{slug}",
+                        style: format!(
+                            "border:none; background:transparent; color:{}; font-size:10px; font-weight:700; cursor:pointer;",
+                            palette.muted
+                        ),
+                        onclick: move |_| on_reset.call(reset_slug.clone()),
+                        "Reset"
+                    }
+                }
+            }
+            if !presets.is_empty() {
+                div {
+                    style: "display:flex; flex-wrap:wrap; gap:6px;",
+                    for preset in presets.iter() {
+                        button {
+                            key: "{preset.id}",
+                            "data-launch-flags-preset": "{slug}/{preset.id}",
+                            disabled,
+                            style: launch_flags_preset_style(palette, active_preset == Some(preset.id), disabled),
+                            onclick: {
+                                let slug = row_slug.clone();
+                                let args = preset.args.to_string();
+                                move |_| on_change.call((slug.clone(), args.clone()))
+                            },
+                            "{preset.label}"
+                        }
+                    }
+                }
+            }
+            input {
+                "data-launch-flags-input": "{slug}",
+                r#type: "text",
+                value: "{value}",
+                disabled,
+                placeholder: "no flags",
+                style: format!(
+                    "height:30px; padding:0 9px; border:none; border-radius:9px; background:{}; color:{}; \
+                     box-shadow: inset 0 0 0 1px {}; font-family:'JetBrains Mono', ui-monospace, monospace; font-size:11px;",
+                    if palette_is_dark(palette) { "rgba(13,18,24,0.72)" } else { "rgba(255,255,255,0.90)" },
+                    palette.text,
+                    if palette_is_dark(palette) { "rgba(93,116,134,0.44)" } else { "rgba(208,219,229,0.85)" }
+                ),
+                onfocus: move |_| on_focus_input.call(()),
+                onblur: move |_| on_blur_input.call(()),
+                oninput: {
+                    let slug = slug.clone();
+                    move |evt: FormEvent| on_change.call((slug.clone(), evt.value()))
+                },
+            }
+            div {
+                style: format!("font-size:10px; line-height:1.45; color:{};", palette.muted),
+                "{explanation}"
+            }
+        }
+    }
+}
+
+fn launch_flags_preset_style(palette: Palette, active: bool, disabled: bool) -> String {
+    let background = if disabled {
+        "transparent".to_string()
+    } else if active {
+        palette.accent.to_string()
+    } else if palette_is_dark(palette) {
+        "rgba(21,28,35,0.94)".to_string()
+    } else {
+        "rgba(255,255,255,0.86)".to_string()
+    };
+    let color = if active && !disabled {
+        "#ffffff"
+    } else {
+        palette.muted
+    };
+    format!(
+        "height:24px; padding:0 10px; border:none; border-radius:999px; background:{background}; color:{color}; \
+         font-size:10px; font-weight:700; cursor:{};",
+        if disabled { "not-allowed" } else { "pointer" }
+    )
+}
+
 #[component]
 fn ThemeEditorOverlay(
     snapshot: SharedSnapshot,
@@ -132891,6 +133871,102 @@ fn SettingsField(
         }
     }
 }
+/// The one-line summary the settings rail shows in place of the flag values.
+///
+/// It counts CLIs that OWN a box (`extra_args_slug == slug`), so `codex-anything`
+/// — which shares codex's — is not counted twice, and "customised" means the
+/// user has stored something, not that a default tier exists.
+fn launch_flags_rail_summary(stored: &std::collections::BTreeMap<String, String>) -> String {
+    let total = launch_flags_rows().count();
+    let customised = launch_flags_rows()
+        .filter(|descriptor| stored.contains_key(descriptor.extra_args_slug))
+        .count();
+    format!("{total} CLIs · {customised} customised")
+}
+
+/// The CLIs that get a ROW in the launch-flags modal, in registry order.
+///
+/// ⛔ Derived, never hand-listed: `docs/spec-agent-cli-extra-args-modal.md` §1
+/// makes this the place the "a CLI is DATA" law would otherwise stop being true,
+/// and the titlebar `+` menu is the standing proof of what hand-rolling costs.
+/// A CLI that does not own its box (it reads another's) is not a row — one CLI,
+/// one box.
+fn launch_flags_rows()
+-> impl Iterator<Item = &'static yggterm_core::agent_cli::AgentCliDescriptor> {
+    yggterm_core::agent_cli::AGENT_CLIS
+        .iter()
+        .filter(|descriptor| descriptor.extra_args_slug == descriptor.slug)
+}
+
+/// What one row's box should show: the stored value, or the descriptor's default
+/// tier when the user has never set one.
+///
+/// ⚠ An entry present but EMPTY is a user who cleared the box, and it must stay
+/// cleared — `Some("")` is not `None`. That distinction is the whole reason the
+/// store keys a map instead of defaulting a `String` field.
+fn launch_flags_box_value(
+    descriptor: &yggterm_core::agent_cli::AgentCliDescriptor,
+    stored: &std::collections::BTreeMap<String, String>,
+) -> String {
+    if let Some(value) = stored.get(descriptor.extra_args_slug) {
+        return value.clone();
+    }
+    descriptor
+        .default_permission_preset()
+        .map(|preset| preset.args.to_string())
+        .unwrap_or_default()
+}
+
+#[component]
+fn LaunchFlagsSettingsSection(
+    palette: Palette,
+    summary: String,
+    on_open: EventHandler<MouseEvent>,
+) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:6px;",
+            div {
+                style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
+                div {
+                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                    "Agent CLI launch flags"
+                }
+                span {
+                    style: format!("font-size:10px; font-weight:700; color:{};", palette.muted),
+                    "{summary}"
+                }
+            }
+            button {
+                "data-launch-flags-open-button": "1",
+                style: format!(
+                    "display:flex; align-items:center; justify-content:space-between; height:34px; padding:0 12px; \
+                     border:none; border-radius:11px; background:{}; color:{}; \
+                     box-shadow: inset 0 0 0 1px {}; font-size:12px; font-weight:700;",
+                    if palette_is_dark(palette) {
+                        "rgba(21,28,35,0.94)"
+                    } else {
+                        "rgba(255,255,255,0.86)"
+                    },
+                    palette.text,
+                    if palette_is_dark(palette) {
+                        "rgba(93,116,134,0.56)"
+                    } else {
+                        "rgba(208,219,229,0.85)"
+                    }
+                ),
+                onclick: move |evt| on_open.call(evt),
+                span { "Configure" }
+                span { style: format!("color:{};", palette.muted), "↗" }
+            }
+            div {
+                style: format!("font-size:11px; line-height:1.45; color:{};", palette.muted),
+                "Flags appended to every new and resumed session of that CLI. Each CLI spells its permission checks differently."
+            }
+        }
+    }
+}
+
 #[component]
 fn ThemeSettingsSection(
     palette: Palette,
@@ -144698,6 +145774,73 @@ mod tests {
     }
 
     #[test]
+    fn the_declined_swap_also_stands_its_successor_up() {
+        // ⛔ Recording the intent is only half of it. The queue's only reader is
+        // a daemon's own retire poll, so on a host whose newest daemon predates
+        // the queue the entry is written by something current and read by
+        // nothing — measured at twelve versions behind for 5.5 hours with the
+        // entry at `attempts: 0`. Source-level because the defect is a missing
+        // CALL, which no unit test of either half would notice.
+        let source = include_str!("shell.rs");
+        let body = source
+            .split("fn queue_startup_swap_intent(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("the intent producer should be present");
+        assert!(
+            body.contains("start_successor_for_declined_swap("),
+            "a declined swap must stand the successor up as well as record it — \
+             a queue whose consumer can be older than its producer has no floor"
+        );
+    }
+
+    #[test]
+    fn a_successor_is_not_spawned_beside_one_that_already_serves() {
+        // At OR ABOVE: a daemon ahead of the target already serves this client.
+        assert_eq!(
+            successor_spawn_verdict("3.0.130", &[(3, 0, 130)], 0, 1_000),
+            "already_live"
+        );
+        assert_eq!(
+            successor_spawn_verdict("3.0.130", &[(3, 0, 131)], 0, 1_000),
+            "already_live"
+        );
+        // Only older daemons alive — this is the state the whole fix exists for.
+        assert_eq!(
+            successor_spawn_verdict("3.0.130", &[(3, 0, 118), (3, 0, 75)], 0, 1_000),
+            "spawn"
+        );
+        // An empty host spawns too: nothing is serving at all.
+        assert_eq!(successor_spawn_verdict("3.0.130", &[], 0, 1_000), "spawn");
+    }
+
+    #[test]
+    fn a_reconcile_that_re_runs_does_not_spawn_a_daemon_per_decline() {
+        // Measured: three declines in ninety seconds on one GUI launch. Three
+        // daemons would be a fork bomb wearing a repair.
+        let stale = [(3u64, 0u64, 118u64)];
+        assert_eq!(
+            successor_spawn_verdict("3.0.130", &stale, 1_000, 1_000 + 20_000),
+            "floored"
+        );
+        assert_eq!(
+            successor_spawn_verdict(
+                "3.0.130",
+                &stale,
+                1_000,
+                1_000 + STARTUP_SUCCESSOR_SPAWN_FLOOR_MS
+            ),
+            "spawn",
+            "and it must eventually retry — a one-shot repair that failed is gone, not slow"
+        );
+        // A zero stamp is "never tried", not "tried at the epoch".
+        assert_eq!(
+            successor_spawn_verdict("3.0.130", &stale, 0, 10),
+            "spawn"
+        );
+    }
+
+    #[test]
     fn daemon_update_state_marks_hot_update_handoff_active() {
         let mut current_with_handoff = runtime_status_for_test(current_version().as_str(), 1, 5102);
         current_with_handoff.preserved_terminal_owner_count = 1;
@@ -145754,46 +146897,46 @@ mod tests {
     #[test]
     fn modal_precedence_is_topmost_first_and_has_a_single_owner() {
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false),
+            top_modal_of(false, false, false, false, false, false, false, false, false),
             None
         );
         // Each flag alone names its own dialog, in paint order.
         assert_eq!(
-            top_modal_of(true, false, false, false, false, false, false, false),
+            top_modal_of(true, false, false, false, false, false, false, false, false),
             Some(TopModal::KeymapEditor)
         );
         assert_eq!(
-            top_modal_of(false, true, false, false, false, false, false, false),
+            top_modal_of(false, true, false, false, false, false, false, false, false),
             Some(TopModal::ThemeEditor)
         );
         assert_eq!(
-            top_modal_of(false, false, true, false, false, false, false, false),
+            top_modal_of(false, false, false, true, false, false, false, false, false),
             Some(TopModal::MediaCapture)
         );
         assert_eq!(
-            top_modal_of(false, false, false, true, false, false, false, false),
+            top_modal_of(false, false, false, false, true, false, false, false, false),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, true, false, false, false),
+            top_modal_of(false, false, false, false, false, true, false, false, false),
             Some(TopModal::Delete)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, true, false, false),
+            top_modal_of(false, false, false, false, false, false, true, false, false),
             Some(TopModal::CopyEdit)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, true, false),
+            top_modal_of(false, false, false, false, false, false, false, true, false),
             Some(TopModal::ClassicTabsSwitch)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, true),
+            top_modal_of(false, false, false, false, false, false, false, false, true),
             Some(TopModal::StripDropdown)
         );
         // Stacked: the topmost-rendered dialog wins the keyboard. The KeyTips
         // editor paints at z-index 500, above every dialog, so it wins outright.
         assert_eq!(
-            top_modal_of(true, true, true, true, true, true, true, true),
+            top_modal_of(true, true, true, true, true, true, true, true, true),
             Some(TopModal::KeymapEditor)
         );
         // ⛔ A capture prompt outranks every dialog below the two editors. Both
@@ -145802,21 +146945,21 @@ mod tests {
         // keyboard reaches, or Escape would dismiss the wrong dialog and leave
         // the engine blocked on this one.
         assert_eq!(
-            top_modal_of(false, false, true, true, true, true, true, true),
+            top_modal_of(false, false, false, true, true, true, true, true, true),
             Some(TopModal::MediaCapture)
         );
         assert_eq!(
-            top_modal_of(false, false, false, true, true, true, true, true),
+            top_modal_of(false, false, false, false, true, true, true, true, true),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, true, true, true, true),
+            top_modal_of(false, false, false, false, false, true, true, true, true),
             Some(TopModal::Delete)
         );
         // …and a strip dropdown is the FLOOR of that list: a dialog raised while
         // one is open owns the screen over it, never the other way round.
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, true, true),
+            top_modal_of(false, false, false, false, false, false, false, true, true),
             Some(TopModal::ClassicTabsSwitch)
         );
 
@@ -156722,23 +157865,23 @@ mod tests {
             session_kind: None,
         };
         assert_eq!(
-            drag_drop_placement_from_pointer(&separator, 4.0),
+            drag_drop_placement_from_pointer(&separator, 4.0, false),
             DragDropPlacement::Before
         );
         assert_eq!(
-            drag_drop_placement_from_pointer(&separator, 18.0),
+            drag_drop_placement_from_pointer(&separator, 18.0, false),
             DragDropPlacement::After
         );
         assert_eq!(
-            drag_drop_placement_from_pointer(&folder, 4.0),
+            drag_drop_placement_from_pointer(&folder, 4.0, false),
             DragDropPlacement::Before
         );
         assert_eq!(
-            drag_drop_placement_from_pointer(&folder, 18.0),
+            drag_drop_placement_from_pointer(&folder, 18.0, false),
             DragDropPlacement::Into
         );
         assert_eq!(
-            drag_drop_placement_from_pointer(&folder, 30.0),
+            drag_drop_placement_from_pointer(&folder, 30.0, false),
             DragDropPlacement::After
         );
     }
@@ -156796,6 +157939,357 @@ mod tests {
             &target
         ));
     }
+    /// A seated row and its path, for the row-set tests below. The seat is the
+    /// only thing that decides an arrangement, so it is the only thing that
+    /// varies.
+    fn seated_live_session(path: &str, seat: &str) -> ManagedSessionView {
+        let mut session = test_live_shell_session(path);
+        session.source = SessionSource::LiveSsh;
+        session.host_label = "dev".to_string();
+        session.outline_prefix = (!seat.is_empty()).then(|| seat.to_string());
+        session
+    }
+
+    fn live_rows_for_seats(
+        seats: &[(&str, &str)],
+        collapsed: &HashSet<String>,
+        arrangement: &yggterm_core::row_set_outline::RowArrangement,
+    ) -> Vec<(String, usize)> {
+        let live_sessions: Vec<ManagedSessionView> = seats
+            .iter()
+            .map(|(path, seat)| seated_live_session(path, seat))
+            .collect();
+        let mut expanded = HashSet::new();
+        expanded.insert("__live_sessions__".to_string());
+        merged_sidebar_rows_with_projection_rows(
+            &[],
+            &[],
+            &[],
+            &[],
+            &live_sessions,
+            &expanded,
+            collapsed,
+            arrangement,
+        )
+        .into_iter()
+        .filter(|row| row.kind == BrowserRowKind::Session)
+        .map(|row| (row.full_path, row.depth))
+        .collect()
+    }
+
+    /// ⛔⛔ A PRESENTATION STATE MAY NOT REMOVE ROWS FROM A DATA VERB.
+    ///
+    /// Collapsing a row set hides its members — that is what collapsing means,
+    /// and it is right for the screen. `server app rows` is not the screen: the
+    /// booter, the supervision plane, seat audits and orchestration scripts all
+    /// read it to answer "which rows exist". While it answered from the rendered
+    /// list, folding the five books deleted every member from all of them at
+    /// once: 2026-08-13, nine live agent rows invisible to every consumer, and a
+    /// booter that reaped nine subscriptions in six seconds on the strength of
+    /// it — each one a working session, each logged `GONE (retired)`.
+    ///
+    /// Proven on the live host the same night: expanding ONE set brought exactly
+    /// the nine rows back, seats visible going from 5 to 14.
+    #[test]
+    fn the_rows_verb_reports_rows_a_collapsed_set_hides_from_the_screen() {
+        let source = include_str!("shell.rs");
+        let describer = source
+            .split("fn describe_app_rows_snapshot(")
+            .nth(1)
+            .expect("the describer exists");
+        let body = &describer[..describer.find("\n}").expect("body ends")];
+        assert!(
+            body.contains("app_control_rows_with_every_set_open(&shell)"),
+            "the data verb must build its own list with every set OPEN, not read \
+             the rendered one — a fold is a fact about the screen"
+        );
+        assert!(
+            body.contains("hidden_by_collapsed_set"),
+            "and it must still say which rows the screen is folding away, or a \
+             consumer that wants to mirror the sidebar cannot"
+        );
+        // The one that would quietly undo it: reading `snapshot.rows` for the
+        // payload again would restore the old behaviour while the helper sat
+        // there looking correct.
+        let payload = body
+            .split("\"rows\":")
+            .nth(1)
+            .expect("the rows payload exists");
+        assert!(
+            payload.starts_with(" snapshot.rows.iter()"),
+            "the payload must iterate the list this function built; got: {}",
+            &payload[..payload.len().min(60)]
+        );
+    }
+
+    /// ⭐ THE GESTURE THAT DID NOT EXIST. Owner, on the shipped build: *"I tried
+    /// dragging one session over the other, but our drag UX shows before or
+    /// after and not make a row group."* A live row now has an inside band; a
+    /// cwd-tree session row still does not, because there it would offer a drop
+    /// that means nothing and swallow the middle of every row.
+    #[test]
+    fn a_live_row_has_an_inside_band_and_a_cwd_tree_row_does_not() {
+        let mut live = seated_live_session("remote-session://dev/a", "6.0");
+        live.title = "head".to_string();
+        let row = BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "remote-session://dev/a".to_string(),
+            label: "6.0 head".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 1,
+            host_label: "dev".to_string(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+            session_kind: Some(SessionKind::Shell),
+        };
+        assert_eq!(
+            drag_drop_placement_from_pointer(&row, 4.0, true),
+            DragDropPlacement::Before
+        );
+        assert_eq!(
+            drag_drop_placement_from_pointer(&row, 18.0, true),
+            DragDropPlacement::Into,
+            "the middle of a live row forms a set — this is the whole gesture"
+        );
+        assert_eq!(
+            drag_drop_placement_from_pointer(&row, 30.0, true),
+            DragDropPlacement::After
+        );
+        // The same row in the cwd tree keeps the two-way band it always had.
+        assert_eq!(
+            drag_drop_placement_from_pointer(&row, 18.0, false),
+            DragDropPlacement::After
+        );
+    }
+
+    /// ⛔ THE OWNER'S RULE, pinned: the traffic lights are a column of their
+    /// own, far left, in a fixed area. Only the content steps right.
+    ///
+    /// The first build of row sets broke this by putting the disclosure control
+    /// at the head's leading edge, which pushed that row's dot, icon and label
+    /// right — so a header sat FURTHER right than its own members and the dots
+    /// stood in two columns.
+    #[test]
+    fn a_row_sets_nesting_moves_the_content_and_never_the_traffic_light() {
+        let (top_pad, top_text) = sidebar_row_indents(1, true);
+        let (nested_pad, nested_text) = sidebar_row_indents(2, true);
+        let (deep_pad, deep_text) = sidebar_row_indents(3, true);
+        assert_eq!(
+            (top_pad, nested_pad, deep_pad),
+            (top_pad, top_pad, top_pad),
+            "the gutter — and so its status dot — is at one identical x at every depth"
+        );
+        assert!(
+            top_text < nested_text && nested_text < deep_text,
+            "the content still steps right: {top_text} < {nested_text} < {deep_text}"
+        );
+        // ⚠ THE BULLET THAT CAN QUIETLY FAIL. A two-zone row whose gutter kept
+        // the OLD leading run would satisfy every clause above and reclaim
+        // nothing — it would photograph as a success. The old leading run for a
+        // live row was `indent_base_px + 1 * indent_step_px`; the gutter must be
+        // strictly narrower, or titles gained no width.
+        let metrics = session_row_metrics(SessionRowDensity::Sidebar);
+        let old_leading_run = metrics.indent_base_px + metrics.indent_step_px;
+        assert!(
+            top_pad < old_leading_run,
+            "every live row's title must start further left than it used to: \
+             {top_pad} < {old_leading_run}"
+        );
+        // ⛔ And the cwd tree keeps whole-row indentation: a folder has no dot
+        // in that gutter, so there is nothing to hold still and stepping the
+        // row is what makes a tree readable.
+        let (folder_two, folder_two_text) = sidebar_row_indents(2, false);
+        let (folder_three, folder_three_text) = sidebar_row_indents(3, false);
+        assert!(folder_two < folder_three);
+        assert_eq!((folder_two_text, folder_three_text), (0, 0));
+    }
+
+    /// THE OWNER'S ASK, at the surface that draws it: `N.x` sits under `N.0`,
+    /// `N.x.y` under its `N.x`, and the sidebar reads as one outline.
+    #[test]
+    fn live_rows_nest_under_the_seat_that_heads_them() {
+        assert_eq!(
+            live_rows_for_seats(
+                &[
+                    ("remote-session://dev/orch", "6.0"),
+                    ("remote-session://dev/gate", "6.1"),
+                    ("remote-session://dev/gate-a", "6.1.1"),
+                    ("remote-session://dev/ux", "6.3"),
+                    ("remote-session://dev/loose", ""),
+                ],
+                &HashSet::new(),
+                &yggterm_core::row_set_outline::RowArrangement::default(),
+            ),
+            vec![
+                ("remote-session://dev/orch".to_string(), 1),
+                ("remote-session://dev/gate".to_string(), 2),
+                ("remote-session://dev/gate-a".to_string(), 3),
+                ("remote-session://dev/ux".to_string(), 2),
+                ("remote-session://dev/loose".to_string(), 1),
+            ],
+            "Live Sessions rows start at depth 1; each level of the set adds one"
+        );
+    }
+
+    /// Two books at once — the live sidebar always has more than one campaign —
+    /// and neither reaches into the other.
+    #[test]
+    fn concurrent_books_each_keep_their_own_head() {
+        assert_eq!(
+            live_rows_for_seats(
+                &[
+                    ("remote-session://dev/six", "6.0"),
+                    ("remote-session://dev/six-a", "6.1"),
+                    ("remote-session://dev/nine", "9.0"),
+                    ("remote-session://dev/nine-a", "9.1"),
+                ],
+                &HashSet::new(),
+                &yggterm_core::row_set_outline::RowArrangement::default(),
+            ),
+            vec![
+                ("remote-session://dev/six".to_string(), 1),
+                ("remote-session://dev/six-a".to_string(), 2),
+                ("remote-session://dev/nine".to_string(), 1),
+                ("remote-session://dev/nine-a".to_string(), 2),
+            ]
+        );
+    }
+
+    /// A shut set hides what is under it and keeps its own row — a head that
+    /// hid itself could never be reopened.
+    #[test]
+    fn a_collapsed_head_hides_its_members_and_stays_on_screen() {
+        let collapsed: HashSet<String> = ["remote-session://dev/orch".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            live_rows_for_seats(
+                &[
+                    ("remote-session://dev/orch", "6.0"),
+                    ("remote-session://dev/gate", "6.1"),
+                    ("remote-session://dev/gate-a", "6.1.1"),
+                    ("remote-session://dev/loose", ""),
+                ],
+                &collapsed,
+                &yggterm_core::row_set_outline::RowArrangement::default(),
+            ),
+            vec![
+                ("remote-session://dev/orch".to_string(), 1),
+                ("remote-session://dev/loose".to_string(), 1),
+            ]
+        );
+    }
+
+    /// ⛔ INDENTATION IS BUDGETED (`DESIGN.md` §"Row sets"). Past two levels the
+    /// indent holds and the head's own number carries the depth, because a title
+    /// clipped to nothing is worse than a column that stops stepping.
+    #[test]
+    fn indentation_stops_stepping_once_the_sidebar_runs_out_of_room() {
+        let rows = live_rows_for_seats(
+            &[
+                ("remote-session://dev/a", "6.0"),
+                ("remote-session://dev/b", "6.1"),
+                ("remote-session://dev/c", "6.1.1"),
+                ("remote-session://dev/d", "6.1.1.1"),
+                ("remote-session://dev/e", "6.1.1.1.1"),
+            ],
+            &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
+        );
+        let depths: Vec<usize> = rows.iter().map(|(_, depth)| *depth).collect();
+        assert_eq!(
+            depths,
+            vec![1, 2, 3, 3, 3],
+            "the fourth and fifth levels are still NESTED — they are drawn under \
+             their head and hidden with it — they simply stop moving right"
+        );
+    }
+
+    /// The head is the only row that gets a disclosure control, and it reports
+    /// how many rows it holds. A split's compound row counts panes and must
+    /// never offer to collapse them.
+    #[test]
+    fn only_a_head_is_drawn_with_a_disclosure_control() {
+        let live_sessions: Vec<ManagedSessionView> = [
+            ("remote-session://dev/orch", "6.0"),
+            ("remote-session://dev/gate", "6.1"),
+            ("remote-session://dev/gate-a", "6.1.1"),
+        ]
+        .iter()
+        .map(|(path, seat)| seated_live_session(path, seat))
+        .collect();
+        let mut expanded = HashSet::new();
+        expanded.insert("__live_sessions__".to_string());
+        let rows = merged_sidebar_rows(&[], &[], &[], &live_sessions, &expanded);
+        let head = rows
+            .iter()
+            .find(|row| row.full_path == "remote-session://dev/orch")
+            .expect("head row");
+        let leaf = rows
+            .iter()
+            .find(|row| row.full_path == "remote-session://dev/gate-a")
+            .expect("leaf row");
+        assert!(row_heads_a_row_set(head));
+        assert_eq!(
+            head.descendant_sessions, 3,
+            "itself plus the two rows beneath it, however deep they sit"
+        );
+        assert!(!row_heads_a_row_set(leaf));
+        assert_eq!(leaf.descendant_sessions, 1);
+        let mut split_row = head.clone();
+        split_row.full_path = "split://group-1".to_string();
+        assert!(
+            !row_heads_a_row_set(&split_row),
+            "a split is a VIEW, not an arrangement — it counts its panes in the \
+             same field and must not offer to collapse rows it does not hold"
+        );
+    }
+
+    /// ⛔ THE CACHE MUST SEE THE SEAT. Reseating a row rearranges the sidebar,
+    /// and the merge is memoized — before row sets the seat only reached the
+    /// label, which is re-composed after the cache, so leaving it out of the key
+    /// cost nothing and would now leave the outline drawn the old way.
+    #[test]
+    fn reseating_a_row_rebuilds_the_outline_rather_than_serving_the_cached_one() {
+        let flat = live_rows_for_seats(
+            &[
+                ("remote-session://dev/orch", "6.0"),
+                ("remote-session://dev/gate", "7.0"),
+            ],
+            &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
+        );
+        assert_eq!(
+            flat,
+            vec![
+                ("remote-session://dev/orch".to_string(), 1),
+                ("remote-session://dev/gate".to_string(), 1),
+            ],
+            "two books, both top level"
+        );
+        let nested = live_rows_for_seats(
+            &[
+                ("remote-session://dev/orch", "6.0"),
+                ("remote-session://dev/gate", "6.1"),
+            ],
+            &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
+        );
+        assert_eq!(
+            nested,
+            vec![
+                ("remote-session://dev/orch".to_string(), 1),
+                ("remote-session://dev/gate".to_string(), 2),
+            ],
+            "the same rows, reseated, must nest — a stale cache entry would not"
+        );
+    }
+
     #[test]
     fn live_session_drag_drop_reorders_live_group() {
         let path_a = "remote-session://dev/a";
@@ -157267,6 +158761,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("create temp dir");
         let live_path = dir.join(format!("{}-1.json", std::process::id()));
         let live_record = serde_json::to_vec(&ClientInstanceRecord {
+            build_commit: None,
             pid: std::process::id(),
             started_at_ms: 1,
             client_id: None,
@@ -157372,6 +158867,7 @@ mod tests {
         fs::create_dir_all(&legacy_dir).expect("create legacy client dir");
         let legacy_path = legacy_dir.join(format!("{}-1.json", std::process::id()));
         let legacy_record = serde_json::to_vec(&ClientInstanceRecord {
+            build_commit: None,
             pid: std::process::id(),
             started_at_ms: 1,
             client_id: None,
@@ -161580,6 +163076,8 @@ mod tests {
             &[],
             &[],
             &expanded,
+            &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
         );
 
         assert!(rows.iter().any(|row| {
@@ -161633,6 +163131,8 @@ mod tests {
             &[],
             &[],
             &expanded,
+            &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
         );
         assert!(rows.iter().any(|row| {
             row.full_path == "__remote_folder__/practice/home/user/git/samplers"
@@ -176421,6 +177921,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_input_focused_once: false,
             tree_rename_value: String::new(),
             theme_editor_open: false,
+            launch_flags_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -177089,6 +178590,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_input_focused_once: false,
             tree_rename_value: String::new(),
             theme_editor_open: false,
+            launch_flags_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -177288,6 +178790,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_input_focused_once: false,
             tree_rename_value: String::new(),
             theme_editor_open: false,
+            launch_flags_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -177487,6 +178990,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_input_focused_once: false,
             tree_rename_value: String::new(),
             theme_editor_open: false,
+            launch_flags_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -177689,6 +179193,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_input_focused_once: false,
             tree_rename_value: String::new(),
             theme_editor_open: false,
+            launch_flags_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -177895,6 +179400,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_input_focused_once: false,
             tree_rename_value: String::new(),
             theme_editor_open: false,
+            launch_flags_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -178093,6 +179599,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_input_focused_once: false,
             tree_rename_value: String::new(),
             theme_editor_open: false,
+            launch_flags_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -178291,6 +179798,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_input_focused_once: false,
             tree_rename_value: String::new(),
             theme_editor_open: false,
+            launch_flags_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -178527,6 +180035,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_input_focused_once: false,
             tree_rename_value: String::new(),
             theme_editor_open: false,
+            launch_flags_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -178728,6 +180237,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_input_focused_once: false,
             tree_rename_value: String::new(),
             theme_editor_open: false,
+            launch_flags_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -178965,6 +180475,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_input_focused_once: false,
             tree_rename_value: String::new(),
             theme_editor_open: false,
+            launch_flags_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),
@@ -179485,6 +180996,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             tree_rename_input_focused_once: false,
             tree_rename_value: String::new(),
             theme_editor_open: false,
+            launch_flags_open: false,
             theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
             theme_editor_selected_stop: None,
             theme_accent: String::new(),

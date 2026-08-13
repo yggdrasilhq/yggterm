@@ -659,6 +659,24 @@ pub enum AppControlCommand {
     SetThemeEditorOpen {
         open: bool,
     },
+    /// Raise or shut the agent-CLI launch-flags modal, and — when `set` names a
+    /// CLI — store that CLI's flags.
+    ///
+    /// ⚠ Its own verb rather than a generic settings write, because
+    /// `spec-agent-cli-extra-args-modal.md` §7 makes app control's ability to
+    /// OPEN this modal part of the work: the row menu shipped with zero pixels
+    /// of proof for exactly the opposite reason.
+    SetLaunchFlags {
+        #[serde(default)]
+        open: Option<bool>,
+        /// The descriptor slug whose box to write. `None` ⇒ open/close only.
+        #[serde(default)]
+        slug: Option<String>,
+        /// The flags to store. `Some("")` clears the box; omitting it while
+        /// naming a slug RESETS that CLI to its descriptor default.
+        #[serde(default)]
+        args: Option<String>,
+    },
     ResetThemeEditor,
     SetThemeEditorValues {
         #[serde(default)]
@@ -1609,6 +1627,7 @@ impl AppControlCommand {
             Self::LaunchApp { .. } => "launch_app",
             Self::SetUiTheme { .. } => "set_ui_theme",
             Self::SetThemeEditorOpen { .. } => "set_theme_editor_open",
+            Self::SetLaunchFlags { .. } => "set_launch_flags",
             Self::ResetThemeEditor => "reset_theme_editor",
             Self::SetThemeEditorValues { .. } => "set_theme_editor_values",
             Self::Notify { .. } => "notify",

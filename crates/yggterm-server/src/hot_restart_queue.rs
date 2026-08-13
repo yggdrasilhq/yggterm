@@ -37,6 +37,14 @@
 //! refused. A list would have re-created the "two requests disagree about the
 //! target" problem the spec's *"one request in flight"* sentence forbids.
 //!
+//! ## §2 rides here too: the boundary is a fact about the same slot
+//!
+//! *"Drive the swap from relay boundaries, not from polling for silence. The
+//! gate stops being a search and becomes an appointment."* A declared hand-off
+//! does not change WHAT this host owes, only WHEN it may next try — so it is a
+//! field on the one entry ([`declare_relay_boundary`]), not a second file that
+//! could name a different target than the queue does.
+//!
 //! ⛔ **Superseding must not reset the clock when the target is unchanged.**
 //! §5's deadline is measured from `requested_at_ms`, so a re-request for the
 //! version already queued has to leave that stamp alone; otherwise a host that
@@ -76,6 +84,20 @@ pub struct QueuedHotRestart {
     /// What the last attempt actually did. `None` = never attempted.
     #[serde(default)]
     pub last_outcome: Option<String>,
+    /// §2 — when a relay boundary was last DECLARED on this host.
+    ///
+    /// ⛔ **One fact, one field: "spent" is derived, never stored.** A boundary
+    /// is spent when `last_attempt_ms` has moved past it, which is what
+    /// [`relay_boundary_is_unspent`] asks. Recording spentness separately would
+    /// be a second encoding of the same question, and the two readers of this
+    /// field — the file's own retry floor and each drainer's process-local floor
+    /// ([[finding-a-set-is-not-a-fill]] shape) — would then be free to disagree
+    /// about whether one boundary had already been used.
+    #[serde(default)]
+    pub relay_boundary_at_ms: Option<u64>,
+    /// Who declared it. Trace only, never a branch — same rule as `requested_by`.
+    #[serde(default)]
+    pub relay_boundary_by: Option<String>,
 }
 
 /// What [`decide_queue`] did with an incoming request.
@@ -216,10 +238,75 @@ pub fn record_attempt(home_dir: &Path, now_ms: u64, outcome: &str) {
 /// host where the swap cannot converge — turning a lost intent into a fork bomb,
 /// which is a worse bug than the one being fixed. `None` (never attempted) is
 /// always due.
+///
+/// ⭐ §2: **an unspent relay boundary is due whatever the floor says.** The floor
+/// prices the risk of retrying blind; a declared boundary is the opposite of
+/// blind, so it is not the case the floor was written for.
 pub fn attempt_is_due(request: &QueuedHotRestart, now_ms: u64, interval_ms: u64) -> bool {
+    if relay_boundary_is_unspent(request) {
+        return true;
+    }
     match request.last_attempt_ms {
         None => true,
         Some(last) => now_ms.saturating_sub(last) >= interval_ms,
+    }
+}
+
+/// §2 — is there a declared relay boundary that no drainer has spent yet?
+///
+/// Spending is `last_attempt_ms` moving past the boundary, so ONE boundary buys
+/// exactly ONE attempt. That is the whole fork-bomb guard for this lane: a
+/// script that declares a boundary in a loop still cannot make a host spawn
+/// successors faster than it declares them, and [`record_attempt`] spends the
+/// boundary even when the attempt it bought then fails.
+pub fn relay_boundary_is_unspent(request: &QueuedHotRestart) -> bool {
+    match (request.relay_boundary_at_ms, request.last_attempt_ms) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(boundary), Some(last_attempt)) => boundary > last_attempt,
+    }
+}
+
+/// What [`declare_relay_boundary`] found when it was called.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayBoundaryOutcome {
+    /// A swap was owed; the next drainer poll will attempt it without waiting
+    /// out [the retry floor].
+    Declared {
+        target_version: String,
+        waiting_ms: u64,
+    },
+    /// Nothing is owed on this host.
+    ///
+    /// ⚠ **This is the COMMON case and it is not an error.** A relay boundary is
+    /// declared unconditionally at every hand-off; on a converged host there is
+    /// simply nothing to release. Nor is the boundary worth remembering for a
+    /// swap queued later — a fresh entry carries its own `last_attempt_ms` from
+    /// the attempt that created it, and is due on its own schedule.
+    NothingOwed,
+}
+
+/// §2 — *"a relay hand-off is a declared, zero-cost quiet point."* Record that
+/// one just happened, so the swap this host owes is attempted at the boundary
+/// instead of whenever the five-minute floor next expires.
+///
+/// ⛔ **It must not touch `requested_at_ms`.** §5's deadline is measured from
+/// that stamp, and a hand-off is not a new intent — it is a moment at which the
+/// existing intent may run. Moving the stamp here would make a host that relays
+/// often the one that can never reach the deadline, which is the
+/// never-converging gate rebuilt a third time.
+pub fn declare_relay_boundary(home_dir: &Path, now_ms: u64, declared_by: &str) -> RelayBoundaryOutcome {
+    let Some(mut request) = load(home_dir) else {
+        return RelayBoundaryOutcome::NothingOwed;
+    };
+    let waiting_ms = now_ms.saturating_sub(request.requested_at_ms);
+    let target_version = request.target_version.clone();
+    request.relay_boundary_at_ms = Some(now_ms);
+    request.relay_boundary_by = Some(declared_by.to_string());
+    let _ = save(home_dir, &request);
+    RelayBoundaryOutcome::Declared {
+        target_version,
+        waiting_ms,
     }
 }
 
@@ -231,8 +318,19 @@ pub fn format_queued_swap(request: &QueuedHotRestart, now_ms: u64) -> String {
         .last_outcome
         .as_deref()
         .unwrap_or("queued, not yet attempted");
+    // §2: a boundary that has been declared and not yet spent is the difference
+    // between "waiting out five minutes" and "due on the next 20 s poll", and a
+    // reader looking at a stalled host needs to be able to tell those apart.
+    let boundary = if relay_boundary_is_unspent(request) {
+        format!(
+            " · relay boundary declared by {by}, unspent",
+            by = request.relay_boundary_by.as_deref().unwrap_or("unknown"),
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "  swap owed → {version}: queued {waiting_min}m ago by {by}, {attempts} attempt(s), last: {outcome}\n",
+        "  swap owed → {version}: queued {waiting_min}m ago by {by}, {attempts} attempt(s), last: {outcome}{boundary}\n",
         version = request.target_version,
         by = request.requested_by,
         attempts = request.attempts,
@@ -252,6 +350,8 @@ mod tests {
             attempts: 0,
             last_attempt_ms: None,
             last_outcome: None,
+            relay_boundary_at_ms: None,
+            relay_boundary_by: None,
         }
     }
 
@@ -363,5 +463,102 @@ mod tests {
 
     fn format_daemon_line_mentions_the_reason(request: &QueuedHotRestart) -> bool {
         format_queued_swap(request, 120_000).contains("successor never bound")
+    }
+
+    #[test]
+    fn a_relay_boundary_makes_a_floored_retry_due_at_once() {
+        // §2's whole point: the five-minute floor prices the risk of retrying
+        // blind, and a declared hand-off is not blind. Without this the swap
+        // waits out a floor that exists for a case it is not in.
+        let mut queued = request("3.0.120", 0);
+        queued.last_attempt_ms = Some(100_000);
+        assert!(
+            !attempt_is_due(&queued, 150_000, 300_000),
+            "the floor still holds without a boundary"
+        );
+        queued.relay_boundary_at_ms = Some(140_000);
+        assert!(attempt_is_due(&queued, 150_000, 300_000));
+    }
+
+    #[test]
+    fn one_boundary_buys_exactly_one_attempt() {
+        // ⛔ THE FORK-BOMB GUARD. A boundary that stayed "unspent" would release
+        // the floor on every 20 s poll for as long as it sat in the file, which
+        // is the fork bomb the floor exists to prevent — reintroduced by the
+        // mechanism meant to bypass the floor safely.
+        let home = scratch_home("boundary-once");
+        enqueue(&home, &request("3.0.120", 1_000));
+        record_attempt(&home, 10_000, "handoff requested");
+        assert!(!attempt_is_due(&load(&home).unwrap(), 20_000, 300_000));
+
+        assert_eq!(
+            declare_relay_boundary(&home, 20_000, "ygg-claim"),
+            RelayBoundaryOutcome::Declared {
+                target_version: "3.0.120".to_string(),
+                waiting_ms: 19_000,
+            }
+        );
+        let released = load(&home).expect("stored");
+        assert!(attempt_is_due(&released, 20_000, 300_000));
+
+        // The attempt the boundary bought SPENDS it, even though the boundary
+        // field is never cleared — spentness is derived from last_attempt_ms.
+        record_attempt(&home, 21_000, "handoff requested");
+        let spent = load(&home).expect("stored");
+        assert_eq!(
+            spent.relay_boundary_at_ms,
+            Some(20_000),
+            "the boundary is a recorded fact, not a flag that gets cleared"
+        );
+        assert!(!relay_boundary_is_unspent(&spent));
+        assert!(!attempt_is_due(&spent, 30_000, 300_000));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_boundary_never_moves_the_deadline_clock() {
+        // ⛔ §5 measures its 30 minutes from `requested_at_ms`. A relay-heavy
+        // host declares boundaries constantly; if each one restarted that clock,
+        // the host that hands off most would be the one that could never reach
+        // the deadline.
+        let home = scratch_home("boundary-clock");
+        enqueue(&home, &request("3.0.120", 1_000));
+        declare_relay_boundary(&home, 9_999_000, "ygg-claim");
+        let stored = load(&home).expect("stored");
+        assert_eq!(stored.requested_at_ms, 1_000);
+        assert_eq!(stored.attempts, 0, "declaring is not attempting");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn declaring_a_boundary_on_a_converged_host_is_a_no_op() {
+        // The common case — every hand-off declares one, and most hosts owe
+        // nothing. It must not create an entry, because an entry nobody asked
+        // for would be a swap the census reports as owed forever.
+        let home = scratch_home("boundary-empty");
+        assert_eq!(
+            declare_relay_boundary(&home, 1_000, "ygg-claim"),
+            RelayBoundaryOutcome::NothingOwed
+        );
+        assert!(load(&home).is_none(), "no entry may be invented");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_census_line_names_an_unspent_boundary() {
+        // §8: "something must be nameable as the thing it waits for" — and a
+        // host with an unspent boundary is waiting for the next 20 s poll, not
+        // for the five-minute floor. Those read identically without this.
+        let mut queued = request("3.0.120", 0);
+        queued.last_attempt_ms = Some(1_000);
+        queued.relay_boundary_at_ms = Some(2_000);
+        queued.relay_boundary_by = Some("ygg-claim".to_string());
+        let line = format_queued_swap(&queued, 120_000);
+        assert!(line.contains("relay boundary declared by ygg-claim"), "{line}");
+        queued.last_attempt_ms = Some(3_000);
+        assert!(
+            !format_queued_swap(&queued, 120_000).contains("relay boundary"),
+            "a spent boundary must not be advertised as pending"
+        );
     }
 }

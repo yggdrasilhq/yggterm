@@ -49,6 +49,13 @@ gate stops being a search and becomes an appointment.
 born onto a stale daemon inherits the skew and compounds it. **A relay forces or
 awaits the swap BEFORE handing off**, so every successor starts on current.
 
+The declaration is `server relay-boundary`, and it is a field on the §4 queue
+entry rather than a file of its own: a boundary does not change WHAT the host
+owes, only when it may next try. ⛔ **A boundary buys exactly one attempt.** A
+declaration that stayed live would release the retry floor on every 20 s poll,
+which is the fork bomb that floor exists to prevent — rebuilt by the mechanism
+meant to bypass it safely.
+
 ## 3. The session state machine — classification, never silence
 
 The gate asks each owned session what it IS, not whether it has been quiet. Four
@@ -95,6 +102,12 @@ same guard the fleet skill's stall-recovery section already states.
 
 ⚠ **Once per forced swap, never per tick.** The `continue` is a repair for a
 known interruption, not a liveness poll.
+
+⇒ **The deadline is aimed at the COLD SHUTDOWN, and only at it.** That is the
+path where nothing has swapped and the host stays stale. Under a preserving
+handoff the successor is already serving every row, so what remains is ownership
+tidiness — never worth interrupting a live turn for, and interrupting for it
+would be the bare timeout the old prohibition was written about.
 
 ## 6. The exemption: a session running sub-agents is waited for
 

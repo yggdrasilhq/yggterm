@@ -48,6 +48,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ygg_host import resolve_gui_host  # noqa: E402
+
 STATE = Path.home() / ".yggterm" / "relay"
 PROJECTS = Path.home() / ".claude" / "projects"
 
@@ -116,6 +119,39 @@ def find_transcript(uuid, host=None):
     return str(hits[0]) if hits else None
 
 
+# ⭐ THE ACCOUNT RAN OUT OF QUOTA — a state a boot cannot improve, like
+# CONTEXT_DEAD, but for the opposite reason and with the opposite cure.
+#
+# CONTEXT_DEAD is about THIS session and is permanent: relay it. A rate limit is
+# about the ACCOUNT and is temporary: wait for the window. Both look identical to
+# a classifier that only measures activity — the turn ended, the file stopped
+# growing, the row goes IDLE — so both get booted, and a boot into an exhausted
+# quota is refused before the agent ever runs. It spends the wake and leaves the
+# row exactly where it was.
+#
+# ⛔ KEY ON THE STRUCTURED FIELDS, NEVER THE PROSE. The record's own text names
+# the MODEL whose limit was hit ("You've reached your <model> limit…"), so a
+# substring match on it goes stale the day a model is renamed and reads as
+# healthy — the failure-open direction. The fields below are what the CLI writes
+# to say "the API refused this on quota":
+#
+#   {"type":"assistant", "isApiErrorMessage":true, "apiErrorStatus":429,
+#    "error":"rate_limit", "errorDetails":"429 {…\"type\":\"rate_limit_error\"…}",
+#    "message":{"usage":{"output_tokens":0,…}}}
+#
+# Both discriminators are ORed on purpose: the measured record carries both, and
+# keying on one alone would fail silently if that one were ever dropped.
+#
+# ⚠ `usage.output_tokens` is 0, so `progress_marks` already declines to count
+# this as work — the anti-flap counter is not fooled. It is the BOOT that was
+# wrong, not the accounting.
+def api_rate_limited(rec):
+    """Is this transcript record the CLI reporting an account-level rate limit?"""
+    if not isinstance(rec, dict) or not rec.get("isApiErrorMessage"):
+        return False
+    return rec.get("apiErrorStatus") == 429 or rec.get("error") == "rate_limit"
+
+
 REMOTE_PROBE = r'''
 import json,os,sys,time
 p=sys.argv[1]
@@ -125,6 +161,12 @@ age=time.time()-os.path.getmtime(p)
 last=next((r for r in reversed(rows) if r.get("type") in ("assistant","user")),None)
 if last is None: print(json.dumps(["EMPTY",age,""])); sys.exit()
 if last["type"]=="user": print(json.dumps(["MIDTURN",age,""])); sys.exit()
+# ⛔ Same discriminator as api_rate_limited() above, and it must stay the same:
+#    a local row and a remote row differing about whether the account has quota
+#    is a fleet that boots half of itself into a wall.
+if last.get("isApiErrorMessage") and (last.get("apiErrorStatus")==429 or last.get("error")=="rate_limit"):
+    t=" ".join(" ".join(c.get("text","") for c in (last.get("message",{}).get("content") or []) if isinstance(c,dict) and c.get("type")=="text").split())
+    print(json.dumps(["RATE_LIMITED",age,t[:300]])); sys.exit()
 items=[c for c in (last.get("message",{}).get("content") or []) if isinstance(c,dict)]
 if any(c.get("type")=="tool_use" for c in items): print(json.dumps(["MIDTURN",age,""])); sys.exit()
 t=" ".join(" ".join(c.get("text","") for c in items if c.get("type")=="text").split())
@@ -166,6 +208,14 @@ def turn_state(path):
         return ("MIDTURN", age, "")            # a tool_result is mid-turn
     items = [c for c in (last.get("message", {}).get("content") or [])
              if isinstance(c, dict)]
+    if api_rate_limited(last):
+        # ⛔ BEFORE the tool_use test and before TURN_ENDED. This record has no
+        #    tool_use and does have text, so it would otherwise read as an
+        #    ordinary finished turn — which is precisely how a quota outage was
+        #    indistinguishable from a stall.
+        text = " ".join(" ".join(c.get("text", "") for c in items
+                                 if c.get("type") == "text").split())
+        return ("RATE_LIMITED", age, text[:300])
     if any(c.get("type") == "tool_use" for c in items):
         return ("MIDTURN", age, "")
     text = " ".join(" ".join(c.get("text", "") for c in items
@@ -217,7 +267,17 @@ def row_exists(gui_host, ident):
     was a corpse.
     ⇒ **A transcript cannot distinguish KILLED from WEDGED.** Only the row list
       can, and it must be consulted FIRST. (It also explains a `submitted:false`
-      that looked like a busy row refusing input: there was no row.)"""
+      that looked like a busy row refusing input: there was no row.)
+
+    ⛔ TRI-STATE, AND THE THIRD VALUE IS THE IMPORTANT ONE. True = listed.
+    False = the plane answered and this row was not in it. **None = the plane did
+    not answer at all**, which is a fact about US and must never be rendered as a
+    verdict about the row."""
+    if not gui_host:
+        return None
+    reply = ygg(gui_host, "server", "app", "rows")
+    if not isinstance(reply, dict) or "data" not in reply:
+        return None
     return resolve_row_path(gui_host, ident) is not None
 
 
@@ -274,6 +334,10 @@ def classify(uuid, host=None):
     if state == "UNREACHABLE":
         # ⛔ Say "I could not look", never "it is not there".
         return {"state": "UNREACHABLE", "age": 0, "tail": "", "path": t}
+    # ⭐ RATE_LIMITED passes through untouched, deliberately. It is not a point on
+    #    the idle/working axis — the row is neither stalled nor working, the
+    #    ACCOUNT is out of quota — so ageing it into IDLE would put it right back
+    #    on the path that boots it.
     if state == "MIDTURN":
         state = "WORKING" if age < MIDTURN_STUCK_SECS else "STUCK"
     elif state == "TURN_ENDED":
@@ -413,7 +477,7 @@ def main():
     ap = argparse.ArgumentParser(description="keep delegate rows running")
     ap.add_argument("--row", action="append", default=[])
     ap.add_argument("--spawned-by", default="")
-    ap.add_argument("--host", default=os.environ.get("YGG_GUI_HOST", "guihost"))
+    ap.add_argument("--host", default=None)   # ⛔ resolved, never a placeholder
     ap.add_argument("--notify-session", default=os.environ.get("YGGTERM_SESSION_ID", ""))
     ap.add_argument("--watch", type=int, default=0,
                     help="seconds to keep watching; 0 = one pass")
@@ -421,6 +485,11 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
+    # ⛔ Resolve the GUI host OUT LOUD before any row is judged. App control
+    # only answers where the GUI runs; an unresolved host makes every
+    # `row_exists` call fail, and this tool renders that as GONE/RETIRED —
+    # a TERMINAL verdict about live rows, which stops the supervision.
+    args.host = resolve_gui_host(args.host)
 
     rows = list(args.row)
     if args.spawned_by:
@@ -441,7 +510,21 @@ def main():
             rhost = row_host(row, args.host)
             if rhost and rhost == os.uname().nodename:
                 rhost = None                      # it is this machine after all
-            if not row_exists(args.host, row):
+            exists = row_exists(args.host, row)
+            if exists is None:
+                # ⛔⛔ BLIND, NOT GONE — and the difference is the whole point.
+                # `GONE`/`RETIRED` is terminal: a supervisor that reaches it stops
+                # supervising. Measured 2026-08-13 from two campaigns in one hour:
+                # an unresolvable GUI host made this report live, subscribed,
+                # working rows as retired, and a wave was one step from being
+                # treated as finished. A watchdog that cannot tell "I could not
+                # look" from "it is dead", and resolves that toward standing down,
+                # is worse than no watchdog. BLIND is non-terminal: keep watching.
+                report.append({"row": row, "state": "BLIND", "age_min": 0,
+                               "action": "STILL-WATCHING", "tail":
+                               "row plane unreachable — this says nothing about the row"})
+                continue
+            if not exists:
                 # ⛔ Ask the ROW LIST before the transcript. A retired row's
                 #    transcript is frozen mid-turn and is indistinguishable from
                 #    a live wedge.

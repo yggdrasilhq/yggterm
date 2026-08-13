@@ -70,6 +70,23 @@ done
 UUID="${SESSION##*/}"
 [ -n "$CAMPAIGN" ] || CAMPAIGN="$(printf '%s' "$TITLE" | awk '{print $1}' | tr -d ':' )"
 
+# ⛔⛔ NEVER REAP YOURSELF. A brief hands the successor a `PREDECESSOR TO REAP`
+# uuid as a literal — and if the "successor" was started as an in-process helper
+# rather than as its own PTY session, it INHERITS the parent's session id, so
+# that literal is its own. The spawn succeeds, the transcript appears and the ACK
+# token is present, because the brief really was delivered; it was simply
+# delivered to something that is not a separate row. Reported by another campaign
+# 2026-08-13 and survived only because the kill happened to be the first act.
+# ⇒ The guard belongs in the TOOL, not in the operator: discipline resets every
+#    session and a check does not.
+if [ -n "${REPLACE:-}" ] && [ "${REPLACE##*/}" = "$UUID" ]; then
+  echo "ygg-claim: ⛔ REFUSING — --replace names THIS session (${UUID}). A brief handed you" >&2
+  echo "  your own uuid as its predecessor, which means you were spawned as an in-process" >&2
+  echo "  helper rather than as a row. A helper is never a relay: it has no seat, no booter" >&2
+  echo "  subscription, and dies with its parent. Spawn the successor as its own session." >&2
+  exit 64
+fi
+
 log() { printf '%s ygg-claim %s\n' "$(date +%H:%M:%S)" "$*"; }
 
 # --- locate a binary that can talk to the GUI ------------------------------
@@ -95,6 +112,30 @@ ygg() {  # run an app-control verb wherever the GUI actually lives
     ssh "$HOST" "\$HOME/.yggterm/bin/yggterm$q" 2>/dev/null
   else
     "$BIN" "$@" 2>/dev/null
+  fi
+}
+# --- §2 of the hot-restart spec: DECLARE THE RELAY BOUNDARY ----------------
+# A hand-off is the one moment this fleet produces that the daemon gate can
+# actually use: a predecessor has finished and its successor has not started, so
+# a swap owed by this host can run at an announced quiet point instead of
+# waiting for a silence that never comes on a machine full of agents. The verb
+# is a no-op on a converged host, which is the common case — it releases the
+# retry floor for ONE attempt and returns.
+#
+# ⚠ Declared on BOTH planes and neither is redundant: the agent's own host owns
+# the process that just died, and the GUI host owns the terminal runtime that
+# just came free. A converged host answers "no swap is owed" either way.
+# ⚠ Never allowed to fail the claim: a headless binary older than 3.0.129 does
+# not know the verb, and a hand-off must not start failing because a boundary
+# could not be announced.
+boundary() {
+  local why="${1:-ygg-claim}" hb
+  for hb in "$HOME/.yggterm/bin/yggterm-headless" "$HOME/.local/bin/yggterm-headless"; do
+    [ -x "$hb" ] && { "$hb" server relay-boundary --by "$why" >/dev/null 2>&1 || true; break; }
+  done
+  if [ -n "$HOST" ] && [ "$HOST" != "$(hostname)" ]; then
+    ssh "$HOST" "\$HOME/.yggterm/bin/yggterm-headless server relay-boundary --by $(printf '%q' "$why")" \
+      >/dev/null 2>&1 || true
   fi
 }
 has_gui() {
@@ -426,4 +467,8 @@ SURV=0
 for p in $(agent_pids); do SURV=$((SURV+1)); log "SURVIVED: pid $p"; done
 [ "$SURV" = 0 ] || { echo "ygg-claim: predecessor processes survived — reap them by hand" >&2; exit 4; }
 log "predecessor retired and reaped clean"
+# ⇒ HERE is the boundary, and only here. The rename above is not a quiet point;
+# a reaped predecessor is. Declared after the reap is verified, so the boundary
+# names a moment that actually happened rather than one that was requested.
+boundary "ygg-claim-reap"
 log "done"

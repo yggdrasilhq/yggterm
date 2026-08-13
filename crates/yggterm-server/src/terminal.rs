@@ -924,40 +924,64 @@ impl TerminalManager {
         data: &str,
         timeout: Duration,
     ) -> Result<PromptSubmitOutcome> {
+        submit_prompt_echo_verified_with(
+            |text| self.write(key, text),
+            || self.session_screen_snapshot(key),
+            data,
+            timeout,
+        )
+    }
+}
+
+/// The echo-verified submit, driven through two closures instead of a registry.
+///
+/// ⚠ **Extracted so there is exactly ONE statement of the contract**, not two.
+/// The daemon's §5 `continue` repair cannot call the method above: it would have
+/// to hold the daemon's runtime lock for the whole probe-and-wait, freezing every
+/// other session on the host for up to the timeout. Re-implementing the loop
+/// there instead would have left two copies of a rule that took a live root-cause
+/// to get right ([[finding-the-enter-key-is-a-separate-write-of-cr]]), free to
+/// drift the first time either was touched. The closures lock per call and
+/// release before every sleep.
+pub fn submit_prompt_echo_verified_with(
+    write: impl Fn(&str) -> Result<()>,
+    snapshot: impl Fn() -> Option<String>,
+    data: &str,
+    timeout: Duration,
+) -> Result<PromptSubmitOutcome> {
+    {
         // Distinctive enough not to collide with real surface text; cleared via Ctrl+U.
         const PROBE: &str = "yggterm_ready_probe";
         const CLEAR_LINE: &str = "\u{15}"; // Ctrl+U — clears the composer line
         const PROBE_SETTLE: Duration = Duration::from_millis(180);
         const RETRY_INTERVAL: Duration = Duration::from_millis(120);
-        if self.session_screen_snapshot(key).is_none() {
+        if snapshot().is_none() {
             return Ok(PromptSubmitOutcome::NoSession);
         }
         let start = Instant::now();
         loop {
-            self.write(key, PROBE)?;
+            write(PROBE)?;
             thread::sleep(PROBE_SETTLE);
-            let echoed = self
-                .session_screen_snapshot(key)
-                .is_some_and(|screen| screen.contains(PROBE));
+            let echoed = snapshot().is_some_and(|screen| screen.contains(PROBE));
             if echoed {
                 // The program is consuming input. Clear the probe, then submit AS A
                 // HUMAN DOES: type the text, then a DISTINCT Enter keypress. codex
                 // treats a \r concatenated with text in one write as a pasted newline
                 // (composer content), NOT a submit — so the Enter must be its own
                 // write after the text settles (verified live 2026-06-04).
-                self.write(key, CLEAR_LINE)?;
+                write(CLEAR_LINE)?;
                 thread::sleep(Duration::from_millis(60));
                 let text = data.trim_end_matches(['\r', '\n']);
-                self.write(key, text)?;
+                write(text)?;
                 thread::sleep(Duration::from_millis(80));
-                self.write(key, "\r")?;
+                write("\r")?;
                 return Ok(PromptSubmitOutcome::Submitted {
                     waited_ms: start.elapsed().as_millis() as u64,
                 });
             }
             // Not consuming yet: clear any buffered probe so it can't pile up, then
             // wait and retry (or give up at the deadline, leaving the surface clean).
-            let _ = self.write(key, CLEAR_LINE);
+            let _ = write(CLEAR_LINE);
             if start.elapsed() >= timeout {
                 return Ok(PromptSubmitOutcome::NotReady {
                     waited_ms: start.elapsed().as_millis() as u64,
@@ -966,7 +990,9 @@ impl TerminalManager {
             thread::sleep(RETRY_INTERVAL);
         }
     }
+}
 
+impl TerminalManager {
     pub fn resize(&self, key: &str, cols: u16, rows: u16) -> Result<()> {
         let session = self
             .sessions

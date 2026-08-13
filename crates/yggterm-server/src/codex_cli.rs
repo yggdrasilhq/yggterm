@@ -38,6 +38,26 @@ pub(crate) const ENV_YGGTERM_CC_EXTRA_ARGS: &str = "YGGTERM_CC_EXTRA_ARGS";
 /// owning machine compose them with its own descriptor, and lets a CLI that
 /// cannot express a mode refuse by name there rather than silently drop it.
 pub(crate) const ENV_YGGTERM_AGENT_LAUNCH_OPTIONS: &str = "YGGTERM_AGENT_LAUNCH_OPTIONS";
+/// The CLIENT's configured launch flags for the CLI being started, carried over
+/// ssh so a remote row gets the same flags a local one does.
+///
+/// **The gap this closes.** A remote host reads its OWN settings store, which is
+/// a different machine's and holds nothing the user typed into the GUI. Claude
+/// Code alone had a way across the hop (`YGGTERM_CC_EXTRA_ARGS`), so eight
+/// first-class CLIs launched remotely with no permission flag at all and stopped
+/// on a prompt nobody could answer.
+///
+/// ⚖ **Configured args, not launch OPTIONS — the two variables answer different
+/// questions and both are needed.** `YGGTERM_AGENT_LAUNCH_OPTIONS` carries what
+/// ONE launch asked for, abstractly, so the owning machine composes it with its
+/// own descriptor and can refuse a mode by name. This one carries a string the
+/// USER typed for that CLI, which no descriptor can re-derive.
+///
+/// ⛔ It is keyed to the launch, not to the machine: it is exported on the ssh
+/// line for the session being started, never `set_var` into a daemon. The
+/// process-global route is how a daemon's frozen env leaks one session's flags
+/// into the next.
+pub(crate) const ENV_YGGTERM_AGENT_EXTRA_ARGS: &str = "YGGTERM_AGENT_EXTRA_ARGS";
 const ENV_YGGTERM_TERMINAL_COLOR_FOREGROUND: &str = "YGGTERM_TERMINAL_COLOR_FOREGROUND";
 const ENV_YGGTERM_TERMINAL_COLOR_BACKGROUND: &str = "YGGTERM_TERMINAL_COLOR_BACKGROUND";
 const ENV_YGGTERM_TERMINAL_COLOR_PALETTE: [&str; 16] = [
@@ -87,6 +107,8 @@ pub enum ManagedCliTool {
     Kimi,
     Muse,
     Antigravity,
+    // The 2026-08-13 intake.
+    GrokBuild,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +212,7 @@ impl ManagedCliTool {
             Self::Kimi => SessionKind::Kimi,
             Self::Muse => SessionKind::Muse,
             Self::Antigravity => SessionKind::Antigravity,
+            Self::GrokBuild => SessionKind::GrokBuild,
         }
     }
 
@@ -214,6 +237,7 @@ impl ManagedCliTool {
             SessionKind::Kimi => Self::Kimi,
             SessionKind::Muse => Self::Muse,
             SessionKind::Antigravity => Self::Antigravity,
+            SessionKind::GrokBuild => Self::GrokBuild,
             SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => return None,
         })
     }
@@ -3010,6 +3034,27 @@ pub(crate) fn managed_cli_shell_command_full(
     terminal_appearance: Option<&str>,
     launch: &AgentLaunchOptions,
 ) -> Result<String> {
+    managed_cli_shell_command_configured(kind, cwd, action, terminal_appearance, launch, None)
+}
+
+/// As above, with the CLIENT's configured flags supplied EXPLICITLY.
+///
+/// ⚖ A parameter, not a process env var. The remote lane's flags arrive on the
+/// ssh line into the WRAPPER, and the daemon that composes the PTY command is a
+/// different, long-lived process — measured 2026-08-13: the wrapper had
+/// `YGGTERM_AGENT_EXTRA_ARGS` and the composing daemon did not, so the flag
+/// crossed the hop and died at the daemon boundary. Claude Code's lane solves
+/// that with `set_var` inside the daemon; doing the same for nine CLIs would
+/// multiply a process-global write whose failure mode is one session's flags
+/// leaking into the next. `None` ⇒ read the local settings store as before.
+pub(crate) fn managed_cli_shell_command_configured(
+    kind: SessionKind,
+    cwd: Option<&str>,
+    action: ManagedCliAction<'_>,
+    terminal_appearance: Option<&str>,
+    launch: &AgentLaunchOptions,
+    configured_override: Option<&str>,
+) -> Result<String> {
     let Some(tool) = ManagedCliTool::from_session_kind(kind) else {
         anyhow::bail!("session kind does not use a managed Codex CLI");
     };
@@ -3020,7 +3065,7 @@ pub(crate) fn managed_cli_shell_command_full(
         parts.push(preamble);
     }
     parts.push(paths.shell_exports_with_terminal_appearance(tool, terminal_appearance));
-    let extra_args = composed_cli_extra_args(kind, launch)?;
+    let extra_args = composed_cli_extra_args_with(kind, launch, configured_override)?;
     // Invocation SHAPE is descriptor data now (harness spec §3, phase 1): which
     // CLI takes `--resume <id>` vs `resume <id>`, and which re-roots with
     // `-C "$PWD"`, is answered once in `yggterm_core::agent_cli` instead of by
@@ -3096,7 +3141,18 @@ pub(crate) fn composed_cli_extra_args(
     kind: SessionKind,
     launch: &AgentLaunchOptions,
 ) -> Result<String> {
-    let configured = configured_cli_extra_arg_tokens(kind);
+    composed_cli_extra_args_with(kind, launch, None)
+}
+
+pub(crate) fn composed_cli_extra_args_with(
+    kind: SessionKind,
+    launch: &AgentLaunchOptions,
+    configured_override: Option<&str>,
+) -> Result<String> {
+    let configured = match configured_override {
+        Some(raw) => split_extra_args(raw),
+        None => configured_cli_extra_arg_tokens(kind),
+    };
     if launch.is_empty() {
         // Byte-identical to the pre-flag path for every human door.
         return Ok(shell_join_tokens(&configured));
@@ -3130,32 +3186,40 @@ fn configured_cli_extra_arg_tokens(kind: SessionKind) -> Vec<String> {
     {
         return split_extra_args(&forwarded);
     }
+    // Every OTHER CLI's remote lane, on the same principle and one variable
+    // (`ENV_YGGTERM_AGENT_EXTRA_ARGS`): the client exports the flags it holds
+    // for the CLI it is starting, and this host prefers them over its own
+    // settings, which belong to a different user profile on a different machine.
+    //
+    // ⚠ Checked AFTER the CC variable so a mixed-version fleet stays coherent:
+    // an older client that only knows how to export the CC one still wins for
+    // CC, and a current client exports both.
+    if let Ok(forwarded) = env::var(ENV_YGGTERM_AGENT_EXTRA_ARGS)
+        && !forwarded.trim().is_empty()
+    {
+        return split_extra_args(&forwarded);
+    }
     let settings = SessionStore::open_or_init()
         .and_then(|store| store.load_settings())
         .ok();
-    // ⚖ NOT descriptor-derivable, and the arms are spelled out rather than left
-    // to a `_` so that stays visible: the settings store has exactly TWO
-    // extra-args fields (`codex_extra_args`, `claude_code_extra_args`), and a
-    // CLI with no field of its own has no configured args — not codex's.
-    // Giving a new CLI codex's flags is how `--sandbox workspace-write` would
-    // reach a binary that has never heard of it and refuse to start.
-    let raw = match kind {
-        SessionKind::Codex | SessionKind::CodexLiteLlm => {
-            settings.map(|settings| settings.codex_extra_args)
-        }
-        SessionKind::ClaudeCode => settings.map(|settings| settings.claude_code_extra_args),
-        // The 2026-08-08 intake owns no settings field yet. A DECLARED gap:
-        // per-launch `--model` / `--permission-mode` still work for them
-        // (those ride `AgentLaunchOptions`, not this).
-        SessionKind::Pi
-        | SessionKind::OpenCode
-        | SessionKind::QwenCode
-        | SessionKind::Kimi
-        | SessionKind::Muse
-        | SessionKind::Antigravity => None,
-        SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => None,
-    }
-    .unwrap_or_default();
+    // ⭐ DESCRIPTOR-DERIVED, and this is the leak the 2026-08-13 intake closed.
+    // This was a hand-written `match kind` over a settings store with exactly
+    // two extra-args fields, so its only honest answer for SEVEN of nine
+    // first-class agent CLIs was `None` — every one of them launched with no
+    // permission flag and stopped on a prompt the spawner could not answer,
+    // and adding a tenth CLI meant adding a tenth arm that answered `None` too.
+    // The store now keys flags by `extra_args_slug`, which is also what makes
+    // `codex-anything` read CODEX's box rather than growing one of its own.
+    //
+    // ⛔ A CLI still never inherits ANOTHER CLI's flags by accident: an absent
+    // key yields nothing. Giving a new CLI codex's flags is how
+    // `--sandbox workspace-write` would reach a binary that has never heard of
+    // it and refuse to start.
+    let raw = yggterm_core::agent_cli_extra_args_key(kind)
+        .and_then(|slug| {
+            settings.and_then(|settings| settings.agent_cli_extra_args.get(slug).cloned())
+        })
+        .unwrap_or_default();
     split_extra_args(&raw)
 }
 

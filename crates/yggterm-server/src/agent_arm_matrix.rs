@@ -351,6 +351,37 @@ const ARMS: &[Arm] = &[
         re_roots_with_cwd: false,
         store_globs: &[".antigravitycli/*.json"],
     },
+    Arm {
+        kind: SessionKind::GrokBuild,
+        locality: Locality::Local,
+        row_scheme: Some("local://"),
+        runtime_scheme: None,
+        remote_resume_subcommand: None,
+        remote_start_subcommand: None,
+        write_strategy_without_local_runtime: TerminalWriteStrategy::LocalRuntimeFallback,
+        binary: "grok",
+        // Read off `grok --help`, @xai-official/grok 1.0.3 (2026-08-13):
+        // `-r, --resume [<SESSION_ID_OR_TITLE>]`.
+        resume_selector_token: "--resume",
+        re_roots_with_cwd: false,
+        // Empty by DECLARATION, not omission: `~/.grok/sessions` exists but its
+        // shape needs a signed-in host to observe. See the descriptor's
+        // `store_scan_gap`.
+        store_globs: &[],
+    },
+    Arm {
+        kind: SessionKind::GrokBuild,
+        locality: Locality::Remote,
+        row_scheme: Some("remote-grok://"),
+        runtime_scheme: Some("grok-runtime://"),
+        remote_resume_subcommand: Some("resume-grok"),
+        remote_start_subcommand: Some("start-grok"),
+        write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
+        binary: "grok",
+        resume_selector_token: "--resume",
+        re_roots_with_cwd: false,
+        store_globs: &[],
+    },
 ];
 
 /// A §7 divergence that is STILL REAL, recorded so it is a decision rather than
