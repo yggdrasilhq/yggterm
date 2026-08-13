@@ -268,16 +268,23 @@ does not otherwise show, and reserves the blink for real work.
 and filed (there is no detector defect), so the render lands as soon as this is
 answered. **To reverse:** it is a view-layer rule; no data change either way.
 
-## ⭐ ONE RELAUNCH CLEARS BOTH GUI-GATED ITEMS — they are not two decisions
+## ⭐ ONE RELAUNCH CLEARS ALL THREE GUI-GATED ITEMS — they are not three decisions
 
-The deaf-row sidebar proof (above) and the right rail (below) are **the same
-single action**, waiting on the same draft. Whenever that draft is no longer
-worth protecting, one relaunch delivers both: the rail paints again on the first
-frame, and the deaf-row rendering becomes visible for its proof. Neither needs
-anything else from him, and neither can happen before that relaunch.
+The deaf-row sidebar proof (above), the right rail (below), and **the viewport
+blinking he reported live on 2026-08-14** are **the same single action**, waiting
+on the same draft. Whenever that draft is no longer worth protecting, one
+relaunch delivers all three: the rail paints again on the first frame, the
+deaf-row rendering becomes visible for its proof, and the blinking stops.
+
+⭐ **The blinking is the new one, and it is the reason this list grew rather than
+shrank.** Its fix was believed shipped; the GUI held a SECOND copy of the probe
+that types over him, and that copy is the one every automated submit reaches.
+Now fixed and deployed to disk on every host at 3.0.152 — but the running window
+is older than the fix, and the blinking is drawn by the running window.
+→ `docs/pending-bugs.md`, the readiness-probe entry.
 
 ⛔ Nothing here asks him to hurry it — the draft is the thing being protected.
-This entry exists only so the two are not weighed as separate costs.
+This entry exists only so the three are not weighed as separate costs.
 
 ## The right sidebar comes back when you next relaunch the GUI — and cannot before then
 
