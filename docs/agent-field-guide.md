@@ -84,6 +84,35 @@ prove it in `tools/xterm-harness/` (jsdom + the EXACT shipped bundle, minutes to
 write) instead of arguing from a live symptom. The harness turns
 "upstream probably does X" into a test that fails when a version bump changes X.
 
+**⛔⛔ A PRE-PUSH PRIVACY REFUSAL WITH HUNDREDS OF HITS IS USUALLY A STALE BRANCH, NOT A LEAK — AND
+THE ONLY LEVER IT OFFERS IS THE ONE THAT SHIPS ONE (2026-08-13).** The guard scans
+`<tip> --not --remotes=origin`. That range is the right one — but it is enormous whenever the local
+branch is on a lineage `origin` no longer has, which is the normal state of every checkout after a
+history rewrite, a force-push, or a long-lived lane that was reset upstream. Measured on one lane,
+same repo, same command, before and after reconciling, with nothing about the commits changed:
+
+```
+  diverged branch    1,211,081 added lines scanned →  259 hits → REFUSED
+  reconciled branch      1,559 added lines scanned →    0 hits → clean
+```
+
+Every one of those 259 was mined out of history that had been public for weeks. ⛔ **And the
+refusal text names `YGG_PRIVACY_ALLOW=1` as the way forward, which suppresses the WHOLE scan** — so
+a session that knows its own commit is clean is steered straight at the override that would ship a
+real leak past the guard.
+
+⇒ **Run this BEFORE believing any guard refusal:**
+
+```sh
+git rev-list --left-right --count origin/main...HEAD    # left = behind, right = ahead
+```
+
+**If the left number is in the thousands, the branch is the problem and the hits are not yours.**
+Reconcile (**replay onto the new lineage — never a plain `rebase origin/main`, which duplicates the
+whole history, and never a merge, which reinstates the lineage a scrub removed**) and re-run the
+scan. It collapses to your own commits. ⛔ Reach for the override only when the scan is already
+scoped to what you actually wrote and you have read every hit.
+
 ## 2. Profiling recipes that work
 
 No `perf` on a typical desktop host (`perf_event_paranoid=3`), but these do:
