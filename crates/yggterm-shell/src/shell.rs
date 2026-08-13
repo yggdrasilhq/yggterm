@@ -88616,12 +88616,60 @@ fn sidebar_row_shows_busy_icon(snapshot: &RenderSnapshot, row: &BrowserRow) -> b
 /// consume input in silence. It marks the row as worth checking; `server app
 /// terminal input-check` settles it by marker and echo.
 fn sidebar_row_input_unanswered(snapshot: &RenderSnapshot, row: &BrowserRow) -> bool {
+    if row.kind == BrowserRowKind::Group {
+        // A group is COLLAPSED far more often than not, and a deaf row hidden
+        // inside one is invisible for exactly as long as it stays folded —
+        // which is the failure this whole signal exists to end, merely moved up
+        // one level. The busy state has aggregated over descendants since issue
+        // #3; attention has to, for the same reason and by the same walk.
+        return sidebar_group_has_input_unanswered_descendant(snapshot, row)
+            || sidebar_machine_row_has_input_unanswered_live_session(snapshot, row);
+    }
     if row.kind != BrowserRowKind::Session {
         return false;
     }
     yggterm_core::input_unanswered_suggests_wedge(
         sidebar_row_session_for_icon(snapshot, row).and_then(|session| session.input_unanswered_ms),
     )
+}
+
+/// Any session in this group's subtree that has stopped answering — the
+/// attention twin of [`sidebar_group_has_working_descendant`], walking the same
+/// flat depth-ordered descendant span so the two can never disagree about what
+/// "inside this group" means.
+fn sidebar_group_has_input_unanswered_descendant(
+    snapshot: &RenderSnapshot,
+    group_row: &BrowserRow,
+) -> bool {
+    let Some(start) = snapshot.rows.iter().position(|candidate| {
+        candidate.kind == BrowserRowKind::Group && candidate.full_path == group_row.full_path
+    }) else {
+        return false;
+    };
+    let group_depth = group_row.depth;
+    snapshot.rows[start + 1..]
+        .iter()
+        .take_while(|descendant| descendant.depth > group_depth)
+        .filter(|descendant| descendant.kind == BrowserRowKind::Session)
+        .any(|descendant| sidebar_row_input_unanswered(snapshot, descendant))
+}
+
+/// A machine ROOT row whose machine hosts a live session that has stopped
+/// answering. Live sessions hang off the flat "Live Sessions" group rather than
+/// the machine's cwd subtree, so the descendant walk above cannot see them —
+/// matched by host instead, exactly as the working twin does.
+fn sidebar_machine_row_has_input_unanswered_live_session(
+    snapshot: &RenderSnapshot,
+    row: &BrowserRow,
+) -> bool {
+    let Some(machine_key) = row.full_path.strip_prefix("__remote_machine__/") else {
+        return false;
+    };
+    snapshot.live_sessions.iter().any(|session| {
+        yggterm_core::input_unanswered_suggests_wedge(session.input_unanswered_ms)
+            && (session.ssh_target.as_deref() == Some(machine_key)
+                || session.host_label == machine_key)
+    })
 }
 /// Aggregate working state for a machine/cwd group row (issue #3): a group
 /// blinks when ANY session in its subtree is working, so a COLLAPSED machine or
@@ -90188,6 +90236,34 @@ fn SidebarRow(
                     // is inserted ahead of it or the cluster is indented, which
                     // is exactly how the first build of row sets put a header's
                     // dot to the right of its own members'. Out here it cannot.
+                    if !show_live_close && row_is_group && input_unanswered {
+                        // A GROUP holding a row that has stopped answering.
+                        //
+                        // ⛔ It goes in THE GUTTER, not beside the group's own
+                        // dot, and the reason is a COLLISION rather than taste:
+                        // a machine row's dot already spends this exact amber
+                        // on `MachineHealth::Cached`
+                        // (`machine_indicator_color_value`), so repainting it
+                        // would make "this machine is a cached snapshot" and
+                        // "something inside has gone deaf" the same pixel. The
+                        // gutter is empty on every group row, is the column
+                        // DESIGN.md reserves for "the status dot, nothing
+                        // else", and lines this dot up with the session dots it
+                        // is standing in for.
+                        //
+                        // STEADY, never blinking: blink means work is
+                        // happening, and the whole claim here is that it has
+                        // stopped.
+                        span {
+                            "data-sidebar-live-session-status-rail": "1",
+                            style: session_row_dot_rail_style(SessionRowDensity::Sidebar),
+                            span {
+                                "data-sidebar-group-input-unanswered-dot": "1",
+                                title: "A session inside has been typed to with no response — expand to find it",
+                                style: live_session_status_dot_style_with_attention(palette, false, false, true),
+                            }
+                        }
+                    }
                     if show_live_close {
                         span {
                             "data-sidebar-live-session-status-rail": "1",
