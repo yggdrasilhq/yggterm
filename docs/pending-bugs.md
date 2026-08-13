@@ -274,6 +274,53 @@ and still ruin the sentence someone was typing. **The damage IS the write.**
 Proven to fail on the mutant that disables the guard (i.e. on the shipped
 behaviour), while the "still submits normally" control passed.
 
+### ⛔⛔⛔ THE FIX COVERED ONE OF TWO COPIES — AND THE UNFIXED ONE IS THE COPY THE OWNER HITS
+
+*Found 2026-08-14 after the symptom was reported still live, and still worsening
+with uptime, on a build whose installed release already contained the fix above.*
+
+**There are TWO independent implementations of this probe loop:**
+
+| copy | who runs it | reached by | state |
+|---|---|---|---|
+| `yggterm-server/src/terminal.rs` `submit_prompt_echo_verified_with` | the **daemon** | the hot-restart repair's `continue` | **fixed** (the section above) |
+| `yggterm-shell/src/shell.rs` `probe_terminal_input_consumption` | the **GUI** | **`server app terminal submit`** | **was still unfixed** |
+
+⇒ `server app terminal submit` is an **app-control** command, and app-control
+commands are handled by the GUI process (the reply carries `handled_by_pid` to
+say so). **Every automated submit in the fleet therefore went through the copy
+that had never been fixed**, which is why the symptom survived a release
+containing the fix. The GUI copy was, verbatim, the original defect:
+
+```
+write(marker) → sleep 180 ms → snapshot → write(Ctrl+U) → sleep 120 ms → repeat
+```
+
+**≈3.3 marker-and-erase cycles per second for the full timeout**, and its
+`guard_draft` parameter was passed `false` by `SubmitTerminalPrompt` **on
+purpose**, on the reasoning that a caller told to send text is entitled to clear
+the composer line. ⛔ **That reasoning is what the incident refutes:** the
+instruction to send comes from an agent, the half-typed sentence belongs to the
+person at the keyboard, and a submit that erases it has not done what was asked
+— it has destroyed something else. The flag is **removed**, not defaulted: the
+refusal is a property of the probe, never a caller's option.
+
+⭐ **The measured cost, from the lock rather than from an estimate:** a 30 s
+submit against a silent row went from **200 writes to 24**.
+
+⚠ **This corrects the deploy-ordering note below on one point.** "The GUI
+relaunch does not type" is true of the relaunch itself, and the daemon handover
+is still the dangerous *event* — but the GUI is the process that performs the
+destructive writes for every ordinary submit, so **the GUI build is the one that
+has to carry this fix** for the reported symptom to stop.
+
+⭐ **The general shape, and it is the third time this campaign has paid for it:**
+a fix proven on one lane is not proven. The commit, the test and the release were
+all real; the search for *other implementations of the same concept* was the step
+never taken. **Before closing a defect, grep for a second encoding of the thing
+you just fixed** — this file's own SSOT law exists because two copies of one
+concept drift, and here they drifted into one being fixed and one not.
+
 ⛔ **UNTIL A DAEMON CARRYING THIS IS DEPLOYED, THE MITIGATION IS BEHAVIOURAL:**
 do not `terminal submit` to a row that is not consuming input. A row reading
 `busy: agent_working_daemon` will not echo, so the submit will hammer it for the
