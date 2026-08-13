@@ -34,6 +34,7 @@
 //!    restores each exactly as it was. ⛔ Flattening the inner sets open on
 //!    expand is the failure users notice, and it is the one that gets skipped.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// Why an arrangement was refused. Named rather than a bare `bool` because each
@@ -51,7 +52,64 @@ pub enum RowSetRefusal {
 ///
 /// Empty is the normal state: a sidebar with no row sets holds no entries here
 /// and every row is top level.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// What actually goes on disk: the containment and the flags, and NOT the
+/// derived parent index.
+///
+/// ⛔ Persisting `parent` would put the same fact in the file twice, and a
+/// hand-edited or half-written file could then disagree with itself in a way no
+/// code path checks. Rebuilding it on load makes that state unrepresentable —
+/// the single-source-of-truth law, applied to a field that is only an index.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RowSetsWire {
+    #[serde(default)]
+    pub members: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub collapsed: HashSet<String>,
+}
+
+impl From<RowSetsWire> for RowSets {
+    fn from(wire: RowSetsWire) -> Self {
+        let mut parent = HashMap::new();
+        let mut members = HashMap::new();
+        for (head, slot) in wire.members {
+            let mut kept = Vec::with_capacity(slot.len());
+            for member in slot {
+                // A file that names one row under two heads has no defined
+                // order, so the FIRST head wins and the rest is dropped rather
+                // than carried into memory to be discovered later.
+                if member != head && !parent.contains_key(&member) {
+                    parent.insert(member.clone(), head.clone());
+                    kept.push(member);
+                }
+            }
+            if !kept.is_empty() {
+                members.insert(head, kept);
+            }
+        }
+        let collapsed = wire
+            .collapsed
+            .into_iter()
+            .filter(|head| members.contains_key(head))
+            .collect();
+        Self {
+            members,
+            parent,
+            collapsed,
+        }
+    }
+}
+
+impl From<RowSets> for RowSetsWire {
+    fn from(sets: RowSets) -> Self {
+        Self {
+            members: sets.members,
+            collapsed: sets.collapsed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RowSetsWire", into = "RowSetsWire")]
 pub struct RowSets {
     /// head path → its members, in the order they are drawn under it.
     members: HashMap<String, Vec<String>>,
@@ -179,6 +237,59 @@ impl RowSets {
             }
         }
         promoted
+    }
+
+    /// Drop every row the sidebar no longer has, and repair what that leaves.
+    ///
+    /// ⭐ **THE COST OF STORING A RELATION RATHER THAN A FIELD PER ROW, AND IT
+    /// IS THE RIGHT TRADE.** Membership is a fact *between* rows: the order
+    /// under a head has no owner if each row merely names its parent, and a
+    /// parent named on every child is the same fact written N times. So the
+    /// relation is stored once and reconciled against the live rows here —
+    /// which is a single pass, at one call site, instead of a repair invented
+    /// separately by everything that touches a row.
+    ///
+    /// A departed **head** DISSOLVES, exactly as removing one by hand does, so
+    /// a closed session never takes its members off the screen with it. A
+    /// departed **member** simply leaves.
+    ///
+    /// Returns true when anything changed, so a caller can skip a re-render it
+    /// does not need.
+    pub fn retain_live(&mut self, live: &HashSet<String>) -> bool {
+        let departed_heads: Vec<String> = self
+            .members
+            .keys()
+            .filter(|head| !live.contains(*head))
+            .cloned()
+            .collect();
+        let mut changed = false;
+        for head in departed_heads {
+            self.dissolve(&head);
+            changed = true;
+        }
+        let departed_members: Vec<String> = self
+            .parent
+            .keys()
+            .filter(|member| !live.contains(*member))
+            .cloned()
+            .collect();
+        for member in departed_members {
+            self.detach(&member);
+            changed = true;
+        }
+        // A flag for a head that is no longer a set would silently re-collapse
+        // it if the same path ever came back.
+        let stale: Vec<String> = self
+            .collapsed
+            .iter()
+            .filter(|head| !self.members.contains_key(*head))
+            .cloned()
+            .collect();
+        for head in stale {
+            self.collapsed.remove(&head);
+            changed = true;
+        }
+        changed
     }
 
     /// Is `path` hidden by an ANCESTOR being collapsed?
@@ -417,6 +528,62 @@ mod tests {
             sets.visible_rows(["a", "b"]),
             vec![("a".into(), 0), ("b".into(), 0)]
         );
+    }
+
+    /// A closed session must not take rows off the screen with it. A departed
+    /// head dissolves; a departed member just leaves.
+    #[test]
+    fn a_row_that_closed_leaves_the_arrangement_without_taking_anyone_with_it() {
+        let mut sets = arrange(&[("head", "one"), ("head", "two"), ("two", "deep")]);
+        let live: HashSet<String> = ["one", "two", "deep"].iter().map(|s| s.to_string()).collect();
+        assert!(sets.retain_live(&live), "the head departing is a change");
+        assert_eq!(
+            sets.visible_rows(["one", "two"]),
+            vec![("one".into(), 0), ("two".into(), 0), ("deep".into(), 1)],
+            "the members are promoted, and `two` keeps its own set"
+        );
+        // A second pass with nothing missing changes nothing — so a caller may
+        // run this every snapshot without churning the render.
+        assert!(!sets.retain_live(&live));
+    }
+
+    #[test]
+    fn a_departed_member_leaves_and_a_stale_collapse_flag_goes_with_it() {
+        let mut sets = arrange(&[("head", "one")]);
+        sets.set_collapsed("head", true);
+        let live: HashSet<String> = ["head"].iter().map(|s| s.to_string()).collect();
+        assert!(sets.retain_live(&live));
+        assert!(sets.is_empty());
+        // ⛔ Not merely tidiness: a flag outliving its set would silently
+        // re-collapse the same path if it ever came back.
+        assert!(!sets.is_collapsed("head"));
+    }
+
+    /// The parent index is DERIVED, so it is never persisted — a file cannot
+    /// disagree with itself about who holds whom.
+    #[test]
+    fn the_wire_carries_containment_only_and_rebuilds_the_index_on_load() {
+        let sets = arrange(&[("a", "b"), ("b", "c")]);
+        let json = serde_json::to_string(&sets).expect("serializable");
+        assert!(!json.contains("parent"), "the derived index is not on disk: {json}");
+        let back: RowSets = serde_json::from_str(&json).expect("loadable");
+        assert_eq!(back.parent_of("c"), Some("b"));
+        assert_eq!(back.visible_rows(["a"]), sets.visible_rows(["a"]));
+    }
+
+    /// A hand-edited file naming one row under two heads has no defined order.
+    /// The first head wins and the duplicate is dropped on load, rather than
+    /// being carried into memory to surprise someone later.
+    #[test]
+    fn a_file_that_names_a_row_twice_loads_as_one_parent() {
+        let wire = r#"{"members":{"a":["dup"],"z":["dup"]},"collapsed":[]}"#;
+        let sets: RowSets = serde_json::from_str(wire).expect("loadable");
+        let holders = ["a", "z"]
+            .iter()
+            .filter(|head| sets.members_of(head).contains(&"dup".to_string()))
+            .count();
+        assert_eq!(holders, 1, "exactly one head keeps it");
+        assert!(sets.parent_of("dup").is_some());
     }
 
     #[test]
