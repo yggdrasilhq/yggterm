@@ -28365,6 +28365,68 @@ impl ShellState {
         self.browser
             .set_collapsed_paths(self.user_collapsed_synthetic_paths.clone());
     }
+    /// Take a set apart: its members go where the HEAD sat, and the head keeps
+    /// its own place.
+    ///
+    /// ⛔ **PROMOTE TO THE HEAD'S PLACE, NOT TO THE TOP LEVEL** — `DESIGN.md`
+    /// says the members take the head's position, and that is not the same
+    /// thing once sets nest. Caught by live-testing the verb: dissolving a
+    /// hand-made set INSIDE a numbered book ejected its rows from the book
+    /// entirely, because they were marked deliberately loose rather than
+    /// re-filed where their head had been.
+    ///
+    /// ⚠ Members of a set the SEATS would rebuild must still be pinned, or
+    /// "Ungroup" on a numbered book appears to do nothing at all: the seats
+    /// re-form it on the very next frame. Pinning them to the head's parent
+    /// does both jobs — it keeps them where the head was, and it is an answer,
+    /// so the seats stop deciding for them.
+    fn dissolve_row_set(&mut self, head_path: &str) -> Vec<String> {
+        let grandparent = self
+            .row_set_effective_parent(head_path)
+            .filter(|parent| parent != head_path);
+        let members = self.row_arrangement.sets.dissolve(head_path);
+        // Anything the SEATS put under this head is dissolved too — otherwise
+        // half the set survives the gesture and the other half does not.
+        let seat_members: Vec<String> = self
+            .sidebar_row_sets_now()
+            .members_of(head_path)
+            .to_vec();
+        for member in members.iter().chain(seat_members.iter()) {
+            match grandparent.as_deref() {
+                Some(parent) => {
+                    let _ = self.row_arrangement.attach(parent, member, None);
+                }
+                None => self.row_arrangement.detach(member),
+            }
+        }
+        let mut promoted = members;
+        promoted.extend(seat_members);
+        promoted.sort();
+        promoted.dedup();
+        promoted
+    }
+
+    /// The arrangement the sidebar is drawing right now.
+    fn sidebar_row_sets_now(&self) -> yggterm_core::row_set::RowSets {
+        let sessions = self.server.live_sessions();
+        let promoted = sessions
+            .iter()
+            .filter(|session| is_promoted_live_session(session))
+            .collect::<Vec<_>>();
+        let paths = promoted
+            .iter()
+            .map(|session| live_session_row_path(session))
+            .collect::<Vec<_>>();
+        yggterm_core::row_set_outline::sidebar_row_sets(
+            paths
+                .iter()
+                .zip(promoted.iter())
+                .map(|(path, session)| (path.as_str(), session.outline_prefix.as_deref())),
+            &self.row_arrangement,
+            &HashSet::new(),
+        )
+    }
+
     /// What `row` is to the arrangement the sidebar is drawing.
     ///
     /// ⚠ Live-region rows only. A cwd-tree row is nested by its FOLDER, and
@@ -80000,6 +80062,7 @@ async fn process_pending_app_control_requests(
             row_path,
             into_path,
             dissolve,
+            reset,
         } => {
             let target = state.with(|shell| resolve_app_control_row(shell, &row_path));
             match target {
@@ -80007,12 +80070,11 @@ async fn process_pending_app_control_requests(
                     let path = normalize_live_session_path(&row.full_path);
                     let (applied, detail, refusal) = state.with_mut(|shell| {
                         if dissolve {
-                            let members = shell.row_arrangement.sets.dissolve(&path);
-                            for member in &members {
-                                shell.row_arrangement.detach(member);
-                            }
-                            shell.row_arrangement.detach(&path);
+                            let members = shell.dissolve_row_set(&path);
                             (true, json!({ "dissolved": members }), None)
+                        } else if reset {
+                            shell.row_arrangement.clear(&path);
+                            (true, json!({ "reset": path }), None)
                         } else if let Some(head) = into_path.as_deref() {
                             let head = normalize_live_session_path(head);
                             match shell.row_arrangement.attach(&head, &path, None) {
@@ -132021,15 +132083,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
         "ungroup-row-set" => {
             let path = normalize_live_session_path(&row.full_path);
             state.with_mut(|shell| {
-                let members = shell.row_arrangement.sets.dissolve(&path);
-                // The seats would re-form this set on the next frame, so every
-                // promoted row is remembered as deliberately loose — the same
-                // third state a drag-out needs. Without it "Ungroup" appears to
-                // do nothing at all on a numbered book.
-                for member in &members {
-                    shell.row_arrangement.detach(member);
-                }
-                shell.row_arrangement.detach(&path);
+                let members = shell.dissolve_row_set(&path);
                 shell.last_action = format!("ungrouped {} row(s)", members.len());
                 shell.sync_browser_settings();
             });

@@ -1155,6 +1155,10 @@ pub enum AppControlCommand {
         /// Dissolve the set this row HEADS, promoting its members.
         #[serde(default)]
         dissolve: bool,
+        /// Forget the hand's answer for this row so its SEAT decides again.
+        /// ⛔ The way back: `into` and `out` are both sticky by design.
+        #[serde(default)]
+        reset: bool,
     },
     SetTreeSelection {
         paths: Vec<String>,
