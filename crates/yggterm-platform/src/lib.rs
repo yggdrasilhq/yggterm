@@ -315,6 +315,22 @@ pub fn force_activate_kde_wayland_window(match_substr: &str) -> Result<()> {
 /// `print()` lands there); the nonce guards against matching a stale line.
 #[cfg(target_os = "linux")]
 pub fn kde_wayland_active_window_matches(match_substr: &str) -> Result<bool> {
+    let active = kde_wayland_active_window_identity()?;
+    Ok(active.contains(&match_substr.to_lowercase()))
+}
+
+/// The active window's `resourceClass|caption`, lowercased, as KWin reports it.
+///
+/// ⛔ THE IDENTITY WAS ALWAYS HERE AND THE BOUNDARY THREW IT AWAY. This probe
+/// computed the active window's class and caption and returned a bare `bool`, so
+/// a caller that had just been told "the window you are about to photograph is
+/// not yours" could not say **which** window it was. That is the difference
+/// between a capture verb that refuses usefully and one that refuses blankly:
+/// `server app screenshot` once returned a picture of an unrelated application
+/// flagged `capture_faithful: true`, and the reply was byte-identical in shape to
+/// a correct one.
+#[cfg(target_os = "linux")]
+pub fn kde_wayland_active_window_identity() -> Result<String> {
     use std::io::Write;
     let nonce = format!(
         "YGGPROBE-{}-{}",
@@ -400,7 +416,6 @@ pub fn kde_wayland_active_window_matches(match_substr: &str) -> Result<bool> {
     // session interleaves plenty of other lines — poll a generous tail a few
     // times rather than reading once too early (observed live: a single 350ms /
     // 80-line read reliably missed the marker).
-    let needle = match_substr.to_lowercase();
     let marker = format!("{nonce} ACTIVE=");
     let mut last_error: Option<String> = None;
     let mut journal_lines = 0usize;
@@ -416,7 +431,7 @@ pub fn kde_wayland_active_window_matches(match_substr: &str) -> Result<bool> {
                 any_probe_lines = text.matches("YGGPROBE-").count();
                 for line in text.lines().rev() {
                     if let Some(active) = line.split(&marker).nth(1) {
-                        return Ok(active.contains(&needle));
+                        return Ok(active.trim().to_string());
                     }
                 }
                 if !journal.status.success() {

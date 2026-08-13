@@ -693,6 +693,37 @@ pub fn overlay_terminal_canvas_onto_snapshot(
     anyhow::bail!("terminal canvas overlay is only implemented on linux")
 }
 
+/// What the compositor said about the window that is currently active.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompositorVerdict {
+    /// KWin named the active window (`resourceClass|caption`, lowercased).
+    Names(String),
+    /// KWin was asked and could not answer.
+    Unavailable,
+    /// Not a KDE session, so there is no KWin to ask.
+    NotAsked,
+}
+
+/// May the spectacle backend take this shot?
+///
+/// ⛔ THIS IS AN ARBITRATION BETWEEN TWO INSTRUMENTS THAT DISAGREE, and it is a
+/// function so the disagreement can be tested without a compositor. Spectacle
+/// photographs whatever the COMPOSITOR calls active; the toolkit's
+/// `is_focused()` is a different question answered by a different party, and on
+/// KDE Wayland it is not reliably updated. When they disagree, the compositor is
+/// right by construction — it is the one deciding what gets photographed.
+///
+/// The toolkit is used only where KWin cannot be reached, because refusing every
+/// screenshot on a desktop that has no such probe would be worse than the bug.
+#[cfg(target_os = "linux")]
+fn spectacle_may_shoot(verdict: &CompositorVerdict, toolkit_focused: bool) -> bool {
+    match verdict {
+        CompositorVerdict::Names(active) => active.contains("yggterm"),
+        CompositorVerdict::Unavailable | CompositorVerdict::NotAsked => toolkit_focused,
+    }
+}
+
 #[cfg(target_os = "linux")]
 async fn platform_capture_visible_app_surface(
     desktop: &DesktopContext,
@@ -719,7 +750,34 @@ async fn platform_capture_visible_app_surface(
         // the WebKit snapshot, which can only ever render yggterm's own DOM.
         let _ = focus_app_window(desktop);
         thread::sleep(Duration::from_millis(180));
-        if desktop.is_focused() {
+        // ⛔ `desktop.is_focused()` ALONE HAS PHOTOGRAPHED THE WRONG APPLICATION.
+        // Measured 2026-08-13: this call returned a picture of an unrelated
+        // program while reporting `capture_faithful: true` — tao's focus flag is
+        // not reliably updated on KDE Wayland, and spectacle shoots whatever the
+        // COMPOSITOR calls active, so the two can disagree with no sign in the
+        // reply. `capture_os_compositor_screenshot` already learned to ask KWin,
+        // which is the authority; this path, the one every plain
+        // `server app screenshot` takes, did not.
+        //
+        // ⇒ Ask KWin, and believe it over the toolkit when they disagree. The
+        // composite backend cannot make this mistake — it composites the client
+        // it was addressed to — so spectacle is the only path that needs the
+        // gate, and a refusal here falls through to the WebKit snapshot, which
+        // can only ever render yggterm's own DOM.
+        let kwin = if std::env::var("XDG_CURRENT_DESKTOP")
+            .map(|name| name.to_uppercase().contains("KDE"))
+            .unwrap_or(false)
+        {
+            Some(yggterm_platform::kde_wayland_active_window_identity())
+        } else {
+            None
+        };
+        let verdict = match &kwin {
+            Some(Ok(active)) => CompositorVerdict::Names(active.clone()),
+            Some(Err(_)) => CompositorVerdict::Unavailable,
+            None => CompositorVerdict::NotAsked,
+        };
+        if spectacle_may_shoot(&verdict, desktop.is_focused()) {
             match capture_linux_wayland_window_screenshot(output_path) {
                 Ok(()) => {
                     return Ok(SurfaceCapture::new(output_path, "linux_wayland_spectacle")
@@ -728,11 +786,24 @@ async fn platform_capture_visible_app_surface(
                 Err(error) => attempts.push(format!("linux_wayland_spectacle: {error:#}")),
             }
         } else {
-            attempts.push(
-                "linux_wayland_spectacle: skipped — yggterm window is not focused, \
-                 refusing to capture another window"
-                    .to_string(),
-            );
+            // ⛔ NAME WHAT HELD FOCUS. A refusal that cannot say what it would
+            // have photographed sends the agent to re-derive it, and the whole
+            // defect was a reply that said nothing about its SUBJECT.
+            let subject = match &verdict {
+                CompositorVerdict::Names(active) => format!("the active window is {active:?}"),
+                CompositorVerdict::Unavailable => match &kwin {
+                    Some(Err(error)) => format!("KWin probe failed: {error:#}"),
+                    _ => "KWin probe unavailable".to_string(),
+                },
+                CompositorVerdict::NotAsked => format!(
+                    "not KDE; toolkit focus flag is {}",
+                    desktop.is_focused()
+                ),
+            };
+            attempts.push(format!(
+                "linux_wayland_spectacle: skipped — it captures whatever the \
+                 compositor calls active, and that is not this window ({subject})"
+            ));
         }
     }
     // X11 session: faithful window grab (xwd + convert).
@@ -953,6 +1024,8 @@ async fn platform_record_visible_app_surface(
 
 #[cfg(test)]
 mod overlay_tests {
+    #[cfg(target_os = "linux")]
+    use super::{CompositorVerdict, spectacle_may_shoot};
     use super::overlay_dest_rect;
 
     fn approx(a: f64, b: f64) {
@@ -986,5 +1059,40 @@ mod overlay_tests {
         let (_x, _y, w, h) = overlay_dest_rect(100, 100, 0.0, 0.0, 0.0, 0.0, 1920.0, 1160.0);
         approx(w, 1.0);
         approx(h, 1.0);
+    }
+
+    /// ⛔ THE MEASURED CASE, 2026-08-13. `server app screenshot` returned a
+    /// picture of an unrelated application and flagged it `capture_faithful:
+    /// true`. The toolkit said this window was focused; the compositor — the
+    /// party that actually decides what spectacle photographs — said otherwise.
+    /// Nothing arbitrated, so the toolkit won and the shot was of the wrong app.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_compositor_outranks_the_toolkit_when_they_disagree() {
+        let editor = CompositorVerdict::Names("kate|untitled document".to_string());
+        assert!(
+            !spectacle_may_shoot(&editor, true),
+            "the toolkit claiming focus must not authorise a shot the compositor \
+             will aim at another application"
+        );
+
+        let ours = CompositorVerdict::Names("yggterm|main window".to_string());
+        assert!(
+            spectacle_may_shoot(&ours, false),
+            "when the compositor says this window is active the shot is correct, \
+             even though the toolkit's focus flag lags on KDE Wayland — that lag \
+             is why the gate cannot be the toolkit alone in either direction"
+        );
+    }
+
+    /// Where KWin cannot be reached the toolkit is all there is, and refusing
+    /// every screenshot there would be a worse bug than the one being fixed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn without_a_compositor_probe_the_toolkit_still_decides() {
+        for verdict in [CompositorVerdict::Unavailable, CompositorVerdict::NotAsked] {
+            assert!(spectacle_may_shoot(&verdict, true), "{verdict:?}");
+            assert!(!spectacle_may_shoot(&verdict, false), "{verdict:?}");
+        }
     }
 }
