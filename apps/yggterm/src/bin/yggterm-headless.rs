@@ -1309,6 +1309,11 @@ fn maybe_handoff_to_preferred_headless_executable(
 }
 
 fn main() -> Result<()> {
+    // This process becomes a DAEMON that outlives the file it was loaded from,
+    // so it publishes the source it was built from while it still can. See
+    // `yggterm_server::build_identity` for why nothing outside can recover it.
+    yggterm_server::build_identity::declare_build_commit(build_identity::build_commit());
+
     // ⭐ FIRST, before the logger and before any thread: see
     // `yggterm_core::session_bus`. This binary spawns daemons, shadow clients and
     // web surfaces, and a GLib autolaunch in any of them leaks a session bus plus
