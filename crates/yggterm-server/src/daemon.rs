@@ -15220,6 +15220,7 @@ fn spawn_disk_binary_version_poll(
         // the trace: every 15th poll ≈ 5 minutes. Not silence — a stale daemon must
         // stay mineable — just not one identical line every 20 seconds forever.
         const SETTLED_DEFERRAL_HEARTBEAT_EVERY_N_POLLS: u32 = 15;
+        let mut no_successor_polls: u32 = 0;
         let mut stale_sweep_countdown = STALE_SWEEP_EVERY_N_POLLS;
         // Deferral bookkeeping: the reason we last WROTE, how many polls we have
         // deferred in total, and how many we have skipped writing since.
@@ -15299,6 +15300,58 @@ fn spawn_disk_binary_version_poll(
             } else if newer_daemon_version.is_some() {
                 "newer_daemon_live"
             } else {
+                // ⭐ NOBODY SUPERSEDES US — SO A MUTE SET EARLIER IS STALE, AND
+                // CLEARING IT HERE IS THE ONLY PLACE THAT CAN KNOW.
+                //
+                // `superseded_routine_persist_muted` is a HARD latch: once a
+                // newer daemon was seen, this daemon stops writing
+                // `server-state.json` for ever, so its stale view can never
+                // clobber the successor's file. Right — while the successor
+                // lives.
+                //
+                // ⛔ It becomes wrong the moment the successor does not. The
+                // handoff settle window (see [`spawn_handoff_settle_watch`])
+                // now hands the sessions BACK when a successor dies young: this
+                // daemon wakes its readers and is once again the only process
+                // serving them — and, latched, the only process that will never
+                // record them. Nothing on the host then writes their state, and
+                // a row that is live but unrecorded dies unrecoverably the
+                // moment anything signals its holder. That is precisely the
+                // condition immediate-persist-on-adoption was written to end,
+                // reappearing from the other side.
+                //
+                // This branch is reached only when the ONE owner of "who
+                // supersedes me" has just answered *nobody* — the same prober,
+                // in the same loop, that sets the latch a few lines below. So
+                // the latch is set and cleared by one authority, in one place,
+                // from one question, which is the only way the two answers
+                // cannot drift apart.
+                no_successor_polls = no_successor_polls.saturating_add(1);
+                {
+                    let mut rt = lock_daemon_runtime(&runtime, "superseded_persist_unmute");
+                    if should_clear_stale_persist_mute(
+                        rt.superseded_routine_persist_muted,
+                        no_successor_polls,
+                    ) {
+                        rt.superseded_routine_persist_muted = false;
+                        drop(rt);
+                        append_trace_event(
+                            &home_dir,
+                            "daemon",
+                            "lifecycle",
+                            "superseded_routine_persist_unmuted",
+                            serde_json::json!({
+                                "clear_polls": no_successor_polls,
+                                "current_version": SERVER_PROTOCOL_VERSION,
+                                "current_pid": std::process::id(),
+                                // Says WHY, not just that it happened: this
+                                // daemon is serving sessions again and had been
+                                // silently unable to write them down.
+                                "reason": "no newer daemon is live; this daemon owns its sessions again",
+                            }),
+                        );
+                    }
+                }
                 // We are the CURRENT daemon. Size-war lesson (2026-06-12): the
                 // startup-only takeover/retire leaves a stale OLDER daemon
                 // that survives that window (idle-gate defer) free to churn
@@ -15327,6 +15380,11 @@ fn spawn_disk_binary_version_poll(
                 }
                 continue;
             };
+            // A successor IS live (or our binary was replaced), so the run of
+            // clear polls is broken. Reset here rather than inside the mute
+            // block: the count is about what this poll SAW, not about what the
+            // latch happens to be.
+            no_successor_polls = 0;
             {
                 // GATE #8: a strictly newer daemon owns server-state.json from
                 // here on — mute this daemon's routine persists so its stale
@@ -18805,6 +18863,33 @@ struct DaemonRequestOutcome {
 /// the hard mute). See [[finding-dead-sessions-revive-permanent-persist-mute]].
 const UPDATE_RESTART_PERSIST_MUTE_GRACE_MS: u64 = 120_000;
 
+/// How many CONSECUTIVE retire polls must find no newer daemon before a stale
+/// supersession persist mute is cleared. The poll runs every 20 s, so three is
+/// about a minute.
+///
+/// ⛔ **Not one.** [`live_newer_daemon_version`] asks a live successor for its
+/// status, and a successor that is merely slow answers late. Un-muting on a
+/// single missed probe would let this daemon's stale view clobber a HEALTHY
+/// successor's state file — the exact damage the mute exists to prevent, and it
+/// once brought 19 closed sessions back.
+const PERSIST_UNMUTE_AFTER_CLEAR_POLLS: u32 = 3;
+
+/// May a supersession persist mute be cleared on this poll?
+///
+/// Split out and pure for the reason [`classify_handoff_sweep`] is: the two
+/// answers drive opposite behaviour, and the dangerous one — clearing while a
+/// healthy successor owns the file — is the state a live test cannot produce on
+/// demand.
+///
+/// ⛔ **The mute is a LATCH, and it used to be permanent.** That was right while
+/// the successor lived and wrong the moment it did not: the handoff settle
+/// window ([`spawn_handoff_settle_watch`]) now hands sessions BACK to a
+/// predecessor whose successor died young, leaving it the only process serving
+/// them and — latched — the only process that would never record them.
+fn should_clear_stale_persist_mute(muted: bool, consecutive_clear_polls: u32) -> bool {
+    muted && consecutive_clear_polls >= PERSIST_UNMUTE_AFTER_CLEAR_POLLS
+}
+
 /// Should routine persists be suppressed right now?
 ///
 /// `superseded` (gate #8: a strictly newer daemon owns the file) is a HARD mute.
@@ -20693,6 +20778,36 @@ mod tests {
         // Clock skew (armed_at in the future) must not underflow into a false
         // un-mute — saturating_sub keeps it muted within grace.
         assert!(mute(false, true, Some(now + 5_000), now));
+    }
+
+    /// ⛔ THE HARD MUTE IS NO LONGER PERMANENT, AND THE RUN LENGTH IS THE WHOLE
+    /// SAFETY ARGUMENT. Clearing it on a single clear poll would un-mute against
+    /// a successor that was merely slow to answer its status probe, and this
+    /// daemon would then overwrite a healthy successor's state file — worse than
+    /// the gap being fixed. Clearing it never leaves a daemon that has taken its
+    /// sessions back unable to record them, which is unrecoverable the moment
+    /// anything signals it.
+    #[test]
+    fn a_stale_persist_mute_clears_only_after_a_run_of_clear_polls() {
+        use super::PERSIST_UNMUTE_AFTER_CLEAR_POLLS as RUN;
+        use super::should_clear_stale_persist_mute as clear;
+
+        // Not muted: nothing to clear, however long the run.
+        assert!(!clear(false, 0));
+        assert!(!clear(false, RUN + 10));
+
+        // Muted, but the run is short — a slow successor must not be mistaken
+        // for a dead one.
+        for polls in 0..RUN {
+            assert!(
+                !clear(true, polls),
+                "{polls} clear poll(s) must not be enough to un-mute"
+            );
+        }
+
+        // The run is complete: the successor really is gone.
+        assert!(clear(true, RUN));
+        assert!(clear(true, RUN + 1));
     }
 
     // Progressive migration is the mechanism that drains a handed-off daemon's

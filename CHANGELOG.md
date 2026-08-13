@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A machine that takes its terminals back starts writing them down again.**
+  Once a newer background service appeared, the older one stopped recording the
+  state of its sessions for good — correct, because the newer one owned that
+  record. But if the newer one then died and the older one picked its terminals
+  back up, it carried on serving them while still refusing to record them, so
+  those sessions existed only in memory: anything that stopped that process lost
+  them for good. It now notices that nothing supersedes it any more and resumes
+  recording, after about a minute of consistently seeing no newer service — long
+  enough that a merely busy one is never mistaken for a dead one.
+
 - **Updating no longer risks every session on the machine for two seconds.** When
   a new background service took over the running terminals, the old one handed
   them across and immediately quit — so for a couple of seconds the only process
