@@ -15726,6 +15726,10 @@ struct ShellState {
     keymap_editor_error: Option<String>,
     selected_tree_paths: HashSet<String>,
     user_collapsed_synthetic_paths: HashSet<String>,
+    /// Row sets the USER built by hand (`DESIGN.md` §"Row sets"). The SSOT for
+    /// the hand half of an arrangement; the seats supply the rest, derived, and
+    /// this outranks them per row. Persisted beside the split groups.
+    row_arrangement: yggterm_core::row_set_outline::RowArrangement,
     /// GUI-level split-view groups ([[campaign-split-view-groups]]). The single
     /// source of truth for splits: the compound sidebar row, the viewport pane
     /// layout, keep-alive, and persistence all derive from this list. No
@@ -17963,6 +17967,7 @@ impl ShellState {
         // Captured before `settings` is moved into the ShellState struct below
         // ([[campaign-split-view-groups]] persistence restore).
         let restored_split_groups = settings.split_groups.clone();
+        let restored_row_arrangement = settings.row_arrangement.clone();
         let mut browser = SessionBrowserState::new(bootstrap.browser_tree.clone());
         // A persisted user collapse outranks a stale expanded entry for the
         // same synthetic path (the two can disagree when an auto-reveal
@@ -18106,6 +18111,9 @@ impl ShellState {
             // Live Sessions group survives GUI restarts (the auto-reveal
             // lanes consult this set before re-expanding).
             user_collapsed_synthetic_paths: restored_collapsed_synthetic_paths,
+            // Restored so a group the user built by dragging is still there
+            // after a restart — the same promise the split groups make.
+            row_arrangement: restored_row_arrangement,
             // Restored from settings so a built split-view workspace reopens as
             // the intentional artifact the user shaped ([[campaign-split-view-groups]]).
             // Normalized on parse; a group whose members no longer exist is
@@ -18717,6 +18725,7 @@ impl ShellState {
             // every other consumer of the merge asks a question a collapse
             // cannot change.
             &self.user_collapsed_synthetic_paths,
+            &self.row_arrangement,
         );
         enrich_sidebar_rows_with_live_titles(
             &mut merged_rows,
@@ -22375,6 +22384,7 @@ impl ShellState {
             // here for the same reason a folder is. A match the user cannot be
             // shown is not a match.
             &HashSet::new(),
+            &self.row_arrangement,
         );
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -28336,6 +28346,48 @@ impl ShellState {
         self.browser
             .set_collapsed_paths(self.user_collapsed_synthetic_paths.clone());
     }
+    /// Every live row the arrangement may speak about, by the path its row
+    /// carries.
+    fn live_row_paths_for_arrangement(&self) -> HashSet<String> {
+        self.server
+            .live_sessions()
+            .iter()
+            .filter(|session| is_promoted_live_session(session))
+            .map(live_session_row_path)
+            .collect()
+    }
+
+    /// Who holds `path` on the drawn sidebar — the hand's answer if there is
+    /// one, and the seat's otherwise.
+    ///
+    /// ⚠ Asks the SAME function the sidebar draws from rather than reading
+    /// `row_arrangement` directly: a drop beside a row must join whatever the
+    /// user can SEE holding it, and most rows are held by their seat rather
+    /// than by anything a hand has said.
+    fn row_set_effective_parent(&self, path: &str) -> Option<String> {
+        let sessions = self.server.live_sessions();
+        let promoted = sessions
+            .iter()
+            .filter(|session| is_promoted_live_session(session))
+            .collect::<Vec<_>>();
+        let paths = promoted
+            .iter()
+            .map(|session| live_session_row_path(session))
+            .collect::<Vec<_>>();
+        let sets = yggterm_core::row_set_outline::sidebar_row_sets(
+            paths
+                .iter()
+                .zip(promoted.iter())
+                .map(|(path, session)| (path.as_str(), session.outline_prefix.as_deref())),
+            &self.row_arrangement,
+            // Collapse is irrelevant to WHO HOLDS a row, and passing the real
+            // set here would make a drop's meaning depend on what is folded
+            // away — the arrangement must not change because something is shut.
+            &HashSet::new(),
+        );
+        sets.parent_of(path).map(str::to_string)
+    }
+
     fn update_synthetic_group_collapse_state(&mut self, path: &str, expanded: bool) {
         if expanded {
             self.user_collapsed_synthetic_paths.remove(path);
@@ -30675,6 +30727,7 @@ impl ShellState {
             .collect::<Vec<_>>();
         collapsed.sort();
         self.settings.collapsed_synthetic_paths = collapsed;
+        self.settings.row_arrangement = self.row_arrangement.clone();
         self.persist_settings();
     }
     fn toggle_titlebar_new_menu(&mut self) {
@@ -39430,6 +39483,7 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
         // screen, and a verb that stopped working because a human collapsed
         // something would be the row plane leaking the sidebar's state.
         &HashSet::new(),
+        &shell.row_arrangement,
     );
     enrich_sidebar_rows_with_live_titles(
         &mut merged_rows,
@@ -44600,6 +44654,7 @@ fn sidebar_merge_cache_key(
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
     collapsed_row_set_heads: &HashSet<String>,
+    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
 ) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for row in stored_rows {
@@ -44727,6 +44782,25 @@ fn sidebar_merge_cache_key(
     for path in collapsed {
         path.hash(&mut hasher);
         0xf7_u8.hash(&mut hasher);
+    }
+    // ⛔ THE HAND-BUILT ARRANGEMENT IS AN INPUT TO THE ROW LIST, so a drag that
+    // forms a set must miss this cache. Same lesson the seat taught an hour
+    // earlier: anything that decides SHAPE has to be in the key, and a
+    // containment map is only a stable key once it is sorted.
+    let mut heads = row_arrangement.sets.heads().collect::<Vec<_>>();
+    heads.sort_unstable();
+    for head in heads {
+        head.hash(&mut hasher);
+        for member in row_arrangement.sets.members_of(head) {
+            member.hash(&mut hasher);
+        }
+        0xf6_u8.hash(&mut hasher);
+    }
+    let mut detached = row_arrangement.detached.iter().collect::<Vec<_>>();
+    detached.sort();
+    for path in detached {
+        path.hash(&mut hasher);
+        0xf5_u8.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -49085,6 +49159,7 @@ fn merged_sidebar_rows(
         live_sessions,
         expanded_paths,
         &HashSet::new(),
+        &yggterm_core::row_set_outline::RowArrangement::default(),
     )
 }
 fn merged_sidebar_rows_with_projection_rows(
@@ -49095,6 +49170,7 @@ fn merged_sidebar_rows_with_projection_rows(
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
     collapsed_row_set_heads: &HashSet<String>,
+    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
 ) -> Vec<BrowserRow> {
     let remote_session_count = remote_machines
         .iter()
@@ -49110,6 +49186,7 @@ fn merged_sidebar_rows_with_projection_rows(
         live_sessions,
         expanded_paths,
         collapsed_row_set_heads,
+        row_arrangement,
     );
     let key_ms = key_started_at.elapsed().as_secs_f64() * 1000.0;
     let cache_lookup_started_at = Instant::now();
@@ -49147,6 +49224,7 @@ fn merged_sidebar_rows_with_projection_rows(
         live_sessions,
         expanded_paths,
         collapsed_row_set_heads,
+        row_arrangement,
     );
     let uncached_ms = uncached_started_at.elapsed().as_secs_f64() * 1000.0;
     if let Ok(mut cache) = sidebar_merge_cache().lock() {
@@ -49201,6 +49279,7 @@ fn merged_sidebar_rows_traced(
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
     collapsed_row_set_heads: &HashSet<String>,
+    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
 ) -> Vec<BrowserRow> {
     let remote_session_count = remote_machines
         .iter()
@@ -49220,6 +49299,7 @@ fn merged_sidebar_rows_traced(
             live_sessions,
             expanded_paths,
             collapsed_row_set_heads,
+            row_arrangement,
         );
     }
     let perf_home = perf_home_dir(settings_path);
@@ -49232,6 +49312,7 @@ fn merged_sidebar_rows_traced(
         live_sessions,
         expanded_paths,
         collapsed_row_set_heads,
+        row_arrangement,
     );
     let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     if duration_ms >= 4.0 || remote_session_count >= 500 {
@@ -49294,6 +49375,7 @@ fn merged_sidebar_rows_uncached(
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
     collapsed_row_set_heads: &HashSet<String>,
+    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
 ) -> Vec<BrowserRow> {
     let stored_rows = filter_stored_rows_for_expansion(stored_rows, expanded_paths);
     let stored_projection_rows = filter_remote_workspace_projection_rows(stored_projection_rows);
@@ -49444,6 +49526,7 @@ fn merged_sidebar_rows_uncached(
         &remote_session_index,
         expanded_paths,
         collapsed_row_set_heads,
+        row_arrangement,
     );
     let push_live_ms = push_live_started_at.elapsed().as_secs_f64() * 1000.0;
     let push_remote_started_at = Instant::now();
@@ -49715,6 +49798,7 @@ fn push_live_session_rows(
     remote_session_index: &RemoteSessionIndex,
     expanded_paths: &HashSet<String>,
     collapsed_row_set_heads: &HashSet<String>,
+    arrangement: &yggterm_core::row_set_outline::RowArrangement,
 ) {
     if sessions.is_empty() {
         return;
@@ -49764,6 +49848,7 @@ fn push_live_session_rows(
             .iter()
             .zip(sessions.iter())
             .map(|(path, session)| (path.as_str(), session.outline_prefix.as_deref())),
+        arrangement,
         collapsed_row_set_heads,
     );
     // Two live rows CAN name one path (a document open twice over). The
@@ -52131,7 +52216,101 @@ fn gui_row_order_scope() -> String {
     format!("gui:{host}")
 }
 
+/// A drop that ARRANGES rather than reorders: what the pointer's band means for
+/// the hand-built half of a row set.
+///
+/// ⭐ **THE ONE RULE, and it is why Before/After needs no second gesture: a
+/// dropped row takes the TARGET's place in the arrangement.** Dropped INTO a
+/// row, it joins that row's set. Dropped beside a row, it joins whatever holds
+/// that row — which is nothing when the target is top level, and that is how a
+/// member leaves a set. One rule covers joining, moving between sets, and
+/// leaving, so none of them is a special case anybody can forget to build.
+///
+/// ⛔ **It writes MEMBERSHIP and never a seat.** Renumbering to form a group
+/// would rewrite `outline_prefix` on rows the user created — forbidden — and
+/// would not work anyway on the un-numbered rows he most needs to group.
+///
+/// Returns true when the arrangement changed.
+fn apply_row_set_drop(
+    shell: &mut ShellState,
+    target: &DragDropTarget,
+    drag_paths: &[String],
+) -> bool {
+    let target_path = normalize_live_session_path(&target.path);
+    let head = match target.placement {
+        DragDropPlacement::Into => Some(target_path.clone()),
+        // Beside a row: take that row's own head, whatever it is.
+        DragDropPlacement::Before | DragDropPlacement::After => {
+            shell.row_set_effective_parent(&target_path)
+        }
+    };
+    let mut changed = false;
+    for path in drag_paths {
+        let member = normalize_live_session_path(path);
+        if member == target_path {
+            continue;
+        }
+        match &head {
+            Some(head) if head != &member => {
+                if shell.row_arrangement.attach(head, &member, None).is_ok() {
+                    changed = true;
+                }
+            }
+            // Dropped beside a top-level row — it leaves whatever held it, and
+            // that choice is REMEMBERED, or its seat would re-adopt it on the
+            // next frame and the gesture would look like it did nothing.
+            _ => {
+                if shell.row_set_effective_parent(&member).is_some() {
+                    shell.row_arrangement.detach(&member);
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
 fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
+    // An INTO drop is an arrangement, not an order: it forms or joins a row
+    // set and leaves the live-session order untouched. Handled before the
+    // reorder path because the two answer different questions about the same
+    // gesture.
+    let arrangement_drop = {
+        let shell = state.read();
+        shell
+            .drag_hover_target
+            .clone()
+            .filter(|target| {
+                target.path != "__live_sessions__"
+                    && shell.live_row_paths_for_arrangement().contains(&normalize_live_session_path(&target.path))
+            })
+            .map(|target| (target, shell.drag_paths.clone()))
+    };
+    if let Some((target, drag_paths)) = arrangement_drop {
+        let mut changed = false;
+        state.with_mut(|shell| {
+            changed = apply_row_set_drop(shell, &target, &drag_paths);
+            if changed {
+                shell.record_ui_telemetry(
+                    "row_set_arranged",
+                    json!({
+                        "target": target.path,
+                        "placement": format!("{:?}", target.placement).to_ascii_lowercase(),
+                        "drag_paths": drag_paths,
+                    }),
+                );
+                shell.last_action = match target.placement {
+                    DragDropPlacement::Into => format!("grouped {} row(s)", drag_paths.len()),
+                    _ => format!("moved {} row(s)", drag_paths.len()),
+                };
+                shell.sync_browser_settings();
+            }
+        });
+        if changed {
+            state.with_mut(ShellState::clear_drag_state);
+            return;
+        }
+    }
     let live_reorder = {
         let shell = state.read();
         shell.drag_hover_target.clone().and_then(|target| {
@@ -53122,8 +53301,11 @@ fn live_session_drop_target(
         });
     }
     let row_path = normalize_live_session_path(&row.full_path);
+    // ⚠ `depth >= 1`, not `== 1`. A row set's members are drawn deeper than
+    // their head, and a member that could not be dropped onto was a row you
+    // could put into a set and never take out again.
     if row.kind == BrowserRowKind::Session
-        && row.depth == 1
+        && row.depth >= 1
         && live_paths.contains(&row_path)
         && !drag_paths
             .iter()
@@ -53229,10 +53411,27 @@ fn context_menu_drop_placement(row: &BrowserRow) -> Option<WorkspaceDropPlacemen
         BrowserRowKind::Group | BrowserRowKind::Session => None,
     }
 }
-fn drag_drop_placement_from_pointer(row: &BrowserRow, y: f64) -> DragDropPlacement {
+/// Where in a row's height the pointer is, and therefore what a drop would mean.
+///
+/// ⭐ **A LIVE-SESSION ROW HAS AN INSIDE BAND — that is what makes a row set
+/// formable by hand.** Until this existed, dropping one live row onto another
+/// could only land Before or After it, so the gesture reordered and formed
+/// nothing, and a set could be created by numbering rows and by no other means:
+/// **agent-createable and not human-createable**, on a feature whose own spec
+/// says both halves exist or neither is real.
+///
+/// `in_live_region` rather than "is a Session": the cwd tree draws session rows
+/// too, and they are files in folders — an inside band there would offer a drop
+/// that means nothing and swallow the middle of every row.
+fn drag_drop_placement_from_pointer(
+    row: &BrowserRow,
+    y: f64,
+    in_live_region: bool,
+) -> DragDropPlacement {
     let y = y.max(0.0);
-    let can_drop_inside =
-        row.kind == BrowserRowKind::Group && row.group_kind != Some(WorkspaceGroupKind::Separator);
+    let can_drop_inside = (row.kind == BrowserRowKind::Group
+        && row.group_kind != Some(WorkspaceGroupKind::Separator))
+        || (in_live_region && row.kind == BrowserRowKind::Session);
     if can_drop_inside {
         if y <= 12.0 {
             DragDropPlacement::Before
@@ -89131,9 +89330,11 @@ fn SidebarRow(
                 },
                 onmouseenter: move |evt| {
                     if drag_active {
+                        // A separator is never a live row and never holds one.
                         let placement = drag_drop_placement_from_pointer(
                             &row_for_enter,
                             evt.element_coordinates().y,
+                            false,
                         );
                         on_drag_hover.call((placement, evt));
                     }
@@ -89146,6 +89347,7 @@ fn SidebarRow(
                         let placement = drag_drop_placement_from_pointer(
                             &row_for_move,
                             evt.element_coordinates().y,
+                            false,
                         );
                         on_drag_hover.call((placement, evt));
                     }
@@ -89366,7 +89568,7 @@ fn SidebarRow(
             onmouseenter: move |evt| {
                 if drag_active {
                     let placement =
-                        drag_drop_placement_from_pointer(&row_for_enter, evt.element_coordinates().y);
+                        drag_drop_placement_from_pointer(&row_for_enter, evt.element_coordinates().y, show_live_close);
                     on_drag_hover.call((placement, evt));
                 }
             },
@@ -89376,7 +89578,7 @@ fn SidebarRow(
                 }
                 if drag_active {
                     let placement =
-                        drag_drop_placement_from_pointer(&row_for_move, evt.element_coordinates().y);
+                        drag_drop_placement_from_pointer(&row_for_move, evt.element_coordinates().y, show_live_close);
                     on_drag_hover.call((placement, evt));
                 }
             },
@@ -156934,23 +157136,23 @@ mod tests {
             session_kind: None,
         };
         assert_eq!(
-            drag_drop_placement_from_pointer(&separator, 4.0),
+            drag_drop_placement_from_pointer(&separator, 4.0, false),
             DragDropPlacement::Before
         );
         assert_eq!(
-            drag_drop_placement_from_pointer(&separator, 18.0),
+            drag_drop_placement_from_pointer(&separator, 18.0, false),
             DragDropPlacement::After
         );
         assert_eq!(
-            drag_drop_placement_from_pointer(&folder, 4.0),
+            drag_drop_placement_from_pointer(&folder, 4.0, false),
             DragDropPlacement::Before
         );
         assert_eq!(
-            drag_drop_placement_from_pointer(&folder, 18.0),
+            drag_drop_placement_from_pointer(&folder, 18.0, false),
             DragDropPlacement::Into
         );
         assert_eq!(
-            drag_drop_placement_from_pointer(&folder, 30.0),
+            drag_drop_placement_from_pointer(&folder, 30.0, false),
             DragDropPlacement::After
         );
     }
@@ -157022,6 +157224,7 @@ mod tests {
     fn live_rows_for_seats(
         seats: &[(&str, &str)],
         collapsed: &HashSet<String>,
+        arrangement: &yggterm_core::row_set_outline::RowArrangement,
     ) -> Vec<(String, usize)> {
         let live_sessions: Vec<ManagedSessionView> = seats
             .iter()
@@ -157037,11 +157240,57 @@ mod tests {
             &live_sessions,
             &expanded,
             collapsed,
+            arrangement,
         )
         .into_iter()
         .filter(|row| row.kind == BrowserRowKind::Session)
         .map(|row| (row.full_path, row.depth))
         .collect()
+    }
+
+    /// ⭐ THE GESTURE THAT DID NOT EXIST. Owner, on the shipped build: *"I tried
+    /// dragging one session over the other, but our drag UX shows before or
+    /// after and not make a row group."* A live row now has an inside band; a
+    /// cwd-tree session row still does not, because there it would offer a drop
+    /// that means nothing and swallow the middle of every row.
+    #[test]
+    fn a_live_row_has_an_inside_band_and_a_cwd_tree_row_does_not() {
+        let mut live = seated_live_session("remote-session://dev/a", "6.0");
+        live.title = "head".to_string();
+        let row = BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "remote-session://dev/a".to_string(),
+            label: "6.0 head".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 1,
+            host_label: "dev".to_string(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+            session_kind: Some(SessionKind::Shell),
+        };
+        assert_eq!(
+            drag_drop_placement_from_pointer(&row, 4.0, true),
+            DragDropPlacement::Before
+        );
+        assert_eq!(
+            drag_drop_placement_from_pointer(&row, 18.0, true),
+            DragDropPlacement::Into,
+            "the middle of a live row forms a set — this is the whole gesture"
+        );
+        assert_eq!(
+            drag_drop_placement_from_pointer(&row, 30.0, true),
+            DragDropPlacement::After
+        );
+        // The same row in the cwd tree keeps the two-way band it always had.
+        assert_eq!(
+            drag_drop_placement_from_pointer(&row, 18.0, false),
+            DragDropPlacement::After
+        );
     }
 
     /// ⛔ THE OWNER'S RULE, pinned: the traffic lights are a column of their
@@ -157100,6 +157349,7 @@ mod tests {
                     ("remote-session://dev/loose", ""),
                 ],
                 &HashSet::new(),
+                &yggterm_core::row_set_outline::RowArrangement::default(),
             ),
             vec![
                 ("remote-session://dev/orch".to_string(), 1),
@@ -157125,6 +157375,7 @@ mod tests {
                     ("remote-session://dev/nine-a", "9.1"),
                 ],
                 &HashSet::new(),
+                &yggterm_core::row_set_outline::RowArrangement::default(),
             ),
             vec![
                 ("remote-session://dev/six".to_string(), 1),
@@ -157151,6 +157402,7 @@ mod tests {
                     ("remote-session://dev/loose", ""),
                 ],
                 &collapsed,
+                &yggterm_core::row_set_outline::RowArrangement::default(),
             ),
             vec![
                 ("remote-session://dev/orch".to_string(), 1),
@@ -157173,6 +157425,7 @@ mod tests {
                 ("remote-session://dev/e", "6.1.1.1.1"),
             ],
             &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
         );
         let depths: Vec<usize> = rows.iter().map(|(_, depth)| *depth).collect();
         assert_eq!(
@@ -157235,6 +157488,7 @@ mod tests {
                 ("remote-session://dev/gate", "7.0"),
             ],
             &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
         );
         assert_eq!(
             flat,
@@ -157250,6 +157504,7 @@ mod tests {
                 ("remote-session://dev/gate", "6.1"),
             ],
             &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
         );
         assert_eq!(
             nested,
@@ -162046,6 +162301,7 @@ mod tests {
             &[],
             &expanded,
             &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
         );
 
         assert!(rows.iter().any(|row| {
@@ -162100,6 +162356,7 @@ mod tests {
             &[],
             &expanded,
             &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
         );
         assert!(rows.iter().any(|row| {
             row.full_path == "__remote_folder__/practice/home/user/git/samplers"

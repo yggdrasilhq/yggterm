@@ -506,6 +506,13 @@ pub struct AppSettings {
     /// so a built workspace reopens as an intentional artifact; members resume
     /// via the normal per-pane handoff on restore.
     pub split_groups: Vec<SplitGroup>,
+    /// Row sets the USER built by hand — `DESIGN.md` §"Row sets". Only the hand
+    /// half lives here: the arrangement the seats imply is derived every frame
+    /// and would go stale on disk the moment a delegate is reseated. Sits beside
+    /// `split_groups` because it is the same class of fact — a GUI-level
+    /// arrangement over live rows, which is the user's layout and not the
+    /// daemon's session state.
+    pub row_arrangement: crate::row_set_outline::RowArrangement,
     /// Which member of the start page's SESSION family the split button last
     /// ran (`codex` · `claude-code` · `terminal`).
     ///
@@ -558,6 +565,7 @@ impl Default for AppSettings {
             expanded_browser_paths: Vec::new(),
             collapsed_synthetic_paths: Vec::new(),
             split_groups: Vec::new(),
+            row_arrangement: crate::row_set_outline::RowArrangement::default(),
             start_page_session_choice: None,
             start_page_app_choice: None,
         }
@@ -1290,6 +1298,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.collapsed_synthetic_paths = serde_json::from_value(value.clone())
             .context("failed to parse collapsed_synthetic_paths")?;
     }
+    if let Some(value) = object.get("row_arrangement") {
+        settings.row_arrangement = serde_json::from_value(value.clone())
+            .context("failed to parse row_arrangement")?;
+    }
     if let Some(value) = object.get("split_groups") {
         settings.split_groups = serde_json::from_value::<Vec<SplitGroup>>(value.clone())
             .context("failed to parse split_groups")?
@@ -1350,6 +1362,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "perf_profiling_enabled": settings.perf_profiling_enabled,
         "selected_browser_path": settings.selected_browser_path,
         "expanded_browser_paths": settings.expanded_browser_paths,
+        "row_arrangement": settings.row_arrangement,
         "collapsed_synthetic_paths": settings.collapsed_synthetic_paths,
         "split_groups": settings.split_groups,
         // The start page's two sticky split buttons. Their own doc comments say

@@ -139,6 +139,16 @@ impl RowSets {
         self.members.get(path).map_or(&[], Vec::as_slice)
     }
 
+    /// Every row that heads a set, in no particular order.
+    ///
+    /// ⚠ **Unordered, so a caller that needs determinism must sort.** The
+    /// containment is a map; the sidebar's draw order comes from the caller's
+    /// own list, never from here. The one caller today hashes this into a cache
+    /// key and sorts for exactly that reason.
+    pub fn heads(&self) -> impl Iterator<Item = &str> {
+        self.members.keys().map(String::as_str)
+    }
+
     /// Does `path` head a set? A head with an empty member list is not a set:
     /// the last member leaving dissolves it, so an empty husk can never linger
     /// and offer a disclosure control that opens onto nothing.
