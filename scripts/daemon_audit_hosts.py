@@ -2,7 +2,11 @@
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ygg_live_host  # noqa: E402  (path is set immediately above)
 
 
 AUDIT_SNIPPET = r"""
@@ -52,7 +56,14 @@ print(json.dumps(rows))
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Audit yggterm daemon processes across hosts.")
-    parser.add_argument("hosts", nargs="*", default=["local", "oc", "guihost"])
+    # ⛔ NO LITERAL HOST NAME IN THE DEFAULT. The one that used to sit here did
+    # not resolve, so the default invocation audited two hosts, reported
+    # `ok: false` for the third in a field nobody aggregates, and left out the
+    # machine that runs the GUI — the host with by far the most daemons, which
+    # is the entire subject of this audit. Resolved lazily in `main`, never as
+    # an argparse default: defaults are evaluated even for `--help`, and the
+    # resolver makes ssh probes.
+    parser.add_argument("hosts", nargs="*", default=None)
     return parser.parse_args()
 
 
@@ -82,7 +93,8 @@ def run_host(host: str) -> dict:
 
 def main() -> int:
     args = parse_args()
-    report = [run_host(host) for host in args.hosts]
+    hosts = args.hosts or ygg_live_host.hosts_with_live("local", "oc")
+    report = [run_host(host) for host in hosts]
     print(json.dumps(report, indent=2))
     return 0 if all(item.get("ok") for item in report) else 1
 

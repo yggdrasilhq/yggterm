@@ -123,3 +123,89 @@ fn the_recipes_assign_live_host_from_the_resolver_and_stop_on_failure() {
         );
     }
 }
+
+/// ⛔ AND A LITERAL HOST NAME IN CODE IS THE SAME BUG WEARING A DIFFERENT
+/// COSTUME. The cache-read failed loudly on line one; a hardcoded name fails
+/// *quietly*, because the tool carrying it still works on the hosts it can
+/// reach. One unresolvable literal blinded four separate tools in a single day
+/// — a fleet deploy that skipped the only host a UI change can be proven on,
+/// three fleet supervisors that then rendered the missing host's rows as dead,
+/// and a daemon audit whose default invocation reported confidently on two
+/// hosts while omitting the one with the most daemons on it.
+///
+/// ⚠ AND IT IS SCOPED TO A HOST POSITION, because the first version of this
+/// check was not and immediately flagged two search-fixture lines that resolve
+/// nothing. A lock that fires on prose or on data teaches people to delete the
+/// lock. What is forbidden is the name reaching ssh or a host list.
+#[cfg(unix)]
+fn names_a_host_literally(line: &str) -> bool {
+    if !line.contains("guihost") {
+        return false;
+    }
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return false; // a comment explaining the trap is not the trap
+    }
+    // A host POSITION: something that will be ssh-ed to, or a list of things
+    // that will be. Anything else carrying the token is data, not a target.
+    line.contains("ssh")
+        || line.contains("hosts")
+        || line.contains("HOSTS")
+        || line.contains("--host")
+}
+
+#[test]
+fn the_hardcoded_host_check_can_say_both_yes_and_no() {
+    // ⛔ BOTH CONTROLS. A predicate that has collapsed to `false` passes the
+    // sweep below on an offending tree and reads exactly like a clean repo.
+    assert!(names_a_host_literally(
+        r#"    parser.add_argument("hosts", nargs="*", default=["local", "oc", "guihost"])"#
+    ));
+    assert!(names_a_host_literally(r#"HOSTS="dev guihost oc""#));
+    assert!(!names_a_host_literally(
+        r#"        if lowered in {"guihost", "oc", "local"}:"#
+    ));
+    assert!(!names_a_host_literally(
+        "# the live GUI on guihost is Wayland-native"
+    ));
+    assert!(!names_a_host_literally("HOSTS=\"dev oc\""));
+}
+
+#[test]
+fn no_script_hardcodes_a_gui_host_name_where_a_program_will_resolve_it() {
+    let root = repo_root();
+    if !root.join("scripts/ygg-live-host.sh").exists() {
+        return;
+    }
+
+    let mut offenders = Vec::new();
+    for path in recipe_files(&root) {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !matches!(ext, "sh" | "py") {
+            continue; // prose may name it; only executable text may not
+        }
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (number, line) in body.lines().enumerate() {
+            if names_a_host_literally(line) {
+                offenders.push(format!(
+                    "{}:{}: {}",
+                    path.strip_prefix(&root).unwrap_or(&path).display(),
+                    number + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these lines name a GUI host literally in a position a program will try \
+         to resolve. The name does not resolve off the machine it describes, so \
+         the tool keeps working on the other hosts and silently drops this one. \
+         Call scripts/ygg-live-host.sh (shell) or scripts/ygg_live_host.py \
+         (python) instead:\n{}",
+        offenders.join("\n")
+    );
+}
