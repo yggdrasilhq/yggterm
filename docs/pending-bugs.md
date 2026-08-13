@@ -291,6 +291,15 @@ case but the **normal** state of a parallel campaign.
    takes the next number **after** `origin/main`'s, and pushes the bump alone —
    a number taken from a stale file is the whole defect.
 
+⭐ **AND `3.0.120` JOINED THEM WITHIN THE HOUR.** The build cut to end the
+collision was itself deployed over ~15 minutes later: on the desktop host
+`~/.local/bin/yggterm` reads `--version 3.0.120` with an md5 that is **not** the
+3.0.120 that was built and censused. Four consecutive version numbers, each
+meaning two builds. ⇒ this is not a race that a careful cluster can avoid by
+being quick — **there is no arbitration, so the number is simply not an
+identifier**, and every "is my fix live" check written against `--version` is
+answering a different question.
+
 **Falsifier:** two clusters bump and deploy in the same minute, and the fleet
 census can name which build is on the host.
 
