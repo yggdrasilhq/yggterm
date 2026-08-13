@@ -1178,51 +1178,6 @@ no uncorked yggterm stream, and the filter sink must reach `SUSPENDED`.
 fix needs an ear, not an instrument. The measurable half above is sufficient to
 build against and does not wait on that.
 
-## ⛔⛔ [6.7] THE PRIVACY GUARD SCANS ALL OF HISTORY ON A NEW BRANCH, SO EVERY LANE PUSH FAILS AND TEACHES THE OVERRIDE
-
-**Status:** OPEN
-
-*found 2026-08-13 while pushing a lane branch; affects every cluster in this batch*
-
-`ygg-privacy-guard hook` derives its scan range from the pre-push stdin line:
-
-```python
-rng = f"{rsha}..{lsha}" if not rsha.startswith("0000") else lsha
-```
-
-**On a new branch `rsha` IS `0000…`**, so the range collapses to `lsha` — the
-branch tip — and the guard scans **every commit reachable from it**, i.e. the
-whole repository history, rather than the commits actually being pushed.
-
-⇒ Pushing `lane/dev/6.7-resource` (one commit, 247 added lines) was refused for
-private terms sitting in **commit messages that are already ancestors of
-`origin/main` and have been public for weeks**. Verified: `origin/main..HEAD`
-contained exactly one commit, and the guard's own `scan --rev-range
-origin/main..HEAD` returned *"✅ no private data found in what is being pushed."*
-
-**Why this is ⛔⛔ and not a nuisance.** The only escape is
-`YGG_PRIVACY_ALLOW=1`. A guard that refuses **every** new branch regardless of
-content trains every agent to set that variable reflexively, and the override is
-a single environment variable that suppresses the whole scan — so the guard
-stops working precisely when someone finally does push something private. **A
-check that cries wolf on every lane branch is worse than no check**, because it
-manufactures the habit that defeats it. All eight clusters in this batch push
-lane branches.
-
-**The fix:** for a new branch, ask what the remote does not already have —
-`git rev-list <lsha> --not --remotes=origin` — instead of walking the tip's
-entire ancestry. Failing closed is right; failing closed on already-published
-history is not failing closed, it is failing blind.
-
-**Falsifier:** create a branch with one innocuous commit and push it. The guard
-must pass without an override.
-
-⇒ **Separately, and this one is owner-gated:** the terms it caught are real and
-they are *already public* in `origin/main` commit messages (a graph name, a bank
-hostname). Removing them means rewriting published history, which has been done
-once before on a sibling repo and orphaned 34 commits. Not a relay action.
-→ `docs/owner-attention.md`.
-
 ## ⛔ [6.7] SIXTEEN STUCK CRASH HANDLERS, THE OLDEST DATING TO BOOT
 
 **Status:** OPEN
@@ -2357,37 +2312,6 @@ a width table. This also means the 3.0.105/106 atlas work has NOT closed the
 family — prevention on the rAF-gap edge is not catching every route to a stale
 atlas, and the next investigation should start from which route this frame took,
 not from whether the atlas is the mechanism.
-
-## ⛔⛔ THE PRE-PUSH PRIVACY GUARD PASSES TERMS THE REPO'S OWN CHECKER REJECTS
-
-**Status:** OPEN
-
-**Caught live 2026-08-11 by leaking one.** A commit touching
-`.agents/skills/yggterm-agent-fleet/ygg-booter.py` named a sibling campaign by
-its private project name, in both the file and the commit message.
-`scripts/check-privacy.sh` rejects that name (`rc=1`, *"a private
-store/portal/project name is present"*). **`ygg-privacy-guard` passed it — twice,
-to two PUBLIC remotes — with `✅ no private data found in what is being pushed`.**
-Verified afterwards: the guard's only occurrence of the term is inside its own
-docstring; it is not in its `TERMS` list.
-
-⇒ ⭐ **The two checkers have different term lists, and the WEAKER one is the one
-standing at the boundary.** `check-privacy.sh` runs when an agent remembers to run
-it; the guard runs on every push and is the last line of defence. A leak therefore
-only has to beat the weaker of the two, which is exactly backwards.
-⚠ Nothing here says the guard is broken as designed — its own docstring shows it
-was built for a specific incident (identities and hostnames). The defect is that
-**two lists exist at all**: one question, two owners, and they have already
-diverged in the direction that leaks.
-
-**Remediated for this instance:** term scrubbed from file and message, tip amended
-and force-pushed to both remotes with `--force-with-lease`. ⚠ The blob remains in
-GitHub's dangling objects until GC, same limitation as the earlier incident in
-[[finding-private-data-in-public-repos-and-the-prepush-guard]].
-
-**The fix is to collapse the lists, not to sync them** — a shared term file both
-tools read, so a term added anywhere is enforced everywhere. Adding the one
-missing word to the guard would close this instance and leave the class open.
 
 ## ⛔⛔ 3.0.106 CAUSED A SECOND RENDER BUG, AND THE HONEST TRACE IS WHAT CAUGHT IT
 
