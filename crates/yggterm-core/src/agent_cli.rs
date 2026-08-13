@@ -2170,9 +2170,15 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `--dangerously-skip-permissions` STILL stops on agy's workspace-TRUST
         // prompt ("Do you trust the contents of this project?") in a folder it
         // has not seen before. Default arm and bypass arm produced the identical
-        // screen. ⇒ agy has TWO gates in series and this flag releases only one;
-        // `agy --help` offers nothing for the other, and the trust decision
-        // lives in `~/.grok`-style per-folder state, not on the command line.
+        // screen. ⇒ agy has TWO gates in series and this flag releases only one.
+        //
+        // ⭐ Where the other gate's answer lives, found by following it up:
+        // agy's own settings file carries a `trustedWorkspaces` LIST OF PATHS
+        // beside its `permissions` block. So the prompt is once-per-folder and
+        // persistent, not a recurring block — which is why this is a fact about
+        // agy rather than a defect in yggterm. ⛔ And it is why yggterm must not
+        // "fix" it: writing another CLI's settings file on the user's behalf is
+        // the same prohibition codex's `config.toml` already carries.
         // Muse's `--yolo` is the contrast — it trusts the workspace too.
         //
         // ⚠ A row parked on that prompt is, from the sidebar, indistinguishable
@@ -2205,8 +2211,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 label: "Skip checks",
                 args: "--dangerously-skip-permissions",
                 explanation: "Auto-approves all tool permission requests. It does NOT answer the \
-                              workspace-trust prompt a first run in a new folder shows — agy has \
-                              no flag for that one, so answer it once per folder.",
+                              workspace-trust prompt a first run in a new folder shows: agy has \
+                              no flag for that gate and keeps the answer in its own settings, so \
+                              it is asked once per folder and never again.",
                 is_default: true,
             },
         ],
@@ -2251,12 +2258,16 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // table, and the brand's actual colour rather than a nearest match.
         brand_color: "#000000",
         menu_hint: 'g',
-        // ⚠ The HELP is clear that grok owns session titles — `--resume` matches
-        // "session titles for the current directory", and speaks of a "sole
-        // renamed match". But `store_scan_gap` below means yggterm cannot READ
-        // that title, and declaring `Store` while unable to read one leaves the
-        // row with NO name at all. So yggterm generates until the store scan
-        // lands, at which point this flips to `Store` in the same commit.
+        // ⚠ STAYS `Generated`, and the reason CHANGED once the store became
+        // readable. The help is clear that grok owns session titles — `--resume`
+        // matches "session titles for the current directory" and speaks of a
+        // "sole renamed match" — and `summary.json` has a `session_summary`
+        // field for it. But that field was **empty in every session observed**,
+        // and a field that exists is not evidence the CLI fills it. Declaring
+        // `Store` on a field name alone would make yggterm respect a title that
+        // is not there and leave the row nameless. The reader below returns the
+        // summary when it is non-empty, so nothing is lost either way; flip this
+        // when a session with real turns is seen carrying one.
         title_authority: TitleAuthority::Generated,
         // MEASURED: `-s, --session-id <SESSION_ID>` — "Use a specific session
         // UUID for a **new** conversation (must be a valid UUID and must not
@@ -2372,23 +2383,19 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         permission_provenance: PermissionProvenance::Measured,
         content_rederives_on_resume: true,
-        session_store_globs: &[],
+        // ⭐ MEASURED 2026-08-13 against real sessions, and the gap this replaces
+        // was WRONG about needing the owner: a fleet host was already signed in.
+        // ⚠ `summary.json` alone, deliberately — the session directory also holds
+        // `chat_history.jsonl`, `events.jsonl` and `updates.jsonl`, and globbing
+        // those would yield three entries for one session.
+        session_store_globs: &[".grok/sessions/*/*/summary.json"],
+        // The `.lock` siblings are not matched by the glob, so nothing to exclude.
         store_excluded_name_fragments: &[],
         // grok reads `GROK_SANDBOX` for the sandbox profile; nothing in its help
         // or its strings relocates the HOME, which stays `~/.grok`.
         store_home_env_override: None,
-        store_scan_gap: Some(
-            "`~/.grok/sessions` is a path constant in the shipped executable and \
-             `grok sessions list` is a real verb, but the on-disk SHAPE is unread: \
-             creating even one session requires `grok login` (or an XAI_API_KEY), a \
-             credential only the owner holds, and `grok sessions list` on a signed-out \
-             host answers `No sessions found.` rather than revealing a layout. The \
-             help's `--resume [<SESSION_ID_OR_TITLE>]` matching titles \"for the \
-             current directory\" says the store is bucketed per-cwd like kimi's, which \
-             is a hypothesis and not a measurement. Closing this needs one real session \
-             on a signed-in host; `title_authority` flips to Store in the same commit.",
-        ),
-        read_store_entry: read_no_store_entry,
+        store_scan_gap: None,
+        read_store_entry: read_grok_build_store_entry,
     },
 ];
 
@@ -2503,6 +2510,50 @@ fn read_qwen_store_entry(path: &Path) -> Option<AgentStoreEntry> {
 /// yet it is still the working directory. Handing that back as a title would
 /// make every fresh row read as the home directory, so a name equal to the cwd is treated
 /// as absent — the same judgement the cwd-derived placeholder gets elsewhere.
+/// Grok Build files one DIRECTORY per session, bucketed by working directory:
+/// `~/.grok/sessions/<percent-encoded-cwd>/<session-uuid>/summary.json`, beside
+/// `chat_history.jsonl`, `events.jsonl` and a `system_prompt.txt`.
+///
+/// ⭐ The bucket name is the cwd PERCENT-ENCODED, so unlike kimi's MD5-of-cwd
+/// buckets it is reversible — but nothing here decodes it, because
+/// `summary.json` carries `info.cwd` as a plain absolute path and `info.id` as
+/// the session uuid. **Read the file, not the path**: the directory name is a
+/// second encoding of a value the file already states, and the two could only
+/// ever disagree.
+///
+/// Measured 2026-08-13 against real sessions on a signed-in host: `info.id` is a
+/// 36-char uuid that equals its own directory name, `info.cwd` is absolute, and
+/// `updated_at` is RFC-3339 with nanoseconds. The glob targets `summary.json`
+/// alone so one session yields exactly one entry.
+fn read_grok_build_store_entry(path: &Path) -> Option<AgentStoreEntry> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let info = value.get("info")?;
+    let session_id = info.get("id")?.as_str()?.trim().to_string();
+    let cwd = info.get("cwd")?.as_str()?.trim().to_string();
+    if session_id.is_empty() || cwd.is_empty() {
+        return None;
+    }
+    // ⚠ `session_summary` was EMPTY in every session observed, and both had a
+    // single message — so this reads it when present and never fabricates one.
+    // That emptiness is also why `title_authority` stays `Generated`: a field
+    // that exists is not evidence the CLI fills it, and `Store` would leave a
+    // row nameless on the strength of a field name.
+    let title = value
+        .get("session_summary")
+        .and_then(|summary| summary.as_str())
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .map(ToOwned::to_owned);
+    Some(AgentStoreEntry {
+        session_id,
+        cwd,
+        modified_epoch_ms: modified_epoch_ms_of(path),
+        title,
+        detail: None,
+    })
+}
+
 fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     let raw = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;

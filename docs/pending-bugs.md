@@ -2259,64 +2259,45 @@ under the same webview workload and compare crash counts. If the software arm
 crashes at the same rate, the GL path is incidental and the abort cluster is the
 real story.
 
-## ⚠ [6.6] `agy` HAS TWO GATES IN SERIES, AND ITS BYPASS FLAG RELEASES ONLY ONE
+## ⚠ [6.6] GROK BUILD MAY NEVER FILL THE TITLE FIELD IT HAS
 
 **Status:** OPEN
 
-*Measured 2026-08-13 on the live GUI host, BOTH ARMS IN ONE RUN.*
+*The last of the 2026-08-13 intake's declared unknowns, and it is small.*
 
-A row launched `agy --dangerously-skip-permissions` and a row launched with no
-flags at all produced the **identical screen**: agy's workspace-trust prompt,
-*"Do you trust the contents of this project?"*, waiting on a keypress.
+Grok's `summary.json` carries a `session_summary` field, and its `--resume` help
+matches "session titles for the current directory" and speaks of a *"sole renamed
+match"* — so the CLI plainly has titles. **In every session observed the field was
+EMPTY**, and every one of those sessions had a single message.
 
-`agy --help` documents that flag as *"Auto-approve all tool permission requests
-without prompting"*, and it does exactly that — the trust gate is a **different,
-earlier gate**, per folder, and agy offers no flag for it. Muse is the contrast:
-its `--yolo` disables approval AND sandboxing AND trusts the workspace.
+`title_authority` therefore stays `Generated`: a field that exists is not evidence
+the CLI fills it, and declaring `Store` on a field NAME would make yggterm respect
+a title that is not there and leave the row nameless. The store reader already
+returns the summary when it is non-empty, so nothing is lost either way.
 
-⇒ **What this most likely explains, stated as a hypothesis and not a cause:** a
-row parked on a full-screen prompt is, from the sidebar, indistinguishable from
-one whose CLI never launched. The falsifier is to read the row's SCREEN rather
-than its phase — `launch_phase: Running` and a healthy `machine_health` are true
-of both.
+**Falsifier:** one grok session with several real turns. If `session_summary` is
+populated, flip `title_authority` to `Store`. If it stays empty, the field is a
+placeholder and this entry closes as a fact about grok.
 
-**What is NOT true any more:** the launcher carrying no permission flag. Every
-registered CLI now has a stored box, and it reaches the launch on both lanes —
-proven by `qwen '--yolo'` locally and `qwen --yolo` in `/proc/<pid>/cmdline` on
-the far host, with the reset case producing a bare `qwen` in the same run.
+### ✅ Closed 2026-08-13, both by their own falsifiers
 
-**Falsifier for what remains:** find a flag, config key or state file that makes
-agy skip the trust prompt for a folder it has not seen. If one exists it belongs
-in the descriptor's Skip-checks tier; if none does, this entry closes as a fact
-about agy rather than a defect in yggterm, and the tier's explanation (which
-already says so) is the whole fix.
+- **The session store is READ.** The gap claimed this needed a login only the
+  owner holds. It did not: a fleet host was already signed in, and the layout is
+  `~/.grok/sessions/<percent-encoded-cwd>/<uuid>/summary.json`, whose `info.cwd`
+  is a plain absolute path and whose `info.id` equals its own directory name. ⇒
+  **the bucket name is a second encoding of a value the file already states**, so
+  the reader reads the file and never decodes the path. ⚠ The glob targets
+  `summary.json` alone; the session directory also holds `chat_history.jsonl`,
+  `events.jsonl` and `updates.jsonl`, and globbing those would yield three
+  entries for one session.
+- **Auto-provisioning works.** Proven on the one fleet host that had no grok at
+  all: `@xai-official` is now in the managed npm prefix and `grok --version`
+  answers there. ⚠ The 67 MB payload is fetched on first real run, not at
+  install, so an empty `~/.grok/downloads` beside a working `--version` is the
+  expected intermediate state and not a failed install.
 
-## ⚠ [6.6] GROK BUILD'S STORE AND ITS AUTO-PROVISIONING ARE BOTH UNPROVEN
-
-**Status:** OPEN
-
-*Landed 2026-08-13; these are the two halves that could not be proven with it.*
-
-Grok Build is a registered kind and launches: a row opened on the live host
-exec'd `grok` and drew its own TUI. Two things are declared rather than measured.
-
-1. **The session store.** `~/.grok/sessions` is a path constant in the shipped
-   executable and `grok sessions list` is a real verb, but the on-disk SHAPE is
-   unread, because creating even one session needs `grok login` — an owner gate
-   (`owner-attention.md`). `title_authority` is `Generated` for the same reason:
-   the help says grok owns session titles, and declaring `Store` while unable to
-   READ one would leave every row with no name at all. **Both flip in one commit
-   once a signed-in host exists.**
-2. **Auto-provisioning.** The launch succeeded on a host that ALREADY had `grok`
-   — the owner installed it at `~/.grok/bin/grok` before this work started, and
-   the launch PATH found it there. So `CliInstall::Npm("@xai-official/grok")` is
-   correct by inspection (the npm launcher fetches the platform binary into
-   `~/.grok/downloads`, which is exactly what is on disk) and **untested on a
-   host that lacks it**.
-
-**Falsifier:** on a host with no `grok`, launch `--kind grok-build` and check
-that `~/.yggterm/npm/lib/node_modules/@xai-official` appears and the row draws
-grok's TUI rather than `grok: command not found`.
+⇒ **The lesson worth keeping: the gap was written as an owner gate and was never
+one.** Nobody had asked the hosts. An inherited "blocked" is a claim, not a fact.
 
 ## ⛔ [6.6] `server app` IS DISPATCHED IN TWO FILES, SO A NEW VERB IS ABSENT FROM THE ONE AGENTS CALL
 
