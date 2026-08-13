@@ -15913,6 +15913,8 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
                     let write_path = runtime_path.clone();
                     let snapshot_runtime = Arc::clone(&runtime);
                     let snapshot_path = runtime_path.clone();
+                    let draft_runtime = Arc::clone(&runtime);
+                    let draft_path = runtime_path.clone();
                     let outcome = crate::terminal::submit_prompt_echo_verified_with(
                         move |text| {
                             // Locked per WRITE, released before every sleep —
@@ -15925,6 +15927,14 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
                             lock_daemon_runtime(&snapshot_runtime, "hot_restart_repair_snapshot")
                                 .terminals
                                 .session_screen_snapshot(&snapshot_path)
+                        },
+                        // §5's repair is the LAST thing that may stomp a human:
+                        // it fires on a just-re-resumed row, which is exactly
+                        // when someone is most likely to be typing at it.
+                        move || {
+                            lock_daemon_runtime(&draft_runtime, "hot_restart_repair_draft")
+                                .terminals
+                                .session_has_pending_input_draft(&draft_path)
                         },
                         "continue",
                         HOT_RESTART_REPAIR_SUBMIT_TIMEOUT,
@@ -15940,6 +15950,8 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
                                 Ok(crate::terminal::PromptSubmitOutcome::Submitted { .. }) => "submitted",
                                 Ok(crate::terminal::PromptSubmitOutcome::NotReady { .. }) => "not_ready",
                                 Ok(crate::terminal::PromptSubmitOutcome::NoSession) => "no_session",
+                                Ok(crate::terminal::PromptSubmitOutcome::HumanTyping { .. }) =>
+                                    "human_typing",
                                 Err(_) => "error",
                             },
                             "error": outcome.as_ref().err().map(|error| error.to_string()),
@@ -15947,9 +15959,15 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
                             "current_pid": std::process::id(),
                         }),
                     );
+                    // ⛔ `HumanTyping` requeues exactly like `NotReady`, and for
+                    // the same reason: NOTHING was written, so the record is not
+                    // spent and dropping it would lose the repair outright.
+                    // Deferring to the person at the keyboard must cost them
+                    // nothing.
                     if matches!(
                         outcome,
                         Ok(crate::terminal::PromptSubmitOutcome::NotReady { .. })
+                            | Ok(crate::terminal::PromptSubmitOutcome::HumanTyping { .. })
                     ) {
                         unsubmitted.push(session_key);
                     }
@@ -23300,6 +23318,7 @@ mod tests {
             pty_cols: None,
             pty_rows: None,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,

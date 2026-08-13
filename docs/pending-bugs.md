@@ -29,6 +29,71 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⛔⛔⛔ [6.7] THE READINESS PROBE TYPES OVER THE HUMAN — THIS IS THE "I CANNOT TYPE" BUG, ROOT-CAUSED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Caught live 2026-08-14 in the owner's own keystrokes, which arrived shredded:*
+
+```
+yggterm_ready_probeBy yggterm_ready_probese yggterm_ready_probesi yggterm_ready_probeon…
+```
+
+That is `By session…` interleaved with **our own marker**. Reported alongside it:
+*"blinking profusely and I could not type"*, and — decisively — *"by session
+blinking I mean the VIEWPORT blinking"*.
+
+⛔ **`submit_prompt_echo_verified_with` (`terminal.rs`) writes into a composer a
+human is using, and erases it.** Per attempt it writes `yggterm_ready_probe`,
+sleeps 180 ms, and if the marker has not echoed writes **`\u{15}` — Ctrl+U, which
+clears the line the human is composing** — then retries every ~300 ms until the
+timeout. A single 30 s submit against a row someone is typing at is **~100
+injected markers and ~100 erased lines**.
+
+⇒ **ONE cause, all three reported symptoms:**
+
+| symptom | mechanism |
+|---|---|
+| the VIEWPORT blinks | the loop painting the marker and wiping it, ~3×/s |
+| cannot type | Ctrl+U erases the line; the marker interleaves with the keys |
+| *"5–10 min after a restart"* | rows are not consuming yet, so **every** submit spins its FULL timeout |
+
+⭐ **That last row is the owner's standing #1** (*"all sessions refuse input for
+the first 5-10 minutes after a restart"*). Nothing is wrong with the sessions:
+after a restart nothing echoes yet, so every automated submit enters its retry
+loop at once and the rows are hammered for as long as the timeouts last. **The
+restart storm is not a restart problem, it is a retry-loop problem.**
+
+⚠ **Reproduced by the reporter's own instruments, not inferred.** Two
+`terminal submit` calls to a busy row each returned `submitted:false` after
+`waited_ms: 30103` — the failing case IS the hammering case, and the reply says
+"not submitted" while ~200 writes have already landed. ⇒ **`submitted:false` does
+not mean "nothing was written"**, and that is exactly backwards from how every
+caller reads it.
+
+### The fix
+
+- **`human_draft` guard, re-checked before EVERY write** (not once at the top —
+  the echo wait is 180 ms and a person can start typing inside it). `Some(false)`
+  = confirmed empty; **`None` is NOT permission** — an unreadable composer is
+  where being wrong is least affordable, so it refuses too.
+- **New `PromptSubmitOutcome::HumanTyping`**, which **requeues exactly like
+  `NotReady`**: nothing was written, so the record is not spent and deferring to
+  the person at the keyboard costs them nothing.
+- **Exponential backoff to a 2 s ceiling**: same deadline, ~12 writes instead of
+  ~100, and the surface is left alone in between.
+
+⭐ **The lock asserts on the WRITES, not the return value** — a version returning
+the right enum after already stomping the composer would pass a verdict-only test
+and still ruin the sentence someone was typing. **The damage IS the write.**
+Proven to fail on the mutant that disables the guard (i.e. on the shipped
+behaviour), while the "still submits normally" control passed.
+
+⛔ **UNTIL A DAEMON CARRYING THIS IS DEPLOYED, THE MITIGATION IS BEHAVIOURAL:**
+do not `terminal submit` to a row that is not consuming input. A row reading
+`busy: agent_working_daemon` will not echo, so the submit will hammer it for the
+full timeout. Check first, and never retry a `submitted:false` by sending again.
+
 ## ⛔ [6.7] `main` IS RED IN ANY CHECKOUT WITHOUT THE LIVE-HOST CACHE — THE DEPLOY GUARD TESTS NEED A HOST TO EXIST
 
 **Status:** OPEN
