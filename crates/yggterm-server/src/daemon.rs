@@ -12435,6 +12435,24 @@ fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntim
                             Some(metadata.screen.as_str()),
                         ) {
                             Ok(()) => {
+                                // ⛔⛔ PERSIST NOW, NOT ON THE NEXT ROUTINE TICK.
+                                // During a handover the PREDECESSOR's routine
+                                // persistence is muted for ever
+                                // (`superseded_routine_persist_muted`, so it
+                                // cannot clobber the successor's state file),
+                                // and the successor has not yet reached a tick.
+                                // ⇒ there is a window in which NO process on
+                                // the host will write the session state, and it
+                                // is exactly the window where every runtime is
+                                // in flight. Measured 2026-08-13: a successor
+                                // adopted 38 runtimes and was signalled 16 s
+                                // later; **seven agent sessions resolved to
+                                // nothing afterwards** because neither daemon
+                                // had recorded them. A row that was written
+                                // down can be re-resumed — that is what the
+                                // manual `resume-cc --require-existing`
+                                // recovery proved.
+                                let persisted = rt.persist_state_only().is_ok();
                                 append_trace_event(
                                     &home_dir,
                                     "daemon",
@@ -12446,6 +12464,10 @@ fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntim
                                         "cols": metadata.cols,
                                         "rows": metadata.rows,
                                         "screen_bytes": metadata.screen.len(),
+                                        // A failure here means the row is live
+                                        // but unrecoverable, which is worth
+                                        // seeing before someone kills a daemon.
+                                        "persisted": persisted,
                                     }),
                                 );
                                 (true, None)

@@ -29,37 +29,140 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
-## ⛔⛔⛔ SEVEN AGENT ROWS DIED IN ONE SECOND DURING A DAEMON HANDOVER — the constitution's core guarantee, failing with a timestamp
+## ⛔⛔⛔ THE HANDOVER RELEASES ON THE SUCCESSOR'S ACCEPTANCE, NEVER ON ITS SURVIVAL — a two-second window in which one signal destroys every session on the host
 
 **Status:** OPEN
 
-Measured 2026-08-13 22:31–22:47, live, on the integrator host.
+Seven agent rows died in one second on 2026-08-13 at 22:31:42, every transcript ending on a
+`tool_result` — cut mid-turn, work destroyed, and **not recoverable**: those uuids return zero from
+`server sessions`.
 
-**What happened, as measurement only:**
+**Root-caused from the daemon's own trace.** The sequence:
 
-| time | event |
-|---|---|
-| 22:30:21 | a daemon starts from **a lane's own build tree** — `/home/pi/gh/yggterm--<lane>/target/release/yggterm-headless server daemon` |
-| **22:31:42** | **seven agent CLIs write their last transcript byte. Byte-identical mtimes, to the second.** |
-| 22:31:49 | a second daemon starts, this one the installed `~/.yggterm/bin/yggterm-headless` |
-| 22:36:33 | one row is re-resumed by hand (`server remote resume-cc <uuid> --require-existing`) and survives |
+```
+22:30:59  pid A  hot_update_handoff_prepared   → 3.0.148, the INSTALLED binary
+22:31:04  pid A  spawned_daemon_exit             child signal 15 (SIGTERM)
+22:31:16  pid B  pty_handoff_listener_bound + run_begin
+22:31:26  pid B  superseded_daemon_takeover
+22:31:40  pid A  pty_fd_handoff_sweep            "AllMoved { moved: 38 }"
+22:31:42  pid B  spawned_daemon_exit             signal 15 (SIGTERM)      ← the death second
+```
 
-⛔ **They were CUT MID-TURN, not exited.** Every dead transcript ends on a `tool_result` record —
-the agent received a tool result and was killed before it could produce the next turn. **That is
-work destroyed, not work finished.**
+⇒ **The predecessor released all 38 descriptors at :40, and the process holding them was signalled
+at :42. Both holders gone ⇒ nothing to resume from.**
 
-⛔ **The sessions are NOT recoverable.** A dead row's uuid returns **zero** occurrences from
-`server sessions`; there is nothing to resume. Peer sockets fell **33 → 8** in the same window.
+⛔ **THE DESIGN GAP, AND IT STANDS WHOEVER SENT THE SIGNAL.** `hand_off_all_runtimes` is
+all-or-nothing, and the predecessor then **exits** — exiting is the only way it can release its own
+copies of the masters. So **the predecessor releases on the successor's ACCEPTANCE, never on its
+SURVIVAL.** That is a window in which killing a young process destroys every session on the host,
+unrecoverably. **Two seconds wide here, and it needs no bug in the handover to fire.** It is
+obligation 2 of the constitution — *they never stall their work waiting for ours* — with a stopwatch
+on it.
 
-⇒ **This is exactly the guarantee `CLAUDE.md` names as the highest-value work in the project:**
-*"Other agents' sessions survive our restarts"* and *"a restart of ours must not interrupt, reset, or
-destroy what another agent is doing."* ⚠ **And the count is the same as the previously recorded
-incident — ~7 agent PTYs** — which suggests a mechanism that has not moved rather than a new one.
+**Fix directions, cheapest first:**
+1. The predecessor **lingers until the successor is observed alive for a settle interval** instead of
+   exiting on `AllMoved`. It serves nothing; it just keeps the fds.
+2. An adopting daemon **records its adopted set durably on arrival**, so a recovery spawn can
+   re-resume. ⭐ That is exactly what the manual `server remote resume-cc <uuid> --require-existing`
+   did by hand, and why one row survived.
 
-⚠⚠ **WHAT IS NOT ESTABLISHED, AND MUST NOT BE ASSUMED:** that the lane-build daemon *caused* the
-deaths. It is temporally adjacent and it is the anomaly in the sequence, but nothing here proves
-causation, and this campaign has had six causal stories collapse in a single evening. **Both daemons
-were still alive afterwards**, so this is not a simple "old daemon evicted".
+### ⚠ TWO READINGS OF THAT INCIDENT WERE WRONG, AND BOTH ARE RETRACTED HERE
+
+- ⛔ **"A daemon started from a lane build tree 80 s earlier" is NOT implicated.** That daemon was
+  **isolated** — `/proc/<pid>/environ` shows a private `YGGTERM_HOME` under a lane sandbox, so it
+  could not bind or serve the row plane at all. **It was an ordinary installed-binary handover.**
+  Temporal adjacency, nothing more, and it was filed as "the anomaly" before anyone read the environ.
+- ⛔ **"~7 PTYs again, so the mechanism has not moved" is NOT a recurring magic number.** It is
+  simply **the owned set of whichever daemon happened to be mid-handover.** Reading a repeated count
+  as a signature invented a continuity that does not exist.
+
+**Who sent the signal is NOT established.** The codebase's only process-tree terminator
+(`terminate_linux_process_tree`) is reached solely from `run_remote_terminate_agent`, scoped to one
+explicit session id, never a sibling daemon. **16 signalled spawns span 21:07 → 22:33**, so it is a
+standing external source rather than one event.
+
+⭐ **A steer for anyone running sandbox teardowns, and it is cheaper than another seven rows: match
+your teardown on your own `YGGTERM_HOME`, never on a binary path.** A loop keyed to a path can reach
+the installed daemon; a loop keyed to your own home cannot.
+
+### ⭐ ANSWERED FROM THE TRACE: IT WAS AN ORDINARY INSTALLED-BINARY HANDOVER, AND THE SUCCESSOR WAS SIGNALLED
+
+Falsifier 2 below is already settled by the real home's own trace, so nobody
+needs to run it. The lane-build daemon was **isolated** — its
+`/proc/<pid>/environ` carries a private `YGGTERM_HOME` under another lane's
+sandbox, so it could not bind or serve the row plane at all. The sequence that
+actually killed the rows is the installed binary handing over to itself:
+
+    22:30:59  pid A  hot_update_handoff_prepared   expected_version 3.0.148, installed binary
+    22:31:04  pid A  spawned_daemon_exit           child …291, signal 15 (SIGTERM), success false
+    22:31:16  pid B  pty_handoff_listener_bound + run_begin
+    22:31:26  pid B  superseded_daemon_takeover
+    22:31:40  pid A  pty_fd_handoff_sweep          outcome "AllMoved { moved: 38 }"
+    22:31:40  pid A  retiring_daemon_aliased_own_socket   3.0.146 → 3.0.148, aliased true
+    22:31:42  pid B  spawned_daemon_exit           signal 15 (SIGTERM), success false   ← THE DEATH SECOND
+
+⛔⛔ **The predecessor released all 38 descriptors at 22:31:40 and the process
+now holding them was signalled at 22:31:42.** Both holders were then gone, which
+is exactly why the uuids resolve to nothing: there is no survivor to resume from.
+⇒ The count matching the earlier incident is not a coincidence of size — **it is
+the whole owned set of whichever daemon was mid-handover.**
+
+**Who sent the signal is NOT established, and the daemon's own code is largely
+cleared.** The only process-tree terminator in the codebase
+(`terminate_linux_process_tree`, which SIGTERMs a root *and every descendant*) is
+reached solely from `run_remote_terminate_agent`, scoped to one explicit session
+id — not a sibling daemon. **16 such SIGTERM'd spawns appear between 21:07 and
+22:33**, i.e. the pattern ran for ninety minutes before the incident, so it is a
+standing external source rather than one event.
+⚠ **Declared, because this session ran kill loops in that window:** mine were
+`pkill -f` patterns matching only `…/scratchpad/sbin/…`, `…/yggterm--<lane>/…`
+and a `.old.` binary, plus an environ-matched loop that killed only processes
+naming this session's own sandbox. **None can match
+`~/.yggterm/bin/yggterm-headless`**, and nine of the sixteen SIGTERMs predate the
+first of them. Not mine — but stated rather than omitted, because a broad
+`pkill -f` on a shared host is precisely the shape that would do this.
+
+### ⛔⛔ AND THE DESIGN GAP IS REAL WHOEVER SENT THE SIGNAL: THE HANDOVER HAS NO CONFIRMATION STEP
+
+`hand_off_all_runtimes` is all-or-nothing and the predecessor then **exits** —
+because exiting is the only way to release its own copies of the masters. So the
+predecessor releases on the successor's *acceptance*, never on its *survival*,
+and between "successor holds the fds" and "successor is stable" there is a window
+in which killing the successor destroys **every session on the host**,
+unrecoverably, with no process left holding anything.
+⇒ **That is obligation 2 of the constitution with a stopwatch on it**: two
+seconds wide here, and it does not require a bug in the handover to fire — only
+something else killing a young process.
+⇒ **Fix directions, cheapest first:** (a) the predecessor lingers until the
+successor has been observed alive for a settle interval rather than exiting on
+`AllMoved` — it still holds nothing it can serve, but it holds the fds; (b) an
+adopting daemon records its adopted set durably on arrival, so a recovery spawn
+can re-resume them, which is exactly what the manual
+`server remote resume-cc <uuid> --require-existing` did by hand.
+
+### ⭐ (b) IS LANDED — AND THE REASON IT WAS NEEDED IS WORSE THAN "IT HAD NOT GOT ROUND TO IT"
+
+Adoption wrote a trace event and **nothing durable**. The obvious reading is that
+the successor simply had not reached its next routine persist in the 16 s it
+lived. The real reason is structural, and it is why the rows were unrecoverable
+rather than merely stale:
+
+⛔ **The PREDECESSOR's routine persistence is muted for ever once it is
+superseded** (`superseded_routine_persist_muted` → `routine_persist_should_mute`
+returns `true` unconditionally, with no grace expiry — deliberately, so a
+retiring daemon cannot clobber the successor's state file). ⇒ during a handover
+**no process on the host will write the session state**: the one that knows the
+sessions is muted, and the one that now holds them has not ticked yet. That
+window is exactly when every runtime is in flight.
+
+**Fixed:** a daemon that adopts a runtime persists **immediately**, inside the
+same lock, before it acknowledges the handoff. The `pty_handoff_adopted` trace
+now carries `persisted`, because a row that is live but unrecorded is
+unrecoverable the moment someone signals its holder, and that is worth seeing
+before the next kill rather than after it.
+⚠ **This does not close (a).** It converts "seven sessions destroyed" into "seven
+sessions re-resumable", which is the difference the manual recovery already
+demonstrated on one row — it does not stop the window existing.
 
 **The falsifiers, in the order that costs least:**
 1. Start a daemon from a lane's `target/release` on a host with live agent rows, in a sandbox, and
@@ -7188,8 +7291,37 @@ screen carries whatever the person typed.
 ⛔ **Denied to a shadow client, and the reason is SCOPE, not read-only-ness**
 (`a_shadow_client_may_not_read_every_session_on_the_host`): a shadow is a viewer
 of ONE session, and this answers with every session the daemon owns.
-⇒ **What is left of §3, in order:** harvest real parked-at-a-question screens
-from the fleet with this verb, and only then write the recognizer against them. ⚠ The recognizer also cannot be
+⇒ **THE HARVEST WAS RUN, AND IT ARGUES AGAINST BUILDING THE RECOGNIZER YET.**
+`server gate-screen` was swept across all three hosts: **52 sessions, 51 with a
+readable screen** — the corpus that did not exist before (the old instrument gave
+205-of-225 stored summary lines rather than screen text).
+
+    esc-to-interrupt      10 / 51        blocker kinds: working 10 · recently_active 12
+    numbered-choice        2 / 51                       not_restorable 13 · none 17
+    trailing '?'           2 / 51        shows_agent_working: 10
+    permission wording     1 / 51
+
+⛔ **Zero validated parked-at-a-question screens, and the two pattern hits are
+FALSE POSITIVES.** Inspected structurally: 3 numbered lines among 11 and 36, **no
+line ending in `?`, and no selection caret on any numbered line** — ordinary
+numbered output, not a prompt. Both were also already `blocker: none`, i.e. the
+gate was not holding anything for them.
+⇒ **A recognizer written today would be validated against nothing and would fire
+on ordinary output** — precisely the asymmetric failure this entry warned about,
+where a false BLOCKED-ON-HUMAN gets a mid-turn session cold-killed.
+
+⭐ **And one structural measurement changes what a recognizer should look at:
+50 of 51 screens end MID-OUTPUT**, while 37 of 51 show a composer glyph somewhere
+in the tail. So "is the last line a prompt" is the wrong shape of question. ⇒ The
+discriminator worth testing when real samples arrive is **the selection caret on
+a choice line** — a structural mark, not a phrase — which is exactly what both
+false positives lacked. That also explains why stripping escapes for legibility
+would destroy the signal, and why `gate-screen` keeps them.
+
+⇒ **What is left of §3, in order:** keep sampling until real prompts are caught
+(a periodic harvest is cheap, bounded and risks nothing), then write the
+recognizer against the caret hypothesis. **Do not write it from invented prompt
+strings** — the corpus says the strings are not there to be guessed at. ⚠ The recognizer also cannot be
 manufactured on demand without driving a live session into a permission prompt,
 which is not something to do to another agent's row.
 
