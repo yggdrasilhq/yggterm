@@ -914,6 +914,11 @@ long enough to be reported as routine.
 *measured on the desktop host 2026-08-13, 40 s window, build identity checked in
 the same command*
 
+⚠ **The fan is NOT this entry's question and is not answered by these numbers** —
+see § *THE HOST RUNS AT 90+°C WITH 14 OF ITS 16 CORES IDLE*, which owns it. The
+heat is a TLB-shootdown storm that CPU percentage cannot see. This entry owns
+only the CPU share itself.
+
 The owner reports the fan still running. On the desktop host, on a GUI **29 min
 old** with the visible row sitting at a bare prompt:
 
@@ -1019,6 +1024,224 @@ invalidation" cannot currently be asked at all on a live GUI. **Either add a
 shell-webview eval/devtools verb, or reproduce the row count in the sandbox**
 (spawn N probe rows, watch whether the web process cost scales with N — that
 also settles the O(rows) blink question above).
+
+## ⛔⛔ [6.7] THE HOST RUNS AT 90+°C WITH 14 OF ITS 16 CORES IDLE, AND THE HEAT IS NOT CPU
+
+**Status:** OPEN
+
+*measured on the desktop host 2026-08-13 18:15–18:30, windows quoted per figure*
+
+The entry above opens with "the owner reports the fan still running" and then
+measures CPU percentage. **CPU percentage does not explain the fan, and chasing
+it cannot.** Over a 30 s window the machine was **9.96% busy — 1.59 cores of
+16** — while two independent sensors read **k10temp 93.6°C / acpitz 91.0°C**.
+Across 1,204 recorder rounds spanning 3.3 h: min 49.0°C, **mean 69.6°C, max
+97.1°C, 28 alarm rounds**, 6.6% of rounds above 85°C.
+
+### ⭐ THE HEAT IS NOT CORRELATED WITH OUR CPU AT ALL, AND THAT IS THE FINDING
+
+Temperature against concurrent whole-machine CPU, joined on 10 s buckets over
+the recorder's full span:
+
+| CPU band | n | mean temp | max temp |
+|---|---|---|---|
+| 25–50% of a core | 395 | 69.3°C | 93.6°C |
+| 50–100% | 590 | 69.4°C | 95.0°C |
+| 100–200% | 180 | 71.2°C | 97.1°C |
+
+**Pearson r = 0.071 across n=1,170.** Mean temperature moves 1.9°C across a 4×
+range of CPU, and the machine reaches 93.6°C inside its *lowest* band. **57 of
+the 80 hot rounds (>85°C) happened while the entire machine was under one core
+of load.**
+
+⇒ **No optimisation in the 0.5–2 core range can move the thermals on this host.**
+That does not retire the efficiency mandate — the CPU, memory and thread findings
+below stand on their own merits — but it does mean **the fan is not a scoreboard
+for this campaign's code work**, and treating it as one will burn sessions.
+
+### ⛔⛔ A MECHANISM THIS ENTRY ASSERTED, AND THE EXPERIMENT THAT KILLED IT
+
+**The claim, filed here earlier the same session and now withdrawn:** that the
+heat was a TLB-shootdown storm from page migration keeping cores out of C3. It
+had everything a good hypothesis has, which is exactly why it is recorded:
+
+- 78% of all interrupts were software IPIs (**CAL 12,084/s, TLB 7,831/s**)
+  against ~1,100/s for every hardware IRQ combined.
+- The arithmetic fit almost exactly: **3,858 migrations/s × 2 shootdowns each =
+  7,716 predicted vs 7,831 measured.**
+
+**The experiment:** `vm.compaction_proactiveness=0` + `vm.watermark_boost_factor=0`
+at runtime, which halts proactive compaction on demand.
+
+| | before | after |
+|---|---|---|
+| `pgmigrate_success` | 3,858/s | **0.0/s** |
+| `compact_migrate_scanned` | 1,436,800/s | **6,397/s** |
+| TLB irq/s | 7,831 | 3,602 |
+| C-state idle | 90.60% | 90.12% |
+| **k10temp** | **93.6°C** | **92.6°C** |
+
+**Migrations went to exactly zero and the temperature did not move.** Three
+lessons, each of which cost a wrong claim:
+
+1. ⛔ **The clean arithmetic fit was a coincidence of one window.** With
+   migrations at zero, TLB still ran **3,602/s** — so a second, larger shootdown
+   source was always there and the tidy 2× ratio hid it. **A ratio that fits is
+   not a mechanism that holds.**
+2. ⛔ **The TLB "improvement" is not claimable either.** Before-change windows
+   ranged **1,210–7,831/s**; 3,602 sits inside that. Only `pgmigrate=0` and the
+   225× scan drop are outside burst variance — because those are *mechanically
+   forced* by the sysctl, not inferred from a rate.
+3. ⚠ **Cores were ~90% C-state idle in BOTH arms.** A story about C-state exits
+   should have been checked against C-state residency before it was written.
+
+### ⚠ THE COUNTERS ARE BURSTY — SINGLE-WINDOW RATES PROVE NOTHING HERE
+
+Two windows minutes apart, same build, same idle machine, **no change between
+them**: TLB 7,831 → 1,210/s, migrations 3,858 → 809/s, compaction scanning
+1,436,800 → 453,916/s. **6.5× between adjacent samples.** Any before/after on
+these rates produces a confident number meaning nothing. Use a monotonic proxy
+(cumulative `pgmigrate_success` per unit of `pgalloc_normal`) or many alternating
+windows.
+
+### What actually remains as a heat candidate
+
+**`/sys/firmware/acpi/platform_profile` = `performance`** (choices: `low-power`,
+`balanced`, `performance`), with `cpufreq/boost=1` and EPP
+`balance_performance`. **`power-profiles-daemon` and `tuned` are both inactive,
+so nothing owns this setting** — it is not being re-applied by a desktop applet
+each boot. A firmware profile that raises the sustained power limit and fan curve
+is a first-order explanation for 93°C at 10% load, and it is entirely independent
+of anything this repo ships. **Owner decision**, logged in `owner-attention.md`.
+
+Also ruled out while here: the battery is **not charging** (`BAT0: Not
+charging`, running on USB-C mains), so charge heat is not it; GPU 63°C and
+nvme 60°C are unremarkable.
+
+### The compaction waste is real, but it is a separate and much smaller item
+
+Independent of the heat: `/proc/buddyinfo` zone Normal holds **2 free order-9
+blocks** (the 2 MB huge-page order) against 5,652 at order-7, and kcompactd was
+scanning 1.4M pages/s at a **100% failure rate** (`compact_stall` 4.1/s ==
+`compact_fail` 4.1/s) chasing blocks that do not exist. Stopping that removed
+genuine waste and cost nothing observable. ⛔ **But do not file it as CPU** —
+kcompactd measures **0.93% of a core**, kswapd 0.87%. It is worth stopping
+because it is pointless, not because it is expensive.
+
+⚠ Swap keeps growing regardless (`pswpout` 963/s, `pgmajfault` 1,469/s after the
+change), which is the web-process entry below and is the item with real value in
+it.
+
+## ⛔⛔ [6.7] THE WEB PROCESS'S MEMORY BOUND CANNOT HOLD, BECAUSE SWAP MAKES ITS FOOTPRINT LIE
+
+**Status:** OPEN
+
+*single-pid lifetime measurement, desktop host 2026-08-13, restart-free*
+
+`configure_linux_webkit_memory_policy` (`apps/yggterm/src/main.rs`) sets
+`YGGTERM_WEBKIT_CACHE_MODEL=web-browser` and a limit of
+`(MemTotal_MB / 8).clamp(768, 3072)` — **1,888 MB** on this 15 GB host — with
+conservative/strict thresholds at 0.75/0.90 (**1,416 / 1,699 MB**). The code
+comment states the intended contract outright: *"the bound on it is not this
+knob but the memory policy below … so caching more does not mean growing
+without end."*
+
+⛔ **That contract is not holding, and the cache model is NOT the defect.**
+`docs/optimization-pass.md` §9f settled `web-browser` deliberately — a cacheless
+model made every navigation refetch every byte. **Do not reach for that knob.**
+
+### The measurement
+
+One `WebKitWebProcess`, one pid, tracked across its own lifetime (so no restart
+straddles the samples):
+
+| age | RSS | swap | **committed** |
+|---|---|---|---|
+| 0.0 h | 516 MB | 11 MB | **526 MB** |
+| 1.0 h | 776 MB | 243 MB | **1,019 MB** |
+| 2.0 h | 604 MB | 655 MB | **1,259 MB** |
+| 2.2 h (`smaps_rollup`) | 588 MB | 931 MB | **1,519 MB** |
+
+**+733 MB in two hours, monotonic, no plateau — ~366 MB/h.**
+
+⚠ **RSS peaks at hour 1 and then FALLS while the total keeps climbing.** Watching
+RSS alone would have shown this leak *reversing*. The campaign's own rule earns
+itself again: the number that must fit in the machine is `rss + swap`.
+
+### Why the bound cannot fire
+
+At 2.2 h the process holds **1,519 MB committed — already past the 1,416 MB
+conservative threshold — and no reclaim has occurred.** Its RSS is 588 MB, 31%
+of the limit, and would have to *more than double* before a resident-based
+threshold could trip.
+
+⇒ **Empirically WebKit is not reacting to committed memory.** The loop is
+self-reinforcing and gets worse exactly when it should get better: swap pressure
+evicts the cache → RSS falls → WebKit reads more headroom → it caches more →
+more swap pressure.
+
+⚠ **Stated honestly: this is inferred from behaviour, not from reading WebKit's
+footprint implementation.** What is established is that committed memory passed
+conservative without reclaim. What is NOT established is which quantity
+WebKitGTK actually polls. **Settle it before fixing**, because the two fixes are
+different: if the metric is resident, the limit must be derived from a figure
+that includes swap (or the thresholds lowered so they trip before the kernel
+evicts); if the metric already includes swap, the bound is firing and failing,
+which is a different bug entirely.
+
+**Falsifier:** let one web process run several hours. Plateau near 1,888 MB
+committed ⇒ the bound works and this entry is wrong. Sail past it ⇒ confirmed.
+
+## ⛔ [6.7] A DEAD PTY LEAVES ITS WRITER THREAD RUNNING FOREVER
+
+**Status:** OPEN
+
+*thread census on the desktop host 2026-08-13*
+
+The live daemon carried **58 threads** against **12** on an idle daemon of the
+same build. The census names the population:
+
+| thread | live daemon | idle daemon |
+|---|---|---|
+| `pty-writer-remote…` | **22** | 1 |
+| `pty-reader-remote…` | **19** | 1 |
+| `pty-writer-local…` | 4 | 1 |
+| `pty-reader-local…` | 4 | 1 |
+
+⭐ **Readers and writers are born in pairs** — `spawn_terminal_writer_thread`
+(`crates/yggterm-server/src/terminal.rs:1653`) is called from inside the
+reader-spawning path (`terminal.rs:1947`), one of each per terminal. **So 22
+writers against 19 readers is three writers that outlived their reader**, and it
+only grows.
+
+**Root cause, from the two loops.** The reader exits on `Ok(0)` (PTY EOF). The
+writer runs `while let Ok(request) = rx.recv()`, which ends only when *every*
+`SyncSender` clone has dropped. The reader holds `reader_writer_tx`, a clone,
+which drops at EOF — but the original `writer_tx` is returned to the caller and
+retained by the terminal entry. **A PTY that dies while its entry survives leaks
+its writer thread permanently**, blocked on a channel nothing will ever send to.
+
+### It is not free, and it is the "hot loop proportional to accumulated state"
+
+Same daemon, own lifetime:
+
+| age | threads | CPU |
+|---|---|---|
+| 1.6 h | 35 | 5.7% |
+| 3.0 h | 40 | 6.4% |
+| 4.5 h | **59** | **9.8%** |
+
+Memory flat at ~67 MB; **+28 threads in 3 h with CPU up 2.4× against it.** The
+campaign memory predicted this shape — *a hot loop whose iteration count is
+proportional to accumulated state* — and the accumulating population now has a
+name. The GUI shows the same family: **threads 63 → 76 in 2 h** with memory
+flat, including **29 `tokio-rt-worker`** where one multi-thread runtime on a
+16-core host would spawn 16.
+
+⚠ **Suspected, NOT proven:** that the retained entry is the same orphaned-key
+family as the 6.1 restore bug — a close that resolves to a key nothing holds
+removes nothing and leaves the entry behind. **Check whether leaked writers
+correlate with orphaned session keys before fixing either.**
 
 ## ⛔ [6.7] THE WEB-CONTEXT SHARING INSTRUMENT IS BLIND TO THE CASE IT EXISTS TO CATCH
 

@@ -39,6 +39,24 @@ copies.
   *Meanwhile:* the relay is fixing the half that is ours — the ~481,000 clock
   syscalls per second — which is the real defect either way.
 
+- **The desktop host sits at 90+°C while 90% idle, and the cause is host
+  configuration rather than anything this repo ships — two settings are his to
+  rule on.** Temperature there is uncorrelated with our CPU (**Pearson r=0.071,
+  n=1,170**; 57 of 80 hot rounds happened under one core of load), so no code
+  optimisation can move it. **(a) `/sys/firmware/acpi/platform_profile` is
+  `performance`** with `power-profiles-daemon` and `tuned` both inactive, so
+  nothing owns the setting — **recommendation: `balanced`**, which is the single
+  most likely fix for the audible fan. **(b) `vm.watermark_boost_factor=0` +
+  `vm.compaction_proactiveness=0`** — **recommendation: keep**, but on the honest
+  grounds that they stop pointless work (kcompactd scanning 1.4M pages/s at a
+  100% failure rate), **not** because they cool the machine: applied at runtime
+  they drove page migration to exactly zero and temperature did not move.
+  → `docs/pending-bugs.md` § *THE HOST RUNS AT 90+°C WITH 14 OF ITS 16 CORES
+  IDLE*, which records the falsified mechanism in full.
+  *Meanwhile:* the relay is on the half that is genuinely ours and is not about
+  heat at all — ~366 MB/h of web-process growth whose bound cannot fire, and a
+  daemon leaking a thread per dead PTY.
+
 - **The response-layer rule, or five separate patches?** — five verbs report the
   request rather than the effect, and he framed the fix's SHAPE as the open
   question. → yggterm `docs/pending-bugs.md` § *FIVE VERBS REPORT THE REQUEST,
