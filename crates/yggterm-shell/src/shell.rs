@@ -610,6 +610,35 @@ const INPUT_GATE_STUCK_INFLIGHT_RESTORE_AFTER_MS: u64 = 45_000;
 // How long the gate may refuse a row we CANNOT prove live before we say so in
 // telemetry. Reported once per stuck episode, not once per tick.
 const INPUT_GATE_STUCK_REPORT_AFTER_MS: u64 = 15_000;
+// ⛔ THE LAST RESORT, AND THE REASON IT HAD TO EXIST.
+//
+// Reporting was the whole of the unprovable branch: it said
+// `input_gate_stuck_unrestorable` once and then returned, so every later tick
+// took the same branch and returned again. **There was no path out of it.** The
+// restore arm below — the escape hatch — sits past a test the stuck row cannot
+// pass, so the hatch could never fire for precisely the rows that were stuck.
+// Measured on the desktop host: 11 episodes across **8 distinct sessions**,
+// refused for up to **160 s**, every one of them with an attach in flight.
+// Owner-reported as "once in a while a session stops responding to inputs …
+// one of the worst annoyances".
+//
+// ⚠ WHAT MAKES IT SAFE TO OPEN THE GATE HERE. The reusability test is a
+// conjunction of three things, and they are not of equal standing:
+// `host_id.is_some()` and `daemon_owns_session_runtime()` are FACTS about the
+// world — a surface exists and the daemon holds a live PTY for it right now —
+// while `was_ever_ready()` is this CLIENT's memory of having seen a transition.
+// A client that missed it (restart, remount, a re-resume that never announced
+// ready) has no live PTY to protect, only its own amnesia, and condemning the
+// row for that is what the owner experiences as the bug. So past this deadline
+// the two facts are enough and the memory is not required.
+//
+// ⛔ It still refuses when the daemon does NOT own the runtime: there is no PTY
+// to receive the keystrokes, and opening the gate would swallow them silently —
+// worse than refusing. Those rows need a re-attach, not a gate.
+//
+// Set beyond INPUT_GATE_STUCK_INFLIGHT_RESTORE_AFTER_MS on purpose: a PROVEN
+// live surface gets its keyboard back sooner than an unproven one.
+const INPUT_GATE_STUCK_UNPROVEN_RESTORE_AFTER_MS: u64 = 60_000;
 // How often the deadline looks. Fast enough that the worst case stays inside
 // "a beat", cheap enough to be free: the tick reads three sets and returns.
 const INPUT_GATE_DEADLINE_TICK_MS: u64 = 1_000;
@@ -27723,6 +27752,35 @@ impl ShellState {
                             .contains(&session_path),
                     }),
                 );
+            }
+            // ⛔ THE BRANCH USED TO END HERE, AND THAT WAS THE BUG. Reporting is
+            // not recovering: the report fires once, and every subsequent tick
+            // fell through to this same `return None`, so a row that could not
+            // prove itself live stayed untypeable for the rest of its life.
+            // See INPUT_GATE_STUCK_UNPROVEN_RESTORE_AFTER_MS for why the two
+            // FACTS below are enough without this client's memory of `ready`.
+            if denied_for_ms >= INPUT_GATE_STUCK_UNPROVEN_RESTORE_AFTER_MS
+                && self.terminal_session_host_id(&session_path).is_some()
+                && self.daemon_owns_session_runtime(&session_path)
+            {
+                let cleared_attach = self.terminal_attach_in_flight.remove(&session_path);
+                self.terminal_resume_ready_paths
+                    .insert(session_path.clone());
+                self.input_gate_denied_since_ms.remove(&session_path);
+                self.input_gate_stuck_reported.remove(&session_path);
+                self.record_terminal_io_telemetry(
+                    "input_gate_deadline_restored_unproven",
+                    "warn",
+                    &session_path,
+                    "the gate refused a row it could not prove ready past the last-resort deadline; the daemon owns a live PTY for a mounted host, so readiness was restored without this client's ready-memory",
+                    json!({
+                        "session_path": session_path.clone(),
+                        "denied_for_ms": denied_for_ms,
+                        "deadline_ms": INPUT_GATE_STUCK_UNPROVEN_RESTORE_AFTER_MS,
+                        "cleared_stale_attach_in_flight": cleared_attach,
+                    }),
+                );
+                return Some(session_path);
             }
             return None;
         }
@@ -168192,6 +168250,84 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "a session already being refused must keep ticking — skipping it here \
              would strand the surface the escape hatch exists to restore"
         );
+    }
+
+    /// The owner's "once in a while a session stops responding to inputs".
+    /// A row the client cannot prove ready used to be refused FOREVER: the
+    /// unprovable branch reported once and returned, and every later tick
+    /// returned again, so the escape hatch below it could never fire for the
+    /// rows that were actually stuck. Measured live: 11 episodes, 8 sessions,
+    /// refused up to 160 s.
+    #[test]
+    fn a_row_that_never_proved_ready_still_gets_its_keyboard_back() {
+        let session_path = "remote-cc://dev/gate-test-unproven-but-live";
+        let mut shell = shell_with_a_live_host_behind_a_shut_gate(session_path);
+        // The client's memory of `ready` is what is missing — not the PTY.
+        shell.terminal_sessions_reached_ready.remove(session_path);
+        shell.terminal_attach_in_flight.insert(session_path.to_string());
+        let now = 900_000_u64;
+
+        assert!(
+            !shell.terminal_session_host_reusable_for_reveal(session_path),
+            "scaffold must reproduce the unprovable row the old branch gave up on"
+        );
+        assert!(
+            shell.daemon_owns_session_runtime(session_path),
+            "the PTY must still be live — that is what makes restoring safe"
+        );
+
+        // Before the last-resort deadline the gate keeps refusing.
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(Some(session_path.to_string()), now),
+            None
+        );
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(
+                Some(session_path.to_string()),
+                now + INPUT_GATE_STUCK_UNPROVEN_RESTORE_AFTER_MS - 1
+            ),
+            None,
+            "one millisecond short of the last resort is still the gate's business"
+        );
+
+        // Past it, the row gets its keyboard back and the stale marker goes.
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(
+                Some(session_path.to_string()),
+                now + INPUT_GATE_STUCK_UNPROVEN_RESTORE_AFTER_MS
+            ),
+            Some(session_path.to_string()),
+            "a mounted host whose PTY the daemon owns must not stay untypeable forever"
+        );
+        assert!(shell.terminal_resume_ready_paths.contains(session_path));
+        assert!(!shell.terminal_attach_in_flight.contains(session_path));
+    }
+
+    /// ⛔ The half that must NOT become permissive. With no PTY behind it the
+    /// keystrokes would go nowhere, and a gate that swallows input silently is
+    /// worse than one that refuses it visibly.
+    #[test]
+    fn an_unproven_row_with_no_live_pty_is_still_refused() {
+        let session_path = "remote-cc://dev/gate-test-unproven-and-dead";
+        let mut shell = shell_with_a_live_host_behind_a_shut_gate(session_path);
+        shell.terminal_sessions_reached_ready.remove(session_path);
+        // A runtime status that does NOT list this session ⇒ the daemon owns no
+        // PTY for it. (With no snapshot at all the code deliberately assumes
+        // ownership, so the test must install one to exercise this arm.)
+        shell.latest_runtime_status = Some(runtime_status_for_test("3.0.121", 0, 12345));
+        assert!(
+            !shell.daemon_owns_session_runtime(session_path),
+            "scaffold must reproduce a row with no live PTY behind it"
+        );
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(
+                Some(session_path.to_string()),
+                900_000 + INPUT_GATE_STUCK_UNPROVEN_RESTORE_AFTER_MS * 4
+            ),
+            None,
+            "no PTY means the keystrokes have nowhere to go — keep refusing"
+        );
+        assert!(!shell.terminal_resume_ready_paths.contains(session_path));
     }
 
     #[test]
