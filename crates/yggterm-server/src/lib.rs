@@ -24738,6 +24738,39 @@ pub fn run_app_control_probe_terminal_viewport_input(
     Ok(())
 }
 
+/// Type into the shell's own chrome — see [`AppControlCommand::ProbeChromeInput`].
+///
+/// ⚠ There is deliberately no X11 synthetic-keyboard arm here, unlike the
+/// terminal probe. A chrome field is reached by selector, and a synthetic key
+/// press goes wherever focus happens to be — which on this surface is usually
+/// the terminal. A probe that types into a different widget than the one it
+/// names is worse than no probe.
+pub fn run_app_control_probe_chrome_input(
+    selector: &str,
+    data: &str,
+    clear: bool,
+    press_enter: bool,
+    assert_selector: Option<&str>,
+    assert_attribute: Option<&str>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::ProbeChromeInput {
+            selector: selector.to_string(),
+            data: data.to_string(),
+            clear,
+            press_enter,
+            assert_selector: assert_selector.map(ToOwned::to_owned),
+            assert_attribute: assert_attribute.map(ToOwned::to_owned),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_scroll_terminal_viewport(
     session_path: &str,
     to: &str,

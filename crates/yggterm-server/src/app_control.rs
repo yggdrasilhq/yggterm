@@ -1025,6 +1025,41 @@ pub enum AppControlCommand {
     ProbeTerminalContextMenu {
         session_path: String,
     },
+    /// Type into one of the SHELL'S OWN chrome fields — the start page search
+    /// box, a rename box, any Dioxus-rendered `input`/`textarea` — and sample
+    /// the assertion in the SAME evaluation.
+    ///
+    /// ⛔ **Nothing else on this surface could reach a chrome field, and the
+    /// gap was not cosmetic.** `ProbeTerminalViewportInput` types into a PTY,
+    /// the web/wpe verbs drive a CONTRIBUTED app's page, and a pointer command
+    /// reaches a coordinate. So a chrome affordance could be proven to RENDER
+    /// and never proven to WORK — which is exactly the state the start page's
+    /// search box shipped in.
+    ///
+    /// **The value is written through the native property setter, not
+    /// `el.value = …`.** A framework-controlled input is patched by the
+    /// interpreter, and assigning the property directly can be swallowed
+    /// without the framework ever hearing about it; the setter plus a bubbling
+    /// `input` event is what a real keystroke looks like from the listener's
+    /// side.
+    ///
+    /// `assert_selector`/`assert_attribute` are read once before the keystroke
+    /// and again after the render settles, inside one script. ⚠ Two reads taken
+    /// at two different MOMENTS cannot prove a field drove a re-render — the
+    /// difference between them may be time rather than the typing.
+    ProbeChromeInput {
+        selector: String,
+        data: String,
+        /// Replace the field's contents rather than appending to them.
+        #[serde(default)]
+        clear: bool,
+        #[serde(default)]
+        press_enter: bool,
+        #[serde(default)]
+        assert_selector: Option<String>,
+        #[serde(default)]
+        assert_attribute: Option<String>,
+    },
     RemoveSession {
         session_path: String,
     },
@@ -1622,6 +1657,7 @@ impl AppControlCommand {
                 "probe_terminal_primary_selection_paste"
             }
             Self::ProbeTerminalContextMenu { .. } => "probe_terminal_context_menu",
+            Self::ProbeChromeInput { .. } => "probe_chrome_input",
             Self::RemoveSession { .. } => "remove_session",
             Self::RenameSession { .. } => "rename_session",
             Self::RestartSession { .. } => "restart_session",

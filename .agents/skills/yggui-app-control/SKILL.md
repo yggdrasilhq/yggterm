@@ -1223,6 +1223,44 @@ monitor as a production end-user test (e.g. "I give you access to my erome syste
 and samplenotes sessions"). Only drive sessions the user has explicitly granted in the
 current conversation.
 
+### ⭐ TYPING INTO THE SHELL'S OWN CHROME — `server app chrome type` (3.0.116)
+
+**None of the typing verbs above can reach a field the SHELL renders.**
+`terminal probe-type` and `terminal send` target a PTY, `web`/`wpe` drive a
+CONTRIBUTED app's page, and `pointer`/`click` reach a coordinate. So a chrome
+affordance — the start page search box, a rename field — could be proven to
+RENDER and never proven to WORK, which is the state the start page's search box
+shipped in.
+
+```bash
+LIVE_HOST=$(cat .agents/config/live-host)
+GUI=$(ssh "$LIVE_HOST" 'pgrep -x yggterm | head -1')
+ssh "$LIVE_HOST" "~/.local/bin/yggterm-headless server app chrome type \
+  '[data-yggterm-start-page-search]' --data 'cooker' --clear \
+  --assert '[data-yggterm-start-page-recent-count]'@data-yggterm-start-page-recent-count \
+  --pid $GUI"
+```
+
+- Name the field **by its stamp**, not by tag or position.
+- `--clear` replaces the contents; without it the text is appended.
+- `--assert <selector>@<attribute>` reads the attribute **before** the keystroke
+  and again after the render settles, **in the same evaluation**, and reports
+  `assert_before`, `assert_after`, `assert_changed`, `settle_frames`. ⚠ Two
+  reads taken at two different MOMENTS cannot prove a field drove a re-render —
+  the difference between them may be time rather than the typing. That is the
+  same trap that once made a row `label` look like it lied about the sidebar.
+- ⛔ **`accepted:true` is not the result.** Read `value_before` / `value_after`:
+  a field that took the write but did not change is a field that REFUSED the
+  input. And `assert_changed:false` with `settle_frames:90` means it gave up
+  waiting, not that the value is stable.
+- The write goes through the **native value setter** plus a bubbling `input`
+  event, because a framework-controlled input can swallow a plain
+  `el.value = …` before any listener hears it.
+- There is deliberately **no synthetic-keyboard fallback**: a real key press
+  goes wherever focus is, which on this surface is usually the terminal, and a
+  probe that types into a different widget than the one it names is worse than
+  no probe.
+
 **Use `terminal send`, NOT `terminal probe-type`, to drive a session.** They are
 different tools:
 - **`server app terminal send <S> --data 'X'`** (or `--stdin`) is the DRIVER. It writes

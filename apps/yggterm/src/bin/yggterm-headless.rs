@@ -34,7 +34,7 @@ use yggterm_server::{
     run_app_control_move_window_by,
     run_app_control_launch_app, run_app_control_open_path, run_app_control_paste_terminal_clipboard,
     run_app_control_paste_terminal_clipboard_image, run_app_control_pointer,
-    run_app_control_probe_terminal_context_menu,
+    run_app_control_probe_chrome_input, run_app_control_probe_terminal_context_menu,
     run_app_control_probe_terminal_primary_selection_paste,
     run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
     run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
@@ -260,6 +260,18 @@ fn print_server_app_help() {
     what the widget would carry: a row id for a row_action, a tab id
     for tabs, absent for a plain button
   yggterm-headless server app update <check|restart>
+  yggterm-headless server app chrome type <selector> --data <text> [--clear] [--enter]
+      [--assert <selector>@<attribute>]
+    types into the SHELL'S OWN chrome — the start page search box, a rename
+    field — which no other verb can reach: probe-type targets a PTY, web/wpe
+    drive a contributed app's page, and pointer/click reach a coordinate. Name
+    the field by its stamp (`'[data-yggterm-start-page-search]'`).
+    --assert reads an attribute BEFORE the keystroke and again after the render
+    settles, in the SAME evaluation, and reports `assert_changed`. ⚠ Two reads
+    taken at two different moments cannot prove the field drove a re-render —
+    the difference between them may be time rather than the typing. The reply
+    also carries value_before/value_after: `accepted:true` with the value
+    unchanged is a field that REFUSED the input, not a success.
   yggterm-headless server app terminal <new|send|input-check|focus|probe-type|probe-scroll|probe-select|probe-context-menu> ...
   yggterm-headless server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|codex|claude-code>] [--title <title>] [--purpose <what-for>] [--no-activate]
       [--outline <prefix> | --insert-after <session-path>]
@@ -3053,6 +3065,61 @@ fn main() -> Result<()> {
                         run_app_control_probe_terminal_context_menu(session_path, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app terminal action: {other}"),
+                }
+            }
+            "chrome" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing action for server app chrome"))?;
+                match action {
+                    "type" => {
+                        let selector = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing selector for server app chrome type — name the \
+                                     field by its stamp, e.g. '[data-yggterm-start-page-search]'"
+                                )
+                            })?;
+                        let flag_value = |name: &str| {
+                            args.windows(2).find_map(|window| {
+                                (window[0] == name).then(|| window[1].clone())
+                            })
+                        };
+                        let data = flag_value("--data").ok_or_else(|| {
+                            anyhow::anyhow!("missing --data for server app chrome type")
+                        })?;
+                        let clear = args.iter().any(|arg| arg == "--clear");
+                        let press_enter = args.iter().any(|arg| arg == "--enter");
+                        // `--assert <selector>@<attribute>`: the pair that turns
+                        // "the keystroke landed in the box" into "the keystroke
+                        // changed what the surface renders".
+                        let assert = flag_value("--assert");
+                        let (assert_selector, assert_attribute) = match assert.as_deref() {
+                            Some(spec) => match spec.rsplit_once('@') {
+                                Some((selector, attribute)) => (
+                                    Some(selector.to_string()),
+                                    Some(attribute.to_string()),
+                                ),
+                                None => anyhow::bail!(
+                                    "--assert wants <selector>@<attribute>, got {spec:?}"
+                                ),
+                            },
+                            None => (None, None),
+                        };
+                        run_app_control_probe_chrome_input(
+                            &selector,
+                            &data,
+                            clear,
+                            press_enter,
+                            assert_selector.as_deref(),
+                            assert_attribute.as_deref(),
+                            timeout_ms,
+                        )
+                    }
+                    other => anyhow::bail!("unsupported app chrome action: {other}"),
                 }
             }
             "session" => {
