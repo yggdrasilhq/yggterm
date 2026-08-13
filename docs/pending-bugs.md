@@ -59,35 +59,41 @@ still unrun.**
 **Fix:** honour `--machine-key` for every kind, or refuse the combination by name. ⛔ Do not let it
 keep succeeding quietly — a refusal costs a retry, a silent downgrade costs a wrong conclusion.
 
-## ⛔ THE PRIVACY GUARD MATCHES SHORT TERMS INSIDE UNRELATED IDENTIFIERS, AND REFUSES A PUSH EVERY TIME
+## ⚠ NOTHING CALLS `sync-terms`, SO THE PRIVACY GUARD'S WORDLIST CAN DRIFT AGAIN BETWEEN RUNS
 
 **Status:** OPEN
 
-*Surfaced 2026-08-13 while cry-wolf-testing an unrelated guard change. Filed here because the only
-other record of it is a runbook with a stated expiry three days out.*
+*Opened 2026-08-13 as the residue of a fixed defect: the drift itself was measured, repaired and
+made self-reporting, but only a hand-typed verb reconciles it.*
 
-The term check is a **case-insensitive substring** match, so a short alphabetic term matches inside
-an ordinary identifier that has nothing to do with it. A common `use` statement in one repo trips
-it and the push is refused **every time, deterministically**.
+The pre-push privacy guard is a fleet-synced binary whose **answer key is not synced with it** — the
+wordlist deliberately lives outside every repo, so no repo sync carries it and the binary sync does
+not know it exists. It had silently diverged: one host held the full list, the others a strict
+subset three days stale, so a set of names was unguarded on most of the fleet while every scan there
+printed a green tick.
 
-⛔ **WHY THIS IS URGENT OUT OF PROPORTION TO ITS SIZE.** A guard that refuses a push a developer
-knows is clean, on every attempt, teaches exactly one lesson: reach for the override. And the
-override suppresses the **entire** scan. ⇒ A permanent false positive is not a nuisance; it is a
-pipeline that manufactures the habit a real leak ships on. It is the same defect as a refusal that
-scans a dead lineage — both spend the guard's credibility until nobody reads it.
+**What already shipped** (so this entry is only about the residue): the list is reconciled and
+identical everywhere; every scan now prints a wordlist **fingerprint** beside the count, so two
+hosts are comparable at a glance and a same-size-but-different list is still visible; a missing or
+empty wordlist is now a **refusal** rather than a warning followed by a tick; and the chore is a
+verb, `sync-terms`, which merges by **union** and reads every host back.
 
-**Fix:** require a word boundary for short alphabetic terms.
+**What is open:** nothing invokes that verb. Between manual runs the lists can diverge again, and
+the fingerprint only reveals it to someone who compares two terminals. ⇒ Wire it into whatever
+already reconciles per-host tooling across the fleet, so the reconciliation happens on the same
+schedule as everything else.
 
-⚠ **AND THE REASON IT WAS NOT DONE WHEN IT WAS FOUND, which is a judgement worth preserving:**
-changing term-matching semantics **risks introducing a false NEGATIVE, which is strictly worse than
-a noisy false positive**. It was found at the very end of a context budget and deliberately left
-rather than rushed. ⇒ **Do not take this one in a hurry, and land it with both controls in the same
-run: a known-private string must still refuse, and the innocent identifier must pass.**
+⛔ **The trap to preserve for whoever wires it up: the merge must stay a UNION.** Newest-mtime-wins
+is correct for a binary and catastrophic for a wordlist — it lets a host whose file is merely newer
+(touched, restored from an old backup, written by a session that never had the full list) delete
+terms everywhere, which is exactly the failure the guard exists to prevent, arriving dressed as a
+successful sync. A union cannot lose a term; deliberate removal is a separate explicit flag.
 
-⭐ **The generalisation, third sighting of the shape in one evening:** the guard's substitution-side
-law and its detection-side law are one law seen from two ends — *a replacement must be legal in
-every syntactic position the original occupies*, and *identity does not live only in whole tokens*.
-Both are the mismatch between a flat term list and the syntax a term actually sits in.
+⭐ **And the general law this is an instance of, which is why it was worth the detour:** *a verifier
+reports CLEAN for a term it does not have for exactly the same reason it reports CLEAN for a term
+that is genuinely absent.* Printing the count was already there and was not enough, because nobody
+compares a number on one terminal against a number on another. An absence has to describe its own
+boundary in a form that is **comparable**, not merely present.
 
 ## ⛔⛔ [6.1] SOME ROWS WILL NOT RESTORE, AND A RESTART DOES NOT RECOVER THEM
 
