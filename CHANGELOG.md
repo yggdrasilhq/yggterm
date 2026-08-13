@@ -5,7 +5,7 @@ This file tracks user-visible changes in `yggterm`.
 ## Unreleased
 
 - **An agent row keeps the purpose it was created with, whatever letter that
-  purpose happens to end on (3.0.119).** Three rows were created in one command
+  purpose happens to end on (3.0.120).** Three rows were created in one command
   with `--purpose`; two rendered their purpose and one did not, and the daemon's
   own tenancy record held the missing purpose all along. It looked like an
   ordering defect — the row that lost it was the first of the batch — and it was
