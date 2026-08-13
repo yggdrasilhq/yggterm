@@ -1475,6 +1475,55 @@ verb.**
   That is how a reaped row came back holding a live agent into a worktree its own
   successor was editing.
 
+### ⭐⭐ ORCHESTRATION IS RECURSIVE — any relay may become an orchestrator of its own `N.x.y`
+
+**A cluster is not a leaf.** When a row's scope decomposes into units that are
+themselves too big to do serially, that row **decides for itself** to orchestrate,
+and seats its sub-units beneath it:
+
+```
+        1.0    audit: route the vendor list               ← orchestrator
+        1.1.0  vendor alpha: due diligence                ← orchestrator AND relay
+        1.1.1  vendor alpha: contract completeness
+        1.1.2  vendor alpha: provenance of each document
+        1.2.0  vendor beta: due diligence
+        1.2.1  vendor beta: contract completeness
+```
+
+⇒ **The role is a hat, not a rank.** `1.1.0` is a delegate to `1.0` and an
+orchestrator to `1.1.x` at the same time, and nothing about that is special-cased:
+it claims its seat, subscribes to the monitor, escalates upward, and supervises
+downward, all with the verbs already in this file.
+
+**The case that produced the design** is a due-diligence agent *per case*, under an
+orchestrator routing *many cases*. Recon work has this shape almost always: the
+top knows the list, only the bottom knows whether one item is finished.
+
+**Four rules make the recursion safe.** They are the only things that change:
+
+1. ⭐ **A row decides its OWN depth. It never assigns depth downward.** An
+   orchestrator hands out *scope*, and the receiving row decides whether that scope
+   needs sub-units. Deciding for it produces sub-rows nobody owns.
+2. ⛔ **ESCALATE EXACTLY ONE LEVEL.** `1.1.2` escalates to `1.1.0`, never to `1.0`.
+   Skipping a level hands the top a decision it lacks the context to make and
+   silently strips the middle of its job. Each row's `--escalate-to` is its
+   **immediate** parent — set it that way at subscribe time and never edit it to
+   reach higher.
+3. ⛔ **THE CONFIRM GATE IS THE ROOT'S ALONE, AND IT COVERS THE WHOLE TREE.** Launch
+   width is the human's decision, and a sub-orchestrator fanning out four sub-units
+   has widened the tree exactly as much as the root doing it. ⇒ **A row intending to
+   orchestrate says so upward and gets the width confirmed before it fans out.**
+   Recursion multiplies burn; that is the whole reason the gate exists.
+4. ⭐ **A parent reaps its own children, and only its own.** When `1.1.0` finishes,
+   it retires `1.1.x` before standing down — nobody above it knows those rows
+   existed. ⛔ An orphaned sub-tree is the worst failure available here: rows with
+   no supervisor, escalating to a UUID that no longer answers.
+
+⚠ **Depth is not free and it is not a status symbol.** Two levels is a fleet; three
+is a rare, genuinely wide problem. **If a row cannot name why serial execution
+fails, it should not orchestrate** — it should just do the work, and the sidebar
+stays readable.
+
 ### ⛔⛔ THE ORCHESTRATION SYSTEM IS THE ORCHESTRATOR'S OWN WORK — mend it as you run it
 
 **You are not a dispatcher. You are the lead of your category, and systemic
