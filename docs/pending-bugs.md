@@ -1474,6 +1474,83 @@ alone would have proven nothing.
 ⇒ Collapse the two onto one dispatcher. Until then a new verb must be added to
 both, and the headless copy carries a comment saying so.
 
+## ⭐ THE RENDERER'S LOAD-BEARING FEATURE IS BARE-NAME LINK RESOLUTION — measured, not argued
+
+**Status:** OPEN
+
+*Measured 2026-08-13 by seat 6.8 against a collection in daily use. Structure and
+shapes were counted; no note bodies were read and no targets recorded.*
+
+Filed here because **there is no live row for the renderer**, so a finding aimed
+at "whoever owns it" routes to nobody. This survives until someone opens that
+door.
+
+The link syntaxes a real markdown collection actually uses, as a share of link
+volume:
+
+| shape | share |
+|---|---|
+| **bare `[[name]]`** | **~98%** |
+| pathed `[[folder/name]]` | ~1.8% |
+| aliased `[[name\|label]]` | ~0.3% |
+| heading `[[name#heading]]` | **0 — not once, in thousands of links** |
+| embed `![[name]]` | 3 in total |
+
+⇒ **A renderer that cannot resolve a bare name across a whole collection is
+useless for this corpus; one that lacks aliases and heading-links loses under
+half a percent.** That is a priority ordering derived from use rather than from
+taste, and it inverts the order these features would naturally be built in —
+heading-links and aliases *look* like core wiki-link functionality and are
+respectively never and almost never used.
+
+⚠ **One number must not be over-read.** Cross-collection embedding was the origin
+story of the flatten decision, and the embed count is 3. That is consistent with
+*the old containment made it impractical* and equally consistent with *nobody
+wanted it*. **The count does not distinguish them**, and it should not be quoted
+as if it did.
+
+**Falsifier:** count the same shapes on a second independent collection. If bare
+names are not dominant there, this is one corpus's habit rather than a property
+of the format, and the priority does not transfer.
+
+## ⛔ A CLEAN MERGE PRODUCED A SELF-CONTRADICTING DOCUMENT
+
+**Status:** OPEN
+
+*Hit 2026-08-13 by seat 6.8, landing five lane commits onto a queue 62 commits
+ahead.*
+
+Merging main into a lane that had edited **the same region of this file five
+times** completed with **no conflicts, no markers and no warning** — and
+silently duplicated a 41-line block, keeping both a superseded paragraph and the
+text that replaced it. The entry then said *"the private side is done"* in one
+place and *"Next: the private side"* forty lines later.
+
+**Every gate passed on the corrupted text.** `check-docs-ssot.sh` reported ok;
+the heading count was exactly what it should be (+1 for the one new entry); no
+other lane's entry was harmed. The duplication was invisible to every automatic
+check because **duplicating a block breaks no rule any of them enforce.**
+
+⇒ This is the merge counterpart of a known law here: *a tool reporting success
+is not the same as the content being right.* A merge resolves TEXT, and a
+document whose sections are semantically ordered — supersession, "next steps",
+status lines — can be textually merged into nonsense.
+
+**What caught it:** reading the merged entry, then a script that hashed every
+paragraph over 80 characters and counted repeats. That check found seven
+duplicated paragraphs in one entry and, once fixed, zero across the whole file.
+
+⭐ **Cheap enough to be a gate.** A duplicate-paragraph check over this file
+costs nothing and would have failed the merge — worth adding to
+`check-docs-ssot.sh`, which already owns the question *is this file internally
+sound*. Not added here because that script is the docs law's SSOT and changing
+it belongs with whoever owns that law, not with the lane that tripped over it.
+
+⚠ ALSO: the first probe that looked like a lost section was a **case-sensitive
+grep miss** — the text was there, capitalised. Do not conclude loss from a
+failed search until the search itself is controlled; that is the entry below,
+arriving during the fix for this one.
+
 ## ⛔ A READER THAT FINDS NOTHING LOOKS EXACTLY LIKE A THING THAT HAS NOTHING
 
 **Status:** OPEN
@@ -1817,47 +1894,6 @@ and the count the writer sees change.
 
 ⛔ **Still not claimed: the document BODY**, for the reason in the entry above.
 The rail is what the available instrument can prove, and it is what is claimed.
-
-### Progress, 2026-08-13 — the engine, and what its proof does and does not cover
-
-**Done, and pushed to the app repo.** A single binary; a corpus manifest that
-carries every corpus's vocabulary; two fixture corpora invented end to end with
-no collection id in common; 32 tests. The scope's build order is at step 5.
-
-**The falsifier's first half is met, twice over.** One binary, checked by hash,
-renders both fixtures from their manifests alone — and the test that asserts it
-fails loudly if the two fixtures ever grow a shared collection id, because then
-it would prove nothing. The second half is met with both controls: the app
-repo's privacy checker reports clean, reports DIRTY on a planted leak, and
-reports clean again once the plant is removed.
-
-⚠ **The checker was reporting clean for the wrong reason until this session.**
-It scans untracked files deliberately, and the repo had no `.gitignore` because
-it had no code — so the first build buried every real finding under hundreds of
-dependency paths, which is the "cries wolf, gets switched off" failure its own
-comments warn about. Fixed there; worth knowing wherever else that checker is
-ported, because the defect arrives with the first line of code and not before.
-
-**Live-proven on the GUI host** — built there from the pushed commit, run in a
-backgrounded session, opened on a shadow so no operator viewport moved:
-
-- the app declares as a contribution with both panes, one of them a viewport
-  pane, and the host reaches its control endpoint;
-- the **rail pane renders the fiction corpus** — the corpus name, an Overview
-  button, and every collection with its node count;
-- the **document bar renders and re-renders**: a route change posted straight to
-  the app's own endpoint moved the bar's headings, which proves the refetch path
-  end to end without touching the GUI at all.
-
-⛔ **NOT proven, and not claimed: the document BODY.** It rendered blank — and so
-did the shipped pilot editor's, through the identical path in the same sitting.
-That control is why this is filed as its own entry above rather than carried
-here as a kasten defect. The body remains unproven either way until someone
-captures a document surface on a real GUI.
-
-**Next:** the private side — one manifest per corpus that fits, committed in that
-corpus's own repository, never here. Four of the five; the fifth is a pipeline
-rather than a corpus and gets no node overview.
 
 ## ⛔ [6.4] `server app start-page` IS A NAVIGATION VERB SHELVED AMONG THE READ VERBS
 
