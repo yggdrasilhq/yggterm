@@ -8889,6 +8889,30 @@ field, and the owner finding the truth by looking at his screen:**
 | `terminal new --prompt-stdin` | `delivered: true` | `submitted:true, waited_ms:19802` — and the transcript never gained a user row, twice in one minute |
 | `terminal send` | `accepted: true` | bytes written; into an agent row that is one Enter PER LINE |
 
+✅ **TWO OF THE FIVE RE-TESTED AT 3.0.141 AND BOTH NOW REPORT THE EFFECT**
+(2026-08-13 sweep, on a row created for the purpose and removed after):
+
+| verb | reply | read-back |
+|---|---|---|
+| `session rename` | `accepted: true` | label reads `ygg-sweep-rename-probe` — the change is real |
+| `session remove` | `verified: true`, `live_processes: []` | row absent from the census; 6th consecutive clean sample that day |
+
+⚠ **THREE WERE NOT RE-TESTED, AND THE REASONS ARE PART OF THE RESULT.**
+`sessions reorder` rewrites the WHOLE rendered order including rows owned by
+other sessions, so it is not a probe to fire on a live sidebar;
+`terminal new --prompt-stdin` and `terminal send` need a live agent row, and the
+`terminal send` row is documented behaviour now (one Enter per line) rather than
+a false success. **Do not read the two ✅ as four.**
+
+⛔ **AND THE FIRST ATTEMPT AT THIS RE-TEST PRODUCED A FALSE RESULT, which is the
+part worth carrying.** The read-back interpolated the session path through two
+shells into a python comparison; it matched nothing, and reported
+`<row not in census>` for a row that was plainly there — a check that FAILS OPEN
+and reads exactly like a real finding. It was caught only by adding a positive
+control: *can this comparison find a row I know exists?* ⇒ **A verification
+harness needs its own positive control before its negatives mean anything**,
+which is the same rule as the entries it is verifying, one level up.
+
 ### ⛔ THE ROW PLANE WAS UNREACHABLE FROM EVERY NON-GUI HOST, AND THE REFUSAL DID NOT SAY SO
 
 Measured by a delegate, 2026-08-07: row 5.1 (on dev) tried to message row 5.2
