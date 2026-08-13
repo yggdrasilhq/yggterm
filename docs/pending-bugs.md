@@ -13747,3 +13747,55 @@ clean reproduction needs a cwd that has never hosted an agent session.
 
 **Falsifier:** a row created with a cwd that has never hosted an agent session
 reaches a composer and consumes input.
+
+## ⛔⛔ [6.1] `server attach --help` CREATES A SESSION NAMED `--help` AND SPAWNS A LIVE SHELL
+
+**Status:** OPEN
+
+*Hit on a real daemon by accident, 2026-08-14.*
+
+`attach` reads its flag as a positional session name. Asking a verb for its usage
+therefore **mutates the machine**: a session called `--help` is created and a live
+`bash -i` is spawned on the daemon. Recovery was manual — identify the pid and
+`SIGHUP` it, because **an interactive bash ignores `SIGTERM`**.
+
+⇒ A help flag is the one argument a user types when they do *not* know what the
+verb does, so it is the worst possible argument to give side effects. Same family
+as the rest of this file: **the verb answers a different question than its name
+suggests**, and here the wrong answer is durable.
+
+**Falsifier:** `server attach --help` prints usage, exits non-zero or zero without
+creating a session, and `server sessions` shows no new row afterwards.
+
+## ⛔ [6.1] SUPERSESSION CANNOT FIRE WHEN THE SOCKET PATH EXCEEDS THE SOCKADDR LIMIT
+
+**Status:** OPEN
+
+`live_newer_daemon_socket` scans `$YGGTERM_HOME` for `server-*.sock`. But
+`default_endpoint` **relocates** the socket to `/run/user/<uid>/yggterm/h-<hash>/`
+whenever the home path would exceed the **108-byte `sockaddr_un` limit**. When it
+relocates, the scan looks in a directory the socket is no longer in, finds
+nothing, and **no daemon ever retires — silently**.
+
+⚠ **Harmless on the real hosts** (`~/.yggterm` is short), which is why it has
+never been seen in production. It is not harmless for testing: it makes any
+long-path sandbox **structurally unable to exercise handover at all**, and it cost
+a full run before the cause was found. ⇒ The enumerator must ask
+`default_endpoint` where the socket IS, never assume where it would be — the same
+shape as *enumerate an alias set from the versions that EXIST, never from the
+files that happen to REMAIN*.
+
+**Falsifier:** a sandbox whose `YGGTERM_HOME` exceeds 108 bytes still supersedes a
+predecessor daemon.
+
+## ⚠ [6.1] A PTY-SPAWNING TEST MUST HOLD THE TERMINAL-IDENTITY GUARD
+
+**Status:** OPEN
+
+A test that spawns a pty reads the **process-wide** terminal-identity env, so
+without `codex_cli::env_test_guard` it makes the two identity tests in `lib.rs`
+flaky — **not itself**. Six tests did exactly this.
+
+⭐ **The tidy explanation was wrong and was killed by a control:** *"extra tests
+just perturb the schedule"* did not survive **six DECOY tests that left the suite
+green**. A flake that moves when you add unrelated tests still has a cause.
