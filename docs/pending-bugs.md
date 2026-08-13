@@ -11102,3 +11102,119 @@ the earlier investigation had nothing to count. Keep a monotonic
 - Falsifier: a subscribed row whose turn has ended and whose transcript was last
   written 5–10 minutes ago must be booted at its deferral deadline, and the log
   must show why.
+
+# THE 6.9 BATCH — found while building the phone's transport
+
+Four tooling defects, none of which blocked the phone lane, all found by using
+the CLI as an instrument rather than by reading it. Each is filed against the
+thing that owns it, not against the lane that tripped over it.
+
+## ⛔⛔ [6.9] `server status --json` IS NOT A FLAG, AND IT FAILS BY GOING QUIET
+
+**Status:** OPEN
+
+*found 2026-08-13 while measuring response weights for the phone*
+
+`server status` already emits JSON. Passing `--json` — which every neighbouring
+verb accepts (`server daemons --json`, `server gate-screen --json`,
+`server perf-summary --json`) — prints usage and leaves **stdout empty**.
+
+**Why this is worse than a plain error.** The natural way to measure a response
+is `server status --json | wc -c`. That returns `0`. A previous session did
+exactly this, got `0` for both `status` and `snapshot`, and wrote the conclusion
+into a design document as a measured fact: *"no daemon is running on the host
+this session sits on."* A daemon was running, with hundreds of sessions. The
+document then carried that as the reason a load-bearing number could not be
+obtained.
+
+⇒ **A flag a tool does not have is indistinguishable from a service that is not
+there, if the only thing you look at is the byte count.**
+
+**Fix:** accept `--json` as a no-op on the verbs that already emit JSON, *or*
+write the usage to stderr and exit non-zero. Either removes the silent-empty
+path. The first is friendlier, because the flag is guessable precisely because
+its neighbours take it.
+
+**Falsifier:** `server status --json | wc -c` returns a number greater than zero,
+or the command exits non-zero.
+
+## ⛔ [6.9] THE ROW-CLEANUP VERB IS NAMED IN THREE PLACES AND EXISTS IN NONE OF THEM
+
+**Status:** OPEN
+
+*found 2026-08-13 cleaning up a throwaway session*
+
+The documented cleanup step for a probe row is written as `session remove`. That
+is not a verb. Three separate corrections are needed before it works:
+
+1. `server session remove …` answers `unsupported server command: session`. The
+   real verb is **`server app session remove`**.
+2. It is app-control, so it only answers **on the host where the GUI runs**. ⭐
+   The error for this is genuinely good — it names the candidate hosts and the
+   exact command to identify the right one. That message is the model the rest of
+   this entry should be held to.
+3. It removes the row **from the GUI**, and the owning daemon still lists the
+   session afterwards. Ending the process took writing `exit` and then a lone
+   carriage return into the PTY.
+
+⇒ Three different questions — *what is the verb*, *where does it answer*, *what
+does it actually remove* — and the documented name answers none of them. This is
+the standing pattern: **a row verb reports the request, not the effect.**
+
+**Fix:** correct the name wherever the cleanup step is written, and say both the
+GUI-host constraint and the fact that removal is a GUI-side operation. If a
+caller wants the runtime gone, that needs to be a separate, named thing.
+
+**Falsifier:** the documented cleanup line, copied verbatim, removes a probe row
+and its runtime.
+
+## ⚠ [6.9] `server attach` DOUBLE-PREFIXES A KEY THAT ALREADY CARRIES A SCHEME
+
+**Status:** OPEN
+
+*found 2026-08-13 creating a throwaway session*
+
+Creating a session with a key of the form `local://<name>` produces a session
+whose key is `local://local://<name>`. It is then addressable only by the
+doubled form, so every later call has to repeat the mistake to work.
+
+**Fix:** strip an existing scheme, or refuse the argument. Silently concatenating
+is the one option that makes the caller carry the error forward.
+
+**Falsifier:** attaching with a scheme-qualified key yields a session listed
+under exactly that key.
+
+## ⛔⛔ [6.9] A REPOSITORY THAT HAS NEVER HOSTED AN AGENT SESSION CANNOT HOST A ROW
+
+**Status:** OPEN
+
+⚠ Root cause NOT found. The inherited explanation is wrong and is falsified
+below; do not build around it.
+
+*reported by the orchestrator 2026-08-13: three attempts to create a row with a
+cwd in one particular repository, three failures to ever consume input, against
+five contemporaneous launches into sibling worktrees that came up normally —
+same host, same verb, same model, same minute*
+
+**What is falsified.** The claim as stated — that this repository cannot host a
+row — is not about the repository and not about the agent CLI. Run directly in
+that directory, the CLI answers a prompt normally and exits zero; the identical
+control in a working worktree behaves the same. So the failure is in the
+**row-launch path**, not in the destination.
+
+**The one hard datum.** No project namespace directory existed for that cwd
+despite three launch attempts, so those launches never reached session
+initialisation at all. A row appeared; nothing behind it started.
+
+**A hypothesis tested and rejected**, recorded so it is not re-derived: the
+obvious candidate is a first-run trust gate on an unseen directory. It does not
+hold. None of the sibling worktrees that host working rows has a trust entry
+either, so the presence or absence of one does not separate the failures from
+the successes.
+
+⚠ **RE-TESTING THAT CWD IS NOW CONTAMINATED.** Probing it created the namespace
+that was previously absent, so it no longer starts from the original condition. A
+clean reproduction needs a cwd that has never hosted an agent session.
+
+**Falsifier:** a row created with a cwd that has never hosted an agent session
+reaches a composer and consumes input.
