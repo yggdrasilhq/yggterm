@@ -1404,11 +1404,62 @@ the start-page entry.
 not before: adding a tenth CLI to a surface with two text boxes for nine of them
 makes the surface worse, and adding it to the fixed surface is a config edit.
 
+## ⛔ THE SHADOW CLIENT DOES NOT PAINT A DOCUMENT SURFACE'S BODY
+
+**Status:** OPEN
+
+*Measured 2026-08-13 by seat 6.8, with a control, while trying to obey two rules
+at once.*
+
+The shadow-probe law says probe through the shadow, never the operator's GUI.
+The field guide says a visual symptom needs a faithful pixel. **For a document
+surface those two rules point at an instrument that cannot answer**: the shadow
+paints the surface's BAR and the app's RAIL pane, and leaves the BODY blank.
+
+What was measured, on one shadow, in one sitting:
+
+| surface | declared | painted on the shadow |
+|---|---|---|
+| an app's rail pane | button, section, three rows | ✅ every row, with live content |
+| the document surface's **bar** | two `section` widgets | ✅ and it re-rendered on a route change |
+| the document surface's **body** | six `list-row`, then a `markdown` | ⛔ nothing |
+| the pilot editor's document body | one multiline `text-input`, 3,625 chars | ⛔ nothing |
+
+⇒ **The control is what makes this a finding rather than a guess.** A new app
+rendering an empty body is a new app's bug until the SHIPPED pilot renders an
+equally empty body through the identical path — same shadow, same verbs, same
+minute. It did. Two independent apps, both declaring body-class widgets with
+real content, both blank; and the same shadow painting bar and rail correctly,
+which is the positive control that it can paint an app's widgets at all.
+
+**Why it misleads rather than merely limiting.** Every telemetry field agrees the
+surface is fine — `has_schema: true`, `stale: false`, `error: null`,
+`visible: true` — and the bar visibly updates when the route changes, so the
+surface is demonstrably live and refetching. An author following the two laws
+correctly is handed a blank frame with a clean bill of health and no reason to
+suspect the instrument. The shadow's own documentation says its terminal
+viewport was fixed and its screenshots are valid pixel proof for a terminal bug;
+nothing says the document body is exempt, so the exemption reads as an app bug.
+
+**Falsifier:** open any document-surface app on a shadow and capture. The body
+must contain what the app declared. Until then, treat a blank document body on a
+shadow as unproven rather than broken — and note that the honest alternative,
+foregrounding the operator's GUI, is forbidden by the law that sent you here, so
+this gap has no workaround that does not break a different rule.
+
+⚠ Not yet established: whether the body paints on a real GUI and only fails on a
+shadow (the documented pilot proof suggests so), or whether both are affected.
+That needs one capture on a real GUI, which this seat did not take.
+
 ## ⭐⭐ [6.8] THE KASTEN APPS ARE WAITING TO BE BUILT
 
 **Status:** OPEN
 
 *requested 2026-08-13*
+
+**Where it stands 2026-08-13, after the first build session:** the engine exists,
+is tested, is pushed, and its surface is live-proven as far as the instruments
+allow — see the progress note at the end of this entry.
 
 Two related surfaces, requested as their own relay:
 
@@ -1424,6 +1475,47 @@ dependency on someone else.
 ⛔ **The private graphs' surfaces stay in private repos.** Anything that resolves
 to a real path, person or case is a privacy defect in a public repo — this is
 the guard that has already failed once by scanning tracked files only.
+
+### Progress, 2026-08-13 — the engine, and what its proof does and does not cover
+
+**Done, and pushed to the app repo.** A single binary; a corpus manifest that
+carries every corpus's vocabulary; two fixture corpora invented end to end with
+no collection id in common; 32 tests. The scope's build order is at step 5.
+
+**The falsifier's first half is met, twice over.** One binary, checked by hash,
+renders both fixtures from their manifests alone — and the test that asserts it
+fails loudly if the two fixtures ever grow a shared collection id, because then
+it would prove nothing. The second half is met with both controls: the app
+repo's privacy checker reports clean, reports DIRTY on a planted leak, and
+reports clean again once the plant is removed.
+
+⚠ **The checker was reporting clean for the wrong reason until this session.**
+It scans untracked files deliberately, and the repo had no `.gitignore` because
+it had no code — so the first build buried every real finding under hundreds of
+dependency paths, which is the "cries wolf, gets switched off" failure its own
+comments warn about. Fixed there; worth knowing wherever else that checker is
+ported, because the defect arrives with the first line of code and not before.
+
+**Live-proven on the GUI host** — built there from the pushed commit, run in a
+backgrounded session, opened on a shadow so no operator viewport moved:
+
+- the app declares as a contribution with both panes, one of them a viewport
+  pane, and the host reaches its control endpoint;
+- the **rail pane renders the fiction corpus** — the corpus name, an Overview
+  button, and every collection with its node count;
+- the **document bar renders and re-renders**: a route change posted straight to
+  the app's own endpoint moved the bar's headings, which proves the refetch path
+  end to end without touching the GUI at all.
+
+⛔ **NOT proven, and not claimed: the document BODY.** It rendered blank — and so
+did the shipped pilot editor's, through the identical path in the same sitting.
+That control is why this is filed as its own entry above rather than carried
+here as a kasten defect. The body remains unproven either way until someone
+captures a document surface on a real GUI.
+
+**Next:** the private side — one manifest per corpus that fits, committed in that
+corpus's own repository, never here. Four of the five; the fifth is a pipeline
+rather than a corpus and gets no node overview.
 
 ## ⛔ [6.4] `server app start-page` IS A NAVIGATION VERB SHELVED AMONG THE READ VERBS
 
