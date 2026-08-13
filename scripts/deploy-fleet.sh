@@ -19,7 +19,23 @@
 set -uo pipefail
 
 FROM="target/release"
-HOSTS="dev guihost oc"
+# ⛔⛔ THE GUI HOST IS RESOLVED, NEVER SPELLED. A literal placeholder here does not
+# resolve, so the DEFAULT invocation deployed to the two headless hosts, failed
+# four copies with an unresolvable name, exited non-zero — and silently skipped
+# the one host the GUI actually runs on, which is the only host a UI change can
+# be proven on. Measured 2026-08-13; the workaround in use was to pass --hosts by
+# hand, which is exactly the hand-assembly this script exists to end.
+# ⇒ `scripts/ygg-live-host.sh` is the repo's single owner of "where is the live
+#   GUI". Ask it. If it cannot answer, say so loudly rather than deploying to a
+#   short list that looks complete.
+HOSTS="dev $("$(dirname "$0")/ygg-live-host.sh" 2>/dev/null || true) oc"
+HOSTS="$(printf '%s\n' $HOSTS | awk 'NF && !seen[$0]++' | tr '\n' ' ')"
+if [ "$(printf '%s\n' $HOSTS | awk 'NF' | wc -l)" -lt 3 ]; then
+  echo "deploy-fleet: ⛔ could not resolve the live GUI host — ygg-live-host.sh gave nothing." >&2
+  echo "  Deploying to '$HOSTS' would SKIP the only host a UI change can be proven on." >&2
+  echo "  Pass --hosts explicitly if that is really what you want." >&2
+  exit 2
+fi
 DRY=0
 ALLOW_BEHIND=0
 while [ $# -gt 0 ]; do
