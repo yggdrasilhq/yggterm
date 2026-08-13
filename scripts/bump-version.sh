@@ -150,7 +150,23 @@ while [ "$attempt" -le "$ATTEMPTS" ]; do
   # Someone else pushed between the fetch and the push, so this number is spent.
   # Undo our own commit and restore ONLY the two files we touched — never
   # `reset --hard`, which would take another session's uncommitted work with it.
-  note "push rejected — another cluster claimed $NEXT first; taking the next one"
+  #
+  # ⚠ SAY WHICH REJECTION THIS WAS. A non-fast-forward has two causes and they
+  # are opposite situations: another cluster spent this number (a real race), or
+  # this checkout was simply behind and never held a claim on anything. Naming
+  # only the first made an ordinary stale checkout read as live contention —
+  # observed 2026-08-13, where the retry then fast-forwarded and allocated the
+  # SAME number successfully, which is impossible if it had really been taken.
+  # A message that cannot be wrong is a message that carries no information.
+  git fetch --quiet origin main 2>/dev/null
+  REJECT_MAIN=$(git rev-parse FETCH_HEAD 2>/dev/null || echo "")
+  REJECT_TAKEN=$(git show "$REJECT_MAIN:Cargo.toml" 2>/dev/null |
+    awk -F'"' '/^version = /{print $2; exit}')
+  if [ -n "$REJECT_TAKEN" ] && [ "$REJECT_TAKEN" = "$NEXT" ]; then
+    note "push rejected — another cluster claimed $NEXT first; taking the next one"
+  else
+    note "push rejected — this checkout was behind origin/main (which is at ${REJECT_TAKEN:-unknown}), not outraced; re-reading and retrying"
+  fi
   git reset --quiet --soft HEAD~1
   git restore --staged --worktree -- Cargo.toml $LOCKED 2>/dev/null ||
     git checkout -- Cargo.toml $LOCKED 2>/dev/null
