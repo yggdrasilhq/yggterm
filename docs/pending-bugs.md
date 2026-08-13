@@ -29,6 +29,52 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⛔⛔⛔ SEVEN AGENT ROWS DIED IN ONE SECOND DURING A DAEMON HANDOVER — the constitution's core guarantee, failing with a timestamp
+
+**Status:** OPEN
+
+Measured 2026-08-13 22:31–22:47, live, on the integrator host.
+
+**What happened, as measurement only:**
+
+| time | event |
+|---|---|
+| 22:30:21 | a daemon starts from **a lane's own build tree** — `/home/pi/gh/yggterm--<lane>/target/release/yggterm-headless server daemon` |
+| **22:31:42** | **seven agent CLIs write their last transcript byte. Byte-identical mtimes, to the second.** |
+| 22:31:49 | a second daemon starts, this one the installed `~/.yggterm/bin/yggterm-headless` |
+| 22:36:33 | one row is re-resumed by hand (`server remote resume-cc <uuid> --require-existing`) and survives |
+
+⛔ **They were CUT MID-TURN, not exited.** Every dead transcript ends on a `tool_result` record —
+the agent received a tool result and was killed before it could produce the next turn. **That is
+work destroyed, not work finished.**
+
+⛔ **The sessions are NOT recoverable.** A dead row's uuid returns **zero** occurrences from
+`server sessions`; there is nothing to resume. Peer sockets fell **33 → 8** in the same window.
+
+⇒ **This is exactly the guarantee `CLAUDE.md` names as the highest-value work in the project:**
+*"Other agents' sessions survive our restarts"* and *"a restart of ours must not interrupt, reset, or
+destroy what another agent is doing."* ⚠ **And the count is the same as the previously recorded
+incident — ~7 agent PTYs** — which suggests a mechanism that has not moved rather than a new one.
+
+⚠⚠ **WHAT IS NOT ESTABLISHED, AND MUST NOT BE ASSUMED:** that the lane-build daemon *caused* the
+deaths. It is temporally adjacent and it is the anomaly in the sequence, but nothing here proves
+causation, and this campaign has had six causal stories collapse in a single evening. **Both daemons
+were still alive afterwards**, so this is not a simple "old daemon evicted".
+
+**The falsifiers, in the order that costs least:**
+1. Start a daemon from a lane's `target/release` on a host with live agent rows, in a sandbox, and
+   see whether rows die ~80 s later. If they do, the mechanism is *which binary* rather than *a
+   handover*, and the fix is that a lane build must never be able to take over the row plane.
+2. Perform an ordinary installed-binary handover with live rows and see whether they survive. If
+   they die too, the lane build is irrelevant and the defect is the handover itself.
+3. Check whether the dying rows were owned by the retiring daemon or the new one — a reply that
+   cannot name **which daemon served it** is the instrument gap that makes this hard, and it is
+   already filed separately.
+
+⭐ **The one thing that DID work, and it is the seed of the repair:** `server remote resume-cc <uuid>
+--require-existing` brought a row back and it is still running. **Recovery exists; it is just not
+automatic.**
+
 ## ⛔ THE HOOK INSTALLER EXISTS TWICE, THE TWO COPIES DISAGREE, AND ONE CRASHES ON A WORKTREE
 
 **Status:** OPEN
@@ -2289,64 +2335,45 @@ under the same webview workload and compare crash counts. If the software arm
 crashes at the same rate, the GL path is incidental and the abort cluster is the
 real story.
 
-## ⚠ [6.6] `agy` HAS TWO GATES IN SERIES, AND ITS BYPASS FLAG RELEASES ONLY ONE
+## ⚠ [6.6] GROK BUILD MAY NEVER FILL THE TITLE FIELD IT HAS
 
 **Status:** OPEN
 
-*Measured 2026-08-13 on the live GUI host, BOTH ARMS IN ONE RUN.*
+*The last of the 2026-08-13 intake's declared unknowns, and it is small.*
 
-A row launched `agy --dangerously-skip-permissions` and a row launched with no
-flags at all produced the **identical screen**: agy's workspace-trust prompt,
-*"Do you trust the contents of this project?"*, waiting on a keypress.
+Grok's `summary.json` carries a `session_summary` field, and its `--resume` help
+matches "session titles for the current directory" and speaks of a *"sole renamed
+match"* — so the CLI plainly has titles. **In every session observed the field was
+EMPTY**, and every one of those sessions had a single message.
 
-`agy --help` documents that flag as *"Auto-approve all tool permission requests
-without prompting"*, and it does exactly that — the trust gate is a **different,
-earlier gate**, per folder, and agy offers no flag for it. Muse is the contrast:
-its `--yolo` disables approval AND sandboxing AND trusts the workspace.
+`title_authority` therefore stays `Generated`: a field that exists is not evidence
+the CLI fills it, and declaring `Store` on a field NAME would make yggterm respect
+a title that is not there and leave the row nameless. The store reader already
+returns the summary when it is non-empty, so nothing is lost either way.
 
-⇒ **What this most likely explains, stated as a hypothesis and not a cause:** a
-row parked on a full-screen prompt is, from the sidebar, indistinguishable from
-one whose CLI never launched. The falsifier is to read the row's SCREEN rather
-than its phase — `launch_phase: Running` and a healthy `machine_health` are true
-of both.
+**Falsifier:** one grok session with several real turns. If `session_summary` is
+populated, flip `title_authority` to `Store`. If it stays empty, the field is a
+placeholder and this entry closes as a fact about grok.
 
-**What is NOT true any more:** the launcher carrying no permission flag. Every
-registered CLI now has a stored box, and it reaches the launch on both lanes —
-proven by `qwen '--yolo'` locally and `qwen --yolo` in `/proc/<pid>/cmdline` on
-the far host, with the reset case producing a bare `qwen` in the same run.
+### ✅ Closed 2026-08-13, both by their own falsifiers
 
-**Falsifier for what remains:** find a flag, config key or state file that makes
-agy skip the trust prompt for a folder it has not seen. If one exists it belongs
-in the descriptor's Skip-checks tier; if none does, this entry closes as a fact
-about agy rather than a defect in yggterm, and the tier's explanation (which
-already says so) is the whole fix.
+- **The session store is READ.** The gap claimed this needed a login only the
+  owner holds. It did not: a fleet host was already signed in, and the layout is
+  `~/.grok/sessions/<percent-encoded-cwd>/<uuid>/summary.json`, whose `info.cwd`
+  is a plain absolute path and whose `info.id` equals its own directory name. ⇒
+  **the bucket name is a second encoding of a value the file already states**, so
+  the reader reads the file and never decodes the path. ⚠ The glob targets
+  `summary.json` alone; the session directory also holds `chat_history.jsonl`,
+  `events.jsonl` and `updates.jsonl`, and globbing those would yield three
+  entries for one session.
+- **Auto-provisioning works.** Proven on the one fleet host that had no grok at
+  all: `@xai-official` is now in the managed npm prefix and `grok --version`
+  answers there. ⚠ The 67 MB payload is fetched on first real run, not at
+  install, so an empty `~/.grok/downloads` beside a working `--version` is the
+  expected intermediate state and not a failed install.
 
-## ⚠ [6.6] GROK BUILD'S STORE AND ITS AUTO-PROVISIONING ARE BOTH UNPROVEN
-
-**Status:** OPEN
-
-*Landed 2026-08-13; these are the two halves that could not be proven with it.*
-
-Grok Build is a registered kind and launches: a row opened on the live host
-exec'd `grok` and drew its own TUI. Two things are declared rather than measured.
-
-1. **The session store.** `~/.grok/sessions` is a path constant in the shipped
-   executable and `grok sessions list` is a real verb, but the on-disk SHAPE is
-   unread, because creating even one session needs `grok login` — an owner gate
-   (`owner-attention.md`). `title_authority` is `Generated` for the same reason:
-   the help says grok owns session titles, and declaring `Store` while unable to
-   READ one would leave every row with no name at all. **Both flip in one commit
-   once a signed-in host exists.**
-2. **Auto-provisioning.** The launch succeeded on a host that ALREADY had `grok`
-   — the owner installed it at `~/.grok/bin/grok` before this work started, and
-   the launch PATH found it there. So `CliInstall::Npm("@xai-official/grok")` is
-   correct by inspection (the npm launcher fetches the platform binary into
-   `~/.grok/downloads`, which is exactly what is on disk) and **untested on a
-   host that lacks it**.
-
-**Falsifier:** on a host with no `grok`, launch `--kind grok-build` and check
-that `~/.yggterm/npm/lib/node_modules/@xai-official` appears and the row draws
-grok's TUI rather than `grok: command not found`.
+⇒ **The lesson worth keeping: the gap was written as an owner gate and was never
+one.** Nobody had asked the hosts. An inherited "blocked" is a claim, not a fact.
 
 ## ⛔ [6.6] `server app` IS DISPATCHED IN TWO FILES, SO A NEW VERB IS ABSENT FROM THE ONE AGENTS CALL
 
@@ -3252,6 +3279,24 @@ and it is one line.
 single parse is safe on this verb — that idiom reads the first object and discards the rest
 without error, which is worse than failing.
 
+
+### ⚠ NOT REFUTED, BUT BOUNDED — 2026-08-13 sweep
+
+Seven `session remove` calls across 3.0.133–3.0.146, every one parsed by a plain
+`json.load` with no exception, and every one carried a `verified` that matched
+reality (the row really left the census, `live_processes: []`).
+
+⛔ **That is not a refutation and must not be read as one.** The entry says the
+verb **CAN** answer this way; an intermittent fault is not disproved by clean
+samples, and seven is a small number. What the run does is **bound the rate**:
+this is not the ordinary reply shape, so a caller hitting it is hitting something
+conditional — most likely a second write racing the first, which is where a
+re-test should look rather than at the happy path I just exercised seven times.
+
+⚠ **And the unsafe idiom the entry names is still the one to fix regardless of
+frequency.** `json.loads(out[out.find("{"):])` reads the first object and never
+learns a second existed, so a caller using it cannot even detect the fault it is
+victim to. That half needs no reproduction to justify.
 ## ⛔⛔ A SCRUB'S VERIFIER ASKS WHETHER THE STRING IS GONE, NEVER WHETHER THE REPLACEMENT IS VALID
 
 **Status:** OPEN
