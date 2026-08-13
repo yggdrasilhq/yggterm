@@ -64,14 +64,28 @@ to (`DaemonRuntime::terminal_runtime_key_for_path`), and every in-daemon caller
 rather than the session map's raw fold. A request that still cannot be served
 emits `daemon/terminal_runtime/request_refused` naming which map held what.
 
-**What live proof is owed, and why it is not free.** The four rows' PTYs are
-owned by a daemon running the OLD binary, and a bridge routes to the owner. They
-recover when that daemon is superseded and hands its PTYs over; until then the
-fix is proven by the unit truth table
+**LIVE PROOF, 2026-08-13.** `remote-cc://dev/23b20d7c…` — one of the two campaign
+rows that could not be resumed to its relay point — was opened from the desktop
+host and painted: reveal `outcome: ready`, `first_output_ms: 33859`, cold tier,
+`failure_reason: null`, confirmed on a faithful screenshot. Its previous seven
+attempts inside nine minutes all recorded `first_output_ms: null` while
+reporting `ready`. All four rows are live in the row list again.
+
+⚠ **What that proves and what it does not.** The rows recovered when the daemon
+holding the orphaned PTYs died, which cleared the orphans — so the screenshot
+proves the ROWS are usable, not that the resolver change is what made them so.
+What the change does is stop the state recurring, and that is proven separately:
+the truth table
 (`a_rewritten_runtime_key_never_beats_one_the_terminal_map_actually_holds`), the
-structural lock over the callers, and the reproduction above. The observation
-that would falsify the fix: a row whose PTY a 3.0.114+ daemon owns under
-`cc-runtime://<id>`, with no session row, that still refuses to open.
+structural lock that keeps every in-daemon caller on the corrected resolver, and
+the close path no longer being able to remove the wrong key.
+
+**Residual, and it is the honest one:** no 3.0.114+ daemon has yet been observed
+holding an orphan of this shape, because the fix removes the way they are made.
+The observation that would falsify it: a row whose PTY a 3.0.114+ daemon owns
+under `cc-runtime://<id>`, with no session row, that still refuses to open — and
+`daemon/terminal_runtime/request_refused` now names exactly that case if it
+happens.
 
 After the GUI restarted, a subset of rows never came back to a usable state.
 Restarting again does not clear it: the same rows fail the same way, so this is
@@ -102,53 +116,88 @@ per-daemon (five of the daemons on that host are older than the current binary
 open must emit a trace event naming the refusal. Silence here is itself the bug —
 the reporter had no way to tell "this row is gone" from "this row is slow".
 
-## ⛔⛔ [6.1] A ROW DROPPED FROM HISTORY COMES BACK
+## ⛔ [6.2] A NEW CLI ROW IS BORN NAMED AFTER WHOEVER SPAWNED IT
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*reported 2026-08-13 · fixed 2026-08-13 (3.0.114)*
+*re-reported 2026-08-13*
 
-**Reading 1 is not what happened, and checking it was worth the hour.** Every
-restore path INSIDE yggterm already vetoes a closed row against the tombstone
-plane: the cross-daemon import admission does, and so does cold restore from
-`server-state.json` (`drop_tombstoned_live_rows`, which traces
-`cold_restore_of_closed_live_rows_refused`). Reading 2 is the true one, and it is
-sharper than it looks: **there was no restore verb at all.** An agent asked to
-restore a set of rows had to hand-roll one out of `app open` — and `open` must
-stay permissive, because a person re-opening a row they closed yesterday is how a
-close is legitimately undone. A batch is not that intent, and a loop of `open`
-cannot tell the difference.
+Already tracked further down this file as *"a new session's row is named after
+the row you right-clicked"*. Re-reported in this batch with the generalised
+symptom: a freshly spawned row reads `{whatever the spawner is called}
+{claude-code,codex,…}` until the CLI self-titles. Kept as one entry — see the
+existing narrative for the detail; this line exists so the 6.2 delegate knows it
+is in scope.
 
-**Fixed:** `server app sessions restore <session-path>... [--dry-run]` is the
-verb. It checks the batch against the tombstone plane once, opens the survivors
-ONE AT A TIME (issued together, the GUI supersedes all but the last — measured in
-the very recovery that produced this entry), and the reply carries
-`declined_closed_count` plus the declined paths. `server app rows` now reports
-`close_remembered` per session row, so any enumerator outside the daemon can see
-the deny-list it was previously ignoring for lack of a way to read it.
+**Live proof attempted 2026-08-13 on the desktop host, GUI + daemon both
+3.0.116 — and it came back TWO THIRDS green, which is why this stays open.**
+Three ephemeral `claude-code` rows created back to back by one command, same
+cwd, each with `--purpose`:
 
-**Live proof owed:** run the falsifier on the desktop host — close a row, pass
-it to `restore` inside a batch, and confirm `declined_closed_count: 1` with the
-row absent from the resulting live order.
+| row | rendered title |
+|---|---|
+| probe A (created 1st) | `Agent unnamed claude-code` |
+| probe B (created 2nd) | `Agent unnamed claude-code: 6.2 sidebar order probe B` |
+| probe C (created 3rd) | `Agent unnamed claude-code: 6.2 sidebar order probe C` |
 
-During the manual recovery, a second agent CLI was asked to restore the rows and
-**restored rows that had been deliberately deleted earlier**. Two readings, and
-they are not exclusive:
+B and C are the fixed form: named for the agent and its PURPOSE, not for the row
+that spawned them. **A is not, and the purpose is not missing — it is recorded
+and unrendered.** `server terminal tenants` carries
+`created_by.purpose = "6.2 sidebar order probe A"` for that exact row. So the
+create kept it and the title composition dropped it.
 
-1. History deletion does not actually remove the row from whatever the restore
-   path enumerates — so a "deleted" row is only hidden, and any full restore
-   resurrects it.
-2. The restoring agent enumerated a source that legitimately still holds
-   deleted rows and had no way to tell deleted from live.
+⚠ **Three explanations were tried and killed before filing, because "one row out
+of three" invites a guess:**
 
-⇒ **Both readings are a defect in the same place:** there is no single source of
-truth for "this row is gone", so deletion and restore disagree. Note this is the
-same shape as the fleet memory sync's known resurrection trap — a delete that is
-not propagated to every store is a delete that a peer undoes.
+- **Not time decay.** B still rendered its purpose six minutes later.
+- **Not "only the newest row shows it".** Creating C did not take B's purpose
+  away; both held it side by side.
+- **Not lost at create.** The daemon's own tenancy record has A's purpose.
 
-**Falsifier:** delete a row, run a full restore, and enumerate. The deleted row
-must not reappear, and the restore must be able to *name* how many rows it
-declined to restore because they were deleted.
+⇒ What is left is a divergence between the stored purpose and the composed
+title, on the FIRST row of a batch. Not root-caused, and deliberately not
+guessed at.
+
+**ROOT-CAUSED 2026-08-13 (3.0.120), and "the FIRST row of a batch" was a
+coincidence of the probe.** The three purposes ended `A`, `B` and `C`. The copy
+layer's dangling-fragment rule (`ends_with_syntax_fragment` in
+`looks_like_low_signal_generated_title`, `yggterm-core/src/titles.rs`) treats a
+title whose last word is `the`/`a`/`an`/`to`/`for`/… as a generated fragment —
+right for `ship the logs to`, and it reads a trailing **`A`** as the English
+article. `agent_plane_session_title` (`yggterm-server/src/app_control.rs`) asks
+that same judge whether the composed title would survive downstream, and on
+`true` **drops the purpose and returns the bare base**, by design: the title
+survives by losing the only part that says what the row is for. Probe A was
+both the first row created and the one whose purpose ended in `A`; the ordering
+was the confound. Reproduced as a unit fact before any fix —
+`agent_plane_session_title(None, Some("6.2 sidebar order probe A"), …)`
+answered `Agent unnamed shell`, and the same call with `probe B` did not.
+
+**Fixed:** the judge now recognises an agent-plane title —
+`Agent <identity> <kind>`, optionally `: <purpose>` — as **authored**, not
+generated (`is_agent_plane_composed_title`), so none of the machine-copy
+heuristics apply to it. The exemption matches the whole shape, never the
+opening word, or it would be a hatch wide enough to drive every heuristic in
+that file through. `session_kind_label` moved to `yggterm-core` beside the
+slugs it is built from, so the copy layer reads the same vocabulary the
+composer writes rather than a second copy of it. Tests:
+`a_legible_purpose_is_never_amputated_from_an_agent_plane_title` (red before
+the fix, on the probe strings verbatim) and
+`an_agent_plane_title_is_authored_copy_and_is_never_judged_generated`.
+
+⚠ **The pre-existing test could not see this.**
+`an_agent_plane_title_is_never_thrown_away_as_generated_junk` asks only whether
+the TITLE survived, and amputation satisfies it — a bare
+`Agent unnamed claude-code` sails through. A test that asks "did the output
+survive" cannot catch an output that survived by discarding its payload.
+
+**Falsifier:** create three rows in one command with `--purpose`, and all three
+titles carry their purpose; or `created_by.purpose` is absent for the one that
+does not.
+
+**What live proof is owed:** three `claude-code` rows created back to back on
+the desktop host at 3.0.120+, purposes ending `A`, `B`, `C`, and all three
+sidebar titles carrying their purpose.
 
 ## ⛔ A SCREENSHOT OF A NON-TERMINAL VIEW PHOTOGRAPHS WHATEVER HOLDS FOCUS
 
@@ -3356,13 +3405,46 @@ recovery verb then declines by design. `server app open` restored the 6.7 row in
 one call, which is the tell: the row was perfectly openable, and only the
 deny-list stood in the way.
 
-⇒ Two owners: the handover half belongs here; **the tombstone half belongs with
-the restore lifecycle** — see *"[6.1] SOME ROWS WILL NOT RESTORE"* above, whose
-deny-list this is.
+⛔ **THE TOMBSTONE HALF IS NOT WHAT IT LOOKS LIKE — checked in the trace,
+2026-08-13, and the mechanism above is wrong.** A GUI death does not tombstone
+anything: `PrepareClientClose` (the path a closing GUI takes) never calls
+`close_live_session_row`, a hand-killed GUI does not run it at all, and a
+structural lock already forbids the migration and adoption paths from
+tombstoning. The one writer is the explicit close — and every row involved here
+has that close in the trace, by name:
+
+| row | what the trace shows |
+|---|---|
+| `remote-cc://oc/ebf6c53e…` | `app_control` `request_begin` `{"kind":"remove_session", …}` |
+| `remote-cc://dev/7cf25693…` | `live_session_close_preflight`, then `explicit_remote_session_close_warning` |
+| `remote-cc://dev/7bcecf20…` | `live_session_close_preflight`, then `explicit_remote_session_close_requested` |
+
+⇒ These rows were not filed as deletions by mistake. **Something called
+`session remove` on them**, which is the verb that MEANS "delete this row", so
+the deny-list did exactly its job. The real defect is one level up and it is
+worth naming precisely: **after a hand-kill, tooling tidies up rows it judges
+dead using the same verb a person uses to delete one** — and the daemon cannot
+tell those apart, because at the wire they are the same request. Nothing below
+`session remove` can fix that; the caller has to stop reaping corpses with the
+delete verb, or the verb needs a separate spelling for "this is already gone".
+
+⚠ Two other rows reported lost this way were checked and are **not tombstoned at
+all** — `sessions restore` returns both as `restorable`. So the symptom is not
+uniform, which is another reason to trust the per-row trace over the pattern.
+
+**Recovery that exists today:** `server app sessions restore <path>...
+--include-closed` restores a deliberately-closed row and reports it under
+`overridden_closed`, for exactly this case. Shipped 3.0.117.
+
+⇒ Two owners: the handover half — rows dying at all — belongs here. The
+deny-list half is answered above and needs no further work in the restore
+lifecycle; what remains is the CALLER question, which belongs to whichever
+tooling runs the post-kill tidy.
 
 **Falsifier for this half:** kill a GUI holding agent rows, relaunch, and every
-row returns; or `sessions restore` accepts the ones that did not, rather than
-naming them `declined_closed`.
+row returns. If a row is missing, read its trace for `remove_session` /
+`live_session_close_preflight` BEFORE blaming the deny-list — absent that, the
+tombstone theory is disproved for that row.
 
 ⭐ **A SECOND, SIMPLER CANDIDATE CAUSE — measured 2026-08-09, and it fits every
 column of the table above.** Look at *when* the shells died rather than at the
