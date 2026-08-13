@@ -190,6 +190,7 @@ fn print_server_help() {
   yggterm-headless server ping
   yggterm-headless server status
   yggterm-headless server daemons [--json]
+  yggterm-headless server relay-boundary [--by <who>] [--wait-secs <n>] [--json]
   yggterm-headless server <status|snapshot> --endpoint <socket-path|version|pid>
   yggterm-headless server snapshot
   yggterm-headless server shutdown
@@ -3541,6 +3542,10 @@ fn main() -> Result<()> {
         // is a host fact, so it rides the host-wide census rather than any one
         // daemon's status.
         let queued = yggterm_server::hot_restart_queue::load(store.home_dir());
+        // §5's other half is a host fact too: a forced swap that has interrupted
+        // somebody and not yet made it good is a state a reader must be able to
+        // see, and this is the one place they are already looking.
+        let interrupted = yggterm_server::hot_restart_repair::load(store.home_dir());
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis() as u64)
@@ -3551,6 +3556,7 @@ fn main() -> Result<()> {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "daemons": rows,
                     "queued_hot_restart": queued,
+                    "interrupted_sessions": interrupted,
                 }))?
             );
         } else {
@@ -3562,6 +3568,100 @@ fn main() -> Result<()> {
                     now_ms
                 )
             );
+            if let Some(interrupted) = interrupted.as_ref() {
+                print!(
+                    "{}",
+                    yggterm_server::hot_restart_repair::format_pending_repair(interrupted, now_ms)
+                );
+            }
+        }
+        return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "server")
+        && args.get(1).is_some_and(|arg| arg == "relay-boundary")
+    {
+        // §2 of docs/spec-hot-restart-relay-gate.md — *"a relay hand-off is a
+        // genuine, declared, zero-cost quiet point … the gate stops being a
+        // search and becomes an appointment."*
+        //
+        // ⛔ It does NOT spawn a daemon (no `ensure_local_server_ready_for_cli`)
+        // and it does not talk to one. The queue is a HOST fact in a file, and
+        // making the verb reach a daemon would mean choosing which of the
+        // several a stale host is running — the exact question §4 moved out of
+        // any one daemon's status. A drainer picks the boundary up on its next
+        // 20 s poll.
+        let json = args.iter().any(|arg| arg == "--json");
+        let declared_by = args
+            .iter()
+            .position(|arg| arg == "--by")
+            .and_then(|index| args.get(index + 1))
+            .cloned()
+            .unwrap_or_else(|| "relay_boundary".to_string());
+        let wait_secs = args
+            .iter()
+            .position(|arg| arg == "--wait-secs")
+            .and_then(|index| args.get(index + 1))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        let outcome = yggterm_server::hot_restart_queue::declare_relay_boundary(
+            store.home_dir(),
+            now_ms,
+            &declared_by,
+        );
+        let (owed, target_version, waiting_ms) = match &outcome {
+            yggterm_server::hot_restart_queue::RelayBoundaryOutcome::Declared {
+                target_version,
+                waiting_ms,
+            } => (true, Some(target_version.clone()), Some(*waiting_ms)),
+            yggterm_server::hot_restart_queue::RelayBoundaryOutcome::NothingOwed => {
+                (false, None, None)
+            }
+        };
+        // ⚠ The drainer polls every 20 s, so a wait shorter than that can only
+        // ever time out — say so rather than reporting a converged host as
+        // still-owing. Waiting is opt-in because the common case is a converged
+        // host with nothing to wait for.
+        let mut converged = !owed;
+        if owed && wait_secs > 0 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if yggterm_server::hot_restart_queue::load(store.home_dir()).is_none() {
+                    converged = true;
+                    break;
+                }
+            }
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "declared_by": declared_by,
+                    "swap_owed": owed,
+                    "target_version": target_version,
+                    "waiting_ms": waiting_ms,
+                    "waited_for_secs": wait_secs,
+                    "converged": converged,
+                }))?
+            );
+        } else if let Some(target_version) = target_version {
+            let waiting_min = waiting_ms.unwrap_or(0) / 60_000;
+            if converged {
+                println!(
+                    "relay boundary declared by {declared_by}; swap to {target_version} converged"
+                );
+            } else {
+                println!(
+                    "relay boundary declared by {declared_by}; swap to {target_version} \
+                     (owed {waiting_min}m) is due at the next drainer poll"
+                );
+            }
+        } else {
+            println!("relay boundary declared by {declared_by}; no swap is owed on this host");
         }
         return Ok(());
     }

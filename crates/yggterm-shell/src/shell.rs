@@ -36050,6 +36050,11 @@ fn queue_startup_swap_intent(
             runtime_status.server_version,
             runtime_status.owned_terminal_session_count,
         )),
+        // §2: only a relay hand-off declares a boundary. A producer recording an
+        // intent is not a quiet point, and saying so here would spend the very
+        // first attempt of every queued swap the instant it is written.
+        relay_boundary_at_ms: None,
+        relay_boundary_by: None,
     };
     let decision = yggterm_server::hot_restart_queue::enqueue(&home, &request);
     trace_daemon_step(

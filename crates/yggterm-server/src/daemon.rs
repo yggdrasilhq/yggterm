@@ -2,6 +2,7 @@ use crate::codex_cli::{
     TerminalIdentityColorProfile, sync_terminal_identity_appearance_with_profile,
 };
 use crate::hot_restart_queue;
+use crate::hot_restart_repair;
 use crate::terminal::{TerminalBufferStats, terminal_data_has_scrollback_text};
 use crate::{
     ClaudeCodeRuntimeProcessIdentity, CodexRuntimeProcessIdentity, GhosttyHostSupport,
@@ -2010,6 +2011,68 @@ pub fn hot_restart_blocker_is_deadline_exempt(kind: &str) -> bool {
         kind,
         HOT_RESTART_BLOCKER_ORCHESTRATING | HOT_RESTART_BLOCKER_NOT_RESTORABLE
     )
+}
+
+/// §5's deadline: how long a cold retire may be held by interruptible sessions
+/// before it stops asking.
+///
+/// ⚖ Owner-ruled: *"after 30 minutes of waiting, force the swap, stalling the
+/// working sessions"* — and the other half of the same ruling, the `continue`
+/// repair, is [`crate::hot_restart_repair`]. Neither half ships alone.
+pub const HOT_RESTART_FORCED_SWAP_DEADLINE_MS: u64 = 1_800_000;
+
+/// What §5's deadline says about a blocked cold retire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotRestartDeadlineVerdict {
+    /// Still inside the 30 minutes, or nothing is blocking. Keep waiting.
+    KeepWaiting,
+    /// The deadline has passed, and an EXEMPT blocker holds it anyway.
+    ///
+    /// §6: an orchestrating session is waited for without a deadline, and a
+    /// plain shell can never be cold-killed safely at all. §8 demands the wait
+    /// be nameable, so the reason travels with the verdict rather than the
+    /// reader inferring it from a silent refusal.
+    ExemptBlocker { kind: String, session_key: String },
+    /// The deadline has passed and every blocker is interruptible. These are the
+    /// sessions the shutdown is about to interrupt — and therefore exactly the
+    /// sessions owed a `continue`.
+    Force { interrupted: Vec<String> },
+}
+
+/// Apply §5's deadline to a blocked cold retire.
+///
+/// ⛔ **The interrupted list is produced HERE, before the shutdown**, because
+/// spec §8 says it cannot be re-derived afterwards: *"after the swap every
+/// interrupted session looks idle"*. A verdict that only answered yes/no would
+/// force the caller to ask a second time, after the answer had changed.
+///
+/// ⛔ **One exempt blocker vetoes the whole force**, and it is not a per-session
+/// decision. A cold shutdown kills every PTY this daemon owns, so there is no
+/// way to interrupt the working session while sparing the shell next to it —
+/// the choice is all or nothing, and §6 prices the "all" at an orphaned
+/// delegate fleet.
+pub fn hot_restart_deadline_verdict(
+    blockers: &[HotRestartBlocker],
+    owed_for_ms: u64,
+) -> HotRestartDeadlineVerdict {
+    if blockers.is_empty() || owed_for_ms < HOT_RESTART_FORCED_SWAP_DEADLINE_MS {
+        return HotRestartDeadlineVerdict::KeepWaiting;
+    }
+    if let Some(exempt) = blockers
+        .iter()
+        .find(|blocker| hot_restart_blocker_is_deadline_exempt(&blocker.kind))
+    {
+        return HotRestartDeadlineVerdict::ExemptBlocker {
+            kind: exempt.kind.clone(),
+            session_key: exempt.session_key.clone(),
+        };
+    }
+    HotRestartDeadlineVerdict::Force {
+        interrupted: blockers
+            .iter()
+            .map(|blocker| blocker.session_key.clone())
+            .collect(),
+    }
 }
 
 /// One session holding a hot-restart open, and why.
@@ -14476,6 +14539,11 @@ fn spawn_disk_binary_version_poll(
                 );
                 hot_restart_queue::clear(&home_dir);
             }
+            // §5's second half, and it runs on EVERY daemon's poll — including
+            // the daemon that is otherwise current and `continue`s out below,
+            // which is precisely the one most likely to have adopted the
+            // sessions a forced swap interrupted.
+            dispatch_interrupted_session_repairs(&home_dir, &runtime);
             // Retire trigger 1: our on-disk binary was replaced by an update.
             let exe_link = fs::read_link("/proc/self/exe")
                 .map(|link| link.to_string_lossy().into_owned())
@@ -14670,6 +14738,49 @@ fn spawn_disk_binary_version_poll(
                     let owned = rt.terminals.session_keys();
                     rt.hot_update_idle_gate_blockers(&owned)
                 };
+                // §5: after 30 minutes this stops being a wait and becomes the
+                // stale daemon the constitution exists to abolish. The verdict
+                // also PRODUCES the interrupted list, because §8 says it cannot
+                // be re-derived once the PTYs are gone.
+                let owed_for_ms = hot_restart_retire_owed_for_ms(&home_dir, current_millis_u64());
+                let deadline = hot_restart_deadline_verdict(&blockers, owed_for_ms);
+                if let HotRestartDeadlineVerdict::Force { interrupted } = &deadline {
+                    // ⛔ RECORD BEFORE SHUTTING DOWN. The process that knows who
+                    // is about to be interrupted is the one that is about to
+                    // stop existing.
+                    let recorded = hot_restart_repair::record(
+                        &home_dir,
+                        &hot_restart_repair::InterruptedSessions {
+                            recorded_at_ms: current_millis_u64(),
+                            recorded_by_pid: std::process::id(),
+                            recorded_by_version: SERVER_PROTOCOL_VERSION.to_string(),
+                            reason: reason.clone(),
+                            sessions: interrupted.clone(),
+                        },
+                    );
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "lifecycle",
+                        "hot_restart_forced_past_deadline",
+                        serde_json::json!({
+                            "retire_trigger": retire_trigger,
+                            "owed_for_ms": owed_for_ms,
+                            "deadline_ms": HOT_RESTART_FORCED_SWAP_DEADLINE_MS,
+                            "reason": reason,
+                            "interrupted": interrupted,
+                            // A forced swap whose repair was not recorded owes a
+                            // `continue` nobody will send. It still proceeds —
+                            // the deadline is the ruling — but the gap is named.
+                            "repair_recorded": recorded,
+                            "blockers": blockers,
+                            "current_version": SERVER_PROTOCOL_VERSION,
+                            "current_pid": std::process::id(),
+                        }),
+                    );
+                    // Fall THROUGH to the shutdown below. This is the one path
+                    // that does not `continue`.
+                } else {
                 let settled = !blockers.is_empty()
                     && blockers.iter().all(|blocker| blocker.permanent);
                 deferred_polls = deferred_polls.saturating_add(1);
@@ -14718,6 +14829,7 @@ fn spawn_disk_binary_version_poll(
                 }
                 deferred_reason_last = Some(reason);
                 continue;
+                }
             }
             // B4: make it loud if this cold shutdown would strand rows a
             // reachable successor does not cover (observation only).
@@ -15195,6 +15307,163 @@ static HOT_RESTART_SWAP_LANE_SETTLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 static HOT_RESTART_SWAP_LAST_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
 
+/// §5's clock: when this daemon's retire was FIRST held by a blocker. Zero = never.
+///
+/// Set at the gate, not at the retire trigger, because that is what the ruling
+/// measures — *"after 30 minutes of waiting"* is thirty minutes of being held,
+/// not thirty minutes of existing while superseded.
+///
+/// ⛔ **One clock, and it never moves.** It is seeded from the HOST's queue entry
+/// when there is one — that record survives process deaths and is the older, truer
+/// answer to *"how long has this been owed"* — and from the current moment when
+/// there is not (the `newer_daemon_live` shape queues nothing, because a successor
+/// already exists; what is stalled there is this daemon's own exit). Reading the
+/// queue on every poll instead would re-derive the clock from a file a peer can
+/// rewrite, which is how the deadline would quietly restart forever.
+#[cfg(target_os = "linux")]
+static HOT_RESTART_RETIRE_OWED_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// How long this daemon has been trying to retire, for §5's deadline.
+#[cfg(target_os = "linux")]
+fn hot_restart_retire_owed_for_ms(home_dir: &Path, now_ms: u64) -> u64 {
+    let mut since_ms = HOT_RESTART_RETIRE_OWED_SINCE_MS.load(Ordering::Relaxed);
+    if since_ms == 0 {
+        since_ms = hot_restart_queue::load(home_dir)
+            .map(|queued| queued.requested_at_ms)
+            // A stamp from the future (a clock change, a hand-edited file) would
+            // make the deadline unreachable, and a zero stamp would make it
+            // instant. Neither is a reason to interrupt anybody.
+            .filter(|stamp| *stamp > 0 && *stamp <= now_ms)
+            .unwrap_or(now_ms);
+        HOT_RESTART_RETIRE_OWED_SINCE_MS.store(since_ms, Ordering::Relaxed);
+    }
+    now_ms.saturating_sub(since_ms)
+}
+
+/// A repair batch is already being typed; a second one would double-`continue`.
+#[cfg(target_os = "linux")]
+static HOT_RESTART_REPAIR_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// How long the repair waits for a re-resumed agent to start consuming input.
+///
+/// The echo-verified submit is what makes this safe: a just-resumed agent CLI
+/// draws its composer seconds before its input loop is live, so a `continue`
+/// written at "prompt shown" is silently swallowed. Twenty seconds is past the
+/// measured re-resume; a session slower than that keeps its repair unspent
+/// rather than getting a `continue` typed into a menu.
+#[cfg(target_os = "linux")]
+const HOT_RESTART_REPAIR_SUBMIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(20);
+
+/// §5's other half: type `continue` into the sessions a forced swap interrupted.
+///
+/// Runs on EVERY daemon's poll, including the current one, because the daemon
+/// that owes the repair is by construction not the daemon that recorded it —
+/// [`crate::hot_restart_repair`] owns that rule and spends the record as it
+/// answers, so this can be called freely without risking a second `continue`.
+#[cfg(target_os = "linux")]
+fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<DaemonRuntime>>) {
+    // Cheapest instrument first: the record is absent on every host that has
+    // never forced a swap, which is nearly all of them, and this must not take
+    // the daemon's runtime lock 4,320 times a day to learn that.
+    if hot_restart_repair::load(home_dir).is_none()
+        || HOT_RESTART_REPAIR_IN_FLIGHT.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    let now_ms = current_millis_u64();
+    let (owned, runtime_paths) = {
+        let rt = lock_daemon_runtime(runtime, "hot_restart_repair_owned");
+        let owned = rt.terminals.session_keys();
+        let paths = owned
+            .iter()
+            .map(|key| (key.clone(), rt.terminal_runtime_key_for_path(key)))
+            .collect::<Vec<_>>();
+        (owned, paths)
+    };
+    match hot_restart_repair::take_repairable(home_dir, now_ms, std::process::id(), &owned) {
+        hot_restart_repair::RepairVerdict::Nothing => {}
+        hot_restart_repair::RepairVerdict::Expired { age_ms, sessions } => {
+            // ⛔ Loud, never silent. A repair that aged out is a `continue` the
+            // owner was promised and did not get, and the only way anyone learns
+            // that is here.
+            append_trace_event(
+                home_dir,
+                "daemon",
+                "lifecycle",
+                "hot_restart_repair_expired",
+                serde_json::json!({
+                    "age_ms": age_ms,
+                    "window_ms": hot_restart_repair::REPAIR_WINDOW_MS,
+                    "sessions": sessions,
+                    "current_version": SERVER_PROTOCOL_VERSION,
+                    "current_pid": std::process::id(),
+                }),
+            );
+        }
+        hot_restart_repair::RepairVerdict::Repair { sessions } => {
+            HOT_RESTART_REPAIR_IN_FLIGHT.store(true, Ordering::Relaxed);
+            let home_dir = home_dir.to_path_buf();
+            let runtime = Arc::clone(runtime);
+            let targets = sessions
+                .iter()
+                .filter_map(|key| {
+                    runtime_paths
+                        .iter()
+                        .find(|(session_key, _)| session_key == key)
+                        .map(|(session_key, path)| (session_key.clone(), path.clone()))
+                })
+                .collect::<Vec<_>>();
+            // Off the poll thread: the echo-verified submit sleeps between
+            // probes, and the poll it runs on is the same one that would notice
+            // the next daemon becoming stale.
+            std::thread::spawn(move || {
+                for (session_key, runtime_path) in targets {
+                    let write_runtime = Arc::clone(&runtime);
+                    let write_path = runtime_path.clone();
+                    let snapshot_runtime = Arc::clone(&runtime);
+                    let snapshot_path = runtime_path.clone();
+                    let outcome = crate::terminal::submit_prompt_echo_verified_with(
+                        move |text| {
+                            // Locked per WRITE, released before every sleep —
+                            // the whole reason this is not the registry method.
+                            lock_daemon_runtime(&write_runtime, "hot_restart_repair_write")
+                                .terminals
+                                .write(&write_path, text)
+                        },
+                        move || {
+                            lock_daemon_runtime(&snapshot_runtime, "hot_restart_repair_snapshot")
+                                .terminals
+                                .session_screen_snapshot(&snapshot_path)
+                        },
+                        "continue",
+                        HOT_RESTART_REPAIR_SUBMIT_TIMEOUT,
+                    );
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "lifecycle",
+                        "hot_restart_repair_continue",
+                        serde_json::json!({
+                            "session_key": session_key,
+                            "outcome": match &outcome {
+                                Ok(crate::terminal::PromptSubmitOutcome::Submitted { .. }) => "submitted",
+                                Ok(crate::terminal::PromptSubmitOutcome::NotReady { .. }) => "not_ready",
+                                Ok(crate::terminal::PromptSubmitOutcome::NoSession) => "no_session",
+                                Err(_) => "error",
+                            },
+                            "error": outcome.as_ref().err().map(|error| error.to_string()),
+                            "current_version": SERVER_PROTOCOL_VERSION,
+                            "current_pid": std::process::id(),
+                        }),
+                    );
+                }
+                HOT_RESTART_REPAIR_IN_FLIGHT.store(false, Ordering::Relaxed);
+            });
+        }
+    }
+}
+
 /// One poll of §4's lane: is the owed swap satisfied, waiting, or due?
 #[cfg(target_os = "linux")]
 fn hot_restart_swap_step(
@@ -15243,8 +15512,21 @@ fn hot_restart_swap_step(
     }
     // The process-local floor, checked whatever the file says — including when
     // the file is absent, which is the state a peer's convergence leaves behind.
+    //
+    // ⭐ §2: A RELAY BOUNDARY RELEASES THIS FLOOR TOO, and it has to, because
+    // releasing only the file's floor would leave the swap held by the other one
+    // — a bypass that reports success and changes nothing
+    // ([[finding-a-verb-that-reports-failure-on-success]] inverted). The
+    // comparison is against THIS process's own last attempt, so one boundary
+    // still buys each drainer exactly one attempt.
     let last_attempt_ms = HOT_RESTART_SWAP_LAST_ATTEMPT_MS.load(Ordering::Relaxed);
-    if last_attempt_ms != 0
+    let boundary_releases_this_process = queued.as_ref().is_some_and(|queued| {
+        queued
+            .relay_boundary_at_ms
+            .is_some_and(|boundary_ms| boundary_ms > last_attempt_ms)
+    });
+    if !boundary_releases_this_process
+        && last_attempt_ms != 0
         && now_ms.saturating_sub(last_attempt_ms) < HOT_RESTART_SWAP_RETRY_INTERVAL_MS
     {
         return SwapStep::Lingering;
@@ -15257,7 +15539,11 @@ fn hot_restart_swap_step(
         hot_restart_queue::record_attempt(
             home_dir,
             now_ms,
-            "no daemon at or above the target version is live yet; retrying the handoff",
+            if boundary_releases_this_process {
+                "a relay boundary was declared; retrying the handoff at it"
+            } else {
+                "no daemon at or above the target version is live yet; retrying the handoff"
+            },
         );
     }
     match attempt_self_retire_preserving_handoff(endpoint, home_dir, exe_link, owned) {
@@ -15334,6 +15620,10 @@ fn queue_self_retire_swap(
         attempts: 1,
         last_attempt_ms: Some(now_ms),
         last_outcome: Some("handoff requested; successor not yet confirmed live".to_string()),
+        // §2: a boundary is declared by a relay hand-off, never by the daemon
+        // that is queuing the swap — it would be declaring its own quiet point.
+        relay_boundary_at_ms: None,
+        relay_boundary_by: None,
     };
     let decision = hot_restart_queue::enqueue(home_dir, &request);
     append_trace_event(
@@ -18238,9 +18528,11 @@ pub(crate) fn terminal_write_strategy_for_path(
 mod tests {
     use super::{
         DaemonRuntime, HOT_RESTART_BLOCKER_NOT_RESTORABLE, HOT_RESTART_BLOCKER_ORCHESTRATING,
-        HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, HOT_RESTART_BLOCKER_WORKING, HotRestartBlocker,
+        HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, HOT_RESTART_BLOCKER_WORKING,
+        HOT_RESTART_FORCED_SWAP_DEADLINE_MS, HotRestartBlocker, HotRestartDeadlineVerdict,
         hot_restart_block_reason_summary, hot_restart_blocker_is_deadline_exempt,
-        hot_restart_blockers_actionable_first, hot_update_handoff_would_refuse_binary,
+        hot_restart_blockers_actionable_first, hot_restart_deadline_verdict,
+        hot_update_handoff_would_refuse_binary,
     };
     use crate::live_row_tombstones::LiveRowTombstones;
 
@@ -19077,6 +19369,101 @@ mod tests {
         assert!(!hot_restart_blocker_is_deadline_exempt(
             HOT_RESTART_BLOCKER_RECENTLY_ACTIVE
         ));
+    }
+
+    /// §5, the ruling itself: at 30 minutes the wait ends, and the sessions it
+    /// ends on are named so they can be repaired.
+    #[test]
+    fn the_deadline_forces_the_swap_and_names_who_it_interrupts() {
+        let blockers = vec![
+            blocker("local://a", HOT_RESTART_BLOCKER_WORKING, Some(0)),
+            blocker("local://b", HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, Some(0)),
+        ];
+        assert_eq!(
+            hot_restart_deadline_verdict(&blockers, HOT_RESTART_FORCED_SWAP_DEADLINE_MS - 1),
+            HotRestartDeadlineVerdict::KeepWaiting,
+            "inside the window this must behave exactly as it did before §5"
+        );
+        assert_eq!(
+            hot_restart_deadline_verdict(&blockers, HOT_RESTART_FORCED_SWAP_DEADLINE_MS),
+            HotRestartDeadlineVerdict::Force {
+                interrupted: vec!["local://a".to_string(), "local://b".to_string()],
+            },
+            "the interrupted list is produced HERE — after the swap every one of \
+             these sessions looks idle and the list cannot be rebuilt"
+        );
+    }
+
+    /// ⛔ §6 outranks §5, and one exempt blocker vetoes the whole force.
+    ///
+    /// A cold shutdown kills every PTY this daemon owns, so there is no version
+    /// of "interrupt the working one but spare the shell beside it". Getting
+    /// this wrong strands a delegate fleet or destroys a plain shell — the two
+    /// outcomes the exemption exists to prevent.
+    #[test]
+    fn one_exempt_blocker_holds_the_deadline_open_forever() {
+        for exempt_kind in [
+            HOT_RESTART_BLOCKER_ORCHESTRATING,
+            HOT_RESTART_BLOCKER_NOT_RESTORABLE,
+        ] {
+            let blockers = vec![
+                blocker("local://working", HOT_RESTART_BLOCKER_WORKING, Some(0)),
+                blocker("local://exempt", exempt_kind, Some(0)),
+            ];
+            assert_eq!(
+                hot_restart_deadline_verdict(&blockers, HOT_RESTART_FORCED_SWAP_DEADLINE_MS * 10),
+                HotRestartDeadlineVerdict::ExemptBlocker {
+                    kind: exempt_kind.to_string(),
+                    session_key: "local://exempt".to_string(),
+                },
+                "§8: the wait must be nameable, not a silent refusal"
+            );
+        }
+    }
+
+    /// An unblocked gate is not a forced swap. The deadline must not manufacture
+    /// an interruption out of a daemon that was free to go all along — that
+    /// record would owe a `continue` to nobody and fire into a healthy session.
+    #[test]
+    fn a_gate_with_no_blockers_is_never_a_forced_swap() {
+        assert_eq!(
+            hot_restart_deadline_verdict(&[], HOT_RESTART_FORCED_SWAP_DEADLINE_MS * 10),
+            HotRestartDeadlineVerdict::KeepWaiting
+        );
+    }
+
+    /// §5's two halves ship together or not at all: the deadline may only fire
+    /// from a branch that has already written down who it is about to interrupt.
+    ///
+    /// Source-level because the defect is an ORDERING — a `shutdown()` that runs
+    /// before the record is written type-checks, passes every unit test, and
+    /// loses the list forever, since the process that holds it is the one
+    /// exiting.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_forced_swap_records_its_interrupted_set_before_shutting_down() {
+        let source = include_str!("daemon.rs");
+        let gate = source
+            .split("let deadline = hot_restart_deadline_verdict(&blockers, owed_for_ms);")
+            .nth(1)
+            .and_then(|suffix| suffix.split("// B4: make it loud").next())
+            .expect("the deadline branch should be present");
+        let record_at = gate
+            .find("hot_restart_repair::record(")
+            .expect("a forced swap must record the sessions it interrupts");
+        let trace_at = gate
+            .find("hot_restart_forced_past_deadline")
+            .expect("a forced swap must say so in the trace");
+        assert!(
+            record_at < trace_at,
+            "the interrupted set must be recorded before anything else in the branch — \
+             it cannot be re-derived once the PTYs are gone"
+        );
+        assert!(
+            !gate.contains("let _ = shutdown(&endpoint);"),
+            "the shutdown belongs to the shared exit below the gate, so a forced swap \
+             cannot acquire its own copy that skips the row-coverage check"
+        );
     }
 
     // An orchestrating session is NOT permanent: it clears the moment its
@@ -21348,6 +21735,41 @@ mod tests {
         );
     }
 
+    /// §2: BOTH floors must yield to a declared relay boundary, not just the one
+    /// in the file.
+    ///
+    /// Source-level because the defect is a MISSING CONDITION on a second gate,
+    /// and the shape has already cost this project a day: the boundary would be
+    /// declared, `attempt_is_due` would answer true, `server relay-boundary`
+    /// would print success — and the process-local floor would return
+    /// `Lingering` anyway, so nothing would happen and every instrument would
+    /// say it had.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_relay_boundary_releases_the_process_local_floor_too() {
+        let source = include_str!("daemon.rs");
+        let step = source
+            .split("fn hot_restart_swap_step(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("the swap step should be present");
+        assert!(
+            step.contains("boundary_releases_this_process"),
+            "the process-local floor must consult the declared boundary; releasing only the \
+             file's floor is a bypass that reports success and changes nothing"
+        );
+        let floor = step
+            .split("let last_attempt_ms = HOT_RESTART_SWAP_LAST_ATTEMPT_MS.load")
+            .nth(1)
+            .and_then(|suffix| suffix.split("return SwapStep::Lingering;").next())
+            .expect("the process-local floor should be present");
+        assert!(
+            floor.contains("!boundary_releases_this_process"),
+            "the boundary check must be part of the floor's own condition, not merely \
+             computed near it"
+        );
+    }
+
     /// The successor clears the entry, because the writer does not survive to.
     ///
     /// Live-proven defect, 2026-08-13: the daemon that queued a swap handed its
@@ -21412,6 +21834,8 @@ mod tests {
             attempts: 3,
             last_attempt_ms: Some(600_000),
             last_outcome: Some("successor never bound the target socket".to_string()),
+            relay_boundary_at_ms: None,
+            relay_boundary_by: None,
         };
         let rendered = super::format_daemon_census_with_queued_swap(&[], Some(&queued), 1_800_000);
         assert!(rendered.contains("swap owed → 9.9.9"), "{rendered}");
