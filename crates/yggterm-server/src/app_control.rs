@@ -3351,7 +3351,7 @@ mod tests {
             // spells a function word. These are labels, not dangling syntax.
             "restore lane A",
             "compare arm B against arm A",
-            "grep the echograph for",
+            "grep the build log for",
             "reap leftover app processes",
         ];
         for kind in EVERY_SESSION_KIND {
