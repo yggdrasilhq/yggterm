@@ -194,6 +194,59 @@ symptom: a freshly spawned row reads `{whatever the spawner is called}
 existing narrative for the detail; this line exists so the 6.2 delegate knows it
 is in scope.
 
+## ⛔ A SCREENSHOT OF A NON-TERMINAL VIEW PHOTOGRAPHS WHATEVER HOLDS FOCUS
+
+**Status:** OPEN
+
+*found 2026-08-13 while taking start-page proof, and it nearly published a false one*
+
+`server app screenshot /tmp/out.png` answered
+`capture_faithful: true, capture_backend: linux_wayland_spectacle` — and the
+PNG was **a picture of a text editor**, not yggterm at all. The Spectacle
+backend shoots the focused window, and the GUI did not hold focus.
+
+⇒ **The flag was true about the pixels and silent about the SUBJECT.** It is
+documented as meaning "this frame is not canvas-blind", which is a claim about
+terminal fidelity only; nothing in the reply says *which window* was captured.
+An agent following the field guide reads `faithful:true` and reasons from a
+frame of another application.
+
+⚠ Passing `--pid <gui>` did NOT fix it either: it then returned
+`capture_faithful: false, capture_backend: linux_webkit_snapshot`. That frame
+IS correct for a start page (DOM, no xterm canvas) — so on a non-terminal view
+the honest frame is the one flagged unfaithful, and the dishonest one is
+flagged faithful. Exactly inverted for this surface.
+
+**Wanted:** `--pid` implies window-targeted capture, and a shot that is not of
+the addressed client reports `faithful:false` with a reason naming what it
+photographed. A capture verb that cannot say what it captured is not a
+verification instrument.
+
+**Falsifier:** with the GUI unfocused, `screenshot --pid <gui>` returns a frame
+of that GUI, or refuses.
+
+## ⛔ deploy-fleet SSHes TO THE HOST IT IS ALREADY RUNNING ON
+
+**Status:** OPEN
+
+*found 2026-08-13 deploying 3.0.113*
+
+`scripts/deploy-fleet.sh --hosts "dev guihost oc"` run **on** the `oc` host tried to
+`ssh oc` and failed all four copies with `Could not resolve hostname oc`. Its
+local-host test is `[ "$host" = "$(hostname -s)" ]`, and that machine's
+`hostname -s` is not `oc` — the fleet name and the kernel hostname differ.
+
+⇒ A deploy that reports ⛔ for the host doing the deploying, while the other two
+hosts land correctly, invites exactly the split the script exists to prevent:
+the operator reads three-quarters success and moves on. Worked around by a
+second run with `--hosts local`.
+
+**Wanted:** resolve each host name against the fleet's own alias table (or
+compare resolved addresses) rather than against `hostname -s`.
+
+**Falsifier:** `deploy-fleet.sh --hosts "dev guihost oc"` run on any of the three
+lands twelve copies and reports no ⛔.
+
 ## ⛔⛔ [6.3] yedit's VIEWPORT PAINTS NOTHING WHILE ITS FILE RAIL IS FULL
 
 **Status:** OPEN
