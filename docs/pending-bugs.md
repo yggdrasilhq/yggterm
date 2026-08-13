@@ -1254,29 +1254,44 @@ is running.**
 ⇒ The machine sits in `performance` **whenever it is plugged in**, which is the
 desk state in which the fan was reported.
 
-### The profile arms, replicated, and honestly short of proof
+### ⭐ THE PROFILE ARMS — SETTLED BY AN INTERLEAVED A/B
 
-| arm | n | mean | **max** |
-|---|---|---|---|
-| AC + `performance` (baseline) | 1,251 | 69.9 | **97.1°C** |
-| AC + `performance` + sysctls | 19 | 82.6 | **94.0°C** |
-| AC→battery, `performance` | 160 | 70.7 | **95.6°C** |
-| **AC + `balanced`** (controlled trial) | 29 | 69.9 | **75.6°C** |
-| battery + `balanced` | 8 | 69.8 | **78.1°C** |
+⛔ **The earlier sequential windows were replaced, not extended.** The machine
+went from mains to battery mid-session, which changes power source *and* profile
+together, and the battery then charged — so any sequential arm comparison
+straddles a moving thermal load. **Arms alternating every 5 minutes** put that
+drift on both arms equally. Interleaving was unaffordable for the build A/B
+(every swap cost a GUI restart); here a swap is one write and no restart, so the design
+that was correct-but-impossible there is correct-and-free.
 
-**Every `performance` window exceeds 94°C; every `balanced` window stays under
-79°C — while the MEAN is identical (~70) in all five.** It is a ceiling effect,
-not a shift, which is exactly what capping a firmware power limit does.
+| arm | n | mean | p50 | peak | **>85°C** | >80°C |
+|---|---|---|---|---|---|---|
+| `performance` | 90 | 71.9°C | 70 | **92°C** | **9 (10.0%)** | 25 (27.8%) |
+| `balanced` | 71 | 65.2°C | 65 | **83°C** | **0 (0.0%)** | 2 (2.8%) |
 
-⭐ **The one controlled pair is `AC + performance` vs `AC + balanced`** — same
-power source, only the profile differs. The battery arm is confounded (power
-source *and* profile both changed) and must not be pooled with it as evidence.
+**`balanced` eliminates the >85°C band entirely — 0/71 against 9/90, Fisher
+exact p≈0.004.** Mains throughout, `arm_overridden=0`, `off_mains=0`, verified
+per sample rather than assumed.
 
-⚠ **Still not proof.** Combined balanced n=37 with zero rounds above 85°C against
-a 6.6% baseline rate is **p≈0.08**. ⇒ **What is owed is a longer `AC + balanced`
-window (n≈360, one hour).** ⛔ **It cannot be run while the machine is on
-battery**, because the profile is then not ours to hold — it is whatever the
-power source dictates. Resume when mains returns.
+⭐ **The mean moved this time (−6.7°C) where five earlier windows said it did
+not.** The earlier windows were uncontrolled; this is what a controlled
+comparison bought, and it is the direct answer to *"why does a 90%-idle machine
+run hot"* — because the firmware profile, not the workload, sets the ceiling.
+
+⚠ **An owner report arrived mid-trial and matched the schedule he could not
+see:** "very hot … cooled down just now" at ~19:54, against a `performance`
+block running 19:48–19:53 (peaks 91, 92°C) and a `balanced` block beginning
+19:53:03 (62–74°C). ⛔ **The trial was then STOPPED EARLY and the profile pinned
+to `balanced`** — it was 60 seconds from deliberately reproducing a condition the
+owner had just reported as unusable. **An experiment does not outrank the
+machine's owner using the machine.**
+
+⛔ **AND THE HEAT DID NOT CAUSE THE TYPING FAILURE, though they resolved minutes
+apart.** The same report said he could not type; the cause was a **poisoned
+composer** — `Error: connecting to …/server-3-0-130.sock` sitting *inside* the
+`❯` box of the row he was typing into — cleared by the socket alias at ~19:45,
+not by the cooling at ~19:53. **Two faults, two fixes, one coincidence.** The
+tempting single-cause story would have been wrong in both directions.
 
 **What the trial changes and how to revert it:** `platform_profile` is a runtime
 firmware setting; writing it caps the sustained power limit and fan curve and
