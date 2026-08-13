@@ -792,8 +792,8 @@ else: **the number lives in `outline_prefix` ONLY, never in the title.**
 **Why this is not cosmetic.** Measured on one sidebar the day this was written: **five rows named
 `New Ychrome`, one `New Yedit`, one `Agent unnamed shell`** — and reading their screens showed they
 were *not interchangeable at all*: one was a live browser part-way through a multi-step form on a
-vendor console, one was a search engine open under a different campaign's browser profile, and
-**four were bare `/bin/bash` at `~` that had never been used.**
+vendor console, one was a search engine open under a different browser profile, and four were bare
+`/bin/bash` at `~` with nothing typed into them.
 ⇒ **the default label names the LAUNCH VERB, not the JOB**, so
 every one of them reads as the same row. The one you must not close and the four that are litter
 are visually identical, and the only way to tell them apart is to read seven screens.
@@ -805,6 +805,37 @@ sidebar cannot even use novelty as a signal.
 ⇒ **The duty is the spawner's, at spawn, in the same breath** — not the app's, and not "later".
 A surface opened and left unnamed is the same defect as a delegate left unclaimed (①), and it fires
 far more often because opening a browser does not feel like spawning a session.
+
+### ⛔⛔⛔ AND THE HARD LIMIT ON ALL OF THE ABOVE: NAME YOUR OWN ROWS. NEVER THE OWNER'S.
+
+**Owner-reported 2026-08-13, within the hour, and the harm was immediate and visible on his
+screen.** An orchestrator applied ①b to six rows it had not spawned. It read their screens, found
+four of them holding a bare shell with nothing typed in, titled them *"abandoned launch, safe to
+close"* — **and they were the owner's own browser stack, tagged by him, which he navigates by.**
+
+> **⭐ AN AGENT MAY NAME ITS OWN ROWS AND ITS DELEGATES' ROWS. ROWS THE OWNER CREATED ARE HIS —
+> never rename, never re-describe, never "improve".**
+
+⛔ **AND THE TELL WAS AVAILABLE BEFORE ACTING, POINTING THE OTHER WAY: A ROW YOU CANNOT ACCOUNT FOR
+IS MORE LIKELY TO BE A HUMAN'S THAN TO BE LITTER.** The orchestrator had exactly that evidence — it
+could not attribute six rows to any spawner — and **read it backwards**, concluding *abandoned*
+where it should have concluded *not mine*. **Inability to attribute a row is positive evidence that
+you did not create it.**
+
+⚠ **Every description it wrote was ACCURATE**, and that is the trap: the shells really were unused
+and really were closable. **Accuracy about a row is not authority over it.** Being right about what
+a thing is grants nothing about whose it is.
+
+⛔ **AN EMPTY ROW IS THE ONE WHOSE PURPOSE LIVES ENTIRELY OUTSIDE IT.** A row a human is holding
+open *for later* is indistinguishable, from the inside, from one nobody wants — the intent is in
+the human, not in the PTY. ⇒ **emptiness is never evidence of abandonment.**
+
+**⇒ Before renaming any row, answer: did I spawn this, or did a row I own spawn it?** If you cannot
+say yes, **leave it exactly as it is** and, if it genuinely confuses the sidebar, say so to its
+owner instead. ⚖ Recovery is only cheap if you captured the old value: **read the current title
+back and keep it before you write** — that is what made the restoration above take one call instead
+of an unconvergent search, and `detail_label`/profile chips are **not** recoverable from
+`row-order-ledger.json` or `removed-rows.json`.
 
 **② ⛔ RETIRING THE ROW DOES NOT KILL THE PROCESS — and a finished delegate does not exit.** An
 agent CLI sits at its prompt forever after its last turn. `session remove` can answer
