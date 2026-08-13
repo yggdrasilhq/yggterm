@@ -29,6 +29,87 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⛔⛔⛔ [6.7→6.1] 37 OF 51 ROWS CANNOT BE TYPED INTO: THE DAEMON CANNOT UPGRADE, SO EVERY NEW CLIENT ASKS FOR A SOCKET THAT WILL NEVER EXIST
+
+**Status:** OPEN
+
+*owner-reported 2026-08-13 19:15 ("I can't type in many sessions"); root-caused
+the same hour on the desktop host. **This is the constitution's unmet guarantee
+firing as a user-visible outage**, so it belongs to the hot-restart relay gate
+lane, not to resource work — filed by 6.7 because 6.7 was measuring when it hit.*
+
+### The symptom, measured
+
+`live_session_snapshot_debug`: **37 of 51 sessions in `RemoteBootstrap`, 14
+`Running`.** A row in `RemoteBootstrap` has no PTY, so typing goes nowhere.
+The affected set spans several unrelated campaigns end to end,
+plus two of the 6.x clusters — it is not confined to one lane.
+
+### The stuck rows say exactly what is wrong, in their own composer
+
+```
+❯ Error: connecting to /home/pi/.yggterm/server-3-0-128.sock
+Caused by:
+    No such file or directory (os error 2)
+```
+
+⭐ **Read `live_sessions[].terminal_lines`** — the CLI's stderr lands *inside*
+the `❯` box, which is the already-filed poisoned-composer shape: a row that is
+alive, refuses input, and is indistinguishable from a busy one until you read
+its screen.
+
+### The chain, end to end
+
+1. Daemon started **13:44 as 3.0.118**; on-disk binary is now **3.0.128**
+   (`running_build_id` 1786608864 vs `on_disk_build_id` 1786628472).
+2. `hot_restart_pending: True` — **and it can never converge.** The drain defers
+   while any session was active in the last **300 s**, and `hot_restart_blockers`
+   lists **9 sessions**, every one an agent row: `recently_active` at idle_ms of
+   **69, 89, 119…**. ⛔ **The agents that make the host busy are the same agents
+   whose activity resets the window.** On a machine running agents around the
+   clock the window never opens. *(The measuring session was itself blocker #4,
+   `kind: working` — you cannot observe this without joining it.)*
+3. So only `server-3-0-118.sock` exists. `server-3-0-122.sock` and
+   `server-3-0-128.sock` do **not**.
+4. New and resumed sessions launch from the **on-disk 3.0.128 binary**, which
+   addresses the daemon by a **version-keyed socket path** — the version string
+   is a rendezvous key, already a filed bug class.
+5. `refresh_legacy_server_socket_aliases` (`socket_sweep.rs`) **back-aliases
+   legacy versions only** — `server-3-0-110/112/113/116.sock → …-118.sock`. ⇒
+   **By design there is no forward alias, because the scheme assumes the daemon
+   is always the newest thing on the host.** When the daemon cannot upgrade that
+   assumption inverts and *every current client is orphaned while a museum of
+   dead versions stays perfectly aliased.*
+
+⇒ **The upgrade path and the addressing scheme have opposite failure modes, and
+together they livelock:** the daemon cannot move forward because the rows are
+busy, and the rows cannot connect because the daemon has not moved forward.
+
+### ⛔ WHAT WAS DELIBERATELY NOT DONE, AND WHY
+
+**Creating `server-3-0-128.sock → server-3-0-118.sock` by hand would probably
+unstick all 37 rows in one command. It was not done.** The alias scheme is
+back-only *by design*; a hand-made forward alias invents a cross-version proxy
+the code never intended, and this project has already had one proxied call to an
+older owner **return nothing silently**. ⇒ **That trade turns 37 loudly-broken
+rows into 37 possibly-silently-wrong ones**, which is worse, and it would hide
+the livelock that is the actual defect. If it is ever done as an emergency
+unstick it must be logged, time-boxed and removed, never left in place.
+
+⚠ **There is no sanctioned force-verb.** `server monitor --scenario hot-restart`
+observes the drain; nothing commands it. That absence *is* the unbuilt gate.
+
+### What actually fixes it
+
+`docs/spec-hot-restart-relay-gate.md` — **the drain must not require a quiet
+window**, which the constitution already states in exactly those words. Until it
+lands, every deploy on a busy host can strand the whole row set this way, and the
+failure is invisible from any instrument except the row's own screen.
+
+**Falsifier:** if the daemon reaches 3.0.128 and rows still sit in
+`RemoteBootstrap` with that error, the socket key is not the cause and the
+resume path owns it instead.
+
 ## ⛔⛔ [6.1] SOME ROWS WILL NOT RESTORE, AND A RESTART DOES NOT RECOVER THEM
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
