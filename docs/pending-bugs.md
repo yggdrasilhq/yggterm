@@ -9775,10 +9775,10 @@ broken and does nothing."* ⇒ **This entry did not decay into "probably fixed b
 it is live at 3.0.148.** Recording that explicitly, because an entry sitting a hundred versions
 behind its last measurement invites exactly that assumption.
 
-**His terminal, read from the daemon's own screen — he ran it three times:**
+**The owner's terminal, read from the daemon's own screen — run three times:**
 
 ```
-pi@***:~$ yedit
+user@host:~$ yedit
 yedit: document surface opened — `yedit --close` to close it.      (×3)
 ```
 
@@ -12127,7 +12127,7 @@ followed by a relaunch.
 (2026-07-28).** Full field report:
 **[`docs/agent-passkey-gap-2026-07-28.md`](agent-passkey-gap-2026-07-28.md)**.
 Written from a real deadline job (minting a Cloudflare DNS-01 token to renew
-the expiring `*.gour.top` wildcard). The passkey machinery is built and
+an expiring wildcard certificate). The passkey machinery is built and
 correct; it is simply **never wired to a surface an agent makes**:
 1. **Surface policy is bound ONCE, at `open_web_surface` time**
    (`crates/yggterm-shell/src/shell.rs:8715`). A surface built while
@@ -12497,9 +12497,9 @@ that bg video. There is no way to stop it unless I close the session row."*
 Confirmed in the trace, twice, and **we caused it ourselves**:
 
 ```
-1785964054633  pid 1510425 (the user's GUI)  native_open  y.gour.top/watch?v=j1Vk6Y-23CY
-1785964154970  pid 1690716 (an AGENT shadow) native_open  youtube.com/watch?v=j1Vk6Y-23CY   ← the phantom, +100.3 s
-1785964425582  pid 1699947 (another shadow)  native_open  youtube.com/watch?v=j1Vk6Y-23CY   ← again
+1785964054633  pid 1510425 (the user's GUI)  native_open  media.example.invalid/watch?v=VIDEOID0001
+1785964154970  pid 1690716 (an AGENT shadow) native_open  video.example.invalid/watch?v=VIDEOID0001   ← the phantom, +100.3 s
+1785964425582  pid 1699947 (another shadow)  native_open  video.example.invalid/watch?v=VIDEOID0001   ← again
 ```
 
 ⚠ **There is no ~60s timer** — the user's "after ~1min" is the agent's own shadow
