@@ -2162,6 +2162,206 @@ alone would have proven nothing.
 ⇒ Collapse the two onto one dispatcher. Until then a new verb must be added to
 both, and the headless copy carries a comment saying so.
 
+## ⭐ THE RENDERER'S LOAD-BEARING FEATURE IS BARE-NAME LINK RESOLUTION — measured, not argued
+
+**Status:** OPEN
+
+*Measured 2026-08-13 by seat 6.8 against a collection in daily use. Structure and
+shapes were counted; no note bodies were read and no targets recorded.*
+
+Filed here because **there is no live row for the renderer**, so a finding aimed
+at "whoever owns it" routes to nobody. This survives until someone opens that
+door.
+
+The link syntaxes a real markdown collection actually uses, as a share of link
+volume:
+
+| shape | share |
+|---|---|
+| **bare `[[name]]`** | **~98%** |
+| pathed `[[folder/name]]` | ~1.8% |
+| aliased `[[name\|label]]` | ~0.3% |
+| heading `[[name#heading]]` | **0 — not once, in thousands of links** |
+| embed `![[name]]` | 3 in total |
+
+⇒ **A renderer that cannot resolve a bare name across a whole collection is
+useless for this corpus; one that lacks aliases and heading-links loses under
+half a percent.** That is a priority ordering derived from use rather than from
+taste, and it inverts the order these features would naturally be built in —
+heading-links and aliases *look* like core wiki-link functionality and are
+respectively never and almost never used.
+
+⚠ **One number must not be over-read.** Cross-collection embedding was the origin
+story of the flatten decision, and the embed count is 3. That is consistent with
+*the old containment made it impractical* and equally consistent with *nobody
+wanted it*. **The count does not distinguish them**, and it should not be quoted
+as if it did.
+
+**Falsifier:** count the same shapes on a second independent collection. If bare
+names are not dominant there, this is one corpus's habit rather than a property
+of the format, and the priority does not transfer.
+
+## ⛔ A CLEAN MERGE PRODUCED A SELF-CONTRADICTING DOCUMENT
+
+**Status:** OPEN
+
+*Hit 2026-08-13 by seat 6.8, landing five lane commits onto a queue 62 commits
+ahead.*
+
+Merging main into a lane that had edited **the same region of this file five
+times** completed with **no conflicts, no markers and no warning** — and
+silently duplicated a 41-line block, keeping both a superseded paragraph and the
+text that replaced it. The entry then said *"the private side is done"* in one
+place and *"Next: the private side"* forty lines later.
+
+**Every gate passed on the corrupted text.** `check-docs-ssot.sh` reported ok;
+the heading count was exactly what it should be (+1 for the one new entry); no
+other lane's entry was harmed. The duplication was invisible to every automatic
+check because **duplicating a block breaks no rule any of them enforce.**
+
+⇒ This is the merge counterpart of a known law here: *a tool reporting success
+is not the same as the content being right.* A merge resolves TEXT, and a
+document whose sections are semantically ordered — supersession, "next steps",
+status lines — can be textually merged into nonsense.
+
+**What caught it:** reading the merged entry, then a script that hashed every
+paragraph over 80 characters and counted repeats. That check found seven
+duplicated paragraphs in one entry and, once fixed, zero across the whole file.
+
+⭐ **Cheap enough to be a gate.** A duplicate-paragraph check over this file
+costs nothing and would have failed the merge — worth adding to
+`check-docs-ssot.sh`, which already owns the question *is this file internally
+sound*. Not added here because that script is the docs law's SSOT and changing
+it belongs with whoever owns that law, not with the lane that tripped over it.
+
+⚠ ALSO: the first probe that looked like a lost section was a **case-sensitive
+grep miss** — the text was there, capitalised. Do not conclude loss from a
+failed search until the search itself is controlled; that is the entry below,
+arriving during the fix for this one.
+
+## ⛔ A READER THAT FINDS NOTHING LOOKS EXACTLY LIKE A THING THAT HAS NOTHING
+
+**Status:** OPEN
+
+*Three instances 2026-08-13, two of them found independently within the hour by
+seats 6.8 and 6.2.*
+
+**The generalisation first, because it is worth more than any of its instances
+and it is what a reader should carry away:**
+
+> **An empty result and a broken reader are the same picture.** Nothing errors,
+> every count is plausible, and the failure is invisible precisely because the
+> system is designed to survive emptiness gracefully.
+
+| the reader | its silence looked like |
+|---|---|
+| a corpus reader looking for the wrong facts filename | two populated collections holding nothing |
+| an editor handed a path it accepted and dropped | a rendering bug — exit 0, empty surface |
+| a viewer painting no document body | an app that declared no content |
+| **a shadow client that had died** | **a rail stuck on "Loading…" — a slow fetch, then a regression** |
+
+⚠ **That last row was measured 2026-08-13 and nearly published as a false
+finding.** A rail that had rendered fully an hour earlier came back reading
+*Loading…* on two different corpora. The app was serving its schema correctly
+throughout — `curl` proved it — so the obvious reading was a host regression
+between 3.0.132 and 3.0.140, and there was even a plausible culprit (a widget
+added in between). **The shadow had simply died**, and `--client <name>` answered
+*no live client by that name* the moment anything asked. ⇒ **A dead instrument
+does not return an error; it returns a plausible picture.** The only thing that
+caught it was checking the instrument's own health **in the same run** as the
+measurement — and the control that exonerated the new widget (a corpus without
+it, stalling identically) was itself taken through the dead instrument and
+proved nothing either.
+
+⇒ **When adding any reader, ask what its silence would look like** — and if the
+answer is "the same as success on empty input", give it a way to say *I looked
+and found nothing* distinct from *there was nothing*. Every entry below is a
+consequence of nobody having asked that question.
+
+### The instance this entry was opened for: the shadow does not paint a body
+
+*Measured 2026-08-13 by seat 6.8, with a control, while trying to obey two rules
+at once. GUI at 3.0.132.*
+
+The shadow-probe law says probe through the shadow, never the operator's GUI.
+The field guide says a visual symptom needs a faithful pixel. **For a document
+surface those two rules point at an instrument that cannot answer**: the shadow
+paints the surface's BAR and the app's RAIL pane, and leaves the BODY blank.
+
+What was measured, on one shadow, in one sitting:
+
+| surface | declared | painted on the shadow |
+|---|---|---|
+| an app's rail pane | button, section, three rows | ✅ every row, with live content |
+| the document surface's **bar** | two `section` widgets | ✅ and it re-rendered on a route change |
+| the document surface's **body** | six `list-row`, then a `markdown` | ⛔ nothing |
+| the pilot editor's document body | one multiline `text-input`, 3,625 chars | ⛔ nothing |
+
+⇒ **The control is what makes this a finding rather than a guess.** A new app
+rendering an empty body is a new app's bug until the SHIPPED pilot renders an
+equally empty body through the identical path — same shadow, same verbs, same
+minute. It did. Two independent apps, both declaring body-class widgets with
+real content, both blank; and the same shadow painting bar and rail correctly,
+which is the positive control that it can paint an app's widgets at all.
+
+**Why it misleads rather than merely limiting.** Every telemetry field agrees the
+surface is fine — `has_schema: true`, `stale: false`, `error: null`,
+`visible: true` — and the bar visibly updates when the route changes, so the
+surface is demonstrably live and refetching. An author following the two laws
+correctly is handed a blank frame with a clean bill of health and no reason to
+suspect the instrument. The shadow's own documentation says its terminal
+viewport was fixed and its screenshots are valid pixel proof for a terminal bug;
+nothing says the document body is exempt, so the exemption reads as an app bug.
+
+**Falsifier:** open any document-surface app on a shadow and capture. The body
+must contain what the app declared. Until then, treat a blank document body on a
+shadow as unproven rather than broken — and note that the honest alternative,
+foregrounding the operator's GUI, is forbidden by the law that sent you here, so
+this gap has no workaround that does not break a different rule.
+
+### ⚠ A REAL-GUI CAPTURE EXISTS NOW, AND IT ANSWERS A DIFFERENT QUESTION
+
+*Taken 2026-08-13 by seat 6.2 at 3.0.133. The halves are kept apart here on
+purpose, because this entry will be read by people who ran neither.*
+
+**Established:** the app plane paints on a real GUI. A freshly launched pilot
+editor rendered its entire rail on a faithful frame — toolbar, search field,
+view toggle, headings, the empty-state line. So *"a document surface cannot
+render on a real GUI"* is refuted, and whatever the shadow is doing, it is not
+that.
+
+⛔ **NOT established, and it is exactly the half this entry is about.** That
+capture could not reach the LOADED state, so it shows **an empty surface
+painting its rail** — not **a populated body painting its content**. The
+observation above is a surface with 3,625 declared characters painting nothing.
+Those are two different pictures and neither substitutes for the other.
+
+⇒ **Do not read this entry as "the body is proven on a real GUI."** The
+shadow-versus-real-GUI comparison is **still open**, and the instrument that
+would close it is a surface that will actually load a document.
+
+⚠ **Why that instrument is currently unavailable is another lane's finding, not
+this seat's measurement:** the editor accepts a path argument, reports success,
+and does not load it — filed separately by the seat that hit it. It is named
+here only because it is what blocks the decisive test, and it is itself the
+second row of this entry's own table. Two seats found the same shape in the same
+hour on different planes, which is the argument for the headline.
+
+**A likely cause, and the experiment that was deliberately NOT run.** A shadow
+declares itself with a role that the daemon's gate holds to read-only — it never
+sends terminal-ensure, resize or focus, and paints from the read stream. A
+document surface is not a PTY, but it is plausible the body sits behind the same
+gate. The clean test is a full client, not a shadow, in its own compositor.
+
+⛔ **It was not run, on purpose.** A second full client on the operator's machine
+contends for session ownership, and the one-viewer-per-session assumption is
+precisely the thing the constitution names as unfixed — a spare full client
+yanking the operator's live session is a known shape here, not a hypothetical.
+The diagnostic is not worth that risk from a lane that only needed to know
+whether its own app was broken, and the control already answered that. Recorded
+so the next reader does not have to re-derive the risk before deciding, and so
+that "nobody tried it" is not mistaken for "it did not work."
+
 ## ⭐⭐ [6.8] THE KASTEN APPS ARE WAITING TO BE BUILT
 
 **Status:** OPEN
@@ -2174,18 +2374,108 @@ allow — see the progress note at the end of this entry.
 
 Two related surfaces, requested as their own relay:
 
-1. **`ztlkasten`** — the public journalling rule-set repo, which already has a
-   design and a door in the campaign memory.
-2. **A kasten-style overview for each private graph** — dossier, fin, med, tax,
-   call. Same shape, one per graph.
+1. **`ztlkasten`** — the journalling rule-set repo, which already has a design
+   and a door in the campaign memory.
+2. **A kasten-style overview for each private corpus** — five of them, one per
+   domain, and the request says *same shape, one per corpus*.
 
-⇒ These are the softwares the graph campaigns are waiting on, and they are
+⇒ These are the softwares the private campaigns are waiting on, and they are
 listed here so the queue reflects that the wait is real work and not a
 dependency on someone else.
 
-⛔ **The private graphs' surfaces stay in private repos.** Anything that resolves
-to a real path, person or case is a privacy defect in a public repo — this is
-the guard that has already failed once by scanning tracked files only.
+⛔ **The private corpora's surfaces stay in private repos.** Anything that
+resolves to a real path, person or case is a privacy defect in a public repo —
+this is the guard that has already failed once by scanning tracked files only.
+
+⚠ **This entry leaked the roster it forbids, and the leak is fixed above.** The
+original wording listed the five corpora by their short names in a sentence that
+appends the common suffix for the reader. The wordlist guard holds each full
+name and would have caught them; it cannot catch a roster written in pieces, so
+nothing fired. **A count and a shape carry the whole engineering fact** — that
+there are five consumers of one contract — and the roster carried only identity.
+Never pushed: caught on the lane branch. Routed to the guard's owner as a dream.
+
+### The scope, written before any code so it can be corrected cheaply
+
+*written 2026-08-13 by seat 6.8, which is this entry's owner*
+
+**The call that shapes everything else: this is ONE app with N configurations,
+not two apps and not six.** The request already said *same shape, one per
+corpus*; the measurement agrees. Both consumers are a corpus of typed nodes in
+folders, addressed by slug, cross-linked, with prose attached — the journalling
+vault addresses its nodes as markdown files whose grouping vocabulary is *also*
+files (a tag is a note), and a private corpus addresses its nodes as a
+structured-facts file plus an optional prose file under a folder that names the
+kind. **Same shape, two vocabularies.** So the vocabulary becomes data.
+
+⇒ **`kasten.toml`, a manifest at a corpus root, is the ONE contract** between the
+engine and any corpus. It declares the collections and what each is called, how a
+node's title, status and date are read, and which sub-collections may never enter
+a publication path (§5 of the app's own spec already requires that property to be
+declared and enforceable rather than an accident of layout). The engine ships in
+the public repo and never learns a corpus name; each private corpus commits a
+manifest of a few lines **in its own private repo**. That is what keeps this
+entry's own prohibition structurally true rather than a thing an author has to
+remember.
+
+**Tier A, by the app-architecture spec's own question** — *who must paint the
+pixels, and why?* Collections, rows, prose, counts and a search box are what the
+host already draws. The app therefore ships **no UI code at all**: a headless
+daemon plus a thin CLI, an OSC declare, a loopback control endpoint serving the
+widget schema, rendered on the document surface. Chrome is the schema either way;
+here the content is too.
+
+**What gets built, in this order:**
+
+1. This scope. ✅
+2. The manifest schema, and a synthetic corpus fixture with **invented** names —
+   the fixture is the classic leak because a realistic string feels like good
+   practice, so the fixture is fiction end to end.
+3. The engine: read the manifest, index the corpus, emit the schema. Proven
+   against the fixture, in the public repo, with no private corpus in reach.
+4. The scaffolding — ensure-daemon, OSC emitter, manifest writer, loopback
+   server. The pilot app already carries these ~200 lines and the platform's
+   migration order wants them extracted **once a second consumer exists**. This
+   lane is that consumer. ⚠ Copy first and file the extraction; doing it inline
+   would put a platform refactor inside an app's first commit.
+5. Live proof on the GUI host: a faithful screenshot of the document surface
+   showing the fictional corpus, per the visual-symptom law.
+6. Only then the private side: one manifest per corpus that fits, committed
+   there, never here.
+
+**What does NOT get built, stated so the boundary is correctable now and not
+after a week:**
+
+- **No editor.** Reading and capture only. Editing a buffer is another app's job
+  and duplicating it would be a second source of truth for the same gesture.
+- **No collaboration or arbiter.** Owner-settled: that primitive belongs to the
+  host, and it is the same two-live-viewers problem the constitution already
+  names as this project's highest-value work.
+- **No markdown handling of its own.** Owner-settled: the renderer organ is the
+  SSOT, and an app that grows its own breaks the property that makes the pipeline
+  worth having.
+- **No boards, calendars or dashboards first.** They demo well and serve neither
+  hot path. The design value is flow, priced in decisions and keystrokes on
+  *capture a thought* and *find a thing again*; a feature that cannot pay on both
+  is a feature for some other program.
+- **No new host widget kinds.** If the content needs one, it is filed as a
+  vocabulary gap for the host to admit, not drawn inside a native surface. A
+  graph view is the obvious candidate and it is explicitly **not** opened here.
+- **No writes into any private corpus.** Read-only in the first pass. Each corpus
+  already has a CLI that owns its mutations, and a second writer is a second
+  source of truth for the same records.
+
+**The honest exception, found by measuring rather than assuming: one of the five
+is not a corpus.** Four hold hundreds of node files between them; the fifth holds
+three prose files, a database and a tree of pipeline logs and queues. It is a
+**pipeline**, and an overview of it is a job-and-run view, which is a different
+program. Building the node overview and calling it five would be a false claim
+about coverage, so this lane delivers four and says which one it did not.
+
+**Falsifier for the whole scope:** the same binary, unchanged, renders two
+corpora with disjoint folder vocabularies from their manifests alone — and a
+`grep` of the public repo for any private corpus name, path or node title returns
+nothing, with a positive control proving the grep can find a planted one.
 
 ### Progress, 2026-08-13 — the engine, and what its proof does and does not cover
 
@@ -2224,9 +2514,74 @@ That control is why this is filed as its own entry above rather than carried
 here as a kasten defect. The body remains unproven either way until someone
 captures a document surface on a real GUI.
 
-**Next:** the private side — one manifest per corpus that fits, committed in that
-corpus's own repository, never here. Four of the five; the fifth is a pipeline
-rather than a corpus and gets no node overview.
+**The private side is done, and it is four manifests, not four programs.**
+Rather than hand-writing one per corpus, the engine grew an `init` verb that
+proposes a manifest by surveying what a corpus actually contains — the same
+chore, done the same way every time, instead of assembled from primitives once
+per corpus and got subtly wrong on the third. It proposes to stdout, refuses to
+overwrite an existing manifest, and emits no source it did not observe. Each
+manifest was then edited for the two things no generator can see from disk:
+what a corpus is CALLED, and which of its collections may never be published.
+
+Four corpora now carry one, each committed in its own repository and none of
+them named here. Three pushed; the fourth's repository is deliberately
+remote-less and its commit is local by design, which is a standing decision and
+not an omission.
+
+**Running it against real corpora paid for itself twice, and both were silent
+failures rather than errors:**
+
+1. **A directory node names its facts file after the node KIND**, not
+   `index.toml`. Two populated collections were reported as holding nothing.
+   Fixed by declaring it. The obvious alternative — a hard-coded list of likely
+   filenames — is the trap this whole design exists to avoid: it works on the
+   corpus it was written against and reads zero nodes on the next, which looks
+   exactly like an empty collection.
+2. **A collection rooted at the corpus itself swallowed the corpus's own index
+   files as nodes.** They parse, so the count was merely wrong and nothing
+   complained. A declared entry file now also means *a node is a directory*,
+   which is what it was always saying.
+
+**The fifth is confirmed not a corpus, by measurement rather than by repeating
+this entry's own earlier claim.** Pointed at it, `init` finds a single
+collection of two prose files and reports its other directories as holding
+nothing — they are queues, logs and a work area. It is a pipeline; a
+job-and-run view is a different program and this lane does not pretend to
+deliver one.
+
+### Capture is built, and live-proven end to end
+
+*2026-08-13, later the same session.*
+
+The overview served retrieval only, which made the app a reader rather than a
+journal. **Both hot paths now exist.** A thought lands in today's dated entry in
+a declared collection with **one command and no decisions** — no title, no
+folder, no tag. The entry opens with its own date as a heading, which is what a
+note collection reads its title from, so the writer never names one; each
+thought gets a time marker they never type, which costs nothing on the hot path
+and is the only way to recover the order of a day's thinking later.
+
+**One declaration, and everything else is derived rather than restated.** The
+capture target names a collection; the file name, the heading and the ordering
+all come from what that collection already says about itself. Three
+misconfigurations are refused at manifest LOAD rather than at capture time,
+because a corpus set up to file thoughts somewhere that will never show them
+would fail silently and the writer would find out late or never.
+
+**Live proof on the GUI host, before and after, on one rail:**
+
+- the capture box renders at the top of the rail, above navigation, identical on
+  every route — a thought arriving three collections deep must not require the
+  reader to go anywhere;
+- the rail read **Journal 3**; the capture action was posted exactly as the rail
+  posts it; the rail read **Journal 4**, and the day's entry was on disk with
+  its date heading and time marker.
+
+That is the surface path, not just the CLI — box, action, write, re-index,
+and the count the writer sees change.
+
+⛔ **Still not claimed: the document BODY**, for the reason in the entry above.
+The rail is what the available instrument can prove, and it is what is claimed.
 
 ## ⛔ [6.4] `server app start-page` IS A NAVIGATION VERB SHELVED AMONG THE READ VERBS
 
