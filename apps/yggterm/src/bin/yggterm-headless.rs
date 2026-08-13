@@ -191,6 +191,11 @@ fn print_server_help() {
   yggterm-headless server status
   yggterm-headless server daemons [--json]
   yggterm-headless server relay-boundary [--by <who>] [--wait-secs <n>] [--json]
+  yggterm-headless server gate-screen [<session-key>] [--tail <n>] [--json]
+    what the hot-restart idle gate is CLASSIFYING FROM, per owned session — the
+    live in-daemon screen plus the blocker it produced. This is not
+    `server snapshot`'s terminal_lines, which is usually a stored summary line
+    rather than screen text. Read-only, on demand, never written to the trace.
   yggterm-headless server <status|snapshot> --endpoint <socket-path|version|pid>
   yggterm-headless server snapshot
   yggterm-headless server shutdown
@@ -1415,6 +1420,60 @@ fn main() -> Result<()> {
                 "message": message,
             }))?
         );
+        return Ok(());
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "gate-screen" {
+        // §3's audit instrument. Read-only, on demand, and connected directly
+        // like the other read-only diagnostics — a verb that spawned a daemon
+        // in order to ask what a daemon is looking at would answer about a
+        // process that did not exist when the question was asked.
+        //
+        // ⛔ NOT WRITTEN ANYWHERE. The screens go to this stdout and nowhere
+        // else — see `HotRestartGateScreen`. A caller harvesting a corpus owns
+        // where it lands and how long it lives.
+        let endpoint = cli_server_endpoint(store.home_dir());
+        let path = args.get(2).filter(|arg| !arg.starts_with("--"));
+        let tail_lines = cli_flag_value(&args, "--tail").and_then(|value| value.parse().ok());
+        let sessions = yggterm_server::hot_restart_gate_screens(
+            &endpoint,
+            path.map(String::as_str),
+            tail_lines,
+        )?;
+        if args.iter().any(|arg| arg == "--json") {
+            println!("{}", serde_json::to_string_pretty(&sessions)?);
+            return Ok(());
+        }
+        if sessions.is_empty() {
+            println!("no sessions owned by this daemon match");
+            return Ok(());
+        }
+        for session in &sessions {
+            let verdict = match session.blocker.as_ref() {
+                Some(blocker) => format!(
+                    "{kind}{permanent}, idle {idle}",
+                    kind = blocker.kind,
+                    permanent = if blocker.permanent { " (permanent)" } else { "" },
+                    idle = blocker
+                        .idle_ms
+                        .map(|ms| format!("{}s", ms / 1000))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+                None => "not blocking".to_string(),
+            };
+            println!(
+                "== {key}\n   gate verdict: {verdict}\n   screen_text_shows_agent_working: {working}\n   screen: {screen}",
+                key = session.session_key,
+                working = session.shows_agent_working,
+                screen = if session.screen_available {
+                    "readable"
+                } else {
+                    "UNREADABLE — the gate is classifying this one blind"
+                },
+            );
+            for line in session.screen_tail.iter().flatten() {
+                println!("   | {line}");
+            }
+        }
         return Ok(());
     }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "app-declares"

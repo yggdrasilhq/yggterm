@@ -165,7 +165,7 @@ pub use daemon::{
     sync_external_window, sync_terminal_identity, sync_terminal_identity_with_profile, sync_theme,
     declare_session_tenancy,
     terminal_app_declares, terminal_ensure, terminal_history, terminal_read, terminal_resize,
-    terminal_restart, terminal_tenants,
+    hot_restart_gate_screens, terminal_restart, terminal_tenants,
     terminal_restart_with_size,
     terminal_retained_snapshot, terminal_snapshot, terminal_write, toggle_preview_block,
     update_session_copy,
