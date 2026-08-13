@@ -633,7 +633,41 @@ def fleet_state(args):
     subs = []
     for s in load_subs():
         win, why = boot_after_for(s)
+        # ⭐ "WHEN IS THIS ROW DUE" IS THE EXPENSIVE HALF, SO IT IS OPT-IN.
+        #    Answering it means classifying the row — a live row-list call plus
+        #    a transcript read, the same work a tick does — which is fine when a
+        #    human is looking at the pane and ruinous on a refresh loop. Without
+        #    `--due` this stays a cheap read of local files.
+        # ⛔ AND A FAILED LOOK IS REPORTED AS A FAILED LOOK. `due_in_s: null`
+        #    with a state of UNREACHABLE says "I could not see"; rendering that
+        #    as "not due" would be a verdict we never earned.
+        due = {}
+        if getattr(args, "due", False):
+            try:
+                rhost = BB.row_host(s.get("row") or "", s.get("host") or args.host)
+                if rhost and rhost == this_host():
+                    rhost = None
+                c = BB.classify(s["uuid"], rhost)
+                # ⛔ "DUE" IS A COUNTDOWN, NOT A VERDICT ALREADY REACHED. Only
+                #    answering once a row is already IDLE makes the number
+                #    useless for the one thing a human wants it for — deciding
+                #    whether to defer a row BEFORE it is kicked. JUST_ENDED and
+                #    IDLE are the same fact at two ages (the turn has ended),
+                #    and the countdown is meaningful across both.
+                # ⛔ A MID-TURN ROW HAS NO DUE TIME AT ALL, and must not be
+                #    given one: the window is measured from a turn ending, and
+                #    this row's has not.
+                due = {
+                    "state": c["state"],
+                    "idle_s": round(c["age"]),
+                    "due_in_s": (max(0, round(win - c["age"]))
+                                 if c["state"] in ("IDLE", "JUST_ENDED") else None),
+                }
+            except Exception as e:
+                due = {"state": "UNREACHABLE", "idle_s": None, "due_in_s": None,
+                       "why": str(e)[:120]}
         subs.append({
+            **due,
             "uuid": s["uuid"],
             "row": s.get("row"),
             "campaign": s.get("campaign") or "",
@@ -1166,6 +1200,10 @@ def main():
     ap.add_argument("--json", action="store_true",
                     help="list/status: the machine-readable state, for a surface "
                          "to render and drive")
+    ap.add_argument("--due", action="store_true",
+                    help="list/status --json: also classify each subscriber to say "
+                         "WHEN it is next at risk of a boot. Costs a row-list call "
+                         "and a transcript read per subscriber, so it is opt-in")
     args = ap.parse_args()
     # ⛔ Never carry a placeholder host into a boot decision.
     args.host = resolve_gui_host(args.host)
