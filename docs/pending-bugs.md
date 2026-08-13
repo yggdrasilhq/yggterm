@@ -1653,58 +1653,94 @@ also live.
 **Falsifier:** spawn and tear down N remote sessions on a fresh daemon and count
 zombies. It must stay at zero.
 
-## ⛔ [6.7] YGGTERM HOLDS AN UNCORKED AUDIO STREAM OPEN FOREVER, WHICH IS THE DISTORTED NOTIFICATION AND A POWER DRAW
+## ⛔ [6.7] UNEXPLAINED: HAND-MADE SOCKET ALIASES AT A JUST-RETIRED NAME WERE DELETED, SIBLINGS WERE NOT
 
 **Status:** OPEN
 
-*measured 2026-08-13 — this REFUTES the swap-pressure explanation offered above*
+*observation retained after the hypothesis built on it was falsified — the
+hypothesis is dead, the data is not*
 
-The batch attributed the lagged, distorted notification audio to swap pressure
-("the analog signal is not lagging, the machine is"). That is not what is
-happening. On a GUI relaunched **11 minutes** earlier, with 8 GB of RAM free and
-the GUI at 17% of a core — no pressure condition of any kind:
+**What was seen**, on the GUI host in the minutes after 3.0.131 retired:
 
-```
-Sink Input #86796
-        Corked: no
-                application.name         = "Yggterm"
-                application.process.binary = "WebKitWebProcess"
-                media.name               = "Playback Stream"
-```
+| alias | outcome |
+|---|---|
+| at `server-3-0-131.sock` (the just-retired name) | **deleted 3×**, within seconds to ~100 s of creation |
+| at 3 other versions, created in the **same command** | survived untouched |
+| the same alias at the same path, 7 min later | survived 150 s |
 
-**`Corked: no` is the finding.** The webview holds an **uncorked — actively
-streaming — playback stream open permanently**, with nothing playing. The
-WebAudio threads that serve it (`webaudioSrc:src`, `webaudioSrcTask`,
-`queue0:src`) are present on a fresh process and never go away.
+⇒ Whatever deleted them is **transient, fires in a window around a retirement,
+and targets exactly the name a retiring daemon writes.** Siblings born in the
+same syscall batch were spared, so it is not a blanket sweep.
 
-**Two costs, and they explain both reported symptoms:**
+⛔ **The mechanism proposed for it is FALSIFIED and must not be repeated:** that
+`classify_socket_entry` condemns an entry by NAME on a re-proved dead sighting
+and executes that sentence later against a different file. At the next handover
+the falsifier ran in the wild on two hosts — `retiring_daemon_aliased_own_socket`
+fired, the alias at the retiring name resolved to the live successor, and it
+**survived 535 s**. The case that mattered is not affected.
 
-1. **Power.** An uncorked stream keeps the audio graph running, so the pipeline
-   never suspends. The hardware sink does reach `SUSPENDED`, but the filter sink
-   in front of it reads `RUNNING` for as long as yggterm holds the stream. On a
-   laptop that is a continuous, entirely avoidable draw — and this cluster's
-   mandate names power explicitly.
-2. **The distortion.** Audio glitching is a missed real-time deadline, not a
-   memory condition. A stream held uncorked for hours and fed nothing will
-   underrun; when a notification finally arrives it plays through a pipeline
-   that has been starving, which is exactly "lagged and distorted". A pegged
-   main thread (92.6% of a core, see the entry above) makes the missed deadline
-   near-certain.
+⚠ **So this is a curiosity, not a blocker** — nothing is sequenced behind it and
+the daemon-written bequest is not being eaten. It is recorded because **a
+hypothesis dying does not kill the observation that prompted it**, and an
+unexplained deletion in the socket lifecycle is worth having on file the next
+time something goes missing there.
 
-⇒ **The audio item does NOT retire as a symptom of the memory bug.** It is a
-lifecycle defect of the same family as the unreaped `ssh` children and the
-never-released web contexts: a resource acquired and never given back.
+**Falsifier for the remaining question:** create an alias at a just-retired
+version's name and watch it for two minutes, with the sweep's own trace on. It
+either dies again — and the deleter is findable — or it does not, and this was
+tied to a condition that no longer exists.
 
-**The fix:** cork the stream when idle, or `suspend()` the `AudioContext`
-between notifications, or build it per notification and drop it after. Whichever
-— the steady state must be no stream.
+## ⛔ [6.7] AN UNCORKED AUDIO STREAM HELD FOREVER — FIXED IN CODE, LIVE PROOF OWED
 
-**Falsifier:** with no notification playing, `pactl list sink-inputs` must show
-no uncorked yggterm stream, and the filter sink must reach `SUSPENDED`.
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-⚠ **Owner-verifiable half:** whether the notification *sounds* right after the
-fix needs an ear, not an instrument. The measurable half above is sufficient to
-build against and does not wait on that.
+*Falsified by: with no notification playing and the GUI idle past the awake
+window, `pactl list sink-inputs` must show no uncorked yggterm stream and the
+filter sink must reach `SUSPENDED`. ⛔ **The running GUI does NOT carry this
+fix** — it is in the lane, not deployed.*
+
+**What was wrong.** The shell kept ONE long-lived `AudioContext` and left it
+**running forever**, so the webview held an uncorked playback stream with
+nothing in it: `Corked: no` on a GUI 11 minutes old, 8 GB free, no pressure of
+any kind. Two costs — a pipeline that never suspends (continuous laptop draw),
+and a stream fed nothing for hours that underruns, so the chime that finally
+arrives plays through a starving pipeline. That is the "lagged and distorted"
+notification, and it is a missed real-time deadline, not a memory condition.
+
+### ⛔ THE OBVIOUS FIX IS THE ONE ALREADY TRIED AND REVERTED
+
+This entry previously suggested "build it per notification and drop it after".
+**That was the original design and it produced a defect the owner reported by
+ear:** a context closed shortly after the last note while a Bluetooth sink still
+held 100–300 ms of buffered audio — the **clipped ending**. A second prior fix
+resumes the context because WebKitGTK starts one SUSPENDED until a user gesture,
+and without it every chime scheduled while the user was away was dropped
+**silently**. ⇒ **Any fix here has to keep both of those intact**, which rules
+out `close()` and rules out per-chime construction.
+
+### The fix, and why the deadline is not a new number
+
+`suspend()` — never `close()` — on an idle timer, reset by each chime. The
+context object is kept and reused, so the clipped-ending fix stands; the
+existing `resume()` path already wakes a suspended context, so the silent-drop
+fix stands.
+
+⭐ **The suspend deadline IS `NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS`**, the
+constant the Bluetooth pre-roll decision already uses — not a second tunable
+beside it. That makes the two agree *by construction*: while the context is
+running, the next chime falls inside the awake window and correctly skips the
+pre-roll; once it suspends, the next chime falls outside it and correctly
+pre-rolls a cold link. A separate constant could drift and give a chime that
+skips the pre-roll onto a link that has gone to sleep — the clipping defect,
+reintroduced by disagreement rather than by design.
+
+**Locked by** three assertions on the generated script: that it suspends, that
+it contains no `close()`, and that the deadline is literally the awake-window
+constant. 13 notification tests pass.
+
+⚠ **The acoustic half needs an ear, not an instrument** — whether the chime still
+sounds right after a suspend/resume cycle is owner-verifiable only. The
+measurable half above stands on its own and does not wait on it.
 
 ## ⛔⛔ [6.7] THE PRIVACY GUARD SCANS ALL OF HISTORY ON A NEW BRANCH, SO EVERY LANE PUSH FAILS AND TEACHES THE OVERRIDE
 
