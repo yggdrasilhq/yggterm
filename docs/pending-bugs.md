@@ -29,133 +29,131 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
-## ⛔⛔⛔ [6.7→6.1] 37 OF 51 ROWS CANNOT BE TYPED INTO: THE DAEMON CANNOT UPGRADE, SO EVERY NEW CLIENT ASKS FOR A SOCKET THAT WILL NEVER EXIST
+## ⛔⛔ [6.7→6.1] EVERY DAEMON BUMP ORPHANS EXACTLY ONE VERSION — THE ONE THAT WAS SERVING
 
 **Status:** OPEN
 
-*owner-reported 2026-08-13 19:15 ("I can't type in many sessions"); root-caused
-the same hour on the desktop host. **This is the constitution's unmet guarantee
-firing as a user-visible outage**, so it belongs to the hot-restart relay gate
-lane, not to resource work — filed by 6.7 because 6.7 was measuring when it hit.*
+*owner-reported 2026-08-13 19:15 ("I can't type in many sessions"). The outage
+itself is over; the mechanism that caused it is untouched and recurs on every
+deploy. Filed from 6.7, belongs with the daemon-lifecycle work.*
 
-### The symptom, measured
+### The defect
 
-`live_session_snapshot_debug`: **37 of 51 sessions in `RemoteBootstrap`, 14
-`Running`.** A row in `RemoteBootstrap` has no PTY, so typing goes nowhere.
-The affected set spans several unrelated campaigns end to end,
-plus two of the 6.x clusters — it is not confined to one lane.
+Sessions address the daemon by a **version-keyed socket path**
+(`server-3-0-<n>.sock`) — the version string is a rendezvous key, already a filed
+bug class. `refresh_legacy_server_socket_aliases` (`socket_sweep.rs`) keeps older
+versions reachable by **aliasing every version that has no socket** to the live
+one.
 
-### The stuck rows say exactly what is wrong, in their own composer
+⛔ **A gap-filling pass cannot cover its own predecessor, because a REAL SOCKET
+IS INVISIBLE TO A PASS THAT ONLY FILLS GAPS.** The version serving at the moment
+aliases are written is correctly skipped — it is not a gap. Then it retires, its
+real socket is unlinked, and nothing ever replaces it.
 
-```
-❯ Error: connecting to /home/pi/.yggterm/server-3-0-128.sock
-Caused by:
-    No such file or directory (os error 2)
-```
+⇒ **Every bump orphans exactly one version: whichever was serving.** Any client
+pinned to it strands, and **a snapshot mitigation re-breaks itself once per
+deploy, forever.**
 
-⭐ **Read `live_sessions[].terminal_lines`** — the CLI's stderr lands *inside*
-the `❯` box, which is the already-filed poisoned-composer shape: a row that is
-alive, refuses input, and is indistinguishable from a busy one until you read
-its screen.
+**Observed end to end on the desktop host, 2026-08-13:**
 
-### The chain, end to end
+| | |
+|---|---|
+| 22 aliases written while **3.0.130 was live** | 130 correctly skipped — it was real |
+| 130 retired, socket unlinked | nothing replaced it |
+| clients pinned to 130 | `Error: connecting to …/server-3-0-130.sock` |
+| slots 126–129 | all aliased and healthy |
+| slot **130** | **missing** — the one that had been serving |
 
-1. Daemon started **13:44 as 3.0.118**; on-disk binary is now **3.0.128**
-   (`running_build_id` 1786608864 vs `on_disk_build_id` 1786628472).
-2. `hot_restart_pending: True` — **and it can never converge.** The drain defers
-   while any session was active in the last **300 s**, and `hot_restart_blockers`
-   lists **9 sessions**, every one an agent row: `recently_active` at idle_ms of
-   **69, 89, 119…**. ⛔ **The agents that make the host busy are the same agents
-   whose activity resets the window.** On a machine running agents around the
-   clock the window never opens. *(The measuring session was itself blocker #4,
-   `kind: working` — you cannot observe this without joining it.)*
-3. So only `server-3-0-118.sock` exists. `server-3-0-122.sock` and
-   `server-3-0-128.sock` do **not**.
-4. New and resumed sessions launch from the **on-disk 3.0.128 binary**, which
-   addresses the daemon by a **version-keyed socket path** — the version string
-   is a rendezvous key, already a filed bug class.
-5. `refresh_legacy_server_socket_aliases` (`socket_sweep.rs`) **back-aliases
-   legacy versions only** — `server-3-0-110/112/113/116.sock → …-118.sock`. ⇒
-   **By design there is no forward alias, because the scheme assumes the daemon
-   is always the newest thing on the host.** When the daemon cannot upgrade that
-   assumption inverts and *every current client is orphaned while a museum of
-   dead versions stays perfectly aliased.*
+⭐ **This also falsifies the hope that the aliases carry themselves forward**: the
+written symlinks *are* surviving files, so the next sweep should inherit them —
+but the bump was watched and **130 was orphaned within minutes anyway**, because
+its slot was never a gap when the pass ran.
 
-⇒ **The upgrade path and the addressing scheme have opposite failure modes, and
-together they livelock:** the daemon cannot move forward because the rows are
-busy, and the rows cannot connect because the daemon has not moved forward.
+### The fix
 
-### ⛔ WHAT WAS DELIBERATELY NOT DONE, AND WHY
+**A retiring daemon must alias its own version to its successor as part of
+retiring** — that is the only moment the system holds both names. Anything done
+later is a sweep guessing from whatever files remain.
 
-**Creating `server-3-0-128.sock → server-3-0-118.sock` by hand would probably
-unstick all 37 rows in one command. It was not done.** The alias scheme is
-back-only *by design*; a hand-made forward alias invents a cross-version proxy
-the code never intended, and this project has already had one proxied call to an
-older owner **return nothing silently**. ⇒ **That trade turns 37 loudly-broken
-rows into 37 possibly-silently-wrong ones**, which is worse, and it would hide
-the livelock that is the actual defect. If it is ever done as an emergency
-unstick it must be logged, time-boxed and removed, never left in place.
+⛔ **And the enumeration defect underneath stays open regardless:** the candidate
+set is derived from **surviving socket files**, so it inherits the sweeper's
+retention policy — ancient sockets were never cleaned and get aliases, recent
+ones are deleted on each bump and get none. **The museum stays addressable while
+the current generation is orphaned.** ⇒ **Enumerate from the versions that
+EXIST, never from the files that happen to REMAIN.**
 
-### ⭐⭐ THE RULE THAT SETTLES IT: THE ARROW IS THE WHOLE ARGUMENT
+### ⭐⭐ THE ARROW RULE — which alias is legitimate
 
 **An alias pointing at a NEWER daemon is the design. An alias pointing at an
-OLDER one is a proxy wearing the design's clothes.**
+OLDER one is a proxy wearing the design's clothes.** Both directions were live on
+the fleet within one hour and the same rule decides them opposite ways:
 
-Both directions were live on the fleet within the same hour, and the same rule
-decides them opposite ways:
+| | daemon | clients want | alias arrow | verdict |
+|---|---|---|---|---|
+| desktop host, 19:15 | 3.0.118 | `…-128.sock` | → **older** | ⛔ **refused** |
+| build host | 3.0.130 | `…-128.sock` | → **newer** | ✅ created (30) |
+| desktop host, 19:45 | 3.0.131 | `…-130.sock` | → **newer** | ✅ created |
 
-| | GUI host | build host |
-|---|---|---|
-| live daemon | 3.0.118 | 3.0.130 |
-| what clients ask for | `server-3-0-128.sock` | `server-3-0-128.sock` |
-| would-be alias | 128 → **118** (older) | 128 → **130** (newer) |
-| verdict | ⛔ **refused** — cross-version proxy | ✅ **created** — the mechanism's own job |
+⇒ **Same rule, opposite answers, because the FACT changed and not the rule** —
+which is the argument for stating rules as directions rather than as verdicts
+about particular versions. Refusing the first was right: a current-client →
+older-daemon proxy has already returned nothing silently here, and it would have
+converted loudly-broken rows into possibly-silently-wrong ones while hiding the
+defect. Guard every such alias with an abort unless the live daemon has a **real,
+non-symlink** socket.
 
-⇒ On the build host the *same* orphaning had appeared with the arrow reversed:
-**twelve consecutive recent versions had no socket and no alias, while ancient
-ones from two major versions back were still perfectly aliased.** Restoring the
-missing recent aliases to the live newest daemon is exactly what
-`refresh_legacy_server_socket_aliases` exists to do; 30 were created and
-`server-3-0-128.sock` answers there now. **Verified independently from that host,
-not taken on report.**
+### ⛔⛔ TWO INSTRUMENTS MISREAD IN ONE EVENING, BY TWO SESSIONS, IN OPPOSITE DIRECTIONS
 
-⛔ **And the root defect underneath is a bug class already filed here: a fallback
-whose candidate set is enumerated from SURVIVING FILES inherits the deleter's
-retention policy.** Ancient sockets were never swept so they got aliases; recent
-ones are deleted on each bump so they got none. **The museum stays addressable
-while the current generation is orphaned** — which is the same shape as the
-earlier instance, now with a second victim. ⇒ Enumerate an alias set from the
-versions that *exist*, never from the files that *happen to remain*.
+Both readings were published before either was checked against the code:
 
-⚠ **On the GUI host this is a MITIGATION at best and was not applied there
-anyway** — sessions that already have the error in their scrollback keep showing
-it until they reconnect, and forcing reconnection means opening rows and moving
-the owner's viewport while he is working.
+1. **A socket-error count of zero** was taken ~70 s after a daemon swap and read
+   as *"the outage is over"*. It was a **transient before clients reconnected**;
+   the errors returned minutes later.
+2. **`launch_phase == RemoteBootstrap`** on 39 of 49 rows was read as *"39 rows
+   are stranded"*. ⛔ **It does not mean stranded.** It is the resting state of a
+   row **not yet attached in this GUI generation** — `daemon.rs` asserts a fresh
+   shell row carries it, and the open path sets it on rows nobody has clicked.
+   With ~46 sidebar rows and ~10 open, 39 is the expected number.
+
+⭐ **The decisive check was a self-counterexample, not an argument:** rows
+*demonstrably executing work* — including the session writing this entry — read
+`RemoteBootstrap`, and one still displayed the stale socket error in its
+scrollback while fully functional. **The error text is buffer residue, not
+state.** ⇒ **The only instrument that stayed correct throughout is whether a row
+RESPONDS.** Prefer it to any status field, and read the code that sets a field
+before quoting it in either direction.
 
 ### ⚠ THE OBSERVER JOINS THE SET IT IS MEASURING
 
 `hot_restart_blockers` listed the diagnosing session itself, `kind: working`,
-idle_ms 119. **That is a property of the measurement, not a nuisance to note and
-move past:** any session capable of running the probe is by definition active,
-and therefore extends the very window whose failure to close it is investigating.
-⇒ **A quiet-window drain cannot be observed from inside the host it gates**, and
-an agent checking whether the drain is stuck makes it slightly more stuck. Any
-future instrument here must either sample from off-host or account for its own
-contribution explicitly.
+idle_ms 119. That is a property of the measurement: any session able to run the
+probe is by definition active, and therefore extends the window whose failure to
+close it is investigating. **A quiet-window drain cannot be observed from inside
+the host it gates.** Sample off-host, or account for your own contribution.
 
-⚠ **There is no sanctioned force-verb.** `server monitor --scenario hot-restart`
-observes the drain; nothing commands it. That absence *is* the unbuilt gate.
+### ⛔ A CAUSAL STORY THIS ENTRY CARRIED AND WITHDREW
 
-### What actually fixes it
+It previously said the drain *"can never converge"* because it defers while any
+session was active in the last 300 s, and that the agents making the host busy
+were the ones resetting the window. **The measurements were sound**
+(`hot_restart_blockers`, `kind: recently_active`, `threshold_ms: 300000`,
+`attempts: 0`) — **the mechanism bolted onto them was not.** The idle gate was
+innocent; the daemon converged by a deliberate version-coexistence route while
+that story predicted it could not.
 
-`docs/spec-hot-restart-relay-gate.md` — **the drain must not require a quiet
-window**, which the constitution already states in exactly those words. Until it
-lands, every deploy on a busy host can strand the whole row set this way, and the
-failure is invisible from any instrument except the row's own screen.
+⇒ **The real cause is narrower and better: the swap queue's only drainer is a
+daemon's retire poll, and the newest daemon was twelve versions older than the
+code that reads the queue.** Producer (the current GUI) and consumer (a stale
+daemon) sit on opposite sides of the very version skew the queue exists to fix.
+`attempts: 0` for 17 minutes was **nobody reading**, not deferral. ⇒ **A queue
+whose consumer can be older than its producer has no floor**, and no amount of
+correctness in the gate can help it — the third time on this project a suspected
+gate turned out to be a bystander.
 
-**Falsifier:** if the daemon reaches 3.0.128 and rows still sit in
-`RemoteBootstrap` with that error, the socket key is not the cause and the
-resume path owns it instead.
+⚠ **The general shape, since two sessions hit it within one hour:** *when two
+readings both fit the data, test the one that licenses the action you already
+wanted to take* — and a brief may carry MEASUREMENTS, never a causal theory
+dressed as fact.
 
 ## ⛔⛔ [6.1] SOME ROWS WILL NOT RESTORE, AND A RESTART DOES NOT RECOVER THEM
 
