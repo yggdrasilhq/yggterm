@@ -244,6 +244,26 @@ copies.
   binary is on the fleet, so the app is usable now either way. **To reverse:**
   one visibility change; nothing else depends on it.
 
+## The working dot: what should a CLOSED row's dot say?
+
+**One line, and it unblocks the render.** The dot can only mean "working" for
+rows that are OPEN — measured on the GUI host, **16 of 50**. Every open row has a
+working answer (7 of 7 agent rows with a live PTY); the other 34 are rows nobody
+has opened, so nothing is running for any daemon to observe and the honest answer
+is "not running".
+
+**The question:** should a closed row's dot look the same as an open row that is
+idle, or different? Today the dot effectively renders ATTACHMENT, which reads as
+activity — that is the symptom he reported.
+
+**Recommendation:** a closed row shows NO dot at all (absence, not a grey dot),
+an open-and-idle row shows the idle dot, an open-and-working row blinks. That
+makes the dot's presence mean "this row is live", which is a fact the sidebar
+does not otherwise show, and reserves the blink for real work.
+**Done meanwhile:** nothing rendered on a guess — the discovery half is finished
+and filed (there is no detector defect), so the render lands as soon as this is
+answered. **To reverse:** it is a view-layer rule; no data change either way.
+
 ---
 
 ## Nothing is waiting on him for these, and they are the relay's actual queue
