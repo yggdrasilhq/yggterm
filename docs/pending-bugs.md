@@ -833,10 +833,33 @@ is usually another cluster's deploy, not your own doing.
 
 ## ⛔⛔ A PRIVATE INFRASTRUCTURE NAME SITS IN THE PUBLIC REPO AS A TEST FIXTURE
 
-**Status:** OPEN
+**Status:** OPEN — working tree is clean; the PUBLISHED HISTORY is not.
 
-Not this cluster's code; routed here because the queue is the one place it
-cannot be lost.
+⚠ **Scope corrected 2026-08-13 by a full-object sweep** (every blob from every
+ref plus unreachable objects, every path name, every commit message, across all
+17 owner-controlled public repos). This was filed as two fixtures. It is not:
+**nine repositories carried private material, and this repository's own
+published history carries 96 blobs and 13 commit messages** naming private
+infrastructure, a personal home path, and — in shipped source, not only docs — a
+bank hostname. The current branch is clean; anyone reading the history is not
+reading a clean repo.
+
+**Seven repositories are DONE** (rewritten and force-pushed 2026-08-13, each
+verified by commit-count, ref-set and SHA-normalized subject parity, and by a
+fresh anonymous clone showing zero hits). **This repository and one sibling are
+orchestrator-gated** on a window where no cluster is pushing, because a rewrite
+landing under a live lane is how work gets orphaned.
+
+⛔ **A rewrite is only half the remedy.** A force-push shrinks the discoverable
+surface and **revokes nothing**: pre-rewrite commits stay retrievable by SHA from
+the host indefinitely — verified on a sibling repo three days after its own
+force-push, by two independent methods. A support request under the
+private-information-removal process was filed 2026-08-13; an earlier request was
+deflected because it had been categorised as a repository-access issue.
+
+⭐ **The method, the four controls, and the traps are written down** and are not
+in this repository, deliberately — the replacement rules necessarily name the
+strings being removed. A successor can execute cold from the runbook.
 
 *found 2026-08-13 by the privacy guard, while it was blocking an unrelated push*
 
