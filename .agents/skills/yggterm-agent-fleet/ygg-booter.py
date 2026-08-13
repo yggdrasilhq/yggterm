@@ -1023,6 +1023,34 @@ def tick(args):
     # The quota hold from a previous tick. Re-read per tick, never cached: a hold
     # that outlived its window must not keep a healthy fleet asleep.
     rl = rate_limit_hold()
+    # ⛔⛔ ENFORCE never-arm AT THE TICK, NOT ONLY AT `subscribe`.
+    #
+    #    The refusal in `cmd_subscribe` lives in THIS SCRIPT, and this script is
+    #    copied into every checkout on the machine — a lane claims with its own
+    #    copy, which is routinely many commits behind. Measured: the guard was
+    #    present in 1 checkout of 11, and the exposed end was the one the hazard
+    #    actually runs through, because `subscribe` is called by a LANE from its
+    #    own tree while the tick runs from exactly one.
+    #
+    #    ⇒ A guard in code that exists in eleven versions is eleven guards. The
+    #    STATE DIR is shared by every checkout and the tick is a single process,
+    #    so enforcement belongs here — and this is also the point of HARM: the
+    #    tick is the only thing that types. A stale script can still create the
+    #    subscription; it can no longer cause anyone to be typed over, and the
+    #    bad record is purged on sight rather than left to be re-found.
+    blocked = never_arm()
+    if blocked:
+        for s in list(subs):
+            if s["uuid"] in blocked:
+                log(f"⛔ {s['uuid'][:8]} is NEVER-ARM ({blocked[s['uuid']]}) yet was "
+                    f"SUBSCRIBED — purging it now, not booting it.")
+                log("   Something armed a human-attended row; it was almost "
+                    "certainly a pre-guard copy of this script in another checkout.")
+                # Dropped from THIS tick's working set either way — a dry run must
+                # not mutate, but it must not pretend it would boot this row.
+                if not args.dry_run:
+                    sub_path(s["uuid"]).unlink(missing_ok=True)
+                subs.remove(s)
     rc = 0
     for s in subs:
         uuid, row, host = s["uuid"], s["row"], s.get("host", args.host)
