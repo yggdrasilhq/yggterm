@@ -859,6 +859,54 @@ empty) yet the push was refused, so the only way forward was
 did nothing wrong.** That is how an override becomes reflex, and the next
 genuine hit gets waved through. The scan range must be the push's own commits.
 
+## ⛔⛔ A ROW STOPS ACCEPTING INPUT AND THIS ONE IS *NOT* THE INPUT GATE
+
+**Status:** OPEN
+
+*owner-reported twice on 2026-08-13; second instance captured live on 3.0.128*
+
+Owner: *"Once in a while a session stops responding to inputs. One of the worst
+annoyances."* Symptom: no typing, no scrolling, a near-blank viewport after
+switching to the row.
+
+⛔ **THE FIRST INSTANCE WAS THE INPUT GATE AND IS FIXED (3.0.128). THIS SECOND
+ONE IS NOT, AND CONFLATING THEM WOULD BURY IT.** Captured while stuck, on a GUI
+whose build identity was read in the same command (`md5 44c6deb71a23`):
+
+- **Zero `input_gate_*` events for the affected row**, in any log, for the whole
+  episode. The gate is not refusing it — the gate has no opinion about it.
+- `launch_phase: Running`, row reads `busy: agent_working_daemon`.
+- The composer line on the daemon's own screen reads
+  **`❯ Theping from 9.3re`** — fragments of several different strings
+  interleaved into one line. Input is reaching *something* and landing
+  scrambled; this is not silence.
+
+⇒ **Two different faults produce the same user experience**, and the
+distinguishing probe is one grep: an `input_gate_stuck_unrestorable` event for
+that session path. Present ⇒ the gate (fixed). **Absent ⇒ this entry.**
+
+### What was checked and did NOT explain it — so nobody re-walks these
+
+- `terminal_host_mode: Unsupported` — **expected**, not a defect: that is the
+  *Ghostty* native host, and this row runs `backend: Xterm`.
+- `terminal_foreground_active: false` — **the documented misread.** That field
+  family was renamed once already because it means "this host holds focus right
+  now", not "the user can type". It is false on a perfectly usable unfocused row.
+- `terminal_lines: 8` — a **snapshot truncation limit**, not the daemon's screen
+  size. It briefly looked like a grid mismatch against escapes addressing rows
+  48–65; the PTY is 169×65 and the escapes are consistent with it. No mismatch.
+
+### The lead worth taking first
+
+The interleaved composer line is the same shape as the already-recorded finding
+that *the garble is substitution, not drift*. ⇒ Start by asking whether the
+row's writer and its screen model disagree about the cursor, not by looking at
+input plumbing — the keystrokes are arriving.
+
+⚠ **Do not "fix" this by restarting the GUI.** A restart re-resumes every row
+and clears the symptom without touching the cause, which is how it has survived
+long enough to be reported as routine.
+
 ## ⛔⛔ [6.7] THE WEB PROCESS IS THE LARGER HALF OF THE IDLE COST AND NOTHING EXPLAINS IT YET
 
 **Status:** OPEN
