@@ -1104,32 +1104,65 @@ these rates produces a confident number meaning nothing. Use a monotonic proxy
 (cumulative `pgmigrate_success` per unit of `pgalloc_normal`) or many alternating
 windows.
 
-### What actually remains as a heat candidate
+### What actually remains as a heat candidate — and WHO OWNS IT
 
-**`/sys/firmware/acpi/platform_profile` = `performance`** (choices: `low-power`,
-`balanced`, `performance`), with `cpufreq/boost=1` and EPP
-`balance_performance`. **`power-profiles-daemon` and `tuned` are both inactive,
-so nothing owns this setting** — it is not being re-applied by a desktop applet
-each boot. A firmware profile that raises the sustained power limit and fan curve
-is a first-order explanation for 93°C at 10% load, and it is entirely independent
-of anything this repo ships. **Owner decision**, logged in `owner-attention.md`.
+**`/sys/firmware/acpi/platform_profile` tracks the POWER SOURCE, and the fan is
+an AC-power phenomenon.** Observed directly:
 
-**Bounded trial, 2026-08-13 18:34–18:39, profile restored to `performance`
-afterwards so the host ended as it started:** on `balanced` the machine never
-exceeded **75.6°C** across 29 rounds, against a baseline max of **97.1°C** over
-1,251 rounds; means were identical (69.9 vs 69.9), and the range compressed at
-both ends.
+| time | power source | profile |
+|---|---|---|
+| 18:15–18:39 | mains (USB-C charging) | `performance` |
+| 19:06 | battery, discharging | `balanced` |
 
-⚠ **Suggestive, NOT established — the trial is underpowered and must not be
-quoted as a result.** At the baseline's 6.6% rate of >85°C rounds, 29 samples
-expect ~1.9 hot rounds, so observing zero is p≈0.13. ⇒ **What is owed is a
-one-hour trial on `balanced`** (n≈360), which the recorder collects unattended;
-the mean is already known not to move, so the statistic to test is the **peak and
-the >85°C round fraction**, not the average.
+⛔ **CORRECTION TO THIS ENTRY'S OWN EARLIER CLAIM.** It said *"nothing owns this
+setting"* on the strength of `systemctl is-active power-profiles-daemon tuned`
+returning `inactive`. **That was a true answer to the wrong question.**
+`org_kde_powerdevil` is running as a **KDE session process started by `kded6`,
+not by systemd**, so systemd correctly reports it inactive while it is very much
+alive. Something — PowerDevil's built-in default or the EC itself; neither
+`powerdevilrc` nor `powermanagementprofilesrc` declares a per-source power
+profile, so it is not yet distinguished — switches the profile on AC↔battery.
+⇒ **Ask the process table, not the service manager, whether a desktop component
+is running.**
 
-Also ruled out while here: the battery is **not charging** (`BAT0: Not
-charging`, running on USB-C mains), so charge heat is not it; GPU 63°C and
-nvme 60°C are unremarkable.
+⇒ The machine sits in `performance` **whenever it is plugged in**, which is the
+desk state in which the fan was reported.
+
+### The profile arms, replicated, and honestly short of proof
+
+| arm | n | mean | **max** |
+|---|---|---|---|
+| AC + `performance` (baseline) | 1,251 | 69.9 | **97.1°C** |
+| AC + `performance` + sysctls | 19 | 82.6 | **94.0°C** |
+| AC→battery, `performance` | 160 | 70.7 | **95.6°C** |
+| **AC + `balanced`** (controlled trial) | 29 | 69.9 | **75.6°C** |
+| battery + `balanced` | 8 | 69.8 | **78.1°C** |
+
+**Every `performance` window exceeds 94°C; every `balanced` window stays under
+79°C — while the MEAN is identical (~70) in all five.** It is a ceiling effect,
+not a shift, which is exactly what capping a firmware power limit does.
+
+⭐ **The one controlled pair is `AC + performance` vs `AC + balanced`** — same
+power source, only the profile differs. The battery arm is confounded (power
+source *and* profile both changed) and must not be pooled with it as evidence.
+
+⚠ **Still not proof.** Combined balanced n=37 with zero rounds above 85°C against
+a 6.6% baseline rate is **p≈0.08**. ⇒ **What is owed is a longer `AC + balanced`
+window (n≈360, one hour).** ⛔ **It cannot be run while the machine is on
+battery**, because the profile is then not ours to hold — it is whatever the
+power source dictates. Resume when mains returns.
+
+**What the trial changes and how to revert it:** `platform_profile` is a runtime
+firmware setting; writing it caps the sustained power limit and fan curve and
+changes nothing about software. `echo performance | sudo tee
+/sys/firmware/acpi/platform_profile` restores it, and **a power-source
+transition rewrites it regardless of what any agent set**. Nothing was left
+applied by this campaign: the 19:06 write was a no-op because the machine had
+already switched itself to `balanced` on unplugging.
+
+⇒ **Owner gate**, in `owner-attention.md`: whether the *AC* profile should be
+`balanced` rather than `performance`. That is a persistent preference about his
+machine's power behaviour, not a defect fix.
 
 ### The compaction waste is real, but it is a separate and much smaller item
 
