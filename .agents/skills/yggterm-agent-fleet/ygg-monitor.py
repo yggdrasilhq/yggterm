@@ -71,6 +71,11 @@ ABANDONED_SECS = 600
 # CPU% at or below this over the sample window counts as "not thinking".
 IDLE_CPU_PCT = 2.0
 CPU_SAMPLE_SECS = 3
+# ⭐ A finished relay row idles by design. Escalating it at 4 minutes produced
+# three false alarms in one minute; this is the window before an idle row is
+# worth a human's or an orchestrator's attention at all.
+IDLE_ESCALATE_SECS = 900
+EPISODES = STATE / "monitor-episodes"
 
 
 def log(m):
@@ -102,6 +107,22 @@ def ygg(host, *args):
         return json.loads(out[out.find("{"):]) if "{" in out else {}
     except Exception:
         return {}
+
+
+def _ep_load(uuid):
+    """Per-row escalation latch, so one episode produces one escalation."""
+    f = EPISODES / f"{uuid}.json"
+    if f.exists():
+        try:
+            return json.loads(f.read_text())
+        except Exception:
+            pass
+    return {"escalated": None}
+
+
+def _ep_save(uuid, st):
+    EPISODES.mkdir(parents=True, exist_ok=True)
+    (EPISODES / f"{uuid}.json").write_text(json.dumps(st))
 
 
 def sub_path(uuid):
@@ -437,15 +458,43 @@ def tick(a):
         row = bs.resolve_row_path(a.gui_host, uuid) or f"remote-cc://{s.get('host','dev')}/{uuid}"
         log(f"{uuid[:8]} {state:<12} {raw['age']//60:>3}m  {why or raw.get('tail','')[:60]}")
 
+        # ⛔ ESCALATE ONCE PER EPISODE, NOT ONCE PER TICK.
+        # Three rows that had just delivered landing reports were escalated inside
+        # one minute, and each would have been escalated again every 4 minutes
+        # forever. A finished relay row is SUPPOSED to be idle — that is what
+        # finishing looks like — so re-reporting it is pure noise, and a watcher
+        # whose output stops being read is the failure this whole plane exists to
+        # correct. The latch clears the moment the row moves again.
+        st = _ep_load(uuid)
+        moved = raw.get("age", 0) < st.get("last_age", 10 ** 9)
+        if moved:
+            st = {"escalated": None}
+
+        def once(kind, why_text):
+            if st.get("escalated") == kind:
+                log(f"  (already escalated {kind}; silent until it moves)")
+                return
+            escalate(a.gui_host, s, row, why_text, a.dry_run)
+            st["escalated"] = kind
+
         if state == "ABANDONED":
             wake(a.gui_host, row, why, a.dry_run)
             log(f"  ⇒ woke {uuid[:8]} on the PTY")
+            st["escalated"] = None
         elif state == "CONTEXT_DEAD":
-            escalate(a.gui_host, s, row, "context exhausted — booting cannot help, it must be RELAYED", a.dry_run)
-        elif state in ("IDLE", "STUCK"):
-            escalate(a.gui_host, s, row, why or f"{state} for {raw['age']//60}m", a.dry_run)
+            once("dead", "context exhausted — booting cannot help, it must be RELAYED")
+        elif state == "IDLE":
+            # ⭐ An IDLE row is most often FINISHED, not stuck. Say so, and ask for
+            # the decision that actually applies: more work, or a reap.
+            if raw["age"] >= IDLE_ESCALATE_SECS:
+                once("idle", f"idle {raw['age']//60}m — it has most likely FINISHED its scope. "
+                             "Read its last prose turn: give it more work, relay it, or reap it")
+        elif state == "STUCK":
+            once("stuck", why or f"STUCK for {raw['age']//60}m")
         elif state == "NO_TRANSCRIPT":
-            escalate(a.gui_host, s, row, "no transcript — its brief was DROPPED, re-submit it", a.dry_run)
+            once("nobrief", "no transcript — its brief was DROPPED, re-submit it")
+        st["last_age"] = raw.get("age", 0)
+        _ep_save(uuid, st)
     return 0
 
 
