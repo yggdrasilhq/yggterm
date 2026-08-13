@@ -1261,6 +1261,90 @@ the campaign memory, the files it wrote. A transcript says what a session
 a brief, a correction, a warning that changes what they should do next. Then it
 earns its cost. Batch several into one send rather than paying per finding.
 
+### ⚖⚖ THE TWO SUPERVISION PLANES — the dumb net and the thinking one
+
+**Both exist, neither replaces the other, and the split is the design.**
+
+| | `ygg-booter.py` | `ygg-monitor.py` |
+|---|---|---|
+| what it is | a **dumb timer**. Quiet too long ⇒ boot | a **classifier**. Asks *why* it is quiet, then chooses |
+| virtue | still works when everything cleverer has failed | can tell thinking from abandoned, and dead from stalled |
+| who subscribes | **every relay, as a recommendation** | every relay **and the orchestrator** |
+| escalates to | the human | **the orchestrator's row**, falling back to a human |
+
+⛔ **THE ORCHESTRATOR MUST SUBSCRIBE TO THE BOOTER.** It is the one session whose
+silent death costs the most — it takes the supervision of every row beneath it —
+and it is the only one nothing else is watching. The net has to go under the
+safety net. ⭐ A relay that has an edge case the monitor cannot express talks to
+the booter directly; that is what the dumb layer is for.
+
+**⭐ MID-TURN IS NOT ONE STATE, AND THAT IS WHY A WATCHDOG KEPT DOING NOTHING.**
+The old classifier lumped every long mid-turn row into STUCK and refused to nudge
+any of them — *"a `continue` would race its own input"* — then escalated into a
+log file nobody read. Measured 2026-08-13: two cluster rows sat **22 minutes**
+that way, and what actually happened to them was that a restart re-resumed their
+sessions on fresh PTYs and abandoned their turns.
+
+⇒ **The discriminator is CPU.** A thinking agent burns it; an abandoned one does
+not. Both rows read ~0% while alive and silent, and a PTY write woke both
+instantly. So the states split:
+
+- **mid-turn + busy** ⇒ WORKING. Leave it alone.
+- **mid-turn + at rest + past the threshold** ⇒ **ABANDONED**. Wake it. This is
+  the case the old rule refused, and it is the one that always needed the nudge.
+- **out of context** ⇒ CONTEXT_DEAD. Booting is *guaranteed* to fail forever; it
+  must be **relayed**, not woken.
+- **no transcript** ⇒ the brief was DROPPED. Re-submit; do not wait.
+
+⚠ **And sample CPU over a window.** `ps %CPU` is a **lifetime average** — a
+process that burned a core an hour ago and has been idle since still reads busy,
+which would classify an abandoned row as working forever.
+
+⛔ **WAKE ON THE PTY, NOT THE COMPOSER.** `terminal submit` drives the GUI's
+*mounted* terminal host, so it stalls its full 30 s and answers `submitted:false`
+for any row with nothing mounted — which is most rows a watcher looks at. Both
+stalled rows above refused `submit` twice and took a PTY write immediately. And
+**the Enter is a separate write of `\r`** after a short pause; concatenated, an
+agent CLI reads it as pasted composer content rather than a submit.
+
+### ⭐⭐ ANY SESSION CAN ATTACH TO A RUNNING ORCHESTRATOR
+
+This is not only for rows an orchestrator spawned. **Any session, started for any
+reason, can subscribe itself and name its intent:**
+
+```sh
+ygg-monitor.py subscribe --role relay --seat <n> --machine <host> \
+    --escalate-to <orchestrator-uuid> --intent "what this row is for, one line"
+```
+
+From that moment it is supervised like a cluster row: classified on every tick,
+woken when abandoned, relayed when its context dies, and escalated to the
+orchestrator rather than into a void.
+
+⇒ **This is what makes it safe to start something and walk away.** Open a new
+avenue, hand it an intent, attach it, and the supervision plane carries it to
+completion — or wakes someone who can decide. The orchestrator does not need to
+have planned the work to look after it.
+
+### ⛔⛔ PROMOTION AND DEMOTION ARE THE OWNER'S, ALWAYS
+
+A row can be taken **out** of automation entirely and handed back to the human:
+
+```sh
+ygg-monitor.py demote <uuid> --reason "design fork — weighing this by hand"
+ygg-monitor.py promote <uuid>          # hand it back to supervision
+```
+
+A demoted row is **skipped by every verb**: not nudged, not escalated, not reaped.
+⭐ The case this exists for is a **design fork** — the point where the trade-off
+needs a human to weigh it, and an agent cheerfully continuing is the wrong
+outcome. It is also the shape of *"leave this one to me"* for any other reason,
+and no reason is owed.
+
+⚠ **The booter is a separate subscription.** Demoting silences the monitor; run
+`ygg-booter.py unsubscribe` as well to make the row fully quiet. Two planes, two
+switches, and `list` prints which rows are pinned so the split is never invisible.
+
 ### ⭐ REAP A CLUSTER THE MOMENT ITS WORK IS DONE — do not let a small one relay on
 
 A cluster that exists for a small, terminal piece of work — add a CLI kind, wire
