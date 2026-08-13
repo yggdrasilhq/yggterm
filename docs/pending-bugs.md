@@ -350,15 +350,20 @@ successor died holding them.
 session.** The same run measured `bytes_stolen_after_park: 0`, and the ordinary
 handover — successor lives — showed **no gap at all** across the swap.
 
-**Also unmeasured, and widened by the same change:** the predecessor now lives
+**Partly measured, and widened by the same change:** the predecessor now lives
 ~10 s longer while both daemons hold the same runtimes, where before it was
-250 ms. Both answer for those sessions during that window. No row duplication
-was observed, but the sandbox has no GUI, so the row layer's behaviour over a
-10 s double-claim is **untested rather than proven fine**.
+250 ms. Both answer for those sessions during that window.
 
-**Falsifier for the residual:** run a handover under a live GUI with rows on
-screen, and watch the sidebar for duplicate or flickering rows for the length of
-`YGGTERM_HANDOFF_SETTLE_MS`.
+⭐ **Probed one layer under the sidebar, mid-window:** a client snapshot taken
+while both daemons held all three runtimes reported **three distinct session
+paths — no duplicate identity.** That is where a duplicated row would have to
+come from, so the mechanism most likely to break is measured, not assumed.
+
+⛔ **It is still not a pixel.** The sandbox has no GUI, so what the sidebar
+RENDERS over a 10 s double-claim is untested. **Falsifier:** run a handover under
+a live GUI with rows on screen and watch for duplicate or flickering rows for the
+length of `YGGTERM_HANDOFF_SETTLE_MS` — the one check that needs the GUI host and
+cannot be done headlessly.
 
 ## ⛔⛔⛔ [6.7] A ROW CAN BE ALIVE, IDLE-LOOKING, AND NOT READING ITS PTY — THE "I CANNOT TYPE" BUG
 
