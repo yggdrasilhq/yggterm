@@ -982,6 +982,50 @@ fn remove_session_should_detach_keep_alive_runtime(keep_alive_runtime: bool) -> 
     false
 }
 
+/// Pure half of [`DaemonRuntime::terminal_runtime_key_for_path`]: the session
+/// map proposed `resolved` for `path` — does the terminal map's own contents
+/// overrule it?
+///
+/// One question only, and it is not "which name is canonical". It is **which
+/// name does something answer to**. The session-map fold is a guess whenever it
+/// rewrites a key (`cc-runtime://<id>` → `local://<id>`), and a guess that names
+/// an empty slot is worse than no rewrite at all: the caller does not get a
+/// slower answer, it gets `terminal session not found` forever.
+fn runtime_key_prefers_requested_path(
+    path: &str,
+    resolved: &str,
+    terminals_hold_resolved: bool,
+    terminals_hold_path: bool,
+) -> bool {
+    path != resolved && !terminals_hold_resolved && terminals_hold_path
+}
+
+/// [`DaemonRuntime::terminal_runtime_key_for_path`] for the free functions that
+/// are handed the runtime-key SET instead of the manager — same rule, same
+/// helper, so the two cannot drift into disagreeing about which key names a
+/// row's PTY.
+///
+/// Without it `apply_terminal_runtime_truth_to_snapshot` asks whether the set
+/// holds the FOLDED key, gets `false` for a runtime it plainly owns, and stamps
+/// the row `RemoteBootstrap` — which is what the four stuck rows reported while
+/// their PTYs were alive and answering.
+fn runtime_key_for_path_against_keys(
+    server: &YggtermServer,
+    runtime_keys: &HashSet<String>,
+    path: &str,
+) -> String {
+    let resolved = server.terminal_runtime_key_for_path(path);
+    if runtime_key_prefers_requested_path(
+        path,
+        &resolved,
+        runtime_keys.contains(&resolved),
+        runtime_keys.contains(path),
+    ) {
+        return path.to_string();
+    }
+    resolved
+}
+
 fn valid_initial_terminal_size(cols: Option<u16>, rows: Option<u16>) -> Option<(u16, u16)> {
     match (cols, rows) {
         (Some(cols), Some(rows)) if cols > 0 && rows > 0 => Some((cols, rows)),
@@ -1605,7 +1649,8 @@ fn restore_preserved_owner_live_sessions_from_snapshot_with_policy(
         if !seen.insert(session.session_path.clone()) {
             continue;
         }
-        let runtime_key = server.terminal_runtime_key_for_path(&session.session_path);
+        let runtime_key =
+            runtime_key_for_path_against_keys(server, runtime_keys, &session.session_path);
         if !runtime_keys.contains(&session.session_path) && !runtime_keys.contains(&runtime_key) {
             continue;
         }
@@ -2939,10 +2984,7 @@ impl crate::session_tenancy::EphemeralReapHost for LiveEphemeralReapHost<'_> {
             .ephemeral_live_session_declarations()
             .into_iter()
             .map(|(session_path, declaration)| {
-                let runtime_key = self
-                    .runtime
-                    .server
-                    .terminal_runtime_key_for_path(&session_path);
+                let runtime_key = self.runtime.terminal_runtime_key_for_path(&session_path);
                 crate::session_tenancy::EphemeralCandidate {
                     idle_secs: self
                         .runtime
@@ -4317,7 +4359,7 @@ impl DaemonRuntime {
         let keys = self.server.live_codex_session_keys_for_runtime_identity();
         let mut refreshed = 0usize;
         for key in keys {
-            let runtime_path = self.server.terminal_runtime_key_for_path(&key);
+            let runtime_path = self.terminal_runtime_key_for_path(&key);
             let Some(pid) = self.terminals.session_process_id(&runtime_path) else {
                 continue;
             };
@@ -4424,7 +4466,7 @@ impl DaemonRuntime {
             .live_claude_code_session_keys_for_runtime_identity();
         let mut refreshed = 0usize;
         for key in keys {
-            let runtime_path = self.server.terminal_runtime_key_for_path(&key);
+            let runtime_path = self.terminal_runtime_key_for_path(&key);
             let Some(pid) = self.terminals.session_process_id(&runtime_path) else {
                 continue;
             };
@@ -4475,8 +4517,100 @@ impl DaemonRuntime {
         ServerResponse::Snapshot { snapshot, message }
     }
 
+    /// The key to address `path`'s PTY by: the SESSION map's answer, corrected
+    /// by the one fact only the daemon can see — which spelling its own
+    /// `TerminalManager` actually holds.
+    ///
+    /// ⛔ **A resolver may not hand back a key nothing answers to.**
+    /// [`crate::YggtermServer::terminal_runtime_key_for_path`] folds a
+    /// runtime-lane key (`cc-runtime://<id>`, `codex-runtime://<id>`) down to
+    /// `local://<id>` whenever the session map holds no row for it. That fold is
+    /// right for a legacy adopted runtime, whose PTY really is `local://<id>`,
+    /// and WRONG for a daemon-owned one — and the server cannot tell the two
+    /// apart, because the difference lives in the terminal map it cannot see.
+    ///
+    /// When the fold is wrong every read, write, resize and close addresses a
+    /// key the manager does not have, so the row is not slow, it is
+    /// unaddressable: the viewport paints
+    /// `Error: terminal session not found: local://<id>` and a restart repaints
+    /// it, because the restart re-runs the same fold. Measured on the desktop
+    /// host 2026-08-13 — four rows whose live PTY the current daemon owned as
+    /// `cc-runtime://<id>` had lost their session rows to a close, and every
+    /// open attempt (seven on one row inside nine minutes) died on the folded
+    /// name while the runtime sat there answering to its own.
     fn terminal_runtime_key_for_path(&self, path: &str) -> String {
-        self.server.terminal_runtime_key_for_path(path)
+        let resolved = self.server.terminal_runtime_key_for_path(path);
+        if runtime_key_prefers_requested_path(
+            path,
+            &resolved,
+            self.can_serve_runtime_key(&resolved),
+            self.can_serve_runtime_key(path),
+        ) {
+            return path.to_string();
+        }
+        resolved
+    }
+
+    /// Can this daemon answer a terminal request for `key` at all — from its own
+    /// map, or by proxying to the predecessor that still owns the PTY?
+    ///
+    /// Both halves, because the constitution's promise is that a session owned
+    /// by an OLDER daemon is still a first-class row here and clicking it WORKS.
+    /// A daemon that has just taken over holds none of its predecessor's
+    /// runtimes in `terminals` — it holds their addresses — so asking only the
+    /// local map would fold every proxied runtime-lane key back to
+    /// `local://<id>` and forward a name the OWNER cannot resolve either. The
+    /// row would then fail across a version bump for exactly the reason the
+    /// version-coexistence design exists to prevent, and the user would learn
+    /// that two daemons exist.
+    fn can_serve_runtime_key(&self, key: &str) -> bool {
+        self.terminals.holds_session(key)
+            || self.preserved_terminal_owners.owner_for_key(key).is_some()
+    }
+
+    /// **NAME THE REFUSAL.** A terminal request that cannot be served is the
+    /// moment a row stops being openable, and until this event existed it was
+    /// the quietest thing in the system: the viewport painted one error line,
+    /// the reveal log recorded `outcome: ready`, and the row list still showed a
+    /// healthy `Kept alive` entry with a full generated summary. The reporter
+    /// had no way to tell *this row is gone* from *this row is slow* — which is
+    /// itself the shipped defect, separately from whatever caused the refusal.
+    ///
+    /// So the event carries the two facts that separate the cases, and they are
+    /// the ones no error string can: whether the SESSION map still has a row for
+    /// this path, and whether the TERMINAL map holds either spelling of its key.
+    /// `held_under_requested_path: true` with `held_under_runtime_path: false`
+    /// is the resolver fold naming an empty slot; both false with a live row is
+    /// a runtime that genuinely died.
+    fn trace_terminal_request_refused(
+        &self,
+        verb: &'static str,
+        path: &str,
+        runtime_path: &str,
+        error: &anyhow::Error,
+    ) {
+        let Ok(home) = crate::resolve_yggterm_home() else {
+            return;
+        };
+        append_trace_event(
+            &home,
+            "daemon",
+            "terminal_runtime",
+            "request_refused",
+            serde_json::json!({
+                "verb": verb,
+                "path": path,
+                "runtime_path": runtime_path,
+                "session_row_present": self.server.live_session_row_key(path).is_some(),
+                "held_under_runtime_path": self.terminals.holds_session(runtime_path),
+                "held_under_requested_path": self.terminals.holds_session(path),
+                "running_under_runtime_path": self.terminals.session_is_running(runtime_path),
+                "preserved_owner": self
+                    .preserved_owner_for_runtime_key(runtime_path)
+                    .map(|endpoint| owner_endpoint_label(&endpoint)),
+                "error": error.to_string(),
+            }),
+        );
     }
 
     fn preserved_owner_for_runtime_key(&self, runtime_key: &str) -> Option<ServerEndpoint> {
@@ -7007,7 +7141,12 @@ impl DaemonRuntime {
     fn close_live_session_row(&mut self, path: &str) -> Result<ClosedLiveRow> {
         self.tombstone_live_row(path);
         let stop_command = self.server.terminal_stop_command(path);
-        let runtime_path = self.server.terminal_runtime_key_for_path(path);
+        // THE CORRECTED resolver, not the session map's raw fold: a close that
+        // addresses the folded `local://<id>` removes nothing and leaves the
+        // real `cc-runtime://<id>` PTY running with no row anywhere — an orphan
+        // that outlives every daemon and is exactly what made the four stuck
+        // rows unopenable.
+        let runtime_path = self.terminal_runtime_key_for_path(path);
         // BOTH remote agent kinds. `remote_shutdown_target_for_path` parses
         // `remote-session://` only, so every `remote-cc://` row returned None
         // here and its remote claude was never asked to stop — the row left the
@@ -7311,7 +7450,7 @@ impl DaemonRuntime {
                     // resolver that broke `session remove`.
                     let remote_target = self.server.remote_agent_pty_target_for_path(&path);
                     let stop_command = self.server.terminal_stop_command(&path);
-                    let runtime_path = self.server.terminal_runtime_key_for_path(&path);
+                    let runtime_path = self.terminal_runtime_key_for_path(&path);
                     if let Some((machine, session_id, kind)) = remote_target {
                         match request_remote_agent_session_shutdown(
                             &machine,
@@ -8168,7 +8307,7 @@ impl DaemonRuntime {
                 // unopened row (reported 2026-07-10: only the opened rows
                 // turned green).
                 let runtime_pending = keep_alive && {
-                    let runtime_path = self.server.terminal_runtime_key_for_path(&path);
+                    let runtime_path = self.terminal_runtime_key_for_path(&path);
                     !self.terminals.has_session(&runtime_path)
                         && self
                             .preserved_owner_for_runtime_key(&runtime_path)
@@ -8793,7 +8932,12 @@ impl DaemonRuntime {
                         stop_command.as_deref(),
                     )?;
                 }
-                let stream = self.terminals.read(&runtime_path, cursor)?;
+                let stream = self
+                    .terminals
+                    .read(&runtime_path, cursor)
+                    .inspect_err(|error| {
+                        self.trace_terminal_request_refused("read", &path, &runtime_path, error)
+                    })?;
                 ServerResponse::TerminalStream {
                     cursor: stream.cursor,
                     chunks: stream
@@ -9519,8 +9663,11 @@ fn apply_terminal_runtime_truth_to_snapshot(
     snapshot: &mut ServerUiSnapshot,
 ) {
     if let Some(active_session) = snapshot.active_session.as_mut() {
-        let runtime_owned = runtime_keys
-            .contains(&server.terminal_runtime_key_for_path(&active_session.session_path));
+        let runtime_owned = runtime_keys.contains(&runtime_key_for_path_against_keys(
+            server,
+            runtime_keys,
+            &active_session.session_path,
+        ));
         if !runtime_owned && snapshot_session_row_survives_runtime_loss(active_session) {
             active_session.launch_phase = crate::TerminalLaunchPhase::RemoteBootstrap;
         } else if runtime_owned && snapshot_session_is_pending_runtime_launch(active_session) {
@@ -9534,8 +9681,11 @@ fn apply_terminal_runtime_truth_to_snapshot(
         }
     }
     for session in &mut snapshot.live_sessions {
-        let runtime_owned =
-            runtime_keys.contains(&server.terminal_runtime_key_for_path(&session.session_path));
+        let runtime_owned = runtime_keys.contains(&runtime_key_for_path_against_keys(
+            server,
+            runtime_keys,
+            &session.session_path,
+        ));
         if !runtime_owned && snapshot_session_row_survives_runtime_loss(session) {
             session.launch_phase = crate::TerminalLaunchPhase::RemoteBootstrap;
         } else if runtime_owned && snapshot_session_is_pending_runtime_launch(session) {
@@ -9552,8 +9702,11 @@ fn apply_terminal_runtime_truth_to_snapshot(
     // the daemon-bump contract: a rescued shell must come back where the user
     // left it, not at the top or the bottom.
     snapshot.live_sessions.retain(|session| {
-        runtime_keys.contains(&server.terminal_runtime_key_for_path(&session.session_path))
-            || (active_path.as_deref() == Some(session.session_path.as_str())
+        runtime_keys.contains(&runtime_key_for_path_against_keys(
+            server,
+            runtime_keys,
+            &session.session_path,
+        )) || (active_path.as_deref() == Some(session.session_path.as_str())
                 && snapshot_session_is_pending_runtime_launch(session))
             || snapshot_session_row_survives_runtime_loss(session)
     });
@@ -9562,7 +9715,11 @@ fn apply_terminal_runtime_truth_to_snapshot(
         return;
     };
     let active_runtime_present =
-        runtime_keys.contains(&server.terminal_runtime_key_for_path(&active_path));
+        runtime_keys.contains(&runtime_key_for_path_against_keys(
+            server,
+            runtime_keys,
+            &active_path,
+        ));
     let active_requires_runtime = snapshot
         .active_session
         .as_ref()
@@ -17984,6 +18141,89 @@ mod tests {
             persist.contains("self.reconcile_live_row_tombstones();"),
             "persist() is the chokepoint that clears a revived row's tombstone and \
              expires the deny-list; without it the veto never lifts"
+        );
+    }
+
+    /// **THE FOUR ROWS THAT WOULD NOT RESTORE** (desktop host, 2026-08-13).
+    ///
+    /// A live PTY the daemon owned as `cc-runtime://<id>`, whose session row had
+    /// been removed by a close, resolved to `local://<id>` — a key the terminal
+    /// map has never held — so every read answered
+    /// `terminal session not found: local://<id>` and the row painted that error
+    /// instead of a terminal. Not slow, not transient: a restart re-runs the same
+    /// fold, which is why "restarting again does not clear it".
+    ///
+    /// The rule the truth table below encodes: **the session map's rewrite only
+    /// stands while something answers to the name it produced.**
+    #[test]
+    fn a_rewritten_runtime_key_never_beats_one_the_terminal_map_actually_holds() {
+        let requested = "cc-runtime://019e5c2a-7d41-7b90-a3f2-5e8c1d4b6a70";
+        let folded = "local://019e5c2a-7d41-7b90-a3f2-5e8c1d4b6a70";
+
+        // THE BUG: session row gone, PTY alive under the requested spelling.
+        assert!(
+            super::runtime_key_prefers_requested_path(requested, folded, false, true),
+            "the daemon owns this PTY under the key it was asked for; folding it to a \
+             name nothing answers to makes the row permanently unopenable"
+        );
+
+        // The legacy adoption the fold exists for: the PTY really is `local://`.
+        assert!(
+            !super::runtime_key_prefers_requested_path(requested, folded, true, false),
+            "a genuinely adopted local runtime must keep resolving to its own key"
+        );
+
+        // Both spellings held — the session map's answer still wins, so a
+        // duplicate never silently re-points an already-working row.
+        assert!(!super::runtime_key_prefers_requested_path(
+            requested, folded, true, true
+        ));
+
+        // Neither held: nothing to prefer, so nothing changes and the caller
+        // still gets the fold's answer (and its error) rather than a new one.
+        assert!(!super::runtime_key_prefers_requested_path(
+            requested, folded, false, false
+        ));
+
+        // No rewrite happened at all — the question does not arise.
+        assert!(!super::runtime_key_prefers_requested_path(
+            requested, requested, false, true
+        ));
+    }
+
+    /// The correction is only worth having if the daemon's own callers go
+    /// through it. `YggtermServer::terminal_runtime_key_for_path` cannot see the
+    /// terminal map, so a `self.server.` call inside the daemon is a caller that
+    /// re-opens the hole — including the CLOSE path, where addressing the wrong
+    /// key removes nothing and leaves an orphan PTY behind, which is how the
+    /// four stuck rows were made in the first place.
+    ///
+    /// Structural, because the alternative is a live `DaemonRuntime`; the
+    /// bypass is the part that silently returns.
+    #[test]
+    fn the_daemon_resolves_runtime_keys_through_its_own_terminal_aware_resolver() {
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let bypasses = source
+            .lines()
+            .filter(|line| {
+                line.contains("server.terminal_runtime_key_for_path(")
+                    && !line.contains("self.server.terminal_runtime_key_for_path(path)")
+                    && !line.contains("let resolved = server.terminal_runtime_key_for_path(path);")
+            })
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        assert!(
+            bypasses.is_empty(),
+            "these reach the session map's fold directly and lose the terminal-map \
+             correction: {bypasses:?}"
+        );
+
+        let close = daemon_fn_body(source, "    fn close_live_session_row(&mut self, path: &str)");
+        assert!(
+            close.contains("let runtime_path = self.terminal_runtime_key_for_path(path);"),
+            "the close must address the key the terminal map answers to, or it removes \
+             nothing and orphans the PTY"
         );
     }
 

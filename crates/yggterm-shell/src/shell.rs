@@ -55675,6 +55675,30 @@ fn append_viewport_session_contract_violations(
 fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
     let shell = state.read();
     let snapshot = shell.snapshot();
+    // **"THIS ROW IS GONE" MADE VISIBLE.** The tombstone plane is the one
+    // record that the user CLOSED a row, and until now it could only be
+    // consulted from inside the daemon. Everything that rebuilds a set of rows
+    // from the outside — an agent asked to restore a lost campaign, a script
+    // walking the tree — enumerated a scan of the transcripts on disk, where a
+    // closed row is indistinguishable from one that was never opened, and
+    // handed the user back the rows they had deliberately deleted. A restore
+    // cannot honour a deny-list it cannot read; this is the read.
+    //
+    // ONE load for the whole list, not one per row: `removed-rows.json` is
+    // shared by every daemon on the machine and this describer runs on demand.
+    let close_remembered: std::collections::HashSet<String> = resolve_yggterm_home()
+        .map(|home| {
+            let paths = snapshot
+                .rows
+                .iter()
+                .filter(|row| row.kind == BrowserRowKind::Session)
+                .map(|row| row.full_path.as_str())
+                .collect::<Vec<_>>();
+            yggterm_server::live_row_closes_remembered_among(&home, paths)
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default();
     json!({
         "row_count": snapshot.rows.len(),
         "rows": snapshot.rows.iter().map(|row| {
@@ -55731,6 +55755,10 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "icon_text": tree_icon_glyph(row),
                 "live_member": live_member,
                 "live_keep_alive": live_keep_alive,
+                // Did the USER close this row? `null` on anything that is not a
+                // session, because the question does not apply to a group.
+                "close_remembered": (row.kind == BrowserRowKind::Session)
+                    .then(|| close_remembered.contains(&row.full_path)),
                 "draggable": is_tree_drag_source_row(row),
                 "drop_target_row": is_drop_target_row(row),
                 "machine_key": machine.as_ref().map(|machine| machine.machine_key.clone()),

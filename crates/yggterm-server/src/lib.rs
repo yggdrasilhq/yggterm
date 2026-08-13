@@ -22316,6 +22316,99 @@ pub fn run_app_control_describe_rows(timeout_ms: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `server app sessions restore <session-path>... [--dry-run]` — put a named set
+/// of rows back, WITHOUT putting back the ones the user deleted.
+///
+/// ⛔ **THE CHORE THIS REPLACES.** There was no restore verb, so an agent asked
+/// to recover a lost set of rows hand-assembled one out of `app open` — and
+/// `open` is a user-intent verb that must stay permissive, because a person
+/// re-opening a row they closed yesterday is exactly how a close is legitimately
+/// undone. Restoring a LIST is not that intent, and the hand-rolled loop had no
+/// way to tell the two apart: handed the full set it restored all of it,
+/// including rows that had been deliberately deleted earlier. Reported
+/// 2026-08-13, during the recovery from the restore failure itself.
+///
+/// So the deny-list is consulted HERE, once, for the whole batch — the same
+/// tombstone plane the daemon's own import and cold-restore admission already
+/// veto against, which makes this the third reader of one answer rather than a
+/// second answer. And the reply NAMES what it declined: a restore that silently
+/// dropped rows would be its own kind of lie, and the count is what a caller
+/// checks to know the veto ran at all.
+///
+/// Sequential on purpose. The GUI supersedes an in-flight open with the next
+/// one (`latest_open_request_id`), so issuing N at once yields one restored row
+/// and N-1 cancelled reveals — measured live, in the very recovery that
+/// produced this entry. Each open therefore waits for its own settle, exactly
+/// as `app open` does, because it IS `app open`.
+pub fn run_app_control_restore_sessions(
+    session_paths: Vec<String>,
+    dry_run: bool,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    if session_paths.is_empty() {
+        anyhow::bail!(
+            "usage: server app sessions restore <session-path>... [--dry-run]  \
+             (name the rows; there is no restore-everything, and there should not be)"
+        );
+    }
+
+    let declined: Vec<String> = live_row_closes_remembered_among(
+        &home,
+        session_paths.iter().map(String::as_str),
+    );
+    let declined_set: std::collections::HashSet<&str> =
+        declined.iter().map(String::as_str).collect();
+    let candidates: Vec<&String> = session_paths
+        .iter()
+        .filter(|path| !declined_set.contains(path.as_str()))
+        .collect();
+
+    let mut restored = Vec::<String>::new();
+    let mut failed = Vec::<Value>::new();
+    if !dry_run {
+        for path in &candidates {
+            let outcome = request_app_control(
+                &home,
+                AppControlCommand::OpenPath {
+                    session_path: (*path).clone(),
+                    view_mode: Some(AppControlViewMode::Terminal),
+                },
+                timeout_ms,
+            )
+            .and_then(|_| {
+                wait_for_app_control_open_path_ready(
+                    &home,
+                    path,
+                    Some(AppControlViewMode::Terminal),
+                    timeout_ms,
+                )
+            });
+            match outcome {
+                Ok(_) => restored.push((*path).clone()),
+                // A row that will not come back is reported BY NAME and the
+                // batch continues: the whole point of restoring a set is that
+                // one dead row must not cost the other nineteen.
+                Err(error) => failed.push(json!({
+                    "session_path": path,
+                    "error": error.to_string(),
+                })),
+            }
+        }
+    }
+
+    write_stdout_payload(&serde_json::to_string_pretty(&json!({
+        "dry_run": dry_run,
+        "requested": session_paths.len(),
+        "declined_closed_count": declined.len(),
+        "declined_closed": declined,
+        "restorable": candidates.len(),
+        "restored": restored,
+        "failed": failed,
+    }))?)?;
+    Ok(())
+}
+
 pub fn run_app_control_set_row_expanded(
     row_path: &str,
     expanded: bool,
