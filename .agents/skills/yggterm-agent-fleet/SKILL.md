@@ -1158,6 +1158,32 @@ Then, per §8 and §3b:
          └── outline_prefix, STORED SEPARATELY and composed on at render time
 ```
 
+### ⭐ AN ORCHESTRATOR SITS AT `N.0` — the cheapest fix available, and it is the owner's
+
+A group of rows reads best when **every member has the same shape**, the head
+included. So an orchestrator running the `6.x` clusters takes **`6.0`**, not `6`:
+
+```
+        6.0   orchestration: cluster, monitor, mend the system   ← the head
+        6.1   restore lifecycle: …
+        6.2   CLI rows: …
+        6.3   sidebar truth: …
+```
+
+**Why this and not a bare `6`.** A book chapter reads `6.` with a trailing dot, and
+that was the first instinct — but **the outline verb normalises a trailing dot
+away**: ask for `6.` and it stores `6`. Measured, not assumed. So the dot can only
+ever be produced at render time, which is a code change; **`N.0` needs none, works
+today, and sorts correctly** because segments compare as integers (`6.0` < `6.1` <
+`6.10`).
+
+⇒ **Prefer the arrangement that needs no code.** A convention that costs one
+`session outline` call beats a rendering feature that costs a release, and it also
+survives every future change to how labels are composed.
+
+⚠ **A childless top-level row is a different case** and still wants `N.` from the
+renderer — that one has no sub-seats to be consistent with.
+
 **The seat lives in `outline_prefix` and nowhere else.** The sidebar composes
 `label = "<outline_prefix> <title>"` at render time, so a title that also carries
 the number gets it twice.
