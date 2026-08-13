@@ -131,6 +131,38 @@ whole history, and never a merge, which reinstates the lineage a scrub removed**
 scan. It collapses to your own commits. ⛔ Reach for the override only when the scan is already
 scoped to what you actually wrote and you have read every hit.
 
+⭐ **The guard now says this itself.** When a refusal arrives on a branch that is behind its
+upstream, it reports the ahead/behind counts, names `git fetch && git rebase <upstream>` as the
+next step, and **omits the override line entirely** — replacing it with a warning that the
+override suppresses the whole scan. The obvious implementation of that check does not work: keying
+it on *"the scanned range is much larger than what I am ahead by"* stays silent in exactly the case
+it is for, because after a force-push `ahead` inflates in lockstep with the range and the ratio
+stays about 1. **Being BEHIND is the signal; the ratio measures nothing.**
+
+⚠ **The guard's wordlist holds whole tokens, and identity does not live only in tokens.** An
+enumeration that names several private things by their short stems and supplies the shared suffix
+*once* matches no term and passes clean, while a human reassembles it without effort. The guard now
+carries a narrow structural check for that one shape — a suffix shared by two or more known terms,
+appearing on a line with two or more of their distinct stems as whole words — derived from the
+wordlist itself. Deliberately narrow: a general natural-language leak detector is a hole with no
+bottom, and a check that cries wolf manufactures the override habit that defeats the tool.
+Measured across three repositories' entire published histories: zero hits.
+
+### ⛔ AN EXIT CODE AFTER A PIPELINE ANSWERS A DIFFERENT QUESTION THAN YOU ASKED
+
+```sh
+git show <ref>:<file> | grep -c '<pattern>' ; echo $?     # ⛔ this is grep's status ONLY by luck
+```
+
+`$?` is the **last** command's status, so a check written this way asks *"did the final stage
+succeed"* rather than *"did the match succeed"* — and the two diverge exactly when an earlier stage
+fails, which is when you most need the answer. Same family as `cargo test … | tail`, which reports
+`tail`'s status and turns a red suite green. ⇒ use `${PIPESTATUS[0]}`, or drop the pipe.
+
+⭐ **And the discipline that catches it: run both controls in the same command.** The instance that
+produced this line was only recognised because a negative control returned 0 and a positive control
+returned 168 side by side — a single reading of either would have looked like an answer.
+
 ## 2. Profiling recipes that work
 
 No `perf` on a typical desktop host (`perf_event_paranoid=3`), but these do:
