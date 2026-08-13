@@ -379,6 +379,64 @@ def cmd_succeed(a):
     return 0
 
 
+def cmd_park(a):
+    """⭐ A ROW BLOCKED ON PURPOSE IS NEITHER WORKING NOR FINISHED, AND THE
+    CLASSIFIER HAD NO STATE FOR IT.
+
+    An idle row is reported as *"most likely FINISHED its scope — give it more
+    work, relay it, or reap it"*. That is right for a row that ran out of work
+    and wrong for one the ORCHESTRATOR deliberately blocked, which is a different
+    decision with a different answer. Measured 2026-08-13 within five minutes:
+    seat 6.2 was idle because a deploy freeze forbade the desktop screenshot its
+    remaining scope needed, and seat 6.3 was idle because its next step needs a
+    field in a file another seat was mid-edit in. Both escalated as probably
+    finished; reaping either would have destroyed live context.
+
+    ⛔ The cost is not the noise — an episode latch already stops the repeat. It
+    is that the REASON lives only in the orchestrator's head, so the next
+    orchestrator re-derives it from scratch, and the obvious reading of an idle
+    row is the destructive one.
+
+    ⚠ EVERY PARK EXPIRES. A suppression without an expiry is how a row goes
+    unsupervised forever, which is the failure this whole plane exists to
+    prevent — so `--hours` is bounded and the tick resumes normal classification
+    the moment it lapses, saying so out loud."""
+    p = sub_path(_bare_uuid(a.uuid))
+    if not p.exists():
+        log(f"{a.uuid[:8]} is not subscribed")
+        return 1
+    if not a.reason:
+        log("park: --reason is required — a park nobody can read is a silence")
+        return 64
+    hours = max(0.1, min(float(a.hours), 24.0))
+    s = json.loads(p.read_text())
+    s["parked"] = True
+    s["parked_reason"] = a.reason
+    s["parked_until"] = int(time.time() + hours * 3600)
+    s["parked_by"] = _bare_uuid(a.by or os.environ.get("YGGTERM_SESSION_ID", ""))
+    p.write_text(json.dumps(s, indent=1))
+    log(f"⭐ {a.uuid[:8]} PARKED for {hours:g}h — not escalated as finished while it waits.")
+    log(f"   Reason: {a.reason}")
+    log(f"   ⚠ Expires {time.strftime('%H:%M', time.localtime(s['parked_until']))}; "
+        "after that it classifies normally again.")
+    return 0
+
+
+def cmd_unpark(a):
+    p = sub_path(_bare_uuid(a.uuid))
+    if not p.exists():
+        log(f"{a.uuid[:8]} is not subscribed")
+        return 1
+    s = json.loads(p.read_text())
+    was = s.pop("parked_reason", "")
+    for k in ("parked", "parked_until", "parked_by"):
+        s.pop(k, None)
+    p.write_text(json.dumps(s, indent=1))
+    log(f"{a.uuid[:8]} unparked — back under normal classification"
+        + (f" (was: {was})" if was else ""))
+    return 0
+
+
 def cmd_demote(a):
     """The owner takes a row back. Nothing automated touches it again."""
     p = sub_path(_bare_uuid(a.uuid))
@@ -415,6 +473,10 @@ def cmd_list(a):
         return 0
     for s in subs:
         pin = "  ⭐ OWNER-PINNED" if s.get("owner_pinned") else ""
+        if s.get("parked"):
+            left = int(((s.get("parked_until") or 0) - time.time()) // 60)
+            pin += (f"  ⏸ PARKED {left}m left: {s.get('parked_reason','')[:44]}"
+                    if left > 0 else f"  ⏸ PARK LAPSED: {s.get('parked_reason','')[:44]}")
         log(f"{s['uuid'][:8]}  {s.get('role','relay'):<13} seat={str(s.get('seat') or '-'):<5} "
             f"→{(s.get('escalate_to') or 'human')[:8]}  {(s.get('intent') or '')[:44]}{pin}")
     return 0
@@ -558,6 +620,18 @@ def tick(a):
         if s.get("owner_pinned"):
             log(f"{uuid[:8]} SKIP — owner-pinned ({s.get('pinned_reason','')})")
             continue
+        if s.get("parked"):
+            left = (s.get("parked_until") or 0) - time.time()
+            if left > 0:
+                log(f"{uuid[:8]} PARKED       {int(left//60):>3}m left  {s.get('parked_reason','')[:60]}")
+                continue
+            # ⚠ Lapsed parks announce themselves. A park that expired quietly
+            # would be indistinguishable from one still in force, and the row
+            # would look supervised while nothing was deciding about it.
+            log(f"{uuid[:8]} PARK EXPIRED — was: {s.get('parked_reason','')[:60]}")
+            for k in ("parked", "parked_until", "parked_reason", "parked_by"):
+                s.pop(k, None)
+            sub_path(uuid).write_text(json.dumps(s, indent=1))
         rhost = None if s.get("host") in ("", None, "local") else s.get("host")
         raw = bs.classify(uuid, rhost)
         state, why = refine(raw, uuid, rhost)
@@ -628,11 +702,16 @@ def main():
     p.add_argument("--no-booter-reminder", action="store_true")
     p.set_defaults(fn=cmd_subscribe)
 
-    for name, fn in (("unsubscribe", cmd_unsubscribe), ("demote", cmd_demote), ("promote", cmd_promote)):
+    for name, fn in (("unsubscribe", cmd_unsubscribe), ("demote", cmd_demote),
+                     ("promote", cmd_promote), ("park", cmd_park), ("unpark", cmd_unpark)):
         p = sub.add_parser(name)
         p.add_argument("uuid")
         if name == "demote":
             p.add_argument("--reason", default="")
+        if name == "park":
+            p.add_argument("--reason", default="", help="why it waits, and on what — required")
+            p.add_argument("--hours", type=float, default=2.0, help="expiry, clamped to 24h")
+            p.add_argument("--by", default="", help="the orchestrator parking it")
         p.set_defaults(fn=fn)
 
     p = sub.add_parser("succeed", help="move every subscriber from a retired orchestrator to its successor")

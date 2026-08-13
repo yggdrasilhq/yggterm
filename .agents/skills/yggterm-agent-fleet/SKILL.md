@@ -1545,6 +1545,45 @@ avenue, hand it an intent, attach it, and the supervision plane carries it to
 completion — or wakes someone who can decide. The orchestrator does not need to
 have planned the work to look after it.
 
+### ⭐⭐ PARK A ROW YOU BLOCKED ON PURPOSE — "IDLE" AND "BLOCKED" ARE DIFFERENT DECISIONS
+
+**An idle row escalates as *"most likely FINISHED its scope — more work, relay,
+or reap"*.** That is right for a row that ran out of work. It is wrong, and the
+obvious reading of it is destructive, for a row **the orchestrator deliberately
+blocked**.
+
+**Measured 2026-08-13, twice inside five minutes, on the same orchestrator:**
+
+| seat | why it was idle | what "probably finished" would have cost |
+|---|---|---|
+| **6.2** | its remaining scope owed a live screenshot on the desktop host, and **the orchestrator's own deploy freeze forbade probes** | reaping a row waiting on a gate that orchestrator set |
+| **6.3** | its next step needs a field in a file **another seat was mid-edit in** | destroying live context on a half-built piece |
+
+⇒ Both were blocked *by the orchestrator's own decisions*, and both were reported
+to it as probably finished. **The plane was describing the rows accurately and
+answering the wrong question.**
+
+⛔ **The real cost is not noise** — an episode latch already stops the repeat. It
+is that **the reason lives only in the current orchestrator's head**, so its
+successor inherits two idle rows, no explanation, and a default reading that says
+reap. That is a handover defect wearing a classifier's clothes.
+
+```sh
+ygg-monitor.py park <uuid> --reason "what it waits on, and what releases it" --hours 4
+ygg-monitor.py unpark <uuid>       # the blocker cleared
+```
+
+**⚠ EVERY PARK EXPIRES, and that is the load-bearing half.** A suppression with
+no expiry is how a row goes unsupervised forever — the exact failure this plane
+exists to prevent. `--hours` is clamped to 24, the tick resumes normal
+classification the moment it lapses, and **a lapsed park announces itself**
+(`PARK EXPIRED — was: …`) so it can never be confused with one still in force.
+⭐ `--reason` is required: a park nobody can read is just a silence.
+
+⚖ **Park is not demote.** Demote means *the owner took this row back* and is
+the human's switch; park means *I blocked this row and here is what releases
+it*, and is the orchestrator's bookkeeping about its own decisions.
+
 ### ⛔⛔ PROMOTION AND DEMOTION ARE THE OWNER'S, ALWAYS
 
 A row can be taken **out** of automation entirely and handed back to the human:
