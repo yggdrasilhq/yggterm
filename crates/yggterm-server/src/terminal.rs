@@ -65,6 +65,18 @@ pub enum PromptSubmitOutcome {
     NotReady { waited_ms: u64 },
     /// No such session (key absent).
     NoSession,
+    /// A HUMAN is typing into this composer, so nothing was written and nothing
+    /// was cleared.
+    ///
+    /// ⛔ **The probe is destructive to a person mid-sentence and that is why
+    /// this exists.** It writes a marker, and when the marker does not echo it
+    /// sends Ctrl+U — which wipes the line the human is composing — then does it
+    /// again every ~300 ms for the whole timeout. Against a row someone is
+    /// typing at, a single 30 s submit is ~100 injected markers and ~100 erased
+    /// lines: the viewport flickers, the keystrokes come out interleaved with
+    /// `yggterm_ready_probe`, and the row is unusable until the timeout ends.
+    /// Reported live 2026-08-14 as *"blinking profusely and I could not type"*.
+    HumanTyping { waited_ms: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -941,6 +953,7 @@ impl TerminalManager {
         submit_prompt_echo_verified_with(
             |text| self.write(key, text),
             || self.session_screen_snapshot(key),
+            || self.session_has_pending_input_draft(key),
             data,
             timeout,
         )
@@ -960,6 +973,7 @@ impl TerminalManager {
 pub fn submit_prompt_echo_verified_with(
     write: impl Fn(&str) -> Result<()>,
     snapshot: impl Fn() -> Option<String>,
+    human_draft: impl Fn() -> Option<bool>,
     data: &str,
     timeout: Duration,
 ) -> Result<PromptSubmitOutcome> {
@@ -973,7 +987,23 @@ pub fn submit_prompt_echo_verified_with(
             return Ok(PromptSubmitOutcome::NoSession);
         }
         let start = Instant::now();
+        // ⛔ CHECKED BEFORE EVERY WRITE, never once at the top. A human can start
+        // typing at any point during a 30 s wait, and the whole failure being
+        // fixed here is a probe that kept writing while somebody was mid-word.
+        // `Some(false)` = confirmed no draft; `None` = unknown, which is NOT
+        // permission — an unreadable composer is the case where we can least
+        // afford to be wrong, so it refuses too.
+        let human_is_typing = || human_draft() != Some(false);
+        if human_is_typing() {
+            return Ok(PromptSubmitOutcome::HumanTyping { waited_ms: 0 });
+        }
+        let mut retry_backoff = RETRY_INTERVAL;
         loop {
+            if human_is_typing() {
+                return Ok(PromptSubmitOutcome::HumanTyping {
+                    waited_ms: start.elapsed().as_millis() as u64,
+                });
+            }
             write(PROBE)?;
             thread::sleep(PROBE_SETTLE);
             let echoed = snapshot().is_some_and(|screen| screen.contains(PROBE));
@@ -995,13 +1025,28 @@ pub fn submit_prompt_echo_verified_with(
             }
             // Not consuming yet: clear any buffered probe so it can't pile up, then
             // wait and retry (or give up at the deadline, leaving the surface clean).
+            // ⛔ Re-checked: the echo wait is 180 ms during which a human may have
+            // started, and CLEAR_LINE would erase what they just typed.
+            if human_is_typing() {
+                return Ok(PromptSubmitOutcome::HumanTyping {
+                    waited_ms: start.elapsed().as_millis() as u64,
+                });
+            }
             let _ = write(CLEAR_LINE);
             if start.elapsed() >= timeout {
                 return Ok(PromptSubmitOutcome::NotReady {
                     waited_ms: start.elapsed().as_millis() as u64,
                 });
             }
-            thread::sleep(RETRY_INTERVAL);
+            // ⛔ BACK OFF. A flat 120 ms retry against a row that is simply busy
+            // means ~100 marker writes and ~100 line clears across a 30 s
+            // timeout — the "viewport blinking" symptom is literally this loop
+            // painting and erasing three times a second. A row that has not
+            // answered in seconds will not answer in the next 120 ms, so the
+            // interval doubles to a 2 s ceiling: same deadline, ~12 writes
+            // instead of ~100, and the surface is left alone in between.
+            thread::sleep(retry_backoff.min(Duration::from_secs(2)));
+            retry_backoff = (retry_backoff * 2).min(Duration::from_secs(2));
         }
     }
 }
@@ -4257,6 +4302,91 @@ mod tests {
     use std::io;
     use std::sync::mpsc;
     use std::time::Instant;
+
+    /// ⛔ THE PROBE MAY NOT TYPE OVER A HUMAN.
+    ///
+    /// Reported live 2026-08-14: *"blinking profusely and I could not type"*,
+    /// and the owner's own next message arrived shredded —
+    /// `yggterm_ready_probeBy yggterm_ready_probese…` — his keystrokes
+    /// interleaved with our marker. The submit path writes `yggterm_ready_probe`
+    /// and, when it does not echo, sends Ctrl+U (which erases the line the human
+    /// is composing) and retries, ~3×/s for the whole 30 s timeout. Against a
+    /// row a person is typing at, that is ~100 injected markers and ~100 erased
+    /// lines, and it is also the "viewport blinking" symptom: the loop painting
+    /// and wiping the composer three times a second.
+    ///
+    /// ⭐ Asserts on the WRITES, not on the return value. A version that returned
+    /// the right enum after already stomping the composer would pass a
+    /// verdict-only test and still ruin the sentence someone was typing — the
+    /// damage IS the write, so the write is what the test has to watch.
+    #[test]
+    fn the_readiness_probe_never_writes_into_a_composer_a_human_is_using() {
+        let writes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let record = Arc::clone(&writes);
+        let outcome = submit_prompt_echo_verified_with(
+            move |text| {
+                record.lock().unwrap().push(text.to_string());
+                Ok(())
+            },
+            // A live session, so the refusal cannot be mistaken for "no session".
+            || Some(String::from("$ ")),
+            // A human has an unsent draft in the composer.
+            || Some(true),
+            "continue",
+            Duration::from_millis(500),
+        )
+        .expect("probe must not error");
+
+        assert!(
+            matches!(outcome, PromptSubmitOutcome::HumanTyping { .. }),
+            "a composer with a human draft must yield HumanTyping, got {outcome:?}"
+        );
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "NOTHING may be written at a human mid-sentence — not the probe, and \
+             above all not the Ctrl+U that erases their line. Wrote: {:?}",
+            writes.lock().unwrap()
+        );
+    }
+
+    /// The other half: with no human draft the probe still works exactly as
+    /// before. A guard that refused everything would "fix" the symptom by
+    /// breaking every automated submit on the fleet.
+    #[test]
+    fn the_readiness_probe_still_submits_when_no_human_is_typing() {
+        let writes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let record = Arc::clone(&writes);
+        let screen = Arc::new(Mutex::new(String::from("$ ")));
+        let echo = Arc::clone(&screen);
+        let outcome = submit_prompt_echo_verified_with(
+            move |text| {
+                record.lock().unwrap().push(text.to_string());
+                // The child is consuming input: it echoes what it is sent.
+                echo.lock().unwrap().push_str(text);
+                Ok(())
+            },
+            move || Some(screen.lock().unwrap().clone()),
+            // Confirmed empty composer.
+            || Some(false),
+            "continue",
+            Duration::from_secs(2),
+        )
+        .expect("probe must not error");
+
+        assert!(
+            matches!(outcome, PromptSubmitOutcome::Submitted { .. }),
+            "an idle composer must still be submitted to, got {outcome:?}"
+        );
+        let wrote = writes.lock().unwrap().clone();
+        assert!(
+            wrote.iter().any(|w| w == "continue"),
+            "the payload must actually be written: {wrote:?}"
+        );
+        assert!(
+            wrote.last().is_some_and(|w| w == "\r"),
+            "Enter is a SEPARATE write of \\r and must come last: {wrote:?}"
+        );
+    }
 
     /// The daemon's vt100 mirror and the client's xterm must agree on how many
     /// cells an emoji occupies. When they disagree, every line carrying one
