@@ -1463,6 +1463,40 @@ and it is the only one nothing else is watching. The net has to go under the
 safety net. ⭐ A relay that has an edge case the monitor cannot express talks to
 the booter directly; that is what the dumb layer is for.
 
+### ⛔⛔ A REAP DOES NOT UNSUBSCRIBE — AND THE ORPHANS ESCALATE INTO A CORPSE
+
+**Retiring an orchestrator removes its ROW. It does not touch the supervision
+plane.** Every cluster that named it in `escalate_to` goes on naming it, and
+`escalate()` addressed `remote-cc://<host>/<uuid>` unconditionally — so the send
+landed nowhere and the log said *"escalated to orchestrator"* over the top of it.
+
+⇒ **The worst available shape: the plane reports itself healthy while no
+escalation from any cluster can arrive.** Every cluster still classifies fine,
+every tick looks green, and the one message that matters is the one that
+evaporates.
+
+**Measured at a seat-6.0 handover, 2026-08-13.** Ninety seconds after a clean
+`--replace` reap, **five cluster rows were escalating to a dead UUID**. Nothing
+reported it; it was found only because the successor happened to run `list`
+before trusting the plane. ⚠ **A cluster cannot see this at all** — from inside a
+cluster the plane it escalates into is background weather, which is precisely
+why it is the orchestrator's to notice and to mend.
+
+**The three repairs, and the third is the general one:**
+
+1. ⭐ **`ygg-monitor.py succeed --from <old> --to <new>`** moves every subscriber
+   with the seat and unsubscribes the retired orchestrator. **`ygg-claim.sh
+   --replace` now runs it for you**, so succession carries the plane along.
+2. ⛔ **It runs BEFORE the process-reap gate**, not after. The rows are orphaned
+   the moment the row is removed, so the repair must not sit behind a check that
+   can `exit 4` — the identical lesson the claim's verifier was already fixed for.
+   **Put side effects that matter before a verification gate.**
+3. ⭐ **`escalate()` now checks the target is a live row and falls back to the
+   human card**, naming the orchestrator that vanished. That is the backstop for
+   every *other* way a target goes stale. ⚠ **An empty row list is an instrument
+   failure, not a dead target** — the check requires positive evidence that the
+   row plane answered, or an ssh blip would route every escalation to a human.
+
 **⭐ MID-TURN IS NOT ONE STATE, AND THAT IS WHY A WATCHDOG KEPT DOING NOTHING.**
 The old classifier lumped every long mid-turn row into STUCK and refused to nudge
 any of them — *"a `continue` would race its own input"* — then escalated into a

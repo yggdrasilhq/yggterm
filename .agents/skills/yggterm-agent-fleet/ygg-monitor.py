@@ -260,6 +260,23 @@ def escalate(host, sub, row, why, dry):
     if dry:
         log(f"  DRY would escalate {row} -> {to or 'human'}: {why}")
         return
+    # ⛔ AN ESCALATION TARGET THAT NO LONGER EXISTS SWALLOWS THE ESCALATION AND
+    # REPORTS SUCCESS. `terminal send` answers about the REQUEST, not the
+    # delivery, so a retired orchestrator absorbs every cluster's cry for help
+    # and this function used to log "escalated to orchestrator" over the top of
+    # it. `succeed` keeps the pointers fresh at a handover; this is the backstop
+    # for every other way a target goes stale, and it fails to the human rather
+    # than into a void — the whole point of the plane.
+    orphaned = ""
+    if to:
+        live = {(r.get("full_path") or "").rsplit("/", 1)[-1]
+                for r in (ygg(host, "server", "app", "rows").get("data") or {}).get("rows", [])}
+        # ⚠ An EMPTY row list is an instrument failure, not a dead target. Falling
+        # back on it would route every escalation to the human the moment ssh
+        # blips — so require positive evidence that the row plane answered.
+        if live and to not in live:
+            log(f"  ⚠ escalation target {to[:8]} is NOT a live row — falling back to a human card")
+            orphaned, to = to, ""
     if to:
         target = f"remote-cc://{sub.get('escalate_host', sub.get('host', 'dev'))}/{to}"
         note = (f"MONITOR — row {sub.get('seat') or row} needs a decision: {why}. "
@@ -272,9 +289,12 @@ def escalate(host, sub, row, why, dry):
                        capture_output=True, text=True, timeout=60)
         log(f"  escalated to orchestrator {to[:8]}")
     else:
-        ygg(host, "server", "app", "notify", "relay needs a human", why,
+        extra = (f". Its orchestrator {orphaned[:8]} is GONE — this row is unsupervised "
+                 f"until someone claims the seat.") if orphaned else ""
+        ygg(host, "server", "app", "notify", "relay needs a human", why + extra,
             "--tone", "warning", "--session", row)
-        log("  escalated to a human card (no orchestrator subscribed)")
+        log("  escalated to a human card "
+            + (f"(orchestrator {orphaned[:8]} is gone)" if orphaned else "(no orchestrator subscribed)"))
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +337,45 @@ def cmd_unsubscribe(a):
         log(f"unsubscribed {a.uuid[:8]}")
     else:
         log(f"{a.uuid[:8]} was not subscribed — nothing to do")
+    return 0
+
+
+def cmd_succeed(a):
+    """⛔ REAPING DOES NOT UNSUBSCRIBE, AND THE ORPHANS ESCALATE INTO A CORPSE.
+
+    Retiring an orchestrator removes its ROW. It does not touch this plane, so
+    every cluster that named it in `escalate_to` goes on naming it — and
+    `escalate()` addresses `remote-cc://<host>/<dead-uuid>` unconditionally and
+    logs "escalated to orchestrator". The send lands nowhere and reports success,
+    which is the worst available shape: the supervision plane looks healthy while
+    no escalation from any cluster can arrive.
+
+    Measured 2026-08-13 at a seat-6.0 handover: FIVE cluster rows were left
+    escalating to a UUID reaped ninety seconds earlier. Nothing reported it —
+    a cluster cannot see this at all, because from inside a cluster the plane
+    it escalates into is background weather.
+
+    ⇒ Succession must move the subscribers with the seat. One call, and
+    ygg-claim.sh --replace runs it for you."""
+    old, new = _bare_uuid(a.from_uuid), _bare_uuid(a.to_uuid)
+    if not old or not new:
+        log("succeed: need --from <old-orchestrator> and --to <new>")
+        return 64
+    moved = []
+    for s in load_subs():
+        if _bare_uuid(s.get("escalate_to") or "") == old:
+            s["escalate_to"] = new
+            if a.escalate_host:
+                s["escalate_host"] = a.escalate_host
+            sub_path(s["uuid"]).write_text(json.dumps(s, indent=1))
+            moved.append(f"{s['uuid'][:8]}(seat {s.get('seat') or '-'})")
+    for who in moved:
+        log(f"  re-pointed {who} -> {new[:8]}")
+    log(f"succeeded {old[:8]} -> {new[:8]}: {len(moved)} row(s) re-pointed")
+    p = sub_path(old)
+    if p.exists() and old != new:
+        p.unlink()
+        log(f"  unsubscribed the retired orchestrator {old[:8]}")
     return 0
 
 
@@ -575,6 +634,12 @@ def main():
         if name == "demote":
             p.add_argument("--reason", default="")
         p.set_defaults(fn=fn)
+
+    p = sub.add_parser("succeed", help="move every subscriber from a retired orchestrator to its successor")
+    p.add_argument("--from", dest="from_uuid", required=True)
+    p.add_argument("--to", dest="to_uuid", required=True)
+    p.add_argument("--escalate-host", default="")
+    p.set_defaults(fn=cmd_succeed)
 
     p = sub.add_parser("list"); p.set_defaults(fn=cmd_list)
 

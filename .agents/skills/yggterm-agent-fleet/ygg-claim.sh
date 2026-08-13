@@ -375,6 +375,23 @@ try: d=json.load(sys.stdin)["data"]; print(d.get("verified"), d.get("verified_re
 except Exception: print("unknown")' 2>/dev/null)"
 log "remove: row_still_listed=$LISTED verified=$VERIF"
 
+# --- move the SUBSCRIBERS with the seat ------------------------------------
+# ⛔ RETIRING A ROW DOES NOT TOUCH THE SUPERVISION PLANE, AND THE ORPHANS THEN
+# ESCALATE INTO A CORPSE. `escalate()` addresses `remote-cc://<host>/<uuid>`
+# unconditionally and logs "escalated to orchestrator" whether or not the row
+# exists — so a handover silently leaves every cluster escalating into nothing,
+# while the plane reports itself healthy. Measured at a seat-6.0 handover
+# 2026-08-13: five cluster rows, orphaned ninety seconds after the reap, found
+# only because the successor happened to run `list`.
+#
+# ⇒ Run it HERE, before the process-reap gate below can `exit 4`. The rows are
+#   orphaned the moment the row is removed, so the repair must not sit behind a
+#   check that might skip it — the same lesson the verifier above was fixed for.
+if [ -x "$(dirname "$0")/ygg-monitor.py" ]; then
+  "$(dirname "$0")/ygg-monitor.py" succeed --from "$PUUID" --to "${MINE##*/}" 2>&1 \
+    | sed 's/^/  /' || log "⚠ monitor succession failed — re-point subscribers by hand"
+fi
+
 # `verified:false` with the row already delisted means the ROW is gone but the
 # agent PROCESS survived — typically because only the local transport was reaped.
 # Identify by cmdline, requiring BOTH a plausible agent binary and the uuid;
@@ -382,6 +399,12 @@ log "remove: row_still_listed=$LISTED verified=$VERIF"
 agent_pids() {   # every process that is genuinely THIS agent, and nothing else
   for p in $(pgrep -f -- "$PUUID" 2>/dev/null); do
     [ "$p" = "$$" ] && continue
+    # A pid from `pgrep` can exit before we read it — and the failure is the
+    # SHELL's redirection, not tr's, so `2>/dev/null` on the command never
+    # suppressed it. A clean reap printed "/proc/N/cmdline: No such file" three
+    # times at the handover that found this, which reads as breakage in the one
+    # output a successor studies most closely.
+    [ -r "/proc/$p/cmdline" ] || continue
     c="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)" || continue
     case "$c" in *pgrep*|*ygg-claim*|*terminate-cc*) continue ;; esac
     case "$c" in *claude*"$PUUID"*|*codex*"$PUUID"*|*"--session-id $PUUID"*) printf '%s ' "$p" ;; esac
