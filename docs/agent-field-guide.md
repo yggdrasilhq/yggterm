@@ -239,6 +239,34 @@ fact and was one command from being falsified. A relayed measurement is a CLAIM 
 it yourself — and building a measurement on top of an instrument that does not exist is how a whole
 lane's numbers turn out to be about nothing.
 
+### ⛔⛔ A CLEAN PRIVACY-GUARD RUN IS NOT EVIDENCE THE FILE IS CLEAN
+
+`ygg-privacy-guard` scans **the commits a push is carrying**, by design — that is
+what makes it fast and what makes it fair to the author who did nothing wrong.
+The consequence is not obvious and it bites:
+
+⇒ **A private term already on `main` is permanently invisible to it.** It will
+never be in anyone's push range again, so every future push over that file
+returns a clean result while the term sits in the public tree.
+
+Found 2026-08-14: three identifiers — a `username@hostname` shell prompt, a
+private wildcard domain, and a personal video URL — were live in
+`docs/pending-bugs.md` on `origin/main`, through a full-object history sweep the
+day before **and** through several clean guard runs.
+
+- ⭐ **Scan the WHOLE FILE, not your diff.** That is how these were found, and it
+  costs one `grep`.
+- ⛔ **And "pushed" is not the finish line for a removal — "on the public default
+  branch" is.** A lane push is correct practice for lane work and *wrong* for a
+  redaction: what a stranger reads is `HEAD` of `main`. **Verify by ancestry**
+  (`git merge-base --is-ancestor <sha> origin/main`), never by your own push
+  reporting success. Caught the same day: a removal was reported as landed while
+  it sat on a lane branch, and the exposure stayed live in between.
+- ⚠ **Both halves are the same shape**: an operation reported success about a
+  different question than the one being asked. The guard answered "is this push
+  clean", not "is this file clean"; the push answered "did the write succeed",
+  not "is it visible on main".
+
 ### ⛔ A DOM READ IS `server app dom-eval` — `chrome type --assert` TYPES FIRST
 
 `server app chrome` offers only `type`. Its `--assert <selector>@<attribute>` is a real DOM read but

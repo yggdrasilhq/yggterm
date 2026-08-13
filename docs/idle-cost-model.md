@@ -28,11 +28,21 @@ this file. ⛔ **Nothing here transfers to an `hpet` host without re-measurement
 |---|---|---|---|---|---|
 | **daemon** | 19 | **3.468** | 0.889 | **2.580** | 5.48 GB |
 | web process | 9 | 0.387 | 0.334 | 0.053 | 2.68 GB |
-| ychrome | 12 | 0.238 | 0.117 | 0.122 | 0.64 GB |
-| gui/client | 12 | 0.049 | 0.024 | 0.025 | 0.75 GB |
+| ychrome | 11 | 0.238 | 0.117 | 0.122 | 0.64 GB |
+| CLI client (ssh-carried) | 11 | 0.039 | 0.015 | 0.024 | 0.60 GB |
+| **gui** | **1** | **0.010** | 0.009 | 0.002 | 0.15 GB |
 | net process | 20 | 0.002 | 0.002 | 0.000 | 1.53 GB |
-| other | 36 | 0.022 | 0.015 | 0.007 | 1.40 GB |
+| other | 37 | 0.023 | 0.015 | 0.008 | 1.40 GB |
 | **total** | 108 | **4.167** | 1.380 | 2.787 | 12.48 GB |
+
+⛔ **CORRECTED — the first version of this table classified on the command line
+and got the `gui` row wrong.** All 12 processes it called `gui` were
+`yggterm server remote start-cc|resume-cc` wrappers, whose command line contains
+the binary path. **And the known remedy — key on `comm`, not the command line —
+would ALSO have failed here**, because `comm` is `yggterm` for the GUI *and* for
+an ssh-carried CLI client. ⇒ **Only the SUBCOMMAND separates them.** The daemon
+row was never affected (it matches `server daemon`, which no wrapper carries),
+so the 83% headline is unchanged at **83.2%**.
 
 ⇒ **The daemon population is 83% of the whole footprint, and 74% of its own cost
 is kernel time.** Prior work in this area measured the GUI and the web process,
@@ -142,7 +152,7 @@ control for the whole mechanism.
 | **failed `try_lock()` per second** | **322.8** |
 | share of event-trace that is lock_wait | **98.8%** |
 | share of perf-telemetry that is `terminal_read` | **96.4%** |
-| `~/.yggterm` on this host today | **9.5 GB** |
+| both streams' footprint **on disk** | **~20 MB** (they rotate) |
 
 Contention by request kind: `terminal_read` 12,736 · `status` 164 · `snapshot` 12.
 ⇒ **98.6% of all lock contention in the daemon is `terminal_read`** — reading a
@@ -188,6 +198,24 @@ The premise that failed is the assumption that `WouldBlock` is rare: it fires
 **322.8 times a second**. Each one costs a `resolve_yggterm_home()`, two
 `serde_json::json!` allocations, and **two file appends — to report a 0 ms
 wait.** The fast path is not the path being taken.
+
+### ⚠ It is 22x smaller on the host that actually gets complained about
+
+Same 15 s window, both hosts, measured independently by the implementing lane:
+
+| host | sessions / daemons | combined write rate |
+|---|---|---|
+| this (integrator) host | 340 / 21 | **133 KB/s** |
+| the desktop host | 2 / 7 | **6 KB/s** |
+
+⇒ **22x, and it tracks session count, not hardware.** That is a *confirmation*
+of §2 rather than a contradiction of it: contention is 98.6% `terminal_read`,
+and `terminal_read` is per-session, so the trace volume must scale with sessions
+and it does.
+
+⛔ **But it means this defect is close to absent on the machine the fan
+complaint came from.** Fix it on its own merits — CPU, IO and SSD wear on the
+host that carries the fleet. **Do not offer it as the explanation for his fan.**
 
 ## 5. A SHIPPED fix is not a RUNNING fix — the outlier, identified
 
@@ -278,6 +306,9 @@ per-event `append_trace_event` calls **and the `PerfGuard` beside them** with an
 in-memory counter flushed once per interval, carrying count + percentiles.
 **Expected effect:** combined write load **141 KB/s → <2 KB/s, 12.49 GB/day →
 ~150 MB/day**, and the contention becomes visible instead of rounding to zero.
+⛔ **The win is CPU, IO and SSD wear — NOT disk.** Both streams rotate and hold
+~20 MB; nothing is reclaimed by fixing this. ⚠ And it is **22x smaller on the
+desktop host** (§4), so it is a fleet-host win, not an answer to the fan.
 **Falsifier:** if combined growth does not fall by ≥90x, the 437-bytes-per-
 contention attribution in §4 is wrong.
 ⛔ **Fix both files in one change.** They are one code path; treating them as two
@@ -315,6 +346,11 @@ is that CPU stops hiding in exited threads, so §3's instrument gap closes.
 - **The 21-minute render storm is untouched by this.** That is a user-time,
   GUI-side, latching phenomenon; nothing in the daemon model explains it, and
   the numbers here should not be offered as if they do.
-- **`~/.yggterm` at 9.5 GB is reported, not attributed.** §4 accounts for
-  8.3 GB/day of *current* write rate; how much of the 9.5 GB standing total is
-  lock_wait trace versus session state was not measured.
+- ⛔ **`~/.yggterm` at 9.5 GB is NOT the trace.** An earlier version of this file
+  put that figure beside the write rates, which invited the reading that §4
+  fills the disk. It does not: both streams rotate and hold **~20 MB**. The
+  9.5 GB is dominated by a **managed npm cache at 7.6 GB** with no retention
+  rule — a separate defect, separately filed, not this one. ⇒ **§S2's win is
+  write rate — CPU, IO and SSD wear — and essentially no reclaimed disk.**
+  Quoting it as "12 GB/day of disk reclaimed" would be measured later and found
+  false.

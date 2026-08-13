@@ -58,12 +58,14 @@ anything.
     server cost — host-wide, window 5.0s, clocksource=tsc
     controls: spinner 1.002 (ok)  sleeper 0.000 (ok)   -> VALID
 
-    role            n    cores    user  kernel     RSS    swap
-    daemon         19    3.468   0.889   2.580   5.48G   0.00G
-    web_process     9    0.387   0.334   0.053   2.68G   0.00G
-    gui             1    0.049   0.024   0.025   0.75G   0.00G
+    role                  n    cores    user  kernel     RSS    swap
+    daemon               19    3.468   0.889   2.580   5.48G   0.00G
+    web_process           9    0.387   0.334   0.053   2.68G   0.00G
+    ychrome              11    0.238   0.117   0.122   0.64G   0.00G
+    cli_client            11   0.039   0.015   0.024   0.60G   0.00G
+    gui                   1    0.010   0.009   0.002   0.15G   0.00G
     ...
-    TOTAL         108    4.167   1.380   2.787  12.48G   0.00G
+    TOTAL               108    4.167   1.380   2.787  12.48G   0.00G
 
     writers         KB/s   GB/day
     event-trace     95.3     8.43
@@ -74,9 +76,17 @@ anything.
 1. **Host-wide, and every term says which daemon it came from** (`--by-daemon`).
    This is the direct answer to the `terminal_session_count` trap: a per-daemon
    number presented as a host number is how a handover reads as a catastrophe.
-2. **Classify by `comm`, never by command line.** Keying on the command line
-   once classified a dozen near-idle `ssh` and `bash` wrappers as `gui` and
-   diluted that role's mean by 2x.
+2. ⛔ **Classify by the SUBCOMMAND. `comm` is not enough, and neither is the
+   command line.** Keying on the command line once classified a dozen near-idle
+   wrappers as `gui` and diluted that role's mean by 2x — and it did it again
+   during the measurement that produced this spec, where all 12 processes called
+   `gui` were `yggterm server remote start-cc|resume-cc` wrappers whose command
+   line contains the binary path. **The known remedy — use `comm` — would ALSO
+   have failed**, because `comm` is `yggterm` for the GUI *and* for an
+   ssh-carried CLI client. The discriminating field is the subcommand:
+   `server daemon` ⇒ daemon, `server remote …` ⇒ CLI client, no subcommand ⇒
+   the GUI. Roles that share a binary can only be told apart by what they were
+   asked to do.
 3. **Print each role's sample count `n` beside its mean.** A single stale row
    otherwise renders as a full role.
 4. **Report the clocksource.** On an `hpet` host `clock_gettime` costs 45.8x
