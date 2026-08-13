@@ -56633,6 +56633,9 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
         .map(|row| row.full_path.clone())
         .collect();
     snapshot.rows = app_control_rows_with_every_set_open(&shell);
+    // The Live Sessions rail's own rows, so a row can say which of its two
+    // legitimate presences it is.
+    let live_rail_paths = live_sidebar_session_paths(&snapshot.rows);
     // **"THIS ROW IS GONE" MADE VISIBLE.** The tombstone plane is the one
     // record that the user CLOSED a row, and until now it could only be
     // consulted from inside the daemon. Everything that rebuilds a set of rows
@@ -56693,6 +56696,21 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 // delete rows from the answer: it did, and the booter reaped
                 // nine live sessions on the strength of it.
                 "hidden_by_collapsed_set": !rendered.contains(&row.full_path),
+                // ⛔ WHICH PRESENCE THIS ROW IS. A live session legitimately
+                // appears twice — once in the Live Sessions rail and once in
+                // its cwd folder ([[spec-active-sessions-dual-presence]]) — and
+                // the two entries carry the same session id, prefix and label.
+                // A consumer reading this verb could not tell that from a
+                // duplicated row, and at least one concluded the answer could
+                // not be trusted in either direction. The instrument states its
+                // subject rather than leaving the caller to infer it.
+                "presence": if live_rail_paths.contains(&row.full_path) {
+                    "live_rail"
+                } else if live_member {
+                    "cwd_tree"
+                } else {
+                    "row"
+                },
                 "selected": shell.selected_tree_paths.contains(&row.full_path),
                 "session_id": row.session_id,
                 "session_cwd": row.session_cwd,
@@ -79976,6 +79994,66 @@ async fn process_pending_app_control_requests(
                     ),
                     None => format!("session {session_path} is not in a split group"),
                 }),
+            }
+        }
+        AppControlCommand::ArrangeRowSet {
+            row_path,
+            into_path,
+            dissolve,
+        } => {
+            let target = state.with(|shell| resolve_app_control_row(shell, &row_path));
+            match target {
+                Some(row) => {
+                    let path = normalize_live_session_path(&row.full_path);
+                    let (applied, detail, refusal) = state.with_mut(|shell| {
+                        if dissolve {
+                            let members = shell.row_arrangement.sets.dissolve(&path);
+                            for member in &members {
+                                shell.row_arrangement.detach(member);
+                            }
+                            shell.row_arrangement.detach(&path);
+                            (true, json!({ "dissolved": members }), None)
+                        } else if let Some(head) = into_path.as_deref() {
+                            let head = normalize_live_session_path(head);
+                            match shell.row_arrangement.attach(&head, &path, None) {
+                                Ok(()) => (true, json!({ "into": head }), None),
+                                // Named, not swallowed: a refused arrangement is
+                                // a different mistake from a row that could not
+                                // be found, and a caller that cannot tell them
+                                // apart retries the wrong one.
+                                Err(refusal) => {
+                                    (false, json!({ "into": head }), Some(format!("{refusal:?}")))
+                                }
+                            }
+                        } else {
+                            shell.row_arrangement.detach(&path);
+                            (true, json!({ "detached": path }), None)
+                        }
+                    });
+                    if applied {
+                        state.with_mut(ShellState::sync_browser_settings);
+                    }
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "accepted": applied,
+                            "row_path": row_path,
+                            "detail": detail,
+                        })),
+                        error: refusal,
+                    }
+                }
+                None => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({ "accepted": false, "row_path": row_path })),
+                    error: Some(format!("no row found for {row_path}")),
+                },
             }
         }
         AppControlCommand::SetRowExpanded { row_path, expanded } => {
