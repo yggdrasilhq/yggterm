@@ -78370,9 +78370,13 @@ async fn process_pending_app_control_requests(
             // after it confirms the echo. It is the SAME function `CheckTerminalInput`
             // calls, so "is this row reading input" has one answer, not two.
             //
-            // The draft guard is OFF here on purpose: this caller has been told to send
-            // that text, so clearing the composer line is part of doing what was asked.
-            // A bare check turns it on.
+            // ⛔ The draft guard used to be OFF here, on the reasoning that this
+            // caller had been told to send the text so clearing the composer was
+            // part of doing what was asked. It is now unconditional: the send
+            // instruction comes from an agent, the half-typed sentence belongs to
+            // the person at the keyboard, and a submit that erases it has not
+            // done what was asked — it has destroyed something else. A draft
+            // yields a named refusal, which the caller must NOT retry.
             let verdict = probe_terminal_input_consumption(
                 endpoint.clone(),
                 runtime_session_path.clone(),
@@ -78380,7 +78384,6 @@ async fn process_pending_app_control_requests(
                 session_kind,
                 trace_home.as_path(),
                 timeout,
-                false,
             )
             .await;
             let waited_ms = verdict.waited_ms;
@@ -78517,7 +78520,6 @@ async fn process_pending_app_control_requests(
                 session_kind,
                 trace_home.as_path(),
                 timeout,
-                true,
             )
             .await;
             AppControlResponse {
@@ -106960,6 +106962,35 @@ const TERMINAL_INPUT_NO_COMPOSER_REASON: &str =
     "no agent composer row appeared within the timeout — the row is mid-output, in a menu, or is not an agent CLI, so input readiness is unanswerable rather than false";
 const TERMINAL_INPUT_DRAFT_REASON: &str =
     "the composer holds an unsent draft — refusing to probe, because the probe types a marker and clears the line with Ctrl+U and would destroy it";
+const TERMINAL_INPUT_UNREADABLE_COMPOSER_REASON: &str =
+    "the composer could not be read, so whether a human is mid-sentence is unknown — refusing to probe, because being wrong here costs somebody their line";
+
+/// How long to wait before the probe tries again, and the ceiling it climbs to.
+///
+/// ⛔ **The flat retry was the "viewport blinking" bug.** Writing the marker and
+/// then Ctrl+U every ~300 ms means ~100 injected markers and ~100 erased lines
+/// across a 30 s timeout, and the visible result is the composer being painted
+/// and wiped three times a second. A row that has not answered in seconds will
+/// not answer in the next 120 ms, so the interval doubles to a 2 s ceiling:
+/// the same deadline, ~12 writes instead of ~100, and the surface is left alone
+/// in between.
+const TERMINAL_INPUT_PROBE_RETRY_MIN: Duration = Duration::from_millis(120);
+const TERMINAL_INPUT_PROBE_RETRY_CEILING: Duration = Duration::from_secs(2);
+
+/// May the probe write into this composer?
+///
+/// ⛔ **`None` is NOT permission.** An unreadable composer is precisely the case
+/// where being wrong is least affordable: the probe's next act is a Ctrl+U, and
+/// a Ctrl+U into a sentence somebody is typing destroys it. Only a positive
+/// reading of "there is no draft here" authorises a write.
+fn probe_write_is_permitted(composer_holds_draft: Option<bool>) -> bool {
+    composer_holds_draft == Some(false)
+}
+
+/// The next retry interval, doubling to a fixed ceiling.
+fn probe_retry_backoff(previous: Duration) -> Duration {
+    (previous * 2).min(TERMINAL_INPUT_PROBE_RETRY_CEILING)
+}
 
 /// One verdict on one question: **is this row consuming input right now?**
 #[derive(Debug, Clone)]
@@ -106987,10 +107018,16 @@ struct TerminalInputProbeVerdict {
 /// [[finding-fresh-restarted-codex-no-input]]), and a WEDGED row draws one
 /// forever while reading nothing.
 ///
-/// `guard_draft` makes the probe refuse instead of running when the composer
-/// already holds typed text. `SubmitTerminalPrompt` leaves it off — its caller
-/// has asked for that text to be sent and the Ctrl+U is part of doing so — while
-/// a bare check must never cost the human a sentence for the sake of an answer.
+/// ⛔ **THE PROBE NEVER TYPES OVER A HUMAN, AND THAT IS NOT A CALLER'S CHOICE.**
+/// This used to take a `guard_draft` flag which `SubmitTerminalPrompt` set to
+/// `false`, reasoning that its caller had asked for the text to be sent so the
+/// Ctrl+U was part of doing what was asked. **That reasoning is what the owner's
+/// 2026-08-14 report refuted**: the instruction to send comes from an agent, the
+/// sentence in the composer belongs to the person at the keyboard, and one does
+/// not license destroying the other. The refusal is now unconditional, exactly
+/// as the daemon-side twin `submit_prompt_echo_verified_with` already does it —
+/// a caller that wants the text sent gets a NAMED refusal and stops. ⛔ It must
+/// not retry: a second attempt is a second barrage.
 async fn probe_terminal_input_consumption(
     endpoint: ServerEndpoint,
     runtime_session_path: String,
@@ -106998,7 +107035,6 @@ async fn probe_terminal_input_consumption(
     session_kind: Option<SessionKind>,
     trace_home: &Path,
     timeout: Duration,
-    guard_draft: bool,
 ) -> TerminalInputProbeVerdict {
     let started = Instant::now();
     let mut composer_shown = false;
@@ -107032,17 +107068,28 @@ async fn probe_terminal_input_consumption(
             reason: TERMINAL_INPUT_NO_COMPOSER_REASON,
         };
     }
-    if guard_draft && composer_held_draft {
-        return TerminalInputProbeVerdict {
-            consuming_input: false,
-            composer_shown: true,
-            composer_held_draft: true,
-            activity,
-            waited_ms: started.elapsed().as_millis() as u64,
-            reason: TERMINAL_INPUT_DRAFT_REASON,
-        };
-    }
+    // The freshest reading of "is somebody mid-sentence in there", carried across
+    // iterations so every write is authorised by a reading taken AFTER the last
+    // one. `Some(false)` is the only value that lets a write through.
+    let mut composer_draft_now = Some(composer_held_draft);
+    let mut retry_backoff = TERMINAL_INPUT_PROBE_RETRY_MIN;
     while started.elapsed() < timeout {
+        // ⛔ CHECKED BEFORE EVERY WRITE, never once at the top. A human can start
+        // typing at any point during a 30 s wait, and the whole failure being
+        // fixed here is a probe that kept writing while somebody was mid-word.
+        if !probe_write_is_permitted(composer_draft_now) {
+            return TerminalInputProbeVerdict {
+                consuming_input: false,
+                composer_shown: true,
+                composer_held_draft: composer_draft_now.unwrap_or(false),
+                activity,
+                waited_ms: started.elapsed().as_millis() as u64,
+                reason: match composer_draft_now {
+                    Some(true) => TERMINAL_INPUT_DRAFT_REASON,
+                    _ => TERMINAL_INPUT_UNREADABLE_COMPOSER_REASON,
+                },
+            };
+        }
         let _ = terminal_write_app_control_input_async(
             endpoint.clone(),
             runtime_session_path.clone(),
@@ -107053,22 +107100,24 @@ async fn probe_terminal_input_consumption(
         )
         .await;
         sleep(Duration::from_millis(180)).await;
-        let echoed = matches!(
-            terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home).await,
-            Ok((ref screen, ..)) if screen.contains(TERMINAL_INPUT_ECHO_PROBE)
-        );
-        // Clear the probe whether it echoed (consumed) or was buffered while the
-        // CLI wasn't reading yet — the composer is left clean either way.
-        let _ = terminal_write_app_control_input_async(
-            endpoint.clone(),
-            runtime_session_path.clone(),
-            session_path.clone(),
-            TERMINAL_INPUT_CLEAR_LINE.to_string(),
-            "submit_probe",
-            trace_home,
-        )
-        .await;
+        let screen = terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home)
+            .await
+            .ok()
+            .map(|(screen, ..)| screen);
+        let echoed = screen
+            .as_deref()
+            .is_some_and(|screen| screen.contains(TERMINAL_INPUT_ECHO_PROBE));
         if echoed {
+            // Our marker is on the screen and has to come off it again.
+            let _ = terminal_write_app_control_input_async(
+                endpoint.clone(),
+                runtime_session_path.clone(),
+                session_path.clone(),
+                TERMINAL_INPUT_CLEAR_LINE.to_string(),
+                "submit_probe",
+                trace_home,
+            )
+            .await;
             sleep(Duration::from_millis(60)).await;
             return TerminalInputProbeVerdict {
                 consuming_input: true,
@@ -107079,7 +107128,39 @@ async fn probe_terminal_input_consumption(
                 reason: TERMINAL_INPUT_CONSUMING_REASON,
             };
         }
-        sleep(Duration::from_millis(120)).await;
+        // ⭐ The marker did NOT echo, so it is not on this screen — which makes
+        // this reading a clean discriminator: any text in the composer now is
+        // somebody else's. Re-read before the Ctrl+U, because the echo wait is
+        // 180 ms and a person can easily start typing inside it.
+        composer_draft_now = screen
+            .as_deref()
+            .map(terminal_composer_row_holds_draft);
+        if !probe_write_is_permitted(composer_draft_now) {
+            // ⛔ Return WITHOUT the Ctrl+U. The clear is the destructive half.
+            return TerminalInputProbeVerdict {
+                consuming_input: false,
+                composer_shown: true,
+                composer_held_draft: composer_draft_now.unwrap_or(false),
+                activity,
+                waited_ms: started.elapsed().as_millis() as u64,
+                reason: match composer_draft_now {
+                    Some(true) => TERMINAL_INPUT_DRAFT_REASON,
+                    _ => TERMINAL_INPUT_UNREADABLE_COMPOSER_REASON,
+                },
+            };
+        }
+        // Clear the buffered probe so it cannot pile up, then back off.
+        let _ = terminal_write_app_control_input_async(
+            endpoint.clone(),
+            runtime_session_path.clone(),
+            session_path.clone(),
+            TERMINAL_INPUT_CLEAR_LINE.to_string(),
+            "submit_probe",
+            trace_home,
+        )
+        .await;
+        sleep(retry_backoff).await;
+        retry_backoff = probe_retry_backoff(retry_backoff);
     }
     TerminalInputProbeVerdict {
         consuming_input: false,
@@ -178712,6 +178793,108 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
              from 'something wrote where I cannot see'. Uncounted: {offenders:#?}"
         );
     }
+    /// ⛔ THE PROBE MAY NOT WRITE INTO A COMPOSER A HUMAN IS USING.
+    ///
+    /// The daemon-side twin was fixed in `b7b601b7`; this file kept a SECOND,
+    /// independent copy of the same loop, and `server app terminal submit` is an
+    /// app-control command handled by the GUI — so this copy is the one the
+    /// owner actually hits. Reported live 2026-08-14 as the viewport blinking
+    /// and being unable to type.
+    ///
+    /// ⭐ `None` is not permission. An unreadable composer is exactly where being
+    /// wrong costs somebody their sentence.
+    #[test]
+    fn the_probe_refuses_to_write_unless_the_composer_is_known_to_be_empty() {
+        assert!(
+            probe_write_is_permitted(Some(false)),
+            "a composer positively known to hold no draft is the ONLY case that \
+             authorises a write"
+        );
+        assert!(
+            !probe_write_is_permitted(Some(true)),
+            "a composer holding a human's unsent draft must refuse the probe — \
+             the probe's next act is a Ctrl+U, which erases that line"
+        );
+        assert!(
+            !probe_write_is_permitted(None),
+            "an UNREADABLE composer must refuse too: `None` means 'I do not know \
+             whether someone is mid-sentence', and guessing yes-write there is \
+             how the owner's keystrokes came back shredded"
+        );
+    }
+
+    /// ⛔ THE FLAT RETRY IS THE "VIEWPORT BLINKING" SYMPTOM, MEASURED AS A WRITE
+    /// COUNT.
+    ///
+    /// ⭐ Asserts on the WRITES, not on a verdict. A version that returns the
+    /// right enum after painting and wiping the composer a hundred times has
+    /// still produced the symptom — the damage IS the writes, so the writes are
+    /// what this counts.
+    #[test]
+    fn a_row_that_never_answers_is_written_to_about_a_dozen_times_not_a_hundred() {
+        let timeout = Duration::from_secs(30);
+        let mut elapsed = Duration::ZERO;
+        let mut backoff = TERMINAL_INPUT_PROBE_RETRY_MIN;
+        let mut writes = 0usize;
+        while elapsed < timeout {
+            // One iteration writes the marker and then clears it.
+            writes += 2;
+            elapsed += Duration::from_millis(180) + backoff;
+            backoff = probe_retry_backoff(backoff);
+        }
+        assert!(
+            writes <= 40,
+            "a 30 s probe against a silent row must cost about a dozen \
+             marker/clear pairs, not ~100. The flat 120 ms retry produced ~3 \
+             paint-and-wipe cycles a second, which is the blinking the owner \
+             reported. Writes: {writes}"
+        );
+        assert!(
+            backoff <= TERMINAL_INPUT_PROBE_RETRY_CEILING,
+            "the backoff must be bounded so the deadline is still honoured"
+        );
+    }
+
+    /// ⛔ THE GATE MUST BE CONSULTED BEFORE EVERY WRITE, AND THE RETRY MUST BACK
+    /// OFF — a structural guard, because the defect is a MISSING CALL.
+    ///
+    /// ⭐ The behavioural tests above lock what the gate MEANS; only a source
+    /// scan can lock that the loop still ASKS it. A probe that stopped calling
+    /// `probe_write_is_permitted` would pass both of them while typing over the
+    /// owner exactly as before, which is the whole failure being fixed here.
+    #[test]
+    fn every_probe_write_site_is_still_guarded_and_the_retry_still_backs_off() {
+        let source = include_str!("shell.rs");
+        let start = source
+            .find("async fn probe_terminal_input_consumption(")
+            .expect("the probe function must exist");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\nasync fn ")
+            .map(|at| at + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let guards = body.matches("probe_write_is_permitted").count();
+        assert!(
+            guards >= 2,
+            "the composer must be re-read and re-checked before EVERY write: \
+             once before the marker, and again before the Ctrl+U (the echo wait \
+             is 180 ms and a person can start typing inside it). Found {guards} \
+             guard call(s)"
+        );
+        assert!(
+            body.contains("sleep(retry_backoff)") && body.contains("probe_retry_backoff"),
+            "the retry must use the backing-off interval; a flat sleep here is \
+             the paint-and-wipe loop the owner sees as blinking"
+        );
+        assert!(
+            !body.contains("guard_draft"),
+            "refusing to type over a human is not a caller's option — the flag \
+             that let `SubmitTerminalPrompt` opt out is what caused the incident"
+        );
+    }
+
     /// The owner's #1: a row that has stopped reading its PTY must stop looking
     /// exactly like a healthy one.
     ///

@@ -215,6 +215,53 @@ and still ruin the sentence someone was typing. **The damage IS the write.**
 Proven to fail on the mutant that disables the guard (i.e. on the shipped
 behaviour), while the "still submits normally" control passed.
 
+### ⛔⛔⛔ THE FIX COVERED ONE OF TWO COPIES — AND THE UNFIXED ONE IS THE COPY THE OWNER HITS
+
+*Found 2026-08-14 after the symptom was reported still live, and still worsening
+with uptime, on a build whose installed release already contained the fix above.*
+
+**There are TWO independent implementations of this probe loop:**
+
+| copy | who runs it | reached by | state |
+|---|---|---|---|
+| `yggterm-server/src/terminal.rs` `submit_prompt_echo_verified_with` | the **daemon** | the hot-restart repair's `continue` | **fixed** (the section above) |
+| `yggterm-shell/src/shell.rs` `probe_terminal_input_consumption` | the **GUI** | **`server app terminal submit`** | **was still unfixed** |
+
+⇒ `server app terminal submit` is an **app-control** command, and app-control
+commands are handled by the GUI process (the reply carries `handled_by_pid` to
+say so). **Every automated submit in the fleet therefore went through the copy
+that had never been fixed**, which is why the symptom survived a release
+containing the fix. The GUI copy was, verbatim, the original defect:
+
+```
+write(marker) → sleep 180 ms → snapshot → write(Ctrl+U) → sleep 120 ms → repeat
+```
+
+**≈3.3 marker-and-erase cycles per second for the full timeout**, and its
+`guard_draft` parameter was passed `false` by `SubmitTerminalPrompt` **on
+purpose**, on the reasoning that a caller told to send text is entitled to clear
+the composer line. ⛔ **That reasoning is what the incident refutes:** the
+instruction to send comes from an agent, the half-typed sentence belongs to the
+person at the keyboard, and a submit that erases it has not done what was asked
+— it has destroyed something else. The flag is **removed**, not defaulted: the
+refusal is a property of the probe, never a caller's option.
+
+⭐ **The measured cost, from the lock rather than from an estimate:** a 30 s
+submit against a silent row went from **200 writes to 24**.
+
+⚠ **This corrects the deploy-ordering note below on one point.** "The GUI
+relaunch does not type" is true of the relaunch itself, and the daemon handover
+is still the dangerous *event* — but the GUI is the process that performs the
+destructive writes for every ordinary submit, so **the GUI build is the one that
+has to carry this fix** for the reported symptom to stop.
+
+⭐ **The general shape, and it is the third time this campaign has paid for it:**
+a fix proven on one lane is not proven. The commit, the test and the release were
+all real; the search for *other implementations of the same concept* was the step
+never taken. **Before closing a defect, grep for a second encoding of the thing
+you just fixed** — this file's own SSOT law exists because two copies of one
+concept drift, and here they drifted into one being fixed and one not.
+
 ⛔ **UNTIL A DAEMON CARRYING THIS IS DEPLOYED, THE MITIGATION IS BEHAVIOURAL:**
 do not `terminal submit` to a row that is not consuming input. A row reading
 `busy: agent_working_daemon` will not echo, so the submit will hammer it for the
@@ -375,6 +422,41 @@ unnoticed.
 
 **Falsifier:** spawn a row with `terminal new` and read `ygg-booter.py list` — it must appear without
 anyone having typed a second command.
+
+### ⭐ DESIGN SETTLED 2026-08-14 (6.1), AND IT IS NOT THE VERB — WITH A PREREQUISITE NOBODY HAS WRITTEN DOWN
+
+Measured before deciding, so the next session need not re-derive any of it:
+
+- ⛔ **The product binary has NO dependency on the relay plane today.** Nothing under `crates/` or
+  `apps/` mentions `.agents/skills`, `ygg-booter`, or `~/.yggterm/relay` (grepped). Teaching
+  `terminal new` to arm makes **yggterm the product** depend on an agent-fleet convention that ships
+  in a skills directory — a new coupling in the wrong direction, and a second encoding of the
+  booter's subscription record if the Rust side writes it directly.
+- ⚖ **The owner's ruling is "armed by the act of EXISTING", and the verb cannot deliver that.** A
+  verb arms only what *it* spawned. Rows created by any other path — `ygg-claim.sh`, a restore, a
+  future surface — stay unarmed, and coverage again depends on which door was used. **Enumeration
+  satisfies the ruling; a verb approximates it.**
+- ⇒ **The fix belongs in `ygg-booter.py`: enumerate live rows and arm the unarmed ones**, on `list`,
+  on `tick`, and on `status`. That passes the falsifier above (a `list` right after a spawn absorbs
+  it), needs no product change, keeps the record schema with its owner, and retroactively covers
+  rows that already exist.
+
+⛔⛔ **THE PREREQUISITE, AND IT IS LOAD-BEARING: `booter-disarmed.tsv` IS WRITE-ONLY TODAY.**
+`ygg-claim.sh` appends to it (`--no-booter <reason>`); **nothing reads it** (grepped across the whole
+skill directory). ⇒ **Auto-arm shipped without a reader would silently re-arm every row that was
+deliberately disarmed with a stated reason, one tick later** — turning the owner's "disarm WITH
+REASON" into a no-op while appearing to honour it. **Write the reader first, and test the
+disarm→enumerate→still-disarmed path before the arming path.**
+
+⛔ **AND THE SAFETY CONSTRAINT THAT MAKES BLANKET AUTO-ARM DANGEROUS:** the booter's whole function
+is to TYPE INTO a stalled session. The owner's own interactive rows must never be armed — "never
+whoop his viewport" — so the enumerator needs a positive test for *agent* rows rather than "every row
+I can see". ⚠ `ygg-babysit.py` exposes only `resolve_row_path` / `row_exists` / `row_host`, no
+metadata, so that filter has to come from the raw `server app rows` JSON (kind, tenancy provenance),
+not from the existing helpers.
+
+⇒ **Order of work:** (1) read the disarm ledger, (2) agent-row filter with a proven negative case
+against a human row, (3) enumerate-and-arm on `list`/`tick`/`status`, (4) run the falsifier above.
 
 ## ⚠ `terminal submit`'s "no agent composer row appeared" HAS TWO OPPOSITE CAUSES AND ONE MESSAGE
 
