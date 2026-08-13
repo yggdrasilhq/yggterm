@@ -132,13 +132,43 @@ is a CLAIM; it cost a seat's launch.
 confidently and wrongly: the same walk reports 291 descendants under the left
 tree, which is measured to draw.)*
 
-⭐ **IT IS A REGRESSION, NOT A STRUCTURAL DEFECT — proven by A/B against a
-second live GUI.** A second instance running an **older build** renders the same
-rail correctly (`kids:4` — header, section, scroll body, handle). The body
-dispatch chain itself is unchanged since 2026-07-09, and the rail code path is
-**byte-identical between the build that fails and current `main`** ⇒ the defect
-is live on main and nothing has fixed it. Regression window: the older build
-(≤ 14:25) → 3.0.148 (22:25) on 2026-08-13.
+⭐⭐ **IT IS INSTANCE STATE, NOT THE BUILD, AND NOT THE CODE. NOBODY SHOULD
+BISECT THIS.** Stood the CURRENT build up in a clean private sandbox
+(`scripts/underglass-sandbox.sh`, under-glass **off**, `gdk_backend=wayland`
+asserted, XWayland impossible) and ran the same probe: **`kids:4`,
+`rail_header:1`, `rail_scroll:1`** — header, section, scroll body, handle. The
+rail renders correctly on code NEWER than the build that fails.
+
+⛔ **A RETRACTION, RECORDED BECAUSE IT NEARLY COST A NIGHT'S BISECT.** This entry
+briefly claimed a regression with a window to bisect. That was wrong twice over:
+
+- **The A/B was confounded.** The working instance differed from the failing one
+  in THREE ways at once — older build, *and* a different rendering configuration
+  (`YGGTERM_WEB_SURFACE_UNDER_GLASS=1`), *and* an empty session set. Only the
+  build was credited. ⇒ **Count the variables before naming the cause.**
+- **The window was invented from the wrong instrument.** Its vintage was inferred
+  from the process START TIME; the binary itself answers `--version` in one call
+  and said **3.0.112** (08-11), not the same-afternoon build that had been
+  assumed. ⭐ **Ask the binary, never the clock.**
+
+And the measurement that should have killed it before any sandbox ran: across
+the whole range 3.0.112 → 3.0.148 there are 4338 changed lines in `shell.rs` and
+**ZERO** touching `rail_render_view`, any `*RailBody`, `SideRailShell`,
+`RailHeader`, `RailScrollBody`, `rendered_mode` or `right_panel_mode`. A bisect
+cannot land on a rail change when there is no rail change in the range.
+
+⇒ **The specimen is the owner's long-lived GUI instance, and it is the only
+place the bug exists.** What that instance has and a clean one does not: ~385
+rows, ~306 notifications, four contributed panes all reporting
+`in_snapshot_map:false`, and a `right_panel.raw_mode` pinned at `app_pane`
+through every mode change while `requested_mode` moves. **That pin is the prime
+suspect** — on a clean instance `raw_mode` tracks the mode exactly.
+
+⛔ **Two explanations are now excluded, both of which looked strong.** *"The rail
+is per-selected-session and nothing is selected"* — the clean sandbox reports
+`active_session_path` **absent** too and still draws `kids:4`. And *"the fault is
+in the body dispatch chain"* — that chain is unchanged since 2026-07-09 and is
+byte-identical between the failing build and current `main`.
 
 ⛔ **NOT mode-specific and NOT data-dependent.** Sampling state and DOM
 *together* (a reading taken at a different moment proves nothing) across all
