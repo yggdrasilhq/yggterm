@@ -1310,17 +1310,21 @@ fn maybe_handoff_to_preferred_headless_executable(
 }
 
 fn main() -> Result<()> {
-    // This process becomes a DAEMON that outlives the file it was loaded from,
-    // so it publishes the source it was built from while it still can. See
-    // `yggterm_server::build_identity` for why nothing outside can recover it.
-    yggterm_server::build_identity::declare_build_commit(build_identity::build_commit());
-
     // ⭐ FIRST, before the logger and before any thread: see
     // `yggterm_core::session_bus`. This binary spawns daemons, shadow clients and
     // web surfaces, and a GLib autolaunch in any of them leaks a session bus plus
     // its activated helper daemons permanently — 4,574 MB of them were measured on
     // the live host. Children inherit whatever we resolve here.
     let _session_bus = yggterm_core::session_bus::adopt_or_refuse_session_bus();
+
+    // This process becomes a DAEMON that outlives the file it was loaded from,
+    // so it publishes the source it was built from while it still can. See
+    // `yggterm_server::build_identity` for why nothing outside can recover it.
+    //
+    // ⚠ AFTER the bus resolve, not before — same reason as the GUI binary's:
+    // "first statement in main()" is the whole guarantee the lock enforces, and
+    // nothing here needs the identity declared first.
+    yggterm_server::build_identity::declare_build_commit(build_identity::build_commit());
 
     tracing_subscriber::fmt()
         .with_env_filter("info")
