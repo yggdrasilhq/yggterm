@@ -36125,11 +36125,15 @@ fn queue_startup_swap_intent(
         relay_boundary_by: None,
     };
     let decision = yggterm_server::hot_restart_queue::enqueue(&home, &request);
+    // ⭐ AND STAND THE SUCCESSOR UP. Recording the intent is only half of it —
+    // see the function's own comment for why the queue alone cannot converge.
+    let successor = start_successor_for_declined_swap(endpoint, &home, expected_version.as_str());
     trace_daemon_step(
         endpoint,
         "startup_hot_swap_declined_swap_queued",
         json!({
             "decision": decision.word(),
+            "successor": successor,
             "target_version": expected_version.as_str(),
             "stale_version": runtime_status.server_version,
             "stale_pid": runtime_status.server_pid,
@@ -36138,6 +36142,97 @@ fn queue_startup_swap_intent(
             "daemon_executable": daemon_executable.display().to_string(),
         }),
     );
+}
+
+/// How long this process waits before trying to stand a successor up again.
+///
+/// The startup reconcile re-runs while the GUI settles — measured three times in
+/// ninety seconds on one launch — and a spawn per decline is a fork bomb wearing
+/// a repair. Mirrors the daemon lane's own retry floor for the same reason.
+const STARTUP_SUCCESSOR_SPAWN_FLOOR_MS: u64 = 300_000;
+
+/// Set to the last time THIS GUI tried to stand a successor up.
+static STARTUP_SUCCESSOR_LAST_SPAWN_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// ⭐ **§4's missing consumer: a declined swap must STAND THE SUCCESSOR UP, not
+/// only record that one is owed.**
+///
+/// ⛔ **Why the queue alone cannot converge.** The queue's only reader is a
+/// daemon's own retire poll — so on a host whose newest daemon predates the
+/// queue, the intent is written by something current (this GUI, which the user
+/// just launched) and read by nothing at all. Measured 2026-08-13: a host held
+/// **twelve versions behind for 5.5 hours** with the entry at `attempts: 0`.
+/// That is not the idle gate deferring; it is nobody reading. A record whose
+/// only reader is the component being superseded needs a reader that is not.
+///
+/// ⭐ **And the GUI is the right process to do it, for a reason that is easy to
+/// lose:** a daemon FREEZES its launch environment, and every session it ever
+/// spawns inherits it. A successor started by hand from an ssh shell has no
+/// display, no session bus and the wrong PATH, and poisons that host silently
+/// ([[finding-daemon-frozen-env-poisons-sessions]]). Spawned from here it
+/// inherits the GUI's own environment, which is exactly the environment the
+/// sessions want — the manual repair has to reconstruct that from
+/// `/proc/<gui>/environ`; this gets it for free.
+///
+/// ⚠ **Additive, never an eviction.** The new daemon owns nothing when it
+/// starts; the stale one keeps its sessions and converges on its own terms,
+/// handing PTYs over alive. Proven live on the GUI host: seven adopted PTYs, the
+/// superseded daemon retiring by itself, the host's ancient lingerers untouched.
+fn start_successor_for_declined_swap(
+    endpoint: &ServerEndpoint,
+    home: &Path,
+    target_version: &str,
+) -> &'static str {
+    let live: Vec<(u64, u64, u64)> = reachable_versioned_daemon_statuses(home)
+        .into_iter()
+        .filter_map(|(_, status)| version_triple(status.server_version.as_str()))
+        .collect();
+    let now_ms = current_millis() as u64;
+    let verdict = successor_spawn_verdict(
+        target_version,
+        &live,
+        STARTUP_SUCCESSOR_LAST_SPAWN_MS.load(std::sync::atomic::Ordering::Relaxed),
+        now_ms,
+    );
+    if verdict != "spawn" {
+        return verdict;
+    }
+    STARTUP_SUCCESSOR_LAST_SPAWN_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    match spawn_daemon_process(endpoint) {
+        Ok(()) => "spawned",
+        Err(_) => "spawn_failed",
+    }
+}
+
+/// Should this decline stand a successor up? Pure, so the two guards can be
+/// tested without a daemon census or a clock.
+///
+/// ⛔ **Both guards are load-bearing and they fail differently.** Without the
+/// liveness check every decline spawns a peer beside a successor that already
+/// exists; without the floor, a startup reconcile that re-runs three times in
+/// ninety seconds spawns three daemons. The first is a wasted process, the
+/// second is a fork bomb wearing a repair.
+fn successor_spawn_verdict(
+    target_version: &str,
+    live_versions: &[(u64, u64, u64)],
+    last_spawn_ms: u64,
+    now_ms: u64,
+) -> &'static str {
+    let Some(target) = version_triple(target_version) else {
+        return "target_version_unparsed";
+    };
+    // ⭐ At OR ABOVE, not equal. A daemon ahead of the target already serves
+    // this client, and spawning beside it would add a process to a host that
+    // has just been observed collecting them.
+    if live_versions.iter().any(|live| *live >= target) {
+        return "already_live";
+    }
+    if last_spawn_ms != 0 && now_ms.saturating_sub(last_spawn_ms) < STARTUP_SUCCESSOR_SPAWN_FLOOR_MS
+    {
+        return "floored";
+    }
+    "spawn"
 }
 
 fn reconcile_stale_daemon_on_startup(endpoint: &ServerEndpoint, current_exe: &Path) -> bool {
@@ -145118,6 +145213,73 @@ mod tests {
             "a declined reconcile must leave the intent behind for the daemon's retry — \
              one unrecognised runtime key otherwise vetoes the whole host's daemon upgrade, \
              silently and for as long as that row lives"
+        );
+    }
+
+    #[test]
+    fn the_declined_swap_also_stands_its_successor_up() {
+        // ⛔ Recording the intent is only half of it. The queue's only reader is
+        // a daemon's own retire poll, so on a host whose newest daemon predates
+        // the queue the entry is written by something current and read by
+        // nothing — measured at twelve versions behind for 5.5 hours with the
+        // entry at `attempts: 0`. Source-level because the defect is a missing
+        // CALL, which no unit test of either half would notice.
+        let source = include_str!("shell.rs");
+        let body = source
+            .split("fn queue_startup_swap_intent(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("the intent producer should be present");
+        assert!(
+            body.contains("start_successor_for_declined_swap("),
+            "a declined swap must stand the successor up as well as record it — \
+             a queue whose consumer can be older than its producer has no floor"
+        );
+    }
+
+    #[test]
+    fn a_successor_is_not_spawned_beside_one_that_already_serves() {
+        // At OR ABOVE: a daemon ahead of the target already serves this client.
+        assert_eq!(
+            successor_spawn_verdict("3.0.130", &[(3, 0, 130)], 0, 1_000),
+            "already_live"
+        );
+        assert_eq!(
+            successor_spawn_verdict("3.0.130", &[(3, 0, 131)], 0, 1_000),
+            "already_live"
+        );
+        // Only older daemons alive — this is the state the whole fix exists for.
+        assert_eq!(
+            successor_spawn_verdict("3.0.130", &[(3, 0, 118), (3, 0, 75)], 0, 1_000),
+            "spawn"
+        );
+        // An empty host spawns too: nothing is serving at all.
+        assert_eq!(successor_spawn_verdict("3.0.130", &[], 0, 1_000), "spawn");
+    }
+
+    #[test]
+    fn a_reconcile_that_re_runs_does_not_spawn_a_daemon_per_decline() {
+        // Measured: three declines in ninety seconds on one GUI launch. Three
+        // daemons would be a fork bomb wearing a repair.
+        let stale = [(3u64, 0u64, 118u64)];
+        assert_eq!(
+            successor_spawn_verdict("3.0.130", &stale, 1_000, 1_000 + 20_000),
+            "floored"
+        );
+        assert_eq!(
+            successor_spawn_verdict(
+                "3.0.130",
+                &stale,
+                1_000,
+                1_000 + STARTUP_SUCCESSOR_SPAWN_FLOOR_MS
+            ),
+            "spawn",
+            "and it must eventually retry — a one-shot repair that failed is gone, not slow"
+        );
+        // A zero stamp is "never tried", not "tried at the epoch".
+        assert_eq!(
+            successor_spawn_verdict("3.0.130", &stale, 0, 10),
+            "spawn"
         );
     }
 
