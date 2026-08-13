@@ -713,6 +713,16 @@ after = the same build relaunched, measured at 3 min idle.
 ⇒ **~2.4 GB and ~75% of a core reclaimed by a restart costing about ten
 seconds.** That is relief, not a fix.
 
+⚠ **Both columns are the SAME BUILD — checked, because they nearly were not.**
+The desktop GUI now reports 3.0.113, which would make the table a cross-version
+comparison and worth nothing. It is not: the measured process started 11:53 and
+was gone by 12:05, while the binary was replaced at **12:04:33** by another
+cluster's deploy and the current GUI started **12:05:37** from it. Both columns
+are 3.0.112. ⇒ **On a machine where other clusters deploy continuously, "same
+build" is an assumption with a short shelf life** — stamp the binary mtime and
+the pid's start time alongside any A/B, or the table quietly becomes a
+version diff.
+
 ⭐ **And it answers the question the batch was filed on.** Kernel time fell
 **8×** on a machine whose clock did not change, so the ~481,000 clock syscalls
 per second were *not* a constant cost — **the spin rate itself grows with
