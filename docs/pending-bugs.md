@@ -92,11 +92,33 @@ add or drop keys here (Dioxus applies `style` property-by-property and does not
 clear dropped keys — that lingering was the docked-rail-ghost bug)."*
 
 ⇒ a style property emitted in one mode and **absent** from another is not
-cleared, it LINGERS. That is the documented failure family for this exact
-element, it would survive every later mode change (which matches "hours"), and
-it would leave the card painting while its contents collapse.
-⛔ Not confirmed. Falsifier: read the rail content div's computed style and
-child geometry, and compare the key SET emitted across all four modes.
+cleared, it LINGERS. This symptom is a VERBATIM recurrence of the one that
+trap first produced (*"the right sidebar cannot be opened, nothing draws on the
+right"*), which is why it was the obvious next suspect.
+
+⛔ **AND IT DOES NOT HOLD — checked, in the code, and recorded so nobody walks
+it again.** `sidebar_panel_outer_style` and `sidebar_panel_card_style` each
+build ONE `format!` with a fixed key set and vary only the values, which is
+exactly the fix that trap was closed with. The key sets cannot differ by mode.
+
+⛔ **Zoom does not hold either.** The card is transparent in-flow by design
+(`background-color:transparent`, the app background paints behind it), so the
+pale band is the app background — and the tree and the rail pass **byte-identical**
+zoom arguments (`zoom_percent_f32(settings.ui_font_size, 14.0)`) to the same
+helper. A zoom collapse would have taken the tree with it, and the tree draws.
+
+⇒ **What is left is the body itself, and every reading says it should draw.**
+`rail_render_view` is the single owner of "what is the rail drawing" and the
+probe reads that same value; it reports `docked:true` + a `rendered_mode` the
+dispatch has an arm for; `SideRailShell` interpolates `{body}` unconditionally;
+and the body's first child is an unconditional `RailHeader`. Every one of those
+is true and the rail is still empty, which is the shape of a reading that is
+answering a different question than its name suggests.
+
+⭐ **Falsifier, and it needs an instrument that does not exist yet:** read the
+rail content div's CHILD COUNT and computed geometry from the live DOM. If the
+children are absent, the body never rendered and the fault is upstream of the
+styles; if they are present with zero size, it is layout.
 
 ⚠ **There is no DOM-read verb to run that falsifier with.** `server app chrome`
 offers only `type`, whose `--assert <selector>@<attribute>` is the sole DOM read
@@ -328,6 +350,39 @@ row grows; an unreachable one is frozen. Sample twice a few seconds apart.
 **Fix:** name the two states in the reply. The daemon endpoint the submit resolved to is already known
 at that point, so "the row I addressed is served by a socket nothing has bound" is answerable.
 
+## ⛔ A DAEMON THAT TAKES ITS SESSIONS BACK IS STILL MUTED — NOTHING ON THE HOST WRITES THEIR STATE
+
+**Status:** OPEN
+
+Found while building the settle window, 2026-08-14. Not caused by it — made
+reachable by it, and it is the same shape as the bug the immediate-persist fix
+already closed from the other side.
+
+`superseded_routine_persist_muted` is a **hard, permanent latch**
+(`daemon.rs`, `routine_persist_should_mute`): once a strictly newer daemon is
+seen, this daemon never writes `server-state.json` again. That is right while the
+successor is alive — a stale predecessor must not clobber the successor's file.
+
+⛔ **It is wrong the moment the successor dies.** The settle window now hands the
+sessions back: the predecessor wakes its readers and is once again the only
+process serving them. It is also still muted, and the successor that DID write
+the state file is gone. ⇒ **No process on the host will record those sessions
+again.** If the predecessor is then killed, they are unrecoverable — exactly the
+condition the immediate-persist-on-adoption fix was written to end.
+
+**The fix, and why it is not a one-liner.** Clearing the latch is only safe when
+no live newer daemon exists — another one may have arrived meanwhile — so the
+test is `live_newer_daemon_version(...).is_none()`, the existing single owner of
+that question. The obstacle is reach, not logic: `spawn_handoff_settle_watch`
+holds no runtime handle. The superseded-retire caller has the
+`Arc<Mutex<DaemonRuntime>>`; the hot-update caller has only `&mut self`.
+
+⚠ **Do not solve it by passing an `Option<Arc<…>>`** — "a handle that is
+sometimes there" is a fork wearing a table's clothes, and this crate has paid for
+that shape before. Either give both callers the same handle, or make the mute a
+DERIVED fact (ask whether a newer daemon is live) rather than a latch, which is
+what it actually means.
+
 ## ⚠ A HANDOVER THAT LOSES ITS SUCCESSOR STILL LOSES THE SECONDS THAT SUCCESSOR ALREADY READ
 
 **Status:** OPEN
@@ -350,15 +405,20 @@ successor died holding them.
 session.** The same run measured `bytes_stolen_after_park: 0`, and the ordinary
 handover — successor lives — showed **no gap at all** across the swap.
 
-**Also unmeasured, and widened by the same change:** the predecessor now lives
+**Partly measured, and widened by the same change:** the predecessor now lives
 ~10 s longer while both daemons hold the same runtimes, where before it was
-250 ms. Both answer for those sessions during that window. No row duplication
-was observed, but the sandbox has no GUI, so the row layer's behaviour over a
-10 s double-claim is **untested rather than proven fine**.
+250 ms. Both answer for those sessions during that window.
 
-**Falsifier for the residual:** run a handover under a live GUI with rows on
-screen, and watch the sidebar for duplicate or flickering rows for the length of
-`YGGTERM_HANDOFF_SETTLE_MS`.
+⭐ **Probed one layer under the sidebar, mid-window:** a client snapshot taken
+while both daemons held all three runtimes reported **three distinct session
+paths — no duplicate identity.** That is where a duplicated row would have to
+come from, so the mechanism most likely to break is measured, not assumed.
+
+⛔ **It is still not a pixel.** The sandbox has no GUI, so what the sidebar
+RENDERS over a 10 s double-claim is untested. **Falsifier:** run a handover under
+a live GUI with rows on screen and watch for duplicate or flickering rows for the
+length of `YGGTERM_HANDOFF_SETTLE_MS` — the one check that needs the GUI host and
+cannot be done headlessly.
 
 ## ⛔⛔⛔ [6.7] A ROW CAN BE ALIVE, IDLE-LOOKING, AND NOT READING ITS PTY — THE "I CANNOT TYPE" BUG
 
@@ -13855,3 +13915,55 @@ clean reproduction needs a cwd that has never hosted an agent session.
 
 **Falsifier:** a row created with a cwd that has never hosted an agent session
 reaches a composer and consumes input.
+
+## ⛔⛔ [6.1] `server attach --help` CREATES A SESSION NAMED `--help` AND SPAWNS A LIVE SHELL
+
+**Status:** OPEN
+
+*Hit on a real daemon by accident, 2026-08-14.*
+
+`attach` reads its flag as a positional session name. Asking a verb for its usage
+therefore **mutates the machine**: a session called `--help` is created and a live
+`bash -i` is spawned on the daemon. Recovery was manual — identify the pid and
+`SIGHUP` it, because **an interactive bash ignores `SIGTERM`**.
+
+⇒ A help flag is the one argument a user types when they do *not* know what the
+verb does, so it is the worst possible argument to give side effects. Same family
+as the rest of this file: **the verb answers a different question than its name
+suggests**, and here the wrong answer is durable.
+
+**Falsifier:** `server attach --help` prints usage, exits non-zero or zero without
+creating a session, and `server sessions` shows no new row afterwards.
+
+## ⛔ [6.1] SUPERSESSION CANNOT FIRE WHEN THE SOCKET PATH EXCEEDS THE SOCKADDR LIMIT
+
+**Status:** OPEN
+
+`live_newer_daemon_socket` scans `$YGGTERM_HOME` for `server-*.sock`. But
+`default_endpoint` **relocates** the socket to `/run/user/<uid>/yggterm/h-<hash>/`
+whenever the home path would exceed the **108-byte `sockaddr_un` limit**. When it
+relocates, the scan looks in a directory the socket is no longer in, finds
+nothing, and **no daemon ever retires — silently**.
+
+⚠ **Harmless on the real hosts** (`~/.yggterm` is short), which is why it has
+never been seen in production. It is not harmless for testing: it makes any
+long-path sandbox **structurally unable to exercise handover at all**, and it cost
+a full run before the cause was found. ⇒ The enumerator must ask
+`default_endpoint` where the socket IS, never assume where it would be — the same
+shape as *enumerate an alias set from the versions that EXIST, never from the
+files that happen to REMAIN*.
+
+**Falsifier:** a sandbox whose `YGGTERM_HOME` exceeds 108 bytes still supersedes a
+predecessor daemon.
+
+## ⚠ [6.1] A PTY-SPAWNING TEST MUST HOLD THE TERMINAL-IDENTITY GUARD
+
+**Status:** OPEN
+
+A test that spawns a pty reads the **process-wide** terminal-identity env, so
+without `codex_cli::env_test_guard` it makes the two identity tests in `lib.rs`
+flaky — **not itself**. Six tests did exactly this.
+
+⭐ **The tidy explanation was wrong and was killed by a control:** *"extra tests
+just perturb the schedule"* did not survive **six DECOY tests that left the suite
+green**. A flake that moves when you add unrelated tests still has a cause.
