@@ -27603,8 +27603,8 @@ mod tests {
         // a gate-screen reading is only meaningful from the daemon that OWNS
         // the session, so silently answering from the wrong one would produce a
         // corpus describing nothing.
-        const STAMPED_AT_VERSION: &str = "3.0.132";
-        const STAMPED_SHAPE_HASH: u64 = 0x9d92c7118ca5cb96;
+        const STAMPED_AT_VERSION: &str = "3.0.142";
+        const STAMPED_SHAPE_HASH: u64 = 0x967609ee5ac9a131;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
