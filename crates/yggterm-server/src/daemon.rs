@@ -2103,6 +2103,19 @@ pub struct HotRestartBlocker {
     /// The idle window the session is being measured against.
     #[serde(default)]
     pub threshold_ms: u64,
+    /// How long this session has been WRITTEN TO without answering, when that
+    /// is outstanding at all. A large value beside a small `idle_ms` is the
+    /// signature of a row that has gone deaf: keystrokes are arriving and
+    /// nothing is coming back.
+    ///
+    /// ⚠ Suspicion, never a verdict — a child may legitimately consume input in
+    /// silence (echo off, a password prompt). It says where to point
+    /// `terminal input-check`, which settles it by marker and echo.
+    ///
+    /// `#[serde(default)]` = `None`, so an older daemon's blockers simply do not
+    /// carry the signal rather than claiming a row is answering.
+    #[serde(default)]
+    pub input_unanswered_ms: Option<u64>,
     /// `true` when waiting cannot clear this blocker — the session will still be
     /// unsafe to cold-kill in an hour, so a reader must not report it as "any
     /// moment now". Only [`HOT_RESTART_BLOCKER_NOT_RESTORABLE`] sets it.
@@ -4241,6 +4254,7 @@ impl DaemonRuntime {
                     kind: HOT_RESTART_BLOCKER_NOT_RESTORABLE.to_string(),
                     idle_ms: self.terminals.session_idle_for_ms(&runtime_path),
                     threshold_ms,
+                    input_unanswered_ms: self.terminals.input_unanswered_ms(&runtime_path),
                     permanent: true,
                 });
                 continue;
@@ -4261,6 +4275,7 @@ impl DaemonRuntime {
                     kind: HOT_RESTART_BLOCKER_ORCHESTRATING.to_string(),
                     idle_ms: self.terminals.session_idle_for_ms(&runtime_path),
                     threshold_ms,
+                    input_unanswered_ms: self.terminals.input_unanswered_ms(&runtime_path),
                     permanent: false,
                 });
                 continue;
@@ -4276,11 +4291,21 @@ impl DaemonRuntime {
                     kind: HOT_RESTART_BLOCKER_WORKING.to_string(),
                     idle_ms: self.terminals.session_idle_for_ms(&runtime_path),
                     threshold_ms,
+                    input_unanswered_ms: self.terminals.input_unanswered_ms(&runtime_path),
                     permanent: false,
                 });
                 continue;
             }
-            if let Some(idle_ms) = self.terminals.session_idle_for_ms(&runtime_path)
+            // ⛔ OUTPUT idle, not the conflated activity field. `idle_ms` is
+            // documented as "how long since this session last produced output"
+            // and used to read a timestamp the WRITER also stamps — so a row
+            // that had stopped reading its PTY reported near-zero idle for as
+            // long as someone kept typing at it, and blocked the deploy that
+            // would have cleared it. Being typed AT is not being in use.
+            // A drafted input line is protected separately and deliberately
+            // (`session_has_pending_input_draft`), so this does not expose an
+            // unsent prompt.
+            if let Some(idle_ms) = self.terminals.session_output_idle_for_ms(&runtime_path)
                 && idle_ms < threshold_ms
             {
                 blockers.push(HotRestartBlocker {
@@ -4288,6 +4313,7 @@ impl DaemonRuntime {
                     kind: HOT_RESTART_BLOCKER_RECENTLY_ACTIVE.to_string(),
                     idle_ms: Some(idle_ms),
                     threshold_ms,
+                    input_unanswered_ms: self.terminals.input_unanswered_ms(&runtime_path),
                     permanent: false,
                 });
             }
@@ -19768,6 +19794,7 @@ mod tests {
             kind: kind.to_string(),
             idle_ms,
             threshold_ms: 300_000,
+            input_unanswered_ms: None,
             permanent: kind == HOT_RESTART_BLOCKER_NOT_RESTORABLE,
         }
     }
