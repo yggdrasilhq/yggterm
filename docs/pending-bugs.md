@@ -1176,6 +1176,72 @@ source cannot be triaged. Not done in-session on purpose: the service was mid-
 trial and collecting the data the entries above rest on, so restarting it would
 have destroyed the measurement.
 
+## ⛔⛔ [6.7] THE DESKTOP-HOST IDLE-CPU A/B CANNOT RESOLVE ITS OWN EFFECT — STOP SCHEDULING IT
+
+**Status:** AWAITING A DECISION
+
+*Decided by whoever owns cluster sequencing: the orchestrator holds a granted
+window for this A/B, and this entry argues it should not be spent here.*
+
+*measured 2026-08-13 from the recorder's own history; no new instrument needed*
+
+Three attempts at a desktop-host before/after have now come out confounded. The
+reason is not workload discipline, it is arithmetic: **the quantity being
+measured has a noise floor an order of magnitude larger than the effect.**
+
+### The do-nothing floor, same pid, same build, nothing changed
+
+| | windows | min | mean | max | **sd** |
+|---|---|---|---|---|---|
+| GUI, 5-min windows | 33 | 11.5% | 31.1% | 57.9% | **12.65** |
+| GUI, 30-min windows | 5 | 12.2% | 31.6% | 47.7% | **11.65** |
+| web_content, 5-min | 33 | 17.0% | 27.1% | 38.1% | 5.29 |
+
+**The GUI's idle CPU swings 11.5% → 57.9% of a core on ONE build with no change
+of any kind.** ⭐ **And lengthening the window does not help: sd falls only
+12.65 → 11.65 from 5 to 30 minutes.** That is the whole finding — the variance is
+**low-frequency workload drift, not sampling noise**, so it does not average out
+and a longer window buys almost nothing.
+
+### The power calculation, stated BEFORE any arm is run
+
+At sd = 11.65, 80% power, α = 0.05, `n ≈ 16·(sd/effect)²` per arm:
+
+| effect | windows/arm | wall-clock at 30 min/window |
+|---|---|---|
+| **3 pp** (the plausible effect) | **241** | **~10 days per arm** |
+| 10 pp | 22 | ~22 h per arm |
+
+**The fix's measured effect is 0.1 pp on the build host** (1.5% → 1.4%). Even
+scaling generously for the `hpet` clock penalty the arm difference is ~1–3 pp —
+**below what this design can resolve, by roughly 10×.**
+
+⇒ **A "result" from a handful of windows here is noise with a sign.** That is how
+three prior attempts produced confident, contradictory numbers, including one in
+which the *older* process was the cheaper one.
+
+### What to do instead
+
+1. ⭐ **The fix is ALREADY attributed by the instrument that can attribute it.**
+   The sandbox gap fingerprint is deterministic, not statistical: idle renders
+   **1.65 → 0.65/s (61%)**, with the 1001 ms gap population going **31.3% → 0%**.
+   Killing a timer removes its period from the histogram — that is causation, and
+   it needed no quiet host at all.
+2. **If a host-level number is genuinely wanted, the only valid design is
+   INTERLEAVED, not sequential** — alternate arms every ~10 min for many hours so
+   drift lands on both arms equally, and compare *adjacent* pairs. Sequential
+   arms cannot beat a drifting confound at any sample size. ⚠ That means a GUI
+   restart every 10 minutes for hours on the owner's daily driver, which is a
+   far larger intrusion than the number is worth.
+3. **Spend a quiet host on something whose signal exceeds its noise instead** —
+   e.g. the web-process plateau test, where the quantity grows ~366 MB/h
+   monotonically against a much smaller variance.
+
+⛔ **The general rule this entry exists to install:** *state the do-nothing floor
+before designing the comparison.* One query against the recorder answers it, and
+it would have saved three attempts. A perf number quoted without its floor is not
+a measurement.
+
 ## ⛔⛔ [6.7] THE WEB PROCESS'S MEMORY BOUND CANNOT HOLD, BECAUSE SWAP MAKES ITS FOOTPRINT LIE
 
 **Status:** OPEN
