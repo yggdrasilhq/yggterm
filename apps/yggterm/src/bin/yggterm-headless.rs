@@ -49,7 +49,8 @@ use yggterm_server::{
     run_app_control_app_pane_action, run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded,
     run_app_control_set_search, run_app_control_set_session_keep_alive,
-    run_app_control_set_split_group_ratio, run_app_control_set_theme_editor_open,
+    run_app_control_set_launch_flags, run_app_control_set_split_group_ratio,
+    run_app_control_set_theme_editor_open,
     run_app_control_set_theme_editor_values, run_app_control_set_tree_selection,
     run_app_control_set_window_chrome_hover, run_app_control_show_start_page,
     run_app_control_split_web_tab, run_app_control_start_action,
@@ -2389,6 +2390,42 @@ fn main() -> Result<()> {
                     other => anyhow::bail!(
                         "unsupported app command action: {other} (try list|invoke <id>)"
                     ),
+                }
+            }
+            // ⛔ THE SAME ARM EXISTS IN `apps/yggterm/src/main.rs`, AND THAT IS
+            // THE DEFECT, NOT THE DUPLICATION. `server app` is dispatched twice
+            // — once in the GUI binary, once here — so a verb added to one is
+            // ABSENT from the other while every instrument agrees the code
+            // shipped: the binary carried the arm, `--build-commit` matched the
+            // deploy, and `server app launch-flags` still answered "unsupported
+            // app control command". Filed in pending-bugs; until the two
+            // dispatchers become one, a new verb must be added HERE too, and
+            // this is the copy agents actually call.
+            "launch-flags" => {
+                let positional = cli_positional_args(&args, 3);
+                let action = positional.first().copied().unwrap_or("open");
+                let slug = cli_flag_value(&args, "--cli").map(str::to_string);
+                let flags = cli_flag_value(&args, "--args").map(str::to_string);
+                match action {
+                    "open" | "show" | "on" | "true" | "1" => {
+                        run_app_control_set_launch_flags(Some(true), slug, flags, timeout_ms)
+                    }
+                    "close" | "hide" | "off" | "false" | "0" => {
+                        run_app_control_set_launch_flags(Some(false), slug, flags, timeout_ms)
+                    }
+                    "set" => {
+                        let slug = slug.context(
+                            "server app launch-flags set needs --cli <slug> (and --args to \
+                             store; omit --args to reset that CLI to its default)",
+                        )?;
+                        run_app_control_set_launch_flags(None, Some(slug), flags, timeout_ms)
+                    }
+                    "reset" => {
+                        let slug = slug
+                            .context("server app launch-flags reset needs --cli <slug>")?;
+                        run_app_control_set_launch_flags(None, Some(slug), None, timeout_ms)
+                    }
+                    other => anyhow::bail!("unsupported app launch-flags action: {other}"),
                 }
             }
             "theme-editor" => {
