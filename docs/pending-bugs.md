@@ -117,7 +117,14 @@ becomes "the whole body is a placeholder" (2026-08-14).
 
 **A GUI that has already taken a fault stays damaged.** The mutations are gone
 and nothing can re-derive them; the host's model is self-consistent and wrong.
-Only a restart rebuilds the DOM from scratch. So the owner's rail is still blank
+
+⭐ **The divergence is bounded by the GUI PROCESS, and that is measured, not
+inferred.** Induce a fault in a sandbox, confirm the rail body frozen on one
+header while `rendered_mode` reports another, then kill the GUI and relaunch the
+same binary against the SAME `YGGTERM_HOME` and daemon: `webview_edit_faults`
+1 → 0 and the header goes `Session Metadata` → `Settings`, matching state, on the
+first frame. Same sessions, same rows — only the page rebuilt. ⇒ A relaunch is a
+complete cure and nothing short of it is any cure at all. So the owner's rail is still blank
 and no code change reaches it — ⛔ and a restart must not be taken from under
 him: he has an unsent half-typed draft in a live composer (`owner-attention.md`).
 
@@ -1603,6 +1610,21 @@ rows replaced by a `markdown` widget the body is *still* blank:
 
 ⇒ The same-app rail control is what separates this from an app bug: the schema
 is good, and the viewport placement is not painting a widget it says it paints.
+
+⛔ **NOT the lost-edit-batch class — checked 2026-08-14, and the check is now one
+field.** The [6.3] entry root-causes a different "renders nothing while state
+reports it correctly": a webview edit batch that throws is acked as applied, so
+the host never re-sends it and that subtree freezes for the life of the process.
+**Two of this entry's own measurements rule it out.** A frozen subtree is frozen
+because ITS mutations were lost — it cannot render the identical schema
+completely in the rail in the same minute; and the class requires a fault to have
+already happened, whereas this reproduces on demand. ⇒ **Read
+`webview_edit_faults` in `server app state` when you next reproduce it.** Zero
+confirms this is a real render-path defect in the viewport placement, and closes
+the question for good; non-zero would mean the opposite and this entry folds into
+[6.3]. ⚠ Stated as reasoning plus an instrument, NOT as a run: 6.3 has the
+fault-injection harness but no way to declare a document surface, which needs
+this lane's app.
 
 ⚠ **Falsifier, not yet run:** drive the shipped pilot editor through the
 identical path in the same sandbox and confirm ITS markdown body paints. That
