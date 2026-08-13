@@ -176,108 +176,44 @@ per-daemon (five of the daemons on that host are older than the current binary
 open must emit a trace event naming the refusal. Silence here is itself the bug —
 the reporter had no way to tell "this row is gone" from "this row is slow".
 
-## ⛔ A SCREENSHOT OF A NON-TERMINAL VIEW PHOTOGRAPHS WHATEVER HOLDS FOCUS
+## ⛔ THE CENSUS STILL CANNOT ASK AN ON-DISK BINARY WHICH SOURCE IT IS
 
 **Status:** OPEN
 
-*found 2026-08-13 while taking start-page proof, and it nearly published a false one*
+*narrowed 2026-08-13 at 3.0.133: the RUNNING plane now answers directly, and the
+disk plane is what remains*
 
-`server app screenshot /tmp/out.png` answered
-`capture_faithful: true, capture_backend: linux_wayland_spectacle` — and the
-PNG was **a picture of a text editor**, not yggterm at all. The Spectacle
-backend shoots the focused window, and the GUI did not hold focus.
+**What shipped.** A process publishes the commit it was built from while it still
+can: the daemon on `server status` (`server_build_commit`), the GUI in its client
+record (`build_commit`), and `server daemons` grew a BUILD column that
+`deploy-fleet.sh` now prints for every host beside the four on-disk copies. Live
+on the desktop host: the new daemon read `690bb64bbb07` — equal to the deploying
+tree's HEAD — while four coexisting older daemons read `(pre-field)`, so the
+column was shown to say two different things in one run rather than a constant.
+The running GUI answered the same commit with `/proc/<pid>/exe` md5 equal to the
+deployed binary's, read in the same command as the version probe.
 
-⇒ **The flag was true about the pixels and silent about the SUBJECT.** It is
-documented as meaning "this frame is not canvas-blind", which is a claim about
-terminal fidelity only; nothing in the reply says *which window* was captured.
-An agent following the field guide reads `faithful:true` and reasons from a
-frame of another application.
+⇒ That half was the more urgent one and it was invisible: `--build-commit` can
+only ever interrogate a FILE, and a deploy replaces the file under a live
+process. Measured before the fix, the running GUI's exe hashed to a value
+matching **no file on the host**, so its build could not be named at all.
 
-⚠ Passing `--pid <gui>` did NOT fix it either: it then returned
-`capture_faithful: false, capture_backend: linux_webkit_snapshot`. That frame
-IS correct for a start page (DOM, no xterm canvas) — so on a non-terminal view
-the honest frame is the one flagged unfaithful, and the dishonest one is
-flagged faithful. Exactly inverted for this surface.
+**What remains.** The census still compares the four on-disk copies by md5 rather
+than asking each one `--build-commit`. The trap is unchanged: that flag on a
+binary built before it existed **falls through to LAUNCHING THE GUI**, so a
+census that interrogated every copy would open windows across the fleet on
+exactly the machines that are behind — the ones it exists to find.
 
-**Wanted:** `--pid` implies window-targeted capture, and a shot that is not of
-the addressed client reports `faithful:false` with a reason naming what it
-photographed. A capture verb that cannot say what it captured is not a
-verification instrument.
+⚠ And "the fleet is past that version now" is not the answer it looks like. The
+copies a census interrogates are the ones a deploy just wrote, so they are new by
+construction; the dangerous case is precisely the host where a copy did NOT land,
+which is where the old binary still is. Until an older binary can be asked and
+refuse safely, md5 is the honest instrument for the disk — and it now sits beside
+a running plane that names its own commit, so a divergence can at last be
+described rather than merely detected.
 
-⚠ **Second sighting, 2026-08-13 at 3.0.116, and it is the more dangerous one
-because the frame was RIGHT.** With `force-foreground on` set first, the same
-call answered `capture_faithful: true, capture_backend:
-linux_wayland_spectacle` and returned a correct picture of the start page. The
-reply is byte-identical in shape to the one that photographed a text editor.
-⇒ **The flag did not become trustworthy; the FOCUS happened to be correct.** An
-agent cannot tell the two cases apart from the reply, which is exactly the
-defect — a verification instrument whose output is the same whether or not it
-verified anything. Reading the PNG remains the only check.
-
-⭐ **THIRD SIGHTING NARROWS THE FIX — 2026-08-13 at 3.0.120, cluster 6.2.** With
-`force-foreground on` and `--pid <gui>` on a **terminal** view, the same call
-answered `capture_backend: xterm_canvas_composite_over_dom`, and the PNG was the
-addressed GUI: sidebar, viewport and metadata rail, `--crop`/`--scale` applied
-correctly. ⇒ **The in-process composite backend cannot photograph the wrong
-window — it composites the client it was addressed to.** Only
-`linux_wayland_spectacle` can, because it shoots whatever the compositor says is
-focused, and it is the fallback chosen when the view is not a terminal. So the
-fix is not "make `faithful` honest" in general: it is that the **spectacle
-fallback must report which window it got, or refuse when the addressed pid does
-not hold focus**. The composite path is already the trustworthy one.
-
-⏳ **IN CODE, LIVE PROOF OWED — 2026-08-13, cluster 6.2.** Root-caused to two
-instruments answering different questions with nothing arbitrating between them.
-Spectacle photographs whatever the **compositor** calls active; the gate in
-`app_capture.rs` asked the **toolkit** (`desktop.is_focused()`), which is not
-reliably updated on KDE Wayland. When they disagreed the toolkit won, and the
-shot was of another application. `capture_os_compositor_screenshot` — the
-`--backend os` path — had already learned to ask KWin and cross-check; the path
-every plain `server app screenshot` takes had not.
-
-⇒ The fallback now asks KWin and **believes it over the toolkit**, and a refusal
-**names what held focus** rather than refusing blankly. The identity was always
-available: `kde_wayland_active_window_matches` computed the active window's class
-and caption and returned a bare `bool`, discarding the one fact a caller needs;
-it is now `kde_wayland_active_window_identity`, with the predicate as a thin
-wrapper. The toolkit is still used where KWin cannot be reached, because refusing
-every screenshot on a desktop with no such probe is worse than the bug.
-
-Locked by two tests over the extracted arbitration (`spectacle_may_shoot`), so
-the disagreement is testable without a compositor: the measured case — toolkit
-says focused, compositor names another application — must refuse, and the
-converse case (compositor names this window while the toolkit's flag lags) must
-still shoot, so the gate cannot be the toolkit in either direction.
-
-**Owed:** the live check, which needs the GUI unfocused on the desktop host.
-
-**Falsifier:** with the GUI unfocused, `screenshot --pid <gui>` returns a frame
-of that GUI, or refuses **naming what it would have photographed**.
-
-## ⛔ THE CENSUS STILL CANNOT ASK A DEPLOYED BINARY WHICH SOURCE IT IS
-
-**Status:** OPEN
-
-*residual of the version-collision entry, which closed 2026-08-13 once the stamp
-was live-proven: `--build-commit` on the desktop host answered `e8d765c7e6ba`,
-equal to the deploying tree's HEAD, with the deployed md5 identical to the build
-product's. The guard, the stamp and the allocation verb all shipped.*
-
-`deploy-fleet.sh`'s census prints **the deploying build's** commit and md5s, and
-compares each host's copy by md5 alone. It does not ask each copy
-`yggterm --build-commit`, which is the direct question.
-
-⛔ **It cannot yet, and the reason is the trap:** `--build-commit` on a binary
-built before the flag existed **falls through to LAUNCHING THE GUI** on whatever
-host it is asked. A census that interrogated every copy would open windows across
-the fleet on exactly the machines that are behind — the ones it exists to find.
-
-**Wanted:** once every host is at or past the first version carrying the flag,
-switch the census from md5 comparison to asking each copy directly, so it reports
-the source each binary was built from rather than inferring it. Until then md5 is
-the honest instrument, and the census already prints what to compare against.
-
-**Falsifier:** the census names the commit of a copy it did not itself deploy.
+**Falsifier:** the census names the commit of an on-disk copy it did not itself
+deploy, on a host that is behind, without launching anything.
 
 ## ⛔ deploy-fleet SSHes TO THE HOST IT IS ALREADY RUNNING ON
 
@@ -322,6 +258,45 @@ external editor rather than in yedit.
 
 **Falsifier:** a viewport reporting a non-zero line and character count must
 paint at least one glyph. If it cannot, it must say so rather than render black.
+
+⭐ **THE APP PLANE ITSELF PAINTS ON THE REAL GUI — measured 2026-08-13 by the
+deploy-identity cluster at 3.0.133, on the desktop host, faithful frame.** A
+freshly launched yedit surface rendered its whole rail: the toolbar icons, the
+regex search field, the Markdown/Split/Text toggle, the FILES heading with its
+`+` control, the empty-state line, and the Wrap control. ⇒ **Whatever is wrong
+here is not "a document surface cannot render on a real GUI"**, which is worth
+knowing before anyone spends a session on the widget layer.
+
+⚠ **AND THE LOADED STATE COULD NOT BE REACHED FROM THE CLI, which is a second
+defect wearing this one's clothes** (own entry below): `yedit <path>` answers
+`document surface opened` and the rail still reads *No files open*. So this
+sighting says nothing about the black viewport — the document was never loaded,
+and a rail that is EMPTY is a different state from the full rail above. Recorded
+so the next reader does not mistake an unloaded surface for a fixed one.
+
+## ⛔ `yedit <path>` REPORTS A SURFACE OPENED AND NEVER OPENS THE FILE
+
+**Status:** OPEN
+
+*found 2026-08-13 at 3.0.133 while capturing a document surface on the desktop host*
+
+`yedit /tmp/<name>.md` prints `yedit: document surface opened — 'yedit --close'
+to close it.` and exits 0. The surface does open. The FILES rail then reads **No
+files open. 📄 creates one; 📁 opens a path.** — the path argument was accepted,
+reported on, and dropped.
+
+⇒ The verb's success line describes the half it did (a surface exists) and says
+nothing about the half the argument asked for, so the reply is indistinguishable
+from a correct one. An agent scripting `yedit <path>` gets exit 0 and an empty
+editor, and the natural next conclusion is that the document failed to RENDER —
+which sends the reader into the black-viewport entry above chasing a paint bug
+that is not there.
+
+**Wanted:** open the named file, or refuse by name. Either is fine; reporting
+success for a request that was discarded is not.
+
+**Falsifier:** after `yedit <path>` on an existing readable file, that file is in
+the FILES rail.
 
 ## ⛔⛔ [6.3] EVERY SIDEBAR BUTTON OPENS THE NOTIFICATION SIDEBAR
 
