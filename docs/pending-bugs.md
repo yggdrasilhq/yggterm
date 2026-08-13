@@ -1514,6 +1514,21 @@ answering for exactly the ancient versions nobody runs.
    is a CACHE, and repairing a cache leaves you depending on the cache** — one whose writer vanished
    unnoticed for forty-eight versions. With fix 1 in place this is a latency nicety and an inert
    table stops being an outage.
+   ⭐ **PARTLY LANDED, 3.0.132 — a retiring daemon bequeaths its own name.** Not a ledger and not
+   a sweep: `alias_own_socket_to_successor` runs on both handover exits, immediately before the
+   process releases its socket, and symlinks this version's socket at the successor's. It needs no
+   durable table because **it is the one instant when both names are known at once** — the
+   successor is bound and answering, the predecessor is about to unlink — and a pass run at daemon
+   START structurally cannot know it.
+   ⚠ **The gap it closes is the one a gap-filling pass cannot: its own predecessor.** A live socket
+   is invisible to a pass that only fills gaps, so **every handover orphaned exactly one version —
+   whichever was serving.** Measured twice in one evening on two hosts under two different numbers,
+   each time naming the version that had just retired; a manual alias sweep therefore re-broke
+   itself once per deploy. Traced as `retiring_daemon_aliased_own_socket` with the successor's
+   socket and an `aliased` flag, so a handover that could not bequeath its name says so.
+   ⇒ Still owed here: fix 1, which deletes the class rather than the instance; and 6.7's line for
+   whatever sweep remains — **enumerate an alias set from the versions that EXIST, never from the
+   files that happen to REMAIN.**
 3. ⛔ **INDEPENDENT, DO IT REGARDLESS: a CLI's stderr must never reach an agent row's PTY.** It is
    the blast-radius fix — the difference between *"a call failed"* and *"a row became unreachable
    and looked busy for forty minutes"* — and it is orthogonal to whichever of 1 or 2 lands.
@@ -5174,11 +5189,24 @@ rediscovering it. What was measured, and why none of it is a corpus:
   compile, review as correct, and fire on the wrong screens — the exact shape
   that made `isSidechain` read `false` on all 179,392 records.
 
-⇒ **What has to exist first, and it is the smaller job:** a way to read the
-screen the GATE reads — either a verb that exposes
-`session_screen_snapshot` per owned key, or the blocker list carrying a screen
-excerpt. **Then** harvest real parked-at-a-question screens from the fleet, and
-only then write the recognizer against them. ⚠ The recognizer also cannot be
+⭐ **THE PREREQUISITE IS BUILT — `server gate-screen`, 3.0.132.**
+`yggterm-headless server gate-screen [<session-key>] [--tail <n>] [--json]`
+answers, per owned session, with the screen
+`hot_update_idle_gate_blockers` classified from AND the blocker that
+classification produced — the blocker taken from the gate's own function rather
+than re-derived, so a session this verb calls unblocked is unblocked in the
+gate's eyes. Escape sequences are kept: a parked-at-a-permission-prompt screen
+is told apart partly by how it is DRAWN, and a reading stripped for legibility
+would hand the recognizer a corpus the gate never sees.
+⛔ **Read-only, on demand, and the screen never reaches a trace event** — pinned
+by `the_gate_screen_verb_never_writes_a_screen_to_the_trace`, because
+`event-trace*.jsonl` is durable, is copied around in bundles, and a session's
+screen carries whatever the person typed.
+⛔ **Denied to a shadow client, and the reason is SCOPE, not read-only-ness**
+(`a_shadow_client_may_not_read_every_session_on_the_host`): a shadow is a viewer
+of ONE session, and this answers with every session the daemon owns.
+⇒ **What is left of §3, in order:** harvest real parked-at-a-question screens
+from the fleet with this verb, and only then write the recognizer against them. ⚠ The recognizer also cannot be
 manufactured on demand without driving a live session into a permission prompt,
 which is not something to do to another agent's row.
 

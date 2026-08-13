@@ -4,6 +4,22 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A daemon handing its sessions over now leaves its name behind (3.0.132).**
+  Every yggterm version answers on a socket of its own, and a CLI started
+  against one keeps asking for that exact name for as long as it lives. When a
+  daemon retired, its name vanished with it — so an agent session pinned to the
+  version that had just handed over got `No such file or directory` instead of a
+  terminal, and on an agent CLI that error lands in the composer and leaves the
+  row with nothing to type into. A retiring daemon now points its own name at
+  its successor before it goes, which is the only moment both names are known at
+  once. Nothing else changes: the successor was already serving.
+
+- **You can now see what the update gate is looking at (3.0.132).** When yggterm
+  holds an update back because a session is busy, `yggterm-headless server
+  gate-screen` shows the screen it read and the verdict it reached, per session.
+  It is read-only, it runs only when asked, and nothing it shows is written
+  anywhere.
+
 - **The status dots line up, and every title got wider (3.0.131).** The dots
   now sit in a fixed column of their own at the far left, identical on every
   row whatever its nesting — one unbroken line down the sidebar instead of a

@@ -2098,6 +2098,69 @@ pub struct HotRestartBlocker {
     pub permanent: bool,
 }
 
+/// §3's missing instrument: what the idle gate ACTUALLY LOOKED AT for one
+/// session, answered on demand.
+///
+/// ⭐ **Why this exists.** The gate classifies from
+/// `terminals.session_screen_snapshot(runtime_path)` — the live in-daemon vt100
+/// screen — and until now no shipped verb exposed it, so the gate's input could
+/// not be audited from outside the daemon. `server snapshot`'s
+/// `live_sessions[].terminal_lines` is a DIFFERENT field: measured on one host,
+/// **205 of 225 agent sessions' last lines were a stored summary line rather
+/// than screen text at all**, so a corpus harvested from it describes something
+/// the gate never reads. That is why blocked-on-human (§3's remainder) is
+/// unbuilt: a recognizer has nothing to be validated against.
+///
+/// ⛔ **THIS IS ON-DEMAND AND READ-ONLY, AND THE SCREEN MUST NEVER REACH A TRACE
+/// EVENT.** `~/.yggterm/event-trace*.jsonl` is durable, is copied around in
+/// bundles and is read by every later session; session screen text in it is a
+/// standing leak surface — an agent's screen carries whatever the person typed.
+/// Pinned by `the_gate_screen_verb_never_writes_a_screen_to_the_trace`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotRestartGateScreen {
+    pub session_key: String,
+    /// The blocker this session contributes right now, or `None` when it is not
+    /// holding the gate at all.
+    ///
+    /// ⛔ Produced by [`DaemonRuntime::hot_update_idle_gate_blockers`], the
+    /// gate's own function — never re-derived here. A second classifier would
+    /// be a second encoding of the one question this verb exists to answer
+    /// faithfully, and the first time the two disagreed the audit would be
+    /// describing a gate that does not exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<HotRestartBlocker>,
+    /// `false` when the screen could not be read — an unowned key, a runtime
+    /// that has gone. Distinguished from an empty screen on purpose: "I could
+    /// not look" and "I looked and it was blank" are different findings, and
+    /// collapsing them is how a corpus fills with silence that means nothing.
+    pub screen_available: bool,
+    /// The tail of that screen, newest last. `None` when unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_tail: Option<Vec<String>>,
+    /// What `screen_text_shows_agent_working` said about the WHOLE screen — not
+    /// about the tail returned above, which is a display convenience.
+    pub shows_agent_working: bool,
+}
+
+/// How much of the screen a gate-screen reading returns when the caller does not
+/// say. Enough to see a composer, a permission prompt and the line above them.
+const HOT_RESTART_GATE_SCREEN_DEFAULT_TAIL_LINES: usize = 24;
+
+/// The last `tail_lines` lines of a screen, newest last.
+///
+/// ⛔ **Escape sequences are kept.** A "blocked on a permission prompt" screen is
+/// told apart from a working one partly by how it is DRAWN — a boxed prompt, a
+/// cursor parked on a numbered choice — and a reading stripped for legibility
+/// would hand a recognizer a corpus the gate never sees
+/// ([[finding-normalization-destroys-the-discriminator]]).
+fn gate_screen_tail(screen: &str, tail_lines: usize) -> Vec<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    lines[lines.len().saturating_sub(tail_lines)..]
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect()
+}
+
 /// Order blockers so the headline names something the reader can act on.
 ///
 /// The summary prints `first()`, and a PERMANENT blocker is by construction the
@@ -2568,6 +2631,16 @@ pub enum ServerRequest {
         #[serde(default)]
         path: Option<String>,
     },
+    /// §3's audit instrument: the screen the hot-restart idle gate classifies
+    /// from, per owned session, plus the blocker that classification produced.
+    /// On demand only, nothing on a timer, and ⛔ never traced. `path: None` =
+    /// every session this daemon owns. See [`HotRestartGateScreen`].
+    HotRestartGateScreens {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        tail_lines: Option<usize>,
+    },
     /// Record who created a row, and (opt-in) that the creator declared it
     /// ephemeral. Write-once per row — see
     /// [`crate::YggtermServer::declare_live_session_tenancy`].
@@ -2719,6 +2792,10 @@ pub enum ServerResponse {
         /// Individual rows carry their own reasons.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         degraded: Option<String>,
+    },
+    HotRestartGateScreens {
+        #[serde(default)]
+        sessions: Vec<HotRestartGateScreen>,
     },
     Ack {
         message: Option<String>,
@@ -2952,7 +3029,14 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         // ---- everything else: ownership, input, lifecycle, or shared-view
         // mutation. Default-deny, listed explicitly (no wildcard) so a newly
         // added variant cannot silently inherit Allow. ----
-        ServerRequest::PrepareUpdateRestart
+        // ⛔ DENIED although it is read-only, and the reason is the SCOPE, not
+        // the verb. A shadow is a read-only viewer of ONE session; this answers
+        // with the screen of every session the daemon owns, which would turn a
+        // single-session viewer into a whole-host screen reader on the strength
+        // of "it only reads". An agent that wants this runs the CLI on the host
+        // and is unaffected.
+        ServerRequest::HotRestartGateScreens { .. }
+        | ServerRequest::PrepareUpdateRestart
         | ServerRequest::PrepareClientClose
         | ServerRequest::HotRestart { .. }
         | ServerRequest::RetireDaemon { .. }
@@ -6051,6 +6135,54 @@ impl DaemonRuntime {
         }
     }
 
+    /// Answer what the idle gate saw, for the sessions this daemon owns.
+    ///
+    /// ⛔ **No `append_trace_event` anywhere on this path, and that is a
+    /// requirement rather than an omission** — see [`HotRestartGateScreen`].
+    /// The one place this reading may land is the reply to the caller that
+    /// asked for it.
+    ///
+    /// ⭐ The blockers come from the gate's OWN function, called once for the
+    /// whole owned set, so a session that this verb reports as unblocked is
+    /// unblocked in the gate's eyes and not merely in this verb's.
+    fn hot_restart_gate_screens_response(
+        &self,
+        path: Option<String>,
+        tail_lines: Option<usize>,
+    ) -> ServerResponse {
+        let owned = self.terminals.session_keys();
+        let blockers = self.hot_update_idle_gate_blockers(&owned);
+        let tail_lines = tail_lines.unwrap_or(HOT_RESTART_GATE_SCREEN_DEFAULT_TAIL_LINES);
+        let sessions = owned
+            .iter()
+            // A named session that this daemon does not own answers with an
+            // EMPTY list rather than an unavailable row: "ask a different
+            // daemon" is a topology the caller should not have to learn, and a
+            // row invented here would vouch for a reading nobody took.
+            .filter(|key| path.as_deref().is_none_or(|wanted| wanted == key.as_str()))
+            .map(|key| {
+                let runtime_path = self.terminal_runtime_key_for_path(key);
+                let screen = self.terminals.session_screen_snapshot(&runtime_path);
+                HotRestartGateScreen {
+                    session_key: key.clone(),
+                    blocker: blockers
+                        .iter()
+                        .find(|blocker| &blocker.session_key == key)
+                        .cloned(),
+                    screen_available: screen.is_some(),
+                    // ⛔ The predicate is asked of the WHOLE screen, exactly as
+                    // the gate asks it. Asking it of the tail would answer a
+                    // question about this verb's formatting.
+                    shows_agent_working: screen
+                        .as_deref()
+                        .is_some_and(yggterm_core::screen_text_shows_agent_working),
+                    screen_tail: screen.map(|screen| gate_screen_tail(&screen, tail_lines)),
+                }
+            })
+            .collect();
+        ServerResponse::HotRestartGateScreens { sessions }
+    }
+
     /// Ask the daemon that actually owns this row's PTY what is running in it,
     /// and answer as if we had walked it ourselves.
     ///
@@ -7822,6 +7954,33 @@ impl DaemonRuntime {
                             }),
                         );
                         if let HandoffSweep::AllMoved { .. } = sweep {
+                            // ⭐ The same bequest as the superseded-retire sweep,
+                            // and for the same reason: this daemon's version name
+                            // is about to stop answering, and the successor is the
+                            // only thing that can carry it.
+                            // `default_endpoint` IS this daemon's version-named
+                            // socket — the one owner of "which socket am I", so
+                            // the bequest cannot name a different file from the
+                            // one we are about to release.
+                            let aliased = alias_own_socket_to_successor(
+                                self.store.home_dir(),
+                                &default_endpoint(self.store.home_dir()),
+                            );
+                            append_trace_event(
+                                self.store.home_dir(),
+                                "daemon",
+                                "lifecycle",
+                                "retiring_daemon_aliased_own_socket",
+                                serde_json::json!({
+                                    "successor_version": successor,
+                                    "successor_socket": aliased
+                                        .as_ref()
+                                        .map(|path| path.display().to_string()),
+                                    "aliased": aliased.is_some(),
+                                    "server_version": SERVER_PROTOCOL_VERSION,
+                                    "pid": std::process::id(),
+                                }),
+                            );
                             // The successor holds every descriptor now. The ONLY
                             // safe way to release ours is to EXIT: dropping
                             // runtimes individually leaves their reader threads
@@ -9193,6 +9352,9 @@ impl DaemonRuntime {
                 }
             }
             ServerRequest::TerminalTenants { path } => self.terminal_tenants_response(path),
+            ServerRequest::HotRestartGateScreens { path, tail_lines } => {
+                self.hot_restart_gate_screens_response(path, tail_lines)
+            }
             ServerRequest::DeclareSessionTenancy {
                 path,
                 created_by,
@@ -11048,6 +11210,21 @@ pub(crate) fn parse_daemon_version_triple(version: &str) -> Option<(u64, u64, u6
 /// file is a claim, and a stale one from a dead daemon must not count.
 #[cfg(unix)]
 fn live_newer_daemon_version(home_dir: &Path, own_endpoint: &ServerEndpoint) -> Option<String> {
+    live_newer_daemon_socket(home_dir, own_endpoint).map(|(version, _)| version)
+}
+
+/// The same question as [`live_newer_daemon_version`], answered with the SOCKET
+/// as well as the version — because the one caller that needs the path is the
+/// one about to unlink its own.
+///
+/// ⛔ One prober, not two. The version-only form delegates here; a second walk
+/// of `$YGGTERM_HOME` would be a second answer to "who supersedes me" that could
+/// disagree with the first, and this walk is the one that was optimised from 26
+/// probes down to 0-2.
+fn live_newer_daemon_socket(
+    home_dir: &Path,
+    own_endpoint: &ServerEndpoint,
+) -> Option<(String, PathBuf)> {
     let my_version = parse_daemon_version_triple(SERVER_PROTOCOL_VERSION)?;
     let mut own_sockets = Vec::new();
     for endpoint in [&default_endpoint(home_dir), own_endpoint] {
@@ -11079,11 +11256,58 @@ fn live_newer_daemon_version(home_dir: &Path, own_endpoint: &ServerEndpoint) -> 
     // Newest first, so the first confirmation is also the best handoff target.
     candidates.sort_by(|left, right| right.0.cmp(&left.0));
     candidates.into_iter().find_map(|(_, path)| {
-        let status = status(&ServerEndpoint::UnixSocket(path)).ok()?;
+        let status = status(&ServerEndpoint::UnixSocket(path.clone())).ok()?;
         parse_daemon_version_triple(&status.server_version)
             .is_some_and(|peer| peer > my_version)
-            .then(|| status.server_version.trim().to_string())
+            .then(|| (status.server_version.trim().to_string(), path))
     })
+}
+
+/// ⭐ **A RETIRING DAEMON ALIASES ITS OWN VERSION TO ITS SUCCESSOR, as part of
+/// retiring.** Called immediately before the exit that releases this daemon's
+/// socket.
+///
+/// ⛔ **Why it can only be done HERE.** A gap-filling pass run at daemon START
+/// cannot cover the version that is LIVE while it runs — a real socket is
+/// invisible to a pass that only fills gaps — so **every handover orphans
+/// exactly one version: whichever one was serving.** Any client pinned to it
+/// then gets `connecting to …/server-<that>.sock: No such file or directory`,
+/// and on an agent CLI that error lands in the composer and leaves the row with
+/// no PTY. Measured twice on one evening, on two hosts, under two different
+/// version numbers, each time naming the version that had just retired.
+///
+/// This is the single moment in the system's life when **both names are known at
+/// once**: the successor is bound and answering, and the predecessor's socket is
+/// about to disappear. Nothing run later can reconstruct the pairing, which is
+/// why every attempt so far has had to guess it from whichever socket files
+/// happened to survive — a candidate set that inherits the sweeper's retention
+/// policy rather than describing the fleet
+/// ([[finding-a-fallback-derived-from-survivors-protects-nobody]]).
+///
+/// ⚠ Direction matters and only one direction is sound: this points an OLDER
+/// version's name at a NEWER daemon. The reverse — a current client proxied to
+/// an older daemon — has already returned nothing silently on this project, and
+/// is never what this writes, because the successor is by construction newer.
+#[cfg(unix)]
+fn alias_own_socket_to_successor(home_dir: &Path, own_endpoint: &ServerEndpoint) -> Option<PathBuf> {
+    let (_, successor_socket) = live_newer_daemon_socket(home_dir, own_endpoint)?;
+    let ServerEndpoint::UnixSocket(mine) = own_endpoint else {
+        return None;
+    };
+    // Only a real, version-named socket of our own. A daemon on a custom
+    // endpoint has no version name to bequeath, and aliasing an arbitrary path
+    // would put a name in the tree that no client ever looks for.
+    parse_versioned_server_socket_name(mine)?;
+    if fs::canonicalize(mine).ok()? == fs::canonicalize(&successor_socket).ok()? {
+        // Already the same file — we are looking at our own alias.
+        return None;
+    }
+    // Unlink-then-symlink while still bound: established connections are
+    // unaffected by the unlink, and a client that connects during the ~250 ms
+    // before exit reaches the successor rather than a socket about to die.
+    let _ = fs::remove_file(mine);
+    std::os::unix::fs::symlink(&successor_socket, mine).ok()?;
+    Some(successor_socket)
 }
 
 /// Per [[bug-class-old-daemon-never-retires]]: in the managed-versions install
@@ -11231,6 +11455,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::DropTerminalRuntime { .. } => "drop_terminal_runtime",
         ServerRequest::SetSessionKeepAlive { .. } => "set_session_keep_alive",
         ServerRequest::TerminalTenants { .. } => "terminal_tenants",
+        ServerRequest::HotRestartGateScreens { .. } => "hot_restart_gate_screens",
         ServerRequest::DeclareSessionTenancy { .. } => "declare_session_tenancy",
         ServerRequest::Wpe { .. } => "wpe",
         ServerRequest::WpeAgent { .. } => "wpe_agent",
@@ -11962,6 +12187,25 @@ fn spawn_superseded_self_retire_sweep(
                     }),
                 );
                 if let HandoffSweep::AllMoved { .. } = sweep {
+                    // ⭐ Bequeath our NAME before we stop answering to it, or
+                    // every client pinned to this version strands the moment we
+                    // exit. This is the only place both names are known.
+                    let aliased = alias_own_socket_to_successor(&home_dir, &endpoint);
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "lifecycle",
+                        "retiring_daemon_aliased_own_socket",
+                        serde_json::json!({
+                            "successor_version": successor,
+                            "successor_socket": aliased
+                                .as_ref()
+                                .map(|path| path.display().to_string()),
+                            "aliased": aliased.is_some(),
+                            "server_version": SERVER_PROTOCOL_VERSION,
+                            "pid": std::process::id(),
+                        }),
+                    );
                     // The successor holds every descriptor. Exiting is the only
                     // way to release ours — dropping runtimes individually
                     // leaves reader threads on cloned masters, and two daemons
@@ -13705,6 +13949,29 @@ pub fn terminal_tenants(
         ServerResponse::TerminalTenants { rows, degraded } => Ok((rows, degraded)),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal tenants response: {:?}", other),
+    }
+}
+
+/// What the hot-restart idle gate is looking at, right now, per owned session.
+///
+/// `path: None` asks about every session the daemon owns. A daemon that owns
+/// nothing answers with an empty list, which is the honest answer to "what is
+/// holding your gate" — not an error.
+pub fn hot_restart_gate_screens(
+    endpoint: &ServerEndpoint,
+    path: Option<&str>,
+    tail_lines: Option<usize>,
+) -> Result<Vec<HotRestartGateScreen>> {
+    match send_request(
+        endpoint,
+        &ServerRequest::HotRestartGateScreens {
+            path: path.map(ToOwned::to_owned),
+            tail_lines,
+        },
+    )? {
+        ServerResponse::HotRestartGateScreens { sessions } => Ok(sessions),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected hot restart gate screens response: {:?}", other),
     }
 }
 
@@ -18549,8 +18816,8 @@ mod tests {
         HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, HOT_RESTART_BLOCKER_WORKING,
         HOT_RESTART_FORCED_SWAP_DEADLINE_MS, HotRestartBlocker, HotRestartDeadlineVerdict,
         hot_restart_block_reason_summary, hot_restart_blocker_is_deadline_exempt,
-        hot_restart_blockers_actionable_first, hot_restart_deadline_verdict,
-        hot_update_handoff_would_refuse_binary,
+        ServerRequest, ShadowAccess, gate_screen_tail, hot_restart_blockers_actionable_first,
+        hot_restart_deadline_verdict, hot_update_handoff_would_refuse_binary, role_gate,
     };
     use crate::live_row_tombstones::LiveRowTombstones;
 
@@ -19481,6 +19748,62 @@ mod tests {
             !gate.contains("let _ = shutdown(&endpoint);"),
             "the shutdown belongs to the shared exit below the gate, so a forced swap \
              cannot acquire its own copy that skips the row-coverage check"
+        );
+    }
+
+    #[test]
+    fn the_gate_screen_verb_never_writes_a_screen_to_the_trace() {
+        // ⛔ The whole reason this verb is on-demand. `event-trace*.jsonl` is
+        // durable, is collected into bundles and is read by every later
+        // session; a session's screen carries whatever the person typed into
+        // it. The reading may go to the caller that asked and nowhere else.
+        let source = include_str!("daemon.rs");
+        let handler = source
+            .split("fn hot_restart_gate_screens_response(")
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split("ServerResponse::HotRestartGateScreens { sessions }")
+                    .next()
+            })
+            .expect("the gate-screen handler should be present");
+        assert!(
+            !handler.contains("append_trace_event"),
+            "the gate-screen reading must never reach a trace event — it is a \
+             durable, widely-copied file and this is session screen text"
+        );
+    }
+
+    #[test]
+    fn the_gate_screen_tail_keeps_the_newest_lines_and_their_escapes() {
+        // Newest LAST, because that is the order a reader's eye expects and the
+        // order every other screen dump on this project uses.
+        let screen = "one\ntwo\n\u{1b}[32mthree\u{1b}[m\nfour";
+        assert_eq!(
+            gate_screen_tail(screen, 2),
+            vec!["\u{1b}[32mthree\u{1b}[m".to_string(), "four".to_string()],
+        );
+        // A screen shorter than the window is returned whole rather than
+        // padded — a padded reading would put lines in a corpus that were never
+        // on the screen.
+        assert_eq!(gate_screen_tail("only", 24), vec!["only".to_string()]);
+        // ⚠ Empty is empty, and it must not panic: an agent session between a
+        // clear and its first repaint really does read as no lines at all.
+        assert!(gate_screen_tail("", 24).is_empty());
+        assert!(gate_screen_tail("anything", 0).is_empty());
+    }
+
+    #[test]
+    fn a_shadow_client_may_not_read_every_session_on_the_host() {
+        // Read-only is not the test; SCOPE is. A shadow is a viewer of ONE
+        // session, and this verb answers with the screen of every session the
+        // daemon owns.
+        assert_eq!(
+            role_gate(&ServerRequest::HotRestartGateScreens {
+                path: None,
+                tail_lines: None,
+            }),
+            ShadowAccess::Deny,
         );
     }
 
@@ -27025,8 +27348,15 @@ mod tests {
         // version-ordered compatibility gate looking at two builds of one
         // version with different shapes — the lost-PTY latch storm of
         // 2026-07-17.
-        const STAMPED_AT_VERSION: &str = "3.0.90";
-        const STAMPED_SHAPE_HASH: u64 = 0xa69ad1bbd1767587;
+        // Re-stamped for 3.0.132: `HotRestartGateScreens` arrived — §3's audit
+        // instrument, the first verb that exposes the screen the hot-restart
+        // idle gate actually classifies from. An older daemon has never heard
+        // of it and errors on it, which is the loud failure this split is for:
+        // a gate-screen reading is only meaningful from the daemon that OWNS
+        // the session, so silently answering from the wrong one would produce a
+        // corpus describing nothing.
+        const STAMPED_AT_VERSION: &str = "3.0.132";
+        const STAMPED_SHAPE_HASH: u64 = 0x9d92c7118ca5cb96;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
