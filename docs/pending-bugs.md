@@ -424,39 +424,6 @@ row grows; an unreachable one is frozen. Sample twice a few seconds apart.
 **Fix:** name the two states in the reply. The daemon endpoint the submit resolved to is already known
 at that point, so "the row I addressed is served by a socket nothing has bound" is answerable.
 
-## ⛔ A DAEMON THAT TAKES ITS SESSIONS BACK IS STILL MUTED — NOTHING ON THE HOST WRITES THEIR STATE
-
-**Status:** OPEN
-
-Found while building the settle window, 2026-08-14. Not caused by it — made
-reachable by it, and it is the same shape as the bug the immediate-persist fix
-already closed from the other side.
-
-`superseded_routine_persist_muted` is a **hard, permanent latch**
-(`daemon.rs`, `routine_persist_should_mute`): once a strictly newer daemon is
-seen, this daemon never writes `server-state.json` again. That is right while the
-successor is alive — a stale predecessor must not clobber the successor's file.
-
-⛔ **It is wrong the moment the successor dies.** The settle window now hands the
-sessions back: the predecessor wakes its readers and is once again the only
-process serving them. It is also still muted, and the successor that DID write
-the state file is gone. ⇒ **No process on the host will record those sessions
-again.** If the predecessor is then killed, they are unrecoverable — exactly the
-condition the immediate-persist-on-adoption fix was written to end.
-
-**The fix, and why it is not a one-liner.** Clearing the latch is only safe when
-no live newer daemon exists — another one may have arrived meanwhile — so the
-test is `live_newer_daemon_version(...).is_none()`, the existing single owner of
-that question. The obstacle is reach, not logic: `spawn_handoff_settle_watch`
-holds no runtime handle. The superseded-retire caller has the
-`Arc<Mutex<DaemonRuntime>>`; the hot-update caller has only `&mut self`.
-
-⚠ **Do not solve it by passing an `Option<Arc<…>>`** — "a handle that is
-sometimes there" is a fork wearing a table's clothes, and this crate has paid for
-that shape before. Either give both callers the same handle, or make the mute a
-DERIVED fact (ask whether a newer daemon is live) rather than a latch, which is
-what it actually means.
-
 ## ⚠ A HANDOVER THAT LOSES ITS SUCCESSOR STILL LOSES THE SECONDS THAT SUCCESSOR ALREADY READ
 
 **Status:** OPEN
@@ -488,11 +455,20 @@ while both daemons held all three runtimes reported **three distinct session
 paths — no duplicate identity.** That is where a duplicated row would have to
 come from, so the mechanism most likely to break is measured, not assumed.
 
-⛔ **It is still not a pixel.** The sandbox has no GUI, so what the sidebar
-RENDERS over a 10 s double-claim is untested. **Falsifier:** run a handover under
-a live GUI with rows on screen and watch for duplicate or flickering rows for the
-length of `YGGTERM_HANDOFF_SETTLE_MS` — the one check that needs the GUI host and
-cannot be done headlessly.
+✅ **AND THE PIXEL WAS TAKEN — the falsifier ran, 2026-08-14.** A full GUI under a
+private headless compositor (`scripts/underglass-sandbox.sh`), four rows on a
+3.0.150 daemon, handed over to a 3.0.151 successor. Frames captured before, four
+times across the window, and after: **the sidebar rendered the same four rows
+throughout — no duplicate row, no flicker, no change in the count.** The
+predecessor exited only after `settled: true`, the successor then owned all four,
+and `successor_identified: true` — the first live exercise of the pid +
+start-time identity path rather than the fallback.
+
+⚠ **One instrument in those frames is NOT evidence and must not be cited:** the
+Session Metadata panel showed an identical daemon uptime in the mid-window and
+post-window captures, so that panel does not repoll on its own. The row list is
+what was measured; the panel's daemon fields say nothing about which daemon was
+serving.
 
 ## ⛔⛔⛔ [6.7] A ROW CAN BE ALIVE, IDLE-LOOKING, AND NOT READING ITS PTY — THE "I CANNOT TYPE" BUG
 
@@ -860,40 +836,6 @@ term → must refuse; clean range → must push.
 
 **Falsifier:** run each installer against a git worktree and against a plain checkout in the same
 run, then push from both.
-
-## ⛔⛔ MAIN IS RED: THE PROTOCOL SHAPE-STAMP GUARD FAILS ON `origin/main` ITSELF
-
-**Status:** OPEN
-
-*found 2026-08-13 while merging a lane; **not caused by that lane***
-
-`daemon::tests::protocol_shape_stamp_forces_version_bump` fails on `origin/main`:
-
-```
-computed 0x967609ee5ac9a131   stamped 0x9d92c7118ca5cb96 (STAMPED_AT_VERSION 3.0.132)
-workspace version is now 3.0.144
-```
-
-⇒ **`ServerRequest`/`ServerResponse` changed after 3.0.132 and the stamp was not
-updated in the same commit** — which is the exact thing this guard exists to
-prevent. Its own comment names the incident it was built for: a wire change
-shipping under an unchanged version left the fleet's version-ordered
-compatibility gate looking at two builds of one version with different shapes.
-
-**Proved not to be the merging lane's doing:** that lane's diff touches only
-`lib.rs`, `terminal.rs` and `shell.rs`, never `daemon.rs`; and the
-`ServerRequest`/`ServerResponse` blocks extracted from `origin/main` are
-**byte-identical** to the merged tree's, so main computes the same failing hash.
-
-⛔ **Do NOT simply re-stamp it to make the suite green.** The stamp is a forcing
-function: it demands a **workspace version bump in the same commit as the wire
-change**. Re-stamping alone silences the guard and ships the very condition it
-was written to catch. **Whoever changed the enums owns the bump** — find that
-commit and re-stamp with it, or revert the shape change.
-
-**Falsifier:** `cargo test -p yggterm-server --lib protocol_shape_stamp` on a
-clean `origin/main` checkout. It must pass; today it does not.
-
 
 ## ⛔⛔ [6.7→6.1] EVERY DAEMON BUMP ORPHANS EXACTLY ONE VERSION — THE ONE THAT WAS SERVING
 
