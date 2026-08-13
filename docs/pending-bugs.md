@@ -1500,25 +1500,48 @@ server-3-0-128.sock              real socket (the live daemon)
 onward is orphaned the moment its daemon retires. The mechanism is faithfully aliasing a museum
 while every modern version falls through it.
 
-⚠ **What is measured vs what is inferred.** The two sources, the self-erasing property and the
-filesystem census above are all confirmed. **What writes `client-instances/` scope dirs, and why it
-stopped covering versions after 3-0-80, is NOT yet established** — that is the first thing to find,
-and it is where the fix probably lives.
+### ⛔⛔ AND SOURCE 2 IS WRITE-DEAD: NOTHING HAS POPULATED IT FOR ~48 VERSIONS
 
-### Fixes, and the first is not the obvious one
+*Question closed 2026-08-13 by the reporting campaign, verified here before the ranking was changed.*
 
-1. ⭐ **Make the alias set durable rather than derived from surviving files.** A version's alias must
-   not depend on its own socket file outliving its daemon, which is the property that guarantees
-   failure. Recording each bound version in a ledger — or restoring whatever populated
-   `client-instances/` — removes the whole class.
-2. **A caller that cannot reach its pinned socket should fall back to the CURRENT daemon**, not
-   die. It is the same host and the same `$YGGTERM_HOME`; a version-pinned path is an optimisation,
-   not an identity.
-3. ⛔ **A CLI's stderr must never reach an agent row's PTY.** Whatever invokes the CLI inside a
-   session must capture it. This is the half that turns a recoverable miss into an unreachable row,
-   and it is worth fixing even if 1 and 2 land.
+**No production code writes a `client-instances/` scope dir.** Of 69 references across `crates/`
+and `apps/`, every one is a read, a scan, or a path join. The **only** `create_dir_all` on that path
+in the tree is `crates/yggterm-server/src/daemon.rs:25296` — inside
+`#[test] fn versioned_server_socket_alias_candidates_include_client_instance_versions()`, seeding a
+fixture.
+
+⇒ **The 24 scope dirs on disk are residue from a writer that no longer exists**, and the newest
+being `3-0-80` dates its disappearance. ⛔ **So both inputs are dead in different ways: source 1
+erases itself, source 2 is never written.** The mechanism is not degraded, it is **inert — and it
+has been inert for roughly forty-eight versions while appearing to work**, because the residue kept
+answering for exactly the ancient versions nobody runs.
+
+### Fixes — and the ranking below was INVERTED once the above was known
+
+1. ⭐⭐ **PRIMARY: a caller that cannot reach its pinned socket falls back to the CURRENT daemon.**
+   This is correctness and it deletes the whole class. The argument is already in the symptom —
+   **a version-pinned path is an optimisation, not an identity.**
+   ⚠ **But "same host, same home" must be CHECKED, not assumed.** Installs across `~/.local/bin`
+   and `~/.yggterm/bin` have been observed disagreeing, and if those resolve different
+   `$YGGTERM_HOME` values a fallback could silently attach a caller to a daemon owning none of its
+   sessions — **worse than the honest error, because it would succeed.**
+2. **SECONDARY: make the alias set durable** (a ledger of bound versions, or a writer for
+   `client-instances/`). ⛔ **This was ranked first and should not be**: it means reinstating the
+   component whose silent disappearance caused this, then depending on it again. **The alias table
+   is a CACHE, and repairing a cache leaves you depending on the cache** — one whose writer vanished
+   unnoticed for forty-eight versions. With fix 1 in place this is a latency nicety and an inert
+   table stops being an outage.
+3. ⛔ **INDEPENDENT, DO IT REGARDLESS: a CLI's stderr must never reach an agent row's PTY.** It is
+   the blast-radius fix — the difference between *"a call failed"* and *"a row became unreachable
+   and looked busy for forty minutes"* — and it is orthogonal to whichever of 1 or 2 lands.
 4. ⚠ **Ruled out already, so nobody repeats it:** the claim script's title watcher is innocent (it
    is already fully redirected), and the booter's run path captures output. The writer is elsewhere.
+
+⚠ **Separately, and it is why this sat unnoticed: there is NO SAFE COMPOSER CLEAR today.** A
+kill-line ate a person's half-typed sentence when used for exactly this repair, and Escape
+interrupts a live turn. ⇒ Until the owner's yank-and-restore ruling is built (see the `terminal
+send` entry), **a poisoned row is reachable only by dropping a file it reads** — and the sender owns
+removing that file once consumption is confirmed.
 
 ⚖ **Relation to the constitution.** *"Other agents' sessions survive our restarts"* is the standing
 guarantee, and this is a live counter-example: our own deploys are degrading other agents' rows.
