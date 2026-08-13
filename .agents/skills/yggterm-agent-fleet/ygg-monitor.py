@@ -280,8 +280,19 @@ def escalate(host, sub, row, why, dry):
 # ---------------------------------------------------------------------------
 # Verbs
 # ---------------------------------------------------------------------------
+def _bare_uuid(v):
+    """⛔ $YGGTERM_SESSION_ID IS NOT A BARE UUID — it is `cc-runtime://<uuid>`.
+
+    Used as a filename the `//` becomes a path separator, so subscribe died with
+    FileNotFoundError on `.../monitor/cc-runtime:/<uuid>.json`. ygg-claim.sh has
+    always stripped it (`${SESSION##*/}`); this did not, so every session that
+    subscribed the documented way crashed and only `--uuid` worked. Reported by a
+    cluster 2026-08-13. Take the last path segment, exactly as the claim does."""
+    return (v or "").rsplit("/", 1)[-1].strip()
+
+
 def cmd_subscribe(a):
-    uuid = a.uuid or os.environ.get("YGGTERM_SESSION_ID", "")
+    uuid = _bare_uuid(a.uuid or os.environ.get("YGGTERM_SESSION_ID", ""))
     if not uuid:
         log("subscribe: need --uuid (or $YGGTERM_SESSION_ID)")
         return 64
@@ -300,7 +311,7 @@ def cmd_subscribe(a):
 
 
 def cmd_unsubscribe(a):
-    p = sub_path(a.uuid)
+    p = sub_path(_bare_uuid(a.uuid))
     if p.exists():
         p.unlink()
         log(f"unsubscribed {a.uuid[:8]}")
@@ -311,7 +322,7 @@ def cmd_unsubscribe(a):
 
 def cmd_demote(a):
     """The owner takes a row back. Nothing automated touches it again."""
-    p = sub_path(a.uuid)
+    p = sub_path(_bare_uuid(a.uuid))
     if not p.exists():
         log(f"{a.uuid[:8]} is not subscribed")
         return 1
@@ -326,7 +337,7 @@ def cmd_demote(a):
 
 
 def cmd_promote(a):
-    p = sub_path(a.uuid)
+    p = sub_path(_bare_uuid(a.uuid))
     if not p.exists():
         log(f"{a.uuid[:8]} is not subscribed")
         return 1
