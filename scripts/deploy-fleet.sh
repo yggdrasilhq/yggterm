@@ -271,9 +271,27 @@ for host in $HOSTS; do
     continue
   fi
   echo "  == $host =="
-  cen='for p in $HOME/.local/bin/yggterm $HOME/.local/bin/yggterm-headless \
+  # ⛔ ASK `--version` FIRST AND LET IT DECIDE WHETHER THE OTHER QUESTION IS SAFE.
+  # `--build-commit` on a binary built before the flag existed is an UNKNOWN
+  # ARGUMENT, and an unknown argument to the GUI binary falls through to
+  # LAUNCHING THE GUI — so a census that asked every copy would open windows
+  # across the fleet on precisely the hosts that are behind, which are the ones
+  # it exists to find. `--version` is safe on every build ever shipped, so it is
+  # the gate: below the floor the copy is named `(pre-flag)` and never asked.
+  # The floor is the version whose deployed copy was OBSERVED answering the flag,
+  # not the version whose source first contained it — those differ, and only the
+  # first one is evidence.
+  cen='MINV=3.0.125
+       for p in $HOME/.local/bin/yggterm $HOME/.local/bin/yggterm-headless \
                 $HOME/.yggterm/bin/yggterm $HOME/.yggterm/bin/yggterm-headless; do
-         printf "    on disk  %-42s %-9s %s\n" "$p" "$($p --version 2>/dev/null || echo ERR)" "$(md5sum "$p" 2>/dev/null | cut -c1-10)"
+         v=$("$p" --version 2>/dev/null || echo ERR)
+         c="(pre-flag)"
+         case "$v" in
+           ERR|"") c="(no answer)";;
+           *) [ "$(printf "%s\n%s\n" "$MINV" "$v" | sort -V | head -1)" = "$MINV" ] &&
+                c=$("$p" --build-commit 2>/dev/null || echo "(refused)");;
+         esac
+         printf "    on disk  %-42s %-9s %-14s %s\n" "$p" "$v" "$c" "$(md5sum "$p" 2>/dev/null | cut -c1-10)"
        done
        $HOME/.yggterm/bin/yggterm-headless server daemons 2>/dev/null |
          sed "s/^/    running  /" || echo "    running  <no census: this host has no reachable daemon>"'
