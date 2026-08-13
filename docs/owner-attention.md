@@ -30,6 +30,19 @@ copies.
 
 ## Decisions only he makes
 
+- **The public lore corpus maps which services he uses, even after every listed private term is
+  scrubbed — remove the corpus, or keep the feature?** The term-list rewrite catches the names on
+  the guard list; it cannot catch the COLLECTION, and a set of site-lore entries for portals and
+  vendors is a map of a person's affairs by the standing definition, with no single entry being
+  private. Removing it guts a working feature; keeping it leaves the map. **It is a product call,
+  not a leak call** — which is why it is here even though he ruled that leaks themselves are not an
+  owner gate. → `~/gh/ychrome/docs/pending-bugs.md` and the campaign memory
+  `finding-ychrome-public-lore-maps-a-private-life` (already recorded as owner-decision-owed).
+  **Recommendation: run the term-list rewrite now and decide the corpus separately** — the first is
+  unambiguously in mandate and the second is not, and bundling them would put an unasked product
+  decision inside an irreversible force-push.
+  *Meanwhile:* the term-list rewrite proceeds and nothing waits on this.
+
 - **The laptop boots with no usable TSC, so every `clock_gettime` costs 45.8×
   what it should (1222.5 ns on `hpet` vs 26.7 ns on `tsc`) — may we add
   `tsc=reliable` to its kernel command line?** It is a boot-config change on his
