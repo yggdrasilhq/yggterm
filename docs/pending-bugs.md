@@ -2450,6 +2450,39 @@ a measurement.
 
 **Status:** OPEN
 
+### ✅ CONFIRMED LIVE 2026-08-14 — THE BOUND IS ALREADY BEING EXCEEDED, INVISIBLY
+
+Previously this was settled from `strings` on the shipped `.so` (the bound polls
+`VmRSS`). It is now measured on the running host, and the process has **already
+crossed the limit without the limit noticing**:
+
+| yggterm's web process (child of the GUI) | |
+|---|---|
+| `VmRSS` — **what the bound compares against** | **947 MB** |
+| `VmSwap` | 1,118 MB |
+| **committed (`RSS + swap`)** | **2,065 MB** |
+| the configured bound (`MemTotal/8`) | **1,889 MB** |
+
+⇒ **176 MB over the bound, and the bound reads 947 MB — barely half.** The
+overage is not merely unseen, it is unseeable *by construction*: the amount by
+which the process exceeds its budget is precisely the amount the kernel swapped
+out, which is exactly what an RSS-valued comparison stops counting. **The metric
+subtracts the evidence of the thing it is measuring.**
+
+⛔ **This is why "tune the constant" is the wrong instinct and remains refused.**
+No value of `MemTotal/8` fixes a comparison whose left side shrinks as the
+problem grows — lowering it does nothing once the excess is in swap. Either the
+comparison becomes swap-inclusive (a cgroup, which counts what the machine
+actually committed) or the bound stays decorative.
+
+⚠ **Scope, stated honestly so nobody over-claims it.** The whole yggterm family
+(GUI + 4 WebKit children) commits **≈3.5 GB, of which ≈2.0 GB is swapped**, on a
+14.8 GB host carrying **12.3 GB of swap in use**. So yggterm is a significant
+share of the swap pressure, **not the cause of it** — the rest is spread across
+many unrelated desktop processes. ⇒ Fixing this bound makes yggterm frugal; it
+will not by itself bring the machine out of swap, and claiming otherwise would
+set up a measurement that is guaranteed to disappoint.
+
 *single-pid lifetime measurement, desktop host 2026-08-13, restart-free*
 
 `configure_linux_webkit_memory_policy` (`apps/yggterm/src/main.rs`) sets
