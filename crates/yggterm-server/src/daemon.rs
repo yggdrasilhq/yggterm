@@ -1,6 +1,7 @@
 use crate::codex_cli::{
     TerminalIdentityColorProfile, sync_terminal_identity_appearance_with_profile,
 };
+use crate::hot_restart_queue;
 use crate::terminal::{TerminalBufferStats, terminal_data_has_scrollback_text};
 use crate::{
     ClaudeCodeRuntimeProcessIdentity, CodexRuntimeProcessIdentity, GhosttyHostSupport,
@@ -12320,8 +12321,26 @@ pub fn daemon_census(home_dir: &Path) -> Vec<DaemonCensusRow> {
 /// Render the census as the table a human reads. Pure, so the wording is
 /// unit-testable and cannot drift from the data.
 pub fn format_daemon_census(rows: &[DaemonCensusRow]) -> String {
+    format_daemon_census_with_queued_swap(rows, None, 0)
+}
+
+/// The same table, plus §4's host-level answer to *"is a swap owed here?"*.
+///
+/// ⚠ The queued swap is a HOST fact and deliberately not a column: it outlives
+/// the daemon being replaced — that is the whole point of queuing it — so
+/// attaching it to any one row would make it look like that daemon's property
+/// and lose it the moment that daemon goes. One line under the table, once.
+pub fn format_daemon_census_with_queued_swap(
+    rows: &[DaemonCensusRow],
+    queued: Option<&hot_restart_queue::QueuedHotRestart>,
+    now_ms: u64,
+) -> String {
     if rows.is_empty() {
-        return "no reachable yggterm daemons on this host\n".to_string();
+        let mut out = "no reachable yggterm daemons on this host\n".to_string();
+        if let Some(queued) = queued {
+            out.push_str(&hot_restart_queue::format_queued_swap(queued, now_ms));
+        }
+        return out;
     }
     let mut out = String::new();
     out.push_str(
@@ -12350,6 +12369,9 @@ pub fn format_daemon_census(rows: &[DaemonCensusRow]) -> String {
                 label = if settled { "lingering" } else { "deferring" },
             ));
         }
+    }
+    if let Some(queued) = queued {
+        out.push_str(&hot_restart_queue::format_queued_swap(queued, now_ms));
     }
     out.push_str("  (* = the daemon this CLI talks to by default)\n");
     out
@@ -14525,35 +14547,59 @@ fn spawn_disk_binary_version_poll(
             // new-version successor to ADOPT the streams — no re-resume. The
             // newer_daemon_live split-brain case, the kill-switch, and any handoff
             // failure all fall back to the cold shutdown so we still retire.
-            let handed_off =
-                retire_trigger == "disk_binary_replaced" && !self_retire_handoff_disabled() && {
+            //
+            // ⛔ AND THIS LANE NO LONGER `break`s. The loop used to stop the
+            // moment a handoff was accepted, which is why a swap that did not
+            // converge stayed un-converged forever: the one thread that could
+            // notice and retry had exited. Spec §4 — *"a request that cannot run
+            // now runs at the next boundary, and it is never lost"* — is exactly
+            // the deletion of that `break`, plus a durable record of what was
+            // owed so the retry survives this process too. Measured on the GUI
+            // host 2026-08-13: one `daemon_self_retire` at 13:45:52, one
+            // `daemon_self_retire_handoff_ok` at 13:46:02, and 45 minutes later
+            // the host still had no daemon at the GUI's version and nothing
+            // anywhere recorded that one was owed. The workshop host had
+            // eighteen daemons stacked the same way, the oldest 20.6 days old.
+            let swap_lane =
+                if retire_trigger == "disk_binary_replaced" && !self_retire_handoff_disabled() {
                     let owned = lock_daemon_runtime(&runtime, "disk_binary_replace_handoff")
                         .terminals
                         .session_keys();
-                    !owned.is_empty()
-                        && attempt_self_retire_preserving_handoff(
+                    if owned.is_empty() {
+                        // Our hands are empty: the drain finished, so the normal
+                        // gate below is the right way out and it will find
+                        // nothing to block on.
+                        SwapStep::Failed
+                    } else {
+                        hot_restart_swap_step(
                             &endpoint,
                             &home_dir,
                             &exe_link_for_handoff,
                             &owned,
+                            retire_trigger,
                         )
+                    }
+                } else {
+                    SwapStep::Failed
                 };
-            if handed_off {
-                // The handler spawned the new-version successor and wrote the
-                // preserved-owner registry; we now linger as the PTY owner. Do
-                // NOT shutdown (that would kill the PTYs we just preserved). Stop
-                // polling and, when progressive migration is enabled, hand our
-                // sessions one-by-one to the successor as each becomes safe so
-                // ownership converges to the newest daemon (working-state +
-                // titles then work natively there); otherwise idle-shutdown /
-                // the stale-daemon sweep retires us once our sessions drain.
-                // See [[finding-daemon-authoritative-working-state-2945]].
-                spawn_progressive_session_migration(
-                    endpoint.clone(),
-                    home_dir.clone(),
-                    Arc::clone(&runtime),
-                );
-                break;
+            match swap_lane {
+                SwapStep::HandedOff => {
+                    // The handler spawned the new-version successor and wrote
+                    // the preserved-owner registry; we now linger as the PTY
+                    // owner. Do NOT shutdown (that would kill the PTYs we just
+                    // preserved). Hand our sessions one-by-one to the successor
+                    // as each becomes safe so ownership converges to the newest
+                    // daemon (working-state + titles then work natively there).
+                    // See [[finding-daemon-authoritative-working-state-2945]].
+                    spawn_progressive_session_migration(
+                        endpoint.clone(),
+                        home_dir.clone(),
+                        Arc::clone(&runtime),
+                    );
+                    continue;
+                }
+                SwapStep::Lingering | SwapStep::Converged => continue,
+                SwapStep::Failed => {}
             }
             // No handoff: the only way out is a COLD SHUTDOWN, which kills this
             // daemon's PTY children and makes the next client recovery-spawn a
@@ -15056,20 +15102,245 @@ fn disk_replace_handoff_candidates(exe_link: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// How long a QUEUED swap waits before a drainer tries again.
+///
+/// The retire poll runs every 20 s. Retrying the handoff on every one of those
+/// would spawn a successor three times a minute on a host where the swap cannot
+/// converge — a lost intent turned into a fork bomb, which is a worse bug than
+/// the one §4 fixes. Five minutes is short enough that a transient obstacle
+/// (state file mid-write, successor still binding) costs one interval, and long
+/// enough that a genuinely stuck host is not paying for the attempt.
+#[cfg(target_os = "linux")]
+const HOT_RESTART_SWAP_RETRY_INTERVAL_MS: u64 = 300_000;
+
+/// What one poll of the queued-swap lane concluded.
+///
+/// ⛔ Only [`SwapStep::Failed`] falls through to the cold-shutdown gate, and the
+/// asymmetry is the safety property: a daemon that has ALREADY handed off is a
+/// preserved PTY owner, and letting a later failed retry drop it into the cold
+/// path would kill the very PTYs the first handoff preserved. Failure only
+/// counts when we never got a handoff in the first place — which is exactly the
+/// pre-§4 behaviour for that case.
+#[cfg(target_os = "linux")]
+enum SwapStep {
+    /// The handoff RPC was accepted just now; start the drain and linger.
+    HandedOff,
+    /// We are a preserved owner with a swap still owed; linger.
+    Lingering,
+    /// A daemon at or above the target is live. The entry is cleared; we linger
+    /// until the drain empties our hands.
+    Converged,
+    /// No handoff was ever obtained. Fall through to the cold-shutdown gate.
+    Failed,
+}
+
+/// This process has seen its owed swap converge, so its lane has nothing left to
+/// ask for.
+///
+/// ⛔ Process-local, and it must NOT be replaced by "is the file gone?". The
+/// file is the HOST's record and is correctly deleted on convergence — reading
+/// its absence as "nothing has happened yet" is how clearing the entry would
+/// make this daemon start asking for a brand-new swap on the very next poll,
+/// twenty seconds later, forever. The record and the memory answer different
+/// questions and one cannot stand in for the other.
+#[cfg(target_os = "linux")]
+static HOT_RESTART_SWAP_LANE_SETTLED: AtomicBool = AtomicBool::new(false);
+
+/// When THIS process last asked for the swap. Zero = never.
+///
+/// A second floor under the file's own `last_attempt_ms`, because the file is
+/// shared: a peer daemon's write must never hand this process a fresh allowance
+/// to spawn another successor. Same lesson as `MIGRATION_RELEASE_ATTEMPTS` —
+/// an allowance that resets is not an allowance.
+#[cfg(target_os = "linux")]
+static HOT_RESTART_SWAP_LAST_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// One poll of §4's lane: is the owed swap satisfied, waiting, or due?
+#[cfg(target_os = "linux")]
+fn hot_restart_swap_step(
+    endpoint: &ServerEndpoint,
+    home_dir: &Path,
+    exe_link: &str,
+    owned: &[String],
+    retire_trigger: &str,
+) -> SwapStep {
+    let now_ms = current_millis_u64();
+    if HOT_RESTART_SWAP_LANE_SETTLED.load(Ordering::Relaxed) {
+        return SwapStep::Lingering;
+    }
+    let queued = hot_restart_queue::load(home_dir);
+    if let Some(queued) = queued.as_ref() {
+        // ⛔ The CHEAP probe, not a roster sweep. `live_newer_daemon_version`
+        // filters on socket FILENAMES first, so this is 0-2 status calls rather
+        // than one per daemon — and this loop plus the migration drain were
+        // together the O(N²·M) that cost 8.12 cores on a 27-daemon machine.
+        let live_newer = live_newer_daemon_version(home_dir, endpoint);
+        let satisfied = live_newer
+            .as_deref()
+            .is_some_and(|live| hot_restart_queue::satisfied_by(queued, live));
+        if satisfied {
+            append_trace_event(
+                home_dir,
+                "daemon",
+                "lifecycle",
+                "hot_restart_swap_queue_satisfied",
+                serde_json::json!({
+                    "target_version": queued.target_version,
+                    "live_successor_version": live_newer,
+                    "attempts": queued.attempts,
+                    "waited_ms": now_ms.saturating_sub(queued.requested_at_ms),
+                    "current_version": SERVER_PROTOCOL_VERSION,
+                    "current_pid": std::process::id(),
+                }),
+            );
+            hot_restart_queue::clear(home_dir);
+            HOT_RESTART_SWAP_LANE_SETTLED.store(true, Ordering::Relaxed);
+            return SwapStep::Converged;
+        }
+        if !hot_restart_queue::attempt_is_due(queued, now_ms, HOT_RESTART_SWAP_RETRY_INTERVAL_MS) {
+            return SwapStep::Lingering;
+        }
+    }
+    // The process-local floor, checked whatever the file says — including when
+    // the file is absent, which is the state a peer's convergence leaves behind.
+    let last_attempt_ms = HOT_RESTART_SWAP_LAST_ATTEMPT_MS.load(Ordering::Relaxed);
+    if last_attempt_ms != 0
+        && now_ms.saturating_sub(last_attempt_ms) < HOT_RESTART_SWAP_RETRY_INTERVAL_MS
+    {
+        return SwapStep::Lingering;
+    }
+    HOT_RESTART_SWAP_LAST_ATTEMPT_MS.store(now_ms, Ordering::Relaxed);
+    if queued.is_some() {
+        // §8: a swap that is still waiting must name what it waits for. The
+        // retry writes its own outcome below; this records that the PREVIOUS
+        // attempt did not converge, which is the fact the old code never kept.
+        hot_restart_queue::record_attempt(
+            home_dir,
+            now_ms,
+            "no daemon at or above the target version is live yet; retrying the handoff",
+        );
+    }
+    match attempt_self_retire_preserving_handoff(endpoint, home_dir, exe_link, owned) {
+        Some(handoff) => {
+            queue_self_retire_swap(home_dir, &handoff, retire_trigger, now_ms);
+            SwapStep::HandedOff
+        }
+        None if queued.is_some() => SwapStep::Lingering,
+        None => SwapStep::Failed,
+    }
+}
+
+/// Record the intent this handoff was for, so it survives both this poll and
+/// this process. Nothing else on the host remembers it.
+#[cfg(target_os = "linux")]
+fn queue_self_retire_swap(
+    home_dir: &Path,
+    handoff: &SelfRetireHandoff,
+    retire_trigger: &str,
+    now_ms: u64,
+) {
+    let Some(target_version) = handoff.target_version.as_deref() else {
+        // ⛔ Do NOT queue our own version as a stand-in. `satisfied_by` would
+        // clear it on the next poll (we are live, at that version), so the entry
+        // would report a converged swap that never happened — a queue that lies
+        // is worse than no queue. Say so instead, and keep the pre-§4 one-shot
+        // behaviour for this install shape.
+        append_trace_event(
+            home_dir,
+            "daemon",
+            "lifecycle",
+            "hot_restart_swap_queue_skipped",
+            serde_json::json!({
+                "reason": "the replacement binary would not report a version",
+                "daemon_executable": handoff.daemon_executable.display().to_string(),
+                "current_version": SERVER_PROTOCOL_VERSION,
+                "current_pid": std::process::id(),
+            }),
+        );
+        return;
+    };
+    let request = hot_restart_queue::QueuedHotRestart {
+        target_version: target_version.to_string(),
+        daemon_executable: handoff.daemon_executable.display().to_string(),
+        requested_by: retire_trigger.to_string(),
+        requested_at_ms: now_ms,
+        attempts: 1,
+        last_attempt_ms: Some(now_ms),
+        last_outcome: Some("handoff requested; successor not yet confirmed live".to_string()),
+    };
+    let decision = hot_restart_queue::enqueue(home_dir, &request);
+    append_trace_event(
+        home_dir,
+        "daemon",
+        "lifecycle",
+        "hot_restart_swap_queued",
+        serde_json::json!({
+            "decision": decision.word(),
+            "target_version": target_version,
+            "requested_by": retire_trigger,
+            "daemon_executable": handoff.daemon_executable.display().to_string(),
+            "current_version": SERVER_PROTOCOL_VERSION,
+            "current_pid": std::process::id(),
+        }),
+    );
+}
+
+/// What an accepted self-retire handoff hands back to the retire poll.
+///
+/// `target_version` is deliberately still an `Option`: a raw/dev install can
+/// legitimately fail the `--version` probe, and the difference between "we asked
+/// and it would not say" and "we came up as ourselves" is the difference between
+/// a queue entry that means something and one that clears itself the instant it
+/// is written.
+#[cfg(target_os = "linux")]
+struct SelfRetireHandoff {
+    target_version: Option<String>,
+    daemon_executable: PathBuf,
+}
+
 /// Hand this daemon's live PTYs to a freshly-spawned new-version successor
 /// instead of cold-exiting. Routes through the proven `hot_restart` handoff —
 /// `force = true` because an autonomous disk-replace retire is an agent-style
-/// deploy and we cannot cheaply read the successor's version here (the on-disk
-/// binary already IS the new version, so the spawned successor comes up correct).
-/// Returns `true` only when the RPC was accepted; the caller then lingers as the
-/// preserved owner and must NOT shutdown.
+/// deploy, so the "target must differ from mine" check is not the guard we want
+/// here. Returns `Some(target_version)` only when the RPC was accepted; the
+/// caller then lingers as the preserved owner and must NOT shutdown.
+///
+/// ⛔ **ASK THE BINARY WHAT IT IS BEFORE PROMISING WHAT IT WILL BE.** This
+/// function used to pass `expected_version: None` on the reasoning that *"we
+/// cannot cheaply read the successor's version here (the on-disk binary already
+/// IS the new version, so the spawned successor comes up correct)"*. Both halves
+/// were wrong, and `try_startup_stale_daemon_hot_swap` had already learned the
+/// lesson on its own lane — [[finding-a-claim-proven-on-one-lane-is-not-proven]]:
+///
+/// - **Cheap to read:** [`crate::yggterm_executable_reported_version`] is one
+///   `--version` on the very binary we are about to spawn, and the startup path
+///   in the GUI already pays it for exactly this decision.
+/// - **Does NOT come up correct:** under a managed Direct install every launched
+///   binary re-execs to `install-state.active_version`, and the handler only
+///   promotes install-state to the target when it is TOLD one
+///   (`promote_direct_install_active_version`). With `None` the child re-execs
+///   back to the OLD active version, finds our socket already bound, and exits
+///   0 — while `spawn_ok: true` records that the *spawn* worked. A `None` target
+///   also disables the handler's "a live daemon at or above the target IS the
+///   successor" shortcut, so the doomed spawn is the only path taken.
+///
+/// Measured on the GUI host 2026-08-13: `hot_update_handoff_prepared
+/// {reason: "disk_binary_replaced_self_retire", spawn_ok: true,
+/// expected_version: null}` at 13:46:02, `daemon_self_retire_handoff_ok` in the
+/// same second, and then nothing — the daemon stayed on 3.0.118 with 3.0.120 on
+/// disk and a 3.0.120 GUI talking to it.
+///
+/// ⚠ An unreadable version keeps the old `None` behaviour rather than refusing:
+/// this path is how a host escapes a stale daemon, and failing closed on a probe
+/// that a raw/dev install can legitimately fail would strand exactly the hosts
+/// that need it most.
 #[cfg(target_os = "linux")]
 fn attempt_self_retire_preserving_handoff(
     endpoint: &ServerEndpoint,
     home_dir: &Path,
     exe_link: &str,
     owned: &[String],
-) -> bool {
+) -> Option<SelfRetireHandoff> {
     let candidates = disk_replace_handoff_candidates(exe_link);
     let Some(new_exe) = candidates
         .iter()
@@ -15077,7 +15348,7 @@ fn attempt_self_retire_preserving_handoff(
         .cloned()
     else {
         if candidates.is_empty() {
-            return false;
+            return None;
         }
         append_trace_event(
             home_dir,
@@ -15098,12 +15369,13 @@ fn attempt_self_retire_preserving_handoff(
                 "exe_link": exe_link,
             }),
         );
-        return false;
+        return None;
     };
+    let target_version = crate::yggterm_executable_reported_version(&new_exe);
     match hot_restart_detailed(
         endpoint,
         &new_exe,
-        None,
+        target_version.as_deref(),
         None,
         Some("disk_binary_replaced_self_retire"),
         true,
@@ -15120,6 +15392,11 @@ fn attempt_self_retire_preserving_handoff(
                 "daemon_self_retire_handoff_ok",
                 serde_json::json!({
                     "new_exe": new_exe.display().to_string(),
+                    // The field whose absence made this path a no-op that
+                    // reported success. Present even when unreadable, so a
+                    // future reader can tell "we did not ask" from "we asked
+                    // and the binary would not say".
+                    "target_version": target_version,
                     "outcome": outcome,
                     "owned_terminal_session_count": owned.len(),
                     "owned_terminal_session_keys": owned,
@@ -15128,7 +15405,10 @@ fn attempt_self_retire_preserving_handoff(
                     "current_pid": std::process::id(),
                 }),
             );
-            true
+            Some(SelfRetireHandoff {
+                target_version,
+                daemon_executable: new_exe,
+            })
         }
         Err(error) => {
             append_trace_event(
@@ -15138,11 +15418,12 @@ fn attempt_self_retire_preserving_handoff(
                 "daemon_self_retire_handoff_failed",
                 serde_json::json!({
                     "new_exe": new_exe.display().to_string(),
+                    "target_version": target_version,
                     "error": error.to_string(),
                     "current_pid": std::process::id(),
                 }),
             );
-            false
+            None
         }
     }
 }
@@ -20937,6 +21218,89 @@ mod tests {
         assert!(
             !unix_loop.contains("match handle_unix_stream(stream"),
             "unix accept loop must not let one partial client monopolize the daemon"
+        );
+    }
+
+    /// The self-retire handoff must NAME the version it is handing off to.
+    ///
+    /// Source-level because the defect is a missing ARGUMENT, and an argument
+    /// that is `None` type-checks, ships, and reports success: the handler only
+    /// promotes install-state (so the successor stays on the new version instead
+    /// of re-exec'ing back) and only takes its "a live daemon at or above the
+    /// target IS the successor" shortcut when it is TOLD a target. Measured on
+    /// the GUI host 2026-08-13 — `hot_update_handoff_prepared {spawn_ok: true,
+    /// expected_version: null}`, a daemon that stayed on 3.0.118 with 3.0.120 on
+    /// disk, and nothing on the host recording that a swap was owed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_self_retire_handoff_names_its_target_version() {
+        let source = include_str!("daemon.rs");
+        let body = source
+            .split("fn attempt_self_retire_preserving_handoff(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("the self-retire handoff should be present");
+        assert!(
+            body.contains("yggterm_executable_reported_version(&new_exe)"),
+            "the self-retire handoff must ask the replacement binary what version it is — \
+             the claim that it 'cannot cheaply read the successor's version here' was false, \
+             and the startup path had already been fixed on its own lane"
+        );
+        assert!(
+            body.contains("target_version.as_deref(),"),
+            "the probed version must reach hot_restart_detailed as expected_version; \
+             passing None makes install-state promotion and the live-successor shortcut \
+             both unreachable"
+        );
+    }
+
+    /// §4: the retire poll must QUEUE the intent and keep polling, never stop at
+    /// the first accepted handoff.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_disk_replace_retire_lane_queues_instead_of_breaking() {
+        let source = include_str!("daemon.rs");
+        let lane = source
+            .split("let swap_lane =")
+            .nth(1)
+            .and_then(|suffix| suffix.split("// No handoff: the only way out").next())
+            .expect("the queued-swap lane should be present");
+        assert!(
+            lane.contains("SwapStep::HandedOff"),
+            "the lane must branch on the swap step"
+        );
+        assert!(
+            !lane.contains("break;"),
+            "the retire poll must NOT stop after an accepted handoff — that break is why \
+             a swap that did not converge stayed un-converged forever, and why one host \
+             stacked eighteen daemons"
+        );
+        assert!(
+            lane.contains("continue"),
+            "a lingering preserved owner keeps polling so the queued swap can be retried"
+        );
+    }
+
+    #[test]
+    fn the_census_reports_a_swap_this_host_still_owes() {
+        // §8: "if a swap is waiting, something must be nameable as the thing it
+        // waits for". The census is where a human already looks for daemon
+        // trouble, so a host that owes a swap says so there.
+        let queued = crate::hot_restart_queue::QueuedHotRestart {
+            target_version: "9.9.9".to_string(),
+            daemon_executable: "/opt/example/bin/example-headless".to_string(),
+            requested_by: "disk_binary_replaced".to_string(),
+            requested_at_ms: 0,
+            attempts: 3,
+            last_attempt_ms: Some(600_000),
+            last_outcome: Some("successor never bound the target socket".to_string()),
+        };
+        let rendered = super::format_daemon_census_with_queued_swap(&[], Some(&queued), 1_800_000);
+        assert!(rendered.contains("swap owed → 9.9.9"), "{rendered}");
+        assert!(rendered.contains("30m ago"), "{rendered}");
+        assert!(
+            rendered.contains("successor never bound the target socket"),
+            "the census must name what the swap is waiting for, not just that it waits: {rendered}"
         );
     }
 

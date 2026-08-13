@@ -3537,10 +3537,31 @@ fn main() -> Result<()> {
         // different subset each time.
         let json = args.iter().any(|arg| arg == "--json");
         let rows = yggterm_server::daemon_census(store.home_dir());
+        // §4: "is a swap owed on this host?" has no other place to be asked. It
+        // is a host fact, so it rides the host-wide census rather than any one
+        // daemon's status.
+        let queued = yggterm_server::hot_restart_queue::load(store.home_dir());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
         if json {
-            println!("{}", serde_json::to_string_pretty(&rows)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "daemons": rows,
+                    "queued_hot_restart": queued,
+                }))?
+            );
         } else {
-            print!("{}", yggterm_server::format_daemon_census(&rows));
+            print!(
+                "{}",
+                yggterm_server::format_daemon_census_with_queued_swap(
+                    &rows,
+                    queued.as_ref(),
+                    now_ms
+                )
+            );
         }
         return Ok(());
     }
