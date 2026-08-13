@@ -3516,6 +3516,46 @@ while being entirely relevant to a subject-keyed one. **Pick the key that matche
 removes both failures at once, because a UUID is the only identifier in this system that belongs to
 exactly one namespace.
 
+
+### ⚠ RE-TESTED 2026-08-13 — the DANGER half is confirmed outright; the OMISSION half could not be measured, and the reason is the finding
+
+**Confirmed, from a single listing taken today:** the enumeration contains
+**two separate pairs of entries carrying byte-identical names**, distinguishable
+only by their `[ref]`. So "pick the plausible one from the list" is not merely
+risky, it is undecidable for those four — and the cost the entry prices (a
+mistaken cross-session message forcing a cold context re-read on an idle row) is
+paid by whoever guesses wrong.
+
+✅ **A mitigation has since appeared and is worth recording:** sending to a bare
+name that matches more than one entry is now **refused**, with the tool printing
+the candidate and its ref and asking for confirmation. Measured tonight — a send
+to a bare name was rejected until re-sent with the ref. That turns the dangerous
+guess into a prompt.
+
+⛔ **The OMISSION half could not be tested, and the obstacle is the same defect
+one layer down.** The listing's entries are **session names** — for most rows an
+auto-generated slug, not the row's title — and the listing carries **no session
+path and no uuid**. So a row from `server app rows` and an entry in the listing
+**cannot be matched by any field either of them publishes.** Counting is all that
+remains, and counting cannot separate "omitted" from "named differently":
+
+```
+claude-code rows the GUI reports on that machine   49   (30 of them seated)
+entries in the listing                             30
+```
+
+⇒ **The reason the original reporter had to guess by title is that there is
+nothing else to guess by**, and that is also why the claim cannot be checked.
+⭐ **The fix that makes this entry testable is the same one that makes it safe:
+put the row's session path in the listing.**
+
+⚠ **`live_member` IS NOT A LIVENESS FLAG** — noted while attempting this. All 49
+rows report `live_member: true`, including ones with no running CLI; it means
+"member of the Live group", not "the process is running". Anyone re-testing this
+by filtering on it will compare the wrong population.
+
+**Falsifier:** a listing entry and a row can be matched by a published field, and
+a row known live by uuid is present in the listing.
 ## ⛔⛔ THE BOOTER KICKED A CONTEXT-DEAD SESSION EVERY 10 MINUTES FOR TEN HOURS, AND ITS OWN LOG SAID "WORKING"
 
 **Status:** OPEN
