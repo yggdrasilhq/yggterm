@@ -1601,13 +1601,36 @@ answering for exactly the ancient versions nobody runs.
 
 ### Fixes — and the ranking below was INVERTED once the above was known
 
-1. ⭐⭐ **PRIMARY: a caller that cannot reach its pinned socket falls back to the CURRENT daemon.**
-   This is correctness and it deletes the whole class. The argument is already in the symptom —
-   **a version-pinned path is an optimisation, not an identity.**
-   ⚠ **But "same host, same home" must be CHECKED, not assumed.** Installs across `~/.local/bin`
-   and `~/.yggterm/bin` have been observed disagreeing, and if those resolve different
-   `$YGGTERM_HOME` values a fallback could silently attach a caller to a daemon owning none of its
-   sessions — **worse than the honest error, because it would succeed.**
+1. ⛔⛔ **ALREADY BUILT — DO NOT BUILD IT AGAIN. Measured 2026-08-13, and the ranking below was
+   written without checking.** "A caller that cannot reach its pinned socket falls back to the
+   current daemon" is `resolve_client_daemon_endpoint`, and it works **in both version
+   directions**. Reproduced against real binaries in an isolated `YGGTERM_HOME`, with the pinned
+   socket not merely dead but NON-EXISTENT:
+
+       daemon 3.0.132 live, no 3-0-128 socket at all   → the 3.0.128 CLI's `server status` answers,
+                                                          and its `server attach` gets a session the
+                                                          3.0.132 daemon owns (`local://…` in its
+                                                          `owned_terminal_session_keys`)
+       daemon 3.0.128 live, no 3-0-132 socket at all   → the 3.0.132 CLI answers and attaches too,
+                                                          reporting the mismatch rather than failing
+       both directions                                  → NOTHING on stderr, so neither can be what
+                                                          lands in an agent's composer
+
+   ⇒ **The ENOENT could not be reproduced from a CLI in either direction.** What remains is the
+   state the fallback is *correct* to fail in: **no reachable daemon at ANY version**, which is
+   exactly where the GUI host sat for 5.5 hours — the newest daemon twelve versions behind every
+   client, and no successor because nothing on the host could drain the swap queue. ⇒ **The cure
+   was a daemon at the current version EXISTING, not a cleverer client**, so the primary fix is
+   the queue-consumer one (§"A QUEUE WHOSE CONSUMER CAN BE OLDER THAN ITS PRODUCER" in the
+   hot-restart entry), and this line is closed.
+   ⚠ **Still unexplained, and it is the honest remainder:** whether any non-CLI caller bypasses
+   the resolver. The GUI's recovery walk has its own fallback
+   (`runtime_status_can_serve_current_app`, which deliberately refuses a daemon BEHIND the client
+   so an owed deploy is not hidden). **Reproduce before building anything here.**
+   ⚠ The old caveat still applies to whatever is built next: **"same host, same home" must be
+   CHECKED, not assumed** — installs across `~/.local/bin` and `~/.yggterm/bin` have been observed
+   disagreeing, and a fallback that attached a caller to a daemon owning none of its sessions
+   would be **worse than the honest error, because it would succeed.**
 2. **SECONDARY: make the alias set durable** (a ledger of bound versions, or a writer for
    `client-instances/`). ⛔ **This was ranked first and should not be**: it means reinstating the
    component whose silent disappearance caused this, then depending on it again. **The alias table
