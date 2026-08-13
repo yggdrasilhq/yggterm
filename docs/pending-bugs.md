@@ -1321,6 +1321,21 @@ this gap has no workaround that does not break a different rule.
 shadow (the documented pilot proof suggests so), or whether both are affected.
 That needs one capture on a real GUI, which this seat did not take.
 
+**A likely cause, and the experiment that was deliberately NOT run.** A shadow
+declares itself with a role that the daemon's gate holds to read-only — it never
+sends terminal-ensure, resize or focus, and paints from the read stream. A
+document surface is not a PTY, but it is plausible the body sits behind the same
+gate. The clean test is a full client, not a shadow, in its own compositor.
+
+⛔ **It was not run, on purpose.** A second full client on the operator's machine
+contends for session ownership, and the one-viewer-per-session assumption is
+precisely the thing the constitution names as unfixed — a spare full client
+yanking the operator's live session is a known shape here, not a hypothetical.
+The diagnostic is not worth that risk from a lane that only needed to know
+whether its own app was broken, and the control already answered that. Recorded
+so the next reader does not have to re-derive the risk before deciding, and so
+that "nobody tried it" is not mistaken for "it did not work."
+
 ## ⭐⭐ [6.8] THE KASTEN APPS ARE WAITING TO BE BUILT
 
 **Status:** OPEN
@@ -1473,9 +1488,46 @@ That control is why this is filed as its own entry above rather than carried
 here as a kasten defect. The body remains unproven either way until someone
 captures a document surface on a real GUI.
 
-**Next:** the private side — one manifest per corpus that fits, committed in that
-corpus's own repository, never here. Four of the five; the fifth is a pipeline
-rather than a corpus and gets no node overview.
+**The private side is done, and it is four manifests, not four programs.**
+Rather than hand-writing one per corpus, the engine grew an `init` verb that
+proposes a manifest by surveying what a corpus actually contains — the same
+chore, done the same way every time, instead of assembled from primitives once
+per corpus and got subtly wrong on the third. It proposes to stdout, refuses to
+overwrite an existing manifest, and emits no source it did not observe. Each
+manifest was then edited for the two things no generator can see from disk:
+what a corpus is CALLED, and which of its collections may never be published.
+
+Four corpora now carry one, each committed in its own repository and none of
+them named here. Three pushed; the fourth's repository is deliberately
+remote-less and its commit is local by design, which is a standing decision and
+not an omission.
+
+**Running it against real corpora paid for itself twice, and both were silent
+failures rather than errors:**
+
+1. **A directory node names its facts file after the node KIND**, not
+   `index.toml`. Two populated collections were reported as holding nothing.
+   Fixed by declaring it. The obvious alternative — a hard-coded list of likely
+   filenames — is the trap this whole design exists to avoid: it works on the
+   corpus it was written against and reads zero nodes on the next, which looks
+   exactly like an empty collection.
+2. **A collection rooted at the corpus itself swallowed the corpus's own index
+   files as nodes.** They parse, so the count was merely wrong and nothing
+   complained. A declared entry file now also means *a node is a directory*,
+   which is what it was always saying.
+
+**The fifth is confirmed not a corpus, by measurement rather than by repeating
+this entry's own earlier claim.** Pointed at it, `init` finds a single
+collection of two prose files and reports its other directories as holding
+nothing — they are queues, logs and a work area. It is a pipeline; a
+job-and-run view is a different program and this lane does not pretend to
+deliver one.
+
+**Still open in this entry:** the journalling half. The overview serves
+*retrieval*, which is one of the two hot paths; **capture is not built.** That
+is the next load-bearing piece, and it is the one the design value actually
+ranks — a system judged on journalling that cannot yet take an entry is a
+reader, not a journal.
 
 ## ⛔ [6.4] `server app start-page` IS A NAVIGATION VERB SHELVED AMONG THE READ VERBS
 
