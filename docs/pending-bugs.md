@@ -1446,7 +1446,7 @@ for ~11 s, which is already tracked and would produce exactly this.
 **Falsifier:** time both verbs against the same GUI at several row counts. `state`
 must not diverge from `clients` by more than the work it genuinely does more of.
 
-## ⛔ A DIRTY CHECKOUT ONLY WARNS, SO A SHIPPED BINARY STAMPED ITSELF `-dirty`
+## ⛔ A DIRTY CHECKOUT ONLY WARNS, SO A RELEASED BINARY STAMPS ITSELF `-dirty`
 
 **Status:** OPEN
 
