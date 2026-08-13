@@ -1581,34 +1581,52 @@ it does not, only the counter is.
 shared ones. A reader cannot currently tell the healthy reading from the worst
 one.
 
-## ⛔ [6.7] A DAEMON RE-DROPS THE SAME UNRECOVERABLE SESSIONS THREE TIMES A SECOND, FOREVER
+## ⛔ [6.7] A DAEMON RE-DROPPED THE SAME UNRECOVERABLE SESSIONS 3×/s — FIXED IN CODE, LIVE PROOF OWED
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*measured 2026-08-13*
+*Falsified by: `grep -c live_session_persist_dropped` on a fresh daemon's
+`event-trace.jsonl` after an hour at rest. It must equal the number of DISTINCT
+unrecoverable keys, not grow with time.*
 
-`live_session_persist_dropped` fires **92 times in 30 s (184/min)** from one
-daemon, and it is the same two keys over and over, always with
-`"reason":"not_recoverable"`:
+**Measured before the fix.** `live_session_persist_dropped` fired **92 times in
+30 s (184/min)** from one daemon — the same two keys, always
+`"reason":"not_recoverable"`. **15% of all trace lines.** `event-trace.jsonl`
+grew **13.8 MB/hour** and all `~/.yggterm/*.jsonl` together **28 MB/hour**, at
+rest, with several daemon generations each writing their own.
 
-```
-{"name":"live_session_persist_dropped","payload":{
-  "detail":{"kind":"SshShell","source":"LiveSsh","ssh_target":"…"},
-  "key":"live::<uuid>","protect_all_live":false,"reason":"not_recoverable"}}
-```
+**Root cause.** `persisted_state_with_update_protection` runs on every persist
+pass and calls `trace_drop` for each live session that fails
+`managed_live_session_is_recoverable`. There was no dedup, so a permanently
+unrecoverable session was re-judged, re-dropped and **re-logged forever**.
 
-A session judged permanently unrecoverable is re-judged, re-dropped and re-logged
-on every persist pass instead of being dropped once. It accounts for **15% of all
-trace lines** and is the visible half of the daemons' 13.9% idle CPU.
+⭐ **The compute was never the cost — the WRITE was.** The recoverability check
+is cheap; the trace is disk I/O on a machine with nothing running. A fix aimed at
+the loop rather than at the logging would have optimised the wrong half.
 
-**It also writes.** At rest `~/.yggterm/event-trace.jsonl` grows **13.8 MB/hour**
-and all `~/.yggterm/*.jsonl` together grow **28 MB/hour** — continuous disk I/O
-on a laptop with nothing running, from several daemon generations each keeping
-its own trace open. Twelve `event-trace.g*.jsonl` files of ~20 MB each were
-resident, three of them being written concurrently.
+**The fix.** `persist_drop_already_traced(key, reason)` keeps the **first**
+occurrence and drops the repetitions. The first line is the whole diagnostic —
+it names which gate dropped which key, which is what the 2026-06-11 incident
+needed — and the repetitions carry no information it does not.
 
-**Falsifier:** a session that reports `not_recoverable` must be logged once and
-never re-examined; the event rate on an idle daemon must go to zero.
+⛔ **Keyed on `(key, reason)`, not on `key`.** A session later dropped for a
+*different* reason is a new fact and must still be logged. Bounded by the number
+of session keys, so the set cannot grow without limit.
+
+**Locked by** `a_repeated_persist_drop_is_traced_once_but_a_new_reason_is_traced_again`,
+which asserts all three halves — first traced, repeat not traced, new reason
+traced again. Full suite: 1069 pass.
+
+⚠ **Checked, because the dedup is a process-global static and a test binary is
+one process:** no test anywhere asserts on persist-drop traces, so this
+introduces no order-dependence in the suite. (Two tests failed on one run and
+passed on the next; both manipulate process-global env vars — `TERM`,
+`COLORFGBG` — behind a guard, a pre-existing parallel-execution flake unrelated
+to this change.)
+
+⚠ **Not claimed: that this removes the 28 MB/hour.** It removes the largest
+single contributor (15% of lines) from *one* event. Several daemon generations
+each holding their own trace open is a separate item.
 
 ## ⛔ [6.7] A DAEMON LEAVES ITS `ssh` CHILDREN UNREAPED
 
