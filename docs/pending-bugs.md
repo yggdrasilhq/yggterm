@@ -1575,24 +1575,46 @@ why it produces two defects at once:
    save horizontal space.
 3. It is visible **only on hover**, as the close button already is.
 4. Clicking it opens the contained rows, **slightly** indented.
-5. ⛔ **THE STATUS DOTS OF ALL ROWS ARE NEVER INDENTED.** One fixed leading gutter, identical x at
-   every depth, for every row. **Only the text indents.**
+5. ⛔ **THE STATUS DOTS ARE A COLUMN OF THEIR OWN, FAR LEFT, IN A FIXED AREA** — identical on every
+   row at every depth, and on rows belonging to no set. **Only the text indents.**
+
+### The layout model this specifies — two zones, not one flow with a padding rule
+
+| zone | contents | behaviour |
+|---|---|---|
+| **gutter** | the status dot, nothing else | fixed width, flush to the far left, identical everywhere. Never shifts, shrinks, or participates in nesting |
+| **content** | icon, title, trailing controls | begins after the gutter; **the only thing indentation moves** |
+
+The three reasons are stated as requirements because they decide the trade-offs: **more room for
+titles**, **so indentation causes no further real-estate shortage**, and **it looks better**.
 
 ⭐ **Clauses 2 and 5 are one fix and clause 1 falls out of it.** Moving the disclosure to the
-trailing edge makes the leading gutter uniform, after which the indent belongs to the label alone
-and can grow with depth without ever moving a dot.
+trailing edge lets the dot sit flush left, after which the indent belongs to the label alone and can
+grow with depth without ever costing gutter space or moving a dot.
 
 ⛔ **Do not satisfy clause 1 by adding a matching left-pad to members.** That leaves clause 5
 broken and spends the horizontal space clause 2 exists to reclaim.
+
+⛔ **And a shared leading pad that happens to be equal on every row is NOT the gutter.** That is one
+zone pretending to be two, and the dots move again the moment anything else needs to sit before the
+icon. **Separate the zones structurally so the bad state is unrepresentable rather than enforced.**
+
+⚠ **The gutter must be NARROWER than today's leading run, not merely uniform.** Reclaiming the
+chevron's slot is where the extra title width comes from, and it must reach **every** row, including
+those in no set. A correct two-zone layout whose gutter is set to today's leading-run width
+satisfies every other clause, delivers none of the width, **and photographs as a success**.
+⇒ Quote the title's starting x before and after.
 
 ⚠ **A row with no seat is not part of any set and must not be moved, grouped, re-described or
 tidied by this work** — grouping makes the tree legible *without* renaming anything, which is the
 whole point of it. See the standing row-hygiene law in
 `.agents/skills/yggterm-agent-fleet/SKILL.md`.
 
-**Falsifier:** a screenshot in which a head and each of its members are sampled for dot-x — all
-equal — and label-x — strictly increasing with depth — with the disclosure control absent until the
-row is hovered.
+**Falsifier:** one screenshot sampling **every** row in the sidebar, not one set. `dot-x` is a
+single value across heads, members, nested members and rows in no set; `label-x` increases strictly
+with depth **and is smaller at depth 0 than on the build before the change**; the disclosure control
+is absent until the row is hovered. ⭐ With a real gutter the dots form one unbroken vertical line
+down the whole sidebar — **a kink at any row means the zones were never separated.**
 
 ## ⛔⛔ NOTHING PREVENTS A LOCAL TAG FROM REPUBLISHING A PRE-SCRUB LINEAGE
 
