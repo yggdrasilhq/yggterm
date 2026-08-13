@@ -35962,6 +35962,53 @@ fn try_startup_stale_daemon_hot_swap(
     }
 }
 
+/// Record that this host owes a swap, when the startup reconcile declines to
+/// take it now. §4: *"a request that cannot run now runs at the next boundary,
+/// and it is never lost."*
+///
+/// ⚠ The GUI is a PRODUCER here, never the drainer. Draining belongs to the
+/// daemon's own retire poll, which runs whether or not a GUI is attached — and a
+/// GUI that both queued and drained would be back to trying once per launch,
+/// which is the defect.
+fn queue_startup_swap_intent(
+    endpoint: &ServerEndpoint,
+    runtime_status: &ServerRuntimeStatus,
+    current_exe: &Path,
+) {
+    let Ok(home) = resolve_yggterm_home() else {
+        return;
+    };
+    let expected_version = current_version();
+    let daemon_executable = startup_hot_swap_daemon_executable(current_exe);
+    let request = yggterm_server::hot_restart_queue::QueuedHotRestart {
+        target_version: expected_version.as_str().to_string(),
+        daemon_executable: daemon_executable.display().to_string(),
+        requested_by: "gui_startup_reconcile_declined".to_string(),
+        requested_at_ms: current_millis() as u64,
+        attempts: 0,
+        last_attempt_ms: None,
+        last_outcome: Some(format!(
+            "startup reconcile declined while the {} daemon owned {} runtime(s) it could not all account for",
+            runtime_status.server_version,
+            runtime_status.owned_terminal_session_count,
+        )),
+    };
+    let decision = yggterm_server::hot_restart_queue::enqueue(&home, &request);
+    trace_daemon_step(
+        endpoint,
+        "startup_hot_swap_declined_swap_queued",
+        json!({
+            "decision": decision.word(),
+            "target_version": expected_version.as_str(),
+            "stale_version": runtime_status.server_version,
+            "stale_pid": runtime_status.server_pid,
+            "owned_terminal_session_count": runtime_status.owned_terminal_session_count,
+            "owned_terminal_session_keys": runtime_status.owned_terminal_session_keys,
+            "daemon_executable": daemon_executable.display().to_string(),
+        }),
+    );
+}
+
 fn reconcile_stale_daemon_on_startup(endpoint: &ServerEndpoint, current_exe: &Path) -> bool {
     let expected_version = current_version();
     let authorized_runtime_keys = startup_authorized_hot_update_runtime_keys();
@@ -35975,6 +36022,26 @@ fn reconcile_stale_daemon_on_startup(endpoint: &ServerEndpoint, current_exe: &Pa
                 expected_version.as_str(),
                 authorized_runtime_keys.as_ref(),
             ) else {
+                // ⛔ THE SILENT DECLINE — §4's second producer, and the one that
+                // kept a GUI host stale for a whole session.
+                //
+                // `startup_daemon_hot_swap_reason_with_authorized_keys` answers
+                // `None` when the stale daemon owns terminal runtimes whose keys
+                // are not ALL in the authorized set (`server-state.json`'s live
+                // sessions ∪ `hot-update-terminal-owners.json`). The predicate
+                // takes `all()`, so ONE unrecognised key vetoes the whole host's
+                // daemon upgrade — and a row created since the last state
+                // persist is exactly such a key. Measured on the GUI host
+                // 2026-08-13: of the stale daemon's NINE owned keys, eight were
+                // authorized and one was not, and the reconcile returned `false`
+                // with no trace and nothing left behind. The GUI ran three
+                // builds ahead of its daemon for the rest of the session.
+                //
+                // ⇒ Do NOT relax the predicate — it is the guard against handing
+                // off runtimes nobody can account for. Queue the intent and let
+                // the daemon's own retry find the moment when that key has been
+                // persisted, which is precisely what §4 exists to make possible.
+                queue_startup_swap_intent(endpoint, &runtime_status, current_exe);
                 return false;
             };
             return try_startup_stale_daemon_hot_swap(
@@ -144506,6 +144573,38 @@ mod tests {
                 .and_then(|pids| pids.first())
                 .and_then(Value::as_u64),
             Some(4102)
+        );
+    }
+
+    /// The startup reconcile must never decline in silence — §4's second
+    /// producer.
+    ///
+    /// Source-level because the defect is a MISSING CALL on an early return, and
+    /// an early return type-checks. Measured on the GUI host 2026-08-13: the
+    /// stale daemon owned nine runtimes, eight of their keys were authorized and
+    /// one was not, `startup_daemon_hot_swap_reason_with_authorized_keys`
+    /// therefore answered `None`, and this function returned `false` with no
+    /// trace and nothing left behind. The GUI ran three builds ahead of its own
+    /// daemon for the rest of the session, and nothing on the host recorded that
+    /// a swap was owed.
+    #[test]
+    fn the_startup_reconcile_queues_the_swap_it_declines_to_take() {
+        let source = include_str!("shell.rs");
+        let body = source
+            .split("fn reconcile_stale_daemon_on_startup(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("\nfn ").next())
+            .expect("the startup reconcile should be present");
+        let decline = body
+            .split("startup_daemon_hot_swap_reason_with_authorized_keys(")
+            .nth(1)
+            .and_then(|suffix| suffix.split("return try_startup_stale_daemon_hot_swap").next())
+            .expect("the decline arm should be present");
+        assert!(
+            decline.contains("queue_startup_swap_intent("),
+            "a declined reconcile must leave the intent behind for the daemon's retry — \
+             one unrecognised runtime key otherwise vetoes the whole host's daemon upgrade, \
+             silently and for as long as that row lives"
         );
     }
 
