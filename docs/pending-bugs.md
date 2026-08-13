@@ -908,6 +908,37 @@ hour on 2026-08-13, other clusters deploying. Growth measurements over hours
 need either a quiet host or the sandbox on `dev`; a GUI that vanishes mid-sample
 is usually another cluster's deploy, not your own doing.
 
+## ⛔⛔ A PRIVATE INFRASTRUCTURE NAME SITS IN THE PUBLIC REPO AS A TEST FIXTURE
+
+**Status:** OPEN
+
+Not this cluster's code; routed here because the queue is the one place it
+cannot be lost.
+
+*found 2026-08-13 by the privacy guard, while it was blocking an unrelated push*
+
+`crates/yggterm-core/src/titles.rs` (~line 1381) contains a test fixture whose
+sample strings name a **real component of the private data fabric**. It arrived
+with the 3.0.117 titles fix and is **already on `origin/main`**, so it is already
+public — this is a cleanup, not a prevention.
+
+⛔ **The term is deliberately not repeated here**, because this file is in the
+same public repo. Read the line; the guard names it on any push that touches
+that range.
+
+**The rule it breaks** is the standing one: *invent every example.* Fixtures get
+copied from whatever the author had in their head that day, and a fixture is
+exactly the kind of line nobody re-reads. Replace the sample strings with
+invented ones.
+
+⚠ **Second, separate defect exposed by the same event, and it is the more
+dangerous of the two:** the guard blocked a **later pusher** for an **earlier
+author's** line — my range was clean (`git log -S` over `origin/main..HEAD`
+empty) yet the push was refused, so the only way forward was
+`YGG_PRIVACY_ALLOW=1`. ⇒ **The guard teaches the override to the one person who
+did nothing wrong.** That is how an override becomes reflex, and the next
+genuine hit gets waved through. The scan range must be the push's own commits.
+
 ## ⛔ [6.7] THE WEB-CONTEXT SHARING INSTRUMENT IS BLIND TO THE CASE IT EXISTS TO CATCH
 
 **Status:** OPEN
