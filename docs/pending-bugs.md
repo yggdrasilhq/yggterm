@@ -299,35 +299,38 @@ nothing else is already tracked below. Same family: **a rail whose content comes
 over a bridge shows its chrome and never its payload.** Check whether one dead
 bridge explains all three before writing three fixes.
 
-## ⭐ [6.3] LIVE ROWS CANNOT BE COLLECTED INTO COLLAPSIBLE, NESTABLE SETS
+## ⭐ [6.3] ROW SETS CANNOT BE ARRANGED BY HAND OR BY A VERB
 
 **Status:** OPEN
 
-*asked 2026-08-13; extended twice the same day*
+*asked 2026-08-13; extended twice the same day; narrowed once the default
+arrangement shipped*
 
-A **row set** is a set of live-session rows collected under one of them and
-collapsible as a unit — `6.0` heading `6.1`, `6.2`, `6.3`, hidden until it is
-expanded. Sets must NEST arbitrarily deep, because orchestration is recursive
-and seats now go `N.x.y.z…`. An agent must be able to arrange rows from a verb
-as easily as a hand can by dragging.
+⛔ **The whole rule is in `DESIGN.md` §"Row sets".** It is settled and it is not
+re-opened here: the noun is **`row set`** (`section` collides with
+`AppPaneWidget::Section`; `group` is splits and `folder` is the cwd tree); a set
+means NOTHING but arrangement; a split is a view and a row set is an
+arrangement, and **neither may relocate the other**; each set keeps its own
+collapsed flag through an outer collapse.
 
-⛔ **The whole rule, including the noun and the collision with splits, is in
-`DESIGN.md` §"Row sets".** It is settled and it is not re-opened here: the noun
-is **`row set`** (`section` collides with `AppPaneWidget::Section`; `group` is
-splits and `folder` is the cwd tree); a set means NOTHING but arrangement; a
-split is a view and a row set is an arrangement, and **neither may relocate the
-other**; each set keeps its own collapsed flag through an outer collapse.
+What is left is the ARRANGING, both halves of it — the default arrangement (the
+outline's own nesting) is drawn, so this entry is now only about overriding it:
 
-⚠ **THE DRAG HALF DOES NOT EXIST — do not plan around reusing it.** Measured
-2026-08-13 by reading the resolver: `row_drop_placement_for_offset` returns
-`Into` only when the target row `is_group`, and a live-session row is not a
-group, so a row dropped on another row can only land Before or After it.
-`live_session_drop_target` then passes that straight to the reorder. ⇒ Dragging
-one live row onto another REORDERS it today and forms nothing. Giving session
-rows an inside band is new behaviour, and it is the first thing to build.
+1. ⚠ **THE INSIDE BAND ON A SESSION ROW DOES NOT EXIST — do not plan around
+   reusing it.** Measured 2026-08-13 by reading the resolver:
+   `row_drop_placement_for_offset` returns `Into` only when the target row
+   `is_group`, and a live-session row is not a group, so a row dropped on another
+   row can only land Before or After it. `live_session_drop_target` then passes
+   that straight to the reorder. ⇒ Dragging one live row onto another REORDERS it
+   and forms nothing.
+2. **The CLI verb** (`server app row-set …`), so a delegate can arrange rows as
+   easily as a hand can. Both halves exist or neither is real.
+3. **Where an explicit arrangement is kept.** The derived one needs no storage;
+   an explicit one does, and `row_set_outline::sidebar_row_sets` is shaped to
+   take it as a third argument that wins per row.
 
-**Falsifier for the finished feature:** collapse an outer set that contains a
-collapsed inner set and an expanded one, expand the outer again, and find both
+**Falsifier for the finished feature:** arrange an outer set holding a collapsed
+inner set and an expanded one, collapse the outer, expand it again, and find both
 inner sets exactly as they were.
 
 ## ⛔⛔ [6.4] A libyggterm APP SPAWNED FOR A ROW RUNS ON THE WRONG MACHINE

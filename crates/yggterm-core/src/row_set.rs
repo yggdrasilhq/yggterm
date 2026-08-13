@@ -150,6 +150,30 @@ impl RowSets {
         self.collapsed.contains(head)
     }
 
+    /// How many rows sit beneath `path`, however deep, and whether or not it is
+    /// collapsed.
+    ///
+    /// ⚖ Deliberately blind to the collapsed flags: this is the number a shut
+    /// set puts next to its disclosure control, and a count that fell to zero
+    /// the moment it was needed would be worse than no count at all.
+    pub fn descendant_count(&self, path: &str) -> usize {
+        let mut count = 0usize;
+        let mut seen = HashSet::new();
+        let mut stack = vec![path.to_string()];
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current.clone()) {
+                // Only reachable from a hand-edited file; `insert_member`
+                // refuses cycles. Counting must still terminate.
+                continue;
+            }
+            for member in self.members_of(&current) {
+                count += 1;
+                stack.push(member.clone());
+            }
+        }
+        count
+    }
+
     /// Collapse or expand ONE set. Touches no other set's flag — that is the
     /// whole point of storing the flags apart from the containment.
     pub fn set_collapsed(&mut self, head: &str, collapsed: bool) {

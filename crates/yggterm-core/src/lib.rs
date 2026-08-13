@@ -49,10 +49,16 @@ mod retention;
 /// 2026-07-30.
 pub mod session_bus;
 mod session_kind;
+/// HOW ROWS ARE ARRANGED — the containment relation behind collapsible sets of
+/// live rows. Knows nothing about seats; see `row_set_outline` for the bridge.
+pub mod row_set;
+/// THE DEFAULT ARRANGEMENT — the row sets the seats themselves imply (`6.1`
+/// under `6.0`, `6.1.1` under `6.1`). The one place a seat may produce a
+/// containment edge.
+pub mod row_set_outline;
 /// WHERE A ROW SITS — the owner's `0 / 1 / 1.1 / 2` sidebar outline, parsed and
 /// compared as integers per dotted segment. One owner for the sort key, so a
 /// verb can never report an order the sidebar does not draw.
-pub mod row_set;
 pub mod session_outline;
 mod telemetry;
 /// How a text payload reaches a terminal composer — and why an agent CLI needs

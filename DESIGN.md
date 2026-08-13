@@ -1286,6 +1286,28 @@ rewrite it as a side effect.
 `N.x.y.z…`. The model is a containment relation — a set holds rows *and other
 sets* — never a boolean or a single non-recursive parent field.
 
+**THE DEFAULT ARRANGEMENT IS THE OUTLINE ITSELF, and it is not decoration.** The
+owner's rule, and the standing principle he settled it as: *group `N.x` rows
+under `N.0` as the header, and `N.x.y` rows under their `N.x` header where
+applicable* — this replaces ad-hoc row tidying as the way a fleet's structure is
+made legible. So a head is found by looking, in order, for the **`.0` seat of the
+row's own level** (`6.1` and `6.2` sit under `6.0`; `6.1.1` sits under `6.1.0`
+when a sub-orchestrator holds that seat), and failing that the **bare parent
+seat** (`6.1.1` under `6.1`). One rule at every depth, which is what makes the
+nesting recursive rather than two hard-coded levels.
+
+- ⛔ **Derived every frame from `outline_prefix`, never stored and never parsed
+  out of a title.** The seats already carry this; a written-down copy would go
+  stale the moment a delegate is reseated or reaped, and a seat read back out of
+  prose is destroyed by the next re-title. `row_set_outline` is the ONE place a
+  seat may produce a containment edge.
+- ⛔ **A head is a ROW, not a heading.** If nobody holds `6.0`, then `6.1` and
+  `6.2` stay top level rather than collecting under an invented placeholder: a
+  synthetic head could not be clicked, closed or driven.
+- **Membership stays arbitrary.** This is the *default*, so an explicit
+  arrangement — the verb and the drag — overrides it per row and never has to
+  fight it.
+
 - **Each set owns its own collapsed flag**, and collapsing an outer set hides
   everything beneath it without touching the inner flags. Re-expanding restores
   each inner set exactly as it was. ⛔ Flattening the inner sets open on expand
@@ -1293,7 +1315,9 @@ sets* — never a boolean or a single non-recursive parent field.
 - **Indentation is budgeted.** The sidebar runs out of horizontal room before
   the outline runs out of levels. Indent the first two levels; past that, hold
   the indent and let the head's own number carry the depth — a title clipped to
-  nothing is worse than a column that stops stepping.
+  nothing is worse than a column that stops stepping. ⚠ The rows past the budget
+  are still fully NESTED — drawn under their head and hidden with it; only the
+  left edge stops moving.
 
 #### Row sets and splits are orthogonal, and neither may relocate the other
 

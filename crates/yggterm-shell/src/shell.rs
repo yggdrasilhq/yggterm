@@ -18713,6 +18713,10 @@ impl ShellState {
             self.server.ssh_targets(),
             &sidebar_hot_sessions,
             &merged_expanded_paths,
+            // The rendered sidebar is the ONE surface that draws a shut row set;
+            // every other consumer of the merge asks a question a collapse
+            // cannot change.
+            &self.user_collapsed_synthetic_paths,
         );
         enrich_sidebar_rows_with_live_titles(
             &mut merged_rows,
@@ -22366,6 +22370,11 @@ impl ShellState {
             self.server.ssh_targets(),
             &live_sessions,
             &search_expanded,
+            // Search reaches INTO shut containers — that is what
+            // `search_expanded_paths` above is for — so a row set is opened
+            // here for the same reason a folder is. A match the user cannot be
+            // shown is not a match.
+            &HashSet::new(),
         );
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -39416,6 +39425,11 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
         shell.server.ssh_targets(),
         &shell.server.live_sessions(),
         &expanded_paths,
+        // ⛔ EVERY SET OPEN, deliberately. This resolves the row an agent named;
+        // whether the user has shut the set it sits in is a fact about the
+        // screen, and a verb that stopped working because a human collapsed
+        // something would be the row plane leaking the sidebar's state.
+        &HashSet::new(),
     );
     enrich_sidebar_rows_with_live_titles(
         &mut merged_rows,
@@ -39756,10 +39770,21 @@ fn hot_session_paths_sorted(shell: &ShellState) -> Vec<String> {
     hot
 }
 fn set_app_control_row_expanded(shell: &mut ShellState, row: &BrowserRow, expanded: bool) {
-    if row.kind != BrowserRowKind::Group {
+    if row.expanded == expanded {
         return;
     }
-    if row.expanded == expanded {
+    // A row set's head is an ordinary session row, so it collapses through the
+    // one store that already answers "which containers has the user shut?" —
+    // the same set a machine root or the Live Sessions group uses, persisted the
+    // same way, and outranking the auto-reveal seeding the same way. A second
+    // store keyed on a different kind of path would be two answers to one
+    // question.
+    if row_heads_a_row_set(row) {
+        shell.update_synthetic_group_collapse_state(&row.full_path, expanded);
+        shell.sync_browser_settings();
+        return;
+    }
+    if row.kind != BrowserRowKind::Group {
         return;
     }
     if is_synthetic_sidebar_row(row) {
@@ -44567,6 +44592,7 @@ fn sidebar_merge_cache_key(
     ssh_targets: &[SshConnectTarget],
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
+    collapsed_row_set_heads: &HashSet<String>,
 ) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for row in stored_rows {
@@ -44669,6 +44695,13 @@ fn sidebar_merge_cache_key(
         session.host_label.hash(&mut hasher);
         session.ssh_target.hash(&mut hasher);
         session.ssh_prefix.hash(&mut hasher);
+        // ⛔ THE SEAT DECIDES SHAPE, NOT ONLY TEXT. Before row sets it only
+        // reached the label, which `enrich_sidebar_rows_with_live_titles`
+        // re-composes AFTER this cache — so a missing hash here cost nothing.
+        // The seat now decides which rows nest under which, and that is built
+        // inside the cached merge: leave it out and reseating a delegate would
+        // leave the outline drawn the old way until some unrelated field moved.
+        session.outline_prefix.hash(&mut hasher);
         for entry in &session.metadata {
             entry.label.hash(&mut hasher);
             entry.value.hash(&mut hasher);
@@ -44681,6 +44714,12 @@ fn sidebar_merge_cache_key(
     for path in expanded {
         path.hash(&mut hasher);
         0xf9_u8.hash(&mut hasher);
+    }
+    let mut collapsed = collapsed_row_set_heads.iter().collect::<Vec<_>>();
+    collapsed.sort();
+    for path in collapsed {
+        path.hash(&mut hasher);
+        0xf7_u8.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -49017,6 +49056,13 @@ fn schedule_terminal_focus_after_activation(state: Signal<ShellState>, session_p
         "#
     ));
 }
+/// The merged sidebar with every row set drawn OPEN.
+///
+/// The shape questions this answers — is a row present, where does it sit, what
+/// is it called — are all independent of whether a set is shut, so the callers
+/// that ask them (drag targeting, reorder planning, restore telemetry) need no
+/// collapse state and do not carry one. Only the rendered snapshot does, and it
+/// calls [`merged_sidebar_rows_traced`] with the user's own set.
 fn merged_sidebar_rows(
     stored_rows: &[BrowserRow],
     remote_machines: &[RemoteMachineSnapshot],
@@ -49031,6 +49077,7 @@ fn merged_sidebar_rows(
         ssh_targets,
         live_sessions,
         expanded_paths,
+        &HashSet::new(),
     )
 }
 fn merged_sidebar_rows_with_projection_rows(
@@ -49040,6 +49087,7 @@ fn merged_sidebar_rows_with_projection_rows(
     ssh_targets: &[SshConnectTarget],
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
+    collapsed_row_set_heads: &HashSet<String>,
 ) -> Vec<BrowserRow> {
     let remote_session_count = remote_machines
         .iter()
@@ -49054,6 +49102,7 @@ fn merged_sidebar_rows_with_projection_rows(
         ssh_targets,
         live_sessions,
         expanded_paths,
+        collapsed_row_set_heads,
     );
     let key_ms = key_started_at.elapsed().as_secs_f64() * 1000.0;
     let cache_lookup_started_at = Instant::now();
@@ -49090,6 +49139,7 @@ fn merged_sidebar_rows_with_projection_rows(
         ssh_targets,
         live_sessions,
         expanded_paths,
+        collapsed_row_set_heads,
     );
     let uncached_ms = uncached_started_at.elapsed().as_secs_f64() * 1000.0;
     if let Ok(mut cache) = sidebar_merge_cache().lock() {
@@ -49143,6 +49193,7 @@ fn merged_sidebar_rows_traced(
     ssh_targets: &[SshConnectTarget],
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
+    collapsed_row_set_heads: &HashSet<String>,
 ) -> Vec<BrowserRow> {
     let remote_session_count = remote_machines
         .iter()
@@ -49161,6 +49212,7 @@ fn merged_sidebar_rows_traced(
             ssh_targets,
             live_sessions,
             expanded_paths,
+            collapsed_row_set_heads,
         );
     }
     let perf_home = perf_home_dir(settings_path);
@@ -49172,6 +49224,7 @@ fn merged_sidebar_rows_traced(
         ssh_targets,
         live_sessions,
         expanded_paths,
+        collapsed_row_set_heads,
     );
     let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     if duration_ms >= 4.0 || remote_session_count >= 500 {
@@ -49233,6 +49286,7 @@ fn merged_sidebar_rows_uncached(
     ssh_targets: &[SshConnectTarget],
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
+    collapsed_row_set_heads: &HashSet<String>,
 ) -> Vec<BrowserRow> {
     let stored_rows = filter_stored_rows_for_expansion(stored_rows, expanded_paths);
     let stored_projection_rows = filter_remote_workspace_projection_rows(stored_projection_rows);
@@ -49382,6 +49436,7 @@ fn merged_sidebar_rows_uncached(
         &display_promoted_sessions,
         &remote_session_index,
         expanded_paths,
+        collapsed_row_set_heads,
     );
     let push_live_ms = push_live_started_at.elapsed().as_secs_f64() * 1000.0;
     let push_remote_started_at = Instant::now();
@@ -49629,11 +49684,30 @@ fn build_remote_session_index(remote_machines: &[RemoteMachineSnapshot]) -> Remo
     }
     index
 }
+/// Does this row head a row set — is it drawn with a disclosure control?
+///
+/// ⭐ **The count IS the answer, and that is not a shortcut.** A row's
+/// `descendant_sessions` has always meant "sessions beneath me": 1 for a leaf,
+/// N for a folder. A Live-Sessions head counts its members in the same field, so
+/// the disclosure control, the count badge and the folder rows all read one
+/// number rather than a second flag that could disagree with it.
+///
+/// The split compound row is excluded BY PATH: it also counts (its panes), but a
+/// split is a VIEW and a row set is an ARRANGEMENT — `DESIGN.md` §"Row sets and
+/// splits are orthogonal" — and giving it a disclosure control would offer to
+/// collapse rows it does not hold.
+fn row_heads_a_row_set(row: &BrowserRow) -> bool {
+    matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
+        && row.descendant_sessions > 1
+        && !row.full_path.starts_with("split://")
+}
+
 fn push_live_session_rows(
     rows: &mut Vec<BrowserRow>,
     sessions: &[&ManagedSessionView],
     remote_session_index: &RemoteSessionIndex,
     expanded_paths: &HashSet<String>,
+    collapsed_row_set_heads: &HashSet<String>,
 ) {
     if sessions.is_empty() {
         return;
@@ -49666,46 +49740,96 @@ fn push_live_session_rows(
             .collect::<Vec<_>>(),
     );
     let seats = live_session_seats(sessions.iter().copied());
-    for session in sessions {
-        let cwd = metadata_value(session, "Cwd");
-        let label =
-            live_session_label_with_index(remote_session_index, session, &short_ids, &seats);
-        let detail_label = {
-            let summary = live_session_summary_with_index(remote_session_index, session);
-            live_session_detail_label(summary, live_session_keep_alive(session))
-        };
-        let full_path = if session.kind == SessionKind::Document {
-            session
-                .metadata
-                .iter()
-                .find(|entry| entry.label == "Path")
-                .map(|entry| entry.value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| normalize_live_session_path(&session.session_path))
-        } else {
-            normalize_live_session_path(&session.session_path)
-        };
-        rows.push(BrowserRow {
-            kind: if session.kind == SessionKind::Document {
-                BrowserRowKind::Document
-            } else {
-                BrowserRowKind::Session
-            },
-            full_path,
-            label: label.clone(),
-            detail_label,
-            document_kind: (session.kind == SessionKind::Document)
-                .then_some(WorkspaceDocumentKind::Note),
-            group_kind: None,
-            session_title: Some(label),
-            depth: 1,
-            host_label: session.host_label.clone(),
-            descendant_sessions: 1,
-            expanded: true,
-            session_id: Some(session.id.clone()),
-            session_cwd: (!cwd.trim().is_empty()).then_some(cwd),
-            session_kind: Some(session.kind),
-        });
+    // ⭐ ROW SETS. The seats the rows already hold say which of them belong
+    // together — `6.1` under `6.0`, `6.1.1` under `6.1` — and
+    // `row_set_outline` is the one place that reading happens. Built here, from
+    // the paths the rows are ABOUT to carry, so a Document row is arranged by
+    // the file path it will show rather than by its session path.
+    //
+    // ⛔ Derived, never stored: a saved copy would disagree with the seats the
+    // moment a delegate is reseated or reaped.
+    let row_paths: Vec<String> = sessions
+        .iter()
+        .map(|session| live_session_row_path(session))
+        .collect();
+    let row_sets = yggterm_core::row_set_outline::sidebar_row_sets(
+        row_paths
+            .iter()
+            .zip(sessions.iter())
+            .map(|(path, session)| (path.as_str(), session.outline_prefix.as_deref())),
+        collapsed_row_set_heads,
+    );
+    // Two live rows CAN name one path (a document open twice over). The
+    // arrangement holds each path once, so the emit walks the sessions AT a
+    // path rather than assuming one — otherwise nesting would silently drop a
+    // row the flat list used to draw.
+    let mut sessions_at_path: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, path) in row_paths.iter().enumerate() {
+        sessions_at_path.entry(path.as_str()).or_default().push(index);
+    }
+    for (path, nesting) in row_sets.visible_rows(row_paths.iter().map(String::as_str)) {
+        for index in sessions_at_path.get(path.as_str()).into_iter().flatten() {
+            let session = sessions[*index];
+            let cwd = metadata_value(session, "Cwd");
+            let label =
+                live_session_label_with_index(remote_session_index, session, &short_ids, &seats);
+            let detail_label = {
+                let summary = live_session_summary_with_index(remote_session_index, session);
+                live_session_detail_label(summary, live_session_keep_alive(session))
+            };
+            rows.push(BrowserRow {
+                kind: if session.kind == SessionKind::Document {
+                    BrowserRowKind::Document
+                } else {
+                    BrowserRowKind::Session
+                },
+                full_path: path.clone(),
+                label: label.clone(),
+                detail_label,
+                document_kind: (session.kind == SessionKind::Document)
+                    .then_some(WorkspaceDocumentKind::Note),
+                group_kind: None,
+                session_title: Some(label),
+                // Live Sessions rows sit at depth 1; a set adds its own.
+                // ⚠ INDENTATION IS BUDGETED (`DESIGN.md` §"Row sets"): step two
+                // levels, then hold and let the head's own number carry the
+                // depth. A title clipped to nothing is worse than a column that
+                // stops stepping.
+                depth: 1 + nesting.min(ROW_SET_MAX_INDENT_LEVELS),
+                host_label: session.host_label.clone(),
+                descendant_sessions: 1 + row_sets.descendant_count(&path),
+                expanded: !row_sets.is_collapsed(&path),
+                session_id: Some(session.id.clone()),
+                session_cwd: (!cwd.trim().is_empty()).then_some(cwd),
+                session_kind: Some(session.kind),
+            });
+        }
+    }
+}
+
+/// How many levels of a row set's nesting the sidebar actually indents.
+///
+/// `DESIGN.md` §"Row sets": the sidebar runs out of horizontal room long before
+/// the outline runs out of levels, so past this the indent holds and the head's
+/// own number carries the depth.
+const ROW_SET_MAX_INDENT_LEVELS: usize = 2;
+
+/// The sidebar path a live session's own row carries.
+///
+/// A Document row is addressed by the FILE it shows — that is the path the tree,
+/// the selection and the arrangement all key on — and every other session by its
+/// normalized session path.
+fn live_session_row_path(session: &ManagedSessionView) -> String {
+    if session.kind == SessionKind::Document {
+        session
+            .metadata
+            .iter()
+            .find(|entry| entry.label == "Path")
+            .map(|entry| entry.value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| normalize_live_session_path(&session.session_path))
+    } else {
+        normalize_live_session_path(&session.session_path)
     }
 }
 /// A synthetic compound sidebar row for a split group — a miniature map of the
@@ -89093,6 +89217,11 @@ fn SidebarRow(
     let icon_focus_path = row.full_path.clone();
     let label_focus_path = row.full_path.clone();
     let row_is_group = row.kind == BrowserRowKind::Group;
+    // A row set's head. `DESIGN.md` §"Row sets": the sidebar shows no noun at
+    // all for a set, only a disclosure control on the head — so this is the ONE
+    // thing the head looks different by.
+    let row_is_row_set_head = row_heads_a_row_set(&row);
+    let row_set_member_count = row.descendant_sessions.saturating_sub(1);
     let row_expanded = row.expanded;
     let row_toggle_target_expanded = !row.expanded;
     rsx! {
@@ -89220,10 +89349,14 @@ fn SidebarRow(
                 on_end_drag.call(());
             },
             onkeydown: move |evt| {
-                if !row_is_group {
+                // Arrows open and shut anything that HOLDS rows — a folder, a
+                // machine, or a row set's head. Enter stays a group's alone: on
+                // a session row it belongs to opening the session.
+                let holds_rows = row_is_group || row_is_row_set_head;
+                if !holds_rows {
                     return;
                 }
-                if evt.key() == Key::Enter {
+                if row_is_group && evt.key() == Key::Enter {
                     evt.prevent_default();
                     evt.stop_propagation();
                     on_select.call(TreeSelectionMode::Replace);
@@ -89269,6 +89402,43 @@ fn SidebarRow(
                     // and truncates at the row's own edge instead of 24px short.
                     div {
                     style: "display:flex; align-items:center; gap:8px; min-width:0; flex:1 1 auto;",
+                    // THE DISCLOSURE CONTROL ON A ROW SET'S HEAD. Leading, so
+                    // the head reads as the thing its members hang from — and
+                    // only on a head, because a slot reserved on every row would
+                    // push the whole rail sideways to signal nothing.
+                    if row_is_row_set_head {
+                        button {
+                            "data-sidebar-row-set-disclosure": "1",
+                            "data-sidebar-row-set-expanded": if row_expanded { "true" } else { "false" },
+                            "data-sidebar-row-set-members": "{row_set_member_count}",
+                            // Per-element (§12.1), reason "list-item": one per
+                            // head of an unbounded list (§8), exactly as the
+                            // group expander is exempted.
+                            "data-keytip-exempt": "list-item",
+                            "data-sidebar-row-toggle-target": "expander",
+                            title: if row_expanded { "Collapse this group of rows" } else { "Expand this group of rows" },
+                            style: format!(
+                                "display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto; \
+                                 width:16px; height:18px; border:none; border-radius:5px; background:transparent; \
+                                 color:{}; padding:0; margin-right:-2px; font-size:9.5px; cursor:pointer;",
+                                palette.muted
+                            ),
+                            onmousedown: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onmouseup: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onclick: move |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                                on_set_expanded.call(row_toggle_target_expanded);
+                            },
+                            RowDisclosureChevron { expanded: row_expanded }
+                        }
+                    }
                     if show_live_close {
                         span {
                             "data-sidebar-live-session-status-rail": "1",
@@ -156770,6 +156940,217 @@ mod tests {
             &target
         ));
     }
+    /// A seated row and its path, for the row-set tests below. The seat is the
+    /// only thing that decides an arrangement, so it is the only thing that
+    /// varies.
+    fn seated_live_session(path: &str, seat: &str) -> ManagedSessionView {
+        let mut session = test_live_shell_session(path);
+        session.source = SessionSource::LiveSsh;
+        session.host_label = "dev".to_string();
+        session.outline_prefix = (!seat.is_empty()).then(|| seat.to_string());
+        session
+    }
+
+    fn live_rows_for_seats(
+        seats: &[(&str, &str)],
+        collapsed: &HashSet<String>,
+    ) -> Vec<(String, usize)> {
+        let live_sessions: Vec<ManagedSessionView> = seats
+            .iter()
+            .map(|(path, seat)| seated_live_session(path, seat))
+            .collect();
+        let mut expanded = HashSet::new();
+        expanded.insert("__live_sessions__".to_string());
+        merged_sidebar_rows_with_projection_rows(
+            &[],
+            &[],
+            &[],
+            &[],
+            &live_sessions,
+            &expanded,
+            collapsed,
+        )
+        .into_iter()
+        .filter(|row| row.kind == BrowserRowKind::Session)
+        .map(|row| (row.full_path, row.depth))
+        .collect()
+    }
+
+    /// THE OWNER'S ASK, at the surface that draws it: `N.x` sits under `N.0`,
+    /// `N.x.y` under its `N.x`, and the sidebar reads as one outline.
+    #[test]
+    fn live_rows_nest_under_the_seat_that_heads_them() {
+        assert_eq!(
+            live_rows_for_seats(
+                &[
+                    ("remote-session://dev/orch", "6.0"),
+                    ("remote-session://dev/gate", "6.1"),
+                    ("remote-session://dev/gate-a", "6.1.1"),
+                    ("remote-session://dev/ux", "6.3"),
+                    ("remote-session://dev/loose", ""),
+                ],
+                &HashSet::new(),
+            ),
+            vec![
+                ("remote-session://dev/orch".to_string(), 1),
+                ("remote-session://dev/gate".to_string(), 2),
+                ("remote-session://dev/gate-a".to_string(), 3),
+                ("remote-session://dev/ux".to_string(), 2),
+                ("remote-session://dev/loose".to_string(), 1),
+            ],
+            "Live Sessions rows start at depth 1; each level of the set adds one"
+        );
+    }
+
+    /// Two books at once — the live sidebar always has more than one campaign —
+    /// and neither reaches into the other.
+    #[test]
+    fn concurrent_books_each_keep_their_own_head() {
+        assert_eq!(
+            live_rows_for_seats(
+                &[
+                    ("remote-session://dev/six", "6.0"),
+                    ("remote-session://dev/six-a", "6.1"),
+                    ("remote-session://dev/nine", "9.0"),
+                    ("remote-session://dev/nine-a", "9.1"),
+                ],
+                &HashSet::new(),
+            ),
+            vec![
+                ("remote-session://dev/six".to_string(), 1),
+                ("remote-session://dev/six-a".to_string(), 2),
+                ("remote-session://dev/nine".to_string(), 1),
+                ("remote-session://dev/nine-a".to_string(), 2),
+            ]
+        );
+    }
+
+    /// A shut set hides what is under it and keeps its own row — a head that
+    /// hid itself could never be reopened.
+    #[test]
+    fn a_collapsed_head_hides_its_members_and_stays_on_screen() {
+        let collapsed: HashSet<String> = ["remote-session://dev/orch".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            live_rows_for_seats(
+                &[
+                    ("remote-session://dev/orch", "6.0"),
+                    ("remote-session://dev/gate", "6.1"),
+                    ("remote-session://dev/gate-a", "6.1.1"),
+                    ("remote-session://dev/loose", ""),
+                ],
+                &collapsed,
+            ),
+            vec![
+                ("remote-session://dev/orch".to_string(), 1),
+                ("remote-session://dev/loose".to_string(), 1),
+            ]
+        );
+    }
+
+    /// ⛔ INDENTATION IS BUDGETED (`DESIGN.md` §"Row sets"). Past two levels the
+    /// indent holds and the head's own number carries the depth, because a title
+    /// clipped to nothing is worse than a column that stops stepping.
+    #[test]
+    fn indentation_stops_stepping_once_the_sidebar_runs_out_of_room() {
+        let rows = live_rows_for_seats(
+            &[
+                ("remote-session://dev/a", "6.0"),
+                ("remote-session://dev/b", "6.1"),
+                ("remote-session://dev/c", "6.1.1"),
+                ("remote-session://dev/d", "6.1.1.1"),
+                ("remote-session://dev/e", "6.1.1.1.1"),
+            ],
+            &HashSet::new(),
+        );
+        let depths: Vec<usize> = rows.iter().map(|(_, depth)| *depth).collect();
+        assert_eq!(
+            depths,
+            vec![1, 2, 3, 3, 3],
+            "the fourth and fifth levels are still NESTED — they are drawn under \
+             their head and hidden with it — they simply stop moving right"
+        );
+    }
+
+    /// The head is the only row that gets a disclosure control, and it reports
+    /// how many rows it holds. A split's compound row counts panes and must
+    /// never offer to collapse them.
+    #[test]
+    fn only_a_head_is_drawn_with_a_disclosure_control() {
+        let live_sessions: Vec<ManagedSessionView> = [
+            ("remote-session://dev/orch", "6.0"),
+            ("remote-session://dev/gate", "6.1"),
+            ("remote-session://dev/gate-a", "6.1.1"),
+        ]
+        .iter()
+        .map(|(path, seat)| seated_live_session(path, seat))
+        .collect();
+        let mut expanded = HashSet::new();
+        expanded.insert("__live_sessions__".to_string());
+        let rows = merged_sidebar_rows(&[], &[], &[], &live_sessions, &expanded);
+        let head = rows
+            .iter()
+            .find(|row| row.full_path == "remote-session://dev/orch")
+            .expect("head row");
+        let leaf = rows
+            .iter()
+            .find(|row| row.full_path == "remote-session://dev/gate-a")
+            .expect("leaf row");
+        assert!(row_heads_a_row_set(head));
+        assert_eq!(
+            head.descendant_sessions, 3,
+            "itself plus the two rows beneath it, however deep they sit"
+        );
+        assert!(!row_heads_a_row_set(leaf));
+        assert_eq!(leaf.descendant_sessions, 1);
+        let mut split_row = head.clone();
+        split_row.full_path = "split://group-1".to_string();
+        assert!(
+            !row_heads_a_row_set(&split_row),
+            "a split is a VIEW, not an arrangement — it counts its panes in the \
+             same field and must not offer to collapse rows it does not hold"
+        );
+    }
+
+    /// ⛔ THE CACHE MUST SEE THE SEAT. Reseating a row rearranges the sidebar,
+    /// and the merge is memoized — before row sets the seat only reached the
+    /// label, which is re-composed after the cache, so leaving it out of the key
+    /// cost nothing and would now leave the outline drawn the old way.
+    #[test]
+    fn reseating_a_row_rebuilds_the_outline_rather_than_serving_the_cached_one() {
+        let flat = live_rows_for_seats(
+            &[
+                ("remote-session://dev/orch", "6.0"),
+                ("remote-session://dev/gate", "7.0"),
+            ],
+            &HashSet::new(),
+        );
+        assert_eq!(
+            flat,
+            vec![
+                ("remote-session://dev/orch".to_string(), 1),
+                ("remote-session://dev/gate".to_string(), 1),
+            ],
+            "two books, both top level"
+        );
+        let nested = live_rows_for_seats(
+            &[
+                ("remote-session://dev/orch", "6.0"),
+                ("remote-session://dev/gate", "6.1"),
+            ],
+            &HashSet::new(),
+        );
+        assert_eq!(
+            nested,
+            vec![
+                ("remote-session://dev/orch".to_string(), 1),
+                ("remote-session://dev/gate".to_string(), 2),
+            ],
+            "the same rows, reseated, must nest — a stale cache entry would not"
+        );
+    }
+
     #[test]
     fn live_session_drag_drop_reorders_live_group() {
         let path_a = "remote-session://dev/a";
@@ -161554,6 +161935,7 @@ mod tests {
             &[],
             &[],
             &expanded,
+            &HashSet::new(),
         );
 
         assert!(rows.iter().any(|row| {
@@ -161607,6 +161989,7 @@ mod tests {
             &[],
             &[],
             &expanded,
+            &HashSet::new(),
         );
         assert!(rows.iter().any(|row| {
             row.full_path == "__remote_folder__/practice/home/user/git/samplers"
