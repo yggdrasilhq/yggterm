@@ -169,79 +169,30 @@ not hold focus**. The composite path is already the trustworthy one.
 **Falsifier:** with the GUI unfocused, `screenshot --pid <gui>` returns a frame
 of that GUI, or refuses.
 
-## ⛔⛔ TWO CLUSTERS TAKE THE SAME VERSION NUMBER, AND A DEPLOY FROM A PRE-REBASE TREE SILENTLY REVERTS THE OTHER'S FIX
+## ⛔ THE CENSUS STILL CANNOT ASK A DEPLOYED BINARY WHICH SOURCE IT IS
 
 **Status:** OPEN
 
-*Measured 2026-08-13 by cluster 6.2, which lost a full build → deploy → restart
-→ probe cycle to it and read a FALSE RED at the end.*
+*residual of the version-collision entry, which closed 2026-08-13 once the stamp
+was live-proven: `--build-commit` on the desktop host answered `e8d765c7e6ba`,
+equal to the deploying tree's HEAD, with the deployed md5 identical to the build
+product's. The guard, the stamp and the allocation verb all shipped.*
 
-`3.0.117`, `3.0.118` and `3.0.119` were each allocated **twice within minutes**
-by clusters working in parallel. Nothing arbitrates the number: a cluster reads
-`Cargo.toml`, adds one, and pushes; a second cluster that read the same file
-before the first push takes the same number. `deploy-fleet.sh` then does its job
-perfectly and prints `every copy on every host reads back at 3.0.118` — while
-two different builds are wearing that string across the fleet.
+`deploy-fleet.sh`'s census prints **the deploying build's** commit and md5s, and
+compares each host's copy by md5 alone. It does not ask each copy
+`yggterm --build-commit`, which is the direct question.
 
-**The compound failure, and it is the expensive part.** A cluster that built
-before rebasing deploys a binary that lacks the other's commit. That deploy
-lands over the first, the GUI hot-restarts onto it (a re-exec keeps the pid, so
-`/proc/<pid>/exe` still reads the clean path and nothing looks stale), and the
-first cluster's live probe then comes back **RED against a binary that never
-carried its fix**. The obvious reading of that result is *"my root cause was
-wrong"* — the single most expensive wrong conclusion available, since the
-correct response is to re-derive a diagnosis that was right all along.
+⛔ **It cannot yet, and the reason is the trap:** `--build-commit` on a binary
+built before the flag existed **falls through to LAUNCHING THE GUI** on whatever
+host it is asked. A census that interrogated every copy would open windows across
+the fleet on exactly the machines that are behind — the ones it exists to find.
 
-⇒ **The version is not an identity.** `--version` is what the census compares,
-so the census cannot see this at all; only `md5sum /proc/<gui>/exe` against the
-build you produced can. That check is documented in the yggui skill as a
-*caution about another agent*; the measurement here is that it is not an edge
-case but the **normal** state of a parallel campaign.
+**Wanted:** once every host is at or past the first version carrying the flag,
+switch the census from md5 comparison to asking each copy directly, so it reports
+the source each binary was built from rather than inferring it. Until then md5 is
+the honest instrument, and the census already prints what to compare against.
 
-**Wanted, in order of cost:**
-1. ✅ **SHIPPED** — `deploy-fleet.sh` refuses a deploy whose HEAD is not a
-   descendant of `origin/main`, and NAMES the commits the build would revert.
-   Proven red/green against the pre-fix script: with build products present and
-   the tree one commit behind, the old script deployed it and printed a version;
-   the new one refuses. Locked by `deploy_fleet_guard.rs` (two tests: the
-   refusal names the missing commit, and a rebased tree clears the gate and
-   reaches the next check — so the gate is a gate, not a blanket refusal).
-2. ⏳ **IN CODE, LIVE PROOF OWED** — `build.rs` stamps the commit and both bins
-   answer `--build-commit`; the census prints the build's commit and both md5s
-   with the line *any other md5 is another build*. ⛔ `--version` is deliberately
-   unchanged: it is a rendezvous key (socket names, the daemon version gate, and
-   `yggterm_executable_reported_version`'s token scan resolve against it).
-   ⚠ The census does NOT ask a deployed binary for its commit, because
-   `yggterm --build-commit` on a binary predating this change falls through to
-   LAUNCHING THE GUI on every host it is asked. Once ≥ this version is fleet-wide
-   that probe becomes safe and the census should switch to it.
-   **Owed:** a release build, deployed, and `yggterm --build-commit` on the
-   desktop host matching `git rev-parse --short=12 HEAD`.
-3. ✅ **SHIPPED** — `scripts/bump-version.sh` allocates the number from
-   `origin/main` (never from the working file, which is exactly as stale as this
-   checkout's last pull) and **claims it by pushing the bump alone, before the
-   build**. That shrinks the race window from the length of a build-and-deploy to
-   the length of one push, and a lost race is now *detected*: the push is
-   rejected, the script undoes its own commit by path — never `reset --hard`,
-   which would take another session's uncommitted work with it — and takes the
-   next number. Locked by `version_allocation.rs` (three tests; the first
-   reproduces the collision — a working file at `3.0.9` over an origin at
-   `3.0.5` allocates `3.0.6`, and the pre-fix reading returns `3.0.10`).
-   ⚠ It refuses a checkout carrying unpushed commits, because "alone" is the
-   whole mechanism: a number that rides along with the work it releases is only
-   claimed when that work lands, which is the race.
-
-⭐ **AND `3.0.120` JOINED THEM WITHIN THE HOUR.** The build cut to end the
-collision was itself deployed over ~15 minutes later: on the desktop host
-`~/.local/bin/yggterm` reads `--version 3.0.120` with an md5 that is **not** the
-3.0.120 that was built and censused. Four consecutive version numbers, each
-meaning two builds. ⇒ this is not a race that a careful cluster can avoid by
-being quick — **there is no arbitration, so the number is simply not an
-identifier**, and every "is my fix live" check written against `--version` is
-answering a different question.
-
-**Falsifier:** two clusters bump and deploy in the same minute, and the fleet
-census can name which build is on the host.
+**Falsifier:** the census names the commit of a copy it did not itself deploy.
 
 ## ⛔ deploy-fleet SSHes TO THE HOST IT IS ALREADY RUNNING ON
 
