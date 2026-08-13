@@ -12,6 +12,91 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔⛔ [6.9→6.7] THE LOCK-CONTENTION INSTRUMENT IS THE LARGEST WRITER IN THE SYSTEM, AND IT REPORTS ZERO
+
+**Status:** OPEN
+
+*measured 2026-08-14; derivation and controls in [`idle-cost-model.md`](idle-cost-model.md) §4*
+
+`lock_daemon_runtime_for_request` (`crates/yggterm-server/src/daemon.rs:17628`)
+traces only when `try_lock()` returns `WouldBlock`. Its doc comment states the
+fast path therefore costs nothing. **`WouldBlock` fires 322.8 times per second**
+on a live daemon, so the fast path is not the path being taken. Each firing
+costs a `resolve_yggterm_home()`, two `serde_json::json!` allocations and **two
+file appends**.
+
+- `event-trace.jsonl` grows at **95.0 KB/s** — **98.8% of it is lock_wait**, a
+  projected **8.3 GB/day from one file**.
+- **93.9% of those events report `waited_ms: 0`.** The field is integer
+  milliseconds and nearly every wait is sub-millisecond, so **the instrument
+  built to measure contention prints zero on almost all the contention it is
+  recording.** The count is the signal; the value is blind.
+- **98.6% of the contention is `terminal_read`** — reading a PTY serializes
+  against every other request through one global `Mutex<DaemonRuntime>`.
+
+⭐ **Fix the resolution and the flush BEFORE touching the lock** (`idle-cost-model.md`
+§S2 then §S3): changing contention while the only instrument that can see it
+rounds to zero would leave the result unmeasurable.
+
+**Falsifier:** if `event-trace.jsonl` growth does not fall ≥90x after S2,
+lock_wait was not 98.8% of the volume.
+
+## ⛔⛔ [6.9→6.1] THE DAEMON POPULATION IS 83% OF THE IDLE FOOTPRINT, AND ITS COST IS PER-DAEMON
+
+**Status:** OPEN
+
+*measured 2026-08-14; model, controls and limits in [`idle-cost-model.md`](idle-cost-model.md) §1–§3*
+
+15 census daemons and 57 sessions on one host: **daemons are 3.468 of the
+4.167 total cores (83%)**, 74% of it kernel time. Joint model
+(**R² = 0.939**): `cores = 0.116 + 0.0104·sessions + 0.000337·rows`.
+
+⛔ **Age explains nothing and its slope is NEGATIVE** (R² 0.323). Older daemons
+cost slightly *less*. **This is the opposite of the GUI's shape**, whose idle
+cost climbs 7.4x over its life. Two different defects behind one hot machine —
+leak-hunting in the daemon is aimed at nothing.
+
+| | daemons | sessions | cores | cores/session |
+|---|---|---|---|---|
+| legacy (pre-3.0.149) | 14 | 34 | 3.012 | **0.0886** |
+| current (3.0.151) | 1 | 23 | 0.456 | **0.0198** |
+
+⇒ **A session costs 4.5x more on a near-empty daemon than on a shared one.**
+Consolidating all 57 onto one daemon models at **0.864 cores — 2.60 reclaimable
+(75%)**.
+
+⚠ **Two honest limits, both in the model doc:** no census daemon owns zero
+sessions, so the floor term is real but **unattributed** between "per-daemon"
+and "paid by the first session"; and one outlier daemon is excluded and wants
+its own look.
+
+⛔ **This is a priced justification for the lifecycle work, NOT a licence to reap
+daemons holding other agents' live sessions.** The constitution's guarantee
+governs how they retire.
+
+**Falsifier:** consolidate and re-measure. If daemon cores do not fall ≥2.0, the
+per-daemon model is wrong.
+
+## ⛔ [6.9→6.7] DAEMON CPU HIDES IN EXITED THREADS — ONE OS THREAD PER CONNECTION
+
+**Status:** OPEN
+
+*derivation in [`idle-cost-model.md`](idle-cost-model.md) §3*
+
+`spawn_unix_client_handler` (`daemon.rs:785`) spawns a **fresh OS thread per
+accepted connection**. Measured churn: **4.23 threads/s** on a 1-session daemon,
+**25.2/s** on a 23-session daemon, **exactly 0.00 on a daemon owning nothing** —
+a clean negative control.
+
+⇒ **Process-level CPU exceeds the sum over live threads by ~5x** (0.202 vs
+0.041 cores), across six flat windows, because `/proc/<pid>/stat` counts exited
+threads and `/proc/<pid>/task` cannot. **Any per-thread profile of a daemon is
+currently missing ~80% of its CPU.**
+
+⚠ **Do not promise cores for the pool fix.** Thread spawn is ~50 µs, so 4/s is
+~0.0002 cores. The **38 ms per handler is the work, not the spawn.** The value
+is that CPU stops being invisible to per-thread instruments.
+
 
 # THE 2026-08-13 BATCH — reported after a restart lost the campaign rows
 
