@@ -1547,6 +1547,262 @@ removing that file once consumption is confirmed.
 guarantee, and this is a live counter-example: our own deploys are degrading other agents' rows.
 ⇒ It belongs with the hot-restart/daemon-lifecycle work, not with the deploy-identity work.
 
+## ⛔⛔ NOTHING PREVENTS A LOCAL TAG FROM REPUBLISHING A PRE-SCRUB LINEAGE
+
+**Status:** OPEN
+
+*Found by the leaks cluster 2026-08-13 and confirmed independently before filing. The tags
+themselves have since been corrected on every host; what is open is that nothing stops it
+recurring, and no check would notice.*
+
+Two annotated tags in a working clone pointed at the pre-rewrite lineage and were **the only
+thing keeping ~1900 commits of pre-scrub history alive in that clone**. None of those commits
+was reachable from any origin ref, so every branch-level check read clean.
+
+⛔ **WHY THIS IS WORSE THAN THE EQUIVALENT PROBLEM ON A BRANCH.** A stale branch needs someone to
+name it: `git push <branch>`. **A tag rides along.** `git push --tags` and `git push --follow-tags`
+send these without anyone deciding to, and either one **republishes the pre-scrub lineage** —
+re-leaking, in one habitual command, exactly what a history rewrite was run to remove, *after*
+that rewrite has reported success.
+
+⇒ **The re-leak needs no decision. It needs only a habit.**
+
+**What is still open:**
+
+- **No guard.** A fresh clone, a restored backup, or the next rewrite re-arms this, and nothing
+  in the ship path checks for it. The check is cheap: commits reachable from local tags and from
+  no origin ref must be **0**.
+- ⛔ **A scrub's file scope must cover vendored trees IF they are tracked.** Verified for this
+  repo — its harness `node_modules` is gitignored with 0 tracked files, so it was correctly out
+  of scope — but *"it is third-party"* is not the same answer as *"it is not tracked"*, and a
+  private term inside a committed `vendor/` directory publishes like any other. One `git ls-files`
+  settles it.
+
+**Fix:** `git fetch --tags --force` on every host, as part of any post-rewrite reset step —
+resetting branches while leaving tags on the old lineage leaves the hazard fully armed and the
+checkout looking clean. Then confirm per host rather than assuming a sweep covered them.
+
+### ⚠ THE INSTRUMENT NOTE, because this was nearly dismissed as a false alarm
+
+An initial check compared `for-each-ref %(objectname)` against `ls-remote`'s non-`^{}` line and
+reported **0 differing tags of 2** — and that zero was a **false negative from a join that matched
+no keys at all**, not a finding. The verification could not have expressed a difference.
+
+⇒ **Annotated tags carry two SHAs** — the tag object, and the commit it dereferences to — and a
+comparison that mixes the two levels answers confidently and wrongly in either direction.
+**Compare `refs/tags/X^{}` against `ls-remote refs/tags/X^{}`**, and run a positive control before
+trusting a zero.
+
+⛔ **AND DO NOT WRITE A PRE-SCRUB SHA INTO A PUBLIC FILE.** A force-push revokes nothing: those
+commits stay fetchable from the forge by hash. A table of before/after SHAs published here would
+hand any reader a direct handle to the content the rewrite removed — the leak re-opening through
+the document that reports it closed. Describe the shape; never publish the hashes.
+
+## ⛔ `session remove` CAN REPLY WITH TWO CONCATENATED JSON OBJECTS
+
+**Status:** OPEN
+
+*Reported by a relay 2026-08-13 while reaping a row it had just created.*
+
+The reply was **not parseable as a single JSON document** — two objects run together in one
+response body. A caller doing the ordinary thing (`json.load`) gets an exception, and a caller
+doing the careless thing (`json.loads(out[out.find("{"):])`) silently reads only the first object
+and never learns a second existed.
+
+⇒ The relay could not read the reply at all, and fell back to instruments that cannot lie: the row
+absent from `server app rows`, no process matching the uuid, and **no transcript file ever
+written**. That is the correct response, and it is also the second-best outcome — **a verb whose
+reply cannot be parsed is a verb that reports nothing**, and this one is already in the family of
+verbs that report the request rather than the effect.
+
+⛔ **AND THE SUPERVISION PLANE ITSELF USES THE UNSAFE IDIOM.** `ygg-monitor.py`'s `ygg()` helper
+parses every reply with `json.loads(out[out.find("{"):])`, which on a two-object reply reads the
+first and discards the second **without raising**. ⇒ The watchdog would read a truncated answer
+from this verb and carry on confidently. Fix the caller as well as the verb; the caller is ours
+and it is one line.
+
+**Fix:** one response, one JSON document. ⚠ Until then, callers must not assume `find("{")` plus a
+single parse is safe on this verb — that idiom reads the first object and discards the rest
+without error, which is worse than failing.
+
+## ⛔⛔ A SCRUB'S VERIFIER ASKS WHETHER THE STRING IS GONE, NEVER WHETHER THE REPLACEMENT IS VALID
+
+**Status:** OPEN
+
+*Found while authoring a hostname scrub, 2026-08-13, before it ran.*
+
+The private name appeared **890 times across 34 `.rs` files**, and not only in prose — it sat
+**inside identifiers**: `<name>_live`, `<name>Payload`, and a test function named
+`terminal_host_problem_rejects_<name>_sparse_prompt_after_update`.
+
+⛔ **The privacy guard's own suggested replacement contains a HYPHEN.** Applying it would have
+produced `gui-host_live` and `gui-hostPayload` — **not valid Rust** — across 34 files. ⇒ **The tool
+that flags the leak proposes the fix that breaks the build.**
+
+⚠ **And every count-based check would have passed.** Commit parity, ref parity, subject parity and
+the residual term scan all ask *"is the string gone?"*. **None of them asks whether what replaced
+it is legal.** The failure appears only at compile time, which no orphan proof reaches.
+
+**The law, which is the existing "never replace an ordinary word" rule turned around to face the
+other side:**
+
+> **A replacement must be legal in every syntactic position the original occupies. If the original
+> is ever an identifier fragment, the replacement must be alphanumeric.**
+
+### ⭐ COUNT THE CONTEXTS, NOT THE FILES
+
+> **Enumerate the distinct syntactic CONTEXTS a term appears in before choosing the replacement.
+> The count of FILES tells you the size of the job; the count of CONTEXTS tells you whether one
+> replacement string can even do it.**
+
+Those are different questions and **only the second can invalidate the choice** — yet the file
+count is the one every scan reports, so it is the one that gets used.
+
+⚠ **Outside code the same class bites differently and is easier to miss.** A term scrubbed out of
+prose also lives in **wikilink targets, filenames and YAML keys**, where a replacement containing a
+space, a slash or a colon breaks the link graph or the frontmatter parser rather than a compiler.
+⇒ **The failure surfaces late in every case**, which is what makes the class dangerous: the scrub
+reports success and the breakage is found by whoever next uses the feature.
+
+**Fixes:** the guard must not suggest a replacement that is illegal where the term actually
+appears — at minimum it should warn when a term occurs inside identifiers. And the gate must be
+chosen to match the contexts rather than copied from the last repo: `cargo check --workspace
+--all-targets` where the term is an identifier (it compiles **test** targets, and a mangled
+test-function name has no other symptom); resolve the lookups and parse the frontmatter where it
+is a filename or a key. **A gate that cannot fail on the context in question is not a gate.**
+
+## ⛔⛔ A HANDOVER BRIEF CARRIES THE ORCHESTRATOR'S UUID AS A LITERAL, SO SUCCESSION REINTRODUCES THE ORPHAN
+
+**Status:** OPEN
+
+*Fleet tooling — `ygg-monitor.py subscribe`. Repaired for existing subscribers on the morning of
+2026-08-13, and back within two hours through a new one.*
+
+`ygg-monitor.py succeed` moves every subscriber from a retired orchestrator to its successor — but
+it can only repair subscriptions that already exist. **A relay's handover brief inlines the
+orchestrator's uuid as a literal**, so when a cluster relays, the successor subscribes itself with
+whatever uuid its brief carried.
+
+⇒ Measured ~2 h after the original fix: a cluster's successor came up subscribed with `escalate_to`
+pointing at an orchestrator **reaped at 15:58**. Its own predecessor had been correctly re-pointed
+hours earlier; the brief had not, because a brief is a frozen document. **Every escalation from
+that row would have gone nowhere while the plane looked healthy** — the exact failure the morning's
+fix was for.
+
+**Fix:** `subscribe` must **verify `--escalate-to` names a LIVE row** and refuse (or warn loudly
+and fall back to escalating to a human) when it does not. The identical check already exists in
+`escalate()`; it belongs at subscribe time too, where it is cheapest and where the stale value
+enters the system. ⚠ Guard it the same way: an empty row listing is an instrument failure, not a
+dead target, so require positive evidence that the row plane answered.
+
+⭐ **The general shape, worth more than the fix:** *a repair that sweeps existing STATE does not
+stop new state arriving stale from a frozen DOCUMENT.* Any identifier copied into a brief is a
+snapshot, and briefs outlive the thing they name. **Validate identifiers at the point of entry,
+not only in the store.**
+
+## ⛔⛔ `sessions sort --dry-run` REPORTS `changed:false` ON A LIST THAT IS NOT SORTED
+
+**Status:** OPEN
+
+*Measured by another campaign 2026-08-13, sampled SIMULTANEOUSLY — both verbs launched from one
+shell, so the difference cannot be time.*
+
+```
+  server app rows          2.0 2.1 [3.2] 3.0 3.1 3.3 3.4   <- wrong, and it matched the screen
+  sessions sort --dry-run  changed:false, rendered_order lists 3.2 in the RIGHT place
+  sessions sort (apply)    changed:true — the row moved, order correct afterwards
+```
+
+⇒ **The dry run reports the order it WOULD PRODUCE as though it were the order that EXISTS. It
+cannot report a disagreement it is itself the source of.**
+
+⛔ **And the help text closes the trap:** it tells the caller *"sorting a sorted list reports
+`changed:false` — the success case, not a no-op to chase."* True of a real sort, **false of the
+dry run**, so it instructs the caller to stop looking exactly when they should look harder.
+
+**Fix:** have the dry run diff its computed order against the **rendered** order it would replace,
+and report `changed` from that — which is what every caller already assumes it does.
+
+⚠ **Ordering note:** a proposal to have `ygg-claim.sh` run `sessions sort` as its last act is
+sensible and is NOT taken yet, because this defect makes the sort's behaviour untrustworthy to
+reason about. **Fix the dry run first**, then the claim script's new duty can be verified rather
+than assumed.
+
+## ⛔⛔ A ROW-TABLE WRITE IS INVISIBLE TO THE NEXT READ, AND `rename`+`outline` CORRUPTS THE TITLE
+
+**Status:** OPEN
+
+Six rows renamed in one batch; the `rows` read issued immediately after showed **all six
+unchanged**. A second read moments later showed **all six correct, with nothing re-sent.**
+⇒ **An immediate read-back is a FALSE NEGATIVE** — and the field guide has just told the caller to
+read state back, so the instrument and the instruction disagree.
+
+**The corollary is real corruption, reproduced in two calls:**
+
+```
+rename  → "<new title>"    accepted: true
+outline → 4.2.1            (composes onto the STALE title it can still see)
+rows    → session_title = "4.2.1 Agent unnamed shell"
+```
+
+⇒ The seat is stored **inside `session_title`** and the rename is lost, so the sidebar renders the
+seat **twice** the next time the prefix is composed.
+
+⭐ **This is the known double-numbering hazard arriving by a route its own warnings do not name.**
+Not an author writing the seat into the title on purpose — **two correct writes racing.**
+⚠ **`ygg-claim.sh` survives it only by accident**: its watch loop re-asserts the title and absorbs
+the lag. **That accident is currently load-bearing**, so simplifying that watcher would expose the
+corruption fleet-wide.
+
+**Fix:** `outline` must compose against the authoritative title rather than a possibly-stale read —
+or the two writes must be one call. **A caller cannot fix this from outside**, because the read
+that would verify it is the read that lies.
+
+⚠ **Unmeasured and deliberately left so:** a row displaced despite `seat.honoured:true`. The obvious
+theory — an unnumbered row above the numbered block shifting the insert index — **was tested and
+refuted** (probe seated exactly right). **No cause is recorded, because none was measured.**
+
+## ⭐ CONTEXT-MENU SESSIONS SHOULD READ "New Claude Code Session", NOT "New claude-code session"
+
+**Status:** OPEN
+
+*Owner-requested 2026-08-13. Small, cosmetic, and explicitly wanted.*
+
+A session launched from the right-click context menu is named **`New {kind} session`**, which is
+confirmed to be **the correct behaviour** — the request concerns only the rendering of the kind.
+
+⇒ **Wanted:** `New Claude Code Session`, `New Codex Session`, `New Kimi Session` — the CLI's
+**display name**, title-cased, not its slug.
+
+⚠ So this needs a **display-name mapping per CLI kind**, not a `replace('-',' ')` and title-case:
+`claude-code → Claude Code`, `codex → Codex`, `kimi → Kimi`. A naive transform gets `Claude Code`
+right by luck and will get later kinds wrong. ⛔ **The kind slug stays the SSOT** — this is a
+presentation layer over it, and the slug must not be renamed to make the label easier.
+
+## ⚠ A ROW ADOPTED BY A CAMPAIGN MAY HAVE BEEN THE OWNER'S, AND THE FIELD THAT WOULD SETTLE IT IS UNKNOWN
+
+**Status:** AWAITING A DECISION
+
+A row titled `Agent unnamed shell` (uuid tail `0462c0fb66e1`) was seated under another campaign's
+sub-seat, re-titled by that campaign, and is now driving a live surface for it.
+
+⛔ **It may be an owner-created row that a delegate simply attached to**, rather than a stray. The
+standing row-hygiene law is that an agent may name its own row and the rows it spawned and nothing
+else — and **adopting** a row is that same act wearing a different name, so it needs the same
+permission. Only the owner can say which this was.
+
+**Recommendation, and what the campaign is doing meanwhile: leave it exactly as it is.** The row is
+in active use, the current title is accurate, and reversing it mid-flow costs more than waiting.
+**Reversal is two calls** — `rename` back to `Agent unnamed shell`, then `outline ""` to clear the
+seat — after which the campaign opens its own surface instead.
+
+⚠ **And the identifying chips are NOT stored in `detail_label`.** Dumped before any rename, six
+near-identical rows all already read the generic *"Interactive shell rooted at …"* boilerplate. The
+one chip that proved recoverable came from the application's own banner line on the row's screen,
+not from the row record. ⇒ **Where the sidebar renders those chips from is unknown, and finding it
+is the real engineering here** — it is the field that actually carries a human's identification of
+a row, so no restore of a mis-tidied row can be promised until it is known.
+
 ## ⚠ ~1700 COMMITS LIVE ONLY IN ONE CLONE'S REMOTE-TRACKING REFS — KEEP OR DROP?
 
 **Status:** OPEN
