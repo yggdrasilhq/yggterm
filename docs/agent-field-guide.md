@@ -725,6 +725,25 @@ The deployed `yedit` binary's features existed **only** as untracked files on
 the build host — no git repo, no remote, no copy anywhere. Before editing any
 fleet tool, confirm its source is in version control and pushed.
 
+### 7.9a An indentation-keyed patch DOUBLE-INSERTS at every deeper site
+
+A shallower indent is a **substring of a deeper one**: `"<28sp>foo();"` occurs
+inside `"<32sp>foo();"`, starting four characters in. So a two-pass
+search-and-replace keyed on indentation — one pass per indent level, to keep the
+inserted line aligned — matches the deeper sites **twice**: once in its own pass,
+and again in the shallower pass, including lines the first pass just created.
+
+Measured instance: five stamp sites, nine insertions, every duplicate silently
+mis-indented above its correct twin. Nothing errored, and the code compiled and
+passed — a duplicated idempotent store changes no behaviour, so tests cannot see
+it. In a public repo it ships as visible sloppiness.
+
+⭐ **The check that caught it: count the patched sites against the anchor you
+expected.** Five `reader_activity` stamps must yield five new lines, not nine. A
+patch that "worked" can still have fired twice, and the count is the only cheap
+witness. Prefer anchoring on a unique enclosing line over indentation; if you
+must key on indent, verify each insertion sits immediately after its anchor.
+
 ### 7.10 The row ledger is the authoritative record of what existed — consult it FIRST
 
 `~/.yggterm/row-order-ledger.json` records which live-session rows existed and
