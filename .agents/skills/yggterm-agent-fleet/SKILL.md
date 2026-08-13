@@ -1584,6 +1584,14 @@ classification the moment it lapses, and **a lapsed park announces itself**
 the human's switch; park means *I blocked this row and here is what releases
 it*, and is the orchestrator's bookkeeping about its own decisions.
 
+⛔ **AND PARK DOES NOT REACH THE BOOTER — same two-planes trap as demote.** The
+dumb net is a separate subscription and knows nothing about parks, so a parked
+row that is also booter-subscribed still gets booted for being quiet, which is
+precisely the wake the park exists to prevent. ⇒ Either leave a parked row off
+the booter, or `ygg-booter.py defer --secs` it across the same window. **Two
+planes, two switches** — and the split is the design, so do not "fix" it by
+teaching one plane about the other.
+
 ### ⛔⛔ PROMOTION AND DEMOTION ARE THE OWNER'S, ALWAYS
 
 A row can be taken **out** of automation entirely and handed back to the human:
