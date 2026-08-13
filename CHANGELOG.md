@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A running yggterm can now say which source it was built from (3.0.133).**
+  `yggterm --build-commit` could only ever answer for a file, and installing a
+  new version replaces that file underneath the copy already running — so the
+  question *"is the thing in front of me the build I just installed?"* had no
+  answer. Now the running process says: the background service reports it in
+  `yggterm-headless server status`, the window reports it in `server app
+  clients`, and `server daemons` shows a BUILD column. A fleet deploy prints
+  both planes side by side, so a machine whose files are current while its
+  services are still finishing older work reads as exactly that, instead of
+  reading as fully up to date.
+
+- **A screenshot now says which authority decided it was safe to take
+  (3.0.133).** The capture path asks the compositor whether this window is the
+  one that would be photographed, and falls back to yggterm's own drawing when
+  it is not. Previously it recorded that decision only when it refused, so a
+  frame the compositor confirmed and a frame taken because the compositor could
+  not be reached looked identical in the reply — and only one of those is
+  trustworthy.
+
 - **A daemon handing its sessions over now leaves its name behind (3.0.132).**
   Every yggterm version answers on a socket of its own, and a CLI started
   against one keeps asking for that exact name for as long as it lives. When a
