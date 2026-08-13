@@ -52,6 +52,7 @@ pub mod grid_overlay;
 // swap" record. PUBLIC because the intent outlives the daemon being replaced:
 // the GUI forms it, a daemon poll drains it, and `server daemons` reports it.
 pub mod hot_restart_queue;
+pub mod hot_restart_repair;
 mod host;
 mod live_row_tombstones;
 mod profile_write_lock;

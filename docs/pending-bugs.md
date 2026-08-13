@@ -4981,10 +4981,73 @@ swap and the reason the last attempt gave (§8: *"something must be nameable as 
 thing it waits for"*). The self-retire handoff now probes the replacement binary
 and passes its version.
 
-**Still unbuilt:** §2 (relay boundaries as the appointment), §5
-(the deadline + `continue` repair), and the rest of §3 — **blocked-on-human is
-not yet a state**, and an agent session's WORKING state is still inferred from
-silence rather than from a positive signal.
+**Still unbuilt:** the rest of §3 — **blocked-on-human is not yet a state**, and
+an agent session's WORKING state is still inferred from silence rather than from
+a positive signal.
+
+**Landed in code, LIVE PROOF OWED — §2, the relay boundary as the appointment.**
+`server relay-boundary [--by <who>] [--wait-secs <n>] [--json]` declares that a
+hand-off just happened, and the queued swap is then attempted on the next 20 s
+drainer poll instead of waiting out `HOT_RESTART_SWAP_RETRY_INTERVAL_MS`.
+`ygg-claim.sh` declares one after a predecessor is retired **and reaped** — the
+rename is not a quiet point, a reaped predecessor is. The boundary is a field on
+the existing queue entry, not a second file, because it does not change WHAT the
+host owes, only when it may next try.
+⛔ **Two floors, and releasing one is releasing none.** The file's
+`attempt_is_due` and each drainer's process-local
+`HOT_RESTART_SWAP_LAST_ATTEMPT_MS` both gate the retry; a bypass that cleared
+only the first would print success and change nothing. Pinned by
+`a_relay_boundary_releases_the_process_local_floor_too`.
+⛔ **One boundary buys exactly one attempt**, derived as
+`relay_boundary_at_ms > last_attempt_ms` rather than stored as a flag — a
+boundary that stayed unspent would release the floor on every poll, which is the
+fork bomb the floor exists to prevent, rebuilt by the thing meant to bypass it
+safely.
+⚠ **Proven at the CLI against an isolated `YGGTERM_HOME`**: no-op on a converged
+host, declared on an owing one, `requested_at_ms` untouched, and `server daemons`
+naming the unspent boundary. **NOT proven: a daemon actually draining at a
+boundary** — that needs a host owing a real swap with a daemon new enough to read
+the field. **Falsifier:** on such a host, `server relay-boundary` then within
+~20 s a `hot_restart_swap_queued`/handoff attempt whose queue `last_outcome` reads
+*"a relay boundary was declared; retrying the handoff at it"*.
+
+**Landed in code, LIVE PROOF OWED — §5, the deadline AND its repair.** They ship
+together or not at all. `hot_restart_deadline_verdict` applies
+`HOT_RESTART_FORCED_SWAP_DEADLINE_MS` (30 min) to a blocked **cold shutdown**;
+`crates/yggterm-server/src/hot_restart_repair.rs` is the durable record of who it
+interrupted, and every daemon's poll dispatches a `continue` to exactly those
+sessions, once.
+⚠ **Scoped to the cold-shutdown gate on purpose, NOT to the progressive
+migration.** Under `disk_binary_replaced` the successor is already serving — the
+swap has happened, and only ownership tidiness remains, which is not worth
+interrupting a live turn for. The path where nothing has swapped and the host
+stays stale is the cold gate, and that is what the deadline is aimed at.
+⛔ **One exempt blocker vetoes the whole force.** A cold shutdown kills every PTY
+this daemon owns, so there is no "interrupt the working session but spare the
+shell beside it"; §6's orchestrating wait and a plain shell both hold it open
+indefinitely, and the verdict NAMES which one (§8).
+⛔ **The interrupted set is recorded BEFORE the shutdown**, pinned source-level by
+`the_forced_swap_records_its_interrupted_set_before_shutting_down`, because the
+process that knows the list is the one about to exit and §8 says it cannot be
+re-derived.
+⛔ **The record is spent on DISPATCH, and it EXPIRES** (`REPAIR_WINDOW_MS`, 10
+min). A lost repair beats a `continue` typed twice into someone's session, and a
+repair arriving half an hour late is not a repair — it is the unprompted nudge §5
+forbids.
+⚠ **The `continue` goes through the echo-verified submit**, which was extracted
+into `submit_prompt_echo_verified_with` so the daemon can drive it while holding
+its runtime lock only per-write. A just-resumed agent CLI draws its composer
+before its input loop is live, so a `continue` written at "prompt shown" is
+swallowed silently.
+⚠ **NOT proven: a deadline that actually fired.** It needs a host held past 30
+minutes by interruptible blockers alone, which cannot be manufactured to order.
+**Falsifier, and both halves must be checked:** a
+`hot_restart_forced_past_deadline` trace event naming its `interrupted` list,
+followed within the repair window by one `hot_restart_repair_continue
+{outcome: "submitted"}` per session on the daemon that adopted them — and
+`server daemons` printing `repair owed:` in between. ⛔ A forced swap whose
+repair never lands is the deadline shipping alone, which is the thing the old
+prohibition forbade.
 
 ⚠ **§4's second producer is built and pushed but NOT yet live-proven, because it
 only runs in the GUI.** `queue_startup_swap_intent` records the intent when
