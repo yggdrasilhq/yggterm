@@ -5360,13 +5360,30 @@ only the first would print success and change nothing. Pinned by
 boundary that stayed unspent would release the floor on every poll, which is the
 fork bomb the floor exists to prevent, rebuilt by the thing meant to bypass it
 safely.
-⚠ **Proven at the CLI against an isolated `YGGTERM_HOME`**: no-op on a converged
-host, declared on an owing one, `requested_at_ms` untouched, and `server daemons`
-naming the unspent boundary. **NOT proven: a daemon actually draining at a
-boundary** — that needs a host owing a real swap with a daemon new enough to read
-the field. **Falsifier:** on such a host, `server relay-boundary` then within
-~20 s a `hot_restart_swap_queued`/handoff attempt whose queue `last_outcome` reads
-*"a relay boundary was declared; retrying the handoff at it"*.
+⭐ **§2 IS LIVE-PROVEN, 3.0.130, and the falsifier ran exactly as written.** A real
+daemon in a real retire loop, owning a real PTY, with a queue entry it could not
+converge (the replacement binary reported a newer version and never came up — the
+"successor that never arrives" case the retry exists for), in an isolated
+`YGGTERM_HOME` so no fleet row was touched:
+
+    19:18:33  attempt 1        last_outcome: "handoff requested; successor not yet confirmed live"
+    19:19:16 … 19:20:37        attempts PINNED at 1 across five 20 s polls — the floor holding
+    19:20:49.937              server relay-boundary --by … → Declared {waiting_ms: 136779}
+    19:21:03.363  attempt 2   last_outcome: "a relay boundary was declared; retrying the handoff at it"
+    19:21:13 … 19:21:50       attempts STAY at 2 — one boundary bought exactly one attempt
+
+⭐ **13.4 s from declaration to retry against a 5-minute floor**, i.e. the next
+drainer poll. Both floors were released by the one boundary and both had to be:
+the process-local static lives in that same daemon process, which had recorded
+its own attempt 136 s earlier, so a bypass of the file alone would have printed
+success and changed nothing. And the boundary being SPENT is what stops it there
+— `boundary_at_ms < last_attempt_ms` after the retry, so the floor re-engages
+rather than releasing on every poll.
+⚠ Honest scope: the queue's CLI-level behaviour (no-op on a converged host,
+`requested_at_ms` untouched, the census naming an unspent boundary) was already
+proven; what this adds is **the daemon draining at the boundary**, which was the
+open half. The synthetic element is the successor binary, not the daemon, the
+queue, the floors or the poll.
 
 **Landed in code, LIVE PROOF OWED — §5, the deadline AND its repair.** They ship
 together or not at all. `hot_restart_deadline_verdict` applies
@@ -5396,24 +5413,135 @@ into `submit_prompt_echo_verified_with` so the daemon can drive it while holding
 its runtime lock only per-write. A just-resumed agent CLI draws its composer
 before its input loop is live, so a `continue` written at "prompt shown" is
 swallowed silently.
-⚠ **NOT proven: a deadline that actually fired.** It needs a host held past 30
-minutes by interruptible blockers alone, which cannot be manufactured to order.
-**Falsifier, and both halves must be checked:** a
+⭐ **THE REPAIR HALF IS LIVE-PROVEN, 3.0.130, all the way down to the PTY** — and
+it is the half that could not be proven any other way, because everything
+interesting about it happens between a daemon's runtime lock and a program's
+input loop. Isolated `YGGTERM_HOME`, a real daemon owning a real shell, an
+interrupted record naming that key and a foreign `recorded_by_pid`:
+
+    server daemons   repair owed: `continue` for 1 session(s) interrupted 0s ago
+                     by pid <other> (3.0.130), window 600s — local://<key>
+    trace            hot_restart_repair_continue {outcome: "submitted", error: null}
+    the session's own stream, in order:
+                     yggterm_ready_probe   ← written, and ECHOED (input loop live)
+                     ^U                    ← the probe cleared
+                     continue  \r          ← the text, then a LONE carriage return
+                     bash: continue: only meaningful in a `for', `while', or `until' loop
+
+⭐ The shell's complaint is the proof: the `continue` did not merely reach the
+PTY, it was **submitted as a line**, which is the thing a concatenated `\r` does
+not do. The record was cleared on dispatch, so the next poll took nothing.
+
+⚠ **STILL NOT PROVEN: the deadline itself firing (`Force`), and it must not be
+manufactured.** Not for want of trying — the reason is structural and worth
+recording so nobody spends the hours again. `Force` requires a blocker set that
+is entirely interruptible, i.e. at least one AGENT-kind session and no plain
+shell beside it, and **there is no headless way to mint an agent-kind session**:
+`server attach` mints a shell by design (→ `not_restorable` → exempt → the veto
+fires first and hides the state under test), and `automation run --kind
+claude-code` routes through app-control and refuses on a host with no GUI
+(*"no live Yggterm GUI client is registered for app control on this host"*).
+The remaining honest routes are (a) catch it in the wild, or (b) a full GUI in
+`scripts/underglass-sandbox.sh`'s private sway + private `YGGTERM_HOME`, mint the
+row there, and force the deadline against a host that owns nothing real.
+⛔ Driving a live daemon that holds other agents' rows into a forced cold
+shutdown to watch the mechanism work is not a test, and is not to be done.
+**Falsifier, unchanged, and both halves must be checked:** a
 `hot_restart_forced_past_deadline` trace event naming its `interrupted` list,
 followed within the repair window by one `hot_restart_repair_continue
 {outcome: "submitted"}` per session on the daemon that adopted them — and
 `server daemons` printing `repair owed:` in between. ⛔ A forced swap whose
 repair never lands is the deadline shipping alone, which is the thing the old
 prohibition forbade.
+⚠ **And the deadline's clock only starts where the swap lane gives up.** The cold
+gate is reached from `SwapStep::Failed`, and a host with a queue entry it keeps
+retrying returns `Lingering` instead — so on that host the deadline is never
+evaluated at all. Its real trigger is a daemon retiring under
+`newer_daemon_live` (or with empty hands, or with the handoff kill-switch set),
+where `hot_restart_retire_owed_for_ms` falls back to the queue entry's
+`requested_at_ms`, or to this process's first poll when nothing is queued.
 
-⚠ **§4's second producer is built and pushed but NOT yet live-proven, because it
-only runs in the GUI.** `queue_startup_swap_intent` records the intent when
+⭐ **§4's second producer IS live-proven, on the GUI host, 3.0.130.**
+`queue_startup_swap_intent` records the intent when
 `reconcile_stale_daemon_on_startup` declines; a source-level test pins the call
 site (`the_startup_reconcile_queues_the_swap_it_declines_to_take`), which is the
-right shape because the defect is a missing call on an early return. **Falsifier
-for whoever restarts the GUI next:** grep the GUI's trace for
-`startup_hot_swap_declined_swap_queued`, and check that the host's
-`hot-restart-queue.json` names `requested_by: "gui_startup_reconcile_declined"`.
+right shape because the defect is a missing call on an early return. What the
+live host showed:
+
+    startup_hot_swap_declined_swap_queued {decision: "superseded", target_version: "3.0.130",
+        stale_pid: …, stale_version: "3.0.118", owned_terminal_session_count: 9}
+    …then TWICE more {decision: "unchanged"} — and requested_at_ms did NOT move
+
+⭐ The `unchanged` repeats are the second half of the same proof: §5's deadline is
+measured from `requested_at_ms`, and a GUI that re-declines every poll would have
+reset that clock forever. It does not.
+
+### ⛔⛔ A QUEUE WHOSE CONSUMER CAN BE OLDER THAN ITS PRODUCER HAS NO FLOOR
+
+**Open. The manual repair below works and is safe; the automatic one is unbuilt.**
+
+Measured on the GUI host 2026-08-13, and it reached the owner as *"I cannot type
+in many sessions"*: the host sat **twelve versions behind for 5.5 hours** with a
+queue entry reading `attempts: 0`. The reading everyone reached for — *"the idle
+gate is deferring, and the agents that make the host busy are the same agents
+whose activity resets the 300 s window, so an observer joins the blocker set by
+observing"* — is a good story and it was **not what was happening**. `attempts: 0`
+is nobody reading, not deferral.
+
+⭐ **The queue's only consumer is a daemon's retire poll.** The producer is
+whatever notices the host is stale — including the GUI, which is always current
+because the user just launched it. So the two sides of the record sit on opposite
+sides of the very version skew the record exists to close, and **a host whose
+newest daemon predates the queue can write down what it owes and can never act on
+it.** No amount of correctness in the gate reaches that; the gate is a bystander.
+
+⚠ **Its shape as a rule, because it will recur wherever a durable record spans a
+version boundary:** a producer can always be assumed current (someone just
+started it), a consumer cannot (it is the thing being replaced). ⇒ **A record
+whose only reader is the component being superseded needs a reader that is not.**
+
+**The manual repair, and it is safe, additive and reversible** — start a daemon
+at the on-disk version alongside the stale one, then let the existing machinery
+converge:
+
+    # ⛔ THE ENVIRONMENT IS THE LOAD-BEARING PART, NOT A DETAIL.
+    # A daemon FREEZES its launch environment and every session it ever spawns
+    # inherits it — see [[finding-daemon-frozen-env-poisons-sessions]]. A daemon
+    # started from a helpful ssh shell has no WAYLAND_DISPLAY, no session bus and
+    # the wrong PATH, and it poisons that host's sessions permanently, with no
+    # error anywhere. Launch it with the GUI's OWN environ:
+    python3 - <<'EOF'
+    import subprocess
+    raw = open("/proc/<gui-pid>/environ","rb").read().decode(errors="replace")
+    env = dict(x.split("=",1) for x in raw.split("\0") if "=" in x)
+    subprocess.Popen([DAEMON_BIN,"server","daemon"], env=env, start_new_session=True)
+    EOF
+
+What followed on its own, inside 60 s, with no eviction and no PTY deaths:
+
+    pty_handoff_listener_bound                    ← the missing server-<v>.sock now exists
+    pty_handoff_adopted                       x7  ← the stale daemon's PTYs, handed over ALIVE
+    preserved_owner_live_sessions_restored    x4
+    superseded_daemon_takeover
+    hot_restart_swap_queue_satisfied {satisfied_by: "self", attempts: 0, waited_ms: 1027179}
+
+⭐ **17 minutes of preserved intent, satisfied by the successor asking "am I the
+successor?"** — the §4 clause that exists because the writer cannot own the
+record's lifecycle. The superseded daemon then retired on its own terms and left
+the table; the host's four ancient lingerers were untouched, still holding their
+shells. ⇒ **A second daemon does not disturb a pending hot-restart handshake, it
+completes it**, which is the constitution's version-coexistence clause behaving
+exactly as written.
+
+**What is still owed here:** the GUI's startup decline must **start a coexisting
+successor**, not merely record that one is owed. It is the only component on a
+stale host guaranteed to be current, and it already knows the target version and
+the daemon executable — it writes both into the queue entry. Until that ships,
+every host in this state needs a human or an agent to run the snippet above.
+⚠ **Do NOT reach for a socket alias instead.** Aliasing an absent version onto a
+live daemon is only sound in the older-client → newest-daemon direction; pointing
+a current client at an older daemon is the backwards cross-version proxy that has
+already returned nothing silently on this project.
 
 ⚠ **What that producer exists for: the GUI's startup reconcile drops the intent,
 and one unrecognised session key is enough to do it.** `startup_daemon_hot_swap_reason_with_authorized_keys`
