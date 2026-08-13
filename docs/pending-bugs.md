@@ -259,36 +259,73 @@ regex search field, the Markdown/Split/Text toggle, the FILES heading with its
 here is not "a document surface cannot render on a real GUI"**, which is worth
 knowing before anyone spends a session on the widget layer.
 
-⚠ **AND THE LOADED STATE COULD NOT BE REACHED FROM THE CLI, which is a second
-defect wearing this one's clothes** (own entry below): `yedit <path>` answers
-`document surface opened` and the rail still reads *No files open*. So this
-sighting says nothing about the black viewport — the document was never loaded,
-and a rail that is EMPTY is a different state from the full rail above. Recorded
-so the next reader does not mistake an unloaded surface for a fixed one.
+⚠ **AND THE LOADED STATE COULD NOT BE REACHED, for a reason that turned out to
+be neither the CLI nor the paint** (own entry below): the shell driving that
+surface was on a different machine from the GUI, and a surface declares a
+**loopback** control URL — so the GUI resolved it on its own host, found nothing
+listening, and rendered *No files open* with every widget healthy. The file had
+been stored correctly the whole time, in the other host's daemon.
 
-## ⛔ `yedit <path>` REPORTS A SURFACE OPENED AND NEVER OPENS THE FILE
+⇒ So this sighting says nothing about the black viewport: an EMPTY rail pointed
+at the wrong daemon is a different state from the full rail above. **Recorded
+so the next reader does not mistake it for one**, and because the first version
+of that entry blamed the CLI for dropping the path, which it does not do.
+
+## ⛔⛔ A DOCUMENT SURFACE DECLARES A LOOPBACK URL, SO A CROSS-MACHINE SURFACE RENDERS EMPTY AND HEALTHY
 
 **Status:** OPEN
 
-*found 2026-08-13 at 3.0.133 while capturing a document surface on the desktop host*
+*found 2026-08-13; supersedes this entry's own first diagnosis, which was wrong*
 
-`yedit /tmp/<name>.md` prints `yedit: document surface opened — 'yedit --close'
-to close it.` and exits 0. The surface does open. The FILES rail then reads **No
-files open. 📄 creates one; 📁 opens a path.** — the path argument was accepted,
-reported on, and dropped.
+⛔ **CORRECTION FIRST, because the wrong version of this entry was published and
+would send a reader into the wrong file.** It said `yedit <path>` accepts the
+path, reports `document surface opened`, and drops it. **It does not drop it.**
+Asked directly, the daemon takes the file and says so:
 
-⇒ The verb's success line describes the half it did (a surface exists) and says
-nothing about the half the argument asked for, so the reply is indistinguishable
-from a correct one. An agent scripting `yedit <path>` gets exit 0 and an empty
-editor, and the natural next conclusion is that the document failed to RENDER —
-which sends the reader into the black-viewport entry above chasing a paint bug
-that is not there.
+```
+POST /open {"path":"/tmp/<probe>.md"}  →  {"ok":true,"id":"…","document_version":"8:false"}
+/ping before → "document_version":"7:false"   /ping after → "8:false"
+```
 
-**Wanted:** open the named file, or refuse by name. Either is fine; reporting
-success for a request that was discarded is not.
+The client resolves the path against its own cwd and posts it; the route stores
+it; the version advances. Every link in that chain works.
 
-**Falsifier:** after `yedit <path>` on an existing readable file, that file is in
-the FILES rail.
+**What is actually wrong.** The control endpoint a surface declares is a
+**loopback address with no host in it** — `http://127.0.0.1:<port>`. The declare
+rides the PTY byte stream to the GUI, and the GUI then resolves that address on
+**its own** machine. Measured across two hosts:
+
+| | |
+|---|---|
+| daemon on the host running the shell | `http://127.0.0.1:46219` |
+| daemon on the host running the GUI | `http://127.0.0.1:46335` |
+| listeners on `46219` on the GUI host | **none** |
+
+⇒ The GUI was pointed at a port nothing on it has ever bound. **And the surface
+rendered as EMPTY rather than as unreachable:** full rail — toolbar, regex
+search, Markdown/Split/Text toggle, FILES heading with its `+`, *No files open*,
+Wrap. Every widget healthy, describing a daemon that does not exist on that
+machine.
+
+⚠ **This is why the campaign-wide document-body comparison has stayed open.**
+Two lanes tried to compare a shadow-rendered body against a real-GUI one and
+recorded it blocked, because nothing would load a document into a surface. The
+loading was never the problem — **the GUI was reading a different daemon.** A
+surface driven from a shell ON the GUI host does not take this path.
+
+⛔ **It is a distinct defect from a libyggterm app launching on the wrong
+machine, and fixing that one does not fix this.** Any manual `ssh <host>` into a
+yggterm PTY — which the OSC declare explicitly supports via `LC_*` forwarding —
+lands the same way. A declare that crosses a machine boundary must carry an
+address the GUI can resolve, or the surface must refuse and say the endpoint is
+unreachable.
+
+**Wanted:** the declare carries a reachable endpoint, or the surface reports the
+endpoint it could not reach. Either is fine; rendering an empty document with
+healthy widgets is not.
+
+**Falsifier:** a surface declared from a shell on another machine either shows
+that machine's open documents, or names the endpoint it failed to reach.
 
 ## ⛔⛔ [6.3] EVERY SIDEBAR BUTTON OPENS THE NOTIFICATION SIDEBAR
 
