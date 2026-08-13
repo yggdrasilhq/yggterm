@@ -93,6 +93,39 @@ done
 UUID="${SESSION##*/}"
 [ -n "$CAMPAIGN" ] || CAMPAIGN="$(printf '%s' "$TITLE" | awk '{print $1}' | tr -d ':' )"
 
+# ⛔⛔ THIS SCRIPT RUNS FROM THE LANE'S OWN WORKTREE, WHICH IS NORMALLY BEHIND MAIN
+# — and claiming is necessarily a lane's FIRST act, so the copy that claims is
+# always the pre-merge one. A brief that says "the booter arms by default" is
+# describing the ORCHESTRATOR's checkout, not the lane's.
+#
+# Measured 2026-08-14: a lane claimed with a copy 23 commits stale, whose
+# `BOOTER` default was the OPPOSITE of the current one, and ran completely
+# unwatched. There was no warning line, and there could not be: **a tool cannot
+# announce the absence of a feature it does not have.** The only version that can
+# raise the alarm is a CURRENT one, so the check has to live here and it has to
+# describe the skew rather than any single feature.
+#
+# ⚠ A warning, never a refusal: a lane being behind main is ordinary, and a lane
+#   that is deliberately editing this tool must still be able to claim.
+# ⚠ Compares against whatever `origin/main` this checkout last fetched — a stale
+#   REF can still say "current". It is a smoke alarm, not a proof.
+claim_self_staleness_warning() {
+  local here root rel behind
+  here="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || return 0
+  root="$(git -C "$here" rev-parse --show-toplevel 2>/dev/null)" || return 0
+  rel="$(git -C "$here" ls-files --full-name "$(basename "$0")" 2>/dev/null)" || return 0
+  [ -n "$rel" ] || return 0
+  git -C "$root" cat-file -e "origin/main:$rel" 2>/dev/null || return 0
+  git -C "$root" diff --quiet "origin/main" -- "$rel" 2>/dev/null && return 0
+  behind="$(git -C "$root" rev-list --count HEAD..origin/main 2>/dev/null || echo '?')"
+  log "⛔ STALE TOOL — this copy of $(basename "$0") differs from origin/main's."
+  log "   This checkout is $behind commit(s) behind main, so DEFAULTS HERE MAY NOT"
+  log "   MATCH WHAT YOUR BRIEF DESCRIBES. Merge origin/main, then verify the arm"
+  log "   yourself — it is the part that fails silently:"
+  log "     ygg-booter.py list | grep ${UUID:0:8}"
+}
+claim_self_staleness_warning
+
 # ⛔⛔ NEVER REAP YOURSELF. A brief hands the successor a `PREDECESSOR TO REAP`
 # uuid as a literal — and if the "successor" was started as an in-process helper
 # rather than as its own PTY session, it INHERITS the parent's session id, so
@@ -415,9 +448,21 @@ log "claimed and verified by read-back: seat=$NUM title=$FINAL_TITLE"
 # (`ygg-booter.py unsubscribe --row <path>`); the booter retires a row only on
 # facts it can see for itself — the row is gone, or the subscription expired.
 if [ "${BOOTER:-0}" = 1 ] && [ -x "$(dirname "$0")/ygg-booter.py" ]; then
-  "$(dirname "$0")/ygg-booter.py" subscribe \
-      ${CAMPAIGN:+--campaign "$CAMPAIGN"} --note "$FINAL_TITLE" 2>&1 \
-    | sed 's/^/  /' || log "⚠ booter subscribe failed — this row is NOT watched"
+  # ⛔ `cmd | sed || log` CANNOT DETECT A FAILED ARM — the pipeline's exit status
+  # is `sed`'s, which succeeds on any input. Same family as the documented
+  # "`| tail` eats the exit code". And an exit code is the wrong question anyway:
+  # this seat's own law is that a verb reports the REQUEST, not the EFFECT.
+  # ⇒ capture, print, then assert on the booter's own READ-BACK line.
+  _arm_out="$("$(dirname "$0")/ygg-booter.py" subscribe \
+      ${CAMPAIGN:+--campaign "$CAMPAIGN"} --note "$FINAL_TITLE" 2>&1)"
+  _arm_rc=$?
+  printf '%s\n' "$_arm_out" | sed 's/^/  /'
+  if [ "$_arm_rc" -ne 0 ] || ! printf '%s' "$_arm_out" | grep -q 'read-back: present'; then
+    log "⛔ THIS ROW IS NOT WATCHED — the booter did not confirm the arm."
+    log "   Arm it by hand, then read it back; do not assume the silence is success:"
+    log "     ygg-booter.py subscribe --row \"$SESSION\" --campaign \"$CAMPAIGN\""
+    log "     ygg-booter.py list | grep ${UUID:0:8}"
+  fi
 elif [ -n "${NO_BOOTER_REASON:-}" ]; then
   # ⛔ RECORD THE DISARM WHERE THE NEXT SESSION READS IT. A row that quietly opted
   # out is indistinguishable from one that was never armed, and that ambiguity is
