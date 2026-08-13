@@ -72,6 +72,13 @@ This file tracks user-visible changes in `yggterm`.
   still cannot serve emits `daemon/terminal_runtime/request_refused` naming
   which map held what — because the row list, the summary and the reveal log all
   reported that row as healthy, and there was no way to tell *gone* from *slow*.
+- **A restore says "that row is not there" instead of waiting three minutes to
+  say nothing (3.0.118).** `open` answers immediately, and by name, when a path
+  resolves to no row — the ordinary outcome for a plain shell whose runtime was
+  destroyed, because nothing is left to restore. `sessions restore` dropped that
+  answer and waited for a readiness that could never arrive, spending the whole
+  cold-open budget per row and then reporting a bare timeout. Caught taking the
+  verb's own live proof: two unresolvable rows, three minutes, no information.
 - **A restore can be told to bring back a row that was closed on purpose
   (3.0.117).** The deny-list stays the default and stays authoritative — that is
   the whole of the previous entry — but a relay retiring its predecessor's row
