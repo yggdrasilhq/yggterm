@@ -43,6 +43,14 @@ copies.
   decision inside an irreversible force-push.
   *Meanwhile:* the term-list rewrite proceeds and nothing waits on this.
 
+- **Was the adopted row `Agent unnamed shell` (uuid tail `0462c0fb66e1`) one you created, or a
+  stray a delegate was entitled to take?** A campaign seated it under a sub-seat, re-titled it, and
+  is now driving a live surface on it — and adopting a row is the same act as renaming one, so it
+  needs the same permission. → `docs/pending-bugs.md` § *A ROW ADOPTED BY A CAMPAIGN MAY HAVE BEEN
+  THE OWNER'S*. **Recommendation: leave it as it is** — it is in active use, the title is accurate,
+  and reversal is two calls at any later time.
+  *Meanwhile:* untouched, and the campaign keeps working on it.
+
 - **The laptop boots with no usable TSC, so every `clock_gettime` costs 45.8×
   what it should (1222.5 ns on `hpet` vs 26.7 ns on `tsc`) — may we add
   `tsc=reliable` to its kernel command line?** It is a boot-config change on his
