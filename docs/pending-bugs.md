@@ -74,6 +74,21 @@ and it disagreed with all three.
 resolution and the github-remote filter with it, and delete the shell copy. Blocked on the guard
 getting a tracked home — see `owner-attention.md`.
 
+⛔⛔ **AND THE TRAP IN INVESTIGATING THIS IS WORSE THAN THE BUG.** A probe that reconstructed the
+hook's invocation with a grep that dropped the `hook` subcommand called the guard bare, got exit 2
+and a wall of usage text — **reproducing the broken-installer symptom exactly, on a HEALTHY repo.**
+Stopping there would have reported the fix as failed, with evidence.
+
+⇒ **The guard's usage output is not evidence of a broken hook. It is evidence that SOMETHING called
+it wrong — and the caller is as likely to be your probe as the installer.** A probe that calls the
+thing slightly wrong is indistinguishable from the thing being broken, because both produce
+usage-and-non-zero. What separates them is reconstructing the REAL call — argv plus the ref line on
+stdin, the way git actually invokes it — rather than an approximation of it.
+
+⭐ **And a hook must be proven in BOTH directions, because either alone proves nothing:** a hook that
+refuses everything passes the block test, and a hook that does nothing passes the pass test. Plant a
+term → must refuse; clean range → must push.
+
 **Falsifier:** run each installer against a git worktree and against a plain checkout in the same
 run, then push from both.
 
