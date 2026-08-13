@@ -1114,6 +1114,19 @@ each boot. A firmware profile that raises the sustained power limit and fan curv
 is a first-order explanation for 93°C at 10% load, and it is entirely independent
 of anything this repo ships. **Owner decision**, logged in `owner-attention.md`.
 
+**Bounded trial, 2026-08-13 18:34–18:39, profile restored to `performance`
+afterwards so the host ended as it started:** on `balanced` the machine never
+exceeded **75.6°C** across 29 rounds, against a baseline max of **97.1°C** over
+1,251 rounds; means were identical (69.9 vs 69.9), and the range compressed at
+both ends.
+
+⚠ **Suggestive, NOT established — the trial is underpowered and must not be
+quoted as a result.** At the baseline's 6.6% rate of >85°C rounds, 29 samples
+expect ~1.9 hot rounds, so observing zero is p≈0.13. ⇒ **What is owed is a
+one-hour trial on `balanced`** (n≈360), which the recorder collects unattended;
+the mean is already known not to move, so the statistic to test is the **peak and
+the >85°C round fraction**, not the average.
+
 Also ruled out while here: the battery is **not charging** (`BAT0: Not
 charging`, running on USB-C mains), so charge heat is not it; GPU 63°C and
 nvme 60°C are unremarkable.
@@ -1131,6 +1144,37 @@ because it is pointless, not because it is expensive.
 ⚠ Swap keeps growing regardless (`pswpout` 963/s, `pgmajfault` 1,469/s after the
 change), which is the web-process entry below and is the item with real value in
 it.
+
+## ⛔ [6.7] THE RESOURCE RECORDER'S `temp_alarm` IS THE RAM SENSOR, NOT THE CPU
+
+**Status:** OPEN
+
+*found 2026-08-13 while reading the recorder's own history*
+
+`scripts/resource-recorder.py::temps()` sets `alarm = 1` when **any** sensor
+under `/sys/class/hwmon` reaches its own `temp*_max`. On the desktop host exactly
+one sensor has a ceiling low enough to matter:
+
+```
+nvme     temp1 = 59C   max = 79C
+spd5118  temp1 = 56C   max = 55C   <== the only one ever alarming
+```
+
+⇒ **`temp_alarm` reports "the DIMM sensor is 1°C over nominal", a near-permanent
+condition, while reading as a CPU thermal alarm.** It fired in 29 of 29 rounds
+during a window in which the CPU ran *cooler* than baseline (64–75.6°C), which is
+how it was caught — the flag went **up** as the machine got colder.
+
+⛔ This is the field-guide family: *the probe answers a different question than
+its name suggests*, in the campaign's own first-act instrument (`ygg-resource
+-recorder status`, the monitoring ritual). Anyone quoting an alarm count is
+quoting the RAM.
+
+**Fix:** record WHICH sensor alarmed, not a bare bit — the sample that is one
+degree over a DIMM's nominal is not the sample that matters, and a count with no
+source cannot be triaged. Not done in-session on purpose: the service was mid-
+trial and collecting the data the entries above rest on, so restarting it would
+have destroyed the measurement.
 
 ## ⛔⛔ [6.7] THE WEB PROCESS'S MEMORY BOUND CANNOT HOLD, BECAUSE SWAP MAKES ITS FOOTPRINT LIE
 
