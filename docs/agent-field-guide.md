@@ -84,6 +84,24 @@ prove it in `tools/xterm-harness/` (jsdom + the EXACT shipped bundle, minutes to
 write) instead of arguing from a live symptom. The harness turns
 "upstream probably does X" into a test that fails when a version bump changes X.
 
+**⛔⛔ A READER THAT FINDS NOTHING LOOKS EXACTLY LIKE A THING THAT HAS NOTHING (2026-08-13).** An
+empty result and a broken reader are the same picture: nothing errors, every count is plausible, and
+the failure hides *precisely because* the system survives emptiness gracefully. Four independent
+instances landed in one evening — a collection reader keyed on the wrong filename reading two
+populated collections as empty; an editor CLI that accepts a path, reports success and drops it, so
+`exit 0` plus an empty editor reads as a paint bug; a surface declaring thousands of characters and
+painting none; and a subject-comparison whose normalizer returned empty, so every subject "missed"
+and it reported sixteen losses that did not exist.
+
+⇒ **THE ACTIONABLE HALF, which is what makes it a rule rather than an epigram: if a reader's silence
+looks the same as success on empty input, give it a way to say *"I looked and found nothing"* apart
+from *"there was nothing."*** ⭐ And when you add any reader, ask what its silence would look like
+**before** you trust its first clean run. Pairs with the both-controls rule below: a positive control
+alone cannot detect an instrument that has collapsed to a constant answer.
+
+*The open defects in this family live in `docs/pending-bugs.md`; this entry owns the durable rule and
+does not duplicate them.*
+
 **⛔⛔ `launch_phase: RemoteBootstrap` IS NOT A FAULT STATE, AND COUNTING IT PRODUCED A FALSE OUTAGE
 (2026-08-13).** During a real socket outage, two sessions independently read `RemoteBootstrap 41 /
 Running 10` as *"41 rows are stranded with no PTY"*. It is the ordinary resting state of a row.
