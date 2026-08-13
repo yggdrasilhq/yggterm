@@ -1474,6 +1474,38 @@ alone would have proven nothing.
 ⇒ Collapse the two onto one dispatcher. Until then a new verb must be added to
 both, and the headless copy carries a comment saying so.
 
+## ⛔ THE BINARY ROSTER REPLACED A HARDCODED LIST WITH A NAME PREFIX, AND STRANDS THE SAME WAY
+
+**Status:** OPEN
+
+*Found 2026-08-13 by seat 6.8, on installing an app that is not named `y…`.*
+
+The fleet's binary sync discovers its roster instead of hand-listing it, and its
+own comment says why: *a hardcoded roster silently strands every app nobody
+remembered to add.* That was the right diagnosis. **The replacement globs
+`~/.local/bin/y*`**, so it strands every app whose name does not begin with `y`
+— by the same silence, for a whole class rather than for forgotten individuals.
+
+Verified rather than assumed: the shipped editor matches the glob, and a
+newly-installed app named without the prefix does not. It was installed by hand
+on all three hosts, and **it will drift the moment it is rebuilt on one of
+them**, because nothing will carry the new build across.
+
+⇒ **This is a discovery mechanism that finds nothing for a whole category and
+reports no error** — the shape this queue already carries four instances of. The
+convention is real (the platform's apps are `y…`), but a convention is not a
+membership test, and the roster is treating it as one.
+
+**Fix, in preference order:** (1) discover by MANIFEST — an app that has written
+`~/.yggterm/apps/<name>.json` has declared itself, which is a statement of
+membership rather than a guess from spelling; (2) keep the glob and add an
+explicit ALLOW list beside the existing DENY, so an off-convention app is one
+line rather than invisible.
+
+⚠ Not fixed here: this is fleet tooling, not this repo, and the owning row
+should make the call. Recorded so the next off-convention app does not spend an
+evening wondering why its upgrade never reached the other hosts.
+
 ## ⭐ THE RENDERER'S LOAD-BEARING FEATURE IS BARE-NAME LINK RESOLUTION — measured, not argued
 
 **Status:** OPEN
@@ -1894,6 +1926,17 @@ and the count the writer sees change.
 
 ⛔ **Still not claimed: the document BODY**, for the reason in the entry above.
 The rail is what the available instrument can prove, and it is what is claimed.
+
+**And it is now invocable, which it was not.** Everything above was true of a
+binary living in a build tree, reachable by nobody: `command -v` found nothing on
+any host. **A journal that cannot be invoked is not a journal**, so the app is
+installed on all three fleet hosts, one hash across all of them, and proven from
+a clean login shell on each — a corpus created on the spot, a thought captured
+into it, the entry read straight back. That is the step between *built* and
+*usable*, and it is easy to skip because every earlier proof passes without it.
+
+⚠ **It will not stay in sync by itself** — see the roster entry above. A rebuild
+on one host reaches only that host until the roster question is settled.
 
 ## ⛔ [6.4] `server app start-page` IS A NAVIGATION VERB SHELVED AMONG THE READ VERBS
 
