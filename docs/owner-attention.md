@@ -235,6 +235,19 @@ copies.
   binary is on the fleet, so the app is usable now either way. **To reverse:**
   one visibility change; nothing else depends on it.
 
+- **The deaf-row sidebar fix cannot be SEEN until the GUI restarts, and the
+  restart would destroy an unsent draft he is holding.** The build carrying it is
+  deployed on every host, but the sidebar is drawn by the GUI process, so the
+  running window keeps the old rendering until it relaunches — and a live
+  composer currently holds half-typed text that a relaunch discards.
+  **Recommendation: send or clear that draft, then say so** and the relay
+  relaunches and takes the proof in minutes; nothing else is needed from him.
+  → `docs/pending-bugs.md`, the deaf-row entry.
+  *Meanwhile:* the code is landed, tested against both mutants, and pushed; only
+  the live screenshot waits. ⛔ The relay will NOT relaunch on its own — the
+  constitution makes a restart free, and an unsent draft is exactly the case it
+  is not.
+
 ## The working dot: what should a CLOSED row's dot say?
 
 **One line, and it unblocks the render.** The dot can only mean "working" for
