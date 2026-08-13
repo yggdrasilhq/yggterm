@@ -6418,15 +6418,28 @@ The owner asked for a working indicator. 6.3 owns the RENDER half; this entry
 owns the prior question — **what makes a session's working-state knowable at
 all**, and why `working` is `None` on most rows.
 
-### There is exactly ONE producer, and it needs a locally-owned live PTY
+### There is exactly ONE producer, and it reads a live PTY's screen
 
 `DaemonRuntime::working_flags` is the whole supply. For an agent CLI it reads
 the live in-daemon vt100 screen and asks THAT CLI's own matcher
 (`descriptor.screen_shows_working`); for a plain shell it asks whether a
-foreground process is active. **Both require this daemon to be holding the
-session's PTY.** There is no transcript source, no remote source, and no
-fallback — so for any row whose PTY this daemon does not hold, the working state
-is not merely unknown, it is unaskable.
+foreground process is active. **Both require a daemon to be holding the
+session's PTY.** There is no transcript source and no other signal.
+
+⚠ **CORRECTION, made within the hour by reading further rather than leaving it
+to harden.** A first version of this entry said a row whose PTY this daemon does
+not hold is *unaskable*. **That is wrong.** `refresh_proxied_working_flags` +
+`working_flags_including_proxied` already ask the OWNING daemon for exactly the
+rows this one cannot answer, and cache the result (`proxied_working_flags`,
+refreshed at most once per `PROXIED_WORKING_REFRESH_MS`) because an unbounded
+per-snapshot fan-out would cost a round trip per row per frame. That capability
+was added precisely because the snapshot — *"what the sidebar dot reads"* — used
+to answer from the raw screen scrape and so reported `None` forever for a row
+owned by an older coexisting daemon.
+⇒ **The real coverage is: owned locally ∪ owned by a reachable sibling daemon
+whose preserved-owner endpoint resolves.** What is genuinely outside it is a row
+whose PTY lives on ANOTHER HOST, and a row that is not running at all — and for
+the second of those, `None` is the honest answer.
 
 ### ⛔ AND "I COULD NOT LOOK" IS ENCODED AS "NOTHING TO REPORT"
 
@@ -6471,6 +6484,16 @@ concluded.
 per row, whether a working reading was POSSIBLE and what it read. Then `None`
 splits into "not running here" and "running and idle", and the dot can stop
 standing in for attachment.
+
+⇒ **The order of work, given the correction above.** The proxy already extends
+coverage, so the first job is NOT another source — it is making the existing one
+able to say *"I could not look"*, because a proxy that returns nothing and a
+screen that says idle are today the same value. Concretely: `working_flags`
+returns `Vec<(String, bool)>` and drops the unreadable, so
+`refresh_proxied_working_flags` cannot tell "the owner said not-working" from
+"the owner never answered" either — **the conflation is inherited by the very
+mechanism meant to repair it.** Fixing the encoding is therefore upstream of
+both the proxy's correctness and anything the render can do.
 
 ## ⚖⚖ THE HOT-RESTART GATE IS UNBUILT — THE DESIGN IS NOW SETTLED
 
