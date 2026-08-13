@@ -188,6 +188,18 @@ agent cannot tell the two cases apart from the reply, which is exactly the
 defect — a verification instrument whose output is the same whether or not it
 verified anything. Reading the PNG remains the only check.
 
+⭐ **THIRD SIGHTING NARROWS THE FIX — 2026-08-13 at 3.0.120, cluster 6.2.** With
+`force-foreground on` and `--pid <gui>` on a **terminal** view, the same call
+answered `capture_backend: xterm_canvas_composite_over_dom`, and the PNG was the
+addressed GUI: sidebar, viewport and metadata rail, `--crop`/`--scale` applied
+correctly. ⇒ **The in-process composite backend cannot photograph the wrong
+window — it composites the client it was addressed to.** Only
+`linux_wayland_spectacle` can, because it shoots whatever the compositor says is
+focused, and it is the fallback chosen when the view is not a terminal. So the
+fix is not "make `faithful` honest" in general: it is that the **spectacle
+fallback must report which window it got, or refuse when the addressed pid does
+not hold focus**. The composite path is already the trustworthy one.
+
 **Falsifier:** with the GUI unfocused, `screenshot --pid <gui>` returns a frame
 of that GUI, or refuses.
 
