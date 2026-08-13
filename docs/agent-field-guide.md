@@ -190,6 +190,41 @@ fails, which is when you most need the answer. Same family as `cargo test … | 
 produced this line was only recognised because a negative control returned 0 and a positive control
 returned 168 side by side — a single reading of either would have looked like an answer.
 
+### ⛔ `server app rows` DOES NOT CARRY THE WEDGE FIELDS — `server snapshot` DOES
+
+A brief handed on the claim that `server app rows` emits `input_unanswered_ms` and
+`wedge_suspected`, which would make it the instrument for measuring a deaf row. **It does not.**
+Measured: 384 rows, and the union of every field name across all of them contains neither.
+
+```sh
+server app rows | python3 -c 'import sys,json; rs=json.load(sys.stdin)["data"]["rows"]; \
+  print(sorted({k for r in rs for k in r}))'      # ⇒ no input_unanswered_ms, no wedge_suspected
+```
+
+`input_unanswered_ms` lives on `SnapshotSessionView` (`daemon.rs`), so **`server snapshot`** is the
+owner; `wedge_suspected` is not a field at all but a derived predicate —
+`input_unanswered_suggests_wedge()` against `INPUT_UNANSWERED_WEDGE_SUSPECT_MS` in `yggterm-core`,
+which is the single owner of the threshold that gate, row payload and sidebar all read.
+
+⭐ **The lesson is the shape, not the fields:** the claim arrived in a handover as an established
+fact and was one command from being falsified. A relayed measurement is a CLAIM until you have run
+it yourself — and building a measurement on top of an instrument that does not exist is how a whole
+lane's numbers turn out to be about nothing.
+
+### ⛔ A DOM READ IS `server app dom-eval` — `chrome type --assert` TYPES FIRST
+
+`server app chrome` offers only `type`. Its `--assert <selector>@<attribute>` is a real DOM read but
+it writes a keystroke before reading, so it can never be pointed at a GUI a human is using.
+**`server app dom-eval "<js>"` runs JS in the GUI webview and returns the serialized result without
+typing** — pass the script POSITIONALLY, flags after it, or a leading flag makes it evaluate the
+flag string. Base64 the script through `ssh` to keep quoting honest.
+
+⛔ It answers only on the host where the GUI runs, and only to a registered client — a headless host
+has a daemon and sessions but no client. `server app clients` answers "is the GUI here" directly.
+⭐ A GUI with its own `YGGTERM_HOME` (a sandbox, another lane's rig) is reachable by pointing that
+variable at it, which is how a second live instance can be READ for comparison. Never DRIVE one:
+a mode change or relaunch corrupts whatever it is measuring.
+
 ## 2. Profiling recipes that work
 
 No `perf` on a typical desktop host (`perf_event_paranoid=3`), but these do:
