@@ -359,7 +359,7 @@ components, and **no context menu**. Sequenced after yggtopo deliberately —
 yggtopo establishes the component vocabulary and yggdrasil-maker consumes it.
 If the second app needs new primitives, that is a finding about the first.
 
-## ⛔⛔ [6.7] THE GUI HOLDS 1.0 GB AND ITS WEB PROCESS 850 MB WITH NO WORK RUNNING
+## ⛔⛔ [6.7] AT REST THE GUI BURNS 93% OF A CORE, AND TWO THIRDS OF IT IS THE KERNEL ANSWERING `clock_gettime`
 
 **Status:** OPEN
 
@@ -411,6 +411,181 @@ around:
 ⇒ **Growth-over-time is the measurement that matters**, not a point sample.
 A single RSS reading names a symptom; RSS plotted against uptime names a class.
 
+⚠ **One correction from the measurement below, because it changes where to
+look.** The dichotomy above — *"a leak or an unbounded accumulation, **not** a
+hot loop, because a hot loop costs the same in hour 36 as in hour 1"* — is the
+one thing the evidence does not support. It **is** a hot loop, and it **does**
+get worse with uptime, because its iteration count is proportional to
+accumulated state: the same loop measures 7.3% of a core on a fresh process and
+58.8% after 36.9 h on the same machine. ⇒ Do not look for a leak *instead of* a
+loop. Look for **what the loop walks**, and why that keeps growing.
+
+### ROOT CAUSE, measured 2026-08-13 — it is CPU, and memory is the amplifier
+
+⚠ **The heading this entry was filed under was the wrong instrument.** RSS named
+a symptom; it did not name the cost. Three measurements reframe it.
+
+**1. The idle cost is CPU, not memory.** Sampling `utime+stime` from
+`/proc/<pid>/stat` over 45 s on a quiet machine — *not* `ps %CPU`, which is a
+lifetime average and has misled this campaign before:
+
+| process | CPU at rest |
+|---|---|
+| the GUI | **92.6% of one core** |
+| its `WebKitWebProcess` | **33.0% of one core** |
+| 6 × daemon | 0.9–7.5% each, **13.9% together** |
+
+⇒ **~1.4 cores burned continuously with nothing running.** That is the fan, and
+that is the power drain. An idle app should cost nothing measurable.
+
+**2. Two thirds of the GUI's cost is in the kernel, and it is one syscall.**
+The 45 s split is `utime` 33.5% / `stime` **58.8%** — 64% of the GUI's CPU is
+kernel time. `strace -c` on the main thread names it: **222,293
+`clock_gettime` calls in 6 s**, 95.8% of all syscall time, 178,211 of them
+`CLOCK_MONOTONIC`.
+
+**3. Each of those calls costs 45.8× what it should, because this host has no
+usable TSC.**
+
+| host | clocksource | `CLOCK_MONOTONIC` cost | calls to burn one core-second |
+|---|---|---|---|
+| build host | `tsc` (vDSO) | **26.7 ns** | 37,400,000 |
+| desktop host | `hpet` | **1222.5 ns** | **818,000** |
+
+`available_clocksource` on the desktop host is `hpet acpi_pm` — TSC is not
+registered at all, so `CLOCK_MONOTONIC` **cannot be served from the vDSO** and
+every query is a real syscall reading a 14.3 MHz MMIO counter. At 1222.5 ns,
+58.8% of a core is **≈481,000 clock syscalls per second at idle**.
+
+⇒ **The same code costs ~1.3% of a core on a TSC machine and 58.8% here.** The
+clocksource is a boot-config matter and is logged in `docs/owner-attention.md`;
+**the defect that is ours is making half a million clock syscalls a second at
+all.** Apple-grade means not being 45× sensitive to the platform clock. Under
+the same instrument (`strace -c`, same host) the 2026-07-21 session measured
+~4,200 `clock_gettime`/s; today it is ~37,000/s — **≈9× more clock queries than
+July**, which is a code-side regression on top of the machine-side amplifier.
+
+**Where the spin comes from.** `eu-stack` on the pegged main thread, 70 samples:
+the dominant stack is `tao EventLoop::run → gtk_main_iteration_do →
+g_main_context_iteration → clock_gettime`, with `ControlFlow::Wait` set — so the
+loop is *supposed* to block. It does not: the instrument-independent ratio is
+**1,554 `clock_gettime` per `ppoll`**, i.e. the loop spins hundreds of times
+between blocking polls. Every future the VirtualDom wakes turns into a
+`UserWindowEvent::Poll` through `tao_waker` (`vendor/dioxus-desktop/src/waker.rs`),
+and the GUI has **162 `spawn(` sites** plus three app-root `use_future` loops.
+
+**And each render is enormous.** `root_render_count` moves **4.4 renders/sec at
+complete rest** — 131 renders in 30 s with nobody touching the machine. Against
+33.5% of a core in user time that is **~76 ms of CPU per render**. The profile
+shows why: `ShellState::snapshot → SessionBrowserState::all_rows → flatten_rows`
+(6 frames deep) `→ session_id_suffix`, which allocates a `Vec<char>` **and** a
+`String` per session per call, plus `SessionTitleStore::open` and
+`summary_timeline_for_session_id` **on the main thread during render**. The
+matching syscall churn is visible in the same trace: 59 `mkdir` (59 EEXIST),
+1,030 `newfstatat` (686 ENOENT), 490 `pread64` in 6 s.
+
+**Why it renders at all when nothing changed.** The app-root timer loops call
+`state.with_mut(...)` unconditionally — `INPUT_GATE_DEADLINE_TICK_MS = 1_000`
+and `HOT_WARM_CHECK_INTERVAL_MS = 5_000` (`crates/yggterm-shell/src/shell.rs`).
+`with_mut` on a Dioxus signal marks it dirty on drop **whether or not the
+closure changed anything**, and the signal is the whole `ShellState` that the
+root reads. A tick that decides nothing still costs a full-tree re-render.
+
+⇒ **Two independent defects, either survivable alone:** renders that had nothing
+to render, and a render that is O(whole tree) with per-row allocation.
+
+**4. The memory number was also understated, because a third of it is swapped.**
+RSS alone cannot see it:
+
+| | RSS | swapped | real anon footprint |
+|---|---|---|---|
+| GUI | 1,011,896 KB | 257,912 KB | **1.27 GB** |
+| `WebKitWebProcess` | 901,008 KB | 873,956 KB | **1.77 GB** |
+| together | | | **3.04 GB** |
+
+983 MB of the GUI's total is a **single glibc `[heap]` brk arena** — glibc does
+not return brk memory to the OS unless the top is free, so freed memory stays
+resident. And the GUI's thread census shows accumulation directly: **11
+`WebsiteDataStore` + 13 `ReceiveQueue` threads** for what should be a handful of
+web contexts. ⇒ **that is the monotonic half** — web contexts created and never
+released — and it is what makes a constant hot loop *feel* worse over uptime, by
+pushing its working set into swap.
+
+### The before/after that settles what KIND of defect this is
+
+Same host, same HPET clock, same session set. Before = 36.9 h of uptime;
+after = the same build relaunched, measured at 3 min idle.
+
+| | before (36.9 h) | after (3 min) |
+|---|---|---|
+| GUI CPU at rest | **92.6% of a core** | **17.2%** |
+| ↳ of which kernel (`stime`) | **58.8%** | **7.3%** |
+| ↳ of which user (`utime`) | 33.5% | 9.9% |
+| `WebKitWebProcess` CPU | 33.0% | 18.4% |
+| GUI RSS + swap | 1.27 GB | **345 MB** |
+| web process RSS + swap | 1.77 GB | **292 MB** |
+| **combined anon footprint** | **3.04 GB** | **637 MB** |
+| system swap in use | 10,304 MB | 8,193 MB |
+| GUI `WebsiteDataStore` threads | **11** | **0** |
+| GUI `ReceiveQueue` threads | **13** | **0** |
+
+⇒ **~2.4 GB and ~75% of a core reclaimed by a restart costing about ten
+seconds.** That is relief, not a fix.
+
+⭐ **And it answers the question the batch was filed on.** Kernel time fell
+**8×** on a machine whose clock did not change, so the ~481,000 clock syscalls
+per second were *not* a constant cost — **the spin rate itself grows with
+uptime.** The reporter's two claims are therefore both true and they are the
+same defect: state accumulates (11 → 0 `WebsiteDataStore` threads is that
+accumulation caught directly), each main-loop wake has more to walk, and the
+loop that costs 7.3% of a core on a fresh process costs 58.8% after a day and a
+half. **A hot loop whose iteration count is proportional to accumulated state
+looks exactly like "worse the longer it runs".**
+
+⚠ **17.2% + 18.4% of a core is still the floor on a FRESH process with nobody
+touching it.** The restart hides the growth; it does not reach the floor, and
+the floor is what the Apple-grade standard is actually about.
+
+⚠ **Honest note on how that restart happened.** It was intended and measured,
+but it was triggered by running the *GUI* binary with an unrecognised subcommand
+(`yggterm update --help`) instead of `yggterm-headless`. The GUI binary does not
+print help for an unknown verb — it **launches a client instance**, which then
+took the running GUI down with it and left a `SIGABRT` coredump of its own. Use
+`yggterm-headless` for every control verb; see `docs/agent-field-guide.md`.
+
+**Still to attribute (this cluster's next load):** which of the 162 `spawn`
+sites and three `use_future` loops produce the spurious wakeups, and what
+retains the web contexts.
+
+## ⛔ [6.7] A DAEMON RE-DROPS THE SAME UNRECOVERABLE SESSIONS THREE TIMES A SECOND, FOREVER
+
+**Status:** OPEN
+
+*measured 2026-08-13*
+
+`live_session_persist_dropped` fires **92 times in 30 s (184/min)** from one
+daemon, and it is the same two keys over and over, always with
+`"reason":"not_recoverable"`:
+
+```
+{"name":"live_session_persist_dropped","payload":{
+  "detail":{"kind":"SshShell","source":"LiveSsh","ssh_target":"…"},
+  "key":"live::<uuid>","protect_all_live":false,"reason":"not_recoverable"}}
+```
+
+A session judged permanently unrecoverable is re-judged, re-dropped and re-logged
+on every persist pass instead of being dropped once. It accounts for **15% of all
+trace lines** and is the visible half of the daemons' 13.9% idle CPU.
+
+**It also writes.** At rest `~/.yggterm/event-trace.jsonl` grows **13.8 MB/hour**
+and all `~/.yggterm/*.jsonl` together grow **28 MB/hour** — continuous disk I/O
+on a laptop with nothing running, from several daemon generations each keeping
+its own trace open. Twelve `event-trace.g*.jsonl` files of ~20 MB each were
+resident, three of them being written concurrently.
+
+**Falsifier:** a session that reports `not_recoverable` must be logged once and
+never re-examined; the event rate on an idle daemon must go to zero.
+
 ## ⛔ [6.7] A DAEMON LEAVES ITS `ssh` CHILDREN UNREAPED
 
 **Status:** OPEN
@@ -420,6 +595,12 @@ A single RSS reading names a symptom; RSS plotted against uptime names a class.
 Twelve `[ssh] <defunct>` zombies on the desktop host, **all parented to one
 `yggterm-headless server daemon`** (a 4-day-old process). A thirteenth zombie,
 `[xdg-open]`, is parented to the GUI.
+
+⇒ **New, 2026-08-13: all twelve were spawned inside ONE second**, in two bursts
+(`10:21:39` ×8, `10:21:40` ×4) four days before they were found, and none since.
+That is not per-session leakage — it is **one fan-out that spawns `ssh` per
+target and waits for none of them**, which narrows the search a long way from
+"the daemon's child handling" to the code that probes every machine at once.
 
 ⇒ Something spawns `ssh`, the child exits, and nobody calls `wait`. Zombies cost
 almost no memory, so this is not the fan — but it is an unambiguous
@@ -440,11 +621,31 @@ Sixteen `drkonqi-coredump-launcher` processes are resident on the desktop host,
 ages ranging from 4.7 days to **11 days — i.e. since the machine booted**. Each
 one is a crash whose handler never finished.
 
-**They are not yet attributed.** Whose coredumps these are has not been
-established, and the 6.7 delegate must establish it before drawing any
-conclusion — if they are yggterm's, sixteen crashes is a headline finding; if
-they are not, this entry retires with a one-line note saying so. ⛔ Do not
-assume they are ours because they were found while looking at us.
+**ATTRIBUTED 2026-08-13 — they are ours, and the entry does not retire.**
+`coredumpctl` holds **353 crashes**; by executable:
+
+| executable | crashes |
+|---|---|
+| `open-webui` (a flatpak, **not ours**) | 182 |
+| **`yggterm`** (`~/.local/bin`, `~/.yggterm/bin`, versioned + debug builds) | **~75** |
+| **`WebKitWebProcess`** (ours — the GUI's webviews) | **35** |
+| **`WebKitNetworkProcess`** (ours) | **13** |
+| everything else (plasmashell, dash, spectacle, rustfmt, …) | ~48 |
+
+⇒ **~123 of 353 are yggterm's**, second only to a single unrelated flatpak, and
+the GUI's own signal mix is **`SIGSEGV`** while the web processes abort. Recent
+ones are not historical: `2026-08-11 16:11` yggterm SIGSEGV (81.6 MB),
+`2026-08-09 10:07` yggterm SIGSEGV (443.8 MB), `2026-08-08 23:07`
+WebKitWebProcess SIGABRT (**552.4 MB**).
+
+**And they are charged to the laptop's disk: `/var/lib/systemd/coredump` is
+2.6 GB across 41 files.** A 552 MB core is a direct consequence of the memory
+growth in the entry above — the bigger the process gets, the more a crash costs
+to store.
+
+⇒ Two separable jobs: the stuck handlers (16 `drkonqi-coredump-launcher`
+processes that never finished, oldest dating to boot) and the crashes
+themselves. The crash *rate* is the more valuable of the two and is unowned.
 
 ## ⛔ [6.6] `AGY` LAUNCHES A PLAIN SHELL, AND NO CLI GETS ITS PERMISSION FLAG
 

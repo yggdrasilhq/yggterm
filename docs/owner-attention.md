@@ -30,6 +30,15 @@ copies.
 
 ## Decisions only he makes
 
+- **The laptop boots with no usable TSC, so every `clock_gettime` costs 45.8×
+  what it should (1222.5 ns on `hpet` vs 26.7 ns on `tsc`) — may we add
+  `tsc=reliable` to its kernel command line?** It is a boot-config change on his
+  personal machine and a wrong TSC makes time jump backwards, so it is his call,
+  not the relay's. **Recommendation: try it**, measured payoff is most of a core
+  at idle. → `docs/pending-bugs.md`, the 6.7 idle-CPU entry.
+  *Meanwhile:* the relay is fixing the half that is ours — the ~481,000 clock
+  syscalls per second — which is the real defect either way.
+
 - **The response-layer rule, or five separate patches?** — five verbs report the
   request rather than the effect, and he framed the fix's SHAPE as the open
   question. → yggterm `docs/pending-bugs.md` § *FIVE VERBS REPORT THE REQUEST,

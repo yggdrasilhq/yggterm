@@ -97,6 +97,28 @@ No `perf` on a typical desktop host (`perf_event_paranoid=3`), but these do:
   Instrument *all* candidates, not the one you suspect; the answer is often that
   your suspect costs nothing.
 
+- ⛔ **A syscall count is meaningless until you price the syscall on THAT host.**
+  `clock_gettime` is normally a ~27 ns vDSO read and free to ignore. On a host
+  whose clocksource has fallen back to `hpet` it is a real syscall reading a
+  14.3 MHz MMIO counter at **1222.5 ns — 45.8×** — and the same code costs 1.3%
+  of a core on one machine and 58.8% on another. **Check
+  `/sys/devices/system/clocksource/clocksource0/current_clocksource` before
+  interpreting any profile**, and price the call with a 20-line
+  `clock_gettime` loop rather than assuming.
+- ⭐ **`utime` vs `stime` splits the search in half before you profile.** Kernel-
+  dominant means syscalls (find which with `strace -c`); user-dominant means
+  compute (find where with `eu-stack`). Reading the split costs one
+  `/proc/<pid>/stat` sample and rules out half the hypotheses.
+- ⭐ **A ratio survives the instrument; a rate does not.** `strace` slows the
+  target ~13×, so its absolute rates are fiction — but *`clock_gettime` per
+  `ppoll`* is unaffected and is what proved the main loop was spinning rather
+  than blocking.
+- ⭐ **Measure a fresh process against an aged one to learn the defect's KIND.**
+  Identical build, identical host: if the cost falls, it is accumulation; if it
+  holds, it is a constant loop. This is the one experiment that distinguishes
+  "leak" from "hot loop", and a restart destroys the aged sample — so take the
+  aged measurement FIRST.
+
 **Hold the workload fixed.** The single most common measurement error here is
 comparing two conditions under different load — a CPU/thermal A/B is evidence
 only if the same session is doing the same thing in both windows. When the agent
@@ -302,6 +324,15 @@ until its own disk-binary poll retires it, which can be ~20 minutes later.
   viewport. Run it only on a surface already confirmed broken.
 - Never type into a live agent prompt to "test" it.
 - Restore the user's active session after any probe that had to switch away.
+- ⛔ **`yggterm <unknown-verb>` LAUNCHES THE APP. It does not print help.** Running
+  `~/.yggterm/bin/yggterm update --help` to read a usage string instead started a
+  second client instance, whose singleton path took the *running* GUI down with
+  it and left a `SIGABRT` coredump — 36.9 h of accumulated state gone mid-measurement
+  (2026-08-13). The GUI binary parses only what it recognises and otherwise falls
+  through to "be the app". ⇒ **Every control verb goes to `yggterm-headless`**,
+  which is the client made for agents; reach for the GUI binary only to launch a
+  GUI on purpose. This is the same family as the standing rule against running
+  archived/versioned GUI binaries "just to see the version".
 
 ## 7. Gotchas that cost this project real time (2026-07-26)
 
