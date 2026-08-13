@@ -4992,12 +4992,29 @@ Both halves are the same defect — the kind vocabulary has three encodings (fla
 token, enum debug name, help text) and no owner. Collapse them onto the
 descriptor's `slug`, which is already the SSOT the intake built.
 
-## A PANE-TENANCY TEST IS FLAKY UNDER PARALLEL EXECUTION — it passes alone and fails in the suite
+## TESTS ARE FLAKY UNDER PARALLEL EXECUTION — they pass alone and fail in the suite
 
 **Status:** OPEN
 
+⚠ **It is not one test, and that is the finding.** `yggterm-server`'s suite joins
+it: on 2026-08-13, three separate full runs of an unchanged tree failed on a
+DIFFERENT test each time —
+`tests::refresh_terminal_identity_updates_restored_remote_launch_commands` (twice,
+`refresh_terminal_identity_launch_commands()` returned 0 where 1 was expected) and
+`tests::local_cc_relaunch_rebuild_collapses_poisoned_identity_to_row_id` — while
+five other runs of the same tree passed clean. Both touch the process-global
+terminal identity env that `codex_cli::env_test_guard` exists to serialize, so
+either a writer is not taking the guard or the guard is not the only door. The
+failures cluster when the host is under build load, which changes interleaving —
+so the suite is quietest exactly when nobody is deploying and loudest when
+somebody is.
+
+⇒ **A different test failing each run is the signature to look for**: it rules out
+a regression in any one of them and points at the shared state they have in
+common.
+
 `shell::tests::a_pane_is_a_tenant_of_the_session_that_declared_it_never_of_a_namesake`
-(`crates/yggterm-shell/src/shell.rs`).
+(`crates/yggterm-shell/src/shell.rs`) is the original instance.
 
 Measured 2026-08-08 across three runs with **`shell.rs` unchanged between
 them** (`git log` on the file shows nothing since `b3f96ec4`):
