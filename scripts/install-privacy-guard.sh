@@ -35,6 +35,26 @@
 #   that carries its own wordlist into a public repo publishes the very list
 #   that names the private things.
 #
+# ⛔⛔ THIS IS A SECOND ENCODING AND IT MUST NOT SURVIVE. `ygg-privacy-guard
+# install` ALREADY DOES THIS JOB, and predates this script — writing it without
+# checking was an SSOT violation, and it diverged on day one: this script wrote
+# the hook to invoke `pre-push`, a subcommand the guard does not accept, so the
+# guard printed its usage text and exited non-zero, which git reads as "the hook
+# says no". ⇒ EVERY REPO THIS SCRIPT TOUCHED COULD NO LONGER PUSH AT ALL.
+# ⚠ It failed CLOSED, which is the right direction for a leak gate and is why
+#   this was an availability bug and never an exposure — but note the tell:
+#   AN INERT HOOK AND A WORKING ONE ARE IDENTICAL ON DISK, and the broken one
+#   printed a wall of the guard's own text that looked exactly like the guard
+#   running. ⭐ AN INSTALLER IS PROVEN BY A REAL PUSH OR NOT AT ALL.
+#
+# ⚖ Why this script still exists for now rather than being deleted outright:
+# the guard's own `install` uses `<repo>/.git/hooks`, and in a git WORKTREE
+# `.git` is a FILE — measured, it raises rather than installing, while this
+# script resolves the path with `git rev-parse --git-common-dir` and is correct
+# in both. It also skips repos with no github remote. ⇒ Two encodings exist and
+# they disagree; that is the defect. COLLAPSE THEM INTO THE GUARD when it gets a
+# private repo home — the guard is the owner, and this file is the stopgap.
+#
 #   scripts/install-privacy-guard.sh [<repo> ...]     # default: this repo
 set -uo pipefail
 # ⛔ THE GUARD ITSELF IS NOT IN THIS REPO, AND MUST NOT BE.
