@@ -29,6 +29,45 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⛔ [6.7] `main` IS RED IN ANY CHECKOUT WITHOUT THE LIVE-HOST CACHE — THE DEPLOY GUARD TESTS NEED A HOST TO EXIST
+
+**Status:** OPEN
+
+Filed, not fixed. Owner is whoever owns `deploy-fleet`; 6.7 tripped over it and
+is not reformatting another lane's gate.
+
+`cargo test -p yggterm-core --test deploy_fleet_guard` fails two tests:
+
+```
+a_build_behind_origin_main_is_refused_and_the_missing_commits_are_named
+the_same_tree_passes_the_ancestry_gate_once_it_is_rebased
+```
+
+Both die before reaching the thing they test, on the same stderr:
+
+```
+deploy-fleet: ⛔ could not resolve the live GUI host — ygg-live-host.sh gave nothing.
+```
+
+⭐ **Measured on a pristine `origin/main` worktree, not inferred from a dirty
+tree.** Both fail there identically, so this is not one lane's breakage — it is
+the state of main. From the repo root the resolver works and answers correctly;
+the tests run `deploy-fleet` against a *synthetic* repo, where
+`.agents/config/live-host` does not exist. That cache is gitignored and present
+only on the host it names, so the gate is red on **every headless checkout** and
+green only where someone happens to have run the resolver.
+
+⇒ The test asserts a refusal message about ancestry and receives a refusal
+message about host resolution — a gate failing for a reason it was not written
+to check, which is the shape that teaches people to ignore it. The fix is for
+the guard to be given a host (or a stub) in the synthetic repo, not for the
+resolver to guess.
+
+⚠ Related in shape to the entry relay-4 filed and retracted: a red main whose
+redness belongs to the environment rather than the change in front of you.
+**Re-measure on a pristine worktree before concluding either way** — that is
+what settled this one.
+
 ## ⛔ `/context` RESETS THE BOOTER'S IDLE CLOCK — inspecting a row blinds the defence that watches it
 
 **Status:** OPEN
