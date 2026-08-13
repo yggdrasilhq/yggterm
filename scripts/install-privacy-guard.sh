@@ -19,6 +19,17 @@
 #   the opposite of what a guard is for. "The agent remembered" is precisely
 #   what a guard exists to replace.
 #
+# ⛔⛔ THE VERB IS `hook`, NOT `pre-push`, AND GETTING IT WRONG REFUSES EVERY
+#   PUSH. The guard dispatches on `cmd == "hook"`; anything else falls through
+#   to its usage text and a non-zero exit, which git reads as "the hook says
+#   no". The first version of this installer wrote `pre-push` — the name of the
+#   FILE — and every repo it touched could no longer push at all.
+#   ⚠ It failed CLOSED, which is the right direction for a leak gate and is why
+#   this was an availability bug rather than an exposure. But an installer
+#   cannot be proven by the hook EXISTING: an inert hook and a working one are
+#   identical on disk, and the broken one printed a wall of text that looked
+#   like the guard running. Prove it with a real push.
+#
 # ⭐ The wordlist is NOT here and must never be: the private terms live outside
 #   every repo in ~/.config/ygg-privacy/private-terms.txt (mode 600). A guard
 #   that carries its own wordlist into a public repo publishes the very list
@@ -48,7 +59,7 @@ install_into() {
 #!/usr/bin/env bash
 # installed by yggterm scripts/install-privacy-guard.sh — do not edit here;
 # .git/hooks is untracked, so an edit made here exists on ONE host and nowhere else.
-exec "$SELF" pre-push "\$@"
+exec "$SELF" hook "\$@"
 SHIM
   chmod +x "$gitdir/hooks/pre-push"
   echo "  installed → $(basename "$repo")"
