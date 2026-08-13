@@ -2281,18 +2281,20 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // second encoding of the cd we already did.
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
-        // ⛔ UNMEASURED. Neither `❯` nor `›` occurs anywhere in the shipped
-        // executable's strings, so the glyph is NOT one of the two this repo
-        // already knows and guessing it would make every grok row read as
-        // never-ready — the exact defect a hardcoded `›` caused for Claude Code
-        // (live, 2026-08-06). `\0` is the declared-unknown value.
-        composer_marker: '\0',
-        // MEASURED from the executable's own strings: `/help for commands` is
-        // composer chrome. ⚠ `esc cancel` is NOT listed here: it sits adjacent
-        // to the same status line in the binary and could belong to either the
-        // idle composer or the in-flight footer, and a hint in the wrong half
-        // makes a working row read as a prompt.
-        composer_footer_hints: &["/help for commands", "ctrl"],
+        // ⭐ MEASURED off a LIVE ROW 2026-08-13, and it is why the field was
+        // declared unknown first: neither `❯` nor `›` occurs anywhere in the
+        // shipped executable's strings, so a static read said "not one of the
+        // two this repo knows". The running TUI draws `❯` inside a box-drawn
+        // composer. ⇒ a binary's strings can be silent about a glyph its own
+        // renderer composes; the screen settles it and nothing else does.
+        composer_marker: '\u{276f}',
+        // MEASURED from the executable's own strings plus one live screen:
+        // `/help for commands` is composer chrome, and the row's footer names
+        // the model (`Grok 4`). ⚠ `esc cancel` is NOT listed here: it sits
+        // adjacent to the same status line in the binary and could belong to
+        // either the idle composer or the in-flight footer, and a hint in the
+        // wrong half makes a working row read as a prompt.
+        composer_footer_hints: &["/help for commands", "ctrl", "grok"],
         working_footer_hints: &[],
         // MEASURED on the installed binary: `--permission-mode <MODE>` with
         // `[possible values: default, acceptEdits, auto, dontAsk,
