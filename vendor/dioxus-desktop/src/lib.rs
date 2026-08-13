@@ -69,6 +69,7 @@ pub mod trayicon;
 // Public exports
 pub use assets::AssetRequest;
 pub use config::{Config, WindowCloseBehaviour};
+pub use edits::edit_faults;
 pub use webview::allow_webview_navigation_prefix;
 pub use webview::set_webview_http_navigation_open;
 pub use default_icon::{default_icon, icon_from_memory, icon_from_path};

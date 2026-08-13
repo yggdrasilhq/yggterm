@@ -268,6 +268,33 @@ does not otherwise show, and reserves the blink for real work.
 and filed (there is no detector defect), so the render lands as soon as this is
 answered. **To reverse:** it is a view-layer rule; no data change either way.
 
+## ⭐ ONE RELAUNCH CLEARS BOTH GUI-GATED ITEMS — they are not two decisions
+
+The deaf-row sidebar proof (above) and the right rail (below) are **the same
+single action**, waiting on the same draft. Whenever that draft is no longer
+worth protecting, one relaunch delivers both: the rail paints again on the first
+frame, and the deaf-row rendering becomes visible for its proof. Neither needs
+anything else from him, and neither can happen before that relaunch.
+
+⛔ Nothing here asks him to hurry it — the draft is the thing being protected.
+This entry exists only so the two are not weighed as separate costs.
+
+## The right sidebar comes back when you next relaunch the GUI — and cannot before then
+
+**What he does:** relaunch yggterm, whenever the unsent draft in his composer is
+no longer worth protecting. **What he gets:** the rail paints again immediately.
+
+Measured, not inferred: a webview that threw while applying an edit batch was
+told it had applied, so the running GUI's model of the screen is self-consistent
+and wrong, and nothing can re-send what was lost. Killing and relaunching the GUI
+against the SAME home and daemon restored the rail on the first frame — same
+sessions, same rows, only the page rebuilt. ⇒ This is a GATE, not an open bug:
+no code change reaches the running process, and the fix that stops it recurring
+is already on `main` and arrives with the same relaunch.
+
+⛔ The relaunch is his call and his alone — it is the draft that is being
+protected, not the rail.
+
 ---
 
 ## Nothing is waiting on him for these, and they are the relay's actual queue
