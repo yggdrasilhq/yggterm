@@ -578,6 +578,230 @@ pub struct TerminalShutdownSummary {
     pub errors: Vec<String>,
 }
 
+/// The switch that separates **holding** a pty descriptor from **serving** it.
+///
+/// ⛔ **This exists because a handover used to conflate the two.** A retiring
+/// daemon released its master fds the only way it could — by exiting — so it let
+/// go on the successor's *acceptance* and never on its *survival*. Anything that
+/// killed a young successor in that window destroyed every session on the host,
+/// with no process left holding anything.
+///
+/// Parking a reader stops it consuming bytes while its runtime, and therefore
+/// every descriptor that runtime owns, stays exactly where it is. That is what
+/// lets a predecessor wait out a settle interval before it exits: it is holding
+/// the pty open for a successor it has not yet trusted, without stealing a
+/// single byte from it.
+///
+/// **Why it is a poll and not a flag.** A flag can only be read *after* a
+/// blocking `read` returns — which means the parked reader still swallows one
+/// chunk that now belongs to the successor, and an idle session swallows it
+/// whenever its next output happens to arrive, possibly seconds later. The
+/// reader therefore blocks in `poll` over the pty **and** a wake descriptor, so
+/// the park is observed with no bytes in hand and the pending output stays in
+/// the kernel buffer for whoever reads next. [`Self::stolen_after_park`] counts
+/// the bytes that still slipped through — the race between `poll` reporting
+/// readable and the park landing — because a window this code claims is closed
+/// should be measured rather than asserted.
+pub struct ReaderPark {
+    parked: AtomicBool,
+    /// Set by the reader while it is standing down, cleared when it resumes.
+    /// The park is a REQUEST until this says the reader acted on it.
+    stood_down: AtomicBool,
+    stolen_after_park: AtomicU64,
+    /// The wake side of the reader's `poll`. `None` where the platform has no
+    /// such primitive — there the park degrades to a flag the reader notices
+    /// after its next read, which is all the non-Linux builds need because the
+    /// pty handoff is Linux-only.
+    wake: Option<std::os::fd::OwnedFd>,
+}
+
+impl ReaderPark {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            parked: AtomicBool::new(false),
+            stood_down: AtomicBool::new(false),
+            stolen_after_park: AtomicU64::new(0),
+            wake: new_reader_wake_fd(),
+        })
+    }
+
+    /// A park with no reader behind it — what a session whose pty already died
+    /// looks like to a sweep. Only a test has any use for one.
+    #[cfg(all(target_os = "linux", test))]
+    pub fn detached_for_test() -> Arc<Self> {
+        Self::new()
+    }
+
+    /// Ask the reader to stop consuming. Returns immediately: use
+    /// [`Self::has_stood_down`] to learn whether it actually has.
+    pub fn park(&self) {
+        self.parked.store(true, Ordering::SeqCst);
+        self.wake();
+    }
+
+    /// Resume serving. Safe to call on a reader that never parked.
+    pub fn unpark(&self) {
+        self.parked.store(false, Ordering::SeqCst);
+        self.wake();
+    }
+
+    pub fn is_parked(&self) -> bool {
+        self.parked.load(Ordering::SeqCst)
+    }
+
+    /// Whether the reader has been seen standing down. `false` also means "this
+    /// reader thread is gone" — a dead pty's reader exited long ago and will
+    /// never answer, which is why no caller may block until every park is
+    /// acknowledged.
+    pub fn has_stood_down(&self) -> bool {
+        self.stood_down.load(Ordering::SeqCst)
+    }
+
+    /// Bytes consumed after the park was requested. Expected to be 0; a nonzero
+    /// value is the poll/park race actually happening, and it is a hole in the
+    /// successor's transcript.
+    pub fn stolen_after_park(&self) -> u64 {
+        self.stolen_after_park.load(Ordering::SeqCst)
+    }
+
+    fn wake(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(wake) = self.wake.as_ref() {
+            use std::os::fd::AsRawFd;
+            let value: u64 = 1;
+            // Best effort by construction: a full counter already means "wake",
+            // and the reader re-reads `parked` after every wake anyway.
+            unsafe {
+                libc::write(
+                    wake.as_raw_fd(),
+                    std::ptr::addr_of!(value).cast(),
+                    std::mem::size_of::<u64>(),
+                );
+            }
+        }
+    }
+}
+
+/// The wake descriptor a parked reader blocks on. An `eventfd` rather than a
+/// pipe: one fd instead of two, and its counter is level-triggered, so a wake
+/// that arrives before the reader reaches `poll` is not lost.
+#[cfg(target_os = "linux")]
+fn new_reader_wake_fd() -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn new_reader_wake_fd() -> Option<std::os::fd::OwnedFd> {
+    None
+}
+
+/// What the reader should do next.
+enum ReaderGateVerdict {
+    /// The pty has bytes, or has hung up — take the same read the loop always
+    /// took.
+    Read,
+    /// The gate itself failed. Reported through the loop's existing read-error
+    /// branch rather than a second encoding of "this reader is finished".
+    Failed(String),
+}
+
+/// The reader thread's half of [`ReaderPark`]: it owns the descriptor it polls.
+///
+/// A **dup** of the master, not the master itself: the runtime's own master can
+/// be dropped while this thread is still alive, and polling a closed fd number
+/// is how a thread ends up waiting on whatever file was opened next.
+struct ReaderGate {
+    park: Arc<ReaderPark>,
+    #[cfg(target_os = "linux")]
+    poll_fd: Option<std::os::fd::OwnedFd>,
+}
+
+impl ReaderGate {
+    /// Block until there is something to read, standing down for as long as the
+    /// park is held. Never returns while parked, and never touches the pty while
+    /// parked — that is the whole contract.
+    #[cfg(target_os = "linux")]
+    fn wait(&self) -> ReaderGateVerdict {
+        use std::os::fd::AsRawFd;
+        loop {
+            let parked = self.park.parked.load(Ordering::SeqCst);
+            self.park.stood_down.store(parked, Ordering::SeqCst);
+            let (Some(poll_fd), Some(wake_fd)) = (self.poll_fd.as_ref(), self.park.wake.as_ref())
+            else {
+                // No gate on this session: behave exactly as the pre-park
+                // reader did and let the blocking read be the wait.
+                return ReaderGateVerdict::Read;
+            };
+            let mut fds = [
+                libc::pollfd {
+                    fd: wake_fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    // ⛔ A parked reader watches ONLY the wake fd. Watching the
+                    // pty as well would be harmless for `poll` itself, but it
+                    // costs a wakeup per byte the successor is being handed.
+                    fd: if parked { -1 } else { poll_fd.as_raw_fd() },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return ReaderGateVerdict::Failed(format!("polling pty reader: {error}"));
+            }
+            if fds[0].revents != 0 {
+                drain_reader_wake(wake_fd.as_raw_fd());
+                continue;
+            }
+            if parked {
+                continue;
+            }
+            if fds[1].revents != 0 {
+                // POLLIN, POLLHUP and POLLERR all mean "read now": hangup is
+                // delivered to the existing `Ok(0)` / `Err` branches, which own
+                // what a finished pty means.
+                return ReaderGateVerdict::Read;
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn wait(&self) -> ReaderGateVerdict {
+        ReaderGateVerdict::Read
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn drain_reader_wake(fd: std::os::fd::RawFd) {
+    let mut value: u64 = 0;
+    unsafe {
+        libc::read(
+            fd,
+            std::ptr::addr_of_mut!(value).cast(),
+            std::mem::size_of::<u64>(),
+        );
+    }
+}
+
+/// A dup of the master purely for readiness. Shares the open file description
+/// with the reader's own clone, so it reports exactly the readiness that clone
+/// would see.
+#[cfg(target_os = "linux")]
+fn dup_master_for_poll(master: &(dyn MasterPty + Send)) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let raw = master.as_raw_fd()?;
+    let duped = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
+    (duped >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(duped) })
+}
+
 impl TerminalManager {
     pub fn new() -> Self {
         Self {
@@ -667,6 +891,19 @@ impl TerminalManager {
         )?;
         self.sessions.insert(key.to_string(), runtime);
         Ok(())
+    }
+
+    /// Stand one session's reader down and hand back the switch that wakes it.
+    ///
+    /// The runtime is untouched: the descriptors stay open, the writer stays
+    /// live, the child keeps running. Only the consuming stops. That is the
+    /// distinction the pty handoff needs and the one the old code could not
+    /// make — see [`ReaderPark`].
+    #[cfg(target_os = "linux")]
+    pub fn park_reader(&self, key: &str) -> Option<Arc<ReaderPark>> {
+        let park = Arc::clone(&self.sessions.get(key)?.reader_park);
+        park.park();
+        Some(park)
     }
 
     /// Everything a handoff needs about one live session, gathered while we
@@ -1303,6 +1540,23 @@ impl TerminalManager {
         };
 
         for key in keys {
+            // ⛔ NEVER TEAR DOWN A RUNTIME WE HAVE ALREADY HANDED OVER. A parked
+            // reader means another daemon is serving this pty and we are only
+            // still holding the descriptor (see [`ReaderPark`]). Stopping it
+            // would kill a shell that a live daemon is currently painting for
+            // the user — and our own exit does NOT do that, because exiting
+            // merely closes our copies and the child re-parents to init.
+            if self
+                .sessions
+                .get(&key)
+                .is_some_and(|session| session.reader_park.is_parked())
+            {
+                trace_terminal_event(
+                    "shutdown_skipped_handed_off_runtime",
+                    serde_json::json!({ "path": key }),
+                );
+                continue;
+            }
             let Some(runtime) = self.sessions.remove(&key) else {
                 continue;
             };
@@ -1376,6 +1630,11 @@ struct PtySessionRuntime {
     /// lets a never-revealed session's surfaces be materialized, and a reaped
     /// one be rebuilt, with no reveal. See [`crate::app_declare`].
     app_declares: Arc<Mutex<AppDeclareLog>>,
+    /// Stand this session's reader down without giving up its descriptors —
+    /// see [`ReaderPark`]. Held here so a handoff can park every reader it is
+    /// about to hand over, and un-park them all again if the successor it just
+    /// trusted does not survive.
+    reader_park: Arc<ReaderPark>,
     launch_command: String,
     cwd: Option<String>,
 }
@@ -2045,6 +2304,12 @@ impl PtySessionRuntime {
     ) -> Result<Self> {
         let mut reader = master.try_clone_reader().context("cloning pty reader")?;
         let writer = master.take_writer().context("taking pty writer")?;
+        let park = ReaderPark::new();
+        let gate = ReaderGate {
+            park: Arc::clone(&park),
+            #[cfg(target_os = "linux")]
+            poll_fd: dup_master_for_poll(master.as_ref()),
+        };
         let chunks = Arc::new(Mutex::new(VecDeque::new()));
         let retained_bytes = Arc::new(AtomicUsize::new(0));
         let seq = Arc::new(AtomicU64::new(0));
@@ -2112,7 +2377,27 @@ impl PtySessionRuntime {
                 let mut app_declare_scanner = AppDeclareScanner::new();
                 let mut saw_any_output = false;
                 loop {
-                    match reader.read(&mut buffer) {
+                    // Stand down here rather than inside the read: a parked
+                    // reader must own no bytes at all, so that everything the
+                    // pty produces from this instant belongs to whoever holds
+                    // the descriptor next.
+                    let read_result = match gate.wait() {
+                        ReaderGateVerdict::Read => reader.read(&mut buffer),
+                        ReaderGateVerdict::Failed(error) => Err(std::io::Error::other(error)),
+                    };
+                    if let Ok(bytes) = read_result.as_ref()
+                        && *bytes > 0
+                        && gate.park.is_parked()
+                    {
+                        // The race the park is meant to close, measured instead
+                        // of assumed: `poll` said readable and the park landed
+                        // before the read completed. Bounded to one chunk, and
+                        // that chunk is a hole in the successor's transcript.
+                        gate.park
+                            .stolen_after_park
+                            .fetch_add(*bytes as u64, Ordering::SeqCst);
+                    }
+                    match read_result {
                         Ok(0) => {
                             let raw_data = flush_terminal_utf8_pending(&mut pending_utf8);
                             let protocol_result =
@@ -2333,6 +2618,7 @@ impl PtySessionRuntime {
             screen_state,
             screen_snapshot_memo: Arc::new(Mutex::new(None)),
             app_declares,
+            reader_park: park,
             launch_command: launch_command.to_string(),
             cwd: cwd.map(|value| value.to_string()),
         })
@@ -6452,6 +6738,150 @@ line-two on the real screen\r\n\
             !manager.session_keys().iter().any(|value| value == key),
             "exited runtime must not be advertised as a live terminal session"
         );
+    }
+
+    /// Collect everything the session has produced since `cursor`, waiting up
+    /// to `budget` for it to appear. Returns as soon as anything arrives.
+    #[cfg(target_os = "linux")]
+    fn drain_terminal(
+        manager: &TerminalManager,
+        key: &str,
+        cursor: &mut u64,
+        budget: Duration,
+    ) -> String {
+        let deadline = Instant::now() + budget;
+        let mut text = String::new();
+        while Instant::now() < deadline {
+            let result = manager.read(key, *cursor).expect("read session");
+            *cursor = result.cursor;
+            for chunk in result.chunks {
+                text.push_str(&chunk.data);
+            }
+            if !text.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        text
+    }
+
+    /// ⛔ THE CONTRACT THE HOT-RESTART SETTLE WINDOW RESTS ON.
+    ///
+    /// A parked reader must stop consuming **without losing anything**: the pty
+    /// stays open, the child keeps running, and the bytes written while it was
+    /// parked are still there when it wakes. That is what lets a retiring daemon
+    /// hold its descriptors while it waits to see whether the successor
+    /// survives — the alternative, two daemons reading one pty for the whole
+    /// interval, silently eats half the user's output.
+    ///
+    /// Without the poll gate this test fails in a specific way: the reader is
+    /// blocked inside `read`, so it swallows the post-park write and only then
+    /// notices the flag. Falsified in exactly that shape before it was trusted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_parked_reader_consumes_nothing_and_loses_nothing() {
+        // ⛔ Spawning a pty READS the process-wide terminal-identity env, and
+        // `codex_cli::env_test_guard` is the crate's one lock over it: a test
+        // that reads it while another rewrites it makes BOTH flaky. Measured
+        // here — without this, the two identity tests in `lib.rs` failed on
+        // every full-suite run and passed alone.
+        let _env = crate::codex_cli::env_test_guard();
+        let mut manager = TerminalManager::new();
+        let key = "local://parked-reader";
+        manager
+            .ensure_session(key, "sh -lc 'cat'", None)
+            .expect("spawn a session that echoes what it is given");
+        let mut cursor = 0u64;
+
+        manager.write(key, "BEFORE-PARK\n").expect("write");
+        let before = drain_terminal(&manager, key, &mut cursor, Duration::from_secs(3));
+        assert!(
+            before.contains("BEFORE-PARK"),
+            "the reader must be serving before it is parked, got: {before:?}"
+        );
+
+        let park = manager.park_reader(key).expect("park the reader");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !park.has_stood_down() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            park.has_stood_down(),
+            "a parked reader must reach the gate rather than stay in a read"
+        );
+
+        manager.write(key, "DURING-PARK\n").expect("write");
+        let during = drain_terminal(&manager, key, &mut cursor, Duration::from_millis(600));
+        assert!(
+            during.is_empty(),
+            "a parked reader must consume nothing, got: {during:?}"
+        );
+        assert!(
+            manager.session_is_running(key),
+            "parking must not touch the child — the descriptors are still held"
+        );
+
+        park.unpark();
+        let after = drain_terminal(&manager, key, &mut cursor, Duration::from_secs(3));
+        assert!(
+            after.contains("DURING-PARK"),
+            "the bytes written while parked must survive in the kernel buffer \
+             and arrive on wake, got: {after:?}"
+        );
+        assert_eq!(
+            park.stolen_after_park(),
+            0,
+            "nothing should have been consumed after the park was requested"
+        );
+
+        manager.remove_session(key, None).expect("remove session");
+    }
+
+    /// ⛔ A runtime this daemon has HANDED OVER must survive this daemon's own
+    /// teardown. During the settle window another daemon is painting that pty
+    /// for the user; stopping it here kills a live session that is not ours to
+    /// stop — and our own exit does not, because exiting only closes our copies
+    /// of the descriptors.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutting_down_leaves_a_handed_off_runtime_alone() {
+        // ⛔ Spawning a pty READS the process-wide terminal-identity env, and
+        // `codex_cli::env_test_guard` is the crate's one lock over it: a test
+        // that reads it while another rewrites it makes BOTH flaky. Measured
+        // here — without this, the two identity tests in `lib.rs` failed on
+        // every full-suite run and passed alone.
+        let _env = crate::codex_cli::env_test_guard();
+        let mut manager = TerminalManager::new();
+        let handed_off = "local://handed-off-runtime";
+        let still_ours = "local://still-our-runtime";
+        manager
+            .ensure_session(handed_off, "sh -lc 'sleep 30'", None)
+            .expect("spawn the runtime that will be handed over");
+        manager
+            .ensure_session(still_ours, "sh -lc 'sleep 30'", None)
+            .expect("spawn the runtime we keep");
+
+        let park = manager.park_reader(handed_off).expect("park the reader");
+        let summary = manager.shutdown_all(|_| None);
+
+        assert_eq!(
+            summary.stopped, 1,
+            "only the runtime this daemon still serves may be stopped"
+        );
+        assert!(
+            manager.session_is_running(handed_off),
+            "the handed-off pty must still be running — another daemon is \
+             serving it right now"
+        );
+        assert!(
+            !manager.session_is_running(still_ours),
+            "the runtime we still owned must actually have been stopped"
+        );
+
+        park.unpark();
+        manager
+            .remove_session(handed_off, None)
+            .expect("clean up the surviving runtime");
     }
 
     #[test]
