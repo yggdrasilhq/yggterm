@@ -298,9 +298,26 @@ if [ "$DRY" = 1 ]; then log "dry run — nothing changed"; exit 0; fi
 read_state() {  # -> "<outline_prefix>\t<session_title>", straight from the row table
   rows_json | MINE="$MINE" python3 -c '
 import json,os,sys
+# ⛔ ABSENT FROM THE LISTING IS NOT THE SAME FAILURE AS SEATED WRONG, AND THE OLD
+# CODE COLLAPSED BOTH TO AN EMPTY PAIR. Measured 2026-08-13 by a sibling campaign:
+# three consecutively-claimed rows reported `claim never verified (row reads: |)`
+# and were ALL correctly seated — the read-back could not see them, so it denied an
+# effect that was real, and a retry mechanism spawned duplicate workers on the
+# strength of it. `server app rows` is known to have omitted live rows hidden by a
+# collapsed set before 3.0.140, which is the listing this very check reads.
+# ⇒ Say WHICH failure it is, and match on the UUID rather than on full_path
+# equality, so a scheme/format difference cannot masquerade as a missing row.
 rows=json.load(sys.stdin)["data"]["rows"]
-r=next((x for x in rows if x.get("full_path")==os.environ["MINE"]),None)
-print(((r.get("outline_prefix") or "") + "\t" + (r.get("session_title") or "")) if r else "\t")' 2>/dev/null
+mine=os.environ["MINE"]; uuid=mine.rstrip("/").split("/")[-1]
+r=next((x for x in rows if x.get("full_path")==mine),None)
+if r is None:
+    r=next((x for x in rows if uuid and uuid in ((x.get("full_path") or "")+(x.get("session_id") or ""))),None)
+if r is None:
+    # ⚠ Not "the claim failed" — "this instrument cannot see the row".
+    print("\t\x00ABSENT")
+else:
+    print((r.get("outline_prefix") or "") + "\t" + (r.get("session_title") or "")
+          + ("\t\x00HIDDEN" if r.get("hidden_by_collapsed_set") else ""))' 2>/dev/null
 }
 assert_state() {
   ygg server app session outline "$MINE" "$NUM"          >/dev/null 2>&1
@@ -315,6 +332,8 @@ assert_state() {
 # the read-back so an old row verifies too (and gets rewritten clean on the way).
 matches() {
   local got_num="${1%%	*}" got_title="${1#*	}"
+  # strip the diagnostic markers read_state may append before comparing
+  got_title="${got_title%%	$'\x00'*}"
   got_title="$(printf '%s' "$got_title" | sed -E 's/^[0-9]+(\.[0-9]+)*\.?[[:space:]]+//')"
   [ "$got_num" = "$NUM" ] && [ "$got_title" = "$FINAL_TITLE" ]
 }
@@ -325,8 +344,22 @@ for attempt in 1 2 3; do
   sleep 3
 done
 matches "$GOT" || {
-  echo "ygg-claim: claim never verified (row reads: $(printf '%s' "$GOT" | tr '\t' '|'))" >&2
+  # ⛔ NAME WHICH FAILURE THIS IS. A caller that cannot tell "the claim did not take"
+  # from "the instrument cannot see the row" will retry the claim — and a retry
+  # mechanism acting on the second one has already spawned duplicate workers with a
+  # byte-identical brief. Two agents in one working tree is the loss this averts.
+  case "$GOT" in
+    *$'\x00'ABSENT*)
+      echo "ygg-claim: ⚠ THE ROW IS ABSENT FROM \`server app rows\` — this is NOT proof the claim failed." >&2
+      echo "ygg-claim:   That listing has omitted live rows (hidden by a collapsed set, fixed 3.0.140)." >&2
+      echo "ygg-claim:   Read the plane by session id before concluding anything, and ⛔ DO NOT re-spawn:" >&2
+      echo "ygg-claim:     yggterm server app rows | grep ${MINE##*/}" >&2 ;;
+    *) echo "ygg-claim: claim never verified (row reads: $(printf '%s' "$GOT" | tr '\t' '|' | tr -d '\000'))" >&2 ;;
+  esac
   echo "ygg-claim: ⛔ the booter arm and the --replace reap below did NOT run" >&2; exit 3; }
+case "$GOT" in *$'\x00'HIDDEN*)
+  log "⚠ seated correctly, but the row is HIDDEN BY A COLLAPSED SET — it will not be on screen" ;;
+esac
 log "claimed and verified by read-back: seat=$NUM title=$FINAL_TITLE"
 
 # --- ARM THE BOOTER (OPT-IN) ------------------------------------------------
