@@ -32,6 +32,8 @@ pub enum RemoteRuntimeKind {
     Kimi,
     Muse,
     Antigravity,
+    // The 2026-08-13 intake, additive on the same terms.
+    GrokBuild,
 }
 
 impl RemoteRuntimeKind {
@@ -52,6 +54,7 @@ impl RemoteRuntimeKind {
             Self::Kimi => "kimi",
             Self::Muse => "muse",
             Self::Antigravity => "antigravity",
+            Self::GrokBuild => "grok_build",
         }
     }
 
@@ -65,6 +68,7 @@ impl RemoteRuntimeKind {
             "kimi" => Self::Kimi,
             "muse" => Self::Muse,
             "antigravity" => Self::Antigravity,
+            "grok_build" => Self::GrokBuild,
             // Unrecognized values stay codex: a row written by a NEWER daemon
             // than this one must still read back as *something*, and codex is
             // the value this column held for its whole history.

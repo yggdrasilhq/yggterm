@@ -18,6 +18,8 @@ pub enum SessionKind {
     Muse,
     /// `agy` — Google Antigravity's CLI, closed source.
     Antigravity,
+    /// `grok` — xAI's Grok Build CLI, `@xai-official/grok`, Apache-2.0.
+    GrokBuild,
     Shell,
     SshShell,
     Document,

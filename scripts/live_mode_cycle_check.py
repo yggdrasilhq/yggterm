@@ -7,6 +7,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ygg_live_host  # noqa: E402  (path is set immediately above)
+
 
 def _resolve_live_host() -> str | None:
     """Ask the one resolver which host the live GUI is on.
@@ -14,27 +17,17 @@ def _resolve_live_host() -> str | None:
     ⛔ This used to read `.agents/config/live-host` directly, which is
     gitignored — so the file exists only on the machine whose name it holds,
     and that is the one machine that never needs telling. Every headless
-    checkout got `None` here and the run died on a missing host. The resolver
-    owns the whole order (env → this machine → cached alias verified by probe →
-    discovery → cached alias unverified); the config file is its cache, not a
-    second source of truth.
+    checkout got `None` here and the run died on a missing host.
+
+    ⚠ And it used to shell out to the resolver itself, which made a second
+    python spelling of one call; the doorway is now shared, because three
+    private copies of "ask the resolver" is how the second source of truth grows
+    back one function at a time.
 
     Called lazily from `main`, never as an argparse default: it makes ssh
     probes, and an argparse default is evaluated even for `--help`.
     """
-    script = Path(__file__).resolve().parents[1] / "scripts" / "ygg-live-host.sh"
-    try:
-        done = subprocess.run(
-            [str(script)], capture_output=True, text=True, timeout=90, check=False
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        print(f"error: could not run {script}: {error}", file=sys.stderr)
-        return None
-    if done.stderr:
-        sys.stderr.write(done.stderr)
-    if done.returncode != 0:
-        return None
-    return done.stdout.strip() or None
+    return ygg_live_host.resolve()
 
 
 def parse_args() -> argparse.Namespace:

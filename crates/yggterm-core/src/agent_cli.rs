@@ -452,6 +452,55 @@ fn session_kind_flag_name(kind: SessionKind) -> &'static str {
     }
 }
 
+/// Where a CLI's permission-preset flags came from.
+///
+/// Provenance is part of the UI, not a footnote
+/// (`docs/spec-agent-cli-extra-args-modal.md` §5): a row whose flags were read
+/// off a running binary and a row taken from a vendor's own reference must not
+/// look the same, and a row nobody has measured must not look like either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionProvenance {
+    /// Read off a running binary — `--help`, or a controlled probe of the
+    /// parser when `--help` under-reports (qwen hides `--yolo` from its own).
+    Measured,
+    /// From the vendor's own reference, because the binary is installed on no
+    /// host that has been asked. Renders with a "documented, not verified here"
+    /// marker.
+    Documented,
+    /// Neither. The row renders DISABLED with the reason, rather than offering
+    /// a guess — the same discipline the descriptor table already applies to
+    /// `working_screen_phrases: &[]`.
+    Unmeasured(&'static str),
+}
+
+/// One permission posture offered for a CLI, in that CLI's own vocabulary.
+///
+/// ⛔ **They are not five spellings of one idea and must not be flattened into
+/// one.** Two CLIs express this as a flag, one as a config file the flag only
+/// raises the floor of, one hides the flag from its own `--help`, and one has no
+/// permission gate at all. A ladder that pretends otherwise hands the user a
+/// flag their CLI ignores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionPreset {
+    /// Stable key for this tier, stored nowhere and used to address the tier
+    /// from a verb or a test. Unique within one CLI's list.
+    pub id: &'static str,
+    /// Button text — `Ask each time` · `Sandboxed` · `Skip checks`.
+    pub label: &'static str,
+    /// The exact flags, or empty for "the CLI's own default, no flags".
+    pub args: &'static str,
+    /// One sentence, in the CLI's own vocabulary, shown under the box.
+    pub explanation: &'static str,
+    /// Whether this tier pre-populates a box the user has never set.
+    ///
+    /// ⚖ A BOOL on the tier rather than a `permission_default: &str` naming one:
+    /// an id-by-reference can name a tier that does not exist, and this file has
+    /// already paid for one dangling cross-reference class. Exactly one tier per
+    /// CLI carries it, and `every_cli_with_presets_has_exactly_one_default`
+    /// fails the build otherwise.
+    pub is_default: bool,
+}
+
 /// One session, as read out of a CLI's OWN store (spec §3 `read_store_entry`).
 ///
 /// Deliberately the *material* a scanner needs, not a finished row: the tree
@@ -640,6 +689,31 @@ pub struct AgentCliDescriptor {
     /// consumes the following token as its value, and which per-launch option
     /// supersedes it.
     pub overridden_flags: &'static [(&'static str, FlagArity, OverriddenBy)],
+    /// The stored-settings key this CLI's launch flags live under.
+    ///
+    /// The slug for every CLI but one. `codex-anything` (`codex-litellm` as an
+    /// identifier) is a codex session's flip switch rather than a CLI of its
+    /// own — settled 2026-08-08 — so it reads and writes CODEX's box: one CLI,
+    /// one box, for both backends. Declaring that here is what stops it being
+    /// re-derived as a `matches!(kind, Codex | CodexLiteLlm)` in every place
+    /// that resolves a stored value.
+    pub extra_args_slug: &'static str,
+    /// The permission tiers this CLI offers, SAFEST FIRST, for the launch-flags
+    /// modal (`docs/spec-agent-cli-extra-args-modal.md`).
+    ///
+    /// ⛔ EMPTY means the tiers are unknown, and it is only legitimate beside a
+    /// [`PermissionProvenance::Unmeasured`] — the modal then renders the row
+    /// disabled with the reason. A non-empty list beside `Unmeasured` is a guess
+    /// wearing a measurement's clothes, and the registry lock refuses it.
+    ///
+    /// ⚠ These are the SAME postures [`Self::permission_modes`] maps for
+    /// `--permission-mode`, in a second vocabulary aimed at a human rather than
+    /// a delegate — but they are NOT a second encoding of the boundary, because
+    /// `every_permission_preset_tier_agrees_with_the_launch_mode_it_names`
+    /// checks the bypass tier against the tokens the launch verb would emit.
+    pub permission_presets: &'static [PermissionPreset],
+    /// Where [`Self::permission_presets`] came from — rendered, not footnoted.
+    pub permission_provenance: PermissionProvenance,
     /// True when the CLI re-derives full content from its own store on resume
     /// (all shipped CLIs do). Drives replay policy §5.4: re-derivable ⇒ the PTY
     /// is disposable and rows ride every persist.
@@ -740,6 +814,25 @@ impl AgentCliDescriptor {
     /// about what this CLI is called.
     pub fn new_session_label(&self) -> String {
         format!("New {} Session", self.display_name)
+    }
+
+    /// The tier that pre-populates a box the user has never set.
+    ///
+    /// `None` for a CLI with no tiers — one that shares another's box, or one
+    /// whose flags are [`PermissionProvenance::Unmeasured`]. A caller must treat
+    /// that as "offer nothing", never as "offer the first tier": the first tier
+    /// is the SAFEST one, and silently arming it would be yggterm choosing a
+    /// posture on the user's behalf.
+    pub fn default_permission_preset(&self) -> Option<&'static PermissionPreset> {
+        self.permission_presets
+            .iter()
+            .find(|preset| preset.is_default)
+    }
+
+    /// Whether this CLI gets a ROW of its own in the launch-flags modal, or
+    /// reads another CLI's box.
+    pub fn owns_its_extra_args_box(&self) -> bool {
+        self.extra_args_slug == self.slug
     }
 
     /// Whether this CLI's own store is authoritative for the session title.
@@ -1131,6 +1224,58 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 OverriddenBy::PermissionMode,
             ),
         ],
+        extra_args_slug: "codex",
+        // ⭐ Codex's real home for this is `~/.codex/config.toml`
+        // (`approval_policy`, `sandbox_mode`, per-project trust), and `-c
+        // key=value` overrides any of it per launch — so this box is a
+        // PER-LAUNCH OVERRIDE of a file the user may also be editing. The modal
+        // says so, and never writes that file.
+        //
+        // Approval policies in this build: `untrusted`, `on-request`, `never`.
+        // ⚠ There is no `on-failure` and no `--full-auto`; do not offer either.
+        permission_presets: &[
+            PermissionPreset {
+                id: "ask",
+                label: "Ask each time",
+                args: "-a untrusted -s read-only",
+                explanation: "Runs only trusted commands (ls, cat, sed) unasked and escalates \
+                              everything else; the filesystem is read-only.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "sandboxed",
+                label: "Sandboxed",
+                args: "-a on-request -s workspace-write",
+                explanation: "The model decides when to ask; writes are confined to the \
+                              workspace.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "skip",
+                label: "Skip checks",
+                args: "-s danger-full-access",
+                explanation: "No sandbox: model-generated commands run against the whole \
+                              machine. Confirmation prompts are still asked — the tier beside \
+                              this one is what removes those too.",
+                is_default: true,
+            },
+            // ⚠ A FOURTH tier, and it is not decoration: this is the exact
+            // posture `--permission-mode bypass` emits for codex, and without it
+            // the modal could not reach a posture a delegate launch can ask for
+            // by name. `--dangerously-bypass-hook-trust` is a SEPARATE danger
+            // switch (it runs hooks without persisted trust) and is deliberately
+            // not folded in here.
+            PermissionPreset {
+                id: "bypass-all",
+                label: "Skip checks and prompts",
+                args: "--dangerously-bypass-approvals-and-sandbox",
+                explanation: "No sandbox and no confirmation prompts at all. \
+                              --dangerously-bypass-hook-trust is a separate switch that also \
+                              runs hooks without persisted trust; it is not included here.",
+                is_default: false,
+            },
+        ],
+        permission_provenance: PermissionProvenance::Measured,
         content_rederives_on_resume: true,
         // Codex files sessions by date: `~/.codex/sessions/2026/07/25/
         // rollout-2026-07-25T…-<uuid>.jsonl`, so the depth is not fixed.
@@ -1224,6 +1369,17 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 OverriddenBy::PermissionMode,
             ),
         ],
+        // ⛔ ONE CLI, ONE BOX — this reads and writes CODEX's stored flags.
+        // Settled 2026-08-08: `codex-anything` is a codex session's flip switch,
+        // not a CLI of its own, so it must never grow a second box that can hold
+        // a different sandbox policy from the codex row beside it. Declaring the
+        // shared key here is also what makes it absent from the launch-flags
+        // modal without the modal owning a skip-list.
+        extra_args_slug: "codex",
+        // Empty BECAUSE the box is codex's, not because the tiers are unknown —
+        // `every_cli_declares_presets_or_says_why` separates those two cases.
+        permission_presets: &[],
+        permission_provenance: PermissionProvenance::Measured,
         content_rederives_on_resume: true,
         session_store_globs: &[".codex-litellm/sessions/**/rollout-*.jsonl"],
         store_excluded_name_fragments: &[".bak."],
@@ -1315,6 +1471,43 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 OverriddenBy::PermissionMode,
             ),
         ],
+        extra_args_slug: "claude-code",
+        // Modes in this build: acceptEdits, auto, bypassPermissions, manual,
+        // dontAsk, plan. `--allowedTools` / `--disallowedTools` take tool-name
+        // lists for a middle ground, and `settings.json` carries a `permissions`
+        // block that outlives any single launch.
+        //
+        // ⚠ Two flags one letter apart: `--dangerously-skip-permissions` IS the
+        // bypass; `--allow-dangerously-skip-permissions` only ENABLES it being
+        // used. The tier offers the first and the explanation names the second,
+        // so nobody pastes it expecting the bypass.
+        permission_presets: &[
+            PermissionPreset {
+                id: "ask",
+                label: "Ask each time",
+                args: "--permission-mode manual",
+                explanation: "Every tool use is confirmed by you.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "sandboxed",
+                label: "Sandboxed",
+                args: "--permission-mode acceptEdits",
+                explanation: "File edits apply without asking; commands still ask.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "skip",
+                label: "Skip checks",
+                args: "--dangerously-skip-permissions",
+                explanation: "Bypasses all permission checks. Recommended by Anthropic only for \
+                              sandboxes with no internet access. Note \
+                              --allow-dangerously-skip-permissions is a DIFFERENT flag: it only \
+                              permits the bypass, it does not perform it.",
+                is_default: true,
+            },
+        ],
+        permission_provenance: PermissionProvenance::Measured,
         content_rederives_on_resume: true,
         // CC files one flat dir per cwd, the dir name being the cwd with every
         // character outside [A-Za-z0-9-] replaced: `~/.claude/projects/
@@ -1373,10 +1566,63 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         composer_marker: '\u{203a}',
         composer_footer_hints: &["esc", "ctrl", "/help", "tab"],
         working_footer_hints: &["to interrupt"],
-        // Not yet read off `pi --help` on an installed copy; declaring a mode
-        // yggterm has not verified would be inventing a security posture.
+        // ⛔⛔ pi HAS NO PERMISSION GATE AT ALL, and that is its DOCUMENTED
+        // DESIGN, not a gap in our reading. Its own README: "No permission
+        // popups. Run in a container, or build your own confirmation flow with
+        // extensions." ⇒ there is nothing to bypass, so `Bypass` stays absent
+        // and is refused by name. Re-measured on the installed binary
+        // 2026-08-13: `pi --help` offers --tools/--no-tools/--exclude-tools and
+        // --approve/--no-approve, and nothing that gates a tool CALL.
         permission_modes: &[(AgentPermissionMode::Default, &[])],
-        overridden_flags: &[("--model", FlagArity::TakesValue, OverriddenBy::Model)],
+        overridden_flags: &[
+            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
+            ("--approve", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            ("-a", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            (
+                "--no-approve",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
+            ("-na", FlagArity::Standalone, OverriddenBy::PermissionMode),
+        ],
+        extra_args_slug: "pi",
+        // ⇒ The explanations say the quiet part out loud: EVERY pi session runs
+        // its tools unprompted. What these flags actually control is trust of
+        // project-local SETTINGS FILES, not tool calls, and a ladder that looked
+        // like Claude's without saying so would mislead.
+        //
+        // ⚠ Each tier's args are RUNNABLE AS WRITTEN. `--tools <names>` is not —
+        // a placeholder pasted into a launch is a launch that fails — so the
+        // restricted tier offers the complete `--no-tools` and names the
+        // narrower flags in prose. Global trust default lives in pi's own
+        // settings as `defaultProjectTrust` (ask · never · always).
+        permission_presets: &[
+            PermissionPreset {
+                id: "restricted",
+                label: "No tools",
+                args: "--no-tools",
+                explanation: "Disables all built-in tools and extensions — pi's only real safety \
+                              control. For a narrower set use --tools read,grep or \
+                              --exclude-tools bash.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "no-project-trust",
+                label: "Ignore project settings",
+                args: "--no-approve",
+                explanation: "Nothing in the repo can widen what pi may do this run.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "project-trust",
+                label: "Trust project settings",
+                args: "--approve",
+                explanation: "Trusts project-local settings files for this run. This is NOT a \
+                              tool-permission bypass — pi never asks about tool calls either way.",
+                is_default: true,
+            },
+        ],
+        permission_provenance: PermissionProvenance::Measured,
         content_rederives_on_resume: true,
         // `~/.pi/agent/sessions/--<cwd-with-separators-hyphenated>--/
         // <timestamp>_<uuid>.jsonl`; line 1 is the session header carrying
@@ -1425,8 +1671,45 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         composer_marker: '\u{276f}',
         composer_footer_hints: &["esc", "interrupt", "ctrl", "tab"],
         working_footer_hints: &["esc interrupt", "again to interrupt"],
-        permission_modes: &[(AgentPermissionMode::Default, &[])],
-        overridden_flags: &[("--model", FlagArity::TakesValue, OverriddenBy::Model)],
+        // `--auto` re-measured on the installed binary 2026-08-13: "auto-approve
+        // permissions that are not explicitly denied (dangerous!)" — opencode's
+        // own words. It was absent from this table while the flag existed, so
+        // `--permission-mode bypass --kind opencode` was refused on a CLI that
+        // can express it.
+        permission_modes: &[
+            (AgentPermissionMode::Default, &[]),
+            (AgentPermissionMode::Bypass, &["--auto"]),
+        ],
+        overridden_flags: &[
+            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
+            ("--auto", FlagArity::Standalone, OverriddenBy::PermissionMode),
+        ],
+        extra_args_slug: "opencode",
+        // ⭐ opencode's permission model is a CONFIG FILE and the flag only
+        // raises the floor: `opencode.json` takes a `permission` block keyed by
+        // tool with values allow · ask · deny (glob patterns inside `bash`), and
+        // `--auto` RESPECTS `deny` while overriding `ask`. That is the one case
+        // where a user's config still constrains this box's value, so the
+        // explanation has to say it.
+        permission_presets: &[
+            PermissionPreset {
+                id: "ask",
+                label: "Ask each time",
+                args: "",
+                explanation: "opencode's own default: each permission is asked.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "skip",
+                label: "Skip checks",
+                args: "--auto",
+                explanation: "Auto-approves every permission that is not explicitly denied — \
+                              opencode's own help calls this dangerous. A `deny` in opencode.json \
+                              still holds; only `ask` is overridden.",
+                is_default: true,
+            },
+        ],
+        permission_provenance: PermissionProvenance::Measured,
         // ⚠ The default TUI owns the screen and repaints via opentui; there is
         // no scrollback transcript to re-derive. `--mini` is the streaming
         // variant that does replay.
@@ -1481,8 +1764,75 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         composer_marker: '\u{276f}',
         composer_footer_hints: &["esc", "ctrl", "qwen", "tab"],
         working_footer_hints: &["esc to cancel"],
-        permission_modes: &[(AgentPermissionMode::Default, &[])],
-        overridden_flags: &[("--model", FlagArity::TakesValue, OverriddenBy::Model)],
+        // ⛔ THESE FLAGS ARE HIDDEN FROM `qwen --help`, and the first pass filed
+        // them as non-existent because of it. Confirmed by a controlled probe of
+        // the PARSER, re-run 2026-08-13: `qwen --approval-mode bogus` answers
+        // `Choices: "plan", "default", "auto-edit", "auto", "yolo"`. ⇒ `--help`
+        // is not a CLI's contract; probe the binary, then read the docs.
+        permission_modes: &[
+            // ⚠ Default emits NOTHING, not `--approval-mode default`, and the
+            // lock caught the first draft doing the latter: a value we do not
+            // need to send is a value that cannot rot when the vendor renames
+            // its own choices. The PRESET below spells it out because a human
+            // reading a box wants to see which posture is in force; the launch
+            // vocabulary does not.
+            (AgentPermissionMode::Default, &[]),
+            (AgentPermissionMode::Plan, &["--approval-mode", "plan"]),
+            (
+                AgentPermissionMode::AcceptEdits,
+                &["--approval-mode", "auto-edit"],
+            ),
+            (AgentPermissionMode::Bypass, &["--yolo"]),
+        ],
+        overridden_flags: &[
+            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
+            (
+                "--approval-mode",
+                FlagArity::TakesValue,
+                OverriddenBy::PermissionMode,
+            ),
+            ("--yolo", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            ("-y", FlagArity::Standalone, OverriddenBy::PermissionMode),
+        ],
+        extra_args_slug: "qwen-code",
+        // ⚠ `-s` (sandbox) is an ORTHOGONAL axis, composable with any approval
+        // mode — so the sandboxed tier pins an approval mode too rather than
+        // shipping a half-statement, and says the composition is available for a
+        // custom line. Settings file carries `approvalMode` and `trustedFolders`.
+        permission_presets: &[
+            PermissionPreset {
+                id: "ask",
+                label: "Ask each time",
+                args: "--approval-mode default",
+                explanation: "Every tool call is confirmed. --approval-mode plan is read-only \
+                              planning.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "auto-edit",
+                label: "Auto-edit",
+                args: "--approval-mode auto-edit",
+                explanation: "File edits apply unprompted; commands still ask.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "sandboxed",
+                label: "Sandboxed",
+                args: "-s --approval-mode default",
+                explanation: "Runs the session inside Qwen's sandbox and still confirms every \
+                              tool call. -s composes with ANY approval mode, so add it to a \
+                              custom line for sandbox plus auto-edit.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "skip",
+                label: "Skip checks",
+                args: "--yolo",
+                explanation: "Auto-approves everything (equivalent to --approval-mode yolo).",
+                is_default: true,
+            },
+        ],
+        permission_provenance: PermissionProvenance::Measured,
         content_rederives_on_resume: true,
         // `~/.qwen/projects/<cwd-with-non-alnum-hyphenated>/chats/<uuid>.jsonl`.
         // ⚠ The service's own comment says `~/.qwen/tmp/<id>/chats` — that
@@ -1563,7 +1913,46 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         overridden_flags: &[
             ("--model", FlagArity::TakesValue, OverriddenBy::Model),
             ("--yolo", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            ("--yes", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            (
+                "--auto-approve",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
+            ("-y", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            ("--afk", FlagArity::Standalone, OverriddenBy::PermissionMode),
         ],
+        extra_args_slug: "kimi",
+        // ⭐ MEASURED 2026-08-13 on kimi 1.49.0, installed on all three fleet
+        // hosts. The extra-args spec filed these as `documented` because the
+        // binary was on no host on 2026-08-08 — it is now, so the row loses its
+        // "not verified here" marker. ⛔ No sandbox flag exists; none is invented.
+        permission_presets: &[
+            PermissionPreset {
+                id: "ask",
+                label: "Ask each time",
+                args: "",
+                explanation: "Kimi's own default: every tool call is confirmed.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "skip",
+                label: "Skip checks",
+                args: "--yolo",
+                explanation: "Auto-approves all tool calls; you are still reachable for a \
+                              question the agent asks. Aliases: -y, --yes, --auto-approve.",
+                is_default: true,
+            },
+            PermissionPreset {
+                id: "afk",
+                label: "Away from keyboard",
+                args: "--afk",
+                explanation: "Auto-approves AND auto-dismisses the agent's questions — nothing \
+                              can stop to ask you.",
+                is_default: false,
+            },
+        ],
+        permission_provenance: PermissionProvenance::Measured,
         // Resume replays only the last 5 turns to the screen; the full history
         // stays on disk, so the PTY is NOT a faithful re-derivation.
         content_rederives_on_resume: false,
@@ -1634,7 +2023,61 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         overridden_flags: &[
             ("--model", FlagArity::TakesValue, OverriddenBy::Model),
             ("--yolo", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            (
+                "--approval-mode",
+                FlagArity::TakesValue,
+                OverriddenBy::PermissionMode,
+            ),
+            (
+                "--disable-approval",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
+            (
+                "--disable-sandbox",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
         ],
+        extra_args_slug: "muse",
+        // ⭐ MEASURED 2026-08-13 on Muse Code 0.1.0 (0.1.0-R708.1), installed on
+        // all three fleet hosts. The extra-args spec filed muse as UNMEASURED
+        // and owner-gated; the LOGIN is still his, but the flag surface is not
+        // gated behind it and reads off `--help` like any other CLI. ⇒ the row
+        // is no longer disabled.
+        //
+        // ⭐ Muse is the only CLI here whose bypass releases BOTH gates in one
+        // flag — its `--yolo` turns off approval AND sandboxing AND trusts the
+        // workspace. Antigravity's does not, which is why that row's explanation
+        // has to warn about a prompt this one has no equivalent of.
+        permission_presets: &[
+            PermissionPreset {
+                id: "ask",
+                label: "Ask each time",
+                args: "--approval-mode untrusted",
+                explanation: "Every tool call is confirmed and the sandbox stays on.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "sandboxed",
+                label: "Sandboxed",
+                args: "--approval-mode on-request",
+                explanation: "Muse's own default: the model decides when to ask, and shell \
+                              filesystem/network sandboxing stays on \
+                              (--sandbox-network defaults to proxy-only).",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "skip",
+                label: "Skip checks",
+                args: "--yolo",
+                explanation: "Disables approval AND sandboxing and trusts this workspace for the \
+                              run. --disable-approval and --disable-sandbox are the separate \
+                              halves if you want only one of them.",
+                is_default: true,
+            },
+        ],
+        permission_provenance: PermissionProvenance::Measured,
         content_rederives_on_resume: true,
         session_store_globs: &[],
         store_excluded_name_fragments: &[],
@@ -1690,9 +2133,14 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         composer_footer_hints: &["esc", "ctrl"],
         working_footer_hints: &[],
         // `--dangerously-skip-permissions` is documented in `agy --help` as
-        // "Auto-approve all tool permission requests without prompting".
+        // "Auto-approve all tool permission requests without prompting", and
+        // `--mode <accept-edits|plan>` was measured on the same help 2026-08-13
+        // — it had been missed, so two postures agy can express were refused by
+        // name on a CLI that supports them.
         permission_modes: &[
             (AgentPermissionMode::Default, &[]),
+            (AgentPermissionMode::Plan, &["--mode", "plan"]),
+            (AgentPermissionMode::AcceptEdits, &["--mode", "accept-edits"]),
             (
                 AgentPermissionMode::Bypass,
                 &["--dangerously-skip-permissions"],
@@ -1705,7 +2153,64 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 FlagArity::Standalone,
                 OverriddenBy::PermissionMode,
             ),
+            (
+                "--mode",
+                FlagArity::TakesValue,
+                OverriddenBy::PermissionMode,
+            ),
+            (
+                "--sandbox",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
         ],
+        extra_args_slug: "antigravity",
+        // ⛔⛔ MEASURED 2026-08-13, BOTH ARMS IN ONE RUN, and the result is the
+        // reason this explanation is worded the way it is: a row launched with
+        // `--dangerously-skip-permissions` STILL stops on agy's workspace-TRUST
+        // prompt ("Do you trust the contents of this project?") in a folder it
+        // has not seen before. Default arm and bypass arm produced the identical
+        // screen. ⇒ agy has TWO gates in series and this flag releases only one;
+        // `agy --help` offers nothing for the other, and the trust decision
+        // lives in `~/.grok`-style per-folder state, not on the command line.
+        // Muse's `--yolo` is the contrast — it trusts the workspace too.
+        //
+        // ⚠ A row parked on that prompt is, from the sidebar, indistinguishable
+        // from a row whose CLI never launched. Do not read "it opened a plain
+        // shell" as a launch failure without reading the screen first.
+        permission_presets: &[
+            PermissionPreset {
+                id: "ask",
+                label: "Ask each time",
+                args: "",
+                explanation: "Every tool permission request is prompted.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "sandboxed",
+                label: "Sandboxed",
+                args: "--sandbox",
+                explanation: "Runs with terminal restrictions enabled.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "accept-edits",
+                label: "Auto-edit",
+                args: "--mode accept-edits",
+                explanation: "File edits apply unprompted; --mode plan is read-only planning.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "skip",
+                label: "Skip checks",
+                args: "--dangerously-skip-permissions",
+                explanation: "Auto-approves all tool permission requests. It does NOT answer the \
+                              workspace-trust prompt a first run in a new folder shows — agy has \
+                              no flag for that one, so answer it once per folder.",
+                is_default: true,
+            },
+        ],
+        permission_provenance: PermissionProvenance::Measured,
         content_rederives_on_resume: true,
         // `~/.antigravitycli/<uuid>.json`, one flat file per conversation,
         // carrying `id`, `name` and `projectResources.resources[].gitFolder
@@ -1716,6 +2221,174 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         store_scan_gap: None,
         read_store_entry: read_antigravity_store_entry,
+    },
+    // ── The 2026-08-13 intake. Every field below was read off the installed
+    // binary (`@xai-official/grok` 1.0.3 `1a29d5bc12`, provisioned into the
+    // managed npm prefix on this fleet) or off strings in the shipped
+    // executable, and the provenance is on the field. Nothing here came from a
+    // vendor blog post.
+    AgentCliDescriptor {
+        kind: SessionKind::GrokBuild,
+        // The product names itself "Grok Build TUI" on the first line of its own
+        // `--help`; the npm package and the binary are both plain `grok`. The
+        // SLUG follows `claude-code`/`qwen-code`: the product name, not the
+        // binary, so the binary can be renamed by its vendor without the wire
+        // name of a persisted row changing.
+        display_name: "Grok Build",
+        session_metadata_label: "Grok Build Session",
+        slug: "grok-build",
+        binary_name: "grok",
+        // `bin: {"grok": "bin/grok"}`, Apache-2.0, with per-platform payloads in
+        // optionalDependencies (linux/darwin/win32 × x64/arm64) — so one npm
+        // name provisions correctly on every host the fleet has.
+        install: CliInstall::Npm("@xai-official/grok"),
+        // MEASURED: `grok update  Check for updates or install a specific
+        // version`. A CLI that ships its own updater has it PREFERRED over
+        // re-running the install method.
+        update: CliUpdate::SelfCommand(&["update"]),
+        icon_glyph: "G_",
+        // xAI's black. 21:1 against white text — the highest contrast in the
+        // table, and the brand's actual colour rather than a nearest match.
+        brand_color: "#000000",
+        menu_hint: 'g',
+        // ⚠ The HELP is clear that grok owns session titles — `--resume` matches
+        // "session titles for the current directory", and speaks of a "sole
+        // renamed match". But `store_scan_gap` below means yggterm cannot READ
+        // that title, and declaring `Store` while unable to read one leaves the
+        // row with NO name at all. So yggterm generates until the store scan
+        // lands, at which point this flips to `Store` in the same commit.
+        title_authority: TitleAuthority::Generated,
+        // MEASURED: `-s, --session-id <SESSION_ID>` — "Use a specific session
+        // UUID for a **new** conversation (must be a valid UUID and must not
+        // already exist under the target session directory)". So the fact is
+        // true; ⚠ a collision is an ERROR, exactly like qwen, so a caller must
+        // mint a fresh uuid and never reuse a row id it has already spent.
+        id_assigned_at_birth: true,
+        wrapper_slug: Some("grok"),
+        remote_row_scheme: Some("remote-grok://"),
+        runtime_key_scheme: Some("grok-runtime://"),
+        // ⛔ UNMEASURED — no working screen has been observed, because creating
+        // a session needs `grok login` (see `store_scan_gap`). Empty means the
+        // activity verdict is `Unknown` rather than a guess, which is the answer
+        // that cannot mislead a caller into reading a grinding row as finished.
+        working_screen_phrases: &[],
+        working_screen_negations: &[],
+        // MEASURED: `-r, --resume [<SESSION_ID_OR_TITLE>]`.
+        resume_selector: ResumeSelector::Flag("--resume"),
+        // grok takes the process cwd (`--cwd <CWD>` exists but the launch
+        // command already `cd`s), and `--resume` scopes title matching to the
+        // current directory — so re-rooting on the command line would be a
+        // second encoding of the cd we already did.
+        resume_re_roots_with_cwd: false,
+        model_flag: "--model",
+        // ⭐ MEASURED off a LIVE ROW 2026-08-13, and it is why the field was
+        // declared unknown first: neither `❯` nor `›` occurs anywhere in the
+        // shipped executable's strings, so a static read said "not one of the
+        // two this repo knows". The running TUI draws `❯` inside a box-drawn
+        // composer. ⇒ a binary's strings can be silent about a glyph its own
+        // renderer composes; the screen settles it and nothing else does.
+        composer_marker: '\u{276f}',
+        // MEASURED from the executable's own strings plus one live screen:
+        // `/help for commands` is composer chrome, and the row's footer names
+        // the model (`Grok 4`). ⚠ `esc cancel` is NOT listed here: it sits
+        // adjacent to the same status line in the binary and could belong to
+        // either the idle composer or the in-flight footer, and a hint in the
+        // wrong half makes a working row read as a prompt.
+        composer_footer_hints: &["/help for commands", "ctrl", "grok"],
+        working_footer_hints: &[],
+        // MEASURED on the installed binary: `--permission-mode <MODE>` with
+        // `[possible values: default, acceptEdits, auto, dontAsk,
+        // bypassPermissions, plan]`. ⚠ `auto` and `dontAsk` are NOT mapped —
+        // yggterm has four postures and neither of those is one of them, and
+        // inventing a correspondence for a security boundary is what the
+        // refuse-by-name rule forbids.
+        permission_modes: &[
+            (AgentPermissionMode::Default, &[]),
+            (AgentPermissionMode::Plan, &["--permission-mode", "plan"]),
+            (
+                AgentPermissionMode::AcceptEdits,
+                &["--permission-mode", "acceptEdits"],
+            ),
+            (
+                AgentPermissionMode::Bypass,
+                &["--permission-mode", "bypassPermissions"],
+            ),
+        ],
+        overridden_flags: &[
+            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
+            ("-m", FlagArity::TakesValue, OverriddenBy::Model),
+            (
+                "--permission-mode",
+                FlagArity::TakesValue,
+                OverriddenBy::PermissionMode,
+            ),
+            (
+                "--always-approve",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
+            (
+                "--sandbox",
+                FlagArity::TakesValue,
+                OverriddenBy::PermissionMode,
+            ),
+        ],
+        extra_args_slug: "grok-build",
+        // ⭐ Grok Build's `--permission-mode` vocabulary is Claude Code's, token
+        // for token. That is a real convenience and also a trap: `--allow` /
+        // `--deny` carry "compat alias: --allowedTools / --disallowedTools", so
+        // a user pasting a Claude line into this box gets something that mostly
+        // works, which is the state in which a difference goes unnoticed.
+        //
+        // ⚠ `--sandbox <PROFILE>` TAKES A VALUE, so there is no runnable bare
+        // sandbox tier to offer; the profile lives in `.grok/sandbox.toml` and
+        // is named in prose instead of shipped as a half-written flag.
+        permission_presets: &[
+            PermissionPreset {
+                id: "ask",
+                label: "Ask each time",
+                args: "--permission-mode default",
+                explanation: "Every tool use is confirmed by you. --permission-mode plan is \
+                              read-only planning.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "accept-edits",
+                label: "Auto-edit",
+                args: "--permission-mode acceptEdits",
+                explanation: "File edits apply without asking; commands still ask.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "skip",
+                label: "Skip checks",
+                args: "--permission-mode bypassPermissions",
+                explanation: "Auto-approves every tool execution (--always-approve is the same \
+                              posture spelled as a flag). For a middle ground grok takes --allow \
+                              and --deny rules, and a sandbox profile named with \
+                              --sandbox <PROFILE>.",
+                is_default: true,
+            },
+        ],
+        permission_provenance: PermissionProvenance::Measured,
+        content_rederives_on_resume: true,
+        session_store_globs: &[],
+        store_excluded_name_fragments: &[],
+        // grok reads `GROK_SANDBOX` for the sandbox profile; nothing in its help
+        // or its strings relocates the HOME, which stays `~/.grok`.
+        store_home_env_override: None,
+        store_scan_gap: Some(
+            "`~/.grok/sessions` is a path constant in the shipped executable and \
+             `grok sessions list` is a real verb, but the on-disk SHAPE is unread: \
+             creating even one session requires `grok login` (or an XAI_API_KEY), a \
+             credential only the owner holds, and `grok sessions list` on a signed-out \
+             host answers `No sessions found.` rather than revealing a layout. The \
+             help's `--resume [<SESSION_ID_OR_TITLE>]` matching titles \"for the \
+             current directory\" says the store is bucketed per-cwd like kimi's, which \
+             is a hypothesis and not a measurement. Closing this needs one real session \
+             on a signed-in host; `title_authority` flips to Store in the same commit.",
+        ),
+        read_store_entry: read_no_store_entry,
     },
 ];
 
@@ -2536,6 +3209,199 @@ mod tests {
 
     // Every CLI must be able to express "leave it alone", or a caller has no
     // way to ask for the user's own defaults explicitly.
+    /// Exactly one default tier per CLI that offers tiers at all — the invariant
+    /// that lets `default_permission_preset` return an Option instead of a
+    /// guess, and that a `permission_default: &str` naming a preset id could not
+    /// have given (a dangling name is a compile-time-invisible bug).
+    #[test]
+    fn every_cli_with_presets_has_exactly_one_default() {
+        for descriptor in AGENT_CLIS {
+            if descriptor.permission_presets.is_empty() {
+                continue;
+            }
+            let defaults = descriptor
+                .permission_presets
+                .iter()
+                .filter(|preset| preset.is_default)
+                .count();
+            assert_eq!(
+                defaults, 1,
+                "{}: exactly one permission preset must be the default, found {defaults}",
+                descriptor.display_name
+            );
+        }
+    }
+
+    /// ⛔ An EMPTY preset list is only honest for a CLI that reads another's box,
+    /// or one whose flags nobody has measured. Anywhere else it is a CLI that
+    /// silently offers the user nothing, which is how seven CLIs went a week
+    /// without a way to receive a permission flag.
+    ///
+    /// And the converse: a NON-empty list beside `Unmeasured` is a guess wearing
+    /// a measurement's clothes.
+    #[test]
+    fn every_cli_declares_presets_or_says_why() {
+        for descriptor in AGENT_CLIS {
+            let unmeasured = matches!(
+                descriptor.permission_provenance,
+                PermissionProvenance::Unmeasured(_)
+            );
+            if descriptor.permission_presets.is_empty() {
+                assert!(
+                    !descriptor.owns_its_extra_args_box() || unmeasured,
+                    "{}: owns its own launch-flags box and offers no tiers — either give it \
+                     tiers or declare PermissionProvenance::Unmeasured with the reason",
+                    descriptor.display_name
+                );
+                continue;
+            }
+            assert!(
+                !unmeasured,
+                "{}: declares tiers AND says they are unmeasured. Measure them, or ship none.",
+                descriptor.display_name
+            );
+            if let PermissionProvenance::Unmeasured(reason) = descriptor.permission_provenance {
+                assert!(
+                    reason.split_whitespace().count() >= 6,
+                    "{}: an unmeasured reason must name the obstacle, not wave at it",
+                    descriptor.display_name
+                );
+            }
+        }
+    }
+
+    /// Tier ids are unique within a CLI — they address a tier from a verb and a
+    /// test, and a duplicate would make `--preset skip` ambiguous.
+    #[test]
+    fn permission_preset_ids_are_unique_within_a_cli() {
+        for descriptor in AGENT_CLIS {
+            let mut seen = std::collections::BTreeSet::new();
+            for preset in descriptor.permission_presets {
+                assert!(
+                    seen.insert(preset.id),
+                    "{}: two permission presets share the id {:?}",
+                    descriptor.display_name,
+                    preset.id
+                );
+            }
+        }
+    }
+
+    /// ⛔⛔ THE ONE THAT KEEPS THIS FROM BECOMING A SECOND ENCODING OF A SECURITY
+    /// BOUNDARY. The modal's tiers and `--permission-mode`'s mapping are two
+    /// vocabularies for the same postures — one aimed at a human, one at a
+    /// delegate — and they must not be able to disagree about what BYPASS means.
+    ///
+    /// The invariant is that the posture `--permission-mode bypass` produces is
+    /// OFFERED in the modal — not that it is the pre-populated one. Those are
+    /// different questions and conflating them is what the first draft did:
+    /// codex's least-checks tier is `-s danger-full-access` (no sandbox, prompts
+    /// still asked) while its bypass mode is
+    /// `--dangerously-bypass-approvals-and-sandbox` (no sandbox AND no prompts),
+    /// and those are two real postures, so the modal shows both.
+    ///
+    /// ⭐ The lock earned its place immediately: it caught that codex was
+    /// offering only one of the two, so a user reading the modal could not
+    /// reach the posture a delegate launch could ask for by name.
+    #[test]
+    fn every_bypass_mode_is_offered_as_a_tier() {
+        for descriptor in AGENT_CLIS {
+            let Some(bypass) = descriptor
+                .permission_modes
+                .iter()
+                .find(|(mode, _)| *mode == AgentPermissionMode::Bypass)
+                .map(|(_, tokens)| *tokens)
+            else {
+                continue;
+            };
+            if descriptor.permission_presets.is_empty() {
+                continue;
+            }
+            let offered = descriptor.permission_presets.iter().any(|preset| {
+                let tier_tokens = preset.args.split_whitespace().collect::<Vec<_>>();
+                bypass.iter().all(|token| tier_tokens.contains(token))
+            });
+            assert!(
+                offered,
+                "{}: --permission-mode bypass emits {bypass:?}, and no tier in the modal \
+                 carries it. Two answers to what bypass means for this CLI is the SSOT \
+                 violation this repo's own law forbids.",
+                descriptor.display_name,
+            );
+        }
+    }
+
+    /// A tier's args must be RUNNABLE AS WRITTEN. A placeholder like
+    /// `--tools <names>` pasted into a launch is a launch that dies at the PTY,
+    /// and the first draft of pi's row shipped exactly that.
+    #[test]
+    fn no_permission_preset_ships_a_placeholder_for_a_value() {
+        for descriptor in AGENT_CLIS {
+            for preset in descriptor.permission_presets {
+                assert!(
+                    !preset.args.contains('<') && !preset.args.contains('>'),
+                    "{} / {}: preset args {:?} carry a placeholder. Ship a complete flag and \
+                     name the parameterised one in the explanation instead.",
+                    descriptor.display_name,
+                    preset.id,
+                    preset.args
+                );
+            }
+        }
+    }
+
+    /// Every explanation is a SENTENCE in the CLI's own vocabulary, because it
+    /// is the whole reason the modal beats nine text boxes.
+    #[test]
+    fn every_permission_preset_explains_itself() {
+        for descriptor in AGENT_CLIS {
+            for preset in descriptor.permission_presets {
+                assert!(
+                    preset.explanation.split_whitespace().count() >= 5,
+                    "{} / {}: an explanation shorter than a sentence explains nothing",
+                    descriptor.display_name,
+                    preset.id
+                );
+                assert!(
+                    !preset.label.trim().is_empty(),
+                    "{} / {}: a tier needs a button label",
+                    descriptor.display_name,
+                    preset.id
+                );
+            }
+        }
+    }
+
+    /// Every `extra_args_slug` names a REGISTERED CLI's slug. A typo here would
+    /// silently give one CLI a box nothing else reads or writes.
+    #[test]
+    fn every_extra_args_slug_names_a_registered_cli() {
+        for descriptor in AGENT_CLIS {
+            assert!(
+                AGENT_CLIS
+                    .iter()
+                    .any(|other| other.slug == descriptor.extra_args_slug),
+                "{}: extra_args_slug {:?} is not any registered CLI's slug",
+                descriptor.display_name,
+                descriptor.extra_args_slug
+            );
+            // …and a CLI that borrows a box must borrow from one that OWNS its
+            // own, never from another borrower — one hop, no chains to resolve.
+            if !descriptor.owns_its_extra_args_box() {
+                let owner = AGENT_CLIS
+                    .iter()
+                    .find(|other| other.slug == descriptor.extra_args_slug)
+                    .expect("checked above");
+                assert!(
+                    owner.owns_its_extra_args_box(),
+                    "{} borrows {}'s box, which is itself borrowed",
+                    descriptor.display_name,
+                    owner.display_name
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_agent_cli_supports_the_default_mode() {
         for descriptor in AGENT_CLIS {

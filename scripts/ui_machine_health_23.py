@@ -3,8 +3,12 @@ import argparse
 import json
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ygg_live_host  # noqa: E402  (path is set immediately above)
 
 
 def parse_args() -> argparse.Namespace:
@@ -15,7 +19,12 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--bin", default="./target/debug/yggterm")
-    parser.add_argument("--hosts", nargs="+", default=["guihost", "oc"])
+    # ⛔ NO LITERAL HOST NAME. The one that used to sit here did not resolve, so
+    # the default run of a script whose whole subject is machine REACHABILITY
+    # was itself unable to reach the host it cared most about. Resolved lazily
+    # in `main` — an argparse default is evaluated even for `--help`, and the
+    # resolver makes ssh probes.
+    parser.add_argument("--hosts", nargs="+", default=None)
     parser.add_argument("--count", type=int, default=23)
     parser.add_argument("--timeout-ms", type=int, default=8000)
     parser.add_argument("--poll", type=float, default=0.5)
@@ -77,6 +86,8 @@ def normalize_health(value: str | None) -> str | None:
 
 def main() -> int:
     args = parse_args()
+    if not args.hosts:
+        args.hosts = ygg_live_host.hosts_with_live("oc")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     results: list[dict] = []

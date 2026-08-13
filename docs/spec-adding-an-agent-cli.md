@@ -48,7 +48,8 @@ Ten questions, and the answer to each is a descriptor field:
 | 6 | Does it write its own session title? | grep for an auto-title/rename path | `title_authority` |
 | 7 | What does its screen say while a turn is IN FLIGHT? | its spinner/status component — and then **look at a real screen** | `working_screen_phrases`, `working_footer_hints` |
 | 8 | What glyph heads its input composer? | its prompt component | `composer_marker`, `composer_footer_hints` |
-| 9 | What permission postures can it express? | `--help` on an installed copy | `permission_modes`, `overridden_flags` |
+| 9 | What permission postures can it express? | `--help` on an installed copy — ⚠ and PROBE the parser when the help looks thin; qwen hides `--yolo` and `--approval-mode` from its own `--help` and both work | `permission_modes`, `overridden_flags` |
+| 10 | What does each posture MEAN, in this CLI's words? | one sentence per tier, off the same reading, plus where you read it | `permission_presets`, `permission_provenance` |
 
 **The shallow clones live at `~/gh/cli-reference/<name>`** — that is where
 the 2026-08-08 intake read its answers, and where the next one should.
@@ -313,6 +314,49 @@ descriptor.
 Two of these need the owner and are parked in `owner-attention.md`: Muse Code
 needs a Meta login before anything about it can be measured, and `agy` needs one
 captured working screen.
+
+## 6b. What the 2026-08-13 intake cost — the tenth CLI, measured
+
+Grok Build (`@xai-official/grok`, binary `grok`, Apache-2.0) was added to test
+whether §0's claim — *a CLI is DATA, the harness is CODE* — is still true at ten.
+
+**It is, nearly.** `cargo check --workspace` named exactly THREE match arms:
+
+| site | verdict |
+|---|---|
+| `ManagedCliTool::from_session_kind` | correct — a deliberate no-`_` table that must fail the build |
+| `remote_runtime_agent_registry_kind` | same, and documented as such |
+| `configured_cli_extra_arg_tokens` | ⛔ **THE LEAK** |
+
+⇒ The third was not a table to extend, it was a defect the new CLI exposed: the
+settings store held two named extra-args fields, so its only honest answer for
+seven of nine CLIs was `None`, and the tenth would have made it eight. It is now
+descriptor-derived and the arm is gone. **The lesson generalises: when the
+compiler names an arm, ask whether it is a TABLE (extend it) or a FORK (delete
+it). Two of three here were tables; the one that was a fork was a live bug.**
+
+Three more things the intake had to touch, none of them a `match`:
+
+- **two arm-matrix rows** (§6) — by design, and the shell matrix needs its own
+  distinct fixture session id;
+- **two scheme rows** (§3);
+- **`RemoteRuntimeKind`** — a third deliberate no-`_` table, plus its two db
+  spellings.
+
+⛔ **And one that had nothing to do with the CLI at all:** `server app` is
+dispatched in TWO files, so the new app-control verb shipped into the GUI binary
+and was absent from the headless one agents actually call. It is filed; until it
+is one dispatcher, a new verb goes in both.
+
+### The three answers this intake left honest
+
+`store_scan_gap` (grok's store shape needs a login), `title_authority: Generated`
+(the help says grok owns titles, but declaring `Store` while unable to READ one
+leaves the row with no name), and — briefly — `composer_marker`. That last one is
+worth the sentence: neither `❯` nor `›` appears anywhere in grok's shipped
+executable, so a static read said "not one of the two we know". **The live TUI
+draws `❯`.** A binary's strings can be silent about a glyph its own renderer
+composes; only the screen settles it.
 
 ---
 
