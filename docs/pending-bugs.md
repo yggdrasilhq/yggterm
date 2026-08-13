@@ -838,13 +838,34 @@ YGGTERM_TRACE_RENDER=1`, `YGGTERM_GUI_BIN` pointed at a GUI build — the instal
 binary on a headless host is not one) renders **1.67/s at rest** and reports
 **246 of 258 renders `unattributed`** with `forced_wakes` unchanged: the root
 re-renders while no watched field changed and nothing of ours scheduled it. The
-inter-render gaps name the drivers exactly — **56 gaps of 1001–1002 ms**
-(`INPUT_GATE_DEADLINE_TICK_MS`), and a 350–699 ms population that **pairs to
-~1001 ms** (419+587, 424+577, 441+560, 464+538, 473+528, 491+510), which is the
-beat of a *second* independent 1 Hz timer against the first. So the idle render
-load is two 1 Hz timers, each calling `state.with_mut(...)` whose closure
-early-returns without mutating — and `with_mut` marks the signal dirty on drop
-regardless. Worth fixing on its own terms; **not** the regression.
+inter-render gaps name the driver exactly: over 8,167 steady gaps, **31.3% land at
+1001–1002 ms** — `INPUT_GATE_DEADLINE_TICK_MS`, whose `state.with_mut(...)`
+closure early-returns without mutating while `with_mut` marks the signal dirty
+on drop regardless.
+
+✅ **FIXED and measured (commit `b04d363c`): 1.65 → 0.65 renders/s at rest, a 61%
+cut in idle re-renders**, with the 1001 ms gap population going **31.3% → 0%**.
+⭐ That gap fingerprint is what *attributes* the win: the before/after binaries
+were not the same build, so the rate delta alone would not have been admissible
+— but the specific period vanishing from the histogram is attributable on the
+after-binary alone. **Use the fingerprint, not the rate, when a same-build
+control is unavailable.**
+⚠ CPU on `dev` moved only 1.5% → 1.4%, and that number does **not** travel:
+`dev` has `tsc`, where a render is cheap. On the `hpet` desktop host the same
+renders cost 45.8× more per clock syscall, so the CPU share there is
+**unmeasured** — do not extrapolate it. And this caps a FLAT rate, so it buys a
+slice of the fresh floor and nothing of the climb.
+
+⚠ **One inference here was wrong and the fix disproved it.** The 350–699 ms
+population *pairs* to ~1001 ms (419+587, 424+577, 441+560, 464+538…), which was
+read as a second independent 1 Hz timer. It is not: removing the ONE timer
+removed BOTH populations. A single 1 Hz timer with any irregular source
+interleaved produces exactly that pairing, because the pairs are **bracketed by
+consecutive firings of the same timer**. ⇒ **To count timers, remove one and
+re-measure — the pairing statistic cannot tell you.** What drives the remaining
+0.65/s is unidentified; its dominant period is now **2501 ms**. Ruled out by
+measurement: the under-glass eval-rebind loops (an under-glass ON/OFF A/B gave
+an identical 1.6–1.7/s).
 
 ⚠ **And it explains why three storm autopsies in a row died undiagnosed.** They
 all reported "unattributed, empty histogram", which reads as *nothing wrote* —
