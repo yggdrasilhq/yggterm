@@ -107415,6 +107415,10 @@ fn notification_chime_script(
     );
     let flush_tail = notification_audio::FLUSH_TAIL_SECONDS;
     let dither = NOTIFICATION_DITHER_PEAK_AMPLITUDE;
+    // Reused, not re-chosen: the idle-suspend deadline and the pre-roll
+    // decision must be the same number or they will disagree about whether the
+    // link is awake. See the script's suspend timer.
+    let awake_window_ms = NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS;
     format!(
         r#"
         (async () => {{
@@ -107514,6 +107518,33 @@ fn notification_chime_script(
               playsForMs: Math.ceil((endAt - now) * 1000),
               contextCreatedAt: w.__yggtermAudioCtxCreatedAt || null
             }};
+            // POWER (2026-08-13): the context was left RUNNING forever, so the
+            // webview held an UNCORKED playback stream with nothing in it —
+            // `pactl` showed `Corked: no` on an idle GUI, the audio graph never
+            // suspended and the filter sink never reached SUSPENDED. On a
+            // laptop that is a continuous, entirely avoidable draw, and a
+            // stream held open for hours and fed nothing underruns, which is
+            // the lagged/distorted notification the owner reported.
+            //
+            // ⛔ suspend(), NEVER close(). Closing shortly after the last note
+            // is the clipped-ending defect fixed above; the context object is
+            // kept and reused, and the resume() path above already wakes a
+            // suspended one.
+            //
+            // ⭐ The deadline IS the pre-roll awake window, reusing that one
+            // constant instead of inventing a second: while the context runs
+            // the next chime is inside the window and correctly skips the
+            // pre-roll; once it suspends the next chime is outside it and
+            // correctly pre-rolls. The two cannot drift apart.
+            if (w.__yggtermAudioIdleTimer) {{
+              clearTimeout(w.__yggtermAudioIdleTimer);
+            }}
+            w.__yggtermAudioIdleTimer = setTimeout(() => {{
+              const idle = w.__yggtermAudioCtx;
+              if (idle && idle.state === "running") {{
+                idle.suspend().catch(() => {{}});
+              }}
+            }}, Math.ceil((endAt - now) * 1000) + {awake_window_ms});
           }} catch (chimeError) {{
             // DEFECT FIX: the diagnostic used to be the LAST statement of the
             // try, so it was written exactly when the chime worked and missing
@@ -170119,6 +170150,25 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // so there is still exactly one construction site — see
         // `the_chime_resumes_a_suspended_context_and_never_closes_it`.)
         assert_eq!(script.matches("new (w.AudioContext").count(), 1);
+        // POWER: the steady state must be NO stream. The context is suspended
+        // once the link is presumed asleep, and the deadline reuses the pre-roll
+        // awake window so the two decisions cannot disagree about whether the
+        // link is up.
+        assert!(
+            script.contains("idle.suspend()"),
+            "the chime must retire its stream, or the webview holds an uncorked \
+             playback stream forever"
+        );
+        assert!(
+            !script.contains("__yggtermAudioCtx.close()") && !script.contains("ctx.close()"),
+            "close() shortly after the last note is the clipped-ending defect — \
+             suspend and reuse the context instead"
+        );
+        assert!(
+            script.contains(&format!("+ {NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS})")),
+            "the suspend deadline must BE the pre-roll awake window, not a second \
+             constant that can drift from it"
+        );
         assert!(script.contains("const start = now + preroll + t;"));
         // Noise, NOT silence — several A2DP stacks never prime on digital silence.
         assert!(script.contains("Math.random() + Math.random() - 1"));
