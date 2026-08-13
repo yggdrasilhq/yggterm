@@ -1378,7 +1378,7 @@ mod tests {
             "Agent unnamed claude-code",
             "Agent unnamed claude-code: 6.2 sidebar order probe A",
             "Agent unnamed shell: restore lane A",
-            "Agent probe-7 ssh: grep the echograph for",
+            "Agent probe-7 ssh: grep the build log for",
             "Agent probe-7 codex: why the build is slow",
             "Agent probe-7 document: the and for with the",
         ] {

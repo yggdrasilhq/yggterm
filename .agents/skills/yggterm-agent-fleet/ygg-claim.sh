@@ -39,6 +39,7 @@
 # EXIT  0 claimed (and predecessor retired, if asked) · 2 no row found
 #       3 rename never verified · 4 predecessor survived reaping
 set -uo pipefail
+STATE_DIR="$HOME/.yggterm/relay"
 
 TITLE=""; NUMBER=""; CAMPAIGN=""; REPLACE=""; INHERIT=0
 SESSION="${YGGTERM_SESSION_ID:-}"; WATCH=240; HOST="${YGG_GUI_HOST:-}"; DRY=0
@@ -168,6 +169,31 @@ if not n:
     else:
         majors={num(r)[0] for r in others if num(r)}
         n=str((max(majors)+1) if majors else 1)
+
+# ⛔⛔ WHATEVER WAS DERIVED, NEVER HAND OUT A SEAT SOMEONE ALREADY HOLDS.
+# Reported 2026-08-13: a claim with --campaign and no --number derived 6.1, which
+# 6.1 already held, verified by read-back and reported success. Two rows then wore
+# one seat and could only be told apart by grepping their transcripts.
+#
+# The derivation above matches siblings by looking for the campaign token in a
+# row TITLE — and titles are now stored CLEAN, so which rows mention the
+# campaign word is arbitrary. Rather than make that heuristic cleverer, make the
+# OUTCOME safe: a derived number is a suggestion, and a held seat is a fact.
+# ⚠ Only for DERIVED numbers. An explicit --number is an instruction, and a
+# caller re-running claim on their own row must be a no-op, not a renumber.
+if not os.environ.get("NUMBER",""):
+    held={}
+    for r in others:
+        p=str(r.get("outline_prefix") or "").strip()
+        if p: held[p]=title(r)
+    if n in held:
+        head,_,tail = n.rpartition(".")
+        k = int(tail) + 1 if tail.isdigit() else 1
+        base = head if head else n
+        while (f"{base}.{k}" if head else f"{base}.{k}") in held: k += 1
+        was, n = n, (f"{base}.{k}")
+        print(f"NOTE=derived seat {was} is already held by "
+              f"{held[was][:40]}; taking {n} instead")
 print("OK")
 print("MINE="+mine["full_path"])
 print("MINE_LABEL="+(mine.get("session_title") or mine.get("label") or ""))
@@ -177,6 +203,7 @@ print("PRED_LABEL="+((pred.get("session_title") or pred.get("label") or "") if p
 ')"
 case "$PLAN" in ERR*) echo "ygg-claim: ${PLAN#ERR }" >&2; exit 2 ;; esac
 eval "$(printf '%s\n' "$PLAN" | grep -E '^(MINE|MINE_LABEL|NUM|PRED|PRED_LABEL)=' | sed 's/=/="/; s/$/"/')"
+printf '%s\n' "$PLAN" | grep -E '^NOTE=' | sed 's/^NOTE=/ygg-claim: ⚠ /' || true
 
 # ⛔⛔ THE SEAT NEVER GOES IN THE TITLE. It lives in `outline_prefix` and NOWHERE ELSE.
 #
@@ -298,12 +325,39 @@ fi
 
 # The CLI composes its own title when its first turn ends and will clobber this.
 # Re-assert in the background for a while rather than assuming one write holds.
+#
+# ⛔⛔ THIS WATCHER FOUGHT A CORRECTIVE CLAIM FOR 240 s AND WON (2026-08-13).
+# Two defects, both mine, and the first is the interesting one:
+#
+#  1. It compared `read_state` against "$NUM\t$FINAL_TITLE" — the RAW comparison
+#     that was replaced in the verifier above and never here. The server stores
+#     the title CLEAN, so the watcher saw a mismatch on every pass and re-asserted
+#     every 10 s forever. A half-applied fix is worse than none: the verify
+#     started passing, so nothing looked wrong, while a background loop kept
+#     writing.
+#  2. It OUTLIVED the script. A session that claimed twice — normal, when the
+#     first claim derived a wrong seat — left the first watcher re-asserting the
+#     old seat against the second claim's new one. `server app rows` showed the
+#     old number while the claim's own read-back showed the new one, and the row
+#     could only be settled by killing the watcher tree by hand.
+#
+# ⇒ Use the same predicate as the verify, and retire this session's previous
+#   watcher before starting another. One session, at most one watcher.
+WATCHPID="$STATE_DIR/claim-watcher-${MINE##*/}.pid"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+if [ -f "$WATCHPID" ]; then
+  OLD="$(cat "$WATCHPID" 2>/dev/null || true)"
+  if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null; then
+    kill "$OLD" 2>/dev/null && log "retired this session's previous claim watcher (pid $OLD)"
+  fi
+  rm -f "$WATCHPID"
+fi
 if [ "${WATCH:-0}" -gt 0 ]; then
-  WANT="$(printf '%s\t%s' "$NUM" "$FINAL_TITLE")"
   ( for _ in $(seq 1 $((WATCH/10)) ); do
       sleep 10
-      [ "$(read_state)" = "$WANT" ] || assert_state >/dev/null
+      matches "$(read_state)" || assert_state >/dev/null
     done ) >/dev/null 2>&1 &
+  echo $! > "$WATCHPID"
   log "watching seat+title for ${WATCH}s (the CLI self-titles at first-turn end)"
 fi
 
