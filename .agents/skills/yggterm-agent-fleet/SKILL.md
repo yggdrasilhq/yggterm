@@ -1410,6 +1410,45 @@ does not know which kind it is will guess, and the guess is always *keep going*.
 effect: read back both `row_still_listed` and `verified`, and identify the
 process rather than counting.
 
+### ⛔⛔ NEVER TIDY A CORPSE WITH THE DELETE VERB — the wire cannot tell them apart
+
+**Two intentions, one request, and the difference is invisible downstream:**
+
+| intent | what it means | what it should do |
+|---|---|---|
+| **RETIRE** — "this row's work is finished, remove it" | a decision | tombstone it. It must stay gone across restarts |
+| **TIDY** — "this row is already dead, clean it up" | an observation | nothing durable. The row was lost, not deleted |
+
+⇒ **`session remove` records a DELETION either way.** So a tool that sweeps rows
+it judges dead is filing them as things the user chose to delete — and a later
+restore then correctly refuses to bring them back, which reads to everyone
+involved as *"restore is broken"*.
+
+**How this was established, and it is worth knowing because it disproved a
+plausible theory:** rows lost to a hand-killed GUI were reported as *"lost
+involuntarily and filed as deletions"*, and the tombstone plane was blamed for
+being unable to tell a deletion from a GUI death. Traced per row, that was wrong
+— a GUI death tombstones **nothing**; the close path is never called. Every row
+in question carried an **explicit close request**, and one of them was an
+orchestrator's own deliberate reap, correctly recorded as exactly what it was.
+⇒ **The plane was working. The callers were reaping corpses with the delete
+verb.**
+
+**The rules that follow:**
+
+- ✅ **Reap a row you are RETIRING** — a finished cluster, a superseded
+  predecessor. That is real delete intent and the tombstone is correct.
+- ⛔ **Do not reap a row that is already dead.** You are not removing it, you are
+  declaring the user meant to lose it. Leave it; it is recoverable.
+- ⭐ **Recovering a set that was wrongly tombstoned** is
+  `sessions restore <path>… [--include-closed]`, and `close_remembered` on each
+  row in `server app rows` tells you which rows carry one before you try.
+- ⚠ **Do not hand-roll a restore out of `app open` in a loop.** `open` is
+  permissive by design — re-opening a row yourself is how a close is legitimately
+  undone — so a loop over it silently resurrects rows the user really did delete.
+  That is how a reaped row came back holding a live agent into a worktree its own
+  successor was editing.
+
 ### ⛔⛔ THE ORCHESTRATION SYSTEM IS THE ORCHESTRATOR'S OWN WORK — mend it as you run it
 
 **You are not a dispatcher. You are the lead of your category, and systemic
