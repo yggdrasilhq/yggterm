@@ -1,6 +1,6 @@
 ---
 name: yggterm-agent-fleet
-description: What an agent CLI gains by running inside yggterm — its own addressable row, the ability to spawn and verify delegate sessions, to message any other session, to read its own context budget, and a one-time bootstrap that wires a durable memory + campaign system. Read this before spawning any session, before claiming a row at the start of a campaign (§1), before SUCCEEDING a session that has gone cold (§6 — harvest its transcript, never prompt it), before trusting any row-management verb's own success field (§7), before HANDING OFF a campaign to a successor (§8 — the baton relay, and how to write the brief), and before messaging another campaign or recovering a stalled one (§9 — cross-talk and the single `continue`).
+description: What an agent CLI gains by running inside yggterm — its own addressable row, the ability to spawn and verify delegate sessions, to message any other session, to read its own context budget, and a one-time bootstrap that wires a durable memory + campaign system. Read this before spawning any session, before claiming a row at the start of a campaign (§1), before SUCCEEDING a session that has gone cold (§6 — harvest its transcript, never prompt it), before trusting any row-management verb's own success field (§7), before HANDING OFF a campaign to a successor (§8 — the baton relay, and how to write the brief), before messaging another campaign or recovering a stalled one (§9 — cross-talk and the single `continue`), and before driving a row that is not answering (§11 — the PER-CLI NUANCES register, one subsection per agent CLI, covering the startup gates and menus that hold a row before its composer). ⛔ §11 is written to GROW: hitting an undocumented CLI quirk obliges you to append it there in the same session, because a session's discipline resets at every launch and the register's does not.
 ---
 
 # You are running inside yggterm. Here is what that gives you.
@@ -266,6 +266,69 @@ in the composer, as the delegate's opening message. So:
 
 - **Never treat "not ready" as "nothing happened".**
 - **Never spawn and walk away.** Which is what the next section is for.
+
+### ⛔⛔ A MODAL IS NAVIGABLE, NOT A BLOCKER — you have a keyboard, use it
+
+**Every agent CLI has a startup quirk that can hold a fresh row before its
+composer** — a first-run trust prompt, a pending self-update, a theme picker, a
+login chooser, a "resume or start new" list. **A row you can send keys to is a
+row you can drive.** ⛔ Respawning it somewhere friendlier, or handing the task
+back, is the failure — it abandons the correct cwd to dodge one keystroke.
+
+**The instance that produced this rule.** Two delegates were spawned into a
+directory that had never hosted an agent-CLI session **on that host**. Both sat
+at the CLI's first-run trust prompt (*"Is this a project you created or one you
+trust?"*), which a skip-permissions flag does **not** skip, because it is a
+workspace-trust gate and not a permission gate. Both were killed and respawned
+elsewhere before anyone read the screen. **One `\r` was the whole fix.**
+
+**The three tells, and the first one names the answer out loud:**
+
+1. `input-check` answers `consuming_input:false` with reason *"no agent composer
+   row appeared … the row is **in a menu** …"*. ⇒ **that reason is the diagnosis,
+   not a shrug.** Read it; do not read it as silence.
+2. **No transcript file ever appears** — the CLI has taken no input, so there is
+   nothing to write. (§ above: absent transcript = the brief did not land.)
+3. `submit` answers `submitted:false`. It refused, correctly.
+
+**Read the screen of a row you are NOT looking at** — no activation, so it never
+disturbs the user's viewport, and no screenshot staleness:
+
+```sh
+yggterm server snapshot | python3 -c "
+import json,sys
+for s in json.load(sys.stdin)['live_sessions']:
+    if s['id'].startswith('<uuid-prefix>'):
+        print(''.join(s.get('terminal_lines') or []))"
+```
+
+⚠ **`terminal probe-scroll` is NOT a screen read** — it answers
+`{accepted, reason, session_path}` only. It scrolls; it does not report content.
+`live_sessions[].terminal_lines` is the instrument for "what is on that row".
+
+**Then drive it.** Confirm the highlighted option from the raw lines before
+pressing anything — the marker is `❯` — and send a **lone** `\r` (Enter is its
+own write; see the multi-line refusal above):
+
+```sh
+yggterm server app terminal send "$ROW" --data $'\r'          # confirm default
+yggterm server app terminal send "$ROW" --data $'\x1b[B\r'    # down one, then confirm
+```
+
+⛔ **Confirm the menu is the menu you think it is before arrowing blind** — the
+same keystroke into a composer submits garbage, and into a pending self-update
+prompt confirms the update.
+
+⭐ **And it usually self-heals the class:** a first-run gate answered once is
+normally persisted per-directory by the CLI, so every later row spawned into the
+same cwd walks straight to its composer. Verified in the instance above — the
+second row never saw the prompt. ⇒ **answering it is strictly better than
+avoiding it**, because avoiding it leaves the wall standing for the next agent.
+
+⛔ **A related self-inflicted wound, while reaping:** `pkill -f <uuid>` matches
+**your own shell**, because the uuid is in your command line — it kills the
+session doing the reaping. Collect pids first, exclude `$$`, then signal them.
+Identify; never pattern-match.
 
 ### ⛔⛔ A FINISHED DELEGATE AND A STALLED ONE LOOK IDENTICAL — run `ygg-babysit.py`
 
@@ -1572,7 +1635,142 @@ prevent.
 
 ---
 
-## 11. Adapting this to your own setup
+## 11. ⭐⭐ PER-CLI NUANCES — the quirk register, and it is written to GROW
+
+**Every agent CLI has behaviour that is neither documented nor guessable, and that
+costs a session an hour the first time it meets it.** A session's discipline
+resets at every launch; this register does not. That asymmetry is the whole
+reason the section exists.
+
+### ⛔⛔ THE STANDING LAW: HIT A QUIRK, RECORD IT HERE, IN THE SAME SESSION
+
+**Owner-directed.** When you lose time to a CLI behaving in a way its own flags
+and messages did not predict, **appending it here is part of finishing the
+task, not a chore to do later.** A quirk you solved and did not write down will
+be solved again, from scratch, by the next session — and it will look exactly
+as mysterious to them as it did to you.
+
+- ⭐ **Write the TELL before the FIX.** The fix is cheap once you know what you
+  are looking at; the expensive half is recognising the symptom. Lead every
+  entry with what it *looks* like.
+- ⭐ **Record what the instrument SAID and how you misread it.** The most valuable
+  entries here are the ones where the tool answered correctly and the agent read
+  the answer as noise. That is the reusable lesson.
+- **A new CLI gets its own `###` subsection** the first time anyone drives it.
+  Do not fold its quirks into another CLI's list — the whole value is that a
+  session driving X reads only X's list.
+- **Correct an entry that turns out to be wrong**, and say what replaced it. A
+  stale nuance is worse than a missing one, because it is trusted.
+- ⚠ **Keep every example INVENTED.** This file is public.
+
+---
+
+### Claude Code
+
+**1. ⛔ The first-run workspace-trust gate holds the row before its composer, and
+`--dangerously-skip-permissions` does NOT skip it.** It is a *trust* gate, not a
+*permission* gate, and it fires whenever the cwd has never hosted a Claude Code
+session **on that host** — so a directory that is fine on one fleet machine
+still stops a row on another.
+
+- **Tell:** `input-check` answers `consuming_input:false` with reason *"…the row
+  is **in a menu**…"* · **no transcript file is ever created** · `submit`
+  answers `submitted:false`.
+- **Fix:** read the screen (`server snapshot` → `live_sessions[].terminal_lines`),
+  confirm the `❯` sits on *"1. Yes, I trust this folder"*, send a lone `\r`.
+- ⭐ **Answering it once persists it for that directory**, so every later row in
+  the same cwd walks straight to its composer. **Answer it; never respawn
+  elsewhere to dodge it** — dodging leaves the wall standing for the next agent.
+- Full treatment, with the general "a modal is navigable" law: §3.
+
+**2. `submitted:false` and a dropped brief are DIFFERENT failures — do not
+conflate them.** `submitted:false` is the verb *refusing* because the row was not
+ready: nothing was written, and a retry after the row settles is correct.
+`submitted:true` with **no ACK token in the transcript** is the intermittent
+delivery drop of §3: the write happened and the CLI never received it. One needs
+patience, the other needs a re-submit. Reading the first as the second wastes a
+respawn; reading the second as the first waits forever.
+
+**3. A cold row needs SECONDS, and the composer is drawn well before the input
+loop is live.** Probe with a real timeout (20-40 s), never milliseconds. A row
+that answered `consuming_input:true` in 250 ms was already warm; a fresh launch
+will not.
+
+**4. The model id must survive the shell.** Ids can contain characters the shell
+treats as special (bracketed context-window suffixes, for instance) — quote the
+value at every hop, because it is re-expanded through the launch command. A
+silently mangled id yields a working row on the wrong model, which nothing
+downstream will flag.
+
+**5. `--permission-mode` is per-launch and wins over any global extra-args**, and
+it governs permissions ONLY. It does not cover workspace trust (see 1), a
+first-run theme picker, or an auth/login prompt. **Any of those can hold a row,
+and all of them are navigable.**
+
+**6. The transcript is the only honest delivery receipt.** A transcript file
+exists the moment the CLI takes input, and not before — so *absent after ~60 s*
+means the brief did not land. Its *presence* proves nothing about **whose** brief
+it holds; that is what the ACK token is for. (§3.)
+
+---
+
+### Codex
+
+**1. Enter is part of the payload on a raw `send`** — append `\r` or codex will
+not submit. The readiness-gated `submit` handles this for you and is the safe
+path; raw `send` is for a row you are *looking at*.
+
+**2. ⛔ A raw `send` ending in `\r` into a row that is mid-task, at a menu, or
+showing a pending self-update fires Enter into the wrong thing.** Observed live:
+a `/permissions\r` intended to open a menu **confirmed a pending codex
+self-update instead.** Confirm what is on screen before sending a bare Enter.
+
+**3. Menu navigation is raw escape bytes.** Down-arrow is `\x1b[B` (normal cursor
+mode) or `\x1bOB` (application cursor mode — check the app-state flag, do not
+assume). The full-access selector in `/permissions` is Down ×2 from the top.
+⛔ Never arrow blind through a menu that sets a permission level.
+
+**4. Codex rows and Claude Code rows are DIFFERENT SCHEMES and the open verbs are
+not interchangeable.** A scan-only codex row resolves through the codex open
+path; pushing a Claude Code uuid through it fails **and leaves an orphan behind**,
+so the failure costs cleanup as well as time.
+
+**5. Remote codex refuses the per-launch model/permission options** rather than
+approximating them, and says so. Treat the refusal as correct and adjust the
+launch — do not route around it.
+
+---
+
+### Any CLI — quirks that are about the ROW, not the program
+
+These bite regardless of which agent CLI is inside the row, and they have each
+cost a live session:
+
+- ⛔ **`pkill -f <uuid>` kills YOUR OWN shell**, because the uuid is in your
+  command line. Collect pids, exclude `$$`, then signal. Identify; never
+  pattern-match.
+- ⛔ **`remove` can answer `verified:false` with a survivor that is already
+  exiting.** The verdict is a sample taken at that instant. **Re-check the named
+  pids directly before escalating to a kill** — a runtime that needed one more
+  second reads identically to one that is stuck, and killing it is the more
+  expensive mistake.
+- ⛔ **A row verb answers with the REQUEST, not the EFFECT** — §7 is the full
+  treatment, and it applies to every CLI kind.
+- ⛔ **App control answers only on the host where the GUI runs.** A headless host
+  has daemons and sessions but no client to drive, and says so plainly. Scripts
+  that claim a row need the GUI host passed in when they run anywhere else.
+- ⚠ **`probe-scroll` is not a screen read.** It answers `{accepted, reason,
+  session_path}` — it scrolls, it does not report content.
+  **`server snapshot` → `live_sessions[].terminal_lines` is the instrument for
+  "what is on that row"**, and it needs no activation, so it never disturbs the
+  owner's viewport.
+- ⚠ **Some verbs emit MORE THAN ONE JSON object** on a single call. A naive
+  whole-document parse throws *"Extra data"* and looks like a broken verb. Decode
+  in a loop and read every object.
+
+---
+
+## 12. Adapting this to your own setup
 
 Everything above is generic. To make it yours:
 
