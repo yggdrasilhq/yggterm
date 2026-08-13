@@ -1713,17 +1713,108 @@ self-reinforcing and gets worse exactly when it should get better: swap pressure
 evicts the cache → RSS falls → WebKit reads more headroom → it caches more →
 more swap pressure.
 
-⚠ **Stated honestly: this is inferred from behaviour, not from reading WebKit's
-footprint implementation.** What is established is that committed memory passed
-conservative without reclaim. What is NOT established is which quantity
-WebKitGTK actually polls. **Settle it before fixing**, because the two fixes are
-different: if the metric is resident, the limit must be derived from a figure
-that includes swap (or the thresholds lowered so they trip before the kernel
-evicts); if the metric already includes swap, the bound is firing and failing,
-which is a different bug entirely.
+### ✅ SETTLED 2026-08-13: THE POLLED QUANTITY IS **RESIDENT ONLY**
 
-**Falsifier:** let one web process run several hours. Plateau near 1,888 MB
-committed ⇒ the bound works and this entry is wrong. Sail past it ⇒ confirmed.
+The entry above said this was inferred from behaviour and demanded it be settled
+before any fix. It is now settled from the implementation, two independent ways:
+
+1. **Upstream source.** WTF's `linux/CurrentProcessMemoryStatus.cpp` opens
+   `/proc/self/statm` and parses `size, resident, shared, text, lib, data, dt`.
+   `statm` has **no swap field at all** — swapped-out pages are simply absent.
+2. **The shipped library** (2.52.5, the one actually loaded). The only
+   `/proc/self/status` field name in the whole binary is **`VmRSS:`**. There is
+   no `VmSwap`, no `smaps_rollup`, no `statm`-adjacent swap read anywhere in it.
+
+⇒ **The bound is evaluated against resident memory, and resident memory is
+exactly the quantity the kernel is free to shrink by swapping.** The two forks
+collapse to one: the metric is resident, so the bound is not "firing and
+failing" — it is structurally unreachable on a host that swaps.
+
+**Corroborated by the recorder, on the one web process long-lived enough to
+show a curve** (per-pid lifetime buckets, so no restart straddles it):
+
+| age | RSS | swap | committed |
+|---|---|---|---|
+| 0 h | 586 MB | 63 MB | 649 MB |
+| 1 h | 714 MB | 327 MB | 1,042 MB |
+| 2 h | 647 MB | 715 MB | 1,362 MB |
+
+**RSS is flat across the whole climb while swap grows 11×.** The conservative
+threshold is 1,416 MB *of RSS*; RSS never leaves the 586–714 MB band. The
+footprint doubles past the threshold while the number WebKit reads does not move.
+
+⚠ **What is still NOT settled is the fix, and it must not be guessed.** Both
+candidates — derive the limit from a swap-inclusive figure, or lower the
+fractions — are a constant fitted to one host, which is the exact trap this
+lane has already paid for twice (*a ratio that fits is not a mechanism that
+holds*). A third option exists and is better-founded because it removes the
+inference rather than tuning against it: **give the process a cgroup bound**, so
+the kernel enforces the footprint and, with swap denied to that scope, RSS
+becomes the true footprint again and the existing thresholds start meaning what
+they say. ⛔ Not yet measured, and it changes the failure mode (reclaim/OOM
+rather than unbounded growth), so it needs its own falsifier before anyone
+builds it.
+
+⭐ **The original falsifier is now answerable on paper**: a plateau near 1,888 MB
+committed was never possible, because nothing compares committed to 1,888 MB.
+
+## ⛔ [6.7] THE JAR-LESS WEB CONTEXT GOT NO MEMORY BOUND AT ALL — FIXED IN CODE, LIVE PROOF OWED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*Found by reading the consumer of the policy the entry above configures, 2026-08-13.*
+
+The entry above shows the memory bound is too weak to fire. On one path it was
+not merely weak — **it was never applied.**
+
+`WebContextImpl::new` (`vendor/wry/src/webkitgtk/web_context.rs`) applied the
+configured memory-pressure settings; `WebContextImpl::new_ephemeral`, six lines
+below it, applied only the cache model and built a bare
+`WebContext::new_ephemeral()`. **Two constructors, one policy, applied in one of
+them.**
+
+⇒ **Reachable, not theoretical.** The surface host picks the ephemeral
+constructor for every surface whose context key has no profile directory —
+the jar-less (temp) profile:
+
+```rust
+None => (Rc::new(RefCell::new(WebContext::new_ephemeral())), true),
+```
+
+So a temp-profile surface ran a web process with **no configured limit and no
+thresholds** — inheriting the engine's defaults — while every persistent-profile
+surface got the policy. Nothing reports this at runtime: the settings are
+construct-only properties with no getter, so an unbounded engine and a bounded
+one are indistinguishable from outside.
+
+**The fix.** One helper, `context_builder_with_memory_policy()`, is now the only
+place a context builder is created, and both constructors go through it. It
+applies **both** halves, which are not duplicates of each other: the builder
+property bounds the **web** processes, the static
+`WebsiteDataManager::set_memory_pressure_settings` bounds the **network**
+process.
+
+⚠ **The bound was not bought with ephemerality.** `webkit_web_context_new_ephemeral()`
+is defined as "a context whose website data manager is ephemeral", so the
+replacement composes the engine's own `WebsiteDataManager::new_ephemeral()`
+rather than setting an `is-ephemeral` property by hand — the jar-less guarantee
+still comes from the engine's constructor, not from this file. Trading it away
+would have been a worse bug than the one being fixed: it would put temp-profile
+browsing on disk.
+
+**Locked by** `every_vendored_web_context_is_built_with_the_memory_policy`
+(4 clauses: one builder site; the helper applies both halves; **both**
+constructors route through it; and the ephemeral one still composes the engine's
+ephemeral data manager).
+
+⛔ **The lock lives in `yggterm-shell`, not in the file it scans**, because
+`vendor/wry` is **not a workspace member** — a test written inside it would
+never run. That is the same failure this repo's own manifest records against the
+other vendored crate, where 67 tests sat green and unrun for weeks.
+
+**Live proof owed:** open a temp-profile surface on a build carrying this and
+confirm it still writes **no jar to disk**. That is the risk this change
+introduces, and it is the half that a source scan cannot settle.
 
 ## ⛔ [6.7] A DEAD PTY'S WRITER THREAD — FIXED IN CODE, LIVE PROOF OWED
 
@@ -1776,6 +1867,32 @@ family — threads 63 → 76 in 2 h with memory flat, including **29
 `tokio-rt-worker`** where one multi-thread runtime on a 16-core host spawns 16 —
 and that is a different population in a different process. This fix is the
 daemon's `pty-writer` half only.
+
+⭐ **CORRECTION 2026-08-13 — the GUI's tokio thread COUNT is not the cost, and
+capping `worker_threads` would have been a fix for nothing.** A per-thread
+context-switch census on the live GUI at rest (`voluntary_ctxt_switches` deltas
+over 20 s, every task in `/proc/<pid>/task`) shows the workers are not a pool of
+idle threads sharing the load:
+
+| thread | switches / 20 s |
+|---|---|
+| `tokio-rt-worker` (**one** of them) | **2,486** |
+| `ReceiveQueue` (one) | 1,594 |
+| main `yggterm` | 1,391 |
+| `VBlankMonitor` | 1,267 |
+| every other `tokio-rt-worker` | 26 – 110 each |
+
+⇒ **One worker wakes ~124×/s at rest; the rest are parked and cost only their
+stacks.** Reducing the pool would relocate that task, not remove it. The thing
+worth finding is the ~8 ms-period task driving that one worker. ⛔ Filed as an
+observation, NOT a mechanism — the period has not been attributed to a callsite,
+and this lane has three dead causal stories behind it that all began with a
+number this clean.
+
+⚠ The GUI's *runtime* is `vendor/dioxus-desktop/src/launch.rs`
+(`Builder::new_multi_thread()` with no `worker_threads`), so the pool is
+`num_cpus`. That is the right thing to know before touching it and the wrong
+thing to touch first.
 
 ⚠ **Suspected, NOT proven:** that the retained entry is the same orphaned-key
 family as the restore bug — a close that resolves to a key nothing holds removes

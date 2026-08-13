@@ -139737,6 +139737,88 @@ mod tests {
         );
     }
 
+    /// Every `WebContext` the vendored engine builds must carry the memory
+    /// policy — including the jar-less one.
+    ///
+    /// The memory limit and its conservative/strict thresholds are
+    /// CONSTRUCT-ONLY properties on `WebKitWebContext`; there is no setter. So a
+    /// constructor that does not pass them at build time yields a web process
+    /// with **no configured bound at all**, and nothing reports that at runtime
+    /// — the process simply grows. `new_ephemeral` was written that way, so
+    /// every jar-less (temp) surface ran an unbounded engine while every
+    /// persistent-profile surface got the policy.
+    ///
+    /// ⛔ This scan lives HERE, not in the file it reads: `vendor/wry` is not a
+    /// workspace member, so a test inside it would never run — the failure this
+    /// crate's own manifest records against the other vendored crate.
+    #[test]
+    fn every_vendored_web_context_is_built_with_the_memory_policy() {
+        const HOST: &str = include_str!("../../../vendor/wry/src/webkitgtk/web_context.rs");
+        /// From a signature to the start of the next item at any nesting level.
+        fn item_body<'a>(src: &'a str, signature: &str) -> Option<&'a str> {
+            let start = src.find(signature)?;
+            let rest = &src[start + signature.len()..];
+            let end = ["\n  pub fn ", "\n  fn ", "\nfn ", "\n}\n", "\n/// "]
+                .iter()
+                .filter_map(|marker| rest.find(marker))
+                .min()
+                .unwrap_or(rest.len());
+            Some(&rest[..end])
+        }
+
+        // Clause 1: exactly ONE site may start a context builder, so a future
+        // constructor cannot quietly acquire an unconfigured one.
+        let builder_sites = HOST.matches("WebContext::builder()").count();
+        assert_eq!(
+            builder_sites, 1,
+            "`WebContext::builder()` must appear exactly once — inside \
+             `context_builder_with_memory_policy`. {builder_sites} sites means a \
+             context can be built without the memory limit, which has no setter"
+        );
+
+        // Clause 2: that one site applies BOTH halves. They are not duplicates:
+        // the builder property bounds the WEB processes, the static bounds the
+        // NETWORK process.
+        let helper = item_body(HOST, "fn context_builder_with_memory_policy")
+            .expect("the memory-policy helper is this scan's anchor");
+        for needle in [
+            "WebContext::builder()",
+            ".memory_pressure_settings(",
+            "set_memory_pressure_settings(",
+        ] {
+            assert!(
+                helper.contains(needle),
+                "`context_builder_with_memory_policy` must contain `{needle}`: \
+                 without it one class of process is left unbounded"
+            );
+        }
+
+        // Clause 3: BOTH constructors route through the helper. This is the
+        // clause that actually failed before the fix.
+        for ctor in ["fn new(", "fn new_ephemeral("] {
+            let body = item_body(HOST, ctor)
+                .unwrap_or_else(|| panic!("no `{ctor}` in the vendored web context"));
+            assert!(
+                body.contains("context_builder_with_memory_policy()"),
+                "`{ctor}` must build its context through \
+                 `context_builder_with_memory_policy()`, or it ships an engine \
+                 with no memory bound"
+            );
+        }
+
+        // Clause 4: and the bound may NOT be bought with ephemerality. The
+        // jar-less context still takes its ephemerality from the engine's own
+        // constructor; a persistent data manager here would put temp-profile
+        // browsing on disk, which is a worse bug than the one being fixed.
+        let ephemeral = item_body(HOST, "fn new_ephemeral(").expect("checked above");
+        assert!(
+            ephemeral.contains("WebsiteDataManager::new_ephemeral()"),
+            "the jar-less context must stay truly ephemeral: it may gain the \
+             memory policy only by composing the engine's own ephemeral data \
+             manager, never by trading the jar-less guarantee away"
+        );
+    }
+
     /// THE FIFTH FOCUS PATH (2026-07-26), and the one no JS probe could reach.
     ///
     /// The first four thieves were all JavaScript. This one is GTK: a native web
