@@ -18906,6 +18906,7 @@ impl ShellState {
                     split_candidates.len(),
                     valid_drop_target(&drag_paths, row),
                     saved_ssh_target_machine_key(row, self.server.ssh_targets()).is_some(),
+                    self.row_set_menu_role(row),
                 );
                 let selected_count = drag_paths.len().max(1);
                 // A heading only when it says something the row does not. A
@@ -28364,6 +28365,30 @@ impl ShellState {
         self.browser
             .set_collapsed_paths(self.user_collapsed_synthetic_paths.clone());
     }
+    /// What `row` is to the arrangement the sidebar is drawing.
+    ///
+    /// ⚠ Live-region rows only. A cwd-tree row is nested by its FOLDER, and
+    /// offering to un-group it there would name a structure that surface does
+    /// not have.
+    fn row_set_menu_role(&self, row: &BrowserRow) -> RowSetMenuRole {
+        if !matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
+            || row.full_path.starts_with("split://")
+        {
+            return RowSetMenuRole::None;
+        }
+        let path = normalize_live_session_path(&row.full_path);
+        if !self.live_row_paths_for_arrangement().contains(&path) {
+            return RowSetMenuRole::None;
+        }
+        if row_heads_a_row_set(row) {
+            return RowSetMenuRole::Head;
+        }
+        if self.row_set_effective_parent(&path).is_some() {
+            return RowSetMenuRole::Member;
+        }
+        RowSetMenuRole::None
+    }
+
     /// Every live row the arrangement may speak about, by the path its row
     /// carries.
     fn live_row_paths_for_arrangement(&self) -> HashSet<String> {
@@ -52457,7 +52482,13 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
                 shell.sync_browser_settings();
             }
         });
-        if changed {
+        // ⛔ ONLY an INTO drop ends here. Before/After also carries a POSITION —
+        // `DESIGN.md`: *a member dragged out leaves the set and lands where it
+        // was dropped* — so it falls through to the reorder below, which is the
+        // one owner of where a row sits in the live order. Returning here
+        // detached the row and left it exactly where it started, which reads as
+        // the gesture half-working.
+        if changed && target.placement == DragDropPlacement::Into {
             state.with_mut(ShellState::clear_drag_state);
             return;
         }
@@ -108148,6 +108179,10 @@ fn notification_chime_script(
     );
     let flush_tail = notification_audio::FLUSH_TAIL_SECONDS;
     let dither = NOTIFICATION_DITHER_PEAK_AMPLITUDE;
+    // Reused, not re-chosen: the idle-suspend deadline and the pre-roll
+    // decision must be the same number or they will disagree about whether the
+    // link is awake. See the script's suspend timer.
+    let awake_window_ms = NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS;
     format!(
         r#"
         (async () => {{
@@ -108247,6 +108282,33 @@ fn notification_chime_script(
               playsForMs: Math.ceil((endAt - now) * 1000),
               contextCreatedAt: w.__yggtermAudioCtxCreatedAt || null
             }};
+            // POWER (2026-08-13): the context was left RUNNING forever, so the
+            // webview held an UNCORKED playback stream with nothing in it —
+            // `pactl` showed `Corked: no` on an idle GUI, the audio graph never
+            // suspended and the filter sink never reached SUSPENDED. On a
+            // laptop that is a continuous, entirely avoidable draw, and a
+            // stream held open for hours and fed nothing underruns, which is
+            // the lagged/distorted notification the owner reported.
+            //
+            // ⛔ suspend(), NEVER close(). Closing shortly after the last note
+            // is the clipped-ending defect fixed above; the context object is
+            // kept and reused, and the resume() path above already wakes a
+            // suspended one.
+            //
+            // ⭐ The deadline IS the pre-roll awake window, reusing that one
+            // constant instead of inventing a second: while the context runs
+            // the next chime is inside the window and correctly skips the
+            // pre-roll; once it suspends the next chime is outside it and
+            // correctly pre-rolls. The two cannot drift apart.
+            if (w.__yggtermAudioIdleTimer) {{
+              clearTimeout(w.__yggtermAudioIdleTimer);
+            }}
+            w.__yggtermAudioIdleTimer = setTimeout(() => {{
+              const idle = w.__yggtermAudioCtx;
+              if (idle && idle.state === "running") {{
+                idle.suspend().catch(() => {{}});
+              }}
+            }}, Math.ceil((endAt - now) * 1000) + {awake_window_ms});
           }} catch (chimeError) {{
             // DEFECT FIX: the diagnostic used to be the LAST statement of the
             // try, so it was written exactly when the chime worked and missing
@@ -131134,6 +131196,22 @@ fn row_menu_page_turn(items: &[RowMenuItem], id: &str) -> Option<RowMenuPage> {
 
 /// Build the row menu for `row`. Pure: same inputs, same menu, in a stable order
 /// — which is what makes the KeyTip letters stable too (invariant 1).
+/// What this row is to a row set, for the menu that offers to take it apart.
+///
+/// ⚖ Computed by the caller, which can see the ARRANGEMENT; a row alone cannot
+/// answer it. Depth would be a tempting proxy and a wrong one: a cwd-tree
+/// session row is nested too, and offering to un-group it there names a
+/// structure that surface does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowSetMenuRole {
+    /// Heads a set — un-grouping DISSOLVES it and promotes its members.
+    Head,
+    /// Sits in someone's set — un-grouping removes just this row.
+    Member,
+    /// In no set at all.
+    None,
+}
+
 fn row_menu_items(
     row: &BrowserRow,
     apps: &[AppManifest],
@@ -131142,6 +131220,7 @@ fn row_menu_items(
     split_candidate_count: usize,
     can_move_selected_document: bool,
     can_remove_saved_ssh_target: bool,
+    row_set_role: RowSetMenuRole,
 ) -> Vec<RowMenuItem> {
     let mut items: Vec<RowMenuItem> = Vec::new();
     let is_live_sessions_group = row.full_path == "__live_sessions__";
@@ -131161,6 +131240,28 @@ fn row_menu_items(
     } else {
         String::new()
     };
+    // ROW SET actions. ⚖ A split's `Ungroup` sits below and means something
+    // else entirely — that one takes apart a VIEW, this one an ARRANGEMENT —
+    // which is exactly why `DESIGN.md` forbids the two ever sharing a noun in
+    // the model. They can share a verb in a menu because only one of them is
+    // ever offered on a given row.
+    match row_set_role {
+        RowSetMenuRole::Head => {
+            items.push(RowMenuItem::new(
+                "ungroup-row-set",
+                "Ungroup",
+                'u',
+            ));
+        }
+        RowSetMenuRole::Member => {
+            items.push(RowMenuItem::new(
+                "leave-row-set",
+                "Remove from group",
+                'u',
+            ));
+        }
+        RowSetMenuRole::None => {}
+    }
     // Split-view group actions ([[campaign-split-view-groups]]).
     if !split_group_members.is_empty() {
         // Compound split row: structural ops only — there is no × on the row
@@ -131835,6 +131936,34 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
         return;
     }
     match id.as_str() {
+        // ⛔ DISSOLVE, never cascade and never refuse. `DESIGN.md`: removing a
+        // set's head promotes its members to where the head sat, in order. The
+        // user asked to take the arrangement apart, not to be told about
+        // bookkeeping and not to lose the rows inside it.
+        "ungroup-row-set" => {
+            let path = normalize_live_session_path(&row.full_path);
+            state.with_mut(|shell| {
+                let members = shell.row_arrangement.sets.dissolve(&path);
+                // The seats would re-form this set on the next frame, so every
+                // promoted row is remembered as deliberately loose — the same
+                // third state a drag-out needs. Without it "Ungroup" appears to
+                // do nothing at all on a numbered book.
+                for member in &members {
+                    shell.row_arrangement.detach(member);
+                }
+                shell.row_arrangement.detach(&path);
+                shell.last_action = format!("ungrouped {} row(s)", members.len());
+                shell.sync_browser_settings();
+            });
+        }
+        "leave-row-set" => {
+            let path = normalize_live_session_path(&row.full_path);
+            state.with_mut(|shell| {
+                shell.row_arrangement.detach(&path);
+                shell.last_action = format!("removed {} from its group", row.label);
+                shell.sync_browser_settings();
+            });
+        }
         "ungroup-split" => {
             if let Some(group_id) = row.session_id.clone() {
                 ungroup_split_group(state, &group_id);
@@ -145085,7 +145214,7 @@ mod tests {
             session_cwd: None,
             session_kind: None,
         };
-        let items = row_menu_items(&row, &[], None, &[], 0, false, false);
+        let items = row_menu_items(&row, &[], None, &[], 0, false, false, RowSetMenuRole::None);
         let close_all = items
             .iter()
             .find(|item| item.id == "close-all-live-sessions")
@@ -157991,6 +158120,53 @@ mod tests {
         );
     }
 
+    /// The owner asked for three ways to take a group apart, and a menu that
+    /// offers the wrong one is worse than no menu: on a HEAD, un-grouping
+    /// dissolves the set; on a MEMBER, it removes only that row.
+    #[test]
+    fn the_menu_offers_dissolve_on_a_head_and_leave_on_a_member() {
+        let mut head = BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "remote-session://dev/head".to_string(),
+            label: "6.0 head".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 1,
+            host_label: "dev".to_string(),
+            descendant_sessions: 3,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+            session_kind: Some(SessionKind::Shell),
+        };
+        let ids = |row: &BrowserRow, role| {
+            row_menu_items(row, &[], None, &[], 0, false, false, role)
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        };
+        let on_head = ids(&head, RowSetMenuRole::Head);
+        assert!(on_head.iter().any(|id| id == "ungroup-row-set"), "{on_head:?}");
+        assert!(!on_head.iter().any(|id| id == "leave-row-set"), "{on_head:?}");
+
+        head.descendant_sessions = 1;
+        head.depth = 2;
+        let on_member = ids(&head, RowSetMenuRole::Member);
+        assert!(on_member.iter().any(|id| id == "leave-row-set"), "{on_member:?}");
+        assert!(!on_member.iter().any(|id| id == "ungroup-row-set"), "{on_member:?}");
+
+        // ⛔ A row in no set is offered neither. The cwd tree nests rows by
+        // FOLDER, and naming a group there describes a structure that surface
+        // does not have.
+        let loose = ids(&head, RowSetMenuRole::None);
+        assert!(
+            !loose.iter().any(|id| id == "leave-row-set" || id == "ungroup-row-set"),
+            "{loose:?}"
+        );
+    }
+
     /// ⭐ THE GESTURE THAT DID NOT EXIST. Owner, on the shipped build: *"I tried
     /// dragging one session over the other, but our drag UX shows before or
     /// after and not make a row group."* A live row now has an inside band; a
@@ -163562,7 +163738,7 @@ mod tests {
         // `rowmenu` scope declares, so ALT,E,<letter> can only reach items the
         // menu actually shows (spec §3).
         let row = test_live_session_row("local://abc", "yggterm shell");
-        let items = row_menu_items(&row, &[], None, &[], 0, false, false);
+        let items = row_menu_items(&row, &[], None, &[], 0, false, false, RowSetMenuRole::None);
         let ids: Vec<&str> = items
             .iter()
             .filter(|item| !item.separator)
@@ -163640,7 +163816,7 @@ mod tests {
     #[test]
     fn alt_e_s_l_reaches_claude_code_through_the_open_session_submenu() {
         let row = test_live_session_row("local://abc", "yggterm shell");
-        let items = row_menu_items(&row, &[], None, &[], 0, false, false);
+        let items = row_menu_items(&row, &[], None, &[], 0, false, false, RowSetMenuRole::None);
         let tree = build_keytip_tree(&KeymapConfig::default(), &[], &items);
 
         assert_eq!(
@@ -163681,7 +163857,7 @@ mod tests {
     #[test]
     fn the_row_menu_draws_one_page_while_the_alt_layer_holds_both_levels() {
         let row = test_live_session_row("local://abc", "yggterm shell");
-        let items = row_menu_items(&row, &[], None, &[], 0, false, false);
+        let items = row_menu_items(&row, &[], None, &[], 0, false, false, RowSetMenuRole::None);
 
         let root_page = row_menu_page_items(&items, &None);
         assert!(root_page.iter().any(|item| item.id == OPEN_SESSION_MENU_ID));
@@ -171619,6 +171795,25 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // so there is still exactly one construction site — see
         // `the_chime_resumes_a_suspended_context_and_never_closes_it`.)
         assert_eq!(script.matches("new (w.AudioContext").count(), 1);
+        // POWER: the steady state must be NO stream. The context is suspended
+        // once the link is presumed asleep, and the deadline reuses the pre-roll
+        // awake window so the two decisions cannot disagree about whether the
+        // link is up.
+        assert!(
+            script.contains("idle.suspend()"),
+            "the chime must retire its stream, or the webview holds an uncorked \
+             playback stream forever"
+        );
+        assert!(
+            !script.contains("__yggtermAudioCtx.close()") && !script.contains("ctx.close()"),
+            "close() shortly after the last note is the clipped-ending defect — \
+             suspend and reuse the context instead"
+        );
+        assert!(
+            script.contains(&format!("+ {NOTIFICATION_PREROLL_LINK_AWAKE_WINDOW_MS})")),
+            "the suspend deadline must BE the pre-roll awake window, not a second \
+             constant that can drift from it"
+        );
         assert!(script.contains("const start = now + preroll + t;"));
         // Noise, NOT silence — several A2DP stacks never prime on digital silence.
         assert!(script.contains("Math.random() + Math.random() - 1"));

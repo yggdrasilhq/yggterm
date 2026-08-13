@@ -267,13 +267,48 @@ This is the most dangerous verb in the skill, because its failure mode is
 silence. **A delegate that never received its brief looks exactly like one that
 is working.**
 
+### ⛔⛔ TWO ARGUMENTS ARE BOTH CALLED "HOST" AND THEY MEAN DIFFERENT MACHINES
+
+**They sit two lines apart in every brief, and getting them the same way round is
+the default mistake.** Reported 2026-08-13 by a sibling campaign after it spawned
+a duplicate worker onto a machine with no checkout of the repo:
+
+| argument | which machine | why |
+|---|---|---|
+| `ygg-claim.sh --host <gui>` | **the GUI host** | app control is served by the GUI PROCESS and answers **nowhere else** |
+| `terminal new --machine-key <target>` | **where the WORK lives** | the row's PTY runs there and needs the repo, the toolchain, the checkout |
+
+⇒ On a fleet whose GUI runs on one machine and whose repos live on another,
+**these are different values in the same brief and both are correct.**
+
+⛔⛔ **AND A `--cwd` THAT DOES NOT EXIST ON THE TARGET DOES NOT FAIL — IT FALLS
+BACK A DIRECTORY.** The row is created, the agent starts, and its transcript is
+filed under the **parent's** slug, so even the transcript check in step 4 looks at
+the wrong path. The spawn reports success throughout.
+
+⭐ **One line prevents it, and it is not optional when the target is not this
+machine:**
+
+```sh
+ssh <target> test -d <cwd> || { echo "no <cwd> on <target> — refusing"; exit 1; }
+```
+
+⛔ **Two further pre-spawn checks, from the same incident:** before spawning a
+successor, check whether a **live row already holds that seat** — by transcript
+**mtime**, not by the row listing, which has omitted live rows — and ⛔ **never
+re-spawn on a failed `ygg-claim` read-back.** Absence from the listing is not
+proof the claim failed; `ygg-claim.sh` now says so in as many words, because a
+row that believed its first spawn had not taken performed its handover **twice**.
+
 ### The four steps. Do not collapse them.
 
 ```sh
+# ⛔ --machine-key is WHERE THE WORK LIVES, and it is not necessarily the GUI
+#    host you passed to ygg-claim.sh two lines ago. See the table above.
 # 1. CREATE with no prompt. A prompt passed at create is delivered by a path
 #    that has silently dropped briefs; see the caveat below.
 ROW=$(yggterm server app terminal new \
-        --kind claude-code --machine-key <host> --cwd <dir> \
+        --kind claude-code --machine-key <target-where-the-repo-is> --cwd <dir> \
         --title '<topic>: <what it is for>' \
         --purpose '<one line a human can act on>' \
         --outline <n> --no-activate \

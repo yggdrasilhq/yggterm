@@ -72,6 +72,30 @@ copies.
   *Meanwhile:* the relay is fixing the half that is ours — the ~481,000 clock
   syscalls per second — which is the real defect either way.
 
+- **Should the desktop host's *AC* power profile be `balanced` instead of
+  `performance`? It is pinned to `balanced` right now and that needs his ruling.**
+  Owner-reported the machine "very hot" while charging; an interleaved A/B
+  (arms alternating every 5 min, mains throughout, both arms sharing the same
+  charge drift) settles it:
+
+  | arm | n | mean | peak | **>85°C** |
+  |---|---|---|---|---|
+  | `performance` | 90 | 71.9°C | 92°C | **10.0%** |
+  | `balanced` | 71 | 65.2°C | 83°C | **0.0%** |
+
+  **`balanced` eliminates the >85°C band entirely (0/71 vs 9/90, Fisher exact
+  p≈0.004)**, cuts >80°C from 27.8% to 2.8%, and drops the peak 9°C. Thermals
+  there are uncorrelated with our CPU (r=0.071, n=1,170), so **no code change can
+  substitute for this.** **Recommendation: keep `balanced` on AC.** ⚠ It is his
+  call because it caps sustained power and he may want the headroom.
+  ⛔ **What is in force now:** `balanced`, set at 19:54 after he reported the
+  heat. It is a runtime setting — **any power-source transition rewrites it**, and
+  `echo performance | sudo tee /sys/firmware/acpi/platform_profile` restores it.
+  Nothing persists across a reboot. → `docs/pending-bugs.md` § *THE HOST RUNS AT
+  90+°C WITH 14 OF ITS 16 CORES IDLE*.
+  *Meanwhile:* the relay is on the half that is ours — the web process growing
+  ~366 MB/h whose bound cannot fire, and a daemon leaking a thread per dead PTY.
+
 - **The response-layer rule, or five separate patches?** — five verbs report the
   request rather than the effect, and he framed the fix's SHAPE as the open
   question. → yggterm `docs/pending-bugs.md` § *FIVE VERBS REPORT THE REQUEST,
