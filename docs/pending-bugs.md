@@ -29,39 +29,63 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
-## ⛔⛔⛔ SEVEN AGENT ROWS DIED IN ONE SECOND DURING A DAEMON HANDOVER — the constitution's core guarantee, failing with a timestamp
+## ⛔⛔⛔ THE HANDOVER RELEASES ON THE SUCCESSOR'S ACCEPTANCE, NEVER ON ITS SURVIVAL — a two-second window in which one signal destroys every session on the host
 
 **Status:** OPEN
 
-Measured 2026-08-13 22:31–22:47, live, on the integrator host.
+Seven agent rows died in one second on 2026-08-13 at 22:31:42, every transcript ending on a
+`tool_result` — cut mid-turn, work destroyed, and **not recoverable**: those uuids return zero from
+`server sessions`.
 
-**What happened, as measurement only:**
+**Root-caused from the daemon's own trace.** The sequence:
 
-| time | event |
-|---|---|
-| 22:30:21 | a daemon starts from **a lane's own build tree** — `/home/pi/gh/yggterm--<lane>/target/release/yggterm-headless server daemon` |
-| **22:31:42** | **seven agent CLIs write their last transcript byte. Byte-identical mtimes, to the second.** |
-| 22:31:49 | a second daemon starts, this one the installed `~/.yggterm/bin/yggterm-headless` |
-| 22:36:33 | one row is re-resumed by hand (`server remote resume-cc <uuid> --require-existing`) and survives |
+```
+22:30:59  pid A  hot_update_handoff_prepared   → 3.0.148, the INSTALLED binary
+22:31:04  pid A  spawned_daemon_exit             child signal 15 (SIGTERM)
+22:31:16  pid B  pty_handoff_listener_bound + run_begin
+22:31:26  pid B  superseded_daemon_takeover
+22:31:40  pid A  pty_fd_handoff_sweep            "AllMoved { moved: 38 }"
+22:31:42  pid B  spawned_daemon_exit             signal 15 (SIGTERM)      ← the death second
+```
 
-⛔ **They were CUT MID-TURN, not exited.** Every dead transcript ends on a `tool_result` record —
-the agent received a tool result and was killed before it could produce the next turn. **That is
-work destroyed, not work finished.**
+⇒ **The predecessor released all 38 descriptors at :40, and the process holding them was signalled
+at :42. Both holders gone ⇒ nothing to resume from.**
 
-⛔ **The sessions are NOT recoverable.** A dead row's uuid returns **zero** occurrences from
-`server sessions`; there is nothing to resume. Peer sockets fell **33 → 8** in the same window.
+⛔ **THE DESIGN GAP, AND IT STANDS WHOEVER SENT THE SIGNAL.** `hand_off_all_runtimes` is
+all-or-nothing, and the predecessor then **exits** — exiting is the only way it can release its own
+copies of the masters. So **the predecessor releases on the successor's ACCEPTANCE, never on its
+SURVIVAL.** That is a window in which killing a young process destroys every session on the host,
+unrecoverably. **Two seconds wide here, and it needs no bug in the handover to fire.** It is
+obligation 2 of the constitution — *they never stall their work waiting for ours* — with a stopwatch
+on it.
 
-⇒ **This is exactly the guarantee `CLAUDE.md` names as the highest-value work in the project:**
-*"Other agents' sessions survive our restarts"* and *"a restart of ours must not interrupt, reset, or
-destroy what another agent is doing."* ⚠ **And the count is the same as the previously recorded
-incident — ~7 agent PTYs** — which suggests a mechanism that has not moved rather than a new one.
+**Fix directions, cheapest first:**
+1. The predecessor **lingers until the successor is observed alive for a settle interval** instead of
+   exiting on `AllMoved`. It serves nothing; it just keeps the fds.
+2. An adopting daemon **records its adopted set durably on arrival**, so a recovery spawn can
+   re-resume. ⭐ That is exactly what the manual `server remote resume-cc <uuid> --require-existing`
+   did by hand, and why one row survived.
 
-⚠⚠ **WHAT IS NOT ESTABLISHED, AND MUST NOT BE ASSUMED:** that the lane-build daemon *caused* the
-deaths. It is temporally adjacent and it is the anomaly in the sequence, but nothing here proves
-causation, and this campaign has had six causal stories collapse in a single evening. **Both daemons
-were still alive afterwards**, so this is not a simple "old daemon evicted".
+### ⚠ TWO READINGS OF THAT INCIDENT WERE WRONG, AND BOTH ARE RETRACTED HERE
 
-### ⭐ ANSWERED FROM THE TRACE, 6.1: IT WAS AN ORDINARY INSTALLED-BINARY HANDOVER, AND THE SUCCESSOR WAS SIGNALLED
+- ⛔ **"A daemon started from a lane build tree 80 s earlier" is NOT implicated.** That daemon was
+  **isolated** — `/proc/<pid>/environ` shows a private `YGGTERM_HOME` under a lane sandbox, so it
+  could not bind or serve the row plane at all. **It was an ordinary installed-binary handover.**
+  Temporal adjacency, nothing more, and it was filed as "the anomaly" before anyone read the environ.
+- ⛔ **"~7 PTYs again, so the mechanism has not moved" is NOT a recurring magic number.** It is
+  simply **the owned set of whichever daemon happened to be mid-handover.** Reading a repeated count
+  as a signature invented a continuity that does not exist.
+
+**Who sent the signal is NOT established.** The codebase's only process-tree terminator
+(`terminate_linux_process_tree`) is reached solely from `run_remote_terminate_agent`, scoped to one
+explicit session id, never a sibling daemon. **16 signalled spawns span 21:07 → 22:33**, so it is a
+standing external source rather than one event.
+
+⭐ **A steer for anyone running sandbox teardowns, and it is cheaper than another seven rows: match
+your teardown on your own `YGGTERM_HOME`, never on a binary path.** A loop keyed to a path can reach
+the installed daemon; a loop keyed to your own home cannot.
+
+## ⭐ ANSWERED FROM THE TRACE, 6.1: IT WAS AN ORDINARY INSTALLED-BINARY HANDOVER, AND THE SUCCESSOR WAS SIGNALLED
 
 Falsifier 2 below is already settled by the real home's own trace, so nobody
 needs to run it. The lane-build daemon was **isolated** — its
