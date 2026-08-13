@@ -30,14 +30,6 @@ copies.
 
 ## Decisions only he makes
 
-- **Private terms are already public in `origin/main` commit messages (a graph
-  name, a bank hostname) — remove them by rewriting published history, or accept
-  them?** A rewrite orphaned 34 commits on a sibling repo the last time, so this
-  is not a relay action. **Recommendation: accept and stop the bleeding forward**
-  (the guard already blocks new ones); a rewrite buys little once the terms are
-  indexed. → `docs/pending-bugs.md`, the privacy-guard entry.
-  *Meanwhile:* the relay is fixing the guard's new-branch range bug, which is
-  what made this visible and is un-gated.
 - **The laptop boots with no usable TSC, so every `clock_gettime` costs 45.8×
   what it should (1222.5 ns on `hpet` vs 26.7 ns on `tsc`) — may we add
   `tsc=reliable` to its kernel command line?** It is a boot-config change on his
