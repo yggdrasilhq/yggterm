@@ -10965,6 +10965,38 @@ inherits a sibling's liveness; (iv) `pgrep` counts the querying shell. **Same sh
 split every time: asked about one thing, answered about another.** Only `terminal submit`'s
 `unanswerable` currently keeps the law.
 
+
+### ⚠ DOES NOT REPRODUCE IN STEADY STATE AT 3.0.146 — but read what that covers
+
+A cross-daemon read now works. On the GUI host, five daemons coexisting, one of
+them **200 hours and a hundred versions old**:
+
+```
+session owned by the 3.0.29 daemon   → running: true, 27 lines, 2441 chars
+session owned by the 3.0.146 daemon  → running: true,  3 lines,  422 chars
+```
+
+asked through one CLI that resolves to the current daemon by default. **Different
+values in the same run**, so the instrument is discriminating rather than
+answering `true` to everything — and the old-daemon session is the one with real
+content, which is the case that used to come back `running: false` with an empty
+buffer.
+
+⛔ **THIS IS NOT THE ENTRY'S SCENARIO AND MUST NOT CLOSE IT.** The report is about
+the **mid-update instant** — a row launched at 13:22, symlinks re-pointed at
+14:18, the split opening underneath a live row. What is shown above is a STEADY
+state with an old owner still alive. Cross-daemon addressing having been repaired
+does not establish that the handover window is safe, and the window is where the
+53 minutes were lost.
+
+⚠ **AND THE RESIDUAL IS THIS LANE'S OWN DISEASE:** the reply does not name WHICH
+daemon answered. There is no `served_by` / `owner_pid` field, so a recurrence
+would once again be indistinguishable from a correct answer — exactly the shape
+the running-build identity work exists to end, one plane over. **A reply that
+cannot name its own subject cannot be used to detect this defect coming back.**
+
+**Falsifier for what remains:** a row launched before a version bump answers
+correctly *through* the bump, and the reply names the daemon that served it.
 ## A POPUP-based re-auth cannot be completed on a web surface — the parent never resumes
 
 **Status:** OPEN
