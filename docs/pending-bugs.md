@@ -777,40 +777,6 @@ term → must refuse; clean range → must push.
 **Falsifier:** run each installer against a git worktree and against a plain checkout in the same
 run, then push from both.
 
-## ⛔⛔ MAIN IS RED: THE PROTOCOL SHAPE-STAMP GUARD FAILS ON `origin/main` ITSELF
-
-**Status:** OPEN
-
-*found 2026-08-13 while merging a lane; **not caused by that lane***
-
-`daemon::tests::protocol_shape_stamp_forces_version_bump` fails on `origin/main`:
-
-```
-computed 0x967609ee5ac9a131   stamped 0x9d92c7118ca5cb96 (STAMPED_AT_VERSION 3.0.132)
-workspace version is now 3.0.144
-```
-
-⇒ **`ServerRequest`/`ServerResponse` changed after 3.0.132 and the stamp was not
-updated in the same commit** — which is the exact thing this guard exists to
-prevent. Its own comment names the incident it was built for: a wire change
-shipping under an unchanged version left the fleet's version-ordered
-compatibility gate looking at two builds of one version with different shapes.
-
-**Proved not to be the merging lane's doing:** that lane's diff touches only
-`lib.rs`, `terminal.rs` and `shell.rs`, never `daemon.rs`; and the
-`ServerRequest`/`ServerResponse` blocks extracted from `origin/main` are
-**byte-identical** to the merged tree's, so main computes the same failing hash.
-
-⛔ **Do NOT simply re-stamp it to make the suite green.** The stamp is a forcing
-function: it demands a **workspace version bump in the same commit as the wire
-change**. Re-stamping alone silences the guard and ships the very condition it
-was written to catch. **Whoever changed the enums owns the bump** — find that
-commit and re-stamp with it, or revert the shape change.
-
-**Falsifier:** `cargo test -p yggterm-server --lib protocol_shape_stamp` on a
-clean `origin/main` checkout. It must pass; today it does not.
-
-
 ## ⛔⛔ [6.7→6.1] EVERY DAEMON BUMP ORPHANS EXACTLY ONE VERSION — THE ONE THAT WAS SERVING
 
 **Status:** OPEN
