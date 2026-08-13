@@ -87,6 +87,8 @@ the installed daemon; a loop keyed to your own home cannot.
 
 ## ⭐ ANSWERED FROM THE TRACE, 6.1: IT WAS AN ORDINARY INSTALLED-BINARY HANDOVER, AND THE SUCCESSOR WAS SIGNALLED
 
+**Status:** OPEN
+
 Falsifier 2 below is already settled by the real home's own trace, so nobody
 needs to run it. The lane-build daemon was **isolated** — its
 `/proc/<pid>/environ` carries a private `YGGTERM_HOME` under another lane's
