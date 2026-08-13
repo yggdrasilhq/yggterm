@@ -13,6 +13,463 @@ Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
 
+# THE 2026-08-13 BATCH — reported after a restart lost the campaign rows
+
+Fifteen items were reported together, after a GUI restart failed to restore its
+rows and the recovery had to be done by hand during a rate-limited window. They
+are grouped into the **6.x clusters** the campaign is being run as; the cluster
+tag on each entry is the delegate that owns it. The cluster scheme itself is
+documented in the fleet skill (`.agents/skills/yggterm-agent-fleet/SKILL.md`
+§10 — the N.x orchestrator).
+
+⚠ **The batch's own framing matters:** every one of these was found *while
+trying to recover from the previous one*. The restore failure is what forced the
+start page to be used as a recovery tool, which is where its ordering and search
+gaps were found, which is what made the manual repair take long enough to matter
+during a rate limit. Fixing the restore path is therefore upstream of most of
+the rest, and 6.1 is ordered first for that reason.
+
+## ⛔⛔ [6.1] SOME ROWS WILL NOT RESTORE, AND A RESTART DOES NOT RECOVER THEM
+
+**Status:** OPEN
+
+*reported 2026-08-13, live on the desktop host*
+
+After the GUI restarted, a subset of rows never came back to a usable state.
+Restarting again does not clear it: the same rows fail the same way, so this is
+not a transient of one handover. The reporter's marker was *"the top three
+rows"* of the Live Sessions group at the time of the report.
+
+**What is known from `server app rows` on the live host (44 rows):**
+
+- The failing rows are present in the row list, at `depth: 1`, `busy: false`,
+  `busy_reason: "idle"`, with a populated `detail_label` beginning `Kept alive ·`
+  and carrying a full generated summary. ⇒ **the row's metadata survived**; what
+  did not survive is whatever makes it openable.
+- The group row above them reads `busy: true`,
+  `busy_reason: "group_descendant_working"`, `child_count: 38`.
+
+**Why this is the most expensive item in the batch.** Two campaign sessions —
+this campaign's own row and a sibling's — could not be resumed to their last
+relay point. A relay that cannot be resumed is a relay that has to be re-briefed
+from artefacts, which is precisely the cost the baton relay exists to avoid.
+
+**Where to look, in order:** the restore/reveal path that turns a persisted row
+into an attached PTY; the `Kept alive` persistence class specifically, since
+every observed failure carries it; and whether the failure is per-row state or
+per-daemon (five of the daemons on that host are older than the current binary
+— see the pre-3.0 daemon entry below).
+
+**Falsifier:** a row that reports `Kept alive` in `detail_label` and refuses to
+open must emit a trace event naming the refusal. Silence here is itself the bug —
+the reporter had no way to tell "this row is gone" from "this row is slow".
+
+## ⛔⛔ [6.1] A ROW DROPPED FROM HISTORY COMES BACK
+
+**Status:** OPEN
+
+*reported 2026-08-13*
+
+During the manual recovery, a second agent CLI was asked to restore the rows and
+**restored rows that had been deliberately deleted earlier**. Two readings, and
+they are not exclusive:
+
+1. History deletion does not actually remove the row from whatever the restore
+   path enumerates — so a "deleted" row is only hidden, and any full restore
+   resurrects it.
+2. The restoring agent enumerated a source that legitimately still holds
+   deleted rows and had no way to tell deleted from live.
+
+⇒ **Both readings are a defect in the same place:** there is no single source of
+truth for "this row is gone", so deletion and restore disagree. Note this is the
+same shape as the fleet memory sync's known resurrection trap — a delete that is
+not propagated to every store is a delete that a peer undoes.
+
+**Falsifier:** delete a row, run a full restore, and enumerate. The deleted row
+must not reappear, and the restore must be able to *name* how many rows it
+declined to restore because they were deleted.
+
+## ⛔⛔ [6.2] THE START PAGE CANNOT BE USED TO FIND A SESSION
+
+**Status:** OPEN
+
+*reported 2026-08-13*
+
+The start page is the surface a user falls back to when the sidebar has failed
+them, which is exactly when it was reached for. It could not do the job. Four
+separate gaps, reported together:
+
+1. **No recency order.** It does not list most-recently-used first. The observed
+   order was described as "weird" — meaning it is neither recency nor anything
+   the reader could name. Whatever it currently sorts by, the ordering rule is
+   not discoverable from the output.
+2. **No search.** There is no search box. A user cannot find a session by
+   anything in its title, and cannot find one by anything in its *contents*
+   either. With 44 rows across three machines, scanning is not a substitute.
+3. **It lists libyggterm app rows.** ychrome and the other app rows appear
+   alongside agent sessions. An app row is not a session anyone resumes, so it
+   is noise on the one surface whose job is picking a session.
+4. **The open verb does not name the CLI.** The action reads `Open in Claude` /
+   `Open`. It should name the actual CLI the session belongs to — *Open this
+   Codex Session*, *Open this Claude Session*, *Open this Antigravity Session* —
+   and each entry should be colour-coded to that CLI's brand identity (nearest
+   available colour is fine).
+
+**Why 2 is the load-bearing one.** Searching session *contents* is what turns
+the start page from a list into a recovery tool: after a restore failure the user
+knows what the session was doing, not what it was called.
+
+⚠ **Check both surfaces together.** Any ordering or filtering rule decided here
+applies to the CWD-tree sidebar as well — see the standing rule in `CLAUDE.md`
+about applying a spec across every surface that touches the concept.
+
+## ⛔ [6.2] A NEW CLI ROW IS BORN NAMED AFTER WHOEVER SPAWNED IT
+
+**Status:** OPEN
+
+*re-reported 2026-08-13*
+
+Already tracked further down this file as *"a new session's row is named after
+the row you right-clicked"*. Re-reported in this batch with the generalised
+symptom: a freshly spawned row reads `{whatever the spawner is called}
+{claude-code,codex,…}` until the CLI self-titles. Kept as one entry — see the
+existing narrative for the detail; this line exists so the 6.2 delegate knows it
+is in scope.
+
+## ⛔⛔ [6.3] yedit's VIEWPORT PAINTS NOTHING WHILE ITS FILE RAIL IS FULL
+
+**Status:** OPEN
+
+*reported 2026-08-13 with a screenshot*
+
+The document area is solid black. The right rail beside it is fully populated —
+the Markdown/Split/Text toggle, the regex search box, and a FILES list of ~28
+named documents, one of them selected and highlighted. The status bar under the
+empty viewport reads a real measurement: **8570 words · 457 lines · 61018
+chars**.
+
+⇒ **The document is loaded and measured; only the paint is missing.** This is
+the metadata-vouches-for-clipped-content shape: every instrument around the
+viewport reports success, and the viewport is empty.
+
+**Cost:** this is why the report that produced this batch was composed in an
+external editor rather than in yedit.
+
+**Falsifier:** a viewport reporting a non-zero line and character count must
+paint at least one glyph. If it cannot, it must say so rather than render black.
+
+## ⛔⛔ [6.3] EVERY SIDEBAR BUTTON OPENS THE NOTIFICATION SIDEBAR
+
+**Status:** OPEN
+
+*reported 2026-08-13, "in EVERY yggterm session no matter what sidebar I click"*
+
+Whatever sidebar is requested, the notification sidebar is what opens. Reported
+as appearing suddenly, on every session, after the fleet had been running for
+two days without a restart.
+
+**Prior art in this file:** the right panel is a **global slot** — one app's rail
+renders over another app's row (tracked separately below). This is almost
+certainly the same slot, now failing closed onto one occupant instead of
+occasionally showing the wrong one. ⇒ the two should be diagnosed together, and
+if they are one bug, the entries collapse into one.
+
+**Falsifier:** click each sidebar affordance in turn and read back which rail
+the GUI believes it opened. If the GUI's own model says "files" while the
+notification rail is on screen, the bug is in the render slot; if the model
+itself says "notifications", it is in the request.
+
+## ⛔ [6.3] ychrome's VAULT AND SETTINGS RAILS SAY "Loading…" FOREVER
+
+**Status:** OPEN
+
+*reported 2026-08-13 with a screenshot*
+
+The Vault rail renders its header and the word `Loading...` and never resolves.
+The page beside it is loaded and interactive, so the webview itself is alive.
+
+**Prior art:** the web eval bridge can die on every page (`bug-class-web-eval-
+bridge-dead-all-pages`), and the session-metadata rail rendering its header and
+nothing else is already tracked below. Same family: **a rail whose content comes
+over a bridge shows its chrome and never its payload.** Check whether one dead
+bridge explains all three before writing three fixes.
+
+## ⛔⛔ [6.4] A libyggterm APP SPAWNED FOR A ROW RUNS ON THE WRONG MACHINE
+
+**Status:** OPEN
+
+*reported 2026-08-13*
+
+An app launched from a row's right-click menu — or from anywhere else — must run
+on **that row's host**. ychrome and yRDP do not: they run where the GUI is.
+
+**Why this is a correctness claim and not a preference.** A libyggterm app is
+sold as running on the machine whose data it is showing. An app that silently
+lands on the GUI's host is showing the wrong machine's world while labelled with
+the right machine's row. Partially tracked already for one case (*"open yRDP
+here may open on guihost instead of the row's host"*) — this entry generalises it to
+every app and every launch path, and that generalisation is the fix: **one host
+resolution, used by every launcher**, rather than a per-app patch.
+
+⚠ Related and already tracked: `server app launch-app --cwd` is ignored and the
+row inherits the active session's cwd. Same root shape — the launcher does not
+carry the launch context it was given. Fix them together.
+
+## ⛔ [6.4] A CONTEXT MENU IS ATTACHED TO APPS THAT ARE NOT FILE OPENERS
+
+**Status:** OPEN
+
+*reported 2026-08-13*
+
+yggdrasil-maker carries a context-menu entry. It is not a special-file-opening
+app; it is a program in its own right, so appearing in a file's context menu is
+meaningless. The same must not be inherited by yggtopo.
+
+**The rule this settles:** a libyggterm app *may* integrate into yggterm's
+context menus, and some earn it — ychrome is not a file opener either, but it is
+useful there. So membership is a **choice**, not a property of being an app.
+
+⇒ **Make it a config file, like a GTK/KDE desktop entry.** An app declares
+whether it wants a context-menu slot and under what conditions, and the menu is
+built from those declarations. Compiling the membership in is what makes the
+current state un-fixable without a rebuild.
+
+**Default for the two apps named here:** yggtopo and yggdrasil-maker declare **no**
+context-menu integration. If either turns out to be useful there later, it is a
+config edit and not a code change — that is the test that the fix worked.
+
+## ⭐ [6.4] yRDP OPENS ON A SEARCH BAR OVER AN EMPTY LIST
+
+**Status:** OPEN
+
+*reported 2026-08-13*
+
+yRDP shows no machines, just a search bar. Requested shape: a **start-page-like
+surface** that inherits the same gradient, with a **large-icon view** (the shape
+GNOME uses for its window switcher) where each tile shows **what that machine's
+screen last looked like**.
+
+⇒ The thumbnail is the point: it is what makes the surface lively rather than a
+list of hostnames, and it answers "which machine was I on" the way the eye
+answers it.
+
+## ⭐⭐ [6.5] THE BOOTER HAS NO MANUAL DISARM AND NO RATE-LIMIT AWARENESS
+
+**Status:** OPEN
+
+*reported 2026-08-13*
+
+Reported symptom: during a rate-limited window, subscribers kept being booted.
+A boot into an exhausted quota cannot do work — it spends the wake, fails, and
+leaves the row no further forward.
+
+⚠ **Correction to the premise, measured 2026-08-13 11:22 across all three
+hosts:** the booter is **not armed anywhere right now**. `~/.yggterm/relay/booter/`
+holds zero subscriptions on each host, no watcher process is alive, and the
+newest heartbeat is two days stale. So the kicking described is not ongoing.
+**This does not retire the item** — it narrows it to the two real gaps:
+
+1. **There is no disarm surface.** Disarming today means reaching each host and
+   running the skill's Python by hand. There is no way to see who is armed,
+   when they are due, or to stand one down without a shell. ⇒ the reporter had
+   no instrument to answer *"is the booter what is hurting me right now"*, which
+   is why the premise could not be checked from the GUI.
+2. **The booter does not know about quota.** It has a rule for a context-dead
+   session (tracked above) but none for an account-level rate limit, which is a
+   different state: the session is fine, the *account* cannot spend. A boot in
+   that state should defer to the window reset, not retry on its grid.
+
+**Both are answered by the same thing** — see the yggtopo entry below, which is
+where the disarm surface belongs.
+
+## ⭐⭐ [6.5] THERE IS NO libyggterm APP FOR THE FLEET ITSELF — BUILD `yggtopo`
+
+**Status:** OPEN
+
+*requested 2026-08-13*
+
+**What it is:** `lstopo` + `htop`, for the fleet. An `lstopo`-style topology view
+as the primary visual, with `htop`-style live process data layered onto it, and
+LXC containers as first-class citizens of that topology rather than processes
+that happen to be running.
+
+**Why it is being built now, and it is not the diagram:** it is the surface that
+lets the booter be disarmed, deferred and reconfigured by hand. A second tab
+carries **fleet statistics — who is armed, and when they are due**.
+
+**What makes it a milestone for the project, independent of its own usefulness:**
+it is the first libyggterm GUI app of this shape ever built. It behaves like a
+Windows/Qt/GTK application inside the viewport, composed from yggui components —
+sliders, list views, panels — with the gradient flowing over it the way the start
+page has it. ⇒ **the app is also the proof that the app tier can carry a real
+desktop-class UI**, which is the claim `libyggterm` is being licensed and
+positioned on. Build the htop-like view first: it is the densest widget exercise
+and it is the half the booter tab depends on.
+
+⛔ **No context-menu integration** — see the context-menu entry above.
+⭐ **Reuse yggui components; do not invent** — standing rule, and this app is
+where the temptation is highest because nothing quite like it exists yet.
+
+## ⭐ [6.5] `yggdrasil-maker` WANTS THE SAME REMAKE
+
+**Status:** OPEN
+
+*requested 2026-08-13*
+
+Same treatment as yggtopo: a real app in the viewport built from yggui
+components, and **no context menu**. Sequenced after yggtopo deliberately —
+yggtopo establishes the component vocabulary and yggdrasil-maker consumes it.
+If the second app needs new primitives, that is a finding about the first.
+
+## ⛔⛔ [6.7] THE GUI HOLDS 1.0 GB AND ITS WEB PROCESS 850 MB WITH NO WORK RUNNING
+
+**Status:** OPEN
+
+*measured 2026-08-13 on the desktop host*
+
+Reported symptom: for two days, with the account rate-limited and therefore
+almost nothing running, the laptop fan ran continuously and yggterm kept
+consuming power.
+
+**Measured, same host, 2026-08-13 11:21:**
+
+| what | RSS | age |
+|---|---|---|
+| `yggterm` (the GUI) | **1,042,728 KB** | 36.6 h |
+| its `WebKitWebProcess` | **850,648 KB** | 36.6 h |
+| 6 × `yggterm-headless server daemon` | 9–32 MB each | up to **7.9 days** |
+| 13 × `WebKitNetworkProcess` | ~9 MB each | — |
+
+System state: load 2.23 on an idle machine, **10 GB of 15 GB swap in use** with
+14 GB of RAM. That swap pressure is the known audio-residual condition, which is
+the likeliest explanation for the lagged, distorted notification audio reported
+in the same batch — the analog signal is not lagging, the machine is.
+
+⚠ **The reported "a million yggterm, a zillion WebKitWebProcess" is an
+instrument artefact, and naming it is part of the fix.** There is **one** GUI
+process and **four** `WebKitWebProcess`. htop lists threads by default and the
+GUI has **88** of them, so it fills the screen with rows that share one PID. The
+real defect is not the count — it is that the one process is **1 GB**, and that
+is worse news than a hundred small ones. Any optimisation work that starts from
+the count will optimise the wrong thing.
+
+**The mandate for this cluster is explicitly wider than one leak:** telemetry,
+diagnostics, and pattern research into how yggterm spends CPU, memory and power
+at rest. The standard named is Apple-grade — an idle app should cost nothing
+measurable.
+
+## ⛔ [6.7] A DAEMON LEAVES ITS `ssh` CHILDREN UNREAPED
+
+**Status:** OPEN
+
+*measured 2026-08-13*
+
+Twelve `[ssh] <defunct>` zombies on the desktop host, **all parented to one
+`yggterm-headless server daemon`** (a 4-day-old process). A thirteenth zombie,
+`[xdg-open]`, is parented to the GUI.
+
+⇒ Something spawns `ssh`, the child exits, and nobody calls `wait`. Zombies cost
+almost no memory, so this is not the fan — but it is an unambiguous
+lifecycle defect and it is the cheapest possible entry point into the daemon's
+child handling, which is where the more expensive leaks in this cluster probably
+also live.
+
+**Falsifier:** spawn and tear down N remote sessions on a fresh daemon and count
+zombies. It must stay at zero.
+
+## ⛔ [6.7] SIXTEEN STUCK CRASH HANDLERS, THE OLDEST DATING TO BOOT
+
+**Status:** OPEN
+
+*measured 2026-08-13*
+
+Sixteen `drkonqi-coredump-launcher` processes are resident on the desktop host,
+ages ranging from 4.7 days to **11 days — i.e. since the machine booted**. Each
+one is a crash whose handler never finished.
+
+**They are not yet attributed.** Whose coredumps these are has not been
+established, and the 6.7 delegate must establish it before drawing any
+conclusion — if they are yggterm's, sixteen crashes is a headline finding; if
+they are not, this entry retires with a one-line note saying so. ⛔ Do not
+assume they are ours because they were found while looking at us.
+
+## ⛔ [6.6] `AGY` LAUNCHES A PLAIN SHELL, AND NO CLI GETS ITS PERMISSION FLAG
+
+**Status:** OPEN
+
+*re-reported 2026-08-13*
+
+Two halves, reported together because they are felt together:
+
+1. **AGY launches a plain shell** rather than its CLI. This is the same symptom
+   already tracked below for six new agent CLIs — *a remote row for any of the
+   six new agent CLIs is born a plain shell, six for six, and every field says
+   healthy*. AGY is a seventh instance; the existing entry owns the narrative.
+2. **Every CLI needs its dangerous-skip-permissions equivalent passed.** Each
+   agent CLI spells this differently, and none of them currently receive it, so
+   every spawned row stops on a permission prompt the spawner cannot answer.
+
+⇒ Both are answered by the **settings work already queued below** — *the
+extra-args settings are two text boxes and there are nine CLIs; build the
+modal*. This batch's contribution is priority: it is a small change with an
+outsized effect on daily use, and it was named as such.
+
+## ⭐ [6.6] ADD THE GROK BUILD CLI TO THE ARSENAL
+
+**Status:** OPEN
+
+*requested 2026-08-13*
+
+Add Grok Build as a first-class agent CLI kind alongside the existing ones,
+including its own permission flag per the entry above and its brand colour per
+the start-page entry.
+
+⚠ Sequence it **after** the settings modal and the per-CLI permission flags,
+not before: adding a tenth CLI to a surface with two text boxes for nine of them
+makes the surface worse, and adding it to the fixed surface is a config edit.
+
+## ⭐⭐ [6.8] THE KASTEN APPS ARE WAITING TO BE BUILT
+
+**Status:** OPEN
+
+*requested 2026-08-13*
+
+Two related surfaces, requested as their own relay:
+
+1. **`ztlkasten`** — the public journalling rule-set repo, which already has a
+   design and a door in the campaign memory.
+2. **A kasten-style overview for each private graph** — dossier, fin, med, tax,
+   call. Same shape, one per graph.
+
+⇒ These are the softwares the graph campaigns are waiting on, and they are
+listed here so the queue reflects that the wait is real work and not a
+dependency on someone else.
+
+⛔ **The private graphs' surfaces stay in private repos.** Anything that resolves
+to a real path, person or case is a privacy defect in a public repo — this is
+the guard that has already failed once by scanning tracked files only.
+
+## ⛔ [6.4] `server app start-page` IS A NAVIGATION VERB SHELVED AMONG THE READ VERBS
+
+**Status:** OPEN
+
+*found 2026-08-13 while writing this batch*
+
+`server app`'s verb list reads `clients`, `desktop-identity`, `state`, `rows`,
+`start-page` — four reads and one that is not. `start-page` **navigates the live
+GUI to the start page**; it answers `{"accepted": true, "selected_paths": [...]}`,
+which reads like a query result and is in fact a report of what it just did.
+
+**It disturbed the operator's view during this session's recon**, called as a
+read. The standing directive is not to disturb the running viewport, and the
+verb surface made that directive impossible to follow from the name alone.
+
+⇒ **Fix by renaming, not by documenting.** `show-start-page` (or a `navigate`
+noun that groups it with `open`) puts it in the family it belongs to. This is
+the same class as every other entry in the field guide's instrument table: *the
+verb answers a different question than its name suggests.*
+
+
 ## ⛔⛔ `ListAgents` OMITS LIVE ROWS, SO "PICK THE PLAUSIBLE ONE FROM THE LIST" IS UNSAFE
 
 **Status:** OPEN
@@ -173,67 +630,6 @@ Where to look next, in order:
 
 **Falsifier:** a `start-cc` that spawns no process must leave either an error the
 user sees or a trace event naming the refusal — never a row that says `running`.
-
-## ⛔ THE INPUT GATE STILL SHUTS FOR ~5s ON A ROW THAT WAS NEVER GOING ANYWHERE
-
-**Status:** OPEN
-
-The *permanent* form is fixed in 3.0.110 and live-proven twice on the desktop
-host; what remains open is the window before the deadline catches it.
-
-**What shipped.** Selecting a row registers a fresh `hot_open_row` open attempt
-and clears `terminal_resume_ready_paths`, so readiness now rides entirely on that
-new attempt reaching Ready. When nothing can make it Ready, the row renders
-perfectly and refuses every keystroke. 3.0.110 gave the gate a deadline
-(`tick_input_gate_deadline`) and taught the existing-lease bootstrap skip to
-resolve the attempt it orphans. Measured live: `input_gate_deadline_restored`,
-`denied_for_ms: 5038` and `5048`, on a row whose gate had shut and would
-previously have stayed shut until the row was closed.
-
-⭐⭐ **AND IT IS NOT RARE — 11 RESTORES IN THE FIRST 25 MINUTES**, across at
-least three different rows, every one at 5.03–5.06 s. Two declines in the same
-window, both correct (`was_ever_ready: false`, a cold resume). ⇒ before 3.0.110
-this was stranding a row roughly every other minute of ordinary use, which is
-why it reached the owner as the defect that annoys him most rather than as an
-occasional oddity. The count is also the argument for closing the window rather
-than living with it.
-
-**What is still wrong: the gate should not have shut at all.** The open that
-strands a row has a fingerprint, identical in both captures (2026-08-11 11:45 and
-12:40), read off `terminal_open_attempt/begin`:
-
-    terminal_bootstrap_lease:            set      <- an outstanding lease
-    terminal_bootstrap_owner:            set
-    terminal_session_has_ready_attempt:  true     <- it WAS ready
-    terminal_session_host_id:            m1       <- the host is mounted
-    terminal_attach_in_flight:           false
-    terminal_session_is_retained_live:   false    <- ...and yet
-
-⇒ `rearm_unready_remote_terminal_bootstrap_for_open` sees the outstanding lease
-as pending attach state, strips lease + owner + readiness and bumps the epoch;
-`terminal_session_is_retained_live` is then false, so the open clears readiness
-and registers an attempt — for a host that is mounted, daemon-owned and was
-Ready a moment ago. **Nothing needed to be reopened.** Two threads:
-
-1. **Do not clear readiness for a host that is already live.** The predicate for
-   "demonstrably live" exists and is used by both 3.0.110 fixes —
-   `terminal_session_host_reusable_for_reveal` (host mounted · Ready once in this
-   life · daemon owns the PTY now). ⚠ The open attempt also drives the reveal
-   notices and watchdogs, so suppressing it is not a one-line edit.
-2. **Some attempts never receive a surface observation at all.** The stranded
-   attempts died with `observations: 0`; a healthy re-open of a different row on
-   the same GUI was marked Ready by an observation within 1 s. Until that is
-   understood, the deadline is carrying a fault it should not have to.
-
-⭐ **The trigger is ordinary.** Both captures are a plain row selection on an
-IDLE agent row. Idleness matters: the last release standing is fast-ready on the
-first MEANINGFUL output byte, and an agent at its prompt emits protocol-only
-bytes forever. The same row selected while BUSY recovers in ~700 ms, which is
-why this reads as random.
-
-**Instruments.** `ui/input_policy` is the decision reporting itself; the two new
-telemetry events name the deadline's verdict. ⛔ `app terminal input-check` will
-call a wedged row healthy — see the field guide's instrument table.
 
 ## ⛔ A TEST'S MUTEX GUARDS IT AGAINST ITSELF, NOT AGAINST THE SUITE
 
