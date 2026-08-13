@@ -1282,18 +1282,108 @@ makes the surface worse, and adding it to the fixed surface is a config edit.
 
 Two related surfaces, requested as their own relay:
 
-1. **`ztlkasten`** — the public journalling rule-set repo, which already has a
-   design and a door in the campaign memory.
-2. **A kasten-style overview for each private graph** — dossier, fin, med, tax,
-   call. Same shape, one per graph.
+1. **`ztlkasten`** — the journalling rule-set repo, which already has a design
+   and a door in the campaign memory.
+2. **A kasten-style overview for each private corpus** — five of them, one per
+   domain, and the request says *same shape, one per corpus*.
 
-⇒ These are the softwares the graph campaigns are waiting on, and they are
+⇒ These are the softwares the private campaigns are waiting on, and they are
 listed here so the queue reflects that the wait is real work and not a
 dependency on someone else.
 
-⛔ **The private graphs' surfaces stay in private repos.** Anything that resolves
-to a real path, person or case is a privacy defect in a public repo — this is
-the guard that has already failed once by scanning tracked files only.
+⛔ **The private corpora's surfaces stay in private repos.** Anything that
+resolves to a real path, person or case is a privacy defect in a public repo —
+this is the guard that has already failed once by scanning tracked files only.
+
+⚠ **This entry leaked the roster it forbids, and the leak is fixed above.** The
+original wording listed the five corpora by their short names in a sentence that
+appends the common suffix for the reader. The wordlist guard holds each full
+name and would have caught them; it cannot catch a roster written in pieces, so
+nothing fired. **A count and a shape carry the whole engineering fact** — that
+there are five consumers of one contract — and the roster carried only identity.
+Never pushed: caught on the lane branch. Routed to the guard's owner as a dream.
+
+### The scope, written before any code so it can be corrected cheaply
+
+*written 2026-08-13 by seat 6.8, which is this entry's owner*
+
+**The call that shapes everything else: this is ONE app with N configurations,
+not two apps and not six.** The request already said *same shape, one per
+corpus*; the measurement agrees. Both consumers are a corpus of typed nodes in
+folders, addressed by slug, cross-linked, with prose attached — the journalling
+vault addresses its nodes as markdown files whose grouping vocabulary is *also*
+files (a tag is a note), and a private corpus addresses its nodes as a
+structured-facts file plus an optional prose file under a folder that names the
+kind. **Same shape, two vocabularies.** So the vocabulary becomes data.
+
+⇒ **`kasten.toml`, a manifest at a corpus root, is the ONE contract** between the
+engine and any corpus. It declares the collections and what each is called, how a
+node's title, status and date are read, and which sub-collections may never enter
+a publication path (§5 of the app's own spec already requires that property to be
+declared and enforceable rather than an accident of layout). The engine ships in
+the public repo and never learns a corpus name; each private corpus commits a
+manifest of a few lines **in its own private repo**. That is what keeps this
+entry's own prohibition structurally true rather than a thing an author has to
+remember.
+
+**Tier A, by the app-architecture spec's own question** — *who must paint the
+pixels, and why?* Collections, rows, prose, counts and a search box are what the
+host already draws. The app therefore ships **no UI code at all**: a headless
+daemon plus a thin CLI, an OSC declare, a loopback control endpoint serving the
+widget schema, rendered on the document surface. Chrome is the schema either way;
+here the content is too.
+
+**What gets built, in this order:**
+
+1. This scope. ✅
+2. The manifest schema, and a synthetic corpus fixture with **invented** names —
+   the fixture is the classic leak because a realistic string feels like good
+   practice, so the fixture is fiction end to end.
+3. The engine: read the manifest, index the corpus, emit the schema. Proven
+   against the fixture, in the public repo, with no private corpus in reach.
+4. The scaffolding — ensure-daemon, OSC emitter, manifest writer, loopback
+   server. The pilot app already carries these ~200 lines and the platform's
+   migration order wants them extracted **once a second consumer exists**. This
+   lane is that consumer. ⚠ Copy first and file the extraction; doing it inline
+   would put a platform refactor inside an app's first commit.
+5. Live proof on the GUI host: a faithful screenshot of the document surface
+   showing the fictional corpus, per the visual-symptom law.
+6. Only then the private side: one manifest per corpus that fits, committed
+   there, never here.
+
+**What does NOT get built, stated so the boundary is correctable now and not
+after a week:**
+
+- **No editor.** Reading and capture only. Editing a buffer is another app's job
+  and duplicating it would be a second source of truth for the same gesture.
+- **No collaboration or arbiter.** Owner-settled: that primitive belongs to the
+  host, and it is the same two-live-viewers problem the constitution already
+  names as this project's highest-value work.
+- **No markdown handling of its own.** Owner-settled: the renderer organ is the
+  SSOT, and an app that grows its own breaks the property that makes the pipeline
+  worth having.
+- **No boards, calendars or dashboards first.** They demo well and serve neither
+  hot path. The design value is flow, priced in decisions and keystrokes on
+  *capture a thought* and *find a thing again*; a feature that cannot pay on both
+  is a feature for some other program.
+- **No new host widget kinds.** If the content needs one, it is filed as a
+  vocabulary gap for the host to admit, not drawn inside a native surface. A
+  graph view is the obvious candidate and it is explicitly **not** opened here.
+- **No writes into any private corpus.** Read-only in the first pass. Each corpus
+  already has a CLI that owns its mutations, and a second writer is a second
+  source of truth for the same records.
+
+**The honest exception, found by measuring rather than assuming: one of the five
+is not a corpus.** Four hold hundreds of node files between them; the fifth holds
+three prose files, a database and a tree of pipeline logs and queues. It is a
+**pipeline**, and an overview of it is a job-and-run view, which is a different
+program. Building the node overview and calling it five would be a false claim
+about coverage, so this lane delivers four and says which one it did not.
+
+**Falsifier for the whole scope:** the same binary, unchanged, renders two
+corpora with disjoint folder vocabularies from their manifests alone — and a
+`grep` of the public repo for any private corpus name, path or node title returns
+nothing, with a positive control proving the grep can find a planted one.
 
 ## ⛔ [6.4] `server app start-page` IS A NAVIGATION VERB SHELVED AMONG THE READ VERBS
 
