@@ -2097,6 +2097,60 @@ for the few seconds before the CLI titled itself.
 **Falsifier:** right-click a *session* row, start a session of any CLI, and the
 new row reads `New <CLI> Session` — never a variant of the clicked row's title.
 
+⚠ **THREE SIBLING COMPOSERS SURVIVE, AND THEY ARE LATENT — NOT FIXED, NOT THE
+REPORTED SYMPTOM.** `terminal_launch_context_for_row` and its `active_session`
+twin still build `format!("{} terminal", row.label)`,
+`format!("{} terminal", active.title)` and `format!("{} ssh", row.label)` — the
+same spawner-derived shape, in the plain-terminal paths.
+
+They do not produce the reported symptom because every one of them is a
+`Shell`/`SshShell` launch, and `live_session_default_title` (yggterm-server)
+titles those kinds by their **cwd**, using the hint only when the cwd is empty —
+which these paths always set. That is also why the report named
+`{claude-code,codex,…}` rows specifically: an agent kind KEEPS the fallback, so
+only there did the spawner's name reach the sidebar.
+
+⇒ **Left standing deliberately, and recorded rather than silently fixed**, for
+two reasons: they are unreachable in normal use, and the fallback they carry is
+*descriptive* (`dev ssh`) where a generic `New Terminal` would be less useful in
+the one case that reaches it. **If the empty-cwd case is ever hit, this is the
+entry it belongs to.**
+
+## ⛔ APP-CONTROL CANNOT TYPE INTO THE SHELL'S OWN CHROME
+
+**Status:** OPEN
+
+*found 2026-08-13, blocking live proof of the start page's search box*
+
+There is no verb that puts a keystroke into a Dioxus shell DOM field — a search
+box, a rename field, a settings input. The neighbours all answer a different
+question:
+
+- `server app terminal probe-type` / `terminal send` target a **PTY**, not the
+  chrome around it.
+- `server app web find --text` and the `wpe` verbs drive a **web surface** (a
+  contributed app's page), not yggterm's own shell.
+- `server app click` reaches a coordinate, which can focus a field but cannot
+  put text in it.
+
+⇒ **A shell-chrome affordance can be proven to RENDER and not to WORK**, which
+is precisely the gap that left the start page's search at "box is live, filter
+is unit-tested" instead of live-proven. Any future chrome input — and the
+campaign is adding them — inherits the same hole.
+
+⚠ It also means the field guide's rule "for a visual bug the proof is a faithful
+screenshot" has no counterpart for an INTERACTIVE chrome bug: there is no probe
+that exercises one.
+
+**Wanted:** `server app chrome type <selector-or-testid> <text> [--pid]` and a
+matching read-back, keyed on the `data-yggterm-*` attributes the chrome already
+stamps (the start page search carries `data-yggterm-start-page-search`, and its
+result count carries `data-yggterm-start-page-recent-count`, precisely so a probe
+could assert the pair).
+
+**Falsifier:** typing a word that appears only in one session's generated summary
+leaves exactly that card standing, asserted from the CLI without a human.
+
 ## ⛔⛔ THE REMOTE HELPER DIALS A SOCKET NAMED FOR ITS OWN VERSION — SO UPGRADING IT ALONE KILLS EVERY REMOTE COMMAND
 
 **Status:** OPEN
