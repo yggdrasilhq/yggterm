@@ -1569,6 +1569,24 @@ answering for exactly the ancient versions nobody runs.
    each time naming the version that had just retired; a manual alias sweep therefore re-broke
    itself once per deploy. Traced as `retiring_daemon_aliased_own_socket` with the successor's
    socket and an `aliased` flag, so a handover that could not bequeath its name says so.
+   ⚠⚠ **AND THE BEQUEST IS NOT YET PROVEN TO SURVIVE — measured 2026-08-13, immediately after
+   shipping it, and it is the reason to check rather than to celebrate.** A hand-made alias at the
+   just-retired version was **deleted three times within seconds-to-100 s** of being created, in
+   the minutes after that version's daemon retired — while aliases created in the same command at
+   three OTHER versions survived untouched, and while the same alias at the same path, recreated
+   about seven minutes later, **survived 150 s**. So the deleter is transient and fires in a window
+   around a retirement, and it targets exactly the name a bequest writes.
+   ⚠ **The mechanism below is a HYPOTHESIS and has not been proven:** `classify_socket_entry`
+   condemns an entry by NAME on a re-proved dead sighting (rule 7), and the sighting that condemned
+   `server-3-0-<retiring>.sock` was taken while it was still a dead real socket. Its keep-rules
+   should save an alias — rule 4 keeps anything whose `canonicalize` resolves to something
+   listening — unless the census taken by one of the host's many older daemons had not yet seen the
+   brand-new successor as listening. That would make it: **a name condemned as a dead socket, and
+   unlinked later as a live alias.**
+   ⇒ **Falsifier for whoever takes this:** at the next handover, watch
+   `server-3-0-<retiring>.sock` for two minutes. If the bequest disappears, the sweeper must
+   re-check liveness at the moment of unlink rather than trusting a sighting taken before the
+   entry's identity changed — a stale death sentence executed against a different file.
    ⇒ Still owed here: fix 1, which deletes the class rather than the instance; and 6.7's line for
    whatever sweep remains — **enumerate an alias set from the versions that EXIST, never from the
    files that happen to REMAIN.**
