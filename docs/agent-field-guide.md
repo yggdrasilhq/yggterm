@@ -84,6 +84,24 @@ prove it in `tools/xterm-harness/` (jsdom + the EXACT shipped bundle, minutes to
 write) instead of arguing from a live symptom. The harness turns
 "upstream probably does X" into a test that fails when a version bump changes X.
 
+**⛔⛔ `launch_phase: RemoteBootstrap` IS NOT A FAULT STATE, AND COUNTING IT PRODUCED A FALSE OUTAGE
+(2026-08-13).** During a real socket outage, two sessions independently read `RemoteBootstrap 41 /
+Running 10` as *"41 rows are stranded with no PTY"*. It is the ordinary resting state of a row.
+**The counterexample is direct, not inferred:** an orchestrator sampled the field while mid-turn and
+found **its own row** in `RemoteBootstrap` — along with three other rows that had each sent a
+message minutes earlier.
+
+⇒ **Do not infer health, or its absence, from a phase census.** Two samples 45 s apart were
+byte-identical, so it was not even a settling system; the field simply does not answer the question
+its name suggests. ⭐ **Through the whole incident the only instrument that was right in either
+direction was WHETHER ROWS RESPOND** — a delivered message, an accepted submit, a commit appearing.
+
+⚠ **The trap has a specific shape worth naming: during a genuine incident, any alarming-looking
+field acquires a causal story for free.** Both readings above were published — one as *"the outage
+is over"*, one as *"not resolved"* — and the disputed field was load-bearing in neither. **Before a
+count becomes evidence, find one entity you already know the answer for and check the field against
+it.**
+
 **⛔⛔ A PRE-PUSH PRIVACY REFUSAL WITH HUNDREDS OF HITS IS USUALLY A STALE BRANCH, NOT A LEAK — AND
 THE ONLY LEVER IT OFFERS IS THE ONE THAT SHIPS ONE (2026-08-13).** The guard scans
 `<tip> --not --remotes=origin`. That range is the right one — but it is enormous whenever the local
