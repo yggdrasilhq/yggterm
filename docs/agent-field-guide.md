@@ -263,7 +263,17 @@ day before **and** through several clean guard runs.
   reporting success. Caught the same day: a removal was reported as landed while
   it sat on a lane branch, and the exposure stayed live in between.
 - ⚠ **Both halves are the same shape**: an operation reported success about a
-  different question than the one being asked. The guard answered "is this push
+  different question than the one being asked.
+- ⛔⛔ **AND THE SUBTLER FORM, which is the one that will catch a careful agent:
+  A PASSING CHECK DOES NOT TELL YOU WHICH ACTION CAUSED THE STATE IT OBSERVED.**
+  The removal above was verified with the *right* command, which returned the
+  *right* answer — but it was run after a `fetch`, by which point another
+  session's merge had already produced that state. The check was sound; the
+  **attribution** was false, and the report credited the wrong action. ⇒ When two
+  events could each explain a state and you sampled only after both, you have
+  measured the state, not the cause. **Sample between them, or name the
+  ambiguity.** Same shape as comparing an API read against a screenshot taken at
+  a different moment, which this project has already paid for once. The guard answered "is this push
   clean", not "is this file clean"; the push answered "did the write succeed",
   not "is it visible on main".
 
