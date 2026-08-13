@@ -481,9 +481,48 @@ def resolve(host, ident):
     ⛔ `$YGGTERM_SESSION_ID` is `cc-runtime://<uuid>`; the row is
     `remote-cc://<host>/<uuid>`. Same uuid, different string, and the wrong one
     addresses nothing while every verb still answers OK. Resolve by UUID against
-    the live row list so the mistake cannot be made."""
+    the live row list so the mistake cannot be made.
+
+    ⛔⛔ ITS `None` IS AMBIGUOUS AND MUST NOT DECIDE ANYTHING DESTRUCTIVE — see
+    `row_presence` below. Use it to ADDRESS a row, never to judge whether one
+    exists."""
     BB._ROWS_CACHE.clear()
     return BB.resolve_row_path(host, ident)
+
+
+def row_presence(host, uuid):
+    """TRI-STATE: True listed · False answered-and-absent · None could-not-ask.
+
+    ⛔⛔ THE OUTAGE THIS EXISTS TO PREVENT, measured 2026-08-13 21:04:54-59:
+    **nine live subscriptions were deleted in six seconds, every one of them
+    logged as `GONE (retired)`, while every one of those sessions was alive and
+    working.** The whole fleet lost its watchdog silently, and the only trace was
+    nine confident lines in a log.
+
+    The mechanism is one collapsed distinction. `resolve_row_path` answers `None`
+    both for "the row is not in the listing" and for "the listing never arrived",
+    and it builds its cache ONCE from a single call — so a single failed
+    row-list makes every lookup in that pass answer `None`, and a tick that
+    reads `None` as "retired" unsubscribes everybody. **A watchdog that deletes
+    its own subscriptions because one probe failed cannot be relied on, and
+    nothing about the failure looks like one.**
+
+    ⇒ `row_exists` was already tri-state, and its docstring already said the
+    third value is the important one: *"None = the plane did not answer at all,
+    which is a fact about US and must never be rendered as a verdict about the
+    row."* The verdict path simply was not using it.
+
+    ⚠ AND EVEN `False` IS NOT PROOF ON ITS OWN — row listings have omitted live
+    rows before. So `False` is counted, not acted on; see `GONE_SIGHTINGS`."""
+    BB._ROWS_CACHE.clear()
+    return BB.row_exists(host, uuid)
+
+
+# How many consecutive answered-and-absent readings before a subscription is
+# deleted. Deliberately more than one: a listing that omits a live row has been
+# seen, and the cost of waiting an extra tick is nothing next to the cost of
+# unsubscribing a session that is still working.
+GONE_SIGHTINGS = 3
 
 
 def cmd_subscribe(args):
@@ -898,10 +937,31 @@ def tick(args):
         # ⛔ ROW LIST FIRST. A retired row's transcript is frozen mid-turn forever
         #    and is indistinguishable from a live wedge; booting a corpse is a
         #    watchdog barking at a grave.
-        if resolve(host, uuid) is None:
-            log(f"{uuid[:8]} GONE (retired) — unsubscribing")
-            sub_path(uuid).unlink(missing_ok=True)
+        # ⛔⛔ BUT TRI-STATE, AND CONFIRMED. `None` is "I could not ask" and must
+        #    change nothing; `False` is counted rather than acted on. Reading
+        #    either as "retired" deleted nine live subscriptions in six seconds
+        #    on 2026-08-13 — see `row_presence`.
+        presence = row_presence(host, uuid)
+        if presence is False:
+            s["gone_sightings"] = s.get("gone_sightings", 0) + 1
+            if s["gone_sightings"] >= GONE_SIGHTINGS:
+                log(f"{uuid[:8]} GONE — absent from {GONE_SIGHTINGS} consecutive "
+                    f"row listings, unsubscribing")
+                sub_path(uuid).unlink(missing_ok=True)
+                continue
+            log(f"{uuid[:8]} absent from the row list "
+                f"({s['gone_sightings']}/{GONE_SIGHTINGS}) — waiting for confirmation")
+            if not args.dry_run:
+                sub_path(uuid).write_text(json.dumps(s, indent=1))
             continue
+        if presence is None:
+            # ⛔ Say "I could not look", never "it is not there" — and change
+            #    NOTHING, including the counter: no information is not evidence
+            #    in either direction.
+            log(f"{'CANNOT-SEE':<14} {'':>6}  {'-':<12} {uuid[:8]}  "
+                f"the row list did not answer; nothing decided")
+            continue
+        s["gone_sightings"] = 0
         rhost = BB.row_host(row, host)
         if rhost and rhost == this_host():
             rhost = None
