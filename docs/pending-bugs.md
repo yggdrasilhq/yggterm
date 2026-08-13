@@ -91,6 +91,50 @@ rounds to zero would leave the result unmeasurable.
 **Falsifier:** if `event-trace.jsonl` growth does not fall ≥90x after S2,
 lock_wait was not 98.8% of the volume.
 
+### ✅ S2 IS FIXED IN CODE — LIVE PROOF OWED (the falsifier above is the proof)
+
+**Status of this entry: FIXED IN CODE, awaiting the measured ≥90× drop.**
+
+All three writes removed in one change, as the correction demanded — the two
+`append_trace_event` calls *and* the `PerfGuard` that sat in the same branch.
+What replaces them:
+
+- **An interval-flushed aggregate**, per request name: `count`, `mean_us`,
+  `max_us`, and p50/p95/p99 as **bucket UPPER BOUNDS** (named that way in the
+  payload — a histogram cannot say more than which bucket a percentile landed
+  in, and dressing a bucket edge up as an exact figure is how a rounded number
+  gets quoted as a measurement). One record per 60 s window instead of three per
+  contention.
+- ⭐ **Flushed LAZILY, by the next contention — never by a timer.** A thread
+  waking to check whether it should flush is precisely the idle cost this lane
+  exists to remove. ⚠ Consequence, stated rather than discovered later: a window
+  that ends with no further contention is not emitted until the next one
+  arrives.
+- **`waited_us`, not `waited_ms`** — the unit that made 93.9 % of records read
+  exactly 0.
+- ⭐ **A wait ≥ 50 ms still writes its own timestamped `lock_wait_slow` record.**
+  This function exists because a 34.4 s hold left no trace at all and a starved
+  daemon read as an idle one; aggregating everything would re-create that
+  blindness at a coarser grain. The forensic case is preserved and the volume is
+  not.
+
+⛔ **A pre-existing test REQUIRED the three writes** (`a_request_parked_on_the_
+runtime_lock_is_visible_in_the_trace`) and is updated rather than deleted: its
+reasoning was right and only its mechanism is superseded, so it now asserts the
+aggregate, the slow-path record and the microsecond unit — the same guarantee by
+a means that does not scale with contention. ⭐ **A test that encodes WHY should
+be re-pointed, not removed**; deleting it would have discarded the argument along
+with the assertion.
+
+⚠ **Trap paid twice while writing this, both caught, both worth carrying.**
+(1) The scan read the function's own comment — which necessarily NAMES the
+removed writes — as the offence, so it now strips comment lines; the
+self-matching-literal warning already in that test was about a string literal
+and did not cover a comment. (2) A `cargo test <filter>` that matched a
+*different* test was read as a passing mutant check. **Prove the run happened
+before reading its silence** — the mutant was in fact caught the moment the real
+test name was used.
+
 ## ⛔⛔ [6.9→6.1] THE DAEMON POPULATION IS 83% OF THE IDLE FOOTPRINT, AND ITS COST IS PER-DAEMON
 
 **Status:** OPEN

@@ -17605,6 +17605,98 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
     }
 }
 
+/// How long a single wait must be before it earns its own trace record.
+///
+/// ⛔ **93.9 % of waits were reported as `waited_ms: 0`** — the field was
+/// integer milliseconds and nearly every wait is sub-millisecond, so the
+/// instrument built to measure contention printed zero for almost all the
+/// contention it recorded. The COUNT was the signal and the VALUE was blind.
+/// Everything is now counted in the aggregate below; only a wait a human could
+/// actually notice still writes a line of its own, which is what preserves the
+/// forensic case this function was built for (a 34.4 s hold, quoted below)
+/// while removing the volume.
+const LOCK_WAIT_INDIVIDUAL_TRACE_THRESHOLD: std::time::Duration =
+    std::time::Duration::from_millis(50);
+/// How often the aggregate is emitted.
+///
+/// ⭐ Flushed **lazily, by the next contention event** — never by a timer. A
+/// background thread waking to check whether it should flush is exactly the
+/// idle cost this campaign exists to remove, and a window with no contention in
+/// it has nothing to report anyway.
+const LOCK_WAIT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Powers of two in microseconds, 1 µs … ~1 s, then everything above.
+const LOCK_WAIT_BUCKETS: usize = 22;
+
+#[derive(Debug, Default, Clone)]
+struct LockWaitStats {
+    count: u64,
+    total_us: u64,
+    max_us: u64,
+    buckets: [u64; LOCK_WAIT_BUCKETS],
+}
+
+impl LockWaitStats {
+    fn record(&mut self, waited_us: u64) {
+        self.count += 1;
+        self.total_us += waited_us;
+        self.max_us = self.max_us.max(waited_us);
+        let bucket = (u64::BITS - waited_us.leading_zeros()) as usize;
+        self.buckets[bucket.min(LOCK_WAIT_BUCKETS - 1)] += 1;
+    }
+}
+
+/// The upper bound of the bucket the given fraction falls in, in microseconds.
+///
+/// ⚠ Reported as an UPPER BOUND, not an interpolated percentile, and named that
+/// way in the payload. A histogram cannot say more than which bucket a
+/// percentile landed in, and dressing a bucket edge up as an exact figure is how
+/// a rounded number gets quoted as a measurement.
+fn lock_wait_percentile_upper_us(stats: &LockWaitStats, fraction: f64) -> u64 {
+    if stats.count == 0 {
+        return 0;
+    }
+    let target = (stats.count as f64 * fraction).ceil() as u64;
+    let mut seen = 0u64;
+    for (index, hits) in stats.buckets.iter().enumerate() {
+        seen += hits;
+        if seen >= target {
+            return if index == 0 { 1 } else { 1u64 << index };
+        }
+    }
+    stats.max_us
+}
+
+#[derive(Debug, Default)]
+struct LockWaitWindow {
+    opened: Option<std::time::Instant>,
+    by_request: BTreeMap<&'static str, LockWaitStats>,
+}
+
+static LOCK_WAIT_WINDOW: LazyLock<Mutex<LockWaitWindow>> =
+    LazyLock::new(|| Mutex::new(LockWaitWindow::default()));
+
+/// Fold one wait into the open window, and hand back a window to emit if this
+/// event closed it.
+fn record_lock_wait(
+    window: &mut LockWaitWindow,
+    now: std::time::Instant,
+    request_name: &'static str,
+    waited_us: u64,
+) -> Option<(std::time::Duration, BTreeMap<&'static str, LockWaitStats>)> {
+    let opened = *window.opened.get_or_insert(now);
+    window
+        .by_request
+        .entry(request_name)
+        .or_default()
+        .record(waited_us);
+    let elapsed = now.duration_since(opened);
+    if elapsed < LOCK_WAIT_FLUSH_INTERVAL {
+        return None;
+    }
+    window.opened = Some(now);
+    Some((elapsed, std::mem::take(&mut window.by_request)))
+}
+
 /// Acquire the runtime lock **for a client request, measuring the wait.**
 ///
 /// `handle_request` emits its `request`/`begin` trace AFTER the lock is held,
@@ -17623,8 +17715,16 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
 /// (21:21:34.788, 21:21:57.275, 21:22:30.746) and were all parked right here.
 ///
 /// Fast path costs nothing: `status` alone runs 620k times per fleet-day, so an
-/// uncontended acquisition traces nothing and allocates nothing. Only a request
-/// that actually has to wait pays for — and reports — its own wait.
+/// uncontended acquisition traces nothing and allocates nothing.
+///
+/// ⛔ **THAT SENTENCE USED TO END "only a request that actually has to wait pays
+/// for — and reports — its own wait", AND IT IS HOW THIS BECAME THE LARGEST
+/// WRITER IN THE SYSTEM.** Every word of it was true; the implication that the
+/// paying path is therefore rare was not. `try_lock` FAILS 322.8 times a second
+/// on a busy host — 98.6 % of it `terminal_read`, because reading a PTY
+/// serialises against everything else through this one mutex — so the "only"
+/// path was the hot one. ⇒ **A cost argument about a fast path says nothing
+/// about the system until the slow path's RATE is measured.**
 fn lock_daemon_runtime_for_request<'a>(
     runtime: &'a Arc<Mutex<DaemonRuntime>>,
     request_name: &'static str,
@@ -17639,34 +17739,64 @@ fn lock_daemon_runtime_for_request<'a>(
         Err(std::sync::TryLockError::WouldBlock) => {}
     }
     let home = crate::resolve_yggterm_home().ok();
-    if let Some(home) = home.as_deref() {
+    let started = std::time::Instant::now();
+    // ⛔ NO PER-EVENT WRITES HERE. This branch used to emit THREE records across
+    // TWO files for every failed `try_lock` — `lock_wait_begin`, a drop-scoped
+    // `PerfGuard` into perf-telemetry, and `lock_wait_end` — and the branch runs
+    // 322.8 times a second on a busy host. Measured: 133 KB/s across the two
+    // files, ~11 GB/day, of which 98.8 % was this. The instrument was the
+    // largest writer in the system while reporting that its fast path was free,
+    // which was true and beside the point: it is the SLOW path that is hot.
+    let guard = lock_daemon_runtime(runtime, "handle_request");
+    let waited = started.elapsed();
+    let Some(home) = home.as_deref() else {
+        return guard;
+    };
+    // Microseconds, not milliseconds — see the threshold constant above.
+    let waited_us = waited.as_micros() as u64;
+    if waited >= LOCK_WAIT_INDIVIDUAL_TRACE_THRESHOLD {
+        // Rare by construction, and the only kind of wait anyone has ever
+        // needed a timestamp for.
         append_trace_event(
             home,
             "daemon",
             "request",
-            "lock_wait_begin",
-            serde_json::json!({ "request": request_name }),
+            "lock_wait_slow",
+            serde_json::json!({ "request": request_name, "waited_us": waited_us }),
         );
     }
-    let started = std::time::Instant::now();
-    let guard = {
-        // Drop-scoped so `perf-summary` ranks the wait per request name, beside
-        // the `daemon_request` row that measures the work itself. A request
-        // whose lock_wait dwarfs its own duration is being starved, not slow.
-        let _wait = home
-            .as_deref()
-            .map(|home| yggterm_core::PerfGuard::new(home, "daemon_lock_wait", request_name));
-        lock_daemon_runtime(runtime, "handle_request")
-    };
-    if let Some(home) = home.as_deref() {
+    let flushed = LOCK_WAIT_WINDOW
+        .lock()
+        .ok()
+        .and_then(|mut window| record_lock_wait(&mut window, started, request_name, waited_us));
+    if let Some((elapsed, by_request)) = flushed {
+        let requests: BTreeMap<&str, serde_json::Value> = by_request
+            .iter()
+            .map(|(name, stats)| {
+                (
+                    *name,
+                    serde_json::json!({
+                        "count": stats.count,
+                        "mean_us": stats.total_us / stats.count.max(1),
+                        "max_us": stats.max_us,
+                        "p50_upper_us": lock_wait_percentile_upper_us(stats, 0.50),
+                        "p95_upper_us": lock_wait_percentile_upper_us(stats, 0.95),
+                        "p99_upper_us": lock_wait_percentile_upper_us(stats, 0.99),
+                    }),
+                )
+            })
+            .collect();
         append_trace_event(
             home,
             "daemon",
             "request",
-            "lock_wait_end",
+            "lock_wait_window",
             serde_json::json!({
-                "request": request_name,
-                "waited_ms": started.elapsed().as_millis() as u64,
+                // ⭐ The window is printed with the numbers, always. A rate
+                // quoted without the interval it was taken over is how two
+                // different regimes get read as one.
+                "window_ms": elapsed.as_millis() as u64,
+                "requests": requests,
             }),
         );
     }
@@ -23521,15 +23651,50 @@ mod tests {
             "the UNCONTENDED path must stay free of tracing and allocation — \
              `status` alone runs 620k times per fleet-day"
         );
+        // ⚠ Strip comments before scanning. The function's own comment explains
+        // which writes were REMOVED and therefore names them, so a raw
+        // `contains` reads the explanation as the offence — the same shape as
+        // the self-matching literal already documented above.
+        let code: String = waiter
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // ⛔ THE THREE PER-EVENT WRITES ARE GONE, AND MUST STAY GONE.
+        //
+        // This assertion used to REQUIRE them: `lock_wait_begin`,
+        // `lock_wait_end`, and a `PerfGuard` labelled `daemon_lock_wait`. The
+        // reasoning was right and the cost was never measured. `try_lock` fails
+        // 322.8 times a second on a busy host, so those three records across two
+        // files were 98.8 % of 133 KB/s — about 11 GB/day, making the instrument
+        // the largest writer in the system while its doc comment argued that its
+        // fast path was free. Both halves of the original intent survive below,
+        // by a mechanism that does not scale with contention.
+        for banned in ["lock_wait_begin", "lock_wait_end", "PerfGuard"] {
+            assert!(
+                !code.contains(banned),
+                "`{banned}` is a per-event write on a path that runs 322.8 times \
+                 a second; everything routine belongs in the aggregate"
+            );
+        }
         assert!(
-            waiter.contains("lock_wait_begin") && waiter.contains("lock_wait_end"),
-            "a contended acquisition must bracket its own wait, or the blocked \
-             request is still invisible"
+            code.contains("lock_wait_slow"),
+            "a contended acquisition long enough to STARVE a request must still \
+             leave its own timestamped record — that is the 34.4 s case this \
+             function was built for, and aggregating it away would re-create the \
+             blindness at a coarser grain"
         );
         assert!(
-            waiter.contains("\"daemon_lock_wait\""),
-            "the wait must also land in perf-summary, so contention is rankable \
-             next to the work it is being starved by"
+            code.contains("record_lock_wait") && code.contains("lock_wait_window"),
+            "every wait must still be COUNTED and the count must still be \
+             emitted, per request name, so contention stays rankable next to the \
+             work it is starving — removing the volume must not remove the signal"
+        );
+        assert!(
+            code.contains("as_micros()") && !code.contains("waited_ms"),
+            "the wait must be measured in MICROseconds: as integer milliseconds \
+             93.9 % of real waits recorded as exactly 0, so the instrument built \
+             to measure contention was blind to nearly all of it"
         );
     }
 
@@ -28107,6 +28272,113 @@ mod tests {
     /// Formatting/comment edits inside the enums re-trigger this; that
     /// over-trigger is deliberate — a spare version bump is cheap, a silent
     /// wire divergence is the lost-PTY latch storm of 2026-07-17.
+    /// ⛔ THE CONTENTION TRACER WAS THE LARGEST WRITER IN THE SYSTEM.
+    ///
+    /// Every failed `try_lock` wrote THREE records across TWO files, and the
+    /// branch runs 322.8 times a second on a busy host: 133 KB/s, ~11 GB/day,
+    /// 98.8 % of it this. This is the peer-supplied falsifier as a test — the
+    /// write count for a realistic minute of contention must fall by at least
+    /// 90×, or the attribution was wrong.
+    #[test]
+    fn a_minute_of_contention_writes_one_record_instead_of_sixty_thousand() {
+        use std::time::{Duration, Instant};
+
+        // Measured on the live daemon: 322.8 failed try_locks per second.
+        const PER_SECOND: u64 = 322;
+        const SECONDS: u64 = 60;
+        // ⚠ One event PAST the interval. The flush is lazy by design — it is
+        // driven by the next contention rather than by a timer, because a timer
+        // waking to check whether it should flush is the idle cost this lane
+        // removes. So a run of exactly one interval's events ends at 59.997 s
+        // and correctly flushes nothing.
+        let contentions = PER_SECOND * SECONDS + 1;
+        let old_writes = contentions * 3;
+
+        let mut window = super::LockWaitWindow::default();
+        let origin = Instant::now();
+        let mut new_writes = 0u64;
+        for tick in 0..contentions {
+            let now = origin + Duration::from_micros(tick * 1_000_000 / PER_SECOND);
+            // 93.9 % of real waits are sub-millisecond — the population that
+            // used to be recorded, three records at a time, as `waited_ms: 0`.
+            let waited_us = if tick % 100 < 94 { 180 } else { 4_200 };
+            if super::record_lock_wait(&mut window, now, "terminal_read", waited_us).is_some() {
+                new_writes += 1;
+            }
+        }
+        assert!(
+            new_writes >= 1,
+            "the aggregate must still be emitted — silence is not frugality, it \
+             is the blindness this instrument exists to prevent"
+        );
+        let reduction = old_writes / new_writes.max(1);
+        assert!(
+            reduction >= 90,
+            "a minute of contention must cost at least 90x fewer writes: was \
+             {old_writes} records, now {new_writes} (reduction {reduction}x)"
+        );
+    }
+
+    /// ⛔ A SUB-MILLISECOND WAIT MUST NOT REPORT ZERO.
+    ///
+    /// 93.9 % of recorded waits read `waited_ms: 0` because the field was
+    /// integer milliseconds. The instrument built to measure contention printed
+    /// zero for almost all the contention it recorded — the count was the only
+    /// surviving signal, and the value was blind.
+    #[test]
+    fn the_wait_histogram_still_sees_a_wait_too_short_for_a_millisecond() {
+        let mut stats = super::LockWaitStats::default();
+        for _ in 0..1000 {
+            stats.record(180); // 0.18 ms — reported as 0 by the old field
+        }
+        assert_eq!(stats.count, 1000);
+        assert!(
+            stats.max_us > 0 && stats.total_us / stats.count > 0,
+            "a 180 us wait must survive as a non-zero measurement: {stats:?}"
+        );
+        let p50 = super::lock_wait_percentile_upper_us(&stats, 0.50);
+        assert!(
+            (128..=256).contains(&p50),
+            "the median of a population of 180 us waits must land in the bucket \
+             that contains 180 us, got {p50} us"
+        );
+        // A histogram reports the bucket a percentile fell in, never more. The
+        // tail must still be visibly larger than the body.
+        stats.record(34_400_000); // the documented 34.4 s starvation case
+        assert!(
+            super::lock_wait_percentile_upper_us(&stats, 0.99)
+                < super::lock_wait_percentile_upper_us(&stats, 1.0),
+            "one enormous wait must move the top of the distribution and not the \
+             middle, or a starved daemon hides inside its own median"
+        );
+    }
+
+    /// ⭐ THE FORENSIC CASE MUST SURVIVE THE VOLUME FIX.
+    ///
+    /// This function exists because a 34.4 s hold left NO trace record at all
+    /// and a starved daemon read as an idle one. Aggregating everything would
+    /// re-create that blindness at a coarser grain, so a wait a human could
+    /// notice still writes its own timestamped line.
+    #[test]
+    fn a_wait_long_enough_to_starve_a_request_still_earns_its_own_record() {
+        use std::time::Duration;
+        assert!(
+            Duration::from_secs_f64(34.4) >= super::LOCK_WAIT_INDIVIDUAL_TRACE_THRESHOLD,
+            "the 34.4 s hold that motivated this function must still be traced \
+             individually"
+        );
+        assert!(
+            Duration::from_micros(180) < super::LOCK_WAIT_INDIVIDUAL_TRACE_THRESHOLD,
+            "a routine sub-millisecond wait must NOT write its own record — that \
+             population is 93.9 % of the volume"
+        );
+        assert!(
+            super::LOCK_WAIT_INDIVIDUAL_TRACE_THRESHOLD <= Duration::from_millis(250),
+            "the threshold must stay low enough to catch a wait a person would \
+             feel as a stall"
+        );
+    }
+
     #[test]
     fn protocol_shape_stamp_forces_version_bump() {
         // Re-stamped for 3.0.75: `StartRemoteAgentSession` arrived — the
