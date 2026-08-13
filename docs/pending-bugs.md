@@ -2514,6 +2514,60 @@ before designing the comparison.* One query against the recorder answers it, and
 it would have saved three attempts. A perf number quoted without its floor is not
 a measurement.
 
+## ⛔⛔ [6.7] OUR MANAGED npm CACHE IS 13.3 GB ACROSS THE FLEET AND NOTHING EVER PRUNES IT
+
+**Status:** OPEN
+
+*Found 2026-08-14 while independently re-measuring a peer's trace-growth figure —
+the growth reproduced, but the directory it was blamed for filling turned out to
+be full of something else entirely.*
+
+**It is the largest single consumer of `~/.yggterm` on BOTH hosts**, and it is
+ours: `codex_cli.rs` points the managed Codex CLI install at
+`~/.yggterm/npm-cache` (`MANAGED_NPM_CACHE_DIRNAME`).
+
+| host | `~/.yggterm` total | `npm-cache` | share |
+|---|---|---|---|
+| build host | 9.5 GB | **7.6 GB** | 80 % |
+| desktop host | 7.8 GB | **5.7 GB** | 73 % |
+
+On the desktop host that is **5.7 GB in `_cacache` across 1,476 files, with
+content dating from 2026-03-28 to today** — every tarball of every version ever
+provisioned, kept forever. `npm cache clean`, `--cache-min`, and any retention
+or GC rule are **absent from the whole file**: nothing has ever removed anything
+from it.
+
+⛔ **The fix is a retention rule, NOT a delete.** The cache exists so CLI
+provisioning is not a fresh download every time; emptying it on a timer trades
+disk for network and start latency on the very path that has to be fast. What is
+missing is a bound — the same shape as the memory entry below, and the same
+error: an unbounded store whose growth nobody is watching.
+
+⭐ **Falsifier, cheap and decisive:** record the cache size, run a provisioning
+pass, and record it again. If the delta is ~one package set, the accumulation is
+purely historical and a retention rule reclaims essentially all of it; if it is
+large, provisioning itself is re-downloading and the entry is about the wrong
+layer.
+
+### ⚠ AND IT CORRECTS WHAT THE TRACE-GROWTH NUMBER MEANS
+
+The trace write rate is real and reproduced independently on the build host
+(**133 KB/s combined across `event-trace.jsonl` + `perf-telemetry.jsonl`, ≈11
+GB/day**), but ⛔ **it is a WRITE-RATE cost, not an occupancy cost** — those two
+files are only **5 MB and 9 MB** on disk, because they rotate. The 9.5 GB is not
+them. ⇒ Fixing the trace volume buys **CPU, I/O and SSD wear**, and buys back
+**no meaningful disk**; the disk is bought back here instead. Two different
+frugality wins that were about to be quoted as one number.
+
+⭐ **AND IT DOES NOT TRANSFER BETWEEN HOSTS.** Measured in the same 15 s window:
+the build host writes **133 KB/s** and the desktop host writes **6 KB/s** — a 22×
+gap, tracking session count (340 sessions / 21 daemons versus 2 / 7), not
+hardware. **The trace-volume defect is real and is essentially absent from the
+owner's laptop right now**, so it must not be sold to him as his own machine's
+problem. This is the campaign's standing rule earning itself again: a claim
+proven on one host is not proven, and a rate must be quoted with the host it was
+taken on.
+
 ## ⛔⛔ [6.7] THE WEB PROCESS'S MEMORY BOUND CANNOT HOLD, BECAUSE SWAP MAKES ITS FOOTPRINT LIE
 
 **Status:** OPEN
