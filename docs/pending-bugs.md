@@ -85,9 +85,7 @@ standing external source rather than one event.
 your teardown on your own `YGGTERM_HOME`, never on a binary path.** A loop keyed to a path can reach
 the installed daemon; a loop keyed to your own home cannot.
 
-## ⭐ ANSWERED FROM THE TRACE, 6.1: IT WAS AN ORDINARY INSTALLED-BINARY HANDOVER, AND THE SUCCESSOR WAS SIGNALLED
-
-**Status:** OPEN
+### ⭐ ANSWERED FROM THE TRACE: IT WAS AN ORDINARY INSTALLED-BINARY HANDOVER, AND THE SUCCESSOR WAS SIGNALLED
 
 Falsifier 2 below is already settled by the real home's own trace, so nobody
 needs to run it. The lane-build daemon was **isolated** — its
@@ -141,6 +139,30 @@ successor has been observed alive for a settle interval rather than exiting on
 adopting daemon records its adopted set durably on arrival, so a recovery spawn
 can re-resume them, which is exactly what the manual
 `server remote resume-cc <uuid> --require-existing` did by hand.
+
+### ⭐ (b) IS LANDED — AND THE REASON IT WAS NEEDED IS WORSE THAN "IT HAD NOT GOT ROUND TO IT"
+
+Adoption wrote a trace event and **nothing durable**. The obvious reading is that
+the successor simply had not reached its next routine persist in the 16 s it
+lived. The real reason is structural, and it is why the rows were unrecoverable
+rather than merely stale:
+
+⛔ **The PREDECESSOR's routine persistence is muted for ever once it is
+superseded** (`superseded_routine_persist_muted` → `routine_persist_should_mute`
+returns `true` unconditionally, with no grace expiry — deliberately, so a
+retiring daemon cannot clobber the successor's state file). ⇒ during a handover
+**no process on the host will write the session state**: the one that knows the
+sessions is muted, and the one that now holds them has not ticked yet. That
+window is exactly when every runtime is in flight.
+
+**Fixed:** a daemon that adopts a runtime persists **immediately**, inside the
+same lock, before it acknowledges the handoff. The `pty_handoff_adopted` trace
+now carries `persisted`, because a row that is live but unrecorded is
+unrecoverable the moment someone signals its holder, and that is worth seeing
+before the next kill rather than after it.
+⚠ **This does not close (a).** It converts "seven sessions destroyed" into "seven
+sessions re-resumable", which is the difference the manual recovery already
+demonstrated on one row — it does not stop the window existing.
 
 **The falsifiers, in the order that costs least:**
 1. Start a daemon from a lane's `target/release` on a host with live agent rows, in a sandbox, and
