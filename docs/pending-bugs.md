@@ -12,6 +12,46 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [6.4] THREE PRIVATE IDENTIFIERS REACHED origin/main AND ARE STILL IN HISTORY
+
+**Status:** OPEN — HEAD is clean; the published history is not.
+
+Three private identifiers sat in this file on `origin/main` and were removed from
+HEAD 2026-08-14 (`c6720880`, reachable from `main` via `6e2d9c81`). Removal from
+HEAD shrinks the surface and **revokes nothing**: the blobs remain fetchable at
+their pre-removal commits.
+
+### ⛔ Why a rewrite alone does not close this
+
+**A force-push revokes nothing.** Pre-rewrite SHAs stay fetchable to anyone who
+already has them or who requests them directly. Only a support request to the
+forge removes published blobs. ⚠ **A previous request was deflected for being
+filed under the wrong category** — it is **private information removal**, not
+repository housekeeping, and the category is what decides whether it is actioned.
+
+### ⛔ Why the rewrite has not been run
+
+Four lanes are live on this repository. **A history rewrite landing under live
+lanes is how in-flight work gets orphaned**, and the leak-removal seat's own
+record says do not re-run repositories that have already been swept. Sequencing
+this needs a quiet window and an owner for the whole operation, not a spare hour.
+
+### ⭐ How it survived the earlier sweep — the transferable half
+
+The pre-push guard **scans a push's own commits by design**, so **a term already
+on `main` is permanently invisible to it**. ⇒ **A clean guard run on a push is
+not evidence the file is clean.** These were found by scanning the whole file
+rather than a diff, which is the method that should be used whenever a file is
+being audited rather than merely edited.
+
+⚠ Second trap, hit while fixing this one: the removal was first pushed to a
+**lane branch**, and reported as done, while `main` still carried the terms.
+**For a removal, verify by ancestry against `origin/main`** —
+`git merge-base --is-ancestor <sha> origin/main` — never by the success of a push.
+
+**Falsifier:** the identifiers are absent from `git log -p` over all refs, and the
+forge returns 404 for the pre-removal blob URLs.
+
 ## ⛔⛔⛔ [6.9→6.7] THE LOCK-CONTENTION INSTRUMENT IS THE LARGEST WRITER IN THE SYSTEM, AND IT REPORTS ZERO
 
 **Status:** OPEN
