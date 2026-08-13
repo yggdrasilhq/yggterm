@@ -43,10 +43,39 @@ Usage:
     ygg-booter.py subscribe [--row <path>] [--campaign yggterm] [--max-hours 12]
                             [--kind task|monitor]   # monitor: unsubscribe needs --force
     ygg-booter.py unsubscribe [--row <path>]        # no --row = this session
-    ygg-booter.py list
+    ygg-booter.py list [--json]
     ygg-booter.py tick [--dry-run]                  # one pass over all subscribers
     ygg-booter.py watch [--interval 300]            # the loop — let `subscribe` spawn it
-    ygg-booter.py status                            # alive AND audible? (MUTE is a fault)
+    ygg-booter.py status [--json]                   # alive AND audible? (MUTE is a fault)
+    ygg-booter.py disarm [--hours 4|--forever] [--note why]   # the OFF SWITCH
+    ygg-booter.py arm                               # back on
+
+★ THE OFF SWITCH, and why it is not `unsubscribe` (added 2026-08-13).
+
+  Reported: subscribers kept being booted during a rate-limited window, and there
+  was no way to check whether the booter was the thing causing the pain, let
+  alone stop it, without a shell on every host. Two gaps, both real:
+
+  **1. No disarm.** Stopping the booter meant deleting subscriptions or killing
+  the watcher — both destructive, both losing WHO was being watched, so re-arming
+  meant rebuilding the list from memory. `disarm` keeps every subscription and
+  simply refuses to act; `arm` puts it back exactly as it was. It expires on its
+  own (default 4h) for the same reason a deferral does: a safety net switched off
+  and forgotten is worse than one that was never installed, because everybody
+  still believes it is there.
+
+  **2. No quota awareness.** A rate limit is an ACCOUNT state, not a session
+  state — the session is fine, the account cannot spend — and it is invisible to
+  anything measuring activity, because a refused turn ends like any other. So a
+  quota outage read as a stall and got booted every few minutes, and each boot
+  was refused before the agent ran. The classifier now names it (`RATE_LIMITED`,
+  keyed on the CLI's own `apiErrorStatus: 429` record, not on prose) and one
+  sighting holds the WHOLE fleet, because the limit is account-wide while
+  detection can only ever be per-row.
+
+  Both are readable and drivable from outside via `--json`, which is what the
+  `yggtopo` surface renders — the point being that a human should be able to
+  answer "is the booter what is hurting me" without opening a shell at all.
 
 `subscribe` ARMS the watcher if none is running, so arming the booter and joining
 it are one call — a two-step arm is a step somebody skips.
@@ -71,6 +100,10 @@ SUBS = STATE / "booter"
 PIDFILE = STATE / "booter.pid"
 HEARTBEAT = STATE / "booter.heartbeat"
 LOGPATH = STATE / "booter.log"
+# ⭐ THE OFF SWITCH. A human standing the booter down, without dismantling it.
+DISARMFILE = STATE / "booter.disarmed"
+# ⭐ THE ACCOUNT HAS NO QUOTA. Fleet-wide, because a rate limit is.
+RLHOLDFILE = STATE / "booter.rate-limit-hold"
 
 # The words he used. A boot must be recognisable AS a boot in the transcript —
 # both to a human reading back and to the session itself, which should be able to
@@ -143,6 +176,40 @@ MIN_BOOT_AFTER_SECS = 60
 # Consecutive boots that produced no transcript growth before a human is told.
 MAX_BOOTS = 3
 DEFAULT_INTERVAL = 300
+
+# ⭐⭐ HOW LONG THE FLEET HOLDS AFTER SEEING A 429 (reported 2026-08-13: "during a
+# rate-limited window, subscribers kept being booted").
+#
+# ⛔ THE HOLD IS FLEET-WIDE BECAUSE THE LIMIT IS ACCOUNT-WIDE. Detection is
+# necessarily per-row — only a session that TRIED gets refused — but the fact it
+# discovers is about the account, so one subscriber's 429 stands the whole
+# watcher down. Holding only the row that happened to be refused would boot every
+# other subscriber into the same wall, one at a time, which is the reported
+# symptom exactly.
+#
+# ⚠ WHY A TIMER AND NOT A RESET TIME: the refusal carries no reset timestamp
+# ("try again later"), the CLI keeps no quota state file, and there is no API to
+# ask. Inventing a reset time we cannot observe would be a confident lie. So the
+# hold expires on a timer and the NEXT tick sends one boot as a PROBE; if the
+# account is still dry that row classifies RATE_LIMITED again and the hold
+# re-arms. Cost of being wrong is one wasted boot per half hour, against one
+# every seven minutes today.
+#
+# ⛔ AND IT MUST NOT ESCALATE. A quota window is not something a human can fix,
+# and the owner is the person whose quota it is — he already knows. A watchdog
+# that pages about the weather teaches people to ignore it, which is the failure
+# the CONTEXT_DEAD arm was written to undo.
+RATE_LIMIT_HOLD_SECS = 1800
+
+# ⭐ HOW LONG A MANUAL DISARM LASTS BY DEFAULT.
+#
+# ⛔ IT EXPIRES ON ITS OWN, for the same reason `defer` does: a safety net
+# switched off and forgotten is worse than one that never existed, because
+# everybody still believes it is there. Long enough to cover the reason a human
+# reaches for it (a noisy window, a hands-on debugging session), short enough
+# that forgetting is not fatal. `--forever` exists for the case that genuinely
+# needs it and makes the choice explicit rather than accidental.
+DISARM_HOURS = 4.0
 
 
 def _load_babysit():
@@ -306,6 +373,108 @@ def own_uuid():
     return (os.environ.get("YGGTERM_SESSION_ID") or "").rstrip("/").split("/")[-1]
 
 
+# ─── the off switch ────────────────────────────────────────────────────────────
+
+def disarm_state():
+    """The active disarm, or None. Expiry is evaluated HERE, once.
+
+    ⛔ One reader, so `tick`, `status` and the app surface can never disagree
+    about whether the booter is on — the question a human asks the off switch is
+    "is it off RIGHT NOW", and two answers to that is the same defect as two
+    files claiming to list the open bugs."""
+    try:
+        d = json.loads(DISARMFILE.read_text())
+    except Exception:
+        return None
+    until = d.get("until") or 0
+    if until and time.time() >= until:
+        # Self-clearing, and it says so out loud: a watchdog that silently comes
+        # back on is as surprising as one that silently stays off.
+        DISARMFILE.unlink(missing_ok=True)
+        log(f"⭐ disarm EXPIRED ({d.get('note') or 'no reason given'}) — the booter is ARMED again")
+        return None
+    return d
+
+
+def cmd_disarm(args):
+    """Stand the booter down WITHOUT dismantling it.
+
+    ⛔ THIS IS NOT `unsubscribe`, and the difference is the whole point. Today the
+    only way to stop the booter is to delete subscriptions or kill the watcher —
+    both of which lose who was being watched, so re-arming means reconstructing
+    it from memory, and nobody does. A disarm keeps every subscription intact and
+    simply refuses to act, so `arm` puts the fleet back exactly as it was."""
+    hours = None if args.forever else float(args.hours or DISARM_HOURS)
+    rec = {
+        "since": time.time(),
+        "until": 0 if hours is None else time.time() + hours * 3600,
+        "hours": hours,
+        "note": args.note,
+        "by": own_uuid() or "shell",
+        "host": this_host(),
+    }
+    DISARMFILE.parent.mkdir(parents=True, exist_ok=True)
+    DISARMFILE.write_text(json.dumps(rec, indent=1))
+    back = disarm_state()
+    span = "until re-armed by hand" if hours is None else f"for {hours:g}h"
+    log(f"⛔ booter DISARMED {span} on {this_host()} — {len(load_subs())} subscriptions kept, "
+        f"nobody will be booted. Reason: {args.note or 'none given'}")
+    log(f"   re-arm with: ygg-booter.py arm")
+    log(f"read-back: {'present' if back else '⛔ ABSENT — the disarm did not land'}")
+    return 0 if back else 1
+
+
+def cmd_arm(args):
+    d = disarm_state()
+    if not d:
+        log(f"booter is already armed on {this_host()}")
+    else:
+        DISARMFILE.unlink(missing_ok=True)
+        down_m = (time.time() - d.get("since", time.time())) / 60
+        log(f"⭐ booter ARMED on {this_host()} — it was down {down_m:.0f} min "
+            f"({d.get('note') or 'no reason given'})")
+    if disarm_state():
+        log("⛔ read-back: still disarmed — the file did not clear")
+        return 1
+    # Arming is also the moment to notice that nothing is watching.
+    if load_subs() and not watcher_alive():
+        log(f"⚠ {len(load_subs())} subscriptions but NO watcher process — "
+            f"re-arm the watcher too: ygg-booter.py subscribe --row <row>")
+    return 0
+
+
+# ─── the account ran out of quota ──────────────────────────────────────────────
+
+def rate_limit_hold():
+    """The active fleet-wide quota hold, or None. Expiry evaluated HERE, once."""
+    try:
+        d = json.loads(RLHOLDFILE.read_text())
+    except Exception:
+        return None
+    if time.time() >= (d.get("until") or 0):
+        RLHOLDFILE.unlink(missing_ok=True)
+        return None
+    return d
+
+
+def note_rate_limit(uuid, tail):
+    """A subscriber was refused on quota ⇒ hold the whole fleet.
+
+    Refreshing rather than accumulating: each fresh sighting pushes the window
+    out, so a long outage holds continuously without anyone tracking rounds."""
+    prev = rate_limit_hold()
+    rec = {
+        "since": (prev or {}).get("since", time.time()),
+        "last_seen": time.time(),
+        "until": time.time() + RATE_LIMIT_HOLD_SECS,
+        "seen_on": uuid,
+        "tail": (tail or "")[:200],
+    }
+    RLHOLDFILE.parent.mkdir(parents=True, exist_ok=True)
+    RLHOLDFILE.write_text(json.dumps(rec, indent=1))
+    return rec
+
+
 def resolve(host, ident):
     """Any identifier -> a real ROW PATH, or None.
 
@@ -451,8 +620,83 @@ def cmd_unsubscribe(args):
     return 0
 
 
+def fleet_state(args):
+    """Everything a surface needs to render THIS host's booter, in one read.
+
+    ⭐ This is the shape `yggtopo` renders and drives. It exists because "is the
+    booter what is hurting me right now" was unanswerable without a shell on each
+    host — and an answer that requires a shell is not an answer a human has."""
+    d = disarm_state()
+    rl = rate_limit_hold()
+    alive = watcher_alive()
+    now = time.time()
+    subs = []
+    for s in load_subs():
+        win, why = boot_after_for(s)
+        subs.append({
+            "uuid": s["uuid"],
+            "row": s.get("row"),
+            "campaign": s.get("campaign") or "",
+            "kind": s.get("kind") or "task",
+            "note": s.get("note") or "",
+            "age_h": round((now - s["subscribed_at"]) / 3600, 2),
+            "max_hours": s.get("max_hours"),
+            "boots": s.get("boots", 0),
+            "escalated": bool(s.get("escalated")),
+            # WHEN this row is next at risk of a boot, which is the thing a human
+            # actually wants ("who is due") — not the raw window it was set to.
+            "boot_window_secs": win,
+            "boot_window_why": why,
+        })
+    beat = None
+    if HEARTBEAT.exists():
+        try:
+            beat = json.loads(HEARTBEAT.read_text())
+        except Exception:
+            beat = None
+    silent_s = _watcher_silence_secs(beat)
+    return {
+        "host": this_host(),
+        "now": now,
+        "armed": d is None,
+        "disarm": None if not d else {
+            "since": d.get("since"), "until": d.get("until"),
+            "forever": not d.get("until"), "note": d.get("note") or "",
+            "by": d.get("by") or "",
+        },
+        "watcher": {
+            "pid": alive,
+            "alive": bool(alive),
+            "heartbeat_age_s": None if not beat else round(now - beat.get("ts", 0)),
+            "log_silent_s": silent_s,
+            # ⛔ ALIVE IS NOT AUDIBLE — a surface that draws a green dot for a
+            #    MUTE watcher republishes the exact lie `status` was fixed to stop.
+            "mute": bool(alive) and (silent_s is None
+                                     or silent_s > max(3 * args.interval, 900)),
+        },
+        "rate_limit_hold": None if not rl else {
+            "since": rl.get("since"), "until": rl.get("until"),
+            "seen_on": rl.get("seen_on"), "tail": rl.get("tail"),
+            "secs_left": round(rl["until"] - now),
+        },
+        "subscribers": subs,
+    }
+
+
 def cmd_list(args):
+    if args.json:
+        print(json.dumps(fleet_state(args), indent=1))
+        return 0
     subs = load_subs()
+    d = disarm_state()
+    if d:
+        left = "until re-armed" if not d.get("until") else \
+            f"{(d['until'] - time.time()) / 60:.0f}m left"
+        log(f"⛔ DISARMED ({left}) — {d.get('note') or 'no reason given'}")
+    rl = rate_limit_hold()
+    if rl:
+        log(f"⏸ QUOTA HOLD {(rl['until'] - time.time()) / 60:.0f}m left "
+            f"(429 seen on {rl['seen_on'][:8]})")
     if not subs:
         log("no subscribers")
         return 0
@@ -594,6 +838,21 @@ def tick(args):
     subs = load_subs()
     if not subs:
         return 0
+    # ⛔ THE OFF SWITCH IS CHECKED FIRST AND SUSPENDS EVERYTHING — not just boots.
+    #    "Off" has to mean off, including the housekeeping that unsubscribes a
+    #    row and the escalations that page a human. A switch with quiet
+    #    exceptions is a switch nobody trusts, and an untrusted safety net gets
+    #    dismantled instead of disarmed.
+    d = disarm_state()
+    if d:
+        left = ("until re-armed" if not d.get("until")
+                else f"{(d['until'] - time.time()) / 60:.0f}m left")
+        log(f"DISARMED ({left}) — {len(subs)} subscriptions held, no boots. "
+            f"{d.get('note') or ''}".rstrip())
+        return 0
+    # The quota hold from a previous tick. Re-read per tick, never cached: a hold
+    # that outlived its window must not keep a healthy fleet asleep.
+    rl = rate_limit_hold()
     rc = 0
     for s in subs:
         uuid, row, host = s["uuid"], s["row"], s.get("host", args.host)
@@ -645,7 +904,20 @@ def tick(args):
             log(f"{uuid[:8]} CONTEXT-DEAD — unsubscribing (a boot cannot fix this)")
             sub_path(uuid).unlink(missing_ok=True)
             continue
-        if state in ("WORKING", "JUST_ENDED"):
+        if state == "RATE_LIMITED":
+            # ⛔ THE ACCOUNT IS OUT OF QUOTA, NOT THIS ROW. Hold the FLEET, do
+            #    not escalate (a human cannot grant quota), and do not unsubscribe
+            #    — unlike CONTEXT_DEAD this ends by itself, and the row is meant
+            #    to still be watched when it does.
+            rl = note_rate_limit(uuid, c["tail"])
+            # ⭐ GIVE THE LAST ATTEMPT BACK. That boot was refused by the API
+            #    before the agent ran, so counting it toward MAX_BOOTS would
+            #    escalate "did not wake after 3 boots" about a session that was
+            #    never actually asked anything. Same argument as `refused-draft`.
+            if s.get("boots"):
+                s["boots"] -= 1
+            action = "RATE-LIMITED"
+        elif state in ("WORKING", "JUST_ENDED"):
             s["boots"] = 0                     # progress clears the stall counter
             s["escalated"] = False
         elif state == "UNREACHABLE":
@@ -667,6 +939,21 @@ def tick(args):
         elif state == "IDLE" and c["age"] >= (boot_after := boot_after_for(s)[0]):
             if grew:
                 s["boots"] = 0                 # it worked since last tick
+            if rl:
+                # ⛔ A BOOT INTO AN EXHAUSTED QUOTA IS REFUSED BEFORE THE AGENT
+                #    RUNS. It spends the wake, changes nothing, and — because the
+                #    refusal grows the transcript — looks enough like activity to
+                #    keep the loop going. So: skip, do NOT count it as a boot
+                #    attempt, and say WHY in the log, because "nothing happened
+                #    for an hour" with no line explaining it is how a watchdog
+                #    becomes unfalsifiable.
+                action = "HOLD:rate-limit"
+                held_m = (rl["until"] - time.time()) / 60
+                log(f"{'RATE-HOLD':<14} {c['age'] / 60:>6.1f}m  {action:<12} {uuid[:8]}  "
+                    f"quota hold {held_m:.0f}m left (seen on {rl['seen_on'][:8]})")
+                if not args.dry_run:
+                    sub_path(uuid).write_text(json.dumps(s, indent=1))
+                continue
             if s["boots"] >= MAX_BOOTS:
                 action = "ESCALATE"
                 rc = max(rc, 4)
@@ -798,6 +1085,10 @@ def cmd_watch(args):
 
 
 def cmd_status(args):
+    if args.json:
+        st = fleet_state(args)
+        print(json.dumps(st, indent=1))
+        return 0 if (st["watcher"]["alive"] and not st["watcher"]["mute"]) else 1
     alive = watcher_alive()
     hb = "never"
     mute = ""
@@ -821,8 +1112,22 @@ def cmd_status(args):
                         f"(kill {alive}; ygg-booter.py subscribe …)")
         except Exception:
             pass
+    # ⛔ THE OFF SWITCH IS PART OF THE STATUS LINE, not a footnote. A disarmed
+    #    booter and a broken one are the same silence from the outside; the only
+    #    thing that tells them apart is this line, and a human debugging "why was
+    #    I not booted" reads it first.
+    d = disarm_state()
+    armed = "⛔ DISARMED" if d else "armed"
+    if d:
+        armed += (" until re-armed" if not d.get("until")
+                  else f" {(d['until'] - time.time()) / 60:.0f}m left")
+        if d.get("note"):
+            armed += f" ({d['note']})"
+    rl = rate_limit_hold()
+    hold = "" if not rl else (f" · ⏸ QUOTA HOLD {(rl['until'] - time.time()) / 60:.0f}m "
+                              f"left, 429 seen on {rl['seen_on'][:8]}")
     log(f"watcher: {'alive pid ' + str(alive) if alive else 'NOT RUNNING'} · "
-        f"heartbeat {hb} · subscribers {len(load_subs())}{mute}")
+        f"{armed} · heartbeat {hb} · subscribers {len(load_subs())}{hold}{mute}")
     return 0 if (alive and not mute) else 1
 
 
@@ -830,7 +1135,7 @@ def main():
     ap = argparse.ArgumentParser(description="boot a stalled session that subscribed")
     ap.add_argument("action",
                     choices=["subscribe", "unsubscribe", "defer", "list", "tick",
-                             "watch", "status"])
+                             "watch", "status", "disarm", "arm"])
     ap.add_argument("--secs", type=int, default=0,
                     help=f"defer: boot window for one long wait, clamped to "
                          f"{MIN_BOOT_AFTER_SECS}-{MAX_BOOT_AFTER_SECS}s "
@@ -851,6 +1156,16 @@ def main():
                     help="unsubscribe: stop watching even a monitor subscription")
     ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--hours", type=float, default=None,
+                    help=f"disarm: how long to stay off before re-arming itself "
+                         f"(default {DISARM_HOURS:g}h)")
+    ap.add_argument("--forever", action="store_true",
+                    help="disarm: stay off until `arm` is run by hand. ⛔ A safety "
+                         "net switched off and forgotten is worse than none, so "
+                         "this is deliberately not the default")
+    ap.add_argument("--json", action="store_true",
+                    help="list/status: the machine-readable state, for a surface "
+                         "to render and drive")
     args = ap.parse_args()
     # ⛔ Never carry a placeholder host into a boot decision.
     args.host = resolve_gui_host(args.host)
@@ -862,6 +1177,8 @@ def main():
         "tick": tick,
         "watch": cmd_watch,
         "status": cmd_status,
+        "disarm": cmd_disarm,
+        "arm": cmd_arm,
     }[args.action](args)
 
 

@@ -491,8 +491,20 @@ newest heartbeat is two days stale. So the kicking described is not ongoing.
    different state: the session is fine, the *account* cannot spend. A boot in
    that state should defer to the window reset, not retry on its grid.
 
-**Both are answered by the same thing** — see the yggtopo entry below, which is
-where the disarm surface belongs.
+### What is left, after the mechanism landed
+
+The MECHANISM for both is in `ygg-booter.py` / `ygg-babysit.py` (`disarm` ·
+`arm` · `RATE_LIMITED` · a fleet-wide quota hold · `--json` for a surface to
+render and drive). What remains is **gap 1's surface**: a human still needs a
+shell to press the switch, which was the actual complaint. That is the yggtopo
+booter tab, tracked in the entry below, and this entry closes when that tab can
+disarm a host and show who is armed.
+
+⚠ **Quota detection has no reset time, by construction.** The refusal says only
+"try again later"; the CLI keeps no quota state file and there is no API to ask.
+So the hold expires on a timer (30 min) and the next tick spends ONE boot as a
+probe, which re-arms the hold if the account is still dry. Anything claiming to
+know when the window resets would be inventing it.
 
 ## ⭐⭐ [6.5] THERE IS NO libyggterm APP FOR THE FLEET ITSELF — BUILD `yggtopo`
 
