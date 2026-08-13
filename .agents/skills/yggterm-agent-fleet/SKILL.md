@@ -1261,6 +1261,49 @@ the campaign memory, the files it wrote. A transcript says what a session
 a brief, a correction, a warning that changes what they should do next. Then it
 earns its cost. Batch several into one send rather than paying per finding.
 
+### ⛔⛔ A BRIEF MAY CARRY FACTS. IT MUST NOT CARRY YOUR CAUSAL THEORY.
+
+**Measured on this campaign: one orchestrator handed one cluster a wrong cause
+TWICE, and the cluster had to spend its own turns refuting the brief before it
+could start.** Both were fluent, both were plausible, both were contradicted by
+data already on disk:
+
+1. *"Monotonic at rest ⇒ a leak, not a hot loop — a hot loop costs the same in
+   hour 36 as in hour 1."* Wrong. It was a hot loop whose iteration count grew
+   with accumulated state, so it presented as growth **and** as CPU. Those were
+   never alternatives.
+2. *"The regression is the 4.4/s app-root re-render."* Wrong, and the refutation
+   was **already recorded**: an always-on probe held 739 samples over 12.3 hours
+   showing the render rate FLAT at ~2/s while CPU climbed 3.6×. A constant-rate
+   loop cannot be what grows. Nobody had read it.
+
+⇒ **The failure is not being wrong. It is being wrong AUTHORITATIVELY, in the one
+document the delegate must trust.** A cluster reads its brief as settled ground and
+builds on it; a bad measurement it would have caught in an hour, a bad premise it
+carries for a day. And an orchestrator is *especially* prone to this — it is
+reading fast, across many lanes, at exactly the altitude where a tidy story is most
+satisfying and least tested.
+
+**The rule, and it is cheap:**
+
+- ✅ **Inline MEASUREMENTS** — numbers, with where and when they were taken, and the
+  instrument that produced them. These save the delegate real time.
+- ⛔ **Do not inline the CAUSE.** If you have a hypothesis, mark it as one, in as
+  many words: *"my guess, untested, and the first thing to falsify."*
+- ⭐ **READ THE ALWAYS-ON PROBES BEFORE YOU THEORISE.** Both errors above were
+  refutable from data that already existed. The orchestrator's altitude is worth
+  nothing if it skips the instruments the ground floor already installed.
+- ⛔ **Never let a brief forbid the research.** A brief that bans investigation on
+  a *bug* guarantees the unintelligent fix — and one that asserts the cause bans it
+  in practice, however politely.
+- ⭐ **When a cluster refutes your premise, say so plainly and PROPAGATE it.** The
+  correction is worth more than the original brief, and the other clusters are
+  probably carrying the same assumption.
+
+⚠ **And keep the host quiet when someone is measuring growth.** Deploys that cycle
+the GUI destroy long samples; a cluster measuring over hours needs either a quiet
+machine or a sandbox, and the orchestrator is usually the one cycling it.
+
 ### ⚖⚖ THE TWO SUPERVISION PLANES — the dumb net and the thinking one
 
 **Both exist, neither replaces the other, and the split is the design.**

@@ -1024,6 +1024,30 @@ process for a tombstoned session. And `session remove` must not answer
 process whose session is in the orchestrator's number space but subscribed to
 nothing is now reported every tick. That is what caught this one.
 
+## ⛔ `server app state` TIMES OUT AT 15 s WHILE `app clients` ANSWERS INSTANTLY
+
+**Status:** OPEN
+
+*Flagged 2026-08-13 by cluster 6.7, which did not chase it — it was not their lane.*
+
+On the desktop host, `yggterm-headless server app state` hit its 15 s timeout while
+`server app clients` answered immediately against the same GUI. So the transport
+and the client routing are fine; something in composing `state` specifically is
+slow or blocking.
+
+⚠ **`state` is one of the four verbs an agent reaches for first**, and a 15 s
+timeout on it reads as "the GUI is wedged" to anyone who does not also try
+`clients`. That misreading is expensive: it is the shape that starts a false
+investigation into a healthy app.
+
+**Where to look:** whatever `state` gathers that `clients` does not — most likely a
+per-session walk that grows with row count, or a lock held by another request.
+Note the daemon serves one request at a time and a hot-restart request holds it
+for ~11 s, which is already tracked and would produce exactly this.
+
+**Falsifier:** time both verbs against the same GUI at several row counts. `state`
+must not diverge from `clients` by more than the work it genuinely does more of.
+
 ## ⛔⛔ `ListAgents` OMITS LIVE ROWS, SO "PICK THE PLAUSIBLE ONE FROM THE LIST" IS UNSAFE
 
 **Status:** OPEN
