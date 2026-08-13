@@ -536,8 +536,27 @@ def cmd_promote(a):
     return 0
 
 
+def report_watcher_health():
+    """⛔ A SUBSCRIPTION LIST IS NOT A SUPERVISION GUARANTEE, and until now `list`
+    could not tell the two apart: it printed the same contented roster whether a
+    watcher was running or had exited hours ago. That is this project's own
+    pathology — an instrument answering truthfully about a question nobody asked
+    it. So `list` now states its subject: who is subscribed AND whether anything
+    is actually looking."""
+    procs = watcher_procs()
+    if not procs:
+        log("⛔ NO WATCHER IS RUNNING — the subscriptions below are being read by NOBODY.")
+        log("   Start one:  ygg-monitor.py watch --watch 86400 --interval 240")
+        return
+    for pid, age in procs:
+        log(f"✅ watcher pid={pid} age={age // 3600}h{(age % 3600) // 60:02d}m")
+    if len(procs) > 1:
+        log(f"⚠ {len(procs)} WATCHERS RUNNING — they will double-escalate. Kill all but one.")
+
+
 def cmd_list(a):
     subs = load_subs()
+    report_watcher_health()
     if not subs:
         log("no subscribers")
         return 0
@@ -855,11 +874,44 @@ def tick(a):
     return 0
 
 
+def watcher_procs():
+    """Every live `watch` process, as (pid, age_seconds). Identify, never count —
+    a bare `pgrep -f` matches the shell that asked the question."""
+    out = []
+    try:
+        ps = subprocess.run(["ps", "-eo", "pid=,etimes=,args="],
+                            capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return out
+    for line in ps.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, etimes, args = parts
+        if "ygg-monitor.py" in args and " watch" in args and "bash -c" not in args:
+            try:
+                out.append((int(pid), int(etimes)))
+            except ValueError:
+                pass
+    return out
+
+
 def cmd_watch(a):
     deadline = time.time() + a.watch
     while time.time() < deadline:
         tick(a)
         time.sleep(a.interval)
+    # ⛔⛔ AN EXPIRING SUPERVISOR IS INDISTINGUISHABLE FROM A HEALTHY QUIET ONE.
+    # This loop used to just fall off its deadline and exit silently. Measured
+    # 2026-08-14: the watcher was started with `--watch 21600` and found at age
+    # 5.8h — twelve minutes from ending the only supervision the campaign had,
+    # with nothing to restart it and nothing to announce it. Four orchestrators
+    # had already stalled unnoticed. Same family as "a reader that finds nothing
+    # looks exactly like a thing that has nothing": say it out loud.
+    log(f"⛔ WATCHER EXPIRED after {a.watch}s — NOTHING IS WATCHING {len(load_subs())} "
+        f"SUBSCRIBER(S) ANY MORE. This is not a clean shutdown, it is a deadline.")
+    log("   Restart it, or the next stall escalates to nobody:")
+    log(f"     ygg-monitor.py watch --watch 86400 --interval {a.interval}")
     return 0
 
 
