@@ -82,8 +82,9 @@ pub use agent_cli::{
     AgentPermissionMode, AgentStoreEntry, CODEX_FAMILY, FlagArity, OverriddenBy,
     RecordedStoreLiteral, ResumeSelector, agent_cli_descriptor, agent_cli_for_store_path,
     agent_cli_for_store_session_file, agent_launch_options_from_args,
-    all_agent_cli_store_path_fragments, store_home_dir_name_is_any, store_literal_scan_coverage,
-    store_path_is_under_any, unregistered_store_literals,
+    all_agent_cli_store_path_fragments, session_kind_label, session_kind_label_is_known,
+    store_home_dir_name_is_any, store_literal_scan_coverage, store_path_is_under_any,
+    unregistered_store_literals,
 };
 pub use app_registry::{
     APP_REGISTRY_DIRNAME, AppManifest, AppVerb, app_registry_dir, scan_app_registry,
@@ -128,12 +129,12 @@ pub use telemetry::{
     spawn_terminal_telemetry_event, terminal_telemetry_db_path,
 };
 pub use titles::{
-    LIVE_SUMMARY_REFRESH_HORIZON, SessionSummaryTimelineEntry, SessionTitleResolver,
-    SessionTitleStore, best_effort_context_from_session_path,
+    AGENT_PLANE_TITLE_PREFIX, LIVE_SUMMARY_REFRESH_HORIZON, SessionSummaryTimelineEntry,
+    SessionTitleResolver, SessionTitleStore, best_effort_context_from_session_path,
     best_effort_precis_from_context, best_effort_summary_from_context,
-    best_effort_title_from_context, looks_like_generated_fallback_title,
-    looks_like_low_signal_generated_copy, request_generated_short_name,
-    session_title_store_open_count,
+    best_effort_title_from_context, is_agent_plane_composed_title,
+    looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
+    request_generated_short_name, session_title_store_open_count,
 };
 pub use trace::{
     EVENT_TRACE_FILENAME, EventTraceRecord, EventTraceSpan, append_trace_event, event_trace_path,

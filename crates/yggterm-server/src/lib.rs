@@ -28416,27 +28416,11 @@ fn local_session_target(kind: SessionKind, cwd: Option<&str>) -> SshConnectTarge
     }
 }
 
-/// The ONE lowercase wire name for a session kind — the `--kind` value, the
-/// `session_kind_label` string in telemetry, the row JSON's `icon_kind`.
-///
-/// The agent half is `descriptor.slug` rather than nine hand-written arms,
-/// because that slug is the same string the flag parser accepts: spelling them
-/// separately is how a kind could be LABELLED `pi` and yet be unparseable as
-/// `--kind pi`.
-pub fn session_kind_label(kind: SessionKind) -> &'static str {
-    if let Some(descriptor) = agent_cli_descriptor(kind) {
-        return descriptor.slug;
-    }
-    match kind {
-        SessionKind::Shell => "shell",
-        // Historical spelling: `ssh`, not `ssh-shell`. It is on disk and on the
-        // wire, so it stays hand-written next to the kinds that have no slug.
-        SessionKind::SshShell => "ssh",
-        SessionKind::Document => "document",
-        // Unreachable: every remaining kind has a descriptor and returned above.
-        _ => "shell",
-    }
-}
+/// The ONE lowercase wire name for a session kind lives in `yggterm-core`
+/// beside the slugs it is built from, so the copy layer there can recognise a
+/// title this crate composed out of one. Re-exported rather than re-spelled,
+/// because a second spelling is how the two halves drift.
+pub use yggterm_core::session_kind_label;
 
 fn default_persisted_stored_kind() -> SessionKind {
     SessionKind::Codex
