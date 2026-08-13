@@ -330,6 +330,40 @@ avoiding it**, because avoiding it leaves the wall standing for the next agent.
 session doing the reaping. Collect pids first, exclude `$$`, then signal them.
 Identify; never pattern-match.
 
+### ⭐⭐ TWO TRANSPORTS, TWO QUESTIONS — `submitted: false` does NOT mean unreachable
+
+**There are two ways to reach another session and they fail differently.** Reading
+one's refusal as the other's failure wasted an afternoon.
+
+| | `terminal submit` (the ROW plane) | `SendMessage` (the PEER plane) |
+|---|---|---|
+| needs | the target **at a composer** | nothing — it enqueues |
+| when the row is mid-output | **refuses**, `submitted: false`, after its full timeout | delivers; drains at the receiver's next tool round |
+| addresses | a row path / session | a peer name, or the exact `from` of a message you received |
+| good for | a brief to a row you are seating | anything, any time |
+
+⛔ **`error: null` is not the delivery field. `submitted` is.** A refusal names its
+reason — *"no agent composer row appeared within the timeout — the row is
+mid-output, in a menu, or is not an agent CLI, so input readiness is unanswerable
+rather than false"*. That is the verb being **correct**, not broken.
+
+⇒ **When `submit` refuses, the peer plane still delivers.** These are two
+instruments answering different questions, not a bug and a workaround. Reading
+`submitted: false` as "that row is unreachable" produced, in one afternoon: a
+false report that the orchestrator's inbound channel was dropping messages,
+relayed twice as fact, and a fallback built for a defect that did not exist.
+
+⚠ **The PTY write is the crude third option** — it lands regardless, but it types
+into the row's terminal and interleaves with whatever it is doing. Use it when a
+row must be woken, not as the routine way to say something.
+
+⛔ **AND A RELAYED CLAIM IS A CLAIM YOU ARE MAKING.** The false report above passed
+through a session that forwarded it without running a single `submit` of its own —
+while applying *read the state back* rigorously to its own work all day. **Verify
+before you forward**, especially when the claim is about the infrastructure
+everyone depends on: an infrastructure defect asserted by a trusted peer will be
+believed and acted on immediately, which is exactly why it must be tested first.
+
 ### ⛔⛔ A FINISHED DELEGATE AND A STALLED ONE LOOK IDENTICAL — run `ygg-babysit.py`
 
 **Reported 2026-08-08, and it halted a live pipeline:** *"I am seeing that they both
