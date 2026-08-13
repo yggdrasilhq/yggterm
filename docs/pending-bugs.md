@@ -1628,31 +1628,6 @@ to this change.)
 single contributor (15% of lines) from *one* event. Several daemon generations
 each holding their own trace open is a separate item.
 
-## ⛔ [6.7] A DAEMON LEAVES ITS `ssh` CHILDREN UNREAPED
-
-**Status:** OPEN
-
-*measured 2026-08-13*
-
-Twelve `[ssh] <defunct>` zombies on the desktop host, **all parented to one
-`yggterm-headless server daemon`** (a 4-day-old process). A thirteenth zombie,
-`[xdg-open]`, is parented to the GUI.
-
-⇒ **New, 2026-08-13: all twelve were spawned inside ONE second**, in two bursts
-(`10:21:39` ×8, `10:21:40` ×4) four days before they were found, and none since.
-That is not per-session leakage — it is **one fan-out that spawns `ssh` per
-target and waits for none of them**, which narrows the search a long way from
-"the daemon's child handling" to the code that probes every machine at once.
-
-⇒ Something spawns `ssh`, the child exits, and nobody calls `wait`. Zombies cost
-almost no memory, so this is not the fan — but it is an unambiguous
-lifecycle defect and it is the cheapest possible entry point into the daemon's
-child handling, which is where the more expensive leaks in this cluster probably
-also live.
-
-**Falsifier:** spawn and tear down N remote sessions on a fresh daemon and count
-zombies. It must stay at zero.
-
 ## ⛔ [6.7] UNEXPLAINED: HAND-MADE SOCKET ALIASES AT A JUST-RETIRED NAME WERE DELETED, SIBLINGS WERE NOT
 
 **Status:** OPEN
