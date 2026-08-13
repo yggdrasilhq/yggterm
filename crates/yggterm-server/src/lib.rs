@@ -22366,9 +22366,46 @@ pub fn run_app_control_restore_sessions(
     } else {
         remembered.iter().map(String::as_str).collect()
     };
+    // **IS THE ROW EVEN THERE?** One `DescribeRows` for the whole batch, before
+    // any open. A path the sidebar cannot see has nothing to restore — the
+    // ordinary state of a plain shell whose runtime was destroyed — and opening
+    // it does not fail fast: measured live, the open was ACCEPTED with no error
+    // and then never settled, so the row cost the full 90 s cold-open budget to
+    // report a timeout that named the wrong thing. Absence is a fact this verb
+    // can establish for nothing, so it establishes it.
+    let visible_rows: Option<std::collections::HashSet<String>> =
+        request_app_control(&home, AppControlCommand::DescribeRows, timeout_ms)
+            .ok()
+            .and_then(|response| response.data)
+            .and_then(|data| {
+                data.get("rows")
+                    .and_then(Value::as_array)
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(|row| {
+                                row.get("path").and_then(Value::as_str).map(ToOwned::to_owned)
+                            })
+                            .collect()
+                    })
+            });
+    // ⚠ Only a LIST we actually got answers this. A failed describe means "we
+    // could not look", which is not "the row is not there" — skipping on it
+    // would turn one flaky read into a restore that silently did nothing.
+    let missing: Vec<String> = visible_rows
+        .as_ref()
+        .map(|visible| {
+            session_paths
+                .iter()
+                .filter(|path| !vetoed.contains(path.as_str()) && !visible.contains(*path))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let missing_set: std::collections::HashSet<&str> =
+        missing.iter().map(String::as_str).collect();
     let candidates: Vec<&String> = session_paths
         .iter()
-        .filter(|path| !vetoed.contains(path.as_str()))
+        .filter(|path| !vetoed.contains(path.as_str()) && !missing_set.contains(path.as_str()))
         .collect();
 
     let mut restored = Vec::<String>::new();
@@ -22443,6 +22480,8 @@ pub fn run_app_control_restore_sessions(
         } else {
             Vec::<String>::new()
         },
+        "not_found_count": missing.len(),
+        "not_found": missing,
         "restorable": candidates.len(),
         "restored": restored,
         "failed": failed,

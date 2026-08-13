@@ -72,6 +72,15 @@ This file tracks user-visible changes in `yggterm`.
   still cannot serve emits `daemon/terminal_runtime/request_refused` naming
   which map held what — because the row list, the summary and the reveal log all
   reported that row as healthy, and there was no way to tell *gone* from *slow*.
+- **A restore checks the row exists before it spends a cold-open budget on it
+  (3.0.119).** 3.0.118 made it read the open's own error, which was necessary and
+  not sufficient: measured live, opening a row the sidebar cannot see is
+  ACCEPTED with no error at all and then simply never settles, so the row still
+  cost the full 90 s to report a timeout that named the wrong thing. One
+  `describe rows` for the whole batch now answers that up front, and those paths
+  come back under `not_found` instead. A describe that FAILS is treated as "we
+  could not look", never as "the row is not there" — the other reading turns one
+  flaky read into a restore that silently does nothing.
 - **A restore says "that row is not there" instead of waiting three minutes to
   say nothing (3.0.118).** `open` answers immediately, and by name, when a path
   resolves to no row — the ordinary outcome for a plain shell whose runtime was
