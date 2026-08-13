@@ -191,6 +191,75 @@ verified anything. Reading the PNG remains the only check.
 **Falsifier:** with the GUI unfocused, `screenshot --pid <gui>` returns a frame
 of that GUI, or refuses.
 
+## ⛔⛔ TWO CLUSTERS TAKE THE SAME VERSION NUMBER, AND A DEPLOY FROM A PRE-REBASE TREE SILENTLY REVERTS THE OTHER'S FIX
+
+**Status:** OPEN
+
+*Measured 2026-08-13 by cluster 6.2, which lost a full build → deploy → restart
+→ probe cycle to it and read a FALSE RED at the end.*
+
+`3.0.117`, `3.0.118` and `3.0.119` were each allocated **twice within minutes**
+by clusters working in parallel. Nothing arbitrates the number: a cluster reads
+`Cargo.toml`, adds one, and pushes; a second cluster that read the same file
+before the first push takes the same number. `deploy-fleet.sh` then does its job
+perfectly and prints `every copy on every host reads back at 3.0.118` — while
+two different builds are wearing that string across the fleet.
+
+**The compound failure, and it is the expensive part.** A cluster that built
+before rebasing deploys a binary that lacks the other's commit. That deploy
+lands over the first, the GUI hot-restarts onto it (a re-exec keeps the pid, so
+`/proc/<pid>/exe` still reads the clean path and nothing looks stale), and the
+first cluster's live probe then comes back **RED against a binary that never
+carried its fix**. The obvious reading of that result is *"my root cause was
+wrong"* — the single most expensive wrong conclusion available, since the
+correct response is to re-derive a diagnosis that was right all along.
+
+⇒ **The version is not an identity.** `--version` is what the census compares,
+so the census cannot see this at all; only `md5sum /proc/<gui>/exe` against the
+build you produced can. That check is documented in the yggui skill as a
+*caution about another agent*; the measurement here is that it is not an edge
+case but the **normal** state of a parallel campaign.
+
+**Wanted, in order of cost:**
+1. `deploy-fleet.sh` REFUSES a deploy whose `git rev-parse HEAD` is not a
+   descendant of `origin/main`, so a pre-rebase build cannot land at all. This
+   alone closes the reverting half.
+2. The build stamps its commit, and the census prints `version + short sha`, so
+   one number that means two builds is visible rather than silent.
+3. Allocating a version is a verb (`scripts/bump-version.sh`) that fetches,
+   takes the next number **after** `origin/main`'s, and pushes the bump alone —
+   a number taken from a stale file is the whole defect.
+
+**Falsifier:** two clusters bump and deploy in the same minute, and the fleet
+census can name which build is on the host.
+
+## ⛔ THE FILE THAT NAMES THE LIVE HOST EXISTS ONLY ON THE LIVE HOST
+
+**Status:** OPEN
+
+*Found 2026-08-13 by cluster 6.2, on `oc`.*
+
+`.agents/skills/yggui-app-control/SKILL.md` opens three of its recipes with
+`LIVE_HOST=$(cat .agents/config/live-host)`. `.gitignore` line 21 excludes
+`.agents/config/`, which is right — the alias is infrastructure and the repo is
+public — but the consequence is that the file is present **only on the machine
+whose name it holds**. Every other checkout gets `cat: .agents/config/live-host:
+No such file or directory`, and the recipe dies on its first line.
+
+⚠ **It is backwards exactly where it matters.** The standing directive is that
+sessions run on `dev`/`oc`, never on the desktop host — so the hosts that need
+to be *told* which host is live are precisely the ones that cannot read it, and
+the one host that could read it is the one that does not need to.
+
+**Wanted:** the skill resolves the live host through something every checkout
+has — `$YGG_GUI_HOST`, then the host with a live GUI client (which
+`ygg-claim.sh` already discovers for itself), and the ignored file only as an
+override. A recipe whose first line fails on every machine but one is not a
+recipe.
+
+**Falsifier:** run any `LIVE_HOST=` recipe from a fresh checkout on `dev` and it
+resolves.
+
 ## ⛔ deploy-fleet SSHes TO THE HOST IT IS ALREADY RUNNING ON
 
 **Status:** OPEN
@@ -3250,6 +3319,21 @@ at `hot_update_handoff_active` for four minutes with the same pid, never
 swapping — so the GUI was terminated and relaunched by hand. Rows went **48 →
 46**, and the two that did not come back were both **`remote-cc://` agent
 rows**: another cluster's live 6.7 row, and a 6.2 row.
+
+⭐ **SECOND SIGHTING, AND THE STATE NAMES THE GATE — 2026-08-13, GUI 3.0.116
+with 3.0.118 on disk.** `server app update restart` again answered and did
+nothing. `daemon_update_state` at that moment:
+`state: hot_update_handoff_active`, `hot_update_pending: true`,
+`hot_update_pending_reason: "session_survival_preserved_owner"`,
+`session_survival_required: true`, `preserved_owner_pids: [<one daemon>]`,
+`preserved_runtime_keys` holding 12 rows — **and `can_hand_off: true` in the
+same reply.** ⇒ The verb is not silently failing; it is deferring on preserved
+sessions, forever, while the field that says whether a handoff is possible reads
+`true`. Two fields answering opposite questions with no name to tell them apart
+is why this reads as "the verb did nothing". **Look at what clears
+`session_survival_preserved_owner`** — it is a gate that stays shut while any
+preserved owner exists, and on a machine that always has one it can never open,
+which is the shape the constitution forbids (`docs/spec-hot-restart-relay-gate.md`).
 
 ⚠ **The second half is worse than the loss.** `server app sessions restore` —
 the verb built for exactly this — refused both, answering `declined_closed` with
