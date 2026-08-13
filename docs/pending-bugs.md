@@ -561,6 +561,9 @@ System state: load 2.23 on an idle machine, **10 GB of 15 GB swap in use** with
 the likeliest explanation for the lagged, distorted notification audio reported
 in the same batch — the analog signal is not lagging, the machine is.
 
+⛔ **REFUTED 2026-08-13 — the audio has its own cause, and it is ours.** See the
+entry below; the swap explanation is not needed and does not fit the evidence.
+
 ⚠ **The reported "a million yggterm, a zillion WebKitWebProcess" is an
 instrument artefact, and naming it is part of the fix.** There is **one** GUI
 process and **four** `WebKitWebProcess`. htop lists threads by default and the
@@ -832,6 +835,59 @@ also live.
 
 **Falsifier:** spawn and tear down N remote sessions on a fresh daemon and count
 zombies. It must stay at zero.
+
+## ⛔ [6.7] YGGTERM HOLDS AN UNCORKED AUDIO STREAM OPEN FOREVER, WHICH IS THE DISTORTED NOTIFICATION AND A POWER DRAW
+
+**Status:** OPEN
+
+*measured 2026-08-13 — this REFUTES the swap-pressure explanation offered above*
+
+The batch attributed the lagged, distorted notification audio to swap pressure
+("the analog signal is not lagging, the machine is"). That is not what is
+happening. On a GUI relaunched **11 minutes** earlier, with 8 GB of RAM free and
+the GUI at 17% of a core — no pressure condition of any kind:
+
+```
+Sink Input #86796
+        Corked: no
+                application.name         = "Yggterm"
+                application.process.binary = "WebKitWebProcess"
+                media.name               = "Playback Stream"
+```
+
+**`Corked: no` is the finding.** The webview holds an **uncorked — actively
+streaming — playback stream open permanently**, with nothing playing. The
+WebAudio threads that serve it (`webaudioSrc:src`, `webaudioSrcTask`,
+`queue0:src`) are present on a fresh process and never go away.
+
+**Two costs, and they explain both reported symptoms:**
+
+1. **Power.** An uncorked stream keeps the audio graph running, so the pipeline
+   never suspends. The hardware sink does reach `SUSPENDED`, but the filter sink
+   in front of it reads `RUNNING` for as long as yggterm holds the stream. On a
+   laptop that is a continuous, entirely avoidable draw — and this cluster's
+   mandate names power explicitly.
+2. **The distortion.** Audio glitching is a missed real-time deadline, not a
+   memory condition. A stream held uncorked for hours and fed nothing will
+   underrun; when a notification finally arrives it plays through a pipeline
+   that has been starving, which is exactly "lagged and distorted". A pegged
+   main thread (92.6% of a core, see the entry above) makes the missed deadline
+   near-certain.
+
+⇒ **The audio item does NOT retire as a symptom of the memory bug.** It is a
+lifecycle defect of the same family as the unreaped `ssh` children and the
+never-released web contexts: a resource acquired and never given back.
+
+**The fix:** cork the stream when idle, or `suspend()` the `AudioContext`
+between notifications, or build it per notification and drop it after. Whichever
+— the steady state must be no stream.
+
+**Falsifier:** with no notification playing, `pactl list sink-inputs` must show
+no uncorked yggterm stream, and the filter sink must reach `SUSPENDED`.
+
+⚠ **Owner-verifiable half:** whether the notification *sounds* right after the
+fix needs an ear, not an instrument. The measurable half above is sufficient to
+build against and does not wait on that.
 
 ## ⛔⛔ [6.7] THE PRIVACY GUARD SCANS ALL OF HISTORY ON A NEW BRANCH, SO EVERY LANE PUSH FAILS AND TEACHES THE OVERRIDE
 
