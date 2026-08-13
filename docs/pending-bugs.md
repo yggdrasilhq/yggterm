@@ -11379,6 +11379,45 @@ create a row → remove it (tombstoning it) → web ensure --session <dead path>
 
 **Falsifier:** after `web ensure` on a tombstoned session path, either no surface
 is alive, or a row exists for it.
+
+## ✅ THE NAMED SEQUENCE IS NOW REFUSED — fix (b) shipped, measured 2026-08-13
+
+Ran the entry's own sequence on the live host under a granted window: create a
+row → `session remove` it (tombstoning it) → `web ensure --session <dead path>`.
+
+```
+accepted: false
+detail: "…'s row was closed by the user and its runtime is gone, so reviving a
+         web surface under it would give you a live page with no row the user
+         can see or click into. Create your own session … and drive its surface
+         instead"
+```
+
+⇒ **The refusal restates this entry's own justification**, so option (b) was the
+one taken. ⭐ **No surface came into being at all** — `agent_leases: 0`,
+`active_surface_requests: 0` after the attempt — so the check cost nothing and
+touched no profile.
+
+**Control, same run:** a session path that never existed refuses with a
+*different* reason (`the daemon has no web-surface declare for …`), so the verb
+is discriminating between cases rather than refusing everything by default.
+
+⚠ **TWO THINGS THIS DOES NOT CLOSE, and the entry stays open for them.**
+
+1. **Option (a) was not implemented.** A surface holding a lease does not keep or
+   resurrect a row; the orphan is prevented at one door rather than made
+   unrepresentable. The constitution's UX test — the user can SEE an agent's
+   session and click in to co-browse it — is met here by refusal, not by the row
+   surviving.
+2. **The other sequence is untested:** removing a row that ALREADY has a live
+   surface. `web ensure` refuses a dead path, but nothing here shows what happens
+   to a live surface when its row is removed underneath it. That needs a
+   web-capable row (a plain shell has no declare at all — the control above says
+   so), so it creates a real browser surface and wants its own window and an
+   `agent-<n>` profile.
+
+**Falsifier for what remains:** remove a row whose surface is live, and no
+surface survives without a row.
 ## ★★★ web do FIDELITY ON RE-RENDERING DOMs
 
 **Status:** OPEN
