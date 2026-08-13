@@ -74,6 +74,80 @@ rather than disagreement.** This generalises well past this one field, and it is
 the failure §7's own advice ("read state back") walks you straight into if you
 read it back *later*.
 
+### ⛔⛔ A WRITE TO THE ROW TABLE IS NOT VISIBLE TO YOUR VERY NEXT READ — measured 2026-08-13
+
+**`session rename` answers `accepted: true` synchronously. The row table does not carry the new
+title on the next call.** Six rows were renamed in one batch; the `rows` read issued immediately
+afterwards showed **all six unchanged**. A second read moments later showed **all six correct.
+Nothing was re-sent in between.**
+
+⇒ **AN IMMEDIATE READ-BACK IS A FALSE NEGATIVE, and it is the most dangerous kind, because §7 has
+just finished telling you to read state back.** Reading back is still right; reading back *in the
+same breath* measures the lag, not the write. **Put a round trip between the write and the check**
+— and if the check fails, **read again before you write again.**
+
+**⛔ AND THE COROLLARY IS A REAL CORRUPTION, NOT JUST A WASTED CALL: NEVER ISSUE `rename` AND
+`outline` BACK TO BACK.** `outline` composes the prefix onto the title **it can currently see** —
+which, inside the lag window, is the OLD one — and writes the composed string back into
+`session_title`. Reproduced live, in exactly two calls:
+
+```
+rename  → "ychrome: the vendor-console surface for row 4.2"   accepted: true
+outline → 4.2.1                                              (composes onto the STALE title)
+rows    → session_title = "4.2.1 Agent unnamed shell"    ⛔ the number is now IN the title,
+                                                            and the rename is gone
+```
+
+That is the **double-numbering** hazard `ygg-claim.sh` documents in its own comments, arriving by a
+route the comments do not name: not from an author writing the seat into the title on purpose, but
+from **two correct writes racing each other**. The composed string is now the stored title, so the
+sidebar renders `3.4.1 3.4.1 …` the moment the prefix is composed again.
+
+⇒ **rename, read back until it holds, THEN outline.** `ygg-claim.sh` gets this right by accident —
+it re-asserts the title on a watch loop, which absorbs the lag. **Hand-driving the two verbs does
+not.**
+
+### ⛔⛔ `sessions sort --dry-run` REPORTS `changed:false` ON A LIST THAT IS NOT SORTED
+
+**Measured 2026-08-13, twice, and it is a FALSE NEGATIVE in the one instrument that exists to
+answer "is the sidebar order right?".**
+
+An orchestrator's cluster row sat visibly out of place — seat `3.2` rendered *above* `3.0` and
+`3.1`. Sampled **simultaneously** (both verbs launched in one shell, per the warning above about
+comparing reads taken at different moments):
+
+| instrument | answer |
+|---|---|
+| `server app rows` | `2.0 2.1` **`3.2`** `3.0 3.1 3.3 3.4` — wrong, and it matches the screen |
+| `sessions sort --dry-run` | `changed: false`, and a `rendered_order` listing `3.2` **in the right place** |
+| `sessions sort` (apply) | **`changed: true`** — and the row moved. Order correct afterwards |
+
+⇒ **The dry run reports the order it WOULD PRODUCE as though it were the order that EXISTS**, so it
+can answer "already sorted" about a sidebar it is looking straight at being wrong. This is §7's law
+in its purest form — *the verb answered about the request, not the effect* — and the verb's own
+help text closes the trap: *"sorting a sorted list reports `changed:false` — which is the success
+case, not a no-op to chase."* **That sentence is true of a real sort and false of the dry run**, and
+it instructs you to stop looking at precisely the moment you should look harder.
+
+**⇒ THE RULES:**
+- ⛔ **Never diagnose row order with `--dry-run`.** For this verb the dry run cannot report a
+  disagreement it is itself the source of. **Compare `rows` against the numbering yourself**, or
+  just run the apply — it is idempotent and it tells the truth.
+- ⭐ **RUN `sessions sort` (the APPLY) AS THE LAST ACT OF ANY SPAWN BATCH.** §1 already says a new
+  row lands at the head and *"repair it in the same breath as the spawn — never later, never
+  leaving it for the human."* This is the verb that does it, and until 2026-08-13 nothing in this
+  skill named it for that job — so every orchestrator re-derived the repair by hand, or skipped it.
+  ⚠ **Unless a human has dragged a row themselves** (§1) — a manual placement outranks the numbers,
+  and a blind sort will silently undo it.
+
+⚠ **AND THE ORIGINAL DISPLACEMENT IS STILL UNEXPLAINED — say so rather than inventing a cause.**
+The create reported `seat.honoured: true` and the row was wrong anyway. The obvious hypothesis —
+that an *unnumbered* row sitting above the numbered block shifts the insert index — was **tested
+and REFUTED**: with an unnumbered row deliberately parked at the head, a probe created with
+`--outline 3.8` landed exactly where it belonged (`seated_after` correct, `live_index` correct).
+So the seat arithmetic handles that case. **What moved the row remains unmeasured**, and it belongs
+to whoever owns sidebar truth — route it, do not guess it.
+
 ### ⛔ CLAIM YOUR ROW AS YOUR FIRST ACT ON A CAMPAIGN — do not wait to be asked
 
 **A session that starts long-lived work owns its own identity.** A row born with
@@ -694,6 +768,43 @@ The delegate's own later claim is then a harmless no-op — a row that already h
 ⚠ `--outline` takes a LITERAL string: shell arithmetic like `5.$(…)` has seated rows at `5.5`
 instead of `5.2.5`, one of them colliding with a live row. Pass `5.2.5` literally and read the seat
 back.
+
+**①b ⛔⛔ "EVERY SESSION YOU SPAWN" INCLUDES THE ONES THAT ARE NOT AGENTS — libyggterm APP ROWS AND
+BARE SHELLS TOO.** Owner-directed 2026-08-13, and it was never written down before, which is why
+the sidebar kept filling with rows called **`New Ychrome`**, **`New Yedit`** and **`Agent unnamed
+shell`**.
+
+**A row is a row.** When a working row opens a browser surface, a document surface or a helper
+shell, that surface **gets a sub-seat under its owner and a title that says what it is for** —
+exactly like a delegate:
+
+```sh
+# row 4.2 opens the browser surface it is going to drive:
+ygg server app session rename  "$APP_ROW" "ychrome: the vendor-console surface for row 4.2"
+#  … read the title back (see the write-visibility lag above) …
+ygg server app session outline "$APP_ROW" 4.2.1
+```
+
+⭐ **The seat is `N.x.y` — the owner's seat plus a sub-number**, so the surface sits under the row
+that opened it and a human can see at a glance *whose browser that is*. Same law as everywhere
+else: **the number lives in `outline_prefix` ONLY, never in the title.**
+
+**Why this is not cosmetic.** Measured on one sidebar the day this was written: **five rows named
+`New Ychrome`, one `New Yedit`, one `Agent unnamed shell`** — and reading their screens showed they
+were *not interchangeable at all*: one was a live browser part-way through a multi-step form on a
+vendor console, one was a search engine open under a different campaign's browser profile, and
+**four were bare `/bin/bash` at `~` that had never been used.**
+⇒ **the default label names the LAUNCH VERB, not the JOB**, so
+every one of them reads as the same row. The one you must not close and the four that are litter
+are visually identical, and the only way to tell them apart is to read seven screens.
+
+⚠ **A default title is worse than no title**, because it looks deliberate. `New Ychrome` claims to
+describe the row and does not, and it is *stable across every launch* — so a human scanning the
+sidebar cannot even use novelty as a signal.
+
+⇒ **The duty is the spawner's, at spawn, in the same breath** — not the app's, and not "later".
+A surface opened and left unnamed is the same defect as a delegate left unclaimed (①), and it fires
+far more often because opening a browser does not feel like spawning a session.
 
 **② ⛔ RETIRING THE ROW DOES NOT KILL THE PROCESS — and a finished delegate does not exit.** An
 agent CLI sits at its prompt forever after its last turn. `session remove` can answer
