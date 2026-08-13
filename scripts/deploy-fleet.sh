@@ -10,23 +10,72 @@
 # An agent's discipline resets every session; a verb's does not.
 #
 #   scripts/deploy-fleet.sh [--from <dir>] [--hosts "dev guihost oc"] [--dry-run]
+#                           [--allow-behind]
 #
-# `--from` defaults to target/release. Build it from a CLEAN tree: this script
-# refuses a dirty source checkout, because a shared checkout routinely holds
-# another session's in-flight work and a deploy must never ship it.
+# `--from` defaults to target/release. The tree it was built from must be a
+# DESCENDANT OF `origin/main` — see the refusal below — and a dirty checkout is
+# named in a warning, because a shared checkout routinely holds another
+# session's in-flight work.
 set -uo pipefail
 
 FROM="target/release"
 HOSTS="dev guihost oc"
 DRY=0
+ALLOW_BEHIND=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from) FROM="$2"; shift 2;;
     --hosts) HOSTS="$2"; shift 2;;
     --dry-run) DRY=1; shift;;
+    --allow-behind) ALLOW_BEHIND=1; shift;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
+
+# ⛔⛔ A DEPLOY FROM A PRE-REBASE TREE SILENTLY REVERTS ANOTHER CLUSTER'S FIX.
+# Measured 2026-08-13: `3.0.117`–`3.0.120` were each allocated TWICE within
+# minutes by clusters working in parallel, because nothing arbitrates a version
+# number — read `Cargo.toml`, add one, push. A cluster that built before
+# rebasing then deploys a binary lacking the other's commit; this script does
+# its job perfectly and prints "every copy on every host reads back at 3.0.118"
+# while two different builds wear that string. The GUI hot-restarts onto the
+# older one by re-exec, so the pid is unchanged and `/proc/<pid>/exe` still
+# reads clean, and the first cluster's live probe comes back RED against a
+# binary that never carried its fix. Reading that as "my root cause was wrong"
+# is the single most expensive wrong conclusion available.
+#
+# ⇒ The version cannot detect this and never could. Ancestry can, before the
+# damage: if `origin/main` is not an ancestor of HEAD, this build is missing
+# commits that are already shared, and shipping it un-ships them.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_COMMIT="unstamped"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  BUILD_COMMIT=$(git -C "$REPO" rev-parse --short=12 HEAD)
+  DIRT=$(git -C "$REPO" status --porcelain | head -5)
+  if [ -n "$DIRT" ]; then
+    echo "⚠ the source checkout is dirty — the build may carry work that is not in any commit:"
+    echo "$DIRT" | sed 's/^/    /'
+    git -C "$REPO" status --porcelain | tail -n +6 | head -1 | grep -q . && echo "    … and more"
+  fi
+  if git -C "$REPO" fetch --quiet origin main 2>/dev/null; then
+    UPSTREAM=$(git -C "$REPO" rev-parse FETCH_HEAD)
+  else
+    UPSTREAM=$(git -C "$REPO" rev-parse origin/main 2>/dev/null || echo "")
+    [ -n "$UPSTREAM" ] && echo "⚠ could not reach origin — ancestry is checked against the LAST FETCH, which may be stale"
+  fi
+  if [ -n "$UPSTREAM" ] && ! git -C "$REPO" merge-base --is-ancestor "$UPSTREAM" HEAD; then
+    echo "⛔ REFUSING: HEAD ($BUILD_COMMIT) is not a descendant of origin/main." >&2
+    echo "   This build LACKS commits that are already on main, and deploying it" >&2
+    echo "   reverts them on every host — under a version number that will look" >&2
+    echo "   correct in the census and in --version. Missing:" >&2
+    git -C "$REPO" log --oneline "HEAD..$UPSTREAM" | head -20 | sed 's/^/     /' >&2
+    echo "   Fix: git pull --rebase origin main && rebuild && re-run this." >&2
+    echo "   (--allow-behind exists for bisecting an old build onto a host, and" >&2
+    echo "    for nothing else; the census names the commit either way.)" >&2
+    [ "$ALLOW_BEHIND" = 1 ] || exit 1
+    echo "⚠ --allow-behind: proceeding with a build that is behind origin/main" >&2
+  fi
+fi
 
 GUI="$FROM/yggterm"
 HL="$FROM/yggterm-headless"
@@ -44,7 +93,7 @@ HL_V=$("$HL" --version 2>/dev/null)
   echo "   Build both from the same tree in one command." >&2
   exit 1; }
 VERSION="$GUI_V"
-echo "deploy-fleet: $VERSION from $FROM → $HOSTS"
+echo "deploy-fleet: $VERSION ($BUILD_COMMIT) from $FROM → $HOSTS"
 
 GUI_SUM=$(md5sum "$GUI" | awk '{print $1}')
 HL_SUM=$(md5sum "$HL" | awk '{print $1}')
@@ -101,7 +150,12 @@ done
 # ⛔ VERIFY BY READ-BACK, NOT BY THE COPY REPORTING SUCCESS. Every row verb on
 # this project reports the REQUEST rather than the EFFECT; a deploy that trusts
 # its own `mv` is the same mistake with worse blast radius.
-echo "deploy-fleet: census"
+# ⚠ THE VERSION COLUMN CANNOT IDENTIFY A BUILD — the md5 column is what does.
+# Two clusters spend the same version number routinely, so a copy whose md5 is
+# not one of the two below is a DIFFERENT build wearing the same string, and
+# that is the whole defect this verb was taught to see.
+echo "deploy-fleet: census — this build is $VERSION from commit $BUILD_COMMIT"
+echo "              gui=${GUI_SUM:0:10}  headless=${HL_SUM:0:10}  (any other md5 is another build)"
 for host in $HOSTS; do
   echo "  == $host =="
   cen='for p in $HOME/.local/bin/yggterm $HOME/.local/bin/yggterm-headless \
@@ -112,6 +166,7 @@ for host in $HOSTS; do
 done
 
 if [ "$FAILED" != 0 ]; then echo "⛔ deploy-fleet: at least one copy did not read back"; exit 1; fi
-echo "deploy-fleet: every copy on every host reads back at $VERSION"
+echo "deploy-fleet: every copy on every host reads back at $VERSION ($BUILD_COMMIT)"
+echo "  On the host, ask a binary which source it is: yggterm --build-commit"
 echo "⚠ The daemons do NOT swap here. Each retires onto the new binary on its own"
 echo "  poll once its own sessions allow it — that is the constitution, not a bug."
