@@ -9,6 +9,33 @@ and referenced from here.
 says the answer changed.
 
 
+## ⛔⛔ A PUBLISHED LEAK IS THE RELAY'S PROBLEM, NOT AN OWNER GATE (2026-08-13)
+
+**Settled by the owner.** Private terms already public in a repo's history are
+**removed**, orphans are not left behind, and a support ticket is filed where one
+is needed. ⛔ **This is not a decision to park** — a leak does not belong in
+[`owner-attention.md`](owner-attention.md), and the relay decides, records, and
+acts.
+
+⇒ **It reverses the recommendation that was on file.** That entry asked him to
+choose between rewriting published history and accepting the terms, and
+recommended *accept and stop the bleeding forward* on the grounds that a rewrite
+buys little once terms are indexed. The call went the other way. The entry was
+pruned when this was recorded, per that file's own rule that the relay prunes
+what it answers.
+
+**What is still genuinely his**, and stays in `owner-attention.md`: the GitHub
+Support ticket, because only he can chase a third party.
+
+⚠ **What the ruling does NOT decide is the TIMING**, and that half is the
+orchestrator's. A rewrite force-pushes published history, so every clone and
+worktree on every host must be reset afterwards or its commits become orphans —
+which is how 34 commits were lost on a sibling repo. ⇒ **The window is named by
+the orchestrator after the affected lanes have landed**, never chosen by the
+cluster doing the rewrite, and never inferred from which rows *look* idle. A
+clean working tree with a live agent in it is indistinguishable from an idle
+repo, and reading one as the other is the mistake this note exists to prevent.
+
 ## ⛔⛔ THE yggterm PHONE — FOUR CALLS SETTLED IN ONE SITTING (2026-08-10)
 
 **Settled by the owner** in the session that closed ADR-0001. Facts and the
