@@ -96,6 +96,20 @@ impl RowArrangement {
         self.detached.insert(member.to_string());
     }
 
+    /// Forget every answer the hand gave about `member`, so its SEAT decides
+    /// again.
+    ///
+    /// ⛔ **THE WAY BACK, and without it the arrangement is a one-way door.**
+    /// Both `attach` and `detach` are sticky by design — a row dragged out that
+    /// its seat re-adopted on the next frame would make the gesture look
+    /// broken. The cost of that stickiness is that nothing returns a row to the
+    /// default, so a hand-arranged sidebar could never be handed back to the
+    /// numbering it came from.
+    pub fn clear(&mut self, member: &str) {
+        self.sets.detach(member);
+        self.detached.remove(member);
+    }
+
     /// Forget every answer about rows that are no longer on the sidebar.
     ///
     /// Returns true when anything changed, so a caller can skip a persist it
@@ -515,6 +529,26 @@ mod tests {
             visible(&sets, &["orch", "gate", "ux"]),
             vec![("orch".into(), 0), ("ux".into(), 1), ("gate".into(), 0)]
         );
+    }
+
+    /// ⛔ THE WAY BACK. `attach` and `detach` are both sticky, so without this a
+    /// hand-arranged row could never be handed back to its seat.
+    #[test]
+    fn clearing_a_rows_answer_returns_it_to_its_seat() {
+        let mut arrangement = RowArrangement::default();
+        arrangement.detach("gate");
+        let seats = || rows(&[("orch", "6.0"), ("gate", "6.1")]);
+        let loose = sidebar_row_sets(seats(), &arrangement, &HashSet::new());
+        assert_eq!(loose.parent_of("gate"), None, "the hand's answer stands");
+
+        arrangement.clear("gate");
+        let restored = sidebar_row_sets(seats(), &arrangement, &HashSet::new());
+        assert_eq!(
+            restored.parent_of("gate"),
+            Some("orch"),
+            "and once forgotten the seat decides again"
+        );
+        assert!(!arrangement.answered("gate"));
     }
 
     /// A hand cannot tie a knot the model refuses, and the refusal costs the
