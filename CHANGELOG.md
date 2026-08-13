@@ -4,6 +4,38 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A cwd folder no longer lists its live rows upside down (3.0.116).** A folder
+  holding several live local agent sessions showed them in an order nobody could
+  name. It was reported as the start page's defect — alphabetical by session
+  uuid — and the tie-break blamed for it had never decided an order: that
+  function emits group headers only, and two sessions sharing a cwd produce the
+  same header, so the second is discarded before the tie-break can matter. The
+  real cause is one function over. Every row destined for the same folder shares
+  an insert point, and the insertion runs back-to-front so earlier indices
+  survive later inserts — but the tie ran forward, so each row pushed its
+  predecessor down and the folder came out exactly reversed. Reversed is not a
+  harmless permutation: it is the user's own Live Sessions numbering, upside
+  down. Rows now sort most-recently-used first, over the same epoch map the
+  start page orders by, with the Live Sessions order as the tie-break — which is
+  load-bearing, because a purely local live row has no scan to timestamp it and
+  the epoch is 0 for the whole folder. Found in passing: a fresh profile
+  projected a live session's folder into the tree with **nothing inside it**;
+  the folder scaffolding is now filled by the same injector every other path
+  uses.
+- **App control can type into the shell's own chrome (3.0.116).**
+  `server app chrome type <selector> --data <text> [--clear] [--enter]
+  [--assert <selector>@<attribute>]`. Nothing could do this: the terminal probes
+  target a PTY, the web verbs drive a contributed app's page, and pointer
+  commands reach a coordinate — so a chrome affordance could be proven to render
+  and never proven to work, which is the state the start page's search box
+  shipped in. The write goes through the native value setter plus a bubbling
+  `input` event, because a framework-controlled field can swallow a plain
+  property assignment before any listener hears it. `--assert` samples an
+  attribute before the keystroke and again after the render settles **inside one
+  evaluation**: two reads taken at two different moments cannot prove a field
+  drove a re-render, since the difference between them may be time rather than
+  the typing. The reply carries `value_before`/`value_after` so that
+  `accepted:true` on a field that refused the input cannot read as success.
 - **A row whose runtime the daemon owns can be opened again (3.0.114).** Some
   rows would not restore, and restarting did not recover them — the same rows
   failed the same way, forever. The cause is a resolver that answers with a name

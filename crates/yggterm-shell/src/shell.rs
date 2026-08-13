@@ -36853,6 +36853,7 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
             | AppControlCommand::ProbeTerminalViewportInput { .. }
             | AppControlCommand::ProbeTerminalViewportScroll { .. }
             | AppControlCommand::ProbeTerminalContextMenu { .. }
+            | AppControlCommand::ProbeChromeInput { .. }
             | AppControlCommand::RemoveSession { .. }
             | AppControlCommand::SetSessionKeepAlive { .. }
             | AppControlCommand::SetRowExpanded { .. }
@@ -61761,6 +61762,155 @@ async fn probe_terminal_viewport_input_for(
         }),
     }
 }
+/// Type into a shell chrome field and report what the DOM actually holds.
+///
+/// The reply is deliberately a BEFORE/AFTER pair on both the field and the
+/// assertion, because the only interesting question is whether the keystroke
+/// moved anything. `accepted:true` with `value_before == value_after` is a
+/// field that refused the input, and that must not read as success.
+fn chrome_input_probe_script(
+    selector: &str,
+    data: &str,
+    clear: bool,
+    press_enter: bool,
+    assert_selector: Option<&str>,
+    assert_attribute: Option<&str>,
+) -> String {
+    let json = |value: &str| serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+    let selector_literal = json(selector);
+    let data_literal = json(data);
+    let assert_selector_literal = assert_selector.map(json).unwrap_or_else(|| "null".into());
+    let assert_attribute_literal = assert_attribute.map(json).unwrap_or_else(|| "null".into());
+    format!(
+        r#"
+        (() => {{
+            const selector = {selector_literal};
+            const data = {data_literal};
+            const assertSelector = {assert_selector_literal};
+            const assertAttribute = {assert_attribute_literal};
+            const clear = {clear};
+            const pressEnter = {press_enter};
+            const out = {{
+                verb: 'probe_chrome_input',
+                selector: selector,
+                assert_selector: assertSelector,
+                assert_attribute: assertAttribute,
+            }};
+            const readAssert = () => {{
+                if (!assertSelector || !assertAttribute) return null;
+                const node = document.querySelector(assertSelector);
+                if (!node) return null;
+                return node.getAttribute(assertAttribute);
+            }};
+            try {{
+                const matches = document.querySelectorAll(selector);
+                out.matched = matches.length;
+                const el = matches[0];
+                if (!el) {{
+                    out.accepted = false;
+                    out.reason = 'no_element_matched_selector';
+                    dioxus.send(out);
+                    return;
+                }}
+                out.tag = String(el.tagName || '').toLowerCase();
+                if (typeof el.value === 'undefined') {{
+                    out.accepted = false;
+                    out.reason = 'element_has_no_value_property';
+                    dioxus.send(out);
+                    return;
+                }}
+                out.assert_found = Boolean(!assertSelector || document.querySelector(assertSelector));
+                out.value_before = String(el.value === null ? '' : el.value);
+                const assertBefore = readAssert();
+                out.assert_before = assertBefore;
+                el.focus();
+                const next = clear ? data : out.value_before + data;
+                // ⛔ The NATIVE setter, not `el.value = next`. A
+                // framework-controlled input is patched by its interpreter, and
+                // a plain property assignment can be swallowed before any
+                // listener hears it. This is what a keystroke looks like from
+                // the listener's side.
+                const proto = (typeof HTMLTextAreaElement !== 'undefined'
+                    && el instanceof HTMLTextAreaElement)
+                    ? HTMLTextAreaElement.prototype
+                    : HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (setter && setter.set) {{
+                    setter.set.call(el, next);
+                }} else {{
+                    el.value = next;
+                }}
+                out.value_written = next;
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                if (pressEnter) {{
+                    el.dispatchEvent(new KeyboardEvent('keydown', {{
+                        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+                    }}));
+                }}
+                // Settle. The re-render is a round trip out to Rust and back,
+                // so ONE frame is not enough and a fixed sleep is a guess; wait
+                // for the assertion to move, and say how long it took.
+                let frames = 0;
+                const settle = () => {{
+                    frames += 1;
+                    const assertNow = readAssert();
+                    const moved = assertSelector ? assertNow !== assertBefore : false;
+                    if (moved || frames >= 90) {{
+                        out.accepted = true;
+                        out.value_after = String(el.value === null ? '' : el.value);
+                        out.value_changed = out.value_after !== out.value_before;
+                        out.assert_after = assertNow;
+                        out.assert_changed = assertSelector ? moved : null;
+                        out.settle_frames = frames;
+                        dioxus.send(out);
+                        return;
+                    }}
+                    requestAnimationFrame(settle);
+                }};
+                requestAnimationFrame(settle);
+            }} catch (error) {{
+                out.accepted = false;
+                out.error = error && error.message ? error.message : String(error);
+                dioxus.send(out);
+            }}
+        }})();
+        "#
+    )
+}
+
+async fn probe_chrome_input_for(
+    selector: &str,
+    data: &str,
+    clear: bool,
+    press_enter: bool,
+    assert_selector: Option<&str>,
+    assert_attribute: Option<&str>,
+) -> Value {
+    let script = chrome_input_probe_script(
+        selector,
+        data,
+        clear,
+        press_enter,
+        assert_selector,
+        assert_attribute,
+    );
+    let mut eval = document::eval(&script);
+    match tokio::time::timeout(Duration::from_millis(4_000), eval.recv::<Value>()).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => json!({
+            "accepted": false,
+            "selector": selector,
+            "error": error.to_string(),
+        }),
+        Err(_) => json!({
+            "accepted": false,
+            "selector": selector,
+            "error": "probe_chrome_input_eval_timeout",
+        }),
+    }
+}
+
 fn terminal_external_input_read_nudge_script(session_path: &str, reason: &str) -> String {
     let session_path_literal =
         serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
@@ -78378,6 +78528,42 @@ async fn process_pending_app_control_requests(
                     .filter(|accepted| !accepted)
                     .and_then(|_| result.get("reason"))
                     .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::ProbeChromeInput {
+            selector,
+            data,
+            clear,
+            press_enter,
+            assert_selector,
+            assert_attribute,
+        } => {
+            let result = probe_chrome_input_for(
+                &selector,
+                &data,
+                clear,
+                press_enter,
+                assert_selector.as_deref(),
+                assert_attribute.as_deref(),
+            )
+            .await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| {
+                        result
+                            .get("reason")
+                            .or_else(|| result.get("error"))
+                            .and_then(Value::as_str)
+                    })
                     .map(ToOwned::to_owned),
                 data: Some(result),
             }

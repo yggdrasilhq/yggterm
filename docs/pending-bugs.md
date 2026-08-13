@@ -219,22 +219,51 @@ sidebar's own instance of this entry's defect:
 |---|---|---|
 | local agent sessions in a cwd folder (`build_local_cwd_tree`) | `modified_epoch_ms` desc | ✅ recency, real scanner epochs |
 | remote scanned sessions (`sort_remote_scanned_sessions_by_recency`) | `modified_epoch` desc, then `started_at` | ✅ recency, real scan epochs |
-| **local LIVE session rows** (`synthetic_local_live_session_rows`) | **`cwd`, then `session_path`** | ⚠ **uuid within a group** |
+| **local LIVE session rows** (`inject_cc_sessions_into_stored_rows`) | **the REVERSE of the Live Sessions order** | ⚠ **fixed 3.0.116, live proof owed** |
 
-⇒ **The third is the same shape as the bug this entry opened with.** Its PRIMARY
-sort by cwd is structural and must stay — the function emits a group header each
-time the cwd changes, so sorting by anything else first would shatter the
-grouping. But the tie-break INSIDE one cwd group is `session_path.cmp()`, which
-for `local://<uuid>` rows is alphabetical by uuid. A folder holding several live
-local sessions therefore lists them in an order that means nothing, exactly as
-the start page did.
+⇒ **The third was the same shape as the bug this entry opened with — but not in
+the place this table first named, and the correction is the interesting part.**
 
-**Not fixed here, and deliberately so:** the fix needs a last-used epoch for a
-live row, which is the `start_page_scanned_last_used_epochs` lookup — and
-`synthetic_local_live_session_rows` is not handed the snapshot that lookup reads.
-Threading it through is a real change to the sidebar row builder, not a tweak,
-and it wants its own build-and-prove cycle rather than being tacked onto this
-one.
+The row above used to read `synthetic_local_live_session_rows` / `cwd, then
+session_path` / *uuid within a group*. **That function emits GROUP HEADERS
+ONLY.** Two sessions sharing a cwd produce identical group paths and the second
+is swallowed by `emitted_groups`, so its `session_path` tie-break was
+unobservable in its own output and had never decided an order at all. It read
+exactly like the cause, which is why it was filed as one; a reader who fixed
+that line would have changed nothing and believed the entry closed. It is now
+deleted, with a comment at the site saying why, so the next reader is not sent
+back to it.
+
+The order was decided one function over, in `inject_cc_sessions_into_stored_rows`.
+Every row destined for the SAME cwd group gets the SAME insert point, and the
+loop inserts back-to-front so earlier indices survive later insertions — but the
+tie ran FORWARD. So the first row was inserted first and each successor pushed it
+down: **the folder came out in exactly reverse order.** Not uuid order — the
+user's own Live Sessions outline, upside down, which reads as no order at all.
+
+⭐ **Measured, not reasoned.** With the fix reverted, the new test
+`live_rows_in_a_cwd_group_order_by_recency_then_live_sessions_order` answers
+`["three","two","one"]` for an input of one, two, three. Its fixture makes all
+four candidate orders disagree — input, uuid-alphabetical, reversed-input and
+recency are four different sequences — so whichever appears is diagnostic on its
+own, and the expected answer can never be what the bug happens to produce.
+
+**Fixed in 3.0.116.** Rows sort most-recently-used first, over the SAME epoch map
+the start page orders by (`scanned_last_used_epochs_by_session_id`, one
+implementation, two callers, so the surfaces cannot disagree about what recent
+means). The tie-break is the Live Sessions order. ⚠ **That tie-break is
+load-bearing, not decoration:** a purely local live row has no scan to timestamp
+it, so the epoch is 0 for every row in the folder and the TIE-BREAK is what
+actually orders it — see [[finding-an-unknown-default-sorts-as-a-value]]. It must
+stay something a reader can name.
+
+**Found while fixing it:** the synthetic branch emitted the folder scaffolding
+and stopped, projecting a live session's cwd folder into the tree **with nothing
+inside it** — the session was reachable under Live Sessions only. It now fills
+that scaffolding through the same injector the stored-row path uses, so live
+session rows have ONE owner and a fresh profile cannot order a folder differently
+from an established one. The existing test asserted the row appeared once and was
+pinning that gap; two is what [[spec-active-sessions-dual-presence]] asks for.
 
 ⚠ **Scope note, so the next reader does not "fix" the wrong thing:** the **Live
 Sessions group** is ordered by the user's own outline numbers (`server app
@@ -261,12 +290,17 @@ job is picking a session".
   teal, where before it took the theme accent like six other CLIs.
 - ✅ **The search box renders**, placeholder `Search title, summary, path`.
 
-⚠ **What is still owed, and it is narrow:** a LIVE keystroke into that box. The
-matching itself is the sidebar's already-shipped `row_matches_search`, and the
-wiring is unit-tested, but app-control has no verb that types into a shell DOM
-field — only `server app terminal probe-type`, which targets a PTY. ⇒ **This is
-the entry's remaining work**, and it wants either that verb or a Dioxus-level
-test that drives the signal.
+⚠ **What is still owed, and it is narrow:** a LIVE keystroke into that box, and
+the live proof of the sidebar ordering above. The matching itself is the
+sidebar's already-shipped `row_matches_search` and the wiring is unit-tested.
+The verb that was missing — nothing in app-control could type into a shell DOM
+field — **is built in 3.0.116**: `server app chrome type <selector> --data
+<text> [--assert <selector>@<attribute>]`. It writes through the native value
+setter and dispatches a bubbling `input` event, then samples the assertion
+before the keystroke and again after the render settles **inside one
+evaluation**, because two reads taken at two different moments cannot prove a
+field drove a re-render — the difference between them may be time rather than
+the typing.
 
 **Falsifier for the remainder:** type a word that appears ONLY in a session's
 generated summary — never in its title, cwd or host — and that session is the
