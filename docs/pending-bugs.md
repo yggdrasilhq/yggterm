@@ -29,42 +29,6 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
-## ⚠ NOTHING CALLS `sync-terms`, SO THE PRIVACY GUARD'S WORDLIST CAN DRIFT AGAIN BETWEEN RUNS
-
-**Status:** OPEN
-
-*Opened 2026-08-13 as the residue of a fixed defect: the drift itself was measured, repaired and
-made self-reporting, but only a hand-typed verb reconciles it.*
-
-The pre-push privacy guard is a fleet-synced binary whose **answer key is not synced with it** — the
-wordlist deliberately lives outside every repo, so no repo sync carries it and the binary sync does
-not know it exists. It had silently diverged: one host held the full list, the others a strict
-subset three days stale, so a set of names was unguarded on most of the fleet while every scan there
-printed a green tick.
-
-**What already shipped** (so this entry is only about the residue): the list is reconciled and
-identical everywhere; every scan now prints a wordlist **fingerprint** beside the count, so two
-hosts are comparable at a glance and a same-size-but-different list is still visible; a missing or
-empty wordlist is now a **refusal** rather than a warning followed by a tick; and the chore is a
-verb, `sync-terms`, which merges by **union** and reads every host back.
-
-**What is open:** nothing invokes that verb. Between manual runs the lists can diverge again, and
-the fingerprint only reveals it to someone who compares two terminals. ⇒ Wire it into whatever
-already reconciles per-host tooling across the fleet, so the reconciliation happens on the same
-schedule as everything else.
-
-⛔ **The trap to preserve for whoever wires it up: the merge must stay a UNION.** Newest-mtime-wins
-is correct for a binary and catastrophic for a wordlist — it lets a host whose file is merely newer
-(touched, restored from an old backup, written by a session that never had the full list) delete
-terms everywhere, which is exactly the failure the guard exists to prevent, arriving dressed as a
-successful sync. A union cannot lose a term; deliberate removal is a separate explicit flag.
-
-⭐ **And the general law this is an instance of, which is why it was worth the detour:** *a verifier
-reports CLEAN for a term it does not have for exactly the same reason it reports CLEAN for a term
-that is genuinely absent.* Printing the count was already there and was not enough, because nobody
-compares a number on one terminal against a number on another. An absence has to describe its own
-boundary in a form that is **comparable**, not merely present.
-
 ## ⛔⛔ [6.1] SOME ROWS WILL NOT RESTORE, AND A RESTART DOES NOT RECOVER THEM
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
