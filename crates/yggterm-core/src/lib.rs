@@ -1467,6 +1467,39 @@ pub fn screen_text_shows_agent_working(sample: &str) -> bool {
         .any(|descriptor| descriptor.screen_shows_working(sample))
 }
 
+/// How long input may go unanswered before a row is worth pointing
+/// `terminal input-check` at.
+///
+/// **The single owner of this number.** The daemon ships the FACT
+/// (`input_unanswered_ms` — the gap between the last byte written toward the
+/// child and the last byte it produced); this constant and
+/// [`input_unanswered_suggests_wedge`] are the only place that fact becomes a
+/// suspicion, so the deploy gate, the row payload and the sidebar can never
+/// disagree about what "deaf" means.
+///
+/// 12 s, chosen against what it must NOT catch rather than what it must: a
+/// human typing at a healthy agent CLI gets an echo in milliseconds, and the
+/// slowest legitimate silence-after-input we render is a password prompt, which
+/// is a steady state rather than a gap that keeps growing. Past this, the row
+/// has been written to and has said nothing back for longer than any normal
+/// round trip.
+pub const INPUT_UNANSWERED_WEDGE_SUSPECT_MS: u64 = 12_000;
+
+/// Has input gone unanswered long enough to be worth a definitive check?
+///
+/// ⚠ **A TRIGGER, NEVER A VERDICT.** A child may legitimately take input and
+/// stay silent — echo off, a password prompt, a long command that prints
+/// nothing — so this says *point the instrument here*, it does not say *this
+/// row is broken*. The verdict costs a marker and an echo
+/// (`server app terminal input-check`) and is worth paying only once something
+/// points at a row.
+///
+/// `None` — the daemon reports no outstanding gap, or is too old to report one
+/// — is `false`: absence of the signal must never render as an accusation.
+pub fn input_unanswered_suggests_wedge(input_unanswered_ms: Option<u64>) -> bool {
+    input_unanswered_ms.is_some_and(|gap| gap >= INPUT_UNANSWERED_WEDGE_SUSPECT_MS)
+}
+
 /// Single source of truth for "does the current input line hold an unsent
 /// draft after feeding these input bytes", starting from `prev`. This is the
 /// daemon-side safety signal that PROTECTS a session a user typed into but

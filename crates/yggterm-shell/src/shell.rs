@@ -17173,6 +17173,11 @@ fn snapshot_live_sidebar_session_view(session: &ManagedSessionView) -> ManagedSe
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
         working: session.working,
+        // ⛔ MUST be carried, not defaulted: this projection is what the sidebar
+        // reads, so dropping the field here would leave the daemon knowing a row
+        // had gone deaf and the human still unable to see it — the exact gap
+        // this signal exists to close.
+        input_unanswered_ms: session.input_unanswered_ms,
         agent_launch_options: Default::default(),
     }
 }
@@ -17229,6 +17234,11 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
         working: session.working,
+        // ⛔ MUST be carried, not defaulted: this projection is what the sidebar
+        // reads, so dropping the field here would leave the daemon knowing a row
+        // had gone deaf and the human still unable to see it — the exact gap
+        // this signal exists to close.
+        input_unanswered_ms: session.input_unanswered_ms,
         agent_launch_options: Default::default(),
     }
 }
@@ -44754,12 +44764,35 @@ fn live_session_close_button_style(palette: Palette, selected: bool) -> String {
 /// working right now. Shared by Live Sessions today and Automated Sessions
 /// later (experimental/automations).
 fn live_session_status_dot_style(palette: Palette, keep_alive: bool, working: bool) -> String {
+    live_session_status_dot_style_with_attention(palette, keep_alive, working, false)
+}
+
+/// The status dot, with DESIGN.md's reserved ATTENTION slot wired.
+///
+/// `attention` paints amber over the durability colour and forces the dot
+/// STEADY. Both halves are the spec, not a preference: blink means *working*,
+/// and the first attention case — a row written to that has said nothing back —
+/// is exactly the row that is not working, so letting it blink would assert the
+/// one thing known to be false.
+fn live_session_status_dot_style_with_attention(
+    palette: Palette,
+    keep_alive: bool,
+    working: bool,
+    attention: bool,
+) -> String {
     let _ = palette;
     // Plain color circle (user decision 2026-06-26): green = keep-alive,
     // blue = lives with the GUI. No halo ring — just the flat dot. Working is a
     // HARD on/off blink via `step-end` (no fade); idle is a steady dot.
-    let background = if keep_alive { "#22c55e" } else { "#3b82f6" };
-    let animation = status_dot_blink_opacity_css(working);
+    // AMBER (DESIGN.md "Status indicator vocabulary") outranks both: durability
+    // is what happens to the row eventually, attention is what is wrong with it
+    // now.
+    let background = match (attention, keep_alive) {
+        (true, _) => "#f59e0b",
+        (false, true) => "#22c55e",
+        (false, false) => "#3b82f6",
+    };
+    let animation = status_dot_blink_opacity_css(working && !attention);
     format!(
         "display:inline-flex; width:7px; min-width:7px; height:7px; border-radius:999px; background:{background};{animation}",
     )
@@ -56728,6 +56761,12 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
             let machine = remote_machine_for_sidebar_row(&shell, row);
             let busy_state = sidebar_row_busy_state(&snapshot, row);
             let busy = busy_state.visible;
+            // ⛔ NOT folded into `busy`/`busy_reason`. A deaf row is not busy and
+            // not idle — it is a THIRD state, and answering the busy question
+            // with it would make a wedged row render as working, which is a lie
+            // in the other direction. Separate question, separate field.
+            let input_unanswered_ms = sidebar_row_session_for_icon(&snapshot, row)
+                .and_then(|session| session.input_unanswered_ms);
             let live_member = snapshot.live_sessions.iter().any(|session| {
                 normalize_live_session_path(&session.session_path)
                     == normalize_live_session_path(&row.full_path)
@@ -56789,6 +56828,16 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "child_count": row.descendant_sessions,
                 "busy": busy,
                 "busy_reason": busy_state.reason,
+                // The FACT, and the SUSPICION derived from it by the one owner
+                // of the threshold. Both are emitted: a reader chasing "why is
+                // this row flagged" needs the gap, and a reader scanning for
+                // trouble needs the boolean. ⚠ Suspicion, never a verdict —
+                // `server app terminal input-check` settles it by marker and
+                // echo. `null`/`false` = answering, or a daemon too old to say.
+                "input_unanswered_ms": input_unanswered_ms,
+                "wedge_suspected": yggterm_core::input_unanswered_suggests_wedge(
+                    input_unanswered_ms,
+                ),
                 "icon_kind": ({
                     let base = tree_icon_kind(row);
                     if base == "terminal" && snapshot.live_sessions.iter().any(|s| s.session_path == row.full_path && s.kind == SessionKind::ClaudeCode) {
@@ -88072,6 +88121,7 @@ fn Sidebar(
                         }
                         .to_string();
                         let busy_icon = sidebar_row_shows_busy_icon(&snapshot, &row);
+                        let input_unanswered = sidebar_row_input_unanswered(&snapshot, &row);
                         let row_dragging = sidebar_row_dragging_for_projection(
                             snapshot.drag_paths.as_slice(),
                             &live_group_paths,
@@ -88119,6 +88169,7 @@ fn Sidebar(
                                 visible_label: visible_label.clone(),
                                 icon_kind: icon_kind.clone(),
                                 busy_icon,
+                                input_unanswered,
                                 selected: row_selected,
                                 drop_target: snapshot
                                     .drag_hover_target
@@ -88552,6 +88603,25 @@ fn terminal_input_uses_optimistic_busy_hint(session_path: &str) -> bool {
 }
 fn sidebar_row_shows_busy_icon(snapshot: &RenderSnapshot, row: &BrowserRow) -> bool {
     sidebar_row_busy_state(snapshot, row).visible
+}
+/// Has this row been written to with nothing said back for long enough to be
+/// worth a check?
+///
+/// ⛔ **Deliberately NOT part of [`sidebar_row_busy_state`].** Busy asks "is work
+/// happening here"; this asks "is this row still listening". A deaf row answers
+/// `false` to the first and `true` to the second, and folding them together
+/// would render it as working — swapping one wrong answer for another.
+///
+/// ⚠ A TRIGGER, NEVER A VERDICT: echo-off and password prompts legitimately
+/// consume input in silence. It marks the row as worth checking; `server app
+/// terminal input-check` settles it by marker and echo.
+fn sidebar_row_input_unanswered(snapshot: &RenderSnapshot, row: &BrowserRow) -> bool {
+    if row.kind != BrowserRowKind::Session {
+        return false;
+    }
+    yggterm_core::input_unanswered_suggests_wedge(
+        sidebar_row_session_for_icon(snapshot, row).and_then(|session| session.input_unanswered_ms),
+    )
 }
 /// Aggregate working state for a machine/cwd group row (issue #3): a group
 /// blinks when ANY session in its subtree is working, so a COLLAPSED machine or
@@ -89669,6 +89739,10 @@ fn SidebarRow(
     visible_label: String,
     icon_kind: String,
     busy_icon: bool,
+    /// This row has been written to and has said nothing back for longer than
+    /// any normal round trip — DESIGN.md's amber ATTENTION state. ⚠ A trigger,
+    /// never a verdict; `terminal input-check` settles it.
+    input_unanswered: bool,
     selected: bool,
     drop_target: Option<DragDropPlacement>,
     dragging: bool,
@@ -90125,13 +90199,25 @@ fn SidebarRow(
                                 "data-sidebar-live-session-status-dot": "1",
                                 "data-sidebar-live-session-keep-alive": if row_kept_alive { "1" } else { "0" },
                                 "data-sidebar-live-session-working": if busy_icon { "1" } else { "0" },
-                                title: match (row_kept_alive, busy_icon) {
-                                    (true, true) => "Keep-alive · working",
-                                    (true, false) => "Keep alive",
-                                    (false, true) => "Working",
-                                    (false, false) => "Live (closes with the app)",
+                                "data-sidebar-live-session-input-unanswered": if input_unanswered { "1" } else { "0" },
+                                // The attention state OWNS the tooltip when it
+                                // holds: the durability phrasings answer a
+                                // question nobody is asking of a row that has
+                                // stopped answering. It names the observation
+                                // and the next step, and it does NOT say
+                                // "wedged" — that is a verdict this signal is
+                                // not entitled to make.
+                                title: if input_unanswered {
+                                    "Typed to, no response yet — may not be listening. Check with: server app terminal input-check"
+                                } else {
+                                    match (row_kept_alive, busy_icon) {
+                                        (true, true) => "Keep-alive · working",
+                                        (true, false) => "Keep alive",
+                                        (false, true) => "Working",
+                                        (false, false) => "Live (closes with the app)",
+                                    }
                                 },
-                                style: live_session_status_dot_style(palette, row_kept_alive, busy_icon),
+                                style: live_session_status_dot_style_with_attention(palette, row_kept_alive, busy_icon, input_unanswered),
                             }
                         }
                     }
@@ -160260,6 +160346,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -160331,6 +160418,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -160532,6 +160620,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -160640,6 +160729,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -160726,6 +160816,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -160852,6 +160943,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -160941,6 +161033,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -161050,6 +161143,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -161552,6 +161646,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -161648,6 +161743,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162051,6 +162147,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162101,6 +162198,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162143,6 +162241,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162185,6 +162284,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162257,6 +162357,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162340,6 +162441,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162416,6 +162518,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162464,6 +162567,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162722,6 +162826,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162791,6 +162896,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162864,6 +162970,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162934,6 +163041,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -163009,6 +163117,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -163088,6 +163197,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -163152,6 +163262,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -165700,6 +165811,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -165742,6 +165854,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -165831,6 +165944,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -165902,6 +166016,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -165955,6 +166070,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166310,6 +166426,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166364,6 +166481,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166429,6 +166547,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166497,6 +166616,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166563,6 +166683,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166623,6 +166744,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166677,6 +166799,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -174945,6 +175068,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -174986,6 +175110,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -175789,6 +175914,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -175928,6 +176054,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             pty_cols: None,
             pty_rows: None,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -176175,6 +176302,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -177126,6 +177254,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -177195,6 +177324,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -177245,6 +177375,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -177418,6 +177549,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -178049,6 +178181,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -178131,6 +178264,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -178383,6 +178517,100 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             })
             .expect("live claude-code session row");
         assert!(sidebar_row_shows_busy_icon(&snapshot, row));
+    }
+    /// The owner's #1: a row that has stopped reading its PTY must stop looking
+    /// exactly like a healthy one.
+    ///
+    /// ⭐ Asserts BOTH halves in one test on purpose. The cheap way to make the
+    /// deaf-row half pass is to flag every row, which would paint the whole
+    /// sidebar amber and destroy the signal — so the control row (answering,
+    /// therefore NOT flagged) is what makes the positive assertion mean
+    /// anything. A detector that cannot say `false` has not been tested.
+    #[test]
+    fn sidebar_flags_a_row_that_was_typed_to_and_never_answered() {
+        let deaf_path = "remote-cc://dev/deaf";
+        let live_path = "remote-cc://dev/answering";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(deaf_path));
+
+        let mut deaf = test_live_shell_session(deaf_path);
+        deaf.id = "deaf".to_string();
+        deaf.title = "deaf row".to_string();
+        deaf.kind = SessionKind::ClaudeCode;
+        deaf.host_label = "dev".to_string();
+        deaf.source = SessionSource::LiveSsh;
+        deaf.terminal_foreground_active = Some(false);
+        // Idle-LOOKING and not working: this is precisely the row the sidebar
+        // used to render as plain `idle`, indistinguishable from a healthy one.
+        deaf.working = Some(false);
+        deaf.input_unanswered_ms = Some(yggterm_core::INPUT_UNANSWERED_WEDGE_SUSPECT_MS + 1);
+
+        // The control: same kind, same idle look, but it has answered.
+        let mut answering = test_live_shell_session(live_path);
+        answering.id = "answering".to_string();
+        answering.title = "healthy row".to_string();
+        answering.kind = SessionKind::ClaudeCode;
+        answering.host_label = "dev".to_string();
+        answering.source = SessionSource::LiveSsh;
+        answering.terminal_foreground_active = Some(false);
+        answering.working = Some(false);
+        answering.input_unanswered_ms = None;
+
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(deaf_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(deaf.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![
+                snapshot_session_view_for_ui(deaf),
+                snapshot_session_view_for_ui(answering),
+            ],
+            apps: Vec::new(),
+        });
+        shell.needs_initial_server_sync = false;
+
+        let snapshot = shell.snapshot();
+        let find = |path: &str| {
+            snapshot
+                .rows
+                .iter()
+                .find(|row| {
+                    normalize_live_session_path(&row.full_path)
+                        == normalize_live_session_path(path)
+                })
+                .unwrap_or_else(|| panic!("row for {path}"))
+        };
+        let deaf_row = find(deaf_path);
+        let answering_row = find(live_path);
+
+        assert!(
+            sidebar_row_input_unanswered(&snapshot, deaf_row),
+            "a row written to past the threshold with no answer must be flagged"
+        );
+        assert!(
+            !sidebar_row_input_unanswered(&snapshot, answering_row),
+            "a row that has answered must NOT be flagged — a detector that \
+             flags everything is not a detector"
+        );
+
+        // ⛔ And it must not be reported as BUSY. Answering the busy question
+        // with this signal would render the deaf row as working, which trades
+        // one wrong answer for another.
+        assert!(
+            !sidebar_row_shows_busy_icon(&snapshot, deaf_row),
+            "a deaf row is not working"
+        );
+
+        // DESIGN.md: amber, and STEADY — blink means working, and this row is
+        // the one thing certainly not working.
+        let amber =
+            live_session_status_dot_style_with_attention(palette(UiTheme::ZedDark), false, false, true);
+        assert!(amber.contains("#f59e0b"), "attention dot must be amber");
+        let blinking = status_dot_blink_opacity_css(true);
+        assert!(
+            !amber.contains(blinking.trim()),
+            "the attention dot must be steady, never blinking"
+        );
     }
     #[test]
     fn sidebar_busy_icon_marks_inactive_codex_working_status() {
@@ -178762,6 +178990,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -178800,6 +179029,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -179000,6 +179230,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -179200,6 +179431,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -179403,6 +179635,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -179610,6 +179843,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -179809,6 +180043,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -180008,6 +180243,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -180207,6 +180443,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -180245,6 +180482,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -180447,6 +180685,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -180647,6 +180886,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -180685,6 +180925,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -181410,6 +181651,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -183433,6 +183675,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -183658,6 +183901,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184389,6 +184633,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184430,6 +184675,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184638,6 +184884,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184700,6 +184947,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184830,6 +185078,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184925,6 +185174,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184980,6 +185230,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186429,6 +186680,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186483,6 +186735,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186531,6 +186784,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186582,6 +186836,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186647,6 +186902,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186722,6 +186978,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186782,6 +187039,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186957,6 +187215,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -187047,6 +187306,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
