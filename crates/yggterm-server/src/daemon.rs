@@ -14436,6 +14436,46 @@ fn spawn_disk_binary_version_poll(
         let mut deferred_polls_since_logged: u32 = SETTLED_DEFERRAL_HEARTBEAT_EVERY_N_POLLS;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+            // ⛔ §4: THE ENTRY IS CLEARED BY WHOEVER SATISFIES IT, WHICH IS THE
+            // SUCCESSOR — never by the daemon that wrote it.
+            //
+            // Found by the live proof of the queue itself, 2026-08-13, which is
+            // the only way it could have been found: a 3.0.125 daemon queued a
+            // swap to 3.0.126, the successor came up and adopted all NINE of its
+            // sessions, and the writer then had empty hands — so it fell through
+            // to the cold-shutdown gate, found nothing blocking, and exited,
+            // taking the only process that would ever have cleared the record
+            // with it. The census went on printing `swap owed → 3.0.126` while
+            // 3.0.126 was serving every row on the host. A record that outlives
+            // its own satisfaction is the exact failure this file exists to
+            // remove, rebuilt one turn later.
+            //
+            // ⚠ This is NOT a second copy of the check inside
+            // [`hot_restart_swap_step`]. They answer different questions and
+            // neither can stand in for the other: that one asks *"is a successor
+            // live?"* on behalf of a daemon still holding PTYs, this one asks
+            // *"am I the successor?"* — and only the successor is guaranteed to
+            // still be running when the answer turns true.
+            if let Some(queued) = hot_restart_queue::load(&home_dir)
+                && hot_restart_queue::satisfied_by(&queued, SERVER_PROTOCOL_VERSION)
+            {
+                append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "lifecycle",
+                    "hot_restart_swap_queue_satisfied",
+                    serde_json::json!({
+                        "target_version": queued.target_version,
+                        "satisfied_by": "self",
+                        "attempts": queued.attempts,
+                        "waited_ms": current_millis_u64()
+                            .saturating_sub(queued.requested_at_ms),
+                        "current_version": SERVER_PROTOCOL_VERSION,
+                        "current_pid": std::process::id(),
+                    }),
+                );
+                hot_restart_queue::clear(&home_dir);
+            }
             // Retire trigger 1: our on-disk binary was replaced by an update.
             let exe_link = fs::read_link("/proc/self/exe")
                 .map(|link| link.to_string_lossy().into_owned())
@@ -21305,6 +21345,33 @@ mod tests {
         assert!(
             lane.contains("continue"),
             "a lingering preserved owner keeps polling so the queued swap can be retried"
+        );
+    }
+
+    /// The successor clears the entry, because the writer does not survive to.
+    ///
+    /// Live-proven defect, 2026-08-13: the daemon that queued a swap handed its
+    /// nine sessions to the successor, then had empty hands, fell through to the
+    /// cold-shutdown gate and exited — while the census went on printing
+    /// `swap owed` to a version that was already serving every row on the host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_successor_clears_the_queued_swap_not_the_writer() {
+        let source = include_str!("daemon.rs");
+        let poll = source
+            .split("std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));")
+            .nth(1)
+            .and_then(|suffix| suffix.split("// Retire trigger 1:").next())
+            .expect("the retire poll's head should be present");
+        assert!(
+            poll.contains("hot_restart_queue::satisfied_by(&queued, SERVER_PROTOCOL_VERSION)"),
+            "every daemon must check on every poll whether IT satisfies the queued swap — \
+             gating that on the disk-replace lane leaves the record to a process that \
+             retires the moment it drains"
+        );
+        assert!(
+            poll.contains("hot_restart_queue::clear(&home_dir)"),
+            "a satisfied swap must clear the host record, or the census lies"
         );
     }
 
