@@ -1428,6 +1428,46 @@ UUID as a `to:` address, so a caller holding a spawn's `session_path` never has 
 `server app rows` or the spawn reply, address on that, and **deliver by file if it cannot be
 resolved** rather than guessing from a title.
 
+### ⭐ AND THE SIBLING FAILURE: THE PEER NAME IS A DIFFERENT NAMESPACE FROM THE ROW TITLE
+
+*Found 2026-08-13 by an orchestrator that was about to address four rows at once.*
+
+The listing did **not** omit anything that time. It listed every row — **by peer NAME**, and a peer
+name is derived independently of the row title. So the two namespaces disagree in both directions:
+
+- some rows list under their full title, so a caller assumes titles are what it shows;
+- others list under a short derived slug (`repo-xy`) that **names the repository a session's cwd is
+  in, not the work it is doing**.
+
+⇒ **A slug that looks like it belongs to your campaign can belong to a different one entirely.** In
+the observed case a row slugged for this repo was another campaign's orchestrator, sharing only a
+working directory. Addressing it on the strength of the slug would have delivered a cluster brief
+to an unrelated tree — and, because a send is a wake, paid for the privilege.
+
+**The authoritative local mapping, and it is cheap:**
+
+```sh
+# name -> sessionId -> cwd, for every CC session on this machine
+python3 - <<'PY'
+import json, glob, os
+for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+    try: d = json.load(open(f))
+    except Exception: continue
+    if d.get("sessionId"):
+        print(f"{d.get('name','?'):<28} {d['sessionId'][:8]}  {d.get('status','?'):<6} {d.get('cwd','?')}")
+PY
+```
+
+⚠ **What that answers, and what it does not.** cwd tells you **who is in the blast radius** of an
+action on a directory — which is the right question before a history rewrite, a worktree reset or a
+deploy. It does **not** tell you who is in your campaign: a row whose work is in a vault or a graph
+has a cwd nowhere near the repo it is reasoning about, and will be missing from a cwd-keyed answer
+while being entirely relevant to a subject-keyed one. **Pick the key that matches the question.**
+
+⇒ This strengthens suggestion (3) above rather than replacing it: a `to:` that accepts a UUID
+removes both failures at once, because a UUID is the only identifier in this system that belongs to
+exactly one namespace.
+
 ## ⛔⛔ THE BOOTER KICKED A CONTEXT-DEAD SESSION EVERY 10 MINUTES FOR TEN HOURS, AND ITS OWN LOG SAID "WORKING"
 
 **Status:** OPEN
