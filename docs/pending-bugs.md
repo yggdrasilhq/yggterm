@@ -29,6 +29,93 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⛔ `/context` RESETS THE BOOTER'S IDLE CLOCK — inspecting a row blinds the defence that watches it
+
+**Status:** OPEN
+
+**Audited 2026-08-13 on request, and the answer splits — one half is immune, the other is not.**
+
+- ✅ **The anti-flap counter is IMMUNE.** `progress_marks` counts turns that **used a tool or spent
+  output tokens** — not bytes, not mtime. Its own docstring records why: *"did the file grow" is NOT
+  "did the agent work"*, because a refused turn writes three rows in 5–66 ms. A `/context` produces
+  **no mark**.
+- ⛔ **The IDLE AGE is mtime-derived** (`turn_state` → `path.stat().st_mtime`). ⇒ **Typing
+  `/context` into a row resets its idle clock**, so a dead row that someone inspected looks freshly
+  active to the booter and will not be considered for another window.
+
+⚠ **This is a NEW TRIGGER for a defect the code already documents.** The same comment records a
+context-exhausted session answering *"Prompt is too long"* in 5–66 ms, writing three rows, resetting
+mtime, and being classified `WORKING 0.1m` **while dead for two hours** — the booter kicked that
+corpse every ~10 min **for ten hours**. ⇒ **An observation that corrupts the signal beside it**: an
+audit sweep running `/context` across the fleet would leave every row it touched looking recently
+active while warming none of them.
+
+⭐ **THE DETECTOR THAT WORKS, and it needs no new hook:** the **last transcript record carrying a
+`usage` block**. A `usage` block exists only where an inference actually happened, so a slash command
+that never reaches the model produces none. Measured on a live row the day of the audit: **26 min by
+mtime, 76 min by last real inference — a 50-minute lie.**
+
+**Fix:** publish `last_real_inference_at` as a field **distinct from any file timestamp**, and have
+the classifier's age read *that* rather than `st_mtime`. ⚠ The gauge file
+(`~/.claude/context-gauge/<session>.json`) already exists and carries `pct`/`used`/`window`/`verdict`
+/`dead` — **but no timestamp**, and whether a slash command rewrites it is **untested**. Do not
+assume its mtime is safe; it is written by a prompt-submit hook.
+
+## ⛔⛔ THE SPAWN PATH AND THE PROTECTION PATH ARE DISCONNECTED — `terminal new` cannot arm the booter
+
+**Status:** OPEN
+
+Measured 2026-08-13: **47 agent rows on the fleet, 5 subscribed to the booter** — and 4 of the 5
+belonged to the campaign that wrote the tool. **~11% coverage on what is described as the last line
+of defence**, which makes it a local convention rather than a defence.
+
+⛔ **It is structural, not a discipline problem.** `ygg-claim.sh` arms a row that **claims itself**.
+`server app terminal new` — **the verb an orchestrator actually uses to spawn a cluster** — has **no
+booter option at all**. So an orchestrator fanning out N rows gets **zero** coverage by default, with
+nothing in the verb to remind it. Coverage clusters inside the campaign that knows the tool exists,
+exactly as that shape predicts.
+
+**Owner ruling the same day, which sets the target:** *"THE POLICY IS AUTO ARM AND DISARM WITH
+REASON."* ⇒ Not "arm it for relay work" — **armed by the act of existing**, with disarming requiring
+a stated, recorded reason. This **replaces** the 2026-08-10 opt-in inversion; do not reconcile them.
+
+**Done already (the half that lives outside the binary):** `ygg-claim.sh` arms by default,
+`--booter` is a no-op, `--no-booter` requires a reason, refuses to swallow a following flag as one,
+and appends it to `booter-disarmed.tsv`.
+
+**What is still owed, and it is in the app-control verb:**
+1. `terminal new` arms the spawned row, without a flag.
+2. If a flag survives it is `--no-booter <reason>`, and the reason is recorded where the next
+   session reads it.
+3. ⛔ **`defer` is not `disarm`.** A long build **defers** with a note and **stays armed**. Keep that
+   sharp, or a reason-requirement drives people to disarm when they meant to defer.
+
+⚠ **A row that quietly unsubscribed is indistinguishable from one that was never armed** — the same
+absent-vs-stalled ambiguity that runs through this queue, and the reason the 42 unwatched rows went
+unnoticed.
+
+**Falsifier:** spawn a row with `terminal new` and read `ygg-booter.py list` — it must appear without
+anyone having typed a second command.
+
+## ⚠ `terminal submit`'s "no agent composer row appeared" HAS TWO OPPOSITE CAUSES AND ONE MESSAGE
+
+**Status:** OPEN
+
+Reported 2026-08-13, measured across a 3.0.128 → 129 → 132 → 146 → 148 churn inside one session.
+
+The refusal is returned both when the row is **busy** (wait, it will drain at its turn boundary) and
+when the row's **daemon socket was superseded by a fleet update** (it will never drain; the fix is a
+restart of the terminal). **Opposite causes, opposite responses, one message** — and the message's own
+wording (*"the row is mid-output, in a menu, or is not an agent CLI, so input readiness is
+unanswerable rather than false"*) is correct about being unanswerable and gives the caller nothing to
+act on.
+
+⭐ **The discriminator that worked, and it needs no new verb:** **transcript ROW-COUNT growth.** A busy
+row grows; an unreachable one is frozen. Sample twice a few seconds apart.
+
+**Fix:** name the two states in the reply. The daemon endpoint the submit resolved to is already known
+at that point, so "the row I addressed is served by a socket nothing has bound" is answerable.
+
 ## ⛔⛔⛔ THE HANDOVER RELEASES ON THE SUCCESSOR'S ACCEPTANCE, NEVER ON ITS SURVIVAL — a two-second window in which one signal destroys every session on the host
 
 **Status:** OPEN
