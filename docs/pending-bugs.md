@@ -29,6 +29,43 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⛔ THE HOOK INSTALLER EXISTS TWICE, THE TWO COPIES DISAGREE, AND ONE CRASHES ON A WORKTREE
+
+**Status:** OPEN
+
+Measured 2026-08-13, both directions, one run.
+
+The pre-push leak gate can be installed two ways and they are different code:
+
+| | `ygg-privacy-guard install` | `scripts/install-privacy-guard.sh` |
+|---|---|---|
+| normal checkout | works, and reports PUBLIC/private | works |
+| **git worktree** | ⛔ **raises** — it builds `<repo>/.git/hooks`, and in a worktree **`.git` is a FILE** | works — resolves via `git rev-parse --git-common-dir` |
+| non-github remote | installs anyway | skips |
+
+⇒ **This is a second encoding of one chore and it diverged immediately.** The shell copy was written
+without checking that the guard already owned the job, and its first version invoked the guard as
+`pre-push` — a subcommand the guard does not accept — so the guard printed its usage text and exited
+non-zero, **which git reads as "the hook refuses". Every repo it touched could no longer push at
+all.** Fixed within minutes, but the shape is the point.
+
+⚠ **It failed CLOSED, which is the correct direction for a leak gate**, so this was an availability
+fault and never an exposure. ⭐ **The tell worth keeping: an inert hook and a working one are
+identical on disk**, and the broken one emitted a wall of the guard's own text that looked exactly
+like the guard running. **An installer is proven by a real push or not at all** — a syntax check and
+a successful write prove nothing about whether the hook works.
+
+⚠ **And the coverage this exists to fix is the real defect underneath:** only **2 of 34**
+github-remoted repos here carried the hook, and they are the two with known past leaks — a guard
+installed only where it has already burned someone.
+
+**Fix:** collapse the two into the guard (it is the owner), taking the worktree-correct path
+resolution and the github-remote filter with it, and delete the shell copy. Blocked on the guard
+getting a tracked home — see `owner-attention.md`.
+
+**Falsifier:** run each installer against a git worktree and against a plain checkout in the same
+run, then push from both.
+
 ## ⛔⛔ MAIN IS RED: THE PROTOCOL SHAPE-STAMP GUARD FAILS ON `origin/main` ITSELF
 
 **Status:** OPEN
@@ -3631,6 +3668,46 @@ while being entirely relevant to a subject-keyed one. **Pick the key that matche
 removes both failures at once, because a UUID is the only identifier in this system that belongs to
 exactly one namespace.
 
+
+### ⚠ RE-TESTED 2026-08-13 — the DANGER half is confirmed outright; the OMISSION half could not be measured, and the reason is the finding
+
+**Confirmed, from a single listing taken today:** the enumeration contains
+**two separate pairs of entries carrying byte-identical names**, distinguishable
+only by their `[ref]`. So "pick the plausible one from the list" is not merely
+risky, it is undecidable for those four — and the cost the entry prices (a
+mistaken cross-session message forcing a cold context re-read on an idle row) is
+paid by whoever guesses wrong.
+
+✅ **A mitigation has since appeared and is worth recording:** sending to a bare
+name that matches more than one entry is now **refused**, with the tool printing
+the candidate and its ref and asking for confirmation. Measured tonight — a send
+to a bare name was rejected until re-sent with the ref. That turns the dangerous
+guess into a prompt.
+
+⛔ **The OMISSION half could not be tested, and the obstacle is the same defect
+one layer down.** The listing's entries are **session names** — for most rows an
+auto-generated slug, not the row's title — and the listing carries **no session
+path and no uuid**. So a row from `server app rows` and an entry in the listing
+**cannot be matched by any field either of them publishes.** Counting is all that
+remains, and counting cannot separate "omitted" from "named differently":
+
+```
+claude-code rows the GUI reports on that machine   49   (30 of them seated)
+entries in the listing                             30
+```
+
+⇒ **The reason the original reporter had to guess by title is that there is
+nothing else to guess by**, and that is also why the claim cannot be checked.
+⭐ **The fix that makes this entry testable is the same one that makes it safe:
+put the row's session path in the listing.**
+
+⚠ **`live_member` IS NOT A LIVENESS FLAG** — noted while attempting this. All 49
+rows report `live_member: true`, including ones with no running CLI; it means
+"member of the Live group", not "the process is running". Anyone re-testing this
+by filtering on it will compare the wrong population.
+
+**Falsifier:** a listing entry and a row can be matched by a published field, and
+a row known live by uuid is present in the listing.
 ## ⛔⛔ THE BOOTER KICKED A CONTEXT-DEAD SESSION EVERY 10 MINUTES FOR TEN HOURS, AND ITS OWN LOG SAID "WORKING"
 
 **Status:** OPEN
@@ -6564,7 +6641,9 @@ exists. (The third item is retracted, not open.)
 
 ## ⚖ THE WORKING DOT — the discovery half, and it is NOT a detector defect
 
-**Status:** OPEN — but the open question is a SPEC question, not a bug.
+**Status:** OPEN
+
+⚠ The open question is a SPEC question, not a bug — see the bottom of this entry.
 
 The owner asked for a working indicator. 6.3 owns the RENDER half; this entry
 owns the prior question — **what makes a session's working-state knowable at
@@ -11117,6 +11196,38 @@ inherits a sibling's liveness; (iv) `pgrep` counts the querying shell. **Same sh
 split every time: asked about one thing, answered about another.** Only `terminal submit`'s
 `unanswerable` currently keeps the law.
 
+
+### ⚠ DOES NOT REPRODUCE IN STEADY STATE AT 3.0.146 — but read what that covers
+
+A cross-daemon read now works. On the GUI host, five daemons coexisting, one of
+them **200 hours and a hundred versions old**:
+
+```
+session owned by the 3.0.29 daemon   → running: true, 27 lines, 2441 chars
+session owned by the 3.0.146 daemon  → running: true,  3 lines,  422 chars
+```
+
+asked through one CLI that resolves to the current daemon by default. **Different
+values in the same run**, so the instrument is discriminating rather than
+answering `true` to everything — and the old-daemon session is the one with real
+content, which is the case that used to come back `running: false` with an empty
+buffer.
+
+⛔ **THIS IS NOT THE ENTRY'S SCENARIO AND MUST NOT CLOSE IT.** The report is about
+the **mid-update instant** — a row launched at 13:22, symlinks re-pointed at
+14:18, the split opening underneath a live row. What is shown above is a STEADY
+state with an old owner still alive. Cross-daemon addressing having been repaired
+does not establish that the handover window is safe, and the window is where the
+53 minutes were lost.
+
+⚠ **AND THE RESIDUAL IS THIS LANE'S OWN DISEASE:** the reply does not name WHICH
+daemon answered. There is no `served_by` / `owner_pid` field, so a recurrence
+would once again be indistinguishable from a correct answer — exactly the shape
+the running-build identity work exists to end, one plane over. **A reply that
+cannot name its own subject cannot be used to detect this defect coming back.**
+
+**Falsifier for what remains:** a row launched before a version bump answers
+correctly *through* the bump, and the reply names the daemon that served it.
 ## A POPUP-based re-auth cannot be completed on a web surface — the parent never resumes
 
 **Status:** OPEN
