@@ -9496,18 +9496,21 @@ instrument — the gutter's `document_wrap_gutters` had to be proven through
 `dom-eval` instead. **Fix the timeout, or `app state` quietly stops being the
 probe the field guide says it is.**
 
+✅ **STILL TRUE AT 3.0.139** — `degraded_reason: dom_debug_snapshot_timeout` on
+the live GUI, with `document_editor_count` absent.
 
-## ⚠ TOOLING: server app dom-eval ignores --client / --pid placed before
+⚠ **BUT THE TITLE OVERSTATES IT, AND THAT MATTERS MORE THAN THE CONFIRMATION.**
+*Every* DOM probe field is NOT unreadable: **66 `dom` keys came back in the same
+reply**. The snapshot degrades and drops NAMED fields; it does not go dark. An
+agent reading the headline abandons a working instrument and goes to `dom-eval`
+for things `app state` would have answered — which is a second cost the entry
+was creating rather than describing.
 
-**Status:** OPEN
+⇒ Read `degraded_reason` and then **check for the field you actually want**; its
+absence is the signal, not the presence of the timeout.
 
-**⚠ TOOLING: `server app dom-eval` ignores `--client` / `--pid` placed before
-the script.** It takes the script positionally at `args[3]`, so
-`dom-eval --client shadow '<script>'` silently evaluates the STRING
-`--client` — a successful-looking eval of the wrong thing, which is the
-lie-of-success shape. The global override works only with the script FIRST.
-Either parse the flags or refuse a script that looks like a flag; the skill's
-example should be reordered either way.
+**Falsifier:** with `degraded_reason` set, count the `dom` keys — if it is not
+near zero, the loss is specific and can be named.
 
 
 ## ★★ THE APP ACTION POST DOES NOT NAME ITS SESSION, AND THE DOCUMENT CHANNEL IS
@@ -10333,6 +10336,14 @@ so the filing agent had to fall back to the user's live GUI host. Fresh
 evidence for settled call #6 (drive shadow surfaces with the GUI closed /
 server-side rendering, docs/optimization-pass.md WS2): today agent browsing
 physically requires the user's GUI host.
+
+✅ **STILL TRUE 2026-08-13**: `server app clients` on that headless host answers
+`{"clients": [], "count": 0}`. Re-measured during a sweep, and it is a
+state-of-the-world claim rather than a defect report — it stays true until
+server-side rendering lands, so it should be re-read as a standing constraint,
+not as a bug awaiting a fix.
+
+**Falsifier:** a headless host answers `count > 0` without the user's GUI running.
 
 
 ## ★★ THE DAEMONS CHAIN, AND ONE IDLE bash -i IS WHY (root-caused
