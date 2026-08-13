@@ -150,89 +150,6 @@ not propagated to every store is a delete that a peer undoes.
 must not reappear, and the restore must be able to *name* how many rows it
 declined to restore because they were deleted.
 
-## ⛔ [6.2] A NEW CLI ROW IS BORN NAMED AFTER WHOEVER SPAWNED IT
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-*re-reported 2026-08-13*
-
-Already tracked further down this file as *"a new session's row is named after
-the row you right-clicked"*. Re-reported in this batch with the generalised
-symptom: a freshly spawned row reads `{whatever the spawner is called}
-{claude-code,codex,…}` until the CLI self-titles. Kept as one entry — see the
-existing narrative for the detail; this line exists so the 6.2 delegate knows it
-is in scope.
-
-**Live proof attempted 2026-08-13 on the desktop host, GUI + daemon both
-3.0.116 — and it came back TWO THIRDS green, which is why this stays open.**
-Three ephemeral `claude-code` rows created back to back by one command, same
-cwd, each with `--purpose`:
-
-| row | rendered title |
-|---|---|
-| probe A (created 1st) | `Agent unnamed claude-code` |
-| probe B (created 2nd) | `Agent unnamed claude-code: 6.2 sidebar order probe B` |
-| probe C (created 3rd) | `Agent unnamed claude-code: 6.2 sidebar order probe C` |
-
-B and C are the fixed form: named for the agent and its PURPOSE, not for the row
-that spawned them. **A is not, and the purpose is not missing — it is recorded
-and unrendered.** `server terminal tenants` carries
-`created_by.purpose = "6.2 sidebar order probe A"` for that exact row. So the
-create kept it and the title composition dropped it.
-
-⚠ **Three explanations were tried and killed before filing, because "one row out
-of three" invites a guess:**
-
-- **Not time decay.** B still rendered its purpose six minutes later.
-- **Not "only the newest row shows it".** Creating C did not take B's purpose
-  away; both held it side by side.
-- **Not lost at create.** The daemon's own tenancy record has A's purpose.
-
-⇒ What is left is a divergence between the stored purpose and the composed
-title, on the FIRST row of a batch. Not root-caused, and deliberately not
-guessed at.
-
-**ROOT-CAUSED 2026-08-13 (3.0.120), and "the FIRST row of a batch" was a
-coincidence of the probe.** The three purposes ended `A`, `B` and `C`. The copy
-layer's dangling-fragment rule (`ends_with_syntax_fragment` in
-`looks_like_low_signal_generated_title`, `yggterm-core/src/titles.rs`) treats a
-title whose last word is `the`/`a`/`an`/`to`/`for`/… as a generated fragment —
-right for `ship the logs to`, and it reads a trailing **`A`** as the English
-article. `agent_plane_session_title` (`yggterm-server/src/app_control.rs`) asks
-that same judge whether the composed title would survive downstream, and on
-`true` **drops the purpose and returns the bare base**, by design: the title
-survives by losing the only part that says what the row is for. Probe A was
-both the first row created and the one whose purpose ended in `A`; the ordering
-was the confound. Reproduced as a unit fact before any fix —
-`agent_plane_session_title(None, Some("6.2 sidebar order probe A"), …)`
-answered `Agent unnamed shell`, and the same call with `probe B` did not.
-
-**Fixed:** the judge now recognises an agent-plane title —
-`Agent <identity> <kind>`, optionally `: <purpose>` — as **authored**, not
-generated (`is_agent_plane_composed_title`), so none of the machine-copy
-heuristics apply to it. The exemption matches the whole shape, never the
-opening word, or it would be a hatch wide enough to drive every heuristic in
-that file through. `session_kind_label` moved to `yggterm-core` beside the
-slugs it is built from, so the copy layer reads the same vocabulary the
-composer writes rather than a second copy of it. Tests:
-`a_legible_purpose_is_never_amputated_from_an_agent_plane_title` (red before
-the fix, on the probe strings verbatim) and
-`an_agent_plane_title_is_authored_copy_and_is_never_judged_generated`.
-
-⚠ **The pre-existing test could not see this.**
-`an_agent_plane_title_is_never_thrown_away_as_generated_junk` asks only whether
-the TITLE survived, and amputation satisfies it — a bare
-`Agent unnamed claude-code` sails through. A test that asks "did the output
-survive" cannot catch an output that survived by discarding its payload.
-
-**Falsifier:** create three rows in one command with `--purpose`, and all three
-titles carry their purpose; or `created_by.purpose` is absent for the one that
-does not.
-
-**What live proof is owed:** three `claude-code` rows created back to back on
-the desktop host at 3.0.120+, purposes ending `A`, `B`, `C`, and all three
-sidebar titles carrying their purpose.
-
 ## ⛔ A SCREENSHOT OF A NON-TERMINAL VIEW PHOTOGRAPHS WHATEVER HOLDS FOCUS
 
 **Status:** OPEN
@@ -2197,6 +2114,15 @@ for the few seconds before the CLI titled itself.
 
 **Falsifier:** right-click a *session* row, start a session of any CLI, and the
 new row reads `New <CLI> Session` — never a variant of the clicked row's title.
+
+⚠ **THAT FALSIFIER IS THE ONLY THING STILL OPEN HERE, AND IT CANNOT BE DRIVEN.**
+The right-click path needs the sidebar row menu, and no app-control verb raises
+it (§ *no app-control verb raises the sidebar row menu*) — so this stays
+`LIVE PROOF OWED` on that entry's account, not on its own. **The re-report that
+generalised this to "a freshly spawned row is named after whoever spawned it"
+is closed:** the agent-plane birth title was root-caused and live-proven on the
+desktop host at 3.0.120, three rows created in one command with their purposes
+ending `A`, `B` and `C`, all three rendering their purpose (CHANGELOG 3.0.120).
 
 ⚠ **THREE SIBLING COMPOSERS SURVIVE, AND THEY ARE LATENT — NOT FIXED, NOT THE
 REPORTED SYMPTOM.** `terminal_launch_context_for_row` and its `active_session`
