@@ -4756,7 +4756,29 @@ fn configure_linux_webkit_memory_policy() {
         // `web-browser` is the model WebKit sizes for a browser. The bound on it
         // is not this knob but the memory policy below (a hard limit plus the
         // conservative/strict/kill thresholds) and, since 2.12.18, per-tab
-        // reclaim — so caching more does not mean growing without end.
+        // reclaim.
+        //
+        // ⛔ WHAT THAT POLICY ACTUALLY BOUNDS IS **RESIDENCY, NOT FOOTPRINT** —
+        // this comment used to claim "so caching more does not mean growing
+        // without end", and that guarantee is one the code cannot make.
+        // WebKit evaluates the limit against RESIDENT memory only: upstream WTF
+        // reads `/proc/self/statm`, which has no swap field, and the only
+        // `/proc/self/status` field name in the shipped library is `VmRSS` —
+        // there is no `VmSwap` in it anywhere. So on a host that swaps, the
+        // kernel evicts the cold cache, RSS falls, and the threshold is never
+        // reached while the committed footprint keeps climbing past it.
+        // Measured: RSS flat in a 586-714 MB band while swap grew 11x and
+        // committed went 649 -> 1,362 MB, against a conservative threshold of
+        // 1,416 MB of RSS.
+        //
+        // ⛔ DO NOT "FIX" THIS BY LOWERING THE NUMBER. No constant can bound a
+        // footprint through an RSS-valued comparison, because the kernel can
+        // push RSS below any threshold by swapping. Making it trip against the
+        // band above needs a limit near the 768 MB floor meant for the smallest
+        // supported machines, which abolishes the rule that derives it.
+        // The limit below is a sound derived rule for what it really is: an
+        // eighth of RAM, resident. See `docs/pending-bugs.md` for the only two
+        // honest options.
         // Override with YGGTERM_WEBKIT_CACHE_MODEL=document-viewer to get the
         // old cacheless behaviour back.
         unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_CACHE_MODEL, "web-browser") };
