@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""ygg-chime - native notification audio for yggterm (stopgap for the CLI audio
+path, campaign todo O4). Bypasses the webview entirely: synthesizes the chime
+to PCM and plays it through the platform sink, so it works with no GUI, no
+user gesture, and no WebKit.
+
+The tone is MEASURED, not invented. Three real aircraft cabin chime recordings
+were analysed 2026-07-27 (FFT + onset detection + amplitude envelope):
+
+  * every chime is a PURE SINE - one partial, no octave, no bell overtones.
+    Adding "bell body" makes it sound less like a cabin chime, not more.
+  * the hi-lo pair is a descending MINOR THIRD (D5 587 -> B4 494), never the
+    perfect fourth this script shipped with before.
+  * the gap between the two notes is ~1030 ms. The old 450 ms read as rushed;
+    slow tempo is most of what makes the sound calm rather than urgent.
+  * envelope: ~30 ms attack, then a SUSTAIN (still 89% of peak at 150 ms),
+    then ring-down - 50% @ 305 ms, 10% @ 655 ms, silent by ~1.0 s. That
+    sustain is why CABIN_ENV is a measured table and not an exponential.
+
+⭐ THIS FILE IS THE SOURCE. `~/.local/bin/ygg-chime` is an installed copy, and
+the fleet's binary sync replicates that copy newest-wins across every host - so
+an edit made THERE spreads to three machines with no history, no review and no
+privacy scan. Edit here, then install.
+
+Pattern carries meaning the way it does in a real cabin: one chime = passenger
+call, hi-lo = crew interphone, hi-lo x3 = emergency. Tables approved by ear
+against the source recordings.
+
+  ygg-chime                        # success tone (the cabin chime)
+  ygg-chime --tone warning --repeat 2 --gap 3
+  ygg-chime --volume 0.5           # peak scale, 0..1
+  ygg-chime --notes '[[0,880,0.3],[0.2,660,0.3]]'   # audition a tune
+  ygg-chime --preroll 0            # disable the A2DP wake-up noise
+"""
+import argparse, json, math, random, struct, subprocess, sys, tempfile, os, time
+
+D5, B4 = 587.33, 493.88   # measured: the hi-lo pair, a descending minor third
+PEAK = 0.40               # approved level for the hi-lo tones
+PEAK_SINGLE = 0.48        # the single note carries alone, so it sits a little higher
+GAP = 1.03                # measured gap between hi and lo
+PERIOD = 2.40             # approved pair period for the x3 pattern
+
+# Envelope time-stretch per tone. The measurement could only see 1.03 s of
+# ring-down (the source recording's SECOND strike lands there and masks the
+# rest), and by ear the single note read as cut short against the tone this
+# replaced. The single is stretched to ~2.1 s; the pairs keep the measured
+# envelope, where the notes ringing into each other already carries the length.
+RING = {"success": 1.8, "info": 1.8, "warning": 1.0, "error": 1.0}
+
+# Where to stop the stretched envelope, as a fraction of peak. Stretching the
+# envelope 1.8x also stretches its QUIET tail, which rings on as an "aftertaste"
+# a real cabin chime does not have. Cut it once it falls below this and fade out
+# over 60 ms. The pairs are not stretched, so their measured decay needs no cut.
+TAIL_CUT = {"success": 0.08, "info": 0.08, "warning": 0.0, "error": 0.0}
+FADE = 0.060
+
+TONES = {
+    # one chime - the passenger-call single note
+    "success": [[0.0, D5, PEAK_SINGLE]],
+    "info":    [[0.0, D5, PEAK_SINGLE]],
+    # hi-lo - the crew interphone pair
+    "warning": [[0.0, D5, PEAK], [GAP, B4, PEAK]],
+    # hi-lo x3 - the emergency pattern
+    "error":   [[0.0, D5, PEAK], [GAP, B4, PEAK],
+                [PERIOD, D5, PEAK], [PERIOD + GAP, B4, PEAK],
+                [2 * PERIOD, D5, PEAK], [2 * PERIOD + GAP, B4, PEAK]],
+}
+
+SR = 48000
+ATTACK = 0.030
+
+# Measured amplitude envelope of a real cabin chime, 20 ms grid, normalized to
+# its own peak. Linearly interpolated; past the last point is silence.
+CABIN_ENV = [
+    (0.000,1.0000), (0.020,0.9561), (0.040,0.9561), (0.060,0.9510), (0.080,0.9510), (0.100,0.9253),
+    (0.120,0.9253), (0.140,0.8934), (0.160,0.8745), (0.180,0.8124), (0.200,0.7831), (0.220,0.7263),
+    (0.240,0.6762), (0.260,0.6227), (0.280,0.5657), (0.300,0.5214), (0.320,0.4643), (0.340,0.4250),
+    (0.360,0.3659), (0.380,0.3337), (0.400,0.3010), (0.420,0.2895), (0.440,0.2572), (0.460,0.2452),
+    (0.480,0.2137), (0.500,0.2003), (0.520,0.1758), (0.540,0.1703), (0.560,0.1514), (0.580,0.1445),
+    (0.600,0.1271), (0.620,0.1186), (0.640,0.1028), (0.660,0.0929), (0.680,0.0786), (0.700,0.0672),
+    (0.720,0.0574), (0.740,0.0544), (0.760,0.0510), (0.780,0.0474), (0.800,0.0445), (0.820,0.0404),
+    (0.840,0.0379), (0.860,0.0335), (0.880,0.0311), (0.900,0.0268), (0.920,0.0243), (0.940,0.0201),
+    (0.960,0.0175), (0.980,0.0135), (1.000,0.0088), (1.020,0.0088), (1.050,0.0000),
+]
+
+ENV_LEN = CABIN_ENV[-1][0]
+
+
+def env_cut_time(cut, ring):
+    """When the stretched envelope first falls below `cut` (fraction of peak)."""
+    if cut <= 0.0:
+        return None
+    for t, a in CABIN_ENV:
+        if a < cut:
+            return t * ring
+    return None
+
+
+def env_at(t, ring=1.0, cut_t=None):
+    """Measured envelope at t seconds after the note's attack completes.
+
+    `ring` time-stretches it: 1.0 is exactly as measured, 1.8 rings ~80% longer.
+    `cut_t` ends it early with a short fade, killing the stretched tail.
+    """
+    if cut_t is not None:
+        if t >= cut_t + FADE:
+            return 0.0
+        if t > cut_t:
+            return env_at(cut_t, ring) * (1.0 - (t - cut_t) / FADE)
+    t = t / ring
+    if t <= 0.0:
+        return 1.0
+    if t >= ENV_LEN:
+        return 0.0
+    lo, hi = 0, len(CABIN_ENV) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if CABIN_ENV[mid][0] <= t:
+            lo = mid
+        else:
+            hi = mid
+    t0, a0 = CABIN_ENV[lo]
+    t1, a1 = CABIN_ENV[hi]
+    return a0 + (a1 - a0) * ((t - t0) / (t1 - t0)) if t1 > t0 else a0
+
+
+def render(notes, preroll, volume, tail, ring=1.0, dither=0.0014, cut=0.0):
+    last = max(t for t, _f, _p in notes)
+    cut_t = env_cut_time(cut, ring)
+    audible = ENV_LEN * ring if cut_t is None else min(ENV_LEN * ring, cut_t + FADE)
+    end = preroll + last + ATTACK + audible + tail
+    n = int(SR * end)
+    # Bluetooth link keepalive, across the WHOLE span rather than just the
+    # front. An aggressive A2DP sink sleeps on true digital silence and then
+    # clips the attack of whatever wakes it - the same way a podcast loses the
+    # first instant after a speaker's pause. This chime is mostly silence by
+    # duration (1.03 s between hi and lo, 2.4 s between pairs), so a pre-roll
+    # alone leaves every later note exposed. TPDF dither at ~-57 dBFS is below
+    # audibility but is not digital silence, so the radio never lets go.
+    buf = [(random.random() + random.random() - 1) * dither for _ in range(n)]
+    na = max(1, int(SR * ATTACK))
+    span = na + int(SR * audible)
+    for start_t, freq, peak in notes:
+        s0 = int(SR * (preroll + start_t))
+        peak *= volume
+        for i in range(span):
+            idx = s0 + i
+            if idx >= n:
+                break
+            t = i / SR
+            env = peak * (i / na) if i < na else peak * env_at(t - ATTACK, ring, cut_t)
+            buf[idx] += env * math.sin(2 * math.pi * freq * t)
+    frames = b"".join(struct.pack("<h", max(-32767, min(32767, int(s * 32767)))) for s in buf)
+    hdr = (b"RIFF" + struct.pack("<I", 36 + len(frames)) + b"WAVEfmt " +
+           struct.pack("<IHHIIHH", 16, 1, 1, SR, SR * 2, 2, 16) + b"data" +
+           struct.pack("<I", len(frames)))
+    return hdr + frames
+
+
+def player():
+    for cmd in (["pw-play"], ["paplay"], ["aplay", "-q"]):
+        try:
+            subprocess.run([cmd[0], "--version"], capture_output=True, timeout=5)
+            return cmd
+        except Exception:
+            continue
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tone", default="success", choices=sorted(TONES))
+    ap.add_argument("--notes", help="JSON [[startSec,freqHz,peak],...] - overrides --tone")
+    ap.add_argument("--repeat", type=int, default=1)
+    ap.add_argument("--gap", type=float, default=3.0, help="seconds between repeats")
+    ap.add_argument("--volume", type=float, default=1.0, help="peak scale 0..1")
+    ap.add_argument("--preroll", type=float, default=0.70, help="A2DP wake-up seconds (0 disables)")
+    ap.add_argument("--dither", type=float, default=0.0014,
+                    help="Bluetooth keepalive noise level, spanning the whole chime (0 disables)")
+    ap.add_argument("--tail", type=float, default=1.10, help="dithered run-out after the last note so BT buffers flush")
+    ap.add_argument("--ring", type=float, default=None,
+                    help="envelope time-stretch (1.0 = exactly as measured); defaults per tone")
+    args = ap.parse_args()
+
+    notes = json.loads(args.notes) if args.notes else TONES[args.tone]
+    ring = args.ring if args.ring is not None else (1.0 if args.notes else RING[args.tone])
+    cut = 0.0 if args.notes else TAIL_CUT[args.tone]
+    cmd = player()
+    if not cmd:
+        print("no audio player found (pw-play/paplay/aplay)", file=sys.stderr)
+        return 2
+    wav = render(notes, args.preroll, args.volume, args.tail, ring, args.dither, cut)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        f.write(wav)
+        path = f.name
+    try:
+        for i in range(args.repeat):
+            subprocess.run(cmd + [path], capture_output=True)
+            print(f"chime {i+1}/{args.repeat} played ({args.tone if not args.notes else 'custom'})")
+            if i + 1 < args.repeat:
+                time.sleep(args.gap)
+    finally:
+        os.unlink(path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
