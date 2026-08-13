@@ -278,7 +278,7 @@ def escalate(host, sub, row, why, dry):
             log(f"  ⚠ escalation target {to[:8]} is NOT a live row — falling back to a human card")
             orphaned, to = to, ""
     if to:
-        target = f"remote-cc://{sub.get('escalate_host', sub.get('host', 'dev'))}/{to}"
+        target = f"remote-cc://{_host_of(sub, 'escalate_host', 'host')}/{to}"
         note = (f"MONITOR — row {sub.get('seat') or row} needs a decision: {why}. "
                 f"Its path is {row}. Probe it, read its tail, and act; do not "
                 f"assume it is finished.")
@@ -300,6 +300,25 @@ def escalate(host, sub, row, why, dry):
 # ---------------------------------------------------------------------------
 # Verbs
 # ---------------------------------------------------------------------------
+def _host_of(sub, *keys):
+    """⛔ `.get(k, default)` DEFAULTS ON A MISSING KEY, NOT ON AN EMPTY VALUE.
+
+    A subscription written without `--machine` stores `host: ""` — the key is
+    PRESENT and empty. So `sub.get("host", "dev")` returns `""`, and the row path
+    composes as `remote-cc:///<uuid>`: an empty authority, unroutable, and it
+    reaches nobody while every field involved looks populated.
+
+    Measured 2026-08-13: an escalation for a live row was addressed that way, and
+    the malformed path was visible in the escalation text itself before anyone
+    noticed the subscription had an empty host. ⇒ Fall back on FALSINESS, not on
+    absence, wherever a stored value composes into an address."""
+    for k in keys:
+        v = (sub.get(k) or "").strip()
+        if v and v != "local":
+            return v
+    return "dev"
+
+
 def _bare_uuid(v):
     """⛔ $YGGTERM_SESSION_ID IS NOT A BARE UUID — it is `cc-runtime://<uuid>`.
 
@@ -635,7 +654,7 @@ def tick(a):
         rhost = None if s.get("host") in ("", None, "local") else s.get("host")
         raw = bs.classify(uuid, rhost)
         state, why = refine(raw, uuid, rhost)
-        row = bs.resolve_row_path(a.gui_host, uuid) or f"remote-cc://{s.get('host','dev')}/{uuid}"
+        row = bs.resolve_row_path(a.gui_host, uuid) or f"remote-cc://{_host_of(s, 'host')}/{uuid}"
         log(f"{uuid[:8]} {state:<12} {raw['age']//60:>3}m  {why or raw.get('tail','')[:60]}")
 
         # ⛔ ESCALATE ONCE PER EPISODE, NOT ONCE PER TICK.

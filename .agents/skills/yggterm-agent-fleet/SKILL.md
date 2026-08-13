@@ -1193,12 +1193,21 @@ pattern, the only new parts are the clustering rule and the confirm gate.
 
 | row | what it does |
 |---|---|
-| **`N`** — the orchestrator | clusters the work, writes the briefs, launches, monitors, merges, reaps. It does **not** fix bugs. |
+| **`N.0`** — the orchestrator | clusters the work, writes the briefs, launches, monitors, merges, reaps. It does **not** fix bugs. |
 | **`N.1` … `N.k`** — the clusters | each owns one cluster and relays *within* it: a cluster session hands off to its own successor until its cluster is done, then reports up. |
 
-Seat them as a book — `6`, `6.1`, `6.2` — so the sidebar reads as the plan. The
-orchestrator takes the bare integer; a cluster that spawns its own successor
-keeps the same seat.
+Seat them as a book — `6.0`, `6.1`, `6.2` — so the sidebar reads as the plan. The
+orchestrator takes **`N.0`, never the bare integer** (the reasoning is below, under
+*AN ORCHESTRATOR SITS AT `N.0`*); a cluster that spawns its own successor keeps the
+same seat.
+
+⚠ **This paragraph said "the bare integer" until 2026-08-13, contradicting its own
+section three screens further down, and a fresh orchestrator followed it and
+claimed `7`.** The owner corrected it on sight — the bare integer reads as a
+different KIND of thing from its own children, so the head of the book stops
+looking like part of the book. ⇒ **A document that disagrees with itself is worse
+than one that is merely wrong**, because each half looks authoritative where it is
+read, and the half a newcomer meets first is the one at the top.
 
 ### ⭐ CLUSTER ON TWO AXES AT ONCE, NOT ONE
 
@@ -1303,6 +1312,20 @@ renderer — that one has no sub-seats to be consistent with.
 **The seat lives in `outline_prefix` and nowhere else.** The sidebar composes
 `label = "<outline_prefix> <title>"` at render time, so a title that also carries
 the number gets it twice.
+
+⚠ **A SESSION HAS TWO NAMES AND THE CLAIM ONLY SETS ONE.** `ygg-claim.sh` sets the
+ROW title and re-asserts it for `--watch-secs` against the CLI's self-titling —
+the right defence for the row. **Nothing propagates the claimed title INTO the
+CLI**, so the agent goes on calling itself whatever it composed from its first
+turn while the sidebar shows the claimed name. Two names for one session, and the
+one the human reads is not the one the session answers to.
+
+⇒ Reported by an orchestrator whose row read as its campaign seat while the CLI
+still called it by a first-turn phrase. **Live question, not settled:** either the
+claim should also drive the CLI's own title, or this file should state plainly
+that the two are separate and why. ⛔ Until it is decided, **do not identify a row
+by either name** — resolve to a UUID, which is the only identifier here that
+belongs to exactly one namespace.
 
 ⚠ **This was learned expensively, and it is the same defect twice.** `ygg-claim.sh`
 used to write the seat into the title *as well*, as belt-and-braces against a
@@ -1878,7 +1901,22 @@ still stops a row on another.
   is **in a menu**…"* · **no transcript file is ever created** · `submit`
   answers `submitted:false`.
 - **Fix:** read the screen (`server snapshot` → `live_sessions[].terminal_lines`),
-  confirm the `❯` sits on *"1. Yes, I trust this folder"*, send a lone `\r`.
+  confirm the `❯` sits on *"1. Yes, I trust this folder"*, then send a lone `\r`
+  **with `terminal send`, NOT `terminal submit`.**
+- ⛔⛔ **`submit` DOES NOT DELIVER A BARE `\r`, AND IT REPORTS SUCCESS ANYWAY.**
+  Measured 2026-08-13 on two delegates spawned into fresh clone directories:
+  `terminal submit … --stdin` with a lone carriage return answered `bytes: 1` and
+  `read_nudge.accepted: true` — **and the gate did not move**; re-reading the
+  screen showed it still on the trust prompt. The identical byte through
+  `terminal send … --stdin` answered `accepted: true, bytes: 1` and **both gates
+  cleared instantly.**
+  ⇒ **`submit` is the composer path and normalises its payload** (it reported
+  `reason: "app_control_send_multiline"`), and a lone carriage return does not
+  survive that normalisation. **`send` writes to the PTY, which is what a menu
+  reads.** ⚠ This is the file's own law again — *the verb reports the request,
+  not the effect* — and it bites hardest here, because a trust gate holds the row
+  **before its composer**, which is precisely where a composer-shaped verb cannot
+  work while all of its success fields read healthy.
 - ⭐ **Answering it once persists it for that directory**, so every later row in
   the same cwd walks straight to its composer. **Answer it; never respawn
   elsewhere to dodge it** — dodging leaves the wall standing for the next agent.
