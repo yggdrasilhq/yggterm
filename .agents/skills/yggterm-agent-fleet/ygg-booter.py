@@ -62,6 +62,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ygg_host import resolve_gui_host  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 STATE = Path.home() / ".yggterm" / "relay"
 SUBS = STATE / "booter"
@@ -837,7 +840,7 @@ def main():
     ap.add_argument("--row", default="")
     ap.add_argument("--campaign", default="")
     ap.add_argument("--note", default="")
-    ap.add_argument("--host", default=os.environ.get("YGG_GUI_HOST", "guihost"),
+    ap.add_argument("--host", default=None,   # ⛔ resolved, never a placeholder
                     help="the GUI host — app control resolves only there")
     ap.add_argument("--max-hours", type=float, default=12.0)
     ap.add_argument("--kind", choices=("task", "monitor"), default="task",
@@ -849,6 +852,8 @@ def main():
     ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    # ⛔ Never carry a placeholder host into a boot decision.
+    args.host = resolve_gui_host(args.host)
     return {
         "subscribe": cmd_subscribe,
         "unsubscribe": cmd_unsubscribe,
