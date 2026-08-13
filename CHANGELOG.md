@@ -4,6 +4,36 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A row whose runtime the daemon owns can be opened again (3.0.114).** Some
+  rows would not restore, and restarting did not recover them — the same rows
+  failed the same way, forever. The cause is a resolver that answers with a name
+  nothing holds: when the session map has no row for a runtime-lane key
+  (`cc-runtime://<id>`), it folds the key down to `local://<id>`, which is right
+  for a legacy adopted runtime and wrong for a daemon-owned one. It cannot tell
+  the two apart, because the difference lives in the terminal map it cannot see.
+  So every read, write, resize and close addressed a key that was never there,
+  and the viewport painted `Error: terminal session not found: local://<id>` —
+  including the close, which then removed nothing and left the real PTY running
+  with no row anywhere, making the next orphan. Measured on the desktop host:
+  four rows, all four with a live PTY the current daemon owned under its own
+  name, one of them opened seven times in nine minutes. The daemon now prefers
+  whichever spelling its terminal map actually answers to, and a request it
+  still cannot serve emits `daemon/terminal_runtime/request_refused` naming
+  which map held what — because the row list, the summary and the reveal log all
+  reported that row as healthy, and there was no way to tell *gone* from *slow*.
+- **A restore no longer hands back the rows you deleted (3.0.114).** There was
+  no restore verb, so recovering a lost set of rows meant hand-rolling one out
+  of `app open` — and `open` is a user-intent verb that must stay permissive,
+  because re-opening a row yourself is how a close is legitimately undone. A
+  batch is not that intent, and the hand-rolled loop could not tell the
+  difference: handed the full set it restored all of it, deletions included.
+  `server app sessions restore <session-path>... [--dry-run]` is that verb. It
+  checks every path against the same tombstone plane the daemon's own import and
+  cold-restore already veto against, opens the survivors one at a time (issuing
+  them together makes the GUI supersede all but the last), and the reply names
+  `declined_closed_count` with the paths. `server app rows` now carries
+  `close_remembered` per session row for the same reason: a deny-list nothing
+  outside the daemon could read was a deny-list every restore ignored.
 - **The start page can be used to find a session again (3.0.113).** It is the
   surface reached when the sidebar has failed, and it could not do that job.
   Four things changed. **It is ordered most-recently-used first, and it says so

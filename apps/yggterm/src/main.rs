@@ -881,6 +881,10 @@ fn print_server_app_help() {
     sets the order on the GUI — the process that RENDERS it — and answers with
     the resulting `rendered_order`. `server sessions reorder` writes to whichever
     daemon the CLI resolved, which is not always the one the GUI reads.
+  yggterm server app sessions restore <session-path>... [--dry-run]
+    puts NAMED rows back through the same open a click takes, one at a time, and
+    REFUSES any the user closed — the deny-list is consulted once for the batch
+    and the reply carries `declined_closed_count` plus the paths.
   yggterm server app sessions sort [--dry-run]
     re-derives the Live order from the rows' outline numbers and applies it.
     Segments compare as INTEGERS (1 · 1.1 · 2 · 10), unnumbered rows sort last
@@ -2213,6 +2217,23 @@ fn main() -> Result<()> {
             // `server app sessions sort [--dry-run]` — the owner's shortcut:
             // re-derive the Live order from the rows' outline numbers and apply
             // it, through the same path a manual drag takes.
+            // `server app sessions restore <session-path>... [--dry-run]` —
+            // the recovery verb, with the user's deletions honoured. Every path
+            // is checked against the tombstone plane BEFORE anything is opened,
+            // and the reply names how many it declined; without that a restore
+            // hands back the rows the user deliberately deleted.
+            "sessions" if args.get(3).map(String::as_str) == Some("restore") => {
+                let dry_run = args.iter().any(|arg| arg == "--dry-run");
+                let session_paths = cli_positional_args(&args, 4)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                yggterm_server::run_app_control_restore_sessions(
+                    session_paths,
+                    dry_run,
+                    timeout_ms,
+                )
+            }
             "sessions" if args.get(3).map(String::as_str) == Some("sort") => {
                 yggterm_server::run_app_control_sort_sessions(
                     args.iter().any(|arg| arg == "--dry-run"),

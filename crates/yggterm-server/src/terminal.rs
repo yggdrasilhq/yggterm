@@ -1005,6 +1005,18 @@ impl TerminalManager {
             .is_some_and(|session| session.is_running())
     }
 
+    /// Is `key` a runtime this manager HOLDS — running or exited-but-retained?
+    ///
+    /// Deliberately weaker than [`Self::has_session`], which answers "is it
+    /// running". `read`/`write`/`resize`/`remove_session` address the map, not
+    /// the process: an exited runtime still answers a read with its retained
+    /// screen, and a caller choosing which spelling of a key to address must
+    /// know the map holds it — otherwise it picks a name nothing answers to and
+    /// the read fails with `terminal session not found`.
+    pub fn holds_session(&self, key: &str) -> bool {
+        self.sessions.contains_key(key)
+    }
+
     pub fn rename_session(&mut self, from: &str, to: &str) -> bool {
         if from == to || self.sessions.contains_key(to) {
             return false;

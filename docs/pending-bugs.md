@@ -31,9 +31,47 @@ the rest, and 6.1 is ordered first for that reason.
 
 ## ⛔⛔ [6.1] SOME ROWS WILL NOT RESTORE, AND A RESTART DOES NOT RECOVER THEM
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*reported 2026-08-13, live on the desktop host*
+*reported 2026-08-13, live on the desktop host · root cause found and fixed
+2026-08-13 (3.0.114)*
+
+**ROOT CAUSE, reproduced deterministically.** The resolver that turns a row's
+path into the key its PTY is addressed by answers with a name nothing holds.
+`YggtermServer::terminal_runtime_key_for_path` folds a runtime-lane key
+(`cc-runtime://<id>`, `codex-runtime://<id>`) down to `local://<id>` whenever the
+session map holds no row for it — right for a legacy adopted runtime, wrong for a
+daemon-owned one, and it cannot tell them apart because the difference lives in
+the terminal map it cannot see. Four rows on the desktop host had a live PTY the
+CURRENT daemon owned as `cc-runtime://<id>` and no session row, so every read
+resolved to `local://<id>` and answered
+`Error: terminal session not found: local://<id>` — the whole of the retained
+screen, 110 bytes, painted into the viewport. A restart re-runs the same fold,
+which is exactly why restarting never cleared it. Reproduced on demand by
+running the row's own launch line by hand: `yggterm server remote resume-cc <id>
+<cwd> --require-existing` → the same error, every time, while
+`server status --endpoint 3.0.112` listed `cc-runtime://<id>` among the daemon's
+own `owned_terminal_session_keys`.
+
+**How the orphan is made**, and it is the same defect one layer up: the close
+path resolved the key the same way, so `terminals.remove_session()` removed
+nothing and left the real PTY running with no row anywhere. Every close of a row
+in this state manufactured the next one.
+
+**Fixed:** the daemon now prefers whichever spelling its own terminal map answers
+to (`DaemonRuntime::terminal_runtime_key_for_path`), and every in-daemon caller
+— close, keep-alive, snapshot runtime-truth, identity refresh — goes through it
+rather than the session map's raw fold. A request that still cannot be served
+emits `daemon/terminal_runtime/request_refused` naming which map held what.
+
+**What live proof is owed, and why it is not free.** The four rows' PTYs are
+owned by a daemon running the OLD binary, and a bridge routes to the owner. They
+recover when that daemon is superseded and hands its PTYs over; until then the
+fix is proven by the unit truth table
+(`a_rewritten_runtime_key_never_beats_one_the_terminal_map_actually_holds`), the
+structural lock over the callers, and the reproduction above. The observation
+that would falsify the fix: a row whose PTY a 3.0.114+ daemon owns under
+`cc-runtime://<id>`, with no session row, that still refuses to open.
 
 After the GUI restarted, a subset of rows never came back to a usable state.
 Restarting again does not clear it: the same rows fail the same way, so this is
@@ -66,9 +104,32 @@ the reporter had no way to tell "this row is gone" from "this row is slow".
 
 ## ⛔⛔ [6.1] A ROW DROPPED FROM HISTORY COMES BACK
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-*reported 2026-08-13*
+*reported 2026-08-13 · fixed 2026-08-13 (3.0.114)*
+
+**Reading 1 is not what happened, and checking it was worth the hour.** Every
+restore path INSIDE yggterm already vetoes a closed row against the tombstone
+plane: the cross-daemon import admission does, and so does cold restore from
+`server-state.json` (`drop_tombstoned_live_rows`, which traces
+`cold_restore_of_closed_live_rows_refused`). Reading 2 is the true one, and it is
+sharper than it looks: **there was no restore verb at all.** An agent asked to
+restore a set of rows had to hand-roll one out of `app open` — and `open` must
+stay permissive, because a person re-opening a row they closed yesterday is how a
+close is legitimately undone. A batch is not that intent, and a loop of `open`
+cannot tell the difference.
+
+**Fixed:** `server app sessions restore <session-path>... [--dry-run]` is the
+verb. It checks the batch against the tombstone plane once, opens the survivors
+ONE AT A TIME (issued together, the GUI supersedes all but the last — measured in
+the very recovery that produced this entry), and the reply carries
+`declined_closed_count` plus the declined paths. `server app rows` now reports
+`close_remembered` per session row, so any enumerator outside the daemon can see
+the deny-list it was previously ignoring for lack of a way to read it.
+
+**Live proof owed:** run the falsifier on the desktop host — close a row, pass
+it to `restore` inside a batch, and confirm `declined_closed_count: 1` with the
+row absent from the resulting live order.
 
 During the manual recovery, a second agent CLI was asked to restore the rows and
 **restored rows that had been deliberately deleted earlier**. Two readings, and
