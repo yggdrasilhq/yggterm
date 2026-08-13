@@ -27,6 +27,7 @@ Every entry below cost a session at least once.
 | `/proc/<pid>/environ` | The process called `std::env::set_var` at runtime (yggterm does this for GL and arming decisions) | The app's own reported state |
 | The daemon's `terminal_lines` | You are chasing a CLIENT paint bug. That is the daemon's vt100 screen — comparing it to itself proves nothing about what the client painted | A faithful pixel, or the client buffer |
 | A verb's own `accepted` / `is_trusted` | Always treat as an assumption, not an observation | Read back the page-side *effect* |
+| **Every field in `server app state`, once `webview_edit_faults` is non-zero** | A webview that threw while applying an edit batch is acknowledged as having applied it, so the host diffs against a model in which those mutations landed and NEVER re-sends them. One subtree is then frozen at whatever it held, while every state field keeps reporting the mode it should be showing. **The state is not lying about the state — it has stopped describing the screen.** The rail that drew no body while `right_panel_mode` tracked every command was this, twice, and it cost a retracted bisect across 36 releases | Read `webview_edit_faults` FIRST. Non-zero invalidates the screenshot, not the state, and only a GUI restart clears it. ⛔ Do NOT reach for detached-node counts or interpreter stack depth — a clean instance measures 41 % detached and depth 1, so neither discriminates |
 | `dom-eval` returning `{"result": null}` | Your script had no `return`. The body is spliced into an async function, so an *expression* yields `undefined` → `null` — identical to a field that does not exist | Include a `sanity: 1+1` term in every probe |
 | `getComputedStyle` (verifying an ANIMATION actually paints) | **Always, for a paint bug.** Reading a computed value **forces the style recalculation the paint path never performs**, so the instrument supplies the very invalidation whose absence is the defect. A blink read back as a perfect 1100 ms square wave was, in the same minute, pixel-identical and ABSENT across ten faithful screenshots — WebKitGTK advances a custom-property animation in the style system without marking its `var()` consumers dirty for paint. A July verification built on this probe could only ever answer yes | A faithful screenshot **burst**, and diff frame-to-frame. Confirm other regions change between captures, or a frozen dot is indistinguishable from a cached frame |
 | A performance win that lands exactly on the do-nothing floor | **Always suspect a deletion.** Presented frames falling 9.4/s → 2.1/s was celebrated as a rendering win; 2.1/s *was* the idle baseline, and the real change was that the blink had stopped drawing at all. **A perf number that reaches the floor is a feature that stopped happening until proven otherwise** | Check that the thing being measured still HAPPENS. Pair every cost measurement with a behaviour assertion, or you cannot tell optimisation from removal |
@@ -189,6 +190,68 @@ fails, which is when you most need the answer. Same family as `cargo test … | 
 ⭐ **And the discipline that catches it: run both controls in the same command.** The instance that
 produced this line was only recognised because a negative control returned 0 and a positive control
 returned 168 side by side — a single reading of either would have looked like an answer.
+
+### ⛔⛔ `terminal new` RETURNS `active_session_path` — WHICH IS NOT THE ROW IT JUST CREATED
+
+**This one delivered a 200-line brief into a stranger's live session.** The response to
+`server app terminal new … --no-activate` carries a field named `active_session_path`. With
+`--no-activate` the newly created row is deliberately NOT activated, so that field still names
+**whatever was active before** — another campaign's row, mid-work. Read it as "the row I just made"
+and every following step is aimed at the wrong session: the readiness probe types into it, and the
+submit lands a whole brief in its composer.
+
+⇒ **Resolve the new row by its TITLE, never from that field:**
+
+```sh
+server app rows | python3 -c 'import sys,json
+for r in json.load(sys.stdin)["data"]["rows"]:
+    if "<the --title you passed>" in (r.get("label") or ""): print(r["full_path"])'
+```
+
+⭐ **And the check that catches it even if you get the path wrong:** the four-step spawn ends by
+**grepping the SUCCESSOR'S OWN TRANSCRIPT for a token from your brief** — and a transcript lives
+under `~/.claude/projects/<cwd-slug>/<uuid>.jsonl`, so **the slug itself proves the cwd**. A token
+found under the wrong project slug, or a transcript that is megabytes old when a fresh row should be
+kilobytes, is the misdelivery announcing itself. Both tells were present and both are cheap.
+
+⚠ Same family as the `input-check` spelling: the verb is **`server app terminal input-check`**, not
+`server app input-check`, which answers `unsupported app control command` — easy to misread as "this
+build lacks the verb" rather than "the parent verb is missing".
+
+### ⛔ `server app rows` DOES NOT CARRY THE WEDGE FIELDS — `server snapshot` DOES
+
+A brief handed on the claim that `server app rows` emits `input_unanswered_ms` and
+`wedge_suspected`, which would make it the instrument for measuring a deaf row. **It does not.**
+Measured: 384 rows, and the union of every field name across all of them contains neither.
+
+```sh
+server app rows | python3 -c 'import sys,json; rs=json.load(sys.stdin)["data"]["rows"]; \
+  print(sorted({k for r in rs for k in r}))'      # ⇒ no input_unanswered_ms, no wedge_suspected
+```
+
+`input_unanswered_ms` lives on `SnapshotSessionView` (`daemon.rs`), so **`server snapshot`** is the
+owner; `wedge_suspected` is not a field at all but a derived predicate —
+`input_unanswered_suggests_wedge()` against `INPUT_UNANSWERED_WEDGE_SUSPECT_MS` in `yggterm-core`,
+which is the single owner of the threshold that gate, row payload and sidebar all read.
+
+⭐ **The lesson is the shape, not the fields:** the claim arrived in a handover as an established
+fact and was one command from being falsified. A relayed measurement is a CLAIM until you have run
+it yourself — and building a measurement on top of an instrument that does not exist is how a whole
+lane's numbers turn out to be about nothing.
+
+### ⛔ A DOM READ IS `server app dom-eval` — `chrome type --assert` TYPES FIRST
+
+`server app chrome` offers only `type`. Its `--assert <selector>@<attribute>` is a real DOM read but
+it writes a keystroke before reading, so it can never be pointed at a GUI a human is using.
+**`server app dom-eval "<js>"` runs JS in the GUI webview and returns the serialized result without
+typing** — pass the script POSITIONALLY, flags after it, or a leading flag makes it evaluate the
+flag string. Base64 the script through `ssh` to keep quoting honest.
+
+⛔ It answers only on the host where the GUI runs, and only to a registered client — a headless host
+has a daemon and sessions but no client. `server app clients` answers "is the GUI here" directly.
+⭐ A GUI with its own `YGGTERM_HOME` (a sandbox, another lane's rig) is reachable by pointing that
+variable at it, which is how a second live instance can be READ for comparison. Never DRIVE one:
+a mode change or relaunch corrupts whatever it is measuring.
 
 ## 2. Profiling recipes that work
 
