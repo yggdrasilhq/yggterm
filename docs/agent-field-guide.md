@@ -190,6 +190,33 @@ fails, which is when you most need the answer. Same family as `cargo test … | 
 produced this line was only recognised because a negative control returned 0 and a positive control
 returned 168 side by side — a single reading of either would have looked like an answer.
 
+### ⛔⛔ `terminal new` RETURNS `active_session_path` — WHICH IS NOT THE ROW IT JUST CREATED
+
+**This one delivered a 200-line brief into a stranger's live session.** The response to
+`server app terminal new … --no-activate` carries a field named `active_session_path`. With
+`--no-activate` the newly created row is deliberately NOT activated, so that field still names
+**whatever was active before** — another campaign's row, mid-work. Read it as "the row I just made"
+and every following step is aimed at the wrong session: the readiness probe types into it, and the
+submit lands a whole brief in its composer.
+
+⇒ **Resolve the new row by its TITLE, never from that field:**
+
+```sh
+server app rows | python3 -c 'import sys,json
+for r in json.load(sys.stdin)["data"]["rows"]:
+    if "<the --title you passed>" in (r.get("label") or ""): print(r["full_path"])'
+```
+
+⭐ **And the check that catches it even if you get the path wrong:** the four-step spawn ends by
+**grepping the SUCCESSOR'S OWN TRANSCRIPT for a token from your brief** — and a transcript lives
+under `~/.claude/projects/<cwd-slug>/<uuid>.jsonl`, so **the slug itself proves the cwd**. A token
+found under the wrong project slug, or a transcript that is megabytes old when a fresh row should be
+kilobytes, is the misdelivery announcing itself. Both tells were present and both are cheap.
+
+⚠ Same family as the `input-check` spelling: the verb is **`server app terminal input-check`**, not
+`server app input-check`, which answers `unsupported app control command` — easy to misread as "this
+build lacks the verb" rather than "the parent verb is missing".
+
 ### ⛔ `server app rows` DOES NOT CARRY THE WEDGE FIELDS — `server snapshot` DOES
 
 A brief handed on the claim that `server app rows` emits `input_unanswered_ms` and

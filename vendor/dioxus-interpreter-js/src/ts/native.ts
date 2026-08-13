@@ -30,6 +30,9 @@ export class NativeInterpreter extends JSChannel_ {
   headless: boolean;
   kickStylesheets: boolean;
   queuedBytes: ArrayBuffer[] = [];
+  // The first exception thrown while applying the current flush, carried to
+  // `markEditsFinished` so the acknowledgement can report it. Null = clean.
+  editFault: string | null = null;
 
   // eventually we want to remove liveview and build it into the server-side-events of fullstack
   // however, for now we need to support it since WebSockets in fullstack doesn't exist yet
@@ -440,8 +443,30 @@ export class NativeInterpreter extends JSChannel_ {
     this.queuedBytes = [];
 
     for (let bytes of byteArray) {
-      // @ts-ignore
-      this.run_from_bytes(bytes);
+      // ⛔ ONE BAD BUFFER MUST NOT EAT ITS SIBLINGS. The drain empties
+      // `queuedBytes` BEFORE applying any of it, so an exception escaping this
+      // loop used to destroy every buffer behind the failing one — batches the
+      // host had already been told were delivered, and will never send again.
+      // Each buffer therefore fails alone.
+      //
+      // ⚠ And the stack is restored to the depth this buffer STARTED at, not to
+      // zero: a balanced batch returns the stack where it found it, and a clean
+      // instance legitimately sits at a non-zero depth between batches
+      // (measured: 1). A faulted batch leaves its operands behind, and every
+      // later `replace_with` / `append_children` splices `stack.length - n` —
+      // so one abandoned operand silently mis-addresses every batch that
+      // follows. That is what turns a single lost subtree into a spreading one.
+      const stackDepthAtEntry = this.stack.length;
+      try {
+        // @ts-ignore
+        this.run_from_bytes(bytes);
+      } catch (err) {
+        this.editFault = this.editFault || String((err && (err as any).stack) || err);
+        if (this.stack.length > stackDepthAtEntry) {
+          this.stack.length = stackDepthAtEntry;
+        }
+        console.error("failed to apply an edit batch", err);
+      }
     }
   }
 
@@ -519,14 +544,37 @@ export class NativeInterpreter extends JSChannel_ {
   }
 
   markEditsFinished() {
-    // Send an empty ArrayBuffer to the edits websocket to signal that the edits are finished
+    // Send an ArrayBuffer to the edits websocket to signal that the edits are finished
     // This is used to signal that the edits are done and the next request can be processed
     //
     // A closed or closing socket throws here. That is survivable — the host
     // reconnects and re-sends — but it must not escape, because this runs in a
     // `finally` whose whole job is to make the acknowledgement unconditional.
+    //
+    // ⛔ THE ACK MUST NOT LIE. It stays unconditional — a withheld ack starves
+    // the whole VirtualDom, which is the freeze this file already fixed once —
+    // but "I applied it" and "I tried and it threw" are different answers, and
+    // collapsing them into one is what made a damaged DOM invisible. The host
+    // diffs against a model that says the mutations landed, so it never emits
+    // them again: whatever that batch was carrying is gone for the life of the
+    // process, with nothing in any log. A payload byte is the whole difference
+    // between a silent permanent corruption and a line in the host's log
+    // naming the operation that failed.
+    //
+    //   []            no fault (kept empty for hosts that only check arrival)
+    //   [1] ++ utf8   a fault, followed by the JS error text
     try {
-      this.edits.send(new ArrayBuffer(0));
+      const fault = this.editFault;
+      this.editFault = null;
+      if (fault === null || fault === undefined) {
+        this.edits.send(new ArrayBuffer(0));
+      } else {
+        const text = new TextEncoder().encode(fault.slice(0, 2000));
+        const payload = new Uint8Array(text.length + 1);
+        payload[0] = 1;
+        payload.set(text, 1);
+        this.edits.send(payload);
+      }
     } catch (err) {
       console.error("failed to acknowledge edits", err);
     }
