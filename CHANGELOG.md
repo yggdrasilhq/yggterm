@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **An idle app stops re-rendering itself once a second for no reason
+  (3.0.121).** The input gate's deadline tick ran every second for the life of
+  the process and took a mutable borrow of the whole shell state to do it — and
+  that borrow marks the state dirty when it is dropped, whether or not anything
+  was written. At rest nothing was: the app redrew its entire root every second
+  on a window with no sessions open in it at all. Measured on an idle app with
+  zero sessions, idle redraws fell **61%**, from 1.65 to 0.65 per second. The
+  tick now checks, without taking the borrow, whether it has anything to do.
+  ⚠ This is a floor improvement, not a cure for the slow climb in CPU that a
+  long-running app shows — that climb happens at a flat redraw rate and is a
+  different defect, still open.
+
 - **An agent row keeps the purpose it was created with, whatever letter that
   purpose happens to end on (3.0.120).** Three rows were created in one command
   with `--purpose`; two rendered their purpose and one did not, and the daemon's
