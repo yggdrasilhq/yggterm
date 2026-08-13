@@ -955,6 +955,39 @@ to be debugged twice before its numbers could be quoted — see the commits; the
 lesson is that a role's SAMPLE COUNT must be printed beside its mean, because a
 single stale row renders as a full role.
 
+### SINGLE-BUILD READING, and why it does NOT settle whether the fix helped
+
+Measured with the build identity read at **both ends** of the window, so a
+mid-sample swap invalidates rather than silently corrupts it — `md5_start ==
+md5_end == 1b54ac5de5db`, same pid throughout, 3.0.122, my fix proven an
+ancestor of that build:
+
+| | WebKit | GUI | total |
+|---|---|---|---|
+| 3.0.120, no fix, age 29 min | 25.0% | 14.0% | 39.0% |
+| **3.0.122, fix present, age 10 min** | **15.8%** | **20.8%** | **36.6%** |
+
+⛔ **Do not read this as a before/after. It is not one, and saying otherwise
+would be the third wrong conclusion this campaign has drawn from an
+uncontrolled pair.** The two samples differ in process age (29 vs 10 min) and,
+far more importantly, in **workload** — three clusters were landing work on this
+machine and the number of live rows, streaming sessions and open surfaces was
+not held constant. The GUI reading even moved the *wrong* way for the growth
+model (the older process was the cheaper one), which is the tell that workload
+is dominating uptime here.
+
+⇒ **What is honestly established:** the fix's effect is measured *in the
+sandbox* (61% fewer idle re-renders, attributed by gap fingerprint), and its
+**CPU share on the desktop host has never been isolated**. What this window does
+establish is the standing figure the mandate is judged against: **yggterm costs
+~37% of a core with nobody using it**, which is nowhere near "nothing
+measurable".
+
+⭐ **What would settle it:** a controlled A/B on this host — same row count, same
+active session, alternating builds, md5-guarded at both ends of every window.
+That needs the quiet host the orchestrator has offered twice and this cluster
+has not yet claimed. **Claim it before attempting another before/after here.**
+
 **Next instrument, and the gap that blocks it:** there is no way to evaluate JS
 in the shell's own webview — `server app web eval` and `web devtools` both
 target *session surfaces*, not the chrome. So "which JS timer / which style
