@@ -192,9 +192,46 @@ of three" invites a guess:**
 title, on the FIRST row of a batch. Not root-caused, and deliberately not
 guessed at.
 
+**ROOT-CAUSED 2026-08-13 (3.0.117), and "the FIRST row of a batch" was a
+coincidence of the probe.** The three purposes ended `A`, `B` and `C`. The copy
+layer's dangling-fragment rule (`ends_with_syntax_fragment` in
+`looks_like_low_signal_generated_title`, `yggterm-core/src/titles.rs`) treats a
+title whose last word is `the`/`a`/`an`/`to`/`for`/… as a generated fragment —
+right for `ship the logs to`, and it reads a trailing **`A`** as the English
+article. `agent_plane_session_title` (`yggterm-server/src/app_control.rs`) asks
+that same judge whether the composed title would survive downstream, and on
+`true` **drops the purpose and returns the bare base**, by design: the title
+survives by losing the only part that says what the row is for. Probe A was
+both the first row created and the one whose purpose ended in `A`; the ordering
+was the confound. Reproduced as a unit fact before any fix —
+`agent_plane_session_title(None, Some("6.2 sidebar order probe A"), …)`
+answered `Agent unnamed shell`, and the same call with `probe B` did not.
+
+**Fixed:** the judge now recognises an agent-plane title —
+`Agent <identity> <kind>`, optionally `: <purpose>` — as **authored**, not
+generated (`is_agent_plane_composed_title`), so none of the machine-copy
+heuristics apply to it. The exemption matches the whole shape, never the
+opening word, or it would be a hatch wide enough to drive every heuristic in
+that file through. `session_kind_label` moved to `yggterm-core` beside the
+slugs it is built from, so the copy layer reads the same vocabulary the
+composer writes rather than a second copy of it. Tests:
+`a_legible_purpose_is_never_amputated_from_an_agent_plane_title` (red before
+the fix, on the probe strings verbatim) and
+`an_agent_plane_title_is_authored_copy_and_is_never_judged_generated`.
+
+⚠ **The pre-existing test could not see this.**
+`an_agent_plane_title_is_never_thrown_away_as_generated_junk` asks only whether
+the TITLE survived, and amputation satisfies it — a bare
+`Agent unnamed claude-code` sails through. A test that asks "did the output
+survive" cannot catch an output that survived by discarding its payload.
+
 **Falsifier:** create three rows in one command with `--purpose`, and all three
 titles carry their purpose; or `created_by.purpose` is absent for the one that
 does not.
+
+**What live proof is owed:** three `claude-code` rows created back to back on
+the desktop host at 3.0.117+, purposes ending `A`, `B`, `C`, and all three
+sidebar titles carrying their purpose.
 
 ## ⛔ A SCREENSHOT OF A NON-TERMINAL VIEW PHOTOGRAPHS WHATEVER HOLDS FOCUS
 

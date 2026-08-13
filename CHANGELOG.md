@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **An agent row keeps the purpose it was created with, whatever letter that
+  purpose happens to end on (3.0.117).** Three rows were created in one command
+  with `--purpose`; two rendered their purpose and one did not, and the daemon's
+  own tenancy record held the missing purpose all along. It looked like an
+  ordering defect — the row that lost it was the first of the batch — and it was
+  a spelling one. The purposes ended `A`, `B` and `C`. The copy layer's
+  dangling-fragment rule, which correctly kills a generated title ending on
+  `to` or `for`, reads a trailing `A` as the English article; the title composer
+  asks that same judge whether the composed title would survive downstream, and
+  on `true` it drops the purpose to save the title. So the row survived by
+  losing the one thing that said what it was for. The judge now recognises an
+  agent-plane title — `Agent <identity> <kind>`, optionally `: <purpose>` — as
+  AUTHORED rather than generated: fixed text this build controls around the
+  caller's own words, which none of the machine-copy heuristics apply to. The
+  exemption is the whole shape, never the opening word, so a generated title
+  that merely starts with `Agent` is still judged on its merits. `session_kind_label`
+  moved to `yggterm-core` beside the slugs it is built from, because the copy
+  layer needs the same vocabulary and a second copy of it is the drift this
+  separation exists to prevent.
 - **A cwd folder no longer lists its live rows upside down (3.0.116).** A folder
   holding several live local agent sessions showed them in an order nobody could
   name. It was reported as the start page's defect — alphabetical by session

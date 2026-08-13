@@ -1364,6 +1364,51 @@ mod tests {
         assert!(!looks_like_generated_fallback_title("Remove Them Entirely"));
     }
 
+    /// The judge answers "did a MACHINE invent this", and an agent-plane title
+    /// is authored: this build's fixed text around the caller's own purpose.
+    ///
+    /// The live defect (2026-08-13, 3.0.116): `…probe A` lost its purpose while
+    /// `…probe B` and `…probe C`, created in the same breath, kept theirs. A
+    /// trailing `A` reads as the English article to the dangling-fragment rule,
+    /// so the composed title was judged junk and the composer amputated the
+    /// purpose to save the title.
+    #[test]
+    fn an_agent_plane_title_is_authored_copy_and_is_never_judged_generated() {
+        for title in [
+            "Agent unnamed claude-code",
+            "Agent unnamed claude-code: 6.2 sidebar order probe A",
+            "Agent unnamed shell: restore lane A",
+            "Agent probe-7 ssh: grep the echograph for",
+            "Agent probe-7 codex: why the build is slow",
+            "Agent probe-7 document: the and for with the",
+        ] {
+            assert!(
+                crate::is_agent_plane_composed_title(title),
+                "{title:?} is the shape the agent plane composes"
+            );
+            assert!(
+                !looks_like_generated_fallback_title(title),
+                "{title:?} is authored, so the copy layer must keep it"
+            );
+        }
+
+        // The exemption is the SHAPE, never the opening word: a generated title
+        // that merely starts with `Agent` is still judged on its merits, or the
+        // hatch is wide enough to drive every heuristic in this file through.
+        for title in [
+            "Agent",
+            "Agent unnamed",
+            "Agent 019cf82b",
+            "Agent Handover Notes For",
+        ] {
+            assert!(
+                !crate::is_agent_plane_composed_title(title),
+                "{title:?} is not an agent-plane composition"
+            );
+        }
+        assert!(looks_like_generated_fallback_title("Agent Handover Notes For"));
+    }
+
     #[test]
     fn manual_summary_and_alias_copy_share_session_title_store() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
@@ -2845,8 +2890,69 @@ fn title_from_phrase(phrase: &str) -> Option<String> {
     plausible_title(&title).then_some(title)
 }
 
+/// Every agent-plane row title starts with this word, so a title-based probe
+/// can find agent-owned rows without knowing which agent made them. The
+/// original incident was the opposite: an agent's scratch row was titled from
+/// its cwd exactly like a human's shell in the same directory, so every title
+/// search for it missed and only the user's eyes found it.
+///
+/// It lives beside the copy layer because the copy layer is the one that has to
+/// recognise the shape; `yggterm-server::app_control` composes with it and
+/// re-exports it.
+pub const AGENT_PLANE_TITLE_PREFIX: &str = "Agent";
+
+/// Is this string a title the AGENT PLANE composed — `Agent <identity> <kind>`,
+/// optionally `: <purpose>`?
+///
+/// **Why the copy layer has to be able to tell.** The generated-fallback
+/// heuristics below judge copy a MACHINE invented, and their whole job is to
+/// throw it away in favour of something a human wrote. An agent-plane title is
+/// the opposite: fixed text this build controls, plus the caller's own words.
+/// Judging it by those heuristics reads the caller's words as machine noise —
+/// which is precisely what happened. A row created with the purpose
+/// `6.2 sidebar order probe A` lost that purpose because the trailing `A` fires
+/// [`looks_like_low_signal_generated_title`]'s dangling-article rule, the same
+/// rule that correctly kills `ship the logs to`. Two rows created in the same
+/// breath, whose purposes ended `B` and `C`, kept theirs. It looked like an
+/// ordering bug and was a spelling one.
+///
+/// The shape is matched precisely rather than by the prefix alone, because a
+/// bare `starts_with("Agent")` would exempt any generated title that happened
+/// to open on that word from every check in this file.
+pub fn is_agent_plane_composed_title(title: &str) -> bool {
+    let mut words = title.split_whitespace();
+    if words.next() != Some(AGENT_PLANE_TITLE_PREFIX) {
+        return false;
+    }
+    // `Agent <identity> <kind>`: the identity is at least one word, so the kind
+    // token can never be the second word. With a purpose the kind token carries
+    // the joining colon (`shell:`), without one it ends the title.
+    let mut seen_identity_word = false;
+    for word in words {
+        if seen_identity_word {
+            if let Some(kind) = word.strip_suffix(':') {
+                if crate::agent_cli::session_kind_label_is_known(kind) {
+                    return true;
+                }
+            }
+            if crate::agent_cli::session_kind_label_is_known(word) {
+                return true;
+            }
+        }
+        seen_identity_word = true;
+    }
+    false
+}
+
 pub fn looks_like_generated_fallback_title(title: &str) -> bool {
     let compact = title.trim();
+    // An agent-plane title is AUTHORED — this build's fixed text around a
+    // caller's own purpose — so none of the machine-copy heuristics apply. See
+    // [`is_agent_plane_composed_title`] for the row that lost its purpose to
+    // them.
+    if is_agent_plane_composed_title(compact) {
+        return false;
+    }
     let lower = compact.to_ascii_lowercase();
     let words = compact.split_whitespace().collect::<Vec<_>>();
     let prefixed_session_uuid = [

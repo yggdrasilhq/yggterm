@@ -1885,6 +1885,48 @@ pub fn agent_cli_descriptor(kind: SessionKind) -> Option<&'static AgentCliDescri
     AGENT_CLIS.iter().find(|descriptor| descriptor.kind == kind)
 }
 
+/// The ONE lowercase wire name for a session kind — the `--kind` value, the
+/// `session_kind_label` string in telemetry, the row JSON's `icon_kind`.
+///
+/// The agent half is `descriptor.slug` rather than nine hand-written arms,
+/// because that slug is the same string the flag parser accepts: spelling them
+/// separately is how a kind could be LABELLED `pi` and yet be unparseable as
+/// `--kind pi`.
+///
+/// It lives here rather than in `yggterm-server` because the copy layer in
+/// [`crate::titles`] must recognise a title composed out of one, and a second
+/// copy of the vocabulary over there is exactly the drift this crate exists to
+/// prevent. `yggterm-server` re-exports it, so its call sites are unchanged.
+pub fn session_kind_label(kind: SessionKind) -> &'static str {
+    if let Some(descriptor) = agent_cli_descriptor(kind) {
+        return descriptor.slug;
+    }
+    match kind {
+        SessionKind::Shell => "shell",
+        // Historical spelling: `ssh`, not `ssh-shell`. It is on disk and on the
+        // wire, so it stays hand-written next to the kinds that have no slug.
+        SessionKind::SshShell => "ssh",
+        SessionKind::Document => "document",
+        // Unreachable: every remaining kind has a descriptor and returned above.
+        _ => "shell",
+    }
+}
+
+/// Every lowercase wire name a session kind can wear, so a reader of a title
+/// can ask whether a token is one without owning a list of its own.
+pub fn session_kind_label_is_known(token: &str) -> bool {
+    if AGENT_CLIS.iter().any(|descriptor| descriptor.slug == token) {
+        return true;
+    }
+    [
+        SessionKind::Shell,
+        SessionKind::SshShell,
+        SessionKind::Document,
+    ]
+    .iter()
+    .any(|kind| session_kind_label(*kind) == token)
+}
+
 /// The brand colour for `kind`, or `None` for a non-agent kind (a plain shell,
 /// a document) which paints in the theme accent instead.
 ///

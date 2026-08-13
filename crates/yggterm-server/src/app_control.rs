@@ -1750,12 +1750,10 @@ pub fn resolve_agent_identity() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// Every agent-plane row title starts with this word, so a title-based probe
-/// can find agent-owned rows without knowing which agent made them. The
-/// original incident was the opposite: an agent's scratch row was titled from
-/// its cwd exactly like a human's shell in the same directory, so every
-/// title search for it missed and only the user's eyes found it.
-pub const AGENT_PLANE_TITLE_PREFIX: &str = "Agent";
+/// Every agent-plane row title starts with this word. It is defined beside the
+/// copy layer in `yggterm-core`, which has to recognise the shape this module
+/// composes so it never mistakes a caller's purpose for machine noise.
+pub use yggterm_core::AGENT_PLANE_TITLE_PREFIX;
 
 /// Identity used when a request carries no `--agent`/`$YGGTERM_AGENT`. The
 /// request field's own contract is "absent means SOME agent", so the title
@@ -3324,6 +3322,51 @@ mod tests {
                     assert!(
                         title.starts_with(AGENT_PLANE_TITLE_PREFIX),
                         "title {title:?} lost the agent-plane prefix"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A legible purpose must reach the row, not merely a title that survives.
+    ///
+    /// The assertion above is satisfied by AMPUTATION: drop the purpose and the
+    /// bare `Agent unnamed claude-code` sails through the copy layer. That is
+    /// the bug wearing the fix's clothes, and it is invisible from a test that
+    /// only asks whether the title survived.
+    ///
+    /// The live measurement this is written from (2026-08-13, 3.0.116): three
+    /// agent rows created back to back, and only the one whose purpose ended in
+    /// the letter `A` lost it. Being FIRST had nothing to do with it — the copy
+    /// layer's dangling-fragment rule reads a trailing `A` as the English
+    /// article, exactly as it would in `ship the logs to`.
+    #[test]
+    fn a_legible_purpose_is_never_amputated_from_an_agent_plane_title() {
+        let purposes = [
+            // The three probes, verbatim. A/B/C differ only in the last letter.
+            "6.2 sidebar order probe A",
+            "6.2 sidebar order probe B",
+            "6.2 sidebar order probe C",
+            // The same trap wearing other clothes: a trailing bare token that
+            // spells a function word. These are labels, not dangling syntax.
+            "restore lane A",
+            "compare arm B against arm A",
+            "grep the echograph for",
+            "reap leftover app processes",
+        ];
+        for kind in EVERY_SESSION_KIND {
+            for agent in [None, Some("probe-7")] {
+                for purpose in purposes {
+                    let title = agent_plane_session_title(agent, Some(purpose), kind);
+                    assert!(
+                        title.contains(purpose),
+                        "the purpose {purpose:?} was amputated from {title:?} \
+                         (agent {agent:?}), so the row cannot say what it is for"
+                    );
+                    assert!(
+                        !yggterm_core::looks_like_generated_fallback_title(&title),
+                        "the copy layer would discard {title:?} and rename the row \
+                         after its cwd"
                     );
                 }
             }
