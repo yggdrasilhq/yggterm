@@ -4,6 +4,20 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The sidebar draws the outline it always knew about (3.0.129).** Rows have
+  carried a seat number for a while — `6.0`, `6.1`, `6.1.1` — but the list drew
+  every row flat and left you to rebuild the structure in your head from the
+  numbers. Now a book collects under its head: `6.1` and `6.2` sit under `6.0`,
+  `6.1.1` sits under `6.1`, as deep as the numbering goes, and several books can
+  run side by side without knowing about one another. A head carries a
+  disclosure control and a count; collapsing one folds its rows away and leaves
+  the head where it was. Nesting is derived from the numbers themselves rather
+  than stored, so renumbering a row moves it immediately and nothing can drift
+  out of step. Indentation steps two levels and then holds — past that the row's
+  own number carries the depth, because a title squeezed to nothing is worse
+  than a column that stops stepping. A row with no number, or whose head is not
+  on the list, stays exactly where it was.
+
 - **A session that stopped accepting typing now recovers itself (3.0.128).**
   Once in a while a row would stop responding to input — no typing, no
   scrolling, a blank viewport, and nothing on screen saying why. It never came
