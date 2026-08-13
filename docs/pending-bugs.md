@@ -2475,6 +2475,46 @@ problem grows — lowering it does nothing once the excess is in swap. Either th
 comparison becomes swap-inclusive (a cgroup, which counts what the machine
 actually committed) or the bound stays decorative.
 
+### ✅ THE CGROUP OPTION IS CONFIRMED REACHABLE — SPEC'D, WITH THE NUMBERS THAT SETTLE IT
+
+*Live on the desktop host 2026-08-14, read-only.* The kernel is **already
+measuring the exact quantity WebKit cannot**:
+
+```
+GUI cgroup      /user.slice/user-1000.slice/session-<id>.scope
+controllers     cpu memory pids          <- memory controller present
+memory.current        1,029 MB
+memory.swap.current   2,307 MB           <- the half an RSS poll cannot see
+                    = 3,336 MB committed
+memory.high           max                <- no bound at all
+```
+
+⇒ **Everything the honest fix needs is present**: the controller is enabled, and
+`memory.current` + `memory.swap.current` is precisely the committed figure that
+`VmRSS` structurally under-reports. There is nothing to invent — only to bound.
+
+**Two facts block doing it in place, and they define the shape of the fix:**
+
+1. ⛔ **The scope is not ours.** It is the login `session-<id>.scope`, shared with
+   ~15 unrelated processes, so a bound set there would police the desktop rather
+   than yggterm.
+2. ⛔ **`memory.high` is not writable** by the process — systemd owns it.
+
+⇒ **THE FIX: launch the GUI in its OWN systemd user scope**, e.g.
+`systemd-run --user --scope -p MemoryHigh=… -p MemorySwapMax=…`, which every
+WebKit child inherits — one bound covering the whole family, enforced by the
+kernel against committed memory instead of by WebKit against residency.
+⭐ Use **`MemoryHigh` (reclaim pressure), not `MemoryMax` (OOM-kill)**: the goal is
+frugality, and a hard cap on a browser engine turns a memory spike into a dead
+web surface.
+
+⚠ **NOT YET IMPLEMENTED, and deliberately so.** The change is in the LAUNCH path,
+whose failure mode is *the GUI does not start* — and it cannot be verified
+without relaunching the GUI, which is an owner gate. ⛔ Shipping an unverifiable
+launcher change is the one move here with a worse downside than the bug: the bug
+costs memory, a bad launcher costs the whole app. Land it behind a default-off
+switch and turn it on inside a relaunch window.
+
 ⚠ **Scope, stated honestly so nobody over-claims it.** The whole yggterm family
 (GUI + 4 WebKit children) commits **≈3.5 GB, of which ≈2.0 GB is swapped**, on a
 14.8 GB host carrying **12.3 GB of swap in use**. So yggterm is a significant
