@@ -1595,6 +1595,23 @@ noun that groups it with `open`) puts it in the family it belongs to. This is
 the same class as every other entry in the field guide's instrument table: *the
 verb answers a different question than its name suggests.*
 
+✅ **RE-CONFIRMED BY MEASUREMENT, 2026-08-13 at 3.0.139**, during a sweep for
+entries filed off a single field. It navigates:
+
+```
+PRE-CALL:  Terminal | local://<uuid>      ← a live row, the operator's view
+AFTER:     Rendered | None                ← the start page
+```
+
+⭐ **And the sweep caught the reverse error in its own auditor, which is the part
+worth keeping.** The sweeping cluster had recorded in its own notes that this
+verb *reads and does not navigate* — inferred from one call made while the GUI
+was **already on the start page**, where a navigating verb and a reading verb are
+indistinguishable. A single observation taken in the one state that cannot
+discriminate became a durable "instrument fact" and was nearly used to retract a
+correct entry. ⇒ **Test a state-changing verb from a state it would have to
+change**, and the viewport was restored immediately afterwards.
+
 
 ## ⛔ `deploy-fleet.sh` CANNOT RECOGNISE AN ALIAS FOR THE HOST IT IS RUNNING ON
 
@@ -6058,6 +6075,17 @@ nothing, and concludes there is no GUI on any host — **indistinguishable from 
 real "GUI not running"**. Either one envelope for every app verb, or `clients`
 says plainly in its own `--help` that it is special.
 
+✅ **STILL TRUE AT 3.0.139**, measured on the GUI host in one call each:
+
+```
+clients → ['clients', 'count']
+state   → ['completed_at_ms', 'data', 'error', 'handled_by_pid', 'output_path', 'request_id']
+rows    → ['completed_at_ms', 'data', 'error', 'handled_by_pid', 'output_path', 'request_id']
+```
+
+**Falsifier:** every app verb answers in one envelope, or `clients --help` says
+it is the exception.
+
 ## ⛔ `session remove` ORPHANS THE FAR-SIDE RUNTIME AND REPORTS IT IN A FIELD NOBODY READS
 
 **Status:** OPEN
@@ -7753,9 +7781,32 @@ Reported by row 5.1, untouched here. On **guihost**, `ygg-unwedge` answers *"no 
 running"* — with and without `DISPLAY=:1` — while `server app clients` on that same host lists a
 live client on display `:1`. **The remedy tool is blind on the one machine it exists to remedy.**
 
-Same family as the two entries above: a resolver fails, says nothing useful, and the caller is left
-to invent a theory. Start by comparing what `ygg-unwedge` looks for against what
-`client-instances` actually records.
+✅ **ROOT-CAUSED 2026-08-13 at 3.0.139, and it is two defects in one line.** The
+tool opens with `sup=$(pgrep -f "yggterm --supervise" | head -1)` and exits on
+empty.
+
+1. ⛔ **NOTHING SUPERVISES THE GUI ANY MORE.** On the GUI host the process is
+   `/home/…/yggterm` with **PPID 1** — `server app launch` detaches it and init
+   adopts it, so no `--supervise` process exists to find. The tool's premise is
+   stale, not its resolver. Verified in both directions: a clean run prints the
+   filed symptom verbatim (*"no yggterm GUI supervisor running"*) while
+   `server app clients` lists a live client on that same host.
+
+2. ⛔⛔ **`pgrep -f <pattern>` MATCHES THE CALLER'S OWN COMMAND LINE, so the tool
+   can "find" a supervisor that is the shell asking the question** — and then
+   walks `pgrep -P` to an unrelated child and reports a confident verdict about
+   it. Hit live while measuring this: a diagnostic run whose command line
+   contained the pattern answered *"GUI <pid> has no edit socket; not the
+   flush-gate freeze"* — a specific, plausible, entirely wrong diagnosis about a
+   pid that was not the GUI. The clean run needs the pattern kept out of the
+   caller's argv (build it at runtime, or invoke through a script file).
+
+⇒ The fix is to find the GUI the way everything else does — the client-instances
+record — not to repair the supervisor search. ⚠ And the `pgrep -f` half is
+generic: any fleet tool that discovers a process this way can diagnose the shell
+that asked.
+
+**Falsifier:** on a host with a live GUI client, the tool names that GUI's pid.
 
 ## UNIT TESTS WRITE TRACE EVENTS INTO THE DEVELOPER'S REAL `~/.yggterm`
 
@@ -8321,6 +8372,12 @@ That is a discovery cost paid by every future caller: the honest answer is a
 usage error naming the missing argument. ⚠ Same shape as any parser that treats
 "wrong number of arguments" as "no such thing" — worth a scan for siblings while
 fixing it.
+
+✅ **STILL TRUE AT 3.0.139:** `server sessions reorder` →
+`Error: unsupported server sessions action: reorder`, verbatim.
+
+**Falsifier:** the arity miss names the missing argument instead of denying the
+verb exists.
 
 ## ★★ WHO OWNS "IS THIS ROW WORKING?" — three tools, three answers
 
