@@ -39,23 +39,24 @@ copies.
   *Meanwhile:* the relay is fixing the half that is ours — the ~481,000 clock
   syscalls per second — which is the real defect either way.
 
-- **The desktop host sits at 90+°C while 90% idle, and the cause is host
-  configuration rather than anything this repo ships — two settings are his to
-  rule on.** Temperature there is uncorrelated with our CPU (**Pearson r=0.071,
-  n=1,170**; 57 of 80 hot rounds happened under one core of load), so no code
-  optimisation can move it. **(a) `/sys/firmware/acpi/platform_profile` is
-  `performance`** with `power-profiles-daemon` and `tuned` both inactive, so
-  nothing owns the setting — **recommendation: `balanced`**, which is the single
-  most likely fix for the audible fan. **(b) `vm.watermark_boost_factor=0` +
-  `vm.compaction_proactiveness=0`** — **recommendation: keep**, but on the honest
-  grounds that they stop pointless work (kcompactd scanning 1.4M pages/s at a
-  100% failure rate), **not** because they cool the machine: applied at runtime
-  they drove page migration to exactly zero and temperature did not move.
+- **Should the desktop host's *AC* power profile be `balanced` instead of
+  `performance`?** Its `platform_profile` tracks the power source — `performance`
+  whenever plugged in, `balanced` on battery — and the fan he reported is the
+  plugged-in state. Thermals there are uncorrelated with our CPU (**Pearson
+  r=0.071, n=1,170**; 57 of 80 hot rounds happened under one core of load), so no
+  code change can touch this. Across five windows **every `performance` arm
+  exceeded 94°C and every `balanced` arm stayed under 79°C, with identical means**
+  — a ceiling effect, which is what capping a firmware power limit does.
+  **Recommendation: set the AC profile to `balanced`.** ⚠ Honest caveat: the one
+  controlled pair is n=29, **p≈0.08 — suggestive, not proven**; a one-hour
+  mains-power run settles it and is queued. It is his call because it is a
+  persistent preference about his machine's responsiveness, not a defect.
   → `docs/pending-bugs.md` § *THE HOST RUNS AT 90+°C WITH 14 OF ITS 16 CORES
-  IDLE*, which records the falsified mechanism in full.
+  IDLE*. ⛔ Nothing is left applied: the profile is whatever the power source
+  dictates, and this campaign changed nothing that survives a plug event.
   *Meanwhile:* the relay is on the half that is genuinely ours and is not about
-  heat at all — ~366 MB/h of web-process growth whose bound cannot fire, and a
-  daemon leaking a thread per dead PTY.
+  heat — ~366 MB/h of web-process growth whose bound cannot fire, and a daemon
+  leaking a thread per dead PTY.
 
 - **The response-layer rule, or five separate patches?** — five verbs report the
   request rather than the effect, and he framed the fix's SHAPE as the open
