@@ -31,6 +31,41 @@ if [ "$entries" -ne "$statuses" ]; then
   grep -nE '^\*\*Status:\*\*' "$QUEUE" | grep -vE '\*\*Status:\*\* (OPEN|FIXED IN CODE — LIVE PROOF OWED|AWAITING A DECISION)$' | head -10 >&2
 fi
 
+# 2b. No paragraph appears twice.
+#
+# ⛔ A CLEAN MERGE CAN PRODUCE A SELF-CONTRADICTING DOCUMENT, AND EVERY OTHER GATE
+# HERE PASSES ON IT. Measured 2026-08-13: merging a lane into main duplicated a
+# 41-line block with no conflict, no markers and no warning, keeping BOTH a
+# superseded paragraph and the text that replaced it — so one entry said "the
+# private side is done" in one place and "Next: the private side" forty lines
+# later. The heading count was exactly right, every status was valid, no other
+# lane's entry was touched. Duplicating a block breaks none of the rules above,
+# so nothing could see it.
+#
+# ⇒ This file is SEMANTICALLY ORDERED — supersession, "next steps", status
+# lines — and git merges it as TEXT. Anything whose meaning depends on which
+# paragraph came later is exposed, and many lanes merge into this one file.
+# Cheap to check, and it fails that merge outright.
+dupes=$(python3 - "$QUEUE" <<'PY' || true
+import sys, hashlib
+from collections import Counter
+paras = [p.strip() for p in open(sys.argv[1]).read().split("\n\n")]
+long  = [p for p in paras if len(p) > 80]
+key   = lambda p: hashlib.sha1(" ".join(p.split()).encode()).hexdigest()
+counts = Counter(key(p) for p in long)
+seen = set()
+for p in long:
+    h = key(p)
+    if counts[h] > 1 and h not in seen:
+        seen.add(h)
+        print(f"  x{counts[h]}  {' '.join(p.split())[:110]}")
+PY
+)
+if [ -n "$dupes" ]; then
+  note "these paragraphs appear more than once — a merge duplicated a block, and the entry may now contradict itself:"
+  echo "$dupes" | head -10 >&2
+fi
+
 # 3. No second file claims the queue.
 # A file that POINTS at the queue is correct and expected (CLAUDE.md must). A
 # file that reproduces one is the failure. Pointing = it names the queue's path.

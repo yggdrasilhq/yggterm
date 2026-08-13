@@ -2279,6 +2279,38 @@ alone would have proven nothing.
 ⇒ Collapse the two onto one dispatcher. Until then a new verb must be added to
 both, and the headless copy carries a comment saying so.
 
+## ⛔ THE BINARY ROSTER REPLACED A HARDCODED LIST WITH A NAME PREFIX, AND STRANDS THE SAME WAY
+
+**Status:** OPEN
+
+*Found 2026-08-13 by seat 6.8, on installing an app that is not named `y…`.*
+
+The fleet's binary sync discovers its roster instead of hand-listing it, and its
+own comment says why: *a hardcoded roster silently strands every app nobody
+remembered to add.* That was the right diagnosis. **The replacement globs
+`~/.local/bin/y*`**, so it strands every app whose name does not begin with `y`
+— by the same silence, for a whole class rather than for forgotten individuals.
+
+Verified rather than assumed: the shipped editor matches the glob, and a
+newly-installed app named without the prefix does not. It was installed by hand
+on all three hosts, and **it will drift the moment it is rebuilt on one of
+them**, because nothing will carry the new build across.
+
+⇒ **This is a discovery mechanism that finds nothing for a whole category and
+reports no error** — the shape this queue already carries four instances of. The
+convention is real (the platform's apps are `y…`), but a convention is not a
+membership test, and the roster is treating it as one.
+
+**Fix, in preference order:** (1) discover by MANIFEST — an app that has written
+`~/.yggterm/apps/<name>.json` has declared itself, which is a statement of
+membership rather than a guess from spelling; (2) keep the glob and add an
+explicit ALLOW list beside the existing DENY, so an off-convention app is one
+line rather than invisible.
+
+⚠ Not fixed here: this is fleet tooling, not this repo, and the owning row
+should make the call. Recorded so the next off-convention app does not spend an
+evening wondering why its upgrade never reached the other hosts.
+
 ## ⭐ THE RENDERER'S LOAD-BEARING FEATURE IS BARE-NAME LINK RESOLUTION — measured, not argued
 
 **Status:** OPEN
@@ -2699,6 +2731,17 @@ and the count the writer sees change.
 
 ⛔ **Still not claimed: the document BODY**, for the reason in the entry above.
 The rail is what the available instrument can prove, and it is what is claimed.
+
+**And it is now invocable, which it was not.** Everything above was true of a
+binary living in a build tree, reachable by nobody: `command -v` found nothing on
+any host. **A journal that cannot be invoked is not a journal**, so the app is
+installed on all three fleet hosts, one hash across all of them, and proven from
+a clean login shell on each — a corpus created on the spot, a thought captured
+into it, the entry read straight back. That is the step between *built* and
+*usable*, and it is easy to skip because every earlier proof passes without it.
+
+⚠ **It will not stay in sync by itself** — see the roster entry above. A rebuild
+on one host reaches only that host until the roster question is settled.
 
 ## ⛔ [6.4] `server app start-page` IS A NAVIGATION VERB SHELVED AMONG THE READ VERBS
 
@@ -6484,6 +6527,66 @@ But the cheap fix is guidance, not code: *invent test ids with letters in them.*
 resulting row reports a non-permanent blocker set; `server sessions classify`
 exists. (The third item is retracted, not open.)
 
+## ⚖ THE WORKING DOT — the discovery half, and it is NOT a detector defect
+
+**Status:** OPEN — but the open question is a SPEC question, not a bug.
+
+The owner asked for a working indicator. 6.3 owns the RENDER half; this entry
+owns the prior question — **what makes a session's working-state knowable at
+all**, and why `working` is `None` on most rows.
+
+⛔⛔ **THIS ENTRY WAS FILED TWICE WITH A WRONG PREMISE AND IS REWRITTEN FROM
+MEASUREMENT. Both retractions are kept, because the retracted versions were
+circulated to another lane before they were checked.**
+
+### The answer: a live PTY is the discriminator, and `None` is honest
+
+Measured on the GUI host, agent rows only:
+
+    live PTY present  →  7 answered / 7      (100%)
+    no live PTY       →  2 answered / 43     (the 2 are proxy-filled)
+    by locus:  local 9/9 answered · remote 9 answered, 41 None
+
+⇒ **Every row with a live PTY has a working answer.** A row with no PTY is not
+open — nothing is running for any daemon to observe — and `None` is the correct
+report, exactly as the snapshot's own code says: *"`None` = no live screen
+(preserved/foreign-owned) so the GUI must NOT blink it."*
+⇒ **The "21 of 31 rows report None" count is dominated by rows that are not
+open.** There is no detector to fix.
+
+### ⛔ RETRACTED #1 — "a row this daemon does not own is unaskable"
+
+False. `refresh_proxied_working_flags` + `working_flags_including_proxied`
+already ask the OWNING daemon for exactly the rows this one cannot answer, and
+cache the result because a per-snapshot fan-out would cost a round trip per row
+per frame. That capability was added for this very symptom.
+
+### ⛔ RETRACTED #2 — "the `}?;` drop conflates unknown with idle"
+
+Also false, and this one nearly shipped as a code change. `working_flags` ends in
+`?`, so an unreadable session is absent rather than reported — and **absent is
+the right encoding for both of its consumers**: the proxy refresh uses it to
+decide which rows still need fetching (a session reported as unknown would mark
+its own hole as covered), and the 2.5 s poll only wants definite answers to stamp
+freshness with. Meanwhile the SNAPSHOT — which is what the dot actually reads —
+computes its own three-state `Option<bool>` separately and documents each state.
+⇒ **Two paths, two correct encodings.** A change making `working_flags` return
+`Option<bool>` was written, compiled, and reverted unshipped once the premise
+collapsed: nothing consumed the new information, and unused churn in this
+subsystem is worse than none.
+
+### ⇒ WHAT IS ACTUALLY OPEN, and it belongs to the owner, not to a fix
+
+The dot can only mean "working" for rows that are OPEN — **16 of 50 on the GUI
+host**. For the other 34 the honest states are "not running" and "closed", which
+is a design question: *what should a closed row's dot say, and should it be the
+same shape as a running-but-idle one?* Until that is answered, any render is
+guessing, and the guess it makes today is attachment — which is what the owner is
+reading as activity.
+⚠ **Not a third state invented at the view layer.** If a new distinction is
+wanted, its source is the snapshot's existing three-valued `working` plus
+whether a PTY exists; both are already on the wire.
+
 ## ⚖⚖ THE HOT-RESTART GATE IS UNBUILT — THE DESIGN IS NOW SETTLED
 
 **Status:** OPEN
@@ -9006,6 +9109,30 @@ field, and the owner finding the truth by looking at his screen:**
 | `terminal new --prompt-stdin` | `delivered: true` | `submitted:true, waited_ms:19802` — and the transcript never gained a user row, twice in one minute |
 | `terminal send` | `accepted: true` | bytes written; into an agent row that is one Enter PER LINE |
 
+✅ **TWO OF THE FIVE RE-TESTED AT 3.0.141 AND BOTH NOW REPORT THE EFFECT**
+(2026-08-13 sweep, on a row created for the purpose and removed after):
+
+| verb | reply | read-back |
+|---|---|---|
+| `session rename` | `accepted: true` | label reads `ygg-sweep-rename-probe` — the change is real **for a row that EXISTS**; see the rename entry below, where the same reply is returned for a path that does not |
+| `session remove` | `verified: true`, `live_processes: []` | row absent from the census; 6th consecutive clean sample that day |
+
+⚠ **THREE WERE NOT RE-TESTED, AND THE REASONS ARE PART OF THE RESULT.**
+`sessions reorder` rewrites the WHOLE rendered order including rows owned by
+other sessions, so it is not a probe to fire on a live sidebar;
+`terminal new --prompt-stdin` and `terminal send` need a live agent row, and the
+`terminal send` row is documented behaviour now (one Enter per line) rather than
+a false success. **Do not read the two ✅ as four.**
+
+⛔ **AND THE FIRST ATTEMPT AT THIS RE-TEST PRODUCED A FALSE RESULT, which is the
+part worth carrying.** The read-back interpolated the session path through two
+shells into a python comparison; it matched nothing, and reported
+`<row not in census>` for a row that was plainly there — a check that FAILS OPEN
+and reads exactly like a real finding. It was caught only by adding a positive
+control: *can this comparison find a row I know exists?* ⇒ **A verification
+harness needs its own positive control before its negatives mean anything**,
+which is the same rule as the entries it is verifying, one level up.
+
 ### ⛔ THE ROW PLANE WAS UNREACHABLE FROM EVERY NON-GUI HOST, AND THE REFUSAL DID NOT SAY SO
 
 Measured by a delegate, 2026-08-07: row 5.1 (on dev) tried to message row 5.2
@@ -9482,6 +9609,28 @@ the slot: `reason` is `null` on a call the daemon had a named reason to reject.
 No row is created (`server app rows` holds 35 before and after), so this is a
 silent no-op rather than corruption. That is also what makes it expensive to
 catch: the only way an agent learns the truth today is to re-read the table.
+
+✅ **STILL TRUE AT 3.0.141, and now with BOTH HALVES MEASURED IN ONE SESSION,
+which states the defect more sharply than the original report could:**
+
+```
+rename <a row that exists>      → accepted: true, reason: null   … and the label really changes
+rename <a path that does not>   → accepted: true, reason: null   … and nothing happens
+```
+
+⇒ **The two replies are identical in every field a caller reads.** The defect is
+not that a failure is reported as a success — it is that **success and no-op are
+indistinguishable from the reply**, so no amount of careful checking on the
+caller's side can tell them apart. `reason` is `null` in both, and it is the slot
+that was built to hold the difference.
+
+⚠ **The toast half was NOT re-observed** and I am not claiming it is gone: I
+looked for `notifications` / `toasts` in `app state` and found neither key
+populated, which says my probe did not find them, not that the daemon stopped
+raising them.
+
+**Falsifier:** a rename of a path that does not exist answers with `accepted:
+false`, or a `reason` a caller can read.
 
 ⚖ **Same family as the neighbouring `session remove` entry, one layer up.**
 There the lesson was *`accepted` is the request being understood, not the work
@@ -11446,6 +11595,71 @@ only thing left to attach to was an orphan. Agents should create ONE session
 per run and LEAVE IT UP; visibility beats tidiness.
 
 
+
+⚠ **RE-CHECKED 2026-08-13 AND THE RESULT IS INCONCLUSIVE — recorded so the zero
+is not banked as a fix.** On the live GUI host: `agent_leases: 0`,
+`web surface entries: 0`, orphans found: **none**. But **there were no leased
+surfaces at all**, so "no orphan" is the answer this check gives in a world where
+the bug is impossible to observe. It discriminates nothing. (The matching logic
+was positive-controlled first — it can find a row that exists — so the zero is a
+real zero, just an uninformative one.)
+
+**The decisive test, and the two reasons I did not run it here:**
+
+```
+create a row → remove it (tombstoning it) → web ensure --session <dead path>
+             → does a live surface now exist with no row?
+```
+
+1. ⛔ **Never on the default profile.** The original incident drove a payment
+   gateway on the user's own cookie jar; an unqualified surface IS `default`.
+   Use an `agent-<n>` profile.
+2. ⚠ **It creates a real web surface on the shared GUI host**, which is the
+   subject matter of the open idle-cost investigation — a surface appearing
+   mid-A/B corrupts someone else's measurement. It wants a window, not an
+   opportunistic run.
+
+**Falsifier:** after `web ensure` on a tombstoned session path, either no surface
+is alive, or a row exists for it.
+
+### ✅ THE NAMED SEQUENCE IS NOW REFUSED — fix (b) shipped, measured 2026-08-13
+
+Ran the entry's own sequence on the live host under a granted window: create a
+row → `session remove` it (tombstoning it) → `web ensure --session <dead path>`.
+
+```
+accepted: false
+detail: "…'s row was closed by the user and its runtime is gone, so reviving a
+         web surface under it would give you a live page with no row the user
+         can see or click into. Create your own session … and drive its surface
+         instead"
+```
+
+⇒ **The refusal restates this entry's own justification**, so option (b) was the
+one taken. ⭐ **No surface came into being at all** — `agent_leases: 0`,
+`active_surface_requests: 0` after the attempt — so the check cost nothing and
+touched no profile.
+
+**Control, same run:** a session path that never existed refuses with a
+*different* reason (`the daemon has no web-surface declare for …`), so the verb
+is discriminating between cases rather than refusing everything by default.
+
+⚠ **TWO THINGS THIS DOES NOT CLOSE, and the entry stays open for them.**
+
+1. **Option (a) was not implemented.** A surface holding a lease does not keep or
+   resurrect a row; the orphan is prevented at one door rather than made
+   unrepresentable. The constitution's UX test — the user can SEE an agent's
+   session and click in to co-browse it — is met here by refusal, not by the row
+   surviving.
+2. **The other sequence is untested:** removing a row that ALREADY has a live
+   surface. `web ensure` refuses a dead path, but nothing here shows what happens
+   to a live surface when its row is removed underneath it. That needs a
+   web-capable row (a plain shell has no declare at all — the control above says
+   so), so it creates a real browser surface and wants its own window and an
+   `agent-<n>` profile.
+
+**Falsifier for what remains:** remove a row whose surface is live, and no
+surface survives without a row.
 ## ★★★ web do FIDELITY ON RE-RENDERING DOMs
 
 **Status:** OPEN

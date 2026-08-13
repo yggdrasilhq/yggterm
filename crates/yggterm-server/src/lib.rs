@@ -22665,6 +22665,26 @@ pub fn run_app_control_restore_sessions(
     Ok(())
 }
 
+pub fn run_app_control_arrange_row_set(
+    row_path: &str,
+    into_path: Option<&str>,
+    dissolve: bool,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::ArrangeRowSet {
+            row_path: row_path.to_string(),
+            into_path: into_path.map(str::to_string),
+            dissolve,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_set_row_expanded(
     row_path: &str,
     expanded: bool,
