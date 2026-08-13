@@ -21,6 +21,12 @@ This file tracks user-visible changes in `yggterm`.
   still cannot serve emits `daemon/terminal_runtime/request_refused` naming
   which map held what — because the row list, the summary and the reveal log all
   reported that row as healthy, and there was no way to tell *gone* from *slow*.
+- **A restore waits long enough for a cold open (3.0.115).** `sessions restore`
+  inherited the 15 s app-control default, and restoring is the cold case by
+  definition — the row is not live, so its open pays an ssh, a remote bootstrap
+  and an agent CLI's first paint. Measured live: 19-24 s for a campaign row. The
+  verb reported `failed` for a row that had come back perfectly. The open leg now
+  has its own 90 s floor that `--timeout-ms` can raise and nothing lowers.
 - **A restore no longer hands back the rows you deleted (3.0.114).** There was
   no restore verb, so recovering a lost set of rows meant hand-rolling one out
   of `app open` — and `open` is a user-intent verb that must stay permissive,

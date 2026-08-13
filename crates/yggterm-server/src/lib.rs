@@ -22340,6 +22340,8 @@ pub fn run_app_control_describe_rows(timeout_ms: u64) -> anyhow::Result<()> {
 /// and N-1 cancelled reveals — measured live, in the very recovery that
 /// produced this entry. Each open therefore waits for its own settle, exactly
 /// as `app open` does, because it IS `app open`.
+pub const RESTORE_OPEN_TIMEOUT_MS: u64 = 90_000;
+
 pub fn run_app_control_restore_sessions(
     session_paths: Vec<String>,
     dry_run: bool,
@@ -22366,6 +22368,15 @@ pub fn run_app_control_restore_sessions(
 
     let mut restored = Vec::<String>::new();
     let mut failed = Vec::<Value>::new();
+    // ⛔ NOT the caller's default budget. Restoring is the COLD case by
+    // definition — the row is not live, so its open pays an ssh, a remote
+    // bootstrap and an agent CLI's first paint. Measured on the desktop host,
+    // cold reveals of campaign rows ran 19-24 s; the 15 s default therefore
+    // reported `failed` for a row that came back perfectly, which is the
+    // verb-lies-about-its-own-success shape this file is full of warnings
+    // about. `--timeout-ms` still raises it; nothing lowers it below a real
+    // cold open.
+    let open_timeout_ms = timeout_ms.max(RESTORE_OPEN_TIMEOUT_MS);
     if !dry_run {
         for path in &candidates {
             let outcome = request_app_control(
@@ -22374,14 +22385,14 @@ pub fn run_app_control_restore_sessions(
                     session_path: (*path).clone(),
                     view_mode: Some(AppControlViewMode::Terminal),
                 },
-                timeout_ms,
+                open_timeout_ms,
             )
             .and_then(|_| {
                 wait_for_app_control_open_path_ready(
                     &home,
                     path,
                     Some(AppControlViewMode::Terminal),
-                    timeout_ms,
+                    open_timeout_ms,
                 )
             });
             match outcome {
