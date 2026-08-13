@@ -353,6 +353,25 @@ instruments answering different questions, not a bug and a workaround. Reading
 false report that the orchestrator's inbound channel was dropping messages,
 relayed twice as fact, and a fallback built for a defect that did not exist.
 
+⛔⛔ **AND THE SOCKET LOOKUP IS THE THIRD FALSE INSTRUMENT.** A peer socket is named
+for the **CC process**, not for the shell a tool call runs in. So the obvious check —
+`ls /run/user/$UID/cc-socks/$$.sock` — asks about the **shell** and answers "absent"
+for **every row on the machine, always**. It cannot succeed. ⭐ The listing that works,
+and it names corpses too:
+
+```sh
+ls /run/user/$UID/cc-socks/ | sed 's/\.sock//' | while read p; do
+  printf '%-9s %s\n' "$p" "$(ps -o comm= -p "$p" 2>/dev/null || echo '(dead)')"
+done
+```
+
+⚠ **THREE AGREEING INSTRUMENTS CAN SHARE AN ERROR WHEN THEY SHARE A PREMISE.** In one
+afternoon: `error: null` read as delivery, `submitted: false` read as unreachable, and
+a socket lookup keyed on the wrong pid — each independently "confirming" that an
+orchestrator's inbound channel was dead. It was never dead. **Corroboration between
+instruments of the same family is not corroboration**; it is the same misreading three
+times, and it feels like evidence, which is what makes it dangerous.
+
 ⚠ **The PTY write is the crude third option** — it lands regardless, but it types
 into the row's terminal and interleaves with whatever it is doing. Use it when a
 row must be woken, not as the routine way to say something.
