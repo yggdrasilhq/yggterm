@@ -275,9 +275,34 @@ which asserts the invariant the split exists for — **a write moves the input
 clock and must NOT move the output clock** — plus both threshold directions, so
 a detector wired to a constant cannot pass.
 
-⇒ **Still open:** nothing yet CONSUMES the signal. The sidebar still says `idle`,
-and `recent_activity` still reads the conflated field, so a wedged row can still
-block hot-restart. Wiring those two is the remaining work and is now a small change.
+### ✅ THE FIRST CONSUMER IS WIRED — the deploy gate no longer jams on a deaf row
+
+⭐ **This is the owner's symptom seen from the inside.** He reported *"all sessions
+refuse input for the first 5–10 minutes after a restart"*. It presents as a
+**duration** rather than a failure because his keystrokes kept the dead row
+looking alive, nothing on the host could tell a deaf row from a busy one, and it
+only ended when something else re-resumed the session.
+
+The `recently_active` hot-restart blocker read `session_idle_for_ms` — the
+conflated field — while `HotRestartBlocker::idle_ms` was *documented* as "how
+long since this session last produced output". **The doc was right and the code
+was not.** ⇒ the unusable row reported near-zero idle for as long as it was typed
+at, and blocked the one mechanism that would have cleared it.
+
+**Now:** the blocker reads `session_output_idle_for_ms`, so the field means what
+it says, and carries `input_unanswered_ms` beside it — a large value next to a
+small `idle_ms` is the deaf-row signature, visible without anyone typing a probe.
+⚠ A drafted input line is protected separately and deliberately
+(`session_has_pending_input_draft`), so reading output-idle here does not expose
+an unsent prompt to a restart.
+
+**Locked by** `a_row_being_typed_at_is_idle_by_output_even_though_activity_says_busy`,
+which asserts **both clocks from the same state** — activity says "busy 0 ms ago",
+output says "silent 5 s" — so a reader wired to either field alone cannot pass.
+
+⇒ **Still open:** the SIDEBAR. A wedged row still renders `idle · Ready`, so the
+human remains the only detector of the state the daemon can now see. That is the
+next wiring, and `input_unanswered_ms()` is already there to read.
 
 ## ⛔⛔ [6.7] THE GUI IS BURNING A WHOLE CORE, AND IT IS USER-TIME, NOT SYSCALLS
 

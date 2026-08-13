@@ -784,6 +784,20 @@ impl TerminalManager {
         self.sessions.get(key).map(|session| session.idle_for_ms())
     }
 
+    /// How long since the CHILD last produced output.
+    ///
+    /// ⛔ Not the same question as [`Self::session_idle_for_ms`], which reads a
+    /// field the writer also stamps — so a row that has stopped reading its PTY
+    /// reports near-zero idle for as long as someone keeps typing at it. Any
+    /// caller asking *"is this session in use?"* wants THIS one: being typed at
+    /// is not being in use, and a deaf row answering "active" is what let an
+    /// unusable session block a deploy indefinitely.
+    pub fn session_output_idle_for_ms(&self, key: &str) -> Option<u64> {
+        self.sessions
+            .get(key)
+            .map(|session| now_millis().saturating_sub(session.last_output_ms.load(Ordering::SeqCst)))
+    }
+
     /// `Some(true)` when the owned session has typed-but-unsent input on its
     /// current line, `Some(false)` when the line is clean, `None` when this
     /// daemon does not own the session (so the migration predicate must bias to
@@ -6069,6 +6083,67 @@ line-two on the real screen\r\n\
         manager
             .remove_session(key, None)
             .expect("shutdown wedge-signal probe");
+    }
+
+    /// Being typed AT is not being in use — the gate must read OUTPUT idle.
+    ///
+    /// This is the exact state that jammed a deploy: the row had gone deaf, the
+    /// owner kept typing into it, every keystroke refreshed the conflated
+    /// activity field, and the hot-restart gate read that field and reported the
+    /// unusable session as `recently_active`. The one thing that would have
+    /// cleared the wedge was blocked by the wedge's own symptom.
+    ///
+    /// ⛔ Asserts BOTH clocks from the SAME state, so a reader wired to either
+    /// field alone cannot pass: activity says "busy 0 ms ago", output says
+    /// "silent for 5 s".
+    #[test]
+    fn a_row_being_typed_at_is_idle_by_output_even_though_activity_says_busy() {
+        let mut manager = TerminalManager::new();
+        let key = "output-idle-gate-probe";
+        manager
+            .restart_session(key, "sh -lc 'sleep 30'", None, None)
+            .expect("spawn output-idle session");
+        manager
+            .seed_session(key, "last thing it ever said\n")
+            .expect("seed the final output");
+
+        // The deaf row's shape: written to now, silent for five seconds.
+        {
+            let session = manager.sessions.get(key).expect("session held here");
+            let output_at = session.last_output_ms.load(Ordering::SeqCst);
+            session
+                .last_output_ms
+                .store(output_at.saturating_sub(5_000), Ordering::SeqCst);
+            session
+                .last_activity_ms
+                .store(now_millis(), Ordering::SeqCst);
+        }
+
+        let activity_idle = manager
+            .session_idle_for_ms(key)
+            .expect("activity idle is readable");
+        let output_idle = manager
+            .session_output_idle_for_ms(key)
+            .expect("output idle is readable");
+
+        assert!(
+            activity_idle < 1_000,
+            "the conflated field reports the row as just-active, because the \
+             keystrokes stamped it — this is the reading that jammed the gate"
+        );
+        assert!(
+            output_idle >= 5_000,
+            "output idle must show the row has said nothing for 5s: {output_idle}"
+        );
+        assert!(
+            output_idle > activity_idle,
+            "the two clocks must disagree in this state, or the gate cannot tell \
+             a deaf row from a busy one"
+        );
+
+        manager
+            .remove_session(key, None)
+            .expect("shutdown output-idle probe");
     }
 
     /// A restart must say whether it SHUT ANYTHING DOWN.
