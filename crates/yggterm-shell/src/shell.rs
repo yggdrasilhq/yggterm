@@ -88513,6 +88513,48 @@ fn session_row_status_badge_style(over_icon: bool) -> String {
     )
 }
 
+/// A sidebar row's two indents: the row's own left padding, and how far its
+/// CONTENT is pushed inside that.
+///
+/// ⛔ **THE TRAFFIC LIGHTS ARE A COLUMN OF THEIR OWN, FAR LEFT, IN A FIXED
+/// AREA.** Owner-directed, and it is a layout MODEL rather than a rule about
+/// padding. A live row has two zones:
+///
+/// | zone | holds | behaviour |
+/// |---|---|---|
+/// | gutter | the status dot, nothing else | fixed width, flush to the row's own left edge, identical on every row at every depth |
+/// | content | icon, title, trailing controls | starts after the gutter, and is the only thing nesting moves |
+///
+/// The zones are SIBLINGS in the markup, not a convention about who pads what,
+/// so "something else sits before the dot and the column kinks" is not a state
+/// this row can be in. His three reasons, and each one is a consequence:
+/// **more room for titles** — the gutter is the row's own horizontal padding
+/// rather than the old `base + step` leading run, so every live row's title
+/// starts further left than it used to, including rows in no set at all;
+/// **nesting costs no gutter** — depth is spent out of the content zone, so the
+/// only thing that narrows is the title, from a wider start; and **it looks
+/// better** — the dots form one unbroken vertical line, which is checkable: if
+/// that line kinks at any row, the zone separation is not real.
+///
+/// Everywhere else (the cwd tree) the whole row indents as it always has: a
+/// folder has no dot in that gutter, so there is nothing to hold still, and
+/// stepping the row is what makes a tree readable.
+fn sidebar_row_indents(depth: usize, in_live_region: bool) -> (u32, u32) {
+    let metrics = session_row_metrics(SessionRowDensity::Sidebar);
+    if in_live_region {
+        // Flush to the row's own edge — the same padding its right side wears,
+        // so the gutter is the row's margin and not a column of its own width.
+        return (
+            metrics.pad_h_px,
+            depth.saturating_sub(1) as u32 * metrics.indent_step_px,
+        );
+    }
+    (
+        depth as u32 * metrics.indent_step_px + metrics.indent_base_px,
+        0,
+    )
+}
+
 fn session_row_icon_box_style(density: SessionRowDensity, color: &str) -> String {
     let m = session_row_metrics(density);
     format!(
@@ -89016,8 +89058,7 @@ fn SidebarRow(
     // Indent math from the SHARED row engine — the cwdtree is the vocabulary's
     // reference consumer, so its numbers and the engine's are one definition.
     let sidebar_row_metrics = session_row_metrics(SessionRowDensity::Sidebar);
-    let indent =
-        row.depth as u32 * sidebar_row_metrics.indent_step_px + sidebar_row_metrics.indent_base_px;
+    let (indent, label_indent) = sidebar_row_indents(row.depth, show_live_close);
     let draggable = is_tree_drag_source_row(&row);
     let row_kind_label = format!("{:?}", row.kind);
     let drop_hovered = drop_target.is_some();
@@ -89406,49 +89447,12 @@ fn SidebarRow(
                 }
                 div {
                     style: "display:flex; align-items:center; justify-content:space-between; gap:6px;",
-                    // `flex:1 1 auto` is the tree's half of "the title gets the
-                    // width": with the ✕ out of flow there is nothing left to
-                    // share the line with, so the label cluster takes all of it
-                    // and truncates at the row's own edge instead of 24px short.
-                    div {
-                    style: "display:flex; align-items:center; gap:8px; min-width:0; flex:1 1 auto;",
-                    // THE DISCLOSURE CONTROL ON A ROW SET'S HEAD. Leading, so
-                    // the head reads as the thing its members hang from — and
-                    // only on a head, because a slot reserved on every row would
-                    // push the whole rail sideways to signal nothing.
-                    if row_is_row_set_head {
-                        button {
-                            "data-sidebar-row-set-disclosure": "1",
-                            "data-sidebar-row-set-expanded": if row_expanded { "true" } else { "false" },
-                            "data-sidebar-row-set-members": "{row_set_member_count}",
-                            // Per-element (§12.1), reason "list-item": one per
-                            // head of an unbounded list (§8), exactly as the
-                            // group expander is exempted.
-                            "data-keytip-exempt": "list-item",
-                            "data-sidebar-row-toggle-target": "expander",
-                            title: if row_expanded { "Collapse this group of rows" } else { "Expand this group of rows" },
-                            style: format!(
-                                "display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto; \
-                                 width:16px; height:18px; border:none; border-radius:5px; background:transparent; \
-                                 color:{}; padding:0; margin-right:-2px; font-size:9.5px; cursor:pointer;",
-                                palette.muted
-                            ),
-                            onmousedown: |evt| {
-                                evt.prevent_default();
-                                evt.stop_propagation();
-                            },
-                            onmouseup: |evt| {
-                                evt.prevent_default();
-                                evt.stop_propagation();
-                            },
-                            onclick: move |evt| {
-                                evt.prevent_default();
-                                evt.stop_propagation();
-                                on_set_expanded.call(row_toggle_target_expanded);
-                            },
-                            RowDisclosureChevron { expanded: row_expanded }
-                        }
-                    }
+                    // ⛔ THE GUTTER — zone one, and a SIBLING of the content
+                    // rather than its first child. That structure is the rule:
+                    // a dot inside the content cluster moves whenever anything
+                    // is inserted ahead of it or the cluster is indented, which
+                    // is exactly how the first build of row sets put a header's
+                    // dot to the right of its own members'. Out here it cannot.
                     if show_live_close {
                         span {
                             "data-sidebar-live-session-status-rail": "1",
@@ -89470,11 +89474,26 @@ fn SidebarRow(
                             }
                         }
                     }
+                    // `flex:1 1 auto` is the tree's half of "the title gets the
+                    // width": with the ✕ out of flow there is nothing left to
+                    // share the line with, so the label cluster takes all of it
+                    // and truncates at the row's own edge instead of 24px short.
+                    div {
+                    style: "display:flex; align-items:center; gap:8px; min-width:0; flex:1 1 auto;",
                     div {
                         "data-tree-icon": "1",
                         "data-tree-icon-kind": icon_kind.as_str(),
                         "data-sidebar-row-toggle-target": if row_is_group { "icon" } else { "none" },
-                        style: session_row_icon_box_style(SessionRowDensity::Sidebar, icon_color),
+                        // The nesting lands HERE, inside the content zone — see
+                        // `sidebar_row_indents`. `margin-left` rather than the
+                        // row's padding is the whole point: everything from the
+                        // icon rightwards steps, and the gutter, being a
+                        // sibling of this cluster, cannot.
+                        style: format!(
+                            "{}margin-left:{}px;",
+                            session_row_icon_box_style(SessionRowDensity::Sidebar, icon_color),
+                            label_indent
+                        ),
                         onmousedown: move |evt| {
                             if row_for_icon_mousedown.kind == BrowserRowKind::Group {
                                 claim_sidebar_focus_by_path(Some(&icon_focus_path));
@@ -89657,6 +89676,45 @@ fn SidebarRow(
                     span {
                     "data-session-row-actions": "1",
                     style: session_row_actions_style(5, 9),
+                    // THE DISCLOSURE CONTROL ON A ROW SET'S HEAD — trailing,
+                    // beside the ✕, and revealed by the same hover.
+                    //
+                    // ⛔ IT WAS LEADING FOR ONE BUILD AND THE OWNER CAUGHT IT
+                    // IMMEDIATELY: a control inserted before the head's content
+                    // pushes that row's dot, icon and label right, so a header
+                    // sat FURTHER right than the rows nested under it, and the
+                    // status dots stood in two different columns depending on
+                    // whether a row happened to head a set. Sitting in the
+                    // trailing actions costs the leading gutter nothing, which
+                    // is what lets the dot column be identical at every depth.
+                    if row_is_row_set_head {
+                        button {
+                            "data-sidebar-row-set-disclosure": "1",
+                            "data-sidebar-row-set-expanded": if row_expanded { "true" } else { "false" },
+                            "data-sidebar-row-set-members": "{row_set_member_count}",
+                            // Per-element (§12.1), reason "list-item": one per
+                            // head of an unbounded list (§8), exactly as the
+                            // group expander is exempted.
+                            "data-keytip-exempt": "list-item",
+                            "data-sidebar-row-toggle-target": "expander",
+                            title: if row_expanded { "Collapse this group of rows" } else { "Expand this group of rows" },
+                            style: live_session_close_button_style(palette, selected),
+                            onmousedown: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onmouseup: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onclick: move |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                                on_set_expanded.call(row_toggle_target_expanded);
+                            },
+                            RowDisclosureChevron { expanded: row_expanded }
+                        }
+                    }
                     button {
                         "data-sidebar-live-session-close": "1",
                         // Per-element (§12.1), reason "list-item": a per-row
@@ -156984,6 +157042,48 @@ mod tests {
         .filter(|row| row.kind == BrowserRowKind::Session)
         .map(|row| (row.full_path, row.depth))
         .collect()
+    }
+
+    /// ⛔ THE OWNER'S RULE, pinned: the traffic lights are a column of their
+    /// own, far left, in a fixed area. Only the content steps right.
+    ///
+    /// The first build of row sets broke this by putting the disclosure control
+    /// at the head's leading edge, which pushed that row's dot, icon and label
+    /// right — so a header sat FURTHER right than its own members and the dots
+    /// stood in two columns.
+    #[test]
+    fn a_row_sets_nesting_moves_the_content_and_never_the_traffic_light() {
+        let (top_pad, top_text) = sidebar_row_indents(1, true);
+        let (nested_pad, nested_text) = sidebar_row_indents(2, true);
+        let (deep_pad, deep_text) = sidebar_row_indents(3, true);
+        assert_eq!(
+            (top_pad, nested_pad, deep_pad),
+            (top_pad, top_pad, top_pad),
+            "the gutter — and so its status dot — is at one identical x at every depth"
+        );
+        assert!(
+            top_text < nested_text && nested_text < deep_text,
+            "the content still steps right: {top_text} < {nested_text} < {deep_text}"
+        );
+        // ⚠ THE BULLET THAT CAN QUIETLY FAIL. A two-zone row whose gutter kept
+        // the OLD leading run would satisfy every clause above and reclaim
+        // nothing — it would photograph as a success. The old leading run for a
+        // live row was `indent_base_px + 1 * indent_step_px`; the gutter must be
+        // strictly narrower, or titles gained no width.
+        let metrics = session_row_metrics(SessionRowDensity::Sidebar);
+        let old_leading_run = metrics.indent_base_px + metrics.indent_step_px;
+        assert!(
+            top_pad < old_leading_run,
+            "every live row's title must start further left than it used to: \
+             {top_pad} < {old_leading_run}"
+        );
+        // ⛔ And the cwd tree keeps whole-row indentation: a folder has no dot
+        // in that gutter, so there is nothing to hold still and stepping the
+        // row is what makes a tree readable.
+        let (folder_two, folder_two_text) = sidebar_row_indents(2, false);
+        let (folder_three, folder_three_text) = sidebar_row_indents(3, false);
+        assert!(folder_two < folder_three);
+        assert_eq!((folder_two_text, folder_three_text), (0, 0));
     }
 
     /// THE OWNER'S ASK, at the surface that draws it: `N.x` sits under `N.0`,
