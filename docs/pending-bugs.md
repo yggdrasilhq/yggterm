@@ -329,49 +329,64 @@ nothing else is already tracked below. Same family: **a rail whose content comes
 over a bridge shows its chrome and never its payload.** Check whether one dead
 bridge explains all three before writing three fixes.
 
-## ⛔⛔ [6.3] THE WORKING DOT ANSWERS "IS THIS ROW ATTACHED HERE", NOT "IS THIS AGENT WORKING"
+## ⛔⛔ [6.3] THE DOT READS THE SNAPSHOT, AND ONLY THE OTHER REQUEST ASKS THE OWNING DAEMON
 
 **Status:** OPEN
 
-*Owner-reported 2026-08-13: "take a look at all the traffic lights of the N.x rows — only one or
-two are blinking. So are all the relay rows sitting and the orchestrator chilling?" They were not.
-Eight rows were mid-turn.*
+*Owner-reported 2026-08-13: "only one or two are blinking. So are all the relay rows sitting and the
+orchestrator chilling?" They were not — eight rows were mid-turn.*
 
-**The measurement, on the GUI host's OWN daemon** (⚠ not the one a CLI resolves — see the field
-guide; a first pass on the wrong daemon reported 254 of 260 rows unknown and meant nothing):
+**The mechanism, and it is a wiring gap rather than a missing capability:**
 
-| | seated rows |
-|---|---|
-| `working: true` | 3 |
-| `working: false` | 9 |
-| **`working: null`** | **13** |
+| request | working state | who reads it |
+|---|---|---|
+| `ServerRequest::WorkingFlags` | `working_flags_including_proxied()` — **asks the owning daemon**, has a passing test (`a_proxied_rows_working_flag_is_taken_from_its_owner`) | not the dot |
+| `ServerRequest::Snapshot` | the raw screen scrape, no proxy | **the sidebar dot** |
 
-⭐ **The 13 nulls are not a detector gap, and the discriminator is in the row itself.** Every null
-row carries `status_line: "xterm.js · … waiting for terminal host · daemon ready"` and exactly five
-`terminal_lines` — the launch preamble, not a screen. Every non-null row carries six to eight lines
-of real vt100 with the CLI's own footer in it.
+⇒ **The proxied answer is built, tested, and the surface that needs it asks the other question.** Same
+family as a verb implemented at every layer with no dispatch arm: complete, correct, and not reachable
+from the one caller that wanted it.
 
-⇒ **Mechanism.** `working` is scraped from the live screen
-(`session.working = screen_text.map(|s| descriptor.screen_shows_working(s))`). No screen ⇒ `None` ⇒
-the GUI correctly declines to blink. A row whose terminal this daemon has never attached has no
-screen, so **a row that has not been opened in this GUI can never blink, however hard it is
-working.** The failure is purely one-directional, which fits: there is no false positive anywhere in
-the sample, because the flag never invents work — it only fails to see it.
+**Why the scrape has nothing to say.** `working` is `screen_text.map(|s| descriptor.screen_shows_working(s))`,
+so no screen ⇒ `None` ⇒ the GUI correctly declines to blink. Measured on the GUI host's own daemon
+(⚠ NOT the one a CLI resolves — a first pass on the wrong daemon reported 254 of 260 unknown and meant
+nothing), the two groups separate perfectly:
 
-⛔ **So the dot currently reports ATTACHMENT and is read as ACTIVITY.** `DESIGN.md`'s status
-vocabulary promises the opposite: colour encodes durability, **blink encodes activity**. This is the
-signal the owner supervises the fleet by, and he read it and got the wrong answer.
+| | `launch_phase` | `terminal_process_id` | count |
+|---|---|---|---|
+| has a value | `Running` | a pid | 11 |
+| **`working: null`** | **`RemoteBootstrap`** | **`None`** | **15** |
 
-**The direction:** the OWNING daemon knows. A remote row's title and summary already reach the GUI
-host over the remote-session index; working state has to ride the same path instead of being derived
-only where a PTY happens to be attached. ⚠ Whatever carries it must keep `None` meaning *nobody
-knows* — the tri-state is what stops a stale frame blinking forever, and collapsing it to a bool
-would trade a missing blink for a permanent one.
+Every null row also carries `status_line: "… waiting for terminal host …"` and five `terminal_lines` of
+launch preamble rather than a screen. **Six daemons were coexisting on that host**, and the ssh clients
+holding the agent PTYs were spread across them (`TERM_PROGRAM_VERSION` 3.0.76 on one, 3.0.132 on
+others) — so the dark rows are sessions owned by an OLDER daemon, which is the version-coexistence case
+the constitution explicitly promises to keep first-class.
 
-**Falsifier — and it must be run against rows you did NOT start.** A row that begins working while
-you watch is the case that already works. Sample seated rows for transcript growth over ~25s (a file
-that grows is a session mid-turn) and compare against `working` from the GUI host's daemon in the
-same run: every growing row blinks, every still row does not.
+⇒ **The gap in the proxy itself:** `working_flags_including_proxied` skips any row where
+`preserved_owner_endpoint_for_request` yields no owner, so a row whose owner this daemon does not know
+is never asked about.
+
+⚠ **The obvious cost question, which the fix has to answer:** snapshots are frequent and proxying is
+network I/O to sibling daemons. Do not put an unbounded per-snapshot fan-out on that path — cache the
+proxied flags with a short TTL, or have the owner push them.
+
+⛔ **TWO DIRECTIONS ALREADY REFUTED — do not spend a session re-deriving them:**
+
+1. **"The owning daemon knows, propagate over the remote-session index."** Measured on both daemons for
+   the same session ids: the other host reports `None` for essentially every row too, including rows
+   where the GUI host has a real answer. The GUI host is the better-informed side.
+2. **"Fall back to transcript freshness (`modified_epoch` / `last_used_epoch_by_session_id`)."** That map
+   lags roughly twenty minutes: a row measured mid-turn showed a scan age of 1262s, and nothing in the
+   sample was under ~1000s. It orders "recent work"; it cannot signal activity, and using it would
+   produce a stale blink — worse than a missing one, because a blink that should not be there cannot be
+   noticed.
+
+**Falsifier — and it must run against rows you did NOT start.** A row that begins working while you watch
+is the case that already works. Sample seated rows for transcript growth over ~25s (a file that grows is
+a session mid-turn) against the dot state in the same run: every growing row blinks, every still row does
+not. ⛔ Keep `None` meaning *nobody knows*: collapsing the tri-state to a bool trades a missing blink for
+a permanent one.
 
 ## ⭐ [6.3] ROW SETS CANNOT BE ARRANGED BY HAND OR BY A VERB
 
