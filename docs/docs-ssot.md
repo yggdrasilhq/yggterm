@@ -78,3 +78,24 @@ Compare by SUBJECT, never by hash, across a rewrite boundary — the recipe is i
 
 The check is not advisory. If it is failing, the queue is lying, and a lying
 queue is what this file exists to prevent.
+
+## ⛔ A CLOSED ENTRY THAT COMES BACK — the one thing the SSOT check cannot see
+
+`check-docs-ssot.sh` asks whether every entry is **well-formed**. A resurrected
+entry is perfectly well-formed — it was well-formed the first time it was
+written. *Should this entry still be here at all* is not answerable from the
+file's contents, only from its history.
+
+**It has happened:** an entry closed, live-proven and deleted was re-added
+verbatim by a later whole-file write from a stale copy, in a checkout several
+clusters share. The work was done; the queue said it was not.
+
+⇒ **`scripts/check-queue-resurrection.sh`** reports any heading that a commit
+deleted and that is present again, naming the commits that deleted it. It
+**reports rather than fails** by default, because deliberately re-opening an
+entry is legitimate — but a re-opened entry must **say so in the entry**, or the
+next reader cannot tell a decision from a clobber.
+
+⭐ The cause is a shared checkout plus a whole-file write, not carelessness
+about queues. The queue is a merge surface like any other file, and it is the
+one whose silent regression costs most — it decides what everybody works on.
