@@ -1274,12 +1274,35 @@ the start-page entry.
 not before: adding a tenth CLI to a surface with two text boxes for nine of them
 makes the surface worse, and adding it to the fixed surface is a config edit.
 
-## ⛔ THE SHADOW CLIENT DOES NOT PAINT A DOCUMENT SURFACE'S BODY
+## ⛔ A READER THAT FINDS NOTHING LOOKS EXACTLY LIKE A THING THAT HAS NOTHING
 
 **Status:** OPEN
 
+*Three instances 2026-08-13, two of them found independently within the hour by
+seats 6.8 and 6.2.*
+
+**The generalisation first, because it is worth more than any of its instances
+and it is what a reader should carry away:**
+
+> **An empty result and a broken reader are the same picture.** Nothing errors,
+> every count is plausible, and the failure is invisible precisely because the
+> system is designed to survive emptiness gracefully.
+
+| the reader | its silence looked like |
+|---|---|
+| a corpus reader looking for the wrong facts filename | two populated collections holding nothing |
+| an editor handed a path it accepted and dropped | a rendering bug — exit 0, empty surface |
+| a viewer painting no document body | an app that declared no content |
+
+⇒ **When adding any reader, ask what its silence would look like** — and if the
+answer is "the same as success on empty input", give it a way to say *I looked
+and found nothing* distinct from *there was nothing*. Every entry below is a
+consequence of nobody having asked that question.
+
+### The instance this entry was opened for: the shadow does not paint a body
+
 *Measured 2026-08-13 by seat 6.8, with a control, while trying to obey two rules
-at once.*
+at once. GUI at 3.0.132.*
 
 The shadow-probe law says probe through the shadow, never the operator's GUI.
 The field guide says a visual symptom needs a faithful pixel. **For a document
@@ -1317,9 +1340,33 @@ shadow as unproven rather than broken — and note that the honest alternative,
 foregrounding the operator's GUI, is forbidden by the law that sent you here, so
 this gap has no workaround that does not break a different rule.
 
-⚠ Not yet established: whether the body paints on a real GUI and only fails on a
-shadow (the documented pilot proof suggests so), or whether both are affected.
-That needs one capture on a real GUI, which this seat did not take.
+### ⚠ A REAL-GUI CAPTURE EXISTS NOW, AND IT ANSWERS A DIFFERENT QUESTION
+
+*Taken 2026-08-13 by seat 6.2 at 3.0.133. The halves are kept apart here on
+purpose, because this entry will be read by people who ran neither.*
+
+**Established:** the app plane paints on a real GUI. A freshly launched pilot
+editor rendered its entire rail on a faithful frame — toolbar, search field,
+view toggle, headings, the empty-state line. So *"a document surface cannot
+render on a real GUI"* is refuted, and whatever the shadow is doing, it is not
+that.
+
+⛔ **NOT established, and it is exactly the half this entry is about.** That
+capture could not reach the LOADED state, so it shows **an empty surface
+painting its rail** — not **a populated body painting its content**. The
+observation above is a surface with 3,625 declared characters painting nothing.
+Those are two different pictures and neither substitutes for the other.
+
+⇒ **Do not read this entry as "the body is proven on a real GUI."** The
+shadow-versus-real-GUI comparison is **still open**, and the instrument that
+would close it is a surface that will actually load a document.
+
+⚠ **Why that instrument is currently unavailable is another lane's finding, not
+this seat's measurement:** the editor accepts a path argument, reports success,
+and does not load it — filed separately by the seat that hit it. It is named
+here only because it is what blocks the decisive test, and it is itself the
+second row of this entry's own table. Two seats found the same shape in the same
+hour on different planes, which is the argument for the headline.
 
 **A likely cause, and the experiment that was deliberately NOT run.** A shadow
 declares itself with a role that the daemon's gate holds to read-only — it never
