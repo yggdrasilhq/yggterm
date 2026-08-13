@@ -4207,7 +4207,7 @@ preserved owners rather than stuck.
 **Falsifier:** `readlink /proc/426042/exe` no longer ends in `.old.522814`, or the
 pid is gone. Either way this entry is spent.
 
-## ⛔⛔ `guihost`'s `libyggterm` IS STILL THE PRE-SCRUB HISTORY — ONE PUSH FROM RE-LEAKING `/home/user` INTO A PUBLIC REPO
+## ⛔⛔ `guihost`'s `libyggterm` IS STILL THE PRE-SCRUB HISTORY — ONE PUSH FROM RE-LEAKING A PERSONAL HOME PATH INTO A PUBLIC REPO
 
 **Status:** OPEN
 
@@ -4215,7 +4215,7 @@ Found 2026-08-09 by the practice campaign (row 8) when an APK build failed on
 `oc`. **Not the practice campaign's to fix — it is yours.**
 
 `libyggterm`'s history was rewritten to scrub the real username out of test
-fixtures (`/home/user` → `/home/user` in `crates/yggui/src/drag_tree.rs`,
+fixtures (the real home path → `/home/user` in `crates/yggui/src/drag_tree.rs`,
 `conversation.rs`, `crates/yggui/README.md`). **Two of three fleet checkouts were
 left on the pre-scrub side of that rewrite**, and neither can fast-forward.
 
@@ -4223,7 +4223,7 @@ left on the pre-scrub side of that rewrite**, and neither can fast-forward.
 |---|---|---|---|
 | `dev` | `01e1454` | 288 | post-scrub, correct |
 | `oc` | was `c05b93d`, **now `01e1454`** | 262 → 288 | **fixed 2026-08-09**, see below |
-| `guihost` | `50250fc` | 262 | ⛔ **PRE-SCRUB, still carries `/home/user`** |
+| `guihost` | `50250fc` | 262 | ⛔ **PRE-SCRUB, still carries the real home path** |
 
 ⚠ **`guihost` is the GUI host and the one work is made on.** `git status` there is
 clean and `git cherry @{u} HEAD` reports **26** commits with no patch-equivalent
@@ -4246,8 +4246,8 @@ branch `pre-scrub-backup-2026-08-09` (`c05b93d`) so nothing is unrecoverable.
 two-day-old `.apk` in place, so the build looked like it had succeeded.
 
 **Falsifier when fixed:** `ssh guihost 'cd ~/gh/libyggterm && git status -sb'` shows
-no divergence, and `grep -r "/home/user" ~/gh/libyggterm/crates/*/src/*.rs` on guihost
-returns nothing.
+no divergence, and grepping the real home path across
+`~/gh/libyggterm/crates/*/src/*.rs` on guihost returns nothing.
 
 
 ## ⛔⛔ A PLAIN SHELL DIES ACROSS A HANDOVER AND A WEB-SURFACE ROW BESIDE IT SURVIVES — SAME PRESERVED LIST, OPPOSITE OUTCOMES
