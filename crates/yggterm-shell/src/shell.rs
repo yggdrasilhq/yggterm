@@ -49262,6 +49262,32 @@ struct RemoteSessionIndex {
     modified_epoch_by_path: HashMap<String, i64>,
     generated_title_by_path: HashMap<String, String>,
     generated_summary_by_path: HashMap<String, String>,
+    /// Last-used epoch keyed by SESSION ID — the only key a live row and the
+    /// scan that timestamped it agree on.
+    ///
+    /// ⛔ Not a second encoding of `modified_epoch_by_path`: that map answers
+    /// "when was the file at this PATH touched", and a live row's path is a
+    /// scheme (`local://<uuid>`), not a file. Both are filled from the same
+    /// scan by [`scanned_last_used_epochs_by_session_id`], which is also what
+    /// the start page orders by — so the two surfaces cannot disagree.
+    last_used_epoch_by_session_id: HashMap<String, i64>,
+}
+
+impl RemoteSessionIndex {
+    /// When a live session was last used, in epoch seconds; `0` when no scan
+    /// has ever timestamped it.
+    ///
+    /// ⚠ **`0` means "cannot tell", and a caller must not let it decide an
+    /// order.** A rank key that answers 0 for the whole corpus ties every row
+    /// and hands the ordering to whatever the tie-break is — which is exactly
+    /// how the start page came to be sorted alphabetically by UUID. Every
+    /// caller here pairs this with a tie-break a reader can NAME.
+    fn last_used_epoch(&self, session: &ManagedSessionView) -> i64 {
+        self.last_used_epoch_by_session_id
+            .get(session.id.trim())
+            .copied()
+            .unwrap_or(0)
+    }
 }
 // PERF (fan/CPU spin #2, live stack-sampled 2026-06-11 on v2.8.76): the GUI
 // main thread pegged ~100% inside ShellState::snapshot ->
@@ -49322,6 +49348,7 @@ fn memoized_low_signal_generated_copy(text: &str) -> bool {
 
 fn build_remote_session_index(remote_machines: &[RemoteMachineSnapshot]) -> RemoteSessionIndex {
     let mut index = RemoteSessionIndex::default();
+    index.last_used_epoch_by_session_id = scanned_last_used_epochs_by_session_id(remote_machines);
     for machine in remote_machines {
         for session in &machine.sessions {
             index
@@ -49585,14 +49612,21 @@ fn synthetic_local_live_session_rows(
     if sessions.is_empty() {
         return Vec::new();
     }
+    // ⛔ THIS FUNCTION EMITS GROUP HEADERS ONLY — it builds the folder
+    // scaffolding, never the session rows under it. A group is emitted the
+    // first time its cwd is seen, so ONLY the cwd ordering is observable here;
+    // two sessions sharing a cwd produce identical group paths and the second
+    // is swallowed by `emitted_groups`.
+    //
+    // ⚠ There used to be a `.then_with(|a, b| a.session_path.cmp(...))` on this
+    // sort, and it read like the thing that ordered live rows inside a folder.
+    // It could not: it was unobservable in this function's output, and it sent
+    // a reader looking for the sidebar's ordering bug to a line that has never
+    // decided an order. The rows themselves are ordered by
+    // `inject_cc_sessions_into_stored_rows`, which is the one owner of live
+    // session row emission — including for the groups built here.
     let mut ordered_sessions = sessions.to_vec();
-    ordered_sessions.sort_by(|a, b| {
-        let a_cwd = metadata_value(a, "Cwd");
-        let b_cwd = metadata_value(b, "Cwd");
-        a_cwd
-            .cmp(&b_cwd)
-            .then_with(|| a.session_path.cmp(&b.session_path))
-    });
+    ordered_sessions.sort_by_key(|session| metadata_value(session, "Cwd"));
     let mut rows = Vec::new();
     let mut emitted_groups = HashSet::<String>::new();
     for session in ordered_sessions {
@@ -49634,7 +49668,15 @@ fn inject_local_live_session_rows(
         .iter()
         .any(|row| row.kind == BrowserRowKind::Group);
     if !has_group_rows {
-        return synthetic_local_live_session_rows(sessions, remote_session_index);
+        // The scaffolding is synthesised, then filled by the SAME injector the
+        // stored-row path uses. It used to return the bare group headers and
+        // stop, which projected a live session's folder into the cwd tree with
+        // nothing inside it — the session was reachable only under Live
+        // Sessions. One owner for session rows also means one owner for their
+        // order, so a fresh profile and an established one cannot sort a folder
+        // differently.
+        let synthetic = synthetic_local_live_session_rows(sessions, remote_session_index);
+        return inject_cc_sessions_into_stored_rows(&synthetic, sessions, remote_session_index);
     }
     inject_cc_sessions_into_stored_rows(stored_rows, sessions, remote_session_index)
 }
@@ -49697,8 +49739,28 @@ fn inject_cc_sessions_into_stored_rows(
         .iter()
         .filter_map(|row| row.session_id.clone())
         .collect();
-    let mut insertions: Vec<(usize, BrowserRow)> = Vec::new();
-    for session in sessions {
+    // ⛔ THE ORDER OF THESE ROWS IS PART OF THE CONTRACT — see
+    // `docs/pending-bugs.md`, "the start page cannot be used to find a session".
+    //
+    // Most recently used first, exactly as the start page now states its own
+    // rule, and the tie-break is the LIVE SESSIONS ORDER — the user's own
+    // outline numbering, which is a manual order they authored and can name.
+    //
+    // It must never fall through to `session_path`: a live local row's path is
+    // `local://<uuid>`, so a uuid tie-break sorts a folder alphabetically by a
+    // number that means nothing. That is the defect this fix exists to close,
+    // and the reason `last_used_epoch` documents its `0` so loudly — a purely
+    // local live row has no scan to timestamp it, so the epoch IS 0 for all of
+    // them and the tie-break is what actually orders the folder.
+    let mut ordered_sessions = sessions.iter().copied().enumerate().collect::<Vec<_>>();
+    ordered_sessions.sort_by(|(a_seq, a), (b_seq, b)| {
+        remote_session_index
+            .last_used_epoch(b)
+            .cmp(&remote_session_index.last_used_epoch(a))
+            .then_with(|| a_seq.cmp(b_seq))
+    });
+    let mut insertions: Vec<(usize, usize, BrowserRow)> = Vec::new();
+    for (rank, session) in ordered_sessions.into_iter().map(|(_, s)| s).enumerate() {
         if stored_session_ids.contains(&session.id) {
             continue;
         }
@@ -49727,6 +49789,7 @@ fn inject_cc_sessions_into_stored_rows(
         };
         insertions.push((
             insert_idx,
+            rank,
             BrowserRow {
                 kind: BrowserRowKind::Session,
                 full_path: normalize_live_session_path(&session.session_path),
@@ -49748,10 +49811,18 @@ fn inject_cc_sessions_into_stored_rows(
     if insertions.is_empty() {
         return stored_rows.to_vec();
     }
-    // Insert from back to front so earlier indices are not shifted by later insertions.
-    insertions.sort_by(|a, b| b.0.cmp(&a.0));
+    // Insert from back to front so earlier indices are not shifted by later
+    // insertions.
+    //
+    // ⚠ **The tie must run backwards too, and that is not decoration.** Every
+    // row destined for the SAME cwd group shares one insert point, so with a
+    // forward tie the first row is inserted first and each successor then
+    // pushes it down — the group comes out in exactly REVERSE order. That is
+    // what the sidebar was doing: it showed the user's Live Sessions order
+    // upside down inside every cwd folder, which reads as no order at all.
+    insertions.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     let mut result = stored_rows.to_vec();
-    for (idx, row) in insertions {
+    for (idx, _rank, row) in insertions {
         result.insert(idx, row);
     }
     result
@@ -122201,8 +122272,21 @@ fn start_page_recent_rows_from_browser_rows(
 /// already dedups on. So the epoch is looked up by id, and a live `remote-cc://`
 /// row inherits the mtime of the transcript it is a running instance of.
 fn start_page_scanned_last_used_epochs(snapshot: &RenderSnapshot) -> HashMap<String, i64> {
+    scanned_last_used_epochs_by_session_id(&snapshot.remote_machines)
+}
+
+/// The ONE implementation of "when was this session last used", by session id.
+///
+/// Two surfaces order by it — the start page's Recent work and the cwd tree's
+/// injected live rows ([`RemoteSessionIndex::last_used_epoch`]) — and they read
+/// the same function rather than each deriving an epoch of their own, because
+/// two encodings of one concept are how the sidebar and the start page came to
+/// disagree about what "most recent" means in the first place.
+fn scanned_last_used_epochs_by_session_id(
+    remote_machines: &[RemoteMachineSnapshot],
+) -> HashMap<String, i64> {
     let mut epochs = HashMap::<String, i64>::new();
-    for machine in &snapshot.remote_machines {
+    for machine in remote_machines {
         for session in &machine.sessions {
             let session_id = session.session_id.trim();
             if session_id.is_empty() || session.modified_epoch <= 0 {
@@ -158255,11 +158339,24 @@ mod tests {
         let live_group_session_row = &rows[1];
         assert_eq!(live_group_session_row.label, "Tree Smoke");
         assert_eq!(live_group_session_row.depth, 1);
+        // ⚠ TWO, and two is the CONTRACT — [[spec-active-sessions-dual-presence]].
+        //
+        // This assertion read `1` until 2026-08-13, and the missing row was the
+        // cwd-tree one: the synthetic branch emitted the folder scaffolding and
+        // stopped, so a fresh profile got `/home/user/gh` with nothing inside
+        // it while the session sat under Live Sessions alone. The count was
+        // right about there being no duplicate and silent about there being no
+        // PROJECTION, which is the half this file's own doc comment promises.
         assert_eq!(
             rows.iter()
                 .filter(|row| row.full_path == "local://019cf672-8d68-70a1-bd8b-68487c4fc63d")
                 .count(),
-            1
+            2
+        );
+        assert_eq!(rows[6].full_path, "local://019cf672-8d68-70a1-bd8b-68487c4fc63d");
+        assert_eq!(
+            rows[6].depth, 4,
+            "the cwd-tree copy hangs under /home/user/gh"
         );
     }
 
@@ -183936,6 +184033,150 @@ Shared connection to 192.0.2.14 closed.\r\n";
         assert!(
             out2.iter().any(|r| r.session_id.as_deref() == Some("abc123")),
             "live session MUST be injected under an expanded /home/user"
+        );
+    }
+
+    fn live_local_session_fixture(id: &str, uuid: &str, cwd: &str) -> ManagedSessionView {
+        ManagedSessionView {
+            id: id.to_string(),
+            session_path: format!("local://{uuid}"),
+            title: format!("session {id}"),
+            kind: SessionKind::ClaudeCode,
+            host_label: "localhost".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: "claude".to_string(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                older_available: false,
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![yggterm_server::SessionMetadataEntry {
+                label: "Cwd",
+                value: cwd.to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+            working: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        }
+    }
+
+    fn cwd_group_fixture(full_path: &str, depth: usize) -> BrowserRow {
+        BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: full_path.to_string(),
+            label: full_path.to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            session_title: None,
+            depth,
+            host_label: "local".to_string(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+            session_kind: None,
+        }
+    }
+
+    /// The cwd tree lists live rows most-recently-used first, and when nothing
+    /// has timestamped them it keeps the user's Live Sessions order.
+    ///
+    /// ⚠ **The fixture makes all four candidate orders disagree**, because a
+    /// test whose expected answer is also what the bug produces proves nothing.
+    /// Input order is `one, two, three`; alphabetical-by-uuid is
+    /// `two, three, one`; reversed-input (the shipped defect) is
+    /// `three, two, one`; and recency is `three, one, two`. Any one of those
+    /// four appearing is therefore diagnostic on its own.
+    #[test]
+    fn live_rows_in_a_cwd_group_order_by_recency_then_live_sessions_order() {
+        let one = live_local_session_fixture("one", "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "/w");
+        let two = live_local_session_fixture("two", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "/w");
+        let three = live_local_session_fixture("three", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "/w");
+        let sessions: Vec<&ManagedSessionView> = vec![&one, &two, &three];
+        let stored = vec![cwd_group_fixture("local", 0), cwd_group_fixture("/w", 1)];
+
+        let injected_ids = |index: &RemoteSessionIndex| -> Vec<String> {
+            inject_cc_sessions_into_stored_rows(&stored, &sessions, index)
+                .into_iter()
+                .filter_map(|row| row.session_id)
+                .collect()
+        };
+
+        // Nothing has timestamped these rows: the epoch is 0 for all three, so
+        // the TIE-BREAK is what orders the folder — and it must be the order
+        // the user authored, not the reverse of it and not the uuid.
+        assert_eq!(
+            injected_ids(&RemoteSessionIndex::default()),
+            vec!["one", "two", "three"],
+            "with no scan epochs the folder must keep the Live Sessions order"
+        );
+
+        // With real epochs, recency wins outright — including over the uuid
+        // order, which this fixture deliberately points somewhere else.
+        let mut scanned = RemoteSessionIndex::default();
+        scanned.last_used_epoch_by_session_id =
+            HashMap::from([("one".into(), 200), ("two".into(), 100), ("three".into(), 300)]);
+        assert_eq!(
+            injected_ids(&scanned),
+            vec!["three", "one", "two"],
+            "most recently used first"
+        );
+    }
+
+    /// A live session's folder is not projected into the cwd tree EMPTY.
+    ///
+    /// The synthetic branch — taken when no stored group rows exist, i.e. a
+    /// fresh profile — used to emit the folder headers and stop, so the tree
+    /// showed the folders and nothing inside them while the sessions sat under
+    /// Live Sessions only.
+    ///
+    /// ⚠ The scaffolding emits a cwd's ANCESTORS, not the cwd itself, so a
+    /// session in `/home/user/proj` hangs under `/home/user`. That is the
+    /// existing shape and this test pins it: it is what makes the fallback in
+    /// `find_best_group_for_cwd_in_rows` load-bearing rather than defensive.
+    #[test]
+    fn synthetic_cwd_scaffolding_carries_its_live_sessions() {
+        let cwd = "/home/user/proj";
+        let one = live_local_session_fixture("one", "cccccccc-cccc-4ccc-8ccc-cccccccccccc", cwd);
+        let two = live_local_session_fixture("two", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", cwd);
+        let sessions: Vec<&ManagedSessionView> = vec![&one, &two];
+
+        let rows = inject_local_live_session_rows(&[], &sessions, &RemoteSessionIndex::default());
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == BrowserRowKind::Group)
+                .map(|row| row.full_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local", "/home", "/home/user"],
+            "the cwd scaffolding is the ancestors of the cwd"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter_map(|row| row.session_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["one", "two"],
+            "and it must carry its sessions, in the Live Sessions order"
         );
     }
 
