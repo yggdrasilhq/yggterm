@@ -2891,6 +2891,36 @@ removing that file once consumption is confirmed.
 guarantee, and this is a live counter-example: our own deploys are degrading other agents' rows.
 ⇒ It belongs with the hot-restart/daemon-lifecycle work, not with the deploy-identity work.
 
+
+✅ **THE BEQUEST HOLDS — measured 2026-08-13 across at least eight version moves,
+which is the observation this entry was waiting for.** A retiring daemon
+re-points its own version name at its successor (shipped 3.0.132); the open
+question was whether that survives the NEXT bump, and it did. On the GUI host,
+after 3.0.133 → 3.0.141:
+
+```
+server-3-0-133.sock → answers: server_version 3.0.141, build a0c782b013d5
+server-3-0-137.sock → answers: server_version 3.0.141, build a0c782b013d5
+server-3-0-134.sock → no socket        server-3-0-136.sock → no socket
+```
+
+⇒ A CLI pinned to 3.0.133 still resolves a live path, and it reaches the CURRENT
+daemon. Both controls are in the same run: names that answer, and versions that
+never ran a daemon here and correctly have no socket, so the probe is not
+returning a constant.
+
+⚠ **What this does NOT close.** The bequest is performed BY a retiring daemon, so
+it can only cover a handover the daemon lives through. A daemon that is killed,
+crashes, or is evicted leaves no successor pointer, and the poisoned-composer
+symptom would return exactly there — which is the case worth testing next, and
+it is not this measurement.
+
+⭐ **Read the daemon's BUILD, not its version, when checking this.** Both surviving
+names answer `3.0.141`, and that string alone cannot say whether one is a stale
+listener; the build commit is what makes them provably the same process.
+
+**Falsifier:** after a bump, a socket named for a version whose daemon retired
+gracefully fails to connect.
 ## ⛔⛔ NOTHING PREVENTS A LOCAL TAG FROM REPUBLISHING A PRE-SCRUB LINEAGE
 
 **Status:** OPEN
@@ -10655,6 +10685,33 @@ policy: a child that exits on SIGTERM during a binary swap must be
 relaunched; only a supervisor-addressed TERM is a shutdown order. Recovery
 recipe that works, verbatim: read WAYLAND/XDG/DBUS env off a live desktop
 process → `setsid ~/.local/bin/yggterm --supervise </dev/null &`.
+
+⚠ **CONDITIONALLY LIVE — and the condition is HOW THE GUI WAS STARTED, which
+this entry never states. Measured 2026-08-13.** There are **two** desktop entries
+on the GUI host with different Exec lines:
+
+```
+dev.yggterm.Yggterm.desktop   Exec=…/yggterm --supervise      ← supervised
+yggterm.desktop               Exec=…/yggterm                  ← not
+```
+
+and the GUI actually running was started by neither: `server app launch` detaches
+it, so it has **PPID 1** and **zero** processes match the supervise pattern. ⇒ On
+an agent-launched GUI there is no supervisor to die, and the recovery recipe
+above would put the host into a mode it was not in.
+
+⛔ **Do not read this as "fixed".** A desktop-icon launch still takes the
+supervised path, so the child-exit policy question is real for that half — it is
+simply not reachable from the state an agent finds the host in. **Say which
+launch path a measurement was taken on**, because the two produce different
+process trees and the entry's symptom only exists in one of them.
+
+⇒ Same stale premise as [`ygg-unwedge` being blind on the GUI host](#): that
+tool searches for the `--supervise` parent, which an agent-launched GUI does not
+have. One fact, two entries.
+
+**Falsifier:** on a desktop-launched (supervised) GUI, `kill -TERM <child>` is
+followed by a relaunch.
 
 
 ## ★★ WEBAUTHN / PASSKEYS ARE UNREACHABLE ON AN AGENT-CREATED SURFACE
