@@ -10652,6 +10652,98 @@ clear it. A draft left by a failed boot is our own litter and should be cleared
 by us, not treated as his sentence. The booter cannot currently tell the two
 apart, and distinguishing them is the real work here.
 
+### ⭐⭐ THE "NOTHING SAYS SO" HALF IS NOW ANSWERED — `server rows drafts` IS THE MISSING DETECTOR
+
+**Sighted in production 2026-08-14 ~19:47, on a live orchestrator row**, by the
+read-only draft sweep built the same day for an unrelated reason (the 3.0.155
+hold). The row was **armed, `boots=0`, and holding an unsent line** — i.e.
+already in the silent-skip state, and invisible by every other instrument.
+
+⛔⛔⛔ **AND THE OBVIOUS REMEDY IS THE ONE THING THIS PROJECT FORBIDS. A SINGLE
+`drafts_present` SIGHTING DOES NOT MEAN STALLED — IT MOST OFTEN MEANS SOMEONE IS
+TYPING RIGHT NOW.** The flag is `True` for exactly as long as a human is
+composing, so **at one sample a transient draft is indistinguishable from an
+abandoned one** — and the rows that flag most often are the rows a person is
+actively talking to, i.e. **the detector's positives are biased towards the rows
+where acting is most dangerous.**
+
+⇒ ⛔ *"Submit or clear whatever is in your composer"* is sound advice for an
+unattended delegate and is **an instruction to type over a human** on an attended
+one: clear destroys a half-written sentence, submit sends the fragment as their
+turn. **This is the `never-arm.tsv` reasoning one level out** — that file stops
+the BOOTER typing into an attended row, and this advice has an agent perform the
+same act by hand, with the guard file never consulted **because the actor is not
+the booter.** ⇒ **Exempt `never-arm.tsv` rows from the ADVICE as well as from the
+arming.**
+
+⭐ **THE RULE, so a sighting means something: flag only when `has_pending_draft`
+is True across TWO sweeps separated by minutes AND the transcript has not grown
+between them.** One sample means *someone may be mid-sentence*; two samples with
+no transcript growth means *stalled*.
+
+⭐⭐ **AND INVERT THE NUISANCE INTO THE CAPABILITY `never-arm.tsv` SAYS DOES NOT
+EXIST.** That file's standing warning is *"no probe separates those two cases,
+and guessing wrong types into a human"* — the two cases being an unattended
+delegate and a row a person attends. **A row that repeatedly shows a TRANSIENT
+draft — appearing and clearing without the booter ever writing — is a row
+something is typing into by hand.** That is the first probe that produces
+*candidates* for attendance at all, and it costs nothing: the sweep is read-only
+and already running.
+
+⚠ **It suggests, it does not prove**, and the difference is load-bearing: an
+agent's own composer drafts too (the third case above), so a positive means
+*worth asking about*, never *add it to never-arm*.
+
+⚖ **AND THE FIRST RULING ON SUCH A CANDIDATE WENT THE OTHER WAY, CORRECTLY.** A
+supervision orchestrator was found armed while a person sometimes types into it.
+Its own campaign ruled **stay armed**, and the reasoning generalises: the fleet
+had **already** never-armed the row that person *thinks* in, while this one is an
+orchestrator doing long-running autonomous work that he also talks to — **opposite
+treatments, deliberately.** Waking it is that campaign's liveness mechanism and
+was observed working repeatedly; `--refuse-if-draft` already covers the
+half-written sentence; the residual is **an interruption, not a corruption.**
+⛔⛔ **And the safe-looking option was the silent one:** a `never-arm` entry would
+mean nothing ever wakes that seat again, so the monitor obligation would die with
+four rows still escalating to it and **no alarm anywhere.** ⇒ *Between a defect
+that shouts and one that is mute, take the one that shouts* — and note the
+candidate detector's job ended at producing the candidate. ⛔ **A never-arm entry stays a
+permanent assertion that only the row's own campaign may make.** ⇒ Turning *"no
+probe exists"* into *"here are the rows worth confirming"* is the whole of the
+improvement, and it is enough: two armed rows were found attended-or-adjacent
+within an hour of the instrument existing, one of them by its own campaign
+independently.
+
+⇒ **Finding a stuck-unwakeable row is now one read-only command instead of an
+unbuilt feature**, and it needs no log-reading and no writing:
+`yggterm-headless server rows drafts` → any `drafts_present` row that is also
+armed on the booter is in this trap, or one stall away from it. ⛔ Read the
+`verdict`, not the count: `blind` means some daemon could not be asked, so
+absence of a sighting is not absence of a draft.
+⭐ **Both hosts agreed on the same row under different key spaces**
+(`remote-cc://…` on the GUI host, `local://…` on the PTY host), which is the
+first live confirmation that the GUI-side record tracks the PTY-side draft state
+for a remote row.
+
+⭐⭐ **AND THAT AGREEMENT IS COVERAGE, NOT REDUNDANCY — SWEEP EVERY HOST.** A row
+whose PTY host is too old to carry the field is still answered by its **GUI
+host**, because the GUI-side runtime reconstructs the draft from the bytes the
+client typed. Measured on the armed set: a **dev-only** sweep reported *2 of 17
+daemons answering, one armed row unknowable*; adding the GUI host's single
+current daemon gave **7 armed rows, 7 covered, ZERO blind.** ⇒ **The union of the
+hosts covers what neither covers alone**, and a single-host `blind` is a fact
+about that host, not about the fleet.
+
+⚖ **AND IT ADDS A THIRD CASE TO THE ENTRY'S OPEN QUESTION.** The two arms above
+are "a draft the owner typed" (never type over; escalate to him) and "our own
+litter from a failed boot" (clear it ourselves). The first real sighting was
+**neither: a live agent's own composer**, on a row that was working normally at
+the time. ⇒ Whatever finally distinguishes the arms has **three** inputs, not
+two, and the third is the common case on an agent fleet.
+⚠ **Which is also why it is dangerous rather than merely untidy: the row was
+working, so the defect cost nothing at the moment of detection.** It becomes a
+permanent silent stall only later, when the row goes idle — the state is
+invisible exactly while it is harmless.
+
 **Falsifier:** leave an unsubmitted draft in a subscribed row and let it go idle
 past its boot window. Today the log prints `SKIP:drafting` forever and no card is
 ever sent. It should escalate once, name the row, and say the draft is what is
