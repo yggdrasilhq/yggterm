@@ -782,6 +782,67 @@ population. ⇒ **The outbound half does not close the gap either**, but it is t
 largest unmeasured term left in the request path and it should be measured in
 the daemon rather than bounded from outside.
 
+### ✅ 6l. S6 BUILT — THE HANDLER, MEASURED END TO END IN CPU, PER VERB
+
+*The instrument §S6 asked for: `CLOCK_THREAD_CPUTIME_ID` around the WHOLE closure
+at `spawn_unix_client_handler`, not `handle_request`'s wall-time `PerfGuard`.
+Expected effect **zero cores** — it attributes cost, it removes none.*
+
+Sandbox, 264 seeded rows, no sessions, two consecutive 60 s windows:
+
+| verb | n | CPU µs/conn | wall µs/conn | kernel share |
+|---|---|---|---|---|
+| `status` | 10,184 | **1,385** | 1,423 | **7.6%** |
+| `ping` | 5,092 | **126** | 128 | 3.3% |
+
+⭐ **`ping` is the per-connection FLOOR, measured: 126 µs** — accept, spawn the
+thread, read, dispatch, serialise, write, tear down, for a request that does
+nothing. And `status` at 264 rows costs **1,385 µs**, of which §6h's payload
+build is 1,070 µs; the residual ~315 µs is that floor plus serialising the
+reply. **The three numbers close.**
+
+⛔ **PER VERB, AND THE FIRST VERSION WAS NOT — the tell was arithmetic, not
+suspicion.** A single mean over every connection came out **below the cost of
+the payload build it contains**, which is impossible: 3,385 `status` handlers at
+1,374 µs were being averaged with 1,694 `ping` handlers at 125 µs. ⇒ **A mean
+over a mixed population of verbs is not a handler cost**, and it reads low by
+whatever fraction of traffic is cheap.
+
+⚠⚠ **THE KERNEL SHARE HERE IS 3–8%, NOT THE ~94% THAT MOTIVATED §S6.** On a
+daemon with **no sessions** the handler is overwhelmingly *user* time. That does
+not refute the live figure — it locates it: whatever is 94% kernel is **not the
+connection handler on an idle daemon**, so it is either session-driven or was
+never the handler. ⚠ A named candidate, and it is one the analysis lane reported
+itself: `TASK_COMM_LEN` is 16, so `yggterm-daemon-client-…` truncates to
+`yggterm-daemon-c` and **unnamed spawned threads inherit the parent's `comm`** —
+a by-name classifier can merge reader threads into the handler bucket. ⇒ **Open,
+and not settled here.**
+
+**Two harness defects fixed in the same pass, both of which report a fired
+instrument as one that did not fire:**
+- ⛔ A single failed request used to `break` the arm; the only symptom was
+  *"no window flushed"*. It now counts failures and says so.
+- ⛔ The reader ignored **rotated** trace siblings. At a high drive rate the file
+  rotates mid-arm and carries the flushed windows out with it — same symptom,
+  different cause, and it cost an arm.
+
+⭐ **And the zero-request BASELINE is now taken in the same run, warm**
+(`0.00000 cores` at both 0 and 264 rows). A daemon burns CPU whether or not
+anyone asks it anything, so dividing a process-wide delta by your own request
+count charges that background to requests you caused — an error worth 29× on a
+neighbouring arm. ⚠ Warm matters: taken immediately after start it read
+**0.029 cores**, which is state restore, not background.
+
+⛔ **A field too coarse for its quantity, walked into while documenting the
+trap.** The user/kernel split first shipped on `/proc/thread-self/stat` fields
+14/15, justified as *"summed across a window, hundreds of handlers make it
+meaningful"*. Those are `CLK_TCK` units — 10 ms — and **every** handler is
+shorter than one tick, so each sample truncated to zero and the sum was zero:
+`ticks=0, kernel_share=n/a` across ~26,500 handlers carrying ~2.5 s of CPU.
+⇒ **Truncation is applied per sample BEFORE the sum: a sum of floors is not the
+floor of a sum.** `getrusage(RUSAGE_THREAD)` answers the same question per
+thread at microsecond resolution.
+
 ### 6f. Honest limits on this section
 
 1. ⛔ **The exact periodic call site is NOT located.** The fan-out helper is
