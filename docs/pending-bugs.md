@@ -1527,7 +1527,7 @@ the user **deliberately created from an app verb** and arranged into a group: fr
 side there is nothing "scratch" about it, and nothing in the UI says it is disposable.
 
 ```
-"title": "New Ychrome", "kind": "shell", "keep_alive": false, "cwd": "/home/pi"
+"title": "New Ychrome", "kind": "shell", "keep_alive": false, "cwd": "/home/user"
 ```
 
 ⛔ **THE CONSTITUTION SAYS THE OPPOSITE IN AS MANY WORDS:** *"Plain shells are
