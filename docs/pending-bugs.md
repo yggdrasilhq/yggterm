@@ -581,10 +581,53 @@ sanctioned `linux-wayland` row exactly. **The crash happens on the configuration
 the policy prescribes**, which means "restore the policy" is not available as a fix
 and the sandbox is where any arm must be tried.
 
-⚠ **The crash rate is older than the coredump retention.** 16 leaked
+⚠ **The crash rate is older than the coredump retention.** 18 leaked
 `drkonqi-coredump-launcher` processes are alive with ages of 5 to 12 days, one per
 crash. That count is a crash counter reaching further back than `coredumpctl` does,
-and it says this has been going on for at least twelve days.
+and it says this has been going on for at least twelve days. *(16 when first
+counted; re-counted 2026-08-14 16:05.)*
+
+⛔ **THE "~4x A DAY" IN THE HEADING IS ONE DAY'S FIGURE, NOT A RATE — the crashes
+come in bursts.** Counted from `coredumpctl` on 2026-08-14: **Aug 11 = 1, Aug 12 =
+0, Aug 13 = 5, Aug 14 = 1** (by 16:00). A quiet day therefore refutes nothing, and
+a fix must not be judged against a day or two of silence. The heading is left as
+found so the entry stays findable; this paragraph is the number to quote.
+
+**The full stack of the 15:29:29 fault on 2026-08-14, which localises it further
+than the two-line summary above.** Read bottom-up, it is a GTK draw being
+propagated down the widget tree into WebKit, which hands its GL frame to GTK, which
+asks Mesa to read it back:
+
+```
+gtk_container_propagate_draw   (libgtk-3, several frames)
+  -> libwebkit2gtk-4.1         (its widget draw)
+    -> gdk_cairo_draw_from_gl  (libgdk-3 + 0x44a13)
+      -> libgallium-26.1.5-1   (14 frames)
+        -> libEGL_mesa + 0x2ae67   <- SIGSEGV here
+```
+
+⇒ **The faulting frame is Mesa's, reached through the ONE call GTK3 uses to accept
+a GL-rendered frame from a webview.** Since the terminal canvas renders inside that
+same webview, the xterm surface and the web surface share this path entirely, which
+is what makes "three render faults, one subsystem" a coherent claim rather than a
+guess. Module versions at the fault: `libgallium-26.1.5-1`, `libwebkit2gtk-4.1`,
+`libgdk-3`, built against `gcc-16-16.1.0-3`.
+
+⭐ **EVERY CRASH LEAKS, AND THE LEAK OUTLIVES THE PROCESS BY DAYS.** A GUI that
+SIGSEGVs leaves its `ssh -N -L …` port-forward children orphaned onto PID 1. They
+never exit, so the dead GUI's `yggterm-gui-<pid>.scope` stays `active running`
+forever with nothing in it but those forwards, and each one holds an open SSH
+connection plus a listening socket. **25 such orphans were found on 2026-08-14,
+oldest 12 days**, all with zero established connections; reaping them let both
+surviving scopes collect on their own, which is the proof they were what held the
+scopes open. **Nothing reaps them, so this recurs with every crash** — the reaping
+was a one-off cleanup, not a fix.
+
+⇒ **And the relaunch is where the memory bound is lost**, which is the reason this
+entry matters beyond jank: the cap is applied by a re-exec at startup, so each
+crash is a fresh chance to come back unbounded against a monotonic leak. That
+failure is now recorded rather than silent (`gui/startup/linux_memory_scope`), but
+its FREQUENCY is set by this bug.
 
 **Why it reads to a user as "janky as hell":** a crash is followed by a relaunch
 that passes every other check, and nothing in the app reports having died. Combined
