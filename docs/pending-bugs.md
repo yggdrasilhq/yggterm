@@ -784,9 +784,33 @@ shadow attaches to whatever session is current, so an hourly automated capture
 would be **photographing arbitrary live session content** — other agents' work,
 and whatever private material happens to be on their screens — and storing it on
 disk every hour. ⇒ **The check must drive the shadow onto a probe row IT OWNS,
-never onto "whatever is open".** That is a hard requirement, and it is why this
-is not a five-minute wiring job. Level 4 already creates a probe row, so the row
-exists; targeting the shadow at it is the missing piece.
+never onto "whatever is open".**
+
+### ✅ SHIPPED AS `scripts/canvas-probe.sh` — an on-demand instrument, NOT an hourly one
+
+The chain needed no new feature, only composition, because `server app open
+<session> --pid <client>` already addresses ONE client:
+
+1. create an ephemeral probe row `--no-activate` (so it never enters the view),
+2. start a shadow on its own headless compositor,
+3. `open` the probe row **in the shadow only**, by pid,
+4. draw `scripts/lib/canvas-card.sh` into it — a dense glyph sweep, coloured
+   background runs, and the same words on the DEFAULT background, because an
+   empty prompt is about twelve glyphs and proves nothing,
+5. capture by pid, then tear everything down on `EXIT` including on failure.
+
+**Verified end to end:** `capture_backend=xterm_canvas_composite_over_dom`,
+`capture_faithful=true`, `active_session_path` equal to our own probe row, the
+owner's client on an entirely different session throughout, and afterwards
+`shadow=0`, no probe row, no stray compositor, no leftover PNG. ⭐ It **refuses**
+rather than saves if the shadow drew anything other than our row — that check is
+what keeps a stray frame of someone else's work off the disk.
+
+⚠ **Deliberately NOT wired into the hourly check.** A second GUI plus a
+compositor every hour is real memory on the machine this campaign exists to
+protect, and its verdict would not cover the owner's GL path anyway. The check
+now *points* at it when `terminal_exercised=no`; running it is for investigating
+a fault, not for a timer.
 
 ⚠ **AND A SHADOW FRAME CANNOT EXONERATE THE OWNER'S CANVAS.** It renders under
 headless sway, not the owner's desktop compositor and GL path, so a clean shadow

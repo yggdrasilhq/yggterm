@@ -254,7 +254,12 @@ note "L2/3 capture_faithful=${FAITHFUL:-unknown}"
 #   canvas was never drawn — structurally blind to the only thing it is for.
 #   ⛔ Blind is not clear, for the third time in this file.
 BACKEND="$(grep -o '"capture_backend": *"[^"]*"' <<<"$SHOT_JSON" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
-SESSION_PATH="$(grep -o '"active_session_path": *[^,}]*' <<<"$SHOT_JSON" | head -1 | sed 's/.*: *//')"
+# ⛔ ANCHOR ON THE KEY, NOT ON "the last colon". A session path CONTAINS a colon
+#    (`remote-cc://…`), so a greedy `.*: *` strips through the scheme and prints
+#    `//dev/<uuid>` — a value that is wrong in a way that still looks like a
+#    path, which is the kind of thing a later reader trusts.
+SESSION_PATH="$(grep -o '"active_session_path": *\("[^"]*"\|null\)' <<<"$SHOT_JSON" \
+  | head -1 | sed 's/^[^:]*: *//; s/^"//; s/"$//')"
 # ⭐ THE BACKEND ALONE DECIDES, and deliberately so. Only the canvas-composite
 # backend draws the xterm surface, so its presence is sufficient evidence that
 # the canvas was exercised. `active_session_path` is carried as CONTEXT only —
@@ -267,7 +272,13 @@ case "${BACKEND:-unknown}" in
 esac
 note "L2/3 terminal_exercised=$TERMINAL_EXERCISED backend=${BACKEND:-unknown} active_session_path=${SESSION_PATH:-absent}"
 if [ "$TERMINAL_EXERCISED" = "no" ]; then
-  note "L2/3 ⛔ THE CANVAS WAS NOT CAPTURED - the render faults are UNTESTED this tick, not absent. Open a session and re-run to exercise them."
+  note "L2/3 ⛔ THE CANVAS WAS NOT CAPTURED - the render faults are UNTESTED this tick, not absent."
+  # ⛔ Deliberately a POINTER, not a call. Exercising the canvas costs a second
+  #    GUI plus a compositor, which is real memory on the machine this campaign
+  #    exists to protect, and its verdict would not cover the owner's GL path
+  #    anyway. Hourly is the wrong cadence for it; investigating a fault is the
+  #    right one.
+  note "L2/3 ⇒ to actually draw and photograph a canvas: scripts/canvas-probe.sh <out.png> (own probe row, shadow client, never the owner's view)"
 fi
 if [ "$FAITHFUL" != "true" ]; then
   fail 2 "screenshot is not faithful (capture_faithful=${FAITHFUL:-unknown}) - cannot verify the surface, so treat as broken"
