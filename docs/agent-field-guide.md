@@ -242,6 +242,36 @@ fact and was one command from being falsified. A relayed measurement is a CLAIM 
 it yourself — and building a measurement on top of an instrument that does not exist is how a whole
 lane's numbers turn out to be about nothing.
 
+### ⛔⛔ THE TWO PRIVACY GATES DISAGREED, AND THE WEAKER ONE GATED PUSHES
+
+**Fixed 2026-08-14. Recorded because the shape outlives the instance.**
+
+A relay brief carrying an absolute personal home path reached a public lane
+branch, and the pre-push guard returned a green tick. The repo-local gate
+(`scripts/check-privacy.sh`) refuses that class as its **first** rule. So a class
+one checker treats as rule one, the other did not implement **at all** — not a
+weak version, none — and the one that runs on every push, in every repo, on every
+host was the blind one.
+
+- ⛔ **When two checkers disagree, the question is not which is right — it is
+  which one GATES.** A strict checker nobody's push runs through is a document.
+- ⭐ **The fix has to go in the WRITER, not the repo that noticed.** A rule added
+  to one repo's checker protects one repo; the same rule in the shared pre-push
+  guard protects every repo on every host, which is where a backstop belongs.
+- ⚠ **A rule that fires on its own prescribed remedy is worse than no rule.** The
+  cure for this finding is to write `/home/user`, so the pattern needs a
+  placeholder allowlist and a left anchor — without the anchor a URL ending
+  `/gp/w/home/activity` reads as a personal home path. **A check that cannot see
+  its own remedy becomes noise, and the noise is what teaches the override.**
+- ⭐ **Falsify a guard in both directions before trusting it:** that it now
+  catches the exact commit it previously passed, *and* that it stays silent
+  across a large body of already-public history. Verified here at 3,788 added
+  lines over 40 commits of `main`.
+
+⇒ And the standing consequence: **`scripts/check-privacy.sh` is the stricter gate
+and it is repo-local.** Run it before pushing docs. A green pre-push guard is a
+statement about the classes that guard implements, not about your file.
+
 ### ⛔⛔ A CLEAN PRIVACY-GUARD RUN IS NOT EVIDENCE THE FILE IS CLEAN
 
 `ygg-privacy-guard` scans **the commits a push is carrying**, by design — that is
