@@ -67,6 +67,12 @@ This file tracks user-visible changes in `yggterm`.
   be kept. Until now the only trace of a row being cleared away was its absence,
   which reads the same as never having existed, and that is what turned one
   accidental loss into a permanent mystery. Ask with `server rows departed`.
+- **And the rows lost on 13 August were never closed at all.** They were left out
+  of the file the next background service reads when it takes over, so that
+  service never learned they existed — while the old one still had them and still
+  listed them, which is why the two disagreed and why nothing recorded a closure.
+  Rows kept by default no longer reach that step, and any row that does now leaves
+  a record naming which check dropped it.
 - **The document editor's page is back.** Opening a document row showed an empty
   viewport — or, worse, the row's own shell output apparently rendered as the
   document — while the file list beside it, the word and character counts and the

@@ -922,6 +922,7 @@ rather than because anyone asked). ⚠ **The three-way answer is the point:**
 |---|---|
 | an entry saying `explicit-close` | somebody closed it. Not a bug. |
 | an entry saying `gui-close-disposable` | it was disposable and a GUI close took it. Working as designed — and if the user made that row on purpose, `docs/spec-app-row-survival.md` says it should not have been disposable. |
+| an entry saying `persist-dropped` | ⛔ **it was never closed — it was left OUT of the state file** at a persist, so the SUCCESSOR daemon never learned it existed. The `detail` field names which of the three gates took it. **This is what took the owner's app row group on 2026-08-13**, and it is the reason a lost row could leave `removed-rows.json` empty AND still be listed by the daemon that dropped it. |
 | **no entry at all** | ⛔ **it did not leave through any path that knows it left.** That is its own defect, and it is the state the whole ledger exists to make visible — an absence used to be the ONLY evidence, and an absence reads identically to "never existed". |
 
 ⚠ It is machine-wide (`~/.yggterm/removed-rows.json`, shared by every daemon on

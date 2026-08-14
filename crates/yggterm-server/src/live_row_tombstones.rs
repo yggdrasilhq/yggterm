@@ -134,6 +134,17 @@ pub enum RowDeparture {
     /// written against, and telling it apart from the line above is the whole
     /// point of this ledger.
     GuiCloseDisposable,
+    /// ⛔ **The row was never closed at all — it was left OUT of the state file.**
+    /// It is still in the running daemon's live order; the SUCCESSOR daemon
+    /// simply never learns it existed, so the row vanishes at the next restart
+    /// with nothing having closed it.
+    ///
+    /// This is the one that actually took the owner's row group on 2026-08-13,
+    /// and it is why the two stores disagreed: the old daemon still held the rows
+    /// and still listed them, while the new one had never had them. Neither close
+    /// path runs, so before this variant existed the departure left no record
+    /// anywhere except a trace event in a file that rotates per GUI launch.
+    PersistDropped,
 }
 
 impl RowDeparture {
@@ -141,6 +152,7 @@ impl RowDeparture {
         match self {
             Self::ExplicitClose => "explicit-close",
             Self::GuiCloseDisposable => "gui-close-disposable",
+            Self::PersistDropped => "persist-dropped",
         }
     }
 }
@@ -154,6 +166,14 @@ pub struct LiveRowDeparture {
     pub title: String,
     pub reason: RowDeparture,
     pub at: u64,
+    /// The finer-grained cause, when the reason has one. A persist drop has
+    /// three of them and they mean different things — `not_recoverable`,
+    /// `not_in_protected_runtime_keys`, `mapper_returned_none` — so a reader who
+    /// only learns "it was dropped" still has to go to the trace to find out
+    /// which gate took it. `Option` because the close paths have no sub-cause:
+    /// an invented one would be worse than none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -530,6 +550,7 @@ mod tests {
                     title: "New Ychrome".to_string(),
                     reason: RowDeparture::GuiCloseDisposable,
                     at: 1_000,
+                    detail: None,
                 },
             )
             .expect("record the departure");
@@ -566,6 +587,7 @@ mod tests {
             title: "a row".to_string(),
             reason: RowDeparture::ExplicitClose,
             at: 10,
+            detail: None,
         });
         ledger.push_departure(LiveRowDeparture {
             identity: "id::row".to_string(),
@@ -573,6 +595,7 @@ mod tests {
             title: "a row".to_string(),
             reason: RowDeparture::GuiCloseDisposable,
             at: 20,
+            detail: None,
         });
 
         assert!(ledger.clear("id::row"));

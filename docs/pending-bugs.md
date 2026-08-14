@@ -87,23 +87,23 @@ different one in `outline_prefix`, so it renders with two numbers. That is the
 already-documented double-numbering trap and is cosmetic here, but it is why the
 row reads as more broken than it is.
 
-## ⚠ [6.2] NO GUI CLOSE HAS EVER COMPLETED THE CLOSE PATH IN THE RETAINED TRACES
+## ⚠ [6.2] `server app close` MAY NOT RUN THE GRACEFUL CLOSE PATH AT ALL
 
 **Status:** OPEN
 
-*Found 2026-08-14 while live-proving `spec-app-row-survival.md`, and it is written
-down because it questions the diagnosis of the incident that spec was written for.*
+*Split out 2026-08-14 from a wider entry whose main question has since been
+answered — see the note at the bottom, because the answer changes what this one
+is worth.*
 
-`PrepareClientClose` is the only path that closes a non-keep-alive row. The GUI
-sends it from `maybe_shutdown_daemon_for_last_client`, which is reached only when
-a close is INTENTIONAL and this is the last client. Every step of that path
-traces: `keep_alive_flush_before_close`, then `shutdown_check` /
-`shutdown_suppressed` / `shutdown_unintentional`, then `client_close_prepared`.
+`PrepareClientClose` is the only path that closes a non-keep-alive row, and the
+GUI sends it from `maybe_shutdown_daemon_for_last_client`. Every step traces:
+`keep_alive_flush_before_close`, then `shutdown_check` / `shutdown_suppressed` /
+`shutdown_unintentional`, then `client_close_prepared`.
 
-**In a private sandbox, two different closes started the path and died inside it.**
-Both `swaymsg kill` on the toplevel and `server app close` left the GUI process
-gone with `keep_alive_flush_before_close` written, **no `shutdown_check` and no
-`client_close_prepared`**, the client-instance file still on disk, and a
+**In a private sandbox, two different closes started the path and died inside
+it.** Both `swaymsg kill` on the toplevel and `server app close` left the GUI
+process gone with `keep_alive_flush_before_close` written, **no `shutdown_check`
+and no `client_close_prepared`**, the client-instance file still on disk, and a
 non-keep-alive row still alive. The reap only ran when
 `{"kind":"prepare_client_close"}` was written to the daemon socket by hand.
 
@@ -112,27 +112,30 @@ non-keep-alive row still alive. The reap only ran when
 `keep_alive_flush_before_close`.** The only close-shaped names present are
 `native_close` (web surfaces) and `explicit_remote_session_close_requested`.
 
-⇒ **Two things follow, and the second is the uncomfortable one:**
-
-1. `server app close` may not be a faithful stand-in for a user closing the
-   window. Any lane that closes the GUI to prove a row went away is proving
-   something else.
-2. If that path does not run on the desktop host either, then the app rows lost
-   on 2026-08-14 **did not leave through the disposable reap**, and the fix that
-   makes them keep-alive — correct on its own terms, and shipped — does not
-   address whatever actually took them.
+⇒ **`server app close` may not be a faithful stand-in for a user closing the
+window, and several lanes use it as one.** A lane that closes the GUI to prove a
+row went away is proving something else.
 
 ### Falsifier / where to start
 
-- ⚠ **The absence is bounded by RETENTION, not by history.** Traces rotate per GUI
-  launch and 16 files are kept, so this says "not in the retained window", never
-  "never". Settle it by closing a GUI deliberately and reading the trace back.
-- The next occurrence is now diagnosable without any of this: **`server rows
-  departed`**. An entry saying `gui-close-disposable` means the reap took the row
-  and this entry is wrong. **No entry at all** means the row left through a path
-  that does not know it left, which is the far more serious answer.
-- `spawn_close_force_exit_watchdog` force-exits the process after a timeout and is
-  the obvious suspect for a path that starts and does not finish.
+- ⚠ **The absence is bounded by RETENTION, not by history.** Traces rotate per
+  GUI launch and 16 files are kept, so this says "not in the retained window",
+  never "never". Settle it by closing a GUI deliberately and reading the trace
+  back.
+- `spawn_close_force_exit_watchdog` force-exits the process after a timeout and
+  is the obvious suspect for a path that starts and does not finish.
+
+### ⭐ WHAT THIS ENTRY NO LONGER CLAIMS
+
+It was opened asking whether the close path running or not explained the app
+rows the owner lost. **It does not, and the actual cause is now known: they were
+never closed.** The persist filter dropped them from the state file at an
+update-restart, so the successor daemon never learned they existed — four local
+rows in one persist, two of them named in the trace as the rows he reported
+losing. That is fixed (born keep-alive skips the drop gate) and now leaves a
+`persist-dropped` record. **What remains here is only the instrument question**:
+whether a verb named `close` performs a close. Worth settling, no longer urgent.
+
 ## ⛔⛔ [6.1] THE SUCCESSOR RETIRES AND THE PREDECESSOR KEEPS THE SESSION — THE DRAIN INVERTS
 
 **Status:** OPEN
@@ -5382,6 +5385,36 @@ on a branch with **no** upstream is still worth fixing), and the corrected text 
 `lane/dev/6.7-resource` (`87394d0a`, *"the guard defect is real, 'every lane push fails' is
 not"*), which is unmerged pending the release. **That lane's version supersedes this entry
 on merge.** Until then: do not treat this as a reason not to push.
+
+### ⛔ A SECOND RESIDUAL, MEASURED 2026-08-14 — A BRANCH **WITH** AN UPSTREAM THAT IS BEHIND `main`
+
+⚠ Added as a new instance, not a rewrite of the text above; the supersession from 6.7's
+lane still applies to everything before this heading.
+
+The range is derived from the remote ref of the branch being pushed. For a lane whose
+remote tip is behind `main`, that range therefore contains **every commit `main` gained
+since the lane was last pushed** — including other lanes' commits. So:
+
+- another lane added a personal home path in `docs/pending-bugs.md` and **a later commit on
+  `main` removed it again**;
+- both are already public on `main`;
+- the tree being pushed does not contain it, and `scripts/check-privacy.sh` passes on it;
+- and the lane push is refused anyway, because an added line inside the range is still an
+  added line. ⇒ **An already-remediated leak blocks every later lane push, for everyone.**
+
+⛔ **It is self-perpetuating**: the push that would advance the lane ref is the one being
+refused, so the lane can never catch up on its own.
+
+⭐ **THE WORKAROUND THAT NEEDS NO OVERRIDE, AND IT IS ORDERING, NOT A BYPASS.** Push
+`HEAD:main` **first**, then the lane. `main`'s range is only the lane's own work, so it
+scans the right thing and passes; the content published is byte-identical either way. Only
+the question the guard is asked changes. Landing this way is what got 16 commits onto
+`main` after four refusals.
+
+⇒ The fix is for the guard to scan the **resulting tree**, or to exclude commits already
+reachable from another remote ref, rather than every added line in a range it did not
+author. ⛔ `YGG_PRIVACY_ALLOW=1` is NOT the answer here even though it would work: the
+whole point of this shape is that it teaches the override to people whose tree is clean.
 
 *found 2026-08-13 while pushing a lane branch; affects every cluster in this batch*
 
