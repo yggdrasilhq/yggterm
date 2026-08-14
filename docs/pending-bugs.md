@@ -9688,6 +9688,39 @@ yggterm-server tests. Each of the nine that are no longer failing was re-run
   `remote_resume_shell_command_wraps_prefix_and_cwd`,
   `stored_codex_litellm_sessions_use_litellm_resume_command`).
 
+⛔⛔ **TWO OF THOSE THREE ARE RED AGAIN — re-measured 2026-08-14 on the
+integrator, and confirmed INDIVIDUALLY, not inferred from a total.**
+`tests::remote_resume_shell_command_wraps_prefix_and_cwd` and
+`tests::stored_codex_litellm_sessions_use_litellm_resume_command` each fail on
+their own with `--exact --test-threads=1`. The assertion that goes is the
+**resume subcommand** again — `command.contains("codex resume -C \"$PWD\"")`
+(`lib.rs:33734`) — while the assertions *before* it in the same test still pass,
+so the string is being built, just not in that shape.
+
+⇒ **The suspect is the managed-CLI launch composition, not the legacy path.**
+`agent_launch_command_with_options` now routes through
+`managed_cli_shell_command_full` and only falls back to
+`legacy_agent_launch_command` on error, which is the per-CLI launch-flag work.
+⛔ **Filed, not fixed: this is the arsenal lane's code and the resource lane is
+not touching it.**
+
+⭐ **And the same-shape regression returning is the point.** The entry's own
+caution — *"green HERE is not green EVERYWHERE"*, with nobody having bisected
+what fixed them — was exactly right, and a verified-green record has now been
+outlived twice by the same assertion. ⇒ **Re-run before quoting green**, and
+treat "fixed itself" as unfinished business rather than a result.
+
+⚠ **The third failure in that run was a FLAKE and is not this.**
+`terminal::tests::a_parked_reader_consumes_nothing_and_loses_nothing` fails in
+the parallel workspace run and **passes individually** — the known
+flaky-in-parallel category, not a regression.
+
+⚠ **The filter trap fired here too and would have inverted the finding.**
+`cargo test --lib <bare_name> -- --exact` matches NOTHING for a test inside a
+module: all three printed `ok. 0 passed; 1112 filtered out`, which reads as
+green. The module path is required (`tests::…`, `terminal::tests::…`). ⇒ **A
+result line with `0 passed` is a run that did not happen.**
+
 ⚠ **Honest limits on that.** Nobody bisected what fixed them — the launch-string
 three are plausibly the 3.0.70 launch-composition work, but that is a guess and
 is recorded as one. And this was measured on the INTEGRATOR; the previous
