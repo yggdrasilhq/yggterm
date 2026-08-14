@@ -1256,15 +1256,39 @@ pub fn read_claude_code_transcript_messages(path: &Path) -> Result<Vec<Transcrip
 /// here, because the timeline has a place to put them — a reasoning entry the
 /// reader keeps folded, and a tool entry that shows one line until asked.
 pub fn read_claude_code_transcript_entries(path: &Path) -> Result<Vec<TranscriptEntry>> {
+    read_claude_code_transcript_entries_limited(path, None)
+}
+
+/// The same read, stopping once `max_messages` prose messages have gone by.
+///
+/// The bound is counted in MESSAGES rather than entries because that is what
+/// every caller of the head read wants — "the first turn", "the first 96 turns"
+/// — and an entry budget would mean something different on a tool-heavy session
+/// than on a conversational one.
+fn read_claude_code_transcript_entries_limited(
+    path: &Path,
+    max_messages: Option<usize>,
+) -> Result<Vec<TranscriptEntry>> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to read claude code transcript {}", path.display()))?;
     let mut entries = Vec::new();
+    let mut messages_seen = 0usize;
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else { continue };
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        let before = entries.len();
         claude_code_entries_from_record(&value, &mut entries);
+        if let Some(limit) = max_messages {
+            messages_seen += entries[before..]
+                .iter()
+                .filter(|entry| entry.kind == TranscriptEntryKind::Message)
+                .count();
+            if messages_seen >= limit {
+                break;
+            }
+        }
     }
     Ok(entries)
 }
@@ -1684,6 +1708,75 @@ pub fn read_agent_transcript_entries_tail_limited(
         window = (window.saturating_mul(2))
             .min(MAX_WINDOW_BYTES)
             .min(file_len.max(1));
+    }
+}
+
+/// The HEAD of whichever agent CLI owns `path`, at most `max_messages` prose
+/// messages, stopping as soon as it has them.
+///
+/// A scan calls this once per session file, so it must not read a 20 MB
+/// transcript to answer "when did this session start".
+pub fn read_agent_transcript_messages_limited(
+    path: &Path,
+    max_messages: usize,
+) -> Result<Vec<TranscriptMessage>> {
+    match transcript_reader_kind(path) {
+        TranscriptReaderKind::Codex => read_codex_transcript_messages_with_limit(
+            path,
+            (max_messages > 0).then_some(max_messages),
+        ),
+        TranscriptReaderKind::ClaudeCode => Ok(transcript_messages_from_entries(
+            &read_claude_code_transcript_entries_limited(
+                path,
+                (max_messages > 0).then_some(max_messages),
+            )?,
+        )),
+    }
+}
+
+/// The TAIL of whichever agent CLI owns `path`, at most `max_messages` prose
+/// messages — **the one door onto "what this session actually said"**.
+///
+/// Every producer of generation context asks through here. The reason is the
+/// defect this function was added for: title, précis and summary generation all
+/// called the CODEX tail reader unconditionally, and a Claude Code JSONL shares
+/// no record type with a Codex rollout, so those calls returned `Ok(vec![])` —
+/// no error, no warning, an empty context. Generation then ran off whatever the
+/// screen happened to be showing and the model, asked for a timeline entry with
+/// nothing to write one from, invented a plausible engineering session. The
+/// summaries that reached the sidebar named projects that do not exist.
+///
+/// ⚠ Entries are NOT messages: a turn carries tool calls and reasoning that
+/// [`transcript_messages_from_entries`] drops. So a fixed entry budget silently
+/// becomes a much smaller message budget on a tool-heavy session, which is the
+/// same class of quiet shortfall — the summariser describing the last two turns
+/// of a long session and sounding confident about it. The budget therefore
+/// WIDENS until it has the messages asked for or the file runs out.
+pub fn read_agent_transcript_messages_tail_limited(
+    path: &Path,
+    max_messages: usize,
+) -> Result<Vec<TranscriptMessage>> {
+    /// Opening guess at how many timeline entries carry one prose message.
+    const ENTRIES_PER_MESSAGE_GUESS: usize = 8;
+    /// Stop widening here; past this the read costs more than the context is
+    /// worth, and `older_available` has already said what was left behind.
+    const MAX_ENTRY_BUDGET: usize = 64 * 1024;
+
+    let mut budget = max_messages
+        .saturating_mul(ENTRIES_PER_MESSAGE_GUESS)
+        .max(max_messages)
+        .min(MAX_ENTRY_BUDGET);
+    loop {
+        let tail = read_agent_transcript_entries_tail_limited(path, budget)?;
+        let older_available = tail.older_available;
+        let mut messages = transcript_messages_from_entries(&tail.entries);
+        if messages.len() > max_messages {
+            messages.drain(..messages.len() - max_messages);
+        }
+        if messages.len() >= max_messages || !older_available || budget >= MAX_ENTRY_BUDGET {
+            return Ok(messages);
+        }
+        budget = budget.saturating_mul(4).min(MAX_ENTRY_BUDGET);
     }
 }
 

@@ -12608,7 +12608,7 @@ fn remote_saved_session_match_fragments(session_id: &str) -> anyhow::Result<Vec<
         if candidate_id != session_id {
             continue;
         }
-        let messages = read_codex_transcript_messages(&path)
+        let messages = yggterm_core::read_agent_transcript_messages(&path)
             .with_context(|| format!("reading saved transcript {}", path.display()))?;
         let mut fragments = Vec::new();
         for message in messages.into_iter().rev() {
@@ -14624,8 +14624,14 @@ fn remote_summary_for_path(
         .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default();
-    let head_messages = read_codex_transcript_messages_limited(path, 1).unwrap_or_default();
-    let recent_messages = read_codex_transcript_messages_tail_limited(path, 12).unwrap_or_default();
+    // The AGENT readers, not the Codex ones: this scan line is what a remote
+    // session's copy generation is written from, and a Codex-only read of a
+    // Claude Code transcript yields nothing at all — no error, an empty
+    // `recent_context`, and a summariser left to invent one.
+    let head_messages =
+        yggterm_core::read_agent_transcript_messages_limited(path, 1).unwrap_or_default();
+    let recent_messages =
+        yggterm_core::read_agent_transcript_messages_tail_limited(path, 12).unwrap_or_default();
     let user_message_count = recent_messages
         .iter()
         .filter(|message| message.role == TranscriptRole::User)
@@ -26615,8 +26621,11 @@ pub fn run_remote_preview_tail(path: &str, blocks: usize) -> anyhow::Result<()> 
 }
 
 pub fn run_remote_generation_context(path: &str) -> anyhow::Result<()> {
+    // The far side of `fetch_remote_generation_context`. It answers the same
+    // question as `extract_tail_context` does locally, so it reads the same way
+    // — through the agent dispatch, not a single CLI's decoder.
     let context = generation_context_from_messages(
-        &read_codex_transcript_messages(std::path::Path::new(path))
+        &yggterm_core::read_agent_transcript_messages(std::path::Path::new(path))
             .with_context(|| format!("reading remote transcript {}", path))?,
     );
     write_stdout_line(&context)?;
