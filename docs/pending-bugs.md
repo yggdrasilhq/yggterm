@@ -928,19 +928,73 @@ decoy and its own length check passed.
 ⇒ Whoever fixes the mechanism should also ask what would have happened had the
 verb lied, because the honest field is the only thing that made this visible.
 
-## ⚠ [6.6] FOUR `server` VERBS STILL ANSWER FROM ONE BINARY ONLY, AND EACH NEEDS ITS OWN VERDICT
+## ⚠ [6.6] THE `server` USAGE TEXT IS A THIRD COPY OF "WHICH VERBS EXIST", AND IT DRIFTED THE SAME WAY
 
 **Status:** OPEN
 
-*Measured and mostly closed 2026-08-14, after collapsing `server app`.*
+*Found 2026-08-14 immediately after making three `server` verbs answer from both
+binaries: they worked, and the binary you typed them into still said they did
+not exist.*
+
+Each binary prints its own hand-maintained `server` usage block. Measured after
+the verbs were shared: **23 lines on one, 31 on the other**, for the same
+surface. **Five verbs that answer from both** (`daemons`, `write-lock`,
+`gate-screen`, `relay-boundary`, `wpe`) were listed by one binary only —
+including two that had *just* been moved specifically so both could serve them.
+
+⚠ **And the drift runs BOTH ways**, which is why "the GUI's help is behind" is
+the wrong summary: `write-lock` has answered from both binaries since the first
+round of this work and was missing from the HEADLESS block. A one-directional
+reading would have fixed one side and left the other, and then reported the
+surface as reconciled.
+
+⚠ **This is the same defect one layer up, and it is the more dangerous layer.**
+A missing dispatch fails loudly (`unsupported server command`). A missing usage
+LINE fails silently and teaches the wrong thing: the user reads the help, does
+not see the verb, and concludes it is not available here — which is exactly the
+belief the dispatch fix exists to remove. ⇒ A surface can be shared and still
+be undiscoverable.
+
+The six lines were added by hand so the fix is not self-contradicting, and that
+hand-add is the bug: **the next verb will drift again.** One owner should
+generate both texts, the way `app_control_cli` owns the `server app` help.
+
+⛔ Do not "fix" this by copying one block over the other. They are not identical
+by design — each names its own binary in every line — so the shared thing is the
+verb list, not the text.
+
+## ⚠ [6.6] ONE `server` VERB STILL ANSWERS FROM ONE BINARY ONLY — AND THE "REAL FORK" NEVER EXISTED
+
+**Status:** OPEN
+
+*Measured and mostly closed 2026-08-14, after collapsing `server app`. The last
+three verdicts were taken the same day and they overturned this entry's own
+premise.*
 
 `server <verb>` is dispatched in both binaries, and nine verbs answered from one
-only. ⛔ **Unlike `server app`, this surface is NOT collapsed wholesale, and that
-is the finding.** `server app` was one homogeneous plane where every verb
-belonged on both binaries, so one owner plus a structural ban was right.
-`server` mixes planes: deploy and relay machinery that is genuinely
-headless-only sits beside daemon operations that are not. A blanket ban would
-forbid a real fork. **The question is asked per verb.**
+only. This entry used to say the finding was that **`server` mixes planes** —
+deploy and relay machinery that is *genuinely* headless-only sitting beside
+daemon operations that are not — so a blanket ban would forbid a real fork.
+
+⛔⛔ **THAT PREMISE IS WITHDRAWN. THE FORK WAS THREE READINGS, AND ALL THREE WERE
+WRONG.** `gate-screen`, `relay-boundary` and `wpe` were the entire evidence for
+it. Read end to end, every one is accidental (below), and all three now answer
+from both binaries. **Eight of nine divergences measured, eight accidental, zero
+forks found.**
+
+⚠ **The per-verb rule still stands — but on its own merits, not on a
+counter-example.** Asking per verb is right because a fork *could* exist and a
+structural ban would forbid it silently. What nobody may do any more is cite a
+measured one, because there isn't one. ⇒ If the ninth verb also comes back
+accidental, the honest move is to reopen the wholesale question rather than keep
+a rule whose only justification has evaporated.
+
+⭐ **The transferable half: a READING is not a VERDICT, and this entry said so
+about itself and was still believed.** The three were filed as "reads as
+deploy/relay machinery … that is a reading of their callsites and usage text,
+**not a verdict**". Everything downstream — this entry's framing, and the shared
+module's own header — then quoted them as the established fork. **A caveat
+attached to a claim does not travel with it.**
 
 ### ✅ CLOSED — five accidental divergences, fixed
 
@@ -961,9 +1015,28 @@ binaries. Sharing the verbs while leaving those in place would have made a
 THIRD copy — worse than the duplication being fixed — so the locals are gone and
 both binaries import the shared pair. The lock bans either growing one back.
 
-### ⏳ STILL OPEN — four verbs, and the reading that is not yet a verdict
+### ✅ CLOSED — the three that were the "real fork"
 
-- **`connect`** (GUI-only) — ⭐ **READ END-TO-END NOW, AND THE VERDICT IS
+| verb | the reading | what the body says |
+|---|---|---|
+| `wpe` | deploy/relay machinery, headless by design | opens with `ensure_local_server_ready_for_cli` + `cli_server_endpoint` and talks to the daemon — **the exact test that convicted the four above it** |
+| `gate-screen` | ditto | a read-only daemon query over the socket; no ensure, deliberately, for the same reason `terminal resize` has none |
+| `relay-boundary` | ditto | touches **no daemon at all** — reads and writes a host fact in a file under the home dir, which is the `daemons` census's own shape, and the census was closed as accidental |
+
+All three now answer from both binaries, and their bodies are GONE from the
+headless binary rather than merely also-dispatched — the lock checks for the
+copies, not just for the calls, because a binary that kept its inline block
+beside the new call would pass a call-only assertion while the two drifted.
+Before/after against the shipped binary: all three went from
+`unsupported server command: <verb>` to a real dispatch.
+
+⭐ **`relay-boundary` is the one that stung.** It exists so a relay session can
+declare its own hand-off — and the binary on an agent's `PATH` is `yggterm`,
+which was the one that could not answer it.
+
+### ⏳ STILL OPEN — one verb, and it is a size problem, not a verdict
+
+- **`connect`** (GUI-only) — ⭐ **READ END-TO-END, AND THE VERDICT IS
   ACCIDENTAL.** It reads a snapshot and asks the daemon to place a row: no
   window, no app-control round trip, no process spawn. The earlier note here
   said it "may reasonably need the GUI" and that it "spawns" — both were guesses
@@ -979,10 +1052,6 @@ both binaries import the shared pair. The lock bans either growing one back.
   already moved. The attempt was reverted rather than half-landed.
   ⇒ Whoever takes it should move the cluster as one commit, and should expect
   the helper count, not the verb, to be the work.
-- **`gate-screen`, `relay-boundary`, `wpe`** (headless-only) — read as
-  deploy/relay machinery that belongs to the headless CLI by design, i.e. the
-  FORK side. That is a reading of their callsites and usage text, **not a
-  verdict**, and it is the half of this entry still owed.
 
 ### ⚠ THE INSTRUMENT LIED FIRST, AND THE CONTROL CAUGHT IT
 

@@ -183,6 +183,7 @@ fn print_server_help() {
   yggterm-headless server ping
   yggterm-headless server status
   yggterm-headless server daemons [--json]
+  yggterm-headless server write-lock <acquire|release|status> [--holder <who>]
   yggterm-headless server relay-boundary [--by <who>] [--wait-secs <n>] [--json]
   yggterm-headless server gate-screen [<session-key>] [--tail <n>] [--json]
     what the hot-restart idle gate is CLASSIFYING FROM, per owned session — the
@@ -384,62 +385,6 @@ fn screenshot_post_process_from_args(args: &[String]) -> Option<ScreenshotPostPr
 /// **The exit code is part of the contract**: a typed failure prints its JSON
 /// and exits non-zero, so an agent scripting this can branch on `$?` rather
 /// than re-parsing the outcome it just received.
-fn run_server_wpe(store: &SessionStore, args: &[String]) -> Result<()> {
-    use yggterm_server::wpe_agent::{WpeOutcome, params_from_flags};
-
-    // The plane lives INSIDE the daemon (it owns the agent process), so unlike
-    // the read-only diagnostics this needs a daemon to exist.
-    ensure_local_server_ready_for_cli(store)?;
-    let endpoint = cli_server_endpoint(store.home_dir());
-
-    if args[0] == "agent" {
-        let action = args
-            .get(1)
-            .map(String::as_str)
-            .context("usage: server wpe agent <status|restart|stop>")?;
-        return match yggterm_server::wpe_agent_control(&endpoint, action)? {
-            Ok(report) => {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-                Ok(())
-            }
-            Err(outcome) => {
-                print_wpe_failure("agent", &outcome)?;
-                std::process::exit(1);
-            }
-        };
-    }
-
-    let verb = args[0].as_str();
-    let params = params_from_flags(&args[1..]).map_err(|message| anyhow::anyhow!(message))?;
-    match yggterm_server::wpe_verb(&endpoint, verb, params)? {
-        WpeOutcome::Answer { response } => {
-            println!("{}", serde_json::to_string_pretty(&response)?);
-            Ok(())
-        }
-        outcome => {
-            print_wpe_failure(verb, &outcome)?;
-            std::process::exit(1);
-        }
-    }
-}
-
-/// One printer for every failure arm, so the shape a script parses does not
-/// depend on which way the plane failed.
-fn print_wpe_failure(verb: &str, outcome: &yggterm_server::wpe_agent::WpeOutcome) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "ok": false,
-            "verb": verb,
-            "summary": outcome.summary(),
-            "failure": outcome,
-        }))?
-    );
-    Ok(())
-}
-
-
-
 /// `server update-daemons [--force]` — bring every reachable local daemon onto
 /// this binary's version while PRESERVING their live terminal runtimes.
 ///
@@ -1270,58 +1215,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.len() >= 2 && args[0] == "server" && args[1] == "gate-screen" {
-        // §3's audit instrument. Read-only, on demand, and connected directly
-        // like the other read-only diagnostics — a verb that spawned a daemon
-        // in order to ask what a daemon is looking at would answer about a
-        // process that did not exist when the question was asked.
-        //
-        // ⛔ NOT WRITTEN ANYWHERE. The screens go to this stdout and nowhere
-        // else — see `HotRestartGateScreen`. A caller harvesting a corpus owns
-        // where it lands and how long it lives.
-        let endpoint = cli_server_endpoint(store.home_dir());
-        let path = args.get(2).filter(|arg| !arg.starts_with("--"));
-        let tail_lines = cli_flag_value(&args, "--tail").and_then(|value| value.parse().ok());
-        let sessions = yggterm_server::hot_restart_gate_screens(
-            &endpoint,
-            path.map(String::as_str),
-            tail_lines,
-        )?;
-        if args.iter().any(|arg| arg == "--json") {
-            println!("{}", serde_json::to_string_pretty(&sessions)?);
-            return Ok(());
-        }
-        if sessions.is_empty() {
-            println!("no sessions owned by this daemon match");
-            return Ok(());
-        }
-        for session in &sessions {
-            let verdict = match session.blocker.as_ref() {
-                Some(blocker) => format!(
-                    "{kind}{permanent}, idle {idle}",
-                    kind = blocker.kind,
-                    permanent = if blocker.permanent { " (permanent)" } else { "" },
-                    idle = blocker
-                        .idle_ms
-                        .map(|ms| format!("{}s", ms / 1000))
-                        .unwrap_or_else(|| "unknown".to_string()),
-                ),
-                None => "not blocking".to_string(),
-            };
-            println!(
-                "== {key}\n   gate verdict: {verdict}\n   screen_text_shows_agent_working: {working}\n   screen: {screen}",
-                key = session.session_key,
-                working = session.shows_agent_working,
-                screen = if session.screen_available {
-                    "readable"
-                } else {
-                    "UNREADABLE — the gate is classifying this one blind"
-                },
-            );
-            for line in session.screen_tail.iter().flatten() {
-                println!("   | {line}");
-            }
-        }
-        return Ok(());
+        return yggterm_server::server_cli::run_server_gate_screen_cli(&store, &args);
     }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "app-declares"
     {
@@ -1451,7 +1345,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "wpe" {
-        return run_server_wpe(&store, &args[2..]);
+        return yggterm_server::server_cli::run_server_wpe_cli(&store, &args[2..]);
     }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "restart" {
         ensure_local_server_ready_for_cli(&store)?;
@@ -2056,90 +1950,7 @@ fn main() -> Result<()> {
     if args.first().is_some_and(|arg| arg == "server")
         && args.get(1).is_some_and(|arg| arg == "relay-boundary")
     {
-        // §2 of docs/spec-hot-restart-relay-gate.md — *"a relay hand-off is a
-        // genuine, declared, zero-cost quiet point … the gate stops being a
-        // search and becomes an appointment."*
-        //
-        // ⛔ It does NOT spawn a daemon (no `ensure_local_server_ready_for_cli`)
-        // and it does not talk to one. The queue is a HOST fact in a file, and
-        // making the verb reach a daemon would mean choosing which of the
-        // several a stale host is running — the exact question §4 moved out of
-        // any one daemon's status. A drainer picks the boundary up on its next
-        // 20 s poll.
-        let json = args.iter().any(|arg| arg == "--json");
-        let declared_by = args
-            .iter()
-            .position(|arg| arg == "--by")
-            .and_then(|index| args.get(index + 1))
-            .cloned()
-            .unwrap_or_else(|| "relay_boundary".to_string());
-        let wait_secs = args
-            .iter()
-            .position(|arg| arg == "--wait-secs")
-            .and_then(|index| args.get(index + 1))
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis() as u64)
-            .unwrap_or(0);
-        let outcome = yggterm_server::hot_restart_queue::declare_relay_boundary(
-            store.home_dir(),
-            now_ms,
-            &declared_by,
-        );
-        let (owed, target_version, waiting_ms) = match &outcome {
-            yggterm_server::hot_restart_queue::RelayBoundaryOutcome::Declared {
-                target_version,
-                waiting_ms,
-            } => (true, Some(target_version.clone()), Some(*waiting_ms)),
-            yggterm_server::hot_restart_queue::RelayBoundaryOutcome::NothingOwed => {
-                (false, None, None)
-            }
-        };
-        // ⚠ The drainer polls every 20 s, so a wait shorter than that can only
-        // ever time out — say so rather than reporting a converged host as
-        // still-owing. Waiting is opt-in because the common case is a converged
-        // host with nothing to wait for.
-        let mut converged = !owed;
-        if owed && wait_secs > 0 {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
-            while std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                if yggterm_server::hot_restart_queue::load(store.home_dir()).is_none() {
-                    converged = true;
-                    break;
-                }
-            }
-        }
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "declared_by": declared_by,
-                    "swap_owed": owed,
-                    "target_version": target_version,
-                    "waiting_ms": waiting_ms,
-                    "waited_for_secs": wait_secs,
-                    "converged": converged,
-                }))?
-            );
-        } else if let Some(target_version) = target_version {
-            let waiting_min = waiting_ms.unwrap_or(0) / 60_000;
-            if converged {
-                println!(
-                    "relay boundary declared by {declared_by}; swap to {target_version} converged"
-                );
-            } else {
-                println!(
-                    "relay boundary declared by {declared_by}; swap to {target_version} \
-                     (owed {waiting_min}m) is due at the next drainer poll"
-                );
-            }
-        } else {
-            println!("relay boundary declared by {declared_by}; no swap is owed on this host");
-        }
-        return Ok(());
+        return yggterm_server::server_cli::run_server_relay_boundary_cli(&store, &args);
     }
     // `--endpoint <path|version|pid>` aims a READ-ONLY verb at one of the
     // daemons the census names. Read-only on purpose: seeing all 28 and being

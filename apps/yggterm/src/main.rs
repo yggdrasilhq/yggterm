@@ -846,6 +846,12 @@ fn print_server_help() {
   yggterm server order [--json]
   yggterm server reorder <session-path>... | --stdin [--scope <scope>]
   yggterm server ledger [--scope <scope>]
+  yggterm server daemons [--json]
+  yggterm server write-lock <acquire|release|status> [--holder <who>]
+  yggterm server gate-screen [<session-key>] [--tail <n>] [--json]
+  yggterm server relay-boundary [--by <who>] [--wait-secs <n>] [--json]
+  yggterm server wpe <verb> [--key value ...]
+  yggterm server wpe agent <status|restart|stop>
   yggterm server ping
   yggterm server status
   yggterm server snapshot
@@ -1512,6 +1518,30 @@ fn main() -> Result<()> {
     if args.len() >= 2 && args[0] == "server" && args[1] == "reorder" {
         // ONE owner, both binaries — `yggterm_server::server_cli`.
         return yggterm_server::server_cli::run_server_reorder_cli(&store, &args);
+    }
+    // ⛔ THE LAST THREE `server` DIVERGENCES, AND THEY WERE ACCIDENTAL TOO.
+    // These three were read as deploy/relay machinery that belonged to the
+    // headless CLI by design — the one real fork this surface was said to
+    // have, and the reason it was not collapsed wholesale. Reading their
+    // bodies refutes it: `wpe` opens with `ensure_local_server_ready_for_cli`
+    // + `cli_server_endpoint` and talks to the daemon, which is the very test
+    // that convicted the four before it; `gate-screen` is a read-only daemon
+    // query; and `relay-boundary` reads and writes a file under the home dir
+    // and touches no daemon at all, which is the `daemons` census's shape.
+    // None of them needs a window, and none of them is unavailable to this
+    // binary for any reason but which file it was typed into.
+    // ⇒ A relay declaring its own hand-off is the case that stung: the binary
+    // on an agent's PATH is this one.
+    if args.len() >= 2 && args[0] == "server" && args[1] == "gate-screen" {
+        return yggterm_server::server_cli::run_server_gate_screen_cli(&store, &args);
+    }
+    if args.first().is_some_and(|arg| arg == "server")
+        && args.get(1).is_some_and(|arg| arg == "relay-boundary")
+    {
+        return yggterm_server::server_cli::run_server_relay_boundary_cli(&store, &args);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "wpe" {
+        return yggterm_server::server_cli::run_server_wpe_cli(&store, &args[2..]);
     }
     if args.len() >= 5 && args[0] == "server" && args[1] == "terminal" && args[2] == "write" {
         ensure_local_server_ready_for_cli(&store)?;
@@ -4567,10 +4597,43 @@ mod tests {
             ("yggterm", include_str!("main.rs")),
             ("yggterm-headless", include_str!("bin/yggterm-headless.rs")),
         ] {
-            for verb in ["write_lock", "order", "ledger", "reorder"] {
+            // ⭐ The last three were added 2026-08-14, and adding them is the
+            // finding: they were the FORK this surface was said to have, and
+            // reading their bodies refuted it. `server` has no measured fork
+            // left — only `connect`, whose move is deferred on size, not on a
+            // verdict.
+            for verb in [
+                "write_lock",
+                "order",
+                "ledger",
+                "reorder",
+                "gate_screen",
+                "relay_boundary",
+                "wpe",
+            ] {
                 assert!(
                     source.contains(&format!("server_cli::run_server_{verb}_cli(")),
                     "{binary} must route `server {verb}` to its one owner"
+                );
+            }
+            // ⛔ And the bodies must be GONE, not merely also-dispatched. A
+            // binary that kept its inline copy beside the call would pass the
+            // assertion above while the two copies drifted, which is the exact
+            // failure this whole entry is about. `run_server_wpe` was the local
+            // one; the other two were inline blocks whose distinctive strings
+            // are checked instead.
+            let product = source
+                .split("mod tests {")
+                .next()
+                .expect("the binary has a product half above its tests");
+            for needle in [
+                "fn run_server_wpe(",
+                "no sessions owned by this daemon match",
+                "declare_relay_boundary(",
+            ] {
+                assert!(
+                    !product.contains(needle),
+                    "{binary} kept its own copy of a moved `server` verb ({needle})"
                 );
             }
             // ⛔ And the helpers those verbs need are shared too. Both binaries

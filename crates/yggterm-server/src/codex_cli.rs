@@ -3301,7 +3301,8 @@ pub(crate) fn best_effort_cwd_shell_prefix(cwd: Option<&str>) -> Option<String> 
          if [ \"$__yggterm_cwd_ok\" != 1 ] && [ -n \"$HOME\" ]; then cd \"$HOME\" 2>/dev/null || true; fi; \
          if [ \"$__yggterm_cwd\" != \"$__yggterm_requested\" ]; then \
            printf '%s\\n' \"{marker}: $__yggterm_requested\" \
-             \"yggterm: starting in $PWD instead — work done here is NOT in the directory this row names.\" >&2; \
+             \"yggterm: starting in $PWD instead — work done here is NOT in the directory this row names.\" >&2 \
+             || true; \
          fi",
         requested = shell_single_quote(requested),
         marker = CWD_FALLBACK_NOTICE_MARKER,
