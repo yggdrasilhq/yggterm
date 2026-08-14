@@ -12,14 +12,71 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⚠ [6.2] NO GUI CLOSE HAS EVER COMPLETED THE CLOSE PATH IN THE RETAINED TRACES
+
+**Status:** OPEN
+
+*Found 2026-08-14 while live-proving `spec-app-row-survival.md`, and it is written
+down because it questions the diagnosis of the incident that spec was written for.*
+
+`PrepareClientClose` is the only path that closes a non-keep-alive row. The GUI
+sends it from `maybe_shutdown_daemon_for_last_client`, which is reached only when
+a close is INTENTIONAL and this is the last client. Every step of that path
+traces: `keep_alive_flush_before_close`, then `shutdown_check` /
+`shutdown_suppressed` / `shutdown_unintentional`, then `client_close_prepared`.
+
+**In a private sandbox, two different closes started the path and died inside it.**
+Both `swaymsg kill` on the toplevel and `server app close` left the GUI process
+gone with `keep_alive_flush_before_close` written, **no `shutdown_check` and no
+`client_close_prepared`**, the client-instance file still on disk, and a
+non-keep-alive row still alive. The reap only ran when
+`{"kind":"prepare_client_close"}` was written to the daemon socket by hand.
+
+**On the desktop host, across all 16 retained trace files: zero
+`client_close_prepared`, zero `shutdown_check`, zero
+`keep_alive_flush_before_close`.** The only close-shaped names present are
+`native_close` (web surfaces) and `explicit_remote_session_close_requested`.
+
+⇒ **Two things follow, and the second is the uncomfortable one:**
+
+1. `server app close` may not be a faithful stand-in for a user closing the
+   window. Any lane that closes the GUI to prove a row went away is proving
+   something else.
+2. If that path does not run on the desktop host either, then the app rows lost
+   on 2026-08-14 **did not leave through the disposable reap**, and the fix that
+   makes them keep-alive — correct on its own terms, and shipped — does not
+   address whatever actually took them.
+
+### Falsifier / where to start
+
+- ⚠ **The absence is bounded by RETENTION, not by history.** Traces rotate per GUI
+  launch and 16 files are kept, so this says "not in the retained window", never
+  "never". Settle it by closing a GUI deliberately and reading the trace back.
+- The next occurrence is now diagnosable without any of this: **`server rows
+  departed`**. An entry saying `gui-close-disposable` means the reap took the row
+  and this entry is wrong. **No entry at all** means the row left through a path
+  that does not know it left, which is the far more serious answer.
+- `spawn_close_force_exit_watchdog` force-exits the process after a timeout and is
+  the obvious suspect for a path that starts and does not finish.
 ## ⛔⛔ [6.1] THE SUCCESSOR RETIRES AND THE PREDECESSOR KEEPS THE SESSION — THE DRAIN INVERTS
 
 **Status:** OPEN
 
-⭐ **DIRECTION RULED 2026-08-14 by 6.0 — implementation is owed, not the
-decision. COUNT PRESERVED, AND GIVE A PRESERVED RECORD AN EXIT. Both halves or
-neither**, because shipping the count alone trades non-convergence for a
-permanent pin, which is the worse direction.
+⭐ **DIRECTION RULED 2026-08-14 by 6.0, THEN AMENDED THE SAME DAY when the
+falsifier below disproved a premise of it. The amended ruling is the one to
+build:**
+
+> **The exit comes FIRST and it has a named target — clear a preserved record
+> whose owner is dead. It is independently worth shipping even if the count
+> never lands.** The count follows.
+
+⛔ **The original ruling said "count preserved AND give it an exit, both halves
+or neither", on the reasoning that the permanent pin would be a cost of the
+change. It is not: it is the status quo** (see the falsifier below — a dead
+owner's record already pins a daemon today). Counting would *widen* an existing
+pin rather than create one, which is a materially different trade. ⇒ **Do not
+implement the original form, and do not re-argue it: it was amended on
+measurement, not on preference.**
 
 **The reasoning, which generalises past this entry:** both horns end in a stuck
 daemon and differ in one property. Today's failure (preserved counts zero) is
@@ -2039,54 +2096,6 @@ output says "silent 5 s" — so a reader wired to either field alone cannot pass
 ⇒ **Still open:** the SIDEBAR. A wedged row still renders `idle · Ready`, so the
 human remains the only detector of the state the daemon can now see. That is the
 next wiring, and `input_unanswered_ms()` is already there to read.
-
-## ⛔⛔ [6.7] APP ROWS ARE BORN `keep_alive: false`, SO A GUI RESTART DESTROYS THE USER'S OWN GROUP
-
-**Status:** OPEN
-
-*Owner-hit 2026-08-14. He lost a row group he had built -- one `New Yedit` header and
-four `New Ychrome` rows -- to a GUI restart, and reported it in those words: "a row
-group of mine is gone ... I cannot see it after the restart".*
-
-**The rows were `kind: shell`, `keep_alive: false`.** Second-class rows die with the
-GUI by design, and that design is correct for a scratch shell. It is wrong for a row
-the user **deliberately created from an app verb** and arranged into a group: from his
-side there is nothing "scratch" about it, and nothing in the UI says it is disposable.
-
-```
-"title": "New Ychrome", "kind": "shell", "keep_alive": false, "cwd": "/home/user"
-```
-
-⛔ **THE CONSTITUTION SAYS THE OPPOSITE IN AS MANY WORDS:** *"Plain shells are
-first-class and must survive a bump like anything else."* These did not.
-
-⚠ **It is not recorded as a removal either.** `removed-rows.json` has no entry for
-them, so nothing distinguishes "the user closed this" from "this evaporated" -- and
-`sessions restore` answers `not_found`, because the ids are gone from the GUI's live
-set even though `server-state.json` still lists them under `live_sessions`. **Two
-stores disagree about whether the row exists**, which is its own defect.
-
-### What is NOT lost, and what is
-
-- ✅ **Profile data is safe.** Each row was a shell running `ychrome`; the profile
-  directories persist on disk. Nothing the user had stored was destroyed.
-- ⛔ **Which profiles were open is NOT recoverable** from state: the persisted record
-  carries `title`, `kind`, `cwd` and `ssh_target` and **no app arguments**, so a
-  restore cannot reconstruct which profile each row held.
-
-### Falsifier / where to start
-
-1. `server app launch-app ychrome new`, then read the row back out of
-   `~/.yggterm/server-state.json` -- it must not be born `keep_alive: false`.
-2. There is **no CLI verb to set keep-alive on an existing row** (`--keep-alive` is
-   documented only as unnecessary for agent-CLI kinds, which are born keep-alive).
-   A user who wants to protect a row they already have cannot.
-3. The persisted record needs to carry the app **verb and args**, or a restore can
-   only ever produce a blank instance of the app.
-
-⇒ **Three separable fixes, and the first is the one the owner felt:** rows created
-from an app verb are born keep-alive; a keep-alive toggle exists for any row; and the
-stored record round-trips the launch arguments.
 
 ## ⛔⛔ [6.7] THE GUI IS BURNING A WHOLE CORE, AND IT IS USER-TIME, NOT SYSCALLS
 
