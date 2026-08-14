@@ -897,13 +897,36 @@ p50 is a session effect wearing a verb's name"* — **rows alone are sufficient*
 measured with sessions held at zero. A session effect may exist on top; it is not
 needed.
 
-⇒ **And this is a far larger row-scaled term than §S5's was.** `status` at
-4.6 µs/row was declined at ~1.5% of daemon CPU; `snapshot` costs **6.5x that per
-row**, and ROWS is frozen at each daemon's birth — so a 264-row daemon owning one
-session pays **8.7 ms per snapshot for rows it does not own.** ⛔ **The missing
-multiplier is the live snapshot RATE, which this lane has not measured** — the
-per-row cost is settled, the fleet total is not, and no cores figure should be
-quoted until it is.
+⇒ **And per row it is a far larger term than §S5's.** `status` at 4.6 µs/row was
+declined at ~1.5% of daemon CPU; `snapshot` costs **6.5x that per row**, and ROWS
+is frozen at each daemon's birth — so a 264-row daemon owning one session pays
+**8.7 ms per snapshot for rows it does not own.**
+
+### ⛔ AND THE RATE PRICES IT OUT — SAME VERDICT AS §S5, FOR THE SAME REASON
+
+**The multiplier was asked for before any cores figure was quoted, and it kills
+the optimisation.** Live, fleet-wide: **`snapshot` runs at 0.37/s.**
+
+    0.37/s x 8,720 us = 0.0032 cores  ->  ~0.1% of daemon CPU
+
+⇒ **Do not build a fix for it.** Even allowing a live snapshot to cost 10x the
+sandbox figure it is ~1%. ⭐ **The finding survives as a fact about the verb and
+dies as an optimisation** — which is exactly why the rate was asked for first.
+
+⭐ **That rate is quotable where the others are not, and the asymmetry is
+load-bearing.** `perf_span_is_high_frequency_noise` lists
+`("daemon_request", "terminal_snapshot")` — **not** `("daemon_request",
+"snapshot")`. So snapshot counts are **complete and unsampled**, while `status`,
+`ping`, `working_flags` and `terminal_read` are kept only at ≥8 ms or 1-in-50 and
+their counts are **undercounts**. ⇒ **A status:snapshot ratio read off that
+aggregate is not real**, because only one side is fully recorded.
+
+⚠ **One gap not hidden:** live snapshots show **320.9 ms p50 WALL** against
+8.7 ms of sandbox CPU — 37x. Wall ≥ CPU and live snapshots carry sessions, so
+live snapshot CPU is probably higher than the sandbox figure. At 100 ms of CPU
+the term would be 0.037 cores, ~1%. **Still not worth a version-gated change**,
+and the live CPU figure cannot currently be measured from outside the process
+(below).
 
 ⛔ **THE PRIOR ORDERING WAS OBTAINED BY A KNOWN DEFECT, ON BOTH SIDES OF THE
 DISAGREEMENT.** The "snapshot is cheaper than status" figure (3.67 vs 5.07 ms)
@@ -915,6 +938,29 @@ re-measurement with the baseline subtracted found the background was 0.00000
 cores, so that defect did not bite — **the ordering survived by luck, not by
 method.** ⇒ Neither figure should have been quoted from the weaker instrument.
 
+### ⛔⛔ 6o. AN EXTERNAL ESTIMATOR CANNOT PRICE A LIVE DAEMON'S REQUESTS — THE SIGNAL IS BELOW THE BASELINE'S DRIFT
+
+A baseline-subtracted estimator pointed at live daemons, with baselines
+**bracketing** the load so drift could not pass as request cost, **refused**: the
+brackets moved 0.4240 → 1.1437 cores across one arm and the net came out
+**negative, −254 ms/request**. Impossible ⇒ the arm is void and nothing is quoted
+from it, including the rungs that looked plausible.
+
+⭐ **The reason is structural, and it retro-explains three separate failed
+arms.** A baseline-subtracted estimator needs a **stationary** baseline, and on a
+live daemon the baseline *is* the bursty per-session reader term — the one that
+swings 25x between adjacent 60 s windows. The signal (100 requests × ~2 ms =
+0.2 core-seconds) is ~35x smaller than the baseline's own drift over the same
+10 s (~7 core-seconds). ⇒ **The quantity sits below the noise floor of any
+external instrument.** Not three unlucky arms: one arm attempted three ways
+against a baseline moving faster than the signal.
+
+⇒ **§6l's in-process span is therefore not merely the better instrument, it is
+the ONLY one that can price a live daemon's requests**, because it measures the
+REQUEST rather than the PROCESS and is immune to what the rest of the daemon is
+doing. ⚠ The remaining live figure (20–44 ms per dying thread) is **PROVISIONAL**
+until that record lands.
+
 ### ⛔ 6n. THE THREAD'S PRE-CLOSURE COST IS ~50 µs, MEASURED — SO THE ~1.7 ms GAP IS NOT THE CHILD
 
 Recording `CLOCK_THREAD_CPUTIME_ID`'s **absolute** value at closure end, beside
@@ -923,13 +969,41 @@ the closure delta, makes the thread's pre-closure life a measured field:
     pre_closure = 39-55 us, flat across all three verbs and both row counts
 
 ⇒ **The standing note that thread spawn is ~50 µs is vindicated on the child
-side**, and it was measured rather than assumed. ⛔ **So a ~1.7 ms per-connection
-gap between a closure span and a process counter is NOT the thread's own startup.
-It is parent-side or attribution** — accept, `clone()`, the outcome channel, the
-poll wakeup — and that half is still unmeasured. ⚠ **A difference between two
-instruments is not a measurement**, which is exactly why this field exists: it
-converts one of the two candidate halves into a number and leaves the other
-honestly open.
+side**, and it was measured rather than assumed.
+
+#### ✅ AND THE PARENT SIDE IS NOW MEASURED TOO — THE PATH IS CLOSED
+
+The accept loop's own cost per connection, from the same window as the handlers,
+so the two halves cannot be paired across different moments:
+
+    accept + spawn = 44-48 us/conn, flat across row counts, max 280-662 us
+    n matches the handler count EXACTLY (8,207/8,207 - 13,126/13,126)
+
+⭐ That exact match is the record's own completeness check: every connection is
+accounted for on both sides.
+
+**The whole per-connection floor, measured in three pieces:**
+
+| piece | cost |
+|---|---|
+| parent accept + spawn | **44–48 µs** |
+| child pre-closure (thread entry) | **39–55 µs** |
+| child closure, `ping` — a request that does nothing | **61–126 µs** |
+| **total** | **≈150–230 µs** |
+
+⛔⛔ **So the ~1.7 ms "spent outside the closure" is NOT in the request path at
+all.** It came from subtracting a closure span from a process counter, and the
+process counter was charging concurrent background work — reader threads, chores
+— to connections that merely happened to be open at the time. ⇒ **Same lesson as
+§6o from the other direction: a process-level counter cannot isolate a
+per-connection quantity while anything else in the daemon is running.** ⚠ **A
+difference between two instruments is not a measurement**, and here both halves
+of the difference are now measured directly and they do not add up to it.
+
+⇒ **§S4 should be scheduled on stability and observability grounds, not on
+cores.** The per-connection overhead it would remove is ~150–230 µs at ~4
+connections/s — under **0.001 cores per daemon** — and the note that said so was
+right for a better reason than it gave.
 
 **Two harness defects fixed in the same pass, both of which report a fired
 instrument as one that did not fire:**

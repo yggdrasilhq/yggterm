@@ -181,7 +181,10 @@ else:
 for i, h in enumerate(handler):
     warm = "warm " if i else "COLD "
     print(f"      {warm}handler window: {h['handled']} conns,"
-          f" {h['handlers_per_s']:.0f}/s, proc_cpu_delta={h['proc_cpu_us_delta']}us")
+          f" {h['handlers_per_s']:.0f}/s, proc_cpu_delta={h['proc_cpu_us_delta']}us"
+          f" | accept-loop side: n={h.get('accept_spawn_count', 0)}"
+          f" {h.get('accept_spawn_us_mean', 0)}us/conn"
+          f" max={h.get('accept_spawn_us_max', 0)}us")
     # ⛔ Per VERB. A single mean mixes a ping with a status carrying 264 rows.
     for name, r in sorted(h["requests"].items(), key=lambda kv: -kv[1]["cpu_us_total"]):
         ks = r["kernel_share"]
