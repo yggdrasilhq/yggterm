@@ -123,11 +123,53 @@ mostly survives. That points at the renderer's background-fill pass overdrawing
 glyph cells — an ordering fault between the two passes — rather than at the
 glyph atlas alone.
 
+#### ⭐ 2026-08-14 16:12 — REPRODUCED WITH A SAME-MOMENT DAEMON CONTROL, AND IT SELF-HEALS
+
+Two `capture_faithful: true` frames of the same session on the same GUI process
+(pid 2287224), about 60 s apart, with the daemon's own screen read alongside the
+first.
+
+**1. It is the CLIENT, proven rather than inferred.** The canvas painted
+`Ran 7 she l comm nds`, `an ther lane`, `con ain th literal needle`, `ython3`,
+`.r ad()`. A `server snapshot` taken in the same moment holds **`shell commands`
+six times and the mangled form zero times**. The daemon is the source of truth for
+CONTENT and it is correct, so the client is painting fewer glyphs than the daemon
+holds. ⛔ Sampled together on purpose: a daemon read taken at a different moment
+from a capture cannot tell disagreement from elapsed time.
+
+**2. ⭐⭐ IT IS TRANSIENT AND REPAIRS ITSELF, WHICH CHANGES WHAT COUNTS AS
+EVIDENCE.** The first frame (~15 s after the GUI started) was mangled; the second
+(~75 s, same process, same session, no intervention) painted every one of those
+cells correctly. ⇒ **A single clean frame does not demonstrate a fix, and a single
+mangled frame does not demonstrate a regression.** Any experiment here has to
+sample repeatedly across the first minutes of a surface's life, because that is
+where both observations fell. This also matches the standing warning that a deploy
+re-introduces the symptom: the window right after an attach is when the canvas is
+least trustworthy.
+
+**3. ⚠ THE "TRACKS BACKGROUND COLOUR" READING DOES NOT SURVIVE THIS FRAME.** The
+blanked cells above are ordinary prose on the DEFAULT background — a bulleted
+paragraph and a `Ran N shell commands` line — with no coloured diff run anywhere
+near them. The earlier observation stands as a description of that earlier
+screenshot; what it cannot support is the inference drawn from it, that the
+background-fill pass is overdrawing coloured runs specifically. **The damage is not
+confined to coloured backgrounds**, so a fix aimed only at fill-vs-glyph ordering
+inside coloured runs would leave this case untouched.
+
 ⇒ **Three symptoms now sit in one subsystem**, all on the arm the policy selects
 (`xterm_webgl_enabled_for_wayland`): a SIGSEGV in the GL compositing path, a
 whole-screen glyph substitution, and this per-cell blanking. Treating them as one
 defect is the cheaper hypothesis, and it raises the value of the single
 experiment that would settle all three.
+
+⚠ **One hypothesis tested and REFUTED today, so nobody spends the day on it
+again.** A GUI killed with `SIGTERM` produced a SIGSEGV whose stack was
+byte-identical to a spontaneous crash (same `libEGL_mesa + 0x2ae67`, same 14
+gallium frames), which looked like a repro handle for the crash. It is not: a
+second `SIGTERM` against a freshly started GUI exited cleanly with no core. The
+difference between the two was accumulated rendering, not the signal. ⇒ Teardown
+is not the trigger; it is one more moment at which an already-sick GL context
+faults.
 
 ⚠ **The sandbox may be the wrong instrument, and that has to be said before
 someone spends a day in it.** `underglass-sandbox.sh` runs under headless sway,
