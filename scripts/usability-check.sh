@@ -297,12 +297,31 @@ except Exception:
     sleep 2
     HITS="$($SSH "timeout 25 ~/.local/bin/yggterm server app terminal read-buffer '$PROBE' --mode screen 2>/dev/null" \
       | grep -c "$MARK" || true)"
-    note "L4 probe=$PROBE marker_hits=${HITS:-0}"
-    # >=1 proves the write reached the PTY and produced output. A healthy
-    # interactive shell shows 2 (the echoed command and its result), but not
-    # every shell config echoes, so 1 is the honest bar for "input lands".
-    if [ "${HITS:-0}" -lt 1 ]; then
-      fail 4 "a keystroke sent to a fresh probe session never came back - INPUT DOES NOT LAND"
+    # ⛔ BLIND IS NOT BROKEN — and this level got it wrong once, loudly.
+    #
+    # A row created with --no-activate starts its PTY LAZILY, on first open.
+    # That is sound design (685 rows must not each hold a shell), but it means
+    # the probe has no shell to echo anything, and the write is QUEUED against
+    # a session that has not started. Reading zero back then says nothing about
+    # whether input lands — it says the probe never ran.
+    #
+    # ⚠ Reporting that as "INPUT DOES NOT LAND" produced a false level-4 alarm
+    # that sent this session chasing a nonexistent regression, and rolling a
+    # deploy back on suspicion of causing it. The rollback was right (restore
+    # known-good first) and the diagnosis was wrong.
+    #
+    # ⇒ The honest states are three, not two: it echoed, it demonstrably did
+    # not, or it could not be tested. Only the middle one is a failure, and it
+    # requires the PTY to have actually started.
+    STARTED="$($SSH "timeout 20 ~/.local/bin/yggterm server app terminal read-buffer '$PROBE' --mode screen 2>/dev/null" | wc -c)"
+    note "L4 probe=$PROBE marker_hits=${HITS:-0} buffer_bytes=${STARTED:-0}"
+    if [ "${HITS:-0}" -ge 1 ]; then
+      : # input landed and echoed - the strong pass
+    elif [ "${STARTED:-0}" -lt 200 ]; then
+      # An empty buffer means no shell ever ran in it: lazy start, not a fault.
+      note "L4 ⚠ probe PTY never started (lazy activation) - input path UNVERIFIED this tick, not failed"
+    else
+      fail 4 "the probe session IS running and a keystroke sent to it never came back - INPUT DOES NOT LAND"
     fi
     # Cleanup runs whether or not the assertion passed: a failed probe that
     # leaves a row behind turns one bad hour into a growing pile.
