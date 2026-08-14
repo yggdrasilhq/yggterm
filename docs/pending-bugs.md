@@ -964,6 +964,41 @@ first. ⚠ Falsifier before building it: the tear-down's own `replace_with` targ
 nodes that were never inserted, so prove the repair does not fault on the very
 damage it is repairing.
 
+### ⇒ THE SECOND OWNER REPORT IS THIS BUG, AND IT IS MEASURED LIVE ON HIS GUI
+
+*"in EVERY yggterm session no matter what sidebar I click"* (2026-08-13) was
+filed separately as **every sidebar button opens the notification sidebar**. It
+is this defect and that entry is folded in; do not re-open it.
+
+**Measured on his running GUI, 2026-08-14, read-only, at 3.0.154:**
+
+```
+webview_edit_faults: 2
+right_panel.rendered_mode / requested_mode / reveal_mode : notifications
+the glass                                                : the SETTINGS rail
+```
+
+The model and the screen disagree, and **time is excluded**: three screenshots
+were each BRACKETED by a state read before and after, and all six reads returned
+`notifications` while every frame showed a fully drawn Settings rail, gear
+highlighted. ⚠ That bracketing is the whole method — a single state read taken
+near a screenshot cannot tell a disagreement from a mode that simply moved
+between the two samples.
+
+⇒ From his side the freeze reads as *"whatever I click, I get the same rail"*,
+which is exactly what he reported, with the frozen content being whichever rail
+was painted last. **It is the same discriminator as the 2026-08-08 sighting and
+the blank body: the model advances, the subtree does not.**
+
+⭐ **And it refines the damage.** His rail is NOT blank right now — it is
+populated and frozen, so this is a LATER truncation point than the placeholder
+case above, on a GUI carrying two faults. ⇒ The repair below has a live target
+today, and a repair that only handles a placeholder body would not cure this one.
+
+⚠ **`rendered_mode` is not a report about the screen.** It names the mode the
+host believes it rendered; on a diverged webview it is confidently wrong, and it
+is the field most likely to be quoted as proof that the rail is fine.
+
 ### ⛔ DEAD ENDS — MEASURED, DO NOT RE-DERIVE
 
 - **Not a build regression, and the bisect is retracted.** 4338 changed lines
@@ -2823,27 +2858,6 @@ healthy widgets is not.
 
 **Falsifier:** a surface declared from a shell on another machine either shows
 that machine's open documents, or names the endpoint it failed to reach.
-
-## ⛔⛔ [6.3] EVERY SIDEBAR BUTTON OPENS THE NOTIFICATION SIDEBAR
-
-**Status:** OPEN
-
-*reported 2026-08-13, "in EVERY yggterm session no matter what sidebar I click"*
-
-Whatever sidebar is requested, the notification sidebar is what opens. Reported
-as appearing suddenly, on every session, after the fleet had been running for
-two days without a restart.
-
-**Prior art in this file:** the right panel is a **global slot** — one app's rail
-renders over another app's row (tracked separately below). This is almost
-certainly the same slot, now failing closed onto one occupant instead of
-occasionally showing the wrong one. ⇒ the two should be diagnosed together, and
-if they are one bug, the entries collapse into one.
-
-**Falsifier:** click each sidebar affordance in turn and read back which rail
-the GUI believes it opened. If the GUI's own model says "files" while the
-notification rail is on screen, the bug is in the render slot; if the model
-itself says "notifications", it is in the request.
 
 ## ⛔ [6.3] ychrome's VAULT AND SETTINGS RAILS SAY "Loading…" FOREVER
 
