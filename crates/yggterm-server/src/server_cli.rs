@@ -25,9 +25,20 @@
 //! is no window in any of them, so either binary could always have served them.
 //! Neither could, because of which file they were typed into.
 //!
-//! ⏳ One divergence is left — `connect`, GUI-only. Its verdict is also
-//! accidental; what is deferred is the MOVE, because it drags seven private
-//! helpers with it. That is a size decision, not a fork.
+//! ✅ **ALL NINE ARE HERE, 2026-08-14.** `connect` was the last, and its
+//! deferral was never about a verdict — the verdict was accidental from the
+//! first reading; it was about SIZE, seven private helpers and an enum. What
+//! made it tractable was MEASURING the cluster instead of counting it: 220
+//! contiguous lines of pure functions over `ServerUiSnapshot`, every daemon
+//! request already public on this crate, nothing private to the binary coming
+//! with them.
+//!
+//! ⇒ **Nine of nine divergences measured, nine accidental, ZERO forks found.**
+//! The per-verb rule that kept this surface from being collapsed wholesale
+//! never had a counter-example, and now the set it was protecting is empty. A
+//! structural ban like `server app`'s is defensible here on the evidence; it is
+//! deliberately NOT written, because "no fork has been found" is not the same
+//! claim as "no fork can exist", and the next verb should still be asked.
 
 use anyhow::Context;
 use std::io::Read;
@@ -430,4 +441,329 @@ fn print_wpe_failure(verb: &str, outcome: &crate::wpe_agent::WpeOutcome) -> anyh
         }))?
     );
     Ok(())
+}
+
+// ============================================================================
+// `server connect` — moved here 2026-08-14, the ninth and last divergence.
+//
+// ⛔ Its verdict was recorded as ACCIDENTAL long before this move: it reads a
+// snapshot and asks the daemon to place a row. No window, no app-control round
+// trip, no process spawn. What deferred it was SIZE — the verb drags a cluster
+// of seven helpers and an enum, and an earlier attempt was reverted rather than
+// half-landed, which was the right call at the time.
+//
+// ⭐ What made it tractable in the end was measuring the cluster instead of
+// counting it: the helpers are 220 CONTIGUOUS lines of pure functions over
+// `ServerUiSnapshot`, and every daemon request they issue was ALREADY public on
+// this crate. Nothing private to the binary came with them. ⇒ "seven helpers"
+// sounded like the work and was not; the work is deciding that, which is one
+// grep per callee.
+// ============================================================================
+/// The trailing session identifier of a session path (`.../<uuid>` → `<uuid>`),
+/// used to match a requested path against the daemon's canonical key regardless
+/// of scheme/prefix normalization.
+fn connect_path_session_uuid(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Parse a remote-SCANNED Codex path (`remote-session://<machine>/<uuid>`) into
+/// `(machine_key, id)`. Deliberately does NOT match `remote-cc://`: mirroring the
+/// GUI's `open_session_row`, only a scanned Codex row goes through
+/// OpenRemoteSession; a Claude Code row is opened as a stored session (its path
+/// is not a remote-scanned path, and OpenRemoteSession would look it up as a
+/// Codex transcript and fail with "saved Codex session is no longer available").
+fn parse_remote_scanned_connect_path(path: &str) -> Option<(String, String)> {
+    let rest = path
+        .trim_start_matches('/')
+        .strip_prefix("remote-session://")?;
+    let (machine, id) = rest.split_once('/')?;
+    if machine.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some((machine.to_string(), id.to_string()))
+}
+
+/// Session kind for a path we are opening as a stored session — the CLI twin of
+/// the GUI's `session_kind_for_row`.
+fn connect_session_kind_for_path(path: &str) -> yggterm_core::SessionKind {
+    if path.starts_with("remote-cc://") || path.contains("/.claude/projects/") {
+        yggterm_core::SessionKind::ClaudeCode
+    } else {
+        yggterm_core::SessionKind::Codex
+    }
+}
+
+/// The scanned `(cwd, title)` for a session id, looked up from the daemon's
+/// remote scans. The resume needs the right cwd (`claude -r` / `codex resume`
+/// run inside the session's directory), so pass it through like the GUI does.
+fn connect_scanned_metadata(
+    snapshot: &crate::ServerUiSnapshot,
+    path: &str,
+) -> (Option<String>, Option<String>) {
+    let want = connect_path_session_uuid(path);
+    snapshot
+        .remote_machines
+        .iter()
+        .flat_map(|machine| machine.sessions.iter())
+        .find(|scanned| {
+            scanned.session_id == want || connect_path_session_uuid(&scanned.session_path) == want
+        })
+        .map(|scanned| {
+            let cwd = (!scanned.cwd.trim().is_empty()).then(|| scanned.cwd.clone());
+            let title = (!scanned.title_hint.trim().is_empty()).then(|| scanned.title_hint.clone());
+            (cwd, title)
+        })
+        .unwrap_or((None, None))
+}
+
+fn connect_session_is_active(snapshot: &crate::ServerUiSnapshot, path: &str) -> bool {
+    let want = connect_path_session_uuid(path);
+    snapshot
+        .active_session_path
+        .as_deref()
+        .is_some_and(|active| active == path || connect_path_session_uuid(active) == want)
+}
+
+fn connect_session_key_is_known(snapshot: &crate::ServerUiSnapshot, path: &str) -> bool {
+    let want = connect_path_session_uuid(path);
+    connect_session_is_active(snapshot, path)
+        || snapshot.live_sessions.iter().any(|session| {
+            session.session_path == path || connect_path_session_uuid(&session.session_path) == want
+        })
+}
+
+/// Where a freshly connected row lands in the Live Sessions order.
+pub enum ConnectPlacement {
+    /// Preserve the existing order; put the connected row last. Default: a
+    /// connect must never rewrite an ordering the user arranged.
+    End,
+    /// Preserve the existing order; put the connected row directly after `anchor`.
+    After(String),
+    /// Daemon-native behavior: the row is prepended to the top.
+    Top,
+}
+
+/// Restore `before` as the Live Sessions order, with `connected` placed per
+/// `placement`. The daemon appends any live row we omit, so this can never drop
+/// a row; rows in `before` that are no longer live simply resolve to nothing.
+fn connect_desired_order(
+    before: &[String],
+    connected: &str,
+    placement: &ConnectPlacement,
+) -> Vec<String> {
+    let want = connect_path_session_uuid(connected);
+    let same =
+        |candidate: &str| candidate == connected || connect_path_session_uuid(candidate) == want;
+    // If the row was already live, leave it exactly where the user had it.
+    if before.iter().any(|path| same(path)) {
+        return before.to_vec();
+    }
+    let mut order = Vec::with_capacity(before.len() + 1);
+    match placement {
+        ConnectPlacement::Top => {
+            order.push(connected.to_string());
+            order.extend(before.iter().cloned());
+        }
+        ConnectPlacement::End => {
+            order.extend(before.iter().cloned());
+            order.push(connected.to_string());
+        }
+        ConnectPlacement::After(anchor) => {
+            let anchor_uuid = connect_path_session_uuid(anchor);
+            let mut placed = false;
+            for path in before {
+                order.push(path.clone());
+                if !placed && (path == anchor || connect_path_session_uuid(path) == anchor_uuid) {
+                    order.push(connected.to_string());
+                    placed = true;
+                }
+            }
+            if !placed {
+                order.push(connected.to_string());
+            }
+        }
+    }
+    order
+}
+
+/// `yggterm server connect <session-path>`: connect an existing session into the
+/// live set + GUI. Reuses the same daemon requests the GUI issues on a click.
+fn run_server_connect_apply(
+    endpoint: &crate::ServerEndpoint,
+    path: &str,
+    view: crate::WorkspaceViewMode,
+    placement: ConnectPlacement,
+) -> anyhow::Result<()> {
+    // Capture the row order BEFORE anything opens/focuses — both paths prepend a
+    // newly-live row, so this is the only chance to know where the user's rows sat.
+    let before_order: Vec<String> = crate::snapshot(endpoint)?
+        .0
+        .live_sessions
+        .iter()
+        .map(|session| session.session_path.clone())
+        .collect();
+    // FocusLive reveals + resumes any session the daemon already tracks — even a
+    // row the runtime-truth filter is currently suppressing, since launching its
+    // runtime un-hides it — and is kind-agnostic (it uses the row the daemon
+    // holds). FocusLive is a silent no-op on an unknown key, so a session that is
+    // only in the remote scan falls through to the open path below.
+    let (mut snapshot, mut message) = crate::focus_live_with_view(endpoint, path, Some(view))?;
+    if !connect_session_is_active(&snapshot, path) {
+        // Mirror the GUI's `open_session_row` exactly (one source of truth): a
+        // scanned CODEX row (remote-session://) goes through OpenRemoteSession;
+        // everything else — notably a Claude Code row (remote-cc://), whose path
+        // is not a remote-scanned path — is opened as a stored session carrying
+        // its kind, id, cwd and title.
+        let (cwd, title) = connect_scanned_metadata(&snapshot, path);
+        let (opened, opened_message) =
+            if let Some((machine_key, session_id)) = parse_remote_scanned_connect_path(path) {
+                crate::open_remote_session_with_view(
+                    endpoint,
+                    &machine_key,
+                    &session_id,
+                    cwd.as_deref(),
+                    title.as_deref(),
+                    Some(view),
+                )?
+            } else {
+                crate::open_stored_session_with_view(
+                    endpoint,
+                    connect_session_kind_for_path(path),
+                    path,
+                    Some(connect_path_session_uuid(path)),
+                    cwd.as_deref(),
+                    title.as_deref(),
+                    Some(view),
+                )?
+            };
+        snapshot = opened;
+        message = opened_message;
+    }
+    let connected =
+        connect_session_is_active(&snapshot, path) || connect_session_key_is_known(&snapshot, path);
+    // Put the user's rows back where they were. The daemon prepended the new row;
+    // unless the caller asked for --top, restore `before_order` and place the
+    // connected row per `placement`. Reorder never drops a row (unlisted live
+    // rows are appended), so this is safe even if the scan added rows meanwhile.
+    let mut placed_at = "top";
+    if connected && !matches!(placement, ConnectPlacement::Top) && !before_order.is_empty() {
+        let desired = connect_desired_order(&before_order, path, &placement);
+        let (reordered, _) = crate::reorder_live_sessions_scoped(endpoint, &desired, None)?;
+        snapshot = reordered;
+        placed_at = match placement {
+            ConnectPlacement::After(_) => "after_anchor",
+            _ => "end",
+        };
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "connected": connected,
+            "requested_path": path,
+            "active_session_path": snapshot.active_session_path,
+            "view": match view {
+                crate::WorkspaceViewMode::Terminal => "terminal",
+                crate::WorkspaceViewMode::Rendered => "preview",
+            },
+            "row_placement": placed_at,
+            "order_preserved": placed_at != "top",
+            "live_session_count": snapshot.live_sessions.len(),
+            "message": message,
+        }))?
+    );
+    if !connected {
+        anyhow::bail!(
+            "could not connect {path}: not tracked as a live session and not found in remote scans (run `yggterm server connect --list` to see connectable sessions)"
+        );
+    }
+    Ok(())
+}
+
+
+/// `yggterm server connect --list`: enumerate sessions that EXIST (remote scans)
+/// but are NOT currently in the live set — the connectable "void", newest first.
+fn run_server_connect_list_apply(endpoint: &crate::ServerEndpoint) -> anyhow::Result<()> {
+    let (snapshot, _) = crate::snapshot(endpoint)?;
+    let live_uuids: Vec<&str> = snapshot
+        .live_sessions
+        .iter()
+        .map(|session| connect_path_session_uuid(&session.session_path))
+        .collect();
+    let mut connectable: Vec<&crate::RemoteScannedSession> = snapshot
+        .remote_machines
+        .iter()
+        .flat_map(|machine| machine.sessions.iter())
+        .filter(|scanned| !live_uuids.contains(&connect_path_session_uuid(&scanned.session_path)))
+        .collect();
+    // Newest first, so the sessions the user was most recently working with are
+    // at the top of what can be a large scan (a busy host has hundreds).
+    connectable.sort_by(|a, b| b.modified_epoch.cmp(&a.modified_epoch));
+    let items: Vec<serde_json::Value> = connectable
+        .iter()
+        .map(|scanned| {
+            serde_json::json!({
+                "path": scanned.session_path,
+                "title": scanned.title_hint,
+                "cwd": scanned.cwd,
+                "modified_epoch": scanned.modified_epoch,
+                "live_runtime": scanned.live_runtime,
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "connectable_count": items.len(),
+            "live_session_count": snapshot.live_sessions.len(),
+            "connectable": items,
+        }))?
+    );
+    Ok(())
+}
+
+
+/// `server connect <session-path> | --list` — for BOTH binaries.
+///
+/// ⛔ The ARGUMENT PARSING lives here too, not just the two implementations.
+/// Sharing only the bodies would have left ~40 lines of flag handling to be
+/// copied into the second binary, and a second copy of "what does `--after`
+/// mean" is the same defect one layer out — which is exactly how this surface
+/// came to have nine divergences in the first place.
+pub fn run_server_connect_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    let rest = &args[2..];
+    let listing = rest.iter().any(|arg| arg == "--list" || arg == "-l");
+    // Validate the invocation BEFORE touching the daemon: `ensure_local_...`
+    // would otherwise spawn a daemon just to print a usage error.
+    let path = if listing {
+        None
+    } else {
+        Some(
+            rest.iter()
+                .find(|arg| !arg.starts_with('-'))
+                .context("usage: yggterm server connect <session-path> | --list")?
+                .clone(),
+        )
+    };
+    ensure_local_server_ready_for_cli(store)?;
+    let endpoint = cli_server_endpoint(store.home_dir());
+    let Some(path) = path else {
+        return run_server_connect_list_apply(&endpoint);
+    };
+    let view = match cli_flag_value(args, "--view") {
+        Some("preview") | Some("rendered") => crate::WorkspaceViewMode::Rendered,
+        _ => crate::WorkspaceViewMode::Terminal,
+    };
+    // Row placement. The daemon's open/focus path PREPENDS a newly-live row,
+    // which silently rewrites the user's Live Sessions ordering on every
+    // connect (live-caught: a 15-session batch buried a 28-row list). Default
+    // to preserving the existing order and placing the row LAST; `--top`
+    // restores the old prepend, `--after <path>` places it under an anchor.
+    let placement = if args.iter().any(|arg| arg == "--top") {
+        ConnectPlacement::Top
+    } else if let Some(anchor) = cli_flag_value(args, "--after") {
+        ConnectPlacement::After(anchor.to_string())
+    } else {
+        ConnectPlacement::End
+    };
+    run_server_connect_apply(&endpoint, &path, view, placement)
 }
