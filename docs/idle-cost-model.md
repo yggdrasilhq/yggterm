@@ -947,13 +947,35 @@ brackets moved 0.4240 → 1.1437 cores across one arm and the net came out
 from it, including the rungs that looked plausible.
 
 ⭐ **The reason is structural, and it retro-explains three separate failed
-arms.** A baseline-subtracted estimator needs a **stationary** baseline, and on a
-live daemon the baseline *is* the bursty per-session reader term — the one that
-swings 25x between adjacent 60 s windows. The signal (100 requests × ~2 ms =
-0.2 core-seconds) is ~35x smaller than the baseline's own drift over the same
-10 s (~7 core-seconds). ⇒ **The quantity sits below the noise floor of any
-external instrument.** Not three unlucky arms: one arm attempted three ways
-against a baseline moving faster than the signal.
+arms.** A baseline-subtracted estimator needs a **stationary** baseline. The
+signal (100 requests × ~2 ms = 0.2 core-seconds) is ~35x smaller than the
+baseline's observed drift over the same 10 s (~7 core-seconds). ⇒ **The quantity
+sits below the noise floor of any external instrument.** Not three unlucky arms:
+one arm attempted three ways against a baseline moving faster than the signal.
+
+⛔⛔ **AND THE FIRST VERSION OF THIS PARAGRAPH BLAMED THE WRONG BASELINE — MINE
+TO CORRECT, BECAUSE I WROTE IT.** It said the baseline *is* "the bursty
+per-session reader term, swinging 25x between adjacent 60 s windows". **That 25x
+is WITHDRAWN.** It was measured immediately after the measurer's own load
+generators had been driving those daemons; re-measured with nothing of the
+measurer's running, the daemons that "burst" are flat — **1.03x, 1.05x, 1.12x**
+against the 3.0x/2.8x/8.9x published, and six consecutive 30 s samples of the
+population total span only **1.22x**.
+
+⇒ **The void above is real and directly observed; its EXPLANATION was not.** The
+drift that swamped the signal was substantially **the observer's own load**, not
+an intrinsic property of the daemons. ⭐ **That is the same error as §6n's
+~1.7 ms, from the other direction:** a process-level counter charging concurrent
+work to whatever the measurer happened to be doing. There it charged reader
+threads to open connections; here it charged the measurer's own generators to the
+daemons' chores. ⇒ **The version where you contaminate yourself is the one nobody
+checks for**, and it is a clause of its own in the field guide.
+
+⚠ **One burst survives quiet conditions, and it is a single daemon:** the
+2.12.14 outlier, **4.15x** — the same daemon §5 independently identifies as
+running a fixed-but-still-shipped full-corpus-read defect. ⇒ **Burstiness is a
+property of ONE KNOWN-BAD DAEMON, not of chores.** Another argument for the
+drain, not for a chore fix.
 
 ⇒ **§6l's in-process span is therefore not merely the better instrument, it is
 the ONLY one that can price a live daemon's requests**, because it measures the
