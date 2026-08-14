@@ -20739,20 +20739,49 @@ fn active_client_instance_records_from_dir(
     active: &mut Vec<ClientInstanceRecord>,
     seen: &mut std::collections::BTreeSet<(u32, Option<u64>, u128)>,
 ) -> anyhow::Result<()> {
-    let entries = fs::read_dir(&dir).or_else(|error| {
-        if error.kind() == ErrorKind::NotFound {
-            Ok(fs::read_dir(dir.join(".missing-client-instances-dir"))?)
-        } else {
-            Err(error)
+    // ⛔⛔ ABSENT AND UNREADABLE ARE DIFFERENT ANSWERS, AND THE CALLER BETS A
+    // DAEMON'S LIFE ON THE DIFFERENCE.
+    //
+    // `daemon_should_idle_shutdown` reads an empty result as "no clients are
+    // connected, this daemon may retire". Its error arm says the opposite — if
+    // you cannot tell, do not retire — but this function used to end EVERY
+    // failure in `return Ok(())`, so that arm was unreachable and an unreadable
+    // directory (permissions, fd exhaustion, ENOMEM) reported **no clients**.
+    // ⇒ The careless half of the decision won, and the consequence is a daemon
+    // retiring while a client is still attached to it.
+    //
+    // Absent is a real answer and stays `Ok`: there are no records because
+    // there is no directory. Anything else is "I could not ask", and must
+    // travel to the caller as an error so its caution becomes reachable.
+    // Reported by the resource lane 2026-08-14, against a finding of mine that
+    // named the same seam from the wrong side.
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "reading client instance records from {}",
+                dir.display()
+            )));
         }
-    });
-    let Ok(entries) = entries else {
-        return Ok(());
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        // An iteration error means the listing is INCOMPLETE, so a live client
+        // may be exactly the record we did not reach.
+        let entry = entry.with_context(|| {
+            format!("listing client instance records in {}", dir.display())
+        })?;
         let path = entry.path();
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
+        // A record we cannot READ may name a live client. A record we cannot
+        // PARSE is a real answer — it is not a valid record — and is deleted
+        // below, which is why only this one propagates.
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("reading client instance record {}", path.display())));
+            }
         };
         let Ok(record) = serde_json::from_slice::<ClientInstanceRecord>(&bytes) else {
             let _ = fs::remove_file(&path);
@@ -43828,6 +43857,59 @@ terminal_window_id: None,
         let error = choose_app_control_pid(&records, None, Some("shadow-a"), false)
             .expect_err("two clients under one name is ambiguous");
         assert!(error.to_string().contains("more than one live Yggterm GUI client"));
+    }
+
+    /// ⛔⛔ AN UNREADABLE CLIENT LIST MUST NOT READ AS "NO CLIENTS".
+    ///
+    /// `daemon_should_idle_shutdown` retires a daemon when this returns an
+    /// empty set, and refuses when it errors — *"if you cannot tell, do not
+    /// retire"*. This function used to end every failure in `Ok(())`, so an
+    /// unreadable directory (permissions, fd exhaustion, ENOMEM) reported **no
+    /// clients** and PERMITTED retirement while a client was still attached.
+    /// Two halves of one decision disagreed about what unreadable means, and
+    /// the careless half won.
+    ///
+    /// Both arms, because the distinction is the whole fix: **absent** is a real
+    /// answer and stays `Ok`; **unreadable** must travel as `Err`.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_client_instances_dir_is_an_error_but_an_absent_one_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "yggterm-unreadable-clients-{}-{}",
+            std::process::id(),
+            current_millis_u64()
+        ));
+
+        // ABSENT — a real answer: there are no records because there is no dir.
+        let mut active = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        super::active_client_instance_records_from_dir(
+            &base.join("never-created"),
+            &mut active,
+            &mut seen,
+        )
+        .expect("an absent directory is 'no clients', not a failure");
+        assert!(active.is_empty(), "absent must yield no records");
+
+        // UNREADABLE — "I could not ask".
+        let unreadable = base.join("unreadable");
+        fs::create_dir_all(&unreadable).expect("create dir");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        let mut active = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let result =
+            super::active_client_instance_records_from_dir(&unreadable, &mut active, &mut seen);
+        // Restore before asserting, so a failure cannot leave an undeletable dir.
+        let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755));
+        let _ = fs::remove_dir_all(&base);
+        assert!(
+            result.is_err(),
+            "an unreadable client-instances directory must be an ERROR — reporting \
+             it as 'no clients' lets a daemon retire out from under a live client"
+        );
     }
 
     #[cfg(unix)]
