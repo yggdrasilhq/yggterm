@@ -15,6 +15,61 @@ This file tracks user-visible changes in `yggterm`.
   It also records those delays in microseconds rather than milliseconds — the
   old unit was too coarse for what it was measuring, so nearly every entry read
   as exactly zero.
+- **Every app-control verb now works from both programs.** The command surface
+  that agents and scripts drive was written out twice, once in each of the two
+  programs that answer it, and the two copies had drifted: six commands existed
+  in one and simply did not exist in the other, including playing a notification
+  sound and setting the light or dark theme — neither of which needs a window at
+  all. Asking for one of them from the wrong program reported that the command
+  was unknown, while every other sign said the software was up to date, so it
+  read as a missing feature rather than a missing copy. There is one list now,
+  so a command that exists, exists everywhere. Two things that were quietly
+  broken came out with it: answering a camera or microphone prompt with the
+  request number written first failed as though no answer had been given, and
+  the help text listed different commands depending on which program printed it.
+
+- **One agent CLI can no longer be launched with another one's flags.** The
+  flags a session is started with are configured per CLI, and they were being
+  carried between machines in a single environment variable that named no CLI at
+  all. Any launch composed afterwards read that one variable whatever CLI it was
+  starting, so a permission flag belonging to one tool could be handed to a tool
+  that has never heard of it — and because the flags are composed between the
+  binary and its `resume` subcommand, the resulting command was malformed as
+  well as wrong. Forwarded flags now travel as part of the request that asks for
+  the launch, so they arrive attached to the CLI they were chosen for, and a
+  launch on this machine reads only this machine's settings.
+
+<!-- Known state at the 3.0.154 cut, recorded so a later reader does not find a
+     red tree and assume it shipped unnoticed:
+     · two launch-command tests failed on main AT THIS CUT
+       (remote_resume_shell_command_wraps_prefix_and_cwd,
+        stored_codex_litellm_sessions_use_litellm_resume_command).
+       ✅ ROOT-CAUSED AND FIXED AFTER THE CUT — they were reporting a real
+       kind-blind flag leak, and their own needle also read ambient host
+       state. See the first entry above; nothing here is still red.
+     · the daemon-side persisted-live-sessions work is NOT in 3.0.154; it was
+       pushed to its own lane after this release was cut.
+     · CORRECTION: 3.0.154 was first reported as causing no session deaths.
+       One delegate session did die, 464 s after the release, ending mid
+       tool-call. Cause not established. Do not cite this release as a clean
+       counter-example to deploy-related deaths. -->
+
+- **A machine no longer quietly accumulates background services forever.** After
+  its program file was replaced on disk, a running background service handed its
+  terminals to a fresh one — and then, five minutes later, did it again, and
+  again, indefinitely, starting a brand-new service every time. One service was
+  measured starting eleven of them in under an hour. It happened because the
+  service asked a shared note on disk whether it had already handed over, and its
+  successor tidied that note away as soon as it recognised itself, so the older
+  one kept concluding it had never handed over at all. Each service now remembers
+  its own handover, so it stops asking once a newer one is running. Machines left
+  on for days no longer collect dozens of idle services, each taking a share of
+  the processor.
+
+  The same forgetfulness could also drop a service that was still holding live
+  terminals into the shutdown path meant only for one holding none, which would
+  have closed those terminals. That path now consults the service's own memory
+  rather than the shared note any other service can erase.
 
 - **A machine that takes its terminals back starts writing them down again.**
   Once a newer background service appeared, the older one stopped recording the

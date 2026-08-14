@@ -176,9 +176,21 @@ pub fn decide_queue(
 /// asking for a version that is now behind the running one — a queue that can
 /// only be cleared by hitting a number it has already passed.
 pub fn satisfied_by(request: &QueuedHotRestart, live_version: &str) -> bool {
+    target_satisfied_by(&request.target_version, live_version)
+}
+
+/// The same question asked of a BARE target string, for a caller that remembers
+/// what it handed off to but no longer has the queue record.
+///
+/// ⛔ The record is a HOST-SHARED file and any peer may delete it — the
+/// successor does exactly that the moment it recognises itself as satisfying the
+/// entry. A predecessor that can only ask this question through the file
+/// therefore forgets it ever handed off, and asks again, forever. See
+/// `hot_restart_swap_step`'s process-local target.
+pub fn target_satisfied_by(target_version: &str, live_version: &str) -> bool {
     let (Some(live), Some(target)) = (
         parse_daemon_version_triple(live_version.trim()),
-        parse_daemon_version_triple(request.target_version.trim()),
+        parse_daemon_version_triple(target_version.trim()),
     ) else {
         return false;
     };

@@ -4294,10 +4294,27 @@ impl DaemonRuntime {
         let mut moved_keys: Vec<String> = Vec::new();
         let mut successor_identity = None::<(u32, u64)>;
         let mut first_failure = None::<String>;
+        // ⛔⛔ ATTEMPT EVERY SESSION. This loop used to `break` on the first
+        // failure, so ONE stuck key abandoned every remaining runtime — measured
+        // live 2026-08-14 as `readers_stood_down: 11, moved: 0`, eleven healthy
+        // sessions held hostage by one, once a minute, for as long as the key
+        // stayed stuck. That is why a daemon could never empty its hands, and it
+        // is the mechanism behind the standing legacy-daemon population.
+        //
+        // ⚠ Continuing makes `Partial` far more likely, and `Partial` is the
+        // outcome that must NEVER exit the process — the daemon is then split
+        // across two owners and exiting would close the descriptors of the
+        // runtimes it still holds. `classify_handoff_sweep` and the caller
+        // already encode that; this only changes how often it is reached.
+        //
+        // `first_failure` keeps its name: the FIRST failure is retained, later
+        // ones do not overwrite it, so the reason a sweep is Partial stays the
+        // reason it first went wrong.
         for key in keys {
             let Some(takeout) = self.terminals.handoff_takeout(&key) else {
-                first_failure = Some(format!("{key}: no live runtime to take"));
-                break;
+                first_failure =
+                    first_failure.or(Some(format!("{key}: no live runtime to take")));
+                continue;
             };
             let metadata = crate::pty_handoff::HandoffMetadata {
                 version: crate::pty_handoff::HANDOFF_WIRE_VERSION,
@@ -4317,8 +4334,8 @@ impl DaemonRuntime {
                     successor_identity = ack.adopter_identity().or(successor_identity);
                 }
                 Err(error) => {
-                    first_failure = Some(format!("{key}: {error}"));
-                    break;
+                    first_failure = first_failure.or(Some(format!("{key}: {error}")));
+                    continue;
                 }
             }
         }
@@ -6126,6 +6143,16 @@ impl DaemonRuntime {
         if current_runtime_keys.is_empty() {
             return;
         }
+        // ⛔⛔ NEVER ASK AN OWNER TO DROP A RUNTIME WHOSE CHILD WE SHARE.
+        // An ADOPTED runtime is the predecessor's own process on the
+        // predecessor's own pty; a drop is `remove_session` -> `shutdown` ->
+        // `kill`, so the prune would kill the very agent we adopted. Measured
+        // fatal 2026-08-14 after a lost handoff ack.
+        let adopted_runtime_keys: HashSet<String> = current_runtime_keys
+            .iter()
+            .filter(|key| self.terminals.session_is_adopted(key))
+            .cloned()
+            .collect();
         if self
             .duplicate_runtime_prune_in_flight
             .swap(true, Ordering::SeqCst)
@@ -6157,6 +6184,7 @@ impl DaemonRuntime {
                     &home_dir,
                     reason,
                     &current_runtime_keys,
+                    &adopted_runtime_keys,
                     &registry_owner_endpoints,
                     &pending_removals,
                 );
@@ -11866,6 +11894,10 @@ fn daemon_copy_chore_should_scan_local_tree(generation_enabled: bool, is_superse
     generation_enabled && !is_superseded
 }
 
+/// Whether the client-instance read is CURRENTLY failing, so the trace records
+/// the transition rather than one line per poll.
+static IDLE_SHUTDOWN_CLIENT_READ_FAILING: AtomicBool = AtomicBool::new(false);
+
 fn daemon_should_idle_shutdown(
     home_dir: &Path,
     endpoint: &ServerEndpoint,
@@ -11884,9 +11916,39 @@ fn daemon_should_idle_shutdown(
         return false;
     }
     let clients_empty = match active_client_instance_records(home_dir, endpoint) {
-        Ok(records) => records.is_empty(),
+        Ok(records) => {
+            IDLE_SHUTDOWN_CLIENT_READ_FAILING.store(false, Ordering::Relaxed);
+            records.is_empty()
+        }
         Err(error) => {
             warn!(error=%error, "failed to read active client instances during daemon idle check");
+            // ⛔⛔ THIS IS A SILENT-FOREVER PATH AND IT SITS IN THE DRAIN'S
+            // CRITICAL CLAUSE. Refusing to retire on an unreadable client list
+            // is the right call — "I could not ask" must never be read as "no
+            // clients" — but until now it returned `false` with nothing in the
+            // trace, so a daemon whose read keeps failing never retires and
+            // NOTHING SAYS WHY. The drain's whole second half is "then the
+            // emptied daemon retires on its own"; this is one of the two ways
+            // that silently does not happen.
+            //
+            // Traced on the TRANSITION only. A per-poll event here would be the
+            // re-logged-forever shape that already cost this project 15% of its
+            // trace volume — the fact is "it started failing", not "it is still
+            // failing".
+            if !IDLE_SHUTDOWN_CLIENT_READ_FAILING.swap(true, Ordering::Relaxed) {
+                append_trace_event(
+                    home_dir,
+                    "daemon",
+                    "lifecycle",
+                    "idle_shutdown_blocked_by_unreadable_clients",
+                    serde_json::json!({
+                        "error": error.to_string(),
+                        "consequence": "this daemon will not retire while the read keeps failing",
+                        "current_version": SERVER_PROTOCOL_VERSION,
+                        "current_pid": std::process::id(),
+                    }),
+                );
+            }
             return false;
         }
     };
@@ -12423,6 +12485,7 @@ fn run_duplicate_legacy_owned_runtime_prune(
     home_dir: &Path,
     reason: &'static str,
     current_runtime_keys: &HashSet<String>,
+    adopted_runtime_keys: &HashSet<String>,
     registry_owner_endpoints: &HashMap<String, ServerEndpoint>,
     pending_preserved_owner_removals: &Mutex<Vec<(String, &'static str)>>,
 ) {
@@ -12444,7 +12507,18 @@ fn run_duplicate_legacy_owned_runtime_prune(
         }
         let mut removed_runtime_keys = Vec::new();
         let mut errors = Vec::new();
+        let mut shared_child_skipped = Vec::new();
         for runtime_key in duplicate_runtime_keys {
+            // ⛔ THE ONE CASE WHERE "DROP THE DUPLICATE" HAS NO RIGHT ANSWER:
+            // we adopted this runtime FROM this owner, so both sides are the
+            // same live process and neither is stale. Dropping either kills it.
+            // Leave the duplicate standing; the handoff's own retry is what
+            // resolves it, and a duplicate costs bookkeeping while this costs
+            // the user their session.
+            if adopted_runtime_keys.contains(&runtime_key) {
+                shared_child_skipped.push(runtime_key);
+                continue;
+            }
             match drop_terminal_runtime(
                 &owner_endpoint,
                 &runtime_key,
@@ -12470,6 +12544,22 @@ fn run_duplicate_legacy_owned_runtime_prune(
                     "error": error.to_string(),
                 })),
             }
+        }
+        if !shared_child_skipped.is_empty() {
+            append_trace_event(
+                home_dir,
+                "daemon",
+                "lifecycle",
+                "duplicate_runtime_prune_skipped_shared_child",
+                serde_json::json!({
+                    "reason": "we ADOPTED these from this owner, so both sides are                                the same live process — dropping either would kill it",
+                    "runtime_keys": shared_child_skipped,
+                    "owner_server_pid": owner_status.server_pid,
+                    "owner_server_version": owner_status.server_version,
+                    "current_version": SERVER_PROTOCOL_VERSION,
+                    "current_pid": current_pid,
+                }),
+            );
         }
         let status_after = status(&owner_endpoint).ok();
         let remaining_duplicate_runtime_keys = status_after
@@ -16437,6 +16527,69 @@ static HOT_RESTART_SWAP_LANE_SETTLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 static HOT_RESTART_SWAP_LAST_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
 
+/// The version THIS process handed off to, remembered locally. `None` = we have
+/// never handed off.
+///
+/// ⛔⛔ THE MEMORY ABOVE COULD ONLY EVER BE SET BY READING THE FILE, WHICH IS THE
+/// ONE THING A PEER DELETES. `HOT_RESTART_SWAP_LANE_SETTLED`'s own comment
+/// predicts this failure exactly — *"reading its absence as 'nothing has
+/// happened yet' is how clearing the entry would make this daemon start asking
+/// for a brand-new swap on the very next poll, forever"* — but the only path
+/// that SET it ran inside `if let Some(queued)`, so a predecessor whose entry
+/// had already been cleared could never reach it. The guard against forgetting
+/// was itself reachable only through the thing that gets forgotten.
+///
+/// ⇒ Measured on dev 2026-08-14: one 3.0.151 daemon emitted **160
+/// `daemon_self_retire` polls, 11 handoffs and 11 fresh successor daemons in 53
+/// minutes** — one every five minutes, indefinitely — because each successor
+/// recognised itself as satisfying the queued entry and cleared the shared file
+/// (`satisfied_by: "self"`) before its predecessor's next poll could see it
+/// satisfied. The predecessor re-queued, spawned another successor, which
+/// cleared it again. **The generator, and the reason a daemon population grows
+/// on a host with no deploys at all.**
+///
+/// ⚠ It is also what disarms the cold-shutdown guard: `queued.is_some()` is the
+/// only thing keeping a preserved PTY owner out of the path that kills its PTY
+/// children, and that is the same deleted file.
+#[cfg(target_os = "linux")]
+static HOT_RESTART_SWAP_LOCAL_TARGET: Mutex<Option<String>> = Mutex::new(None);
+
+/// What this process handed off to, if anything.
+#[cfg(target_os = "linux")]
+fn hot_restart_swap_local_target() -> Option<String> {
+    HOT_RESTART_SWAP_LOCAL_TARGET
+        .lock()
+        .ok()
+        .and_then(|target| target.clone())
+}
+
+/// Should `incoming` replace what we already remember?
+///
+/// Pure, so it can be tested without mutating the process-global above — a test
+/// that wrote the real static would make every neighbour that reads it flaky,
+/// which is the same hazard the pty tests hold `env_test_guard` for.
+///
+/// Keep the HIGHEST target ever asked for: a later handoff aims at a newer
+/// build, and converging on the older one would report a swap satisfied while
+/// the newer request it was replaced by is still unanswered.
+#[cfg(target_os = "linux")]
+fn hot_restart_swap_target_supersedes(existing: Option<&str>, incoming: &str) -> bool {
+    match existing {
+        Some(existing) => hot_restart_queue::target_satisfied_by(existing, incoming),
+        None => true,
+    }
+}
+
+/// Remember the target across the file being cleared by anyone else.
+#[cfg(target_os = "linux")]
+fn remember_hot_restart_swap_target(target_version: &str) {
+    if let Ok(mut slot) = HOT_RESTART_SWAP_LOCAL_TARGET.lock()
+        && hot_restart_swap_target_supersedes(slot.as_deref(), target_version)
+    {
+        *slot = Some(target_version.to_string());
+    }
+}
+
 /// §5's clock: when this daemon's retire was FIRST held by a blocker. Zero = never.
 ///
 /// Set at the gate, not at the retire trigger, because that is what the ruling
@@ -16673,7 +16826,18 @@ fn hot_restart_swap_step(
         return SwapStep::Lingering;
     }
     let queued = hot_restart_queue::load(home_dir);
-    if let Some(queued) = queued.as_ref() {
+    // ⛔ THE TARGET COMES FROM THE FILE **OR** FROM THIS PROCESS'S OWN MEMORY,
+    // and the memory is not a cache of the file — it is the half that survives a
+    // peer deleting it. The successor clears the entry the moment it recognises
+    // itself as satisfying it, which is routinely BEFORE its predecessor's next
+    // 20 s poll; asking only the file then answers "you never handed off" to a
+    // daemon that did, and it hands off again. See HOT_RESTART_SWAP_LOCAL_TARGET.
+    let local_target = hot_restart_swap_local_target();
+    let convergence_target = queued
+        .as_ref()
+        .map(|queued| queued.target_version.clone())
+        .or_else(|| local_target.clone());
+    if let Some(target) = convergence_target.as_deref() {
         // ⛔ The CHEAP probe, not a roster sweep. `live_newer_daemon_version`
         // filters on socket FILENAMES first, so this is 0-2 status calls rather
         // than one per daemon — and this loop plus the migration drain were
@@ -16681,7 +16845,7 @@ fn hot_restart_swap_step(
         let live_newer = live_newer_daemon_version(home_dir, endpoint);
         let satisfied = live_newer
             .as_deref()
-            .is_some_and(|live| hot_restart_queue::satisfied_by(queued, live));
+            .is_some_and(|live| hot_restart_queue::target_satisfied_by(target, live));
         if satisfied {
             append_trace_event(
                 home_dir,
@@ -16689,10 +16853,16 @@ fn hot_restart_swap_step(
                 "lifecycle",
                 "hot_restart_swap_queue_satisfied",
                 serde_json::json!({
-                    "target_version": queued.target_version,
+                    "target_version": target,
+                    // ⭐ WHICH HALF ANSWERED. When this reads "process_memory"
+                    // the entry was already gone and the old code would have
+                    // spawned another successor here instead of converging.
+                    "target_source": if queued.is_some() { "queue_file" } else { "process_memory" },
                     "live_successor_version": live_newer,
-                    "attempts": queued.attempts,
-                    "waited_ms": now_ms.saturating_sub(queued.requested_at_ms),
+                    "attempts": queued.as_ref().map(|queued| queued.attempts),
+                    "waited_ms": queued
+                        .as_ref()
+                        .map(|queued| now_ms.saturating_sub(queued.requested_at_ms)),
                     "current_version": SERVER_PROTOCOL_VERSION,
                     "current_pid": std::process::id(),
                 }),
@@ -16701,9 +16871,11 @@ fn hot_restart_swap_step(
             HOT_RESTART_SWAP_LANE_SETTLED.store(true, Ordering::Relaxed);
             return SwapStep::Converged;
         }
-        if !hot_restart_queue::attempt_is_due(queued, now_ms, HOT_RESTART_SWAP_RETRY_INTERVAL_MS) {
-            return SwapStep::Lingering;
-        }
+    }
+    if let Some(queued) = queued.as_ref()
+        && !hot_restart_queue::attempt_is_due(queued, now_ms, HOT_RESTART_SWAP_RETRY_INTERVAL_MS)
+    {
+        return SwapStep::Lingering;
     }
     // The process-local floor, checked whatever the file says — including when
     // the file is absent, which is the state a peer's convergence leaves behind.
@@ -16743,10 +16915,21 @@ fn hot_restart_swap_step(
     }
     match attempt_self_retire_preserving_handoff(endpoint, home_dir, exe_link, owned) {
         Some(handoff) => {
+            if let Some(target_version) = handoff.target_version.as_deref() {
+                remember_hot_restart_swap_target(target_version);
+            }
             queue_self_retire_swap(home_dir, &handoff, retire_trigger, now_ms);
             SwapStep::HandedOff
         }
-        None if queued.is_some() => SwapStep::Lingering,
+        // ⛔⛔ THE SAFETY PROPERTY IN `SwapStep`'s DOC COMMENT LIVES ON THIS LINE:
+        // a daemon that has already handed off is a preserved PTY owner, and
+        // dropping it into the cold path would kill the very PTYs the handoff
+        // preserved. It used to be answered by `queued.is_some()` alone — a
+        // HOST-SHARED file that any peer's convergence deletes — so a peer could
+        // disarm this guard for every other daemon on the machine. "Have I
+        // handed off?" is a fact about THIS process and is now answered by this
+        // process.
+        None if queued.is_some() || local_target.is_some() => SwapStep::Lingering,
         None => SwapStep::Failed,
     }
 }
@@ -18977,6 +19160,44 @@ fn linux_socket_inode(path: &Path) -> Option<u64> {
     fs::metadata(path).ok().map(|metadata| metadata.ino())
 }
 
+/// Everything the stale-daemon sweep knows about one candidate before it decides
+/// whether to signal it. ⛔ Two of these five fields are NOT observations — they
+/// are admissions that the sweep could not observe, and they are kept apart from
+/// the other three for exactly that reason.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+struct DaemonReapProtection {
+    /// A client instance record names this daemon's endpoint.
+    has_gui_clients: bool,
+    /// The daemon answered, and what it answered says it owns live work.
+    has_recoverable_runtime_activity: bool,
+    /// It is this process's own startup bridge sidecar.
+    is_startup_bridge_sidecar: bool,
+    /// ⛔ The client list could not be READ. Not "there are no clients".
+    clients_unreadable: bool,
+    /// ⛔ The daemon did not ANSWER a status probe. Not "it holds nothing" —
+    /// a daemon serves one request at a time, so the busiest daemons are the
+    /// likeliest to be silent, and a release makes every daemon busy at once.
+    status_unavailable: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl DaemonReapProtection {
+    /// ⭐ AMBIGUITY PROTECTS. The remedy on the other side of this predicate is
+    /// SIGTERM followed by SIGKILL 120 ms later, which drops every PTY the
+    /// daemon owns and cuts each agent session mid-command. A gate that cannot
+    /// see must therefore refuse, exactly like the retire path one layer up: the
+    /// cost of being wrong in this direction is a mute daemon nobody reaped
+    /// automatically, and in the other direction it is somebody's work.
+    fn protects(self) -> bool {
+        self.has_gui_clients
+            || self.has_recoverable_runtime_activity
+            || self.is_startup_bridge_sidecar
+            || self.clients_unreadable
+            || self.status_unavailable
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn cleanup_legacy_linux_daemon_processes(
     endpoint: &ServerEndpoint,
@@ -19083,6 +19304,8 @@ fn cleanup_legacy_linux_daemon_processes(
     let mut skipped_runtime_activity_legacy = 0usize;
     let mut skipped_startup_bridge_sidecar_legacy = 0usize;
     let mut skipped_cross_home_orphan = 0usize;
+    let mut skipped_unreadable_clients = 0usize;
+    let mut skipped_no_status = 0usize;
     let proc_entries = fs::read_dir("/proc").context("reading /proc for stale daemon cleanup")?;
     for entry in proc_entries {
         let entry = entry?;
@@ -19130,13 +19353,29 @@ fn cleanup_legacy_linux_daemon_processes(
             .get(&pid)
             .cloned()
             .or_else(|| daemon_home.as_deref().map(default_endpoint));
+        // ⛔⛔ AN UNREADABLE CLIENT LIST IS NOT AN EMPTY ONE, AND THIS CALLER
+        // KILLS. `active_client_instance_records_for_endpoint_scope` was taught
+        // on 2026-08-14 to return `Err` when it cannot read, instead of `Ok`
+        // with nothing in it — and this call site threw that away with `.ok()`,
+        // so the error arrived as "no clients are attached" at the one place
+        // that answers with SIGTERM and then SIGKILL 120 ms later. The sibling
+        // caller only had to be stopped from letting a daemon retire itself;
+        // this one drops every PTY the daemon owns.
+        let clients_unreadable = std::cell::Cell::new(false);
         let has_gui_clients = daemon_home
             .as_deref()
             .zip(candidate_endpoint.as_ref())
             .and_then(|(home, endpoint)| {
-                active_client_instance_records_for_endpoint_scope(home, endpoint).ok()
+                match active_client_instance_records_for_endpoint_scope(home, endpoint) {
+                    Ok(records) => Some(records),
+                    Err(_) => {
+                        clients_unreadable.set(true);
+                        None
+                    }
+                }
             })
             .is_some_and(|records| !records.is_empty());
+        let clients_unreadable = clients_unreadable.get();
         let home_has_live_bridge_process = daemon_home
             .as_deref()
             .is_some_and(linux_home_has_live_bridge_process);
@@ -19151,8 +19390,43 @@ fn cleanup_legacy_linux_daemon_processes(
             home_has_live_bridge_process,
         );
         let is_startup_bridge_sidecar = startup_bridge_sidecar_pid == Some(pid);
-        let has_clients =
-            has_gui_clients || has_recoverable_runtime_activity || is_startup_bridge_sidecar;
+        // ⛔⛔ NO ANSWER IS NOT AN EMPTY ANSWER — AND ON THIS FLEET IT IS THE
+        // ONLY GATE LEFT STANDING. `reachable_versioned_daemon_statuses` drops a
+        // daemon whose `status` call errors (`.ok()?`), so a daemon that is
+        // merely BUSY is absent from the map, and every protective branch of
+        // `linux_daemon_runtime_activity_protected_for_cleanup` requires a
+        // status to be present. A daemon serves one request at a time, so the
+        // daemons most likely to miss a status probe are the ones mid-handover
+        // — which is exactly what a release makes every daemon do at once.
+        //
+        // ⚠ Measured on dev, 8 sweeps on 2026-08-14: `skipped_active_client_legacy`
+        // was 0 in every one while `skipped_runtime_activity_legacy` was 16. The
+        // client gate contributed NOTHING; sixteen live daemons were each one
+        // unanswered status probe away from SIGTERM, and their PTYs with them.
+        //
+        // ⇒ Treat "I could not ask, or was not answered" as evidence of
+        // something to protect, not evidence of an empty daemon. The cost is
+        // that a permanently mute same-home daemon is no longer reaped
+        // automatically; that is the safe direction, it is counted below, and
+        // the constitution's whole point is that a daemon which is still working
+        // outlives our tidying.
+        let protection = DaemonReapProtection {
+            has_gui_clients,
+            has_recoverable_runtime_activity,
+            is_startup_bridge_sidecar,
+            clients_unreadable,
+            status_unavailable: runtime_status_by_pid.get(&pid).is_none(),
+        };
+        let has_clients = protection.protects();
+        if protection.clients_unreadable {
+            skipped_unreadable_clients += 1;
+        }
+        if protection.status_unavailable
+            && !protection.has_gui_clients
+            && !protection.has_recoverable_runtime_activity
+        {
+            skipped_no_status += 1;
+        }
         let age_ms = linux_proc_pid_age_ms(pid).unwrap_or_default();
         let is_legacy_binary =
             legacy_daemon_reap_applies_to_home(current_home.as_deref(), daemon_home.as_deref())
@@ -19207,6 +19481,13 @@ fn cleanup_legacy_linux_daemon_processes(
                 "skipped_runtime_activity_legacy": skipped_runtime_activity_legacy,
                 "skipped_startup_bridge_sidecar_legacy": skipped_startup_bridge_sidecar_legacy,
                 "skipped_cross_home_orphan": skipped_cross_home_orphan,
+                // ⭐ Both of these are "I could not tell", not "there was
+                // nothing there". They are reported separately from the
+                // skipped_* gates above precisely so a sweep that protects
+                // everything because it could see nothing cannot be read as a
+                // sweep that found nothing to do.
+                "skipped_unreadable_clients": skipped_unreadable_clients,
+                "skipped_no_status": skipped_no_status,
                 "same_home_daemon_count": same_home_daemon_count,
                 "oldest_same_home_pid": oldest_same_home_pid,
                 "reap_after_ms": reap_after_ms,
@@ -20389,6 +20670,119 @@ mod tests {
             .split("\n    fn ")
             .next()
             .expect("the end of the function")
+    }
+
+    /// ⛔⛔ ONE STUCK KEY MUST NOT ABANDON THE OTHER TEN.
+    ///
+    /// `hand_off_all_runtimes` used to `break` out of its per-session loop on
+    /// the first failure. Measured live 2026-08-14 during a real handover:
+    /// `readers_stood_down: 11, moved: 0` — eleven healthy runtimes parked and
+    /// then resumed because the FIRST key was stuck, repeating once a minute for
+    /// as long as it stayed stuck. That is why a daemon could never empty its
+    /// hands, and therefore why the legacy population never drains.
+    ///
+    /// The loop must attempt every key and classify at the end. This is a
+    /// structural lock because the loop does real socket IO to a live successor
+    /// and cannot be exercised in a unit test.
+    ///
+    /// ⚠ If this fails because the code was restructured, re-point it — do not
+    /// delete it. The `break` is a one-character regression with a fleet-wide
+    /// consequence.
+    #[test]
+    fn a_handoff_sweep_attempts_every_session_rather_than_stopping_at_the_first_failure() {
+        let source = daemon_product_source();
+        let body = daemon_fn_body(
+            source.as_str(),
+            "fn hand_off_all_runtimes(&mut self, successor_version: &str) -> HandoffSweepOutcome {",
+        );
+        let code = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The two failure arms both used to `break`.
+        assert!(
+            !code.contains("break;"),
+            "the per-session handoff loop must not abandon the remaining \
+             runtimes when one key fails — that is the eleven-hostage bug:\n{code}"
+        );
+        assert!(
+            code.matches("first_failure = first_failure.or(").count() >= 1
+                || code.matches("first_failure.or(").count() >= 1,
+            "the FIRST failure must be retained rather than overwritten, so a \
+             Partial sweep still names what first went wrong:\n{code}"
+        );
+    }
+
+    /// A later handoff aims at a newer build; converging on the older target
+    /// would call the swap satisfied while the request that replaced it is
+    /// still outstanding.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_remembered_swap_target_keeps_the_highest_ever_asked_for() {
+        assert!(
+            super::hot_restart_swap_target_supersedes(None, "3.0.152"),
+            "the first handoff must be remembered"
+        );
+        assert!(
+            super::hot_restart_swap_target_supersedes(Some("3.0.152"), "3.0.153"),
+            "a newer target must supersede an older one"
+        );
+        assert!(
+            !super::hot_restart_swap_target_supersedes(Some("3.0.153"), "3.0.152"),
+            "an OLDER target must not overwrite a newer one — converging on it \
+             would report a swap satisfied while the newer one is unanswered"
+        );
+        assert!(
+            super::hot_restart_swap_target_supersedes(Some("3.0.152"), "3.0.152"),
+            "re-asking for the same target is not a regression"
+        );
+    }
+
+    /// ⛔⛔ THE REGRESSION THIS LOCKS OUT, measured on dev 2026-08-14: one 3.0.151
+    /// daemon spawned **11 successor daemons in 53 minutes**, one every five
+    /// minutes, indefinitely — because each successor cleared the HOST-SHARED
+    /// queue file on recognising itself (`satisfied_by: "self"`) before its
+    /// predecessor's next 20 s poll could read it as satisfied. Asking only the
+    /// file answers "you never handed off" to a daemon that did.
+    ///
+    /// The same deleted file was the ONLY thing keeping a preserved PTY owner
+    /// out of the cold-shutdown path that kills its PTY children, so a peer's
+    /// convergence disarmed that guard for every daemon on the machine.
+    ///
+    /// ⇒ Both questions are about THIS process and must be answerable without
+    /// the file. If this test fails because the names changed, re-point it —
+    /// do not delete it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_swap_lane_does_not_ask_a_peer_writable_file_what_this_process_did() {
+        let source = daemon_product_source();
+        let body = daemon_fn_body(source.as_str(), "fn hot_restart_swap_step(");
+        let code = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            code.contains("hot_restart_swap_local_target()"),
+            "the lane must consult this process's own memory of what it handed \
+             off to, not only the host-shared queue file"
+        );
+        // The cold-path fall-through: `Failed` is what kills preserved PTYs.
+        let failed_guard = code
+            .split("None if")
+            .nth(1)
+            .expect("the guard arm that keeps a preserved owner out of the cold path")
+            .split("=>")
+            .next()
+            .expect("the guard condition");
+        assert!(
+            failed_guard.contains("local_target"),
+            "the guard before SwapStep::Failed still rests on the shared file \
+             alone; a peer clearing it drops this daemon into the path that \
+             kills the PTYs its handoff preserved. Guard was: {failed_guard}"
+        );
     }
 
     /// The ephemeral reap must ride an EXISTING chore tick. A timer of its own
@@ -27647,6 +28041,65 @@ mod tests {
     // A placeholder path cannot be handed to a predicate that stats it. Real
     // files in a tempdir make the resolver work and keep the public repo free of
     // a hard-coded home path.
+    // ⛔⛔ THE SWEEP'S REMEDY IS SIGTERM THEN SIGKILL, SO EVERY AMBIGUITY MUST
+    // PROTECT. Both of the sweep's evidence sources used to swallow their errors
+    // (`.ok()` on the client-instance read, `.ok()?` on the status probe), and
+    // the second one is load-bearing: measured across 8 sweeps on dev,
+    // `skipped_active_client_legacy` was 0 every time while
+    // `skipped_runtime_activity_legacy` was 16 — the client gate protected
+    // nobody, so sixteen live daemons were each one unanswered status probe away
+    // from being signalled, along with every PTY they owned.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reap_candidate_the_sweep_could_not_ask_is_protected() {
+        use crate::daemon::DaemonReapProtection;
+
+        // The three positive signals protect, one at a time.
+        for signal in [
+            DaemonReapProtection {
+                has_gui_clients: true,
+                ..Default::default()
+            },
+            DaemonReapProtection {
+                has_recoverable_runtime_activity: true,
+                ..Default::default()
+            },
+            DaemonReapProtection {
+                is_startup_bridge_sidecar: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(signal.protects(), "{signal:?} should protect");
+        }
+
+        // ⛔ And so does each ADMISSION, alone and with nothing else set. This
+        // is the half that regressed: an unreadable client list read as "no
+        // clients", and an unanswered daemon read as "owns nothing".
+        assert!(
+            DaemonReapProtection {
+                clients_unreadable: true,
+                ..Default::default()
+            }
+            .protects(),
+            "an unreadable client list is not an empty one"
+        );
+        assert!(
+            DaemonReapProtection {
+                status_unavailable: true,
+                ..Default::default()
+            }
+            .protects(),
+            "a daemon that did not answer is not a daemon with nothing to lose"
+        );
+
+        // The only shape that may be signalled: every source answered, and every
+        // answer said there is nothing here.
+        assert!(
+            !DaemonReapProtection::default().protects(),
+            "a fully-answered, fully-empty candidate is the one reapable case"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn daemon_binary_is_legacy_allows_deleted_current_install_path() {
