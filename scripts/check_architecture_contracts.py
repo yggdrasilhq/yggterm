@@ -426,6 +426,52 @@ def check_generation_context_reads_every_agent_cli() -> None:
                 )
 
 
+def check_mirror_never_outranks_a_scan_on_the_summary() -> None:
+    """The remote-metadata mirror may not overwrite a scanned summary.
+
+    The scan reads the owning host's title store — the one owner of "does this
+    session have a summary" — so its answer wins, including when the answer is
+    "none". The mirror is a cache of that.
+
+    ⚠ This is the second field to need the rule. The title had it first, and the
+    comment in `overlay_mirrored_remote_sessions` records why: mirror-wins froze
+    every Claude Code title at its first scanned value, because the pass
+    re-mirrors after overlaying and writes the stale value straight back. The
+    summary sat one field below with the bug still in it, and there it was worse
+    — a cached summary GATES its own regeneration, so a wrong one suppressed the
+    work that would have replaced it, and deleting it from the store could not
+    reach the screen.
+    """
+    text = read("crates/yggterm-server/src/lib.rs")
+    if not text:
+        return
+    marker = "fn overlay_mirrored_remote_sessions("
+    if marker not in text:
+        fail(
+            "crates/yggterm-server/src/lib.rs: "
+            f"{marker!r} is gone — the rule that a scanned summary outranks the "
+            "mirror is now unenforced. Re-point it, or delete it and say where "
+            "the invariant went."
+        )
+        return
+    body = text.split(marker, 1)[1].split("\nfn ", 1)[0]
+    # Coverage floor: a split that captured nothing makes the rest vacuous.
+    if "mirrored_by_id" not in body:
+        fail(
+            "crates/yggterm-server/src/lib.rs: could not capture the body of "
+            f"{marker!r} ({len(body)} bytes)"
+        )
+        return
+    if re.search(r"session\.cached_summary\s*=", body):
+        fail(
+            "crates/yggterm-server/src/lib.rs: overlay_mirrored_remote_sessions "
+            "assigns session.cached_summary from the mirror. The scan read the "
+            "owning host's title store and is the SSOT — including when it says "
+            "there is none. Mirror-wins makes a deleted summary immortal, "
+            "because the pass re-mirrors what it just overlaid."
+        )
+
+
 def check_terminal_retained_replay_policy_contract() -> None:
     shell = read("crates/yggterm-shell/src/shell.rs")
     policy = read("crates/yggterm-shell/src/terminal_retained_replay_policy.rs")
@@ -526,6 +572,7 @@ def main() -> int:
     check_ui_telemetry_contract()
     check_session_copy_policy_contract()
     check_generation_context_reads_every_agent_cli()
+    check_mirror_never_outranks_a_scan_on_the_summary()
     check_terminal_retained_replay_policy_contract()
     check_gui_binary_resolution_contract()
     if FAILURES:
