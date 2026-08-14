@@ -1626,6 +1626,21 @@ fn main() -> Result<()> {
     // `yggterm server ledger [--scope <scope>]` — dump the durable row-order
     // ledger (per-client-scope memory of row slots, including rows that are
     // not currently live). Read-only.
+    // ⛔ THIS VERB ANSWERED ON THE HEADLESS BINARY ONLY, and the census it
+    // reports is a host fact with no GUI in it — so `yggterm server daemons`
+    // answering "unsupported server command: daemons" was an accident of which
+    // file it was typed into, not a property of this binary. Both route to the
+    // one owner now. ⚠ The `server` surface is still dispatched twice; the
+    // triage of which of its other divergences are accidental and which are
+    // real is filed in docs/pending-bugs.md.
+    if args.first().is_some_and(|arg| arg == "server")
+        && args.get(1).is_some_and(|arg| arg == "daemons")
+    {
+        return yggterm_server::run_server_daemons_census(
+            store.home_dir(),
+            args.iter().any(|arg| arg == "--json"),
+        );
+    }
     if args.len() >= 2 && args[0] == "server" && args[1] == "ledger" {
         let scope = args
             .iter()
@@ -4712,6 +4727,34 @@ mod tests {
     /// The tell of a local dispatcher is its own failure message, so that is
     /// what is banned: exactly one file in the tree may say
     /// `unsupported app control command`, and it is the owner.
+    /// ⛔ `server daemons` IS A HOST FACT, SO BOTH BINARIES MUST ANSWER IT.
+    ///
+    /// It answered on the headless CLI only, and the census has no GUI in it —
+    /// which binary a verb reaches was decided by which file it was typed
+    /// into. Same accident as `server app audio`, on the `server` surface
+    /// rather than the `server app` one.
+    ///
+    /// ⚠ This is a per-verb lock, deliberately, and NOT the structural ban
+    /// that `server app` gets. The `server` surface is still dispatched in
+    /// both binaries and its divergences are NOT uniformly accidental — some
+    /// verbs really are headless-only. Banning a second dispatcher there would
+    /// be wrong until each verb has been triaged; the triage is in
+    /// `docs/pending-bugs.md`.
+    #[test]
+    fn both_binaries_answer_the_daemon_census() {
+        for (binary, source) in [
+            ("yggterm", include_str!("main.rs")),
+            ("yggterm-headless", include_str!("bin/yggterm-headless.rs")),
+        ] {
+            assert!(
+                source.contains("run_server_daemons_census("),
+                "{binary} must route `server daemons` to its one owner — the \
+                 census is a host fact and answering it on one binary only is \
+                 how `yggterm server daemons` came to report the verb unknown"
+            );
+        }
+    }
+
     #[test]
     fn neither_binary_dispatches_server_app_itself() {
         for (binary, source) in [

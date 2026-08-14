@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Asking either program for the list of running background services now
+  works.** The census that reports every service on the machine — which
+  versions are running, how long, how much they hold — answered from only one
+  of the two programs; the other reported the command as unknown, though the
+  answer involves no window and nothing that program lacks. Both answer it now.
+
 - **Every app-control verb now works from both programs.** The command surface
   that agents and scripts drive was written out twice, once in each of the two
   programs that answer it, and the two copies had drifted: six commands existed
