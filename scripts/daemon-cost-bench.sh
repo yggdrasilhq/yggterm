@@ -31,6 +31,15 @@
 # seeded rows carry short synthetic strings, the drive rate keeps caches warmer
 # than a real poll rate does, and the seeded state has no PTY grids, ssh targets
 # or remote machines — three tables the live reply path touches.
+#
+# ⛔⛔ AND ONE THING THIS HARNESS CANNOT MEASURE, BY CONSTRUCTION. A daemon's
+# standing cost is dominated by a ~0.2-core floor paid PER REACHABLE DAEMON, and
+# that floor lives in the daemon's PROCESS SUBTREE — the children it spawns for
+# sessions, ssh wrappers and remote clients. A seeded daemon here spawns NO
+# children at all, so it has no subtree, and every arm correctly reads ~0.
+# ⇒ Do not point this at "where does the daemon's CPU go". It prices the REQUEST
+# PATH, which is real and is under 1% of the answer. The quantity that matters
+# is not inside the process this samples.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
