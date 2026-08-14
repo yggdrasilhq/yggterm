@@ -835,6 +835,32 @@ and still ruin the sentence someone was typing. **The damage IS the write.**
 Proven to fail on the mutant that disables the guard (i.e. on the shipped
 behaviour), while the "still submits normally" control passed.
 
+### ⚠ THE GUARD COUNTED THE PROBE AS THE HUMAN — FIXED 2026-08-14, RECORDED HERE BECAUSE THIS ENTRY LOOKED FINISHED
+
+`session_has_pending_input_draft` is reconstructed from whatever passes through
+`PtySessionRuntime::write`, and the echo-verified submit wrote its own marker
+through that same `write`. So the guard above read back a flag **the probe itself
+had just set** and refused its own submit with `HumanTyping { waited_ms: 180 }` —
+and 180 ms is `PROBE_SETTLE`, so the number was the mechanism's signature rather
+than a measurement. Two `pipeline_integration` tests had been failing on main.
+
+⚠ **Direction matters, and it favours the protection:** the contamination pushed
+toward REFUSING to type, never toward typing, so nothing about the draft
+protection or the release hold was ever less safe than believed. What it cost is
+the repair's EFFECTIVENESS — a composer that has drawn its prompt but is not yet
+reading could never be waited out, which is precisely the case echo-verification
+exists to catch.
+
+✅ Fixed by the exemption this write path's own comment already describes for
+DA/DSR auto-responses: a `write_daemon_originated` that enqueues identically and
+does not touch the draft flag, used by the echo-verified submit and the
+hot-restart repair. **Only who may SET the flag changed; every reader still
+refuses on a real human draft.** ⛔ The tests were not relaxed — the one expecting
+a SUCCESSFUL submit is what showed the refusal was wrong rather than renamed.
+⚠ Two tests guard the wiring and one guards the semantics, measured: re-pointing
+the submit at `write` fails the first two and the third still passes, so neither
+is redundant.
+
 ### ⛔⛔⛔ THE FIX COVERED ONE OF TWO COPIES — AND THE UNFIXED ONE IS THE COPY THE OWNER HITS
 
 *Found 2026-08-14 after the symptom was reported still live, and still worsening
