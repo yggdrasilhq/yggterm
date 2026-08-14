@@ -274,19 +274,6 @@ copies.
   binary is on the fleet, so the app is usable now either way. **To reverse:**
   one visibility change; nothing else depends on it.
 
-- **The deaf-row sidebar fix cannot be SEEN until the GUI restarts, and the
-  restart would destroy an unsent draft he is holding.** The build carrying it is
-  deployed on every host, but the sidebar is drawn by the GUI process, so the
-  running window keeps the old rendering until it relaunches — and a live
-  composer currently holds half-typed text that a relaunch discards.
-  **Recommendation: send or clear that draft, then say so** and the relay
-  relaunches and takes the proof in minutes; nothing else is needed from him.
-  → `docs/pending-bugs.md`, the deaf-row entry.
-  *Meanwhile:* the code is landed, tested against both mutants, and pushed; only
-  the live screenshot waits. ⛔ The relay will NOT relaunch on its own — the
-  constitution makes a restart free, and an unsent draft is exactly the case it
-  is not.
-
 ## The working dot: what should a CLOSED row's dot say?
 
 **One line, and it unblocks the render.** The dot can only mean "working" for
@@ -307,81 +294,65 @@ does not otherwise show, and reserves the blink for real work.
 and filed (there is no detector defect), so the render lands as soon as this is
 answered. **To reverse:** it is a view-layer rule; no data change either way.
 
-## ⭐ ONE RELAUNCH CLEARS ALL FIVE GUI-GATED ITEMS — they are not five decisions
+## ✅ THE RELAUNCH HAPPENED ON ITS OWN — four of the five are settled, and none of them needs him
 
-The deaf-row sidebar proof (above), the right rail (below), **the viewport
-blinking he reported live on 2026-08-14**, and **two release proofs that need a
-web process born from the current build** are **the same single action**, waiting
-on the same draft. Whenever that draft is no longer worth protecting, one
-relaunch delivers all five: the rail paints again on the first frame, the
-deaf-row rendering becomes visible for its proof, the blinking stops, and the
-two web-process proofs below can be taken in the same minutes.
+**He does not have to do anything here.** The window turned over at **11:27:34 on
+2026-08-14**, not at anyone's request, and the five items that were consolidated
+behind "one relaunch" are resolved or reclassified below. ⛔ Nothing in this
+section is a gate any more.
 
-⭐ **The two newest are release proofs, not new defects, and they cost him
-nothing extra.** Both fixes are landed and shipped in 3.0.154; what is owed is
-only the observation, and neither can be observed until a web process starts
-from that build. They were deliberately NOT collected during the 3.0.154 deploy
-precisely because collecting them meant restarting the GUI.
-→ `docs/pending-bugs.md` § *THE JAR-LESS WEB CONTEXT GOT NO MEMORY BOUND AT ALL*
-and § *AN UNCORKED AUDIO STREAM HELD FOREVER*.
+**Verified by IDENTITY rather than by version**, which is the only check that
+settles which code is actually running: the GUI process's `/proc/<pid>/exe`
+md5sums **byte-identical to the installed binary**. A version string is a claim
+the process makes about itself; the hash is what it is executing.
 
-⭐ **The blinking is the new one, and it is the reason this list grew rather than
-shrank.** Its fix was believed shipped; the GUI held a SECOND copy of the probe
-that types over him, and that copy is the one every automated submit reaches.
-Now fixed and deployed to disk on every host at 3.0.152 — but the running window
-is older than the fix, and the blinking is drawn by the running window.
-→ `docs/pending-bugs.md`, the readiness-probe entry.
+| item | outcome |
+|---|---|
+| the right rail | ✅ **collected — it paints** |
+| "every sidebar button opens the notification rail" | ✅ **collected — cured by the same frame** |
+| the deaf-row sidebar rendering | ⛔ **not collectible today** — see below; no longer HIS |
+| the viewport blinking | the fix is in the running process; only he can say it stopped |
+| the two web-process release proofs | still owed, and unchanged by this |
 
-⛔ Nothing here asks him to hurry it — the draft is the thing being protected.
-This entry exists only so the five are not weighed as separate costs.
+### ✅ THE RIGHT RAIL PAINTS, AND THE FROZEN SUBTREE IS GONE
 
-### ⚠ MEASURED 2026-08-14: A RELAUNCH DOES NOT REACH A DRAFT HELD IN A ROW
+One faithful frame settles both (`capture_faithful: true`, the xterm canvas
+composited over the DOM snapshot — a `faithful:false` frame is canvas-blind and
+could not have). The rail renders its header, its controls and a populated,
+scrollable list. **And the model AGREES with the glass**: a state read taken
+before *and* after the capture both reported the same rail the frame shows.
 
-The premise under all five is *"a relaunch discards the half-typed text"*. It had
-been carried across relays without being tested, so it was tested, in a sandbox,
-on a throwaway session:
+⭐ That is the same instrument that convicted the bug 70 minutes earlier, run
+again: on the PREVIOUS process, `webview_edit_faults` was **2** and the model said
+one rail while the glass showed another. On this one it is **0** and they agree.
+⇒ The divergence really was bounded by the GUI process, exactly as the entry
+predicted, and a relaunch really is a complete cure.
 
-```
-type unsubmitted text into a row      → daemon screen holds it
-kill the GUI process                  → daemon STILL holds it, with no GUI running at all
-relaunch the GUI, same home + daemon  → text still there, row back in the sidebar
-```
+### ⛔ THE DEAF-ROW SIDEBAR PROOF CANNOT BE TAKEN, AND THE REASON IS NOT A FAILURE
 
-⇒ **Text typed into a ROW is not in the GUI.** It lives in a PTY the daemon owns,
-the agent CLI never learns the window restarted, and the campaign's own
-draft-detector reads it off the terminal SCREEN for exactly that reason.
+Its gate is gone — the window it needed has already happened. But the proof needs
+a **wedged row to look at**, and there is not one: across 378 rows, **zero carry
+an `input_unanswered_ms` value at all**. A wedged row is what renders the state
+this fix exists to show, so with none in the fleet there is nothing to photograph.
 
-⚠ **What this does NOT cover, and it is the whole question:** text typed into a
-**yggterm-side input** — the search box, an SSH field, a document buffer — lives
-in the page and a relaunch does lose it. So the answer depends on *where* the
-draft is, which only he can say.
+⇒ **It leaves this file.** It is no longer waiting on him — it is an ordinary
+queue item waiting on a wedged row to occur, or on one being induced deliberately.
+→ `docs/pending-bugs.md`, the deaf-row entry, whose own "still open: the SIDEBAR"
+clause already says so.
 
-**Recommendation: tell us which one it is.** If it is a row's composer, the
-relaunch costs nothing and the five items clear on his next convenient moment
-rather than waiting on the draft at all. If it is a yggterm input, nothing
-changes and the gate stands exactly as written. ⛔ The relay has not relaunched
-anything and will not — this narrows the question, it does not answer it.
+### ⇒ AND THE DRAFT QUESTION IS MOOT
 
-⚠ One caveat that survives either answer: the risk in a relaunch was never the
-window, it is a DAEMON swap taken alongside it, which re-resumes sessions. A GUI
-relaunch against the same daemon is the case measured above; a relaunch that also
-moves the daemon is not.
+The question this file was carrying — *which composer holds his draft* — no longer
+needs an answer. The relaunch happened either way. **If it was in a row it
+survived**, which was measured directly: text typed into a row lives in a PTY the
+daemon owns, survives the GUI process dying outright with no GUI running at all,
+and returns on relaunch against the same home and daemon. If it was in a
+yggterm-side input it is already gone, and nothing he says now changes that.
 
-## The right sidebar comes back when you next relaunch the GUI — and cannot before then
-
-**What he does:** relaunch yggterm, whenever the unsent draft in his composer is
-no longer worth protecting. **What he gets:** the rail paints again immediately.
-
-Measured, not inferred: a webview that threw while applying an edit batch was
-told it had applied, so the running GUI's model of the screen is self-consistent
-and wrong, and nothing can re-send what was lost. Killing and relaunching the GUI
-against the SAME home and daemon restored the rail on the first frame — same
-sessions, same rows, only the page rebuilt. ⇒ This is a GATE, not an open bug:
-no code change reaches the running process, and the fix that stops it recurring
-is already on `main` and arrives with the same relaunch.
-
-⛔ The relaunch is his call and his alone — it is the draft that is being
-protected, not the rail.
+⚠ **The one thing worth keeping from it**, because it will otherwise be
+re-learned: the risk in a relaunch was never the WINDOW. It is a **daemon swap
+taken alongside one**, which re-resumes sessions. A relaunch against the same
+daemon — the case measured, and the case that just occurred — costs nothing.
 
 ---
 
