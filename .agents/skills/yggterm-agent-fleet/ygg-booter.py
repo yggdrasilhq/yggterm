@@ -1601,6 +1601,43 @@ def boot(host, row, dry):
     return ""
 
 
+CHOICE_PROMPT_MARKERS = (
+    "hit your session limit", "session limit", "usage limit", "upgrade to max",
+    "switch to a team account", "team account", "api billing", "pay per token",
+    "select an option", "choose an option", "1. stop and wait", "stop and wait",
+)
+
+
+def _screen_shows_a_choice(host, row):
+    """TRI-STATE: True a prompt is on screen · False none · None could not look.
+
+    ⛔⛔ THE DEFECT THIS EXISTS FOR, RAISED BY THE OWNER 2026-08-14. When the plan's
+    limit is hit the CLI parks on a three-option prompt -- stop and wait, switch to
+    a team account, or use API billing -- and the first is dismissed with Enter.
+    `_pty_type_and_enter` finishes with a **lone `\\r`**, which does not "dismiss"
+    anything: **it selects whatever option is highlighted.** If the highlight is not
+    on the harmless one, a timer silently changes billing on the owner's account.
+    Nobody decided that; a watchdog did.
+
+    ⚠ `--refuse-if-draft` does NOT cover this. It guards a half-typed DRAFT, and a
+    modal is not a draft — so the existing guard passes and the Enter still lands.
+
+    ⚠ Nor does the `RATE_LIMITED` classifier: that keys on the CLI's own
+    `apiErrorStatus: 429` record in the TRANSCRIPT, and a row parked on a modal has
+    not necessarily written one. **The dialog is only visible on the SCREEN**, which
+    is why this reads the screen and not the transcript.
+
+    ⛔ REFUSE ON DOUBT. `None` (could not look) is treated as a refusal by the
+    caller, for the same reason the never-arm ledger is: this thing types."""
+    r = _run(host, ["server", "app", "terminal", "read-buffer", row,
+                    "--mode", "screen"], "")
+    body = (r.stdout or "")
+    if not body.strip():
+        return None                      # could not look
+    low = body.lower()
+    return any(m in low for m in CHOICE_PROMPT_MARKERS)
+
+
 def _pty_type_and_enter(host, row):
     """Type the boot text, pause, then press Enter — as TWO writes.
 
@@ -1616,6 +1653,18 @@ def _pty_type_and_enter(host, row):
     ⚠ A pre-3.0.83 owner ignores the flag, so acceptance is not proof the guard
     ran. That is the honest limit and it is why the return distinguishes a
     refusal rather than folding it into failure."""
+    # ⛔⛔ SCREEN FIRST. The Enter below SELECTS a highlighted option, so a row
+    # parked on a choice prompt must never be typed into. Refuse on doubt.
+    choice = _screen_shows_a_choice(host, row)
+    if choice is True:
+        log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — its SCREEN is showing a "
+            f"prompt awaiting a choice (plan limit / billing). A bare Enter here "
+            f"SELECTS an option; that decision is the owner's, not a timer's.")
+        return "refused-choice-prompt"
+    if choice is None:
+        log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — could not read its screen, "
+            f"so it cannot be ruled out that a prompt is waiting. Blind is not clear.")
+        return "refused-screen-unreadable"
     typed = _run(host, ["server", "terminal", "write", row, "--stdin",
                         "--refuse-if-draft"], BOOT_TEXT)
     if _field(typed.stdout or "", "refused_for_draft") is True:
