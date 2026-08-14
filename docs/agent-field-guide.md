@@ -338,6 +338,36 @@ symptom was the instrument, not the subject.** Two frames 24 s apart, same row,
 `Document` selected in both, settle it: the "clean" frame shows the identical
 lines the "garbled" one renders as mojibake.
 
+### ⛔⛔ A RAIL THAT RENDERS DOES NOT EXONERATE THE VIEWPORT — DIFFERENT PANE, DIFFERENT BATCH
+
+**An app declares its rail and its document body as two SEPARATE panes, fetched
+separately and applied in separate webview edit batches.** So "the same app
+renders the identical schema completely in the rail, in the same minute" proves
+only that the rail's batch applied. It says nothing about the viewport's.
+
+⇒ **That reading closed the wrong door twice.** A published entry used it to rule
+OUT the lost-edit-batch class ("a frozen subtree cannot render the same schema
+completely elsewhere") and to conclude the viewport had a render-path defect of
+its own. It was the lost-batch class, and the rail was the one instrument
+structurally incapable of noticing. Proven by an A/B on one probe: pre-fix binary
+→ zero markdown nodes and a blank body; fixed binary → the body renders.
+
+⛔ **And "it reproduces on demand" does not rule the class out either.** If the
+throwing mutation is emitted on every render of that subtree, the fault re-fires
+deterministically — reproducibility is what this class looks like, not evidence
+against it.
+
+⭐ **The instrument that does discriminate is `webview_edit_faults`**, and it is
+monotonic: read it in `server app state` at the moment you reproduce.
+
+⚠ **Same entry, second inverted conclusion:** it reported the surfaces prose
+wrong for saying `list-row` renders at document scale, and told the next reader
+to correct it. The host partitions `Markdown | TextInput{multiline} | ListRow`
+into the body — **the prose was right and the doc comment beside the code was
+merely incomplete.** Correcting the docs on that advice would have made them
+wrong. ⇒ **When prose and code disagree, read the code that RUNS, not the comment
+above it.**
+
 ⛔ **So `capture_faithful: true` answers "was the xterm canvas composited", NOT
 "is this what the user sees".** On a terminal view those coincide. On a document
 surface they came apart completely, and nothing in the reply said so.

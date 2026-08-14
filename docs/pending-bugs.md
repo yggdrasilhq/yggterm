@@ -3863,63 +3863,6 @@ screen last looked like**.
 list of hostnames, and it answers "which machine was I on" the way the eye
 answers it.
 
-## ⛔⛔ [6.5] A DOCUMENT SURFACE'S BODY DOES NOT PAINT, AND ITS CONTRACT SAYS TWO DIFFERENT THINGS
-
-**Status:** OPEN
-
-*measured 2026-08-13 on a real GUI (an isolated sandbox, not the owner's)*
-
-Reported symptom: an app's viewport pane renders its top bar and leaves the body
-blank, while every telemetry field reads healthy — `has_schema: true`,
-`stale: false`, `error: null`. Two lanes have now spent time on it. It has been
-attributed to the read-only shadow client; **it is not the shadow.**
-
-**Half of it is a contract that disagrees with itself, and that half is
-actionable now.** yggterm's own deserialiser says:
-
-> Chrome widgets (tabs, buttons, toggles, labels) form a top bar; `markdown` and
-> multiline `text-input` widgets are the scrolling body.
-
-`.agents/skills/libyggterm-surfaces/SKILL.md` says multiline `text-input` **and
-`list-row`** "render at document scale". ⇒ **`list-row` is chrome in a viewport
-pane.** An app that believes the prose declares a list of rows as its document
-body, gets a blank page, and has no way to find out why — nothing failed. The
-host is the SSOT; the prose is wrong and should be corrected.
-
-**The other half is a real defect and is NOT explained by the above.** With the
-rows replaced by a `markdown` widget the body is *still* blank:
-
-| what was checked | result |
-|---|---|
-| the schema actually served | `markdown` widget, `id` + `source`, **928 chars** of real content over HTTP |
-| the same schema in the RAIL, same app, same minute | renders **completely** — cards, sections, status dots, rows, tabs, search box, footer |
-| the field names | `section.text`, `tabs.active`, `markdown.source` — all matched against the host's enum |
-| "the refetch is racing the re-stamp" | **falsified** — same blank with the app re-stamping every 120 s |
-
-⇒ The same-app rail control is what separates this from an app bug: the schema
-is good, and the viewport placement is not painting a widget it says it paints.
-
-⛔ **NOT the lost-edit-batch class — checked 2026-08-14, and the check is now one
-field.** The [6.3] entry root-causes a different "renders nothing while state
-reports it correctly": a webview edit batch that throws is acked as applied, so
-the host never re-sends it and that subtree freezes for the life of the process.
-**Two of this entry's own measurements rule it out.** A frozen subtree is frozen
-because ITS mutations were lost — it cannot render the identical schema
-completely in the rail in the same minute; and the class requires a fault to have
-already happened, whereas this reproduces on demand. ⇒ **Read
-`webview_edit_faults` in `server app state` when you next reproduce it.** Zero
-confirms this is a real render-path defect in the viewport placement, and closes
-the question for good; non-zero would mean the opposite and this entry folds into
-[6.3]. ⚠ Stated as reasoning plus an instrument, NOT as a run: 6.3 has the
-fault-injection harness but no way to declare a document surface, which needs
-this lane's app.
-
-⚠ **Falsifier, not yet run:** drive the shipped pilot editor through the
-identical path in the same sandbox and confirm ITS markdown body paints. That
-attempt stalled on the editor's own daemon (`Loading…` in the rail, control
-endpoint never answered) and was not retried. If its body is blank too, this is
-the document-surface body path for every app, not one widget.
-
 ## ⚠ [6.5] THE APP SCAFFOLDING HAS THREE HAND-COPIES AND ONE OF THEM FAILED SILENTLY
 
 **Status:** OPEN
