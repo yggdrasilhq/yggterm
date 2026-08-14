@@ -939,6 +939,60 @@ recent-activity reading it invites is not available from that verb. The one plac
 it moved was `daemon_request/status`, whose count rose by exactly my own injected
 load — **the instrument's only visible response was to the observer.**
 
+### 6j-7. ⭐⭐ THE BURSTY TERM IS ONE PTY READER THREAD PER SESSION — arm run, loop closed
+
+§6j-6 named sessions as the next arm and declined to price them. Priced here, on
+a private sandbox with rows held at **0** so sessions are the only variable, each
+session flooding its pty (`yes`) to saturate the path §4 identified.
+
+⛔⛔ **THE FIRST RUN WAS WRONG BY 14–29x AND THE ERROR WAS MINE AGAIN.** It divided
+the daemon's whole CPU delta by my request count — but a flooding session burns
+CPU **whether or not anyone sends a request**, so pty work was being charged to
+requests. Subtracting a no-request baseline measured at each rung:
+
+| sessions | quiet ms/req | noisy ms/req (uncontrolled) | **noisy ms/req (controlled)** | background |
+|---|---|---|---|---|
+| 0 | 0.67 | 0.67 | **0.67** | 0.000 cores |
+| 2 | 0.78 | ~~13.47~~ | **0.96** | **2.035 cores** |
+| 6 | 0.84 | ~~120.40~~ | **4.15** | **5.176 cores** |
+
+⇒ **The dominant cost is not per-request at all.** ⭐ *The same habit that produced
+four retracted claims produced a 120 ms/request figure; the only reason it did not
+survive is that a background rate was measured instead of assumed.*
+
+**And the split instrument says exactly where it sits.** Same sandbox, 4 flooding
+sessions, 30 s, spinner 0.9996 / residual 100.2%:
+
+| term | cores |
+|---|---|
+| **long-lived threads** | **3.364 (97.5%)** |
+| died in-window (handlers) | 0.085 (2.5%) |
+| total | 3.449 |
+
+with the **top four threads at 0.838, 0.837, 0.836, 0.836 — exactly four, one per
+session.**
+
+⇒ ⭐⭐ **THE BURSTY LONG-LIVED TERM OF §6j-2 IS A PER-SESSION PTY READER THREAD,
+and its cost tracks that session's OUTPUT VOLUME.** That closes the loop on three
+separate observations at once: the 25x swings between adjacent 60 s windows
+(**agent output is bursty**), §6i's 13 threads across 4 daemons alternating
+`clock_nanosleep` with on-CPU bursts (**a reader polling between reads**), and
+§4's contention being **98.6% `terminal_read`**.
+
+⚠ **DO NOT QUOTE 0.84 CORES AS THE COST OF A SESSION.** `yes` saturates a pty at a
+rate no agent CLI approaches; this is the **ceiling**, and the live population's
+per-thread figures (0.02–0.19 cores) are what ordinary output costs. The
+transferable claim is the **shape** — one thread per session, cost proportional
+to output volume — not the magnitude.
+
+⇒ **The ledger, finally, in cores and without a share:** per-session reader
+threads are the large, episodic term and the handler term is the small, stable
+one (~1.8–1.9 cores fleet-wide). ⛔ **Nothing here is a leak and nothing here is
+idle cost in the strict sense** — a daemon whose sessions are quiet costs
+0.67 ms/request and its readers cost nearly nothing. **The population is
+expensive because it is BUSY, and the drain (§S1) remains the action, because it
+moves that work onto fewer, current daemons rather than removing it.**
+
 ## 6k. WHY AN UNPOLLED DAEMON DOES NOT RETIRE — the answer owed to the build lane
 
 The optimisation lane's sandbox arms all exited after ~75 s
