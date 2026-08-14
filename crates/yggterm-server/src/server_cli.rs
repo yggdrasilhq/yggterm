@@ -5,20 +5,29 @@
 //! `crate::app_control_cli` collapsed it, and nine of its verbs answered from
 //! one binary only.
 //!
-//! ⛔ **BUT THIS SURFACE IS NOT COLLAPSED WHOLESALE, AND THAT IS DELIBERATE.**
-//! Unlike `server app` — one homogeneous plane where every verb belonged on
-//! both — `server` MIXES planes: deploy and relay machinery that is genuinely
-//! headless-only (`gate-screen`, `relay-boundary`, `wpe`) sits beside daemon
-//! operations that are not. A structural ban on a second dispatcher here would
-//! forbid a fork that is real. ⇒ The question is asked PER VERB, and only the
-//! verbs answered accidentally live here.
+//! ⛔ **THE QUESTION IS ASKED PER VERB, NOT WHOLESALE — but every verb asked so
+//! far has answered the same way.** `server app` was collapsed with a
+//! structural ban because it was one homogeneous plane. This surface was
+//! believed to mix planes, with deploy and relay machinery that was *genuinely*
+//! headless-only sitting beside daemon operations that were not, and that
+//! belief is why no ban was written here.
 //!
-//! What made these four accidental is visible in their own first lines: each
-//! does `ensure_local_server_ready_for_cli` + `cli_server_endpoint` and then
-//! talks to the DAEMON over the local socket. There is no window in any of
-//! them, so the headless CLI — the binary agents drive, and the one that most
-//! wants to reorder rows and hold a write lock — could always have served them.
-//! It could not, because of which file they were typed into.
+//! ⚠ **CORRECTED 2026-08-14: the fork it described does not exist.** The three
+//! verbs named as the real fork — `gate-screen`, `relay-boundary`, `wpe` —
+//! were read end to end and every one is accidental. They live here now. The
+//! per-verb rule stands on its own merits; it no longer stands on a measured
+//! counter-example, and nobody should quote one from this file.
+//!
+//! What makes a verb accidental is visible in its own first lines, and the test
+//! has convicted seven of them: it does `ensure_local_server_ready_for_cli` +
+//! `cli_server_endpoint` and then talks to the DAEMON over the local socket, or
+//! it reads a host fact out of the home directory and talks to nothing. There
+//! is no window in any of them, so either binary could always have served them.
+//! Neither could, because of which file they were typed into.
+//!
+//! ⏳ One divergence is left — `connect`, GUI-only. Its verdict is also
+//! accidental; what is deferred is the MOVE, because it drags seven private
+//! helpers with it. That is a size decision, not a fork.
 
 use anyhow::Context;
 use std::io::Read;
@@ -229,5 +238,196 @@ pub(crate) fn run_server_reorder_apply(
     {
         anyhow::bail!("{}", update.summary());
     }
+    Ok(())
+}
+
+/// `server gate-screen` — for BOTH binaries.
+///
+/// §3's audit instrument. Read-only, on demand, and connected directly like the
+/// other read-only diagnostics — a verb that spawned a daemon in order to ask
+/// what a daemon is looking at would answer about a process that did not exist
+/// when the question was asked.
+///
+/// ⛔ NOT WRITTEN ANYWHERE. The screens go to this stdout and nowhere else —
+/// see `HotRestartGateScreen`. A caller harvesting a corpus owns where it lands
+/// and how long it lives.
+pub fn run_server_gate_screen_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    let endpoint = cli_server_endpoint(store.home_dir());
+    let path = args.get(2).filter(|arg| !arg.starts_with("--"));
+    let tail_lines = cli_flag_value(args, "--tail").and_then(|value| value.parse().ok());
+    let sessions =
+        crate::hot_restart_gate_screens(&endpoint, path.map(String::as_str), tail_lines)?;
+    if args.iter().any(|arg| arg == "--json") {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+        return Ok(());
+    }
+    if sessions.is_empty() {
+        println!("no sessions owned by this daemon match");
+        return Ok(());
+    }
+    for session in &sessions {
+        let verdict = match session.blocker.as_ref() {
+            Some(blocker) => format!(
+                "{kind}{permanent}, idle {idle}",
+                kind = blocker.kind,
+                permanent = if blocker.permanent { " (permanent)" } else { "" },
+                idle = blocker
+                    .idle_ms
+                    .map(|ms| format!("{}s", ms / 1000))
+                    .unwrap_or_else(|| "unknown".to_string()),
+            ),
+            None => "not blocking".to_string(),
+        };
+        println!(
+            "== {key}\n   gate verdict: {verdict}\n   screen_text_shows_agent_working: {working}\n   screen: {screen}",
+            key = session.session_key,
+            working = session.shows_agent_working,
+            screen = if session.screen_available {
+                "readable"
+            } else {
+                "UNREADABLE — the gate is classifying this one blind"
+            },
+        );
+        for line in session.screen_tail.iter().flatten() {
+            println!("   | {line}");
+        }
+    }
+    Ok(())
+}
+
+/// `server relay-boundary` — for BOTH binaries.
+///
+/// §2 of docs/spec-hot-restart-relay-gate.md — *"a relay hand-off is a genuine,
+/// declared, zero-cost quiet point … the gate stops being a search and becomes
+/// an appointment."*
+///
+/// ⛔ It does NOT spawn a daemon (no `ensure_local_server_ready_for_cli`) and it
+/// does not talk to one. The queue is a HOST fact in a file, and making the verb
+/// reach a daemon would mean choosing which of the several a stale host is
+/// running — the exact question §4 moved out of any one daemon's status. A
+/// drainer picks the boundary up on its next 20 s poll.
+pub fn run_server_relay_boundary_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    let json = args.iter().any(|arg| arg == "--json");
+    let declared_by = args
+        .iter()
+        .position(|arg| arg == "--by")
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+        .unwrap_or_else(|| "relay_boundary".to_string());
+    let wait_secs = args
+        .iter()
+        .position(|arg| arg == "--wait-secs")
+        .and_then(|index| args.get(index + 1))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let outcome =
+        crate::hot_restart_queue::declare_relay_boundary(store.home_dir(), now_ms, &declared_by);
+    let (owed, target_version, waiting_ms) = match &outcome {
+        crate::hot_restart_queue::RelayBoundaryOutcome::Declared {
+            target_version,
+            waiting_ms,
+        } => (true, Some(target_version.clone()), Some(*waiting_ms)),
+        crate::hot_restart_queue::RelayBoundaryOutcome::NothingOwed => (false, None, None),
+    };
+    // ⚠ The drainer polls every 20 s, so a wait shorter than that can only ever
+    // time out — say so rather than reporting a converged host as still-owing.
+    // Waiting is opt-in because the common case is a converged host with nothing
+    // to wait for.
+    let mut converged = !owed;
+    if owed && wait_secs > 0 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if crate::hot_restart_queue::load(store.home_dir()).is_none() {
+                converged = true;
+                break;
+            }
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "declared_by": declared_by,
+                "swap_owed": owed,
+                "target_version": target_version,
+                "waiting_ms": waiting_ms,
+                "waited_for_secs": wait_secs,
+                "converged": converged,
+            }))?
+        );
+    } else if let Some(target_version) = target_version {
+        let waiting_min = waiting_ms.unwrap_or(0) / 60_000;
+        if converged {
+            println!("relay boundary declared by {declared_by}; swap to {target_version} converged");
+        } else {
+            println!(
+                "relay boundary declared by {declared_by}; swap to {target_version} \
+                 (owed {waiting_min}m) is due at the next drainer poll"
+            );
+        }
+    } else {
+        println!("relay boundary declared by {declared_by}; no swap is owed on this host");
+    }
+    Ok(())
+}
+
+/// `server wpe <verb>` — for BOTH binaries.
+///
+/// The plane lives INSIDE the daemon (it owns the agent process), so unlike the
+/// read-only diagnostics this needs a daemon to exist.
+pub fn run_server_wpe_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    use crate::wpe_agent::{WpeOutcome, params_from_flags};
+
+    ensure_local_server_ready_for_cli(store)?;
+    let endpoint = cli_server_endpoint(store.home_dir());
+
+    if args[0] == "agent" {
+        let action = args
+            .get(1)
+            .map(String::as_str)
+            .context("usage: server wpe agent <status|restart|stop>")?;
+        return match crate::wpe_agent_control(&endpoint, action)? {
+            Ok(report) => {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            Err(outcome) => {
+                print_wpe_failure("agent", &outcome)?;
+                std::process::exit(1);
+            }
+        };
+    }
+
+    let verb = args[0].as_str();
+    let params = params_from_flags(&args[1..]).map_err(|message| anyhow::anyhow!(message))?;
+    match crate::wpe_verb(&endpoint, verb, params)? {
+        WpeOutcome::Answer { response } => {
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            Ok(())
+        }
+        outcome => {
+            print_wpe_failure(verb, &outcome)?;
+            std::process::exit(1);
+        }
+    }
+}
+
+/// One printer for every failure arm, so the shape a script parses does not
+/// depend on which way the plane failed.
+fn print_wpe_failure(verb: &str, outcome: &crate::wpe_agent::WpeOutcome) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": false,
+            "verb": verb,
+            "summary": outcome.summary(),
+            "failure": outcome,
+        }))?
+    );
     Ok(())
 }

@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Three more commands now work from whichever program you type.** The
+  command that shows what the restart gate is looking at, the one that declares
+  a hand-off so a pending upgrade can land at a quiet moment, and the headless
+  browser plane all answered from one of the two programs and reported the
+  command as unknown from the other. None of them involves a window, and the
+  hand-off one is typed by the very sessions that had the wrong program on
+  their path. All three answer from both now.
+
 - **A session opened in a folder that only exists on another machine now says
   so, instead of quietly starting somewhere else.** Opening a session in a
   directory this machine does not have has always been allowed to proceed —

@@ -33861,6 +33861,21 @@ mod tests {
         // And it goes to stderr, so it cannot be mistaken for the CLI's own
         // first line of output by anything reading the stream.
         assert!(prefix.contains(">&2"), "{prefix}");
+        // ⛔⛔ AND IT CANNOT BE ALLOWED TO FAIL THE LAUNCH. The prefix is joined
+        // onto the rest of the command with ` && `, so whatever it ends with
+        // GATES the exec. Before this notice existed the prefix ended in a
+        // `… || true; fi`, which is always 0; a bare `printf … >&2` at the end
+        // hands the whole launch a non-zero status the one time stderr is not
+        // writable, and the CLI simply never starts — a silent non-launch,
+        // which is a worse version of the bug this notice exists to report.
+        assert!(
+            prefix.trim_end().ends_with("fi"),
+            "the prefix must still end in an `if`, whose status is 0: {prefix}"
+        );
+        assert!(
+            prefix.contains(">&2 || true"),
+            "the fallback notice can fail the launch it was added to explain: {prefix}"
+        );
         // A launch with no cwd asks for nothing and so can be denied nothing.
         assert!(crate::best_effort_cwd_shell_prefix(None).is_none());
         assert!(crate::best_effort_cwd_shell_prefix(Some("   ")).is_none());
