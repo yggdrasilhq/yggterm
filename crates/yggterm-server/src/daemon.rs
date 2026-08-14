@@ -873,6 +873,29 @@ struct ClientHandlerWindow {
     opened: Option<std::time::Instant>,
     opened_proc_cpu_us: u64,
     by_request: BTreeMap<&'static str, ClientHandlerStats>,
+    /// The accept loop's OWN cost per connection — see
+    /// [`record_accept_spawn_cost`]. Kept in the same window so the two halves
+    /// of a connection are read off one record and cannot be paired across
+    /// different moments.
+    accept_spawn_count: u64,
+    accept_spawn_us_total: u64,
+    accept_spawn_us_max: u64,
+}
+
+/// What the accept loop spends handing one connection to a thread.
+///
+/// ⚠ This is the PARENT half. `clone()` charges most of a thread's creation to
+/// the caller, so a child-side span cannot see it — and the child-side
+/// pre-closure cost was measured at a flat 39–55 µs, which is far too small to
+/// explain a ~1.7 ms per-connection gap. This is where the rest would have to
+/// be, if it is anywhere in the request path at all.
+fn record_accept_spawn_cost(cpu_us: u64) {
+    let Ok(mut window) = CLIENT_HANDLER_WINDOW.lock() else {
+        return;
+    };
+    window.accept_spawn_count += 1;
+    window.accept_spawn_us_total += cpu_us;
+    window.accept_spawn_us_max = window.accept_spawn_us_max.max(cpu_us);
 }
 
 thread_local! {
@@ -964,6 +987,14 @@ fn record_client_handler_cost(cpu_us: u64, wall_us: u64, thread_total_cpu_us: u6
             None
         } else {
             let emitted = std::mem::take(&mut window.by_request);
+            let accept = (
+                window.accept_spawn_count,
+                window.accept_spawn_us_total,
+                window.accept_spawn_us_max,
+            );
+            window.accept_spawn_count = 0;
+            window.accept_spawn_us_total = 0;
+            window.accept_spawn_us_max = 0;
             window.opened = Some(now);
             let previous_proc_cpu_us = window.opened_proc_cpu_us;
             window.opened_proc_cpu_us = proc_cpu_us;
@@ -971,12 +1002,14 @@ fn record_client_handler_cost(cpu_us: u64, wall_us: u64, thread_total_cpu_us: u6
                 elapsed,
                 proc_cpu_us.saturating_sub(previous_proc_cpu_us),
                 emitted,
+                accept,
             ))
         }
     };
-    let Some((elapsed, proc_cpu_us_delta, emitted)) = flush else {
+    let Some((elapsed, proc_cpu_us_delta, emitted, accept)) = flush else {
         return;
     };
+    let (accept_count, accept_us_total, accept_us_max) = accept;
     let Some(home) = TRACE_HOME_DIR.as_ref() else {
         return;
     };
@@ -1026,6 +1059,10 @@ fn record_client_handler_cost(cpu_us: u64, wall_us: u64, thread_total_cpu_us: u6
             "cpu_us_total": cpu_us_total,
             "proc_cpu_us_delta": proc_cpu_us_delta,
             "handlers_per_s": handled as f64 * 1000.0 / window_ms as f64,
+            // The accept loop's own half of a connection, from the same window.
+            "accept_spawn_count": accept_count,
+            "accept_spawn_us_mean": accept_us_total / accept_count.max(1),
+            "accept_spawn_us_max": accept_us_max,
             // ⛔ Per VERB. A single mean over every connection mixes a `ping`
             // with a `status` carrying 264 rows, and reads low.
             "requests": requests,
@@ -17702,11 +17739,25 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             }
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // ⭐ THE PARENT SIDE OF A CONNECTION, MEASURED RATHER THAN
+                    // INFERRED. The handler span covers the child thread; this
+                    // covers what the accept loop itself spends per connection —
+                    // the `clone()`, the argument clones, the channel sender.
+                    // It was previously only reachable as a DIFFERENCE between a
+                    // closure span and a process counter, which is the shape
+                    // this lane keeps getting wrong, and which is unmeasurable
+                    // on a live daemon anyway: an external estimator needs a
+                    // stationary baseline, and the baseline here is the bursty
+                    // per-session reader term.
+                    let spawn_started_cpu_us = thread_cpu_micros();
                     spawn_unix_client_handler(
                         stream,
                         runtime.clone(),
                         last_activity_ms.clone(),
                         client_outcome_tx.clone(),
+                    );
+                    record_accept_spawn_cost(
+                        thread_cpu_micros().saturating_sub(spawn_started_cpu_us),
                     );
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
