@@ -1558,6 +1558,30 @@ DEDUPLICATION of a duplicate that the handover's own failure created.** Every
 component behaved as designed; the defect is that one of them manufactures the
 input another one is entitled to destroy.
 
+### ⭐ THE SECOND FIX, AND IT IS THE ONE THAT TOUCHES THE KILLER (`d9966a7c`)
+
+The prune calls `drop_terminal_runtime` on the OWNER, and a drop is
+`remove_session` → `shutdown` → **`kill`**. So the prune does not merely forget a
+duplicate record — **it kills the child.** After a lost ack that child is the one
+the successor has just adopted and is serving.
+
+⚠ **The same code fired twice with opposite outcomes**, which is what narrows it:
+
+| | duplicate created by | prune dropped | outcome |
+|---|---|---|---|
+| the cut seat | a **lost ack** — successor took the fd, never acknowledged | the side a **live process was on** | **fatal, mid `tool_use`** |
+| an unrelated row | a **genuine re-launch** (resume started 2 s BEFORE the drop) | the **stale** side | **correct**, process survived 66 min |
+
+⇒ **In the lost-ack case neither side is stale**, so *"drop the duplicate"* has no
+right answer to give. The caller must not ask the question, rather than the prune
+trying to choose better.
+
+**Adoption is the discriminator, and it was already representable** —
+`PtyChildHandle::is_adopted` existed as dead code. A runtime we forked owns its
+child alone; an adopted one is the same process on the same pty as the
+predecessor's copy. The prune now skips adopted keys and **traces the skip**, so
+a standing duplicate is visible bookkeeping rather than a silent one.
+
 ### What this means for the fix already landed
 
 `22f97c41` (idempotent re-adoption of the same child) **removes the
@@ -1571,8 +1595,12 @@ a lost ack is observed converging.
 `removed_terminal: true` appears **exactly twice in the entire trace corpus**,
 both `duplicate_legacy_owned_runtime_prune`, both from the same predecessor:
 this key at 01:34:41, and `local://75445547…` at 01:28:18 (one second after the
-first failed sweep — **worth checking whether that row died too; it is not on
-any death list**).
+first failed sweep). ✅ **Checked: not a casualty.** Its `claude --resume`
+started **two seconds BEFORE** the drop, so the resume is what created that
+duplicate and the prune removed the **stale** side; the process was still alive
+66 minutes later, and its last assistant record predates the drop by 4.3 hours,
+so nothing was interrupted. ⚠ Its transcript mtime sits just after the drop and
+would have read as "died mid-stride" — the mtime-is-teardown trap.
 
 The 00:22:13 death has **zero** such events. ⇒ **Either a second mechanism
 exists, or that death predates trace coverage of this event.** Do not
