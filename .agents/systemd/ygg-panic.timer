@@ -1,0 +1,15 @@
+[Unit]
+Description=yggterm resource panic watch, hourly
+
+[Timer]
+# ⛔ OnCalendar, NOT OnUnitActiveSec. The monotonic form left `Trigger: n/a` —
+#    the timer showed "enabled" and "active (running)" while having no next
+#    elapse at all, which is the worst shape a watchdog can take: it reports
+#    healthy and never fires. A wall-clock schedule always yields a next run.
+#    ⚠ Off the hour deliberately, so it does not pile onto every other :00 job.
+OnCalendar=*-*-* *:17:00
+AccuracySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
