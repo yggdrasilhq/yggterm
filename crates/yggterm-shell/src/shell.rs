@@ -11039,8 +11039,26 @@ fn web_surface_tab_create_rect(
 /// invariant — every rule keyed on the `:root[data-under-glass="1"]` stamp, so a
 /// runtime probe demotion restores all of it with no re-render — and this rule is
 /// not keyed on it and must apply whether or not the shell is under glass.
+/// ⛔ AND IT STANDS DOWN VISUALLY, NOT ONLY FOR THE POINTER.
+///
+/// Until 2026-08-14 this rule surrendered input and nothing else:
+/// [`terminal_host_visibility_style`] returns `opacity:1; visibility:visible;`
+/// unconditionally, so a covered host kept painting. That was survivable only
+/// while the document body painted OVER it — and the day the body failed to
+/// mount, what the user got was not a blank page but THE TERMINAL, presented as
+/// their document. The reported symptom was "the document view renders a
+/// screenful of corrupted glyph clusters"; it was the row's own six lines of
+/// shell output, drawn by the canvas that was never told to stand down.
+///
+/// A document surface is opaque and full-bleed, so it owes the terminal
+/// nothing. `visibility` (never `display`) keeps the host's geometry, so the
+/// PTY grid does not resize on every toggle — the same choice, for the same
+/// reason, as the web-surface rules below.
 const DOCUMENT_SURFACE_STANDDOWN_CSS: &str = r#"
 [data-document-surface-owns-viewport="true"] { pointer-events: none; }
+[data-document-surface-owns-viewport="true"] .xterm { visibility: hidden; }
+[data-document-surface-owns-viewport="true"] .yggterm-reveal-ghost { visibility: hidden; }
+[data-document-surface-owns-viewport="true"] .yggterm-cold-mount-veil { visibility: hidden; }
 "#;
 
 const WEB_UNDER_GLASS_CSS: &str = r#"
@@ -50835,13 +50853,45 @@ fn live_session_enriched_detail_label(
     row_path: &str,
     summary: String,
     kept_alive_paths: &HashSet<String>,
+    cwd_warned_paths: &HashSet<String>,
 ) -> String {
+    let summary = if cwd_warned_paths.contains(row_path) {
+        format!("{CWD_NOT_HERE_PREFIX} {summary}")
+    } else {
+        summary
+    };
     live_session_detail_label(summary, kept_alive_paths.contains(row_path))
 }
+
+/// Opens the detail line of a row whose launch could not be given the
+/// directory it asked for. It goes IN FRONT of whatever sentence won —
+/// stored, generated, or default — because the thing being corrected is the
+/// claim those sentences make, and a correction that trails a claim is read
+/// after it or not at all.
+const CWD_NOT_HERE_PREFIX: &str =
+    "⚠ NOT in the directory this row names — it does not exist on this machine.";
+/// How a row's summary should speak about its working directory.
+///
+/// ⛔ "rooted at X" is a claim about where the process IS, and it was made
+/// unconditionally from what the launch ASKED FOR. A local launch into a
+/// directory that does not exist here still starts — the launch prefix walks
+/// up to an existing ancestor and falls back to `$HOME` on purpose — so the
+/// row asserted a location the process had never been in, and read as healthy
+/// for as long as it lived. When the daemon has marked the row, the sentence
+/// says what actually happened instead.
+fn session_cwd_phrase(session: &ManagedSessionView, cwd: &str) -> String {
+    if metadata_value(session, "Cwd Warning").trim().is_empty() {
+        format!("rooted at {cwd}")
+    } else {
+        format!("NOT in {cwd} — that directory does not exist on this machine, so it started elsewhere")
+    }
+}
+
 fn live_session_default_summary(session: &ManagedSessionView) -> Option<String> {
     let cwd = session_cwd_for_managed_session(session)
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .map(|value| session_cwd_phrase(session, &value));
     match session.kind {
         SessionKind::SshShell => {
             let target = session
@@ -50853,12 +50903,12 @@ fn live_session_default_summary(session: &ManagedSessionView) -> Option<String> 
                 })
                 .unwrap_or_else(|| session.host_label.clone());
             Some(match cwd {
-                Some(cwd) => format!("SSH terminal on {target} rooted at {cwd}."),
+                Some(phrase) => format!("SSH terminal on {target} {phrase}."),
                 None => format!("SSH terminal on {target}."),
             })
         }
         SessionKind::Shell => Some(match cwd {
-            Some(cwd) => format!("Local shell rooted at {cwd}."),
+            Some(phrase) => format!("Local shell {phrase}."),
             None => "Local shell terminal.".to_string(),
         }),
         SessionKind::Document => Some("Document preview.".to_string()),
@@ -50878,7 +50928,7 @@ fn live_session_default_summary(session: &ManagedSessionView) -> Option<String> 
                 "session"
             };
             Some(match cwd {
-                Some(cwd) => format!("Local {name} {noun} rooted at {cwd}."),
+                Some(phrase) => format!("Local {name} {noun} {phrase}."),
                 None => format!("Local {name} {noun}."),
             })
         }
@@ -50924,6 +50974,7 @@ fn enrich_sidebar_rows_with_live_titles(
     let mut authoritative_live_paths = HashSet::<String>::new();
     let mut remote_live_direct_title_paths = HashSet::<String>::new();
     let mut kept_alive_paths = HashSet::<String>::new();
+    let mut cwd_warned_paths = HashSet::<String>::new();
     let remote_session_index = build_remote_session_index(remote_machines);
     for session in live_sessions {
         if !matches!(session.source, SessionSource::Stored) {
@@ -50931,6 +50982,15 @@ fn enrich_sidebar_rows_with_live_titles(
         }
         if live_session_keep_alive(session) {
             kept_alive_paths.insert(session.session_path.clone());
+        }
+        // ⛔ Collected here rather than inside the summary builder because the
+        // summary the sidebar shows is usually NOT built here at all: a stored
+        // or LLM-generated one wins, and the birth-time default that produced
+        // "rooted at <dir>" is written by a same-named function in the SERVER
+        // crate. Whichever sentence wins, the warning has to survive it, so it
+        // is applied where the label is finally composed.
+        if !metadata_value(session, "Cwd Warning").trim().is_empty() {
+            cwd_warned_paths.insert(session.session_path.clone());
         }
         let session_cwd = session_cwd_for_managed_session(session);
         let cwd = session_cwd.as_deref().unwrap_or_default();
@@ -51008,6 +51068,7 @@ fn enrich_sidebar_rows_with_live_titles(
                     &row.full_path,
                     summary.clone(),
                     &kept_alive_paths,
+                    &cwd_warned_paths,
                 );
             } else if kept_alive_paths.contains(&row.full_path) {
                 row.detail_label = live_session_detail_label(row.detail_label.clone(), true);
@@ -51023,6 +51084,7 @@ fn enrich_sidebar_rows_with_live_titles(
                     &row.full_path,
                     summary.clone(),
                     &kept_alive_paths,
+                    &cwd_warned_paths,
                 );
             } else if kept_alive_paths.contains(&row.full_path) {
                 row.detail_label = live_session_detail_label(row.detail_label.clone(), true);
@@ -51068,6 +51130,7 @@ fn enrich_sidebar_rows_with_live_titles(
                 &row.full_path,
                 summary.clone(),
                 &kept_alive_paths,
+                &cwd_warned_paths,
             );
         } else if kept_alive_paths.contains(&row.full_path) {
             row.detail_label = live_session_detail_label(row.detail_label.clone(), true);
@@ -76664,9 +76727,24 @@ async fn process_pending_app_control_requests(
             // blind to them. No fallback: a silent DOM frame would lie about what's
             // on screen, so a refusal (e.g. window could not be focused on Wayland)
             // is returned as an error the agent can see.
+            // ⛔ A DOCUMENT SURFACE IS NOT A TERMINAL, WHATEVER THE VIEW MODE
+            // SAYS. An app row is a shell, so `active_view_mode` reads
+            // `Terminal` even while yedit owns the whole viewport — and
+            // compositing the xterm canvas over that frame paints the row's
+            // shell output across the document, in the ONE instrument an agent
+            // is told to trust for a visual claim. The chrome snapshot alone is
+            // the faithful frame here: the document surface is ordinary DOM.
+            let document_owns_viewport = {
+                let shell = state.read();
+                shell
+                    .server
+                    .active_session_path()
+                    .is_some_and(|path| shell.document_surface_visible_for(path))
+            };
             let prefer_terminal_composite = !compositor
                 && matches!(target, ScreenshotTarget::App)
                 && terminal_xterm_canvas_renderer_enabled()
+                && !document_owns_viewport
                 && state.read().server.active_view_mode() == WorkspaceViewMode::Terminal;
             // (backend, faithful, faithful_reason, is_terminal_region, attempts, output_path)
             let mut success: Option<(String, bool, String, bool, Vec<String>, String)> = None;
@@ -127922,7 +128000,22 @@ fn DocumentSurfaceBody(
                 for (index, widget) in body_widgets.iter().enumerate() {
                     div {
                         key: "half-{widget.key(index, &value_epochs)}",
-                        "{yggui_contract::document_split_stamps::HALF}": if split_view {
+                        // ⛔ SPELLED OUT, NOT INTERPOLATED, AND THAT IS LOAD-BEARING.
+                        // An RSX attribute NAME is a literal: `"{EXPR}"` interpolates
+                        // a VALUE, never a name, so this written as
+                        // `"{yggui_contract::document_split_stamps::HALF}"` emitted an
+                        // attribute called `{yggui_contract::…::HALF}` — braces, colons
+                        // and all — which `setAttribute` refuses outright
+                        // (`InvalidCharacterError: Invalid qualified name`). The throw
+                        // killed the whole edit batch, so EVERY mutation after it was
+                        // dropped and never re-sent: the halves, the gutter, the editor
+                        // and the reader all failed to mount while the container's own
+                        // `style` (emitted before the throw) kept tracking the data.
+                        // That is why the viewport painted nothing while the rail, the
+                        // footer counts and `document_surfaces.has_schema` all reported
+                        // success — they come from a different pane and a different
+                        // batch. Locked by `document_split_stamp_attribute_names_are_literal`.
+                        "data-yggui-doc-split-half": if split_view {
                             if index == 0 { "first" } else { "second" }
                         } else { "" },
                         style: if split_view {
@@ -128142,8 +128235,10 @@ fn DocumentSurfaceBody(
                 // of naming them in yggui-contract rather than inline here.
                 if split_view {
                     div {
-                        "{yggui_contract::document_split_stamps::GUTTER}": "1",
-                        "{yggui_contract::document_split_stamps::RATIO}": "{split_ratio}",
+                        // Literal names — see the half stamp above for why an
+                        // interpolated attribute NAME silently destroys this subtree.
+                        "data-yggui-doc-split-gutter": "1",
+                        "data-yggui-doc-split-ratio": "{split_ratio}",
                         role: "separator",
                         "aria-orientation": "vertical",
                         "aria-valuenow": "{(split_ratio * 100.0) as i64}",
@@ -137988,6 +138083,78 @@ mod tests {
             }),
             "and the RSS floor still holds"
         );
+    }
+
+    // ── RSX attribute-name locks (queue 6.8) ───────────────────────────────
+
+    /// ⛔ AN RSX ATTRIBUTE NAME CANNOT BE INTERPOLATED, AND GETTING IT WRONG IS
+    /// SILENT AND TOTAL.
+    ///
+    /// `"{EXPR}": value` reads as "name this attribute after EXPR" and does not
+    /// mean that: RSX interpolates VALUES, so the emitted attribute is literally
+    /// called `{EXPR}`, braces and colons included. `setAttribute` refuses it
+    /// (`InvalidCharacterError: Invalid qualified name`), the webview abandons
+    /// the REST of that edit batch, and Dioxus never re-sends it — it diffs
+    /// against a model in which those mutations landed. So the subtree being
+    /// built never appears, permanently, while every field around it reports
+    /// success and `webview_edit_faults` is the only thing that moves.
+    ///
+    /// It cost the document surface its entire body: three such names, and the
+    /// viewport painted nothing while the rail, the word counts and
+    /// `document_surfaces.has_schema` were all correct (they come from a
+    /// different pane, in a different batch). The class is worth a structural
+    /// lock rather than a comment, because the mistake LOOKS like the fix for a
+    /// hardcoded string.
+    #[test]
+    fn no_rsx_attribute_name_is_interpolated() {
+        let source = include_str!("shell.rs");
+        let offenders: Vec<(usize, &str)> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with(concat!('"', '{')))
+            .filter(|(_, line)| {
+                line.split_once(concat!('}', '"'))
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with(':'))
+            })
+            .map(|(index, line)| (index + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these RSX attribute NAMES are interpolated, so setAttribute rejects them \
+             and the rest of the edit batch is silently dropped — spell the name out \
+             and lock it against its contract constant instead: {offenders:?}"
+        );
+    }
+
+    /// The split-view stamps are spelled out as literal attribute names above
+    /// because of the rule the previous test enforces. `yggui-contract` stays
+    /// the one owner of the spelling; this is what makes copying it safe, and
+    /// what fails if either side is renamed alone.
+    #[test]
+    fn document_split_stamp_attribute_names_match_the_contract() {
+        assert_eq!(
+            yggui_contract::document_split_stamps::HALF,
+            "data-yggui-doc-split-half"
+        );
+        assert_eq!(
+            yggui_contract::document_split_stamps::GUTTER,
+            "data-yggui-doc-split-gutter"
+        );
+        assert_eq!(
+            yggui_contract::document_split_stamps::RATIO,
+            "data-yggui-doc-split-ratio"
+        );
+        let source = include_str!("shell.rs");
+        for stamp in [
+            yggui_contract::document_split_stamps::HALF,
+            yggui_contract::document_split_stamps::GUTTER,
+            yggui_contract::document_split_stamps::RATIO,
+        ] {
+            assert!(
+                source.contains(&format!("\"{stamp}\":")),
+                "the document surface must carry `{stamp}` as a LITERAL attribute name"
+            );
+        }
     }
 
     // ── Store-registry locks (harness spec §3 / §8 phase 1b) ───────────────
@@ -162555,6 +162722,98 @@ mod tests {
             Some("Remove Them Entirely")
         );
     }
+    #[test]
+    fn a_row_whose_cwd_is_not_on_this_machine_stops_claiming_to_be_rooted_there() {
+        // The sidebar sentence is the thing the user reads, and it asserted
+        // "rooted at <dir>" from what the launch ASKED FOR. A launch into a
+        // directory that exists only on another host still starts — elsewhere
+        // — so that sentence was the whole "looks healthy forever" symptom.
+        let with_cwd = |warning: Option<&str>| {
+            let mut metadata = vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/workspace/only-on-another-host".to_string(),
+            }];
+            if let Some(warning) = warning {
+                metadata.push(SessionMetadataEntry {
+                    label: "Cwd Warning",
+                    value: warning.to_string(),
+                });
+            }
+            metadata
+        };
+        let mut session = ManagedSessionView {
+            id: "live-local-elsewhere".to_string(),
+            session_path: "local://elsewhere".to_string(),
+            title: "Elsewhere".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "localhost".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "/bin/bash".to_string(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                older_available: false,
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+            working: None,
+            input_unanswered_ms: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        };
+
+        session.metadata = with_cwd(None);
+        let healthy = live_session_default_summary(&session).expect("a shell has a summary");
+        assert_eq!(
+            healthy,
+            "Local shell rooted at /workspace/only-on-another-host."
+        );
+
+        session.metadata = with_cwd(Some("does not exist on this machine"));
+        let marked = live_session_default_summary(&session).expect("a shell has a summary");
+        assert!(
+            !marked.contains("rooted at"),
+            "the marked row still claims to be rooted somewhere it is not: {marked}"
+        );
+        assert!(
+            marked.contains("/workspace/only-on-another-host"),
+            "the marked row must still name what was asked for: {marked}"
+        );
+
+        // An agent row takes the same phrase — the symptom was reported on a
+        // Claude Code row, and a fix that only reached shells would leave the
+        // reported case exactly as it was.
+        session.kind = SessionKind::ClaudeCode;
+        let marked = live_session_default_summary(&session).expect("an agent row has a summary");
+        assert!(!marked.contains("rooted at"), "{marked}");
+
+        // And a row with no cwd at all says nothing about one, marked or not.
+        session.metadata = vec![];
+        assert_eq!(
+            live_session_default_summary(&session).as_deref(),
+            Some("Local Claude Code session.")
+        );
+    }
+
     #[test]
     fn enrich_sidebar_rows_with_live_titles_humanizes_short_local_shell_labels() {
         let live_sessions = vec![ManagedSessionView {

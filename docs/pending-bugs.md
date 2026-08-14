@@ -142,6 +142,418 @@ bootstrapping. The campaign already records that a re-resume onto a fresh PTY is
 when the squish/broken-bottom artefacts appear, so the first-paint window is
 where the renderer is most stressed and is the cheapest place to try to reproduce
 this.
+## ⚠ [6.0] A FINISHED LANE'S ROW HOLDS ITS SEAT FOREVER, AND NOTHING RETIRES IT
+
+**Status:** OPEN
+
+*Found 2026-08-14 root-causing an owner report that three separate seat numbers
+were each worn by two or three rows at once.*
+
+The seat a row wears lives in `outline_prefix`. Nothing ever clears it, and
+nothing retires the row of a session that has stopped. So a lane that finished
+yesterday still holds its number today, indistinguishable in the row table from
+a lane that is mid-flight — two of the squatters in the reported case had been
+dead for sixteen hours, and one was a **husk**: a row whose session has no
+process and no transcript on any host.
+
+**Half of this is fixed and is not what this entry is about.** `ygg-claim.sh`
+exempted an explicit `--number` from its held-seat check, so a relay handing a
+seat down in a brief never noticed the seat was taken; that guard now runs on
+both paths and refuses by name. What remains is the condition it now refuses
+*over*: **the seats are genuinely held by rows nobody will ever use again**, so
+the refusal is correct and still leaves a human to clear it by hand.
+
+⇒ **The uncomfortable half — there are TWO registries of seat numbers and
+neither is authoritative:**
+
+| registry | knows about | read by |
+|---|---|---|
+| the GUI row table (`outline_prefix`) | every row, live or dead | the user, and now the claim guard |
+| the supervision board (`seat`) | only rows that SUBSCRIBED | orchestrators writing briefs |
+
+An orchestrator asks the board "is this seat free?", the board cannot see the
+five finished lanes still wearing numbers, and it answers yes. That is how every
+duplicate in the reported case was created — not by carelessness, but by asking
+the registry that structurally cannot know.
+
+**What would close this:** a row's seat is released when its session ends, OR
+the board reports seats it cannot account for so the answer stops being
+confidently wrong. ⚠ **Not by reaping finished rows automatically** — the owner
+ruled plainly on the reported case (*do not blindly delete*), and a finished
+lane's row is how he reads back what it did.
+
+⭐ **The renumbering that cleared the reported case moved the FINISHED lanes and
+left every live and owner-visible row where it was**, which is the ordering to
+repeat: a number a person is currently looking at is the one that should not
+move.
+
+## ⚠ [6.0] ONE SESSION, TWO ROWS, SAME VIEW — a husk rendered at two depths
+
+**Status:** OPEN
+
+*Found 2026-08-14 in the same sweep, and it is a different defect from the seat
+collision above: these two rows agree on their number because they are the same
+session twice.*
+
+A single session path appears **twice in one `server app rows` payload**, both
+entries carrying `presence: live_rail` and `live_member: true`, identical
+`path` and `full_path`, identical label — and differing only in `depth` (2 and
+4). The tree builder emitted it under two parents.
+
+⛔ **This is a single-source-of-truth violation in the row table itself**, not a
+rendering nicety: any consumer that keys rows by `path` sees one row, any
+consumer that counts sees two, and the sweep that found it initially
+mis-attributed the duplicate to a seat-numbering bug because the two rows also
+share a number — which they must, being one row.
+
+The instance is a husk (no process, no transcript on any host), so a reasonable
+first hypothesis is that a session which has died while a member of a row set is
+emitted both as a live-rail member and as a set descendant. **Not yet tested**,
+and the husk should be preserved rather than cleared until it is — it is
+currently the only known reproduction.
+
+⚠ It also wears a **legacy number inside its title text** while carrying a
+different one in `outline_prefix`, so it renders with two numbers. That is the
+already-documented double-numbering trap and is cosmetic here, but it is why the
+row reads as more broken than it is.
+
+## ⛔⛔ [6.2] THE GUI CLOSE PATH NEVER RUNS, SO THE "DIES WITH THE GUI" TIER IS VESTIGIAL
+
+**Status:** AWAITING A DECISION
+
+**Who decides:** the owner, or 6.0 on his behalf. Repairing this would START
+destroying rows that survive today — see "why this is a decision" below.
+
+*Measured 2026-08-14 on the desktop host, read-only, plus a private sandbox.*
+
+**Nine GUI launches in the retained traces (`register` × 9). Zero events from any
+step of the shutdown path.** Not one of:
+
+`keep_alive_flush_before_close` · `force_exit_after_close_timeout` ·
+`shutdown_check` · `shutdown_suppressed` · `shutdown_unintentional` ·
+`client_close_prepared` · `client_close_preserved_for_update`
+
+⇒ **`PrepareClientClose` — the only thing that closes a non-keep-alive row — has
+not been sent once in the retained window.** The tier documented as "second-class
+rows die with the GUI" does not, in practice, die with the GUI. It is not being
+enforced at all.
+
+A sandbox reproduces it from the other side: both a toplevel kill and
+`server app close` left the GUI gone with the flush written and **nothing after
+it**, the client-instance file still on disk, and a non-keep-alive row still
+alive. The reap only ran when `{"kind":"prepare_client_close"}` was written to the
+daemon socket by hand.
+
+### Mechanism — a hypothesis with a named falsifier, not a conclusion
+
+`finalize_client_shutdown` is called from exactly two places: **after
+`dioxus::LaunchBuilder::launch(app)` returns**, and from the 2.5 s
+`spawn_close_force_exit_watchdog`. On Linux the winit/tao event loop is
+documented as diverging — `run` never returns — which would make the first
+callsite dead code and leave the watchdog as the only sender. And the watchdog
+never fired either, so the process is going away inside 2.5 s by a route that
+runs neither.
+
+- **Falsify by**: closing a GUI deliberately and reading the trace back. One
+  event from that list disproves the whole entry.
+- ⚠ **Bounded by RETENTION, not by history** — traces rotate per GUI launch and
+  16 files are kept. This says "not in the retained window", never "never".
+- ⚠ Note `finalize_client_shutdown` also `swap(false)`s the intentional-shutdown
+  flag, so whichever caller runs first CONSUMES it and a second caller silently
+  takes the `shutdown_unintentional` arm. That matters once either callsite
+  starts working.
+
+### ⚖ Why this is a DECISION and not a fix to take
+
+**Repairing the close path would newly destroy rows that survive today.** Every
+non-keep-alive row on the machine is currently outliving GUI closes it was
+designed to die with; making the path work would start reaping them, on a fleet
+whose users have had the opposite behaviour for an unknown period.
+
+⇒ It also cuts the other way, and this is the part worth the owner's attention:
+**`spec-app-row-survival.md` §5's warning that a GUI kill is destructive to app
+rows appears to be false in practice** — nothing is reaping them. The rows lost
+on 2026-08-13 were taken by the persist filter, not by a close.
+
+**Recommendation (6.2):** do NOT repair the close path. Retire the tier instead —
+if no row has died with the GUI in the retained history, the tier is a promise the
+product has not been keeping, and honouring it now is a regression wearing a
+bugfix. Confirm the mechanism first with the falsifier above.
+
+## ⛔⛔ [6.1] THE SUCCESSOR RETIRES AND THE PREDECESSOR KEEPS THE SESSION — THE DRAIN INVERTS
+
+**Status:** OPEN
+
+⭐ **DIRECTION RULED 2026-08-14 by 6.0, THEN AMENDED THE SAME DAY when the
+falsifier below disproved a premise of it. The amended ruling is the one to
+build:**
+
+> **The exit comes FIRST and it has a named target — clear a preserved record
+> whose owner is dead. It is independently worth shipping even if the count
+> never lands.** The count follows.
+
+⛔ **The original ruling said "count preserved AND give it an exit, both halves
+or neither", on the reasoning that the permanent pin would be a cost of the
+change. It is not: it is the status quo** (see the falsifier below — a dead
+owner's record already pins a daemon today). Counting would *widen* an existing
+pin rather than create one, which is a materially different trade. ⇒ **Do not
+implement the original form, and do not re-argue it: it was amended on
+measurement, not on preference.**
+
+**The reasoning, which generalises past this entry:** both horns end in a stuck
+daemon and differ in one property. Today's failure (preserved counts zero) is
+tied to a handover in flight and **resolves when that handover completes or the
+session ends — it has an exit**. Counting preserved naively has **no exit**: a
+bequeathed record outlives the daemon that wrote it, so nothing will ever clear
+it. ⇒ **Prefer the failure that has an exit.**
+⭐ And note what a preserved key is: **a one-way door**. A gate reading a count
+that can only rise has no way back — the same class as a hold that re-arms from
+the artefact it froze. *What writes the signal I gate on, and does it keep
+writing once I have gated?* For a bequeathed record: nothing, ever.
+
+⛔ **Implementation stays behind the 3.0.155 hold.** This settles the direction
+so the work is cheap when the hold lifts, not so it happens sooner.
+
+⚠ **An owner named in a brief is a claim about the past.** This entry first named
+6.9 as holding the constraining cost model. That row stood down and its lane
+merged; the seat is now a different campaign that has never seen a daemon, so
+routing there would have filed to a stranger. The `N_reachable × ~0.2-core`
+constraint survives in the campaign memory door, not in a live row. **Check a row
+still holds the seat before routing to it.**
+
+*Measured 2026-08-14 in an isolated `YGGTERM_HOME` with a real
+predecessor/successor pair, both built from source in this repo (3.0.154 and a
+3.0.155 built only for this test). Fleet daemon census 23 before and 23 after,
+so nothing outside the sandbox was touched.*
+
+**What happened, in order:**
+
+1. predecessor 3.0.154 owns one live plain-shell PTY — `owned=1`;
+2. successor 3.0.155 starts — `owned=0, preserved=1`, i.e. it knows the runtime
+   by bequest but does not own it;
+3. the hot-update handoff is driven explicitly and **starts**:
+   `hot_update_handoff_used: true`, `update_priority: "handoff_preserve_sessions"`,
+   `"hot update handoff started: preserving 1 live terminal runtime(s)"`,
+   and the predecessor's cold shutdown is correctly skipped
+   (`fallback_shutdown_skip_reason: "handoff_preserved_owner"`);
+4. **90 s later the SUCCESSOR logs `daemon idle shutdown` and exits.** The
+   predecessor is still alive and still `owned=1`.
+
+⇒ **The new daemon retired and the old one stayed.** That is the drain running
+backwards, and it is one concrete way the constitution's *"then the emptied
+daemon retires on its own"* does not happen.
+
+⚠ **No session was lost. The pty child survived the whole run**, verified by pid
+rather than by a row listing — a re-resume would have produced a different pid.
+The failure is **non-convergence, not data loss**, and it must not be filed as
+the latter.
+
+### ⛔ THE MECHANISM: TWO QUANTITIES SHARE ONE NAME, AND THE GATE'S COMMENT NAMED THE OTHER
+
+`daemon_should_idle_shutdown`'s first gate said *"including preserved hot-update
+PTYs, which are counted here"*. They are not.
+
+| name | what it is | preserved counted? |
+|---|---|---|
+| the `terminal_session_count` **argument** | `runtime.terminals.stats().session_count` at both call sites — sessions in this daemon's own registry with `is_running()` | **no** |
+| `ServerRuntimeStatus::terminal_session_count` | `terminal_session_keys.len()` | **yes** |
+
+⇒ A successor holding the runtime only as PRESERVED passes gate 1. The comment
+has been corrected in place; **the behaviour has not been changed.**
+
+⚠ **Gate 3 is what usually hides this.** The successor also has to have no
+client-instance records, so on the live fleet the GUI registering with the new
+daemon protects it. It bites where there is no client record: a headless deploy,
+or the window between daemon start and GUI registration.
+
+### ⛔ WHY THIS IS NOT A ONE-LINE FIX
+
+Counting preserved keys here inverts the failure: bequeathed records outlive the
+daemons that wrote them, so a daemon holding a stale preserved key would never
+retire — against a measured population cost of `N_reachable × a ~0.2-core floor`.
+**Both directions have a known failure mode**, which is why this is a decision
+and not a patch.
+
+⭐ **The connection that makes it load-bearing:** the readiness-probe entry's own
+ruling is that *the dangerous action is a handover that FAILS to converge, not a
+bump as such*, and that a non-converging daemon and "the thing that types over a
+draft" are the same population. This is a reproducible way to manufacture one.
+
+### ⭐⭐ BOTH HALVES ARE ALREADY BUILDABLE FROM DATA ON DISK — AND ONE OF THEM IS A TRAP
+
+Checked 2026-08-14 so the implementer does not have to rediscover it.
+`PreservedTerminalOwnerEntry` already persists everything the exit needs:
+
+    runtime_key · endpoint · owner_server_version · owner_server_build_id
+    owner_server_pid · created_at_ms
+
+⇒ Two independent exits exist in the record: an owner that can be **probed**
+(endpoint + pid + build_id), and a **`created_at_ms` that can expire**.
+
+⛔⛔ **AND THE PROBE MUST NOT GO IN THE GATE.** The probe already exists —
+`prune_unrepresented_preserved_owners` — and its own comment records why it is
+dangerous: it calls blocking `status()` per distinct owner endpoint **inside the
+global runtime lock**, and a dead or hung owner costs the full request timeout.
+Measured on this fleet, where deploys leave 24+ superseded daemons alive:
+`remove_session` p50 **447 ms**, p99 **10,590 ms**, max **44,991 ms** (n=1,220).
+
+**`daemon_should_idle_shutdown` runs on every accept-loop `WouldBlock` poll.**
+Putting a lock-held, multi-second, per-owner socket probe on that path would be
+far worse than the bug it fixes.
+
+⇒ **The shape that is safe:** the gate reads only cheap local state — the
+`created_at_ms` expiry, and at most a cached liveness answer
+(`preserved_owner_unreachable_until_ms` already exists as a negative cache).
+**The socket probe stays where it is, off the poll path.** ⚠ A naive "prune
+first, then count" is the obvious implementation and it is the wrong one.
+
+**Falsifier:** run the pair in an isolated home with no client record; the
+successor must still be alive after its idle window with the runtime adopted,
+and the predecessor must be the one that exits. ⚠ Add a second arm with a
+preserved record whose owner is **already dead**: that daemon must still retire,
+or the fix has bought a permanent pin.
+
+### ⛔⛔ THE SECOND ARM WAS WRITTEN FIRST, AS INSTRUCTED, AND IT FAILS TODAY
+
+**Measured 2026-08-14. Both arms in ONE run, one variable, zero daemon contact
+during the window** (every request resets `last_activity_ms` and would prevent
+the very idle shutdown being measured), verdict read from each daemon's **own
+log**, and **gate 3's input was zero client-instance files in both arms**:
+
+| the preserved record's owner | successor |
+|---|---|
+| **alive** | **RETIRED** (1 `idle shutdown` line) |
+| **dead** | **did NOT retire** (0 lines), still `owned=0, preserved=1` |
+
+⇒ **A dead owner's preserved record already pins a daemon today.** The premise
+that today's failure "has an exit" is **false for the case that matters**: it has
+an exit while the owner lives, and none once the owner dies.
+
+⭐ **This does not overturn the ruling, it sharpens it.** Counting preserved does
+not *introduce* the permanent pin — the pin already exists for dead owners, so
+counting would *widen* it. ⇒ **The exit half is now the more important half, and
+it has a named first job: clear a record whose owner is dead.** That is exactly
+the case that already fails, so the exit earns its place before the count does.
+
+⚠ **NOT CURRENTLY FIRING ON THE FLEET, and that is stated so nobody hunts it.**
+The live home holds **36 preserved entries and all 36 owners are alive (0 dead)**,
+checked by pid *and* by `argv[0]` still being a yggterm daemon, so a reused pid
+cannot read as alive. ⇒ **Latent, not active.** It arms whenever an owner dies —
+a crash, a `kill -9`, or the stale-daemon sweep's own SIGTERM.
+
+⛔ **Do not cite this as the cause of the legacy daemon pile.** It is a candidate
+mechanism with zero instances currently present, and the honest statement is that
+the pile is not being held this way today.
+
+## ⛔⛔ [6.0] THE SUPERVISION WATCHER IS DEPLOYED BY WHICHEVER CHECKOUT IT HAPPENED TO START IN
+
+**Status:** OPEN
+
+*Found 2026-08-14 while shipping a fix to the booter and trying to prove it was live.*
+
+`.agents/skills/` is tracked in this repository, so **every worktree carries its own
+copy of `ygg-booter.py`** — and the long-running watcher runs whichever copy was
+present in the directory it was started from. Measured on one host: **five distinct
+md5s of that file across fourteen checkouts**, with the running watcher on a copy
+that was neither the newest nor on the default branch.
+
+⇒ **A fix can be committed, reviewed, merged and pushed, and the watcher will keep
+running the old code indefinitely.** Nothing reports the difference. `git log` says
+the fix shipped; the process disagrees, and the process is the one that types into
+rows.
+
+⚠ **This is the supervision tool, so the failure is self-concealing.** The instrument
+that would tell you the watcher is stale is the watcher, and it reports on the code
+it is running, not the code that exists.
+
+### ⛔⛔ IT HAS ALREADY COST A SAFETY FIX, WITHIN MINUTES OF THAT FIX LANDING
+
+A defect that pinned every row on the fleet was fixed, pushed, and proved live on a
+tick. **Minutes later a second watcher was started from a checkout whose working
+tree predated the fix, and it re-pinned the entire fleet** — advancing the deadline
+on every tick from the same frozen evidence, exactly as before. `git log` showed the
+fix landed; a reader checking it would have concluded the problem was solved.
+**Thirteen of fourteen checkouts on that host were still pre-fix at the time.**
+
+⭐ **And the "proved live on a tick" claim was itself only true of ONE checkout.** The
+deploy step that does not exist is *"merge into every checkout that can host a
+watcher, then restart them"* — so a correct fix, correctly verified, was not in
+force anywhere the verification did not look.
+
+⇒ A floor has been put under it (a hold record written by pre-fix code is now
+discarded on read, since it carries no evidence ledger and therefore nothing that
+can ever stop it growing) but **that is a defence against the symptom, not a fix for
+the deploy path.**
+
+### ⛔ IT COST A SECOND SAFETY FIX THE SAME DAY — and a PARTIAL fix is now in
+
+Same shape, hours later. The fleet's entire wake path was down; the fix was
+committed, pushed and proved live on a tick. **Killing that watcher caused
+another to respawn from a different checkout whose copy predated the fix, and
+the fleet went straight back to refusing every boot.** Nine of fourteen
+checkouts were superseded at that moment.
+
+⚠ **The aggravating detail, and it is the one worth keeping: the stale path is
+the HABITUAL one.** The copy an agent invokes by hand is the one in its own cwd
+and its own shell history; the copy that is actually supervising is discoverable
+only from `/proc`. **Three sessions were caught by this in one afternoon,
+including two that had the identify-which-copy-is-executing law in memory at the
+time.** ⇒ Knowing the law does not protect you, because the wrong copy is the one
+every habit reaches for. The tool has to say it.
+
+**Shipped:** the booter now compares its own bytes against `origin/main`'s copy
+and says so loudly — **before** spawning, while the agent arming the fleet is
+still there to read it, and again at watcher startup, so the log answers *which
+copy is supervising* without anyone reading `/proc`. It compares against the
+last-fetched ref and deliberately does not fetch, so arming never depends on the
+network; an unavailable comparison reports *could not tell* rather than passing
+quietly.
+
+⛔ **THE LIMIT, STATED PLAINLY: THIS ONLY PROTECTS A CHECKOUT THAT HAS ALREADY
+PULLED IT.** A copy stale enough to lack the check cannot warn about itself, and
+a watcher armed from one is silent exactly as before. Verified both ways: a
+current checkout answers `True` with matching hashes; a superseded one has no
+such function at all. ⇒ **The entry stays OPEN**, because the deploy path is
+still the real defect and this only shortens the window.
+
+⚖ Not done, deliberately: pulling the other checkouts. Several carry lanes'
+uncommitted work, and a relay refreshing another lane's tree to fix its own
+tooling problem risks the work it was protecting.
+
+### ⭐ THE CHEAP TEST THAT WAS BEING SKIPPED
+
+**An existence check is not a deployment check.** `git cat-file -e <sha>^{commit}`
+proves an object was **fetched**; it says nothing about whether it is in `HEAD`, let
+alone on disk in the tree a process is executing. The ladder, cheapest first, and
+the cheapest is the one that misleads:
+
+| check | what it actually proves |
+|---|---|
+| `git cat-file -e <sha>` | the object exists locally — i.e. somebody fetched it |
+| `git merge-base --is-ancestor <sha> HEAD` | it is in this checkout's history |
+| `grep '<the new symbol>' <the file on disk>` | the working tree has it |
+| resolve the process's `cwd` + argv, then grep **that** file | the running code has it |
+
+⚠ Only the last one answers "is the fix in force", and a relative `argv[1]` means
+the file a watcher runs cannot be known without resolving its `cwd` first.
+
+### What good looks like
+
+- **One owner for "which file does the watcher execute"**, the way every other
+  concept in this repo has a single source of truth.
+- A watcher that can **state its own build identity** — a hash it prints on request
+  — so a deploy can be proved by identity rather than assumed from a merge, which
+  `docs/deploy-spec.md` §0 already requires of every other component.
+- ⛔ **Restarting it must stay safe under a live hold.** The rate-limit hold is
+  persisted outside any checkout, so it survives a restart today; any redesign must
+  keep that property, and must not leave two watchers running — a duplicate doubles
+  every boot.
+
+### Falsifier
+
+Compare the md5 of the file the watcher process actually executes (resolve its cwd,
+then the relative path from its command line) against the file on the default
+branch. Equal on every host, or this is open.
 
 ## ⛔⛔⛔ [6.7] THE GUI SIGSEGVs IN THE GL COMPOSITING PATH, ~4x A DAY, AND NOTHING REPORTS IT
 
@@ -670,48 +1082,6 @@ instrument uses `getrusage(RUSAGE_THREAD)`, in microseconds, so it is not subjec
 to the truncation that produced the retracted figure — **it is the thing that
 settles what the 15–30× gap actually is.**
 
-## ⛔ [6.9→6.1] AN UNREADABLE CLIENT-RECORD DIRECTORY READS AS "NO CLIENTS" AND PERMITS RETIREMENT
-
-**Status:** OPEN
-
-*source reading, and the withdrawal of the anomaly that led here, in
-[`idle-cost-model.md`](idle-cost-model.md) §6k-1..§6k-3*
-
-`daemon_should_idle_shutdown` (`daemon.rs:11537`) is careful: if
-`active_client_instance_records` returns `Err` it returns `false` — *if you
-cannot tell whether clients exist, do not retire.*
-
-**The callee guarantees that arm never fires.**
-`active_client_instance_records_from_dir` (`lib.rs:20737`) ends every failure in
-`let Ok(entries) = entries else { return Ok(()) };`, and drops per-entry errors
-with `.flatten()`. It has no `Err` path, so neither does its caller.
-
-⇒ An unreadable client-instances directory — permissions, fd exhaustion, ENOMEM —
-is reported as **an empty set of clients**, which satisfies gate 3 and **permits
-retirement while a client may be connected**. Two halves of one decision disagree
-about what an unreadable directory means and the careless half wins.
-
-⚠ **This is the INVERSE of the "a failing read means it never retires" reading.**
-That one cannot happen today; this one can. Both come from the same `Result` being
-vestigial.
-
-**Fix:** let the callee distinguish *absent* (legitimately no clients ⇒ `Ok`) from
-*unreadable* (⇒ `Err`), so the caller's existing caution becomes reachable.
-
-⛔ **NOT A DEFECT, CLOSED: "a daemon with all three retire gates open did not
-retire".** I filed that and it was wrong twice over. `client_instance_dirs_for_scan`
-scans **every** directory under the client-instances root, so a record filed under
-another endpoint version is still in scope; and `daemon_is_superseded` needs a
-**live** newer daemon, which that home did not have. Records non-empty and not
-superseded ⇒ gate 3 correctly returns `false` indefinitely. Demonstrated: a daemon
-with no record retires at **+90.2 s**, one with a record naming a live process was
-still running at **+204.8 s**.
-⛔⛔ **And the probe that manufactured it: `/proc/<pid>` existence is TRUE FOR A
-ZOMBIE.** The harness called a daemon "still alive at 200 s" that its own trace
-shows retiring at +90.2 s. `/proc/<pid>` answers *has this been reaped*, not *is
-this running* — and calling `poll()` to check is itself what reaps it. **Prefer
-the subject's own lifecycle record over any external liveness probe.**
-
 ## ⛔⛔⛔ [6.9→6.7] EVERY PEER `status` POLL REBUILDS THE WHOLE ROW INVENTORY
 
 **Status:** OPEN
@@ -1225,6 +1595,268 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⚠ [6.6] TWO FUNCTIONS NAMED `live_session_default_summary`, ONE PER CRATE, AND ONLY ONE IS EVER READ
+
+**Status:** OPEN
+
+*Found 2026-08-14 while fixing the cwd-fallback row description — by editing
+the wrong one and watching the live sidebar not change.*
+
+`live_session_default_summary` exists twice:
+
+- `crates/yggterm-server/src/lib.rs` — writes the row's summary at BIRTH, and
+  that stored string is what the sidebar shows;
+- `crates/yggterm-shell/src/shell.rs` — the sidebar's own fallback, reached
+  only when no stored or generated summary exists.
+
+They answer the same question in different words for the same row kind
+("Interactive shell rooted at X; use it for…" versus "Local shell rooted at
+X."), which is exactly the second encoding this project forbids. Editing either
+one compiles, passes its own tests, and changes nothing the user sees.
+
+⚠ **The trap is the shared NAME, not the duplication alone.** Grep, jump-to-
+definition and a memory of "the summary builder" all land on whichever one the
+tool reaches first, and the wrong one looks right — same signature shape, same
+match arms, same sentences to within a few words.
+
+⇒ Collapse to one owner. The birth-time write is the load-bearing copy; the
+shell-side fallback should call it rather than re-spell it.
+
+⛔ Whoever takes this must check what else reads the stored summary before
+changing its wording: it is persisted, so existing rows keep the old sentence
+until something rewrites them, and a test that asserts the new wording against
+a restored row will be red for reasons that have nothing to do with the change.
+
+## ⛔⛔ [6.6] REAL-KEY INPUT DELIVERS NOTHING ON THE GUI HOST, AND A RESTART WILL NOT FIX IT
+
+**Status:** OPEN
+
+*Measured by seat 3.6, relayed via 3.0 and 6.0. The build-age half was tested
+here 2026-08-14 and it REFUTES the leading hypothesis.*
+
+```
+web do type                       -> delivered:false, nothing lands
+web do fill --mechanism real-keys  -> delivered:false, nothing lands
+web do click                       -> delivered:true,  works
+```
+
+0/6 against two unrelated targets (a six-box OTP group, and a plain single input
+on a freshly reloaded page), so it is not a property of one component.
+
+**Ruled OUT by test — do not repeat these:** not `--selector-set` wedging the
+component (fresh nonce, pristine boxes, still 0/6); not activation
+(`server app open` first, still 0/6); not a missing lease (`web lease` returned
+`leased:true`, still 0/6).
+
+### ⛔ AND "IT IS PROBABLY A STALE BINARY" IS REFUTED — the code is unchanged
+
+The running GUI was build `5f76dcb0` (3.0.148) while `origin/main` was **224
+commits ahead**, so the staleness was real. It is not the cause:
+
+- **No commit in those 224 touches `real_keys` or `real-keys` anywhere in
+  `crates/`.** The three files that implement the mechanism
+  (`app_control.rs`, `app_control_web_cli.rs`, `shell.rs`) are unchanged on that
+  string; `shell.rs` has 8 commits in the window but none of them touch it.
+- ⭐ Re-run 2026-08-14 with the scope WIDENED to `vendor/`, where the injection
+  actually lives (`vendor/dioxus-desktop/src/web_surface.rs` — `inject_key`,
+  `synth_key`, the focus loan, the map plan). One commit in the window touches
+  `vendor/dioxus-desktop` at all and it is not that file. The original grep had
+  stopped at `crates/`, which does NOT contain the mechanism.
+
+### ⛔⛔ AND "SO DIAGNOSE IT AS CODE, IT IS LIVE IN MAIN" IS ALSO REFUTED — measured, six arms
+
+That was an inference from the staleness refutation, not a measurement, and the
+measurement disagrees. `scripts/web-real-keys-ab.sh` brings up a private
+sandbox GUI, gets a live web surface, and runs `do type` with `do click` as the
+**control on the same surface in the same run**. Every arm below answered
+`delivered:true` for BOTH verbs and read the typed value back:
+
+| # | build | machine | surface state |
+|---|---|---|---|
+| 1 | current `main` | build host | active, mapped |
+| 2 | current `main` | build host | hidden after being born visible (`visibilityState:hidden`, `mapped:false`) |
+| 3 | current `main` | build host | born headless (`engine_visible:false`), the same shape the failing surface had |
+| 4 | the OLD build the GUI was running | build host | active, mapped |
+| 5 | current `main` | **the GUI host itself**, private sandbox | active, mapped |
+| 6 | current `main` | build host, harness self-check | active, mapped |
+
+⇒ The mechanism is **not** broken in `main`, not broken in the older build, not
+broken by the hidden/headless states agents actually drive, and not broken on
+the GUI host's hardware, compositor or IM configuration. The IM guard was
+checked separately and had applied on the live GUI
+(`linux_im_module_policy` → `gtk-im-context-simple`, `im_already_set:false`),
+so the ibus route is not open there either.
+
+⚠ **What is therefore still open is narrower and harder:** the failure is
+conditional on the live GUI PROCESS or on the specific third-party page that
+was being driven — not on the code path, the build, or the machine.
+
+### ⛔ AND THE REPRODUCTION IS GONE — the process that carried it has been replaced
+
+Checked by identity rather than by version, 2026-08-14: the GUI now serving is
+a NEW process whose `/proc/<pid>/exe` is byte-identical to the installed
+binary (same md5), and both report 3.0.154. The window that produced the six
+failures was the older build recorded above, and it is no longer running.
+
+⇒ Only one of the two remaining candidates can still be tested — the page —
+and only if the same site is driven again. **A probe against the live GUI now
+would exercise the same configuration the six arms already cleared and prove
+nothing**, so this is NOT an owner gate and was deliberately not parked as one.
+
+⇒ **Status is therefore "open, not reproducible".** It stays here because
+`delivered:false` on a credential path is worth catching if it returns, and the
+harness makes that one command. ⛔ Do not re-derive the six arms; run
+`scripts/web-real-keys-ab.sh`, which reports its own control. ⛔ And do not
+cycle the owner's desktop for it — that was already shown not to answer the
+question, and now there is nothing on that desktop left to answer it with.
+
+### ⭐ WHY THIS OUTRANKS ONE BROKEN VERB
+
+`delivered:false` is the verb being HONEST, and that is luck rather than design.
+Every credential-injection path on that host routes through real keys, so any
+caller that reads `delivered` as advisory — or does not read it — types nothing
+into a payment field and reports success. There is a recorded instance of that
+exact shape elsewhere in the fleet, where a fill wrote a credential into a hidden
+decoy and its own length check passed.
+
+⇒ Whoever fixes the mechanism should also ask what would have happened had the
+verb lied, because the honest field is the only thing that made this visible.
+
+## ⚠ [6.6] THE `server` USAGE TEXT IS A THIRD COPY OF "WHICH VERBS EXIST", AND IT DRIFTED THE SAME WAY
+
+**Status:** OPEN
+
+*Found 2026-08-14 immediately after making three `server` verbs answer from both
+binaries: they worked, and the binary you typed them into still said they did
+not exist.*
+
+Each binary prints its own hand-maintained `server` usage block. Measured after
+the verbs were shared: **23 lines on one, 31 on the other**, for the same
+surface. **Five verbs that answer from both** (`daemons`, `write-lock`,
+`gate-screen`, `relay-boundary`, `wpe`) were listed by one binary only —
+including two that had *just* been moved specifically so both could serve them.
+
+⚠ **And the drift runs BOTH ways**, which is why "the GUI's help is behind" is
+the wrong summary: `write-lock` has answered from both binaries since the first
+round of this work and was missing from the HEADLESS block. A one-directional
+reading would have fixed one side and left the other, and then reported the
+surface as reconciled.
+
+⚠ **This is the same defect one layer up, and it is the more dangerous layer.**
+A missing dispatch fails loudly (`unsupported server command`). A missing usage
+LINE fails silently and teaches the wrong thing: the user reads the help, does
+not see the verb, and concludes it is not available here — which is exactly the
+belief the dispatch fix exists to remove. ⇒ A surface can be shared and still
+be undiscoverable.
+
+The six lines were added by hand so the fix is not self-contradicting, and that
+hand-add is the bug: **the next verb will drift again.** One owner should
+generate both texts, the way `app_control_cli` owns the `server app` help.
+
+⛔ Do not "fix" this by copying one block over the other. They are not identical
+by design — each names its own binary in every line — so the shared thing is the
+verb list, not the text.
+
+## ⚠ [6.6] ONE `server` VERB STILL ANSWERS FROM ONE BINARY ONLY — AND THE "REAL FORK" NEVER EXISTED
+
+**Status:** OPEN
+
+*Measured and mostly closed 2026-08-14, after collapsing `server app`. The last
+three verdicts were taken the same day and they overturned this entry's own
+premise.*
+
+`server <verb>` is dispatched in both binaries, and nine verbs answered from one
+only. This entry used to say the finding was that **`server` mixes planes** —
+deploy and relay machinery that is *genuinely* headless-only sitting beside
+daemon operations that are not — so a blanket ban would forbid a real fork.
+
+⛔⛔ **THAT PREMISE IS WITHDRAWN. THE FORK WAS THREE READINGS, AND ALL THREE WERE
+WRONG.** `gate-screen`, `relay-boundary` and `wpe` were the entire evidence for
+it. Read end to end, every one is accidental (below), and all three now answer
+from both binaries. **Eight of nine divergences measured, eight accidental, zero
+forks found.**
+
+⚠ **The per-verb rule still stands — but on its own merits, not on a
+counter-example.** Asking per verb is right because a fork *could* exist and a
+structural ban would forbid it silently. What nobody may do any more is cite a
+measured one, because there isn't one. ⇒ If the ninth verb also comes back
+accidental, the honest move is to reopen the wholesale question rather than keep
+a rule whose only justification has evaporated.
+
+⭐ **The transferable half: a READING is not a VERDICT, and this entry said so
+about itself and was still believed.** The three were filed as "reads as
+deploy/relay machinery … that is a reading of their callsites and usage text,
+**not a verdict**". Everything downstream — this entry's framing, and the shared
+module's own header — then quoted them as the established fork. **A caveat
+attached to a claim does not travel with it.**
+
+### ✅ CLOSED — five accidental divergences, fixed
+
+| verb | why it was accidental |
+|---|---|
+| `daemons` | the census reads a home dir and nothing else |
+| `write-lock` · `order` · `ledger` · `reorder` | each opens with `ensure_local_server_ready_for_cli` + `cli_server_endpoint` and then talks to the DAEMON over the local socket — no window in any of them |
+
+All five now have one owner (`yggterm_server::server_cli`, plus the census in
+`daemon.rs`) and answer from both binaries. Locked per verb by
+`both_binaries_answer_the_daemon_census` and
+`both_binaries_answer_the_daemon_socket_verbs`. Verified before/after against
+the shipped binary: `unsupported server command: order` becomes a dispatch.
+
+⭐ **And the helpers went with them.** `cli_server_endpoint` and
+`ensure_local_server_ready_for_cli` were byte-identical private copies in BOTH
+binaries. Sharing the verbs while leaving those in place would have made a
+THIRD copy — worse than the duplication being fixed — so the locals are gone and
+both binaries import the shared pair. The lock bans either growing one back.
+
+### ✅ CLOSED — the three that were the "real fork"
+
+| verb | the reading | what the body says |
+|---|---|---|
+| `wpe` | deploy/relay machinery, headless by design | opens with `ensure_local_server_ready_for_cli` + `cli_server_endpoint` and talks to the daemon — **the exact test that convicted the four above it** |
+| `gate-screen` | ditto | a read-only daemon query over the socket; no ensure, deliberately, for the same reason `terminal resize` has none |
+| `relay-boundary` | ditto | touches **no daemon at all** — reads and writes a host fact in a file under the home dir, which is the `daemons` census's own shape, and the census was closed as accidental |
+
+All three now answer from both binaries, and their bodies are GONE from the
+headless binary rather than merely also-dispatched — the lock checks for the
+copies, not just for the calls, because a binary that kept its inline block
+beside the new call would pass a call-only assertion while the two drifted.
+Before/after against the shipped binary: all three went from
+`unsupported server command: <verb>` to a real dispatch.
+
+⭐ **`relay-boundary` is the one that stung.** It exists so a relay session can
+declare its own hand-off — and the binary on an agent's `PATH` is `yggterm`,
+which was the one that could not answer it.
+
+### ⏳ STILL OPEN — one verb, and it is a size problem, not a verdict
+
+- **`connect`** (GUI-only) — ⭐ **READ END-TO-END, AND THE VERDICT IS
+  ACCIDENTAL.** It reads a snapshot and asks the daemon to place a row: no
+  window, no app-control round trip, no process spawn. The earlier note here
+  said it "may reasonably need the GUI" and that it "spawns" — both were guesses
+  from its name and from a grep that matched the word in a comment. It does
+  neither.
+  ⛔ **But it is NOT a bounded move, which is why it is still open.** Attempting
+  it showed `connect` drags a private cluster with it — `ConnectPlacement`,
+  `run_server_connect`, `run_server_connect_list`, plus
+  `connect_desired_order`, `connect_path_session_uuid`, `connect_scanned_metadata`,
+  `connect_session_is_active`, `connect_session_key_is_known`,
+  `connect_session_kind_for_path` and `parse_remote_scanned_connect_path`. That
+  is ~190 lines of verb over seven more helpers, against ~120 lines for the four
+  already moved. The attempt was reverted rather than half-landed.
+  ⇒ Whoever takes it should move the cluster as one commit, and should expect
+  the helper count, not the verb, to be the work.
+
+### ⚠ THE INSTRUMENT LIED FIRST, AND THE CONTROL CAUGHT IT
+
+The first extractor scanned only `args[1] == "verb"` and produced verb lists
+that **omitted `daemons` entirely** — that verb is dispatched as
+`args.get(1).is_some_and(...)`. A live observation of `daemons` happened to be
+in hand as a control; without it a confidently wrong inventory would have been
+published. ⇒ **Validate a source scanner against a case whose answer you already
+know.** That enumerating this dispatch needs four different spellings is itself
+evidence for the entry.
+
 ## ⚠ [6.6] A PROCESS-GLOBAL ENV WRITE MAKES THE LAUNCH-COMMAND TESTS FLAKY IN PARALLEL
 
 **Status:** OPEN
@@ -1418,10 +2050,28 @@ which is exactly what he reported, with the frozen content being whichever rail
 was painted last. **It is the same discriminator as the 2026-08-08 sighting and
 the blank body: the model advances, the subtree does not.**
 
-⭐ **And it refines the damage.** His rail is NOT blank right now — it is
-populated and frozen, so this is a LATER truncation point than the placeholder
-case above, on a GUI carrying two faults. ⇒ The repair below has a live target
-today, and a repair that only handles a placeholder body would not cure this one.
+⭐ **And it refined the damage:** his rail was not blank, it was populated and
+frozen — a LATER truncation point than the placeholder case above, on a GUI
+carrying two faults. A repair that only handles a placeholder body would not have
+cured it.
+
+### ✅ THAT GUI IS CURED, AND THE CURE CONFIRMS THE MODEL — 2026-08-14 11:27
+
+**The window turned over on its own** (verified by IDENTITY, not version: the
+process's `/proc/<pid>/exe` md5sums byte-identical to the installed binary).
+Re-measured on the new process with the same bracketed instrument:
+
+```
+before the relaunch  webview_edit_faults: 2   model says one rail, glass shows another
+after  the relaunch  webview_edit_faults: 0   model and glass AGREE, rail fully painted
+```
+
+⇒ **The divergence is bounded by the GUI PROCESS**, which this entry asserted
+from a sandbox and which has now been seen on the machine that had the damage.
+⛔ It does not close anything: recurrence was already fixed, and **the open work
+is still REPAIR** — a resync for the next GUI that takes a fault, since the only
+cure available today remains killing the page. There is simply no damaged
+surface to test a repair against at this moment.
 
 ⚠ **`rendered_mode` is not a report about the screen.** It names the mode the
 host believes it rendered; on a diverged webview it is confidently wrong, and it
@@ -1996,98 +2646,6 @@ output says "silent 5 s" — so a reader wired to either field alone cannot pass
 ⇒ **Still open:** the SIDEBAR. A wedged row still renders `idle · Ready`, so the
 human remains the only detector of the state the daemon can now see. That is the
 next wiring, and `input_unanswered_ms()` is already there to read.
-
-## ⛔⛔ [6.8] THE YEDIT DOCUMENT SURFACE PAINTS GARBAGE WHILE ITS MODEL HOLDS 34 CHARACTERS
-
-**Status:** OPEN
-
-*Owner-reported 2026-08-14 with two screenshots, on a FRESH GUI at 3.0.154 — so it
-is **not** the stale-binary defect fixed the same morning.*
-
-**The Document view of a `New Yedit` row renders a screenful of corrupted glyph
-clusters** -- dense mojibake laid out in terminal-like rows across the top of the
-canvas -- while the surface's own status bar reads:
-
-```
-7 words · 4 lines · 34 chars
-```
-
-⇒ **The model is tiny and the RENDER is garbage.** Whatever is being painted is not
-the document.
-
-### ⭐ The discriminating evidence, and it is already in hand
-
-- **The Terminal view of the SAME row is clean.** It shows the launch cleanly:
-  `yedit: document surface opened` preceded by a secrets-fetch failure the app
-  emits at startup. So the row, the PTY and the terminal renderer are all fine.
-- ⇒ **The corruption is confined to the Document surface**, and the layout of the
-  garbage is terminal-shaped -- cells, not prose.
-
-### Falsifier / where to start
-
-1. Open a document surface on a scratch row and capture a **faithful** frame
-   (`capture_faithful: true`, backend `xterm_canvas_composite_over_dom`). ⛔ A
-   `faithful:false` frame is canvas-blind and cannot settle this.
-2. ⚠ **Suspect the compositing path before the text path.** The screenshot backend
-   composites the xterm canvas with the DOM; a Document view should not be painting
-   terminal cells at all, and what is on screen looks like exactly that -- a cell
-   grid full of uninitialised or mis-decoded content.
-3. Check whether the status-bar counts and the painted content come from the same
-   buffer. They disagree by three orders of magnitude, so at least one of them is
-   reading something it does not own.
-
-⚠ **The owner also reports a recurring dropped-glyph issue alongside this.** Do not
-assume the two are one defect: dropped glyphs were also visible on the stale
-12-hour GUI and improved when it was retired, so there may be a render-path bug
-that the stale binary made worse rather than caused.
-
-## ⛔⛔ [6.7] APP ROWS ARE BORN `keep_alive: false`, SO A GUI RESTART DESTROYS THE USER'S OWN GROUP
-
-**Status:** OPEN
-
-*Owner-hit 2026-08-14. He lost a row group he had built -- one `New Yedit` header and
-four `New Ychrome` rows -- to a GUI restart, and reported it in those words: "a row
-group of mine is gone ... I cannot see it after the restart".*
-
-**The rows were `kind: shell`, `keep_alive: false`.** Second-class rows die with the
-GUI by design, and that design is correct for a scratch shell. It is wrong for a row
-the user **deliberately created from an app verb** and arranged into a group: from his
-side there is nothing "scratch" about it, and nothing in the UI says it is disposable.
-
-```
-"title": "New Ychrome", "kind": "shell", "keep_alive": false, "cwd": "/home/user"
-```
-
-⛔ **THE CONSTITUTION SAYS THE OPPOSITE IN AS MANY WORDS:** *"Plain shells are
-first-class and must survive a bump like anything else."* These did not.
-
-⚠ **It is not recorded as a removal either.** `removed-rows.json` has no entry for
-them, so nothing distinguishes "the user closed this" from "this evaporated" -- and
-`sessions restore` answers `not_found`, because the ids are gone from the GUI's live
-set even though `server-state.json` still lists them under `live_sessions`. **Two
-stores disagree about whether the row exists**, which is its own defect.
-
-### What is NOT lost, and what is
-
-- ✅ **Profile data is safe.** Each row was a shell running `ychrome`; the profile
-  directories persist on disk. Nothing the user had stored was destroyed.
-- ⛔ **Which profiles were open is NOT recoverable** from state: the persisted record
-  carries `title`, `kind`, `cwd` and `ssh_target` and **no app arguments**, so a
-  restore cannot reconstruct which profile each row held.
-
-### Falsifier / where to start
-
-1. `server app launch-app ychrome new`, then read the row back out of
-   `~/.yggterm/server-state.json` -- it must not be born `keep_alive: false`.
-2. There is **no CLI verb to set keep-alive on an existing row** (`--keep-alive` is
-   documented only as unnecessary for agent-CLI kinds, which are born keep-alive).
-   A user who wants to protect a row they already have cannot.
-3. The persisted record needs to carry the app **verb and args**, or a restore can
-   only ever produce a blank instance of the app.
-
-⇒ **Three separable fixes, and the first is the one the owner felt:** rows created
-from an app verb are born keep-alive; a keep-alive toggle exists for any row; and the
-stored record round-trips the launch arguments.
 
 ## ⛔⛔ [6.7] THE GUI IS BURNING A WHOLE CORE, AND IT IS USER-TIME, NOT SYSCALLS
 
@@ -3102,76 +3660,6 @@ host's name and reporting success.
 **Falsifier:** a deploy run on a host whose alias does not resolve there writes
 that host's four copies, or refuses in a way no reader can mistake for success.
 
-## ⛔⛔ [6.3] yedit's VIEWPORT PAINTS NOTHING WHILE ITS FILE RAIL IS FULL
-
-**Status:** OPEN
-
-*reported 2026-08-13 with a screenshot*
-
-The document area is solid black. The right rail beside it is fully populated —
-the Markdown/Split/Text toggle, the regex search box, and a FILES list of ~28
-named documents, one of them selected and highlighted. The status bar under the
-empty viewport reads a real measurement: **8570 words · 457 lines · 61018
-chars**.
-
-⇒ **The document is loaded and measured; only the paint is missing.** This is
-the metadata-vouches-for-clipped-content shape: every instrument around the
-viewport reports success, and the viewport is empty.
-
-**Cost:** this is why the report that produced this batch was composed in an
-external editor rather than in yedit.
-
-**Falsifier:** a viewport reporting a non-zero line and character count must
-paint at least one glyph. If it cannot, it must say so rather than render black.
-
-⭐⭐ **A CHEAP, DETERMINISTIC REPRO — 2026-08-13, deploy-identity cluster.** The
-original sighting needed a 61,018-character document, which makes every check
-expensive and every difference arguable. The same state reproduces with a
-**152-character** file authored for the purpose, in four commands, provided the
-shell is ON THE GUI HOST (see the loopback entry below — a surface driven from
-another machine reads a daemon that does not exist there, which is what made
-this look unreproducible):
-
-```sh
-# on the GUI host
-printf '# probe\n\nOne paragraph.\n\n- a\n- b\n' > /tmp/<probe>.md
-yggterm server app terminal new --kind shell --cwd /tmp --purpose '<why>' --pid $GUI
-yggterm server app terminal send <row> --data 'yedit /tmp/<probe>.md' --pid $GUI
-# then a LONE carriage return — the text alone sits at the prompt unsubmitted
-yggterm server terminal write <row> --data "$(printf '\r')"
-```
-
-Measured result: the FILES rail fills, the probe appears **selected and
-highlighted**, and the status bar reads **30 words · 10 lines · 152 chars** —
-the file's true measurement. So the loading half is sound and the discrepancy is
-downstream of it, on a document small enough to hold in the head.
-
-⚠ **A clean document-VIEW frame is still owed** and was not taken here: another
-lane held a modal over the viewport at capture time, and closing another
-session's dialog mid-flight is not a thing to do for a screenshot. One
-`server app open <row> --view preview --pid $GUI` plus one screenshot completes
-it from the state above.
-
-⭐ **THE APP PLANE ITSELF PAINTS ON THE REAL GUI — measured 2026-08-13 by the
-deploy-identity cluster at 3.0.133, on the desktop host, faithful frame.** A
-freshly launched yedit surface rendered its whole rail: the toolbar icons, the
-regex search field, the Markdown/Split/Text toggle, the FILES heading with its
-`+` control, the empty-state line, and the Wrap control. ⇒ **Whatever is wrong
-here is not "a document surface cannot render on a real GUI"**, which is worth
-knowing before anyone spends a session on the widget layer.
-
-⚠ **AND THE LOADED STATE COULD NOT BE REACHED, for a reason that turned out to
-be neither the CLI nor the paint** (own entry below): the shell driving that
-surface was on a different machine from the GUI, and a surface declares a
-**loopback** control URL — so the GUI resolved it on its own host, found nothing
-listening, and rendered *No files open* with every widget healthy. The file had
-been stored correctly the whole time, in the other host's daemon.
-
-⇒ So this sighting says nothing about the black viewport: an EMPTY rail pointed
-at the wrong daemon is a different state from the full rail above. **Recorded
-so the next reader does not mistake it for one**, and because the first version
-of that entry blamed the CLI for dropping the path, which it does not do.
-
 ## ⛔⛔ A DOCUMENT SURFACE DECLARES A LOOPBACK URL, SO A CROSS-MACHINE SURFACE RENDERS EMPTY AND HEALTHY
 
 **Status:** OPEN
@@ -3227,6 +3715,54 @@ healthy widgets is not.
 
 **Falsifier:** a surface declared from a shell on another machine either shows
 that machine's open documents, or names the endpoint it failed to reach.
+
+### ⛔⛔ THE STATED CAUSE WAS ALREADY HANDLED NINETEEN DAYS BEFORE THIS WAS
+### MEASURED — so the diagnosis above is wrong a second time
+
+*added 2026-08-14 by the lane that root-caused the document body. Not closed —
+sharpened. ⚠ Read this before spending a session on "the declare should carry a
+host", which is the fix this entry currently implies and which would be building
+a second mechanism beside a working one.*
+
+**A forward already exists, and its own comment names this exact problem.**
+`resolve_control_endpoint_url` is called on every declare that CREATES a
+contribution, and it does the right thing:
+
+```rust
+// The GUI fetches this endpoint over a plain socket, so a remote
+// loopback needs an `ssh -L` forward — NOT the webview's SOCKS proxy.
+```
+
+⇒ It rewrites `http://127.0.0.1:<remote-port>` to `http://127.0.0.1:<local-port>`
+over an `ssh -L` child. **It landed 2026-07-25; this defect was measured
+2026-08-13.** The mechanism was in the binary the whole time the surface rendered
+empty, so **"the declare carries a loopback with no host" cannot be the cause** —
+something is skipping the forward, not missing it.
+
+**Where to look, and it is one line:**
+
+```rust
+let Some(target) = ssh_target.filter(|t| !ssh_target_host_is_loopback(t)) else {
+    return (url.to_string(), None);          // ⇐ no forward, silently
+};
+```
+
+⇒ **With `ssh_target: None` the forward is skipped and the declared loopback is
+kept verbatim** — which produces precisely the reported state: the GUI resolves
+`127.0.0.1:<remote-port>` on its own machine, finds nothing, and renders a
+healthy empty surface. The question this entry should be asking is **why
+`ssh_target` was `None` for that row**, not why the declare had no host in it.
+
+**Falsifier, replacing the one above:** reproduce the empty surface and read the
+declare's own trace — `ui/sidebar_contribution/declare` carries `control`, and
+the resolution logs `forwarded`. `forwarded: false` on a row whose PTY is on
+another machine is the defect, and it localises it to the caller that supplies
+`ssh_target` rather than to the app, the declare format or the GUI's fetch.
+
+⚠ **Not re-measured live.** This is a code fact plus a date, which is enough to
+retire the wrong direction and not enough to close the entry. ⛔ Whoever takes it
+must still run the falsifier — see the sibling entry closed the same day, where
+two published attributions were both overturned by one A/B.
 
 ## ⛔ [6.3] ychrome's VAULT AND SETTINGS RAILS SAY "Loading…" FOREVER
 
@@ -3399,6 +3935,34 @@ tests cover the selection (self excluded, non-daemon sockets ignored, stable
 order) and both structural rules, and both structural tests were confirmed
 FAILING against the pre-fix shape.
 
+### ⭐ THE PRE-FIX BASELINE, MEASURED ON THE BUILD HOST — and it separates perfectly
+
+Taken read-only from the build host's own daemon, 2026-08-14, 272 live rows:
+
+| `working` | has a local pid | `launch_phase` | rows |
+|---|---|---|---|
+| **`None`** | **no** | **`RemoteBootstrap`** | **215** |
+| `false` | no | `Running` | 20 |
+| `true` | yes | `Running` | 17 |
+| `true` | no | `Running` | 11 |
+| `false` | yes | `Running` | 9 |
+
+**79% of live rows have no working answer at all, and the split is exact:**
+every one of the 215 unknowns is a row this daemon does not own, and **not a
+single row with a local pid is unknown**. So the dot is not failing to read a
+screen — it is never being told there is a screen to read.
+
+⭐ **The 31 rows answered WITHOUT a local pid are the proxy already working**, for
+the rows whose owner happens to be in the preserved-owner registry. That is the
+number that makes the gap precise rather than rhetorical: **26 answered locally,
+31 answered by proxy, 215 not asked about at all.** Discovery's whole job is that
+last column, and this is what an after-measurement must be compared against.
+
+⚠ Both figures are one instant on one host. The GUI host's own earlier sample was
+21 of 31 unknown; this host is larger and worse. **Compare like with like** — a
+count taken on a different host, or with a different live-row population, is not
+this baseline moving.
+
 ⛔ **None of that is the defect's own falsifier, which is why this is still
 OPEN.** What is proven is that the mechanism exists and cannot recurse. What is
 NOT proven is the number this entry is actually about: whether the 21-of-31 rows
@@ -3524,63 +4088,6 @@ screen last looked like**.
 ⇒ The thumbnail is the point: it is what makes the surface lively rather than a
 list of hostnames, and it answers "which machine was I on" the way the eye
 answers it.
-
-## ⛔⛔ [6.5] A DOCUMENT SURFACE'S BODY DOES NOT PAINT, AND ITS CONTRACT SAYS TWO DIFFERENT THINGS
-
-**Status:** OPEN
-
-*measured 2026-08-13 on a real GUI (an isolated sandbox, not the owner's)*
-
-Reported symptom: an app's viewport pane renders its top bar and leaves the body
-blank, while every telemetry field reads healthy — `has_schema: true`,
-`stale: false`, `error: null`. Two lanes have now spent time on it. It has been
-attributed to the read-only shadow client; **it is not the shadow.**
-
-**Half of it is a contract that disagrees with itself, and that half is
-actionable now.** yggterm's own deserialiser says:
-
-> Chrome widgets (tabs, buttons, toggles, labels) form a top bar; `markdown` and
-> multiline `text-input` widgets are the scrolling body.
-
-`.agents/skills/libyggterm-surfaces/SKILL.md` says multiline `text-input` **and
-`list-row`** "render at document scale". ⇒ **`list-row` is chrome in a viewport
-pane.** An app that believes the prose declares a list of rows as its document
-body, gets a blank page, and has no way to find out why — nothing failed. The
-host is the SSOT; the prose is wrong and should be corrected.
-
-**The other half is a real defect and is NOT explained by the above.** With the
-rows replaced by a `markdown` widget the body is *still* blank:
-
-| what was checked | result |
-|---|---|
-| the schema actually served | `markdown` widget, `id` + `source`, **928 chars** of real content over HTTP |
-| the same schema in the RAIL, same app, same minute | renders **completely** — cards, sections, status dots, rows, tabs, search box, footer |
-| the field names | `section.text`, `tabs.active`, `markdown.source` — all matched against the host's enum |
-| "the refetch is racing the re-stamp" | **falsified** — same blank with the app re-stamping every 120 s |
-
-⇒ The same-app rail control is what separates this from an app bug: the schema
-is good, and the viewport placement is not painting a widget it says it paints.
-
-⛔ **NOT the lost-edit-batch class — checked 2026-08-14, and the check is now one
-field.** The [6.3] entry root-causes a different "renders nothing while state
-reports it correctly": a webview edit batch that throws is acked as applied, so
-the host never re-sends it and that subtree freezes for the life of the process.
-**Two of this entry's own measurements rule it out.** A frozen subtree is frozen
-because ITS mutations were lost — it cannot render the identical schema
-completely in the rail in the same minute; and the class requires a fault to have
-already happened, whereas this reproduces on demand. ⇒ **Read
-`webview_edit_faults` in `server app state` when you next reproduce it.** Zero
-confirms this is a real render-path defect in the viewport placement, and closes
-the question for good; non-zero would mean the opposite and this entry folds into
-[6.3]. ⚠ Stated as reasoning plus an instrument, NOT as a run: 6.3 has the
-fault-injection harness but no way to declare a document surface, which needs
-this lane's app.
-
-⚠ **Falsifier, not yet run:** drive the shipped pilot editor through the
-identical path in the same sandbox and confirm ITS markdown body paints. That
-attempt stalled on the editor's own daemon (`Loading…` in the rail, control
-endpoint never answered) and was not retried. If its body is blank too, this is
-the document-surface body path for every app, not one widget.
 
 ## ⚠ [6.5] THE APP SCAFFOLDING HAS THREE HAND-COPIES AND ONE OF THEM FAILED SILENTLY
 
@@ -5101,6 +5608,36 @@ on a branch with **no** upstream is still worth fixing), and the corrected text 
 `lane/dev/6.7-resource` (`87394d0a`, *"the guard defect is real, 'every lane push fails' is
 not"*), which is unmerged pending the release. **That lane's version supersedes this entry
 on merge.** Until then: do not treat this as a reason not to push.
+
+### ⛔ A SECOND RESIDUAL, MEASURED 2026-08-14 — A BRANCH **WITH** AN UPSTREAM THAT IS BEHIND `main`
+
+⚠ Added as a new instance, not a rewrite of the text above; the supersession from 6.7's
+lane still applies to everything before this heading.
+
+The range is derived from the remote ref of the branch being pushed. For a lane whose
+remote tip is behind `main`, that range therefore contains **every commit `main` gained
+since the lane was last pushed** — including other lanes' commits. So:
+
+- another lane added a personal home path in `docs/pending-bugs.md` and **a later commit on
+  `main` removed it again**;
+- both are already public on `main`;
+- the tree being pushed does not contain it, and `scripts/check-privacy.sh` passes on it;
+- and the lane push is refused anyway, because an added line inside the range is still an
+  added line. ⇒ **An already-remediated leak blocks every later lane push, for everyone.**
+
+⛔ **It is self-perpetuating**: the push that would advance the lane ref is the one being
+refused, so the lane can never catch up on its own.
+
+⭐ **THE WORKAROUND THAT NEEDS NO OVERRIDE, AND IT IS ORDERING, NOT A BYPASS.** Push
+`HEAD:main` **first**, then the lane. `main`'s range is only the lane's own work, so it
+scans the right thing and passes; the content published is byte-identical either way. Only
+the question the guard is asked changes. Landing this way is what got 16 commits onto
+`main` after four refusals.
+
+⇒ The fix is for the guard to scan the **resulting tree**, or to exclude commits already
+reachable from another remote ref, rather than every added line in a range it did not
+author. ⛔ `YGG_PRIVACY_ALLOW=1` is NOT the answer here even though it would work: the
+whole point of this shape is that it teaches the override to people whose tree is clean.
 
 *found 2026-08-13 while pushing a lane branch; affects every cluster in this batch*
 
@@ -6994,6 +7531,47 @@ a width table. This also means the 3.0.105/106 atlas work has NOT closed the
 family — prevention on the rAF-gap edge is not catching every route to a stale
 atlas, and the next investigation should start from which route this frame took,
 not from whether the atlas is the mechanism.
+
+### ⭐ A SIGHTING THAT RECOVERED WITH NOTHING TOUCHED, BOUNDED AT 24 SECONDS
+
+*Added 2026-08-14 by the lane that root-caused the document-surface mount
+failure. Contributed here rather than filed separately: this entry already owns
+the question, and a second copy is how a queue rots.*
+
+**Two frames of the SAME row, 24 seconds apart, on the GUI host.** The first is
+the full-amplitude form — the whole viewport a cell-aligned substitution garble.
+The second is legible, and it carries the **identical line count, the identical
+wrap points and the identical trailing block cursor**, which is what proves the
+two frames show one screen and not two.
+
+⇒ **Between them: no scroll, no keystroke, no remount, no resize, nothing sent
+to that row.** The recovery was spontaneous.
+
+⛔ **That contradicts this entry's own title, and the title is the part to
+distrust.** "Clear on scroll" was the reported remedy, and a remedy is not a
+mechanism — scrolling forces a full repaint, so it *reveals* recovery rather
+than causing it. Something else already re-rasterizes on its own within seconds.
+**Whoever picks this up should find what that is before adding another
+repair path** — a heal that races an existing spontaneous recovery is precisely
+how the 3.0.106 regression above was manufactured.
+
+**The mild and full forms were both present on one host in one morning**, which
+is independent support for this entry's claim that they are one mechanism at
+different atlas-staleness depths, from a day nobody was testing for it.
+
+⚠ **AND THE CONFOUND, STATED RATHER THAN RESOLVED, BECAUSE IT CANNOT BE
+RESOLVED FROM THESE FRAMES.** That morning the host also carried a twelve-hour
+`(deleted)` GUI process alongside a current one (`docs/deploy-spec.md` §2, which
+attributes dropped glyphs to exactly that). **Nothing in these frames says which
+process painted them.** So they establish the *shape* of the fault and the
+spontaneous recovery, and they establish nothing about uptime as a cause.
+⇒ **Re-sight it on a host proven to be running exactly ONE GUI instance** before
+drawing any conclusion about age or eviction pressure.
+
+⛔ **Do not fold this into the document-surface defect it was reported beside.**
+That one was a dead edit batch and is fixed; this fires on an ordinary terminal
+view with no app surface involved, and merging them would bury a live render bug
+inside a closed entry.
 
 ## ⛔⛔ 3.0.106 CAUSED A SECOND RENDER BUG, AND THE HONEST TRACE IS WHAT CAUGHT IT
 

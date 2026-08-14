@@ -470,14 +470,60 @@ def cmd_subscribe(a):
             log(f"⛔ --escalate-to '{escalate_to}' is SHORT and matches "
                 f"{len(hits)} subscriptions — storing it verbatim, but pass the FULL "
                 f"uuid: a stub cannot be told from a good pointer on the board.")
+    # ⛔⛔ THE SAME ROT, THE OTHER CLASS: a WELL-FORMED pointer at a seat that has
+    # since been relieved. The block above catches a uuid that is the wrong
+    # SHAPE; this catches one that is the right shape and the wrong ERA. A brief
+    # is frozen at the moment it is written, orchestrators turn over several
+    # times a day, and every successor inherits the predecessor's uuid in prose.
+    # `succeed` re-points rows that were subscribed AT the handover — it cannot
+    # reach a row that subscribes afterwards quoting the old brief, which is
+    # exactly when this fires.
+    # ⇒ Measured 2026-08-14: THREE briefs in one afternoon named a retired
+    #   orchestrator, and one of them armed a fresh lane whose every escalation
+    #   would have rung into an empty room. Nothing on the board shows it: a
+    #   dead pointer and a live one render identically.
+    # ⚖ Resolve only when it is UNAMBIGUOUS — the same rule the prefix branch
+    #   above follows. One live orchestrator for the campaign is a fact; two is
+    #   a question, and guessing between them would deliver alarms to the wrong
+    #   seat, which is worse than saying so.
+    if escalate_to and len(escalate_to) == 36 and not sub_path(escalate_to).exists():
+        live = []
+        for p in SUBS.glob("*.json"):
+            try:
+                s = json.loads(p.read_text())
+            except Exception:
+                continue
+            if s.get("role") == "orchestrator" and (
+                    not a.campaign or s.get("campaign") == a.campaign):
+                live.append((p.stem, s.get("seat") or "-"))
+        if len(live) == 1:
+            log(f"⚠ --escalate-to {escalate_to[:8]} names a seat that is NO LONGER "
+                f"SUBSCRIBED — it has been relieved since your brief was written. "
+                f"Resolved to the one live orchestrator for this campaign: "
+                f"{live[0][0]} (seat {live[0][1]}).")
+            escalate_to = live[0][0]
+        else:
+            log(f"⛔⛔ --escalate-to {escalate_to[:8]} names a seat that is NO LONGER "
+                f"SUBSCRIBED, and {len(live)} live orchestrators could be meant, so "
+                f"this is NOT being guessed. Storing it verbatim — but every "
+                f"escalation from this row will ring into an empty room until it is "
+                f"corrected. Live orchestrators: "
+                f"{', '.join(f'{u[:8]}(seat {st})' for u, st in live) or 'none'}. "
+                f"Fix with: ygg-monitor.py succeed --from {escalate_to} --to <uuid>")
     rec = {"uuid": uuid, "host": a.machine, "role": a.role,
            "escalate_to": escalate_to or a.escalate_to, "escalate_host": a.escalate_host,
            "campaign": a.campaign, "seat": a.seat,
            "owner_pinned": False, "booter": True,
            "intent": a.intent, "since": int(time.time())}
     sub_path(uuid).write_text(json.dumps(rec, indent=1))
+    # ⛔ REPORT THE EFFECT, NOT THE REQUEST. This read `a.escalate_to` — the value
+    # the CALLER passed — so a pointer that had just been resolved (from a prefix,
+    # or from a retired seat) was still announced as the old one. The record on
+    # disk and the line on screen disagreed, and the line is the one a human
+    # reads back to confirm the subscription. Same field-class as the row verbs.
+    stored = rec["escalate_to"]
     log(f"subscribed {uuid[:8]} as {a.role}"
-        + (f", escalating to {a.escalate_to[:8]}" if a.escalate_to else ", escalating to a human"))
+        + (f", escalating to {stored[:8]}" if stored else ", escalating to a human"))
     if a.role == "orchestrator" and not a.no_booter_reminder:
         log("⛔ AN ORCHESTRATOR MUST ALSO SUBSCRIBE TO THE BOOTER — it is the net that")
         log("   catches this plane itself. Run: ygg-booter.py subscribe")

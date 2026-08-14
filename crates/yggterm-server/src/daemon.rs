@@ -7253,7 +7253,11 @@ impl DaemonRuntime {
         // npm-provisionable CLI it kicks the background install this refusal then
         // tells the user to wait for.
         if let Some(refusal) = self.server.local_agent_cli_launch_refusal_for_path(path) {
-            self.server.record_launch_refusal_for_path(path, &refusal);
+            self.server.record_launch_refusal_for_path(
+                path,
+                &refusal,
+                "CLI binary not installed",
+            );
             if let Ok(home) = crate::resolve_yggterm_home() {
                 append_trace_event(
                     &home,
@@ -7268,6 +7272,30 @@ impl DaemonRuntime {
             }
             let _ = self.persist_state_only();
             bail!("{refusal}");
+        }
+        // ⛔ NOT a refusal, on the same funnel. A local launch into a directory
+        // that does not exist here still STARTS — `best_effort_cwd_shell_prefix`
+        // walks up to an existing ancestor and falls back to `$HOME` on purpose,
+        // so the CLI runs, just somewhere else. The defect was never that it
+        // failed; it was that the row went on naming a directory the process had
+        // never been in, and nothing anywhere said otherwise. Mark it and let
+        // the launch proceed.
+        if let Some(requested) = self.server.local_launch_cwd_fallback_for_path(path) {
+            self.server
+                .record_launch_cwd_fallback_for_path(path, &requested);
+            if let Ok(home) = crate::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "daemon",
+                    "terminal_ensure",
+                    "launch_cwd_missing_here",
+                    serde_json::json!({
+                        "path": path,
+                        "requested_cwd": requested,
+                    }),
+                );
+            }
+            let _ = self.persist_state_only();
         }
         if path.starts_with("remote-session://")
             && let Ok(home) = crate::resolve_yggterm_home()
@@ -8007,7 +8035,81 @@ impl DaemonRuntime {
     /// Remember that the user closed the row currently listed for `path`, so no
     /// peer daemon can hand it back. Call BEFORE the removal — the identity is
     /// read out of the live order, which the removal empties.
+    ///
+    /// It also writes the DEPARTURE record (`spec-app-row-survival.md` §3). Both
+    /// here, because both are read out of the live order the removal is about to
+    /// empty, and a record written after the fact would have nothing to name.
+    /// Write down that a row left the live set, and WHY.
+    ///
+    /// ⛔ THE DEFECT (`docs/spec-app-row-survival.md` §3). A group of app rows
+    /// evaporated on a GUI restart and `removed-rows.json` had no entry for any
+    /// of them — so nothing in the system could tell *"the user closed this"*
+    /// from *"this went on its own"*, and the loss was undiagnosable rather than
+    /// merely annoying. **An absence is not a record.** The row's own store said
+    /// it was live, the GUI's live set disagreed, and neither of them said what
+    /// had happened, because nothing had written it down.
+    ///
+    /// ⚠ Call BEFORE the removal. The identity and the title are read out of the
+    /// live order, which the removal empties — a recorder that runs afterwards
+    /// finds nothing to name and silently writes nothing, which is precisely the
+    /// failure it was added to end.
+    ///
+    /// Best-effort by design: a row leaving is not something to abort, so a
+    /// ledger write that fails is traced and the close proceeds.
+    fn record_row_departure(
+        &mut self,
+        path: &str,
+        reason: crate::live_row_tombstones::RowDeparture,
+    ) {
+        let Some(key) = self.server.live_session_row_key(path) else {
+            return;
+        };
+        let identity = crate::normalized_live_row_identity(&key);
+        let title = self
+            .server
+            .resolve_live_session_entry(&key)
+            .map(|(_resolved, session)| session.title)
+            .unwrap_or_default();
+        let departure = crate::live_row_tombstones::LiveRowDeparture {
+            identity: identity.clone(),
+            path: key.clone(),
+            title: title.clone(),
+            reason,
+            at: crate::live_row_tombstones::now_secs(),
+            // A close has no sub-cause: it was closed. Inventing one would make
+            // the field lie for the two reasons that do not have one.
+            detail: None,
+        };
+        let home = self.store.home_dir().to_path_buf();
+        match self.live_row_tombstones.record_departure(&home, departure) {
+            Ok(_) => append_trace_event(
+                &home,
+                "daemon",
+                "session",
+                "live_session_row_departed",
+                serde_json::json!({
+                    "path": key,
+                    "identity": identity,
+                    "title": title,
+                    "reason": reason.label(),
+                }),
+            ),
+            Err(error) => append_trace_event(
+                &home,
+                "daemon",
+                "session",
+                "live_session_row_departure_record_failed",
+                serde_json::json!({
+                    "path": key,
+                    "reason": reason.label(),
+                    "error": error.to_string(),
+                }),
+            ),
+        }
+    }
+
     fn tombstone_live_row(&mut self, path: &str) {
+        self.record_row_departure(path, crate::live_row_tombstones::RowDeparture::ExplicitClose);
         let Some(identity) = self
             .server
             .live_session_row_key(path)
@@ -8321,6 +8423,23 @@ impl DaemonRuntime {
                         Ok(false) => {}
                         Err(error) => errors.push(format!("{path}: {error}")),
                     }
+                    // ⛔ THE EVAPORATION, WRITTEN DOWN — and this is the one site
+                    // that had no record at all. Nobody named these rows; they
+                    // are taken for a property they have, so the user has no act
+                    // of their own to remember and nothing else in the system
+                    // says they went. That is why a group of app rows could
+                    // simply cease to exist here and leave `removed-rows.json`
+                    // empty (`spec-app-row-survival.md` §3).
+                    //
+                    // BEFORE the removal, like every other identity read here:
+                    // the live order is where the row's identity and title live,
+                    // and the next line empties it. NOT a tombstone — a veto
+                    // would stop a peer daemon offering the row back, and this
+                    // close does not carry the user's authority to forbid that.
+                    self.record_row_departure(
+                        &path,
+                        crate::live_row_tombstones::RowDeparture::GuiCloseDisposable,
+                    );
                     match self.server.remove_live_session(&path) {
                         Ok(true) => metadata_removed += 1,
                         Ok(false) => {}
@@ -10979,6 +11098,13 @@ fn collect_live_cc_title_syncs(
         // resumed one with `--resume <uuid>`, so this id-keyed lookup finds the
         // JSONL on the very first turn. (A bare `claude` would mint its own uuid
         // → this lookup fails → stuck launch hint; live-caught drift 2026-07-01.)
+        //
+        // ⛔ The `continue` here is CORRECT for a title poll and is not the
+        // swallow: this loop's job is titles, and a row with no transcript has
+        // no title to read. The hint the comment names now has a home of its
+        // own — `collect_stuck_launch_faults` — so the signal is reported by
+        // the code that wants it instead of being discarded by the code that
+        // does not.
         let Some(jsonl) = local_cc_session_jsonl_path(&session.id) else {
             continue;
         };
@@ -11008,6 +11134,44 @@ fn collect_live_cc_title_syncs(
         }
     }
     updates
+}
+
+/// Local Claude Code rows that are MID-TURN and yet have no transcript of
+/// their own — the "stuck launch hint" `collect_live_cc_title_syncs` names in
+/// its comment and, being a title poll, correctly has nothing to do with.
+///
+/// ⭐ WHY THIS IS SOUND, AND WHY THE OBVIOUS VERSION IS NOT. The row id IS the
+/// transcript id from birth (`id_assigned_at_birth`, `agent_cli.rs`), and the
+/// lookup scans every project directory, so it is independent of which
+/// directory the CLI actually ran in. A missing transcript therefore means the
+/// process in this row is not the session the row claims to be — a bare
+/// `claude` that minted its own uuid, or something else entirely.
+///
+/// ⛔ It is keyed on MID-TURN, never on "recently active". A session that has
+/// only just started is recently active and has no transcript yet, because CC
+/// writes the file on its first turn — so the looser signal would flag every
+/// healthy launch for the first seconds of its life, which is how a detector
+/// earns the reputation that gets it switched off. An agent that is mid-turn
+/// has by definition had a turn.
+///
+/// Pure over its two inputs so the boundary above can be tested without a
+/// daemon, a PTY or a home directory.
+fn collect_stuck_launch_faults(
+    live_sessions: &[ManagedSessionView],
+    mid_turn_paths: &HashSet<String>,
+    transcript_exists: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    live_sessions
+        .iter()
+        .filter(|session| {
+            session.kind == SessionKind::ClaudeCode
+                && (session.session_path.starts_with("local://")
+                    || session.session_path.starts_with("cc-runtime://"))
+                && mid_turn_paths.contains(&session.session_path)
+                && !transcript_exists(&session.id)
+        })
+        .map(|session| session.session_path.clone())
+        .collect()
 }
 
 /// Reads CC titles for a given list of session ids on the remote machine.
@@ -11479,7 +11643,16 @@ fn run_background_copy_chore(
     generation_enabled: bool,
     remote_cc_confirmed: &mut HashSet<String>,
 ) -> Result<usize> {
-    let (store, settings, live_sessions, remote_machines, ssh_targets, perf_home, working_paths) = {
+    let (
+        store,
+        settings,
+        live_sessions,
+        remote_machines,
+        ssh_targets,
+        perf_home,
+        working_paths,
+        mid_turn_paths,
+    ) = {
         let runtime = lock_daemon_runtime(runtime, "run_background_copy_chore_read");
         let settings = runtime.store.load_settings().unwrap_or_default();
         // Eventual propagation of a GUI profiling toggle into the daemon's gate.
@@ -11488,24 +11661,34 @@ fn run_background_copy_chore(
         // its vt100 screen shows the agent working (esc-to-interrupt SSOT) or
         // its PTY produced output within the recent window — generation rides
         // real turns, never idle sessions.
-        let working_paths: HashSet<String> = runtime
-            .server
-            .live_sessions()
-            .iter()
-            .filter(|session| {
-                let runtime_path = runtime.terminal_runtime_key_for_path(&session.session_path);
-                let screen_working = runtime
-                    .terminals
-                    .session_screen_snapshot(&runtime_path)
-                    .is_some_and(|screen| yggterm_core::screen_text_shows_agent_working(&screen));
-                let recently_active = runtime
-                    .terminals
-                    .session_idle_for_ms(&runtime_path)
-                    .is_some_and(|idle_ms| idle_ms < BACKGROUND_COPY_WORKING_RECENT_MS);
-                screen_working || recently_active
-            })
-            .map(|session| session.session_path.clone())
-            .collect();
+        //
+        // ⭐ The two halves are collected SEPARATELY as well, because they
+        // answer different questions and one consumer needs the stricter one.
+        // "Recently active" includes a session that has only just started and
+        // is painting its banner; "screen shows the agent working" cannot,
+        // because the agent cannot be mid-turn before its first turn. The
+        // stuck-launch check below is only sound against the second — see
+        // `collect_stuck_launch_faults`. Both are built in ONE pass so the
+        // split costs no extra screen reads.
+        let mut working_paths: HashSet<String> = HashSet::new();
+        let mut mid_turn_paths: HashSet<String> = HashSet::new();
+        for session in runtime.server.live_sessions() {
+            let runtime_path = runtime.terminal_runtime_key_for_path(&session.session_path);
+            let screen_working = runtime
+                .terminals
+                .session_screen_snapshot(&runtime_path)
+                .is_some_and(|screen| yggterm_core::screen_text_shows_agent_working(&screen));
+            let recently_active = runtime
+                .terminals
+                .session_idle_for_ms(&runtime_path)
+                .is_some_and(|idle_ms| idle_ms < BACKGROUND_COPY_WORKING_RECENT_MS);
+            if screen_working {
+                mid_turn_paths.insert(session.session_path.clone());
+            }
+            if screen_working || recently_active {
+                working_paths.insert(session.session_path.clone());
+            }
+        }
         (
             runtime.store.clone(),
             settings,
@@ -11514,6 +11697,7 @@ fn run_background_copy_chore(
             runtime.server.ssh_targets().to_vec(),
             runtime.store.home_dir().to_path_buf(),
             working_paths,
+            mid_turn_paths,
         )
     };
     // A `PerfGuard`, not a `PerfSpan`: the tree load and the update build
@@ -11555,6 +11739,25 @@ fn run_background_copy_chore(
         &ssh_targets,
         remote_cc_confirmed,
     ));
+    // The stuck-launch hint, reported instead of discarded. Traced rather than
+    // written onto the row: this says the row's IDENTITY is wrong, which no
+    // status line can fix, and a chore that rewrote rows on a heuristic would
+    // be a worse instrument than the silence it replaces.
+    for path in collect_stuck_launch_faults(&live_sessions, &mid_turn_paths, |id| {
+        local_cc_session_jsonl_path(id).is_some()
+    }) {
+        append_trace_event(
+            &perf_home,
+            "daemon",
+            "terminal_ensure",
+            "stuck_launch_no_transcript",
+            serde_json::json!({
+                "session_path": path,
+                "detail": "mid-turn local Claude Code row with no transcript under its own id — \
+                           the process in this row is not the session the row names",
+            }),
+        );
+    }
     perf.annotate(serde_json::json!({
         "updates": updates.len(),
         "live_sessions": live_sessions.len(),
@@ -12011,9 +12214,42 @@ fn daemon_should_idle_shutdown(
     idle_shutdown_ms: u64,
     terminal_session_count: usize,
 ) -> bool {
-    // Never retire a daemon that still owns live sessions (including preserved
-    // hot-update PTYs, which are counted here) — there is no fd-handoff, so a
-    // shutdown would interrupt them.
+    // Never retire a daemon that still owns live RUNNING sessions — there is no
+    // fd-handoff on this path, so a shutdown would interrupt them.
+    //
+    // ⛔⛔ THIS COMMENT USED TO SAY "including preserved hot-update PTYs, which
+    // are counted here". THEY ARE NOT COUNTED HERE, and the difference decides
+    // whether a handover can finish. Measured 2026-08-14 in an isolated home
+    // with a real predecessor/successor pair:
+    //
+    //   `terminal_session_count` (this argument) is
+    //   `runtime.terminals.stats().session_count` at both call sites — sessions
+    //   in THIS daemon's own registry that are `is_running()`. A preserved
+    //   owner record is not a running session here, so it contributes ZERO.
+    //
+    //   `ServerRuntimeStatus::terminal_session_count`, which shares the name, is
+    //   `terminal_session_keys.len()` and DOES include preserved keys. Two
+    //   different quantities, one name, and the doc described the other one.
+    //
+    // ⇒ A successor that has accepted a hot-update handoff and holds the runtime
+    // only as PRESERVED (owned = 0) passes this gate. Observed: successor
+    // 3.0.155 logged `idle shutdown` at its 90 s window while reporting
+    // `preserved_terminal_owner_count: 1`, and the 3.0.154 predecessor kept the
+    // session. **The NEW daemon retired and the OLD one stayed** — the drain
+    // inverted. ⚠ No session was lost; the pty child survived throughout. The
+    // failure is non-convergence, not data loss.
+    //
+    // ⚠ It needs gate 3 to also be open, so a successor with a live client
+    // record is protected. That is why the fleet does not see this constantly:
+    // the GUI registers with the new daemon. It bites when the successor has no
+    // client record — a headless deploy, or the window before the GUI registers.
+    //
+    // ⛔ DELIBERATELY NOT "FIXED" BY COUNTING PRESERVED HERE. That inverts into
+    // the other failure: bequeathed records outlive the daemons that made them,
+    // so a daemon holding a stale preserved key would never retire, and the
+    // measured cost of the daemon population is `N_reachable × a ~0.2-core
+    // floor`. Which way this should go is a design call recorded in
+    // `docs/pending-bugs.md`, not something to change under a held release.
     if terminal_session_count > 0 {
         return false;
     }
@@ -13769,6 +14005,65 @@ fn running_build_label(build_commit: &str) -> &str {
     }
 }
 
+
+/// `server daemons` — the host-wide daemon census, for BOTH binaries.
+///
+/// ⛔ It answered on the headless CLI only, so `yggterm server daemons` said
+/// `unsupported server command: daemons` while the census it names is a pure
+/// host fact with no GUI in it — `daemon_census` reads the home dir and
+/// nothing else. Same accident as `server app audio`: which binary a verb
+/// reaches was decided by which file it was typed into.
+///
+/// ⇒ The `server` verb surface is dispatched in both binaries too, and the
+/// divergence there is NOT uniformly accidental (some verbs really are
+/// headless-only). This is the one confirmed-accidental case, moved to its
+/// one owner; the triage of the rest is in `docs/pending-bugs.md`.
+pub fn run_server_daemons_census(home_dir: &Path, json: bool) -> anyhow::Result<()> {
+    // The census. `server status` answers for ONE daemon — the one matching
+    // this CLI's own version — and the whole daemon-lifecycle problem is
+    // about the others. Without this an agent rebuilds it from `ps`,
+    // `readlink /proc/<pid>/exe` and a trace grep, every time, and gets a
+    // different subset each time.
+    let rows = crate::daemon_census(home_dir);
+    // §4: "is a swap owed on this host?" has no other place to be asked. It
+    // is a host fact, so it rides the host-wide census rather than any one
+    // daemon's status.
+    let queued = crate::hot_restart_queue::load(home_dir);
+    // §5's other half is a host fact too: a forced swap that has interrupted
+    // somebody and not yet made it good is a state a reader must be able to
+    // see, and this is the one place they are already looking.
+    let interrupted = crate::hot_restart_repair::load(home_dir);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "daemons": rows,
+                "queued_hot_restart": queued,
+                "interrupted_sessions": interrupted,
+            }))?
+        );
+    } else {
+        print!(
+            "{}",
+            crate::format_daemon_census_with_queued_swap(
+                &rows,
+                queued.as_ref(),
+                now_ms
+            )
+        );
+        if let Some(interrupted) = interrupted.as_ref() {
+            print!(
+                "{}",
+                crate::hot_restart_repair::format_pending_repair(interrupted, now_ms)
+            );
+        }
+    }
+    Ok(())
+}
 /// The same table, plus §4's host-level answer to *"is a swap owed here?"*.
 ///
 /// ⚠ The queued swap is a HOST fact and deliberately not a column: it outlives
@@ -20203,9 +20498,11 @@ fn daemon_request_outcome_for_response(
 /// an *idle* 3.0.85 daemon was issuing **~7,000 `sendto`/second**, in exactly
 /// that shape:
 ///
-///     sendto(8, "{",    1, MSG_NOSIGNAL, NULL, 0) = 1
-///     sendto(8, "\"",   1, MSG_NOSIGNAL, NULL, 0) = 1
-///     sendto(8, "kind", 4, MSG_NOSIGNAL, NULL, 0) = 4
+/// ```text
+/// sendto(8, "{",    1, MSG_NOSIGNAL, NULL, 0) = 1
+/// sendto(8, "\"",   1, MSG_NOSIGNAL, NULL, 0) = 1
+/// sendto(8, "kind", 4, MSG_NOSIGNAL, NULL, 0) = 4
+/// ```
 ///
 /// ⭐ The tell was sitting in this very function's twin: `read_request` wraps
 /// its side in a `BufReader`, and this one wrapped nothing. **An asymmetry
@@ -20771,6 +21068,45 @@ mod tests {
             1_000 + crate::live_row_tombstones::TOMBSTONE_TTL_SECS,
             super::PeerRowAdmission::OwnedOrAgentStore,
         ));
+    }
+
+    /// ⛔ THE EVAPORATION SITE HAS TO WRITE ITS OWN RECORD, AND IT IS THE ONE
+    /// SITE THAT DID NOT (`docs/spec-app-row-survival.md` §3).
+    ///
+    /// `PrepareClientClose` does not go through `close_live_session_row` — it
+    /// removes each non-keep-alive row itself, which is how a group of app rows
+    /// left the live set with no entry anywhere saying they had gone. Structural
+    /// for the same reason the tombstone test is: the ORDERING is the part that
+    /// breaks in silence, because the identity and title are read out of the live
+    /// order the very next line empties, and a recorder that runs afterwards
+    /// finds nothing to name and writes nothing at all.
+    #[test]
+    fn the_gui_close_records_why_each_row_left_before_it_removes_it() {
+        let source = daemon_product_source();
+        let arm = source
+            .split("ServerRequest::PrepareClientClose => {")
+            .nth(1)
+            .expect("the PrepareClientClose request arm")
+            .split("\n            ServerRequest::")
+            .next()
+            .expect("the end of the arm");
+
+        let recorded = arm
+            .find("RowDeparture::GuiCloseDisposable")
+            .expect("the GUI close must say WHY the row left, not merely remove it");
+        let removed = arm
+            .find("self.server.remove_live_session(&path)")
+            .expect("the GUI close must still remove the row");
+        assert!(
+            recorded < removed,
+            "the record is read out of the live order, so it must be written \
+             BEFORE the removal empties it"
+        );
+        assert!(
+            !arm.contains("RowDeparture::ExplicitClose"),
+            "nobody named these rows: reporting them as an explicit close would \
+             erase the only distinction this ledger exists to make"
+        );
     }
 
     /// The tombstone is only worth having if something WRITES it. A close must
@@ -26135,6 +26471,111 @@ mod tests {
         let idle = std::collections::HashSet::new();
         let updates = super::collect_live_cc_title_syncs(&server.live_sessions(), &idle);
         assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn stuck_launch_faults_need_a_mid_turn_row_not_merely_a_busy_one() {
+        // The signal the title poll's comment names, reported by the code that
+        // wants it. Every arm below is a way the naive version gets it wrong.
+        let template = {
+            let mut server = crate::YggtermServer::new(
+                false,
+                crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+                yggui_contract::UiTheme::ZedLight,
+            );
+            server.start_local_session(
+                crate::SessionKind::ClaudeCode,
+                Some("/workspace/demo"),
+                Some("demo claude"),
+            );
+            server.live_sessions()[0].clone()
+        };
+        let make = |path: &str, id: &str, kind: crate::SessionKind| {
+            let mut session = template.clone();
+            session.session_path = path.to_string();
+            session.id = id.to_string();
+            session.kind = kind;
+            session
+        };
+        let sessions = vec![
+            make("local://aaaa", "aaaa", crate::SessionKind::ClaudeCode),
+            make("cc-runtime://bbbb", "bbbb", crate::SessionKind::ClaudeCode),
+            make("local://cccc", "cccc", crate::SessionKind::ClaudeCode),
+            make("local://dddd", "dddd", crate::SessionKind::Shell),
+            make(
+                "remote-cc://box/eeee",
+                "eeee",
+                crate::SessionKind::ClaudeCode,
+            ),
+        ];
+        // Mid-turn: the two local CC rows, the shell, and the remote CC row.
+        // Only the first two may ever be reported.
+        let mid_turn: std::collections::HashSet<String> = [
+            "local://aaaa".to_string(),
+            "cc-runtime://bbbb".to_string(),
+            "local://dddd".to_string(),
+            "remote-cc://box/eeee".to_string(),
+        ]
+        .into();
+
+        // No transcript anywhere ⇒ both local CC rows are faults. A shell has
+        // no transcript by construction and a remote row's transcript is on
+        // the other machine, so neither is this daemon's to judge.
+        let faults = super::collect_stuck_launch_faults(&sessions, &mid_turn, |_| false);
+        assert_eq!(faults, vec!["local://aaaa", "cc-runtime://bbbb"]);
+
+        // A transcript for one of them clears exactly that one.
+        let faults = super::collect_stuck_launch_faults(&sessions, &mid_turn, |id| id == "aaaa");
+        assert_eq!(faults, vec!["cc-runtime://bbbb"]);
+
+        // ⛔ THE ARM THAT MATTERS. A row that is merely BUSY — freshly
+        // launched, painting its banner, no turn yet — is not mid-turn, and
+        // must not be reported: CC writes its transcript on the first turn, so
+        // flagging this would fire on every healthy launch.
+        let nothing_mid_turn = std::collections::HashSet::new();
+        let faults = super::collect_stuck_launch_faults(&sessions, &nothing_mid_turn, |_| false);
+        assert!(faults.is_empty(), "{faults:?}");
+    }
+
+    #[test]
+    fn the_stuck_launch_check_is_wired_to_the_strict_set() {
+        // ⛔ The unit test above cannot see the mutation that matters. Which
+        // set reaches `collect_stuck_launch_faults` is decided at the CALL
+        // SITE, and passing the looser `working_paths` there would compile,
+        // pass every test, and flag every healthy launch for the first
+        // seconds of its life. So the wiring is locked here.
+        //
+        // Scanned over the PRODUCT half with comment lines dropped: the
+        // paragraph above names both sets, and a lock that matched its own
+        // prose would pass while the code did the opposite.
+        let product: String = yggterm_core::agent_cli::product_lines(include_str!("daemon.rs"))
+            .into_iter()
+            .map(|(_, line)| line)
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // ⛔ And it must skip the DEFINITION, which spells the name too and
+        // whose parameter list contains `mid_turn_paths` whatever the caller
+        // passes. The first match in the file is `fn collect_stuck_launch…`,
+        // so a lock that took it would have read the signature and reported
+        // the wiring — it did exactly that on the first run.
+        let needle = "collect_stuck_launch_faults(";
+        let call = product
+            .match_indices(needle)
+            .find(|(at, _)| !product[..*at].ends_with("fn "))
+            .map(|(at, _)| &product[at + needle.len()..])
+            .and_then(|rest| rest.split_once(')'))
+            .map(|(args, _)| args)
+            .expect("the chore calls collect_stuck_launch_faults");
+        assert!(
+            call.contains("&mid_turn_paths"),
+            "the stuck-launch check is no longer keyed on the mid-turn set: {call}"
+        );
+        assert!(
+            !call.contains("&working_paths"),
+            "the stuck-launch check was rewired to the looser working set, which \
+             flags every healthy launch before its first turn: {call}"
+        );
     }
 
     #[test]
