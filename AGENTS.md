@@ -109,6 +109,45 @@ If a default is wrong, **change the table and say why in the row**, with a
 measurement. Do not work around it with an env var, and do not "just try" one on
 the live host.
 
+## ⛔⛔ SCRATCH SPACE — `/tmp` IS RAM ON THE DESKTOP HOST, SO NEVER WRITE THERE
+
+**`/tmp` on the desktop host is a `tmpfs`.** It is memory wearing a filesystem's
+clothes: every byte written is charged to RAM, then to swap, and it is never
+reclaimed until something deletes it. Nothing warns you, `df` looks like a disk,
+and the cost lands on the owner as a slow machine.
+
+⇒ **Agent scratch goes in `~/.yggterm/scratchpad/<whatever-you-like>`.** It is
+disk-backed. Not `/tmp`, not `/dev/shm`, not `$XDG_RUNTIME_DIR`. The same rule
+binds every tool this project drives: staged downloads, screenshots, probe
+output, A/B binaries, bundles.
+
+**What this rule is worth, measured on 2026-08-14** while the owner's 14 GB
+laptop sat at 11 GB of 15 GB swap and he reported it burning:
+
+| what was on the tmpfs | size |
+|---|---|
+| leaked CLI provisioner staging dirs (51, since 2026-08-02) | **2.85 GB** |
+| stale agent session scratch | **613 MB** |
+| abandoned deploy / A/B binaries | **452 MB** |
+| **total reclaimed, held open by nothing** | **~3.9 GB of RAM** |
+
+⚠ **A disk-backed scratch is not a licence either.** Unbounded on disk is a
+slower leak, not a fixed one — which is why the roots carry budgets and are
+swept oldest-first.
+
+**The tooling, and it is enforcement rather than advice:**
+
+```sh
+scripts/ygg-scratch-guard.sh --host <h>            # report; non-zero if abusive
+scripts/ygg-scratch-guard.sh --host <h> --enforce  # reap to budget, incl. stale tmpfs scratch
+scripts/ygg-resource-panic.sh                      # memory/CPU/space thresholds, exit 1 on breach
+```
+
+⭐ **Reap, do not exhort.** An agent harness that picks its own `/tmp/<tool>-<uid>`
+session directory cannot be argued with, and asking people to be tidy has never
+bounded anything. The guard therefore sweeps what is stale rather than relying on
+whoever made it.
+
 ## Engineering constraints
 
 - Primary implementation language: **Rust**.
