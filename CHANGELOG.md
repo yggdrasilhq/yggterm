@@ -12,7 +12,11 @@ This file tracks user-visible changes in `yggterm`.
        Pre-existing, unrelated to this release, and owned — see the entry in
        docs/pending-bugs.md.
      · the daemon-side persisted-live-sessions work is NOT in 3.0.154; it was
-       pushed to its own lane after this release was cut. -->
+       pushed to its own lane after this release was cut.
+     · CORRECTION: 3.0.154 was first reported as causing no session deaths.
+       One delegate session did die, 464 s after the release, ending mid
+       tool-call. Cause not established. Do not cite this release as a clean
+       counter-example to deploy-related deaths. -->
 
 - **A machine no longer quietly accumulates background services forever.** After
   its program file was replaced on disk, a running background service handed its
