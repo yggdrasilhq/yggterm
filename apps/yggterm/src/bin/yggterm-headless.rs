@@ -184,6 +184,8 @@ fn print_server_help() {
   yggterm-headless server ping
   yggterm-headless server status
   yggterm-headless server daemons [--json]
+  yggterm-headless server connect <session-path> [--view terminal|preview] [--top|--after <path>]
+  yggterm-headless server connect --list
   yggterm-headless server write-lock <acquire|release|status> [--holder <who>]
   yggterm-headless server relay-boundary [--by <who>] [--wait-secs <n>] [--json]
   yggterm-headless server gate-screen [<session-key>] [--tail <n>] [--json]
@@ -1214,6 +1216,9 @@ fn main() -> Result<()> {
             }))?
         );
         return Ok(());
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "connect" {
+        return yggterm_server::server_cli::run_server_connect_cli(&store, &args);
     }
     if args.len() >= 2 && args[0] == "server" && args[1] == "gate-screen" {
         return yggterm_server::server_cli::run_server_gate_screen_cli(&store, &args);

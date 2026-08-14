@@ -11,6 +11,12 @@ This file tracks user-visible changes in `yggterm`.
   and on both programs, and a value that is not a number is refused out loud
   instead of quietly becoming 200. Asking for 5,000 lines now reaches back
   **100 seconds** instead of 3.7.
+- **The command that pulls a lost session back into the list now works from
+  either program.** Reconnecting a session that has dropped out of Live
+  Sessions answered from one of the two programs only, and reported the command
+  as unknown from the other — which is the program most people have on their
+  path. It was the last command on that surface that still differed between
+  them; all of them now answer from both.
 
 - **Three more commands now work from whichever program you type.** The
   command that shows what the restart gate is looking at, the one that declares

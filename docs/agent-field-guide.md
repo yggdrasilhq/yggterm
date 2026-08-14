@@ -548,6 +548,57 @@ has a daemon and sessions but no client. `server app clients` answers "is the GU
 variable at it, which is how a second live instance can be READ for comparison. Never DRIVE one:
 a mode change or relaunch corrupts whatever it is measuring.
 
+### 1.99 ⛔⛔⛔ THE INSTRUMENT THAT INCLUDES ITSELF IN WHAT IT MEASURES
+
+**No table row above predicts this one, because it is not a property of any
+instrument — it is a property of where you pointed it.** Six sightings on
+2026-08-14, across two seats, in one day. Every one was GREEN or QUIET and
+WRONG, and the green looked exactly like success:
+
+| the check | what it read that it should not have |
+|---|---|
+| `until ! pgrep -f "cargo test --workspace"` | the WAITING SHELL's own command line — the pattern is in it ⇒ waited forever for itself. **No suite ran for an hour** while progress was read from a log file that did not exist |
+| `pgrep -f -- "--session-id"` + a `case` on a peer's uuid | the SEARCHING SHELL, because the uuid was typed into the pattern ⇒ a report addressed to the orchestrator **was delivered to its author** |
+| `pkill -f "ygg-booter.py watch"` | its own command line ⇒ **killed the shell that ran it** |
+| a source lock scanning a binary WHOLE | that binary's own TEST assertion, which is written against the very string being sought |
+| the same lock after stripping tests | ⭐ **its own COMMENT, which named the needle while explaining the defect.** Introduced *in the act of documenting the class* |
+| a stall detector reading a row's screen | a THINKING row, reported as a corpse |
+
+⇒ **The failure is always the same shape and never looks the same twice.** A
+process pattern that matches the searcher; a source scan that matches its own
+prose; a probe that supplies the state it is testing for (see `getComputedStyle`
+in the table above — same class, discovered separately).
+
+#### ⭐⭐ THE ONLY DEFENCE THAT WORKS: MAKE IT FAIL ON PURPOSE
+
+**A check never observed failing has not been tested — it has been run.** The
+reachability lock in `app_control_cli.rs` passed its whole life, passed on
+`main`, and passed under a mutant that darkened every real dispatch. Three
+greens, all meaningless, until one decoy.
+
+⇒ For any check whose input includes the file or the process it lives in:
+**mutate the thing it watches and REQUIRE it to go red**, then restore and
+require green. Both directions, same run. If it stays green under the mutant, it
+is reading something other than the code.
+
+#### ⛔ AND THE CONTROL IS THE NEWER, LESS-EXAMINED HALF — SUSPECT IT FIRST
+
+The corollary, paid for the same day by the seat verifying the fix above. Their
+mutant renamed the call sites and got GREEN, and they nearly reported the fix as
+broken. The lock searches for `server_cli::`, and each binary carries **nine** of
+those — eight call sites plus **an import that was not renamed**. The module was
+still genuinely reached. **The lock was right both times; the control was the
+untested instrument.**
+
+⇒ When a control disagrees with a fix, check the control before drafting the
+accusation. And an incomplete mutant fails in the *reassuring* direction, which
+is why it is not self-announcing.
+
+⚠ **A green suite is not evidence a fix worked.** Two lanes fixed one red lock
+independently and identically that day; one version stripped tests and comments
+and one did not. Both were green. Only the decoy separated the fix from the
+placebo.
+
 ## 2. Profiling recipes that work
 
 No `perf` on a typical desktop host (`perf_event_paranoid=3`), but these do:
