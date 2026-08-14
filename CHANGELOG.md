@@ -4,6 +4,29 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A row you opened an app in no longer disappears when you close the window.**
+  Rows made by launching an app were treated as scratch: the software decided
+  what was worth keeping from the row's type, and an app runs inside an ordinary
+  shell, so a whole group of app rows someone had deliberately arranged could be
+  cleared away by closing the window. Nothing on screen said those rows were
+  disposable, and from the outside nothing about them was. A row created by
+  launching an app is now kept by default, exactly like an agent session. Rows
+  you did not ask for — a scratch shell, or one a tool explicitly marked as
+  temporary — still close with the window, which is what that tier is for.
+- **An app row now comes back as the app, instead of as an empty prompt.** The
+  record kept which app and which action the row was, but it used that
+  information once, on the first restart, and then forgot to write it down
+  again — so the row survived one restart and came back blank on the next. A
+  second fault hid underneath: the step that rebuilds the app's command only ran
+  for rows that keep a transcript on disk, which agent sessions do and app rows
+  do not, so the rebuild never ran for the only rows it was written for. Both
+  are fixed; a restarted app row returns running its own app.
+- **You can now ask where a row went.** When a row leaves the list, the software
+  writes down which row it was, what it was called, when it went, and why —
+  either somebody closed it, or the window closed and the row was not marked to
+  be kept. Until now the only trace of a row being cleared away was its absence,
+  which reads the same as never having existed, and that is what turned one
+  accidental loss into a permanent mystery. Ask with `server rows departed`.
 - **The document editor's page is back.** Opening a document row showed an empty
   viewport — or, worse, the row's own shell output apparently rendered as the
   document — while the file list beside it, the word and character counts and the

@@ -8007,7 +8007,78 @@ impl DaemonRuntime {
     /// Remember that the user closed the row currently listed for `path`, so no
     /// peer daemon can hand it back. Call BEFORE the removal — the identity is
     /// read out of the live order, which the removal empties.
+    ///
+    /// It also writes the DEPARTURE record (`spec-app-row-survival.md` §3). Both
+    /// here, because both are read out of the live order the removal is about to
+    /// empty, and a record written after the fact would have nothing to name.
+    /// Write down that a row left the live set, and WHY.
+    ///
+    /// ⛔ THE DEFECT (`docs/spec-app-row-survival.md` §3). A group of app rows
+    /// evaporated on a GUI restart and `removed-rows.json` had no entry for any
+    /// of them — so nothing in the system could tell *"the user closed this"*
+    /// from *"this went on its own"*, and the loss was undiagnosable rather than
+    /// merely annoying. **An absence is not a record.** The row's own store said
+    /// it was live, the GUI's live set disagreed, and neither of them said what
+    /// had happened, because nothing had written it down.
+    ///
+    /// ⚠ Call BEFORE the removal. The identity and the title are read out of the
+    /// live order, which the removal empties — a recorder that runs afterwards
+    /// finds nothing to name and silently writes nothing, which is precisely the
+    /// failure it was added to end.
+    ///
+    /// Best-effort by design: a row leaving is not something to abort, so a
+    /// ledger write that fails is traced and the close proceeds.
+    fn record_row_departure(
+        &mut self,
+        path: &str,
+        reason: crate::live_row_tombstones::RowDeparture,
+    ) {
+        let Some(key) = self.server.live_session_row_key(path) else {
+            return;
+        };
+        let identity = crate::normalized_live_row_identity(&key);
+        let title = self
+            .server
+            .resolve_live_session_entry(&key)
+            .map(|(_resolved, session)| session.title)
+            .unwrap_or_default();
+        let departure = crate::live_row_tombstones::LiveRowDeparture {
+            identity: identity.clone(),
+            path: key.clone(),
+            title: title.clone(),
+            reason,
+            at: crate::live_row_tombstones::now_secs(),
+        };
+        let home = self.store.home_dir().to_path_buf();
+        match self.live_row_tombstones.record_departure(&home, departure) {
+            Ok(_) => append_trace_event(
+                &home,
+                "daemon",
+                "session",
+                "live_session_row_departed",
+                serde_json::json!({
+                    "path": key,
+                    "identity": identity,
+                    "title": title,
+                    "reason": reason.label(),
+                }),
+            ),
+            Err(error) => append_trace_event(
+                &home,
+                "daemon",
+                "session",
+                "live_session_row_departure_record_failed",
+                serde_json::json!({
+                    "path": key,
+                    "reason": reason.label(),
+                    "error": error.to_string(),
+                }),
+            ),
+        }
+    }
+
     fn tombstone_live_row(&mut self, path: &str) {
+        self.record_row_departure(path, crate::live_row_tombstones::RowDeparture::ExplicitClose);
         let Some(identity) = self
             .server
             .live_session_row_key(path)
@@ -8321,6 +8392,23 @@ impl DaemonRuntime {
                         Ok(false) => {}
                         Err(error) => errors.push(format!("{path}: {error}")),
                     }
+                    // ⛔ THE EVAPORATION, WRITTEN DOWN — and this is the one site
+                    // that had no record at all. Nobody named these rows; they
+                    // are taken for a property they have, so the user has no act
+                    // of their own to remember and nothing else in the system
+                    // says they went. That is why a group of app rows could
+                    // simply cease to exist here and leave `removed-rows.json`
+                    // empty (`spec-app-row-survival.md` §3).
+                    //
+                    // BEFORE the removal, like every other identity read here:
+                    // the live order is where the row's identity and title live,
+                    // and the next line empties it. NOT a tombstone — a veto
+                    // would stop a peer daemon offering the row back, and this
+                    // close does not carry the user's authority to forbid that.
+                    self.record_row_departure(
+                        &path,
+                        crate::live_row_tombstones::RowDeparture::GuiCloseDisposable,
+                    );
                     match self.server.remove_live_session(&path) {
                         Ok(true) => metadata_removed += 1,
                         Ok(false) => {}
@@ -20804,6 +20892,45 @@ mod tests {
             1_000 + crate::live_row_tombstones::TOMBSTONE_TTL_SECS,
             super::PeerRowAdmission::OwnedOrAgentStore,
         ));
+    }
+
+    /// ⛔ THE EVAPORATION SITE HAS TO WRITE ITS OWN RECORD, AND IT IS THE ONE
+    /// SITE THAT DID NOT (`docs/spec-app-row-survival.md` §3).
+    ///
+    /// `PrepareClientClose` does not go through `close_live_session_row` — it
+    /// removes each non-keep-alive row itself, which is how a group of app rows
+    /// left the live set with no entry anywhere saying they had gone. Structural
+    /// for the same reason the tombstone test is: the ORDERING is the part that
+    /// breaks in silence, because the identity and title are read out of the live
+    /// order the very next line empties, and a recorder that runs afterwards
+    /// finds nothing to name and writes nothing at all.
+    #[test]
+    fn the_gui_close_records_why_each_row_left_before_it_removes_it() {
+        let source = daemon_product_source();
+        let arm = source
+            .split("ServerRequest::PrepareClientClose => {")
+            .nth(1)
+            .expect("the PrepareClientClose request arm")
+            .split("\n            ServerRequest::")
+            .next()
+            .expect("the end of the arm");
+
+        let recorded = arm
+            .find("RowDeparture::GuiCloseDisposable")
+            .expect("the GUI close must say WHY the row left, not merely remove it");
+        let removed = arm
+            .find("self.server.remove_live_session(&path)")
+            .expect("the GUI close must still remove the row");
+        assert!(
+            recorded < removed,
+            "the record is read out of the live order, so it must be written \
+             BEFORE the removal empties it"
+        );
+        assert!(
+            !arm.contains("RowDeparture::ExplicitClose"),
+            "nobody named these rows: reporting them as an explicit close would \
+             erase the only distinction this ledger exists to make"
+        );
     }
 
     /// The tombstone is only worth having if something WRITES it. A close must
