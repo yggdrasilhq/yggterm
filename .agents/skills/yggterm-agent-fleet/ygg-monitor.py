@@ -679,6 +679,60 @@ def report_escalation_gap(subs):
             log(f"   {u}  ⇒ subscribe it with --escalate-to <its campaign's orchestrator>")
         log("   ⚠ cwd is a PRIOR, not the answer: a row can work in a checkout that has")
         log("     nothing to do with its subject. Confirm against its last prose turn.")
+    # ⛔⛔ A CROSSING THAT CHECKS ONE DIRECTION IS NOT A CROSSING. This reported
+    # only `armed - watched` (on the booter, escalating to nobody) and was blind
+    # to the reverse — subscribed here, unarmed there — while calling itself the
+    # coverage crossing and printing "0 warnings". Measured cost: seat 6.6 ran a
+    # full hour with a monitor subscription and no booter arm, and this said the
+    # board was clean the whole time. A peer's separate report found it.
+    #
+    # ⛔⛔ AND THE REVERSE CHECK IS THE DANGEROUS HALF — `never_arm()`'s own
+    # docstring predicts exactly this failure: the booter's remedy is to TYPE
+    # INTO a row. An attended row that ever gains a monitor subscription would
+    # surface here as "unarmed", whose obvious remedy is to arm it, walking a
+    # well-meant tidy-up straight into typing over someone's unsent draft. So
+    # attended and opted-out rows are excluded, and if those lists cannot be READ
+    # this refuses to report at all rather than name a row it could not screen.
+    # ⚠ Missing is not unreadable: an absent list legitimately means "nobody yet".
+    attended, optedout, screens_ok = set(), set(), True
+    try:
+        for line in (STATE / "never-arm.tsv").read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                attended.add(line.split("\t", 1)[0].strip()[:8])
+    except FileNotFoundError:
+        pass
+    except Exception:
+        screens_ok = False
+    try:
+        for line in (STATE / "booter-disarmed.tsv").read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2 or not parts[1].strip():
+                continue
+            u8, why = parts[1].strip()[:8], (parts[3].strip() if len(parts) > 3 else "")
+            optedout.discard(u8) if why.startswith("__rearmed__:") else optedout.add(u8)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        screens_ok = False
+
+    if not screens_ok:
+        log("⚠ never-arm / opt-out ledger UNREADABLE — the unarmed-row check did NOT run.")
+        log("   Refusing to name rows I cannot screen: an attended row listed here would")
+        log("   invite arming it, and the booter's remedy is to TYPE INTO the row.")
+    else:
+        unarmed = sorted(watched - armed - dying - attended - optedout)
+        if unarmed:
+            log(f"⛔ {len(unarmed)} ROW(S) SUBSCRIBED HERE BUT NOT ARMED ON THE BOOTER — "
+                f"an escalation target exists, but nothing will WAKE a stall:")
+            for u in unarmed:
+                log(f"   {u}  ⇒ RECORD A DECISION — arm it if it is an unattended delegate;")
+                log(f"        add it to never-arm.tsv if a person types in it.")
+            log("   ⛔ Do NOT bulk-arm: no probe separates those two cases, and guessing")
+            log("     wrong types into a human. Decide per row.")
     if dying:
         log(f"   ({len(dying)} retired row(s) on the booter are being counted down "
             f"by GONE_SIGHTINGS — not a gap, no action)")
