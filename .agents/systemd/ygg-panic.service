@@ -1,0 +1,20 @@
+[Unit]
+Description=yggterm resource panic watch (seat 6.7)
+Documentation=file:%h/gh/yggterm--resource/docs/usability-contract.md
+
+[Service]
+Type=oneshot
+# ⛔ Not a session cron: a session-scoped timer dies at handover, which is
+#    exactly when nobody is watching. The subscription lives on disk and any
+#    successor inherits it by claiming the seat.
+# ⚠ %h, not a literal home path — these units are checked into a PUBLIC repo.
+#    Adjust the checkout directory below if yours differs.
+ExecStart=%h/gh/yggterm--resource/.agents/skills/yggterm-agent-fleet/ygg-panic.py tick
+# ⛔ EXIT 1 MEANS "BREACH FOUND", WHICH IS A SUCCESSFUL RUN.
+#    Without this systemd marks a perfectly working watch as FAILED every time
+#    it does its job -- and, far worse, a REAL failure of the service then looks
+#    identical to a routine breach. The CLI keeps 1 = breach because that is
+#    useful to script against; the unit is where the two meanings are separated.
+SuccessExitStatus=1
+Nice=10
+IOSchedulingClass=idle
