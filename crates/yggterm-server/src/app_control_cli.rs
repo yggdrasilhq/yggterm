@@ -2258,9 +2258,47 @@ mod dispatch_reachability_lock {
     #[test]
     fn every_cli_module_is_reached_by_a_dispatcher() {
         const LIB: &str = include_str!("lib.rs");
+        // ⛔ THE BINARIES ARE DISPATCHERS TOO, and leaving them out made this
+        // lock red on `main` the moment a CLI module arrived that they — rather
+        // than `app_control_cli` — reach. `server_cli` is exactly that: nine
+        // `server` verbs, dispatched from both binaries by design, which is the
+        // whole reason the module exists.
+        //
+        // ⭐ Added here rather than exempting `server_cli` by name. An exemption
+        // would buy a green suite and blind the lock to that module genuinely
+        // going dark — which is the failure it exists to catch, and a live risk
+        // the day nine verbs moved into it.
+        //
+        // ⛔⛔ AND THE BINARIES ARE SCANNED PRODUCT-HALF ONLY. Their test modules
+        // assert ON these very strings — `main.rs` builds the needle
+        // `server_cli::run_server_{verb}_cli(` to lock the dispatch — so a whole-file
+        // scan matches the ASSERTION and the lock passes while every product
+        // dispatch is gone. Caught by mutating both binaries to reach a module
+        // that does not exist: the lock stayed green. A source lock that reads its
+        // own prose is the recurring defect in this file's neighbourhood.
+        // ⛔⛔⛔ AND COMMENT LINES ARE STRIPPED, which is not belt-and-braces:
+        // the paragraph you are reading NAMED the needle it scans for, so the
+        // lock matched its own prose and stayed green through a mutant that
+        // darkened every real dispatch. Reworded prose would fix that once; a
+        // stripped scan fixes it for every future comment, and this file's
+        // neighbourhood has produced the same defect three times in a day.
+        let scannable = |source: &'static str| -> String {
+            source
+                .split("mod tests {")
+                .next()
+                .expect("a source has a product half above its tests")
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let dispatchers = [
-            include_str!("app_control_cli.rs"),
-            include_str!("app_control_web_cli.rs"),
+            scannable(include_str!("app_control_cli.rs")),
+            scannable(include_str!("app_control_web_cli.rs")),
+            scannable(include_str!("../../../apps/yggterm/src/main.rs")),
+            scannable(include_str!(
+                "../../../apps/yggterm/src/bin/yggterm-headless.rs"
+            )),
         ];
         let mut modules: Vec<&str> = Vec::new();
         for line in LIB.lines() {
