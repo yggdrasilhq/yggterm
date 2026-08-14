@@ -338,6 +338,41 @@ discarded on read, since it carries no evidence ledger and therefore nothing tha
 can ever stop it growing) but **that is a defence against the symptom, not a fix for
 the deploy path.**
 
+### ⛔ IT COST A SECOND SAFETY FIX THE SAME DAY — and a PARTIAL fix is now in
+
+Same shape, hours later. The fleet's entire wake path was down; the fix was
+committed, pushed and proved live on a tick. **Killing that watcher caused
+another to respawn from a different checkout whose copy predated the fix, and
+the fleet went straight back to refusing every boot.** Nine of fourteen
+checkouts were superseded at that moment.
+
+⚠ **The aggravating detail, and it is the one worth keeping: the stale path is
+the HABITUAL one.** The copy an agent invokes by hand is the one in its own cwd
+and its own shell history; the copy that is actually supervising is discoverable
+only from `/proc`. **Three sessions were caught by this in one afternoon,
+including two that had the identify-which-copy-is-executing law in memory at the
+time.** ⇒ Knowing the law does not protect you, because the wrong copy is the one
+every habit reaches for. The tool has to say it.
+
+**Shipped:** the booter now compares its own bytes against `origin/main`'s copy
+and says so loudly — **before** spawning, while the agent arming the fleet is
+still there to read it, and again at watcher startup, so the log answers *which
+copy is supervising* without anyone reading `/proc`. It compares against the
+last-fetched ref and deliberately does not fetch, so arming never depends on the
+network; an unavailable comparison reports *could not tell* rather than passing
+quietly.
+
+⛔ **THE LIMIT, STATED PLAINLY: THIS ONLY PROTECTS A CHECKOUT THAT HAS ALREADY
+PULLED IT.** A copy stale enough to lack the check cannot warn about itself, and
+a watcher armed from one is silent exactly as before. Verified both ways: a
+current checkout answers `True` with matching hashes; a superseded one has no
+such function at all. ⇒ **The entry stays OPEN**, because the deploy path is
+still the real defect and this only shortens the window.
+
+⚖ Not done, deliberately: pulling the other checkouts. Several carry lanes'
+uncommitted work, and a relay refreshing another lane's tree to fix its own
+tooling problem risks the work it was protecting.
+
 ### ⭐ THE CHEAP TEST THAT WAS BEING SKIPPED
 
 **An existence check is not a deployment check.** `git cat-file -e <sha>^{commit}`
