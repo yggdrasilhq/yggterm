@@ -32,14 +32,15 @@
 # than a real poll rate does, and the seeded state has no PTY grids, ssh targets
 # or remote machines — three tables the live reply path touches.
 #
-# ⛔⛔ AND ONE THING THIS HARNESS CANNOT MEASURE, BY CONSTRUCTION. A daemon's
-# standing cost is dominated by a ~0.2-core floor paid PER REACHABLE DAEMON, and
-# that floor lives in the daemon's PROCESS SUBTREE — the children it spawns for
-# sessions, ssh wrappers and remote clients. A seeded daemon here spawns NO
-# children at all, so it has no subtree, and every arm correctly reads ~0.
+# ⛔⛔ AND ONE THING THIS HARNESS CANNOT MEASURE. A daemon's standing cost is
+# dominated by a ~0.2-core floor paid PER REACHABLE DAEMON, and it is spent
+# INSIDE THE DAEMON PROCESS (a quiet daemon's subtree is nearly empty; measured
+# 0.13-0.25 cores of its own CPU with children at ~0.00-0.02). A daemon seeded
+# here reads ~0 because it has NO SESSIONS AND NO PEERS, not because the cost
+# sits in children.
 # ⇒ Do not point this at "where does the daemon's CPU go". It prices the REQUEST
-# PATH, which is real and is under 1% of the answer. The quantity that matters
-# is not inside the process this samples.
+# PATH, which is real and is under 1% of the answer. To reach the floor a
+# harness needs sessions or a peer population, and this one seeds neither.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -1522,12 +1522,38 @@ per-request signal on a live daemon — **every one of those fits, because the
 floor is not spent per request.** Those arms did not fail to find the cost; they
 correctly established it is **not in the path they measured.**
 
-⇒ ⭐ **And the reconciliation this lane can add: the floor is in the SUBTREE, not
-in the daemon process.** Every arm here measured the daemon *process*, and the
-sandbox daemons **spawn no children at all** — no sessions, no wrappers, no
-remote clients — so they have no subtree to carry a floor. That is why
-0.00017 cores was reproducible and honest and still missed a 0.2-core term: **the
-quantity was never inside the process being sampled.**
+⛔⛔ **A RECONCILIATION I PUBLISHED HERE WAS WRONG, AND MY OWN NEXT MEASUREMENT
+REFUTED IT.** I wrote that *"the floor is in the SUBTREE, not the daemon
+process"*, on the reasoning that sandbox daemons spawn no children. **It is in
+the daemon process.** Read-only two-sample `/proc` walk over all 16 daemons and
+their 172 descendants, 45 s, daemon-only column:
+
+| version | owned | presv | rows | **daemon process alone** | children |
+|---|---|---|---|---|---|
+| 2.12.14 | 3 | 0 | 73 | **0.3320** | 0.0000 |
+| 3.0.52 | 7 | 21 | 243 | 0.2524 | 0.2164 |
+| 3.0.62 | 1 | 27 | 246 | 0.2207 | 0.0000 |
+| 3.0.53 | 1 | 28 | 244 | 0.2076 | 0.0089 |
+| 3.0.0 | 1 | 14 | 86 | 0.1720 | 0.0084 |
+| 3.0.26 | 1 | 17 | 90 | 0.1267 | 0.0093 |
+
+**Eleven of sixteen daemons sit at 0.13–0.25 cores of their OWN CPU with
+essentially empty subtrees.** The subtree only balloons on the two daemons
+hosting actively-working agents — `rustc` at 6.78 cores and `claude` at 1.84 in
+that window, which is a compile and a live turn, **not daemon overhead**.
+
+⇒ **The two framings agree numerically and my gloss was the error:** the
+0.19–0.24 measured per subtree *is* the daemon process, because a quiet daemon's
+subtree is nearly empty. ⇒ **The floor is inside the process — and my sandbox
+read ~0 because it had no sessions and no peers, not because the cost lives in
+children.**
+
+⛔ **This is the third mechanism of mine refuted in this campaign, and the first
+I PUBLISHED rather than sent as a candidate.** The two that cost nothing (`comm`
+truncation, the peer fan-out) went out as hypotheses; this one went into a
+document and into two lanes' hands before it was tested. ⇒ **The rule that kept
+the others cheap is the rule I broke: a mechanism is a candidate until a
+measurement it could have failed has been run.**
 
 ⇒ **§S1's justification INVERTS, and it is still not a leak:** not *"reclaim
 leaked cores"* but **"stop paying a reachability floor fourteen times over for
