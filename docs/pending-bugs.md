@@ -12,6 +12,59 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔⛔ [6.7] THE TERMINAL PAINTS THE WRONG GLYPH FOR EVERY CHARACTER
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-14 with a screenshot ("Glyph BUG"), on a row that was
+mid-`Bootstrapping…`*
+
+The whole viewport renders as mojibake. ⚠ **The structure is intact** — line
+breaks, indentation, word lengths, syntax colouring and bold all correct — and
+only the glyphs are wrong, consistently and deterministically substituted. The
+sidebar and the notification rail beside it painted perfectly.
+
+⇒ **That signature is a character-to-glyph MAPPING fault, not corrupt bytes.**
+Corrupt bytes would destroy the structure too; here the structure survives and
+only the lookup is wrong.
+
+**What has been established, each by a check that could have failed:**
+
+- ⛔ **It is NOT a missing or changed font on the render host.** `fc-match` there
+  resolves JetBrains Mono, Hack and DejaVu Sans Mono, and no font file has
+  changed in three days. This was the leading hypothesis and it is dead.
+- The terminal BUFFER holds clean text while the canvas paints garbage, so the
+  data reaching the client is correct.
+
+**The surviving candidate, and it is only a candidate:** the xterm **WebGL glyph
+atlas**. The atlas is a texture; a lost or corrupted GL context re-renders every
+character from the wrong atlas coordinates, which is exactly a deterministic
+wrong-glyph substitution. The presentation policy arms
+`xterm_canvas_policy=xterm_webgl_enabled_for_wayland` on this host, and **the
+same GL stack is already faulting** — see the SIGSEGV entry below, four crashes a
+day in `gdk_cairo_draw_from_gl` and `libEGL_mesa`→`libgallium`. One subsystem,
+plausibly two faces: a hard fault crashes the GUI, a soft one corrupts the atlas.
+
+⛔ **This is NOT yet established and must not be repeated as though it were.** No
+measurement has been run that could have failed it. The trace holds no
+context-loss event, but nothing appears to record one, so that absence supports
+nothing either way.
+
+**The measurement that would settle it, and it belongs in the SANDBOX:** run the
+same content under `YGGTERM_ENABLE_XTERM_CANVAS=0` (DOM renderer) in
+`scripts/underglass-sandbox.sh` and see whether the corruption reproduces. ⛔ Not
+against the owner's GUI — `presentation-policy.md` is the law and this is exactly
+the flag it forbids touching there.
+
+**Falsifier:** if the corruption reproduces with WebGL off, the atlas is
+exonerated and the fault is upstream of the renderer.
+
+⚠ **Correlation worth keeping:** it was observed on a row that was still
+bootstrapping. The campaign already records that a re-resume onto a fresh PTY is
+when the squish/broken-bottom artefacts appear, so the first-paint window is
+where the renderer is most stressed and is the cheapest place to try to reproduce
+this.
+
 ## ⛔⛔⛔ [6.7] THE GUI SIGSEGVs IN THE GL COMPOSITING PATH, ~4x A DAY, AND NOTHING REPORTS IT
 
 **Status:** OPEN
