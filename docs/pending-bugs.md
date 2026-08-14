@@ -132,6 +132,57 @@ changing today.
 **Falsifier:** if `/tmp` on that host is ever NOT a tmpfs, the RAM half of this
 entry is void and only the unbounded-growth half stands.
 
+## ⛔⛔ [6.7] A RESTARTED GUI REPORTS `entered` / `bounded:true` WITHOUT ARMING ANYTHING — FIXED IN CODE, LIVE PROOF OWED
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**Falsifier:** after the next GUI restart from a running GUI, the startup trace
+`gui/startup/linux_memory_scope` must read `outcome: "inherited"` with
+`inherited_unit` naming the scope; a reading of `entered` there means the fix did
+not take, and a reading of `bounded: false` means the marker outlived its bound
+and the GUI is genuinely uncapped.
+
+**Caught live 2026-08-14 20:17**, restarting the GUI onto a new build:
+
+| instrument | said |
+|---|---|
+| `gui/startup/linux_memory_scope` | `{"outcome":"entered","bounded":true}` |
+| `/proc/<new pid>/cgroup` | `…/yggterm-gui-<the PREVIOUS pid>.scope` |
+
+⛔ **The two disagreed, and the campaign's stated way of telling them apart is
+the one that fails here.** The recorded rule was *"read the scope's pid against
+the process's pid — that comparison tells 'the cap armed' from 'the cap was
+inherited', and nothing else does"*. Both instruments were consulted and they
+returned opposite verdicts, so neither could settle it.
+
+**Mechanism, from the source rather than reasoned:** `server app update restart`
+relaunches the GUI **from inside the running GUI**. The successor therefore
+inherits `YGGTERM_MEMORY_SCOPE_ACTIVE` in its environment and the parent's cgroup
+by fork, hits the idempotent early return in `enter_memory_scope_if_needed`
+(`apps/yggterm/src/main.rs`), and returns `Entered` **without ever executing
+`systemd-run`**. The scope's unit name is `yggterm-gui-{pid}` computed by
+whichever process *did* run it — so the name carries a dead pid for the entire
+life of every restarted GUI.
+
+⛔ **AND THE MARKER CAN OUTLIVE THE BOUND.** The two halves of the inheritance
+travel by different mechanisms — the marker by environment, the ceiling by
+cgroup. A plain fork carries both, which is why this was benign on the day it was
+caught. Anything that carries an environment further than it carries a process
+(a user unit, a relaunch through a daemon that captured the env from an earlier
+GUI) would take the same early return and report `bounded: true` **while sitting
+in the plain login scope at `memory.high = max`** — which is precisely the
+failure this trace field was added to make impossible.
+
+✅ **Fixed:** the idempotent path now reads `/proc/self/cgroup` + `memory.high`
+instead of trusting the marker, and reports `inherited` with the unit it landed
+in. `max`, empty and unreadable all count as **unbounded** — blind is not
+bounded. Locked by a test shown to fail against a mutated predicate.
+
+⭐ **The reusable half:** an early return added for idempotence answered a
+DIFFERENT question than the one the caller was asking. `Entered` meant "I did the
+work" at the site that created it and "someone did the work" at the site that
+skipped it, and one enum variant covered both.
+
 ## ⛔⛔⛔ [6.7] AUDIT THE SESSION-ONLY RE-ATTACH MACHINERY — ONE SUBSYSTEM BEHIND THE GATES, THE RENDER DIVERGENCE AND THE RESTART STORM
 
 **Status:** OPEN
