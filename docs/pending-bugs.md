@@ -12,6 +12,76 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [6.1] THE SUCCESSOR RETIRES AND THE PREDECESSOR KEEPS THE SESSION — THE DRAIN INVERTS
+
+**Status:** AWAITING A DECISION
+
+**Who decides:** whoever owns daemon lifecycle — 6.1 proposes, 6.9 holds the
+cost model that constrains it. The measurement and the mechanism are settled;
+only the remedy is open, because both directions have a known failure mode.
+
+*Measured 2026-08-14 in an isolated `YGGTERM_HOME` with a real
+predecessor/successor pair, both built from source in this repo (3.0.154 and a
+3.0.155 built only for this test). Fleet daemon census 23 before and 23 after,
+so nothing outside the sandbox was touched.*
+
+**What happened, in order:**
+
+1. predecessor 3.0.154 owns one live plain-shell PTY — `owned=1`;
+2. successor 3.0.155 starts — `owned=0, preserved=1`, i.e. it knows the runtime
+   by bequest but does not own it;
+3. the hot-update handoff is driven explicitly and **starts**:
+   `hot_update_handoff_used: true`, `update_priority: "handoff_preserve_sessions"`,
+   `"hot update handoff started: preserving 1 live terminal runtime(s)"`,
+   and the predecessor's cold shutdown is correctly skipped
+   (`fallback_shutdown_skip_reason: "handoff_preserved_owner"`);
+4. **90 s later the SUCCESSOR logs `daemon idle shutdown` and exits.** The
+   predecessor is still alive and still `owned=1`.
+
+⇒ **The new daemon retired and the old one stayed.** That is the drain running
+backwards, and it is one concrete way the constitution's *"then the emptied
+daemon retires on its own"* does not happen.
+
+⚠ **No session was lost. The pty child survived the whole run**, verified by pid
+rather than by a row listing — a re-resume would have produced a different pid.
+The failure is **non-convergence, not data loss**, and it must not be filed as
+the latter.
+
+### ⛔ THE MECHANISM: TWO QUANTITIES SHARE ONE NAME, AND THE GATE'S COMMENT NAMED THE OTHER
+
+`daemon_should_idle_shutdown`'s first gate said *"including preserved hot-update
+PTYs, which are counted here"*. They are not.
+
+| name | what it is | preserved counted? |
+|---|---|---|
+| the `terminal_session_count` **argument** | `runtime.terminals.stats().session_count` at both call sites — sessions in this daemon's own registry with `is_running()` | **no** |
+| `ServerRuntimeStatus::terminal_session_count` | `terminal_session_keys.len()` | **yes** |
+
+⇒ A successor holding the runtime only as PRESERVED passes gate 1. The comment
+has been corrected in place; **the behaviour has not been changed.**
+
+⚠ **Gate 3 is what usually hides this.** The successor also has to have no
+client-instance records, so on the live fleet the GUI registering with the new
+daemon protects it. It bites where there is no client record: a headless deploy,
+or the window between daemon start and GUI registration.
+
+### ⛔ WHY THIS IS NOT A ONE-LINE FIX
+
+Counting preserved keys here inverts the failure: bequeathed records outlive the
+daemons that wrote them, so a daemon holding a stale preserved key would never
+retire — against a measured population cost of `N_reachable × a ~0.2-core floor`.
+**Both directions have a known failure mode**, which is why this is a decision
+and not a patch.
+
+⭐ **The connection that makes it load-bearing:** the readiness-probe entry's own
+ruling is that *the dangerous action is a handover that FAILS to converge, not a
+bump as such*, and that a non-converging daemon and "the thing that types over a
+draft" are the same population. This is a reproducible way to manufacture one.
+
+**Falsifier:** run the pair in an isolated home with no client record; the
+successor must still be alive after its idle window with the runtime adopted,
+and the predecessor must be the one that exits.
+
 ## ⛔⛔ [6.0] THE SUPERVISION WATCHER IS DEPLOYED BY WHICHEVER CHECKOUT IT HAPPENED TO START IN
 
 **Status:** OPEN
