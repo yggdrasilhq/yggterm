@@ -12,6 +12,37 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔⛔ [6.9→6.7] THE HANDLER SPAN MEASURES 9% OF THE HANDLER, IN THE WRONG UNIT
+
+**Status:** OPEN
+
+*measured 2026-08-14; instrument, controls and the two refuted candidates in
+[`idle-cost-model.md`](idle-cost-model.md) §6j — spec is §S6*
+
+A connection-handler thread burns **25.0 ms of CPU (1.6 user + 23.4 kernel,
+93.8% kernel)**. The `PerfGuard` span over it covers **~2.4 ms**, because the
+guard **drops when `handle_request` returns** and records **wall time**, which
+cannot distinguish work from waiting.
+
+⇒ **~1.8–1.9 cores of the daemon population are spent where no instrument
+looks.** That number is stable: two 60 s runs over 20 daemons put the
+dead-thread term at 1.793 and 1.944 cores, per-daemon reproducible to ~5–10%.
+
+**Fix (§S6), two small parts:** add a `CLOCK_THREAD_CPUTIME_ID` reading to
+`PerfGuard` beside the wall reading (**priced at 570 ns/call on this host — two
+calls is 0.05% of a ~2.4 ms span**), and wrap the whole closure at
+`spawn_unix_client_handler` (`daemon.rs:785`) instead of just `handle_request`.
+
+**Expected effect: ZERO cores — do not promise any.** It converts an
+unattributable 1.8 cores into an attributed one. **Prediction it must satisfy:**
+~25 ms on a loaded daemon, ~0.7 ms on an empty one.
+
+⛔ **Ruled out by measurement, so do not re-propose them:** `malloc_trim(0)` at
+`daemon.rs:19103` (**0.020–0.039 ms** at 30 threads/360 MB — ~600x too small),
+the page-faults it induces (353–852/request ≈ 0.5–1.7 ms), the lock wait itself
+(`try_lock` then a **blocking** `lock`; a block costs no CPU), and the trace
+writer (handles cached, no stat or reopen per call).
+
 ## ⛔ [6.3] ONE SESSION RENDERS AS TWO ROWS, AT TWO DIFFERENT NESTING DEPTHS
 
 **Status:** OPEN
@@ -93,9 +124,35 @@ being audited rather than merely edited.
 **Falsifier:** the identifiers are absent from `git log -p` over all refs, and the
 forge returns 404 for the pre-removal blob URLs.
 
-## ⛔⛔⛔ [6.9→6.7] EVERY PEER `status` POLL REBUILDS THE WHOLE ROW INVENTORY, AND THE POLLS GO AS N²
+## ⛔ [6.9] A DAEMON WITH ALL THREE RETIRE GATES OPEN DID NOT RETIRE
 
 **Status:** OPEN
+
+*source reading and the three gates in [`idle-cost-model.md`](idle-cost-model.md) §6k*
+
+`daemon_should_idle_shutdown` (`daemon.rs:11526`) requires three conditions:
+zero terminal sessions (owned **and** preserved), idle beyond
+`idle_shutdown_ms` (default 90 s), and no active client-instance records for
+**its own endpoint** (or being superseded).
+
+One sandbox daemon satisfies all three by observation — its own state file reports
+`stored_sessions=0, live_sessions=0`, it holds **only LISTEN sockets with zero
+established connections**, and the single client-instance record in its home is
+filed under a *different* endpoint version than the one it serves — yet it had
+been alive **48 minutes** against a 90 s window.
+
+⇒ Either the check is not reached on that path, or one of the three inputs is not
+what the state file says. **Not a cost item** (it measures 0.0002 cores); it
+matters because the drain in §S1 depends on emptied daemons actually retiring.
+
+## ⛔⛔⛔ [6.9→6.7] EVERY PEER `status` POLL REBUILDS THE WHOLE ROW INVENTORY
+
+**Status:** OPEN
+
+⛔ **This heading used to end "AND THE POLLS GO AS N²". That half is RETRACTED
+(see below) and was removed from the title on 2026-08-14** — it had been left
+standing over a body that withdrew it, which is the most quotable line in the
+entry contradicting the entry.
 
 *measured 2026-08-14; derivation, controls and the N=1 arm in
 [`idle-cost-model.md`](idle-cost-model.md) §6 — spec is §S5*
@@ -143,24 +200,35 @@ sees an empty `stored_terminal_session_keys`, which reads as *"this peer holds n
 dormant rows"* — the exact input that has dropped rows in a handover before, and
 **14 daemons that will never restart still speak the old shape**.
 
-⛔⛔ **EXPECTED EFFECT IS DISPUTED — MEASURE BEFORE BUILDING.** The 0.66 figure
-divides the model's per-row coefficient by the poll rate. Reading the handler's
-own `PerfGuard` duration instead gives **11 µs/row, not 94** (slope over 14
-daemons, r=+0.683; 70–101 rows → 2.09–2.57 ms, 243–246 rows → 2.92–3.17 ms),
-which makes this **≈0.08 cores** and puts status handling at ~5% of a daemon's
-idle cost rather than most of it. ⚠ Flagged not adopted: that instrument records
-`daemon_request/status` at 1.8/s against 49.7/s arriving — **~3.6% of requests**,
-unexplained, and `PerfGuard` has no sampling logic. The **slope** is robust (a
-uniform under-recording factor cancels between daemons); the absolute share is
-not. ⇒ **Instrument the status path directly — per-reply row count and elapsed
-CPU, not wall — and confirm both the slope and its share of daemon CPU before
-building.** The row term is directly confirmed and the O(R log R) → O(1) change
-is still right; ⛔ **do not promise 0.66 cores for it.**
-⇒ **And it reopens the bigger question: where does the other ~95% of daemon CPU
-go?** `idle-cost-model.md` §6g.
+⛔⛔ **S5 IS DECIDED AGAINST — DO NOT BUILD IT. THE COST IS NOT HERE.** Three
+successive estimates of the per-row cost of a `status` reply, each refuting the
+last: **94 µs/row** (coefficient ÷ poll rate — a ratio), **~11 µs/row** (naive
+fit on `PerfGuard` records), **≈4.65 µs/row** (inverse-probability-weighted
+re-fit at 4.71, and an independent unsampled sandbox counter at 4.645 on CPU not
+wall, r=+0.9981 — agreeing within 1.4%).
 
-**Expected effect, as originally derived (⚠ disputed above):** ≈**0.66 cores**
-(0.000337/row × 1,953 rows), ~25% of the 2.64-core daemon footprint.
+⛔ **The naive fit was biased by the sampling predicate.** `("daemon_request",
+"status")` is on `perf_span_is_high_frequency_noise`, and
+`perf_span_should_record` keeps a span when `duration_ms >=
+NOISY_SPAN_RECORD_FLOOR_MS` (8.0) **or** on a 1-in-50 sample
+(`crates/yggterm-core/src/perf.rs:54–116`). ⇒ **records are kept for being SLOW**,
+high-row daemons clear the floor more often (13.5–16.8% vs 3.5–7.6%), and the
+sampling therefore correlates with the variable being fitted. **It cannot cancel.**
+⭐ **Rule: read the sampling predicate before deciding whether sampling cancels —
+a duration threshold is a filter on the dependent variable.**
+
+⇒ **All of status serving is ≈0.057 cores of the 3.47-core population (1.6%), and
+request serving explains under 1% of the fitted floor. Neither unattributed term
+is `status`.** The census split would buy ~1.5% while paying with a version-gated
+protocol change whose `#[serde(default)]` failure mode is a documented row-loss
+hazard at handover. ⚠ **Reversal condition:** re-open if status serving ever
+exceeds ~10% of daemon cost (a far larger population, or rows well beyond ~260).
+
+⭐ **What survives:** the row inventory *is* rebuilt on every reply (O(R log R)
+plus `persisted_state()`), which was worth establishing — it is simply cheap.
+⇒ **The real question is now open and unowned: ~93% of daemon CPU is
+unattributed.** Not request serving (<1%), not daemon churn (5.7%, measured).
+`idle-cost-model.md` §6g and §6h.
 **Falsifier:** re-run the paired comparison (1-owned daemons, low vs high rows,
 both controls in one run). If the per-row coefficient does not fall to ~0,
 `status` was not what the row term was buying.
@@ -384,8 +452,20 @@ threads and `/proc/<pid>/task` cannot. **Any per-thread profile of a daemon is
 currently missing ~80% of its CPU.**
 
 ⚠ **Do not promise cores for the pool fix.** Thread spawn is ~50 µs, so 4/s is
-~0.0002 cores. The **38 ms per handler is the work, not the spawn.** The value
+~0.0002 cores. The **~25 ms per handler is the work, not the spawn.** The value
 is that CPU stops being invisible to per-thread instruments.
+
+⛔ **UPDATED §6j — the "38 ms" in this entry was a retracted ratio; the measured
+figure is ~25 ms** (1.6 ms user + 23.4 ms kernel, direct per-thread, 93.8%
+kernel). ⭐ **And a handler on an EMPTY daemon costs 0.70 ms**, so ~95% of the cost
+travels with what the daemon HOLDS, not with the connection — a pool would keep
+that 95%. ⭐ **The row term is now settled three ways at ~4.5 µs/row** (a causal
+seeded arm, an IPW re-fit of field data, and the optimisation lane's own arm), so
+rows are ~1.2 ms of a 25 ms thread. **The residual tracks SESSIONS** — named as
+the next arm in §6j-6, not priced. The conclusion of this entry is unchanged and now rests on measurement.
+⛔ **A version/RSS split of the per-request cost was measured, then FAILED TO
+REPLICATE (8.5 ms then 33.3 ms on the same daemon) and is withdrawn** — do not
+resurrect it from the first run.
 
 
 # THE 2026-08-13 BATCH — reported after a restart lost the campaign rows
