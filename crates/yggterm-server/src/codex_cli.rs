@@ -304,6 +304,28 @@ impl ManagedCliPaths {
         })
     }
 
+    /// ⛔ WHERE A PACKAGE'S OWN INSTALLER STAGES ITS DOWNLOAD — AND IT MUST NOT
+    ///    BE `/tmp`.
+    ///
+    /// A published CLI's `preinstall` script stages with `os.tmpdir()`, which is
+    /// `$TMPDIR` or `/tmp`. On the desktop host `/tmp` is a **tmpfs**, so a
+    /// 78 MB release tarball is downloaded into RAM. That alone would be a bad
+    /// trade on a 14 GB laptop; the package also never removes the directory it
+    /// made, so every auto-update leaks the whole 78 MB and it never comes back.
+    ///
+    /// ⇒ Measured on the desktop host 2026-08-14: **51 leaked staging dirs,
+    /// 2.85 GB, accumulating since 2026-08-02**, held in a RAM-backed
+    /// filesystem while the machine sat at 11 GB of 15 GB swap. The owner's
+    /// report was memory pressure, and this was the largest single cause.
+    ///
+    /// ⚠ **The leak is in a package we do not own, and this does not fix it.**
+    /// It moves the damage off RAM and onto disk, where a leaked tarball is
+    /// merely untidy instead of an eviction. The package still needs its own
+    /// `rmSync(tmpDir)`, and the sweep below still has to run.
+    fn staging_dir(&self) -> PathBuf {
+        self.home.join("cli-staging")
+    }
+
     fn ensure_dirs(&self) -> Result<()> {
         fs::create_dir_all(&self.prefix)
             .with_context(|| format!("creating managed npm prefix {}", self.prefix.display()))?;
@@ -311,7 +333,34 @@ impl ManagedCliPaths {
             .with_context(|| format!("creating managed npm bin {}", self.bin_dir.display()))?;
         fs::create_dir_all(&self.cache_dir)
             .with_context(|| format!("creating managed npm cache {}", self.cache_dir.display()))?;
+        let staging = self.staging_dir();
+        fs::create_dir_all(&staging)
+            .with_context(|| format!("creating CLI staging dir {}", staging.display()))?;
         Ok(())
+    }
+
+    /// Reap staging directories a package's installer abandoned.
+    ///
+    /// Best-effort and deliberately unconditional on success: this runs BEFORE
+    /// an install rather than after, because the leak belongs to a script we do
+    /// not control and which may fail, be killed, or simply never clean up. A
+    /// sweep that only ran on the happy path would miss exactly the cases that
+    /// leak most.
+    fn sweep_staging(&self) {
+        let staging = self.staging_dir();
+        let Ok(entries) = fs::read_dir(&staging) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            // Anything here is a leftover by construction: the directory exists
+            // only as scratch for an installer that has already exited.
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(&path);
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+        }
     }
 
     fn env_path(&self) -> OsString {
@@ -1734,6 +1783,58 @@ mod tests {
         }
     }
 
+    /// ⛔ A PACKAGE'S INSTALLER MUST NOT STAGE ITS DOWNLOAD IN RAM.
+    ///
+    /// `os.tmpdir()` in a `preinstall` script resolves to `$TMPDIR`, and on the
+    /// desktop host `/tmp` is a **tmpfs**. A published CLI stages a 78 MB
+    /// tarball there and never removes the directory, so every auto-update
+    /// leaked 78 MB of RAM permanently: 51 dirs, 2.85 GB, measured on a machine
+    /// sitting at 11 GB of 15 GB swap. The owner reported it as memory pressure.
+    ///
+    /// Two properties, because either alone is insufficient — staging on disk
+    /// without sweeping merely relocates an unbounded leak, and sweeping a
+    /// tmpfs still spikes RAM by the download size on every update.
+    #[test]
+    fn cli_staging_is_on_disk_and_swept() {
+        let paths = provision_test_paths("staging");
+        let staging = paths.staging_dir();
+
+        // 1. It is under the managed home, NOT the system temp dir, so a
+        //    tmpfs-backed /tmp is never where a 78 MB download lands.
+        assert!(
+            staging.starts_with(&paths.home),
+            "staging {} must live under the managed home {}",
+            staging.display(),
+            paths.home.display()
+        );
+        assert_ne!(
+            staging.parent(),
+            Some(std::env::temp_dir().as_path()),
+            "staging must not be a child of the system temp dir"
+        );
+
+        // 2. A leftover from an installer that never cleaned up is reaped.
+        //    The leak belongs to a script we do not own, so the sweep must not
+        //    depend on that script behaving.
+        paths.ensure_dirs().expect("ensure dirs");
+        let abandoned = staging.join("codex-litellm-AbCdEf");
+        std::fs::create_dir_all(&abandoned).expect("stage a leftover");
+        std::fs::write(abandoned.join("payload.tar.gz"), b"x").expect("write payload");
+        assert!(abandoned.exists(), "control: the leftover was staged");
+
+        paths.sweep_staging();
+
+        assert!(
+            !abandoned.exists(),
+            "an abandoned staging dir must be reaped before the next install"
+        );
+        assert!(
+            staging.exists(),
+            "the staging root itself must survive the sweep"
+        );
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
     /// The owner's 2026-08-08 ruling, asserted as a property of the registry:
     /// *"yggterm should auto install, update ALL clis in all connected systems
     /// including localhost."*
@@ -2904,11 +3005,20 @@ fn install_npm_batch(
     }
     let npm = npm_binary().context("npm is required to manage Codex tools")?;
     paths.ensure_dirs()?;
+    // ⛔ Reap what the last install abandoned before making more. See
+    //    `staging_dir` for why this is not the package's job to be trusted with.
+    paths.sweep_staging();
     let mut command = Command::new(npm);
     command
         .env("NPM_CONFIG_PREFIX", &paths.prefix)
         .env("npm_config_prefix", &paths.prefix)
         .env("npm_config_cache", &paths.cache_dir)
+        // ⛔ TMPDIR, not /tmp. A package's `preinstall` stages a 78 MB tarball
+        //    via `os.tmpdir()` and never removes it; on the desktop host /tmp is
+        //    a tmpfs, so that leak lands in RAM. `npm_config_tmp` is set too
+        //    because npm has its own notion and they are not the same knob.
+        .env("TMPDIR", paths.staging_dir())
+        .env("npm_config_tmp", paths.staging_dir())
         .env("npm_config_update_notifier", "false")
         .env("npm_config_audit", "false")
         .env("npm_config_fund", "false")
