@@ -2092,6 +2092,27 @@ def tick(args):
             if not args.dry_run:
                 update_sub(uuid, s)
             continue
+        # ⛔⛔ A QUOTA MESSAGE WHOSE OWN RESET TIME HAS PASSED IS HISTORY, NOT A
+        #    LIVE LIMIT — demote it to IDLE *before* dispatch, or the row stays
+        #    parked forever. `RATE_LIMITED` is deliberately never booted (correct:
+        #    do not boot into a live wall), but the classification is read off a
+        #    frozen tail, and a parked row never writes anything to change it. So
+        #    a row that hit a limit ONCE is skipped on every tick thereafter.
+        #    ⇒ Measured by a sibling campaign: a subscription present the whole
+        #    time, a reset 74 minutes past, `boots=0`, and a live runtime that a
+        #    single carriage return then woke on the first try. The row was
+        #    perfectly wakeable; nothing ever asked it.
+        # ⚠ Typing here is still guarded and that is what makes this safe: the
+        #    boot reads the SCREEN first and refuses on a choice prompt or an
+        #    unreadable screen, so a row sitting on the plan-limit DIALOG is
+        #    still never typed into, and `--refuse-if-draft` still protects a
+        #    half-typed sentence.
+        if state == "RATE_LIMITED" and tail_reset_has_passed(c.get("tail")):
+            log(f"{uuid[:8]} quota message is HISTORY — its own reset time has "
+                f"passed and nothing has been written since. Treating as IDLE so "
+                f"it can be woken rather than skipped forever.")
+            state = "IDLE"
+
         if state == "RATE_LIMITED":
             # ⛔⛔ THE PREMISE BELOW WAS FALSE FOR 7.5 HOURS AND TOOK THE WHOLE
             #    WAKE PLANE DOWN WITH IT. "The account is out of quota, not this
