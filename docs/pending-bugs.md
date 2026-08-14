@@ -12,6 +12,57 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [6.0] SOME ROW SUMMARIES DESCRIBE WORK THAT NEVER HAPPENED, IN THE SIDEBAR THE USER READS
+
+**Status:** OPEN
+
+*Found 2026-08-14 while sweeping rows for a different reason.*
+
+A row's `detail_label` is its summary, and for a handful of rows it is **generic
+software-engineering boilerplate that appears nowhere in that session**. Not a
+stale summary, not a vague one — a confident description of a different project.
+
+**The signature is unmistakable once seen:** *"The current objective is to
+integrate the new `<X>` middleware into the existing `<Y>`"*, with `<X>`/`<Y>`
+drawn from tutorial-grade material (auth middleware, OAuth2 token refresh, a
+WebSocket collaboration layer, a Flask API, a microservice request pipeline) —
+subjects this project does not contain.
+
+⇒ **Confirmed on two rows by independent probe**, each against its own
+transcript:
+- a row whose lane did **document-surface rendering** carries a summary about a
+  *real-time collaboration layer for a collaborative drawing application*. The
+  phrase "collaborative drawing" occurs **0** times in that session.
+- a row whose lane is a **business/licensing discussion** carries a summary about
+  *authentication middleware in a Flask API*. `Flask`, `middleware` and
+  `microservice` each occur **0** times in that session.
+
+⭐ **The real prefix is preserved and the fabrication is appended**, which is what
+makes it convincing: the summary opens with the session's genuine first tokens
+and then continues into invented content. A reader who recognises the opening
+trusts the rest.
+
+⚠ **SEVERITY IS ABOUT WHO READS IT.** The sidebar is how the user knows what each
+row is doing. A fabricated summary is worse than an absent one: it answers the
+question wrongly and gives no sign it is guessing. At least one affected row is
+one the user works in himself.
+
+⛔ **WHAT THIS ENTRY DOES NOT CLAIM.** A first measurement here reported "31 of 31
+summaries fabricated" and **that number was wrong and is withdrawn** — it tested
+whether the summary appears VERBATIM in the session's first message, which a
+generated summary never would, since paraphrasing is its job. Most summaries do
+describe their lane's real subject and are fine. **The defect is the subset whose
+DOMAIN does not match the session at all**, which is a different and much smaller
+population. The sound detector is domain mismatch, not string containment.
+
+**Not yet established, and worth knowing before a fix:** whether these are
+produced when summary generation fails or is rate-limited and a fallback is
+persisted anyway (there is a standing rule in this fleet that a heuristic
+fallback must never be persisted over a rate-limit refusal), or whether the
+generator is simply hallucinating from insufficient input. **The falsifier is
+cheap:** force a summary generation for a row whose content is known, with the
+generator's backend unavailable, and see what gets written.
+
 ## ⚠ [6.0] A FINISHED LANE'S ROW HOLDS ITS SEAT FOREVER, AND NOTHING RETIRES IT
 
 **Status:** OPEN
