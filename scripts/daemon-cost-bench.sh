@@ -118,6 +118,10 @@ for K in "${ROWS[@]}"; do
     # delta by your own request count charges that background to the requests
     # you sent — a denominator you caused against a numerator you did not. That
     # error was worth 29x on a neighbouring arm. Measure it; never assume zero.
+    # ⚠ Settle BEFORE the baseline. A control is only a control once it is
+    # warm: taken immediately after startup it charges state restore and the
+    # first scans to the background and reads high.
+    sleep 20
     BG_A="$(proc_cpu_us "$DPID")"; BG_T0="$(date +%s)"
     sleep 20
     BG_B="$(proc_cpu_us "$DPID")"; BG_T1="$(date +%s)"
@@ -138,15 +142,26 @@ for K in "${ROWS[@]}"; do
     # request past the boundary the window this run paid for is never emitted.
     sleep 1
     YGGTERM_HOME="$HOME_DIR" timeout 10 "$BIN" server status >/dev/null 2>&1 || true
-    python3 - "$HOME_DIR/event-trace.jsonl" "$K" <<'PY'
-import json, sys
-path, k = sys.argv[1], sys.argv[2]
+    python3 - "$HOME_DIR" "$K" <<'PY'
+import glob, json, os, sys
+home, k = sys.argv[1], sys.argv[2]
+# ⛔ Read the ROTATED siblings too. At a high drive rate the trace file rotates
+# mid-arm and carries the flushed windows out with it, and the only symptom is
+# "no window flushed" — which reads as "the instrument did not fire" when in
+# fact it fired and the reader was looking at the wrong file. Cost one arm.
+paths = [os.path.join(home, "event-trace.jsonl")]
+paths += sorted(glob.glob(os.path.join(home, "event-trace.g*.jsonl")))
 status, handler = [], []
-for line in open(path, errors="replace"):
-    if '"status_cost"' in line:
-        status.append(json.loads(line)["payload"])
-    elif '"client_handler_cost"' in line:
-        handler.append(json.loads(line)["payload"])
+for path in paths:
+    try:
+        lines = open(path, errors="replace")
+    except OSError:
+        continue
+    for line in lines:
+        if '"status_cost"' in line:
+            status.append(json.loads(line)["payload"])
+        elif '"client_handler_cost"' in line:
+            handler.append(json.loads(line)["payload"])
 if not status:
     print(f"rows={k} no window flushed — raise --dwell above the flush interval")
 else:
@@ -159,12 +174,15 @@ else:
 # ⚠ The LAST window, not the first: the first covers process start, so it
 # reports a control that was never warm.
 for i, h in enumerate(handler):
-    ks = h["kernel_share"]
     warm = "warm " if i else "COLD "
-    print(f"      {warm}handler: cpu_us/conn={h['cpu_us_mean']:<7}"
-          f" wall_us/conn={h['wall_us_mean']:<7} max={h['cpu_us_max']:<8}"
-          f" kernel_share={'n/a' if ks is None else f'{100*ks:.1f}%'}"
-          f" ticks={h['cpu_ticks_sampled']:<5} conns/s={h['handlers_per_s']:.0f}")
+    print(f"      {warm}handler window: {h['handled']} conns,"
+          f" {h['handlers_per_s']:.0f}/s, proc_cpu_delta={h['proc_cpu_us_delta']}us")
+    # ⛔ Per VERB. A single mean mixes a ping with a status carrying 264 rows.
+    for name, r in sorted(h["requests"].items(), key=lambda kv: -kv[1]["cpu_us_total"]):
+        ks = r["kernel_share"]
+        print(f"        {name:<16} n={r['handled']:<6} cpu_us/conn={r['cpu_us_mean']:<7}"
+              f" wall_us/conn={r['wall_us_mean']:<7} max={r['cpu_us_max']:<7}"
+              f" kernel={'n/a' if ks is None else f'{100*ks:.1f}%'}")
 PY
   else
     # Startup work — state restore, scans — is not the idle cost. Settle first.
