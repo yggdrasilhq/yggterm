@@ -54,7 +54,7 @@ being audited rather than merely edited.
 **Falsifier:** the identifiers are absent from `git log -p` over all refs, and the
 forge returns 404 for the pre-removal blob URLs.
 
-## ✅ [6.9→6.7] S6 IS BUILT — THE HANDLER NOW REPORTS CPU, END TO END, PER VERB
+## ⛔ [6.9→6.7] S6 — THE HANDLER NOW REPORTS CPU, END TO END, PER VERB
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
