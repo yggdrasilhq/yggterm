@@ -10669,6 +10669,24 @@ is True across TWO sweeps separated by minutes AND the transcript has not grown
 between them.** One sample means *someone may be mid-sentence*; two samples with
 no transcript growth means *stalled*.
 
+⭐⭐ **AND INVERT THE NUISANCE INTO THE CAPABILITY `never-arm.tsv` SAYS DOES NOT
+EXIST.** That file's standing warning is *"no probe separates those two cases,
+and guessing wrong types into a human"* — the two cases being an unattended
+delegate and a row a person attends. **A row that repeatedly shows a TRANSIENT
+draft — appearing and clearing without the booter ever writing — is a row
+something is typing into by hand.** That is the first probe that produces
+*candidates* for attendance at all, and it costs nothing: the sweep is read-only
+and already running.
+
+⚠ **It suggests, it does not prove**, and the difference is load-bearing: an
+agent's own composer drafts too (the third case above), so a positive means
+*worth asking about*, never *add it to never-arm*. ⛔ **A never-arm entry stays a
+permanent assertion that only the row's own campaign may make.** ⇒ Turning *"no
+probe exists"* into *"here are the rows worth confirming"* is the whole of the
+improvement, and it is enough: two armed rows were found attended-or-adjacent
+within an hour of the instrument existing, one of them by its own campaign
+independently.
+
 ⇒ **Finding a stuck-unwakeable row is now one read-only command instead of an
 unbuilt feature**, and it needs no log-reading and no writing:
 `yggterm-headless server rows drafts` → any `drafts_present` row that is also
