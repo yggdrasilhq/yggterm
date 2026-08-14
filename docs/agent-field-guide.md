@@ -301,6 +301,126 @@ a mode change or relaunch corrupts whatever it is measuring.
 
 No `perf` on a typical desktop host (`perf_event_paranoid=3`), but these do:
 
+### ⛔⛔⛔ THE UNIT LAW — when every instrument agrees and the answer is still missing, suspect the UNIT
+
+**Four lanes spent a day refining precision inside units that could not express
+the answer.** Every instrument was honest, every control passed, and the quantity
+was not in frame. That is not a precision problem and no amount of care inside
+the unit finds it.
+
+**Three faces, all from one day, all invisible to every instrument because every
+instrument shared the unit:**
+
+| face | the unit | what it cost |
+|---|---|---|
+| **STORAGE** | an identifier held at two lengths (8 vs 36) | a `succeed` silently skipped rows and reported a clean count; one seat escalated into a void for hours while the board rendered it healthy |
+| **ACCOUNT** | one daemon vs the **POPULATION** | every arm measured a daemon and none measured how MANY — `population ≈ N_reachable × ~0.2 cores`. Per daemon the old and current builds are indistinguishable; the pile is expensive because it is **numerous**, and no amount of precision on one daemon expresses that |
+| **SCOPE** | a sandbox daemon vs a **loaded** one | a sandbox daemon has **no sessions and no peers**, so it reads ~0 and can never exhibit the floor. `0.00017 cores` was reproducible, honest, and blind by construction |
+| **REGIME** | saturated vs idle | flooding a pty with `yes(1)` measured the reader path's **ceiling**; carried to a fleet whose sessions are idle it inverted the whole ledger |
+
+⭐ **A fourth face is the observer's own:** a unit that silently *includes the
+measurer* — a counter charging your load to the subject, a probe reading back its
+own write, an "after" window taken in the wake of your own generator.
+
+⇒ **The tell is agreement without resolution.** When independent instruments
+converge and the number still will not appear, stop improving the instruments and
+ask **what quantity they all decline to express.** Change the unit — count the
+population, not the instance; load the subject before pricing it; measure the
+regime it actually occupies, not the one that saturates it; compare identifiers by
+prefix, not equality.
+
+⛔⛔ **AND A RETRACTION THIS TABLE CARRIES AGAINST ITSELF.** The ACCOUNT row above
+originally read *process vs process SUBTREE*, on the reasoning that a sandbox
+daemon spawns no children and so has *no subtree to carry the floor*. **That was
+withdrawn on 2026-08-14** by a read-only two-sample `/proc` walk over 16 daemons
+and 172 descendants: **eleven of sixteen carry 0.13–0.25 cores in the daemon
+process itself with essentially empty subtrees.** The subtree only balloons on
+daemons hosting working agents, where it is a compile and a live turn — somebody's
+work, not daemon overhead. The two framings never disagreed; the distinction was
+invented. ⭐ **The rule its author drew from it is the one to keep: a mechanism is
+a CANDIDATE until a measurement it could have failed has been run.** Two earlier
+mechanisms from the same lane died as cheap hypotheses; this one reached a
+document and two lanes' hands first, and that is the only difference.
+⚠ Corrected here by the orchestrator because the lane that filed it had already
+stood down and the lane that retracted it does not own this file — **an orphaned
+withdrawn claim outlives both of them.**
+
+⚠ **And a harness that cannot express the term should say so in its own
+documentation**, or it goes on looking general-purpose while being blind by
+construction.
+
+### ⛔⛔ an EXTERNAL estimator is unusable when the baseline IS what you subtract
+
+**Read this before pointing any `/proc`-based profiler at a busy process.** It
+cost the resource campaign four measurements, and they failed as one class rather
+than as four accidents.
+
+The recipes below all work by **differencing a process-level counter**: sample
+`/proc/<pid>/stat` twice, attribute the delta to whatever you were doing in
+between. That is sound **only while nothing else in the process is running**. The
+moment the process has its own concurrent work — background chores, per-session
+reader threads, another client's traffic — the counter charges that work to your
+window too, and you divide it by *your* denominator.
+
+**The arithmetic that kills it.** To price ~2 ms of per-request work at 100
+requests you are looking for ~0.2 core-seconds. A daemon carrying live sessions
+drifts by ~0.7 cores over the same 10 s — **~35x larger than the signal**. The
+quantity is below the noise floor of the instrument.
+
+⭐ **THE TELL IS A CONTROL THAT REFUSES, AND IT IS WORTH BUILDING FOR:** bracket
+the measured window with a baseline **before and after**. When those two
+disagree — one live daemon read 0.4240 then 1.1437 cores — the arm is void, and
+you learn it instead of publishing a number. One bracket produced an impossible
+**negative** per-request cost, which is the cheapest kind of refutation to read.
+
+**Four failures, one cause** (all in `idle-cost-model.md`):
+
+| attempt | how it failed |
+|---|---|
+| two-point dose slope | slope between two noisy points; did not replicate (8.5 → 33.3 ms, same subject) |
+| version/RSS sub-group split | n=2 per group off that slope; died on widening 4 → 8 |
+| baseline-subtracted live arm | brackets disagreed 2.7x; negative result; VOID |
+| a per-connection cost "outside the handler" | **1.7 ms that does not exist** — background charged to whatever connection happened to be open. Measured directly from inside, the whole floor is **150–230 µs** |
+
+⇒ **What to do instead.** Measure the *operation*, not the *process*: an
+in-process span using `CLOCK_THREAD_CPUTIME_ID` around the work itself is immune
+to what the rest of the program is doing, and it is the only thing that can price
+a per-request quantity on a busy daemon. If you cannot get inside the process,
+**say the quantity is unmeasurable rather than publishing the residual.**
+
+⛔ **A RETRACTION APPENDED TO A CLAIM ROTS INDEPENDENTLY OF IT.** Correcting by
+appending a note leaves the oldest sentence first, so a reader meets the withdrawn
+version before the correction — and when the correction is itself superseded you
+get three layers, of which the middle one reads as current. One block in the cost
+model accreted `~50 µs` → `38 ms` → `~25 ms` → `150–230 µs` this way.
+⇒ **State the current position FIRST and keep the trail beneath it.**
+⭐ **And sweep by TERM, not by document:** a docs retraction sweeps docs, while
+the dangerous copy is the one in a **different file type** — a source comment
+reads as authoritative precisely because it sits next to the code, and nobody
+greps comments when retracting a doc.
+
+⛔ **AND THE OBSERVER IS PART OF THE BASELINE.** After driving load at a subject,
+its counters stay elevated. A comparison whose "after" window follows your own
+arm measures **you**. This produced a published claim that a term swung 25x
+between adjacent windows; re-measured quiet, the same daemons moved 1.03–1.12x.
+⇒ **Let the subject settle, and never take the second half of a comparison in the
+wake of your own generator.**
+
+⚠ **Two per-thread traps in the same family**, since the first recipe below is
+exactly where they bite:
+- **`/proc/<tid>/stat` utime/stime are 10 ms CLK_TCK units, truncated
+  INDEPENDENTLY.** Below ~10 ms the smaller component is annihilated and a
+  user/kernel *share* is driven to 100% for the larger. Against
+  `getrusage(RUSAGE_THREAD)` on a known 4 ms/20 ms mix: true 83.3%, ticks say
+  **100.0%**. Short-lived threads read **zero** — 622 consecutive handler threads
+  read 0 ticks while each spent ~1.4 ms. ⇒ **never read a per-thread share from
+  tick fields**; use `getrusage(RUSAGE_THREAD)`.
+- **A control must live in the SUBJECT'S regime.** A positive control burning
+  250 ms per thread says nothing about subjects burning 1.4 ms. Sweep it: the
+  process-level *sum* survives (1.000 → 1.058 from 250 ms down to 1.5 ms), the
+  per-thread split does not. **A sum of floors is not the floor of a sum.**
+
+
 - **Per-thread CPU** — read `utime+stime` from `/proc/<pid>/task/*/stat` twice N
   seconds apart. Thread names tell you the subsystem immediately. Include the
   daemon and the WebKit child, not just the GUI.

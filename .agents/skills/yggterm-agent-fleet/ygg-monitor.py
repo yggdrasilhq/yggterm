@@ -483,6 +483,93 @@ def cmd_subscribe(a):
     return 0
 
 
+SEAT_MEMORY = STATE / "seat-membership.json"
+
+
+def _deferred_until(uuid):
+    """Epoch a row is deferred until, or 0. ⛔ THE DEFERRAL LIVES IN THE BOOTER'S
+    STORE, NOT THIS ONE — the two planes keep separate files, which is exactly why
+    the idle verdict could not see it and pronounced a correctly-waiting lane
+    finished. Reading across is the same move `screen_ledgers` already makes."""
+    try:
+        rec = json.loads((STATE / "booter" / f"{uuid}.json").read_text())
+    except Exception:
+        return 0
+    until = rec.get("boot_after_until") or 0
+    return until if until > time.time() else 0
+
+
+def _seat_handover_repair(host, dry):
+    """⛔⛔ THE FIX FOR `succeed` LIVES IN A FILE THAT SEVENTEEN CHECKOUTS OWN.
+
+    `succeed` now migrates a retiring row's subscription to its successor — but
+    `succeed` is invoked BY THE RELAYING LANE, from that lane's own copy of this
+    file. A lane six commits behind runs the old body, deletes the record, and
+    mints the orphan exactly as before. Reported by a 9.x seat that relays hourly
+    and had watched an orchestrator hand-backfill the same gap all night:
+    *"your fix is correct; it is just not where the call happens."*
+
+    ⇒ Same shape as the arming guard, which was moved out of `cmd_subscribe`
+      (eleven copies, lane-invoked) into the tick (one process, the point of
+      harm). There is ONE watcher and it runs from a current checkout.
+
+    ⚠ BUT THE TICK CANNOT RECOVER WHAT IS ALREADY DELETED. By the time a stale
+    `succeed` has run, the predecessor's record is gone and there is nothing left
+    to migrate — so a purely reactive sweep is too late by construction. This
+    therefore REMEMBERS each seat's membership while it is healthy, and restores
+    it to whoever holds the seat next.
+
+    ⛔ IT NEVER INVENTS MEMBERSHIP. A seat that was never subscribed is never
+    subscribed by this, which is what keeps it away from the rows that stood down
+    DELIBERATELY (three of them on 9.x) and from the owner's own copilot row —
+    none of those has a remembered record, because none was ever on the plane.
+    The attended screen is consulted as a second floor regardless."""
+    rows, ok = live_rows(host)
+    if not ok:
+        return []          # blind is not empty; a repair on no evidence is a guess
+    attended, _ = screen_ledgers()
+    if attended is None:
+        return []          # the same refusal the wake path takes, for the same reason
+    try:
+        mem = json.loads(SEAT_MEMORY.read_text()) if SEAT_MEMORY.exists() else {}
+    except Exception:
+        mem = {}
+    subs = {s["uuid"]: s for s in load_subs()}
+    repaired = []
+    seen = {}
+    for r in rows:
+        seat = (r.get("outline_prefix") or "").strip()
+        uuid = _bare_uuid(r.get("full_path") or "")
+        if not seat or not uuid:
+            continue
+        seen[seat] = uuid
+        if uuid in subs:                       # healthy: remember this seat's shape
+            s = subs[uuid]
+            mem[seat] = {"role": s.get("role"), "campaign": s.get("campaign"),
+                         "escalate_to": s.get("escalate_to"),
+                         "escalate_host": s.get("escalate_host"), "host": s.get("host")}
+            continue
+        prev = mem.get(seat)
+        if not prev or uuid[:8] in attended:
+            continue
+        if not dry:
+            rec = dict(prev)
+            rec.update({"uuid": uuid, "seat": seat, "owner_pinned": False, "booter": True,
+                        "since": int(time.time()),
+                        "intent": f"seat {seat} membership restored at handover by the tick"})
+            sub_path(uuid).write_text(json.dumps(rec, indent=1))
+        repaired.append(f"seat {seat}: {uuid[:8]} inherited "
+                        f"role={prev.get('role')} →{(prev.get('escalate_to') or 'human')[:8]}")
+    for x in repaired:
+        log(f"  {'DRY would restore' if dry else '⭐ RESTORED'} {x}")
+    if not dry:
+        try:
+            SEAT_MEMORY.write_text(json.dumps(mem, indent=1))
+        except Exception as e:
+            log(f"  ⚠ could not persist seat membership: {e}")
+    return repaired
+
+
 def cmd_normalize(a):
     """⛔ A SHORT POINTER IS NOT A COSMETIC PROBLEM — IT IS A SEVERED ESCALATION.
 
@@ -587,8 +674,38 @@ def cmd_succeed(a):
     for who in moved:
         log(f"  re-pointed {who} -> {new[:8]}")
     log(f"succeeded {old[:8]} -> {new[:8]}: {len(moved)} row(s) re-pointed")
+    # ⛔⛔ A SUCCESSOR INHERITS THE SEAT AND NOT THE PLANE, SO EVERY RELAY MINTS A
+    # FRESH ORPHAN. This used to just DELETE the predecessor's own subscription:
+    # the retiring row left the plane, the incoming row was never added, and the
+    # board then showed a live seat armed on the booter and escalating to nobody.
+    #
+    # Reported independently by TWO campaigns within an hour, 2026-08-14. One
+    # orchestrator ran `succeed` correctly, saw its subscribers re-point, and did
+    # not notice it had never subscribed ITSELF. The other relays roughly hourly
+    # and said it plainly: *each relay leaves the predecessor subscribed and the
+    # successor unsubscribed, so the gap is generated fresh every time.* An
+    # orchestrator backfilling those by hand is treating a symptom that the tool
+    # re-creates on the next handover.
+    #
+    # ⇒ MIGRATE the record instead of deleting it. Role, campaign and escalate_to
+    #   are properties of the SEAT, not of the session sitting in it.
+    # ⚠ Never clobber: a successor that already subscribed itself knows more about
+    #   its own intent than the corpse does.
     p = sub_path(old)
     if p.exists() and old != new:
+        try:
+            rec = json.loads(p.read_text())
+        except Exception:
+            rec = None
+        if rec and not sub_path(new).exists():
+            rec["uuid"] = new
+            rec["since"] = int(time.time())
+            rec["intent"] = (rec.get("intent") or "") + " (inherited at succession)"
+            sub_path(new).write_text(json.dumps(rec, indent=1))
+            log(f"  ⭐ successor {new[:8]} INHERITED the seat's subscription "
+                f"(role={rec.get('role')}, seat={rec.get('seat') or '-'})")
+        elif rec:
+            log(f"  successor {new[:8]} was already subscribed — left alone")
         p.unlink()
         log(f"  unsubscribed the retired orchestrator {old[:8]}")
     return 0
@@ -1096,6 +1213,11 @@ def tick(a):
     #   Idempotent, expands only unambiguous prefixes, silent when there is
     #   nothing to do.
     _normalize_pointers(a.dry_run)
+    # ⛔ BEFORE prune_dead, which is what removes the evidence. The repair reads a
+    # seat's remembered membership; pruning a retired row first is fine, but
+    # recording the HEALTHY state has to happen while the healthy row is still
+    # listed, and both live in this one call.
+    _seat_handover_repair(a.gui_host, a.dry_run)
     prune_dead(a.gui_host, load_subs(), a.dry_run)
     seat_audit(a.gui_host, load_subs(), a.dry_run)
     # ⛔ Runs over PARKED and PINNED rows too — a hold silences a verdict, not an
@@ -1177,7 +1299,30 @@ def tick(a):
         elif state == "IDLE":
             # ⭐ An IDLE row is most often FINISHED, not stuck. Say so, and ask for
             # the decision that actually applies: more work, or a reap.
-            if raw["age"] >= IDLE_ESCALATE_SECS:
+            #
+            # ⛔⛔ UNLESS IT HAS ARMED A DEFERRAL, WHICH IS A DECLARATION OF INTENT
+            # TO CONTINUE. Idleness cannot tell "finished" from "correctly
+            # waiting"; a future `boot_after_until` can, and the lane wrote it
+            # itself. Reported 2026-08-14 by an orchestrator whose market-session
+            # lane — holding a socket through a trading day, deferred 25 minutes
+            # by its own hand — was escalated as *"most likely FINISHED … give it
+            # more work, relay it, or reap it"*, quoting the lane's own words
+            # "staying subscribed" back as evidence that it had stopped.
+            #
+            # ⚠ That campaign had already paid for this once, from the other
+            # side: a lane stood ITSELF down on "am I done?" and left an account
+            # unwatched for 7h43m through a market open. They replaced the
+            # question with "what is the market doing?" — and this verdict asked
+            # the discarded question again from the supervisor's seat, where a
+            # supervisor acting on it in good faith would undo their fix.
+            # ⇒ A row with no terminal state cannot answer "am I done". Do not
+            #   ask it, and do not answer for it.
+            until = _deferred_until(uuid)
+            if until:
+                log(f"  ⏳ idle {raw['age']//60}m but ARMED until "
+                    f"{time.strftime('%H:%M', time.localtime(until))} — a deferral is a "
+                    f"declaration of intent to continue; NO verdict offered")
+            elif raw["age"] >= IDLE_ESCALATE_SECS:
                 once("idle", f"idle {raw['age']//60}m — it has most likely FINISHED its scope. "
                              "Read its last prose turn: give it more work, relay it, or reap it")
         elif state == "STUCK":
