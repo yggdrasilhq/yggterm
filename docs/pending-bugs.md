@@ -767,9 +767,22 @@ both binaries import the shared pair. The lock bans either growing one back.
 
 ### ⏳ STILL OPEN — four verbs, and the reading that is not yet a verdict
 
-- **`connect`** (GUI-only) — reaches `run_server_connect` / `run_server_connect_list`
-  and spawns. The only one of the nine with a plausible reason to be
-  GUI-side. ⛔ Not read end-to-end; do not assume either way.
+- **`connect`** (GUI-only) — ⭐ **READ END-TO-END NOW, AND THE VERDICT IS
+  ACCIDENTAL.** It reads a snapshot and asks the daemon to place a row: no
+  window, no app-control round trip, no process spawn. The earlier note here
+  said it "may reasonably need the GUI" and that it "spawns" — both were guesses
+  from its name and from a grep that matched the word in a comment. It does
+  neither.
+  ⛔ **But it is NOT a bounded move, which is why it is still open.** Attempting
+  it showed `connect` drags a private cluster with it — `ConnectPlacement`,
+  `run_server_connect`, `run_server_connect_list`, plus
+  `connect_desired_order`, `connect_path_session_uuid`, `connect_scanned_metadata`,
+  `connect_session_is_active`, `connect_session_key_is_known`,
+  `connect_session_kind_for_path` and `parse_remote_scanned_connect_path`. That
+  is ~190 lines of verb over seven more helpers, against ~120 lines for the four
+  already moved. The attempt was reverted rather than half-landed.
+  ⇒ Whoever takes it should move the cluster as one commit, and should expect
+  the helper count, not the verb, to be the work.
 - **`gate-screen`, `relay-boundary`, `wpe`** (headless-only) — read as
   deploy/relay machinery that belongs to the headless CLI by design, i.e. the
   FORK side. That is a reading of their callsites and usage text, **not a
