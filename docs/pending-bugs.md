@@ -143,6 +143,44 @@ under ~4.5%.
 ⭐ **Reopened, and this is the load-bearing question now: where do the other
 ~98% of daemon CPU go?** Not the request path. `idle-cost-model.md` §6h.
 
+## ⛔⛔ [6.7→6.1] A DRAINED DAEMON STILL CANNOT IDLE-RETIRE, BECAUSE ITS PEERS KEEP RESETTING ITS TIMER
+
+**Status:** OPEN
+
+*negative control + code, 2026-08-14; the run and its resolution limits are in
+[`idle-cost-model.md`](idle-cost-model.md) §6i*
+
+`daemon_should_idle_shutdown` (`crates/yggterm-server/src/daemon.rs:11589`) has
+two gates, and **in a live fleet neither can ever open:**
+
+1. `if terminal_session_count > 0 { return false }` — owning any session,
+   **including a preserved hot-update PTY**, blocks retirement outright. Every
+   census daemon qualifies.
+2. Otherwise it needs **90 s with no request**. But `mark_daemon_activity` runs
+   on **every** request, unconditionally, before dispatch (`daemon.rs:19423`),
+   and peers poll each daemon at **3.4–4.2/s**. ⇒ The 90 s timer is reset
+   roughly **300 times over** before it could fire.
+
+⇒ **A daemon whose sessions have all been migrated off it will still not
+idle-retire, for as long as one peer remains.** The population keeps its own
+members alive.
+
+⭐ **Proven by the converse, not argued:** the same binary, seeded with 0/100/264
+rows in an isolated home that nobody polls, **exits after 75 s** logging
+`daemon idle shutdown, idle_shutdown_ms=90000` — having burned less than
+**0.0002 cores** in the meantime.
+
+⚠ **Scope.** This is the *idle-shutdown* path, not the *successor-retire* path
+(`daemon.rs:15274`, 20 s poll), which is what actually drains superseded daemons
+and has its own deferral gate. ⇒ **The consequence for §S1 is narrow and
+concrete: a drain that migrates sessions off and then waits for the emptied
+daemon to notice it is idle will wait forever.** Whatever performs the drain has
+to retire it explicitly.
+
+⛔ **Filed from 6.7, owned by the daemon-lifecycle lane.** 6.7 measured it while
+running the negative control for the cost model and is not touching daemon
+lifecycle.
+
 ## ⛔⛔ [6.9→6.1] THE DAEMON POPULATION IS 83% OF THE IDLE FOOTPRINT, AND ITS COST IS PER-DAEMON
 
 **Status:** OPEN
