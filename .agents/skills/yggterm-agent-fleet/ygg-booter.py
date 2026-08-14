@@ -1829,8 +1829,25 @@ def tick(args):
                                     f"No boot can clear this; relay the campaign to a "
                                     f"fresh session.")
                 s["escalated"] = True
-            log(f"{uuid[:8]} CONTEXT-DEAD — unsubscribing (a boot cannot fix this)")
-            sub_path(uuid).unlink(missing_ok=True)
+            # ⛔⛔ THE THIRD SILENT-UNLINK PATH, AND IT SURVIVED THE FIX TO THE
+            # OTHER TWO. GONE and EXPIRED were both taught to lapse loudly on
+            # 2026-08-14 because a subscription that vanishes without a trace is
+            # indistinguishable from one that was never set. This one does the
+            # same thing for the same reason and was left deleting the record —
+            # the shape where one case is handled and its sibling is not, which
+            # this fleet has now paid for four times in a week.
+            # ⇒ Context exhaustion is the MOST common death here, so the path
+            #   most likely to erase the evidence was the one still doing it.
+            # ⚠ Lapse rather than retire: the SESSION is unrecoverable, but the
+            #   ROW is routinely re-claimed by a successor, and re-subscribing
+            #   clears the lapse and reports how long it went uncovered.
+            s["lapsed"] = True
+            s["lapsed_at"] = int(time.time())
+            s["lapsed_reason"] = "context exhausted and unrecoverable; escalated"
+            log(f"{uuid[:8]} LAPSED — CONTEXT-DEAD (a boot cannot fix this); "
+                f"keeping the record so this is visible. Re-subscribe to clear it.")
+            if not args.dry_run:
+                update_sub(uuid, s)
             continue
         if state == "RATE_LIMITED":
             # ⛔⛔ THE PREMISE BELOW WAS FALSE FOR 7.5 HOURS AND TOOK THE WHOLE
@@ -1851,18 +1868,25 @@ def tick(args):
             if row_process_absent(uuid):
                 log(f"{uuid[:8]} QUOTA-DEAD — no process; its quota tail is history, "
                     f"not a live refusal. Unsubscribing instead of holding the fleet.")
-                try:
-                    STATE.mkdir(parents=True, exist_ok=True)
-                    with RETIRED_LEDGER.open("a") as fh:
-                        fh.write("%s\t%s\t%s\t%s\n" % (
-                            time.strftime("%Y-%m-%dT%H:%M:%S%z"), uuid,
-                            "booter tick (auto)",
-                            "classified RATE_LIMITED with no process running as this row: "
-                            "a corpse whose last words were a quota message. Retrying it "
-                            "re-armed the fleet-wide hold on every tick."))
-                except Exception as exc:
-                    log(f"   ⚠ could not record the retirement: {exc}")
-                sub_path(uuid).unlink(missing_ok=True)
+                # ⛔ A DRY RUN MUST NOT MUTATE, and this path did both things a
+                # dry run is promised not to do: it appended to the retired
+                # ledger and deleted the subscription. Every other mutation in
+                # this tick is guarded; this one was missed, so `tick --dry-run`
+                # — the command someone reaches for precisely BECAUSE they are
+                # unsure — was the one that quietly retired rows.
+                if not args.dry_run:
+                    try:
+                        STATE.mkdir(parents=True, exist_ok=True)
+                        with RETIRED_LEDGER.open("a") as fh:
+                            fh.write("%s\t%s\t%s\t%s\n" % (
+                                time.strftime("%Y-%m-%dT%H:%M:%S%z"), uuid,
+                                "booter tick (auto)",
+                                "classified RATE_LIMITED with no process running as this row: "
+                                "a corpse whose last words were a quota message. Retrying it "
+                                "re-armed the fleet-wide hold on every tick."))
+                    except Exception as exc:
+                        log(f"   ⚠ could not record the retirement: {exc}")
+                    sub_path(uuid).unlink(missing_ok=True)
                 continue
             # A LIVE row refused on quota is the real thing: hold the FLEET, do
             # not escalate (a human cannot grant quota), and do not unsubscribe
