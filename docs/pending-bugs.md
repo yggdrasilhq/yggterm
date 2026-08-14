@@ -332,7 +332,24 @@ only the row that owns the uuid may decide, and only after measuring from inside
 1. resolve your own pid — `ps -o ppid=` upward from `$$` until `comm=claude`;
 2. measure the other — `top -b -n 2 -d 5 -p <pid>` **and** `pgrep -P <pid>`.
    Non-trivial CPU or a cycling child means it is working. Leave it and report;
-3. only then `kill -TERM` by explicit pid.
+3. only then `kill -TERM` by explicit pid;
+4. **prove the survivor survived — its transcript must GROW after the kill.**
+   Nothing else distinguishes "I killed the leftover" from "I killed the worker
+   and the row went quiet".
+
+⛔⛔ **STEP 2's `pgrep -P` IS LOAD-BEARING, NOT BELT-AND-BRACES, AND A NEAR-MISS
+PROVED IT.** A peer used a 10-second CPU-tick delta **on the parent** as its
+discriminator and got a clean 5× separation on both its rows — a good reading,
+and it would have been the WRONG ANSWER on a third row, where a `cargo test`
+child burns the CPU while its parent sits at the idle rate. It would have read
+*quiet parent* and killed a working agent. ⇒ **Parent CPU rate is a fine
+corroborator and a bad verdict; the children are the half it structurally cannot
+see.**
+
+⚠ **AND THE DETECTOR HAS A FALSE-PAIR TRAP.** Some `claude` processes carry
+neither `--session-id` nor `--resume`, so a naive grouping files them together
+under an **empty key** and reports them as a duplicate. **Treat a missing key as
+UNCLASSIFIED, never as a match.**
 
 ⚠ **AND THE WORST CONSEQUENCE IS NOT MEMORY.** Two live agents can share one
 session uuid **and one worktree**, both running cargo against the same `target/`.
