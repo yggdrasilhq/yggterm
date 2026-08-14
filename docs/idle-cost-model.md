@@ -643,7 +643,59 @@ heavy, not growing with age, invisible to a per-request instrument — which is
 exactly why it needed pricing rather than adoption. It fits the shape and does
 not fill the magnitude.
 
-## 7. The specs this justifies
+## 6i. THE STANDING COST IS IN PERIODIC CHORE THREADS, NOT IN SERVING ANYTHING
+
+The live-population half of the arm split with the optimisation lane. Per-thread
+`/proc` sampling, both controls in each quoted run.
+
+**First, a correction to my own reading one step earlier.** A by-name pass put
+49% of daemon CPU in a bucket labelled `yggterm-headles` and I read that as *the
+main thread*. It is not. **Rust's `thread::spawn` without `.name()` leaves the
+child with the parent's `comm`**, so that bucket is *every unnamed background
+chore*. Measured directly, the real main thread (`tid == pid`) is:
+
+| daemon | main-thread cores | user | kernel | top syscall |
+|---|---|---|---|---|
+| four census daemons | **0.0007–0.0012** | ~0.0002 | ~0.0005 | **`poll` 99–100%** |
+
+⇒ **The accept loop costs nothing and is asleep in `poll`.** ⛔ A truncated
+`comm` is not a thread identity — `TASK_COMM_LEN` is 16, so
+`yggterm-daemon-client-…` and the process name both truncate to something that
+looks like a category and is not one.
+
+**Where it actually is.** 60 s at 30 Hz, controls spinner 1.000 / sleeper 0.000:
+
+| cores | pid | comm | syscall profile |
+|---|---|---|---|
+| **0.1894** | 2.12.14 outlier | unnamed spawned | `clock_nanosleep` 81%, **on-CPU 19%** |
+| 0.0526 | 3.0.52 | unnamed spawned | `clock_nanosleep` 93%, on-CPU 6% |
+| 0.0436 / 0.0411 | 2.12.14 outlier | unnamed spawned | `clock_nanosleep` 93%, on-CPU 5% |
+| 0.0400 | 3.0.39 | unnamed spawned | `clock_nanosleep` 94%, on-CPU 5% |
+| 0.0376 | 3.0.62 | unnamed spawned | `clock_nanosleep` 94%, on-CPU 5% |
+| 0.0355 | 2.12.14 outlier | `yggterm-perf-in` | `clock_nanosleep` 96%, on-CPU 4% |
+| — | — | **13 threads > 0.0005** | **0.4475 cores over 4 daemons** |
+
+⭐ **The histogram carries its own consistency check.** `/proc/<tid>/syscall`
+reads as unparseable exactly when the thread is **on CPU rather than in a
+syscall**, so that bucket is a duty cycle: the 0.1894-core thread reads **19%
+on-CPU**, and 0.19 cores *is* 19% of a core. The two agree without being fitted
+to each other, on every row.
+
+⇒ **These are periodic chores that wake, burn USERSPACE CPU, and sleep** — not
+request handlers, not the accept loop, not anything triggered from outside.
+⭐ **The hottest single thread in the fleet (0.1894 cores) is on the 2.12.14
+outlier**, which is where §5 already placed a fixed-but-still-running
+full-corpus-read defect. Same daemon, arrived at by a different instrument.
+
+⛔ **WHAT IS NOT YET ESTABLISHED, and I am not quoting a number for it.** The
+split between *chore threads* and *connection handlers* needs a run whose
+controls bracket, and four attempts at 15–50 Hz read spinner **0.805–0.819 —
+VOID**. The host was carrying an unrelated OCR workload (six processes at
+160–230% CPU, load average 65 on 32 cores), which is also a reminder that **"the
+machine is hot" is not by itself a statement about this program.**
+
+⇒ **Standing ledger: request serving <1% · daemon churn 5.7% · periodic chore
+threads now the leading candidate for the bulk, un-split and unquantified.**
 
 Ordered by cores returned per unit of risk. Each carries the number it should
 move and the falsifier that would show it did nothing.
