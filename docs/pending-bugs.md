@@ -260,6 +260,63 @@ bootstrapping. The campaign already records that a re-resume onto a fresh PTY is
 when the squish/broken-bottom artefacts appear, so the first-paint window is
 where the renderer is most stressed and is the cheapest place to try to reproduce
 this.
+## ⛔⛔ [6.0] THE FLEET'S SUPERVISION TOOLS HAVE NO DEPLOYMENT STEP — A FIX ON `main` REACHES ALMOST NOBODY
+
+**Status:** OPEN
+
+`ygg-monitor.py`, `ygg-booter.py`, `ygg-claim.sh` and `ygg-babysit.py` are the
+fleet's watchdogs, and they exist as **one copy per checkout**, invoked by
+repo-relative path (`.agents/skills/yggterm-agent-fleet/…`) — which is the form
+the skill documents and every brief hands down. There is no install, no sync and
+no version check. **Landing a fix on `origin/main` therefore changes the
+behaviour of no running invocation at all**; it changes it only for whoever pulls
+afterwards, in the tree they happen to be standing in.
+
+**Measured 2026-08-14, minutes after a monitor fix landed on `main`:**
+
+| where | carries the fix |
+|---|---|
+| the 3 worktrees branched from a tip that had it | ✅ 3 |
+| the other 12 checkouts on the same host | ⛔ 0 |
+| the shared `~/gh/yggterm` on all three hosts | ⛔ 0 (two of them **188 commits behind**) |
+| **the running watcher process** | ⛔ 0 |
+
+⛔ **The watcher is the sharpest edge: it was launched as
+`python3 ./.agents/…/ygg-monitor.py watch`, a RELATIVE path, so which copy the
+fleet's supervision loop is running is decided by the cwd of whoever started it**
+— a fact recorded nowhere and visible only through `/proc/<pid>/cwd`.
+
+⚠ **AND THE FAILURE MODE IS A FALSE "LIVE" CLAIM, NOT AN OUTAGE.** The author
+verifies the fix from the tree they just edited — the one path where it is
+already true — and reports it live. It was a peer campaign running the
+documented path that found the alarm still firing. **This is
+`an-existence-check-is-not-a-deployment-check` with the ladder's last rung
+missing: committed → pushed → *present in the file the process is running*.**
+
+⭐ **SECOND OCCURRENCE OF THE SAME CLASS.** The booter saga hit it in the other
+direction: a hold written by pre-fix code had to be discarded on read *because 13
+of 14 checkouts still carried the old booter and a stale watcher re-pinned the
+fleet minutes after the fix landed*. The workaround was made defensive there;
+the distribution problem itself was never addressed.
+
+**Recommendation — reuse the mechanism that already works rather than build one.**
+`fleet-binary-sync` already replicates a roster of ~16 binaries in `~/.local/bin`
+across all three hosts on every session start. The supervision tools are simply
+not on that roster. Installing them there and documenting the bare command
+(`ygg-monitor list`, not a path) would make the invocation **cwd-independent**,
+give the fleet one copy per host instead of one per checkout, and put them under
+a sync that is already proven.
+⚠ **Blast radius is why this is filed rather than done:** every skill file,
+brief and memory door hardcodes the repo-relative path, so the change has to
+carry a compatibility period rather than a flag day. ⛔ And note the roster's own
+open defect (discovery by `y*` glob) in `owner-attention.md` — a tool named
+without a leading `y` would be silently stranded by the very mechanism adopted to
+fix this.
+
+*Meanwhile:* the three shared checkouts were fast-forwarded by hand and the fix
+is live-proven from the documented path on `dev`. That is a patch of one
+instance, not of the class.
+
 ## ⚠ [6.16] A DELETED SUMMARY COULD NOT REACH A RUNNING DAEMON
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
