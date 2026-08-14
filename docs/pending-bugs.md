@@ -9704,16 +9704,64 @@ so the string is being built, just not in that shape.
 ⛔ **Filed, not fixed: this is the arsenal lane's code and the resource lane is
 not touching it.**
 
+### ✅ ROOT-CAUSED AND FIXED BY THE ARSENAL LANE — this subsection retires on merge
+
+*`6574d385` on `lane/dev/6.6-arsenal`; the live half independently measured by
+the orchestrator.*
+
+A commit on 2026-08-13 replaced a **kind-guarded** env read with a **kind-blind**
+one, so `YGGTERM_AGENT_EXTRA_ARGS` was consulted for *every* `SessionKind` out of
+ambient process env — one variable, nine CLIs. ⛔ **That variable has no setter
+anywhere in the tree** (`codex_cli.rs:3197` and `lib.rs:17625` only ever read
+it), so any value it holds is **pollution inherited from whatever spawned the
+daemon**. Measured live: **3 of 20 daemons carried
+`YGGTERM_AGENT_EXTRA_ARGS=--dangerously-skip-permissions`**, including the one
+serving by default — so a codex/kimi/agy launch on any of them would have been
+handed a Claude flag. Latent only because everything live is claude-code.
+
+⭐ **And the subcommand was never missing.** Extra args compose *between* binary
+and subcommand by design, so the injected flag displaced the adjacency
+`codex resume -C "$PWD"` requires. The assertion was reporting a **prefix
+injection**, not a deletion — which is why "the resume subcommand went missing"
+survived two rounds as a description that could not be acted on.
+
+⇒ **This entry's own caution — *"two of the four survivors are known to be
+environment-dependent"* — was the answer all along. It just never named which
+input.** ⚠ **An "environment-dependent" note that does not name the variable is
+not a diagnosis**; it is the shape of one, and it kept the finding alive across
+two cycles without ever advancing it.
+
 ⭐ **And the same-shape regression returning is the point.** The entry's own
 caution — *"green HERE is not green EVERYWHERE"*, with nobody having bisected
 what fixed them — was exactly right, and a verified-green record has now been
 outlived twice by the same assertion. ⇒ **Re-run before quoting green**, and
 treat "fixed itself" as unfinished business rather than a result.
 
-⚠ **The third failure in that run was a FLAKE and is not this.**
+⚠ **The third failure in that run was not this one — but calling it "a flake"
+was wrong, and the correction is mine.**
 `terminal::tests::a_parked_reader_consumes_nothing_and_loses_nothing` fails in
-the parallel workspace run and **passes individually** — the known
-flaky-in-parallel category, not a regression.
+the parallel workspace run and **passes individually**, and I wrote that off as
+the known flaky-in-parallel category. ⛔ **That category has since been given a
+mechanism, and it is a defect, not randomness:**
+`sync_claude_extra_args_for_request` (`daemon.rs:10007`) does
+`unsafe { std::env::set_var(…) }` **process-wide**, and the launch builder reads
+it back — so in a test binary, where every test shares one process, launches
+race each other. Measured by the arsenal lane: **4 parallel runs → 2 green, 2 red
+on DIFFERENT tests; serial ×2 → 1096/1096 both times.**
+
+⭐ **It is the same shape as the bug above** — a per-launch value carried in
+process-global state, outliving its launch. The difference is that this one is
+the CC lane's *designed* round-trip, so it is filed OPEN and deliberately not
+changed under a release.
+
+⛔ **⇒ "Known flaky in parallel" must stop being used as a dismissal.** It had
+been doing the work of a diagnosis across several lanes, mine included, and it
+names a real defect with a real blast radius. **Re-run serially
+(`--test-threads=1`) before writing anything off** — a parallel red that does not
+reproduce serially is now *evidence about that `set_var`*, not noise to discard.
+⚠ My "passes individually ⇒ flake" inference was evidence-correct and its
+conclusion was too strong: it did establish the failure was not in the
+parked-reader code, and it did **not** establish that nothing was wrong.
 
 ⚠ **The filter trap fired here too and would have inverted the finding.**
 `cargo test --lib <bare_name> -- --exact` matches NOTHING for a test inside a
