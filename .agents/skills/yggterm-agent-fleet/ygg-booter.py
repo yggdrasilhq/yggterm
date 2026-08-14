@@ -1712,8 +1712,13 @@ def cmd_list(args):
         log(f"⛔ DISARMED ({left}) — {d.get('note') or 'no reason given'}")
     rl = rate_limit_hold()
     if rl:
+        # ⛔⛔ NAME THE CONSEQUENCE, NOT JUST THE CONDITION. "QUOTA HOLD, seen on
+        #    <row>" reads as a fact about THAT row, and a campaign checking its
+        #    own seat concluded it was fine. The hold is FLEET-WIDE: while it is
+        #    up, nothing can be delivered to anybody.
         log(f"⏸ QUOTA HOLD {(rl['until'] - time.time()) / 60:.0f}m left "
-            f"(429 seen on {rl['seen_on'][:8]})")
+            f"(429 seen on {rl['seen_on'][:8]}) — ⛔ NO BOOT CAN BE DELIVERED TO "
+            f"ANY ROW, INCLUDING YOURS, WHILE THIS IS UP")
     # ⭐ Name the directory this reads. A sibling campaign lost minutes concluding
     #   "no subscription file exists" while looking in the relay root — which also
     #   holds per-uuid .json files of a DIFFERENT kind, so the wrong directory
@@ -1732,8 +1737,16 @@ def cmd_list(args):
             mins = int((time.time() - s.get("lapsed_at", 0)) // 60)
             mark = (f"  ⛔ LAPSED {mins}m ago — {s.get('lapsed_reason', 'no reason recorded')}"
                     f" · NOT WATCHED; re-subscribe to clear")
+        # ⛔⛔ THE SUPPRESSION MUST BE ON THE ROW'S OWN LINE, reported 2026-08-14
+        #    by a campaign that had been reading its seat as healthy for hours.
+        #    Everybody runs `list | grep <their-uuid>`, which throws away the
+        #    header — so a row reads `boots=0`, its subscription JSON is perfect,
+        #    its own tick prints ✅, and nothing can reach it. That is what makes
+        #    a watchdog unfalsifiable, and it is how one outage ran 7.5 hours
+        #    with every instrument green.
+        held = "  ⏸ SUPPRESSED — fleet quota hold, no boot can be delivered" if rl else ""
         log(f"{s['uuid'][:8]}  {s.get('campaign') or '-':<12} "
-            f"age={age_h:4.1f}h boots={s['boots']} {s['row']}{mark}")
+            f"age={age_h:4.1f}h boots={s['boots']} {s['row']}{held}{mark}")
     log(f"{len(subs)} subscription(s) in {SUBS}"
         + (f" — ⛔ {lapsed} LAPSED and no longer watched" if lapsed else ""))
     return 0
@@ -2239,7 +2252,8 @@ def tick(args):
             else:
                 s["boots"] += 1
                 via = boot(host, row, args.dry_run)
-                if via == "refused-draft":
+                if via in ("refused-draft", "refused-choice-prompt",
+                           "refused-screen-unreadable"):
                     # ⛔ A refusal is NOT a failed boot and must not count as one.
                     # The row is idle because its owner is mid-sentence, which is
                     # the one state where booting is worse than waiting — so give
@@ -2247,8 +2261,23 @@ def tick(args):
                     # tick. ⚠ Do NOT `continue` here: the state write and the
                     # window log at the bottom of the loop are what make a
                     # skipped row visible instead of merely absent.
+                    # ⛔⛔ THE OTHER TWO REFUSALS WERE MISSING FROM THIS LIST AND
+                    #    THAT COST A LANE ITS WHOLE BUDGET. A row parked on the
+                    #    plan-limit dialog is refused by OUR OWN screen guard on
+                    #    every tick — and each refusal was counted as a boot, so
+                    #    after MAX_BOOTS the watchdog escalated "did not wake
+                    #    after N boots" about a session **nobody ever asked
+                    #    anything**. Measured 2026-08-14 on the lane holding the
+                    #    owner's top item.
+                    # ⭐ The rule the original comment states is the right one; it
+                    #    was simply applied to one refusal out of three. **If the
+                    #    guard stopped the write, the row was never asked** —
+                    #    which is true of a draft, a choice prompt, and an
+                    #    unreadable screen alike.
                     s["boots"] -= 1
-                    action = "SKIP:drafting"
+                    action = {"refused-draft": "SKIP:drafting",
+                              "refused-choice-prompt": "SKIP:choice-prompt",
+                              "refused-screen-unreadable": "SKIP:blind"}[via]
                 else:
                     # Say WHICH door delivered it. A watchdog that reports
                     # "booted" without saying how cannot be debugged when it

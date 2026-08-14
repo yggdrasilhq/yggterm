@@ -27,6 +27,25 @@ This file tracks user-visible changes in `yggterm`.
   be kept. Until now the only trace of a row being cleared away was its absence,
   which reads the same as never having existed, and that is what turned one
   accidental loss into a permanent mystery. Ask with `server rows departed`.
+- **The document editor's page is back.** Opening a document row showed an empty
+  viewport — or, worse, the row's own shell output apparently rendered as the
+  document — while the file list beside it, the word and character counts and the
+  view controls were all correct. The page itself never drew a single character.
+  Three of the page's internal markers were written in a form the browser engine
+  rejects outright, and refusing one of them made it abandon everything it was
+  told to draw afterwards, permanently, without reporting a failure anywhere a
+  person could see. The markers are now written in a form it accepts, and a test
+  fails the build if that form is ever reintroduced anywhere in the interface.
+  The two long-standing reports of "the document area is blank" and "the document
+  area is full of garbled text" were one fault, not two.
+- **A terminal no longer keeps drawing underneath the document that covers it.**
+  It had been made unclickable but was still painting, which is why a page that
+  failed to draw showed the terminal instead of showing nothing.
+- **Screenshots of a document page now show the document.** A document row is
+  still a shell underneath, so the screenshot tool treated it as a terminal and
+  painted the terminal's contents over the page — meaning the one instrument used
+  to confirm what is on screen was showing something else.
+
 - **The diagnostic that was supposed to watch for slowdowns was itself one of
   the biggest things running.** Every time two parts of the background service
   wanted the same resource at the same moment, it wrote three lines to disk

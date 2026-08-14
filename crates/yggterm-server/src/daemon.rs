@@ -12099,9 +12099,42 @@ fn daemon_should_idle_shutdown(
     idle_shutdown_ms: u64,
     terminal_session_count: usize,
 ) -> bool {
-    // Never retire a daemon that still owns live sessions (including preserved
-    // hot-update PTYs, which are counted here) — there is no fd-handoff, so a
-    // shutdown would interrupt them.
+    // Never retire a daemon that still owns live RUNNING sessions — there is no
+    // fd-handoff on this path, so a shutdown would interrupt them.
+    //
+    // ⛔⛔ THIS COMMENT USED TO SAY "including preserved hot-update PTYs, which
+    // are counted here". THEY ARE NOT COUNTED HERE, and the difference decides
+    // whether a handover can finish. Measured 2026-08-14 in an isolated home
+    // with a real predecessor/successor pair:
+    //
+    //   `terminal_session_count` (this argument) is
+    //   `runtime.terminals.stats().session_count` at both call sites — sessions
+    //   in THIS daemon's own registry that are `is_running()`. A preserved
+    //   owner record is not a running session here, so it contributes ZERO.
+    //
+    //   `ServerRuntimeStatus::terminal_session_count`, which shares the name, is
+    //   `terminal_session_keys.len()` and DOES include preserved keys. Two
+    //   different quantities, one name, and the doc described the other one.
+    //
+    // ⇒ A successor that has accepted a hot-update handoff and holds the runtime
+    // only as PRESERVED (owned = 0) passes this gate. Observed: successor
+    // 3.0.155 logged `idle shutdown` at its 90 s window while reporting
+    // `preserved_terminal_owner_count: 1`, and the 3.0.154 predecessor kept the
+    // session. **The NEW daemon retired and the OLD one stayed** — the drain
+    // inverted. ⚠ No session was lost; the pty child survived throughout. The
+    // failure is non-convergence, not data loss.
+    //
+    // ⚠ It needs gate 3 to also be open, so a successor with a live client
+    // record is protected. That is why the fleet does not see this constantly:
+    // the GUI registers with the new daemon. It bites when the successor has no
+    // client record — a headless deploy, or the window before the GUI registers.
+    //
+    // ⛔ DELIBERATELY NOT "FIXED" BY COUNTING PRESERVED HERE. That inverts into
+    // the other failure: bequeathed records outlive the daemons that made them,
+    // so a daemon holding a stale preserved key would never retire, and the
+    // measured cost of the daemon population is `N_reachable × a ~0.2-core
+    // floor`. Which way this should go is a design call recorded in
+    // `docs/pending-bugs.md`, not something to change under a held release.
     if terminal_session_count > 0 {
         return false;
     }

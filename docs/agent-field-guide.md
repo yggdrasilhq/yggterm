@@ -246,6 +246,126 @@ fact and was one command from being falsified. A relayed measurement is a CLAIM 
 it yourself — and building a measurement on top of an instrument that does not exist is how a whole
 lane's numbers turn out to be about nothing.
 
+### ⛔⛔ `git log -S` SKIPS MERGES, SO A DELETION THAT ARRIVED VIA A MERGE READS AS "NEVER EXISTED"
+
+**This is the correction to a law this campaign already carried, and the missing
+half is what resurrected a queue entry on `main`.**
+
+The standing rule was: *a conflict whose upstream side is EMPTY is textually
+identical to a deliberate deletion — `git log -S '<phrase>' -- <file>` settles
+it.* True, **and only with `--full-history -m`.** Plain `git log -S` does not
+walk merge commits, so a deletion that reached `main` *through* a merge is
+invisible to it and the command answers **"this was never here"** — which is
+exactly the answer that tells a lane to keep its own side.
+
+⇒ Measured 2026-08-14: a lane hit three empty-upstream conflicts, ran the bare
+form, got zero commits for each, correctly concluded "never had it" for two —
+and **wrong for the third**, which `main` had held and deleted as fixed. The
+entry came back. The instrument was right, the invocation was not, and the
+failure direction is always toward resurrection.
+
+```sh
+git log --oneline --full-history -m -S '<distinctive phrase>' -- <file>
+```
+
+⭐ **The general form: a history query that silently excludes a class of commit
+answers a narrower question than the one you asked** — and here the excluded
+class is *precisely* the one that performs integrations, which is where
+deletions cross branches.
+
+### ⛔⛔ A GATE THAT REPORTS A VIOLATION AND EXITS 0 IS DECORATION
+
+`check-queue-resurrection.sh` defaults to **report-and-pass**; `--strict` is what
+makes it exit 1. That default is right for a human reading output and wrong for
+every automated caller — and the campaign's own standing instruction (*"run this
+after any queue merge"*) never mentioned the flag.
+
+⇒ **A resurrection therefore sat on `main` through several push loops**, each of
+which ran the check, saw exit 0, and reported the push clean. Three separate
+sessions "ran the gate" and none of them gated.
+
+- ⛔ **In any script or push loop: `--strict`.** Without it the check is a
+  comment.
+- ⚠ It now prints `EXITING 0 ANYWAY — findings above are REAL` on the default
+  path, because the previous output was indistinguishable from a pass to
+  everything except a careful human.
+- ⭐ **The pattern to look for elsewhere:** any checker whose *default* is
+  advisory. Its findings are invisible to exactly the callers that cannot read.
+
+### ⛔⛔⛔ A "FAITHFUL" FRAME OF A DOCUMENT SURFACE SHOWED THE TERMINAL, NOT THE DOCUMENT
+
+**Found 2026-08-14 while root-causing the document surface that painted garbage.
+This is the instrument an agent is instructed to trust for any visual claim, and
+on this surface it was compositing the wrong pane.**
+
+Two independent things made it lie, and each alone was enough:
+
+1. **The screenshot compositor painted the xterm canvas over a document surface.**
+   The row's own state reads `active_view_mode: Terminal`, so the compositing
+   path drew shell output across the document it was asked to photograph.
+2. **`terminal_host_visibility_style` returns `opacity:1; visibility:visible;`
+   unconditionally**, so a terminal *covered* by another surface keeps painting.
+
+⇒ ⭐ **The consequence is the part to remember: when the document body failed to
+mount, the terminal WAS the document** — and the owner's "corrupted glyph
+clusters" were simply shell output showing through an empty pane. **The reported
+symptom was the instrument, not the subject.** Two frames 24 s apart, same row,
+`Document` selected in both, settle it: the "clean" frame shows the identical
+lines the "garbled" one renders as mojibake.
+
+⛔ **So `capture_faithful: true` answers "was the xterm canvas composited", NOT
+"is this what the user sees".** On a terminal view those coincide. On a document
+surface they came apart completely, and nothing in the reply said so.
+
+✅ **BOTH HALVES FIXED 2026-08-14 — but read what was fixed, because one of them
+was not fixed where you would look for it.** The compositor now refuses to
+composite the xterm canvas when a document surface owns the viewport.
+`terminal_host_visibility_style` **still returns `opacity:1; visibility:visible;`
+unconditionally** and is *correct* to: the standdown is a CSS rule keyed on
+`[data-document-surface-owns-viewport="true"]`, beside the `pointer-events` rule
+that was already there. ⚠ So a reader who greps that function will conclude the
+second half is still open. It is not — grep `DOCUMENT_SURFACE_STANDDOWN_CSS`.
+
+- ⚠ **The fix is in the BINARY, so the question is which binary is running.** On
+  a GUI older than this landing, both halves are still live and a
+  document-surface screenshot still lies. Settle it by identity
+  (`docs/deploy-spec.md` §1), never by version.
+- ⭐ **`webview_edit_faults` remains the field to read** whenever a surface
+  renders nothing while its state reports healthy — it was the only one that
+  moved throughout (4 in the repro, 0 after) while
+  `has_schema: true, error: null, visible: true` all reported fine. That is not
+  specific to this defect: it is the general tell that a subtree stopped
+  tracking its state, and it is monotonic, so a non-zero reading means damage
+  has happened even if the screen currently looks right.
+- ⭐ **The general rule this belongs to:** *an instrument that composites more
+  than one source must say which source it drew.* A boolean that means "the
+  compositor ran" reads as "the picture is true", and those are different claims.
+
+### ⛔⛔ `cmd | tail -1 && echo OK` REPORTS THE PIPE'S SUCCESS, NOT THE COMMAND'S
+
+**Caught 2026-08-14 in a push-retry loop that had been used all session.** A bash
+pipeline's exit status is its **last** stage, so:
+
+```sh
+git push origin HEAD:main 2>&1 | tail -1 && echo PUSHED     # ⛔ prints PUSHED on a REJECTED push
+```
+
+`tail` succeeded, therefore the `&&` fired, therefore the loop announced success
+and broke out — on a push the remote had refused. The retry loop that existed
+precisely to survive a busy `main` was the thing that stopped retrying.
+
+- ⭐ **The failure is silent and it reads as diligence**, because the loop *looks*
+  like careful engineering and its log line says the right word.
+- ⇒ **Capture the status, do not pipe it:**
+  `if out=$(git push … 2>&1); then …; else …; fi` — or `set -o pipefail`.
+- ⛔⛔ **AND THEN VERIFY THE EFFECT, NOT THE VERB.** Even a correct exit code is
+  the command's opinion. The check that cannot lie is
+  `git merge-base --is-ancestor HEAD origin/main` after a fetch. Same rule as
+  every row verb in this fleet: **read the state back**.
+- ⚠ The saving grace here was that the *earlier* pushes were verified by ancestry
+  when the discrepancy surfaced, which is how it was established that only the
+  last one had been lost rather than an afternoon of them.
+
 ### ⛔⛔ THE ONE-WAY DOOR — a classification whose evidence stops updating once you classify
 
 **Two campaigns hit this in the same week, with the arrow pointing opposite ways, and
