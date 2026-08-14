@@ -877,26 +877,54 @@ same figure whatever the truth was. ⇒ *A number can land in the right range an
 still deserve its retraction, because a method that cannot be wrong about the
 right things is not evidence.* Quote §6j-3's 25.0 ms, which was measured.
 
-### 6j-6. ⭐⭐ THE EMPTY-DAEMON CONTROL: the request PATH is 2.3 ms; the rest is CARGO
+### 6j-6. ⭐⭐ THE EMPTY-DAEMON CONTROL: the request PATH is ~1.7 ms; the rest is CARGO
 
 A daemon started on a private home from the **current** binary, owning nothing
 and polled by nobody, is the one arm where the baseline is a true zero — so a
-per-request cost needs no noisy subtraction. Exactly 200 `status` calls, nothing
-else touching it:
+per-request cost needs no noisy subtraction, and rows can be varied on their own
+while age, heap, version and session count stay fixed. That is the confound the
+live population cannot escape and a cross-sectional fit over it already failed
+once (§7 note 1).
 
-    200 requests -> 46 ticks of daemon CPU  =  2.30 ms CPU per request
-    (0 rows, 0 sessions, current version)
+⚠ **A first pass read 2.30 ms and that figure was COLD.** Measured minutes after
+the daemon started, it carried first-call lazy init and trace-file creation. With
+a discarded warm-up pass the steady state is **0.70 ms**. ⭐ *An empty-daemon
+control is only a control once it is warm* — the same class of mistake as the
+residual control that started its burn before the window opened (§6j-1), caught
+twice in one session by the same habit of re-reading a control that looks fine.
 
-⭐ **That independently reproduces §6g's 2.4 ms** from a completely different
-instrument — §6g timed the span from inside the daemon; this counts ticks from
-outside and divides by a request count *I* chose.
+**Rows, varied alone, 200 requests per point after a warm-up pass:**
 
-⇒ **THE REQUEST PATH IS CHEAP. Serving `status` costs ~2.3 ms; a handler on a
-live daemon costs ~25 ms.** So **roughly 90% of what a handler thread burns is
-caused by what the daemon is HOLDING, not by the request being answered** — and
-it is 93.8% kernel. ⛔ **This is the strongest reason S5 stays decided against:**
-the row inventory sits in the 2.3 ms that a fix would target, while the ~23 ms
-that dominates is somewhere else entirely.
+| seeded rows | 0 | 80 | 260 | 1000 |
+|---|---|---|---|---|
+| **ms CPU / request** | **0.70** | **1.10** | **1.70** | **5.20** |
+
+⇒ slope **4.5 µs/row**, intercept **0.70 ms**, monotonic and near-linear
+(3.3–5.0 µs/row between adjacent points).
+
+⭐⭐ **THREE INDEPENDENT METHODS NOW AGREE ON THE ROW TERM:** this causal arm at
+**4.5 µs/row**, §6g's inverse-probability-weighted re-fit of sampled field data
+at **4.71**, and the optimisation lane's own seeded arm at **4.645**. Nothing is
+shared between those three but the subject. ⛔ **The 94 µs/row of §6e is wrong by
+20x and must never be quoted again.**
+
+⇒ **THE REQUEST PATH IS CHEAP.** At a live daemon's 263 rows the whole `status`
+reply is **~1.7 ms**, of which the row inventory is ~1.2 ms — against **~25 ms
+for a handler thread on a live daemon**. ⛔ **This is the strongest reason S5
+stays decided against:** the row inventory a fix would target is ~1.2 ms of a
+25 ms thread, and it is already the *best-measured* term in the model.
+
+**And it is not the request MIX either.** `snapshot` shows p50 **259.8 ms** in
+the daemons' own aggregate, which invites "the expensive handlers are the other
+verbs". On the sandbox, `snapshot` costs **3.67 ms against `status`'s 5.07 ms at
+1000 rows — it is CHEAPER.** So that 259.8 ms is not intrinsic to the verb.
+
+⇒ **WHAT THE RESIDUAL TRACKS IS SESSIONS, NOT ROWS AND NOT THE VERB.** It is the
+one dimension the sandbox never reproduced: `snapshot` gathers terminal state per
+session, §4 found contention is **98.6% `terminal_read`** which is per-session,
+and §3 found thread churn rising from 4.23/s at 1 session to 25.22/s at 23. ⛔
+**Stated as the next arm, not as a result** — no session-seeded sandbox was built,
+so nothing here prices it.
 
 ⛔ **THE SPECIFIC CALL IS NOT ESTABLISHED, AND I AM NOT NAMING ONE.** Ruled out
 by measurement, not by argument: `malloc_trim` (§6j-4), induced page-faults
@@ -1095,7 +1123,7 @@ The 38 ms per handler is the *work*, not the spawn. ⇒ **This is a stability an
 observability fix, not a CPU fix**; do not promise cores for it. Its real value
 is that CPU stops hiding in exited threads, so §3's instrument gap closes.
 ⛔ **§6j-5 updates the number: quote ~25 ms, not 38 ms**, and note that a handler
-on an EMPTY daemon costs 2.3 ms — so a pool would keep ~90% of the cost, which
+on an EMPTY daemon costs 0.70 ms — so a pool would keep ~95% of the cost, which
 travels with the thread's work rather than with its creation. The conclusion
 ("not a CPU fix") is unchanged and now rests on a measurement instead of an
 inference.
@@ -1104,7 +1132,7 @@ inference.
 
 **The problem is an instrument, not a regression.** `PerfGuard` records **wall
 time** and its guard **drops when `handle_request` returns**. So for a handler
-thread that burns 25.0 ms of CPU, the existing span covers **2.3 ms** — about 9%
+thread that burns 25.0 ms of CPU, the existing span covers **~2.4 ms** — under 10%
 — and reports it in a unit that cannot tell 25 ms of work from 25 ms of waiting.
 **That is why §6j-4 could refute candidates but not name the cost**, and why four
 sections of this file have argued about a quantity nothing measures.
@@ -1114,7 +1142,7 @@ sections of this file have argued about a quantity nothing measures.
 1. Add a **CPU-time reading** to `PerfGuard` beside the wall reading —
    `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` at construction and at drop. Emit
    both. ⭐ **Priced on this host: 570 ns per call**, so two calls per span cost
-   **~1.1 µs against a 2.3 ms span — 0.05%**, and the guard already takes two
+   **~1.1 µs against a ~2.4 ms span — 0.05%**, and the guard already takes two
    wall readings.
 2. Wrap the **whole handler closure** at `spawn_unix_client_handler`
    (`daemon.rs:785`), not just `handle_request`, so the span covers thread entry
@@ -1123,7 +1151,7 @@ sections of this file have argued about a quantity nothing measures.
 **Expected effect: zero cores.** ⛔ **Do not promise any**, and that is the point
 — it converts an unattributable ~1.8 cores into an attributed one. The prediction
 it must satisfy: **the new CPU-time span should read ~25 ms on a loaded daemon
-and ~2.3 ms on an empty one**, reproducing §6j-3 and §6j-6 from inside the
+and ~0.7 ms on an empty one**, reproducing §6j-3 and §6j-6 from inside the
 process.
 
 **Falsifier, denominated in counts so it runs on a busy host:** if the widened

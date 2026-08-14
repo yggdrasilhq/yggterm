@@ -20,7 +20,7 @@ Closed narratives from before 2026-08-02 are in
 [`idle-cost-model.md`](idle-cost-model.md) §6j — spec is §S6*
 
 A connection-handler thread burns **25.0 ms of CPU (1.6 user + 23.4 kernel,
-93.8% kernel)**. The `PerfGuard` span over it covers **2.3 ms**, because the
+93.8% kernel)**. The `PerfGuard` span over it covers **~2.4 ms**, because the
 guard **drops when `handle_request` returns** and records **wall time**, which
 cannot distinguish work from waiting.
 
@@ -30,12 +30,12 @@ dead-thread term at 1.793 and 1.944 cores, per-daemon reproducible to ~5–10%.
 
 **Fix (§S6), two small parts:** add a `CLOCK_THREAD_CPUTIME_ID` reading to
 `PerfGuard` beside the wall reading (**priced at 570 ns/call on this host — two
-calls is 0.05% of a 2.3 ms span**), and wrap the whole closure at
+calls is 0.05% of a ~2.4 ms span**), and wrap the whole closure at
 `spawn_unix_client_handler` (`daemon.rs:785`) instead of just `handle_request`.
 
 **Expected effect: ZERO cores — do not promise any.** It converts an
 unattributable 1.8 cores into an attributed one. **Prediction it must satisfy:**
-~25 ms on a loaded daemon, ~2.3 ms on an empty one.
+~25 ms on a loaded daemon, ~0.7 ms on an empty one.
 
 ⛔ **Ruled out by measurement, so do not re-propose them:** `malloc_trim(0)` at
 `daemon.rs:19103` (**0.020–0.039 ms** at 30 threads/360 MB — ~600x too small),
@@ -296,9 +296,12 @@ is that CPU stops being invisible to per-thread instruments.
 
 ⛔ **UPDATED §6j — the "38 ms" in this entry was a retracted ratio; the measured
 figure is ~25 ms** (1.6 ms user + 23.4 ms kernel, direct per-thread, 93.8%
-kernel). ⭐ **And a handler on an EMPTY daemon costs 2.3 ms**, so ~90% of the cost
+kernel). ⭐ **And a handler on an EMPTY daemon costs 0.70 ms**, so ~95% of the cost
 travels with what the daemon HOLDS, not with the connection — a pool would keep
-that 90%. The conclusion of this entry is unchanged and now rests on measurement.
+that 95%. ⭐ **The row term is now settled three ways at ~4.5 µs/row** (a causal
+seeded arm, an IPW re-fit of field data, and the optimisation lane's own arm), so
+rows are ~1.2 ms of a 25 ms thread. **The residual tracks SESSIONS** — named as
+the next arm in §6j-6, not priced. The conclusion of this entry is unchanged and now rests on measurement.
 ⛔ **A version/RSS split of the per-request cost was measured, then FAILED TO
 REPLICATE (8.5 ms then 33.3 ms on the same daemon) and is withdrawn** — do not
 resurrect it from the first run.
