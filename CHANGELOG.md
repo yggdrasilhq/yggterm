@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+<!-- Known state at the 3.0.154 cut, recorded so a later reader does not find a
+     red tree and assume it shipped unnoticed:
+     · two launch-command tests fail on main
+       (remote_resume_shell_command_wraps_prefix_and_cwd,
+        stored_codex_litellm_sessions_use_litellm_resume_command).
+       Pre-existing, unrelated to this release, and owned — see the entry in
+       docs/pending-bugs.md.
+     · the daemon-side persisted-live-sessions work is NOT in 3.0.154; it was
+       pushed to its own lane after this release was cut. -->
+
 - **A machine no longer quietly accumulates background services forever.** After
   its program file was replaced on disk, a running background service handed its
   terminals to a fresh one — and then, five minutes later, did it again, and

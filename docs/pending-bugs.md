@@ -167,6 +167,19 @@ lock_wait was not 98.8% of the volume.
 
 ### ✅ S2 IS FIXED IN CODE — LIVE PROOF OWED (the falsifier above is the proof)
 
+⛔ **NOT IN RELEASE 3.0.154 — THE CODE WAS NEVER IN THAT BUILD.** Verified by
+symbol, not by commit list: `persisted_live_sessions` appears on `origin/main`
+only in `yggterm-shell/src/shell.rs` (the GUI side). The **daemon-side** fix
+lives solely on `origin/lane/dev/6.7-resource` (`daemon.rs`, `lib.rs`), in two
+`perf(daemon)` commits pushed at ~01:45Z — after 3.0.154 was cut at 01:26:57Z.
+⇒ **The proof is not merely untaken, the code was not running.** Do not read the
+"live proof owed" status as "deployed and unverified".
+
+⛔ **A 3.0.155 to land it is DELIBERATELY HELD.** Landing it needs a daemon bump,
+and a daemon bump is the action the readiness-probe entry forbids while a human
+has an unsent draft open — see that entry's ordering clause. The hold ends when
+the draft is sent or cleared.
+
 **Status of this entry: FIXED IN CODE, awaiting the measured ≥90× drop.**
 
 All three writes removed in one change, as the correction demanded — the two
@@ -607,6 +620,36 @@ can splice `continue` plus its retry barrage into a half-typed sentence.
 
 ⇒ **Deploying the fix runs the unfixed path one last time.** The protection
 begins at the handover AFTER the one that installs it.
+
+### ⭐ MEASURED 2026-08-14: A **GRACEFUL** HANDOVER DOES NOT TYPE — THE `continue` RIDES THE INTERRUPTED RECORD
+
+*Taken after a full fleet daemon bump (3.0.154, 01:26:57Z) that was performed
+while an unsent draft was open — i.e. against this very prohibition. It is
+recorded because the outcome narrows the rule rather than excusing the breach.*
+
+| probe | reading |
+|---|---|
+| `hot-restart-interrupted.json` | **does not exist** |
+| `hot_restart_repair_continue` | **0** events, whole corpus |
+| `hot_restart_forced_past_deadline` | **0** events, ever |
+| events naming the drafted row after the bump | 3, all `live_session_birth` with `launch_now: false` — ledger registration, no write |
+
+**Nothing was typed into any row.** The mechanism: the repair submits `continue`
+only to sessions named in the **interrupted-sessions record**, and that record is
+written on the **forced** cold shutdown past the deadline. A handover that settles
+gracefully interrupts nothing, so it records nothing, so it submits nothing.
+
+⇒ **The dangerous action is a handover that FAILS to converge, not a bump as
+such.** ⚠ That distinction is load-bearing and cuts both ways: the daemon that
+cannot converge is exactly the one carrying the poisoned-session deadlock filed
+by 6.1, so *"a stuck daemon"* and *"the thing that types over a draft"* are the
+same population. **The rule to keep is: do not bump while a draft is open UNLESS
+the outgoing daemons can be shown to converge gracefully.**
+
+⛔ **This is NOT permission to bump during a draft.** One graceful observation
+does not license the general case, and the cost of being wrong is a person's
+sentence. It was luck that this handover converged; the check was made after the
+fact, which is the wrong order and is the actual lesson here.
 
 ⛔ **So while a human has an unsent draft in a live composer, do not deploy a
 daemon** — not even this fix, and not "quickly". The correct order is: the draft
