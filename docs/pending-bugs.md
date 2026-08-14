@@ -10640,6 +10640,35 @@ clear it. A draft left by a failed boot is our own litter and should be cleared
 by us, not treated as his sentence. The booter cannot currently tell the two
 apart, and distinguishing them is the real work here.
 
+### ⭐⭐ THE "NOTHING SAYS SO" HALF IS NOW ANSWERED — `server rows drafts` IS THE MISSING DETECTOR
+
+**Sighted in production 2026-08-14 ~19:47, on a live orchestrator row**, by the
+read-only draft sweep built the same day for an unrelated reason (the 3.0.155
+hold). The row was **armed, `boots=0`, and holding an unsent line** — i.e.
+already in the silent-skip state, and invisible by every other instrument.
+
+⇒ **Finding a stuck-unwakeable row is now one read-only command instead of an
+unbuilt feature**, and it needs no log-reading and no writing:
+`yggterm-headless server rows drafts` → any `drafts_present` row that is also
+armed on the booter is in this trap, or one stall away from it. ⛔ Read the
+`verdict`, not the count: `blind` means some daemon could not be asked, so
+absence of a sighting is not absence of a draft.
+⭐ **Both hosts agreed on the same row under different key spaces**
+(`remote-cc://…` on the GUI host, `local://…` on the PTY host), which is the
+first live confirmation that the GUI-side record tracks the PTY-side draft state
+for a remote row.
+
+⚖ **AND IT ADDS A THIRD CASE TO THE ENTRY'S OPEN QUESTION.** The two arms above
+are "a draft the owner typed" (never type over; escalate to him) and "our own
+litter from a failed boot" (clear it ourselves). The first real sighting was
+**neither: a live agent's own composer**, on a row that was working normally at
+the time. ⇒ Whatever finally distinguishes the arms has **three** inputs, not
+two, and the third is the common case on an agent fleet.
+⚠ **Which is also why it is dangerous rather than merely untidy: the row was
+working, so the defect cost nothing at the moment of detection.** It becomes a
+permanent silent stall only later, when the row goes idle — the state is
+invisible exactly while it is harmless.
+
 **Falsifier:** leave an unsubmitted draft in a subscribed row and let it go idle
 past its boot window. Today the log prints `SKIP:drafting` forever and no card is
 ever sent. It should escalate once, name the row, and say the draft is what is
