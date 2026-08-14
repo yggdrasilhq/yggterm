@@ -15,6 +15,56 @@ This file tracks user-visible changes in `yggterm`.
   the launch, so they arrive attached to the CLI they were chosen for, and a
   launch on this machine reads only this machine's settings.
 
+<!-- Known state at the 3.0.154 cut, recorded so a later reader does not find a
+     red tree and assume it shipped unnoticed:
+     · two launch-command tests failed on main AT THIS CUT
+       (remote_resume_shell_command_wraps_prefix_and_cwd,
+        stored_codex_litellm_sessions_use_litellm_resume_command).
+       ✅ ROOT-CAUSED AND FIXED AFTER THE CUT — they were reporting a real
+       kind-blind flag leak, and their own needle also read ambient host
+       state. See the first entry above; nothing here is still red.
+     · the daemon-side persisted-live-sessions work is NOT in 3.0.154; it was
+       pushed to its own lane after this release was cut. -->
+
+- **A machine no longer quietly accumulates background services forever.** After
+  its program file was replaced on disk, a running background service handed its
+  terminals to a fresh one — and then, five minutes later, did it again, and
+  again, indefinitely, starting a brand-new service every time. One service was
+  measured starting eleven of them in under an hour. It happened because the
+  service asked a shared note on disk whether it had already handed over, and its
+  successor tidied that note away as soon as it recognised itself, so the older
+  one kept concluding it had never handed over at all. Each service now remembers
+  its own handover, so it stops asking once a newer one is running. Machines left
+  on for days no longer collect dozens of idle services, each taking a share of
+  the processor.
+
+  The same forgetfulness could also drop a service that was still holding live
+  terminals into the shutdown path meant only for one holding none, which would
+  have closed those terminals. That path now consults the service's own memory
+  rather than the shared note any other service can erase.
+
+- **A machine that takes its terminals back starts writing them down again.**
+  Once a newer background service appeared, the older one stopped recording the
+  state of its sessions for good — correct, because the newer one owned that
+  record. But if the newer one then died and the older one picked its terminals
+  back up, it carried on serving them while still refusing to record them, so
+  those sessions existed only in memory: anything that stopped that process lost
+  them for good. It now notices that nothing supersedes it any more and resumes
+  recording, after about a minute of consistently seeing no newer service — long
+  enough that a merely busy one is never mistaken for a dead one.
+
+- **Updating no longer risks every session on the machine for two seconds.** When
+  a new background service took over the running terminals, the old one handed
+  them across and immediately quit — so for a couple of seconds the only process
+  holding those terminals open was one that had just started. Anything that
+  stopped it in that moment took every session with it, unrecoverably; seven
+  agent sessions were lost that way. The old service now keeps holding the
+  terminals open, without reading them, until the new one has proved it can stay
+  alive — and if it cannot, the old service simply picks them all back up and
+  carries on. Nothing is closed and nothing is retyped. Measured: an ordinary
+  handover loses no output at all, and one where the new service is killed
+  mid-swap keeps every session running.
+
 - **An interrupted session is no longer left un-nudged (3.0.142).** When yggterm
   has waited half an hour to update and finally goes ahead anyway, it owes a
   `continue` to each session it interrupted. If that session's agent had not

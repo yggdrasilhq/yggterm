@@ -36,6 +36,19 @@ use std::{
 };
 use tokio::sync::Notify;
 
+/// How many edit batches the webview has reported it could not fully apply.
+///
+/// Non-zero means the DOM and the `VirtualDom`'s model of it have diverged and
+/// cannot converge on their own — every count is a subtree that stopped tracking
+/// its state. Process-wide and monotonic, because the damage is too: nothing
+/// clears it short of a restart. Read it with [`edit_faults`].
+static EDIT_FAULTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Edit batches the webview failed to apply since launch. See [`EDIT_FAULTS`].
+pub fn edit_faults() -> u64 {
+    EDIT_FAULTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// This handles communication between the requests that the webview makes and the interpreter.
 #[derive(Clone)]
 pub(crate) struct WryQueue {
@@ -376,7 +389,47 @@ impl EditWebsocket {
                     match ws_msg {
                         // We expect the webview to send a binary message when it has applied the edits
                         // This is a signal that we can continue processing
-                        tungstenite::Message::Binary(_) => break,
+                        tungstenite::Message::Binary(ack) => {
+                            // ⛔ THE ACK IS NOT A BOOLEAN — it reports whether
+                            // the batch APPLIED, and the difference is the
+                            // whole bug this instrument exists for. An empty
+                            // payload is the clean case. A leading `1` means
+                            // the webview threw partway through, so an unknown
+                            // suffix of that batch never reached the DOM.
+                            //
+                            // Nothing re-sends it. `VirtualDom` diffs against a
+                            // model in which those mutations landed, so it will
+                            // never emit them again: the subtree they were
+                            // building is wrong for the life of the process,
+                            // and every later patch aimed at it is addressed to
+                            // nodes that were never inserted. That is invisible
+                            // from every OS-level instrument and from the app's
+                            // own state — the rail that renders no body while
+                            // `right_panel_mode` reports the mode changing
+                            // correctly was this, twice, and it cost a bisect
+                            // across 36 releases before anyone read the DOM.
+                            //
+                            // Loud, counted, and attributable. It cannot be
+                            // repaired from here, but it must never again be
+                            // something an agent has to rediscover by walking
+                            // the DOM.
+                            if ack.first() == Some(&1) {
+                                let detail = String::from_utf8_lossy(&ack[1..]).to_string();
+                                let faults = EDIT_FAULTS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    + 1;
+                                tracing::error!(
+                                    webview_id = location.webview_id,
+                                    faults,
+                                    detail = %detail,
+                                    "the webview threw while applying an edit batch; the rest of \
+                                     that batch never reached the DOM and will never be re-sent \
+                                     (this subtree is now permanently stale — restart the GUI to \
+                                      clear it)"
+                                );
+                            }
+                            break;
+                        }
                         // If the websocket closes, switch back to the pending state and
                         // re-queue the edits that haven't been acknowledged yet
                         tungstenite::Message::Close(_) => {

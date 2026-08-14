@@ -988,6 +988,70 @@ The remedy is a **succession**: harvest what the session knows from artefacts th
 cost nothing to read, write it somewhere durable, and continue in a fresh, small,
 warm session. Both problems disappear at once.
 
+### ⛔⛔ AND DELIVERING COSTS THE SAME AS ASKING — the rule this skill was missing
+
+**Root-caused 2026-08-13 after a campaign burned a large re-read to deliver one
+sentence.** §6 says the *asking* is the expense and §10 says a message is for
+*delivering, not enquiring* — and a reader who follows both to the letter still
+concludes that **delivering is free. It is not.** A cold row pays the same full
+re-read whether your message asks it something or tells it something. The
+direction of the message was never the variable.
+
+⇒ **THE VARIABLE IS `CONTEXT SIZE × CACHE WARMTH`, and before 2026-08-13 nothing
+in the fleet reported the second one.**
+
+**BEFORE YOU SUBMIT TO A ROW, MEASURE BOTH:**
+
+```sh
+U=<their-uuid>; F=$(ls -t ~/.claude/projects/*/$U.jsonl | head -1)
+python3 - "$F" <<'EOF'
+import json,sys,time,datetime
+last=None; ts=None
+for ln in open(sys.argv[1]):
+    try: d=json.loads(ln)
+    except: continue
+    if (d.get('message') or {}).get('usage'):
+        last=d['message']['usage']; ts=d.get('timestamp')   # a usage block == a REAL inference
+tot=sum(last.get(k,0) for k in ('input_tokens','cache_read_input_tokens','cache_creation_input_tokens'))
+age=(time.time()-datetime.datetime.fromisoformat(ts.replace('Z','+00:00')).timestamp())/60
+print(f"context {tot:,} ({tot/1_000_000*100:.0f}%)  ·  last real inference {age:.0f} min ago")
+EOF
+```
+
+⛔⛔ **`mtime` IS NOT CACHE WARMTH — this is the THIRD costume of one defect.**
+A slash command (`/context`) writes the transcript **without sending a
+cached-prefix inference request**: mtime moves, the cache does not warm. Measured
+the day this was written — a row read **26 min** by mtime and **76 min** by last
+real inference, a 50-minute lie, and the owner caught it. The family:
+*mtime is not PROGRESS* · *mtime is not LIVENESS* (a refused turn answers in
+milliseconds and still stamps it) · **`mtime is not CACHE WARMTH`**.
+⇒ **The discriminator is the last record carrying a `usage` block.** A `usage`
+block only exists where an inference actually happened.
+
+**THE DECISION, once you have both numbers:**
+
+| their state | channel |
+|---|---|
+| warm (< ~50 min) **or** small context | **submit** — it is cheap, say the thing |
+| **cold AND large** | ⛔ **do not submit.** Use the FILE channel: the queue, their campaign door, a brief |
+| cold, large, **and time-critical** | submit anyway, and say in the message why it could not wait |
+
+⭐ **And check whether the content is ALREADY ON DISK.** The burn that produced
+this rule delivered *"your question is already answered"* — and the answer sat in
+a committed file that row reads anyway. **A message whose content is in a file the
+row already reads is a pure loss.**
+
+### ⚖ THE BOOTER IS A STALL DEFENCE; A CACHE KEEPALIVE IS A DIFFERENT JOB
+
+**Named apart 2026-08-13 so nobody ships a promise the window cannot keep.** The
+booter's idle window is **7 minutes** — tuned to kick a row that STOPPED. Cache
+warmth runs on a different clock (~50 min on the extended TTL, under 5 on the API
+default). ⇒ **One window cannot serve both:** as a keepalive, 7 minutes is
+simultaneously *too late* for a default-TTL cache and *43 minutes too eager* for
+an extended-TTL one. **Either the window becomes per-purpose, or the keepalive is
+built separately — but do not describe the booter as the cache defence while it
+runs a stall clock.**
+
 ### ⛔⛔ The asking IS the expense
 
 **Never ask a cold, high-context session to write you a handover.** Requesting one

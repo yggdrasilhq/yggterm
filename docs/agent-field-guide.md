@@ -19,6 +19,10 @@ Every entry below cost a session at least once.
 | `app screenshot` after any GL/compositing change | `toDataURL` returns the canvas backing buffer even when nothing composites to screen; reports `capture_faithful:true` over a black screen | `--backend os`, or the user's eyes |
 | `app screenshot` on a client that has switched sessions **(fixed 2026-07-25, `e0dc6c1` — keep the cross-check habit)** | It composited every `isVisible` host ordered by `mountedAt`, and a session you switch BACK to is REVEALED not re-mounted — so its host is the OLDEST while the host it replaced is the newest and stays visible for a while. The stale host was drawn ON TOP: a near-blank frame with `capture_faithful: true` while the terminal was painted fine. Nine rapid switches reproduced it every time | `shadow-client.sh capture` (grim = the compositor's own pixels). The payload now reports `active_session_path` beside the path it drew — if they differ, the frame is not your session |
 | `server status` | It pins to its own version's socket and can answer from — or spawn — an empty orphan daemon | `server app …` (PID-routed) |
+| `server status` → `terminal_session_count` **as "how many sessions are on this host"** | **Always during a handover, which is exactly when you are watching.** It counts what the ONE daemon you reached OWNS, and a handover changes which daemon that is: a fresh successor answers with a handful while the rest are still owned by, or preserved on, its predecessors. Measured 2026-08-14 — a watch on this field alerted `53 → 29` on a host that had just gained sessions (host-wide **57**, 261 rows, nothing lost). It fires the loudest false alarm precisely on the event it is meant to police | Sum the `OWNED` column of `server daemons` across every daemon, or read `ROWS` from the newest — both are host-wide. Never compare one daemon's count taken before a swap with another's taken after |
+| `server status --endpoint <pid>` → `terminal_session_keys` **as "which sessions this daemon OWNS"** | **Always, and it looks right because it is a superset.** It is `owned + preserved`, and on an old daemon the preserved half dominates: a 3.0.62 daemon answered 28 keys while owning **1** and preserving 27. Attributing a session to a daemon on this field credits the PTY to whichever daemon merely holds a bridge record — so "which daemon owned the row that died" comes out wrong, in the direction of blaming the oldest daemon present. Checked against `server daemons` on 14 daemons: `terminal_session_keys` == `OWNED + PRESV`, 14/14 | `owned_terminal_session_keys` / `owned_terminal_session_count`, which are separate fields in the same payload. `preserved_terminal_owner_keys` is the other half if you want it |
+| `strings <binary> \| grep <a literal your change adds>` **used to prove your build is in** | The literal you picked is a `serde_json::json!` **KEY**. Measured 2026-08-14: a new `"target_source"` key read **0 occurrences** by raw byte search in a binary that unambiguously contained the line — while `"queue_file"` and `"process_memory"`, the two VALUES on that same line and unique to it in the whole tree, were both present and adjacent to the neighbouring key in rodata. Two forced rebuilds and an rlib hunt were spent on a false negative that nearly binned a correct build | Pick a literal that is unique to your change **and appears as a VALUE**, then confirm with `nm -C <binary> \| grep <your new fn>`. ⚠ The presence direction still works — this entry is about the ABSENCE direction being unsound |
+| `grep <event> ~/.yggterm/event-trace.*.jsonl` **as "what the live daemons did"** | **You have run `cargo test` on this host.** The test binaries write into the SAME trace directory as the daemons, so a corpus-wide count silently mixes fixtures with production. Measured 2026-08-14 while harvesting a proof: `live_session_persist_dropped` returned exactly 2 events over 2 distinct keys — *precisely the fixed behaviour* — and every one came from a test pid, with sibling events carrying fixture paths (`wedge-signal-probe`, `remote-session://dev/sized-restart`). Live daemons had emitted **none**, so the real reading was *vacuous*, not *fixed* | Filter by pid and confirm each pid is a daemon (`server daemons`), or bound the window to after the last test run. ⚠ A count that matches your hypothesis exactly is the case to check hardest |
 | A `MutationObserver` / DOM-mutation count | Something animates via CSS. Animations mutate nothing; a page can present frames forever at 0 mutations | Count presented frames (below) |
 | `terminal_host_count` / `active_terminal_host_count` | Detached-but-alive xterm entries exist. It counts hosts in the DOM; `window.__yggtermXtermHosts` can hold more | Enumerate the JS host map |
 | A `requestAnimationFrame` probe you installed | Always. rAF self-sustains at refresh rate, so it measures itself | An external frame counter |
@@ -26,6 +30,7 @@ Every entry below cost a session at least once.
 | `/proc/<pid>/environ` | The process called `std::env::set_var` at runtime (yggterm does this for GL and arming decisions) | The app's own reported state |
 | The daemon's `terminal_lines` | You are chasing a CLIENT paint bug. That is the daemon's vt100 screen — comparing it to itself proves nothing about what the client painted | A faithful pixel, or the client buffer |
 | A verb's own `accepted` / `is_trusted` | Always treat as an assumption, not an observation | Read back the page-side *effect* |
+| **Every field in `server app state`, once `webview_edit_faults` is non-zero** | A webview that threw while applying an edit batch is acknowledged as having applied it, so the host diffs against a model in which those mutations landed and NEVER re-sends them. One subtree is then frozen at whatever it held, while every state field keeps reporting the mode it should be showing. **The state is not lying about the state — it has stopped describing the screen.** The rail that drew no body while `right_panel_mode` tracked every command was this, twice, and it cost a retracted bisect across 36 releases | Read `webview_edit_faults` FIRST. Non-zero invalidates the screenshot, not the state, and only a GUI restart clears it. ⛔ Do NOT reach for detached-node counts or interpreter stack depth — a clean instance measures 41 % detached and depth 1, so neither discriminates |
 | `dom-eval` returning `{"result": null}` | Your script had no `return`. The body is spliced into an async function, so an *expression* yields `undefined` → `null` — identical to a field that does not exist | Include a `sanity: 1+1` term in every probe |
 | `getComputedStyle` (verifying an ANIMATION actually paints) | **Always, for a paint bug.** Reading a computed value **forces the style recalculation the paint path never performs**, so the instrument supplies the very invalidation whose absence is the defect. A blink read back as a perfect 1100 ms square wave was, in the same minute, pixel-identical and ABSENT across ten faithful screenshots — WebKitGTK advances a custom-property animation in the style system without marking its `var()` consumers dirty for paint. A July verification built on this probe could only ever answer yes | A faithful screenshot **burst**, and diff frame-to-frame. Confirm other regions change between captures, or a frozen dot is indistinguishable from a cached frame |
 | A performance win that lands exactly on the do-nothing floor | **Always suspect a deletion.** Presented frames falling 9.4/s → 2.1/s was celebrated as a rendering win; 2.1/s *was* the idle baseline, and the real change was that the blink had stopped drawing at all. **A perf number that reaches the floor is a feature that stopped happening until proven otherwise** | Check that the thing being measured still HAPPENS. Pair every cost measurement with a behaviour assertion, or you cannot tell optimisation from removal |
@@ -35,6 +40,7 @@ Every entry below cost a session at least once.
 | `yggterm --version` | You need the **protocol** version. It reports the `yggterm` package; the daemon uses `yggterm-server`'s, which a version-only bump may not recompile | The daemon's own socket name, `server-<v>.sock` |
 | A `FAILED` / `test result:` grep over `cargo test --workspace` | **The workspace does not COMPILE.** A build error yields no failures *and no results*, so every "is it green?" grep reads clean — an empty set wearing a pass. Reached in ordinary operation: a struct gained a field and three test fixtures were not updated, and the suite was unbuildable until someone tried to run one specific test. Every workspace run between that commit and the fix was reading a non-result as a pass | Assert the run HAPPENED before reading its silence: require a non-zero `test result: ok. N passed` with **N > 0**, and check the exit status. A grep that can only ever find bad news cannot distinguish "no bad news" from "no news" |
 | A row-plane verb failing with *"connecting to `~/.yggterm/server-<v>.sock`: No such file or directory"* | **You will read it as an addressing failure.** It is a CONNECTION failure — the CLI is pinned to a version-stamped socket the daemons never bound. Three rows on one campaign each hit this, each concluded *"that row's uuid is not addressable from here / the peer list is incomplete"*, each filed it as **their own limitation**, and each routed around it by guessing a reachable row — so cross-row messages went to the wrong recipient and were relayed by hand. ⚠ It is **invisible** to anyone using the remote form (`ssh <guihost> '…yggterm-headless …'` reaches the GUI process and never touches the socket) and **total** for anyone using the local one, which is why it presents as a patchy peer list rather than a missing file | Read the error's own noun. **The error names the socket; the symptom names the peer list.** Check `ls ~/.yggterm/server-*.sock` before believing anything about reachability, and note an alias may mask it: a `server-<old>.sock` symlink pointing at a NEWER socket is the design; pointing at an older one is a proxy wearing the design's clothes. ⛔ Enumerate an alias set from the versions that EXIST, never from the files that happen to REMAIN — 73 stale socket files on one host, **757** on another |
+| `git reset --mixed origin/main` in a SHARED checkout, to drop a commit you already landed elsewhere | **Upstream has moved since you landed it.** The reset resurrects your commit's content as an *uncommitted* diff against the newer upstream — so your now-stale copy of a shared file silently **reverts every entry that landed after yours**. Measured: `git diff --stat origin/main -- docs/pending-bugs.md` → **64 deletions**, all another lane's, staged and ready for the next `git add -A`. ⚠ The file was NOT dirty before the reset; the reset is what dirtied it | Confirm patch-equivalence first (`git cherry origin/main HEAD` → a leading `-`), then **`git checkout origin/main -- <path>`** for every shared file the commit touched, and re-read `git status` — the lane's own dirty files must be the only thing left. ⛔ Never `git add -A` in a shared checkout; stage by explicit path |
 | A column index into another tool's **human** output (`awk '{print $3}'`, `split($3,a,":")`) | **The column means something else.** A repair tool read `$3` of `ss` output as an address; in that output `$3` is **Send-Q**, so it extracted nothing — and fell through to the *reassuring* branch, printing `GUI <pid> has no edit socket; not the flush-gate freeze` about a GUI that was holding a listening edit socket the whole time. ⇒ A parse failure that lands on "you're fine" is worse than a crash: it exonerates the thing it was asked to diagnose, in a specific and plausible sentence | Match by **shape**, not position (pull the address out of the LISTENING line by pattern), and prefer a machine-readable mode where one exists. Make the failure branch say *"could not parse"* — never *"nothing found"* |
 | `pgrep -f <pattern>` | **Always, when the pattern is in your own argv.** It matches the asking shell, and `pgrep -P` from there walks to an unrelated child and names it with confidence. ⛔ The obvious guards all leak, each disproved by its own control: *exclude my ancestors* misses the **forked subshell** (a fork inherits its parent's `cmdline` verbatim, so every command substitution is another copy below you), and *…and my descendants* misses the **sibling** pipeline member, which is neither above nor below. A hand-written `case "$c" in *pgrep*\|*bash*)` is a list of the shells someone thought of, and fails for `sh`, `zsh`, `python3 -c`, `xargs`, an ssh command string | **Lineage is the wrong axis.** What every false positive shares is that its command line **IS one of ours** — compare the bytes. Needs no list and cannot go stale. `ygg-procfind.sh` is the shared helper; identify a process, never count it |
 | A shadow client (`--client <name>`) that worked earlier in the session | **A deploy restarted the GUI and stranded it.** This is the most dangerous entry in the table, because it fails in the opposite direction to the rest: a dead shadow does not return an error, it returns a **plausible picture**. A rail stuck on `Loading…` reads first as a slow fetch and then as a regression in whatever you last changed — and the CONTROL runs through the same dead instrument, so two measurements agree completely and both are worthless. It manufactures a false accusation against someone else's code rather than a false absence | Check the instrument's OWN health in the same run as the measurement (`--client <name>` answers *"no live client by that name"* the moment anything asks). ⛔ A shadow that worked an hour ago is not evidence it works now — the GUI moved **eight versions in one session** (3.0.132 → 3.0.140); never assume the build you measured on is the build you are on |
@@ -187,6 +193,106 @@ fails, which is when you most need the answer. Same family as `cargo test … | 
 ⭐ **And the discipline that catches it: run both controls in the same command.** The instance that
 produced this line was only recognised because a negative control returned 0 and a positive control
 returned 168 side by side — a single reading of either would have looked like an answer.
+
+### ⛔⛔ `terminal new` RETURNS `active_session_path` — WHICH IS NOT THE ROW IT JUST CREATED
+
+**This one delivered a 200-line brief into a stranger's live session.** The response to
+`server app terminal new … --no-activate` carries a field named `active_session_path`. With
+`--no-activate` the newly created row is deliberately NOT activated, so that field still names
+**whatever was active before** — another campaign's row, mid-work. Read it as "the row I just made"
+and every following step is aimed at the wrong session: the readiness probe types into it, and the
+submit lands a whole brief in its composer.
+
+⇒ **Resolve the new row by its TITLE, never from that field:**
+
+```sh
+server app rows | python3 -c 'import sys,json
+for r in json.load(sys.stdin)["data"]["rows"]:
+    if "<the --title you passed>" in (r.get("label") or ""): print(r["full_path"])'
+```
+
+⭐ **And the check that catches it even if you get the path wrong:** the four-step spawn ends by
+**grepping the SUCCESSOR'S OWN TRANSCRIPT for a token from your brief** — and a transcript lives
+under `~/.claude/projects/<cwd-slug>/<uuid>.jsonl`, so **the slug itself proves the cwd**. A token
+found under the wrong project slug, or a transcript that is megabytes old when a fresh row should be
+kilobytes, is the misdelivery announcing itself. Both tells were present and both are cheap.
+
+⚠ Same family as the `input-check` spelling: the verb is **`server app terminal input-check`**, not
+`server app input-check`, which answers `unsupported app control command` — easy to misread as "this
+build lacks the verb" rather than "the parent verb is missing".
+
+### ⛔ `server app rows` DOES NOT CARRY THE WEDGE FIELDS — `server snapshot` DOES
+
+A brief handed on the claim that `server app rows` emits `input_unanswered_ms` and
+`wedge_suspected`, which would make it the instrument for measuring a deaf row. **It does not.**
+Measured: 384 rows, and the union of every field name across all of them contains neither.
+
+```sh
+server app rows | python3 -c 'import sys,json; rs=json.load(sys.stdin)["data"]["rows"]; \
+  print(sorted({k for r in rs for k in r}))'      # ⇒ no input_unanswered_ms, no wedge_suspected
+```
+
+`input_unanswered_ms` lives on `SnapshotSessionView` (`daemon.rs`), so **`server snapshot`** is the
+owner; `wedge_suspected` is not a field at all but a derived predicate —
+`input_unanswered_suggests_wedge()` against `INPUT_UNANSWERED_WEDGE_SUSPECT_MS` in `yggterm-core`,
+which is the single owner of the threshold that gate, row payload and sidebar all read.
+
+⭐ **The lesson is the shape, not the fields:** the claim arrived in a handover as an established
+fact and was one command from being falsified. A relayed measurement is a CLAIM until you have run
+it yourself — and building a measurement on top of an instrument that does not exist is how a whole
+lane's numbers turn out to be about nothing.
+
+### ⛔⛔ A CLEAN PRIVACY-GUARD RUN IS NOT EVIDENCE THE FILE IS CLEAN
+
+`ygg-privacy-guard` scans **the commits a push is carrying**, by design — that is
+what makes it fast and what makes it fair to the author who did nothing wrong.
+The consequence is not obvious and it bites:
+
+⇒ **A private term already on `main` is permanently invisible to it.** It will
+never be in anyone's push range again, so every future push over that file
+returns a clean result while the term sits in the public tree.
+
+Found 2026-08-14: three identifiers — a `username@hostname` shell prompt, a
+private wildcard domain, and a personal video URL — were live in
+`docs/pending-bugs.md` on `origin/main`, through a full-object history sweep the
+day before **and** through several clean guard runs.
+
+- ⭐ **Scan the WHOLE FILE, not your diff.** That is how these were found, and it
+  costs one `grep`.
+- ⛔ **And "pushed" is not the finish line for a removal — "on the public default
+  branch" is.** A lane push is correct practice for lane work and *wrong* for a
+  redaction: what a stranger reads is `HEAD` of `main`. **Verify by ancestry**
+  (`git merge-base --is-ancestor <sha> origin/main`), never by your own push
+  reporting success. Caught the same day: a removal was reported as landed while
+  it sat on a lane branch, and the exposure stayed live in between.
+- ⚠ **Both halves are the same shape**: an operation reported success about a
+  different question than the one being asked.
+- ⛔⛔ **AND THE SUBTLER FORM, which is the one that will catch a careful agent:
+  A PASSING CHECK DOES NOT TELL YOU WHICH ACTION CAUSED THE STATE IT OBSERVED.**
+  The removal above was verified with the *right* command, which returned the
+  *right* answer — but it was run after a `fetch`, by which point another
+  session's merge had already produced that state. The check was sound; the
+  **attribution** was false, and the report credited the wrong action. ⇒ When two
+  events could each explain a state and you sampled only after both, you have
+  measured the state, not the cause. **Sample between them, or name the
+  ambiguity.** Same shape as comparing an API read against a screenshot taken at
+  a different moment, which this project has already paid for once. The guard answered "is this push
+  clean", not "is this file clean"; the push answered "did the write succeed",
+  not "is it visible on main".
+
+### ⛔ A DOM READ IS `server app dom-eval` — `chrome type --assert` TYPES FIRST
+
+`server app chrome` offers only `type`. Its `--assert <selector>@<attribute>` is a real DOM read but
+it writes a keystroke before reading, so it can never be pointed at a GUI a human is using.
+**`server app dom-eval "<js>"` runs JS in the GUI webview and returns the serialized result without
+typing** — pass the script POSITIONALLY, flags after it, or a leading flag makes it evaluate the
+flag string. Base64 the script through `ssh` to keep quoting honest.
+
+⛔ It answers only on the host where the GUI runs, and only to a registered client — a headless host
+has a daemon and sessions but no client. `server app clients` answers "is the GUI here" directly.
+⭐ A GUI with its own `YGGTERM_HOME` (a sandbox, another lane's rig) is reachable by pointing that
+variable at it, which is how a second live instance can be READ for comparison. Never DRIVE one:
+a mode change or relaunch corrupts whatever it is measuring.
 
 ## 2. Profiling recipes that work
 
@@ -723,6 +829,25 @@ still carrying the fix is not a reason to destroy their page.
 The deployed `yedit` binary's features existed **only** as untracked files on
 the build host — no git repo, no remote, no copy anywhere. Before editing any
 fleet tool, confirm its source is in version control and pushed.
+
+### 7.9a An indentation-keyed patch DOUBLE-INSERTS at every deeper site
+
+A shallower indent is a **substring of a deeper one**: `"<28sp>foo();"` occurs
+inside `"<32sp>foo();"`, starting four characters in. So a two-pass
+search-and-replace keyed on indentation — one pass per indent level, to keep the
+inserted line aligned — matches the deeper sites **twice**: once in its own pass,
+and again in the shallower pass, including lines the first pass just created.
+
+Measured instance: five stamp sites, nine insertions, every duplicate silently
+mis-indented above its correct twin. Nothing errored, and the code compiled and
+passed — a duplicated idempotent store changes no behaviour, so tests cannot see
+it. In a public repo it ships as visible sloppiness.
+
+⭐ **The check that caught it: count the patched sites against the anchor you
+expected.** Five `reader_activity` stamps must yield five new lines, not nine. A
+patch that "worked" can still have fired twice, and the count is the only cheap
+witness. Prefer anchoring on a unique enclosing line over indentation; if you
+must key on indent, verify each insertion sits immediately after its anchor.
 
 ### 7.10 The row ledger is the authoritative record of what existed — consult it FIRST
 

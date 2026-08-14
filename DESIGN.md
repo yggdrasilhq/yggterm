@@ -1392,7 +1392,9 @@ One coherent light vocabulary for session state, used by Live Sessions today and
 - `GREEN` (`#22c55e`): keep-alive — the session survives the GUI (durable runtime).
 - `BLUE` (`#3b82f6`): live but transient — the session lives only while the GUI does.
 - `BLINKING` (the `yggterm-status-dot-blink` pulse): the agent is working right now. Blink is an orthogonal modifier — a green or blue dot blinks while its session works and returns to steady when idle.
-- `ORANGE/AMBER`: reserved for attention states (recovery in progress, degraded runtime, pending user decision). Not yet wired; when an attention signal is needed, use this slot — do not repurpose green/blue.
+- `ORANGE/AMBER` (`#f59e0b`): attention states — recovery in progress, degraded runtime, pending user decision. **Wired 2026-08-13 for its first case: a session that has been WRITTEN TO and has said nothing back** (`input_unanswered_ms` past `INPUT_UNANSWERED_WEDGE_SUSPECT_MS`). Amber **replaces** the durability colour for as long as the condition holds, because a row that may not be listening is a more urgent fact about it than whether it would survive the GUI; the underlying green/blue is unchanged and returns the moment the row answers. Remaining attention cases (save conflict, recovery in progress) join this same slot.
+  - ⛔ **Steady, never blinking.** Blink means *working*, and a row that has gone deaf is precisely not working — an amber blink would state the one thing that is certainly false.
+  - ⚠ **It marks a SUSPICION, not a verdict**, and the tooltip must say so: a child may legitimately consume input in silence (echo off, a password prompt). `server app terminal input-check` is what settles it, by marker and echo.
 - `RED`: reserved for dead/error (runtime lost, unrecoverable). Same rule: reserved, not yet wired.
 
 Rules: color encodes durability class, blink encodes activity, and reserved colors are introduced only with a spec update here. Automated Sessions (experimental/automations) must adopt this vocabulary unchanged so a user reads one signal system across the whole sidebar.
