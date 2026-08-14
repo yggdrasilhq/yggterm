@@ -20749,6 +20749,51 @@ pub fn active_client_instance_records_for_endpoint_scope(
     Ok(active)
 }
 
+/// Every entry in a client-instances scope directory that could be a RECORD.
+///
+/// ⛔⛔ ONE TRAVERSAL, BECAUSE TWO OF THEM DRIFTED AND NOTHING COULD SEE IT.
+/// The atomic-write staging directory (`<scope>/tmp`) sits in the same folder as
+/// the records. `cleanup_stale_client_instances` in the shell skipped non-files;
+/// this side did not, so `fs::read` hit a DIRECTORY, got `EISDIR`, and the whole
+/// enumeration failed — measured killing every `server app` verb on two fresh
+/// homes until the directory was removed by hand.
+///
+/// ⛔ And the consequence is worse than a failed verb, because of the fix
+/// directly below: an error here means *"I could not ask, do not retire"*. ⇒ **A
+/// daemon whose staging directory exists at sampling time could never retire at
+/// all.** Not a wrong answer — a silent, permanent block on the drain's own
+/// gate, and the constitution forbids a gate that cannot converge.
+///
+/// ⚠ Skips only what it can PROVE is not a file. An entry whose `file_type()`
+/// cannot be read is KEPT, so the caller's own error semantics decide; dropping
+/// it here would be the fail-open direction this seam was just taught to refuse.
+/// Absent directory stays `Ok(empty)` — a real answer — while any other listing
+/// failure travels as an error.
+pub fn client_instance_record_paths(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "reading client instance records from {}",
+                dir.display()
+            )));
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        // An iteration error means the listing is INCOMPLETE, so a live client
+        // may be exactly the record we did not reach.
+        let entry = entry
+            .with_context(|| format!("listing client instance records in {}", dir.display()))?;
+        if entry.file_type().is_ok_and(|kind| !kind.is_file()) {
+            continue;
+        }
+        paths.push(entry.path());
+    }
+    Ok(paths)
+}
+
 fn active_client_instance_records_from_dir(
     dir: &Path,
     active: &mut Vec<ClientInstanceRecord>,
@@ -20770,23 +20815,11 @@ fn active_client_instance_records_from_dir(
     // travel to the caller as an error so its caution becomes reachable.
     // Reported by the resource lane 2026-08-14, against a finding of mine that
     // named the same seam from the wrong side.
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(anyhow::Error::new(error).context(format!(
-                "reading client instance records from {}",
-                dir.display()
-            )));
-        }
-    };
-    for entry in entries {
-        // An iteration error means the listing is INCOMPLETE, so a live client
-        // may be exactly the record we did not reach.
-        let entry = entry.with_context(|| {
-            format!("listing client instance records in {}", dir.display())
-        })?;
-        let path = entry.path();
+    // ⛔ The traversal is shared with the shell's cleanup pass — see
+    //    `client_instance_record_paths`. Two copies of "how do I enumerate this
+    //    directory" is exactly what let the staging-dir case exist on one side
+    //    and not the other.
+    for path in client_instance_record_paths(dir)? {
         // A record we cannot READ may name a live client. A record we cannot
         // PARSE is a real answer — it is not a valid record — and is deleted
         // below, which is why only this one propagates.
@@ -43721,14 +43754,19 @@ terminal_window_id: None,
         {
             let source = std::fs::read_to_string(apps.join(file))
                 .unwrap_or_else(|error| panic!("read {file}: {error}"));
-            // ⭐ The targeting call itself now lives in the ONE `server app`
-            // dispatcher (`app_control_cli`), not in either binary — that is
-            // what collapsing the split dispatch bought. What each BINARY must
-            // still be free of is a clobber of its own, asserted below.
+            // ⭐ UPDATED 2026-08-14, AND IT IS A STRENGTHENING, NOT A RELAXATION.
+            // This used to require the call in EACH binary, which was the best
+            // available shape while `server app` was dispatched twice. The
+            // dispatcher now lives once in `app_control_cli.rs`, so a binary
+            // that still called this would be the second copy coming back. The
+            // invariant is asserted at its new single home below; what stays
+            // per-binary are the clobber checks, which is what a binary could
+            // still grow on its own.
             assert!(
-                source.contains("app_control_cli::run_app_control_cli("),
-                "{file} no longer routes `server app` to the one dispatcher, so \
-                 its targeting is no longer routed through the one owner either"
+                !source.contains("fn print_server_app_help"),
+                "{file} grew its own `server app` help back — that is the second \
+                 dispatcher returning, and the two copies drifted by six verbs \
+                 the last time this happened"
             );
             assert_eq!(
                 source
@@ -43747,12 +43785,25 @@ terminal_window_id: None,
                  set-and-clear in main.rs)"
             );
         }
-        // The owner really does apply the overrides, so the routing assertion
-        // above cannot pass by the behaviour having quietly moved nowhere.
+
+        // The one owner, at the one place that now dispatches for both binaries.
+        // The dispatcher's source is read through its own `SOURCE_FOR_LOCKS`
+        // const (an `include_str!` of itself) rather than off disk: the file
+        // already owns the answer to "what is my source", and a second reader
+        // built from a manifest path would be a copy that can drift when the
+        // file moves.
         assert!(
             crate::app_control_cli::SOURCE_FOR_LOCKS
                 .contains("apply_app_control_target_overrides(&args)"),
-            "the one `server app` dispatcher no longer applies target overrides"
+            "the shared `server app` dispatcher no longer routes targeting \
+             through the one owner"
+        );
+        assert_eq!(
+            crate::app_control_cli::SOURCE_FOR_LOCKS
+                .matches("apply_app_control_target_overrides(&args)")
+                .count(),
+            1,
+            "targeting is applied more than once in the shared dispatcher"
         );
     }
 
@@ -43937,6 +43988,62 @@ terminal_window_id: None,
             "an unreadable client-instances directory must be an ERROR — reporting \
              it as 'no clients' lets a daemon retire out from under a live client"
         );
+    }
+
+    /// ⛔⛔ THE STAGING DIRECTORY IS NOT A RECORD, AND READING IT AS ONE
+    /// PERMANENTLY BLOCKED THE DRAIN.
+    ///
+    /// `<scope>/tmp` is where the atomic write stages. The shell's cleanup pass
+    /// skipped non-files; this reader did not, so `fs::read` hit a directory and
+    /// returned `EISDIR` — and by the fix in the test above, an error here means
+    /// *"I could not ask, do not retire"*. ⇒ Not a wrong answer once: a daemon
+    /// whose staging dir existed at sampling time could **never** retire, which
+    /// is the one thing the constitution says a gate must not do. Two
+    /// enumerations of one directory, and only one of them knew.
+    #[cfg(unix)]
+    #[test]
+    fn the_atomic_write_staging_dir_is_skipped_rather_than_read_as_a_record() {
+        let base = std::env::temp_dir().join(format!(
+            "yggterm-staging-dir-{}-{}",
+            std::process::id(),
+            current_millis_u64()
+        ));
+        fs::create_dir_all(base.join("tmp")).expect("create scope + staging dir");
+
+        // A live record beside it, so the assertion cannot pass by finding
+        // nothing — the failure being tested returns an ERROR, and an empty
+        // success would be a different (and also wrong) answer.
+        let record = serde_json::to_vec(&ClientInstanceRecord {
+            build_commit: None,
+            pid: std::process::id(),
+            started_at_ms: 42,
+            client_id: None,
+            client_role: None,
+            linux_desktop_app_id: Some(super::YGGTERM_DESKTOP_APP_ID.to_string()),
+            process_start_ticks: process_start_ticks(std::process::id()),
+            executable_path: Some("/tmp/yggterm-test".to_string()),
+            display: Some(":10.0".to_string()),
+            wayland_display: None,
+            xdg_session_id: Some("test-session".to_string()),
+            xdg_runtime_dir: None,
+            xauthority: None,
+            webkit_gl_environment: BTreeMap::new(),
+        })
+        .expect("serialize record");
+        fs::write(base.join(format!("{}-42.json", std::process::id())), record)
+            .expect("write record");
+
+        let mut active = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let result = super::active_client_instance_records_from_dir(&base, &mut active, &mut seen);
+        let found = active.len();
+        let _ = fs::remove_dir_all(&base);
+
+        result.expect(
+            "a staging DIRECTORY beside the records must not fail the enumeration — \
+             that error is read as 'do not retire', so it blocks the drain for ever",
+        );
+        assert_eq!(found, 1, "the live record beside the staging dir must still be seen");
     }
 
     #[cfg(unix)]
