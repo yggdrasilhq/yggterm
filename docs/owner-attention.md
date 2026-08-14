@@ -42,6 +42,16 @@ copies.
   `.git/hooks` shim is at least generated from something versioned, and the gate is unchanged and
   working — it refused a real push tonight. **To reverse:** delete one repo.
   *Meanwhile:* nothing waits on this; the relay installs the hook from the tracked installer.
+  ⛔⛔ **THE STAKES ROSE ON 2026-08-14 AND THIS IS NO LONGER HYPOTHETICAL.** The gate **missed a
+  real private value on a real push to a real public repo**, because a third-party form had
+  reformatted it and the gate matches literals. The fix — matching number-shaped terms on digits
+  across any interior window — is now deployed on all three hosts and **exists only as an
+  unversioned file**. ⇒ **Two consequences worth your ruling, not just the original question:**
+  (1) that fix has no review, no history and no way to prove which hosts carry it beyond comparing
+  hashes by hand; (2) the newest-wins replication that spread it could **silently revert it** the
+  moment any host's older copy is touched, and the gate would go back to passing that leak while
+  printing the same reassuring line. **Recommendation unchanged and now more urgent: give it a
+  private Forgejo repo.**
 
 - **Two fleet-sync bugs are in his `~/.claude/hooks/`, which an agent does not rewrite on a peer's
   report — may we fix them?** (1) The roster's exclusion glob is `*.old` **anchored at the end**, so
