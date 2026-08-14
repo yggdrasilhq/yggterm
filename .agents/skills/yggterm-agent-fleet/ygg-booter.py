@@ -1228,7 +1228,72 @@ def cmd_retire(args):
     if mon.exists():
         mon.unlink(missing_ok=True)
         log(f"  and dropped its monitor subscription — a corpse escalates to nobody")
+    # ⛔⛔ AND THE THIRD PLANE — THE ONLY ONE HE CAN SEE.
+    #
+    #    The comment above argues the case and then stops one plane short:
+    #    *a death is a fact about the ROW, not about one watcher's bookkeeping.*
+    #    Booter and monitor are OUR bookkeeping. The sidebar is his. A seat that
+    #    retired with both subscriptions dropped still sat in his sidebar
+    #    forever, because `live_keep_alive` is true on every agent row — which
+    #    is correct for an ordinary resumable session and wrong for a seat that
+    #    has been declared dead with evidence.
+    #
+    #    ⇒ Owner-reported 2026-08-14: *"Why are 6.x predecessors not despawned
+    #    including yours?"* Fifteen 6.x rows were listed, several of them seats
+    #    whose scope was complete and whose processes were already reaped. The
+    #    earlier fix taught this verb about the monitor; nobody taught it about
+    #    the screen.
+    _drop_row(uuid)
     return 0
+
+
+def _drop_row(uuid):
+    """Remove a decided-dead row from the sidebar, on the host that renders it.
+
+    ⚠ Best-effort by design: the ledger write above is the durable record and
+    must not be undone by an unreachable GUI. A failure here is reported loudly
+    and left for a human, never swallowed.
+
+    ⛔ Two traps, both already paid for by this campaign:
+    - **App control only resolves where the GUI runs**, and `retire` deliberately
+      runs on the LOCAL host to write its ledger. So this resolves the GUI host
+      itself rather than inheriting `args.host`.
+    - **The verb reports the REQUEST, not the EFFECT** (`row_still_listed` is
+      not `verified`), so the removal is confirmed by re-reading the rows and
+      looking for the uuid, not by believing the reply.
+    """
+    try:
+        host = resolve_gui_host(None)
+    except Exception as exc:
+        log(f"  ⚠ could not resolve the GUI host ({exc}) — ROW LEFT IN THE SIDEBAR")
+        return
+    if not host:
+        log("  ⚠ no GUI host — ROW LEFT IN THE SIDEBAR, remove it by hand")
+        return
+
+    def row_paths():
+        # A uuid is not an address: `session remove` takes the row's PATH.
+        data = ygg(host, "server", "app", "rows") or {}
+        rows = (data.get("data") or data).get("rows") or []
+        return [r.get("full_path") or r.get("path") for r in rows
+                if str(r.get("session_id") or "") == uuid
+                and (r.get("full_path") or r.get("path"))]
+
+    paths = row_paths()
+    if not paths:
+        log("  and its sidebar row was already gone")
+        return
+    # One session can legitimately render in several views, so remove every
+    # path that names it rather than the first — removing one and reporting
+    # success is how a row appears to survive its own retirement.
+    for path in dict.fromkeys(paths):
+        ygg(host, "server", "app", "session", "remove", path)
+    still = row_paths()
+    if still:
+        log(f"  ⛔ ROW SURVIVED REMOVAL — {len(still)} path(s) still listed on {host}")
+        log("     This is the plane he can see; do not report the retirement as clean.")
+    else:
+        log("  and removed its sidebar row — the plane he actually looks at")
 
 
 def _drop_sub(uuid, why):
