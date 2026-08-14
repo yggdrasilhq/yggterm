@@ -27,6 +27,10 @@
 
 use anyhow::Context;
 use std::io::Read;
+
+/// This module's own source, for the locks that assert the `server app` plane
+/// has exactly one dispatcher and that it is this one.
+pub(crate) const SOURCE_FOR_LOCKS: &str = include_str!("app_control_cli.rs");
 use crate::{
     AppControlRightPanelMode,
     AppControlViewMode,

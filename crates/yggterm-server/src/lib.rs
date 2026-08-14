@@ -43717,9 +43717,14 @@ terminal_window_id: None,
         {
             let source = std::fs::read_to_string(apps.join(file))
                 .unwrap_or_else(|error| panic!("read {file}: {error}"));
+            // ⭐ The targeting call itself now lives in the ONE `server app`
+            // dispatcher (`app_control_cli`), not in either binary — that is
+            // what collapsing the split dispatch bought. What each BINARY must
+            // still be free of is a clobber of its own, asserted below.
             assert!(
-                source.contains("apply_app_control_target_overrides(&args)"),
-                "{file} no longer routes `server app` targeting through the one owner"
+                source.contains("app_control_cli::run_app_control_cli("),
+                "{file} no longer routes `server app` to the one dispatcher, so \
+                 its targeting is no longer routed through the one owner either"
             );
             assert_eq!(
                 source
@@ -43738,6 +43743,13 @@ terminal_window_id: None,
                  set-and-clear in main.rs)"
             );
         }
+        // The owner really does apply the overrides, so the routing assertion
+        // above cannot pass by the behaviour having quietly moved nowhere.
+        assert!(
+            crate::app_control_cli::SOURCE_FOR_LOCKS
+                .contains("apply_app_control_target_overrides(&args)"),
+            "the one `server app` dispatcher no longer applies target overrides"
+        );
     }
 
     #[test]
