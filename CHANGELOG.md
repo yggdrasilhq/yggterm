@@ -4,6 +4,23 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A machine no longer quietly accumulates background services forever.** After
+  its program file was replaced on disk, a running background service handed its
+  terminals to a fresh one — and then, five minutes later, did it again, and
+  again, indefinitely, starting a brand-new service every time. One service was
+  measured starting eleven of them in under an hour. It happened because the
+  service asked a shared note on disk whether it had already handed over, and its
+  successor tidied that note away as soon as it recognised itself, so the older
+  one kept concluding it had never handed over at all. Each service now remembers
+  its own handover, so it stops asking once a newer one is running. Machines left
+  on for days no longer collect dozens of idle services, each taking a share of
+  the processor.
+
+  The same forgetfulness could also drop a service that was still holding live
+  terminals into the shutdown path meant only for one holding none, which would
+  have closed those terminals. That path now consults the service's own memory
+  rather than the shared note any other service can erase.
+
 - **A machine that takes its terminals back starts writing them down again.**
   Once a newer background service appeared, the older one stopped recording the
   state of its sessions for good — correct, because the newer one owned that
