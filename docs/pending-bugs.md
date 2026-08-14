@@ -131,44 +131,75 @@ from inside in three pieces (parent accept+spawn 44–48 µs · child pre-closur
 measurement; schedule S4 on stability and observability, NEVER on cores**
 (<0.001 cores/daemon).
 
-## ⛔ [6.3] ONE SESSION RENDERS AS TWO ROWS, AT TWO DIFFERENT NESTING DEPTHS
+## ⛔ ONE DIRECTORY, TWO READERS, AND ONLY ONE WAS TOLD ABOUT THE STAGING DIR
 
 **Status:** OPEN
 
-*Found by the coverage report's row count, not by looking at the sidebar — which is
-why it survived: an off-by-one in a 378-row listing reads as a rounding artefact.*
+*Found 2026-08-14 by the sidebar lane, which could not run a single app-control
+verb against a freshly created GUI until it deleted a directory by hand.*
 
-**378 session rows, 377 distinct paths.** One session path is emitted twice:
+`client-instances/<scope>/` holds one JSON record per attached client, published
+by an atomic write that stages into a `tmp/` subdirectory of that same folder.
+**Two functions enumerate that directory and they disagree about what a
+non-file entry means:**
 
-```
-local://<a session id>   x2      outline_prefix 6.2
-  depth=2   kind=Session  live_member=true  expanded=true  hidden_by_collapsed_set=false
-  depth=4   kind=Session  live_member=true  expanded=true  hidden_by_collapsed_set=false
-```
+| reader | on a directory entry |
+|---|---|
+| `cleanup_stale_client_instances` (yggterm-shell) | skips it — *"the atomic-write staging dir (and anything else that is not a plain file) is never a record"*, with a test that pins it |
+| `collect_client_instance_records` (yggterm-server) | `fs::read` returns **EISDIR (os error 21)**, which is neither `NotFound` nor a parse failure, so it **propagates and fails the whole enumeration** |
 
-Both entries claim to be live members, both expanded, both unhidden, identical labels —
-they differ **only in `depth`**. So this is not a collapsed-set artefact and not one row
-shadowing another; the same session is genuinely placed at two points in the tree.
+**Reproduced twice, on two independently created sandbox homes at 3.0.154.**
+Every `server app` verb died with `reading client instance record …/tmp: Is a
+directory`, and `rmdir` on that one empty directory made them all work.
 
-⚠ **It may not be a display bug at all.** The duplicated session is also the one whose
-transcript **does not exist** — a row that was created and never inhabited. *"A row that
-never lived"* and *"a row that renders twice"* are plausibly one birth defect rather than
-two, and if so the interesting half is in row creation, not in rendering. **Do not assume
-the rendering half is the bug.**
+⛔ **The consequence is larger than a failed verb, and it is the drain's.** The
+comment directly above that read explains that an error there is deliberately
+NOT treated as "no clients": `daemon_should_idle_shutdown` reads an error as *"I
+could not ask, so do not retire."* ⇒ **a daemon whose staging directory exists at
+the sampling moment can never retire**, and that gate is the one the constitution
+rests the drain on.
 
-⛔ **Single source of truth is the law here** and this is a direct violation: the sidebar
-tree and the row inventory must not be able to answer "where does this session sit" two
-ways. Whatever emits the second entry is a second encoding of placement.
+**Fix:** the one-line `entry.file_type()` skip the other reader already has. ⚠
+Two readers of one directory is the second encoding; the durable fix is one
+traversal both call, since this is exactly the shape where a rule learned on one
+side does not reach the other.
 
-**Falsifier / where to start:** `server app rows` and count `row_count` against
-`len({r.path})` — they must be equal. Then find the front-insert or re-parent path that
-can place an existing session without removing its previous placement; the
-*"A NEW ROW ALWAYS LANDS AT THE HEAD — ten front-insert sites, one missing owner"* entry
-is the nearest known relative and may share the owner.
+**Falsifier:** create `client-instances/<scope>/tmp/` on a live home and run any
+`server app` verb.
 
-⚠ **No live 6.3 seat.** Row identity is the sidebar-truth lane's subject and that lane is
-dead (last assistant record ends on `tool_use` in the 2026-08-13 mass cut). This entry is
-filed rather than fixed, and needs that seat spawned before anyone edits placement code.
+## ⛔ A LOCAL LAUNCH INTO A DIRECTORY THAT DOES NOT EXIST LEAVES A KEEP-ALIVE HUSK
+
+**Status:** OPEN
+
+*Found 2026-08-14 while root-causing the cwd-tree entry below it; it is the
+session that entry was filed against.*
+
+An agent session was created **locally on the GUI host with a working directory
+that exists only on the build host**. The directory is absent there, so the agent
+CLI never started, never wrote a transcript, and never produced the runtime
+identity the daemon overlays onto the session. What remains is a row that is
+`live`, `keep_alive`, idle forever, and has never had a process.
+
+**Three things it costs, none of them cosmetic:**
+
+1. The row holds a keep-alive seat and a sidebar number that read as a working
+   lane.
+2. Its `session_id` is still the daemon's own runtime key rather than an agent
+   conversation id, because only a successful start repoints it. **Anything that
+   looks that id up in the CLI's store finds nothing** — and a session whose
+   transcript "does not exist" is easy to file as a storage bug.
+3. It was the only session in the whole inventory exempt from a dedup guard that
+   keyed on having a transcript, so it rendered where all its healthy siblings
+   had been deleted, and **the anomaly got filed as the bug**.
+
+**What should happen instead:** a launch whose cwd does not exist on the target
+host fails loudly at launch, rather than yielding a session object that will
+never run. ⚠ Whether the deeper defect is the missing existence check or a launch
+that chose the local host for a remote path is not settled here; both are in the
+launch surface, not the sidebar.
+
+**Falsifier:** create a local agent session with `--cwd` naming a path that does
+not exist, and read the row back.
 
 ## ⛔⛔ [6.4] THREE PRIVATE IDENTIFIERS REACHED origin/main AND ARE STILL IN HISTORY
 
