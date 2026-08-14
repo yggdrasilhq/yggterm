@@ -846,10 +846,8 @@ const CLIENT_HANDLER_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::
 /// tick before its closure begins. That halves the instrument's own cost, which
 /// is ~10 µs of `/proc` read against a handler the prediction puts at
 /// 0.7–25 ms.
-#[derive(Debug, Default)]
-struct ClientHandlerWindow {
-    opened: Option<std::time::Instant>,
-    opened_proc_cpu_us: u64,
+#[derive(Debug, Default, Clone)]
+struct ClientHandlerStats {
     handled: u64,
     cpu_us_total: u64,
     cpu_us_max: u64,
@@ -858,6 +856,28 @@ struct ClientHandlerWindow {
     user_us: u64,
     kernel_us: u64,
     split_samples: u64,
+}
+
+#[derive(Debug, Default)]
+struct ClientHandlerWindow {
+    opened: Option<std::time::Instant>,
+    opened_proc_cpu_us: u64,
+    by_request: BTreeMap<&'static str, ClientHandlerStats>,
+}
+
+thread_local! {
+    /// The verb this handler thread served, stashed by `handle_request` so the
+    /// closure that wraps it can attribute its cost.
+    ///
+    /// ⛔ **Without this the aggregate is a mean over a MIXED verb population,
+    /// and it reads low.** The first run had `conns/s = 77` against
+    /// `replies/s = 51` — the extra connections were `ping` and `daemons` calls
+    /// from the harness itself, and averaging them in dragged the handler mean
+    /// *below* the cost of the `status` payload build it contains, which is
+    /// impossible and was the tell. A thread-local costs no lock and needs no
+    /// plumbing: same thread, written before the response is sent, read after.
+    static HANDLER_REQUEST_NAME: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
 }
 
 static CLIENT_HANDLER_WINDOW: LazyLock<Mutex<ClientHandlerWindow>> =
@@ -906,6 +926,7 @@ fn thread_cpu_split_micros() -> Option<(u64, u64)> {
 
 fn record_client_handler_cost(cpu_us: u64, wall_us: u64) {
     let split = thread_cpu_split_micros();
+    let request_name = HANDLER_REQUEST_NAME.with(|name| name.take()).unwrap_or("unread");
     let proc_cpu_us = process_cpu_micros();
     let now = std::time::Instant::now();
     let flush = {
@@ -916,26 +937,28 @@ fn record_client_handler_cost(cpu_us: u64, wall_us: u64) {
             window.opened = Some(now);
             window.opened_proc_cpu_us = proc_cpu_us;
         }
-        window.handled += 1;
-        window.cpu_us_total += cpu_us;
-        window.cpu_us_max = window.cpu_us_max.max(cpu_us);
-        window.wall_us_total += wall_us;
-        window.wall_us_max = window.wall_us_max.max(wall_us);
+        let stats = window.by_request.entry(request_name).or_default();
+        stats.handled += 1;
+        stats.cpu_us_total += cpu_us;
+        stats.cpu_us_max = stats.cpu_us_max.max(cpu_us);
+        stats.wall_us_total += wall_us;
+        stats.wall_us_max = stats.wall_us_max.max(wall_us);
         if let Some((user_us, kernel_us)) = split {
-            window.user_us += user_us;
-            window.kernel_us += kernel_us;
-            window.split_samples += 1;
+            stats.user_us += user_us;
+            stats.kernel_us += kernel_us;
+            stats.split_samples += 1;
         }
         let elapsed = now.duration_since(window.opened.unwrap_or(now));
         if elapsed < CLIENT_HANDLER_FLUSH_INTERVAL {
             None
         } else {
-            let emitted = std::mem::take(&mut *window);
+            let emitted = std::mem::take(&mut window.by_request);
             window.opened = Some(now);
+            let previous_proc_cpu_us = window.opened_proc_cpu_us;
             window.opened_proc_cpu_us = proc_cpu_us;
             Some((
                 elapsed,
-                proc_cpu_us.saturating_sub(emitted.opened_proc_cpu_us),
+                proc_cpu_us.saturating_sub(previous_proc_cpu_us),
                 emitted,
             ))
         }
@@ -946,33 +969,52 @@ fn record_client_handler_cost(cpu_us: u64, wall_us: u64) {
     let Some(home) = TRACE_HOME_DIR.as_ref() else {
         return;
     };
-    let split_total = emitted.user_us + emitted.kernel_us;
+    let window_ms = elapsed.as_millis().max(1) as u64;
+    let requests = emitted
+        .iter()
+        .map(|(name, stats)| {
+            let split_total = stats.user_us + stats.kernel_us;
+            (
+                (*name).to_string(),
+                serde_json::json!({
+                    "handled": stats.handled,
+                    "cpu_us_total": stats.cpu_us_total,
+                    "cpu_us_mean": stats.cpu_us_total / stats.handled.max(1),
+                    "cpu_us_max": stats.cpu_us_max,
+                    "wall_us_mean": stats.wall_us_total / stats.handled.max(1),
+                    "wall_us_max": stats.wall_us_max,
+                    // ⚠ A WINDOW share. Per handler it would be a ratio of two
+                    // microsecond figures on a sub-millisecond span, which is a
+                    // precision this does not have.
+                    "kernel_share": if split_total == 0 {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(stats.kernel_us as f64 / split_total as f64)
+                    },
+                    "kernel_us_total": stats.kernel_us,
+                    "user_us_total": stats.user_us,
+                    "split_samples": stats.split_samples,
+                    "handlers_per_s": stats.handled as f64 * 1000.0 / window_ms as f64,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let handled: u64 = emitted.values().map(|stats| stats.handled).sum();
+    let cpu_us_total: u64 = emitted.values().map(|stats| stats.cpu_us_total).sum();
     append_trace_event(
         home,
         "daemon",
         "perf",
         "client_handler_cost",
         serde_json::json!({
-            "window_ms": elapsed.as_millis() as u64,
-            "handled": emitted.handled,
-            "cpu_us_total": emitted.cpu_us_total,
-            "cpu_us_mean": emitted.cpu_us_total / emitted.handled.max(1),
-            "cpu_us_max": emitted.cpu_us_max,
-            "wall_us_mean": emitted.wall_us_total / emitted.handled.max(1),
-            "wall_us_max": emitted.wall_us_max,
-            // ⚠ Reported as a WINDOW share. Per handler it would be a ratio of
-            // two microsecond figures on a sub-millisecond span, which is a
-            // precision this does not have.
-            "kernel_share": if split_total == 0 {
-                serde_json::Value::Null
-            } else {
-                serde_json::json!(emitted.kernel_us as f64 / split_total as f64)
-            },
-            "kernel_us_total": emitted.kernel_us,
-            "user_us_total": emitted.user_us,
-            "split_samples": emitted.split_samples,
+            "window_ms": window_ms,
+            "handled": handled,
+            "cpu_us_total": cpu_us_total,
             "proc_cpu_us_delta": proc_cpu_us_delta,
-            "handlers_per_s": emitted.handled as f64 * 1000.0 / elapsed.as_millis().max(1) as f64,
+            "handlers_per_s": handled as f64 * 1000.0 / window_ms as f64,
+            // ⛔ Per VERB. A single mean over every connection mixes a `ping`
+            // with a `status` carrying 264 rows, and reads low.
+            "requests": requests,
         }),
     );
 }
@@ -7948,6 +7990,10 @@ impl DaemonRuntime {
         // prune (cheap; usually empty).
         self.drain_pending_preserved_owner_removals();
         let request_name = server_request_name(&request);
+        // Hand the verb to the connection-handler cost aggregate, which wraps
+        // this call and cannot know the name any other way — the request has
+        // not been read yet when its thread starts.
+        HANDLER_REQUEST_NAME.with(|name| name.set(Some(request_name)));
         // App profiling system: time every daemon request, tagged by name, so
         // `server perf-summary` surfaces the slow ones (the switch path is `terminal_ensure`).
         // Drop-based so `?` early returns and panics still record. No-op when the
