@@ -511,6 +511,19 @@ distinguishes "between tool calls" from "finished". ⚠ This is the same defect 
 the parent-rate blindness one level down: both read an instantaneous value where
 the question is about a rate.
 
+⭐ **CORROBORATED FROM OUTSIDE, AND THE DECISIVE READING IS THE ONE THE ROW
+CANNOT TAKE OF ITSELF.** Sampling both processes of that pair six times over
+~12 s: the suspected leftover returned **zero children on 5 of 6 reads** while a
+20-second CPU sample put it at **7.8 % of a core** — and **the row's OWN live
+process, demonstrably alive because it was sending messages at that moment,
+returned zero children on 4 of 6.** ⇒ The childless signature appears on a
+KNOWN-LIVE process at almost the same rate as on the suspect. **The probe does
+not discriminate at all on a single read; it is not weak evidence, it is none.**
+⚠ And the counter-example was already sitting in the first table this
+investigation published — the live process was recorded with no children in the
+same grid used to argue that children are load-bearing — and went unread. **A
+falsifying datum inside your own output is the easiest kind to look past.**
+
 ⭐ **AND THE BEST SURVIVOR-PROOF IS NOT CPU AT ALL — IT IS TRANSCRIPT GROWTH
 AFTER THE FACT.** A row that kept working after its leftover was killed is
 demonstrated by its transcript continuing to grow, which no sample taken before
