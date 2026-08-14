@@ -83,6 +83,7 @@ it are one call — a two-step arm is a step somebody skips.
 Exit: 0 nothing to do · 3 something was booted · 4 a human is needed.
 """
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -2457,6 +2458,62 @@ def watcher_alive():
     return pid if "ygg-booter" in cmd else None
 
 
+def _source_is_current():
+    """(ok, detail): is THIS copy of the booter the one on `origin/main`?
+
+    ⛔⛔ THE DEFECT THIS EXISTS FOR, measured 2026-08-14. `ensure_watcher`
+    spawns the watcher from `HERE` -- the copy of whichever checkout happened to
+    run a `subscribe`. There are fourteen checkouts of this repo on one host and
+    NINE of them carried a superseded booter at the moment this was written, so
+    any of them arming the fleet installs old supervision code, silently, and
+    the fleet then runs whichever copy was launched last rather than the newest.
+    It is not theoretical: minutes after the screen-read outage was fixed, a
+    watcher respawned from a stale checkout and the fleet stayed blind.
+
+    ⚠ AND THE STALE PATH IS THE HABITUAL ONE. The copy an agent invokes by hand
+    is the one in its own cwd and its own shell history; the copy that is
+    actually supervising is discoverable only from /proc. Three sessions were
+    caught by this in one afternoon, INCLUDING two that had the identify-which-
+    copy-is-executing law in memory at the time. Knowing the law does not
+    protect you, so the tool has to say it.
+
+    ⚖ Compares against the last-fetched `origin/main` and does NOT fetch: this
+    runs at watcher startup, and a network call there would make arming depend
+    on the network. A stale answer here is still worth having -- the failure is
+    a copy that is hours behind, not seconds."""
+    src = Path(__file__).resolve()
+    try:
+        top = subprocess.run(["git", "-C", str(src.parent), "rev-parse",
+                              "--show-toplevel"], capture_output=True,
+                             text=True, timeout=20).stdout.strip()
+        if not top:
+            return (None, "not inside a git checkout")
+        rel = str(src.relative_to(Path(top)))
+        r = subprocess.run(["git", "-C", top, "show", f"origin/main:{rel}"],
+                           capture_output=True, timeout=20)
+        if r.returncode != 0:
+            return (None, f"origin/main carries no {rel} to compare against")
+        mine = hashlib.sha256(src.read_bytes()).hexdigest()[:12]
+        theirs = hashlib.sha256(r.stdout).hexdigest()[:12]
+        return (mine == theirs,
+                f"this copy {mine} ({top}) vs origin/main {theirs}")
+    except Exception as exc:                     # never block arming on this
+        return (None, f"could not compare: {exc}")
+
+
+def _warn_if_stale_source(where):
+    ok, detail = _source_is_current()
+    if ok is False:
+        log(f"⛔⛔ STALE BOOTER — {where} is running a copy that does NOT match "
+            f"origin/main. {detail}. It will supervise the fleet with whatever "
+            f"this checkout last pulled; a fix that has shipped is not "
+            f"necessarily in it. Pull this checkout, or arm from one that is "
+            f"current, and keep exactly ONE watcher.")
+    elif ok is None:
+        log(f"⚠ could not tell whether {where}'s booter is current: {detail}")
+    return ok
+
+
 def ensure_watcher(args):
     alive = watcher_alive()
     if alive:
@@ -2475,6 +2532,9 @@ def ensure_watcher(args):
                     f"ygg-booter.py subscribe …")
         return f"already running (pid {alive})"
     STATE.mkdir(parents=True, exist_ok=True)
+    # ⛔ Say it BEFORE spawning, while the agent arming the fleet is still here
+    #    to read it. After the spawn this is a line in a log nobody opens.
+    _warn_if_stale_source("the checkout arming this watcher")
     logf = open(LOGPATH, "a")
     p = subprocess.Popen(
         [sys.executable, str(HERE / "ygg-booter.py"), "watch",
@@ -2491,6 +2551,11 @@ def cmd_watch(args):
     PIDFILE.parent.mkdir(parents=True, exist_ok=True)
     PIDFILE.write_text(str(os.getpid()))
     log(f"watcher up (pid {os.getpid()}, interval {args.interval}s, gui host {args.host})")
+    # ⛔ WHICH COPY IS SUPERVISING? Recorded at startup so the log answers it
+    #    without anyone having to read /proc — the question that cost three
+    #    sessions an afternoon.
+    _warn_if_stale_source(f"this watcher (pid {os.getpid()})")
+    log(f"  source: {Path(__file__).resolve()}")
     try:
         while True:
             # ⛔ THE HEARTBEAT ASSERTS THE LOG IS BREATHING, NOT ONLY THAT WE ARE.
