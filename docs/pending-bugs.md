@@ -10658,6 +10658,15 @@ absence of a sighting is not absence of a draft.
 first live confirmation that the GUI-side record tracks the PTY-side draft state
 for a remote row.
 
+⭐⭐ **AND THAT AGREEMENT IS COVERAGE, NOT REDUNDANCY — SWEEP EVERY HOST.** A row
+whose PTY host is too old to carry the field is still answered by its **GUI
+host**, because the GUI-side runtime reconstructs the draft from the bytes the
+client typed. Measured on the armed set: a **dev-only** sweep reported *2 of 17
+daemons answering, one armed row unknowable*; adding the GUI host's single
+current daemon gave **7 armed rows, 7 covered, ZERO blind.** ⇒ **The union of the
+hosts covers what neither covers alone**, and a single-host `blind` is a fact
+about that host, not about the fleet.
+
 ⚖ **AND IT ADDS A THIRD CASE TO THE ENTRY'S OPEN QUESTION.** The two arms above
 are "a draft the owner typed" (never type over; escalate to him) and "our own
 litter from a failed boot" (clear it ourselves). The first real sighting was
