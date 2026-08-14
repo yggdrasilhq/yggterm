@@ -3498,10 +3498,44 @@ the resolution logs `forwarded`. `forwarded: false` on a row whose PTY is on
 another machine is the defect, and it localises it to the caller that supplies
 `ssh_target` rather than to the app, the declare format or the GUI's fetch.
 
-⚠ **Not re-measured live.** This is a code fact plus a date, which is enough to
-retire the wrong direction and not enough to close the entry. ⛔ Whoever takes it
-must still run the falsifier — see the sibling entry closed the same day, where
-two published attributions were both overturned by one A/B.
+### ✅ AND NOW MEASURED LIVE: THE FORWARD IS ESTABLISHED, ON A REAL CROSS-MACHINE SURFACE
+
+*run 2026-08-14 on the GUI host, on a document surface whose PTY is on another
+machine — read from `server app state`, `shell.sidebar_contributions`:*
+
+```
+declared_control_url : http://127.0.0.1:46219     <- the OTHER host's daemon
+control_url          : http://127.0.0.1:44987     <- a local port, forwarded
+```
+
+⇒ **They differ, so the `ssh -L` forward ran.** `46219` is the same port this
+entry cites as "the daemon on the host running the shell". **The GUI is not being
+pointed at a port nothing on it has bound.** The stated cause is dead by
+measurement as well as by date, and the two agree.
+
+⛔⛔ **AND THE ENTRY'S OWN EVIDENCE NEVER SUPPORTED ITS DIAGNOSIS — read this
+before re-opening the "unreachable endpoint" line of enquiry.** It records that
+the surface rendered its full rail: toolbar, regex search, the view toggle, the
+FILES heading with its `+`, *No files open*, Wrap. **A rail is built from a
+schema fetched over that very endpoint.** An unreachable endpoint cannot produce
+a rendered rail — it produces an error or nothing. So the endpoint was reachable
+the whole time, and *No files open* is a daemon ANSWERING and saying it holds no
+files, not a daemon that could not be found.
+
+⇒ **Two candidates remain, and neither is "unreachable":** the fetch resolved to
+the WRONG daemon (the GUI host's own, which genuinely had no files), or the file
+really was only in the other host's daemon and the surface was reporting that
+correctly. ⭐ Both are settled by the same one-line reading — compare
+`declared_control_url` against `control_url` at the moment the rail says *No
+files open*.
+
+⚠ **What is NOT settled: whether the ORIGINAL 2026-08-13 sighting was this at
+all.** Everything on that date is confounded by a defect fixed the following day:
+an invalid RSX attribute name killed the document body's edit batch on EVERY
+document surface, so a blank document proved nothing about URL resolution. The
+rail was unaffected (different pane, different batch), which is exactly the split
+this entry's evidence shows. ⛔ **Re-sight it on a build after that fix before
+spending a session here** — this entry may have no live symptom left.
 
 ## ⛔ [6.3] ychrome's VAULT AND SETTINGS RAILS SAY "Loading…" FOREVER
 
