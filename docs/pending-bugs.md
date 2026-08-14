@@ -126,6 +126,29 @@ a means that does not scale with contention. ⭐ **A test that encodes WHY shoul
 be re-pointed, not removed**; deleting it would have discarded the argument along
 with the assertion.
 
+### ⛔⛔ THE FALSIFIER NEEDS A SAME-MOMENT CONTROL — THE BASELINE MOVES ON ITS OWN
+
+*Peer-measured and independently confirmed here by ancestry, 2026-08-14.*
+
+**Measuring against the original 141.1 KB/s would credit this fix with something
+it did not do.** Re-measured with the fix **absent**: 23.6 KB/s combined — a **6×
+fall with no code change at all**, because the session population fell 57 → 39
+and contention is 98.6 % `terminal_read`, which is **per session**. ⇒ A
+before/after taken hours apart on this host measures the session count at least
+as much as it measures the change.
+
+⇒ **The falsifier is therefore: a daemon carrying the fix against one that does
+not, AT THE SAME MOMENT, normalised per owned session.** A sequential
+before/after cannot separate the two effects and must not be quoted as if it
+could.
+
+⛔ **AND CHECK DEPLOYMENT BY ANCESTRY, NEVER BY VERSION NUMBER.** `3.0.152` was
+built and deployed *before* this fix was committed, so every host reported a
+version that looked current while running a binary without the change —
+`git merge-base --is-ancestor <fix> <build-commit>` is the only honest test, and
+`yggterm --build-commit` is what it needs. This entry was briefly described as
+deployed on the strength of the version alone.
+
 ⚠ **Trap paid twice while writing this, both caught, both worth carrying.**
 (1) The scan read the function's own comment — which necessarily NAMES the
 removed writes — as the offence, so it now strips comment lines; the
