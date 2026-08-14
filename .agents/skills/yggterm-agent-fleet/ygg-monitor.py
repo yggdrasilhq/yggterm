@@ -57,6 +57,7 @@ import importlib.util
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -201,6 +202,32 @@ def _ep_load(uuid):
 def _ep_save(uuid, st):
     EPISODES.mkdir(parents=True, exist_ok=True)
     (EPISODES / f"{uuid}.json").write_text(json.dumps(st))
+
+
+def _this_host():
+    return socket.gethostname().split(".")[0]
+
+
+def _agent_uuids_on_this_host():
+    """Every agent-CLI session uuid with a LIVE process on THIS machine.
+
+    ⛔ ABSENCE PROVES DEATH ONLY FOR A ROW WHOSE HOST IS THIS HOST. A remote
+    row's process is invisible from here, and calling that absence death is the
+    instrument error this fleet keeps paying for — the caller checks the host
+    before believing a miss.
+
+    ⚠ The uuid is read OUT of each command line, never put INTO the search
+    pattern: a `pgrep -f <uuid>` matches the shell doing the searching, which
+    has cost three sessions here."""
+    live = set()
+    r = _run(None, ["pgrep", "-af", "claude|codex|gemini|amp|opencode"])
+    if not r:
+        return live
+    for line in r.stdout.splitlines():
+        m = re.search(r"--resume\s+([0-9a-f-]{36})|--session-id\s+([0-9a-f-]{36})", line)
+        if m:
+            live.add(m.group(1) or m.group(2))
+    return live
 
 
 def sub_path(uuid):
@@ -1053,11 +1080,44 @@ def report_escalation_gap(subs):
     else:
         unarmed = sorted(watched - armed - dying - attended - optedout)
         if unarmed:
+            # ⛔⛔ A DEAD ROW IS A THIRD CASE, AND OFFERING ONLY TWO PUT A LIE IN
+            #    THE GUARD FILE. This asked "arm it, or add it to never-arm.tsv"
+            #    about a row that had been REAPED hours earlier. Both options
+            #    were wrong, and the asymmetry is what matters: arming a corpse
+            #    is merely useless, while never-arming one writes a PERMANENT
+            #    ASSERTION THAT A HUMAN TYPES AT THAT ADDRESS into the one file
+            #    whose entire job is to stop a machine typing at a person — and
+            #    no later audit questions it, because that is what the file
+            #    means. Reported by a peer campaign 2026-08-14, which correctly
+            #    unsubscribed instead and told me the prompt was the defect.
+            # ⇒ The liveness check costs one /proc scan and turns "record a
+            #   decision" into "unsubscribe this, it is dead", which needs no
+            #   judgement at all.
+            live_here = _agent_uuids_on_this_host()
+            by_stub = {s["uuid"][:8]: s for s in subs}
             log(f"⛔ {len(unarmed)} ROW(S) SUBSCRIBED HERE BUT NOT ARMED ON THE BOOTER — "
                 f"an escalation target exists, but nothing will WAKE a stall:")
             for u in unarmed:
-                log(f"   {u}  ⇒ RECORD A DECISION — arm it if it is an unattended delegate;")
-                log(f"        add it to never-arm.tsv if a person types in it.")
+                rec_s = by_stub.get(u, {})
+                full = rec_s.get("uuid") or ""
+                # An empty host means this machine; see the note at `sub.get("host", "dev")`.
+                host = (rec_s.get("host") or "").strip() or _this_host()
+                if host != _this_host():
+                    # ⚠ BLIND IS NOT DEAD. A remote row's process cannot be seen
+                    #    from here, and reporting that absence as death is the
+                    #    exact instrument error this campaign keeps paying for.
+                    log(f"   {u}  ⇒ RECORD A DECISION — arm it if it is an unattended delegate;")
+                    log(f"        add it to never-arm.tsv if a person types in it.")
+                    log(f"        ⚠ lives on {host}: liveness NOT checked from here, so "
+                        f"'no process' is not among the things I know.")
+                elif full and full not in live_here:
+                    log(f"   {u}  ⇒ DEAD — no agent process on {host} holds it. `unsubscribe` it.")
+                    log(f"        ⛔ Do NOT put it in never-arm.tsv. That file asserts a HUMAN "
+                        f"types at this address; a reaped uuid there is a lie the guard can "
+                        f"never question.")
+                else:
+                    log(f"   {u}  ⇒ RECORD A DECISION — arm it if it is an unattended delegate;")
+                    log(f"        add it to never-arm.tsv if a person types in it.")
             log("   ⛔ Do NOT bulk-arm: no probe separates those two cases, and guessing")
             log("     wrong types into a human. Decide per row.")
     if dying:

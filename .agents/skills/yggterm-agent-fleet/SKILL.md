@@ -905,8 +905,34 @@ done
 ```
 Before reaping, prove it is DONE and not merely quiet — **a finished delegate and a stalled one are
 indistinguishable from the row plane** (§6). Cheap discriminators: its last transcript message is a
-completion report, `pgrep -P <pid>` shows no children, and its work is committed. Then `TERM`,
-**read `/proc/<pid>` back**, and escalate to `KILL` only if it survives.
+completion report, and its work is committed. Then `TERM`, **read `/proc/<pid>` back**, and escalate
+to `KILL` only if it survives.
+
+⛔⛔ **DO NOT USE `pgrep -P <pid>` AS THE "IS IT PARKED" TEST. IT ANSWERS A DIFFERENT QUESTION, IN
+BOTH DIRECTIONS — measured across 19 live rows, 2026-08-14:**
+
+| observation | what it proves | what it does NOT prove |
+|---|---|---|
+| `children > 0` | a LOCAL subprocess is running | nothing about the turn — **one row held 4 children and wrote 0 bytes in 25 s** |
+| `children == 0` | only that no local tool is running right now | ⛔ **NOT parked.** **5 of 19 rows had 0 children while actively working**, growing 9.5–40.7 KB in 25 s |
+| `transcript grew` | ⭐ **WORKING. This is the one sound positive.** | — |
+| `transcript flat` | nothing on its own | ⛔ **NOT parked** — a row compiling, or waiting on the model, writes nothing for minutes |
+| state `S` / `do_epoll_wait` | nothing | it is the resting state of *both* a thinking row and a dead one |
+
+⇒ **A row that is THINKING, or waiting on the model API, has no children and sits in `S` — byte for
+byte the signature a corpse presents.** The rung was being read as an if-and-only-if, and it never
+was one: it is a *sufficient* sign of work, never a *necessary* one.
+
+⭐ **THE SOUND FORM.** Working is cheap to prove and parked is expensive, so never infer parked from
+a single absence. **Parked requires ALL of: the last transcript record is a COMPLETED assistant turn
+(not mid `tool_use`), AND no growth across a generous window, AND no children.** Any one of those
+alone is a guess, and the cost of guessing wrong is a `continue` typed into a live row mid-task —
+the failure class this whole skill exists to prevent.
+
+⚠ **AND THE PART THAT IS NOT ABOUT THE RUNG.** A brief that says a lane is "idle-capable" because an
+earlier session read this same unsound proxy will AGREE with your measurement, and the agreement is
+worth nothing — **it is one method run twice, not two methods corroborating.** Ask what the brief's
+claim was derived FROM before you let it raise your confidence.
 
 ⚖ **Whose job:** the session that SPAWNED it. Not the delegate — it cannot reap itself after its
 last turn — and not the next human to notice.

@@ -260,6 +260,57 @@ bootstrapping. The campaign already records that a re-resume onto a fresh PTY is
 when the squish/broken-bottom artefacts appear, so the first-paint window is
 where the renderer is most stressed and is the cheapest place to try to reproduce
 this.
+## ⛔⛔ [6.0] SOME ROW SUMMARIES DESCRIBE WORK THAT NEVER HAPPENED, IN THE SIDEBAR THE USER READS
+
+**Status:** OPEN
+
+*Found 2026-08-14 while sweeping rows for a different reason.*
+
+A row's `detail_label` is its summary, and for a handful of rows it is **generic
+software-engineering boilerplate that appears nowhere in that session**. Not a
+stale summary, not a vague one — a confident description of a different project.
+
+**The signature is unmistakable once seen:** *"The current objective is to
+integrate the new `<X>` middleware into the existing `<Y>`"*, with `<X>`/`<Y>`
+drawn from tutorial-grade material (auth middleware, OAuth2 token refresh, a
+WebSocket collaboration layer, a Flask API, a microservice request pipeline) —
+subjects this project does not contain.
+
+⇒ **Confirmed on two rows by independent probe**, each against its own
+transcript:
+- a row whose lane did **document-surface rendering** carries a summary about a
+  *real-time collaboration layer for a collaborative drawing application*. The
+  phrase "collaborative drawing" occurs **0** times in that session.
+- a row whose lane is a **business/licensing discussion** carries a summary about
+  *authentication middleware in a Flask API*. `Flask`, `middleware` and
+  `microservice` each occur **0** times in that session.
+
+⭐ **The real prefix is preserved and the fabrication is appended**, which is what
+makes it convincing: the summary opens with the session's genuine first tokens
+and then continues into invented content. A reader who recognises the opening
+trusts the rest.
+
+⚠ **SEVERITY IS ABOUT WHO READS IT.** The sidebar is how the user knows what each
+row is doing. A fabricated summary is worse than an absent one: it answers the
+question wrongly and gives no sign it is guessing. At least one affected row is
+one the user works in himself.
+
+⛔ **WHAT THIS ENTRY DOES NOT CLAIM.** A first measurement here reported "31 of 31
+summaries fabricated" and **that number was wrong and is withdrawn** — it tested
+whether the summary appears VERBATIM in the session's first message, which a
+generated summary never would, since paraphrasing is its job. Most summaries do
+describe their lane's real subject and are fine. **The defect is the subset whose
+DOMAIN does not match the session at all**, which is a different and much smaller
+population. The sound detector is domain mismatch, not string containment.
+
+**Not yet established, and worth knowing before a fix:** whether these are
+produced when summary generation fails or is rate-limited and a fallback is
+persisted anyway (there is a standing rule in this fleet that a heuristic
+fallback must never be persisted over a rate-limit refusal), or whether the
+generator is simply hallucinating from insufficient input. **The falsifier is
+cheap:** force a summary generation for a row whose content is known, with the
+generator's backend unavailable, and see what gets written.
+
 ## ⚠ [6.0] A FINISHED LANE'S ROW HOLDS ITS SEAT FOREVER, AND NOTHING RETIRES IT
 
 **Status:** OPEN
@@ -1443,6 +1494,40 @@ and a daemon bump is the action the readiness-probe entry forbids while a human
 has an unsent draft open — see that entry's ordering clause. The hold ends when
 the draft is sent or cleared.
 
+### ⛔⛔ THE HOLD'S END CONDITION IS NOT OBSERVABLE, SO THE HOLD CAN NEVER BE SHOWN TO HAVE ENDED
+
+*Measured 2026-08-14 while testing the gate rather than the items behind it.*
+
+**"The draft is sent or cleared" is the condition, and nothing can report it.**
+The only instrument that consults draft state is `--refuse-if-draft`, a flag on
+`server terminal write` — so the sole way to learn whether a draft exists is to
+**attempt the write the hold exists to forbid**. `server app --help` is explicit
+that the readiness probe "clears the line", i.e. the instrument is destructive to
+the very thing being asked about.
+
+⇒ **This is a permanent hold wearing a temporary one's clothes.** It is the same
+shape as the constitution's own named failure — *a gate that only converges when
+nothing is active can never converge on a machine that is always active* — and it
+currently gates the drain lane, which the campaign calls its highest-value work.
+
+⭐ **THE DATUM ALREADY EXISTS, NON-DESTRUCTIVELY, AND IS SIMPLY NOT EXPOSED.** The
+daemon carries `has_pending_draft` on a session signature and consults it in
+`session_is_migratable` (`daemon.rs`, and the lock
+`not_migratable_when_draft_present` asserts *"a typed-but-unsent draft must
+protect the session from release"*). So the server already knows, on every
+session, without typing anything.
+
+**Owed, and it is small:** a read-only way to ask — either a `has_pending_draft`
+field on the rows/gate-screen payload, or a `server rows drafts` verb. That
+converts an unobservable end condition into a measurable one and lets the hold
+lift on evidence instead of on someone's recollection.
+
+⚠ **Until then the hold STANDS and must not be lifted on inference.** A read of
+the live plane found no draft-shaped blocker anywhere — but the blocker vocabulary
+has no draft kind at all, and the rows the owner actually types in are not even in
+that daemon's population. **Blind is not clear**, and the cost of being wrong here
+is a person's unsent sentence.
+
 **Status of this entry: FIXED IN CODE, awaiting the measured ≥90× drop.**
 
 All three writes removed in one change, as the correction demanded — the two
@@ -1940,106 +2025,6 @@ generate both texts, the way `app_control_cli` owns the `server app` help.
 ⛔ Do not "fix" this by copying one block over the other. They are not identical
 by design — each names its own binary in every line — so the shared thing is the
 verb list, not the text.
-
-## ⚠ [6.6] ONE `server` VERB STILL ANSWERS FROM ONE BINARY ONLY — AND THE "REAL FORK" NEVER EXISTED
-
-**Status:** OPEN
-
-*Measured and mostly closed 2026-08-14, after collapsing `server app`. The last
-three verdicts were taken the same day and they overturned this entry's own
-premise.*
-
-`server <verb>` is dispatched in both binaries, and nine verbs answered from one
-only. This entry used to say the finding was that **`server` mixes planes** —
-deploy and relay machinery that is *genuinely* headless-only sitting beside
-daemon operations that are not — so a blanket ban would forbid a real fork.
-
-⛔⛔ **THAT PREMISE IS WITHDRAWN. THE FORK WAS THREE READINGS, AND ALL THREE WERE
-WRONG.** `gate-screen`, `relay-boundary` and `wpe` were the entire evidence for
-it. Read end to end, every one is accidental (below), and all three now answer
-from both binaries. **Eight of nine divergences measured, eight accidental, zero
-forks found.**
-
-⚠ **The per-verb rule still stands — but on its own merits, not on a
-counter-example.** Asking per verb is right because a fork *could* exist and a
-structural ban would forbid it silently. What nobody may do any more is cite a
-measured one, because there isn't one. ⇒ If the ninth verb also comes back
-accidental, the honest move is to reopen the wholesale question rather than keep
-a rule whose only justification has evaporated.
-
-⭐ **The transferable half: a READING is not a VERDICT, and this entry said so
-about itself and was still believed.** The three were filed as "reads as
-deploy/relay machinery … that is a reading of their callsites and usage text,
-**not a verdict**". Everything downstream — this entry's framing, and the shared
-module's own header — then quoted them as the established fork. **A caveat
-attached to a claim does not travel with it.**
-
-### ✅ CLOSED — five accidental divergences, fixed
-
-| verb | why it was accidental |
-|---|---|
-| `daemons` | the census reads a home dir and nothing else |
-| `write-lock` · `order` · `ledger` · `reorder` | each opens with `ensure_local_server_ready_for_cli` + `cli_server_endpoint` and then talks to the DAEMON over the local socket — no window in any of them |
-
-All five now have one owner (`yggterm_server::server_cli`, plus the census in
-`daemon.rs`) and answer from both binaries. Locked per verb by
-`both_binaries_answer_the_daemon_census` and
-`both_binaries_answer_the_daemon_socket_verbs`. Verified before/after against
-the shipped binary: `unsupported server command: order` becomes a dispatch.
-
-⭐ **And the helpers went with them.** `cli_server_endpoint` and
-`ensure_local_server_ready_for_cli` were byte-identical private copies in BOTH
-binaries. Sharing the verbs while leaving those in place would have made a
-THIRD copy — worse than the duplication being fixed — so the locals are gone and
-both binaries import the shared pair. The lock bans either growing one back.
-
-### ✅ CLOSED — the three that were the "real fork"
-
-| verb | the reading | what the body says |
-|---|---|---|
-| `wpe` | deploy/relay machinery, headless by design | opens with `ensure_local_server_ready_for_cli` + `cli_server_endpoint` and talks to the daemon — **the exact test that convicted the four above it** |
-| `gate-screen` | ditto | a read-only daemon query over the socket; no ensure, deliberately, for the same reason `terminal resize` has none |
-| `relay-boundary` | ditto | touches **no daemon at all** — reads and writes a host fact in a file under the home dir, which is the `daemons` census's own shape, and the census was closed as accidental |
-
-All three now answer from both binaries, and their bodies are GONE from the
-headless binary rather than merely also-dispatched — the lock checks for the
-copies, not just for the calls, because a binary that kept its inline block
-beside the new call would pass a call-only assertion while the two drifted.
-Before/after against the shipped binary: all three went from
-`unsupported server command: <verb>` to a real dispatch.
-
-⭐ **`relay-boundary` is the one that stung.** It exists so a relay session can
-declare its own hand-off — and the binary on an agent's `PATH` is `yggterm`,
-which was the one that could not answer it.
-
-### ⏳ STILL OPEN — one verb, and it is a size problem, not a verdict
-
-- **`connect`** (GUI-only) — ⭐ **READ END-TO-END, AND THE VERDICT IS
-  ACCIDENTAL.** It reads a snapshot and asks the daemon to place a row: no
-  window, no app-control round trip, no process spawn. The earlier note here
-  said it "may reasonably need the GUI" and that it "spawns" — both were guesses
-  from its name and from a grep that matched the word in a comment. It does
-  neither.
-  ⛔ **But it is NOT a bounded move, which is why it is still open.** Attempting
-  it showed `connect` drags a private cluster with it — `ConnectPlacement`,
-  `run_server_connect`, `run_server_connect_list`, plus
-  `connect_desired_order`, `connect_path_session_uuid`, `connect_scanned_metadata`,
-  `connect_session_is_active`, `connect_session_key_is_known`,
-  `connect_session_kind_for_path` and `parse_remote_scanned_connect_path`. That
-  is ~190 lines of verb over seven more helpers, against ~120 lines for the four
-  already moved. The attempt was reverted rather than half-landed.
-  ⇒ Whoever takes it should move the cluster as one commit, and should expect
-  the helper count, not the verb, to be the work.
-
-### ⚠ THE INSTRUMENT LIED FIRST, AND THE CONTROL CAUGHT IT
-
-The first extractor scanned only `args[1] == "verb"` and produced verb lists
-that **omitted `daemons` entirely** — that verb is dispatched as
-`args.get(1).is_some_and(...)`. A live observation of `daemons` happened to be
-in hand as a control; without it a confidently wrong inventory would have been
-published. ⇒ **Validate a source scanner against a case whose answer you already
-know.** That enumerating this dispatch needs four different spellings is itself
-evidence for the entry.
 
 ## ⚠ [6.6] A PROCESS-GLOBAL ENV WRITE MAKES THE LAUNCH-COMMAND TESTS FLAKY IN PARALLEL
 
@@ -3943,10 +3928,44 @@ the resolution logs `forwarded`. `forwarded: false` on a row whose PTY is on
 another machine is the defect, and it localises it to the caller that supplies
 `ssh_target` rather than to the app, the declare format or the GUI's fetch.
 
-⚠ **Not re-measured live.** This is a code fact plus a date, which is enough to
-retire the wrong direction and not enough to close the entry. ⛔ Whoever takes it
-must still run the falsifier — see the sibling entry closed the same day, where
-two published attributions were both overturned by one A/B.
+### ✅ AND NOW MEASURED LIVE: THE FORWARD IS ESTABLISHED, ON A REAL CROSS-MACHINE SURFACE
+
+*run 2026-08-14 on the GUI host, on a document surface whose PTY is on another
+machine — read from `server app state`, `shell.sidebar_contributions`:*
+
+```
+declared_control_url : http://127.0.0.1:46219     <- the OTHER host's daemon
+control_url          : http://127.0.0.1:44987     <- a local port, forwarded
+```
+
+⇒ **They differ, so the `ssh -L` forward ran.** `46219` is the same port this
+entry cites as "the daemon on the host running the shell". **The GUI is not being
+pointed at a port nothing on it has bound.** The stated cause is dead by
+measurement as well as by date, and the two agree.
+
+⛔⛔ **AND THE ENTRY'S OWN EVIDENCE NEVER SUPPORTED ITS DIAGNOSIS — read this
+before re-opening the "unreachable endpoint" line of enquiry.** It records that
+the surface rendered its full rail: toolbar, regex search, the view toggle, the
+FILES heading with its `+`, *No files open*, Wrap. **A rail is built from a
+schema fetched over that very endpoint.** An unreachable endpoint cannot produce
+a rendered rail — it produces an error or nothing. So the endpoint was reachable
+the whole time, and *No files open* is a daemon ANSWERING and saying it holds no
+files, not a daemon that could not be found.
+
+⇒ **Two candidates remain, and neither is "unreachable":** the fetch resolved to
+the WRONG daemon (the GUI host's own, which genuinely had no files), or the file
+really was only in the other host's daemon and the surface was reporting that
+correctly. ⭐ Both are settled by the same one-line reading — compare
+`declared_control_url` against `control_url` at the moment the rail says *No
+files open*.
+
+⚠ **What is NOT settled: whether the ORIGINAL 2026-08-13 sighting was this at
+all.** Everything on that date is confounded by a defect fixed the following day:
+an invalid RSX attribute name killed the document body's edit batch on EVERY
+document surface, so a blank document proved nothing about URL resolution. The
+rail was unaffected (different pane, different batch), which is exactly the split
+this entry's evidence shows. ⛔ **Re-sight it on a build after that fix before
+spending a session here** — this entry may have no live symptom left.
 
 ## ⛔ [6.3] ychrome's VAULT AND SETTINGS RAILS SAY "Loading…" FOREVER
 
