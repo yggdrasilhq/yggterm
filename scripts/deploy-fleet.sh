@@ -10,7 +10,7 @@
 # An agent's discipline resets every session; a verb's does not.
 #
 #   scripts/deploy-fleet.sh [--from <dir>] [--hosts "dev guihost oc"] [--dry-run]
-#                           [--allow-behind] [--preflight]
+#                           [--allow-behind] [--preflight] [--no-pin]
 #
 # ⭐ `--preflight` runs ONLY the ancestry check and exits, without needing build
 # products. Run it BEFORE the release build. The ancestry gate is correct and is
@@ -46,10 +46,12 @@ DRY=0
 ALLOW_BEHIND=0
 PREFLIGHT=0
 HOSTS_EXPLICIT=0
+NO_PIN=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from) FROM="$2"; shift 2;;
     --hosts) HOSTS="$2"; HOSTS_EXPLICIT=1; shift 2;;
+    --no-pin) NO_PIN=1; shift;;
     --dry-run) DRY=1; shift;;
     --allow-behind) ALLOW_BEHIND=1; shift;;
     --preflight) PREFLIGHT=1; shift;;
@@ -319,6 +321,21 @@ for host in $HOSTS; do
   echo "     Or for this run:       --hosts local" >&2
   FAILED=1
 done
+
+# ⛔ PIN THE TRACE BEFORE THE SWAP, BECAUSE RETENTION WILL NOT KEEP IT.
+# Sessions have died 166-464 s after a release, and every investigation but one
+# arrived to find the trace covering the death already pruned: the byte budget is
+# per home while the write rate is per daemon, so the measured window was ~3 h,
+# not the 3 days the constant advertised. Pinning costs nothing (hard links) and
+# is the difference between the next death being explainable and being another
+# structural absence. ⚠ Deliberately NOT gated on success — a diagnostic that can
+# fail a deploy is a diagnostic that gets switched off.
+if [ "$NO_PIN" = 0 ] && [ "$DRY" = 0 ]; then
+  "$(dirname "$0")/pin-trace-window.sh" --label "$VERSION" --hosts "$HOSTS" \
+    --follow-mins 15 2>&1 | sed 's/^/  /' || \
+    echo "  ⚠ trace pin failed — the deploy continues, but a death in the next" \
+         "15 min may not be explainable afterwards." >&2
+fi
 
 for host in $HOSTS; do
   [ "${HOST_UNREACHABLE[$host]:-0}" = 1 ] && continue

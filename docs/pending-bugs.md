@@ -1746,6 +1746,80 @@ boundary** — a row that dies at 600 s is invisible to any watch that ends at 5
 with a matching signature. Cause is still **not established**, an independent
 crash is still not excluded, and `dmesg` is still unreadable here.
 
+### ⛔⛔ THE EVIDENCE FOR THE EARLIER DEATHS WAS NEVER MISSING — IT HAD BEEN DELETED
+
+**Measured 2026-08-14 (6.1).** Every conclusion above about "no such events in the
+corpus" for the 166/242/272/402 s deaths rests on a corpus that **does not reach
+them**:
+
+| trace corpus on dev | 8 generations + live, 247.9 MiB against a 256 MiB cap |
+|---|---|
+| earliest record | **01:05:11Z** |
+| the four deaths | 16:55Z, 19:50Z, 00:21Z, 00:22Z — **all before it** |
+
+The write rate is **83.1 MiB/h (1.95 GiB/day)**, against the retention comment's
+claimed *"~80 MiB/day"* — wrong by a factor of 25 — so the retained window was
+**2.98 h, not the 3 days** the constant advertised, and the 3-day age rule had
+never once been the binding condition. ⇒ **The absence of a mechanism's events in
+those deaths is STRUCTURAL, not evidential.** It supports nothing, in either
+direction, and any argument built on it must be withdrawn.
+
+**Why it collapses:** the byte budget is per HOME while the write rate is per
+DAEMON, and every daemon on the host writes the same file. The window is roughly
+`cap / (per-daemon rate × N daemons)` — so the diagnostic window shrinks exactly
+as the daemon pile grows, and it is shortest during the releases it is needed for.
+⭐ That is a further argument for the drain that S1 did not have.
+
+**Landed:** the cap is now 1 GiB (~12 h at the measured rate) with the mechanism
+written into the constant, and `scripts/pin-trace-window.sh` hard-links the trace
+window around a deploy — `deploy-fleet.sh` calls it automatically, following for
+15 min, so a death in the danger window survives retention. Links, not copies:
+the pruner's unlink then frees nothing. ⚠ Both were falsified before being
+believed — the follow loop's first version linked NOTHING (an unexported `DEST`
+in the detached shell) while reporting a clean first pass.
+
+### ⛔⛔ A CODE-GROUNDED CANDIDATE: THE STALE-DAEMON SWEEP KILLS, AND BOTH ITS GATES DISCARD ERRORS
+
+**Not proven — no observed instance — but it is the first candidate with a traced
+trigger path rather than a timing coincidence, and its fail-open half is real.**
+
+`cleanup_legacy_linux_daemon_processes` runs **on every daemon start** and
+`terminate_linux_process`es any same-home daemon it finds "legacy" — SIGTERM,
+120 ms, then SIGKILL. "Legacy" is **relative to the sweeper**: a daemon is legacy
+when its `argv[0]`/exe is not the sweeper's own binary path, so a daemon started
+from a build tree classifies every installed daemon as legacy. The single gate
+between that and a killed PTY is `has_clients`, and **both of its terms threw
+their errors away**:
+
+- `active_client_instance_records_for_endpoint_scope(..).ok()` ⇒ an unreadable
+  client list arrived as *"no clients"*. This is the same seam fixed one layer
+  up on 2026-08-14; that fix made the error travel, and this caller — the one
+  that kills rather than merely permits a retirement — dropped it on the floor.
+- `reachable_versioned_daemon_statuses` drops a daemon whose `status` call errors
+  (`.ok()?`), and **every protective branch** of
+  `linux_daemon_runtime_activity_protected_for_cleanup` requires a status to be
+  present. A daemon serves one request at a time, so the daemons most likely to
+  miss a status probe are the ones mid-handover — which is what a release makes
+  every daemon do at once.
+
+**The measurement that makes this urgent, from 8 sweeps in the live corpus:**
+`skipped_active_client_legacy` was **0 in every one**, while
+`skipped_runtime_activity_legacy` was **16**. ⇒ The client gate contributes
+nothing on this fleet; sixteen live daemons were each **one unanswered status
+probe** away from SIGTERM, and every PTY they own with them.
+
+**Landed:** both terms now fail closed — an unreadable client list and an
+unanswered status both count as *something to protect* — and the sweep reports
+`skipped_unreadable_clients` and `skipped_no_status` separately, so a sweep that
+protected everything because it could see nothing can never again be read as a
+sweep that found nothing to do.
+
+⇒ **What would settle it:** at the next release, with the trace window pinned,
+read the sweeps in the 0–600 s band. `killed_legacy` or `killed_orphan` ≥ 1 at a
+death's timestamp is the proof; `skipped_no_status` ≥ 1 says the fix is what
+stood between us and it. ⛔ Until then this is a candidate, not the cause, and it
+does not retire the OOM/external-kill rival above.
+
 ## ⛔⛔ [6.1] THE GUARD PROTECTING A PRESERVED PTY OWNER IS A HOST-SHARED FILE, SO A PEER CAN ERASE IT
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
