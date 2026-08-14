@@ -705,48 +705,6 @@ instrument uses `getrusage(RUSAGE_THREAD)`, in microseconds, so it is not subjec
 to the truncation that produced the retracted figure — **it is the thing that
 settles what the 15–30× gap actually is.**
 
-## ⛔ [6.9→6.1] AN UNREADABLE CLIENT-RECORD DIRECTORY READS AS "NO CLIENTS" AND PERMITS RETIREMENT
-
-**Status:** OPEN
-
-*source reading, and the withdrawal of the anomaly that led here, in
-[`idle-cost-model.md`](idle-cost-model.md) §6k-1..§6k-3*
-
-`daemon_should_idle_shutdown` (`daemon.rs:11537`) is careful: if
-`active_client_instance_records` returns `Err` it returns `false` — *if you
-cannot tell whether clients exist, do not retire.*
-
-**The callee guarantees that arm never fires.**
-`active_client_instance_records_from_dir` (`lib.rs:20737`) ends every failure in
-`let Ok(entries) = entries else { return Ok(()) };`, and drops per-entry errors
-with `.flatten()`. It has no `Err` path, so neither does its caller.
-
-⇒ An unreadable client-instances directory — permissions, fd exhaustion, ENOMEM —
-is reported as **an empty set of clients**, which satisfies gate 3 and **permits
-retirement while a client may be connected**. Two halves of one decision disagree
-about what an unreadable directory means and the careless half wins.
-
-⚠ **This is the INVERSE of the "a failing read means it never retires" reading.**
-That one cannot happen today; this one can. Both come from the same `Result` being
-vestigial.
-
-**Fix:** let the callee distinguish *absent* (legitimately no clients ⇒ `Ok`) from
-*unreadable* (⇒ `Err`), so the caller's existing caution becomes reachable.
-
-⛔ **NOT A DEFECT, CLOSED: "a daemon with all three retire gates open did not
-retire".** I filed that and it was wrong twice over. `client_instance_dirs_for_scan`
-scans **every** directory under the client-instances root, so a record filed under
-another endpoint version is still in scope; and `daemon_is_superseded` needs a
-**live** newer daemon, which that home did not have. Records non-empty and not
-superseded ⇒ gate 3 correctly returns `false` indefinitely. Demonstrated: a daemon
-with no record retires at **+90.2 s**, one with a record naming a live process was
-still running at **+204.8 s**.
-⛔⛔ **And the probe that manufactured it: `/proc/<pid>` existence is TRUE FOR A
-ZOMBIE.** The harness called a daemon "still alive at 200 s" that its own trace
-shows retiring at +90.2 s. `/proc/<pid>` answers *has this been reaped*, not *is
-this running* — and calling `poll()` to check is itself what reaps it. **Prefer
-the subject's own lifecycle record over any external liveness probe.**
-
 ## ⛔⛔⛔ [6.9→6.7] EVERY PEER `status` POLL REBUILDS THE WHOLE ROW INVENTORY
 
 **Status:** OPEN

@@ -246,6 +246,52 @@ fact and was one command from being falsified. A relayed measurement is a CLAIM 
 it yourself — and building a measurement on top of an instrument that does not exist is how a whole
 lane's numbers turn out to be about nothing.
 
+### ⛔⛔ `git log -S` SKIPS MERGES, SO A DELETION THAT ARRIVED VIA A MERGE READS AS "NEVER EXISTED"
+
+**This is the correction to a law this campaign already carried, and the missing
+half is what resurrected a queue entry on `main`.**
+
+The standing rule was: *a conflict whose upstream side is EMPTY is textually
+identical to a deliberate deletion — `git log -S '<phrase>' -- <file>` settles
+it.* True, **and only with `--full-history -m`.** Plain `git log -S` does not
+walk merge commits, so a deletion that reached `main` *through* a merge is
+invisible to it and the command answers **"this was never here"** — which is
+exactly the answer that tells a lane to keep its own side.
+
+⇒ Measured 2026-08-14: a lane hit three empty-upstream conflicts, ran the bare
+form, got zero commits for each, correctly concluded "never had it" for two —
+and **wrong for the third**, which `main` had held and deleted as fixed. The
+entry came back. The instrument was right, the invocation was not, and the
+failure direction is always toward resurrection.
+
+```sh
+git log --oneline --full-history -m -S '<distinctive phrase>' -- <file>
+```
+
+⭐ **The general form: a history query that silently excludes a class of commit
+answers a narrower question than the one you asked** — and here the excluded
+class is *precisely* the one that performs integrations, which is where
+deletions cross branches.
+
+### ⛔⛔ A GATE THAT REPORTS A VIOLATION AND EXITS 0 IS DECORATION
+
+`check-queue-resurrection.sh` defaults to **report-and-pass**; `--strict` is what
+makes it exit 1. That default is right for a human reading output and wrong for
+every automated caller — and the campaign's own standing instruction (*"run this
+after any queue merge"*) never mentioned the flag.
+
+⇒ **A resurrection therefore sat on `main` through several push loops**, each of
+which ran the check, saw exit 0, and reported the push clean. Three separate
+sessions "ran the gate" and none of them gated.
+
+- ⛔ **In any script or push loop: `--strict`.** Without it the check is a
+  comment.
+- ⚠ It now prints `EXITING 0 ANYWAY — findings above are REAL` on the default
+  path, because the previous output was indistinguishable from a pass to
+  everything except a careful human.
+- ⭐ **The pattern to look for elsewhere:** any checker whose *default* is
+  advisory. Its findings are invisible to exactly the callers that cannot read.
+
 ### ⛔⛔⛔ A "FAITHFUL" FRAME OF A DOCUMENT SURFACE SHOWED THE TERMINAL, NOT THE DOCUMENT
 
 **Found 2026-08-14 while root-causing the document surface that painted garbage.
