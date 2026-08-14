@@ -2534,17 +2534,36 @@ fn read_grok_build_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     if session_id.is_empty() || cwd.is_empty() {
         return None;
     }
-    // ⚠ `session_summary` was EMPTY in every session observed, and both had a
-    // single message — so this reads it when present and never fabricates one.
-    // That emptiness is also why `title_authority` stays `Generated`: a field
-    // that exists is not evidence the CLI fills it, and `Store` would leave a
-    // row nameless on the strength of a field name.
-    let title = value
-        .get("session_summary")
-        .and_then(|summary| summary.as_str())
-        .map(str::trim)
-        .filter(|summary| !summary.is_empty())
-        .map(ToOwned::to_owned);
+    // ⭐ A SUMMARY IS NOT A TITLE, AND grok WRITES BOTH. Its own binary
+    // documents them as a pair — "`session_summary` and `generated_title` —
+    // the session summary and its model-generated title" — so the title is
+    // preferred here and the summary is the fallback. Reading only the summary
+    // (as this did) would name a row with a paragraph when grok had a title
+    // for it.
+    //
+    // ⚠ NEITHER field is a placeholder, and neither is guaranteed present.
+    // Grok generates them asynchronously and carries a log line for exactly
+    // the case observed here — "session closed before its title was
+    // generated". Both sessions measured (2026-08-14, a signed-in fleet host)
+    // ran two turns, fired no `session_summary_generated` event, and their
+    // `summary.json` had an empty `session_summary` and no `generated_title`
+    // key at all.
+    //
+    // ⇒ That is why `title_authority` stays `Generated`: not because the CLI
+    // never fills these, but because it often has not filled them YET, and a
+    // `Store` authority would leave those rows nameless. When grok does write
+    // one, it is used.
+    let title = ["generated_title", "session_summary"]
+        .into_iter()
+        .find_map(|field| {
+            value
+                .get(field)
+                .or_else(|| info.get(field))
+                .and_then(|found| found.as_str())
+                .map(str::trim)
+                .filter(|found| !found.is_empty())
+                .map(ToOwned::to_owned)
+        });
     Some(AgentStoreEntry {
         session_id,
         cwd,
@@ -2988,6 +3007,61 @@ pub fn assert_store_predicate_coverage(predicate_name: &str, probe: impl Fn(&str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⭐ A SUMMARY IS NOT A TITLE. grok writes both — its own binary documents
+    /// them as "`session_summary` and `generated_title` — the session summary
+    /// and its model-generated title" — and this reader took the summary,
+    /// which would name a row with a paragraph whenever grok had a real title
+    /// for it. Preference order, and the empty-is-absent rule, pinned here.
+    #[test]
+    fn the_grok_reader_prefers_the_title_over_the_summary() {
+        let dir = std::env::temp_dir().join(format!(
+            "ygg-grok-reader-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let write = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).expect("fixture");
+            path
+        };
+        let entry = |path: &std::path::Path| {
+            read_grok_build_store_entry(path).expect("the fixture is a readable grok session")
+        };
+
+        // Both present ⇒ the TITLE wins.
+        let both = write(
+            "both.json",
+            r#"{"info":{"id":"3f2a10bc-77d4-4e19-9a52-c1e8b0d6af73","cwd":"/w/p"},
+                "generated_title":"Tidy the parser",
+                "session_summary":"A long paragraph about tidying the parser."}"#,
+        );
+        assert_eq!(entry(&both).title.as_deref(), Some("Tidy the parser"));
+
+        // Title absent ⇒ the summary is the fallback, not nothing.
+        let summary_only = write(
+            "summary.json",
+            r#"{"info":{"id":"3f2a10bc-77d4-4e19-9a52-c1e8b0d6af73","cwd":"/w/p"},
+                "session_summary":"A long paragraph about tidying the parser."}"#,
+        );
+        assert_eq!(
+            entry(&summary_only).title.as_deref(),
+            Some("A long paragraph about tidying the parser.")
+        );
+
+        // ⚠ The state actually observed on a signed-in host: a short session
+        // that closed before grok generated either. EMPTY IS ABSENT — a blank
+        // string must not become a blank row name.
+        let neither = write(
+            "neither.json",
+            r#"{"info":{"id":"3f2a10bc-77d4-4e19-9a52-c1e8b0d6af73","cwd":"/w/p"},
+                "session_summary":"   "}"#,
+        );
+        assert_eq!(entry(&neither).title, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // The registry is the SSOT for "is this an agent CLI". If these disagree,
     // a CLI can be an agent to one predicate and not to another — the fork
