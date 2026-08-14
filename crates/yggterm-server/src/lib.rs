@@ -134,6 +134,7 @@ pub use codex_cli::{
     ManagedCliTool, ManagedCliToolStatus, TerminalIdentityColorProfile, managed_cli_refresh_ttl_ms,
 };
 pub use daemon::{
+    run_server_daemons_census,
     ClientDaemonEndpoint, ClientIdentity, ClientRequestEnvelope, ClientRole, SHADOW_CANNOT_OWN,
     ShadowAccess, daemon_enforces_client_roles, role_gate,
     ProfileWriteLockStatus, acquire_profile_write_lock, profile_write_lock_report,

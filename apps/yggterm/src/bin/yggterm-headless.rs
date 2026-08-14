@@ -2039,51 +2039,13 @@ fn main() -> Result<()> {
     if args.first().is_some_and(|arg| arg == "server")
         && args.get(1).is_some_and(|arg| arg == "daemons")
     {
-        // The census. `server status` answers for ONE daemon — the one matching
-        // this CLI's own version — and the whole daemon-lifecycle problem is
-        // about the others. Without this an agent rebuilds it from `ps`,
-        // `readlink /proc/<pid>/exe` and a trace grep, every time, and gets a
-        // different subset each time.
-        let json = args.iter().any(|arg| arg == "--json");
-        let rows = yggterm_server::daemon_census(store.home_dir());
-        // §4: "is a swap owed on this host?" has no other place to be asked. It
-        // is a host fact, so it rides the host-wide census rather than any one
-        // daemon's status.
-        let queued = yggterm_server::hot_restart_queue::load(store.home_dir());
-        // §5's other half is a host fact too: a forced swap that has interrupted
-        // somebody and not yet made it good is a state a reader must be able to
-        // see, and this is the one place they are already looking.
-        let interrupted = yggterm_server::hot_restart_repair::load(store.home_dir());
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis() as u64)
-            .unwrap_or(0);
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "daemons": rows,
-                    "queued_hot_restart": queued,
-                    "interrupted_sessions": interrupted,
-                }))?
-            );
-        } else {
-            print!(
-                "{}",
-                yggterm_server::format_daemon_census_with_queued_swap(
-                    &rows,
-                    queued.as_ref(),
-                    now_ms
-                )
-            );
-            if let Some(interrupted) = interrupted.as_ref() {
-                print!(
-                    "{}",
-                    yggterm_server::hot_restart_repair::format_pending_repair(interrupted, now_ms)
-                );
-            }
-        }
-        return Ok(());
+        // ONE owner, both binaries — see `daemon::run_server_daemons_census`.
+        // The census is a host fact with no GUI in it, and it used to answer
+        // here only.
+        return yggterm_server::run_server_daemons_census(
+            store.home_dir(),
+            args.iter().any(|arg| arg == "--json"),
+        );
     }
     if args.first().is_some_and(|arg| arg == "server")
         && args.get(1).is_some_and(|arg| arg == "relay-boundary")

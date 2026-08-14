@@ -13176,6 +13176,65 @@ fn running_build_label(build_commit: &str) -> &str {
     }
 }
 
+
+/// `server daemons` — the host-wide daemon census, for BOTH binaries.
+///
+/// ⛔ It answered on the headless CLI only, so `yggterm server daemons` said
+/// `unsupported server command: daemons` while the census it names is a pure
+/// host fact with no GUI in it — `daemon_census` reads the home dir and
+/// nothing else. Same accident as `server app audio`: which binary a verb
+/// reaches was decided by which file it was typed into.
+///
+/// ⇒ The `server` verb surface is dispatched in both binaries too, and the
+/// divergence there is NOT uniformly accidental (some verbs really are
+/// headless-only). This is the one confirmed-accidental case, moved to its
+/// one owner; the triage of the rest is in `docs/pending-bugs.md`.
+pub fn run_server_daemons_census(home_dir: &Path, json: bool) -> anyhow::Result<()> {
+    // The census. `server status` answers for ONE daemon — the one matching
+    // this CLI's own version — and the whole daemon-lifecycle problem is
+    // about the others. Without this an agent rebuilds it from `ps`,
+    // `readlink /proc/<pid>/exe` and a trace grep, every time, and gets a
+    // different subset each time.
+    let rows = crate::daemon_census(home_dir);
+    // §4: "is a swap owed on this host?" has no other place to be asked. It
+    // is a host fact, so it rides the host-wide census rather than any one
+    // daemon's status.
+    let queued = crate::hot_restart_queue::load(home_dir);
+    // §5's other half is a host fact too: a forced swap that has interrupted
+    // somebody and not yet made it good is a state a reader must be able to
+    // see, and this is the one place they are already looking.
+    let interrupted = crate::hot_restart_repair::load(home_dir);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "daemons": rows,
+                "queued_hot_restart": queued,
+                "interrupted_sessions": interrupted,
+            }))?
+        );
+    } else {
+        print!(
+            "{}",
+            crate::format_daemon_census_with_queued_swap(
+                &rows,
+                queued.as_ref(),
+                now_ms
+            )
+        );
+        if let Some(interrupted) = interrupted.as_ref() {
+            print!(
+                "{}",
+                crate::hot_restart_repair::format_pending_repair(interrupted, now_ms)
+            );
+        }
+    }
+    Ok(())
+}
 /// The same table, plus §4's host-level answer to *"is a swap owed here?"*.
 ///
 /// ⚠ The queued swap is a HOST fact and deliberately not a column: it outlives
