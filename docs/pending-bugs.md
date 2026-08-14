@@ -800,6 +800,63 @@ Compare the md5 of the file the watcher process actually executes (resolve its c
 then the relative path from its command line) against the file on the default
 branch. Equal on every host, or this is open.
 
+## ⛔⛔⛔ [6.0→6.7] A VERSION BUMP LEAVES TWO LIVE AGENTS ON ONE SESSION UUID, AND THE OBVIOUS CLEANUP KILLS THE WRONG ONE
+
+**Status:** OPEN
+
+*Discovered by the 6.x orchestrator after the 3.0.157 deploy; the kill-direction
+correction and the busy measurement are the resource watch's, 2026-08-14 19:15*
+
+A version bump **re-resumes a live agent row into a NEW process and never reaps
+the old one**. The two land on different ttys, sids and pgids, so they are wholly
+independent and nothing notices. Measured across the deploy window: **4 of 4
+armed rows had a twin**, ~3.2 GB held between them, ~900 MB each.
+
+⛔⛔ **THE DANGEROUS PART IS NOT THE LEAK, IT IS THAT THE CLEANUP IS INVERTED.**
+The first write-up said to kill "the twin", meaning the `--resume` process. **The
+`--resume` process is the LIVE agent** — it is the one the re-resume created and
+the one now serving the row — and the `--session-id` process is the ORIGINAL left
+behind. The ages settle it and nothing else does:
+
+| flag | age at 19:15 | what it is |
+|---|---|---|
+| `--session-id` | **3h27m** — the row's own start | the abandoned original |
+| `--resume` | **29m** — the deploy window | **the live agent** |
+
+⇒ A row that follows "kill the twin" **kills the session executing the command**.
+This was caught only because the affected row resolved its own pid from inside
+before acting.
+
+⛔ **AND "THE DUPLICATE IS IDLE" IS NOT RELIABLE.** One measured duplicate moved
+**0.490 s of CPU in 5 s** (~10% of a core) against its own row's 0.670 s, with a
+tool call in flight and its children **cycling** — a working agent loop, not
+residue. Killing it would have destroyed work someone was mid-way through.
+
+**The rule this yields, and it is the whole of it:**
+
+1. ⭐ **A duplicate is an ALARM, never a kill order.**
+2. ⛔ **Only the row that OWNS the uuid may act on it**, because only it can
+   resolve its own pid from INSIDE: walk `ppid` up from `$$` until
+   `comm=claude`. ⛔ Never infer from flags, age, or size — the inversion above
+   is exactly what that produces.
+3. ⛔ **Never `pkill -f <uuid>`** — the pattern is in the killing shell's own
+   command line, so it matches the searcher.
+4. Measure the other process's CPU and children before deciding it is residue.
+
+**Shipped:** `scripts/ygg-resource-panic.sh` now counts live `claude` processes
+per session uuid on the host it runs on and panics when any uuid has more than
+one — **reporting only**, with the inversion warning in the alarm text itself.
+
+⚠ **The memory is the smaller half.** Two agents on one uuid also share one
+worktree and one cargo `target/`. The affected row saw two *"file modified on disk
+since you last read it"* warnings during the overlap and attributed them to its
+own merge. ⇒ This is the shared-checkout clobber hazard, live, and it is not
+bounded by anything.
+
+**Falsifier:** if a `--session-id` process is ever found to be the one serving a
+row's current turn, the age/flag mapping above is wrong and rule 2 is the only
+safe part of this entry.
+
 ## ⛔⛔ [6.7] THE HOURLY VISUAL CHECK CANNOT SEE THE CANVAS, WHICH IS THE ONLY THING IT IS FOR
 
 **Status:** OPEN

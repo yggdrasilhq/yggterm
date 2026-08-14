@@ -149,6 +149,36 @@ gt "$WEBC" "$GUI_COMMITTED_PANIC_MB"   && p "web process committed ${WEBC}MB —
 gt "$PPT" "$PPT_AVG_PANIC_W"           && p "package power ${PPT}W sustained (> ${PPT_AVG_PANIC_W}W) — this is what spins the fan"
 gt "$TCTL" "$TCTL_PANIC_C"             && p "die temperature ${TCTL}C (> ${TCTL_PANIC_C}C)"
 gt "$CORES" "$YGG_CORES_PANIC"         && p "yggterm family ${CORES} cores (> ${YGG_CORES_PANIC})"
+# 1b MEMORY, ON THIS HOST — TWO AGENT PROCESSES ON ONE SESSION UUID
+#
+# ⛔ A version bump re-resumes a live row into a NEW process and does not reap
+# the old one. They land on different ttys, sids and pgids, so they are wholly
+# independent and nothing ever notices. Measured 2026-08-14 after the 3.0.157
+# deploy: 4 of 4 armed rows had a twin, ~3.2 GB held between them.
+#
+# ⛔⛔ THIS REPORTS. IT MUST NEVER KILL, AND THE REASON IS NOT CAUTION.
+# The obvious cleanup is inverted in the dangerous direction:
+#   - the `--session-id` process is the ORIGINAL; the `--resume` process is the
+#     one the re-resume created, and the RE-RESUME IS THE LIVE AGENT. A recipe
+#     that "kills the twin" kills the session that is running it.
+#   - "the duplicate is idle" is NOT reliable. One measured here moved 0.490s of
+#     CPU in 5s with a tool call in flight and its children cycling — a working
+#     agent, in a shared worktree, whose death would have destroyed real work.
+# ⇒ A duplicate is an ALARM. Only the row that OWNS the uuid may act, and only
+#   after resolving its own pid FROM INSIDE (walk `ppid` up from `$$` until
+#   `comm=claude`) and measuring the other's CPU and children. ⛔ Never
+#   `pkill -f <uuid>`: the pattern is in the killing shell's own command line.
+#
+# ⚠ And the memory is the smaller half. Two agents on one uuid also share one
+# worktree and one cargo `target/`, which is the shared-checkout clobber hazard.
+DUPES=""
+for p in $(pgrep -x claude 2>/dev/null); do
+  u=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null \
+    | grep -oE '[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}' | head -1)
+  [ -n "$u" ] && DUPES="$DUPES$u"$'\n'
+done
+DUPE_UUIDS=$(printf '%s' "$DUPES" | sort | uniq -d | wc -l)
+[ "${DUPE_UUIDS:-0}" -gt 0 ] && p "${DUPE_UUIDS} session uuid(s) have MORE THAN ONE live claude process on $(hostname) — duplicate agents, ~900MB each. ⛔ REPORT ONLY: the re-resumed process is the LIVE one and a 'twin' may be busy; only the owning row may act"
 # 3 SPACE
 gt "$TMPO" "$TMPFS_OURS_PANIC_MB"      && p "${TMPO}MB of ours on tmpfs (> ${TMPFS_OURS_PANIC_MB}MB) — that is RAM"
 # BLIND IS NOT CLEAR. An unreadable entry makes the figure above a FLOOR, not a
