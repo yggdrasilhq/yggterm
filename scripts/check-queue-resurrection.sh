@@ -26,15 +26,21 @@
 # USAGE
 #   scripts/check-queue-resurrection.sh [--since <git-date>] [--strict]
 #     --strict   exit 1 on any finding (for CI); default reports and exits 0
+#     --against <ref>  also scan deletions carried by <ref> — use BEFORE merging
+#                      it, because an unmerged side is invisible to a HEAD scan
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
 
 SINCE="3 days ago"
 STRICT=0
+AGAINST=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --since)  SINCE="${2:-}"; shift 2 ;;
     --strict) STRICT=1; shift ;;
+    # ⛔ Check BEFORE merging: name the ref you are about to merge, so a deletion
+    #    it carries is visible while you can still honour it.
+    --against) AGAINST="${2:-}"; shift 2 ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "check-queue-resurrection: unknown argument: $1" >&2; exit 64 ;;
   esac
@@ -43,14 +49,47 @@ done
 QUEUE=docs/pending-bugs.md
 [ -f "$QUEUE" ] || { echo "queue-resurrection: no $QUEUE here" >&2; exit 2; }
 
-SINCE="$SINCE" QUEUE="$QUEUE" STRICT="$STRICT" python3 - <<'PY'
+SINCE="$SINCE" QUEUE="$QUEUE" STRICT="$STRICT" AGAINST="$AGAINST" python3 - <<'PY'
 import collections, os, subprocess, sys
 
 QUEUE = os.environ["QUEUE"]
 run = lambda c: subprocess.run(c, shell=True, capture_output=True, text=True).stdout
 
 current = {l for l in run(f"grep '^## ' {QUEUE}").splitlines() if l.strip()}
-shas = run(f"git log --since='{os.environ['SINCE']}' --format=%H -- {QUEUE}").split()
+
+# ⛔⛔ THIS CHECK WAS BLIND AT THE ONE MOMENT IT MATTERS: DURING A MERGE.
+#
+# `git log -- QUEUE` lists only commits reachable from HEAD. While a merge is
+# unresolved, the INCOMING side's commits are not reachable yet — they arrive
+# only when the merge commits. So every deletion made upstream was invisible,
+# and the check reported a clean tree over a resurrected entry.
+#
+# ⇒ That is not an edge case, it is the whole case. A resurrection happens when
+#   a conflict hunk is settled by "keep my side" and the entry upstream CLOSED
+#   sits inside it. The check runs, sees nothing, and blesses it.
+#
+# Measured 2026-08-14: an entry closed by an upstream fix was carried back into a
+# lane twice in one hour. Both times this check exited 0. The closing commit was
+# simply not an ancestor of the branch being checked, so nothing in the scan
+# could have named it — and afterwards, once merged, the same check saw it fine,
+# which is what makes the failure so easy to mistake for a false alarm.
+#
+# ⇒ Scan the UNION of both sides. `MERGE_HEAD` exists exactly while a merge is in
+#   flight; `--against <ref>` covers checking BEFORE starting one.
+rev_range = "HEAD"
+extra = run("git rev-parse -q --verify MERGE_HEAD").strip()
+if not extra and os.environ.get("AGAINST"):
+    extra = run(f"git rev-parse -q --verify {os.environ['AGAINST']}").strip()
+if extra:
+    rev_range = f"HEAD {extra}"
+
+# ⛔ AND DIFF MERGES AGAINST THEIR FIRST PARENT. `git show <merge>` prints NO
+#   diff by default, so a deletion that reached a branch THROUGH a merge is
+#   invisible a second way — the same trap this file already warns about for
+#   `git log -S`, which it had while being subject to it.
+shas = run(
+    f"git log --since='{os.environ['SINCE']}' --format=%H {rev_range} -- {QUEUE}"
+).split()
 
 # ⛔⛔ A CHECK THAT CANNOT SEE ITS OWN PRESCRIBED REMEDY BECOMES NOISE, AND NOISE
 # IS WHY NOBODY RUNS IT. This told the reader to "say so in the entry itself" and
@@ -71,7 +110,9 @@ for chunk in body:
 # A heading is 'removed' by a commit whose diff drops its '## ' line.
 removed = collections.defaultdict(list)
 for sha in shas:
-    for line in run(f"git show {sha} --format= -- {QUEUE}").splitlines():
+    for line in run(
+        f"git show --diff-merges=first-parent {sha} --format= -- {QUEUE}"
+    ).splitlines():
         if line.startswith("-## "):
             removed[line[1:]].append(sha)
 
