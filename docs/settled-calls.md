@@ -9,6 +9,59 @@ and referenced from here.
 says the answer changed.
 
 
+## ⛔⛔ CAPPING POWER TO CUT HEAT IS A CHEAT FIX, NOT A FIX (2026-08-14)
+
+**Settled by the owner**, rejecting an A/B this campaign had filed as a recommendation. The
+`balanced` AC power profile does eliminate the >85 °C band (0/71 vs 9/90, p≈0.004) — and that
+measurement is not in dispute. The ruling is that the trade is not worth naming as a fix: the
+profile is a **cheat fix**, never to be consulted again, because it buys the temperature by making
+the whole UI about **20% more sluggish** to compensate. A remedy that degrades the product is not
+a remedy.
+
+⇒ ⛔ **Do not propose, pin, or re-measure `balanced` as a thermal remedy.** The machine runs
+`performance`. ⚠ **And the finding it rested on is now a trap:** *"thermals are uncorrelated with
+our CPU (r=0.071)"* was used to argue the heat was not ours to fix. Under this ruling that
+inference is dead — an uncorrelated thermal load still has a cause, and capping the processor to
+hide it spends the user's responsiveness to buy our silence. **The heat is still open and still
+wants a real cause.**
+
+⭐ The general form, worth carrying: **a remedy that degrades the thing being measured is not a
+result.** It will always look good on the metric it was chosen for.
+
+## THE SITE-LORE CORPUS IS AN ASSET, NOT A LEAK — SEPARATE IT, DO NOT DELETE IT (2026-08-14)
+
+**Settled by the owner**, against this campaign's own framing. The corpus had been filed as a
+privacy problem — a public map of which services the owner uses — with the options being "remove
+it" or "keep the map". Both premises were rejected. The ruling:
+
+- The exposure is **not** a serious privacy flaw at present.
+- At scale the corpus is expected to cover a large fraction of the visible web, which makes it
+  **valuable for agentic navigation** rather than merely incidental.
+- ⇒ **Extract it to a PRIVATE repo (`ychrome-lore`), on the established precedent for the
+  remote-GUI plane.**
+
+One move closes the public map and stops the asset being given away, which is why it beats both
+options that were offered. ⚠ Once it is an asset rather than a byproduct, **its licence is a
+question for the ownership plane**, not a ychrome one.
+
+⭐ **The lesson the campaign owed itself:** framing it as a leak made deletion look responsible.
+A privacy frame can recommend destroying something valuable, and the owner is the only one who
+can see the asset, because only he knows what it becomes at scale.
+
+## FOUR SMALLER CALLS, SAME SESSION (2026-08-14)
+
+- **The leak gate's source goes in a PRIVATE FORGEJO REPO.** It cannot live in this repo — the
+  guard correctly refused its own push, because its source must know which remotes are private.
+- **A CLICK MAY NOT START A DAEMON SWAP.** A swap is an appointment at a relay boundary; a click
+  is a navigation. This closes the path that cost 55 PTYs on 2026-08-09.
+- **ONE WINDOW PER DISPLAY.** A second `app launch` refuses or replaces; two GUIs of the same
+  live build are not legitimate. Filed against the retirement rule in
+  [`pending-bugs.md`](pending-bugs.md).
+- **Windows and macOS stay CLOSED**, and the adopted row `Agent unnamed shell` **stays where it
+  is**. The phone relay **stays at v2**; ADR-0002 §9 does not re-rank it yet.
+- **`yggtopo`'s repo is to be DELETED — `ytop` replaces it in public land.** ⚠ Destructive and
+  outward-facing: verify `ytop` actually carries it before removing anything.
+
 ## ⛔⛔ A WRITE INTO A ROW SOMEONE IS TYPING IN SAVES AND RESTORES THEIR TEXT (2026-08-13)
 
 **Settled by the owner**, after an agent's message spliced into a half-typed sentence and the
