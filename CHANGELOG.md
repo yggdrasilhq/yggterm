@@ -4,6 +4,33 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+<!-- Known state at the 3.0.154 cut, recorded so a later reader does not find a
+     red tree and assume it shipped unnoticed:
+     · two launch-command tests fail on main
+       (remote_resume_shell_command_wraps_prefix_and_cwd,
+        stored_codex_litellm_sessions_use_litellm_resume_command).
+       Pre-existing, unrelated to this release, and owned — see the entry in
+       docs/pending-bugs.md.
+     · the daemon-side persisted-live-sessions work is NOT in 3.0.154; it was
+       pushed to its own lane after this release was cut. -->
+
+- **A machine no longer quietly accumulates background services forever.** After
+  its program file was replaced on disk, a running background service handed its
+  terminals to a fresh one — and then, five minutes later, did it again, and
+  again, indefinitely, starting a brand-new service every time. One service was
+  measured starting eleven of them in under an hour. It happened because the
+  service asked a shared note on disk whether it had already handed over, and its
+  successor tidied that note away as soon as it recognised itself, so the older
+  one kept concluding it had never handed over at all. Each service now remembers
+  its own handover, so it stops asking once a newer one is running. Machines left
+  on for days no longer collect dozens of idle services, each taking a share of
+  the processor.
+
+  The same forgetfulness could also drop a service that was still holding live
+  terminals into the shutdown path meant only for one holding none, which would
+  have closed those terminals. That path now consults the service's own memory
+  rather than the shared note any other service can erase.
+
 - **A machine that takes its terminals back starts writing them down again.**
   Once a newer background service appeared, the older one stopped recording the
   state of its sessions for good — correct, because the newer one owned that

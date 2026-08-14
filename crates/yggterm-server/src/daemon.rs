@@ -16094,6 +16094,69 @@ static HOT_RESTART_SWAP_LANE_SETTLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 static HOT_RESTART_SWAP_LAST_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
 
+/// The version THIS process handed off to, remembered locally. `None` = we have
+/// never handed off.
+///
+/// ⛔⛔ THE MEMORY ABOVE COULD ONLY EVER BE SET BY READING THE FILE, WHICH IS THE
+/// ONE THING A PEER DELETES. `HOT_RESTART_SWAP_LANE_SETTLED`'s own comment
+/// predicts this failure exactly — *"reading its absence as 'nothing has
+/// happened yet' is how clearing the entry would make this daemon start asking
+/// for a brand-new swap on the very next poll, forever"* — but the only path
+/// that SET it ran inside `if let Some(queued)`, so a predecessor whose entry
+/// had already been cleared could never reach it. The guard against forgetting
+/// was itself reachable only through the thing that gets forgotten.
+///
+/// ⇒ Measured on dev 2026-08-14: one 3.0.151 daemon emitted **160
+/// `daemon_self_retire` polls, 11 handoffs and 11 fresh successor daemons in 53
+/// minutes** — one every five minutes, indefinitely — because each successor
+/// recognised itself as satisfying the queued entry and cleared the shared file
+/// (`satisfied_by: "self"`) before its predecessor's next poll could see it
+/// satisfied. The predecessor re-queued, spawned another successor, which
+/// cleared it again. **The generator, and the reason a daemon population grows
+/// on a host with no deploys at all.**
+///
+/// ⚠ It is also what disarms the cold-shutdown guard: `queued.is_some()` is the
+/// only thing keeping a preserved PTY owner out of the path that kills its PTY
+/// children, and that is the same deleted file.
+#[cfg(target_os = "linux")]
+static HOT_RESTART_SWAP_LOCAL_TARGET: Mutex<Option<String>> = Mutex::new(None);
+
+/// What this process handed off to, if anything.
+#[cfg(target_os = "linux")]
+fn hot_restart_swap_local_target() -> Option<String> {
+    HOT_RESTART_SWAP_LOCAL_TARGET
+        .lock()
+        .ok()
+        .and_then(|target| target.clone())
+}
+
+/// Should `incoming` replace what we already remember?
+///
+/// Pure, so it can be tested without mutating the process-global above — a test
+/// that wrote the real static would make every neighbour that reads it flaky,
+/// which is the same hazard the pty tests hold `env_test_guard` for.
+///
+/// Keep the HIGHEST target ever asked for: a later handoff aims at a newer
+/// build, and converging on the older one would report a swap satisfied while
+/// the newer request it was replaced by is still unanswered.
+#[cfg(target_os = "linux")]
+fn hot_restart_swap_target_supersedes(existing: Option<&str>, incoming: &str) -> bool {
+    match existing {
+        Some(existing) => hot_restart_queue::target_satisfied_by(existing, incoming),
+        None => true,
+    }
+}
+
+/// Remember the target across the file being cleared by anyone else.
+#[cfg(target_os = "linux")]
+fn remember_hot_restart_swap_target(target_version: &str) {
+    if let Ok(mut slot) = HOT_RESTART_SWAP_LOCAL_TARGET.lock()
+        && hot_restart_swap_target_supersedes(slot.as_deref(), target_version)
+    {
+        *slot = Some(target_version.to_string());
+    }
+}
+
 /// §5's clock: when this daemon's retire was FIRST held by a blocker. Zero = never.
 ///
 /// Set at the gate, not at the retire trigger, because that is what the ruling
@@ -16330,7 +16393,18 @@ fn hot_restart_swap_step(
         return SwapStep::Lingering;
     }
     let queued = hot_restart_queue::load(home_dir);
-    if let Some(queued) = queued.as_ref() {
+    // ⛔ THE TARGET COMES FROM THE FILE **OR** FROM THIS PROCESS'S OWN MEMORY,
+    // and the memory is not a cache of the file — it is the half that survives a
+    // peer deleting it. The successor clears the entry the moment it recognises
+    // itself as satisfying it, which is routinely BEFORE its predecessor's next
+    // 20 s poll; asking only the file then answers "you never handed off" to a
+    // daemon that did, and it hands off again. See HOT_RESTART_SWAP_LOCAL_TARGET.
+    let local_target = hot_restart_swap_local_target();
+    let convergence_target = queued
+        .as_ref()
+        .map(|queued| queued.target_version.clone())
+        .or_else(|| local_target.clone());
+    if let Some(target) = convergence_target.as_deref() {
         // ⛔ The CHEAP probe, not a roster sweep. `live_newer_daemon_version`
         // filters on socket FILENAMES first, so this is 0-2 status calls rather
         // than one per daemon — and this loop plus the migration drain were
@@ -16338,7 +16412,7 @@ fn hot_restart_swap_step(
         let live_newer = live_newer_daemon_version(home_dir, endpoint);
         let satisfied = live_newer
             .as_deref()
-            .is_some_and(|live| hot_restart_queue::satisfied_by(queued, live));
+            .is_some_and(|live| hot_restart_queue::target_satisfied_by(target, live));
         if satisfied {
             append_trace_event(
                 home_dir,
@@ -16346,10 +16420,16 @@ fn hot_restart_swap_step(
                 "lifecycle",
                 "hot_restart_swap_queue_satisfied",
                 serde_json::json!({
-                    "target_version": queued.target_version,
+                    "target_version": target,
+                    // ⭐ WHICH HALF ANSWERED. When this reads "process_memory"
+                    // the entry was already gone and the old code would have
+                    // spawned another successor here instead of converging.
+                    "target_source": if queued.is_some() { "queue_file" } else { "process_memory" },
                     "live_successor_version": live_newer,
-                    "attempts": queued.attempts,
-                    "waited_ms": now_ms.saturating_sub(queued.requested_at_ms),
+                    "attempts": queued.as_ref().map(|queued| queued.attempts),
+                    "waited_ms": queued
+                        .as_ref()
+                        .map(|queued| now_ms.saturating_sub(queued.requested_at_ms)),
                     "current_version": SERVER_PROTOCOL_VERSION,
                     "current_pid": std::process::id(),
                 }),
@@ -16358,9 +16438,11 @@ fn hot_restart_swap_step(
             HOT_RESTART_SWAP_LANE_SETTLED.store(true, Ordering::Relaxed);
             return SwapStep::Converged;
         }
-        if !hot_restart_queue::attempt_is_due(queued, now_ms, HOT_RESTART_SWAP_RETRY_INTERVAL_MS) {
-            return SwapStep::Lingering;
-        }
+    }
+    if let Some(queued) = queued.as_ref()
+        && !hot_restart_queue::attempt_is_due(queued, now_ms, HOT_RESTART_SWAP_RETRY_INTERVAL_MS)
+    {
+        return SwapStep::Lingering;
     }
     // The process-local floor, checked whatever the file says — including when
     // the file is absent, which is the state a peer's convergence leaves behind.
@@ -16400,10 +16482,21 @@ fn hot_restart_swap_step(
     }
     match attempt_self_retire_preserving_handoff(endpoint, home_dir, exe_link, owned) {
         Some(handoff) => {
+            if let Some(target_version) = handoff.target_version.as_deref() {
+                remember_hot_restart_swap_target(target_version);
+            }
             queue_self_retire_swap(home_dir, &handoff, retire_trigger, now_ms);
             SwapStep::HandedOff
         }
-        None if queued.is_some() => SwapStep::Lingering,
+        // ⛔⛔ THE SAFETY PROPERTY IN `SwapStep`'s DOC COMMENT LIVES ON THIS LINE:
+        // a daemon that has already handed off is a preserved PTY owner, and
+        // dropping it into the cold path would kill the very PTYs the handoff
+        // preserved. It used to be answered by `queued.is_some()` alone — a
+        // HOST-SHARED file that any peer's convergence deletes — so a peer could
+        // disarm this guard for every other daemon on the machine. "Have I
+        // handed off?" is a fact about THIS process and is now answered by this
+        // process.
+        None if queued.is_some() || local_target.is_some() => SwapStep::Lingering,
         None => SwapStep::Failed,
     }
 }
@@ -19900,6 +19993,77 @@ mod tests {
             .split("\n    fn ")
             .next()
             .expect("the end of the function")
+    }
+
+    /// A later handoff aims at a newer build; converging on the older target
+    /// would call the swap satisfied while the request that replaced it is
+    /// still outstanding.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_remembered_swap_target_keeps_the_highest_ever_asked_for() {
+        assert!(
+            super::hot_restart_swap_target_supersedes(None, "3.0.152"),
+            "the first handoff must be remembered"
+        );
+        assert!(
+            super::hot_restart_swap_target_supersedes(Some("3.0.152"), "3.0.153"),
+            "a newer target must supersede an older one"
+        );
+        assert!(
+            !super::hot_restart_swap_target_supersedes(Some("3.0.153"), "3.0.152"),
+            "an OLDER target must not overwrite a newer one — converging on it \
+             would report a swap satisfied while the newer one is unanswered"
+        );
+        assert!(
+            super::hot_restart_swap_target_supersedes(Some("3.0.152"), "3.0.152"),
+            "re-asking for the same target is not a regression"
+        );
+    }
+
+    /// ⛔⛔ THE REGRESSION THIS LOCKS OUT, measured on dev 2026-08-14: one 3.0.151
+    /// daemon spawned **11 successor daemons in 53 minutes**, one every five
+    /// minutes, indefinitely — because each successor cleared the HOST-SHARED
+    /// queue file on recognising itself (`satisfied_by: "self"`) before its
+    /// predecessor's next 20 s poll could read it as satisfied. Asking only the
+    /// file answers "you never handed off" to a daemon that did.
+    ///
+    /// The same deleted file was the ONLY thing keeping a preserved PTY owner
+    /// out of the cold-shutdown path that kills its PTY children, so a peer's
+    /// convergence disarmed that guard for every daemon on the machine.
+    ///
+    /// ⇒ Both questions are about THIS process and must be answerable without
+    /// the file. If this test fails because the names changed, re-point it —
+    /// do not delete it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_swap_lane_does_not_ask_a_peer_writable_file_what_this_process_did() {
+        let source = daemon_product_source();
+        let body = daemon_fn_body(source.as_str(), "fn hot_restart_swap_step(");
+        let code = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            code.contains("hot_restart_swap_local_target()"),
+            "the lane must consult this process's own memory of what it handed \
+             off to, not only the host-shared queue file"
+        );
+        // The cold-path fall-through: `Failed` is what kills preserved PTYs.
+        let failed_guard = code
+            .split("None if")
+            .nth(1)
+            .expect("the guard arm that keeps a preserved owner out of the cold path")
+            .split("=>")
+            .next()
+            .expect("the guard condition");
+        assert!(
+            failed_guard.contains("local_target"),
+            "the guard before SwapStep::Failed still rests on the shared file \
+             alone; a peer clearing it drops this daemon into the path that \
+             kills the PTYs its handoff preserved. Guard was: {failed_guard}"
+        );
     }
 
     /// The ephemeral reap must ride an EXISTING chore tick. A timer of its own
