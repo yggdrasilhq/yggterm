@@ -221,6 +221,25 @@ def main():
         r = sb.run("optout", "--row", DELEGATE, "--note", "__rearmed__:sneaky")
         check("optout refuses a reason that would read as a RE-ARM", r.returncode == 2)
 
+        # ── a watch placed by somebody else must outlive the row's own "done" ─
+        # ⚠ Deliberately does NOT reset never-arm.tsv: the monitor cases below
+        #    need ATTENDED still listed, and the first version of this block
+        #    blanked it and made the next test fail for a reason that had
+        #    nothing to do with the monitor.
+        r = sb.run("subscribe", "--row", DELEGATE)
+        rec = (sb.state / "booter" / f"{DELEGATE}.json").read_text() if \
+            (sb.state / "booter" / f"{DELEGATE}.json").exists() else ""
+        check("a THIRD-PARTY subscription defaults to monitor, not task",
+              '"kind": "monitor"' in rec, f"rc={r.returncode} {rec[:120]}")
+        r = sb.run("unsubscribe", "--row", DELEGATE)
+        check("⛔ and the row cannot then unsubscribe itself when it feels done",
+              r.returncode == 3 and (sb.state / "booter" / f"{DELEGATE}.json").exists(),
+              f"rc={r.returncode} {r.stdout[-160:]}")
+        r = sb.run("subscribe", "--row", DELEGATE, "--kind", "task")
+        rec = (sb.state / "booter" / f"{DELEGATE}.json").read_text()
+        check("an explicit --kind still wins", '"kind": "task"' in rec, rec[:120])
+        (sb.state / "booter" / f"{DELEGATE}.json").unlink()
+
         # ── the OTHER watchdog, which types a message AND a lone CR ───────────
         sb.mon_sub(ATTENDED)
         r = sb.monitor("tick", "--dry-run")
