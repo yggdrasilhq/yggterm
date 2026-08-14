@@ -77,6 +77,24 @@ emit() {
   exit "$FAIL_LEVEL"
 }
 
+# ------------------------------------------------------------- level 0: armed?
+# ⛔ IS THE WATCH ITSELF RUNNING? A successor inherits this seat by claiming it,
+#    not by remembering a setup step, so the one thing that must never depend on
+#    memory is the arming. This level is FIRST because every level below it is
+#    worthless if nothing runs them when no session is awake.
+#
+# ⚠ It checks for a NEXT ELAPSE, not for "enabled". The first version of that
+#    timer reported `enabled` and `active (running)` with `Trigger: n/a` — no
+#    next run at all. A watchdog in that state reports healthy and never fires.
+PANIC_NEXT="$(systemctl --user show ygg-panic.timer -p NextElapseUSecRealtime 2>/dev/null | cut -d= -f2-)"
+PANIC_SUBS="$(ls "$HOME/.yggterm/relay/panic/subs"/*.json 2>/dev/null | wc -l)"
+note "L0 panic_timer_next='${PANIC_NEXT:-none}' subscribers=${PANIC_SUBS:-0}"
+if [ -z "${PANIC_NEXT:-}" ] || [ "${PANIC_NEXT}" = "n/a" ]; then
+  note "L0 ⚠ THE RESOURCE WATCH IS NOT ARMED on this host - install it:"
+  note "L0   cp .agents/systemd/ygg-panic.* ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now ygg-panic.timer"
+fi
+[ "${PANIC_SUBS:-0}" -eq 0 ] && note "L0 ⚠ no seat is subscribed - a breach would wake nobody (ygg-panic.py subscribe --row <addr>)"
+
 # ---------------------------------------------------------------- level 1
 # THE WINDOW IS THE PRODUCT. Exactly one GUI, running a live binary that
 # matches what is installed. Everything below is meaningless if this fails,
