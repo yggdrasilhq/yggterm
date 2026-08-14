@@ -101,6 +101,32 @@ def _babysit():
     return mod
 
 
+def _booter():
+    """The booter's ledger readers, for the same reason `_babysit` exists.
+
+    ⛔ This file used to parse `never-arm.tsv` itself, a few lines below, and the
+    two parsers disagreed about what an unreadable list meant — which is how one
+    watchdog can refuse to name a row it cannot screen while the other types into
+    it. One file, one reader."""
+    spec = importlib.util.spec_from_file_location("ygg_booter", HERE / "ygg-booter.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def screen_ledgers():
+    """(attended, opted-out) as 8-char prefixes. ⛔ `None` means COULD NOT READ.
+
+    Both halves are the booter's own readers, so an unreadable or torn list
+    arrives here as the refusal it is rather than as an empty set. Callers must
+    branch on `None` before they act — and in this file "act" means TYPE INTO A
+    ROW, which is why `wake()` is gated on it."""
+    b = _booter()
+    blocked, optedout = b.never_arm(), b.disarmed_rows()
+    return (None if blocked is None else {u[:8] for u in blocked},
+            None if optedout is None else {u[:8] for u in optedout})
+
+
 #: Returned instead of a reply when the CALL ITSELF failed. ⛔ It is not an
 #: empty answer, and no caller may read it as one — see ygg_host.py for the
 #: afternoon this distinction cost.
@@ -694,30 +720,9 @@ def report_escalation_gap(subs):
     # attended and opted-out rows are excluded, and if those lists cannot be READ
     # this refuses to report at all rather than name a row it could not screen.
     # ⚠ Missing is not unreadable: an absent list legitimately means "nobody yet".
-    attended, optedout, screens_ok = set(), set(), True
-    try:
-        for line in (STATE / "never-arm.tsv").read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                attended.add(line.split("\t", 1)[0].strip()[:8])
-    except FileNotFoundError:
-        pass
-    except Exception:
-        screens_ok = False
-    try:
-        for line in (STATE / "booter-disarmed.tsv").read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("\t")
-            if len(parts) < 2 or not parts[1].strip():
-                continue
-            u8, why = parts[1].strip()[:8], (parts[3].strip() if len(parts) > 3 else "")
-            optedout.discard(u8) if why.startswith("__rearmed__:") else optedout.add(u8)
-    except FileNotFoundError:
-        pass
-    except Exception:
-        screens_ok = False
+    attended, optedout = screen_ledgers()
+    screens_ok = attended is not None and optedout is not None
+    attended, optedout = attended or set(), optedout or set()
 
     if not screens_ok:
         log("⚠ never-arm / opt-out ledger UNREADABLE — the unarmed-row check did NOT run.")
@@ -978,8 +983,32 @@ def tick(a):
     # audit. This is the check that would have surfaced a 6.1 MB row going cold
     # while its orchestrator believed the fleet was healthy.
     fishy_audit(load_subs(), a.dry_run)
+    # ⛔⛔ SCREEN BEFORE THE LOOP, BECAUSE THIS LOOP TYPES. `wake()` sends a
+    #    message and then a lone CR, and a CR into a row somebody is using
+    #    SUBMITS whatever they had half-written. The audit above has warned about
+    #    exactly this hazard since it was written — for the booter — while this
+    #    loop, the one that actually types, screened nothing. The only reason it
+    #    had never happened is that no attended row had ever gained a
+    #    subscription here, which is safety by omission and one tidy-up from
+    #    being removed.
+    #    ⚠ Unreadable is not empty, and the safe direction is to wake nobody: the
+    #    audits above still run, because a hold silences a verdict, not an audit.
+    attended, _optedout = screen_ledgers()
+    if attended is None:
+        log("⛔ the attended-row list is UNREADABLE — WAKING NOBODY this tick.")
+        log("   This loop types into rows; a screen it cannot read is not an")
+        log("   empty one, and the remedy here lands in a person's composer.")
+        return 0
     for s in load_subs():
         uuid = s["uuid"]
+        if uuid[:8] in attended:
+            # Purged, not merely skipped: a subscription on an attended row is a
+            # standing invitation for the next tick, or the next reader, to act.
+            log(f"⛔ {uuid[:8]} is NEVER-ARM (a person types there) yet is SUBSCRIBED "
+                f"HERE — dropping the subscription, not waking it.")
+            if not a.dry_run:
+                sub_path(uuid).unlink(missing_ok=True)
+            continue
         if s.get("owner_pinned"):
             log(f"{uuid[:8]} SKIP — owner-pinned ({s.get('pinned_reason','')})")
             continue
