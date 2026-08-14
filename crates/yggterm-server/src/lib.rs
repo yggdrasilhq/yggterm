@@ -971,6 +971,26 @@ pub fn live_row_closes_remembered_among<'a>(
         .collect()
 }
 
+/// *"Where did my row go?"* — the ledger, newest first.
+///
+/// A record nobody can read is not a record, and that is not a figure of speech
+/// here: `docs/spec-app-row-survival.md` §3 exists because rows vanished and the
+/// system held nothing that said so. Writing the departures without a door to
+/// ask them through would reproduce the same silence one layer up.
+///
+/// Read-only, like the two doors above, and for the same reason — this file is
+/// shared by every daemon on the machine, so a reader that published its own
+/// copy would erase peers' records.
+pub fn live_row_departures(
+    home_dir: &std::path::Path,
+) -> Vec<crate::live_row_tombstones::LiveRowDeparture> {
+    crate::live_row_tombstones::LiveRowTombstones::load(
+        home_dir,
+        crate::live_row_tombstones::now_secs(),
+    )
+    .departures()
+}
+
 /// **A genuinely closed row, for a test in ANOTHER crate.** Not compiled into
 /// any shipping binary: it exists only under the `test-support` feature, which
 /// nothing but a `[dev-dependencies]` edge turns on.
@@ -9513,19 +9533,13 @@ impl YggtermServer {
                         session.kind == SessionKind::Codex && session_id == id.as_str()
                     })
                 {
-                    // ⛔ AN APP ROW IS NOT A PLAIN SHELL, and this line is where
-                    // it used to become one. `stored_session_launch_command`
-                    // answers `exec '<shell>' -i` for a `Shell`, which is the
-                    // correct derivation for a row that IS a shell and a total
-                    // loss for a row that is ychrome. Re-derive the app's own
-                    // command from the token the row persisted, against the
-                    // CURRENT registry (reported, 2026-08-08).
-                    session.launch_command = app_launch
-                        .as_deref()
-                        .and_then(restored_app_verb_launch_command)
-                        .unwrap_or_else(|| {
-                            stored_session_launch_command(session.kind, &cwd, &id)
-                        });
+                    // A row with a STORAGE path is an agent CLI row: its command
+                    // is the resume its transcript names. An app row's command is
+                    // re-derived from its own token in the block below, which runs
+                    // for every app row rather than only the ones that happen to
+                    // have a transcript.
+                    session.launch_command =
+                        stored_session_launch_command(session.kind, &cwd, &id);
                 }
                 upsert_session_metadata(
                     &mut session.metadata,
@@ -9550,11 +9564,33 @@ impl YggtermServer {
                 .as_deref()
                 .filter(|token| app_verb_token_parts(token).is_some())
             {
-                upsert_session_metadata(
-                    &mut session.metadata,
-                    "Source",
-                    app_launch.to_string(),
-                );
+                upsert_session_metadata(&mut session.metadata, "Source", app_launch.to_string());
+                // ⛔ AN APP ROW IS NOT A PLAIN SHELL, AND THIS IS WHERE IT USED
+                // TO BECOME ONE — twice over, and the second one was hidden by
+                // the first. Re-deriving the app's command lived INSIDE the
+                // `Storage` branch above, and an app row has no storage path,
+                // so the branch never ran for the only kind of row it was added
+                // for. Live-caught in a sandbox 2026-08-14: a row persisted with
+                // `app_launch: app:<name>:<verb>` and `keep_alive: true`
+                // restored, correctly protected, as `exec '/bin/bash' -i` — the
+                // owner's "it came back as bare bash" symptom, still there,
+                // under a fix that looked shipped because the TOKEN round-tripped.
+                //
+                // The token, re-derived against the registry AS IT IS NOW: a
+                // manifest's binary path is a fact about the machine. An app that
+                // has been uninstalled resolves to nothing and the row keeps the
+                // shell `build_live_session` gave it, which is a visible empty
+                // prompt rather than an exec of a path that has moved.
+                if is_loopback_ssh_target(&target.ssh_target)
+                    && let Some(command) = restored_app_verb_launch_command(app_launch)
+                {
+                    session.launch_command = command;
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "Launch",
+                        user_visible_launch_command(&session.launch_command),
+                    );
+                }
             }
             // Restore is authoritative — see the note at the sibling site above.
             set_session_keep_alive_metadata(session, keep_alive);
@@ -21501,6 +21537,26 @@ pub fn run_trace_tail(lines: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `server rows departed` — what left the live set, why, and when.
+///
+/// The reason is the column that matters: `explicit-close` means somebody named
+/// this row and closed it, `gui-close-disposable` means the GUI window closed
+/// and the row was not keep-alive, so it went for what it was rather than
+/// because anyone asked. Before this ledger existed the two were indistinguish-
+/// able from an absence, which is how a group of app rows could vanish with
+/// nothing anywhere recording that it had.
+pub fn run_row_departures(limit: usize) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let departures = live_row_departures(&home);
+    let shown: Vec<_> = departures.into_iter().take(limit).collect();
+    write_stdout_payload(&serde_json::to_string_pretty(&serde_json::json!({
+        "home": home.display().to_string(),
+        "count": shown.len(),
+        "departures": shown,
+    }))?)?;
+    Ok(())
+}
+
 pub fn run_trace_follow(lines: usize, poll_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let path = event_trace_path(&home);
@@ -32488,6 +32544,49 @@ mod tests {
     /// and daemon #3 had nothing left to re-derive from. A row outlives many
     /// daemons; a fact that survives one of them is not persisted.
     ///
+    /// ⛔ AND THE COMMAND HAS TO BE RE-DERIVED FOR EVERY APP ROW, not only for
+    /// one that happens to have a transcript.
+    ///
+    /// The re-derivation was nested inside `restore_live_session`'s `Storage`
+    /// branch. `Storage` is an agent CLI's transcript path; an app row has none,
+    /// so the branch never ran for the only kind of row it was added for, and
+    /// an app row restored — correctly protected, token intact — as bare bash.
+    /// Live-caught in a private sandbox 2026-08-14, under a fix that read as
+    /// shipped because the TOKEN round-tripped and only the COMMAND did not.
+    ///
+    /// Structural, because the defect is nesting: the re-derivation must sit
+    /// with the identity re-stamp, which is deliberately outside that branch, so
+    /// putting it back inside would move it BEFORE the stamp in the source.
+    #[test]
+    fn the_app_command_re_derivation_is_not_nested_inside_the_transcript_branch() {
+        let source = include_str!("lib.rs");
+        let body = source
+            .split("pub fn restore_live_session(")
+            .nth(1)
+            .expect("restore_live_session")
+            .split("\n    pub fn ")
+            .next()
+            .expect("the end of restore_live_session");
+        let storage_branch = body
+            .find("if let Some(storage_path) = storage_path.as_deref()")
+            .expect("the transcript branch");
+        let identity_restamp = body
+            .rfind("\"Source\", app_launch.to_string()")
+            .expect("the app identity must be re-stamped on restore");
+        let re_derivation = body
+            .find("restored_app_verb_launch_command(app_launch)")
+            .expect("an app row's command must be re-derived from its token");
+        assert!(
+            storage_branch < identity_restamp,
+            "the identity re-stamp belongs OUTSIDE the transcript branch"
+        );
+        assert!(
+            identity_restamp < re_derivation,
+            "the command re-derivation must sit with the identity re-stamp, not \
+             back inside the transcript branch where no app row ever reaches it"
+        );
+    }
+
     /// Two restarts is the whole point of this test. One is not enough to catch
     /// it, and one is what the create-side test above does.
     #[test]
