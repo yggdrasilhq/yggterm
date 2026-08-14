@@ -10680,7 +10680,21 @@ and already running.
 
 ⚠ **It suggests, it does not prove**, and the difference is load-bearing: an
 agent's own composer drafts too (the third case above), so a positive means
-*worth asking about*, never *add it to never-arm*. ⛔ **A never-arm entry stays a
+*worth asking about*, never *add it to never-arm*.
+
+⚖ **AND THE FIRST RULING ON SUCH A CANDIDATE WENT THE OTHER WAY, CORRECTLY.** A
+supervision orchestrator was found armed while a person sometimes types into it.
+Its own campaign ruled **stay armed**, and the reasoning generalises: the fleet
+had **already** never-armed the row that person *thinks* in, while this one is an
+orchestrator doing long-running autonomous work that he also talks to — **opposite
+treatments, deliberately.** Waking it is that campaign's liveness mechanism and
+was observed working repeatedly; `--refuse-if-draft` already covers the
+half-written sentence; the residual is **an interruption, not a corruption.**
+⛔⛔ **And the safe-looking option was the silent one:** a `never-arm` entry would
+mean nothing ever wakes that seat again, so the monitor obligation would die with
+four rows still escalating to it and **no alarm anywhere.** ⇒ *Between a defect
+that shouts and one that is mute, take the one that shouts* — and note the
+candidate detector's job ended at producing the candidate. ⛔ **A never-arm entry stays a
 permanent assertion that only the row's own campaign may make.** ⇒ Turning *"no
 probe exists"* into *"here are the rows worth confirming"* is the whole of the
 improvement, and it is enough: two armed rows were found attended-or-adjacent
