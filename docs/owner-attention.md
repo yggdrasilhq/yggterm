@@ -155,6 +155,23 @@ copies.
   *Meanwhile:* the pile can no longer GROW — the count held flat across a version
   bump for the first time — so it shrinks on its own as sessions end, and nothing
   is being terminated while this waits.
+  ⭐ **UPDATED 2026-08-14 — the saving is now MEASURED and the reason is not what
+  this campaign said it was.** Daemon cost is `N_reachable x a ~0.2-core floor`,
+  where the floor is the price of **being reachable while holding a row
+  inventory**. On `dev`: **14 legacy daemons hold 2.6–3.3 cores while their
+  process subtrees are IDLE**, the 2 current daemons cost 0.4 while carrying the
+  real work, and daemons that lost their socket cost **exactly 0.000**. Per daemon
+  the legacy and current groups are **indistinguishable (0.94–1.05x)** — the pile
+  is expensive because it is **numerous and reachable**, not because it is old or
+  busy. ⇒ **Draining reclaims 2.6–3.3 cores and the saving will actually arrive**
+  (earlier guidance in this campaign said it would not; that was wrong and is
+  withdrawn). Derivation: `docs/idle-cost-model.md` §6j-9.
+  ⚠ **The one item that is genuinely his:** the cheapest first target is the
+  2.12.14 daemon — alone in the population it bursts 4.15x under quiet conditions
+  and re-reads ~69 MB/s of page cache with three IDLE shells attached. **Those
+  three are plain shells, which the migration path refuses**, so retiring it is a
+  question about three shells he may or may not want back, not a migration
+  problem anyone can solve for him.
 
 ## Credentials and real-money actions (the vault and the card rails)
 
