@@ -33,6 +33,42 @@ rows.
 that would tell you the watcher is stale is the watcher, and it reports on the code
 it is running, not the code that exists.
 
+### ⛔⛔ IT HAS ALREADY COST A SAFETY FIX, WITHIN MINUTES OF THAT FIX LANDING
+
+A defect that pinned every row on the fleet was fixed, pushed, and proved live on a
+tick. **Minutes later a second watcher was started from a checkout whose working
+tree predated the fix, and it re-pinned the entire fleet** — advancing the deadline
+on every tick from the same frozen evidence, exactly as before. `git log` showed the
+fix landed; a reader checking it would have concluded the problem was solved.
+**Thirteen of fourteen checkouts on that host were still pre-fix at the time.**
+
+⭐ **And the "proved live on a tick" claim was itself only true of ONE checkout.** The
+deploy step that does not exist is *"merge into every checkout that can host a
+watcher, then restart them"* — so a correct fix, correctly verified, was not in
+force anywhere the verification did not look.
+
+⇒ A floor has been put under it (a hold record written by pre-fix code is now
+discarded on read, since it carries no evidence ledger and therefore nothing that
+can ever stop it growing) but **that is a defence against the symptom, not a fix for
+the deploy path.**
+
+### ⭐ THE CHEAP TEST THAT WAS BEING SKIPPED
+
+**An existence check is not a deployment check.** `git cat-file -e <sha>^{commit}`
+proves an object was **fetched**; it says nothing about whether it is in `HEAD`, let
+alone on disk in the tree a process is executing. The ladder, cheapest first, and
+the cheapest is the one that misleads:
+
+| check | what it actually proves |
+|---|---|
+| `git cat-file -e <sha>` | the object exists locally — i.e. somebody fetched it |
+| `git merge-base --is-ancestor <sha> HEAD` | it is in this checkout's history |
+| `grep '<the new symbol>' <the file on disk>` | the working tree has it |
+| resolve the process's `cwd` + argv, then grep **that** file | the running code has it |
+
+⚠ Only the last one answers "is the fix in force", and a relative `argv[1]` means
+the file a watcher runs cannot be known without resolving its `cwd` first.
+
 ### What good looks like
 
 - **One owner for "which file does the watcher execute"**, the way every other
