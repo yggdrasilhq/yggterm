@@ -82,15 +82,38 @@ core. The orphan was not a runaway. **The waste is duration times an ordinary ra
 so the fix is retirement, not optimisation**, and a profiler pointed at that process
 would correctly have found nothing wrong with it.
 
-**Fix options, cheapest first.** (1) `app launch` refuses, and says so, when a live
-GUI already owns the display, unless given an explicit `--replace`. (2) `--replace`
-retires the incumbent after the new one paints. ⚠ **Neither may evict a GUI that
-still owns another agent's sessions** — the constitution's version-coexistence
-guarantee applies to GUIs as much as to daemons, so retirement has to be a handover,
-not a kill.
+⭐ **AND RETIREMENT ALREADY EXISTED — it just could not see this case.**
+`should_retire_superseded_client` (`apps/yggterm/src/main.rs`) runs on every GUI
+startup and retires older same-display clients, but **only when the executable PATH
+differs**, which reads as "a new version supersedes an old one". A deploy overwrites
+the binary **in place**: the path stays identical while the running process keeps the
+old inode. So the orphan matched `record_matches_executable`, was read as the current
+build, and was kept. ⇒ **The mechanism was present, wired, and blind to the only case
+that mattered** — which is why five sessions could look at GUI lifecycle and see
+nothing wrong.
 
-**Falsifier:** if a second `app launch` on a host with a healthy GUI ever results in
-exactly one GUI, the guard exists somewhere this reading missed.
+**Shipped in code (LIVE PROOF OWED):**
+
+1. `should_retire_superseded_client` now also retires a same-scope client whose
+   `/proc/<pid>/exe` ends in `(deleted)`. ⚠ **A path-existence check cannot answer
+   this** — the path still resolves after an in-place deploy; only the `/proc` link
+   states it. Both controls tested in one run (a live process must NOT read as
+   deleted; a process whose binary was unlinked MUST).
+2. `server app launch` refuses to add a second **Active** GUI, naming the incumbent
+   pids, unless given `--replace` (retires them first) or `--allow-duplicate` (the
+   sandbox's case). Shadows are never counted or retired: an agent's read-only client
+   must not be taken out by a routine restart.
+
+⚠ **Deliberately NOT fixed: two GUIs of the same LIVE build on one display.** The
+existing test `superseded_client_retire_filter_keeps_current_or_other_scope_gui`
+asserts that case is kept, which is a deliberate decision by whoever wrote it, and
+whether a user may legitimately open two windows is a product question rather than a
+bug. See [`owner-attention.md`](owner-attention.md).
+
+**Falsifier for 1:** deploy over a running GUI, start a new one, and if the old
+process is still alive afterwards the `(deleted)` arm did not fire.
+**Falsifier for 2:** if a second `app launch` against a healthy GUI still yields two
+GUIs, the guard is not on the path both binaries take.
 
 ## ⛔⛔ [6.7] `server trace tail --limit N` IGNORES N — THE DIAGNOSTIC WINDOW IS ~14 SECONDS
 
