@@ -572,8 +572,25 @@ def report_watcher_health():
         log("⛔ NO WATCHER IS RUNNING — the subscriptions below are being read by NOBODY.")
         log("   Start one:  ygg-monitor.py watch --watch 86400 --interval 240")
         return
-    for pid, age in procs:
-        log(f"✅ watcher pid={pid} age={age // 3600}h{(age % 3600) // 60:02d}m")
+    # ⛔ AGE IS NOT LIFE. A watcher's age only means something to someone who
+    # already knows its deadline, and the deadline is the thing that kills it.
+    # `age=5h48m` printed on a 6h window read as healthy and was twelve minutes
+    # from ending the campaign's only supervision. So report what is LEFT, and
+    # let the age be the supporting detail rather than the headline.
+    for pid, age, window in procs:
+        fmt = lambda s: f"{s // 3600}h{(s % 3600) // 60:02d}m"
+        if window is None:
+            log(f"⚠ watcher pid={pid} age={fmt(age)} — window UNKNOWN, so time-to-death "
+                f"cannot be stated. Treat it as expiring at any moment.")
+            continue
+        left = window - age
+        if left <= 0:
+            log(f"⛔ watcher pid={pid} is PAST its {fmt(window)} deadline and is exiting.")
+        elif left <= 3600:
+            log(f"⛔ watcher pid={pid} DIES IN {fmt(left)} (age {fmt(age)} of {fmt(window)}) — "
+                f"restart it now, or {len(load_subs())} subscriber(s) lose their reader.")
+        else:
+            log(f"✅ watcher pid={pid} {fmt(left)} left (age {fmt(age)} of {fmt(window)})")
     if len(procs) > 1:
         log(f"⚠ {len(procs)} WATCHERS RUNNING — they will double-escalate. Kill all but one.")
 
@@ -971,8 +988,14 @@ def tick(a):
 
 
 def watcher_procs():
-    """Every live `watch` process, as (pid, age_seconds). Identify, never count —
-    a bare `pgrep -f` matches the shell that asked the question."""
+    """Every live `watch` process, as (pid, age_seconds, window_seconds_or_None).
+    Identify, never count — a bare `pgrep -f` matches the shell that asked the
+    question.
+
+    ⭐ The window is read from the process's OWN `--watch` argument rather than
+    assumed, because the default has changed and a watcher started by an older
+    checkout carries the older window. Asking the process is the only thing that
+    survives that skew."""
     out = []
     try:
         ps = subprocess.run(["ps", "-eo", "pid=,etimes=,args="],
@@ -985,8 +1008,15 @@ def watcher_procs():
             continue
         pid, etimes, args = parts
         if "ygg-monitor.py" in args and " watch" in args and "bash -c" not in args:
+            window = None
+            toks = args.split()
+            if "--watch" in toks:
+                try:
+                    window = int(toks[toks.index("--watch") + 1])
+                except (ValueError, IndexError):
+                    window = None
             try:
-                out.append((int(pid), int(etimes)))
+                out.append((int(pid), int(etimes), window))
             except ValueError:
                 pass
     return out
