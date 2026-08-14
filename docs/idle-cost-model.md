@@ -985,6 +985,15 @@ per-thread figures (0.02–0.19 cores) are what ordinary output costs. The
 transferable claim is the **shape** — one thread per session, cost proportional
 to output volume — not the magnitude.
 
+⛔ **THIS DOES NOT FINISH THE HANDLER, AND THE GAP MUST BE STATED.** Concurrent
+pty traffic moves per-request cost **0.67 → 4.15 ms**, the right direction and a
+6x factor, but a handler on a live daemon is **~25 ms** (§6j-3). So sessions
+explain part of the handler term and not the whole of it, and **six flooding
+sessions is already a harsher load than the live population carries.** ⇒ The
+handler's composition stays open and **S6 remains the spec that would close it** —
+what changed is that it is now the *smaller* of the two terms, so it should be
+scheduled as an instrument fix rather than as a cost hunt.
+
 ⇒ **The ledger, finally, in cores and without a share:** per-session reader
 threads are the large, episodic term and the handler term is the small, stable
 one (~1.8–1.9 cores fleet-wide). ⛔ **Nothing here is a leak and nothing here is
