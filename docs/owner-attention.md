@@ -30,8 +30,30 @@ copies.
 
 ## Decisions only he makes
 
+- **Where should the leak gate's own source live?** It is currently tracked in **no repository at
+  all** — a loose file in `~/.local/bin`, replicated newest-wins across three hosts, unversioned and
+  unreviewed, while being the thing that stops private data reaching public GitHub. A weakening edit
+  on any host would win that race, spread silently, and every later push would go out unguarded
+  while still printing its reassuring pass. ⛔ **It cannot go in this repo: it was tried and the
+  guard refused its own push, correctly** — its source must know which remotes are private in order
+  to decide when to scan, so that knowledge is in the code. **Recommendation: give it a private
+  Forgejo repo** and keep the wordlist where it already is, outside every repo. **Done meanwhile:**
+  the tracked installer is landed (`scripts/install-privacy-guard.sh`), so the untrackable
+  `.git/hooks` shim is at least generated from something versioned, and the gate is unchanged and
+  working — it refused a real push tonight. **To reverse:** delete one repo.
+  *Meanwhile:* nothing waits on this; the relay installs the hook from the tracked installer.
+  ⛔⛔ **THE STAKES ROSE ON 2026-08-14 AND THIS IS NO LONGER HYPOTHETICAL.** The gate **missed a
+  real private value on a real push to a real public repo**, because a third-party form had
+  reformatted it and the gate matches literals. The fix — matching number-shaped terms on digits
+  across any interior window — is now deployed on all three hosts and **exists only as an
+  unversioned file**. ⇒ **Two consequences worth your ruling, not just the original question:**
+  (1) that fix has no review, no history and no way to prove which hosts carry it beyond comparing
+  hashes by hand; (2) the newest-wins replication that spread it could **silently revert it** the
+  moment any host's older copy is touched, and the gate would go back to passing that leak while
+  printing the same reassuring line. **Recommendation unchanged and now more urgent: give it a
+  private Forgejo repo.**
+
 - **Two fleet-sync bugs are in his `~/.claude/hooks/`, which an agent does not rewrite on a peer's
-  report — may we fix them?** (1) The roster's exclusion glob is `*.old` **anchored at the end**, so
   a rollback snapshot named `.old.<pid>` slips through and **~100 MB of dead binary is replicated to
   three hosts**; the fix is one character, `*.old*`. (2) The roster discovers apps by globbing
   `~/.local/bin/y*`, which silently strands **every app whose name does not begin with `y`** — the
@@ -53,6 +75,17 @@ copies.
   `[ -e "$r/.git" ]` and `git -C "$r" rev-list --count HEAD --not --remotes=origin`.
   *Meanwhile:* the corrected form was run across all 17 checkouts — everything is pushed, nothing
   is outstanding, and the relay will keep running the corrected version by hand each session.
+  ⛔⛔ **A SECOND DEFECT IN THE SAME SNIPPET, AND IT NEARLY UNDID A PRIVACY PURGE (2026-08-14).**
+  `git log @{u}..HEAD | wc -l` returns a COUNT where the meaning is DIRECTIONAL, so it **cannot
+  tell unpushed work from divergence.** After a history rewrite removed a private value from a
+  public repo, a stale checkout read as *"5 unpushed"* — it was **ahead 5 / behind 5**, the old
+  chain sitting beside the new one. ⚠ **The obvious response to "unpushed" is to push, and that
+  would have restored the leak on the public remote.** ⇒ **One instrument answers both questions in
+  the same breath:** `git rev-list --left-right --count origin/main...HEAD` — `N 0` is behind,
+  `0 N` is genuinely unpushed, `N N` is a rewrite and never wants a push.
+  **Recommendation: take this with the worktree fix, as one edit.** ⚖ Given the worktree blindness
+  was the first defect found in this snippet today, a third is likelier than not; it is worth
+  replacing the line rather than patching it twice.
 
 - **The public lore corpus maps which services he uses, even after every listed private term is
   scrubbed — remove the corpus, or keep the feature?** The term-list rewrite catches the names on

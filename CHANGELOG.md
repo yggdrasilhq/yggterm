@@ -11,6 +11,23 @@ This file tracks user-visible changes in `yggterm`.
   and on both programs, and a value that is not a number is refused out loud
   instead of quietly becoming 200. Asking for 5,000 lines now reaches back
   **100 seconds** instead of 3.7.
+- **A row's summary now describes that session, instead of a plausible project
+  nobody here is working on.** Summaries, titles and précis are written from a
+  session's own transcript — but the reader that fetched it only understood one
+  agent CLI's file format, and a file it does not understand it reports as
+  empty rather than as unreadable. So for every Claude Code session the
+  summariser was handed nothing, and, asked for a paragraph about the work, it
+  wrote a confident one about work that never happened. The reader now handles
+  whichever CLI wrote the file. Summaries already stored that way do not
+  correct themselves — a fluent invention does not look like the junk the
+  refresh path watches for — so `scripts/audit-summary-grounding.py` finds them
+  and `--clear` deletes them, after which they regenerate from the real
+  transcript.
+
+- **A summary can no longer be the request that asked for it.** Some rows wore
+  a fragment of the summariser's own instructions as their description; that
+  text is now recognised as the placeholder it is.
+
 - **The command that pulls a lost session back into the list now works from
   either program.** Reconnecting a session that has dropped out of Live
   Sessions answered from one of the two programs only, and reported the command

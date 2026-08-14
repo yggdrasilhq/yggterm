@@ -1422,6 +1422,54 @@ purpose: a finding goes out, an answer comes back.
    session that cannot reach the row plane** — write "drop a file and tell the
    orchestrator".
 
+### ⭐⭐ SEND THE OBSERVATION AND THE GENERALISATION. LEAVE THE MECHANISM TO WHOEVER OWNS THE TABLE.
+
+**The most useful cross-campaign findings this fleet has produced were right about
+the defect and wrong about the fix**, and the pattern is specific enough to name:
+
+⛔ **Do not propose a DISCRIMINATOR for someone else's classifier without knowing
+what its input set already excludes.** Measured 2026-08-14: a campaign correctly
+found that a supervision board had no branch for a row that was alive, correct
+and permanently quiet by design — a real gap that shipped. It then proposed the
+test *"alive, and no arm on the other plane"*. But that board's population was
+built as `subscribed − armed − dying − attended − opted-out`, so **every row in it
+lacked an arm**; the filter was true of the whole set and separated nothing. Taken
+on trust it would have shipped a branch firing on every row equally.
+
+⇒ **They know the input set and you do not.** Send what you SAW and what it
+GENERALISES to; the owner of the table turns that into a mechanism. ⚖ This is a
+division of labour, not a demotion: the finding *was* right and did ship — only
+the proposed mechanism was wrong, and those two want different remedies.
+
+⭐ **And the receiving half, which is what makes the correction worth anything:**
+**check a proposal before building it, and say WHY it failed** rather than quietly
+substituting something better. A silent substitution fixes one bug and teaches
+nobody; the sender repeats the reasoning error on the next campaign's plane.
+
+### ⛔⛔ RECORD THE TRANSITION. DO NOT INFER IT FROM THE ABSENCE OF A SIGNAL.
+
+**Three defects, three planes, one class — all found in a single day, each by a
+different campaign, none recognising it until the third:**
+
+| what was classified | the signal read | why it froze |
+|---|---|---|
+| a rate-limited row | its transcript tail | a parked row stops writing, so every tick re-read the same bytes |
+| a stalled row | recent activity | a row that stands down stops being active, and looks stalled forever |
+| an unsubscribed row | the absence of a subscription | **an unsubscribe left no trace, so *released* and *never subscribed* were identical** |
+
+⇒ ⭐⭐ **THE CLASS: a classification derived from a signal that STOPS UPDATING once
+the class is entered.** It is a one-way door — the evidence that would let the row
+leave the class is the very thing entering it destroyed.
+
+⇒ ⭐⭐ **THE FIX IS THE SAME IN ALL THREE AND IT IS NOT A CLEVERER TEST: write the
+transition down.** A ledger that appends rather than rewrites, refuses to reverse
+itself without an explicit reason, and treats an UNREADABLE ledger as a refusal
+rather than as consent. The third state almost never needs computing — it is
+usually something the system already meant and threw away.
+
+⇒ **The question that finds it before it ships:** *what stops changing once my
+mechanism engages, and am I reading that thing to decide when to disengage?*
+
 ### Stall recovery — a stopped session is usually one word from resuming
 
 **A session's dominant failure is STOPPING, not dying**, and the two look

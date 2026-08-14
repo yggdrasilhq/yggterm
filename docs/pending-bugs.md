@@ -260,56 +260,61 @@ bootstrapping. The campaign already records that a re-resume onto a fresh PTY is
 when the squish/broken-bottom artefacts appear, so the first-paint window is
 where the renderer is most stressed and is the cheapest place to try to reproduce
 this.
-## ⛔⛔ [6.0] SOME ROW SUMMARIES DESCRIBE WORK THAT NEVER HAPPENED, IN THE SIDEBAR THE USER READS
+## ⚠ [6.16] A DELETED SUMMARY CANNOT REACH A RUNNING DAEMON — ABSENCE IS DROPPED AS "NO NEWS"
 
 **Status:** OPEN
 
-*Found 2026-08-14 while sweeping rows for a different reason.*
+*Found 2026-08-14 repairing the fabricated summaries, when the repair did not
+reach the screen.*
 
-A row's `detail_label` is its summary, and for a handful of rows it is **generic
-software-engineering boilerplate that appears nowhere in that session**. Not a
-stale summary, not a vague one — a confident description of a different project.
+A remote session's summary is cached on the machine that renders it
+(`RemoteScannedSession::cached_summary`, and the session's `Summary` metadata).
+Every path that refreshes it from a scan is shaped
+`if let Some(summary) = refreshed_summary { set_session_summary_hint(...) }` —
+so a scan that reports **no** summary leaves the old one in place. There is no
+clear path: `set_session_summary_hint` has no counterpart that removes one.
 
-**The signature is unmistakable once seen:** *"The current objective is to
-integrate the new `<X>` middleware into the existing `<Y>`"*, with `<X>`/`<Y>`
-drawn from tutorial-grade material (auth middleware, OAuth2 token refresh, a
-WebSocket collaboration layer, a Flask API, a microservice request pipeline) —
-subjects this project does not contain.
+⇒ **The consequence is a cache that suppresses its own repair.** A summary job
+is only queued when `summary_missing`, which requires `cached_summary` to be
+absent or to look like junk. A fluent-but-wrong summary is neither. So deleting
+it from the title store — the documented repair — changes nothing the user sees:
+the running daemon still serves the deleted value, and because it serves it,
+nothing regenerates. Measured after clearing 785 summaries across two hosts: the
+store was empty and the rows were **unchanged**, still 98% ungrounded.
 
-⇒ **Confirmed on two rows by independent probe**, each against its own
-transcript:
-- a row whose lane did **document-surface rendering** carries a summary about a
-  *real-time collaboration layer for a collaborative drawing application*. The
-  phrase "collaborative drawing" occurs **0** times in that session.
-- a row whose lane is a **business/licensing discussion** carries a summary about
-  *authentication middleware in a Flask API*. `Flask`, `middleware` and
-  `microservice` each occur **0** times in that session.
+⚠ **It is not persisted** (`server-state.json` carries no `Summary` metadata), so
+the stale values do go away when that daemon retires onto a newer build on its
+own poll. That is the only thing currently clearing them, and it means the repair
+lands on the daemon's schedule rather than when it is run.
 
-⭐ **The real prefix is preserved and the fabrication is appended**, which is what
-makes it convincing: the summary opens with the session's genuine first tokens
-and then continues into invented content. A reader who recognises the opening
-trusts the rest.
+**Careful, because one nearby `is_some()` guard is CORRECT:**
+`promote_remote_codex_live_session_to_scanned` builds its `scanned` from a LIVE
+session view, where a missing summary really does mean "this view does not carry
+one". The authoritative-absence paths are the ones fed by a store scan
+(`apply_remote_preview_payload_for_path_with_hydration` and its siblings), where
+`None` means the store was asked and said there is none.
 
-⚠ **SEVERITY IS ABOUT WHO READS IT.** The sidebar is how the user knows what each
-row is doing. A fabricated summary is worse than an absent one: it answers the
-question wrongly and gives no sign it is guessing. At least one affected row is
-one the user works in himself.
+**What would falsify it:** delete a summary from a remote host's title store
+while its row is visible, wait for a scan, and see whether the row's description
+changes.
 
-⛔ **WHAT THIS ENTRY DOES NOT CLAIM.** A first measurement here reported "31 of 31
-summaries fabricated" and **that number was wrong and is withdrawn** — it tested
-whether the summary appears VERBATIM in the session's first message, which a
-generated summary never would, since paraphrasing is its job. Most summaries do
-describe their lane's real subject and are fine. **The defect is the subset whose
-DOMAIN does not match the session at all**, which is a different and much smaller
-population. The sound detector is domain mismatch, not string containment.
+## ⚠ [6.16] CLAUDE CODE SESSIONS ARE ABSENT FROM SIDEBAR TRANSCRIPT SEARCH
 
-**Not yet established, and worth knowing before a fix:** whether these are
-produced when summary generation fails or is rate-limited and a fallback is
-persisted anyway (there is a standing rule in this fleet that a heuristic
-fallback must never be persisted over a rate-limit refusal), or whether the
-generator is simply hallucinating from insufficient input. **The falsifier is
-cheap:** force a summary generation for a row whose content is known, with the
-generator's backend unavailable, and see what gets written.
+**Status:** OPEN
+
+*Found 2026-08-14 while fixing the fabricated-summary defect, which had the same
+root cause in a different consumer.*
+
+`local_transcript_search_context` is gated on `is_local_codex_history_session_path`
+— Codex and Codex-LiteLLM stores only — so searching the sidebar never matches
+anything a Claude Code session said. The other consumers of that decoder were
+converted to the agent dispatch; this one was left, because its gate is a
+deliberate path test rather than an accidental reader choice, and changing it
+means deciding what the CC search source should be rather than merely swapping a
+call.
+
+**What would falsify it:** type a phrase that occurs only in a Claude Code
+session's prose into the sidebar search and see whether that row is offered.
 
 ## ⚠ [6.0] A FINISHED LANE'S ROW HOLDS ITS SEAT FOREVER, AND NOTHING RETIRES IT
 
