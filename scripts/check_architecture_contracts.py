@@ -370,6 +370,62 @@ def check_session_copy_policy_contract() -> None:
     )
 
 
+def check_generation_context_reads_every_agent_cli() -> None:
+    """Nothing that feeds the copy generator may pick a decoder by hand.
+
+    The defect this closes: title/précis/summary generation called the CODEX
+    tail reader unconditionally. A Claude Code JSONL shares no record type with
+    a Codex rollout, so those reads returned an empty message list — no error,
+    no warning — and the summariser wrote a confident timeline entry with
+    nothing to write it from. The sidebar then described projects that do not
+    exist, on rows the owner works in.
+
+    ⚠ The failure mode is what makes a static contract worth having here: a
+    wrong decoder does not throw, it returns EMPTY. Nothing downstream can tell
+    "this session said nothing" from "I cannot read this file", so the mistake
+    is invisible at runtime and only a rule about the CALL SITE catches it.
+    """
+    single_cli_readers = (
+        "read_codex_transcript_messages",
+        "read_codex_transcript_messages_limited",
+        "read_codex_transcript_messages_tail_limited",
+        "read_codex_transcript_entries",
+        "read_claude_code_transcript_messages",
+        "read_claude_code_transcript_entries",
+    )
+    # Each producer, and the function inside it that must stay CLI-agnostic.
+    producers = [
+        ("crates/yggterm-core/src/titles.rs", "fn extract_tail_context("),
+        ("crates/yggterm-server/src/lib.rs", "fn remote_summary_for_path("),
+        ("crates/yggterm-server/src/lib.rs", "pub fn run_remote_generation_context("),
+    ]
+    for path, marker in producers:
+        text = read(path)
+        if not text:
+            continue
+        if marker not in text:
+            fail(
+                f"{path}: {marker!r} is gone — the contract that its generation "
+                "context reads every agent CLI is now unenforced. Re-point it at "
+                "the function that took over, or delete it and say where the "
+                "invariant went."
+            )
+            continue
+        body = text.split(marker, 1)[1].split("\nfn ", 1)[0].split("\npub fn ", 1)[0]
+        # Coverage floor: a split that captured nothing makes the rest vacuous.
+        if len(body) < 80:
+            fail(f"{path}: could not capture the body of {marker!r} ({len(body)} bytes)")
+            continue
+        for reader in single_cli_readers:
+            if re.search(rf"\b{reader}\s*\(", body):
+                fail(
+                    f"{path}: {marker!r} calls {reader} — generation context must "
+                    "go through read_agent_transcript_messages* so a session whose "
+                    "CLI the caller did not think of yields its own words rather "
+                    "than an empty string."
+                )
+
+
 def check_terminal_retained_replay_policy_contract() -> None:
     shell = read("crates/yggterm-shell/src/shell.rs")
     policy = read("crates/yggterm-shell/src/terminal_retained_replay_policy.rs")
@@ -469,6 +525,7 @@ def main() -> int:
     check_hot_update_contract()
     check_ui_telemetry_contract()
     check_session_copy_policy_contract()
+    check_generation_context_reads_every_agent_cli()
     check_terminal_retained_replay_policy_contract()
     check_gui_binary_resolution_contract()
     if FAILURES:
