@@ -447,6 +447,45 @@ governs how they retire.
 **Falsifier:** consolidate and re-measure. If daemon cores do not fall ≥2.0, the
 per-daemon model is wrong.
 
+### ⭐ THE FLOOR TERM IS NOT INTRINSIC — IT IS CONDITIONAL ON BEING REACHABLE
+
+**Measured 2026-08-14 (6.1), passively, over 60 s windows on 19 daemons.** The
+`0.116` intercept above reads as a per-daemon floor and 6.7 measured no intrinsic
+floor from inside the request path. Both are right, and this reconciles them:
+
+| what it is | cores | its whole process subtree |
+|---|---|---|
+| 10 legacy daemons, sockets bound, 73–246 rows each | **~2.5 total** | essentially **idle** |
+| 2 current daemons, ~200 descendants between them | **0.26 total** | **2.3 cores of real work** |
+| 3 daemons that lost the bind lock (no socket) | **0.000** | idle |
+
+⇒ **A daemon nobody can reach costs nothing at all**, so the floor is not a
+property of *being a daemon*; it is paid by daemons that are reachable while
+holding a row inventory. ⇒ **The current daemons are the cheap ones**, despite
+owning the most: the expensive population is idle-but-burning, not busy.
+
+⛔ **THIS CORRECTS "THE DRAIN MOVES WORK, IT DOES NOT REMOVE IT."** For the
+legacy population the work is not session work — nothing they own is asking for
+it — so draining them **reclaims** it rather than relocating it. The earlier
+warning stands only for the sessions themselves.
+
+⚠ **The mechanism is NOT established and I am not guessing it.** 6.7's
+per-connection figure (150–230 µs) is three orders of magnitude too small to
+reach 0.2 cores at any poll rate I can justify, and *what sets the poll rate* is
+already an open question in the 6.9 lane. Two facts constrain whoever takes it:
+**per-thread accounting sees only ~20% of the process total** here (0.054 vs
+0.281 cores on one daemon) — which is the documented *cost hides in exited
+threads* entry, so ⛔ never price this from `/proc/<pid>/task`; and the
+socket-less zeros above make "reachable" the discriminator worth chasing first.
+
+⭐ **ONE daemon is separately and confirmably pathological**: the 2.12.14
+instance re-reads **69 MB/s** (rchar, zero disk — all page cache) with three idle
+shells attached, against 0.15–1.20 MB/s for every other daemon measured. That is
+the full-corpus-read defect executing in the present tense, on a version that
+predates its fix. ⇒ It is the first drain target, and its three sessions are
+plain shells, which `release_session_for_migration` refuses — so draining it is
+an owner-facing question about three shells, not a migration.
+
 ## ⛔⛔ [6.9→6.1] 14 LEGACY DAEMONS STILL RUN THE DEFECTS THEIR VERSION PREDATES
 
 **Status:** OPEN
@@ -852,6 +891,32 @@ the right enum after already stomping the composer would pass a verdict-only tes
 and still ruin the sentence someone was typing. **The damage IS the write.**
 Proven to fail on the mutant that disables the guard (i.e. on the shipped
 behaviour), while the "still submits normally" control passed.
+
+### ⚠ THE GUARD COUNTED THE PROBE AS THE HUMAN — FIXED 2026-08-14, RECORDED HERE BECAUSE THIS ENTRY LOOKED FINISHED
+
+`session_has_pending_input_draft` is reconstructed from whatever passes through
+`PtySessionRuntime::write`, and the echo-verified submit wrote its own marker
+through that same `write`. So the guard above read back a flag **the probe itself
+had just set** and refused its own submit with `HumanTyping { waited_ms: 180 }` —
+and 180 ms is `PROBE_SETTLE`, so the number was the mechanism's signature rather
+than a measurement. Two `pipeline_integration` tests had been failing on main.
+
+⚠ **Direction matters, and it favours the protection:** the contamination pushed
+toward REFUSING to type, never toward typing, so nothing about the draft
+protection or the release hold was ever less safe than believed. What it cost is
+the repair's EFFECTIVENESS — a composer that has drawn its prompt but is not yet
+reading could never be waited out, which is precisely the case echo-verification
+exists to catch.
+
+✅ Fixed by the exemption this write path's own comment already describes for
+DA/DSR auto-responses: a `write_daemon_originated` that enqueues identically and
+does not touch the draft flag, used by the echo-verified submit and the
+hot-restart repair. **Only who may SET the flag changed; every reader still
+refuses on a real human draft.** ⛔ The tests were not relaxed — the one expecting
+a SUCCESSFUL submit is what showed the refusal was wrong rather than renamed.
+⚠ Two tests guard the wiring and one guards the semantics, measured: re-pointing
+the submit at `write` fails the first two and the third still passes, so neither
+is redundant.
 
 ### ⛔⛔⛔ THE FIX COVERED ONE OF TWO COPIES — AND THE UNFIXED ONE IS THE COPY THE OWNER HITS
 
