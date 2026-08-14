@@ -159,6 +159,17 @@ copies.
   *Meanwhile:* the relay is fixing them one at a time in the pattern the rule
   would generalise, so either answer is cheaper afterwards, not dearer.
 
+- **When exactly does the weekly limit reset?** The fleet-wide boot hold is armed and the booter
+  will wake nobody until it lifts, but the deadline is **an assumption, not a measurement**: you
+  said the weekly limit was being hit, so it is set to **5 days from 2026-08-14 20:09 IST**
+  because that is the horizon you named. Only you can see the real reset instant.
+  **Recommendation: when you know it, set it exactly** —
+  `ygg-booter.py hold --until 2026-08-19T09:00 --reason "weekly reset"` (absolute, idempotent,
+  re-running does not walk it forward), or `ygg-booter.py hold --clear` to release immediately.
+  **Done meanwhile:** the hold is in force fleet-wide and every row reads `⏸ SUPPRESSED` in
+  `ygg-booter.py list`; it **releases itself** at the deadline and the next tick wakes every row,
+  which by then is all of them. **To reverse:** one command, either direction, no state to unwind.
+
 ## Credentials and real-money actions (the vault and the card rails)
 
 - **Any card payment is his, per action, every time** — his standing rule for
