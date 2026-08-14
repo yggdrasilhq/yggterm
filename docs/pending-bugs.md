@@ -29,6 +29,47 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⚠ [6.6] A PROCESS-GLOBAL ENV WRITE MAKES THE LAUNCH-COMMAND TESTS FLAKY IN PARALLEL
+
+**Status:** OPEN
+
+Mechanism identified, deliberately not fixed here: it is the Claude Code
+daemon-runtime lane's designed round-trip, not the arsenal lane's to change.
+
+`sync_claude_extra_args_for_request` (`daemon.rs`) carries one request's
+configured flags by writing them into the **whole process's** environment:
+
+```rust
+unsafe { std::env::set_var(ENV_YGGTERM_CC_EXTRA_ARGS, args); }
+```
+
+and the launch builder reads them back out of that same environment. The comment
+calls it *"same process-wide-env pattern as terminal identity"*, so it is a
+pattern rather than an oversight — but a test binary runs every test in ONE
+process, so any test that drives a CC daemon-runtime request mutates state that
+every other test's launch composition then reads. Which tests lose the race
+depends on scheduling.
+
+**Measured 2026-08-14**, same binary, same code, no rebuild between runs:
+
+| run | result |
+|---|---|
+| parallel ×4 | 2 green; 2 red, on **different** tests each time (`local_cc_relaunch_rebuild_collapses_poisoned_identity_to_row_id`, `refresh_terminal_identity_updates_restored_remote_launch_commands`) |
+| `--test-threads=1` ×2 | 1096 passed, 0 failed, both times |
+
+Every test named above passes when run individually.
+
+⇒ **The queue's "flaky in parallel" category is not one property of one test.**
+At least this slice of it is a single mechanism with a name, and it is the same
+shape as the kind-blind leak fixed alongside this entry: **a per-launch value
+carried in process-global state outlives the launch it belonged to.** The
+durable fix is to pass the value as a request field the whole way down — which
+the generic (non-CC) lane already does, via `configured_override`.
+
+⚠ Until it is fixed, a red parallel run is not evidence of a regression on its
+own. Re-run the named test individually before believing it, and quote which
+way you ran it.
+
 ## ⛔ THE HOOK INSTALLER EXISTS TWICE, THE TWO COPIES DISAGREE, AND ONE CRASHES ON A WORKTREE
 
 **Status:** OPEN

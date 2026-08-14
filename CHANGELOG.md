@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **One agent CLI can no longer be launched with another one's flags.** The
+  flags a session is started with are configured per CLI, and they were being
+  carried between machines in a single environment variable that named no CLI at
+  all. Any launch composed afterwards read that one variable whatever CLI it was
+  starting, so a permission flag belonging to one tool could be handed to a tool
+  that has never heard of it — and because the flags are composed between the
+  binary and its `resume` subcommand, the resulting command was malformed as
+  well as wrong. Forwarded flags now travel as part of the request that asks for
+  the launch, so they arrive attached to the CLI they were chosen for, and a
+  launch on this machine reads only this machine's settings.
+
 - **An interrupted session is no longer left un-nudged (3.0.142).** When yggterm
   has waited half an hour to update and finally goes ahead anyway, it owes a
   `continue` to each session it interrupted. If that session's agent had not

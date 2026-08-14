@@ -364,10 +364,9 @@ const ARMS: &[Arm] = &[
         // `-r, --resume [<SESSION_ID_OR_TITLE>]`.
         resume_selector_token: "--resume",
         re_roots_with_cwd: false,
-        // Empty by DECLARATION, not omission: `~/.grok/sessions` exists but its
-        // shape needs a signed-in host to observe. See the descriptor's
-        // `store_scan_gap`.
-        store_globs: &[],
+        // The shape needed a signed-in host to observe, and now it has been
+        // observed — so this is the descriptor's glob, not an empty placeholder.
+        store_globs: &[".grok/sessions/*/*/summary.json"],
     },
     Arm {
         kind: SessionKind::GrokBuild,
@@ -380,7 +379,9 @@ const ARMS: &[Arm] = &[
         binary: "grok",
         resume_selector_token: "--resume",
         re_roots_with_cwd: false,
-        store_globs: &[],
+        // Both localities read the SAME store layout — the transport differs,
+        // the layout does not.
+        store_globs: &[".grok/sessions/*/*/summary.json"],
     },
 ];
 
