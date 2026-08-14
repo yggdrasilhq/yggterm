@@ -53,6 +53,44 @@ screenshot loop, or any recurring artefact there. `scripts/usability-check.sh`
 was doing it too — writing a screenshot into `/tmp` on that host every hour —
 and now writes under `~/.yggterm/usability`.
 
+### ⭐ A THIRD INSTANCE, 2026-08-14 — AND THIS ONE IS OURS TO FIX
+
+The editor auto-upgrade timer on that host is a unit **we** own, and it leaks the
+same way for the same reason:
+
+```
+ExecStart=/bin/sh -c "curl -fsSL <vendor>/install.sh | /bin/sh"
+```
+
+The vendor script does `mktemp -d` and downloads a **~157 MB** tarball into it,
+and does not remove the directory on every path. **Four survived, from 2 to 12
+days old, ~630 MB of RAM** on a 15 GB machine that was sitting deep in swap. None
+was held open by any process. Reclaimed in-session, together with two stale
+21 MB binaries staged the same way: `/tmp` went **1,976 MB → 1,331 MB** and swap
+fell 6,946 → 6,453 MB in the same minute.
+
+**Ours, and shipped as a drop-in** (`ygg-zed-upgrade.service.d/tmpdir-off-ram.conf`,
+reversible by deleting one file):
+
+```ini
+Environment=TMPDIR=%h/.cache/ygg-zed-upgrade
+ExecStartPre=/bin/rm -rf %h/.cache/ygg-zed-upgrade
+ExecStartPre=/bin/mkdir -p %h/.cache/ygg-zed-upgrade
+ExecStopPost=/bin/rm -rf %h/.cache/ygg-zed-upgrade
+```
+
+**Verified rather than assumed:** systemd reports the environment and both
+`ExecStartPre` steps applied, `df -T` shows the home filesystem is ZFS while
+`/tmp` is `tmpfs`, and a `mktemp -d` under the new `TMPDIR` lands on disk. ⚠ Same caveat as above — this
+RELOCATES the leak off RAM; the vendor script still never cleans up, and the
+`ExecStopPost` sweep is what bounds it here.
+
+⇒ **The pattern to grep for is `curl … | sh` in any unit**, because piping a
+vendor installer hands temp-file policy to a script nobody here controls. The
+other six `ygg-*` units on that host were checked at the same time: none sets
+`TMPDIR`, but none stages a payload of this size, so this was the only one worth
+changing today.
+
 **Falsifier:** if `/tmp` on that host is ever NOT a tmpfs, the RAM half of this
 entry is void and only the unbounded-growth half stands.
 
