@@ -4416,6 +4416,13 @@ measurable half above stands on its own and does not wait on it.
 
 **Status:** OPEN
 
+**Re-opened:** closed at `2d81b5a1` on the headline claim, which was then measured
+false — but a real residual survives it: the range derivation on a branch with **no
+upstream**. Kept open for the residual, not the headline. ⚠ This line is also what
+stops `check-queue-resurrection.sh` reporting the entry every run; it was doing so
+"ever since, and nobody ran it", which is how a real resurrection would have hidden
+behind the noise.
+
 ⛔⛔ **THE HEADLINE CLAIM — "EVERY LANE PUSH FAILS" — WAS MEASURED FALSE ON 2026-08-14,
 AND THIS ENTRY'S OWN FALSIFIER IS WHAT REFUTED IT.** The falsifier below says *push a
 branch and the guard must pass without an override.* A lane did exactly that: **15 commits

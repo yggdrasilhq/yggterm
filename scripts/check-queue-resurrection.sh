@@ -52,6 +52,22 @@ run = lambda c: subprocess.run(c, shell=True, capture_output=True, text=True).st
 current = {l for l in run(f"grep '^## ' {QUEUE}").splitlines() if l.strip()}
 shas = run(f"git log --since='{os.environ['SINCE']}' --format=%H -- {QUEUE}").split()
 
+# ⛔⛔ A CHECK THAT CANNOT SEE ITS OWN PRESCRIBED REMEDY BECOMES NOISE, AND NOISE
+# IS WHY NOBODY RUNS IT. This told the reader to "say so in the entry itself" and
+# then had no way to observe that they had — so a correctly re-opened entry was
+# reported forever, identically to a stale whole-file write. Measured 2026-08-14:
+# one entry had been re-opened DELIBERATELY, said so in its own body at length,
+# and this check had been crying about it "ever since, and nobody ran it" — the
+# entry's own words. The check trained the neglect that then hid a real one.
+# ⇒ Honour an explicit declaration. `**Re-opened:**` inside the entry body means
+#   a human decided; report it as acknowledged and keep the exit clean.
+body = open(QUEUE, encoding="utf-8").read().split("\n## ")
+reopened = set()
+for chunk in body:
+    head = "## " + chunk.split("\n", 1)[0] if not chunk.startswith("## ") else chunk.split("\n", 1)[0]
+    if "**Re-opened:**" in chunk:
+        reopened.add(head.strip())
+
 # A heading is 'removed' by a commit whose diff drops its '## ' line.
 removed = collections.defaultdict(list)
 for sha in shas:
@@ -59,11 +75,16 @@ for sha in shas:
         if line.startswith("-## "):
             removed[line[1:]].append(sha)
 
-hits = [(h, c) for h, c in removed.items() if h in current]
+all_hits = [(h, c) for h, c in removed.items() if h in current]
+hits = [(h, c) for h, c in all_hits if h.strip() not in reopened]
+acked = [h for h, _ in all_hits if h.strip() in reopened]
+
+for h in acked:
+    print(f"queue-resurrection: ✅ acknowledged re-open — {h[3:70]}")
 
 if not hits:
     print(f"queue-resurrection: ok — {len(current)} open entries, "
-          f"none previously deleted ({len(shas)} queue commits scanned)")
+          f"{len(acked)} declared re-open(s) ({len(shas)} queue commits scanned)")
     sys.exit(0)
 
 print(f"⛔ queue-resurrection: {len(hits)} entry(ies) deleted earlier are present again\n",
@@ -72,8 +93,10 @@ for h, c in hits:
     print(f"  {h}", file=sys.stderr)
     print(f"      deleted by: {' '.join(x[:8] for x in c)}", file=sys.stderr)
     print(f"      settle it:  git log -S {h[3:40]!r} -- {QUEUE}\n", file=sys.stderr)
-print("If the entry was deliberately RE-OPENED, say so in the entry itself so the\n"
-      "next reader is not left guessing. Otherwise it is a stale whole-file write —\n"
-      "delete it again and check what else that commit reverted.", file=sys.stderr)
+print("If the entry was deliberately RE-OPENED, add a line `**Re-opened:** <why>` to\n"
+      "the entry body — this check reads it and will stop reporting that entry.\n"
+      "⛔ Say it in the entry, not in a commit message: the next reader has the file,\n"
+      "not the history. Otherwise it is a stale whole-file write — delete it again\n"
+      "and check what else that commit reverted.", file=sys.stderr)
 sys.exit(1 if os.environ["STRICT"] == "1" else 0)
 PY
