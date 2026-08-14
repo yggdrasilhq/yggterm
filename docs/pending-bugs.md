@@ -1820,6 +1820,45 @@ death's timestamp is the proof; `skipped_no_status` ≥ 1 says the fix is what
 stood between us and it. ⛔ Until then this is a candidate, not the cause, and it
 does not retire the OOM/external-kill rival above.
 
+## ⚠ [6.1] TWO SIBLING FUNCTIONS DISAGREE ABOUT AN UNREACHABLE OWNER, AND ONE OF THEM PRUNES
+
+**Status:** OPEN
+
+*Latent, not observed firing. Found while fixing the same class in the
+stale-daemon sweep, 2026-08-14.*
+
+The preserved-owner registry is what tells the sweep *this daemon owns live work,
+do not signal it*. Two functions maintain it, twenty lines apart, and they treat
+"the owner did not answer" oppositely:
+
+| function | on a status `Err` |
+|---|---|
+| `prune_unrepresented_preserved_owner_runtime_sessions` | traces `preserved_owner_runtime_prune_status_failed` and **skips** — correct |
+| `retain_represented_keys`'s predicate | the cached status is `None`, `is_some_and(..)` is **false**, so the key is **PRUNED** |
+
+⇒ **A busy owner that misses one probe can have its preserved-runtime records
+removed**, and the miss is then cached (`mark_preserved_owner_unreachable`,
+"pay the timeout once per owner per window"), so the effect persists rather than
+self-correcting on the next call. Those records feed `preserved_owner_pids` /
+`owner_registry_guard_active` — the guard the reap path leans on — so the same
+"no answer means nothing is there" error sits inside the bookkeeping of the gate
+that protects live daemons from SIGTERM.
+
+⚠ **Not observed:** `preserved_owner_registry_pruned` appears **zero times** in
+the live corpus (only `preserved_owner_deep_reconcile_deferred_on_load`, ×9), so
+this is a latent disagreement rather than a running defect. ⛔ And that corpus is
+~3 h wide, so its silence is weak evidence either way — see the retention entry
+above.
+
+**Recommended fix, not applied here because it needs one fact this entry cannot
+cheaply establish:** an unreachable owner should KEEP its entry (matching its
+sibling), and pruning should be driven by **the owner's process being gone**, not
+by its socket being quiet — the same absent-versus-unreadable split that the
+retire gate and the reap gate now use. Applying only the first half would let a
+dead owner's keys accumulate for ever, which is why it wants the pid-liveness
+check (`linux_preserved_owner_process_ids_for_home` already resolves those pids)
+rather than a one-line flip.
+
 ## ⛔⛔ [6.1] THE GUARD PROTECTING A PRESERVED PTY OWNER IS A HOST-SHARED FILE, SO A PEER CAN ERASE IT
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
