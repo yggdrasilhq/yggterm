@@ -284,9 +284,9 @@ host that carries the fleet. **Do not offer it as the explanation for his fan.**
 
 ### ✅ 4a. S2 IS MEASURED AND PASSES — 493x, against a 90x threshold
 
-*dev, 2026-08-14, on the one daemon that carries `670fa66d` (pid 2945182,
-build `4e801c13`, confirmed by `git merge-base --is-ancestor`, never by version
-number).*
+*2026-08-14, on the fleet host, on the one daemon whose build carries
+`670fa66d` — confirmed by `git merge-base --is-ancestor`, never by version
+number.*
 
 | | |
 |---|---|
@@ -591,7 +591,7 @@ mattered was a **request rate**, and it was visible in the trace the whole time.
 
 ### ✅ 6h. MEASURED DIRECTLY: 4.645 µs/row, and status serving is 1.6% of the daemon population
 
-*dev, 2026-08-14. A counter in `fn status()` itself — every reply, nothing
+*2026-08-14, fleet host. A counter in `fn status()` itself — every reply, nothing
 sampled, `CLOCK_THREAD_CPUTIME_ID` rather than wall. Six seeded row counts,
 isolated homes, one variable.*
 
@@ -657,6 +657,33 @@ for the whole persistence payload to use one field of it. Splitting out
 `persisted_live_sessions()` removes a second full stored-row walk, a PTY-grid
 clone and sort, two table clones and a `HashSet` per reply — **same wire, no
 version gate, no protocol risk.**
+
+**Its paired A/B, on the identical harness, same host, same seeds, binary the
+only difference:**
+
+| ROWS | CPU µs/reply before | after | | whole request before | after |
+|---|---|---|---|---|---|
+| 0 | 36 | 31 | | 383 | 353 |
+| 100 | 409 | 386 | | 898 | 842 |
+| 250 | 955 | 943 | | 1,582 | 1,564 |
+| 1000 | 4,676 | 4,402 | | 6,247 | 5,912 |
+
+    payload build   4.645 -> 4.365 us/row   (-6.0%)   both fits r = 0.998
+    whole request   5.857 -> 5.530 us/row   (-5.6%)
+
+⚠ **Read this as code hygiene, not as a performance win, and the numbers say so
+themselves.** Six percent of a path that is 1.6% of the daemon population is
+~0.002 cores — below anything a user could perceive, and **no CHANGELOG entry
+was written for it.** ⛔ **Quote the paired SLOPE, never a single arm:** the
+per-arm deltas run −1.3% to −13.9% and are not monotone in ROWS, which is
+run-to-run noise of a few percent; the slope over six paired points is the only
+part that survives it.
+
+⭐ **The durable half is a dependency removed, not microseconds saved.** The
+reply path no longer scales with the PTY-grid table, the ssh-target list or the
+machine table at all — three terms this harness seeds EMPTY and the live fleet
+does not, so the A/B above understates the change on a real daemon while
+overstating nothing.
 
 ### 6f. Honest limits on this section
 

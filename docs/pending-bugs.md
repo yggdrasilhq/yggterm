@@ -62,7 +62,8 @@ forge returns 404 for the pre-removal blob URLs.
 **decided against by this lane** on the measurement below — reversing that needs
 only this entry's numbers to be wrong, not a new discussion.*
 
-*measured directly on dev 2026-08-14, unsampled, on `CLOCK_THREAD_CPUTIME_ID`;
+*measured directly 2026-08-14 on the fleet host, unsampled, on
+`CLOCK_THREAD_CPUTIME_ID`;
 harness and both fits in [`idle-cost-model.md`](idle-cost-model.md) §6h*
 
 **What is still true and was measured, not derived:** `status` is 70% of every
@@ -111,6 +112,20 @@ remote machine, and built a `HashSet` to resolve an active path it discarded.
 Split out as `persisted_live_sessions()`, **sharing the filter body** so which
 live sessions persist keeps one owner, guarded by a test that fails if the two
 paths ever disagree.
+
+**Paired A/B, identical harness, binary the only difference:** payload build
+**4.645 → 4.365 µs/row (−6.0%)**, whole request **5.857 → 5.530 (−5.6%)**, both
+fits r=0.998. ⚠ **That is code hygiene, not a performance win** — 6% of a path
+worth 1.6% is ~0.002 cores, below perception, and deliberately **not** given a
+CHANGELOG entry. ⛔ Quote the paired slope, never a single arm: per-arm deltas
+run −1.3% to −13.9% and are not monotone, which is noise. ⭐ The durable half is
+that the reply path no longer scales with the PTY-grid table, the ssh-target
+list or the machine table **at all** — three terms the harness seeds empty and
+the live fleet does not.
+
+⚠ **Live proof owed:** the paired A/B is sandbox-only. What is owed on the live
+fleet is one `status_cost` record from a daemon carrying the change, confirming
+the slope on real rows.
 
 ### ⛔ RECOMMENDED AGAINST: the `census` split as spec'd (owner decision)
 
