@@ -1105,6 +1105,10 @@ def cmd_subscribe(args):
         "kind": getattr(args, "kind", None)
         or ("task" if uuid == own_uuid() else "monitor"),
         "boots": 0,
+        # Consecutive ticks refused because WE could not read the screen. Kept
+        # apart from `boots` because it counts a failure of our instrument, not
+        # an observation about the row -- see the escalation in the tick loop.
+        "blind_skips": 0,
         "last_size": 0,
         "escalated": False,
     }
@@ -2208,6 +2212,9 @@ def tick(args):
         elif state in ("WORKING", "JUST_ENDED"):
             s["boots"] = 0                     # progress clears the stall counter
             s["escalated"] = False
+            # The row moved, so whatever we could not read no longer strands it.
+            s["blind_skips"] = 0
+            s["blind_escalated"] = False
         elif state == "UNREACHABLE":
             action = "CANNOT-SEE"              # never a verdict about the row
         elif state == "NO_TRANSCRIPT":
@@ -2227,6 +2234,8 @@ def tick(args):
         elif state == "IDLE" and c["age"] >= (boot_after := boot_after_for(s)[0]):
             if grew:
                 s["boots"] = 0                 # it worked since last tick
+                s["blind_skips"] = 0
+                s["blind_escalated"] = False
             if rl:
                 # ⛔ A BOOT INTO AN EXHAUSTED QUOTA IS REFUSED BEFORE THE AGENT
                 #    RUNS. It spends the wake, changes nothing, and — because the
@@ -2278,6 +2287,47 @@ def tick(args):
                     action = {"refused-draft": "SKIP:drafting",
                               "refused-choice-prompt": "SKIP:choice-prompt",
                               "refused-screen-unreadable": "SKIP:blind"}[via]
+                    # ⛔⛔ THE MIRROR IMAGE OF THE DOUBLE-CHARGE ABOVE, AND IT IS
+                    #    WORSE: a refund means `boots` never rises, so the row
+                    #    can never reach MAX_BOOTS, so it can NEVER ESCALATE. A
+                    #    row refused forever is a row silent forever, and
+                    #    `SKIP:blind` is invisible to every instrument except
+                    #    this log line. Measured 2026-08-14: a lane slept
+                    #    through a hard external deadline while the watchdog
+                    #    refused it every tick and told nobody.
+                    #
+                    # ⚖ THE REFUND STAYS CORRECT — the row was never asked, so
+                    #   charging it a wake would be a lie. What was missing is
+                    #   that the SILENCE is the defect, not the refusal.
+                    #
+                    # ⭐ WHY ONLY THIS ONE OF THE THREE ESCALATES. A draft and a
+                    #   choice prompt are OBSERVATIONS OF THE ROW: something is
+                    #   genuinely in front of it, waiting is the right answer,
+                    #   and the condition clears itself when the row moves on.
+                    #   An unreadable screen is an observation of OUR OWN
+                    #   INSTRUMENT, and it does not clear itself — if the verb
+                    #   the guard reads with is missing from the running build,
+                    #   it is unreadable on every tick from now until someone is
+                    #   told. So it is bounded in time and then escalated.
+                    #
+                    # ⛔ It still does NOT type. "Blind is not clear" remains the
+                    #   right rule for WRITING into a row; relaxing that is the
+                    #   owner's call and is logged for him, not taken here.
+                    if via == "refused-screen-unreadable":
+                        s["blind_skips"] = s.get("blind_skips", 0) + 1
+                        if s["blind_skips"] >= MAX_BOOTS and not s.get("blind_escalated"):
+                            rc = max(rc, 4)
+                            escalate(host, row,
+                                     f"screen unreadable for {s['blind_skips']} ticks "
+                                     f"({c['age']/60:.0f} min idle) — the guard cannot rule "
+                                     f"out a waiting prompt, so it will not boot this row. "
+                                     f"This is our instrument failing, not the row: check "
+                                     f"that the running build still exposes the screen-read "
+                                     f"verb. The row is NOT being woken by anything.")
+                            s["blind_escalated"] = True
+                            action = "SKIP:blind→ESCALATED"
+                    else:
+                        s["blind_skips"] = 0
                 else:
                     # Say WHICH door delivered it. A watchdog that reports
                     # "booted" without saying how cannot be debugged when it
