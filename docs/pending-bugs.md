@@ -562,6 +562,27 @@ distinguishes "between tool calls" from "finished". ⚠ This is the same defect 
 the parent-rate blindness one level down: both read an instantaneous value where
 the question is about a rate.
 
+⛔⛔ **AND THE POINT-SAMPLE FAILURE RECURS ON THE DERIVATIVE — "IT IS DECLINING"
+IS THE SAME MISTAKE ONE LEVEL UP.** Three CPU readings of the same process by two
+observers ran 0.078 → 0.051 → **0.091** cores. The first two invited "declining,
+therefore finishing"; the third refuted it. ⇒ **Three unsynchronised point
+measurements are not a trend line.** A monotone pair is persuasive precisely
+because it suggests a direction, and neither observer had a sampling protocol that
+could produce one. **A trend needs the same sample repeated under the same
+conditions**, not readings taken at different moments by different sessions.
+
+⚠ **And a live agent between calls is indistinguishable on EVERY instantaneous
+instrument.** The row's own demonstrably-live process measured **1.2 %** with no
+children in one external sample and 7.9 % in another. ⇒ Do not build a threshold
+on absolute CPU. Only **repeated sampling** and **transcript growth after the
+fact** separated live from residue at any point in this investigation.
+
+⭐ **SCOPE, AND IT IS GOOD NEWS: THE TWINNING IS THE DEPLOY, NOT THE RELAY.** A
+clean `--replace` handover reaps its predecessor outright and produces no twin —
+verified on a row whose three old pids were all gone afterwards. ⇒ The affected
+population is **bounded by daemon bumps and does not grow with ordinary campaign
+traffic**, so the sweep watches a closed set rather than a leak.
+
 ⛔⛔ **AND THAT PHRASE IS LITERAL — A ROW CANNOT TAKE THIS CONTROL OF ITSELF, AND
 TRYING PRODUCES A CONFIDENT WRONG ANSWER.** Attempted from inside at 19:30: the
 leftover read children on **0 of 6**, and the row's own process on **6 of 6** —
