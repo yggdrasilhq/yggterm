@@ -189,6 +189,52 @@ cluster, not a reason to assume they share a cause.
 missing arm is the same card rendered through an AGENT row. Run both, compare,
 and the answer is a picture rather than an argument.
 
+### ⭐ THE CONCRETE LEAD: ONE "SKIPPED AS REDUNDANT" BRANCH STARVES BOTH THE KEYBOARD AND THE VIEWPORT
+
+*Traced 2026-08-14 19:5x. This is a mechanism with a live trace event, not a
+hypothesis about a subsystem.*
+
+The session-only retained-rehydrate path takes an early `return` when the host is
+already live:
+
+```rust
+if retained_rehydrate_should_skip_before_read(mode, terminal_live_host_connected(),
+                                              terminal_retained_snapshot_staged()) {
+    append_trace_event(…, "retained_rehydrate_skipped_live_connected", …);
+    return;                      // ← no viewport seed
+}
+```
+
+⛔ **That is the SAME branch the input-gate defect named.** The comment on
+`INPUT_GATE_STUCK_RESTORE_AFTER_MS` says the readiness signal is lost precisely
+"when the mount that would have produced Ready is **skipped as redundant (the
+host is already live)**". ⇒ On that one path a session gets **neither input
+readiness nor a viewport seed**, and a plain shell never enters it at all. The
+keyboard half is fixed; **the paint half is not**, and the two were always the
+same branch.
+
+⇒ **A viewport that is not seeded shows whatever survived the reveal.** That is a
+mechanism for "the bottom paint is broken" that requires nothing to be wrong with
+the canvas, the GL stack, or Mesa — and it is session-only by construction.
+
+**Live counts on the desktop host, in the current trace generation:**
+
+| event | count | reading |
+|---|---|---|
+| `retained_rehydrate_skipped_live_connected` | **2** | the suspect branch, firing |
+| `retained_rehydrate_begin` / `…_daemon_ready_begin` | 6 / 8 | seeds that did run |
+| `retained_rehydrate_skipped_pre_resize` | **0** | the geometry fence is NOT firing now |
+| `attach_ready` | 270 | |
+
+⚠ **The zero is not a refutation.** An absence over one trace window supports
+nothing — this queue's own rule — and the fault is intermittent. The geometry
+fence stays a suspect; it is simply not the one caught in the act.
+
+**Next, and it is cheap:** correlate `retained_rehydrate_skipped_live_connected`
+against the moments a broken bottom paint is seen. If they coincide, the fix is to
+seed the viewport on that branch instead of returning — the same shape as giving
+the input gate a release, which is what the keyboard half needed.
+
 **Falsifier:** if a plain shell is ever seen with the bottom-paint or glyph fault,
 this reframe is wrong and the canvas attribution stands.
 
