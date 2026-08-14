@@ -1441,7 +1441,20 @@ attempt to attribute a death.
 
 ## ⛔⛔ [6.1] THE GUARD PROTECTING A PRESERVED PTY OWNER IS A HOST-SHARED FILE, SO A PEER CAN ERASE IT
 
-**Status:** OPEN — code-cited, not yet observed firing.
+**Status:** FIXED IN CODE (`544b11c0`) — LIVE PROOF OWED. ⚠ It ships in a daemon
+built from this commit; **the 15 daemons already running on dev keep the old
+behaviour and cannot be retrofitted**, so the live proof must come from a
+daemon born after the deploy, not from the current population.
+
+**Falsified by:** a `hot_restart_swap_queue_satisfied` event whose
+`target_source` is `queue_file` on a daemon whose entry a peer had already
+cleared (it should read `process_memory`), or any `SwapStep::Failed` taken by a
+process that has handed off. Both are now traced.
+
+*The same root cause as the non-terminating retire loop below — one host-shared
+single-slot file used as per-process state. Filed as two entries because the two
+consequences are independently serious: this one kills PTYs, that one multiplies
+daemons.*
 
 The safety property is stated outright at `crates/yggterm-server/src/daemon.rs`
 (the `SwapStep` doc comment):
@@ -1501,7 +1514,40 @@ settle-window verdict that **cannot read as success while `all_moved` is false.*
 
 ## ⛔ [6.1] THE SELF-RETIRE LOOP NEVER TERMINATES — A FRESH DAEMON EVERY ~5 MINUTES, INDEFINITELY
 
-**Status:** OPEN
+**Status:** FIXED IN CODE (`544b11c0`) — LIVE PROOF OWED.
+
+### The mechanism, settled
+
+The predecessor asks a **host-shared file** what **this process** did. The
+successor deletes that file the moment it recognises itself as satisfying the
+entry (`satisfied_by: "self"`, a second emitter of the same event name), which
+is routinely *before* the predecessor's next 20 s poll. The predecessor then
+reads "you never handed off", hands off again, and spawns another successor —
+which clears the file again.
+
+⭐ `HOT_RESTART_SWAP_LANE_SETTLED`'s own doc comment predicts this in words:
+*"reading its absence as 'nothing has happened yet' is how clearing the entry
+would make this daemon start asking for a brand-new swap on the very next poll,
+forever."* **The flag was correct and unreachable** — the only code that SET it
+ran inside `if let Some(queued)`, so a process whose entry had already been
+cleared could never get there. The guard against forgetting was reachable only
+through the thing that gets forgotten.
+
+**The fix:** remember the handoff target in the process that made it (keeping the
+highest ever asked for), evaluate convergence from either half, and answer the
+cold-shutdown guard from the same memory.
+
+⚠ **It ships in the daemon that does the retiring, so it stops FUTURE
+generations only.** The 14 legacy daemons already looping on dev run their own
+old code and will keep generating successors until they are drained. ⇒ **the
+drain is still required, and this fix is what stops the drained set from
+refilling.**
+
+**Falsified by:** the daemon population on a host growing across an hour with no
+deploy in it, measured as the row count of `server daemons`. ⛔ Do **not** try to
+measure this by counting distinct pids in the trace — `main_enter` is emitted by
+one-shot CLI invocations too, and that instrument reported 614 "daemons" in two
+hours on a host that had 15.
 
 `retire_trigger: "disk_binary_replaced"` is derived from `exe_link` reading
 `… (deleted)`, which stays true forever once the binary on disk is replaced. So
