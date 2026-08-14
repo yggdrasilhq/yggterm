@@ -724,6 +724,54 @@ Compare the md5 of the file the watcher process actually executes (resolve its c
 then the relative path from its command line) against the file on the default
 branch. Equal on every host, or this is open.
 
+## ⛔⛔ [6.7] THE HOURLY VISUAL CHECK CANNOT SEE THE CANVAS, WHICH IS THE ONLY THING IT IS FOR
+
+**Status:** OPEN
+
+⚠ The blindness is now REPORTED (shipped); it is not REMOVED.
+
+*measured 2026-08-14 17:30*
+
+Levels 2 and 3 of `scripts/usability-check.sh` exist to catch the three open
+render faults. All three live in the **xterm canvas**. The check asserted
+`capture_faithful == true` and passed.
+
+⛔ **`capture_faithful` DOES NOT MEAN "THE TERMINAL WAS CAPTURED".** It means
+*this frame is an honest picture of what was on screen*. With no session open
+the GUI shows the start page, the capture falls back to a compositor grab that
+never touches the canvas, and it still reports true:
+
+```
+active_session_path = null
+capture_backend     = linux_wayland_spectacle
+capture_faithful    = true      <- on a frame containing no terminal at all
+```
+
+⇒ **The hourly health check could go green on a frame where the canvas was never
+drawn** — structurally blind to the only surface it is meant to watch. ⚠ This is
+worse than the already-known *"levels 2/3 see only the ACTIVE row"*: with **no**
+active row it sees no terminal and still passes.
+
+**Shipped:** the check now derives `terminal_exercised` from `capture_backend`
+(only `xterm_canvas_composite*` draws the canvas), says
+*"THE CANVAS WAS NOT CAPTURED — the render faults are UNTESTED this tick, not
+absent"*, and its PASS line carries the same qualifier so a green tick cannot
+stand for a surface nobody looked at. ⭐ The backend alone decides;
+`active_session_path` is context only, because gating on a field that may be
+*absent* rather than null would invent a blindness that is not there.
+
+**Still open, and it is the harder half:** the check cannot *exercise* the canvas
+on its own. It captures whatever is on screen, and opening a session to force a
+terminal into view would take over the owner's viewport, which is forbidden.
+⇒ Wanted: a way to render a terminal surface for capture **without** stealing the
+foreground — an off-screen or shadow capture of a probe row's canvas. Level 4
+already creates a probe session, so the row exists; what is missing is drawing
+and capturing ITS canvas rather than whatever the user happens to be looking at.
+
+**Falsifier:** if a capture ever reports `xterm_canvas_composite*` while no
+terminal is on screen, the backend is not the right signal and this fix names the
+wrong discriminator.
+
 ## ⛔⛔⛔ [6.7] THE GUI SIGSEGVs IN THE GL COMPOSITING PATH, ~4x A DAY, AND NOTHING REPORTS IT
 
 **Status:** OPEN
