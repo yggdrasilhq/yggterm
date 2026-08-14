@@ -232,10 +232,29 @@ if c is None: c=(d.get("data") or {}).get("clients")
 sys.exit(0 if (c and len(c)>0) else 1)' 2>/dev/null
 }
 if ! has_gui; then
+  # ⛔⛔ THE CANDIDATE LIST WAS ALWAYS EMPTY, AND THE REASON IS A SWALLOWED
+  #    STDERR. `ygg()` ends every invocation with `2>/dev/null`, and the daemon
+  #    prints "candidates this daemon knows: …" on STDERR. So the old expansion
+  #      $(ygg server app rows 2>&1 | grep -oE 'candidates …')
+  #    redirected a stream that the function had ALREADY emptied, and matched
+  #    nothing — on every host, every time. Discovery could therefore only ever
+  #    succeed via $YGG_GUI_HOSTS, which is unset by default.
+  # ⇒ Reported 2026-08-14 by a sibling campaign: three passes in a row found no
+  #   host while `--host <the gui host>` worked every time, and two sessions ran
+  #   UNCLAIMED rather than guess. ⚠ My first reading of that report was "a
+  #   transient racing a GUI restart", and it was WRONG — the failure is
+  #   deterministic. The tell was that the report said *three passes in a row*;
+  #   a transient does not repeat on demand. Testing the binary by hand hid it,
+  #   because running the binary directly is not running it through `ygg()`.
+  # ⇒ Read the candidates from the BINARY with stderr merged, never through the
+  #   wrapper. Discovery runs before a host is known, so local is correct here.
+  ORIG_HOST="$HOST"
   found=""
-  for h in ${YGG_GUI_HOSTS:-} $(ygg server app rows 2>&1 | grep -oE 'candidates this daemon knows: [a-z0-9, ]+' | sed 's/.*: //; s/,//g'); do
+  for h in ${YGG_GUI_HOST:-} ${YGG_GUI_HOSTS:-} \
+           $("$BIN" server app rows 2>&1 | grep -oE 'candidates this daemon knows: [a-z0-9, ]+' | sed 's/.*: //; s/,//g'); do
     HOST="$h"; has_gui && { found=1; break; }
   done
+  [ -n "$found" ] || HOST="$ORIG_HOST"   # ⛔ never leave $HOST on the last failed candidate
   [ -n "$found" ] || { echo "ygg-claim: could not find a host with a live GUI client (set --host or \$YGG_GUI_HOST)" >&2; exit 2; }
 fi
 log "GUI host: ${HOST:-$(hostname)} (local binary $BIN)"

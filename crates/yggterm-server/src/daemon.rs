@@ -792,12 +792,288 @@ fn spawn_unix_client_handler(
     if let Err(error) = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
+            // ⭐ The measurement wraps the WHOLE closure, not `handle_request`.
+            // That is the entire point: the existing `PerfGuard` starts inside
+            // `handle_request` and drops when it returns, so the socket read,
+            // the request deserialise, the response serialise, the socket
+            // write and the thread's own teardown are all outside it. See
+            // [`ClientHandlerWindow`].
+            let started_cpu_us = thread_cpu_micros();
+            let started = std::time::Instant::now();
             let result = handle_unix_stream(stream, runtime, last_activity_ms);
             let _ = outcomes.send(result);
+            // ⭐ Both the closure's own delta AND the thread's LIFETIME total.
+            // The difference is what the thread cost before its closure began —
+            // stack setup and entry — which a closure-delta span cannot see and
+            // which a process-counter subtraction attributes without measuring.
+            // A note this file has carried says thread spawn is ~50 µs; this is
+            // the field that can check it rather than assume it.
+            let ended_cpu_us = thread_cpu_micros();
+            record_client_handler_cost(
+                ended_cpu_us.saturating_sub(started_cpu_us),
+                started.elapsed().as_micros() as u64,
+                ended_cpu_us,
+            );
         })
     {
         warn!(error=%error, "failed to spawn daemon client handler");
     }
+}
+
+/// How often the connection-handler cost aggregate is emitted. Flushed
+/// **lazily, by the next handler to finish** — never by a timer, for the same
+/// reason as every other window in this file: a thread waking to check whether
+/// it should flush is the idle cost this work exists to remove.
+const CLIENT_HANDLER_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What one connection handler costs **in CPU, end to end** — the span nothing
+/// was measuring.
+///
+/// ⛔ **Why the existing instrument cannot see this.** `handle_request`'s
+/// `PerfGuard` (a) starts *after* the socket read and the request deserialise
+/// and drops *before* the response serialise, the socket write and the thread's
+/// teardown, and (b) records **wall** time. A handler measured at ~2.4 ms of
+/// guarded wall has been measured at **25 ms of thread CPU**, and the missing
+/// 22 ms is where the daemon population's cost has been hiding — not because it
+/// was hard to find, but because no instrument was pointed at it.
+///
+/// **Two clocks, each used only where it is valid, and this is deliberate:**
+///
+/// - **Per-handler total: `CLOCK_THREAD_CPUTIME_ID`**, nanosecond-resolution.
+/// - **User/kernel split: `/proc/thread-self/stat` fields 14/15**, which are in
+///   `CLK_TCK` units — **10 ms granularity on this host**. ⛔ A single 0.7 ms
+///   handler therefore reads **zero ticks**, which is exactly the
+///   "field too coarse for its quantity" failure this campaign has already paid
+///   for once. It is only summed **across a whole window**, where hundreds of
+///   handlers make the ratio meaningful, and it is reported as a share rather
+///   than as a per-handler value. ⇒ Never read `user_ticks`/`kernel_ticks` off a
+///   short window.
+///
+/// ⚠ The split is read **once, at the end**, not differenced: the thread is
+/// spawned for this connection and has by construction accumulated no whole
+/// tick before its closure begins. That halves the instrument's own cost, which
+/// is ~10 µs of `/proc` read against a handler the prediction puts at
+/// 0.7–25 ms.
+#[derive(Debug, Default, Clone)]
+struct ClientHandlerStats {
+    handled: u64,
+    cpu_us_total: u64,
+    cpu_us_max: u64,
+    wall_us_total: u64,
+    wall_us_max: u64,
+    /// The thread's whole life, closure plus everything before it.
+    thread_total_cpu_us: u64,
+    user_us: u64,
+    kernel_us: u64,
+    split_samples: u64,
+}
+
+#[derive(Debug, Default)]
+struct ClientHandlerWindow {
+    opened: Option<std::time::Instant>,
+    opened_proc_cpu_us: u64,
+    by_request: BTreeMap<&'static str, ClientHandlerStats>,
+    /// The accept loop's OWN cost per connection — see
+    /// [`record_accept_spawn_cost`]. Kept in the same window so the two halves
+    /// of a connection are read off one record and cannot be paired across
+    /// different moments.
+    accept_spawn_count: u64,
+    accept_spawn_us_total: u64,
+    accept_spawn_us_max: u64,
+}
+
+/// What the accept loop spends handing one connection to a thread.
+///
+/// ⚠ This is the PARENT half. `clone()` charges most of a thread's creation to
+/// the caller, so a child-side span cannot see it.
+///
+/// ⛔ **It was built to look for a ~1.7 ms per-connection gap, and it refuted
+/// it.** Measured: **44–48 µs**, flat across row counts, with the count matching
+/// the handler count exactly. With the child's 39–55 µs pre-closure and a
+/// 61–126 µs do-nothing closure, the whole per-connection floor is
+/// **≈150–230 µs**. The 1.7 ms came from subtracting a closure span from a
+/// process counter that was charging concurrent background work to whatever
+/// connection happened to be open — **a difference of two instruments is not a
+/// measurement.**
+fn record_accept_spawn_cost(cpu_us: u64) {
+    let Ok(mut window) = CLIENT_HANDLER_WINDOW.lock() else {
+        return;
+    };
+    window.accept_spawn_count += 1;
+    window.accept_spawn_us_total += cpu_us;
+    window.accept_spawn_us_max = window.accept_spawn_us_max.max(cpu_us);
+}
+
+thread_local! {
+    /// The verb this handler thread served, stashed by `handle_request` so the
+    /// closure that wraps it can attribute its cost.
+    ///
+    /// ⛔ **Without this the aggregate is a mean over a MIXED verb population,
+    /// and it reads low.** The first run had `conns/s = 77` against
+    /// `replies/s = 51` — the extra connections were `ping` and `daemons` calls
+    /// from the harness itself, and averaging them in dragged the handler mean
+    /// *below* the cost of the `status` payload build it contains, which is
+    /// impossible and was the tell. A thread-local costs no lock and needs no
+    /// plumbing: same thread, written before the response is sent, read after.
+    static HANDLER_REQUEST_NAME: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+static CLIENT_HANDLER_WINDOW: LazyLock<Mutex<ClientHandlerWindow>> =
+    LazyLock::new(|| Mutex::new(ClientHandlerWindow::default()));
+
+/// The daemon's own home, resolved once.
+///
+/// ⛔ Deliberately NOT taken from the runtime: reaching for `DaemonRuntime` here
+/// would lock the global mutex on **every connection**, which is the contention
+/// this instrument exists to measure. An instrument that changes the quantity it
+/// reports is worse than none.
+static TRACE_HOME_DIR: LazyLock<Option<PathBuf>> =
+    LazyLock::new(|| yggterm_core::resolve_yggterm_home().ok());
+
+/// This thread's user and kernel time, in **microseconds**.
+///
+/// ⛔ **The obvious source is `/proc/thread-self/stat` fields 14/15, and it
+/// reports zero here — I shipped that version and it did.** Those fields are in
+/// `CLK_TCK` units, 10 ms on this host, and **every** connection handler is
+/// shorter than one tick, so each read truncated to 0. ⚠ The reasoning that
+/// justified it — *"summed across a window, hundreds of handlers make it
+/// meaningful"* — is wrong, and wrong in a way worth naming: **truncation is
+/// applied to each sample before the sum, so it does not average out. A sum of
+/// floors is not the floor of a sum.** The first live run read
+/// `ticks=0, kernel_share=n/a` across ~26,500 handlers carrying ~2.5 s of CPU.
+///
+/// `getrusage(RUSAGE_THREAD)` answers the same question at **microsecond**
+/// resolution, per thread, with the user/kernel split intact — which is the
+/// whole point, since the claim under test is that this path is ~94% kernel.
+#[cfg(target_os = "linux")]
+fn thread_cpu_split_micros() -> Option<(u64, u64)> {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is a valid, zeroed `rusage` we own; `RUSAGE_THREAD` is a
+    // compile-time constant.
+    if unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) } != 0 {
+        return None;
+    }
+    let to_us = |t: libc::timeval| (t.tv_sec as u64) * 1_000_000 + (t.tv_usec as u64);
+    Some((to_us(usage.ru_utime), to_us(usage.ru_stime)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_cpu_split_micros() -> Option<(u64, u64)> {
+    None
+}
+
+fn record_client_handler_cost(cpu_us: u64, wall_us: u64, thread_total_cpu_us: u64) {
+    let split = thread_cpu_split_micros();
+    let request_name = HANDLER_REQUEST_NAME.with(|name| name.take()).unwrap_or("unread");
+    let proc_cpu_us = process_cpu_micros();
+    let now = std::time::Instant::now();
+    let flush = {
+        let Ok(mut window) = CLIENT_HANDLER_WINDOW.lock() else {
+            return;
+        };
+        if window.opened.is_none() {
+            window.opened = Some(now);
+            window.opened_proc_cpu_us = proc_cpu_us;
+        }
+        let stats = window.by_request.entry(request_name).or_default();
+        stats.handled += 1;
+        stats.cpu_us_total += cpu_us;
+        stats.cpu_us_max = stats.cpu_us_max.max(cpu_us);
+        stats.wall_us_total += wall_us;
+        stats.wall_us_max = stats.wall_us_max.max(wall_us);
+        stats.thread_total_cpu_us += thread_total_cpu_us;
+        if let Some((user_us, kernel_us)) = split {
+            stats.user_us += user_us;
+            stats.kernel_us += kernel_us;
+            stats.split_samples += 1;
+        }
+        let elapsed = now.duration_since(window.opened.unwrap_or(now));
+        if elapsed < CLIENT_HANDLER_FLUSH_INTERVAL {
+            None
+        } else {
+            let emitted = std::mem::take(&mut window.by_request);
+            let accept = (
+                window.accept_spawn_count,
+                window.accept_spawn_us_total,
+                window.accept_spawn_us_max,
+            );
+            window.accept_spawn_count = 0;
+            window.accept_spawn_us_total = 0;
+            window.accept_spawn_us_max = 0;
+            window.opened = Some(now);
+            let previous_proc_cpu_us = window.opened_proc_cpu_us;
+            window.opened_proc_cpu_us = proc_cpu_us;
+            Some((
+                elapsed,
+                proc_cpu_us.saturating_sub(previous_proc_cpu_us),
+                emitted,
+                accept,
+            ))
+        }
+    };
+    let Some((elapsed, proc_cpu_us_delta, emitted, accept)) = flush else {
+        return;
+    };
+    let (accept_count, accept_us_total, accept_us_max) = accept;
+    let Some(home) = TRACE_HOME_DIR.as_ref() else {
+        return;
+    };
+    let window_ms = elapsed.as_millis().max(1) as u64;
+    let requests = emitted
+        .iter()
+        .map(|(name, stats)| {
+            let split_total = stats.user_us + stats.kernel_us;
+            (
+                (*name).to_string(),
+                serde_json::json!({
+                    "handled": stats.handled,
+                    "cpu_us_total": stats.cpu_us_total,
+                    "cpu_us_mean": stats.cpu_us_total / stats.handled.max(1),
+                    "cpu_us_max": stats.cpu_us_max,
+                    "wall_us_mean": stats.wall_us_total / stats.handled.max(1),
+                    "wall_us_max": stats.wall_us_max,
+                    // ⭐ Thread lifetime, not closure. The gap between this and
+                    // `cpu_us_mean` is the thread's pre-closure cost, measured.
+                    "thread_cpu_us_mean": stats.thread_total_cpu_us / stats.handled.max(1),
+                    // ⚠ A WINDOW share. Per handler it would be a ratio of two
+                    // microsecond figures on a sub-millisecond span, which is a
+                    // precision this does not have.
+                    "kernel_share": if split_total == 0 {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(stats.kernel_us as f64 / split_total as f64)
+                    },
+                    "kernel_us_total": stats.kernel_us,
+                    "user_us_total": stats.user_us,
+                    "split_samples": stats.split_samples,
+                    "handlers_per_s": stats.handled as f64 * 1000.0 / window_ms as f64,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let handled: u64 = emitted.values().map(|stats| stats.handled).sum();
+    let cpu_us_total: u64 = emitted.values().map(|stats| stats.cpu_us_total).sum();
+    append_trace_event(
+        home,
+        "daemon",
+        "perf",
+        "client_handler_cost",
+        serde_json::json!({
+            "window_ms": window_ms,
+            "handled": handled,
+            "cpu_us_total": cpu_us_total,
+            "proc_cpu_us_delta": proc_cpu_us_delta,
+            "handlers_per_s": handled as f64 * 1000.0 / window_ms as f64,
+            // The accept loop's own half of a connection, from the same window.
+            "accept_spawn_count": accept_count,
+            "accept_spawn_us_mean": accept_us_total / accept_count.max(1),
+            "accept_spawn_us_max": accept_us_max,
+            // ⛔ Per VERB. A single mean over every connection mixes a `ping`
+            // with a `status` carrying 264 rows, and reads low.
+            "requests": requests,
+        }),
+    );
 }
 
 #[cfg(unix)]
@@ -4209,7 +4485,66 @@ impl DaemonRuntime {
         flags
     }
 
+    /// Build the status reply, **and record what building it cost.**
+    ///
+    /// See [`StatusCostWindow`] for why this path needed its own counter rather
+    /// than the `PerfGuard` that already wraps every request: that guard drops
+    /// 98% of sub-8 ms `status` spans, and it drops them in a row-correlated
+    /// way, so the set it keeps cannot be read as the population.
     fn status(&self) -> ServerRuntimeStatus {
+        let started_cpu_us = thread_cpu_micros();
+        let started = std::time::Instant::now();
+        let payload = self.status_payload();
+        let cpu_us = thread_cpu_micros().saturating_sub(started_cpu_us);
+        let wall_us = started.elapsed().as_micros() as u64;
+        // Rows as the daemon listing counts them, so a reading pairs against the
+        // ROWS column a human sees rather than a second definition of "row".
+        let rows = payload.live_terminal_sessions.len() as u64;
+        let stored_rows = payload.stored_terminal_session_count as u64;
+        let flush = STATUS_COST_WINDOW.lock().ok().and_then(|mut window| {
+            record_status_cost(
+                &mut window,
+                std::time::Instant::now(),
+                process_cpu_micros(),
+                cpu_us,
+                wall_us,
+                rows,
+                stored_rows,
+            )
+        });
+        if let Some(flush) = flush {
+            let emitted = &flush.window;
+            let elapsed_us = flush.elapsed.as_micros().max(1) as u64;
+            append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "perf",
+                "status_cost",
+                serde_json::json!({
+                    "window_ms": flush.elapsed.as_millis() as u64,
+                    "replies": emitted.replies,
+                    // CPU, not wall — both are carried so the gap between them
+                    // (lock waits, descheduling) is visible instead of implied.
+                    "cpu_us_total": emitted.cpu_us_total,
+                    "cpu_us_mean": emitted.cpu_us_total / emitted.replies.max(1),
+                    "cpu_us_max": emitted.cpu_us_max,
+                    "wall_us_total": emitted.wall_us_total,
+                    "wall_us_mean": emitted.wall_us_total / emitted.replies.max(1),
+                    "rows_mean": emitted.rows_total / emitted.replies.max(1),
+                    "rows_last": emitted.rows_last,
+                    "stored_rows_last": emitted.stored_rows_last,
+                    // The denominator, from the same window, so the SHARE is a
+                    // property of one record and not of two measurements a
+                    // reader has to divide and hope were taken together.
+                    "proc_cpu_us_delta": flush.proc_cpu_us_delta,
+                    "replies_per_s": emitted.replies as f64 * 1_000_000.0 / elapsed_us as f64,
+                }),
+            );
+        }
+        payload
+    }
+
+    fn status_payload(&self) -> ServerRuntimeStatus {
         let terminal_stats = self.terminals.stats();
         let payload_stats = self.server.payload_stats();
         let preserved_owner_keys = self.preserved_terminal_owner_keys();
@@ -4226,7 +4561,11 @@ impl DaemonRuntime {
         // successor that had to clear its own file can adopt them from us rather
         // than from the file. No mirrored filter — `persisted_state()` IS the
         // filter, so the wire and the file cannot drift apart.
-        let live_terminal_sessions = self.server.persisted_state().live_sessions;
+        // ⚠ `persisted_live_sessions()`, not `persisted_state().live_sessions`
+        // — the same rows by the same filter, without also building the stored
+        // list a second time, sorting every PTY grid, and cloning the machine
+        // table only to drop them. Same wire, less work; see that method.
+        let live_terminal_sessions = self.server.persisted_live_sessions();
         let owned_terminal_session_keys = self.terminals.session_keys();
         let mut terminal_session_keys = owned_terminal_session_keys.clone();
         terminal_session_keys.extend(preserved_owner_keys.iter().cloned());
@@ -7828,6 +8167,10 @@ impl DaemonRuntime {
         // prune (cheap; usually empty).
         self.drain_pending_preserved_owner_removals();
         let request_name = server_request_name(&request);
+        // Hand the verb to the connection-handler cost aggregate, which wraps
+        // this call and cannot know the name any other way — the request has
+        // not been read yet when its thread starts.
+        HANDLER_REQUEST_NAME.with(|name| name.set(Some(request_name)));
         // App profiling system: time every daemon request, tagged by name, so
         // `server perf-summary` surfaces the slow ones (the switch path is `terminal_ensure`).
         // Drop-based so `?` early returns and panics still record. No-op when the
@@ -17842,11 +18185,26 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             }
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // ⭐ THE PARENT SIDE OF A CONNECTION, MEASURED RATHER THAN
+                    // INFERRED. The handler span covers the child thread; this
+                    // covers what the accept loop itself spends per connection —
+                    // the `clone()`, the argument clones, the channel sender.
+                    // It was previously only reachable as a DIFFERENCE between a
+                    // closure span and a process counter, which is the shape
+                    // this lane keeps getting wrong, and which is unmeasurable
+                    // on a live daemon anyway: an external estimator needs a
+                    // stationary baseline, and a live daemon's baseline drifts
+                    // faster than this signal — substantially because the
+                    // measurer's own load generator is part of it.
+                    let spawn_started_cpu_us = thread_cpu_micros();
                     spawn_unix_client_handler(
                         stream,
                         runtime.clone(),
                         last_activity_ms.clone(),
                         client_outcome_tx.clone(),
+                    );
+                    record_accept_spawn_cost(
+                        thread_cpu_micros().saturating_sub(spawn_started_cpu_us),
                     );
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -18135,6 +18493,137 @@ fn record_lock_wait(
     }
     window.opened = Some(now);
     Some((elapsed, std::mem::take(&mut window.by_request)))
+}
+
+/// How often the `status` cost aggregate is emitted. Flushed **lazily, by the
+/// next reply** — same rule as the lock-wait window above, and for the same
+/// reason: a thread waking to check whether it should flush is precisely the
+/// idle cost this lane exists to remove.
+const STATUS_COST_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// CPU consumed by the calling thread, microseconds.
+///
+/// ⚠ Priced on this host before being used, because the fleet spread on this
+/// call is 45.8x and a probe can cost more than the thing it measures:
+/// `CLOCK_THREAD_CPUTIME_ID` is **578 ns** here (a real syscall) against
+/// **26.7 ns** for `CLOCK_MONOTONIC` (vDSO, `tsc`). Two calls per reply at the
+/// measured 3.4–4.2 replies/s is ~4 µs/s — 0.000004 cores — so the instrument
+/// is four orders of magnitude below the ~2.5 ms it is measuring.
+fn thread_cpu_micros() -> u64 {
+    cpu_clock_micros(libc::CLOCK_THREAD_CPUTIME_ID)
+}
+
+/// CPU consumed by every thread of this process, microseconds — **including
+/// threads that have already exited.**
+///
+/// That last part is the whole point of using this rather than summing live
+/// threads: this daemon spawns one OS thread per connection and lets it die, so
+/// an instrument that can only see live threads reports a fraction of the work.
+fn process_cpu_micros() -> u64 {
+    cpu_clock_micros(libc::CLOCK_PROCESS_CPUTIME_ID)
+}
+
+fn cpu_clock_micros(clock: libc::clockid_t) -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, fully initialised `timespec` we own, and the
+    // clock ids used are compile-time constants.
+    if unsafe { libc::clock_gettime(clock, &mut ts) } != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(ts.tv_nsec as u64 / 1_000)
+}
+
+/// What one `status` reply actually costs, measured directly and **sampled not
+/// at all.**
+///
+/// ⛔ **Why the existing instrument could not answer this.** `handle_request`
+/// wraps every request in a [`yggterm_core::PerfGuard`], but
+/// `("daemon_request", "status")` is on `perf_span_is_high_frequency_noise`'s
+/// list, so a span is written only when it ran **≥ 8 ms** *or* wins a **1-in-50**
+/// sample. Over one live `perf-telemetry.jsonl`: 5,604 sub-floor records (each
+/// standing for ~50 replies) and 2,769 tail records (each standing for one) —
+/// the recorded set is **33% tail against a true tail of 0.98%, an enrichment of
+/// ~34x**. ⛔ And the enrichment is *row-correlated*: the 243–246-row daemons
+/// showed 13.5–16.8% of their records above the floor where the 70–101-row
+/// daemons showed 3.5–7.6%, because more rows push more replies past 8 ms. So it
+/// does **not** cancel in a between-daemon comparison, which is what a mean read
+/// off that set was assumed to do. Re-fitting the same daemons with each record
+/// inverse-probability weighted moved the per-row slope from **10.2 µs/row to
+/// 4.7 µs/row**. Hence a counter that samples nothing.
+///
+/// ⚠ And it records **CPU**, not wall. Every other `duration_ms` in this system
+/// is wall time between two `Instant`s; a cost model that wants cores needs the
+/// CPU actually burned, and wall time over-reads it whenever the handler was
+/// descheduled or parked on the runtime lock — which happens here, `status` has
+/// been observed waiting 3.0 s for that lock.
+#[derive(Debug, Default)]
+struct StatusCostWindow {
+    opened: Option<std::time::Instant>,
+    /// Process CPU when the window opened, so the flush can report the SHARE —
+    /// `cpu_us_total / proc_cpu_us_delta` — instead of a bare rate that only
+    /// means something next to a separately-measured denominator.
+    opened_proc_cpu_us: u64,
+    replies: u64,
+    cpu_us_total: u64,
+    cpu_us_max: u64,
+    wall_us_total: u64,
+    /// Σ rows over the window's replies. Carried as a sum rather than a snapshot
+    /// so the reader can pair mean CPU against mean ROWS without assuming the
+    /// row count held still across the minute.
+    rows_total: u64,
+    rows_last: u64,
+    stored_rows_last: u64,
+}
+
+static STATUS_COST_WINDOW: LazyLock<Mutex<StatusCostWindow>> =
+    LazyLock::new(|| Mutex::new(StatusCostWindow::default()));
+
+/// One emitted `status` cost window: what the flushing reply should write.
+struct StatusCostFlush {
+    elapsed: std::time::Duration,
+    proc_cpu_us_delta: u64,
+    window: StatusCostWindow,
+}
+
+/// Fold one reply into the open window, and hand back a window to emit if this
+/// reply closed it.
+fn record_status_cost(
+    window: &mut StatusCostWindow,
+    now: std::time::Instant,
+    proc_cpu_us: u64,
+    cpu_us: u64,
+    wall_us: u64,
+    rows: u64,
+    stored_rows: u64,
+) -> Option<StatusCostFlush> {
+    if window.opened.is_none() {
+        window.opened = Some(now);
+        window.opened_proc_cpu_us = proc_cpu_us;
+    }
+    window.replies += 1;
+    window.cpu_us_total += cpu_us;
+    window.cpu_us_max = window.cpu_us_max.max(cpu_us);
+    window.wall_us_total += wall_us;
+    window.rows_total += rows;
+    window.rows_last = rows;
+    window.stored_rows_last = stored_rows;
+    let elapsed = now.duration_since(window.opened.unwrap_or(now));
+    if elapsed < STATUS_COST_FLUSH_INTERVAL {
+        return None;
+    }
+    let emitted = std::mem::take(window);
+    window.opened = Some(now);
+    window.opened_proc_cpu_us = proc_cpu_us;
+    Some(StatusCostFlush {
+        elapsed,
+        proc_cpu_us_delta: proc_cpu_us.saturating_sub(emitted.opened_proc_cpu_us),
+        window: emitted,
+    })
 }
 
 /// Acquire the runtime lock **for a client request, measuring the wait.**

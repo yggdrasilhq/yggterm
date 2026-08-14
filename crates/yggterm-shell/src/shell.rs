@@ -187660,6 +187660,69 @@ Shared connection to 192.0.2.14 closed.\r\n";
         }
     }
 
+    /// ⛔ THE LIVE-RAIL COPY COMES FIRST, AND ~150 LOOKUPS DEPEND ON IT.
+    ///
+    /// Dual presence means one session owns TWO rows sharing one `full_path` —
+    /// deliberately, because that path is the SESSION's identity. So a
+    /// `find(|row| row.full_path == …)` cannot express which ROW it wants, and
+    /// what it silently gets is the first match. That is correct today only
+    /// because `push_live_session_rows` runs before the stored rows are
+    /// extended in, which is an ORDER, not a stated rule — and it has already
+    /// misfired once, when a force-expanded list handed `resolve_app_control_row`
+    /// the cwd-tree copy, which heads no set, and `row-expanded` began refusing.
+    ///
+    /// This pins the order so the resolvers' assumption is a contract. ⚠ It is
+    /// deliberately NOT a de-duplication: removing a copy is the regression this
+    /// lane just took out of the cwd tree, and `AGENTS.md` calls it a spec
+    /// violation in as many words.
+    #[test]
+    fn the_live_rail_copy_of_a_dual_present_session_is_the_one_a_path_lookup_finds() {
+        let cwd = "/home/user";
+        let uuid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let live_path = format!("local://{uuid}");
+        let session = live_local_session_fixture("one", uuid, cwd);
+        let live_sessions = vec![session];
+        let stored = vec![cwd_group_fixture("local", 0), cwd_group_fixture(cwd, 1)];
+
+        let rows = merged_sidebar_rows_uncached(
+            &stored,
+            &[],
+            &[],
+            &[],
+            &live_sessions,
+            &HashSet::from(["__live_sessions__".to_string()]),
+            &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
+        );
+
+        let hits: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.full_path == live_path)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            2,
+            "the fixture must actually be dual-present, or this test pins nothing"
+        );
+
+        let local_group_at = rows
+            .iter()
+            .position(|row| row.full_path == "local")
+            .expect("the local cwd root");
+        assert!(
+            hits[0] < local_group_at,
+            "the FIRST copy must be the Live Sessions one — every `find` by \
+             full_path resolves to it, so a tree-first order would silently \
+             re-point ~150 lookups at a row that heads no set"
+        );
+        assert!(
+            hits[1] > local_group_at,
+            "and the second copy is the cwd-tree one, inside the tree"
+        );
+    }
+
     // XTERM-BUG: idle-auto-webview (Bug7) — coerce an EMPTY Rendered webview to Terminal
     // for a live terminal session (the auto/background re-assertion), but leave a Rendered
     // surface with real content (the in-development codex web view) and non-live sessions alone.
