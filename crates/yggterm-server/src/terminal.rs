@@ -1203,6 +1203,19 @@ impl TerminalManager {
         session.write(data)
     }
 
+    /// Write text THIS DAEMON authored — a readiness probe, its line-clear, or a
+    /// repair's own prompt. ⛔ Use this and never `write` for daemon-authored
+    /// text: `write` reconstructs the human's unsent-draft flag from whatever
+    /// passes through it, so a probe sent that way is recorded as a person
+    /// typing and the next draft check refuses on the probe's own marker.
+    pub fn write_daemon_originated(&self, key: &str, data: &str) -> Result<()> {
+        let session = self
+            .sessions
+            .get(key)
+            .with_context(|| format!("terminal session not found: {key}"))?;
+        session.write_daemon_originated(data)
+    }
+
     /// Readiness-gated prompt insertion — the robustness contract behind agent /
     /// automation prompt insertion (timer-fired prompts must never land in a
     /// menu / busy / onboarding / update surface and do the wrong thing). Poll the
@@ -1261,7 +1274,11 @@ impl TerminalManager {
         timeout: Duration,
     ) -> Result<PromptSubmitOutcome> {
         submit_prompt_echo_verified_with(
-            |text| self.write(key, text),
+            // ⛔ NOT `self.write`: every write below is this daemon's own — the
+            //    probe marker, its Ctrl+U, and the prompt — and `write` would
+            //    record them as a human's unsent draft, which the very next
+            //    draft check reads back as a person typing.
+            |text| self.write_daemon_originated(key, text),
             || self.session_screen_snapshot(key),
             || self.session_has_pending_input_draft(key),
             data,
@@ -3240,7 +3257,6 @@ impl PtySessionRuntime {
         if data.is_empty() {
             return Ok(());
         }
-        self.last_activity_ms.store(now_millis(), Ordering::SeqCst);
         // Reconstruct the sticky "unsent draft on the current line" flag from
         // the forwarded input. This is the ONLY input path the client drives;
         // daemon-internal protocol auto-responses (DA/DSR replies) bypass it,
@@ -3250,6 +3266,34 @@ impl PtySessionRuntime {
         if next_draft != prev_draft {
             self.pending_input_draft.store(next_draft, Ordering::SeqCst);
         }
+        self.write_daemon_originated(data)
+    }
+
+    /// A write THIS DAEMON authored, which must not be mistaken for a human's.
+    ///
+    /// ⛔⛔ THE READINESS PROBE WAS BEING COUNTED AS THE HUMAN IT PROTECTS.
+    /// `pending_input_draft` is reconstructed from whatever goes through
+    /// `write`, and the echo-verified submit writes its marker through that same
+    /// `write` — so the probe set the flag, slept 180 ms, read the flag it had
+    /// just set, and refused its own submit with `HumanTyping { waited_ms: 180 }`.
+    /// The number was the mechanism's signature: 180 ms is `PROBE_SETTLE`.
+    ///
+    /// ⚠ It bit exactly where echo-verification exists to help. When the CLI is
+    /// already consuming input the marker echoes and the submit completes before
+    /// the check, so healthy rows kept working; what broke is the composer that
+    /// has drawn its prompt but is not yet reading — the first retry aborts, so a
+    /// slow-starting composer can never be waited out, which is the original
+    /// "prompt shown before the input loop is live" bug left unprotected again.
+    ///
+    /// ⇒ The exemption is the one the comment above already describes for DA/DSR
+    /// auto-responses, applied to the other writes this daemon authors. It
+    /// changes only who may SET the flag; every reader still refuses on a real
+    /// human draft, which is what the probe must never type over.
+    fn write_daemon_originated(&self, data: &str) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.last_activity_ms.store(now_millis(), Ordering::SeqCst);
         enqueue_terminal_write(
             &self.writer_tx,
             &self.key,
