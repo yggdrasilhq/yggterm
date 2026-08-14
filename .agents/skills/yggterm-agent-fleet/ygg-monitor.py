@@ -501,6 +501,19 @@ def cmd_normalize(a):
     across three other campaigns (2.x, 3.x, 9.x) were carrying them, every one
     backfilled by an orchestrator that had quoted its own board. The display was
     hiding a fleet-wide defect, not a one-row slip."""
+    fixed, unresolved, scanned = _normalize_pointers(a.dry_run, quiet=False)
+    log(f"normalize: {len(fixed)} expanded, {len(unresolved)} unresolved, "
+        f"{scanned} subscription(s) scanned")
+    return 0
+
+
+def _normalize_pointers(dry, quiet=True):
+    """Expand every short `escalate_to`. Shared by the verb and the tick.
+
+    ⛔ ONE IMPLEMENTATION, because two would be the second encoding this whole
+    fix exists to remove. `quiet` only suppresses the no-op chatter of a
+    background tick — a repair is always logged, or the plane heals silently and
+    nobody learns their brief is teaching lanes to write stubs."""
     known = [p.stem for p in SUBS.glob("*.json")]
     fixed, unresolved = [], []
     for s in load_subs():
@@ -512,17 +525,17 @@ def cmd_normalize(a):
             unresolved.append(f"{s['uuid'][:8]}(seat {s.get('seat') or '-'}) -> "
                               f"{to} matches {len(hits)} subscriptions")
             continue
-        if not a.dry_run:
+        if not dry:
             s["escalate_to"] = hits[0]
             sub_path(s["uuid"]).write_text(json.dumps(s, indent=1))
         fixed.append(f"{s['uuid'][:8]}(seat {s.get('seat') or '-'}) {to} -> {hits[0][:8]}…")
     for x in fixed:
-        log(f"  {'DRY would expand' if a.dry_run else 'expanded'} {x}")
+        log(f"  {'DRY would expand' if dry else 'expanded'} {x}")
     for x in unresolved:
         log(f"  ⚠ LEFT ALONE — {x}")
-    log(f"normalize: {len(fixed)} expanded, {len(unresolved)} unresolved, "
-        f"{len(known)} subscription(s) scanned")
-    return 0
+    if not quiet and not fixed and not unresolved:
+        pass  # the summary line the caller prints says it
+    return fixed, unresolved, len(known)
 
 
 def cmd_unsubscribe(a):
@@ -1065,6 +1078,24 @@ def tick(a):
     # ⛔ Resolve ONCE, out loud. An unresolved host is not a quiet default —
     # it is a blind tick, and every verb below must know that before it runs.
     a.gui_host = resolve_gui_host(a.gui_host)
+    # ⛔⛔ REPAIR THE POINTERS HERE, BECAUSE THE TOOL FIX CANNOT REACH WHERE THEY
+    # ARE MADE. A short `escalate_to` is produced in PROSE — an orchestrator
+    # quotes eight characters into a brief because eight is what the board prints
+    # — and written by a LANE, from that lane's own checkout of this file. So the
+    # normalisation added to `subscribe` only helps lanes that have rebased since
+    # it landed, and the ones that have not are exactly the ones still copying old
+    # briefs.
+    #
+    # Measured 2026-08-14, one hour after fixing the comparison: seat 6.0 sent 6.7
+    # a message reading "(459e6b63)", 6.7 re-subscribed with it three minutes
+    # later from a worktree two hours behind the fix, and the stub was back. The
+    # orchestrator reproduced the defect class it had just closed, by its original
+    # mechanism, while holding the fix.
+    #
+    # ⇒ There is ONE watcher and there are N lane checkouts. Repair from the one.
+    #   Idempotent, expands only unambiguous prefixes, silent when there is
+    #   nothing to do.
+    _normalize_pointers(a.dry_run)
     prune_dead(a.gui_host, load_subs(), a.dry_run)
     seat_audit(a.gui_host, load_subs(), a.dry_run)
     # ⛔ Runs over PARKED and PINNED rows too — a hold silences a verdict, not an
