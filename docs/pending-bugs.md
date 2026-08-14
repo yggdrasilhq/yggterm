@@ -10647,6 +10647,28 @@ read-only draft sweep built the same day for an unrelated reason (the 3.0.155
 hold). The row was **armed, `boots=0`, and holding an unsent line** — i.e.
 already in the silent-skip state, and invisible by every other instrument.
 
+⛔⛔⛔ **AND THE OBVIOUS REMEDY IS THE ONE THING THIS PROJECT FORBIDS. A SINGLE
+`drafts_present` SIGHTING DOES NOT MEAN STALLED — IT MOST OFTEN MEANS SOMEONE IS
+TYPING RIGHT NOW.** The flag is `True` for exactly as long as a human is
+composing, so **at one sample a transient draft is indistinguishable from an
+abandoned one** — and the rows that flag most often are the rows a person is
+actively talking to, i.e. **the detector's positives are biased towards the rows
+where acting is most dangerous.**
+
+⇒ ⛔ *"Submit or clear whatever is in your composer"* is sound advice for an
+unattended delegate and is **an instruction to type over a human** on an attended
+one: clear destroys a half-written sentence, submit sends the fragment as their
+turn. **This is the `never-arm.tsv` reasoning one level out** — that file stops
+the BOOTER typing into an attended row, and this advice has an agent perform the
+same act by hand, with the guard file never consulted **because the actor is not
+the booter.** ⇒ **Exempt `never-arm.tsv` rows from the ADVICE as well as from the
+arming.**
+
+⭐ **THE RULE, so a sighting means something: flag only when `has_pending_draft`
+is True across TWO sweeps separated by minutes AND the transcript has not grown
+between them.** One sample means *someone may be mid-sentence*; two samples with
+no transcript growth means *stalled*.
+
 ⇒ **Finding a stuck-unwakeable row is now one read-only command instead of an
 unbuilt feature**, and it needs no log-reading and no writing:
 `yggterm-headless server rows drafts` → any `drafts_present` row that is also
