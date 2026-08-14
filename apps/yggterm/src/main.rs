@@ -1359,14 +1359,16 @@ fn main() -> Result<()> {
         return yggterm_server::run_browser_import_cli(&args[1..]);
     }
     #[cfg(target_os = "linux")]
-    if args.is_empty() {
+    let memory_scope = if args.is_empty() {
         hydrate_linux_gui_entry_environment_from_desktop();
         // ⛔ ONLY the GUI, and only AFTER the desktop entry has been hydrated —
         // that is where the opt-in is set, so reading it earlier would miss it.
         // A CLI subcommand must never be re-executed into a scope: it would
         // bound a one-shot verb and leave a unit behind for every invocation.
-        enter_memory_scope_if_requested();
-    }
+        enter_memory_scope_if_requested()
+    } else {
+        MemoryScopeOutcome::NotAttempted
+    };
     configure_linux_allocator_limits()?;
     // After the allocator re-exec above (which returns early), so the raise
     // lands on the process that actually runs the GUI.
@@ -1412,6 +1414,25 @@ fn main() -> Result<()> {
         "startup",
         "main_enter",
         serde_json::json!({ "args": args.clone() }),
+    );
+    // ⛔ WHETHER THIS GUI IS BOUNDED AT ALL, ON THE RECORD, EVERY LAUNCH.
+    //
+    // `/proc/<pid>/environ` cannot answer it and neither can the binary's
+    // version: the cap is applied by a re-exec that can fail transiently, so two
+    // processes running identical code differ in whether they are capped. The
+    // only place that difference was previously visible was a cgroup file
+    // somebody had to think to read.
+    #[cfg(target_os = "linux")]
+    append_trace_event(
+        &startup_home,
+        "gui",
+        "startup",
+        "linux_memory_scope",
+        serde_json::json!({
+            "outcome": memory_scope.label(),
+            "bounded": matches!(memory_scope, MemoryScopeOutcome::Entered),
+            "fallback_reason": memory_scope.fallback_reason(),
+        }),
     );
     #[cfg(target_os = "linux")]
     append_trace_event(
@@ -3414,14 +3435,120 @@ fn memory_scope_command_args(
     args
 }
 
+/// What became of the GUI's attempt to bound itself, so the startup trace can
+/// say which of the three it was.
+///
+/// ⛔ **AN UNBOUNDED GUI USED TO BE INDISTINGUISHABLE FROM A BOUNDED ONE.** The
+/// only report of a failure was an `eprintln!` to a stderr nobody reads, so the
+/// cap could be lost on a relaunch and nothing anywhere said so. Measured on the
+/// owner's laptop: the GUI sat in the plain login-session scope with
+/// `memory.high = max` while `systemd-run --user --scope` worked perfectly when
+/// tried by hand a few minutes later — a transient failure that left no trace of
+/// having happened. This enum exists so the next one is on the record.
+///
+/// ⚠ **The loss is coupled to the crash rate, which is why it matters.** The GUI
+/// SIGSEGVs in the GL compositing path several times a day; every relaunch is
+/// another chance to come back unbounded, and the leak this caps is monotonic.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MemoryScopeOutcome {
+    /// Inside the scope: the marker the re-exec stamps on its child is present.
+    Entered,
+    /// `YGGTERM_MEMORY_SCOPE=0` — a bound was declined, so its absence is not a
+    /// fault.
+    OptedOut,
+    /// A CLI subcommand, which must never be re-executed into a scope.
+    NotAttempted,
+    /// Running unbounded, and this is why.
+    Fallback(String),
+}
+
+#[cfg(target_os = "linux")]
+impl MemoryScopeOutcome {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Entered => "entered",
+            Self::OptedOut => "opted_out",
+            Self::NotAttempted => "not_attempted",
+            Self::Fallback(_) => "fallback",
+        }
+    }
+
+    fn fallback_reason(&self) -> Option<&str> {
+        match self {
+            Self::Fallback(reason) => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Ask systemd for a throwaway scope carrying the very properties the real one
+/// will carry, and run `/bin/true` in it.
+///
+/// ⛔ **THIS IS WHAT MAKES THE FALL-THROUGH REAL RATHER THAN CLAIMED.** `exec`
+/// returns only when the *exec itself* fails; if it succeeds and `systemd-run`
+/// then refuses the scope, this process has already been replaced, `systemd-run`
+/// exits with the error, and **the GUI never starts at all**. There is no line
+/// after `exec` for that case to land on. So the refusal has to be discovered
+/// while we are still a process that can carry on: a probe that fails costs one
+/// short-lived subprocess, where the real attempt failing costs the app.
+///
+/// Spawned rather than exec'd, and `--collect` keeps a failed probe from leaving
+/// a unit behind to collide with the launch that follows it.
+#[cfg(target_os = "linux")]
+fn memory_scope_preflight(policy: MemoryScopePolicy, unit: &str) -> Result<(), String> {
+    let args = memory_scope_preflight_args(policy, unit);
+    match Command::new("systemd-run").args(&args).output() {
+        Err(error) => Err(format!("systemd-run could not be run ({error})")),
+        Ok(probe) if probe.status.success() => Ok(()),
+        Ok(probe) => {
+            let stderr = String::from_utf8_lossy(&probe.stderr);
+            let detail = stderr
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .next_back()
+                .unwrap_or("no stderr")
+                .trim()
+                .to_string();
+            Err(format!(
+                "systemd-run refused a probe scope ({}): {detail}",
+                probe.status
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn memory_scope_preflight_args(policy: MemoryScopePolicy, unit: &str) -> Vec<String> {
+    vec![
+        String::from("--user"),
+        String::from("--scope"),
+        String::from("--quiet"),
+        String::from("--collect"),
+        format!("--unit={unit}"),
+        String::from("-p"),
+        format!("MemoryHigh={}M", policy.high_mb),
+        String::from("-p"),
+        format!("MemorySwapMax={}M", policy.swap_max_mb),
+        String::from("--"),
+        String::from("/bin/true"),
+    ]
+}
+
 /// Re-exec into a private systemd user scope, if asked to and if it can.
 ///
-/// ⛔ **FALLING THROUGH IS THE POINT.** `exec` returns ONLY on failure, so every
-/// way this can go wrong — no systemd, no user manager, a refused property —
-/// lands on the next line and the GUI starts exactly as it would have. A launch
-/// path that can prevent the app from starting is worse than the leak it fixes.
+/// ⛔ **FALLING THROUGH IS THE POINT — BUT `exec` ALONE DOES NOT DELIVER IT.**
+/// This comment used to claim that "every way this can go wrong lands on the
+/// next line and the GUI starts exactly as it would have", and that is a
+/// guarantee the code could not make: `exec` returns ONLY when the exec itself
+/// fails, so a `systemd-run` that starts and *then* refuses the scope takes the
+/// GUI down with it, with no next line to land on. The preflight above is what
+/// closes that gap; the fall-through below covers the rest.
+///
+/// ⇒ Returns the outcome instead of swallowing it, because an unbounded GUI that
+/// never says so is the failure that actually happened.
 #[cfg(target_os = "linux")]
-fn enter_memory_scope_if_requested() {
+fn enter_memory_scope_if_requested() -> MemoryScopeOutcome {
     use std::os::unix::process::CommandExt;
 
     // ⛔ DEFAULT ON. This shipped opt-in and therefore bounded nothing.
@@ -3445,26 +3572,49 @@ fn enter_memory_scope_if_requested() {
         std::env::var(ENV_YGGTERM_MEMORY_SCOPE).ok().as_deref(),
         Some("0") | Some("false") | Some("no")
     ) {
-        return;
+        return MemoryScopeOutcome::OptedOut;
     }
     // Idempotent: the child we exec carries this, so it never re-enters.
     if std::env::var_os(ENV_YGGTERM_MEMORY_SCOPE_ACTIVE).is_some() {
-        return;
+        return MemoryScopeOutcome::Entered;
     }
     let Ok(exe) = std::env::current_exe() else {
-        return;
+        return MemoryScopeOutcome::Fallback(String::from(
+            "the running binary could not be located",
+        ));
     };
+    // ⛔ A DEPLOY REPLACES THIS BINARY WHILE IT IS RUNNING, and `current_exe`
+    // then reports the old inode with " (deleted)" glued to the path. Handing
+    // that to `systemd-run` asks it to launch something that no longer exists,
+    // so the scope fails for a reason that has nothing to do with systemd. The
+    // GUI that crashed on the owner's laptop was running exactly such a deleted
+    // binary. Falling through here starts the GUI from the image it already has.
+    if !exe.exists() {
+        let reason = format!(
+            "the running binary has been replaced on disk ({}), so no scope could re-exec it",
+            exe.display()
+        );
+        eprintln!("yggterm: {reason}; starting unbounded instead");
+        return MemoryScopeOutcome::Fallback(reason);
+    }
     let policy = memory_scope_policy(read_mem_total_kb());
+    let pid = std::process::id();
+    if let Err(reason) = memory_scope_preflight(policy, &format!("yggterm-gui-preflight-{pid}")) {
+        eprintln!("yggterm: {reason}; starting unbounded instead");
+        return MemoryScopeOutcome::Fallback(reason);
+    }
     let forwarded: Vec<String> = std::env::args().skip(1).collect();
-    let unit = format!("yggterm-gui-{}", std::process::id());
+    let unit = format!("yggterm-gui-{pid}");
     let args = memory_scope_command_args(policy, &unit, &exe, &forwarded);
     let error = Command::new("systemd-run")
         .args(&args)
         .env(ENV_YGGTERM_MEMORY_SCOPE_ACTIVE, "1")
         .exec();
+    let reason = format!("exec of systemd-run failed after its probe succeeded ({error})");
     eprintln!(
         "yggterm: could not enter a private memory scope ({error}); starting unbounded instead"
     );
+    MemoryScopeOutcome::Fallback(reason)
 }
 
 fn read_mem_total_kb() -> Option<u64> {
@@ -4627,19 +4777,36 @@ mod tests {
         );
     }
 
-    /// ⛔ DEFAULT OFF, AND THE RE-EXEC MUST FALL THROUGH.
+    /// ⛔ DEFAULT **ON**, AND THE RE-EXEC MUST FALL THROUGH.
     ///
     /// A source guard, because both properties are about code that only runs on
     /// a real launch: the failure mode of this change is *the GUI does not
     /// start*, and neither an absent opt-in nor a failed `systemd-run` may ever
     /// produce it.
+    ///
+    /// ⚠ This heading said DEFAULT **OFF** while every assertion below required
+    /// the opposite — left behind when the default was flipped. The body of a
+    /// test is checked by the compiler; its prose is checked by nobody, so a
+    /// stale heading on a passing test is a signpost pointing the wrong way at
+    /// exactly the moment someone is trusting it.
     #[test]
     fn the_memory_scope_is_default_on_and_a_failure_to_enter_it_still_starts_the_gui() {
+        // ⛔ SCAN THE PRODUCT HALF ONLY. `include_str!` pulls in this test too,
+        // and the anchor string below appears in both. While the real signature
+        // matched, `find` happened to hit the function first and the test looked
+        // sound; the moment the signature gained a return type, the anchor
+        // silently relocated to this test's OWN source and every assertion began
+        // describing the test rather than the code. A source guard that can
+        // match itself is not guarding anything.
         let source = include_str!("main.rs");
-        let start = source
-            .find("fn enter_memory_scope_if_requested() {")
+        let product = source
+            .split("mod tests {")
+            .next()
+            .expect("main.rs has a product half above its tests");
+        let start = product
+            .find("fn enter_memory_scope_if_requested()")
             .expect("the scope entry point must exist");
-        let body = &source[start..];
+        let body = &product[start..];
         let end = body[1..]
             .find("\nfn ")
             .map(|at| at + 1)
@@ -4682,6 +4849,83 @@ mod tests {
             !body.contains("expect(") && !body.contains("unwrap()"),
             "nothing in the launch path may panic — a bad bound must cost memory, \
              never the app"
+        );
+        // ⛔ `exec` covers only the case where the exec ITSELF fails. A
+        // `systemd-run` that starts and then refuses the scope has already
+        // replaced this process, and takes the GUI down with it — there is no
+        // line after `exec` for that to land on. The probe is what turns the
+        // fall-through from a claim into a mechanism.
+        assert!(
+            body.contains("memory_scope_preflight("),
+            "the scope must be probed with a throwaway unit BEFORE the real \
+             `exec`, or a refused property stops the GUI starting at all"
+        );
+        assert!(
+            body.contains("exe.exists()"),
+            "a deploy replaces this binary while it runs and `current_exe` then \
+             reports a path ending in ' (deleted)'; re-execing that can only fail"
+        );
+        // The failure that actually happened was not the cap being lost — it was
+        // the cap being lost in silence, so that a bounded and an unbounded GUI
+        // were indistinguishable from outside.
+        assert!(
+            body.contains("MemoryScopeOutcome::Fallback"),
+            "every fall-through must RETURN its reason: an unbounded GUI that \
+             does not say so is the defect this exists to prevent"
+        );
+    }
+
+    /// ⛔ THE PROBE MUST CARRY THE PROPERTIES IT IS PROBING.
+    ///
+    /// A probe that asks for a bare scope answers "can systemd make a scope",
+    /// which is not the question. The question is whether it will accept THESE
+    /// properties, so a refusal of `MemoryHigh`/`MemorySwapMax` — the one
+    /// failure that would otherwise stop the GUI starting — has to be reachable
+    /// by the probe.
+    #[test]
+    fn the_scope_probe_asks_for_the_same_bound_as_the_real_scope() {
+        let policy = super::memory_scope_policy(Some(16 * 1024 * 1024));
+        let probe = super::memory_scope_preflight_args(policy, "yggterm-gui-preflight-1");
+        let real = super::memory_scope_command_args(
+            policy,
+            "yggterm-gui-1",
+            std::path::Path::new("/usr/bin/yggterm"),
+            &[],
+        );
+
+        for property in [
+            format!("MemoryHigh={}M", policy.high_mb),
+            format!("MemorySwapMax={}M", policy.swap_max_mb),
+        ] {
+            assert!(
+                probe.contains(&property),
+                "the probe must ask for {property}, or it cannot discover a \
+                 refusal of it"
+            );
+            assert!(real.contains(&property), "the real scope must ask for {property}");
+        }
+
+        assert!(
+            probe.contains(&String::from("/bin/true")),
+            "the probe must run something that exits immediately — it is testing \
+             the scope, not starting the app"
+        );
+        assert!(
+            !probe.iter().any(|arg| arg.contains("yggterm")
+                && arg.starts_with('/')),
+            "the probe must never launch the GUI binary: a probe that starts a \
+             second GUI is worse than no probe"
+        );
+        assert!(
+            probe.contains(&String::from("--collect")),
+            "a failed probe must not leave a unit behind to collide with the \
+             launch that immediately follows it"
+        );
+        assert_ne!(
+            probe.iter().find(|arg| arg.starts_with("--unit=")),
+            real.iter().find(|arg| arg.starts_with("--unit=")),
+            "the probe and the real scope must not share a unit name, or the \
+             probe's own cleanup races the launch"
         );
     }
 
