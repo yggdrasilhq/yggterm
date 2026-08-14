@@ -3541,6 +3541,54 @@ healthy widgets is not.
 **Falsifier:** a surface declared from a shell on another machine either shows
 that machine's open documents, or names the endpoint it failed to reach.
 
+### ⛔⛔ THE STATED CAUSE WAS ALREADY HANDLED NINETEEN DAYS BEFORE THIS WAS
+### MEASURED — so the diagnosis above is wrong a second time
+
+*added 2026-08-14 by the lane that root-caused the document body. Not closed —
+sharpened. ⚠ Read this before spending a session on "the declare should carry a
+host", which is the fix this entry currently implies and which would be building
+a second mechanism beside a working one.*
+
+**A forward already exists, and its own comment names this exact problem.**
+`resolve_control_endpoint_url` is called on every declare that CREATES a
+contribution, and it does the right thing:
+
+```rust
+// The GUI fetches this endpoint over a plain socket, so a remote
+// loopback needs an `ssh -L` forward — NOT the webview's SOCKS proxy.
+```
+
+⇒ It rewrites `http://127.0.0.1:<remote-port>` to `http://127.0.0.1:<local-port>`
+over an `ssh -L` child. **It landed 2026-07-25; this defect was measured
+2026-08-13.** The mechanism was in the binary the whole time the surface rendered
+empty, so **"the declare carries a loopback with no host" cannot be the cause** —
+something is skipping the forward, not missing it.
+
+**Where to look, and it is one line:**
+
+```rust
+let Some(target) = ssh_target.filter(|t| !ssh_target_host_is_loopback(t)) else {
+    return (url.to_string(), None);          // ⇐ no forward, silently
+};
+```
+
+⇒ **With `ssh_target: None` the forward is skipped and the declared loopback is
+kept verbatim** — which produces precisely the reported state: the GUI resolves
+`127.0.0.1:<remote-port>` on its own machine, finds nothing, and renders a
+healthy empty surface. The question this entry should be asking is **why
+`ssh_target` was `None` for that row**, not why the declare had no host in it.
+
+**Falsifier, replacing the one above:** reproduce the empty surface and read the
+declare's own trace — `ui/sidebar_contribution/declare` carries `control`, and
+the resolution logs `forwarded`. `forwarded: false` on a row whose PTY is on
+another machine is the defect, and it localises it to the caller that supplies
+`ssh_target` rather than to the app, the declare format or the GUI's fetch.
+
+⚠ **Not re-measured live.** This is a code fact plus a date, which is enough to
+retire the wrong direction and not enough to close the entry. ⛔ Whoever takes it
+must still run the falsifier — see the sibling entry closed the same day, where
+two published attributions were both overturned by one A/B.
+
 ## ⛔ [6.3] ychrome's VAULT AND SETTINGS RAILS SAY "Loading…" FOREVER
 
 **Status:** OPEN
