@@ -885,6 +885,57 @@ is retirement at handover, which is the constitution's own guarantee.
 **Falsifier:** if a daemon on a live binary is ever found orphaned, the mechanism
 is not "deploy replaces the inode" and this entry names the wrong cause.
 
+### ⛔ THE SAME DEFECT ON THE INTEGRATOR HOST, FOUR TIMES THE SCALE — MEASURED, NOT DRAINED
+
+*2026-08-14 16:30. Deliberately left running; the reasoning is the point of this
+subsection.*
+
+**19 daemons, 18 of them on a DELETED binary, aged 5 to 19 days.** Same mechanism
+as above, one host over.
+
+⭐ **3.587 cores, continuously — and that number is a real measurement.** Taken as
+a delta of `utime+stime` from `/proc/<pid>/stat` over 20 s. ⛔ **`ps %cpu` cannot
+answer this question** — it is an average over each process's whole lifetime, and
+for daemons aged 5–19 days it describes mostly history. It happened to agree here;
+that is luck, not method. **11.2% of a 32-core host**, burned to serve nothing.
+
+⭐ **The per-daemon signature says what it is spending on.** Daemons holding a
+single child each burn **0.15–0.24 cores** — steady, with one shell to serve. That
+is a poll loop, not work, and it points straight at the peer-`status` entry
+elsewhere in this queue: the cost is per-daemon and constant, so it multiplies by
+exactly the population this entry is about.
+
+⚠ **The RAM half does NOT transfer, and saying so matters.** ~5.9 GB RSS across
+the 19 sounds alarming and is not: that host has 515 GB, 226 GB available, **zero
+swap, and memory pressure flat at 0.00** across all three windows. On the laptop
+the same residue was a memory problem; here it is purely a CPU and heat problem.
+⇒ **Do not import the laptop's urgency into this host** — check the pressure file
+before assuming a big number is a big problem.
+
+⛔ **WHY IT WAS NOT DRAINED, since the drain above was approved and this is the
+same defect.** Two of the 19 hold a live `claude` child and are untouchable by the
+constitution. The other 17 hold **only `bash` shells** — and from the OS alone
+**an idle residue shell and another agent's live session shell look identical**.
+On the laptop that ambiguity was resolvable because the shells were 5–9 days idle
+and unreachable from the current GUI; here this is the host where most agent
+sessions actually live. ⇒ The failure mode of guessing wrong is destroying work
+someone else is mid-way through, which is the exact harm the constitution names
+and which has already cost ~7 agent PTYs once. **A 3.5-core saving does not buy
+that risk**, and there is no zero-risk subset: the daemons with no children burn
+no measurable CPU, so the entire saving sits behind the ambiguous ones.
+
+⇒ **Owned by the daemon-lifecycle lane, not by this one.** What is needed is not a
+bigger mop but the retirement-at-handover guarantee, plus a way to ask a shell
+whether anyone is still on the other end of it. Filed from 6.7 because the resource
+watch is what measured it.
+
+⚠ **INSTRUMENT TRAP, and it hid this population once already today:**
+`pgrep -x yggterm-headless` returns **0, forever**. `comm` is truncated to 15
+characters and the binary's name is 16, so exact-match can never succeed. Use
+`pgrep -x yggterm-headles` (20 here) or `pgrep -f`. ⛔ Note this defeats the
+identify-by-exact-name advice that is correct everywhere else — `pgrep -x yggterm`
+works only because that name is short enough.
+
 ## ⚠ [9.2→6.x] `session rename` IS ASYNC W.R.T. `rows`, SO THE DOCUMENTED VERIFY STEP RETURNS A FALSE NEGATIVE
 
 **Status:** OPEN
