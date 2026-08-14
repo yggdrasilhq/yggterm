@@ -461,8 +461,23 @@ kernel). ⭐ **And a handler on an EMPTY daemon costs 0.70 ms**, so ~95% of the 
 travels with what the daemon HOLDS, not with the connection — a pool would keep
 that 95%. ⭐ **The row term is now settled three ways at ~4.5 µs/row** (a causal
 seeded arm, an IPW re-fit of field data, and the optimisation lane's own arm), so
-rows are ~1.2 ms of a 25 ms thread. **The residual tracks SESSIONS** — named as
-the next arm in §6j-6, not priced. The conclusion of this entry is unchanged and now rests on measurement.
+rows are ~1.2 ms of a 25 ms thread.
+
+✅ **THE SESSIONS ARM IS RUN (§6j-7) AND THE BURSTY TERM IS NAMED: one PTY READER
+THREAD PER SESSION**, cost proportional to that session's OUTPUT VOLUME. On a
+sandbox with 4 flooding sessions the long-lived threads hold **3.364 of 3.449
+cores (97.5%)**, and the top four are **0.838/0.837/0.836/0.836 — exactly one per
+session**. That closes the loop on the 25x swings between adjacent windows, on
+§6i's threads alternating `clock_nanosleep` with on-CPU bursts, and on §4's
+contention being 98.6% `terminal_read`.
+⚠ **Do not quote 0.84 cores as the cost of a session** — `yes` saturates a pty at
+a rate no agent CLI approaches. The transferable claim is the SHAPE (one thread
+per session, cost ∝ output), not the magnitude; live per-thread figures are
+0.02–0.19 cores.
+⛔ **A first pass at this arm read 120 ms/request and was wrong by 29x** — it
+divided the daemon's whole CPU delta by a request count while a flooding session
+burned CPU regardless of requests. **Measure the no-request background rate at
+each rung and subtract it.** The conclusion of this entry is unchanged and now rests on measurement.
 ⛔ **A version/RSS split of the per-request cost was measured, then FAILED TO
 REPLICATE (8.5 ms then 33.3 ms on the same daemon) and is withdrawn** — do not
 resurrect it from the first run.
