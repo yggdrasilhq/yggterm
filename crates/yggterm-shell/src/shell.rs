@@ -50853,13 +50853,45 @@ fn live_session_enriched_detail_label(
     row_path: &str,
     summary: String,
     kept_alive_paths: &HashSet<String>,
+    cwd_warned_paths: &HashSet<String>,
 ) -> String {
+    let summary = if cwd_warned_paths.contains(row_path) {
+        format!("{CWD_NOT_HERE_PREFIX} {summary}")
+    } else {
+        summary
+    };
     live_session_detail_label(summary, kept_alive_paths.contains(row_path))
 }
+
+/// Opens the detail line of a row whose launch could not be given the
+/// directory it asked for. It goes IN FRONT of whatever sentence won —
+/// stored, generated, or default — because the thing being corrected is the
+/// claim those sentences make, and a correction that trails a claim is read
+/// after it or not at all.
+const CWD_NOT_HERE_PREFIX: &str =
+    "⚠ NOT in the directory this row names — it does not exist on this machine.";
+/// How a row's summary should speak about its working directory.
+///
+/// ⛔ "rooted at X" is a claim about where the process IS, and it was made
+/// unconditionally from what the launch ASKED FOR. A local launch into a
+/// directory that does not exist here still starts — the launch prefix walks
+/// up to an existing ancestor and falls back to `$HOME` on purpose — so the
+/// row asserted a location the process had never been in, and read as healthy
+/// for as long as it lived. When the daemon has marked the row, the sentence
+/// says what actually happened instead.
+fn session_cwd_phrase(session: &ManagedSessionView, cwd: &str) -> String {
+    if metadata_value(session, "Cwd Warning").trim().is_empty() {
+        format!("rooted at {cwd}")
+    } else {
+        format!("NOT in {cwd} — that directory does not exist on this machine, so it started elsewhere")
+    }
+}
+
 fn live_session_default_summary(session: &ManagedSessionView) -> Option<String> {
     let cwd = session_cwd_for_managed_session(session)
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .map(|value| session_cwd_phrase(session, &value));
     match session.kind {
         SessionKind::SshShell => {
             let target = session
@@ -50871,12 +50903,12 @@ fn live_session_default_summary(session: &ManagedSessionView) -> Option<String> 
                 })
                 .unwrap_or_else(|| session.host_label.clone());
             Some(match cwd {
-                Some(cwd) => format!("SSH terminal on {target} rooted at {cwd}."),
+                Some(phrase) => format!("SSH terminal on {target} {phrase}."),
                 None => format!("SSH terminal on {target}."),
             })
         }
         SessionKind::Shell => Some(match cwd {
-            Some(cwd) => format!("Local shell rooted at {cwd}."),
+            Some(phrase) => format!("Local shell {phrase}."),
             None => "Local shell terminal.".to_string(),
         }),
         SessionKind::Document => Some("Document preview.".to_string()),
@@ -50896,7 +50928,7 @@ fn live_session_default_summary(session: &ManagedSessionView) -> Option<String> 
                 "session"
             };
             Some(match cwd {
-                Some(cwd) => format!("Local {name} {noun} rooted at {cwd}."),
+                Some(phrase) => format!("Local {name} {noun} {phrase}."),
                 None => format!("Local {name} {noun}."),
             })
         }
@@ -50942,6 +50974,7 @@ fn enrich_sidebar_rows_with_live_titles(
     let mut authoritative_live_paths = HashSet::<String>::new();
     let mut remote_live_direct_title_paths = HashSet::<String>::new();
     let mut kept_alive_paths = HashSet::<String>::new();
+    let mut cwd_warned_paths = HashSet::<String>::new();
     let remote_session_index = build_remote_session_index(remote_machines);
     for session in live_sessions {
         if !matches!(session.source, SessionSource::Stored) {
@@ -50949,6 +50982,15 @@ fn enrich_sidebar_rows_with_live_titles(
         }
         if live_session_keep_alive(session) {
             kept_alive_paths.insert(session.session_path.clone());
+        }
+        // ⛔ Collected here rather than inside the summary builder because the
+        // summary the sidebar shows is usually NOT built here at all: a stored
+        // or LLM-generated one wins, and the birth-time default that produced
+        // "rooted at <dir>" is written by a same-named function in the SERVER
+        // crate. Whichever sentence wins, the warning has to survive it, so it
+        // is applied where the label is finally composed.
+        if !metadata_value(session, "Cwd Warning").trim().is_empty() {
+            cwd_warned_paths.insert(session.session_path.clone());
         }
         let session_cwd = session_cwd_for_managed_session(session);
         let cwd = session_cwd.as_deref().unwrap_or_default();
@@ -51026,6 +51068,7 @@ fn enrich_sidebar_rows_with_live_titles(
                     &row.full_path,
                     summary.clone(),
                     &kept_alive_paths,
+                    &cwd_warned_paths,
                 );
             } else if kept_alive_paths.contains(&row.full_path) {
                 row.detail_label = live_session_detail_label(row.detail_label.clone(), true);
@@ -51041,6 +51084,7 @@ fn enrich_sidebar_rows_with_live_titles(
                     &row.full_path,
                     summary.clone(),
                     &kept_alive_paths,
+                    &cwd_warned_paths,
                 );
             } else if kept_alive_paths.contains(&row.full_path) {
                 row.detail_label = live_session_detail_label(row.detail_label.clone(), true);
@@ -51086,6 +51130,7 @@ fn enrich_sidebar_rows_with_live_titles(
                 &row.full_path,
                 summary.clone(),
                 &kept_alive_paths,
+                &cwd_warned_paths,
             );
         } else if kept_alive_paths.contains(&row.full_path) {
             row.detail_label = live_session_detail_label(row.detail_label.clone(), true);
@@ -162677,6 +162722,98 @@ mod tests {
             Some("Remove Them Entirely")
         );
     }
+    #[test]
+    fn a_row_whose_cwd_is_not_on_this_machine_stops_claiming_to_be_rooted_there() {
+        // The sidebar sentence is the thing the user reads, and it asserted
+        // "rooted at <dir>" from what the launch ASKED FOR. A launch into a
+        // directory that exists only on another host still starts — elsewhere
+        // — so that sentence was the whole "looks healthy forever" symptom.
+        let with_cwd = |warning: Option<&str>| {
+            let mut metadata = vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/workspace/only-on-another-host".to_string(),
+            }];
+            if let Some(warning) = warning {
+                metadata.push(SessionMetadataEntry {
+                    label: "Cwd Warning",
+                    value: warning.to_string(),
+                });
+            }
+            metadata
+        };
+        let mut session = ManagedSessionView {
+            id: "live-local-elsewhere".to_string(),
+            session_path: "local://elsewhere".to_string(),
+            title: "Elsewhere".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "localhost".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "/bin/bash".to_string(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                older_available: false,
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+            working: None,
+            input_unanswered_ms: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        };
+
+        session.metadata = with_cwd(None);
+        let healthy = live_session_default_summary(&session).expect("a shell has a summary");
+        assert_eq!(
+            healthy,
+            "Local shell rooted at /workspace/only-on-another-host."
+        );
+
+        session.metadata = with_cwd(Some("does not exist on this machine"));
+        let marked = live_session_default_summary(&session).expect("a shell has a summary");
+        assert!(
+            !marked.contains("rooted at"),
+            "the marked row still claims to be rooted somewhere it is not: {marked}"
+        );
+        assert!(
+            marked.contains("/workspace/only-on-another-host"),
+            "the marked row must still name what was asked for: {marked}"
+        );
+
+        // An agent row takes the same phrase — the symptom was reported on a
+        // Claude Code row, and a fix that only reached shells would leave the
+        // reported case exactly as it was.
+        session.kind = SessionKind::ClaudeCode;
+        let marked = live_session_default_summary(&session).expect("an agent row has a summary");
+        assert!(!marked.contains("rooted at"), "{marked}");
+
+        // And a row with no cwd at all says nothing about one, marked or not.
+        session.metadata = vec![];
+        assert_eq!(
+            live_session_default_summary(&session).as_deref(),
+            Some("Local Claude Code session.")
+        );
+    }
+
     #[test]
     fn enrich_sidebar_rows_with_live_titles_humanizes_short_local_shell_labels() {
         let live_sessions = vec![ManagedSessionView {

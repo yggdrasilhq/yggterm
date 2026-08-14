@@ -4,6 +4,30 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Three more commands now work from whichever program you type.** The
+  command that shows what the restart gate is looking at, the one that declares
+  a hand-off so a pending upgrade can land at a quiet moment, and the headless
+  browser plane all answered from one of the two programs and reported the
+  command as unknown from the other. None of them involves a window, and the
+  hand-off one is typed by the very sessions that had the wrong program on
+  their path. All three answer from both now.
+
+- **A session opened in a folder that only exists on another machine now says
+  so, instead of quietly starting somewhere else.** Opening a session in a
+  directory this machine does not have has always been allowed to proceed —
+  it falls back to the nearest folder that does exist, and then to your home
+  directory — but nothing said that had happened. The row went on describing
+  itself as being in the folder you picked, so a session that was really
+  running in your home directory looked, indefinitely, like one that was
+  working where you meant. The launch now prints what it did, and the row's
+  description leads with the correction instead of the claim.
+
+- **Asking either program for the list of running background services now
+  works.** The census that reports every service on the machine — which
+  versions are running, how long, how much they hold — answered from only one
+  of the two programs; the other reported the command as unknown, though the
+  answer involves no window and nothing that program lacks. Both answer it now.
+
 - **Five commands came back that had silently stopped existing.** A change
   earlier the same day merged two copies of the command dispatcher into one, and
   five commands did not survive the merge — reading a session's screen,
