@@ -298,6 +298,86 @@ being audited rather than merely edited.
 **Falsifier:** the identifiers are absent from `git log -p` over all refs, and the
 forge returns 404 for the pre-removal blob URLs.
 
+## ⚠ [6.9→6.0] A BARE `unsubscribe` IS NOT A STAND-DOWN, AND THE READ-BACK CANNOT TELL
+
+**Status:** OPEN
+
+*measured 2026-08-14 on this seat's own stand-down; the shape is
+[[finding-a-read-back-that-passes-on-its-way-to-being-wrong]]*
+
+A finishing seat ran `ygg-booter.py unsubscribe` **and** `ygg-monitor.py
+unsubscribe` and **read both planes back at 0**. One hour later a coverage sweep
+wrote a fresh booter subscription for the same row — `kind: monitor`, note
+*"unattended delegate, live process"* — and **booted it**. The monitor
+unsubscribe held; the booter one did not.
+
+⛔ **No tool defect — the verbs differ and the weaker one was used.**
+`unsubscribe` means *stop watching now*; **`optout` means *and do not start
+again***, writing `booter-disarmed.tsv`, which **both `subscribe` and `arm`
+screen** (`ygg-booter.py:718`). `optout`'s own docstring names the case: *a
+delegate that finished its work … arming it would resurrect a row that stopped on
+purpose.*
+
+⇒ **A row standing down must `optout --row … --note …`** (or `ygg-claim.sh
+--no-booter` from inside). **Fix wanted:** say so at the stand-down step of the
+fleet skill, because the failure is silent and the read-back looks right.
+
+⛔ **THE LOOP, which is why it is filed rather than just fixed locally:** the
+sweep arms a row **because its process is live**, the boot keeps the process
+live, and the standing rule *"a monitor is never finished while the thing it
+watches is live"* then reads as justification. **The watch's own subject becomes
+the evidence for the watch**, and a genuinely finished seat cannot leave by
+unsubscribing.
+
+⭐ **METHOD, and it generalises past the booter: VERIFY A PROHIBITION BY TRYING TO
+VIOLATE IT.** A read-back of 0 passed *both* times — it cannot distinguish "not
+subscribed" from "not subscribed *yet again*". What settled it was attempting the
+thing that must fail: a re-`subscribe` after the opt-out came back **REFUSED**
+with the count still 0. **An absence proves nothing about what will be allowed
+next; only a refusal does.**
+
+## ⛔ [6.9→6.1] AN UNREADABLE CLIENT-RECORD DIRECTORY READS AS "NO CLIENTS" AND PERMITS RETIREMENT
+
+**Status:** OPEN
+
+*source reading, and the withdrawal of the anomaly that led here, in
+[`idle-cost-model.md`](idle-cost-model.md) §6k-1..§6k-3*
+
+`daemon_should_idle_shutdown` (`daemon.rs:11537`) is careful: if
+`active_client_instance_records` returns `Err` it returns `false` — *if you
+cannot tell whether clients exist, do not retire.*
+
+**The callee guarantees that arm never fires.**
+`active_client_instance_records_from_dir` (`lib.rs:20737`) ends every failure in
+`let Ok(entries) = entries else { return Ok(()) };`, and drops per-entry errors
+with `.flatten()`. It has no `Err` path, so neither does its caller.
+
+⇒ An unreadable client-instances directory — permissions, fd exhaustion, ENOMEM —
+is reported as **an empty set of clients**, which satisfies gate 3 and **permits
+retirement while a client may be connected**. Two halves of one decision disagree
+about what an unreadable directory means and the careless half wins.
+
+⚠ **This is the INVERSE of the "a failing read means it never retires" reading.**
+That one cannot happen today; this one can. Both come from the same `Result` being
+vestigial.
+
+**Fix:** let the callee distinguish *absent* (legitimately no clients ⇒ `Ok`) from
+*unreadable* (⇒ `Err`), so the caller's existing caution becomes reachable.
+
+⛔ **NOT A DEFECT, CLOSED: "a daemon with all three retire gates open did not
+retire".** I filed that and it was wrong twice over. `client_instance_dirs_for_scan`
+scans **every** directory under the client-instances root, so a record filed under
+another endpoint version is still in scope; and `daemon_is_superseded` needs a
+**live** newer daemon, which that home did not have. Records non-empty and not
+superseded ⇒ gate 3 correctly returns `false` indefinitely. Demonstrated: a daemon
+with no record retires at **+90.2 s**, one with a record naming a live process was
+still running at **+204.8 s**.
+⛔⛔ **And the probe that manufactured it: `/proc/<pid>` existence is TRUE FOR A
+ZOMBIE.** The harness called a daemon "still alive at 200 s" that its own trace
+shows retiring at +90.2 s. `/proc/<pid>` answers *has this been reaped*, not *is
+this running* — and calling `poll()` to check is itself what reaps it. **Prefer
+the subject's own lifecycle record over any external liveness probe.**
+
 ## ⛔⛔⛔ [6.9→6.7] EVERY PEER `status` POLL REBUILDS THE WHOLE ROW INVENTORY
 
 **Status:** OPEN
