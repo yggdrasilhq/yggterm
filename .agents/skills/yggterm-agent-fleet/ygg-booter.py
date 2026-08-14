@@ -474,10 +474,38 @@ def cmd_arm(args):
 # ─── the account ran out of quota ──────────────────────────────────────────────
 
 def rate_limit_hold():
-    """The active fleet-wide quota hold, or None. Expiry evaluated HERE, once."""
+    """The active fleet-wide quota hold, or None. Expiry evaluated HERE, once.
+
+    ⛔⛔ A HOLD WRITTEN BY PRE-FIX CODE IS NOT HONOURED, AND THAT IS THE POINT.
+
+    This file lives in the repo, so **every worktree carries its own copy** and a
+    watcher runs whichever copy sits in the directory it was started from.
+    Measured 2026-08-14, within minutes of shipping the anti-re-arm fix: a second
+    watcher was started from a checkout whose tree predated it, and **it pinned
+    the whole fleet again** — its record advanced `until` on every tick from the
+    same frozen tail, exactly as before, while `git log` showed the fix landed and
+    a reader would have believed it was live. 13 of 14 checkouts on that host were
+    still pre-fix at the time.
+
+    ⇒ A record with no `counted` key was written by code that **cannot honour the
+    invariant that ends a hold**. It is therefore not merely stale, it is
+    *unbounded* — nothing in it will ever stop growing. Refusing it costs at worst
+    one probe boot during a genuine outage, and the next refusal re-arms a proper
+    hold through the fixed path. Honouring it has no exit at all.
+
+    ⚠ This is a floor, not the fix. The real defect is that a watcher's code comes
+    from wherever it was launched; see the queue entry on the supervision watcher's
+    deploy path.
+    """
     try:
         d = json.loads(RLHOLDFILE.read_text())
     except Exception:
+        return None
+    if "counted" not in d:
+        log("⛔ discarding a quota hold written by pre-fix code — it has no "
+            "evidence ledger, so nothing in it can ever stop it growing. "
+            "A stale watcher wrote this; check for a second watcher.")
+        RLHOLDFILE.unlink(missing_ok=True)
         return None
     if time.time() >= (d.get("until") or 0):
         RLHOLDFILE.unlink(missing_ok=True)
