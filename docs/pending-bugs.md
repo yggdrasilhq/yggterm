@@ -12,6 +12,128 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [6.1] THE SUCCESSOR RETIRES AND THE PREDECESSOR KEEPS THE SESSION — THE DRAIN INVERTS
+
+**Status:** OPEN
+
+⭐ **DIRECTION RULED 2026-08-14 by 6.0 — implementation is owed, not the
+decision. COUNT PRESERVED, AND GIVE A PRESERVED RECORD AN EXIT. Both halves or
+neither**, because shipping the count alone trades non-convergence for a
+permanent pin, which is the worse direction.
+
+**The reasoning, which generalises past this entry:** both horns end in a stuck
+daemon and differ in one property. Today's failure (preserved counts zero) is
+tied to a handover in flight and **resolves when that handover completes or the
+session ends — it has an exit**. Counting preserved naively has **no exit**: a
+bequeathed record outlives the daemon that wrote it, so nothing will ever clear
+it. ⇒ **Prefer the failure that has an exit.**
+⭐ And note what a preserved key is: **a one-way door**. A gate reading a count
+that can only rise has no way back — the same class as a hold that re-arms from
+the artefact it froze. *What writes the signal I gate on, and does it keep
+writing once I have gated?* For a bequeathed record: nothing, ever.
+
+⛔ **Implementation stays behind the 3.0.155 hold.** This settles the direction
+so the work is cheap when the hold lifts, not so it happens sooner.
+
+⚠ **An owner named in a brief is a claim about the past.** This entry first named
+6.9 as holding the constraining cost model. That row stood down and its lane
+merged; the seat is now a different campaign that has never seen a daemon, so
+routing there would have filed to a stranger. The `N_reachable × ~0.2-core`
+constraint survives in the campaign memory door, not in a live row. **Check a row
+still holds the seat before routing to it.**
+
+*Measured 2026-08-14 in an isolated `YGGTERM_HOME` with a real
+predecessor/successor pair, both built from source in this repo (3.0.154 and a
+3.0.155 built only for this test). Fleet daemon census 23 before and 23 after,
+so nothing outside the sandbox was touched.*
+
+**What happened, in order:**
+
+1. predecessor 3.0.154 owns one live plain-shell PTY — `owned=1`;
+2. successor 3.0.155 starts — `owned=0, preserved=1`, i.e. it knows the runtime
+   by bequest but does not own it;
+3. the hot-update handoff is driven explicitly and **starts**:
+   `hot_update_handoff_used: true`, `update_priority: "handoff_preserve_sessions"`,
+   `"hot update handoff started: preserving 1 live terminal runtime(s)"`,
+   and the predecessor's cold shutdown is correctly skipped
+   (`fallback_shutdown_skip_reason: "handoff_preserved_owner"`);
+4. **90 s later the SUCCESSOR logs `daemon idle shutdown` and exits.** The
+   predecessor is still alive and still `owned=1`.
+
+⇒ **The new daemon retired and the old one stayed.** That is the drain running
+backwards, and it is one concrete way the constitution's *"then the emptied
+daemon retires on its own"* does not happen.
+
+⚠ **No session was lost. The pty child survived the whole run**, verified by pid
+rather than by a row listing — a re-resume would have produced a different pid.
+The failure is **non-convergence, not data loss**, and it must not be filed as
+the latter.
+
+### ⛔ THE MECHANISM: TWO QUANTITIES SHARE ONE NAME, AND THE GATE'S COMMENT NAMED THE OTHER
+
+`daemon_should_idle_shutdown`'s first gate said *"including preserved hot-update
+PTYs, which are counted here"*. They are not.
+
+| name | what it is | preserved counted? |
+|---|---|---|
+| the `terminal_session_count` **argument** | `runtime.terminals.stats().session_count` at both call sites — sessions in this daemon's own registry with `is_running()` | **no** |
+| `ServerRuntimeStatus::terminal_session_count` | `terminal_session_keys.len()` | **yes** |
+
+⇒ A successor holding the runtime only as PRESERVED passes gate 1. The comment
+has been corrected in place; **the behaviour has not been changed.**
+
+⚠ **Gate 3 is what usually hides this.** The successor also has to have no
+client-instance records, so on the live fleet the GUI registering with the new
+daemon protects it. It bites where there is no client record: a headless deploy,
+or the window between daemon start and GUI registration.
+
+### ⛔ WHY THIS IS NOT A ONE-LINE FIX
+
+Counting preserved keys here inverts the failure: bequeathed records outlive the
+daemons that wrote them, so a daemon holding a stale preserved key would never
+retire — against a measured population cost of `N_reachable × a ~0.2-core floor`.
+**Both directions have a known failure mode**, which is why this is a decision
+and not a patch.
+
+⭐ **The connection that makes it load-bearing:** the readiness-probe entry's own
+ruling is that *the dangerous action is a handover that FAILS to converge, not a
+bump as such*, and that a non-converging daemon and "the thing that types over a
+draft" are the same population. This is a reproducible way to manufacture one.
+
+### ⭐⭐ BOTH HALVES ARE ALREADY BUILDABLE FROM DATA ON DISK — AND ONE OF THEM IS A TRAP
+
+Checked 2026-08-14 so the implementer does not have to rediscover it.
+`PreservedTerminalOwnerEntry` already persists everything the exit needs:
+
+    runtime_key · endpoint · owner_server_version · owner_server_build_id
+    owner_server_pid · created_at_ms
+
+⇒ Two independent exits exist in the record: an owner that can be **probed**
+(endpoint + pid + build_id), and a **`created_at_ms` that can expire**.
+
+⛔⛔ **AND THE PROBE MUST NOT GO IN THE GATE.** The probe already exists —
+`prune_unrepresented_preserved_owners` — and its own comment records why it is
+dangerous: it calls blocking `status()` per distinct owner endpoint **inside the
+global runtime lock**, and a dead or hung owner costs the full request timeout.
+Measured on this fleet, where deploys leave 24+ superseded daemons alive:
+`remove_session` p50 **447 ms**, p99 **10,590 ms**, max **44,991 ms** (n=1,220).
+
+**`daemon_should_idle_shutdown` runs on every accept-loop `WouldBlock` poll.**
+Putting a lock-held, multi-second, per-owner socket probe on that path would be
+far worse than the bug it fixes.
+
+⇒ **The shape that is safe:** the gate reads only cheap local state — the
+`created_at_ms` expiry, and at most a cached liveness answer
+(`preserved_owner_unreachable_until_ms` already exists as a negative cache).
+**The socket probe stays where it is, off the poll path.** ⚠ A naive "prune
+first, then count" is the obvious implementation and it is the wrong one.
+
+**Falsifier:** run the pair in an isolated home with no client record; the
+successor must still be alive after its idle window with the runtime adopted,
+and the predecessor must be the one that exits. ⚠ Add a second arm with a
+preserved record whose owner is **already dead**: that daemon must still retire,
+or the fix has bought a permanent pin.
+
 ## ⛔⛔ [6.0] THE SUPERVISION WATCHER IS DEPLOYED BY WHICHEVER CHECKOUT IT HAPPENED TO START IN
 
 **Status:** OPEN
