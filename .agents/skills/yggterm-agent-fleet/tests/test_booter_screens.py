@@ -15,6 +15,7 @@ product change and, deliberately, no test-only environment override — a bypass
 for a safety path is the thing the safety path is guarding.
 """
 import argparse
+import json
 import os
 import shutil
 import stat
@@ -41,6 +42,18 @@ def check(name, ok, detail=""):
     print(f"{'ok  ' if ok else 'FAIL'}  {name}{('  — ' + detail) if detail and not ok else ''}")
     if not ok:
         FAILURES.append(name)
+
+
+def rowaddr(uuid):
+    """⛔ A ROW ADDRESS IS `<scheme>://<machine>/<uuid>`, NOT A BARE UUID.
+
+    These screens used to pass bare uuids to `--row`, which is exactly the
+    malformed form that made a live subscription resolve absent every tick and
+    lapse as "GONE (retired)". **The suite encoded the bad address as normal, so
+    no screen here could ever have caught it** — the same shape as a suite that
+    shares the code's wrong model and therefore passes before and after the bug.
+    """
+    return f"remote-cc://testhost/{uuid}"
 
 
 class Sandbox:
@@ -134,6 +147,58 @@ class Sandbox:
         shutil.rmtree(self.home, ignore_errors=True)
 
 
+
+def choice_prompt_screens(booter_path, sb):
+    """`_pty_type_and_enter` must refuse a row whose SCREEN shows a choice prompt.
+
+    ⛔ Driven in-process with `_run` stubbed, because the point of two of the three
+    screens is what happens when the screen CANNOT be read — and an unreadable
+    screen is not a clear one. A watchdog that types must refuse on doubt."""
+    code = r'''
+import importlib.util, sys, types
+spec = importlib.util.spec_from_file_location("bb", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+ROW = "remote-cc://testhost/aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+out = {}
+def stub(screen_text, accept=True):
+    def _run(host, argv, stdin_text="", **kw):
+        r = types.SimpleNamespace(stdout="", stderr="", returncode=0)
+        if "read-buffer" in argv:
+            r.stdout = screen_text
+        else:
+            r.stdout = '{"data": {"accepted": true}}' if accept else "{}"
+        return r
+    return _run
+
+# 1. a plan-limit prompt on screen ⇒ REFUSE, and never reach the write
+m._run = stub("You have hit your session limit. 1. Stop and wait  2. Team account")
+out["refuses_choice"] = m._pty_type_and_enter("h", ROW) == "refused-choice-prompt"
+
+# 2. the screen could not be read ⇒ REFUSE. Blind is not clear.
+m._run = stub("")
+out["refuses_blind"] = m._pty_type_and_enter("h", ROW) == "refused-screen-unreadable"
+
+# 3. an ordinary working screen ⇒ proceed
+m._run = stub("pi@host:~$ some ordinary output scrolling by")
+out["proceeds_when_clear"] = m._pty_type_and_enter("h", ROW) == "pty-write"
+import json; print(json.dumps(out))
+'''
+    env = dict(os.environ, HOME=str(sb.home))
+    r = subprocess.run([sys.executable, "-c", code, str(booter_path)],
+                       capture_output=True, text=True, timeout=90, env=env)
+    try:
+        got = json.loads((r.stdout or "").strip().splitlines()[-1])
+    except Exception:
+        got = {}
+    for k, label in (
+        ("refuses_choice", "⛔⛔ boot REFUSES a row whose screen shows a choice prompt"),
+        ("refuses_blind", "⛔ boot REFUSES when the screen cannot be read"),
+        ("proceeds_when_clear", "boot PROCEEDS on an ordinary screen"),
+    ):
+        check(label, got.get(k) is True,
+              f"got={got.get(k)!r} rc={r.returncode} {(r.stderr or r.stdout)[-200:]}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--booter", default=str(DEFAULT_BOOTER))
@@ -157,7 +222,7 @@ def main():
         check("⛔ an UNREADABLE never-arm list is not an empty one", v == "NONE", v)
 
         # ── the callers, which is where the damage would be done ─────────────
-        r = sb.run("subscribe", "--row", DELEGATE)
+        r = sb.run("subscribe", "--row", rowaddr(DELEGATE))
         check("⛔ subscribe REFUSES while the attended list is unreadable",
               r.returncode == 4 and "UNREADABLE" in r.stdout, f"rc={r.returncode} {r.stdout[-160:]}")
 
@@ -199,7 +264,7 @@ def main():
               r.returncode == 0 and not (sb.state / "booter" / f"{ATTENDED}.json").exists(),
               r.stdout[-160:])
 
-        r = sb.run("subscribe", "--row", ATTENDED)
+        r = sb.run("subscribe", "--row", rowaddr(ATTENDED))
         check("⛔ subscribe REFUSES an attended row", r.returncode == 3,
               f"rc={r.returncode} {r.stdout[-160:]}")
 
@@ -209,7 +274,7 @@ def main():
               r.returncode == 0 and "read-back: present" in r.stdout,
               f"rc={r.returncode} {r.stdout[-160:]}")
 
-        r = sb.run("subscribe", "--row", FINISHED)
+        r = sb.run("subscribe", "--row", rowaddr(FINISHED))
         check("⛔ subscribe REFUSES a row that opted out", r.returncode == 5,
               f"rc={r.returncode} {r.stdout[-160:]}")
 
@@ -226,7 +291,7 @@ def main():
         #    need ATTENDED still listed, and the first version of this block
         #    blanked it and made the next test fail for a reason that had
         #    nothing to do with the monitor.
-        r = sb.run("subscribe", "--row", DELEGATE)
+        r = sb.run("subscribe", "--row", rowaddr(DELEGATE))
         rec = (sb.state / "booter" / f"{DELEGATE}.json").read_text() if \
             (sb.state / "booter" / f"{DELEGATE}.json").exists() else ""
         check("a THIRD-PARTY subscription defaults to monitor, not task",
@@ -235,7 +300,7 @@ def main():
         check("⛔ and the row cannot then unsubscribe itself when it feels done",
               r.returncode == 3 and (sb.state / "booter" / f"{DELEGATE}.json").exists(),
               f"rc={r.returncode} {r.stdout[-160:]}")
-        r = sb.run("subscribe", "--row", DELEGATE, "--kind", "task")
+        r = sb.run("subscribe", "--row", rowaddr(DELEGATE), "--kind", "task")
         rec = (sb.state / "booter" / f"{DELEGATE}.json").read_text()
         check("an explicit --kind still wins", '"kind": "task"' in rec, rec[:120])
         (sb.state / "booter" / f"{DELEGATE}.json").unlink()
@@ -246,6 +311,20 @@ def main():
         check("⛔ the monitor REFUSES to wake an attended row that gained a subscription",
               "NEVER-ARM" in r.stdout and "dropping the subscription" in r.stdout,
               f"rc={r.returncode} {r.stdout[-200:]}")
+
+        # ⛔⛔ A BARE UUID IS NOT AN ADDRESS, AND STORING ONE ARMS NOTHING.
+        # `row_presence` asks the row plane at --host; a bare uuid resolves absent
+        # every tick, so the watchdog lapses a LIVE row as "GONE". Reported by a
+        # sibling campaign 2026-08-14 after repairing a live instance; the root was
+        # structural — their spawn wrapper raced and exited non-zero on a spawn that
+        # had SUCCEEDED, so a human compensated with a hand-rolled subscribe, and
+        # the hand-rolled call reproduced the failure the wrapper existed to prevent.
+        r = sb.run("subscribe", "--row", DELEGATE)          # deliberately BARE
+        check("⛔ subscribe REFUSES a bare uuid as a row address",
+              r.returncode == 6 and "not an addressable row" in (r.stdout + r.stderr),
+              f"rc={r.returncode} {(r.stdout + r.stderr)[-200:]}")
+
+        choice_prompt_screens(a.booter, sb)
 
         sb.unreadable()
         r = sb.monitor("tick", "--dry-run")
