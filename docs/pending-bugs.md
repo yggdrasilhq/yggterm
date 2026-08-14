@@ -302,22 +302,53 @@ copies of itself, and had to be recovered from disk by selecting on the GUI's pi
 the role so the GUI's event is selectable. Until then, read it from
 `~/.yggterm/event-trace.*.jsonl` filtered by the GUI's pid.
 
-## ⛔ [6.7] THE DAEMON LEAKS ZOMBIE `ssh` CHILDREN
+## ⛔⛔ [6.7] EVERY DEPLOY ORPHANS A DAEMON, AND NOTHING EVER RETIRES IT
 
 **Status:** OPEN
 
-*measured 2026-08-14 on the desktop host*
+*Measured and drained on the desktop host 2026-08-14, owner-approved*
 
-12 `ssh <defunct>` processes, all parented to one `yggterm-headless server daemon`,
-all **5 days old**. The daemon spawns `ssh` and never reaps it, so the entries
-accumulate in the process table for the daemon's whole life.
+Five `yggterm-headless` daemons were running on the laptop. **All five were on a
+DELETED or `.old` binary** — aged 8.6 hours to **9.1 days**. Not one was there by
+design: a deploy replaces the binary, the running daemon keeps the old inode,
+holds its sessions, and nothing retires it. Same class as the orphaned GUI in the
+launch entry above, one layer down.
 
-Small in isolation — a zombie holds a PID and a table entry, not CPU or memory. It
-is filed because it is unbounded in the one direction that matters: the daemons are
-long-lived by design, so the count only grows, and the fleet runs many of them.
+⇒ **This also answers "why do daemons run on the laptop when the architecture
+puts them on the server?"** They are not a deployment choice. They are residue.
 
-**Falsifier:** if the count on a daemon of comparable age is stable rather than
-monotonic, this is a burst at a known event rather than a missing reap.
+**What each actually held**, measured from the OS rather than from a verb, because
+the old daemons predate `server status` and cannot answer it:
+
+| pid | age | children | live agent children | verdict |
+|---|---|---|---|---|
+| 973443 | 8.6 h | 21 | **20** | ⛔ the live one, untouched |
+| 426042 | 5.2 d | 14 | 0 | 12 of them ZOMBIE `ssh` |
+| 169710 | 9.1 d | 1 | 0 | one idle shell |
+| 523808 | 5.2 d | 1 | 0 | one idle shell |
+| 3844228 | 5.6 d | 1 | 0 | one idle shell |
+
+**Drained the four orphans with SIGTERM.** All retired cleanly, the live daemon
+kept its 21 children, rows went 379→380 and live sessions stayed at 21 — nothing
+was lost. ⚠ Three shells idle for 5–9 days went with them; they were unreachable
+from the current GUI by construction, being owned by daemons whose binary no
+longer exists.
+
+⭐ **The zombie `ssh` leak died with its parent** — 12 → **0**. It was never a
+separate defect: an orphaned daemon that no longer reaps is the same bug wearing
+a second face.
+
+**Result: the yggterm family fell from 0.73 to 0.359 cores**, 9 processes to 4.
+⚠ **Only part of that is the drain.** The four orphans' own CPU was ~0.05 cores;
+the GUI and its web process fell too, which *suggests* the GUI was paying to poll
+daemons that served nothing — but terminal traffic varies by more than this
+margin, so that half is a hypothesis, not a measurement.
+
+⛔ **The drain is a mop, not a fix.** It will refill on the next deploy. The fix
+is retirement at handover, which is the constitution's own guarantee.
+
+**Falsifier:** if a daemon on a live binary is ever found orphaned, the mechanism
+is not "deploy replaces the inode" and this entry names the wrong cause.
 
 ## ⚠ [9.2→6.x] `session rename` IS ASYNC W.R.T. `rows`, SO THE DOCUMENTED VERIFY STEP RETURNS A FALSE NEGATIVE
 
