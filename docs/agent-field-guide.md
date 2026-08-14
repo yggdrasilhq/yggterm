@@ -271,10 +271,26 @@ lines the "garbled" one renders as mojibake.
 "is this what the user sees".** On a terminal view those coincide. On a document
 surface they came apart completely, and nothing in the reply said so.
 
-- ⚠ **Until the compositor fix is live, do not settle a document-surface render
-  claim from a screenshot.** Read the DOM, and read `webview_edit_faults` — it
-  was the only field that moved throughout (4 in the repro) while
-  `has_schema: true, error: null, visible: true` all reported healthy.
+✅ **BOTH HALVES FIXED 2026-08-14 — but read what was fixed, because one of them
+was not fixed where you would look for it.** The compositor now refuses to
+composite the xterm canvas when a document surface owns the viewport.
+`terminal_host_visibility_style` **still returns `opacity:1; visibility:visible;`
+unconditionally** and is *correct* to: the standdown is a CSS rule keyed on
+`[data-document-surface-owns-viewport="true"]`, beside the `pointer-events` rule
+that was already there. ⚠ So a reader who greps that function will conclude the
+second half is still open. It is not — grep `DOCUMENT_SURFACE_STANDDOWN_CSS`.
+
+- ⚠ **The fix is in the BINARY, so the question is which binary is running.** On
+  a GUI older than this landing, both halves are still live and a
+  document-surface screenshot still lies. Settle it by identity
+  (`docs/deploy-spec.md` §1), never by version.
+- ⭐ **`webview_edit_faults` remains the field to read** whenever a surface
+  renders nothing while its state reports healthy — it was the only one that
+  moved throughout (4 in the repro, 0 after) while
+  `has_schema: true, error: null, visible: true` all reported fine. That is not
+  specific to this defect: it is the general tell that a subtree stopped
+  tracking its state, and it is monotonic, so a non-zero reading means damage
+  has happened even if the screen currently looks right.
 - ⭐ **The general rule this belongs to:** *an instrument that composites more
   than one source must say which source it drew.* A boolean that means "the
   compositor ran" reads as "the picture is true", and those are different claims.
