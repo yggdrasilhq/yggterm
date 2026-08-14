@@ -211,6 +211,19 @@ copies.
   constitution's **unsolved per-viewer-geometry problem** from blocker to
   feature. The read-only pinned shadow viewer does not solve it, it dodges it.
 
+- **May a user deliberately run TWO yggterm windows of the same live build on one
+  display?** Today the GUI keeps them: `should_retire_superseded_client` retires an
+  older same-display client only when its executable differs, and a test asserts the
+  same-build case is kept. That decision is now load-bearing, because the crash-plus-
+  restart tangle produces same-build duplicates and the user cannot escape one by
+  restarting. **Recommendation: no — one window per display, and a second launch
+  either refuses or replaces.** It is his call because "I want two windows side by
+  side" is a product answer that no reading of the code can supply.
+  *Meanwhile:* the unambiguous half is fixed and needs no ruling — a GUI running a
+  **deleted** binary is now retired on sight, which is the case that cost the day.
+  The same-build question is filed in [`pending-bugs.md`](pending-bugs.md) and
+  nothing waits on it. **Reversing this is one predicate**, not a redesign.
+
 ## Third parties only he can chase
 
 - **Google Play identity verification is his, and it gates every listing** — the
