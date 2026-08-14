@@ -977,13 +977,55 @@ Background measured **0.00000 cores**, so the defect did not bite *here* — the
 ordering survives. ⭐ **But it survived by luck, not by method**, and a claim that
 rests on an ordering must not rest on the weaker of two instruments.
 
-⭐⭐ **THE SUBSTANTIVE FACT, which reframes the item rather than closing it:
-`snapshot`'s payload is PER-SESSION.** On a session-less daemon it returns
-**176 bytes** (`live_sessions: []`, `active_session: null`) against `status`'s
-**61,463 bytes** of row inventory. So `snapshot` is cheap when there are no
-sessions and expensive when there are — **the aggregate's 259.8 ms is a SESSION
-effect wearing a verb's name.** ⇒ Not "the verb is innocent" but "the verb is a
-per-session verb", which is the same conclusion §6j-7 reached from the other end.
+⛔ **I THEN CALLED `snapshot` A PER-SESSION VERB, AND THAT IS WRONG TOO.** On a
+session-less daemon it prints **176 bytes** against `status`'s **61,463**, and I
+read "cheap without sessions". The build lane's controlled arm — **sessions held
+at ZERO in both rungs, rows the only variable** — prices it per **ROW**:
+
+| verb | rows=0 | rows=264 | per row |
+|---|---|---|---|
+| `status` | 101 µs | 1,421 µs | **5.0 µs/row** |
+| `snapshot` | 123 µs | **8,720 µs** | **32.6 µs/row** |
+
+⭐ That run carries its own consistency check: **5.0 µs/row for `status` against
+the 4.645 and 4.71 already agreed three ways.** ⇒ `snapshot` is cheap without
+**rows**, not without sessions, and 123 µs at zero rows is just the connection
+floor — which is exactly why my session-less arm read it cheap and why I reached
+for the session explanation I already had rather than the one the control
+supports. **A verb that is 6.5x `status` per row, on rows frozen at each daemon's
+birth: a 264-row daemon owning one session pays 8.7 ms per snapshot for rows it
+does not own.**
+
+### ⭐ 6j-6b. PRICED, AND IT DIES WHERE S5 DIED — plus which telemetry stream is sampled
+
+The missing multiplier was the live `snapshot` RATE. ⛔ **Before quoting it, check
+which stream it comes from**, because this file's own finding is that noisy spans
+are sampled:
+
+    perf_span_is_high_frequency_noise  =  status | ping | terminal_read
+                                        | terminal_write | terminal_snapshot
+                                        | working_flags
+
+⭐⭐ **`snapshot` is NOT on that list — and neither the `daemon_request/snapshot`
+span nor the event trace is sampled**, so its count is complete. (`append_trace_event`
+never consults the sampler at all; the predicate governs `PerfGuard` spans only.)
+⇒ **`status`, `ping`, `working_flags` and `terminal_read` counts in
+`perf-summary` are UNDERCOUNTS and their ratios are not real; `snapshot`'s is.**
+
+Two perf-summary reads 203 s apart, fleet-wide: **`daemon_request/snapshot` =
+0.37/s**, with `daemon/snapshot_response` at 0.53/s beside it. ⭐ **§6a's
+independent trace-derived figure is 0.25–0.32/s** — a different unsampled stream,
+agreeing.
+
+⇒ **0.37/s x 8,720 µs = 0.0032 cores fleet-wide — ~0.1% of daemon CPU.**
+
+⛔ **DO NOT BUILD A FIX FOR IT.** The per-row measurement is sound and the
+ordering against `status` is real; the **rate is too low**, exactly as with S5 at
+1.6%. ⚠ Live snapshots show p50 **320.9 ms wall** against 8.7 ms CPU on a
+session-less sandbox, so live snapshot CPU is likely higher — but even at 100 ms
+of CPU the term is ~0.037 cores, ~1%, and still not worth a version-gated change.
+⭐ **The finding survives as a fact about the verb and dies as an optimisation**,
+which is what asking for the multiplier before quoting cores is for.
 
 ### ⭐ 6j-6a. A per-connection cost OUTSIDE the handler closure — and it revives S4
 
