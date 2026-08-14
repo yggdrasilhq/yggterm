@@ -1495,13 +1495,49 @@ per-thread figures (0.02–0.19 cores) are what ordinary output costs. The
 transferable claim is the **shape** — one thread per session, cost proportional
 to output volume — not the magnitude.
 
-⇒ **The ledger, finally, in cores and without a share:** per-session reader
-threads are the large, episodic term and the handler term is the small, stable
-one (~1.8–1.9 cores fleet-wide). ⛔ **Nothing here is a leak and nothing here is
-idle cost in the strict sense** — a daemon whose sessions are quiet costs
-0.67 ms/request and its readers cost nearly nothing. **The population is
-expensive because it is BUSY, and the drain (§S1) remains the action, because it
-moves that work onto fewer, current daemons rather than removing it.**
+⛔⛔ **THE LEDGER THIS PARAGRAPH USED TO CARRY IS WITHDRAWN.** It read: *"nothing
+here is a leak; the population is expensive because it is BUSY, and per-session
+reader threads are the only large term standing."* Both halves are gone.
+
+**What replaced it, from a unit of account no lane had used** — each daemon
+measured against its **whole process subtree**, reproduced over two quiet runs.
+Per daemon, legacy (n=14) and current (n=2) are **indistinguishable at 0.19–0.24
+against 0.20–0.23 cores.** The legacy population costs 2.6–3.3 cores because
+**there are fourteen of them**, and their subtrees are **idle** while the current
+pair's carry 2.3 cores of real work.
+
+    daemon population cost  ~=  N_reachable x floor(~0.2 cores)
+    the floor being THE PRICE OF BEING REACHABLE WHILE HOLDING A ROW INVENTORY
+
+⚠ **Honest limit:** n=2 on the current side, and its per-daemon range overlaps
+legacy's entirely. *"Indistinguishable"* means **no detectable difference**, not
+"identical" — and the population conclusion rests on the **count** (14 vs 2), not
+on that comparison.
+
+⭐⭐ **AND IT EXPLAINS WHY EVERY ARM IN §6h–§6n CAME BACK EMPTY, WITHOUT
+CONTRADICTING ONE OF THEM.** Request serving <1%, snapshot ~0.1%, a 150–230 µs
+per-connection floor, no intrinsic per-daemon floor, an unpolled daemon at
+0.00017 cores, unreachable daemons at 0.000, and a total failure to find any
+per-request signal on a live daemon — **every one of those fits, because the
+floor is not spent per request.** Those arms did not fail to find the cost; they
+correctly established it is **not in the path they measured.**
+
+⇒ ⭐ **And the reconciliation this lane can add: the floor is in the SUBTREE, not
+in the daemon process.** Every arm here measured the daemon *process*, and the
+sandbox daemons **spawn no children at all** — no sessions, no wrappers, no
+remote clients — so they have no subtree to carry a floor. That is why
+0.00017 cores was reproducible and honest and still missed a 0.2-core term: **the
+quantity was never inside the process being sampled.**
+
+⇒ **§S1's justification INVERTS, and it is still not a leak:** not *"reclaim
+leaked cores"* but **"stop paying a reachability floor fourteen times over for
+daemons whose sessions are idle."**
+
+⭐ **The method note, and it is the cousin of "the dangerous copy is in a
+different file type":** this was seen only by **changing the unit of account**.
+Every lane measured the daemon; none measured what the daemon was *for*. **A cost
+model that never looks at the work being served cannot distinguish "expensive
+because busy" from "expensive because numerous."**
 
 ## 6k. WHY AN UNPOLLED DAEMON DOES NOT RETIRE — the answer owed to the build lane
 
