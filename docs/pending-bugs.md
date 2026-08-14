@@ -134,6 +134,38 @@ and the predecessor must be the one that exits. ⚠ Add a second arm with a
 preserved record whose owner is **already dead**: that daemon must still retire,
 or the fix has bought a permanent pin.
 
+### ⛔⛔ THE SECOND ARM WAS WRITTEN FIRST, AS INSTRUCTED, AND IT FAILS TODAY
+
+**Measured 2026-08-14. Both arms in ONE run, one variable, zero daemon contact
+during the window** (every request resets `last_activity_ms` and would prevent
+the very idle shutdown being measured), verdict read from each daemon's **own
+log**, and **gate 3's input was zero client-instance files in both arms**:
+
+| the preserved record's owner | successor |
+|---|---|
+| **alive** | **RETIRED** (1 `idle shutdown` line) |
+| **dead** | **did NOT retire** (0 lines), still `owned=0, preserved=1` |
+
+⇒ **A dead owner's preserved record already pins a daemon today.** The premise
+that today's failure "has an exit" is **false for the case that matters**: it has
+an exit while the owner lives, and none once the owner dies.
+
+⭐ **This does not overturn the ruling, it sharpens it.** Counting preserved does
+not *introduce* the permanent pin — the pin already exists for dead owners, so
+counting would *widen* it. ⇒ **The exit half is now the more important half, and
+it has a named first job: clear a record whose owner is dead.** That is exactly
+the case that already fails, so the exit earns its place before the count does.
+
+⚠ **NOT CURRENTLY FIRING ON THE FLEET, and that is stated so nobody hunts it.**
+The live home holds **36 preserved entries and all 36 owners are alive (0 dead)**,
+checked by pid *and* by `argv[0]` still being a yggterm daemon, so a reused pid
+cannot read as alive. ⇒ **Latent, not active.** It arms whenever an owner dies —
+a crash, a `kill -9`, or the stale-daemon sweep's own SIGTERM.
+
+⛔ **Do not cite this as the cause of the legacy daemon pile.** It is a candidate
+mechanism with zero instances currently present, and the honest statement is that
+the pile is not being held this way today.
+
 ## ⛔⛔ [6.0] THE SUPERVISION WATCHER IS DEPLOYED BY WHICHEVER CHECKOUT IT HAPPENED TO START IN
 
 **Status:** OPEN
