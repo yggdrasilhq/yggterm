@@ -103,6 +103,40 @@ the flag it forbids touching there.
 **Falsifier:** if the corruption reproduces with WebGL off, the atlas is
 exonerated and the fault is upstream of the renderer.
 
+### ⛔ A THIRD SYMPTOM, 2026-08-14 15:09 — CELLS BLANKED RATHER THAN SUBSTITUTED
+
+Owner-reported with a screenshot of this seat's own row. Individual character
+cells are punched out and replaced with the background, mid-word, throughout a
+syntax-highlighted diff block: *"PTY st rts"*, *"lev l 4's"*, *"T at is sound
+design"*, *"z ro back"*, *"i could n t be tes ed"*. Not substituted glyphs this
+time — **missing** ones.
+
+⭐ **The frame narrows it further than either earlier report, for free.** The
+capture composites a DOM snapshot of the chrome with the xterm canvas drawn into
+the terminal rect. In that one image the **sidebar and the session-metadata
+panel are pixel-perfect** while the **terminal is corrupted**. ⇒ The fault is in
+the CANVAS layer, not the page, not the compositor, and not the data.
+
+⚠ **And the damage tracks BACKGROUND COLOUR.** The blanking is concentrated
+inside the coloured added/removed diff runs; text on the default background
+mostly survives. That points at the renderer's background-fill pass overdrawing
+glyph cells — an ordering fault between the two passes — rather than at the
+glyph atlas alone.
+
+⇒ **Three symptoms now sit in one subsystem**, all on the arm the policy selects
+(`xterm_webgl_enabled_for_wayland`): a SIGSEGV in the GL compositing path, a
+whole-screen glyph substitution, and this per-cell blanking. Treating them as one
+defect is the cheaper hypothesis, and it raises the value of the single
+experiment that would settle all three.
+
+⚠ **The sandbox may be the wrong instrument, and that has to be said before
+someone spends a day in it.** `underglass-sandbox.sh` runs under headless sway,
+which is a different GL stack from the owner's KDE/radeonsi desktop, and this
+project's own presentation law is that what you learn on a headless rig does not
+travel. If the corruption does not reproduce there, that is **not** evidence the
+renderer is innocent — it is evidence the sandbox cannot see this class. A
+negative result there must be reported as inconclusive, never as a refutation.
+
 ⚠ **Correlation worth keeping:** it was observed on a row that was still
 bootstrapping. The campaign already records that a re-resume onto a fresh PTY is
 when the squish/broken-bottom artefacts appear, so the first-paint window is
