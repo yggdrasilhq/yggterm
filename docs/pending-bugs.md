@@ -14,7 +14,9 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔⛔⛔ [6.7] A CLI PROVISIONER LEAKS 78 MB OF **RAM** PER AUTO-UPDATE, INTO tmpfs
 
-**Status:** OPEN — the leak is in a package we do not own; our half is shipped
+**Status:** OPEN
+
+⚠ Our half is shipped; the leak itself is in a package this repo does not own.
 
 *Owner-reported 2026-08-14 as memory pressure; measured on the desktop host*
 
