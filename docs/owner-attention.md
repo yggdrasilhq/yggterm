@@ -121,6 +121,17 @@ copies.
   *Meanwhile:* the relay is on the half that is ours — the web process growing
   ~366 MB/h whose bound cannot fire, and a daemon leaking a thread per dead PTY.
 
+- **Repair the GUI close path, or retire the tier it serves?** Nine GUI launches
+  in the retained traces produced ZERO events from any step of the shutdown path,
+  so nothing has been reaping "dies with the GUI" rows at all — and repairing it
+  would START destroying rows that survive today. → yggterm `docs/pending-bugs.md`
+  § *THE GUI CLOSE PATH NEVER RUNS, SO THE "DIES WITH THE GUI" TIER IS VESTIGIAL*
+  (`Status: AWAITING A DECISION`).
+  *Meanwhile:* nothing repaired, and the row group he lost is already fixed by a
+  different route — it was never closed, it was dropped from the state file. My
+  recommendation is in the entry: retire the tier rather than start enforcing a
+  promise the product has not been keeping.
+
 - **The response-layer rule, or five separate patches?** — five verbs report the
   request rather than the effect, and he framed the fix's SHAPE as the open
   question. → yggterm `docs/pending-bugs.md` § *FIVE VERBS REPORT THE REQUEST,

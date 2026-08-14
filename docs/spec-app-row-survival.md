@@ -136,8 +136,26 @@ user's own rows.
 > ⭐ **And the check itself is now cheap and needs no memory of what was there:**
 > `server rows departed` names every row that has left and why. A row missing
 > with a `gui-close-disposable` entry went because it was disposable; a row
-> missing with NO entry did not leave through any path that knows it left, which
-> is a bug in its own right.
+> missing with a `persist-dropped` entry was never closed at all; a row missing
+> with NO entry did not leave through any path that knows it left, which is a bug
+> in its own right.
+>
+> ### ⚠⚠ AND THIS SECTION'S PREMISE MAY SIMPLY BE FALSE — MEASURED, NOT ARGUED
+>
+> *"Treat a GUI kill as destructive to app rows"* assumes the GUI close reaps
+> them. On the desktop host: **nine GUI launches in the retained traces and ZERO
+> events from any step of the shutdown path** — no flush, no watchdog, no
+> `client_close_prepared`. ⇒ **`PrepareClientClose` has not been sent once in that
+> window, so nothing has been reaping anything at GUI close.** A sandbox
+> reproduces it from the other side.
+>
+> ⚖ So the operational rule is over-cautious in one direction and the tier it
+> defends may not exist in practice. **It is left standing anyway**, because the
+> measurement is bounded by trace retention rather than by history, and because
+> being wrong in this direction costs a re-launch while being wrong in the other
+> costs the user's rows. Queue entry `[6.2]` carries the mechanism, the falsifier,
+> and why repairing the close path is a DECISION rather than a fix — it would
+> start destroying rows that survive today.
 
 ⚠ **Until app rows are born keep-alive, treat a GUI kill as destructive to them.**
 
