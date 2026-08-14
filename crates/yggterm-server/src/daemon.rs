@@ -8048,6 +8048,9 @@ impl DaemonRuntime {
             title: title.clone(),
             reason,
             at: crate::live_row_tombstones::now_secs(),
+            // A close has no sub-cause: it was closed. Inventing one would make
+            // the field lie for the two reasons that do not have one.
+            detail: None,
         };
         let home = self.store.home_dir().to_path_buf();
         match self.live_row_tombstones.record_departure(&home, departure) {
