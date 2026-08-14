@@ -67,10 +67,18 @@ and if so this is a control-plane-wide clause and not a `rename` note.
 *measured 2026-08-14; instrument, controls and the two refuted candidates in
 [`idle-cost-model.md`](idle-cost-model.md) §6j — spec is §S6*
 
-A connection-handler thread burns **25.0 ms of CPU (1.6 user + 23.4 kernel,
-93.8% kernel)**. The `PerfGuard` span over it covers **~2.4 ms**, because the
-guard **drops when `handle_request` returns** and records **wall time**, which
-cannot distinguish work from waiting.
+A connection-handler thread on a LIVE daemon burns **20–44 ms of CPU**. The
+`PerfGuard` span over it covers **~2.4 ms**, because the guard **drops when
+`handle_request` returns** and records **wall time**, which cannot distinguish
+work from waiting.
+
+⛔⛔ **THE "93.8% KERNEL" THAT MOTIVATED THIS ENTRY IS RETRACTED** (§6j-3). It came
+from `/proc/<tid>/stat` utime/stime — 10 ms ticks, **each truncated
+independently** — which annihilates the smaller component below ~10 ms and drives
+the share to 100% for the larger. Against `getrusage(RUSAGE_THREAD)` on a known
+4 ms/20 ms mix: true 83.3%, ticks report **100.0%**. ⇒ **Do not describe this cost
+as kernel time.** The magnitude survives (two methods agree); the composition does
+not, and S6's in-process span is the instrument that can answer it.
 
 ⇒ **~1.8–1.9 cores of the daemon population are spent where no instrument
 looks.** That number is stable: two 60 s runs over 20 daemons put the
@@ -82,14 +90,46 @@ calls is 0.05% of a ~2.4 ms span**), and wrap the whole closure at
 `spawn_unix_client_handler` (`daemon.rs:785`) instead of just `handle_request`.
 
 **Expected effect: ZERO cores — do not promise any.** It converts an
-unattributable 1.8 cores into an attributed one. **Prediction it must satisfy:**
-~25 ms on a loaded daemon, ~0.7 ms on an empty one.
+unattributable 1.8 cores into an attributed one.
+
+⭐⭐ **AND IT IS NOW THE ONLY INSTRUMENT THAT CAN ANSWER THE LIVE QUESTION**
+(§6j-8). A baseline-subtracted external estimator was pointed at live daemons and
+came back **VOID**: bracketing baselines on one daemon moved 0.4240 → 1.1437
+cores and produced an impossible **negative** per-request cost. The baseline on a
+live daemon *is* the per-session reader term, and it drifts ~35x faster than the
+signal. (⚠ that term is **not** episodic — see the correction below; it is simply
+large enough that its ordinary variation swamps a per-request quantity.) ⇒ **Per-request cost is below the noise floor of any external
+instrument; only an in-process span can reach it.** ⛔ Treat the remaining live
+figure (20–44 ms per dying thread) as **provisional** until S6's live record
+lands.
+
+**Prediction S6 must satisfy:** ~0.7 ms on an empty daemon, and a live figure that
+either confirms 20–44 ms or replaces it.
 
 ⛔ **Ruled out by measurement, so do not re-propose them:** `malloc_trim(0)` at
 `daemon.rs:19103` (**0.020–0.039 ms** at 30 threads/360 MB — ~600x too small),
 the page-faults it induces (353–852/request ≈ 0.5–1.7 ms), the lock wait itself
 (`try_lock` then a **blocking** `lock`; a block costs no CPU), and the trace
 writer (handles cached, no stat or reopen per call).
+
+⚠ **The request MIX is RESTATED, not refuted** (§6j-6): `snapshot` is a
+**per-ROW** verb — **32.6 µs/row against `status`'s 5.0**, measured with sessions
+held at ZERO in both rungs, so a 264-row daemon owning one session pays 8.7 ms
+per snapshot for rows it does not own. ⛔ **PRICED AND NOT WORTH BUILDING:** the
+live rate is **0.37/s** (unsampled, and §6a's independent trace figure of
+0.25–0.32/s agrees) ⇒ **0.0032 cores, ~0.1%** — it dies where S5 died.
+⭐ **And check which telemetry stream a count comes from before quoting a ratio:**
+`status`/`ping`/`working_flags`/`terminal_read` spans are **sampled** (kept at
+≥8 ms or 1-in-50) so their `perf-summary` counts are undercounts; `snapshot` is
+not on that list, and the event trace is never sampled at all.
+⛔⛔ **AND A "~1.7 ms PER-CONNECTION COST OUTSIDE THE CLOSURE" THAT DOES NOT
+EXIST** — I got it by subtracting a closure span from a process counter that was
+charging concurrent reader/chore work to whatever connection was open. Measured
+from inside in three pieces (parent accept+spawn 44–48 µs · child pre-closure
+39–55 µs · closure 61–126 µs), the **whole per-connection floor is ≈150–230 µs**,
+~8x smaller. ⇒ **S4's old note was right, but by luck at ~50 µs and now by
+measurement; schedule S4 on stability and observability, NEVER on cores**
+(<0.001 cores/daemon).
 
 ## ⛔ [6.3] ONE SESSION RENDERS AS TWO ROWS, AT TWO DIFFERENT NESTING DEPTHS
 
@@ -172,26 +212,47 @@ being audited rather than merely edited.
 **Falsifier:** the identifiers are absent from `git log -p` over all refs, and the
 forge returns 404 for the pre-removal blob URLs.
 
-## ⛔ [6.9] A DAEMON WITH ALL THREE RETIRE GATES OPEN DID NOT RETIRE
+## ⛔ [6.9→6.1] AN UNREADABLE CLIENT-RECORD DIRECTORY READS AS "NO CLIENTS" AND PERMITS RETIREMENT
 
 **Status:** OPEN
 
-*source reading and the three gates in [`idle-cost-model.md`](idle-cost-model.md) §6k*
+*source reading, and the withdrawal of the anomaly that led here, in
+[`idle-cost-model.md`](idle-cost-model.md) §6k-1..§6k-3*
 
-`daemon_should_idle_shutdown` (`daemon.rs:11526`) requires three conditions:
-zero terminal sessions (owned **and** preserved), idle beyond
-`idle_shutdown_ms` (default 90 s), and no active client-instance records for
-**its own endpoint** (or being superseded).
+`daemon_should_idle_shutdown` (`daemon.rs:11537`) is careful: if
+`active_client_instance_records` returns `Err` it returns `false` — *if you
+cannot tell whether clients exist, do not retire.*
 
-One sandbox daemon satisfies all three by observation — its own state file reports
-`stored_sessions=0, live_sessions=0`, it holds **only LISTEN sockets with zero
-established connections**, and the single client-instance record in its home is
-filed under a *different* endpoint version than the one it serves — yet it had
-been alive **48 minutes** against a 90 s window.
+**The callee guarantees that arm never fires.**
+`active_client_instance_records_from_dir` (`lib.rs:20737`) ends every failure in
+`let Ok(entries) = entries else { return Ok(()) };`, and drops per-entry errors
+with `.flatten()`. It has no `Err` path, so neither does its caller.
 
-⇒ Either the check is not reached on that path, or one of the three inputs is not
-what the state file says. **Not a cost item** (it measures 0.0002 cores); it
-matters because the drain in §S1 depends on emptied daemons actually retiring.
+⇒ An unreadable client-instances directory — permissions, fd exhaustion, ENOMEM —
+is reported as **an empty set of clients**, which satisfies gate 3 and **permits
+retirement while a client may be connected**. Two halves of one decision disagree
+about what an unreadable directory means and the careless half wins.
+
+⚠ **This is the INVERSE of the "a failing read means it never retires" reading.**
+That one cannot happen today; this one can. Both come from the same `Result` being
+vestigial.
+
+**Fix:** let the callee distinguish *absent* (legitimately no clients ⇒ `Ok`) from
+*unreadable* (⇒ `Err`), so the caller's existing caution becomes reachable.
+
+⛔ **NOT A DEFECT, CLOSED: "a daemon with all three retire gates open did not
+retire".** I filed that and it was wrong twice over. `client_instance_dirs_for_scan`
+scans **every** directory under the client-instances root, so a record filed under
+another endpoint version is still in scope; and `daemon_is_superseded` needs a
+**live** newer daemon, which that home did not have. Records non-empty and not
+superseded ⇒ gate 3 correctly returns `false` indefinitely. Demonstrated: a daemon
+with no record retires at **+90.2 s**, one with a record naming a live process was
+still running at **+204.8 s**.
+⛔⛔ **And the probe that manufactured it: `/proc/<pid>` existence is TRUE FOR A
+ZOMBIE.** The harness called a daemon "still alive at 200 s" that its own trace
+shows retiring at +90.2 s. `/proc/<pid>` answers *has this been reaped*, not *is
+this running* — and calling `poll()` to check is itself what reaps it. **Prefer
+the subject's own lifecycle record over any external liveness probe.**
 
 ## ⛔⛔⛔ [6.9→6.7] EVERY PEER `status` POLL REBUILDS THE WHOLE ROW INVENTORY
 
@@ -461,15 +522,52 @@ floor from inside the request path. Both are right, and this reconciles them:
 
 ⇒ **A daemon nobody can reach costs nothing at all**, so the floor is not a
 property of *being a daemon*; it is paid by daemons that are reachable while
-holding a row inventory. ⇒ **The current daemons are the cheap ones**, despite
-owning the most: the expensive population is idle-but-burning, not busy.
+holding a row inventory.
+
+⛔⛔ **AND I WITHDRAW MY OWN NEXT SENTENCE, WHICH READ "the current daemons are
+the cheap ones".** Corrected 2026-08-14 against two independent quiet runs (6.9,
+`3cb42114`): **per daemon the groups are indistinguishable — legacy 0.189/0.239,
+current 0.201/0.227, a ratio of 0.94–1.05x.** My table above is TOTALS, and
+reading a per-daemon conclusion out of a total is the arithmetic error the
+column headings invite. My single window happened to catch the current pair low,
+one of them at 0.077 while it was still starting up.
+
+⇒ **What is actually true: the legacy population costs more because there are
+FOURTEEN of them.** The model that survives is
+
+    daemon population cost  ≈  N_reachable × floor(~0.2 cores)
+
+and every other measurement fits it without strain — an unpolled daemon at
+0.00017 cores, the unreachable daemons here at 0.000, the request path under 1%,
+and the failure of any lane to find a per-request signal, because **the floor is
+not spent per request.**
+
+⚠ **The honest limit, carried rather than dropped:** n=2 on the current side and
+its per-daemon range (0.116–0.285) overlaps legacy's entirely, so
+*indistinguishable* means **no detectable difference**, not *identical*. The
+population conclusion does not rest on that comparison — it rests on the count,
+14 vs 2, which is not in doubt.
+
+⭐ **The part of my measurement that stands, because it changed the unit of
+account:** the legacy subtrees are IDLE while the current pair's carry 2.3 cores
+of real work. Every arm before this measured the daemon; none measured what the
+daemon was FOR, and a cost model that never looks at the work being served cannot
+tell *expensive because busy* from *expensive because numerous*.
 
 ⛔ **THIS CORRECTS "THE DRAIN MOVES WORK, IT DOES NOT REMOVE IT."** For the
 legacy population the work is not session work — nothing they own is asking for
 it — so draining them **reclaims** it rather than relocating it. The earlier
 warning stands only for the sessions themselves.
 
-⚠ **The mechanism is NOT established and I am not guessing it.** 6.7's
+⭐⭐ **S1'S −2.60 CORES IS THEREFORE VINDICATED BY A ROUTE SHARING NOTHING WITH
+ITS DERIVATION, AND IT NOW HAS A MECHANISM RATHER THAN A CORRELATION:** 14 legacy
+daemons × ~0.19–0.24 cores = **2.64–3.35 cores, genuinely reclaimable**, because
+nobody is being served by them. ⛔ The claim to make is NOT "reclaim leaked
+cores" — there is still no leak — but **"stop paying a reachability floor
+fourteen times over for daemons whose sessions are idle."**
+
+⚠ **The MODEL is settled; the CODE PATH is not, and I am not guessing it.**
+Knowing the floor is paid for reachability does not say what spends it. 6.7's
 per-connection figure (150–230 µs) is three orders of magnitude too small to
 reach 0.2 cores at any poll rate I can justify, and *what sets the poll rate* is
 already an open question in the 6.9 lane. Two facts constrain whoever takes it:
@@ -477,6 +575,35 @@ already an open question in the 6.9 lane. Two facts constrain whoever takes it:
 0.281 cores on one daemon) — which is the documented *cost hides in exited
 threads* entry, so ⛔ never price this from `/proc/<pid>/task`; and the
 socket-less zeros above make "reachable" the discriminator worth chasing first.
+
+### ⛔⛔ THE DRAIN HAS A VERSION FLOOR: 3.0.32. BELOW IT, SESSIONS CAN ONLY LEAVE BY ENDING
+
+**Measured 2026-08-14 (6.1), two independent artefacts, with a positive control
+in the same run.** A session leaves a daemon either by RELEASE (kill + re-resume,
+which `session_is_migratable` refuses for anything without a store — every plain
+shell) or by the PTY FD HANDOFF, which needs no store. So the handoff is the only
+road out for a shell. It does not exist below 3.0.32:
+
+- `strings /proc/<pid>/exe` on the running 2.12.14 daemon: **0** occurrences of
+  `pty-handoff`. The same probe on the current 3.0.154 binary: **2**. (⚠ The
+  control matters — this literal builds a socket path, so an absent count on a
+  correct build was the failure mode to rule out.)
+- The oldest `pty-handoff-*.sock` ever created on this host is **`3-0-32`**, and
+  **no `2.x` handoff socket exists at all** — an independent artefact agreeing.
+
+**What that costs, against the inventory (34 plain shells and 23 agent sessions
+across the population):**
+
+| | daemons | sessions | ~cores | reachable by the drain? |
+|---|---|---|---|---|
+| pre-3.0.32 legacy | **8** | 17 (14 shells, 3 agent) | ~1.6 | ⛔ **no** — no handoff path exists |
+| 3.0.36–3.0.62 legacy | 6 | 13 (11 shells, 2 agent) | ~1.2 | ✅ yes, once 3.0.155 lands |
+
+⇒ **About half of S1's 2.64–3.35 cores is behind a door the machinery cannot
+open.** Those 17 sessions end when their shells end, and 14 of them are plain
+shells the owner opened weeks ago. ⛔ This is not an argument for killing them —
+the constitution's first-class-shell guarantee is exactly what makes it his call.
+It IS the argument for stating the price when he is asked: → `docs/owner-attention.md`.
 
 ⭐ **ONE daemon is separately and confirmably pathological**: the 2.12.14
 instance re-reads **69 MB/s** (rchar, zero disk — all page cache) with three idle
@@ -543,18 +670,37 @@ currently missing ~80% of its CPU.**
 is that CPU stops being invisible to per-thread instruments.
 
 ⛔ **UPDATED §6j — the "38 ms" in this entry was a retracted ratio; the measured
-figure is ~25 ms** (1.6 ms user + 23.4 ms kernel, direct per-thread, 93.8%
-kernel). ⭐ **And a handler on an EMPTY daemon costs 0.70 ms**, so ~95% of the cost
+figure is 20–44 ms** on a live daemon, ~1.4 ms on a sandbox. ⛔ **The "93.8%
+kernel" is RETRACTED** — per-thread tick fields truncate user and kernel
+independently and annihilate the smaller below ~10 ms (§6j-3). ⭐ **And a handler on an EMPTY daemon costs 0.70 ms**, so ~95% of the cost
 travels with what the daemon HOLDS, not with the connection — a pool would keep
 that 95%. ⭐ **The row term is now settled three ways at ~4.5 µs/row** (a causal
 seeded arm, an IPW re-fit of field data, and the optimisation lane's own arm), so
 rows are ~1.2 ms of a 25 ms thread.
 
-✅ **THE SESSIONS ARM IS RUN (§6j-7) AND THE BURSTY TERM IS NAMED: one PTY READER
+⛔⛔ **THE LEDGER INVERTED 2026-08-14 (§6j-9) — READ THIS FIRST.** Daemon cost is
+**N_reachable x a ~0.2-core floor**, not session work. Per daemon, legacy and
+current are **indistinguishable (0.94–1.05x)**; the legacy population costs
+2.6–3.3 cores because there are **14 of them**, and the owner's subtree
+measurement shows their subtrees are **idle**. ⇒ **"The population is expensive
+because it is BUSY" and "the drain moves work rather than removing it" are BOTH
+WITHDRAWN — the drain genuinely reclaims ~2.6–3.3 cores.** ⭐ **S1's original
+−2.60 is vindicated by an independent route and now has a mechanism.**
+⛔ My reader-thread headline came from a sandbox where I flooded ptys with `yes`:
+**that is the ceiling, not the operating point.** In quiet live data the handler
+term is 57–75% and readers are the remainder.
+
+✅ **THE SESSIONS ARM IS RUN (§6j-7) AND THE PER-SESSION TERM IS NAMED: one PTY READER
 THREAD PER SESSION**, cost proportional to that session's OUTPUT VOLUME. On a
 sandbox with 4 flooding sessions the long-lived threads hold **3.364 of 3.449
 cores (97.5%)**, and the top four are **0.838/0.837/0.836/0.836 — exactly one per
-session**. That closes the loop on the 25x swings between adjacent windows, on
+session**. ⛔ **CORRECTED: the "25x swings between adjacent windows" that this
+originally closed the loop on were MY OWN LOAD GENERATORS** — quiet replication
+reads 1.03–1.12x on the same daemons, and only the 2.12.14 outlier bursts (4.15x)
+on its own. The per-session reader thread is still the term; the burstiness it was
+said to explain was contamination. ⭐ **The observer is part of the baseline: never
+take the "after" window of a comparison in the wake of your own generator.**
+That closes the loop on
 §6i's threads alternating `clock_nanosleep` with on-CPU bursts, and on §4's
 contention being 98.6% `terminal_read`.
 ⚠ **Do not quote 0.84 cores as the cost of a session** — `yes` saturates a pty at
@@ -4322,6 +4468,13 @@ measurable half above stands on its own and does not wait on it.
 ## ⛔⛔ [6.7] THE PRIVACY GUARD SCANS ALL OF HISTORY ON A NEW BRANCH, SO EVERY LANE PUSH FAILS AND TEACHES THE OVERRIDE
 
 **Status:** OPEN
+
+**Re-opened:** closed at `2d81b5a1` on the headline claim, which was then measured
+false — but a real residual survives it: the range derivation on a branch with **no
+upstream**. Kept open for the residual, not the headline. ⚠ This line is also what
+stops `check-queue-resurrection.sh` reporting the entry every run; it was doing so
+"ever since, and nobody ran it", which is how a real resurrection would have hidden
+behind the noise.
 
 ⛔⛔ **THE HEADLINE CLAIM — "EVERY LANE PUSH FAILS" — WAS MEASURED FALSE ON 2026-08-14,
 AND THIS ENTRY'S OWN FALSIFIER IS WHAT REFUTED IT.** The falsifier below says *push a

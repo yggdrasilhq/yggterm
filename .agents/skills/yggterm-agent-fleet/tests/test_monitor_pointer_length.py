@@ -93,6 +93,86 @@ class Sandbox:
         shutil.rmtree(self.home, ignore_errors=True)
 
 
+def seat_repair_screens(monitor_path, sb):
+    """Drive `_seat_handover_repair` directly, in a child with the sandbox HOME.
+
+    ⛔ The two instruments it reads are STUBBED rather than mocked away: the point
+    of three of these screens is what it does when an instrument REFUSES, and a
+    refusal is not an empty answer. `live_rows` returning ok=False is blindness;
+    `screen_ledgers` returning None is an unreadable attended list. Acting on
+    either would be a repair founded on no evidence."""
+    code = r'''
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("mon", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+HEIR = "cafecafe-8888-4888-8888-cafecafecafe"
+OLD  = "beefbeef-9999-4999-8999-beefbeefbeef"
+BOSS = "d0d0d0d0-1010-4010-8010-d0d0d0d0d0d0"
+def rows(pairs, ok=True):
+    return (lambda host: ([{"outline_prefix": s, "full_path": f"remote-cc://dev/{u}"}
+                           for s, u in pairs], ok))
+def sub(u, seat, esc):
+    m.sub_path(u).write_text(json.dumps({"uuid": u, "host": "testhost", "role": "relay",
+        "escalate_to": esc, "escalate_host": "testhost", "campaign": "test",
+        "seat": seat, "owner_pinned": False, "booter": True, "intent": "x", "since": 0}))
+out = {}
+
+# 1. healthy tick REMEMBERS the seat, and changes nothing
+sub(OLD, "9.2", BOSS)
+m.live_rows = rows([("9.2", OLD)]); m.screen_ledgers = lambda: (set(), set())
+m._seat_handover_repair("h", False)
+out["remembered"] = json.loads(m.SEAT_MEMORY.read_text()).get("9.2", {}).get("escalate_to") == BOSS
+
+# 2. the successor holds the seat, unsubscribed (a stale `succeed` deleted the record)
+m.sub_path(OLD).unlink()
+m.live_rows = rows([("9.2", HEIR)])
+r = m._seat_handover_repair("h", False)
+rec = json.loads(m.sub_path(HEIR).read_text()) if m.sub_path(HEIR).exists() else {}
+out["restored"] = bool(r) and rec.get("escalate_to") == BOSS and rec.get("seat") == "9.2"
+
+# 3. a seat NEVER subscribed is never invented — this is what keeps deliberate
+#    stand-downs and the owner's copilot row off the plane
+m.live_rows = rows([("7.7", "0bad0bad-2020-4020-8020-0bad0bad0bad")])
+m._seat_handover_repair("h", False)
+out["never_invents"] = not m.sub_path("0bad0bad-2020-4020-8020-0bad0bad0bad").exists()
+
+# 4. an ATTENDED row is refused even with a remembered seat
+m.sub_path(HEIR).unlink()
+m.live_rows = rows([("9.2", HEIR)]); m.screen_ledgers = lambda: ({HEIR[:8]}, set())
+m._seat_handover_repair("h", False)
+out["skips_attended"] = not m.sub_path(HEIR).exists()
+
+# 5. BLIND row plane repairs nothing
+m.screen_ledgers = lambda: (set(), set()); m.live_rows = rows([("9.2", HEIR)], ok=False)
+m._seat_handover_repair("h", False)
+out["blind_is_not_empty"] = not m.sub_path(HEIR).exists()
+
+# 6. UNREADABLE attended ledger repairs nothing
+m.live_rows = rows([("9.2", HEIR)]); m.screen_ledgers = lambda: (None, None)
+m._seat_handover_repair("h", False)
+out["unreadable_is_not_empty"] = not m.sub_path(HEIR).exists()
+print(json.dumps(out))
+'''
+    env = dict(os.environ, HOME=str(sb.home))
+    env.pop("YGGTERM_SESSION_ID", None)
+    r = subprocess.run([sys.executable, "-c", code, str(monitor_path)],
+                       capture_output=True, text=True, timeout=90, env=env)
+    try:
+        got = json.loads((r.stdout or "").strip().splitlines()[-1])
+    except Exception:
+        got = {}
+    for name, label in (
+        ("remembered", "tick REMEMBERS a healthy seat's membership"),
+        ("restored", "⛔ tick RESTORES membership to the seat's next holder"),
+        ("never_invents", "⛔ tick NEVER invents membership for a seat that had none"),
+        ("skips_attended", "⛔ tick REFUSES an attended row even with a remembered seat"),
+        ("blind_is_not_empty", "⛔ a BLIND row plane repairs nothing"),
+        ("unreadable_is_not_empty", "⛔ an UNREADABLE attended list repairs nothing"),
+    ):
+        check(label, got.get(name) is True,
+              f"got={got.get(name)!r} rc={r.returncode} {(r.stderr or r.stdout)[-200:]}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--monitor", default=str(DEFAULT_MONITOR),
@@ -146,6 +226,32 @@ def main():
               sb.read_sub(LANE)["escalate_to"] == BOSS_NEW,
               f"escalate_to={sb.read_sub(LANE)['escalate_to']!r} {r.stdout[-240:]}")
 
+        # --- succession must hand the PLANE over, not just the seat ----------
+        # ⛔ Deleting the predecessor's own subscription without adding the
+        # successor's mints a fresh orphan on EVERY relay: a live seat, armed on
+        # the booter, escalating to nobody. Two campaigns reported it the same
+        # hour; one relays hourly and regenerated it every time.
+        sb.write_sub(BOSS_OLD, "", seat="9.2", role="relay")
+        p = sb.subs / f"{BOSS_OLD}.json"
+        import json as _j
+        rec = _j.loads(p.read_text()); rec["escalate_to"] = BOSS_NEW; p.write_text(_j.dumps(rec))
+        HEIR = "aaaabbbb-7777-4777-8777-aaaabbbbcccc"
+        r = sb.monitor("succeed", "--from", BOSS_OLD, "--to", HEIR)
+        got = sb.read_sub(HEIR) if (sb.subs / f"{HEIR}.json").exists() else {}
+        check("⛔ succeed HANDS THE PLANE to the successor, not only the seat",
+              got.get("role") == "relay" and got.get("seat") == "9.2"
+              and got.get("escalate_to") == BOSS_NEW
+              and not (sb.subs / f"{BOSS_OLD}.json").exists(),
+              f"heir={got!r} rc={r.returncode} {r.stdout[-240:]}")
+
+        # ...and it must never clobber a successor that already knows its own job.
+        sb.write_sub(BOSS_OLD, BOSS_NEW, seat="9.2", role="relay")
+        sb.write_sub(HEIR, BOSS_NEW, seat="9.9", role="orchestrator")
+        r = sb.monitor("succeed", "--from", BOSS_OLD, "--to", HEIR)
+        check("⛔ succeed does NOT clobber a successor that already subscribed",
+              sb.read_sub(HEIR)["seat"] == "9.9" and "left alone" in r.stdout,
+              f"heir={sb.read_sub(HEIR)!r} {r.stdout[-240:]}")
+
         # --- and it must decline to guess -----------------------------------
         # ⛔ A PREFIX THAT NAMES NOBODY MUST BE LEFT ALONE, not resolved to the
         # nearest thing. Silently repointing a lane at the wrong orchestrator is
@@ -155,6 +261,12 @@ def main():
         check("⛔ normalize LEAVES ALONE a prefix that matches no subscription",
               sb.read_sub(LANE)["escalate_to"] == "99999999" and "LEFT ALONE" in r.stdout,
               f"escalate_to={sb.read_sub(LANE)['escalate_to']!r} {r.stdout[-240:]}")
+        # --- the tick's seat-membership repair -------------------------------
+        # ⛔ A SILENT SWEEP ON A HEALTHY BOARD PROVES NOTHING. Driven in-process
+        # with the row plane and the attended ledger stubbed, because the repair's
+        # whole job is to act on evidence those two supply — and a screen that
+        # can only observe the quiet path is the control that always passes.
+        seat_repair_screens(a.monitor, sb)
     finally:
         sb.cleanup()
 
