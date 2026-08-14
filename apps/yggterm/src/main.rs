@@ -6474,11 +6474,39 @@ mod tests {
             .arg("30")
             .spawn()
             .expect("spawn the staged binary");
+        // ⛔ `spawn` RETURNS BEFORE THE CHILD HAS EXEC'd, so unlinking the copy
+        // on the next line races the kernel: until the exec lands,
+        // `/proc/<pid>/exe` still points at THIS test binary, which is not
+        // deleted, and the positive control reads false for a reason that has
+        // nothing to do with the code under test.
+        //
+        // The signature is what gives it away and is worth recognising
+        // elsewhere: **it passed five times alone and failed inside a full
+        // parallel run**, because the loser is whichever process is slowest to
+        // be scheduled, and nothing is slow when it is the only thing running.
+        // A test that only fails under load is not flaky-and-harmless; it is
+        // measuring the machine instead of the behaviour.
+        let staged = fs::canonicalize(&copy).unwrap_or_else(|_| copy.clone());
+        let exe_link = format!("/proc/{}/exe", child.id());
+        let mut execed = false;
+        for _ in 0..200 {
+            if fs::read_link(&exe_link).is_ok_and(|target| target == staged) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let _ = fs::remove_file(&copy);
         let observed = client_process_runs_a_deleted_binary(child.id());
         let _ = child.kill();
         let _ = child.wait();
         let _ = fs::remove_dir_all(&dir);
+        assert!(
+            execed,
+            "the staged binary never became the child's /proc/<pid>/exe, so the \
+             positive control was never established — this is a fault in the \
+             test's setup, not a verdict on the code"
+        );
         assert!(
             observed,
             "a process whose binary was unlinked must read as deleted"
