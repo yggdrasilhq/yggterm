@@ -1751,7 +1751,26 @@ drain is still required, and this fix is what stops the drained set from
 refilling.**
 
 **Falsified by:** the daemon population on a host growing across an hour with no
-deploy in it, measured as the row count of `server daemons`. ⛔ Do **not** try to
+deploy in it, measured as the row count of `server daemons`.
+
+⚠ **RUN 2026-08-14, AND IT DOES NOT DEMONSTRATE THE FIX.** 16 daemons, flat
+across 40 minutes (01:41→02:16Z), no deploy in the window. That satisfies the
+falsifier as written and is **consistent with** the fix — but it is weak
+evidence, because the **pre-fix daemon in the same window is not generating
+either.** The generator is a race (the successor clears the shared file before
+the predecessor's next poll) and it simply was not provoked. ⇒ **A control that
+also passes supports nothing**, so the falsifier above needs strengthening: the
+demonstrative test is a **3.0.154 daemon acting as a PREDECESSOR**, which cannot
+happen until the next release supersedes it, with
+`target_source: "process_memory"` as the positive signal.
+
+⛔ **And do not count the row lines.** `server daemons` interleaves indented
+`deferring:` continuation lines with daemon rows (25 raw lines for 16 daemons),
+and their number varies with session activity — so a naive line count shows
+phantom population growth purely from sessions becoming busy, which looks exactly
+like the generator being tested for. ⚠ An `awk` filtering on the version column
+is also wrong: the serving daemon's row is prefixed `*`, which shifts every field
+by one, so such a filter silently drops **the daemon actually serving**. ⛔ Do **not** try to
 measure this by counting distinct pids in the trace — `main_enter` is emitted by
 one-shot CLI invocations too, and that instrument reported 614 "daemons" in two
 hours on a host that had 15.
