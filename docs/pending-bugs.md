@@ -111,10 +111,16 @@ the page-faults it induces (353–852/request ≈ 0.5–1.7 ms), the lock wait i
 (`try_lock` then a **blocking** `lock`; a block costs no CPU), and the trace
 writer (handles cached, no stat or reopen per call).
 
-⚠ **The request MIX is RESTATED, not refuted** (§6j-6): `snapshot`'s payload is
-**per-SESSION** — 176 bytes on a session-less daemon against `status`'s 61,463 of
-row inventory — so it is cheap without sessions and expensive with them, and its
-p50 of 259.8 ms in the aggregate is a **session effect wearing a verb's name**.
+⚠ **The request MIX is RESTATED, not refuted** (§6j-6): `snapshot` is a
+**per-ROW** verb — **32.6 µs/row against `status`'s 5.0**, measured with sessions
+held at ZERO in both rungs, so a 264-row daemon owning one session pays 8.7 ms
+per snapshot for rows it does not own. ⛔ **PRICED AND NOT WORTH BUILDING:** the
+live rate is **0.37/s** (unsampled, and §6a's independent trace figure of
+0.25–0.32/s agrees) ⇒ **0.0032 cores, ~0.1%** — it dies where S5 died.
+⭐ **And check which telemetry stream a count comes from before quoting a ratio:**
+`status`/`ping`/`working_flags`/`terminal_read` spans are **sampled** (kept at
+≥8 ms or 1-in-50) so their `perf-summary` counts are undercounts; `snapshot` is
+not on that list, and the event trace is never sampled at all.
 ⭐ **And a per-connection cost sits OUTSIDE the handler closure:** the in-process
 span reads 118–126 µs for `ping` where a process-level arm reads **1.80 ms**, so
 ~1.7 ms per connection is accept + thread create/teardown + outcome channel.
