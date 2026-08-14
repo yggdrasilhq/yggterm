@@ -4,13 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **One agent CLI can no longer be launched with another one's flags.** The
+  flags a session is started with are configured per CLI, and they were being
+  carried between machines in a single environment variable that named no CLI at
+  all. Any launch composed afterwards read that one variable whatever CLI it was
+  starting, so a permission flag belonging to one tool could be handed to a tool
+  that has never heard of it — and because the flags are composed between the
+  binary and its `resume` subcommand, the resulting command was malformed as
+  well as wrong. Forwarded flags now travel as part of the request that asks for
+  the launch, so they arrive attached to the CLI they were chosen for, and a
+  launch on this machine reads only this machine's settings.
+
 <!-- Known state at the 3.0.154 cut, recorded so a later reader does not find a
      red tree and assume it shipped unnoticed:
-     · two launch-command tests fail on main
+     · two launch-command tests failed on main AT THIS CUT
        (remote_resume_shell_command_wraps_prefix_and_cwd,
         stored_codex_litellm_sessions_use_litellm_resume_command).
-       Pre-existing, unrelated to this release, and owned — see the entry in
-       docs/pending-bugs.md.
+       ✅ ROOT-CAUSED AND FIXED AFTER THE CUT — they were reporting a real
+       kind-blind flag leak, and their own needle also read ambient host
+       state. See the first entry above; nothing here is still red.
      · the daemon-side persisted-live-sessions work is NOT in 3.0.154; it was
        pushed to its own lane after this release was cut.
      · CORRECTION: 3.0.154 was first reported as causing no session deaths.

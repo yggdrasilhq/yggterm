@@ -3186,19 +3186,33 @@ fn configured_cli_extra_arg_tokens(kind: SessionKind) -> Vec<String> {
     {
         return split_extra_args(&forwarded);
     }
-    // Every OTHER CLI's remote lane, on the same principle and one variable
-    // (`ENV_YGGTERM_AGENT_EXTRA_ARGS`): the client exports the flags it holds
-    // for the CLI it is starting, and this host prefers them over its own
-    // settings, which belong to a different user profile on a different machine.
+    // ⛔ EVERY OTHER CLI'S FORWARDED FLAGS ARRIVE AS A PARAMETER, NEVER FROM
+    // THIS PROCESS'S ENVIRONMENT — `composed_cli_extra_args_with` takes them as
+    // `configured_override`, and the two wrapper entrypoints that know which
+    // CLI they were invoked for (`run_remote_resume_agent`,
+    // `run_remote_start_agent`) read `YGGTERM_AGENT_EXTRA_ARGS` there and pass
+    // it on as a request field. Reading it HERE as well was a second encoding
+    // of the same question, and the wrong one, because this function is handed
+    // a `kind` while the variable carries none:
     //
-    // ⚠ Checked AFTER the CC variable so a mixed-version fleet stays coherent:
-    // an older client that only knows how to export the CC one still wins for
-    // CC, and a current client exports both.
-    if let Ok(forwarded) = env::var(ENV_YGGTERM_AGENT_EXTRA_ARGS)
-        && !forwarded.trim().is_empty()
-    {
-        return split_extra_args(&forwarded);
-    }
+    // - It is KIND-BLIND. One variable answered for all nine CLIs, so a value
+    //   exported for one of them was returned verbatim for any other — the
+    //   cross-CLI inheritance the slug-keyed settings map exists to prevent
+    //   ("an absent key yields nothing", below). A permission flag belonging to
+    //   one CLI reached a binary that has never heard of it.
+    // - Nothing ever SETS it on a request. Claude Code's lane round-trips
+    //   through the environment deliberately (the daemon `set_var`s it from the
+    //   request, which is why the arm above is legitimate — and it is guarded
+    //   on `kind`, so it can only ever answer for the CLI it belongs to). This
+    //   variable has no such setter anywhere, so an ambient value could only
+    //   ever be POLLUTION inherited from whichever process spawned this one —
+    //   an agent session, or a daemon started from inside one.
+    //
+    // Measured 2026-08-14 on a live daemon carrying an inherited value: a Codex
+    // resume composed as `codex '<a claude flag>' resume …`, which also
+    // displaced the resume subcommand and is what made the two launch-command
+    // tests read as flaky rather than as the regression they were reporting.
+    // The local lane's one owner is the settings store, below.
     let settings = SessionStore::open_or_init()
         .and_then(|store| store.load_settings())
         .ok();
