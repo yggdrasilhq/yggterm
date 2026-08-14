@@ -5440,6 +5440,36 @@ on a branch with **no** upstream is still worth fixing), and the corrected text 
 not"*), which is unmerged pending the release. **That lane's version supersedes this entry
 on merge.** Until then: do not treat this as a reason not to push.
 
+### ⛔ A SECOND RESIDUAL, MEASURED 2026-08-14 — A BRANCH **WITH** AN UPSTREAM THAT IS BEHIND `main`
+
+⚠ Added as a new instance, not a rewrite of the text above; the supersession from 6.7's
+lane still applies to everything before this heading.
+
+The range is derived from the remote ref of the branch being pushed. For a lane whose
+remote tip is behind `main`, that range therefore contains **every commit `main` gained
+since the lane was last pushed** — including other lanes' commits. So:
+
+- another lane added a personal home path in `docs/pending-bugs.md` and **a later commit on
+  `main` removed it again**;
+- both are already public on `main`;
+- the tree being pushed does not contain it, and `scripts/check-privacy.sh` passes on it;
+- and the lane push is refused anyway, because an added line inside the range is still an
+  added line. ⇒ **An already-remediated leak blocks every later lane push, for everyone.**
+
+⛔ **It is self-perpetuating**: the push that would advance the lane ref is the one being
+refused, so the lane can never catch up on its own.
+
+⭐ **THE WORKAROUND THAT NEEDS NO OVERRIDE, AND IT IS ORDERING, NOT A BYPASS.** Push
+`HEAD:main` **first**, then the lane. `main`'s range is only the lane's own work, so it
+scans the right thing and passes; the content published is byte-identical either way. Only
+the question the guard is asked changes. Landing this way is what got 16 commits onto
+`main` after four refusals.
+
+⇒ The fix is for the guard to scan the **resulting tree**, or to exclude commits already
+reachable from another remote ref, rather than every added line in a range it did not
+author. ⛔ `YGG_PRIVACY_ALLOW=1` is NOT the answer here even though it would work: the
+whole point of this shape is that it teaches the override to people whose tree is clean.
+
 *found 2026-08-13 while pushing a lane branch; affects every cluster in this batch*
 
 ⚠ **RE-TESTED 2026-08-14, AND THE SCOPE IS NARROWER THAN THIS ENTRY WAS BEING
