@@ -176,27 +176,38 @@ session that entry was filed against.*
 
 An agent session was created **locally on the GUI host with a working directory
 that exists only on the build host**. The directory is absent there, so the agent
-CLI never started, never wrote a transcript, and never produced the runtime
-identity the daemon overlays onto the session. What remains is a row that is
+CLI never started and never wrote a transcript. What remains is a row that is
 `live`, `keep_alive`, idle forever, and has never had a process.
 
 **Three things it costs, none of them cosmetic:**
 
 1. The row holds a keep-alive seat and a sidebar number that read as a working
    lane.
-2. Its `session_id` is still the daemon's own runtime key rather than an agent
-   conversation id, because only a successful start repoints it. **Anything that
-   looks that id up in the CLI's store finds nothing** — and a session whose
-   transcript "does not exist" is easy to file as a storage bug.
+2. **The condition is already detectable and is already being swallowed.** A
+   local CC row's `session_id` IS its transcript id from birth
+   (`id_assigned_at_birth`, `claude --session-id <uuid>`), so
+   `local_cc_session_jsonl_path(&session.id)` returning `None` means the CLI
+   never wrote anything. `daemon.rs` names that exact signal *"stuck launch
+   hint"* — and then `continue`s past it inside a title poll, so nothing
+   surfaces and the row keeps looking healthy.
 3. It was the only session in the whole inventory exempt from a dedup guard that
    keyed on having a transcript, so it rendered where all its healthy siblings
    had been deleted, and **the anomaly got filed as the bug**.
 
+⛔ **There is NO row-identity component, and an earlier draft of this entry said
+there was.** It claimed the `session_id` stays a daemon runtime key that only a
+successful start repoints. That is wrong for Claude Code on both the local and
+remote paths: the id is assigned up front and handed to the CLI, so the row id is
+the authoritative transcript id from birth and no rebind is involved. The
+transcript is absent because nothing ever ran, not because the id names a
+different namespace. ⇒ **This is launch validation end to end**, and the sidebar
+lane holds no part of it.
+
 **What should happen instead:** a launch whose cwd does not exist on the target
 host fails loudly at launch, rather than yielding a session object that will
 never run. ⚠ Whether the deeper defect is the missing existence check or a launch
-that chose the local host for a remote path is not settled here; both are in the
-launch surface, not the sidebar.
+that chose the local host for a path belonging to another machine is not settled
+here.
 
 **Falsifier:** create a local agent session with `--cwd` naming a path that does
 not exist, and read the row back.
