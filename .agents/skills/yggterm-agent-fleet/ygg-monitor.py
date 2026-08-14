@@ -351,9 +351,22 @@ def escalate(host, sub, row, why, dry):
         # ⚠ An EMPTY row list is an instrument failure, not a dead target. Falling
         # back on it would route every escalation to the human the moment ssh
         # blips — so require positive evidence that the row plane answered.
-        if live and to not in live:
+        #
+        # ⛔⛔ AND MATCH BY PREFIX, NEVER BY SET MEMBERSHIP. `escalate_to` is stored
+        # verbatim, so it may hold 8 chars while the row plane always answers with
+        # 36 — and `to not in live` is then TRUE for a perfectly live orchestrator.
+        # Every escalation from such a row fell back to a human card while logging
+        # that a row sitting right there "is NOT a live row". The identical defect
+        # was diagnosed and commented in `audit` on 2026-08-13 and `_same_uuid` was
+        # written for it; the fix went into the function that REPORTS and not into
+        # this one, which ROUTES. Measured 2026-08-14: seat 6.7 carried a short
+        # pointer from 07:00 and could not have reached its orchestrator all day.
+        if live and not any(_same_uuid(to, r) for r in live):
             log(f"  ⚠ escalation target {to[:8]} is NOT a live row — falling back to a human card")
             orphaned, to = to, ""
+        else:
+            # Address the row plane in the length it speaks, never the stored stub.
+            to = next((r for r in live if _same_uuid(to, r)), to)
     if to:
         target = f"remote-cc://{_host_of(sub, 'escalate_host', 'host')}/{to}"
         note = (f"MONITOR — row {sub.get('seat') or row} needs a decision: {why}. "
@@ -436,8 +449,28 @@ def cmd_subscribe(a):
             log("   Subscriptions are keyed by uuid, so a truncated one silently creates a")
             log("   SECOND subscriber for the same row and both escalate. Pass the full uuid.")
             return 64
+    # ⛔⛔ THE SAME FIELD-CLASS, THE OTHER FIELD. The block above hardened `--uuid`
+    # against the two-lengths trap and left `--escalate-to` — the other uuid in the
+    # same record — taking whatever a brief happened to quote. A short one stored
+    # here is invisible on the board (it renders `[:8]`, so both forms look
+    # identical) and breaks BOTH consumers: `escalate` fell back to a human card
+    # claiming the live orchestrator was dead, and `succeed` skipped the row at
+    # handover. Normalise at the source; the consumers now tolerate it too, but a
+    # value that is correct when written cannot rot in a frozen brief.
+    escalate_to = _bare_uuid(a.escalate_to or "")
+    if escalate_to and len(escalate_to) < 36:
+        hits = [p.stem for p in SUBS.glob("*.json") if p.stem.startswith(escalate_to)]
+        if len(hits) == 1:
+            log(f"⚠ --escalate-to '{escalate_to}' is a PREFIX — resolved to {hits[0]}")
+            escalate_to = hits[0]
+        else:
+            # Not refused: the target may legitimately not be subscribed yet. But
+            # say it out loud, because the board cannot show this and will not.
+            log(f"⛔ --escalate-to '{escalate_to}' is SHORT and matches "
+                f"{len(hits)} subscriptions — storing it verbatim, but pass the FULL "
+                f"uuid: a stub cannot be told from a good pointer on the board.")
     rec = {"uuid": uuid, "host": a.machine, "role": a.role,
-           "escalate_to": a.escalate_to, "escalate_host": a.escalate_host,
+           "escalate_to": escalate_to or a.escalate_to, "escalate_host": a.escalate_host,
            "campaign": a.campaign, "seat": a.seat,
            "owner_pinned": False, "booter": True,
            "intent": a.intent, "since": int(time.time())}
@@ -448,6 +481,61 @@ def cmd_subscribe(a):
         log("⛔ AN ORCHESTRATOR MUST ALSO SUBSCRIBE TO THE BOOTER — it is the net that")
         log("   catches this plane itself. Run: ygg-booter.py subscribe")
     return 0
+
+
+def cmd_normalize(a):
+    """⛔ A SHORT POINTER IS NOT A COSMETIC PROBLEM — IT IS A SEVERED ESCALATION.
+
+    `escalate_to` is stored verbatim from whatever a brief quoted, and briefs
+    quote 8 chars because that is what the board prints. Stored short it breaks
+    every consumer that compares it against the row plane, which always answers
+    with 36 — so the lane's cries fell back to a human card while the log claimed
+    its live orchestrator was dead.
+
+    The consumers now prefix-match, so nothing is BROKEN by a short value any
+    more. This exists because the data should still be right: a frozen brief
+    re-introduces one on every spawn, and a stub cannot be told from a good
+    pointer by eye. Run it after a wave of spawns.
+
+    ⇒ Found 2026-08-14 the moment the board was made to MARK the stubs: SIX rows
+    across three other campaigns (2.x, 3.x, 9.x) were carrying them, every one
+    backfilled by an orchestrator that had quoted its own board. The display was
+    hiding a fleet-wide defect, not a one-row slip."""
+    fixed, unresolved, scanned = _normalize_pointers(a.dry_run, quiet=False)
+    log(f"normalize: {len(fixed)} expanded, {len(unresolved)} unresolved, "
+        f"{scanned} subscription(s) scanned")
+    return 0
+
+
+def _normalize_pointers(dry, quiet=True):
+    """Expand every short `escalate_to`. Shared by the verb and the tick.
+
+    ⛔ ONE IMPLEMENTATION, because two would be the second encoding this whole
+    fix exists to remove. `quiet` only suppresses the no-op chatter of a
+    background tick — a repair is always logged, or the plane heals silently and
+    nobody learns their brief is teaching lanes to write stubs."""
+    known = [p.stem for p in SUBS.glob("*.json")]
+    fixed, unresolved = [], []
+    for s in load_subs():
+        to = _bare_uuid(s.get("escalate_to") or "")
+        if not to or len(to) >= 36:
+            continue
+        hits = [k for k in known if k.startswith(to)]
+        if len(hits) != 1:
+            unresolved.append(f"{s['uuid'][:8]}(seat {s.get('seat') or '-'}) -> "
+                              f"{to} matches {len(hits)} subscriptions")
+            continue
+        if not dry:
+            s["escalate_to"] = hits[0]
+            sub_path(s["uuid"]).write_text(json.dumps(s, indent=1))
+        fixed.append(f"{s['uuid'][:8]}(seat {s.get('seat') or '-'}) {to} -> {hits[0][:8]}…")
+    for x in fixed:
+        log(f"  {'DRY would expand' if dry else 'expanded'} {x}")
+    for x in unresolved:
+        log(f"  ⚠ LEFT ALONE — {x}")
+    if not quiet and not fixed and not unresolved:
+        pass  # the summary line the caller prints says it
+    return fixed, unresolved, len(known)
 
 
 def cmd_unsubscribe(a):
@@ -483,7 +571,14 @@ def cmd_succeed(a):
         return 64
     moved = []
     for s in load_subs():
-        if _bare_uuid(s.get("escalate_to") or "") == old:
+        # ⛔ PREFIX-MATCH, NEVER EQUALITY — the row this function exists to rescue
+        # is exactly the one that stored a SHORT pointer, because that is also the
+        # row whose escalations were already misrouting. `==` skipped it silently
+        # and the succession still reported a clean "3 row(s) re-pointed", so the
+        # board read healthy with one lane escalating into a corpse. Caught
+        # 2026-08-14 by the incoming 6.0 on its own claim, one commit after the
+        # same one-function-fixed-its-sibling-was-not shape in the booter.
+        if _same_uuid(_bare_uuid(s.get("escalate_to") or ""), old):
             s["escalate_to"] = new
             if a.escalate_host:
                 s["escalate_host"] = a.escalate_host
@@ -633,8 +728,14 @@ def cmd_list(a):
             left = int(((s.get("parked_until") or 0) - time.time()) // 60)
             pin += (f"  ⏸ PARKED {left}m left: {s.get('parked_reason','')[:44]}"
                     if left > 0 else f"  ⏸ PARK LAPSED: {s.get('parked_reason','')[:44]}")
+        # ⛔ THE COLUMN THAT HID THE BUG. Rendering `[:8]` makes a stored 8-char stub
+        # and a good 36-char pointer PIXEL-IDENTICAL, so the board — the instrument
+        # this seat is told to believe over every table — could not show that a lane
+        # was escalating into nothing. Mark the stub rather than widen the column.
+        _to = _bare_uuid(s.get("escalate_to") or "")
+        stub = "!" if _to and len(_to) < 36 else " "
         log(f"{s['uuid'][:8]}  {s.get('role','relay'):<13} seat={str(s.get('seat') or '-'):<5} "
-            f"→{(s.get('escalate_to') or 'human')[:8]}  {(s.get('intent') or '')[:44]}{pin}")
+            f"→{(_to or 'human')[:8]}{stub} {(s.get('intent') or '')[:44]}{pin}")
     report_escalation_gap(subs)
     return 0
 
@@ -977,6 +1078,24 @@ def tick(a):
     # ⛔ Resolve ONCE, out loud. An unresolved host is not a quiet default —
     # it is a blind tick, and every verb below must know that before it runs.
     a.gui_host = resolve_gui_host(a.gui_host)
+    # ⛔⛔ REPAIR THE POINTERS HERE, BECAUSE THE TOOL FIX CANNOT REACH WHERE THEY
+    # ARE MADE. A short `escalate_to` is produced in PROSE — an orchestrator
+    # quotes eight characters into a brief because eight is what the board prints
+    # — and written by a LANE, from that lane's own checkout of this file. So the
+    # normalisation added to `subscribe` only helps lanes that have rebased since
+    # it landed, and the ones that have not are exactly the ones still copying old
+    # briefs.
+    #
+    # Measured 2026-08-14, one hour after fixing the comparison: seat 6.0 sent 6.7
+    # a message reading "(459e6b63)", 6.7 re-subscribed with it three minutes
+    # later from a worktree two hours behind the fix, and the stub was back. The
+    # orchestrator reproduced the defect class it had just closed, by its original
+    # mechanism, while holding the fix.
+    #
+    # ⇒ There is ONE watcher and there are N lane checkouts. Repair from the one.
+    #   Idempotent, expands only unambiguous prefixes, silent when there is
+    #   nothing to do.
+    _normalize_pointers(a.dry_run)
     prune_dead(a.gui_host, load_subs(), a.dry_run)
     seat_audit(a.gui_host, load_subs(), a.dry_run)
     # ⛔ Runs over PARKED and PINNED rows too — a hold silences a verdict, not an
@@ -1157,6 +1276,10 @@ def main():
     p.add_argument("--to", dest="to_uuid", required=True)
     p.add_argument("--escalate-host", default="")
     p.set_defaults(fn=cmd_succeed)
+
+    p = sub.add_parser("normalize", help="expand every SHORT escalate_to to the full uuid it names")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_normalize)
 
     p = sub.add_parser("list"); p.set_defaults(fn=cmd_list)
 

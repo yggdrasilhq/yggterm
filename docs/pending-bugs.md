@@ -12,6 +12,54 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⚠ [9.2→6.x] `session rename` IS ASYNC W.R.T. `rows`, SO THE DOCUMENTED VERIFY STEP RETURNS A FALSE NEGATIVE
+
+**Status:** OPEN
+
+*measured 2026-08-14 with a controlled probe on a live agent row*
+
+The fleet contract says **every row verb reports the REQUEST, not the EFFECT, so
+read the state back, every time.** That is right, and it is **not sufficient**:
+`server app session rename` returns before `server app rows` reflects it, so a
+read-back taken immediately returns the **previous** label.
+
+Probe: rename to a marker, read back three times, restore.
+
+```
+BEFORE:                              '<previous label>'
+IMMEDIATELY after rename (no sleep): '<previous label>'   <- STALE
+after 2s:                            '<marker>'           <- landed
+restored:                            '<previous label>'
+```
+
+⇒ **The stale read is indistinguishable from a failed write**, which is exactly
+the failure mode the read-back law exists to catch. An agent that follows the
+law literally, with no delay, gets a **false negative** and reports a defect that
+does not exist. **That happened: a rename was reported as failed, a cause was
+hypothesised, and a successor was asked to investigate a non-problem.** The
+second attempt "worked" only because it happened to carry a `sleep 1`.
+
+**Fix options, cheapest first.**
+
+1. **Doc-only, and it costs nothing:** the read-back clause should say *read it
+   back after a beat*, and name a figure. **1 s was sufficient in every trial;
+   0 s never was.**
+2. **Make the verb synchronous in its own reply**: have `rename` return the
+   post-write label it can already see, so the caller needs no second call.
+3. **Make `rows` read-your-writes** for the calling client.
+
+⚠ **Option 1 alone closes the reporting hazard.** 2 and 3 are the real fix and
+are a design call for whoever owns the control plane.
+
+**Falsifier:** if a 0 s read-back ever returns the new label on an unloaded
+daemon, the timing is load-dependent rather than structural and the doc figure
+needs to be a bound, not a constant.
+
+⚠ **Scope stated rather than implied:** measured on ONE host, ONE row, ONE
+daemon, with the GUI busy. Nobody has checked whether other mutating verbs
+(`outline`, `remove`, `notify --job`) share the property. **They plausibly do**,
+and if so this is a control-plane-wide clause and not a `rename` note.
+
 ## ⛔⛔⛔ [6.9→6.7] THE HANDLER SPAN MEASURES 9% OF THE HANDLER, IN THE WRONG UNIT
 
 **Status:** OPEN
@@ -1929,6 +1977,45 @@ read the sweeps in the 0–600 s band. `killed_legacy` or `killed_orphan` ≥ 1 
 death's timestamp is the proof; `skipped_no_status` ≥ 1 says the fix is what
 stood between us and it. ⛔ Until then this is a candidate, not the cause, and it
 does not retire the OOM/external-kill rival above.
+
+## ⚠ [6.1] TWO SIBLING FUNCTIONS DISAGREE ABOUT AN UNREACHABLE OWNER, AND ONE OF THEM PRUNES
+
+**Status:** OPEN
+
+*Latent, not observed firing. Found while fixing the same class in the
+stale-daemon sweep, 2026-08-14.*
+
+The preserved-owner registry is what tells the sweep *this daemon owns live work,
+do not signal it*. Two functions maintain it, twenty lines apart, and they treat
+"the owner did not answer" oppositely:
+
+| function | on a status `Err` |
+|---|---|
+| `prune_unrepresented_preserved_owner_runtime_sessions` | traces `preserved_owner_runtime_prune_status_failed` and **skips** — correct |
+| `retain_represented_keys`'s predicate | the cached status is `None`, `is_some_and(..)` is **false**, so the key is **PRUNED** |
+
+⇒ **A busy owner that misses one probe can have its preserved-runtime records
+removed**, and the miss is then cached (`mark_preserved_owner_unreachable`,
+"pay the timeout once per owner per window"), so the effect persists rather than
+self-correcting on the next call. Those records feed `preserved_owner_pids` /
+`owner_registry_guard_active` — the guard the reap path leans on — so the same
+"no answer means nothing is there" error sits inside the bookkeeping of the gate
+that protects live daemons from SIGTERM.
+
+⚠ **Not observed:** `preserved_owner_registry_pruned` appears **zero times** in
+the live corpus (only `preserved_owner_deep_reconcile_deferred_on_load`, ×9), so
+this is a latent disagreement rather than a running defect. ⛔ And that corpus is
+~3 h wide, so its silence is weak evidence either way — see the retention entry
+above.
+
+**Recommended fix, not applied here because it needs one fact this entry cannot
+cheaply establish:** an unreachable owner should KEEP its entry (matching its
+sibling), and pruning should be driven by **the owner's process being gone**, not
+by its socket being quiet — the same absent-versus-unreadable split that the
+retire gate and the reap gate now use. Applying only the first half would let a
+dead owner's keys accumulate for ever, which is why it wants the pid-liveness
+check (`linux_preserved_owner_process_ids_for_home` already resolves those pids)
+rather than a one-line flip.
 
 ## ⛔⛔ [6.1] THE GUARD PROTECTING A PRESERVED PTY OWNER IS A HOST-SHARED FILE, SO A PEER CAN ERASE IT
 
