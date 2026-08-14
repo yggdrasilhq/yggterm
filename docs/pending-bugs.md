@@ -439,6 +439,18 @@ structurally blind to exactly the case that matters. **Measure the children —
 an agent advancing; one child pinned for a long time is a wedged call; no
 children plus a quiet parent is the only reading that means residue.
 
+⛔⛔ **AND A CHILDLESS SAMPLE IS NOT RESIDUE — THE GAPS BETWEEN TOOL CALLS ARE
+CHILDLESS BY CONSTRUCTION.** Caught on the live pair at 19:22: two consecutive
+reads 8 s apart both returned **zero children**, which is exactly the residue
+signature above. A 20-second CPU sample taken immediately afterwards returned
+**1.880 s — 9.4 % of a core, within 6 % of the row's own live process — and the
+child was back.** The agent had simply been between calls. ⇒ **Never conclude
+residue from a child COUNT.** The count is a sample of a value that is legitimately
+zero much of the time; only **repeated sampling across at least a CPU-window**
+distinguishes "between tool calls" from "finished". ⚠ This is the same defect as
+the parent-rate blindness one level down: both read an instantaneous value where
+the question is about a rate.
+
 ⭐ **AND THE BEST SURVIVOR-PROOF IS NOT CPU AT ALL — IT IS TRANSCRIPT GROWTH
 AFTER THE FACT.** A row that kept working after its leftover was killed is
 demonstrated by its transcript continuing to grow, which no sample taken before
