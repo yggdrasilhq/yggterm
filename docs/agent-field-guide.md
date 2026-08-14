@@ -337,6 +337,17 @@ to what the rest of the program is doing, and it is the only thing that can pric
 a per-request quantity on a busy daemon. If you cannot get inside the process,
 **say the quantity is unmeasurable rather than publishing the residual.**
 
+⛔ **A RETRACTION APPENDED TO A CLAIM ROTS INDEPENDENTLY OF IT.** Correcting by
+appending a note leaves the oldest sentence first, so a reader meets the withdrawn
+version before the correction — and when the correction is itself superseded you
+get three layers, of which the middle one reads as current. One block in the cost
+model accreted `~50 µs` → `38 ms` → `~25 ms` → `150–230 µs` this way.
+⇒ **State the current position FIRST and keep the trail beneath it.**
+⭐ **And sweep by TERM, not by document:** a docs retraction sweeps docs, while
+the dangerous copy is the one in a **different file type** — a source comment
+reads as authoritative precisely because it sits next to the code, and nobody
+greps comments when retracting a doc.
+
 ⛔ **AND THE OBSERVER IS PART OF THE BASELINE.** After driving load at a subject,
 its counters stay elevated. A comparison whose "after" window follows your own
 arm measures **you**. This produced a published claim that a term swung 25x

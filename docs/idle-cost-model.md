@@ -1459,16 +1459,25 @@ worker pool.
 ⭐ **Its driver is now named (§6d):** the churn is not the daemon's own work, it
 is one thread per peer `status` poll. So S1 and S5 both reduce it as a side
 effect, and S4 should be scheduled *after* them rather than against them.
-**Expected effect:** removes 4–25 thread creations/s per daemon. ⚠ **Expected
-CPU win is the SMALLER half** — thread spawn is ~50 µs, so 4/s is ~0.0002 cores.
-The 38 ms per handler is the *work*, not the spawn. ⇒ **This is a stability and
-observability fix, not a CPU fix**; do not promise cores for it. Its real value
-is that CPU stops hiding in exited threads, so §3's instrument gap closes.
-⛔ **§6j-5 updates the number: quote ~25 ms, not 38 ms**, and note that a handler
-on an EMPTY daemon costs 0.70 ms — so a pool would keep ~95% of the cost, which
-travels with the thread's work rather than with its creation. The conclusion
-("not a CPU fix") is unchanged and now rests on a measurement instead of an
-inference.
+**CURRENT POSITION, measured, and it is the whole of it:** the entire
+per-connection floor is **150–230 µs** — parent accept + spawn **44–48 µs**,
+child pre-closure **39–55 µs**, closure for a `ping` **61–126 µs** — with the
+connection count matching the handler count exactly in the same window. At ~4
+connections/s that is **under 0.001 cores/daemon**.
+⇒ ⛔ **SCHEDULE S4 ON STABILITY AND OBSERVABILITY, NEVER ON CORES.** Its value is
+that CPU stops hiding in exited threads, closing §3's instrument gap.
+
+⚠ **THIS BLOCK HAD THREE LAYERS AND THE MIDDLE ONE ROTTED.** It said "38 ms per
+handler is the work" (a retracted ratio); I appended "quote ~25 ms, not 38" and
+"a pool would keep ~95% of the cost"; **that correction was itself superseded**
+by the measurement above, and sat here reading as current. ⇒ ⭐ **A retraction
+APPENDED to a claim creates a two-layer artefact whose layers rot
+independently.** State the current position FIRST and keep the trail below it,
+rather than letting a reader meet the oldest sentence first.
+
+*Trail: `~50 µs` (spawn only, right by luck) → `38 ms` (ratio, retracted) →
+`~25 ms` (per-thread ticks, superseded) → **150–230 µs measured in three
+pieces**.*
 
 ### ⭐ S6 — MEASURE THE HANDLER IN CPU TIME, AND FOR ITS WHOLE LIFE (build this first)
 
