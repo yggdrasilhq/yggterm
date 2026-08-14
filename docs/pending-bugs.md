@@ -23,11 +23,19 @@ Closed narratives from before 2026-08-02 are in
 across two 60 s windows), and each daemon receives **3.4–4.2/s regardless of what
 it owns** — a 261-row daemon is polled no more often than a 73-row one.
 
-- ⭐ **The poller is the daemon population itself.** An isolated single-daemon
-  installation on the same host, same binaries, **with a live GUI attached**,
-  receives **0.00 `status`/s**. The load appears only when there is a population.
-  ⇒ polls = N(N−1)/T with T≈3.5 s: predicts 60/s at N=15 (measured 51–56/s) and
-  0 at N=1 (measured 0.00). **The cost is QUADRATIC in the daemon population.**
+- ⛔⛔ **"THE COST IS QUADRATIC IN N" WAS FILED HERE AND IS WITHDRAWN.** The
+  single-daemon control that supported it also had `OWNED=0, PRESV=0, ROWS=0`, so
+  it never separated "no peers" from "nothing to poll about"; and a deliberate
+  causal arm (five daemon versions, isolated home, zero sessions, only N varied)
+  measured **0.00/s at N=1 and 0.17/s at N=2** against 0.57 predicted — peer
+  polling is real but **46x too small** to be the fleet's 3.9/s per daemon.
+  ⚠ N could not be raised past 2: a daemon owning no sessions retires.
+  ⇒ **What sets the poll rate is OPEN.** Ruled out: bare N (arm), the receiver's
+  own sessions/rows (flat across OWNED 1–9, ROWS 70–261), the sender's preserved
+  owners (outbound churn flat across PRESV 0–29), client count (3 clients, 1 GUI
+  on this host). Untested candidate: the **density of cross-daemon references**.
+  ⛔ **Do not plan a drain around an early-payoff curve** — nothing measured
+  supports it.
 - ⛔ **`fn status(&self)` (`daemon.rs:4154`) is unconditional and rebuilds, per
   call:** `stored_sessions_persisted()`, a clone per row, **`.sort()`+`.dedup()`
   (O(R log R))**, `persisted_state()` — *the entire persistence payload* — and a
