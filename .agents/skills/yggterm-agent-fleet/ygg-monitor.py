@@ -453,6 +453,30 @@ def cmd_subscribe(a):
     if not uuid:
         log("subscribe: need --uuid (or $YGGTERM_SESSION_ID)")
         return 64
+    # ⛔⛔ A ROW THAT RELEASED ITSELF IS NOT A ROW NOBODY SUBSCRIBED. Restoring
+    #    one resurrects a campaign that declared itself finished, and the board
+    #    then demands a decision about it forever — with both offered answers
+    #    wrong, because it is neither a delegate to arm nor a place a human
+    #    types. The booter has refused this since `optout` shipped; the monitor
+    #    did not, so a row could protect itself on one plane and be restored on
+    #    the other. Measured 2026-08-14 on a closed campaign.
+    released = released_rows()
+    if released is None:
+        log("⛔ the release ledger is UNREADABLE — refusing to subscribe rather than")
+        log("   risk resurrecting a row that stood down. Fix or move "
+            f"{RELEASED_LEDGER}, then retry.")
+        return 65
+    if uuid in released and not getattr(a, "rearm", ""):
+        log(f"⛔ {uuid[:8]} RELEASED its own monitor subscription — it is not "
+            f"unsubscribed by accident.")
+        log(f"   reason recorded: {released[uuid]}")
+        log("   Restoring it resurrects a row that declared itself finished, and it")
+        log("   will then be reported as an unarmed gap on every listing.")
+        log("   If you genuinely mean to watch it again: --rearm '<why>'.")
+        return 66
+    if getattr(a, "rearm", "") and uuid in released:
+        _record_release(uuid, RESUB_MARK + a.rearm)
+        log(f"⚠ re-subscribing {uuid[:8]} over its own release: {a.rearm}")
     # ⛔⛔ AN IDENTIFIER STORED AT TWO LENGTHS BECOMES TWO SUBSCRIBERS. Subscriptions
     # are keyed by FILE NAME, so subscribing `bb5b4358` when `bb5b4358-b83a-…` is
     # already subscribed does not update it — it creates a SECOND watcher for one
@@ -756,11 +780,82 @@ def _normalize_pointers(dry, quiet=True):
     return fixed, unresolved, len(known)
 
 
+RELEASED_LEDGER = STATE / "monitor-released.tsv"
+RESUB_MARK = "__resubscribed__:"
+
+
+def released_rows():
+    """Rows that RELEASED their own monitor subscription, with a reason.
+
+    ⛔⛔ THE ASYMMETRY THIS CLOSES. The booter has release memory — `optout`
+    writes a ledger and a later `subscribe` is refused without `--rearm '<why>'`
+    — and the monitor had NONE. So a row could protect itself on one plane and
+    be silently restored on the other, and a deliberate stand-down was
+    indistinguishable from a subscription nobody had ever made.
+
+    ⇒ Measured 2026-08-14: a campaign closed itself down and released this
+    subscription as its final act. A well-meant repair restored it — the board
+    entry literally read *"subscription restored by …"* — which resurrected a
+    finished row into the unarmed-row population, where the board then demanded
+    a decision about it on every listing. Both offered answers were wrong,
+    because the row was neither an unattended delegate nor a place a human
+    types: **it was DONE.**
+
+    ⭐ The third state is not a new classification to compute. It is what a
+    release already meant, thrown away because nothing recorded it.
+
+    **Append-only, latest record per uuid wins.** A re-subscribe is a new line
+    marked `__resubscribed__:`, so the decision history is kept rather than
+    rewritten — the file is evidence, not state to edit.
+
+    ⚠ Unreadable is NOT empty: a damaged ledger returns None, and the caller
+    refuses to resurrect anything rather than treating silence as consent."""
+    out = {}
+    try:
+        for line in RELEASED_LEDGER.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            uuid = parts[1].strip()
+            reason = parts[2].strip() if len(parts) > 2 else ""
+            if not uuid:
+                continue
+            if reason.startswith(RESUB_MARK):
+                out.pop(uuid, None)
+            else:
+                out[uuid] = reason or "no reason recorded"
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return None
+    return out
+
+
+def _record_release(uuid, reason):
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with RELEASED_LEDGER.open("a") as fh:
+            fh.write("%s\t%s\t%s\n" % (
+                time.strftime("%Y-%m-%dT%H:%M:%S%z"), uuid, reason or ""))
+        return True
+    except Exception as exc:
+        log(f"⛔ could not record the release: {exc}")
+        return False
+
+
 def cmd_unsubscribe(a):
-    p = sub_path(_bare_uuid(a.uuid))
+    uuid = _bare_uuid(a.uuid)
+    p = sub_path(uuid)
     if p.exists():
         p.unlink()
-        log(f"unsubscribed {a.uuid[:8]}")
+        # ⛔ Record it BEFORE reporting success. A release that leaves no trace
+        #    is exactly what let a finished row be restored by someone tidying
+        #    up, and "unsubscribed" printed either way.
+        _record_release(uuid, getattr(a, "note", "") or "")
+        log(f"unsubscribed {a.uuid[:8]} (release recorded)")
     else:
         log(f"{a.uuid[:8]} was not subscribed — nothing to do")
     return 0
@@ -1566,9 +1661,17 @@ def main():
     p.add_argument("--seat", default="")
     p.add_argument("--intent", default="", help="what this row is for, in one line")
     p.add_argument("--no-booter-reminder", action="store_true")
+    p.add_argument("--rearm", default="",
+                   help="why a row that RELEASED its own subscription is being watched again")
     p.set_defaults(fn=cmd_subscribe)
 
-    for name, fn in (("unsubscribe", cmd_unsubscribe), ("demote", cmd_demote),
+    pu = sub.add_parser("unsubscribe")
+    pu.add_argument("uuid")
+    pu.add_argument("--note", default="",
+                    help="why this row is standing down; kept in the release ledger")
+    pu.set_defaults(fn=cmd_unsubscribe)
+
+    for name, fn in (("demote", cmd_demote),
                      ("promote", cmd_promote), ("park", cmd_park), ("unpark", cmd_unpark)):
         p = sub.add_parser(name)
         p.add_argument("uuid")
