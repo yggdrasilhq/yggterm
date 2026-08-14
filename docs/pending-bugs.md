@@ -260,6 +260,58 @@ bootstrapping. The campaign already records that a re-resume onto a fresh PTY is
 when the squish/broken-bottom artefacts appear, so the first-paint window is
 where the renderer is most stressed and is the cheapest place to try to reproduce
 this.
+## ⛔⛔⛔ [6.0] A DAEMON BUMP RE-RESUMES EVERY AGENT ROW AND LEAVES THE OLD AGENT RUNNING
+
+**Status:** OPEN
+
+*measured from `/proc` on the work host, 2026-08-14, ~25 minutes after the
+3.0.157 deploy*
+
+**Every live agent row ended up with TWO `claude` processes on the same session
+uuid, and nothing reaped the predecessor.** 4 of 4 live armed rows, no
+exceptions: an original `--session-id` process and a `--resume` twin whose age
+lands inside the deploy window in every case. **`rss+swap` on the four orphans:
+787 + 707 + 955 + 814 MB = 3,263 MB** — and memory is the owner's stated
+first priority.
+
+**Mechanism, read from `/proc` rather than reasoned about.** The re-resume builds
+a **new PTY** and abandons the old one with its agent still alive. The pair are
+on **different ttys, different sids and different pgids**, so they are wholly
+independent processes — which is exactly why nothing reaps the predecessor and
+why nothing notices. ⚠ **It is not the booter:** `boot()` writes into a row's PTY
+and spawns no process.
+
+⛔ **THIS IS THE CONSTITUTION'S OWN PROMISE FAILING IN A SHAPE IT DOES NOT COVER.**
+*"Other agents' sessions survive our restarts"* — they survived, **as
+duplicates**. The queue already carries *EVERY DAEMON BUMP ORPHANS EXACTLY ONE
+VERSION* for **daemons**; this is the **agent-process** analogue and it was filed
+nowhere. The second cost is not memory: two agents sit at one address on one
+transcript, and **anything that wakes the idle one has it writing into the live
+one's transcript.**
+
+⭐ **A ROW'S SEAT BECOMES AMBIGUOUS, AND THE OBVIOUS TIE-BREAKS ARE WRONG.** Age
+does not decide it (the *older* process is the stale one here, inverting the
+usual instinct) and neither does the flag. **Resolve it from inside: walk `$$`
+upward with `ps -o ppid=` until `comm=claude`.** From outside the tree there is
+no probe that distinguishes them, which is why this is routed to each row rather
+than fixed across the fleet by one session.
+
+**Detection — one line, worth a standing check in any resource sweep:**
+`pgrep -x claude | while read p; do tr '\0' ' ' </proc/$p/cmdline | grep -oE '[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}'; done | sort | uniq -d`
+Any output is a defect.
+
+**Reaping is safe once identity is settled**, and the guards are not optional:
+confirm the twin is idle (`top -b -n 2 -d 2` — the orphan moved 0.03 s of CPU in
+2 s against the live process's 5 %), confirm different tty/sid so a kill cannot
+cross over, then `kill -TERM` **by explicit pid**. ⛔ **Never `pkill -f <uuid>`:
+the pattern is in the killing shell's own command line.**
+
+*Meanwhile:* the orchestrator reaped its own twin (814 MB reclaimed, verified
+alive and still on the board afterwards) and routed the other three to the rows
+that own them. **That is three instances handled, not the cause.** The fix
+belongs in whatever performs the re-resume: it must either hand the existing
+process its new PTY, or retire the predecessor it has just replaced.
+
 ## ⛔⛔ [6.0] THE FLEET'S SUPERVISION TOOLS HAVE NO DEPLOYMENT STEP — A FIX ON `main` REACHES ALMOST NOBODY
 
 **Status:** OPEN
