@@ -131,42 +131,6 @@ from inside in three pieces (parent accept+spawn 44–48 µs · child pre-closur
 measurement; schedule S4 on stability and observability, NEVER on cores**
 (<0.001 cores/daemon).
 
-## ⛔ ONE DIRECTORY, TWO READERS, AND ONLY ONE WAS TOLD ABOUT THE STAGING DIR
-
-**Status:** OPEN
-
-*Found 2026-08-14 by the sidebar lane, which could not run a single app-control
-verb against a freshly created GUI until it deleted a directory by hand.*
-
-`client-instances/<scope>/` holds one JSON record per attached client, published
-by an atomic write that stages into a `tmp/` subdirectory of that same folder.
-**Two functions enumerate that directory and they disagree about what a
-non-file entry means:**
-
-| reader | on a directory entry |
-|---|---|
-| `cleanup_stale_client_instances` (yggterm-shell) | skips it — *"the atomic-write staging dir (and anything else that is not a plain file) is never a record"*, with a test that pins it |
-| `collect_client_instance_records` (yggterm-server) | `fs::read` returns **EISDIR (os error 21)**, which is neither `NotFound` nor a parse failure, so it **propagates and fails the whole enumeration** |
-
-**Reproduced twice, on two independently created sandbox homes at 3.0.154.**
-Every `server app` verb died with `reading client instance record …/tmp: Is a
-directory`, and `rmdir` on that one empty directory made them all work.
-
-⛔ **The consequence is larger than a failed verb, and it is the drain's.** The
-comment directly above that read explains that an error there is deliberately
-NOT treated as "no clients": `daemon_should_idle_shutdown` reads an error as *"I
-could not ask, so do not retire."* ⇒ **a daemon whose staging directory exists at
-the sampling moment can never retire**, and that gate is the one the constitution
-rests the drain on.
-
-**Fix:** the one-line `entry.file_type()` skip the other reader already has. ⚠
-Two readers of one directory is the second encoding; the durable fix is one
-traversal both call, since this is exactly the shape where a rule learned on one
-side does not reach the other.
-
-**Falsifier:** create `client-instances/<scope>/tmp/` on a live home and run any
-`server app` verb.
-
 ## ⛔ A LOCAL LAUNCH INTO A DIRECTORY THAT DOES NOT EXIST LEAVES A KEEP-ALIVE HUSK
 
 **Status:** OPEN
@@ -256,7 +220,19 @@ forge returns 404 for the pre-removal blob URLs.
 
 ## ⛔ [6.9→6.1] AN UNREADABLE CLIENT-RECORD DIRECTORY READS AS "NO CLIENTS" AND PERMITS RETIREMENT
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+⚠ **The sidebar lane's separate filing of the staging-dir half was merged into
+this entry on 2026-08-14 and deleted.** It described the same defect from the
+other side and carried the same fix, so the queue was answering one question
+twice — the duplication `docs-ssot.md` exists to prevent. Its falsifier is kept
+below because this entry did not state one.
+
+**Falsifier:** create `client-instances/<scope>/tmp/` in a home and run any
+`server app` verb against a daemon in it. Before the fix every verb died with
+`reading client instance record …/tmp: Is a directory`; after it, the verb
+succeeds and a live record sitting beside the staging dir is still returned, so
+an empty success cannot pass for a fix.
 
 *source reading, and the withdrawal of the anomaly that led here, in
 [`idle-cost-model.md`](idle-cost-model.md) §6k-1..§6k-3*
