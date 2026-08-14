@@ -427,18 +427,39 @@ lock_wait was not 98.8% of the volume.
 
 ### ✅ S2 IS FIXED IN CODE — LIVE PROOF OWED (the falsifier above is the proof)
 
-⛔ **NOT IN RELEASE 3.0.154 — THE CODE WAS NEVER IN THAT BUILD.** Verified by
-symbol, not by commit list: `persisted_live_sessions` appears on `origin/main`
-only in `yggterm-shell/src/shell.rs` (the GUI side). The **daemon-side** fix
-lives solely on `origin/lane/dev/6.7-resource` (`daemon.rs`, `lib.rs`), in two
-`perf(daemon)` commits pushed at ~01:45Z — after 3.0.154 was cut at 01:26:57Z.
-⇒ **The proof is not merely untaken, the code was not running.** Do not read the
-"live proof owed" status as "deployed and unverified".
+⛔⛔ **"NOT IN RELEASE 3.0.154 — THE CODE WAS NEVER IN THAT BUILD" STOOD HERE AND
+IS WITHDRAWN, 2026-08-14 (6.1). S2 IS IN 3.0.154 AND HAS BEEN RUNNING
+FLEET-WIDE.** It contradicted this entry's own opening line — *S2 landed on
+`main` (670fa66d)* — and the opening line was right.
 
-⛔ **A 3.0.155 to land it is DELIBERATELY HELD.** Landing it needs a daemon bump,
-and a daemon bump is the action the readiness-probe entry forbids while a human
-has an unsent draft open — see that entry's ordering clause. The hold ends when
-the draft is sent or cleared.
+**The test, with a control that had to fail and did:** the deployed binary
+reports its own provenance, so ask it rather than the calendar —
+`--build-commit` on the 3.0.154 binary gives `0a912e38`, and
+`git merge-base --is-ancestor 670fa66d 0a912e38` answers YES. Control: a commit
+known to post-date that build answers NO in the same run, so the probe can
+report both outcomes.
+
+⛔ **HOW IT WENT WRONG, because the method was right and the input was not.**
+"Verified by symbol, not by commit list" is the correct instinct; the symbol
+chosen was `persisted_live_sessions`, which **does not appear anywhere in
+670fa66d** — it belongs to different work. ⇒ **A symbol that was never in the
+change reads absent on a perfectly correct build**, so its absence was evidence
+about nothing. Same family as the field guide's warning that grepping a binary
+for a `json!` KEY can read absent on a correct build: **pick a literal the
+change actually introduces, and confirm it is present somewhere before trusting
+its absence anywhere.**
+
+⭐⭐ **WHAT THIS UNBLOCKS, AND IT IS THE POINT.** The falsifier was believed to
+need 3.0.155, which is owner-held — so the proof looked parked behind a gate
+nobody may open. It is not: the code is deployed on every host **now**, and the
+measured ≥90× drop can be taken against the running fleet without any release.
+⚠ Do not carry "S2 ships in the next release" into a brief again; it shipped
+in the last one.
+
+⚠ **Separately, and still true:** `origin/lane/dev/6.7-resource` is **35 commits
+ahead of `origin/main` and unmerged**, so other 6.7 work is genuinely not in any
+build. That is a real fact about that lane; it was never a fact about S2. ⛔ Do
+not resolve that lane's merge here — ask for it rebased.
 
 **Status of this entry: FIXED IN CODE, awaiting the measured ≥90× drop.**
 
