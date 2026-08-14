@@ -386,6 +386,30 @@ def cmd_subscribe(a):
     if not uuid:
         log("subscribe: need --uuid (or $YGGTERM_SESSION_ID)")
         return 64
+    # ⛔⛔ AN IDENTIFIER STORED AT TWO LENGTHS BECOMES TWO SUBSCRIBERS. Subscriptions
+    # are keyed by FILE NAME, so subscribing `bb5b4358` when `bb5b4358-b83a-…` is
+    # already subscribed does not update it — it creates a SECOND watcher for one
+    # row, which then double-escalates. Caught 2026-08-14 by the orchestrator doing
+    # it to three rows at once, an hour after re-reading its own note about this
+    # exact trap: the guard belongs in the tool, because discipline resets every
+    # session and a check does not.
+    # ⇒ Resolve a short uuid against what is already subscribed rather than
+    #   refusing it, so the convenient form keeps working and stops forking state.
+    if len(uuid) < 36:
+        matches = [p.stem for p in SUBS.glob("*.json") if p.stem.startswith(uuid)]
+        if len(matches) == 1:
+            log(f"⚠ '{uuid}' is a PREFIX — resolved to the subscribed row {matches[0]}")
+            uuid = matches[0]
+        elif len(matches) > 1:
+            log(f"⛔ '{uuid}' is ambiguous across {len(matches)} subscriptions — pass the full uuid:")
+            for m in matches:
+                log(f"     {m}")
+            return 64
+        else:
+            log(f"⛔ REFUSING a short uuid '{uuid}' that matches no existing subscription.")
+            log("   Subscriptions are keyed by uuid, so a truncated one silently creates a")
+            log("   SECOND subscriber for the same row and both escalate. Pass the full uuid.")
+            return 64
     rec = {"uuid": uuid, "host": a.machine, "role": a.role,
            "escalate_to": a.escalate_to, "escalate_host": a.escalate_host,
            "campaign": a.campaign, "seat": a.seat,
@@ -536,8 +560,44 @@ def cmd_promote(a):
     return 0
 
 
+def report_watcher_health():
+    """⛔ A SUBSCRIPTION LIST IS NOT A SUPERVISION GUARANTEE, and until now `list`
+    could not tell the two apart: it printed the same contented roster whether a
+    watcher was running or had exited hours ago. That is this project's own
+    pathology — an instrument answering truthfully about a question nobody asked
+    it. So `list` now states its subject: who is subscribed AND whether anything
+    is actually looking."""
+    procs = watcher_procs()
+    if not procs:
+        log("⛔ NO WATCHER IS RUNNING — the subscriptions below are being read by NOBODY.")
+        log("   Start one:  ygg-monitor.py watch --watch 86400 --interval 240")
+        return
+    # ⛔ AGE IS NOT LIFE. A watcher's age only means something to someone who
+    # already knows its deadline, and the deadline is the thing that kills it.
+    # `age=5h48m` printed on a 6h window read as healthy and was twelve minutes
+    # from ending the campaign's only supervision. So report what is LEFT, and
+    # let the age be the supporting detail rather than the headline.
+    for pid, age, window in procs:
+        fmt = lambda s: f"{s // 3600}h{(s % 3600) // 60:02d}m"
+        if window is None:
+            log(f"⚠ watcher pid={pid} age={fmt(age)} — window UNKNOWN, so time-to-death "
+                f"cannot be stated. Treat it as expiring at any moment.")
+            continue
+        left = window - age
+        if left <= 0:
+            log(f"⛔ watcher pid={pid} is PAST its {fmt(window)} deadline and is exiting.")
+        elif left <= 3600:
+            log(f"⛔ watcher pid={pid} DIES IN {fmt(left)} (age {fmt(age)} of {fmt(window)}) — "
+                f"restart it now, or {len(load_subs())} subscriber(s) lose their reader.")
+        else:
+            log(f"✅ watcher pid={pid} {fmt(left)} left (age {fmt(age)} of {fmt(window)})")
+    if len(procs) > 1:
+        log(f"⚠ {len(procs)} WATCHERS RUNNING — they will double-escalate. Kill all but one.")
+
+
 def cmd_list(a):
     subs = load_subs()
+    report_watcher_health()
     if not subs:
         log("no subscribers")
         return 0
@@ -549,7 +609,79 @@ def cmd_list(a):
                     if left > 0 else f"  ⏸ PARK LAPSED: {s.get('parked_reason','')[:44]}")
         log(f"{s['uuid'][:8]}  {s.get('role','relay'):<13} seat={str(s.get('seat') or '-'):<5} "
             f"→{(s.get('escalate_to') or 'human')[:8]}  {(s.get('intent') or '')[:44]}{pin}")
+    report_escalation_gap(subs)
     return 0
+
+
+def report_escalation_gap(subs):
+    """⛔⛔ CROSS THE TWO PLANES — EACH ONE ALONE LOOKS COMPLETE.
+
+    A row armed on the BOOTER but absent from the MONITOR is watched by a timer
+    that can wake it and by **nobody who would notice it had stopped**: if it
+    stalls, the escalation rings into an empty room. Nothing anywhere reported
+    that asymmetry, because each roster is internally consistent — the booter
+    listed the row, the monitor listed a complete-looking set without it.
+
+    Measured 2026-08-14: **nine** live relays in that state at one crossing, and
+    **four more two hours later** — one of them the successor of a row that had
+    relayed *during* the first sweep. ⇒ **A manual backfill is a SNAPSHOT, and a
+    relay invalidates it silently**, which is precisely why this belongs in the
+    tool and not in an orchestrator's discipline. (Reported by a sibling
+    orchestrator that hit the same trap from the other side.)
+
+    ⚠ This REPORTS; it does not arm and does not subscribe. That restraint is
+    deliberate: auto-arming is a separate, blocked item — the booter's function is
+    to TYPE INTO a stalled session, so arming the wrong row types into a human's
+    terminal, and `booter-disarmed.tsv` has no reader yet, so an eager arm would
+    silently re-arm every deliberately disarmed row. **Reporting a gap is
+    read-only and safe; closing it automatically is not yet.**
+    """
+    # Read the booter's STATE DIRECTORY, not its `list` output. The state dir is
+    # shared by every checkout; the script is not (a guard living only in one
+    # copy of a script is the failure this fleet already paid for). It also
+    # carries `gone_sightings`, which the printed roster does not.
+    booter_subs = STATE / "booter"
+    armed, dying = set(), set()
+    try:
+        files = sorted(booter_subs.glob("*.json"))
+    except Exception:
+        files = []
+    if not files:
+        # ⛔ An empty result is a tool that never ran, not a clean bill of health.
+        log(f"⚠ no booter roster at {booter_subs} — coverage NOT verified")
+        return
+    for p in files:
+        try:
+            rec = json.loads(p.read_text())
+        except Exception:
+            continue
+        u = (rec.get("uuid") or p.stem)[:8]
+        # ⛔ A CORPSE IS NOT AN UNCOVERED ROW, AND CONFLATING THEM KILLS THE
+        #    WARNING. A retired row stays on the booter until GONE_SIGHTINGS
+        #    confirms it — deliberate slowness that exists because a fast
+        #    unsubscribe once deleted nine LIVE subscriptions in six seconds. So
+        #    every reaped row would be reported here as a gap, every time, until
+        #    it aged out.
+        #    ⚠ The cost is asymmetric and that is the trap: a false alarm merely
+        #    looks like diligence, so it survives, and the warning is trained
+        #    into background noise right up until the one that mattered. The
+        #    booter has already begun counting these down; they need no human.
+        if rec.get("gone_sightings", 0) > 0:
+            dying.add(u)
+        else:
+            armed.add(u)
+    watched = {s["uuid"][:8] for s in subs}
+    gap = sorted(armed - watched)
+    if gap:
+        log(f"⛔ {len(gap)} ROW(S) ARMED ON THE BOOTER BUT ESCALATING TO NOBODY — "
+            f"a stall would ring into an empty room:")
+        for u in gap:
+            log(f"   {u}  ⇒ subscribe it with --escalate-to <its campaign's orchestrator>")
+        log("   ⚠ cwd is a PRIOR, not the answer: a row can work in a checkout that has")
+        log("     nothing to do with its subject. Confirm against its last prose turn.")
+    if dying:
+        log(f"   ({len(dying)} retired row(s) on the booter are being counted down "
+            f"by GONE_SIGHTINGS — not a gap, no action)")
 
 
 def fishy_audit(subs, dry):
@@ -855,11 +987,57 @@ def tick(a):
     return 0
 
 
+def watcher_procs():
+    """Every live `watch` process, as (pid, age_seconds, window_seconds_or_None).
+    Identify, never count — a bare `pgrep -f` matches the shell that asked the
+    question.
+
+    ⭐ The window is read from the process's OWN `--watch` argument rather than
+    assumed, because the default has changed and a watcher started by an older
+    checkout carries the older window. Asking the process is the only thing that
+    survives that skew."""
+    out = []
+    try:
+        ps = subprocess.run(["ps", "-eo", "pid=,etimes=,args="],
+                            capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return out
+    for line in ps.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, etimes, args = parts
+        if "ygg-monitor.py" in args and " watch" in args and "bash -c" not in args:
+            window = None
+            toks = args.split()
+            if "--watch" in toks:
+                try:
+                    window = int(toks[toks.index("--watch") + 1])
+                except (ValueError, IndexError):
+                    window = None
+            try:
+                out.append((int(pid), int(etimes), window))
+            except ValueError:
+                pass
+    return out
+
+
 def cmd_watch(a):
     deadline = time.time() + a.watch
     while time.time() < deadline:
         tick(a)
         time.sleep(a.interval)
+    # ⛔⛔ AN EXPIRING SUPERVISOR IS INDISTINGUISHABLE FROM A HEALTHY QUIET ONE.
+    # This loop used to just fall off its deadline and exit silently. Measured
+    # 2026-08-14: the watcher was started with `--watch 21600` and found at age
+    # 5.8h — twelve minutes from ending the only supervision the campaign had,
+    # with nothing to restart it and nothing to announce it. Four orchestrators
+    # had already stalled unnoticed. Same family as "a reader that finds nothing
+    # looks exactly like a thing that has nothing": say it out loud.
+    log(f"⛔ WATCHER EXPIRED after {a.watch}s — NOTHING IS WATCHING {len(load_subs())} "
+        f"SUBSCRIBER(S) ANY MORE. This is not a clean shutdown, it is a deadline.")
+    log("   Restart it, or the next stall escalates to nobody:")
+    log(f"     ygg-monitor.py watch --watch 86400 --interval {a.interval}")
     return 0
 
 

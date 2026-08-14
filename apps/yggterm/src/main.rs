@@ -95,6 +95,14 @@ const ENV_YGGTERM_ALLOW_MULTI_WINDOW: &str = "YGGTERM_ALLOW_MULTI_WINDOW";
 const ENV_YGGTERM_ENABLE_TRANSPARENT_WINDOW: &str = "YGGTERM_ENABLE_TRANSPARENT_WINDOW";
 const ENV_YGGTERM_WEBKIT_CACHE_MODEL: &str = "YGGTERM_WEBKIT_CACHE_MODEL";
 const ENV_YGGTERM_WEBKIT_MEMORY_LIMIT_MB: &str = "YGGTERM_WEBKIT_MEMORY_LIMIT_MB";
+/// Opt IN to bounding the whole yggterm process family with a private systemd
+/// user scope. ⛔ **Default OFF, deliberately.** This is a launch-path change
+/// whose failure mode is *the GUI does not start*, so it ships dark and is
+/// turned on inside a window where somebody is watching.
+const ENV_YGGTERM_MEMORY_SCOPE: &str = "YGGTERM_MEMORY_SCOPE";
+/// Stamped on the re-executed child so it knows it is already inside the scope.
+/// Without this the child would re-exec forever.
+const ENV_YGGTERM_MEMORY_SCOPE_ACTIVE: &str = "YGGTERM_MEMORY_SCOPE_ACTIVE";
 const ENV_YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD: &str =
     "YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD";
 const ENV_YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD: &str = "YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD";
@@ -1506,6 +1514,11 @@ fn main() -> Result<()> {
     #[cfg(target_os = "linux")]
     if args.is_empty() {
         hydrate_linux_gui_entry_environment_from_desktop();
+        // ⛔ ONLY the GUI, and only AFTER the desktop entry has been hydrated —
+        // that is where the opt-in is set, so reading it earlier would miss it.
+        // A CLI subcommand must never be re-executed into a scope: it would
+        // bound a one-shot verb and leave a unit behind for every invocation.
+        enter_memory_scope_if_requested();
     }
     configure_linux_allocator_limits()?;
     // After the allocator re-exec above (which returns early), so the raise
@@ -4738,6 +4751,125 @@ fn webkit_memory_policy(mem_total_kb: Option<u64>) -> WebkitMemoryPolicy {
         strict: 0.90,
     }
 }
+/// What the kernel is asked to hold the whole yggterm family to.
+///
+/// ⛔ **THIS EXISTS BECAUSE WEBKIT'S OWN BOUND CANNOT WORK ON A HOST THAT
+/// SWAPS.** `webkit_memory_policy` above is compared against RESIDENT memory
+/// (upstream reads `/proc/self/statm`; the shipped library's only
+/// `/proc/self/status` field is `VmRSS`), and the kernel is free to push
+/// residency arbitrarily far below any threshold by swapping the cache out.
+/// Measured on the desktop host: RSS flat in a 586–714 MB band while swap grew
+/// 11× and the committed footprint went 649 → 1,362 MB, straight past a
+/// conservative threshold of 1,416 MB *of RSS*, with no reclaim. The metric
+/// subtracts the evidence of the thing it is measuring.
+///
+/// ⭐ A cgroup does not have that blind spot: `memory.current` and
+/// `memory.swap.current` are the two halves of what the machine actually
+/// committed, and bounding both bounds the footprint. **The kernel was already
+/// measuring exactly what `VmRSS` cannot** — nothing here is invented, only
+/// bounded.
+///
+/// ⛔ **`MemoryHigh`, NEVER `MemoryMax`.** `MemoryHigh` throttles and reclaims;
+/// `MemoryMax` OOM-kills. A hard cap on a browser engine turns a memory spike
+/// into a dead web surface, which trades a slow leak for a broken app.
+///
+/// **The derivation, so this is a rule and not a fitted constant.** WebKit's own
+/// sanctioned residency for ONE web process is `MemTotal/8`. The family is that
+/// process plus the GUI plus the network children, so the scope is allowed twice
+/// that resident — the web process's full existing allowance, and as much again
+/// for everything around it — and may swap at most another `MemTotal/8`. The
+/// committed ceiling is therefore `3 × MemTotal/8`, derived from the limit the
+/// app already applies to itself rather than fitted to one machine.
+///
+/// ⚠ **What this does and does not claim.** The observed growth is ~366 MB/h
+/// with no plateau; this gives it a plateau. On a 15 GB host the ceiling lands
+/// above today's ~4.0 GB committed, so it is not expected to reduce steady-state
+/// usage — it bounds the unbounded, which is the actual defect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemoryScopePolicy {
+    high_mb: u64,
+    swap_max_mb: u64,
+}
+
+fn memory_scope_policy(mem_total_kb: Option<u64>) -> MemoryScopePolicy {
+    // The same floor the WebKit policy reserves for the smallest supported
+    // machines, doubled for the family, so a small host is never throttled into
+    // uselessness by its own bound.
+    const MIN_HIGH_MB: u64 = 1536;
+    let web_share_mb = match mem_total_kb {
+        Some(kb) if kb > 0 => (kb / 1024) / 8,
+        _ => 1024,
+    };
+    MemoryScopePolicy {
+        high_mb: (web_share_mb * 2).max(MIN_HIGH_MB),
+        swap_max_mb: web_share_mb.max(MIN_HIGH_MB / 2),
+    }
+}
+
+/// The exact argv used to re-exec this process inside its own scope.
+///
+/// ⭐ Built as a pure function so the prohibition on `MemoryMax` and the shape
+/// of the command are testable without launching anything.
+fn memory_scope_command_args(
+    policy: MemoryScopePolicy,
+    unit: &str,
+    exe: &std::path::Path,
+    forwarded: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        String::from("--user"),
+        String::from("--scope"),
+        String::from("--quiet"),
+        // Do not leave a failed unit behind to collide with the next launch.
+        String::from("--collect"),
+        format!("--unit={unit}"),
+        String::from("-p"),
+        format!("MemoryHigh={}M", policy.high_mb),
+        String::from("-p"),
+        format!("MemorySwapMax={}M", policy.swap_max_mb),
+        String::from("--"),
+        exe.display().to_string(),
+    ];
+    args.extend(forwarded.iter().cloned());
+    args
+}
+
+/// Re-exec into a private systemd user scope, if asked to and if it can.
+///
+/// ⛔ **FALLING THROUGH IS THE POINT.** `exec` returns ONLY on failure, so every
+/// way this can go wrong — no systemd, no user manager, a refused property —
+/// lands on the next line and the GUI starts exactly as it would have. A launch
+/// path that can prevent the app from starting is worse than the leak it fixes.
+#[cfg(target_os = "linux")]
+fn enter_memory_scope_if_requested() {
+    use std::os::unix::process::CommandExt;
+
+    if !matches!(
+        std::env::var(ENV_YGGTERM_MEMORY_SCOPE).ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    ) {
+        return;
+    }
+    // Idempotent: the child we exec carries this, so it never re-enters.
+    if std::env::var_os(ENV_YGGTERM_MEMORY_SCOPE_ACTIVE).is_some() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let policy = memory_scope_policy(read_mem_total_kb());
+    let forwarded: Vec<String> = std::env::args().skip(1).collect();
+    let unit = format!("yggterm-gui-{}", std::process::id());
+    let args = memory_scope_command_args(policy, &unit, &exe, &forwarded);
+    let error = Command::new("systemd-run")
+        .args(&args)
+        .env(ENV_YGGTERM_MEMORY_SCOPE_ACTIVE, "1")
+        .exec();
+    eprintln!(
+        "yggterm: could not enter a private memory scope ({error}); starting unbounded instead"
+    );
+}
+
 fn read_mem_total_kb() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     meminfo.lines().find_map(|line| {
@@ -4756,7 +4888,29 @@ fn configure_linux_webkit_memory_policy() {
         // `web-browser` is the model WebKit sizes for a browser. The bound on it
         // is not this knob but the memory policy below (a hard limit plus the
         // conservative/strict/kill thresholds) and, since 2.12.18, per-tab
-        // reclaim — so caching more does not mean growing without end.
+        // reclaim.
+        //
+        // ⛔ WHAT THAT POLICY ACTUALLY BOUNDS IS **RESIDENCY, NOT FOOTPRINT** —
+        // this comment used to claim "so caching more does not mean growing
+        // without end", and that guarantee is one the code cannot make.
+        // WebKit evaluates the limit against RESIDENT memory only: upstream WTF
+        // reads `/proc/self/statm`, which has no swap field, and the only
+        // `/proc/self/status` field name in the shipped library is `VmRSS` —
+        // there is no `VmSwap` in it anywhere. So on a host that swaps, the
+        // kernel evicts the cold cache, RSS falls, and the threshold is never
+        // reached while the committed footprint keeps climbing past it.
+        // Measured: RSS flat in a 586-714 MB band while swap grew 11x and
+        // committed went 649 -> 1,362 MB, against a conservative threshold of
+        // 1,416 MB of RSS.
+        //
+        // ⛔ DO NOT "FIX" THIS BY LOWERING THE NUMBER. No constant can bound a
+        // footprint through an RSS-valued comparison, because the kernel can
+        // push RSS below any threshold by swapping. Making it trip against the
+        // band above needs a limit near the 768 MB floor meant for the smallest
+        // supported machines, which abolishes the rule that derives it.
+        // The limit below is a sound derived rule for what it really is: an
+        // eighth of RAM, resident. See `docs/pending-bugs.md` for the only two
+        // honest options.
         // Override with YGGTERM_WEBKIT_CACHE_MODEL=document-viewer to get the
         // old cacheless behaviour back.
         unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_CACHE_MODEL, "web-browser") };
@@ -5769,6 +5923,127 @@ mod tests {
             unknown.limit_mb >= 768,
             "an unknown machine still must not put a media page in permanent \
              pressure: {unknown:?}"
+        );
+    }
+
+    /// ⛔ THE SCOPE THROTTLES, IT NEVER KILLS.
+    ///
+    /// `MemoryHigh` applies reclaim pressure; `MemoryMax` OOM-kills. On a
+    /// browser engine a hard cap turns a memory spike into a dead web surface,
+    /// which trades a slow leak for a broken app — so the string must never
+    /// appear in the command at all.
+    #[test]
+    fn the_memory_scope_bounds_with_pressure_and_never_with_a_hard_cap() {
+        let policy = super::memory_scope_policy(Some(16 * 1024 * 1024));
+        let args = super::memory_scope_command_args(
+            policy,
+            "yggterm-gui-1234",
+            std::path::Path::new("/usr/bin/yggterm"),
+            &[String::from("--flag")],
+        );
+        let rendered = args.join(" ");
+        assert!(
+            !rendered.contains("MemoryMax"),
+            "MemoryMax OOM-kills; a killed web process is a worse outcome than \
+             the growth this bounds. Command was: {rendered}"
+        );
+        assert!(
+            rendered.contains("MemoryHigh=") && rendered.contains("MemorySwapMax="),
+            "both halves are required: MemoryHigh bounds what is RESIDENT and \
+             MemorySwapMax bounds what is SWAPPED, and it is their sum that is \
+             the committed footprint WebKit's own RSS-valued bound cannot see. \
+             Command was: {rendered}"
+        );
+        assert!(
+            rendered.contains("--user") && rendered.contains("--scope"),
+            "a user scope, so it needs no privilege and dies with the session"
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("--flag"),
+            "the GUI's own arguments must survive the re-exec"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "/usr/bin/yggterm"),
+            "the re-exec must target this executable: {rendered}"
+        );
+    }
+
+    /// The bound is DERIVED from the limit the app already applies to itself,
+    /// not fitted to one machine — this lane has twice been burned by a constant
+    /// tuned against a single host.
+    #[test]
+    fn the_scope_bound_is_derived_from_the_webkit_share_and_holds_on_every_host() {
+        for total_gb in [8u64, 16, 32, 64] {
+            let kb = total_gb * 1024 * 1024;
+            let web_share = u64::from(super::webkit_memory_policy(Some(kb)).limit_mb);
+            let scope = super::memory_scope_policy(Some(kb));
+            assert!(
+                scope.high_mb >= web_share,
+                "on a {total_gb} GB host the family's resident bound ({} MB) must \
+                 not be tighter than the single web process's own sanctioned \
+                 share ({web_share} MB), or the scope throttles the app inside \
+                 its own budget",
+                scope.high_mb
+            );
+            assert!(
+                scope.swap_max_mb > 0 && scope.swap_max_mb <= scope.high_mb,
+                "swap must be bounded and must not exceed the resident bound: {scope:?}"
+            );
+        }
+        // A small machine is not throttled into uselessness by its own bound.
+        let small = super::memory_scope_policy(Some(2 * 1024 * 1024));
+        assert!(
+            small.high_mb >= 1536,
+            "a 2 GB host still gets a floor it can run in: {small:?}"
+        );
+        // Unreadable meminfo must not produce a bound of zero, which would
+        // throttle instantly.
+        let unknown = super::memory_scope_policy(None);
+        assert!(
+            unknown.high_mb >= 1536 && unknown.swap_max_mb > 0,
+            "an unknown machine takes a safe middle, never a bound of nothing: {unknown:?}"
+        );
+    }
+
+    /// ⛔ DEFAULT OFF, AND THE RE-EXEC MUST FALL THROUGH.
+    ///
+    /// A source guard, because both properties are about code that only runs on
+    /// a real launch: the failure mode of this change is *the GUI does not
+    /// start*, and neither an absent opt-in nor a failed `systemd-run` may ever
+    /// produce it.
+    #[test]
+    fn the_memory_scope_is_opt_in_and_a_failure_to_enter_it_still_starts_the_gui() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn enter_memory_scope_if_requested() {")
+            .expect("the scope entry point must exist");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\nfn ")
+            .map(|at| at + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("ENV_YGGTERM_MEMORY_SCOPE") && body.contains("return;"),
+            "the scope must be opt-in: with the variable unset the function has \
+             to return before touching the launch"
+        );
+        assert!(
+            body.contains("ENV_YGGTERM_MEMORY_SCOPE_ACTIVE"),
+            "the re-executed child must be stamped, or it re-enters forever"
+        );
+        assert!(
+            body.contains(".exec()") && body.contains("eprintln!"),
+            "`exec` returns ONLY on failure, so there must be code AFTER it: \
+             every way entering the scope can fail has to fall through and start \
+             the GUI unbounded rather than not at all"
+        );
+        assert!(
+            !body.contains("expect(") && !body.contains("unwrap()"),
+            "nothing in the launch path may panic — a bad bound must cost memory, \
+             never the app"
         );
     }
 

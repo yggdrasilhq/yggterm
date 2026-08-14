@@ -525,11 +525,63 @@ def row_presence(host, uuid):
 GONE_SIGHTINGS = 3
 
 
+NEVERARM = STATE / "never-arm.tsv"
+
+
+def never_arm():
+    """⛔⛔ ROWS A HUMAN ATTENDS. THE ANSWER IS ALWAYS NO.
+
+    This watchdog's remedy is to **type into** a row. Typing into a row a person
+    is actively using splices into whatever they have half-written and submits
+    the fusion as their own turn. For an unattended agent row that is a rescue;
+    for an attended one it is putting words in someone's mouth.
+
+    ⛔ **The protection here was previously an ACCIDENT and that is why this file
+    exists.** Such a row was safe only because nobody had ever subscribed it —
+    absent from both rosters, so nothing flagged it and nothing armed it. That is
+    load-bearing and invisible, and it inverts under tidying: subscribe it to the
+    monitor "because it looks unwatched", and the coverage crossing then reports
+    it as a gap, whose obvious remedy is to arm it. **A well-meant cleanup would
+    walk straight into typing over a person's unsent draft.** Safety that rests
+    on an omission is one tidy-up from being removed, so it is written down.
+
+    ⇒ The list lives OUTSIDE the repository, because who attends which row is not
+    engineering content. This code only needs to know that the class exists.
+
+    ⚠ A refusal cannot be tested by writing to the row — the readiness probe
+    types first, which is the same hazard wearing a lab coat. **The admissible
+    test is that the filter excludes it from METADATA ALONE**, which needs no
+    write and is therefore both safe and cheap. If an arming path ever classifies
+    one of these as armable, that path is wrong and nothing downstream ships.
+    """
+    out = {}
+    try:
+        for line in NEVERARM.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t", 1)
+            out[parts[0].strip()] = (parts[1].strip() if len(parts) > 1 else "")
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    return out
+
+
 def cmd_subscribe(args):
     uuid = (args.row or "").rstrip("/").split("/")[-1] or own_uuid()
     if not uuid:
         log("no row given and $YGGTERM_SESSION_ID is unset — nothing to subscribe")
         return 2
+    blocked = never_arm()
+    if uuid in blocked:
+        log(f"⛔ REFUSING to arm {uuid[:8]} — {blocked[uuid] or 'human-attended row'}")
+        log("   This watchdog TYPES INTO what it wakes. Arming a row a person is")
+        log("   using would splice into their unsent text and submit it as theirs.")
+        log(f"   If this is genuinely wrong, remove the line from {NEVERARM}")
+        log("   deliberately — do not pass a flag to route around it.")
+        return 3
     row = resolve(args.host, uuid)
     if row is None:
         log(f"⚠ {uuid} does not resolve to a live row on {args.host} — "
@@ -560,6 +612,46 @@ def cmd_subscribe(args):
     back = [s for s in load_subs() if s["uuid"] == uuid]
     log(f"read-back: {'present' if back else '⛔ ABSENT — subscription did not land'}")
     return 0 if back else 1
+
+
+def update_sub(uuid, rec):
+    """⛔ WRITE A SUBSCRIPTION BACK ONLY IF IT STILL EXISTS — never recreate it.
+
+    `tick()` loads the subscription set once, then writes each record back as it
+    advances counters (gone_sightings, boots, rate-limit holds). A row that
+    unsubscribed DURING that tick had its file deleted after the load, so a plain
+    `write_text` CREATED IT AGAIN — carrying the original `subscribed_at`, which
+    is what makes this hard to see: the row reappears with a continuous age, so
+    it reads as "never unsubscribed" rather than "resurrected".
+
+    Measured 2026-08-14 and reported by a sibling campaign: unsubscribe at
+    00:56:48, verified ABSENT at 00:56:50, tracked again at 00:57:10 with its age
+    continuous from the original 00:13 subscription.
+
+    ⛔ THE DOCUMENTED DEFENCE DOES NOT CATCH THIS, AND THAT IS THE POINT. This
+    fleet's standing law is "a verb reports the REQUEST, not the EFFECT — assert
+    on the read-back". That session DID assert on the read-back and the read-back
+    was correct; the state reverted twenty seconds later. A value that is right
+    when you look and wrong afterwards is a strictly harder failure than a lying
+    verb, because the defence passes on its way to being wrong.
+
+    ⇒ Consequence this removes: `AUTO ARM AND DISARM WITH REASON` (owner ruling,
+    2026-08-13) had only half of it working. If a delete cannot persist, the
+    subscriber cannot perform the disarm the ruling assigns it, and every row
+    that correctly stands down pays a wake on the next idle window.
+
+    `O_WRONLY` WITHOUT `O_CREAT` is the whole fix: an update that is incapable of
+    creating. It also closes the window rather than narrowing it — an
+    `exists()` check followed by a write is the same race, just shorter.
+    """
+    try:
+        fd = os.open(sub_path(uuid), os.O_WRONLY | os.O_TRUNC)
+    except FileNotFoundError:
+        log(f"{uuid[:8]} unsubscribed during this tick — not resurrecting it")
+        return False
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(rec, indent=1))
+    return True
 
 
 def boot_after_for(s):
@@ -770,13 +862,18 @@ def cmd_list(args):
     if rl:
         log(f"⏸ QUOTA HOLD {(rl['until'] - time.time()) / 60:.0f}m left "
             f"(429 seen on {rl['seen_on'][:8]})")
+    # ⭐ Name the directory this reads. A sibling campaign lost minutes concluding
+    #   "no subscription file exists" while looking in the relay root — which also
+    #   holds per-uuid .json files of a DIFFERENT kind, so the wrong directory
+    #   looks like the right one with the answer missing.
     if not subs:
-        log("no subscribers")
+        log(f"no subscribers (reading {SUBS})")
         return 0
     for s in subs:
         age_h = (time.time() - s["subscribed_at"]) / 3600
         log(f"{s['uuid'][:8]}  {s.get('campaign') or '-':<12} "
             f"age={age_h:4.1f}h boots={s['boots']} {s['row']}")
+    log(f"{len(subs)} subscription(s) in {SUBS}")
     return 0
 
 
@@ -926,6 +1023,34 @@ def tick(args):
     # The quota hold from a previous tick. Re-read per tick, never cached: a hold
     # that outlived its window must not keep a healthy fleet asleep.
     rl = rate_limit_hold()
+    # ⛔⛔ ENFORCE never-arm AT THE TICK, NOT ONLY AT `subscribe`.
+    #
+    #    The refusal in `cmd_subscribe` lives in THIS SCRIPT, and this script is
+    #    copied into every checkout on the machine — a lane claims with its own
+    #    copy, which is routinely many commits behind. Measured: the guard was
+    #    present in 1 checkout of 11, and the exposed end was the one the hazard
+    #    actually runs through, because `subscribe` is called by a LANE from its
+    #    own tree while the tick runs from exactly one.
+    #
+    #    ⇒ A guard in code that exists in eleven versions is eleven guards. The
+    #    STATE DIR is shared by every checkout and the tick is a single process,
+    #    so enforcement belongs here — and this is also the point of HARM: the
+    #    tick is the only thing that types. A stale script can still create the
+    #    subscription; it can no longer cause anyone to be typed over, and the
+    #    bad record is purged on sight rather than left to be re-found.
+    blocked = never_arm()
+    if blocked:
+        for s in list(subs):
+            if s["uuid"] in blocked:
+                log(f"⛔ {s['uuid'][:8]} is NEVER-ARM ({blocked[s['uuid']]}) yet was "
+                    f"SUBSCRIBED — purging it now, not booting it.")
+                log("   Something armed a human-attended row; it was almost "
+                    "certainly a pre-guard copy of this script in another checkout.")
+                # Dropped from THIS tick's working set either way — a dry run must
+                # not mutate, but it must not pretend it would boot this row.
+                if not args.dry_run:
+                    sub_path(s["uuid"]).unlink(missing_ok=True)
+                subs.remove(s)
     rc = 0
     for s in subs:
         uuid, row, host = s["uuid"], s["row"], s.get("host", args.host)
@@ -952,7 +1077,7 @@ def tick(args):
             log(f"{uuid[:8]} absent from the row list "
                 f"({s['gone_sightings']}/{GONE_SIGHTINGS}) — waiting for confirmation")
             if not args.dry_run:
-                sub_path(uuid).write_text(json.dumps(s, indent=1))
+                update_sub(uuid, s)
             continue
         if presence is None:
             # ⛔ Say "I could not look", never "it is not there" — and change
@@ -1046,7 +1171,7 @@ def tick(args):
                 log(f"{'RATE-HOLD':<14} {c['age'] / 60:>6.1f}m  {action:<12} {uuid[:8]}  "
                     f"quota hold {held_m:.0f}m left (seen on {rl['seen_on'][:8]})")
                 if not args.dry_run:
-                    sub_path(uuid).write_text(json.dumps(s, indent=1))
+                    update_sub(uuid, s)
                 continue
             if s["boots"] >= MAX_BOOTS:
                 action = "ESCALATE"
@@ -1089,7 +1214,7 @@ def tick(args):
         # ⛔ A dry run must not mutate state — an instrument whose observation
         #    changes what it observes is not an instrument.
         if not args.dry_run:
-            sub_path(uuid).write_text(json.dumps(s, indent=1))
+            update_sub(uuid, s)
         # Print the WINDOW this row is being judged against, not just its age.
         # Without it a deferred row and a default one look the same in the log,
         # and "why was it not booted at 8 minutes" costs a code read to answer.

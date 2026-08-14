@@ -5658,7 +5658,7 @@ fn select_web_surface_tab(
     tab_id: u64,
     gesture: WebTabSelect,
 ) {
-    let pending = state.with_mut(|shell| {
+    let pending = state.with_mut_counted(|shell| {
         shell.web_surface_select_tab(&session_path, tab_id, gesture);
         let surface = shell.web_surfaces.get(&session_path)?;
         let tab = surface.tabs.iter().find(|tab| tab.id == tab_id)?;
@@ -5724,7 +5724,7 @@ fn navigate_web_surface_tab(
         // through URL resolution (no `ssh -L`/SOCKS) or the ~KB blob into the
         // trace. Keep the tab's existing egress for when the user navigates away.
         if url.starts_with("data:") {
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.apply_web_surface_tab_navigation_keep_egress(
                     &session_path,
                     tab_id,
@@ -5769,7 +5769,7 @@ fn navigate_web_surface_tab(
             match state.with(|shell| shell.web_surface_egress_reuse_for(&session_path, tab_id, remote)) {
                 WebSurfaceEgressReuse::Resolve => false,
                 WebSurfaceEgressReuse::Own => true,
-                WebSurfaceEgressReuse::Adopt(donor_id) => state.with_mut(|shell| {
+                WebSurfaceEgressReuse::Adopt(donor_id) => state.with_mut_counted(|shell| {
                     shell.adopt_web_surface_session_socks(&session_path, tab_id, donor_id)
                 }),
             };
@@ -5793,7 +5793,7 @@ fn navigate_web_surface_tab(
                     }),
                 );
             }
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.apply_web_surface_tab_navigation_keep_egress(
                     &session_path,
                     tab_id,
@@ -5826,7 +5826,7 @@ fn navigate_web_surface_tab(
                 }),
             );
         }
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.apply_web_surface_tab_navigation(
                 &session_path,
                 tab_id,
@@ -14282,7 +14282,7 @@ async fn apply_sidebar_declare(
         control_token,
     } = declare;
     let mut state = state;
-    let (known, mut refetch) = state.with_mut(|shell| {
+    let (known, mut refetch) = state.with_mut_counted(|shell| {
         shell.sweep_stale_sidebar_contributions(now_ms);
         let mut known = shell.sidebar_contributions.contains_key(&session_path);
         if known && !shell.sidebar_contribution_matches_declare(&session_path, control.as_deref()) {
@@ -14335,7 +14335,7 @@ async fn apply_sidebar_declare(
         let forward_child =
             forward_child.map(|child| std::sync::Arc::new(std::sync::Mutex::new(child)));
         let pane_ids: Vec<String> = panes.iter().map(|pane| pane.id.clone()).collect();
-        refetch = state.with_mut(|shell| {
+        refetch = state.with_mut_counted(|shell| {
             shell.upsert_sidebar_contribution(
                 &session_path,
                 panes.clone(),
@@ -15272,7 +15272,7 @@ async fn materialize_declared_web_surface(
         }),
     );
     let mut state = state;
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.upsert_web_surface(
             &session_path,
             url,
@@ -17173,6 +17173,11 @@ fn snapshot_live_sidebar_session_view(session: &ManagedSessionView) -> ManagedSe
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
         working: session.working,
+        // ⛔ MUST be carried, not defaulted: this projection is what the sidebar
+        // reads, so dropping the field here would leave the daemon knowing a row
+        // had gone deaf and the human still unable to see it — the exact gap
+        // this signal exists to close.
+        input_unanswered_ms: session.input_unanswered_ms,
         agent_launch_options: Default::default(),
     }
 }
@@ -17229,6 +17234,11 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
         working: session.working,
+        // ⛔ MUST be carried, not defaulted: this projection is what the sidebar
+        // reads, so dropping the field here would leave the daemon knowing a row
+        // had gone deaf and the human still unable to see it — the exact gap
+        // this signal exists to close.
+        input_unanswered_ms: session.input_unanswered_ms,
         agent_launch_options: Default::default(),
     }
 }
@@ -32321,6 +32331,52 @@ fn clear_terminal_resume_notification(state: Signal<ShellState>, session_path: &
         false,
     );
 }
+/// A raw `state.with_mut(…)`, COUNTED.
+///
+/// ⛔⛔ **Why this exists: an empty storm autopsy was ambiguous, and the ambiguity
+/// killed three investigations.** The autopsy fingerprints ~26 `ShellState`
+/// fields per render and reports which changed. Three consecutive autopsies
+/// inside a live 21-minute storm each read `512 renders / 511 unattributed /
+/// changed_fields {} / shellstate_mut {}` — and that told us nothing, because
+/// TWO different causes print it:
+///
+/// 1. the wakes come from inside Dioxus (a future or eval resolving), or
+/// 2. a raw `state.with_mut()` wrote a field the fingerprint does not watch.
+///
+/// `SHELLSTATE_MUT_TOTAL` **is** in the watched set, so a write would show — but
+/// only [`safe_shell_mut`] bumped it, and that path covered 130 of 615 write
+/// sites. The other 485 were invisible, so hypothesis 2 could hide.
+///
+/// ⇒ Routing every raw write through here makes a write to `state`
+/// **unmissable**, which is what turns the empty fingerprint into EVIDENCE: with
+/// this in place, `changed_fields: {}` means *nothing wrote to ShellState at
+/// all*, and the remaining explanation is a Dioxus-internal waker.
+///
+/// ⚠ It counts but does not NAME the writer — the histogram bucket is
+/// `raw_unlabelled`. Naming 485 sites is a separate, larger job; knowing whether
+/// a write happened at all is what discriminates the hypotheses, and that is the
+/// question actually blocking the diagnosis. Convert a site to
+/// [`safe_shell_mut`] with a real context string when you need to know WHICH.
+trait ShellStateWriteCounted {
+    fn with_mut_counted<R>(&mut self, operation: impl FnOnce(&mut ShellState) -> R) -> R;
+}
+impl ShellStateWriteCounted for Signal<ShellState> {
+    fn with_mut_counted<R>(&mut self, operation: impl FnOnce(&mut ShellState) -> R) -> R {
+        // Same accounting as `safe_shell_mut`: the total is always counted (one
+        // relaxed add beside a signal write), the histogram only while a probe
+        // or the bounded autopsy window is armed.
+        SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if render_trace_enabled() || storm_autopsy_armed() {
+            if let Ok(mut hist) = SHELLSTATE_MUT_HIST
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+            {
+                *hist.entry("raw_unlabelled").or_insert(0) += 1;
+            }
+        }
+        self.with_mut(operation)
+    }
+}
 fn safe_shell_mut<R>(
     mut state: Signal<ShellState>,
     context: &'static str,
@@ -32403,13 +32459,13 @@ fn queue_app_pane_row_rename_ai_name(
         .await;
         match generated {
             Ok(Ok(name)) => {
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     shell.set_app_pane_row_rename_value(&pane_id, &row_id, name);
                     shell.last_action = "generated a name".to_string();
                 });
             }
             Ok(Err(error)) => {
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     shell.push_notification(
                         NotificationTone::Warning,
                         "Name Generation Failed",
@@ -32418,7 +32474,7 @@ fn queue_app_pane_row_rename_ai_name(
                 });
             }
             Err(error) => {
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     shell.push_notification(
                         NotificationTone::Warning,
                         "Name Generation Failed",
@@ -32451,7 +32507,7 @@ fn queue_rename_field_ai_title_generation(mut state: Signal<ShellState>, row: Br
 
         match outcome {
             Ok(Ok(())) => {
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     if shell.tree_rename_path.as_deref() == Some(row.full_path.as_str()) {
                         shell.cancel_tree_rename();
                     }
@@ -32460,7 +32516,7 @@ fn queue_rename_field_ai_title_generation(mut state: Signal<ShellState>, row: Br
                 queue_title_generation(state, row, true, true);
             }
             Ok(Err(error)) => {
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     shell.push_notification(
                         NotificationTone::Warning,
                         "Title Refresh Failed",
@@ -32469,7 +32525,7 @@ fn queue_rename_field_ai_title_generation(mut state: Signal<ShellState>, row: Br
                 });
             }
             Err(error) => {
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     shell.push_notification(
                         NotificationTone::Warning,
                         "Title Refresh Failed",
@@ -32520,7 +32576,7 @@ fn queue_selected_copy_regeneration(
     })
     .unwrap_or_default();
     if selected_rows.is_empty() {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.close_context_menu();
             shell.push_notification(
                 NotificationTone::Warning,
@@ -32537,7 +32593,7 @@ fn queue_selected_copy_regeneration(
         CopyRegenerationMode::Summary => "summary",
         CopyRegenerationMode::Copy => "copy",
     };
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.close_context_menu();
         shell.last_action = format!("queued {mode_label} regeneration for {target_count} session(s)");
         shell.push_notification(
@@ -32690,7 +32746,7 @@ fn spawn_title_generation_for_target(
         );
     }
     if announce {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.last_action = if force {
                 format!("regenerating title for {}", target.title)
             } else {
@@ -33645,7 +33701,7 @@ async fn ping_and_apply_contribution(
     let now_ms = current_millis();
     // Apply stamps and drain commands atomically, and persist the ack so the
     // NEXT ping to this endpoint retires the batch we just drained.
-    let applied = state.with_mut(|shell| {
+    let applied = state.with_mut_counted(|shell| {
         let refetch = shell.apply_sidebar_ping(
             &session_path,
             app_name,
@@ -33685,7 +33741,7 @@ async fn ping_and_apply_contribution(
         spawn(app_appearance_fetch(state, session, version, trace_home));
     }
     if refetch.document {
-        let seq = state.with_mut(|shell| shell.document_pane_next_request(&session_path));
+        let seq = state.with_mut_counted(|shell| shell.document_pane_next_request(&session_path));
         spawn(document_pane_fetch_schema(state, session_path.clone(), seq));
     }
     // The rail's document list went stale on the same stamp. THIS is the arm that
@@ -33693,7 +33749,7 @@ async fn ping_and_apply_contribution(
     // the first declare every later document change arrives only as a ping.
     if refetch.document_rail
         && let Some((pane_id, seq)) =
-            state.with_mut(|shell| shell.document_rail_pane_to_refetch(&session_path))
+            state.with_mut_counted(|shell| shell.document_rail_pane_to_refetch(&session_path))
     {
         spawn(app_pane_fetch_schema(
             state,
@@ -33717,7 +33773,7 @@ async fn ping_and_apply_contribution(
             if tab.raise
                 && let Some(row) = state.with(|shell| resolve_app_control_row(shell, &tab.session_path))
             {
-                state.with_mut(|shell| shell.prepare_app_control_foreground_open());
+                state.with_mut_counted(|shell| shell.prepare_app_control_foreground_open());
                 spawn_open_session_row(state, row);
             }
         }
@@ -33991,7 +34047,7 @@ async fn restore_app_surfaces_tick(mut state: Signal<ShellState>, trace_home: st
     // endpoint probe, which is longer than the 2.5s tick — marking afterwards
     // would let the next tick pick the same session again and fire a second
     // concurrent probe.
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         for target in &targets {
             shell.mark_app_surface_restore_attempted(
                 &target.session_path,
@@ -34123,7 +34179,7 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
             // sqlite row — the crash story — without waiting for a Save.
             // Co-visible sessions only (the ones whose editors can be typed
             // in): the active session and the active split group's members.
-            let draft_syncs = state.with_mut(|shell| {
+            let draft_syncs = state.with_mut_counted(|shell| {
                 let mut co_visible: Vec<String> = shell
                     .server
                     .active_session_path()
@@ -34461,7 +34517,7 @@ fn spawn_browser_tree_refresh(
     reason: &'static str,
     selected_hint: Option<String>,
 ) {
-    let should_start = state.with_mut(|shell| {
+    let should_start = state.with_mut_counted(|shell| {
         if shell.browser_tree_loading_in_flight || shell.browser_tree_refresh_in_flight {
             return false;
         }
@@ -34523,7 +34579,7 @@ fn spawn_manual_daemon_hot_restart(mut state: Signal<ShellState>) {
     // already finished. So the button read as a click into nothing, and the user could not
     // tell "working on it" from "did that even register". Announce BEFORE the work starts.
     let trace_home = resolve_yggterm_home().ok();
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.last_action = "hot-restarting daemon".to_string();
         shell.push_notification(
             NotificationTone::Info,
@@ -34575,7 +34631,7 @@ fn spawn_manual_daemon_hot_restart(mut state: Signal<ShellState>) {
         })
         .await;
         let succeeded = matches!(outcome, Ok(Ok(_)));
-        state.with_mut(|shell| match outcome {
+        state.with_mut_counted(|shell| match outcome {
             Ok(Ok(result)) => shell.push_notification(
                 NotificationTone::Success,
                 "Daemon Hot-Restart",
@@ -34631,7 +34687,7 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
     let Some(update) = pending else {
         return;
     };
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.pending_update_restart = Some(update.clone());
         shell.last_action = format!("restarting into {}", update.version);
     });
@@ -34651,7 +34707,7 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
         })
         .await;
         let mut close_after_launch = false;
-        state.with_mut(|shell| match launched {
+        state.with_mut_counted(|shell| match launched {
             Ok(Ok(())) => {
                 close_after_launch = true;
             }
@@ -34683,7 +34739,7 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
                 .map(|u| u.version.as_str())
                 == Some(next_version.as_str())
         {
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.pending_update_restart = None;
             });
         }
@@ -34781,7 +34837,7 @@ fn create_split_group_from_members(
     members: Vec<SplitMember>,
     axis: SplitAxis,
 ) -> Option<String> {
-    let outcome = state.with_mut(|shell| {
+    let outcome = state.with_mut_counted(|shell| {
         let mut seen = HashSet::new();
         let members: Vec<SplitMember> = members
             .into_iter()
@@ -34962,7 +35018,7 @@ fn split_groups_debug_json(shell: &ShellState) -> Value {
 /// its group's `active_pane`. Both panes are already mounted, so activating an
 /// in-group member is a cheap reveal/focus flip, not a remount.
 fn focus_split_pane(mut state: Signal<ShellState>, member: &str) {
-    let row = state.with_mut(|shell| {
+    let row = state.with_mut_counted(|shell| {
         if let Some(group) = shell
             .split_groups
             .iter_mut()
@@ -35009,7 +35065,7 @@ fn focused_pane_index(group: &SplitGroup, active_session: Option<&str>) -> Optio
 /// split-tabs session seats two panes — a session path alone cannot name
 /// which one the user meant.
 fn focus_split_pane_by_index(mut state: Signal<ShellState>, group_id: &str, index: usize) {
-    let row = state.with_mut(|shell| {
+    let row = state.with_mut_counted(|shell| {
         let member_session = {
             let group = shell.split_group_by_id_mut(group_id)?;
             let member = group.members.get(index)?.clone();
@@ -35031,7 +35087,7 @@ fn focus_split_pane_by_index(mut state: Signal<ShellState>, group_id: &str, inde
 /// Set the divider ratio for a group (fraction the first pane occupies).
 fn set_split_group_ratio(mut state: Signal<ShellState>, group_id: &str, ratio: f32) {
     let mut changed_members: Vec<String> = Vec::new();
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         if let Some(group) = shell.split_group_by_id_mut(group_id) {
             let clamped = if ratio.is_finite() {
                 ratio.clamp(0.15, 0.85)
@@ -35053,7 +35109,7 @@ fn set_split_group_ratio(mut state: Signal<ShellState>, group_id: &str, ratio: f
 /// pre-group keep-alive so a throwaway shell does not stay immortal after a
 /// brief split. The survivor sessions remain open; the active one stays active.
 fn ungroup_split_group(mut state: Signal<ShellState>, group_id: &str) {
-    let restore = state.with_mut(|shell| {
+    let restore = state.with_mut_counted(|shell| {
         let Some(pos) = shell
             .split_groups
             .iter()
@@ -35085,7 +35141,7 @@ fn ungroup_split_group(mut state: Signal<ShellState>, group_id: &str) {
 /// the group dissolves. Does NOT close the removed session — "close this pane"
 /// is a separate, explicit action.
 fn remove_split_pane(mut state: Signal<ShellState>, group_id: &str, member: &str) {
-    let restore = state.with_mut(|shell| {
+    let restore = state.with_mut_counted(|shell| {
         let Some(group) = shell.split_group_by_id_mut(group_id) else {
             return Vec::new();
         };
@@ -35297,7 +35353,7 @@ fn close_window_preserving_live_sessions(mut state: Signal<ShellState>, reason: 
     if state.read().closing_app {
         return;
     }
-    state.with_mut(sync_window_frame_state);
+    state.with_mut_counted(sync_window_frame_state);
     let (detach_terminal_before_close, endpoint, trace_home) = {
         let shell = state.read();
         (
@@ -35310,7 +35366,7 @@ fn close_window_preserving_live_sessions(mut state: Signal<ShellState>, reason: 
     };
     SUPPRESS_DAEMON_SHUTDOWN_ON_EXIT.store(true, Ordering::SeqCst);
     INTENTIONAL_CLIENT_SHUTDOWN.store(true, Ordering::SeqCst);
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.closing_app = true;
         shell.last_action = match reason.as_deref() {
             Some("update-restart") => "restarting yggterm".to_string(),
@@ -35342,7 +35398,7 @@ fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
     if state.read().closing_app {
         return;
     }
-    state.with_mut(sync_window_frame_state);
+    state.with_mut_counted(sync_window_frame_state);
     let (detach_terminal_before_close, keep_alive_paths, endpoint, trace_home) = {
         let shell = state.read();
         (
@@ -35355,7 +35411,7 @@ fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
         )
     };
     INTENTIONAL_CLIENT_SHUTDOWN.store(true, Ordering::SeqCst);
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.closing_app = true;
         shell.last_action = "closing yggterm".to_string();
         shell.push_notification(
@@ -35530,7 +35586,7 @@ fn spawn_update_workflow(mut state: Signal<ShellState>, trigger: UpdateWorkflowT
             "manual_update_check"
         }
     };
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.update_workflow = UpdateWorkflowState::Checking;
         shell.last_action = "checking for updates".to_string();
         shell.clear_job_notification(SELF_UPDATE_JOB_KEY);
@@ -35577,7 +35633,7 @@ fn spawn_update_workflow(mut state: Signal<ShellState>, trigger: UpdateWorkflowT
                 maybe_event = event_rx.recv() => {
                     match maybe_event {
                         Some(UpdateWorkflowEvent::InstallProgress { version, progress }) => {
-                            state.with_mut(|shell| {
+                            state.with_mut_counted(|shell| {
                                 apply_update_install_progress(shell, &version, &progress);
                             });
                         }
@@ -35585,7 +35641,7 @@ fn spawn_update_workflow(mut state: Signal<ShellState>, trigger: UpdateWorkflowT
                             if let Some(result) = worker_result.take() {
                                 let installed = matches!(result, Ok(Ok(UpdateWorkflowOutcome::Installed(_))));
                                 perf.finish(json!({ "installed": installed }));
-                                state.with_mut(|shell| {
+                                state.with_mut_counted(|shell| {
                                     shell.update_workflow = UpdateWorkflowState::Idle;
                                     match result {
                                         Ok(Ok(UpdateWorkflowOutcome::Installed(update))) => {
@@ -38712,7 +38768,7 @@ fn spawn_launch_app_verb_here(
     verb: AppVerb,
     explicit_row: Option<BrowserRow>,
 ) {
-    let anchor = state.with_mut(|shell| {
+    let anchor = state.with_mut_counted(|shell| {
         shell.clear_alt_overlay();
         shell.close_titlebar_new_menu();
         shell.close_context_menu();
@@ -38868,7 +38924,7 @@ fn spawn_surface_snapshot_action<F>(
     F: FnOnce(ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> + Send + 'static,
 {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.begin_surface_request(request_meta.clone(), pending_label.clone(), global_busy);
     });
     spawn_loading_notice(
@@ -38923,7 +38979,7 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
                 .is_some_and(|path| shell.server.session_supports_terminal(path))
         });
         if !supports_terminal {
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.server.set_view_mode(WorkspaceViewMode::Rendered);
                 shell.push_notification(
                     NotificationTone::Error,
@@ -38947,7 +39003,7 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
             .then(|| shell.server.active_session_path().map(str::to_string))
             .flatten()
     });
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.remember_current_viewport_for_history();
         shell.server.set_view_mode(mode);
         if mode == WorkspaceViewMode::Terminal
@@ -38999,7 +39055,7 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
         },
     );
     if let Some(session_path) = remote_preview_path {
-        let should_sync = state.with_mut(|shell| {
+        let should_sync = state.with_mut_counted(|shell| {
             shell
                 .remote_preview_dirty_epoch
                 .insert(session_path.clone(), current_millis());
@@ -39111,7 +39167,7 @@ fn spawn_focus_live_session_row_retry(
             }
         },
     );
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.remember_current_viewport_for_history();
         shell.show_start_page_when_no_live_sessions = false;
         shell.latest_open_request_id = shell.latest_open_request_id.saturating_add(1);
@@ -39299,7 +39355,7 @@ fn spawn_open_session_row_with_mode_retry_inner(
         })
         .flatten();
     if prefer_terminal && state.with(|shell| session_is_hot_terminal_row(shell, &row)) {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             let idempotent_active_focus =
                 shell.terminal_session_is_active_ready_focus_target(&row.full_path);
             if !idempotent_active_focus {
@@ -39368,7 +39424,7 @@ fn spawn_open_session_row_with_mode_retry_inner(
             session_path: row.full_path.clone(),
         },
     );
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.remember_current_viewport_for_history();
         shell.show_start_page_when_no_live_sessions = false;
         shell.latest_open_request_id = shell.latest_open_request_id.saturating_add(1);
@@ -39603,7 +39659,7 @@ fn spawn_open_session_row_with_mode_retry_inner(
             }
         }
         if let Some(session_path) = preview_sync_session_path {
-            let should_sync = state.with_mut(|shell| {
+            let should_sync = state.with_mut_counted(|shell| {
                 shell
                     .remote_preview_dirty_epoch
                     .insert(session_path.clone(), current_millis());
@@ -40375,7 +40431,7 @@ fn record_agent_pointer(
     action: &str,
 ) {
     let now = current_millis();
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         let session = session_path
             .or_else(|| shell.server.active_session_path().map(ToOwned::to_owned));
         shell.agent_presence.record(agent, session, x, y, action, now);
@@ -40944,7 +41000,7 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
     let target = state.read().ssh_connect_target.trim().to_string();
     let prefix = state.read().ssh_connect_prefix.trim().to_string();
     if target.is_empty() {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.push_notification(
                 NotificationTone::Warning,
                 "SSH Target Needed",
@@ -40961,7 +41017,7 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
             machine_key: machine_key_from_labelish(&target),
         },
     );
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.begin_busy_request(request_meta.clone(), format!("connecting {target}"));
         shell.push_notification(
             NotificationTone::Info,
@@ -40991,7 +41047,7 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
         })
         .await;
         let request_id = request_meta.request_id.clone();
-        state.with_mut(|shell| match outcome {
+        state.with_mut_counted(|shell| match outcome {
             Ok(Ok((snapshot, message))) => {
                 shell.server.apply_snapshot(snapshot);
                 shell.finish_busy_request_for(&request_id);
@@ -41039,7 +41095,7 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
         session_kind_action_label(kind),
         row.label
     );
-    let (launch_context, terminal_appearance) = state.with_mut(|shell| {
+    let (launch_context, terminal_appearance) = state.with_mut_counted(|shell| {
         // Every launch door lands here (see [`spawn_start_session_for_row`]), so
         // the surface bookkeeping the `+` menu and the KeyTip layer need is done
         // once, here: remember the viewport we are leaving, drop the start page,
@@ -41198,7 +41254,7 @@ fn spawn_start_session_for_row(
     // No anchor exists at all: nothing selected in the sidebar and no active
     // session (an empty shell). There is no cwd to inherit and nothing to insert
     // below, so the daemon top-inserts into an empty Live list.
-    let terminal_appearance = state.with_mut(|shell| {
+    let terminal_appearance = state.with_mut_counted(|shell| {
         shell.remember_current_viewport_for_history();
         shell.show_start_page_when_no_live_sessions = false;
         shell.clear_alt_overlay();
@@ -41697,7 +41753,7 @@ fn queue_copy_edit_for_row(mut state: Signal<ShellState>, row: BrowserRow, field
         copy_generation_target_for_sidebar_row(&shell.server, &shell.server.live_sessions(), &row)
             .map(|target| copy_edit_dialog_for_target(shell, target, field))
     });
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.close_context_menu();
         if let Some(dialog) = dialog {
             shell.copy_edit_dialog = Some(dialog);
@@ -41724,7 +41780,7 @@ fn queue_copy_edit_for_active_session(mut state: Signal<ShellState>, field: Copy
             .and_then(|session| copy_generation_target_for_session(&shell.server, session))
             .map(|target| copy_edit_dialog_for_target(shell, target, field))
     });
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.close_titlebar_session_menu();
         if let Some(dialog) = dialog {
             shell.copy_edit_dialog = Some(dialog);
@@ -41815,19 +41871,19 @@ fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
             // committed in its own field, and "Enter = the primary button" would
             // have to invent a primary button this dialog does not have.
             if dismiss {
-                state.with_mut(|shell| shell.close_keymap_editor());
+                state.with_mut_counted(|shell| shell.close_keymap_editor());
             }
             true
         }
         TopModal::ThemeEditor => {
             if dismiss {
-                state.with_mut(|shell| shell.set_theme_editor_open(false));
+                state.with_mut_counted(|shell| shell.set_theme_editor_open(false));
             }
             true
         }
         TopModal::LaunchFlags => {
             if dismiss {
-                state.with_mut(|shell| shell.set_launch_flags_open(false));
+                state.with_mut_counted(|shell| shell.set_launch_flags_open(false));
             }
             true
         }
@@ -41868,7 +41924,7 @@ fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
         }
         TopModal::Delete => {
             if dismiss {
-                state.with_mut(|shell| shell.cancel_delete_dialog());
+                state.with_mut_counted(|shell| shell.cancel_delete_dialog());
             } else {
                 queue_delete_selected_items(state, true);
             }
@@ -41883,7 +41939,7 @@ fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
             true
         }
         TopModal::ClassicTabsSwitch => {
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 if dismiss {
                     shell.cancel_classic_tabs_switch();
                 } else {
@@ -41922,7 +41978,7 @@ fn modal_key_dispatch(mut state: Signal<ShellState>, key: &str) -> bool {
 /// The overflow menu itself has only the strip anchor, so it closes
 /// unconditionally.
 fn close_strip_dropdowns(mut state: Signal<ShellState>) {
-    let active_terminal_session = state.with_mut(|shell| {
+    let active_terminal_session = state.with_mut_counted(|shell| {
         shell.close_strip_anchored_dropdowns();
         overlay_focus_giveback_session(
             shell.server.active_view_mode(),
@@ -41935,7 +41991,7 @@ fn close_strip_dropdowns(mut state: Signal<ShellState>) {
 }
 
 fn update_copy_edit_value(mut state: Signal<ShellState>, value: String) {
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         if let Some(dialog) = shell.copy_edit_dialog.as_mut() {
             dialog.value = value;
         }
@@ -41943,20 +41999,20 @@ fn update_copy_edit_value(mut state: Signal<ShellState>, value: String) {
 }
 
 fn cancel_copy_edit(mut state: Signal<ShellState>) {
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.copy_edit_dialog = None;
     });
     sync_active_terminal_input_policy(state);
 }
 
 fn commit_copy_edit(mut state: Signal<ShellState>) {
-    let dialog = state.with_mut(|shell| shell.copy_edit_dialog.take());
+    let dialog = state.with_mut_counted(|shell| shell.copy_edit_dialog.take());
     let Some(dialog) = dialog else {
         return;
     };
     let value = dialog.value.trim().to_string();
     if value.is_empty() {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.push_notification(
                 NotificationTone::Warning,
                 "Nothing Saved",
@@ -41966,7 +42022,7 @@ fn commit_copy_edit(mut state: Signal<ShellState>) {
         sync_active_terminal_input_policy(state);
         return;
     }
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.server_busy = true;
         match dialog.field {
             CopyEditField::Title => {
@@ -42044,7 +42100,7 @@ fn commit_copy_edit(mut state: Signal<ShellState>) {
             })
             .await
         };
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             match outcome {
                 Ok(Ok(maybe_tree)) => {
                     if let Some(browser_tree) = maybe_tree {
@@ -42762,7 +42818,7 @@ fn maybe_request_copy_generation_for_session(
     if refresh_plan.hydrate_copy {
         spawn_active_session_copy_hydration(state, session.clone());
         if refresh_plan.request_title_generation {
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.title_autogen_retry_after_ms.insert(
                     session.session_path.clone(),
                     now_ms.saturating_add(ACTIVE_TITLE_AUTOGEN_RETRY_MS),
@@ -42784,7 +42840,7 @@ fn maybe_request_copy_generation_for_session(
     }
     if refresh_plan.schedule_background_scan {
         requested_background_scan =
-            state.with_mut(|shell| schedule_background_copy_scan_now(shell, now_ms));
+            state.with_mut_counted(|shell| schedule_background_copy_scan_now(shell, now_ms));
     }
     if requested_background_scan {
         maybe_spawn_background_copy_generation(state);
@@ -44754,12 +44810,35 @@ fn live_session_close_button_style(palette: Palette, selected: bool) -> String {
 /// working right now. Shared by Live Sessions today and Automated Sessions
 /// later (experimental/automations).
 fn live_session_status_dot_style(palette: Palette, keep_alive: bool, working: bool) -> String {
+    live_session_status_dot_style_with_attention(palette, keep_alive, working, false)
+}
+
+/// The status dot, with DESIGN.md's reserved ATTENTION slot wired.
+///
+/// `attention` paints amber over the durability colour and forces the dot
+/// STEADY. Both halves are the spec, not a preference: blink means *working*,
+/// and the first attention case — a row written to that has said nothing back —
+/// is exactly the row that is not working, so letting it blink would assert the
+/// one thing known to be false.
+fn live_session_status_dot_style_with_attention(
+    palette: Palette,
+    keep_alive: bool,
+    working: bool,
+    attention: bool,
+) -> String {
     let _ = palette;
     // Plain color circle (user decision 2026-06-26): green = keep-alive,
     // blue = lives with the GUI. No halo ring — just the flat dot. Working is a
     // HARD on/off blink via `step-end` (no fade); idle is a steady dot.
-    let background = if keep_alive { "#22c55e" } else { "#3b82f6" };
-    let animation = status_dot_blink_opacity_css(working);
+    // AMBER (DESIGN.md "Status indicator vocabulary") outranks both: durability
+    // is what happens to the row eventually, attention is what is wrong with it
+    // now.
+    let background = match (attention, keep_alive) {
+        (true, _) => "#f59e0b",
+        (false, true) => "#22c55e",
+        (false, false) => "#3b82f6",
+    };
+    let animation = status_dot_blink_opacity_css(working && !attention);
     format!(
         "display:inline-flex; width:7px; min-width:7px; height:7px; border-radius:999px; background:{background};{animation}",
     )
@@ -46879,7 +46958,7 @@ async fn keytip_alt_tap_install_loop(state: Signal<ShellState>) {
 /// it independent of which surface holds DOM focus (§13.1, invariant 11).
 fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::Value) {
     if msg.get("tap").and_then(|value| value.as_bool()) == Some(true) {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             if shell.alt_overlay_active {
                 shell.clear_alt_overlay();
             } else {
@@ -46905,7 +46984,7 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
         };
         let command = keytip::accel_command_for(&chord, &state.read().keytip_config);
         if let Some(command) = command {
-            state.with_mut(|shell| shell.clear_alt_overlay());
+            state.with_mut_counted(|shell| shell.clear_alt_overlay());
             dispatch_keytip_node(state, &command);
         }
         return;
@@ -46931,7 +47010,7 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
         // Every other claimed chord IS a keytip command id, and it lands on the
         // same dispatch the accelerator bridge above uses — so `window.fullscreen`
         // has ONE toggle whichever door the key came through.
-        state.with_mut(|shell| shell.clear_alt_overlay());
+        state.with_mut_counted(|shell| shell.clear_alt_overlay());
         dispatch_keytip_node(state, chord);
         return;
     }
@@ -46972,7 +47051,7 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
     // on nothing rather than on the wrong dialog.
     if let Some(kind) = msg.get("follow_modal").and_then(|value| value.as_str()) {
         let kind = kind.to_string();
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             if shell.alt_overlay_active {
                 return;
             }
@@ -47029,7 +47108,7 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
         && matches!(key, "Escape" | "Enter" | "Backspace")
     {
         modal_key_dispatch(state, key);
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             if shell.top_modal().is_none() {
                 shell.clear_alt_overlay();
             }
@@ -47040,12 +47119,12 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
         // Esc backs all the way out: the overlay AND whatever container it opened.
         // Leaving a keyboard-opened row menu on screen after Esc would strand a
         // surface the keyboard can no longer reach.
-        "Escape" => state.with_mut(|shell| {
+        "Escape" => state.with_mut_counted(|shell| {
             shell.clear_alt_overlay();
             shell.close_context_menu();
             shell.close_titlebar_new_menu();
         }),
-        "Backspace" => state.with_mut(|shell| {
+        "Backspace" => state.with_mut_counted(|shell| {
             shell.alt_overlay_sequence.pop();
             if shell.alt_overlay_sequence.is_empty() {
                 // Back at the root scope: the container this chord had opened is no
@@ -47069,7 +47148,7 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
             if state.read().alt_jump_path.is_some() =>
         {
             if key == "Enter" {
-                let target = state.with_mut(|shell| {
+                let target = state.with_mut_counted(|shell| {
                     let path = shell.alt_jump_path.clone();
                     shell.clear_alt_overlay();
                     path.and_then(|path| synthesize_app_control_row(shell, &path))
@@ -47085,7 +47164,7 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
                 "Home" => (-1, true),
                 _ => (1, true),
             };
-            state.with_mut(|shell| shell.navigate_session_jump(delta, to_edge));
+            state.with_mut_counted(|shell| shell.navigate_session_jump(delta, to_edge));
             scroll_sidebar_row_into_view_quietly(state);
         }
         other => {
@@ -47111,7 +47190,7 @@ fn apply_derived_keytips(
     // the layer INSIDE it, and a dialog that has gone takes the layer with it
     // (the container the scope named is no longer there to act on).
     let modal_kind = scope.strip_prefix("modal:").map(|kind| kind.to_string());
-    let closed = state.with_mut(|shell| {
+    let closed = state.with_mut_counted(|shell| {
         if !shell.alt_overlay_active {
             return false;
         }
@@ -47154,7 +47233,7 @@ fn apply_derived_keytips(
         };
         derive_keytips_for_elements(&claimed, elements)
     };
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         // Replace wholesale: the report is the complete derivation for THIS
         // surface; merging with a previous one could dispatch a dead stamp.
         shell.alt_derived_tips.clear();
@@ -47595,7 +47674,7 @@ fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
             // Opening the sidebar from the keyboard (ALT,B) also focuses a row so
             // arrow-key navigation works without a mouse click first (§8). Keeps an
             // existing selection; otherwise focuses the first navigable row.
-            let focus_path = state.with_mut(|shell| {
+            let focus_path = state.with_mut_counted(|shell| {
                 shell.clear_alt_overlay();
                 shell.toggle_sidebar();
                 if !shell.sidebar_open {
@@ -47613,25 +47692,25 @@ fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
             }
         }
         ShellCommand::FocusSearch => {
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.clear_alt_overlay();
                 shell.set_search_focus(true);
             });
             focus_search_input(true);
         }
         ShellCommand::ViewWeb => {
-            state.with_mut(|shell| shell.clear_alt_overlay());
+            state.with_mut_counted(|shell| shell.clear_alt_overlay());
             spawn_set_view_mode(state, WorkspaceViewMode::Rendered);
         }
         ShellCommand::ViewTerminal => {
-            state.with_mut(|shell| shell.clear_alt_overlay());
+            state.with_mut_counted(|shell| shell.clear_alt_overlay());
             spawn_set_view_mode(state, WorkspaceViewMode::Terminal);
         }
-        ShellCommand::ToggleConnect => state.with_mut(|shell| {
+        ShellCommand::ToggleConnect => state.with_mut_counted(|shell| {
             shell.clear_alt_overlay();
             shell.toggle_connect_panel();
         }),
-        ShellCommand::ToggleNotifications => state.with_mut(|shell| {
+        ShellCommand::ToggleNotifications => state.with_mut_counted(|shell| {
             shell.clear_alt_overlay();
             shell.toggle_notifications_panel();
         }),
@@ -47645,7 +47724,7 @@ fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
             // panel open, so the Tab chain never began inside the panel and the
             // user still had to reach for the mouse. Focusing the head of the chain
             // is what makes that justification true.
-            let opened = state.with_mut(|shell| {
+            let opened = state.with_mut_counted(|shell| {
                 shell.clear_alt_overlay();
                 shell.toggle_settings_panel();
                 shell.displayed_right_panel_mode() == RightPanelMode::Settings
@@ -47654,19 +47733,19 @@ fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
                 focus_settings_field(state, SETTINGS_FIRST_FIELD_KEY);
             }
         }
-        ShellCommand::ToggleMetadata => state.with_mut(|shell| {
+        ShellCommand::ToggleMetadata => state.with_mut_counted(|shell| {
             shell.clear_alt_overlay();
             shell.toggle_metadata_panel();
         }),
-        ShellCommand::ToggleFullscreen => state.with_mut(|shell| {
+        ShellCommand::ToggleFullscreen => state.with_mut_counted(|shell| {
             shell.clear_alt_overlay();
             shell.toggle_fullscreen();
         }),
-        ShellCommand::ToggleAlwaysOnTop => state.with_mut(|shell| {
+        ShellCommand::ToggleAlwaysOnTop => state.with_mut_counted(|shell| {
             shell.clear_alt_overlay();
             shell.toggle_always_on_top();
         }),
-        ShellCommand::OpenKeymapEditor => state.with_mut(|shell| {
+        ShellCommand::OpenKeymapEditor => state.with_mut_counted(|shell| {
             shell.clear_alt_overlay();
             shell.open_keymap_editor();
         }),
@@ -47679,7 +47758,7 @@ fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
                 .keymap
                 .chord_for_id("insert.menu")
                 .unwrap_or_default();
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.alt_overlay_active = true;
                 shell.alt_overlay_sequence = insert_chord;
                 shell.titlebar_session_menu_open = false;
@@ -47695,7 +47774,7 @@ fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
                 .keymap
                 .chord_for_id("session.menu")
                 .unwrap_or_default();
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.alt_overlay_active = true;
                 shell.alt_overlay_sequence = chord;
             });
@@ -47707,7 +47786,7 @@ fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
                 .keymap
                 .chord_for_id("session.jump")
                 .unwrap_or_default();
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.alt_overlay_active = true;
                 shell.alt_overlay_sequence = chord;
                 shell.begin_session_jump();
@@ -47715,19 +47794,19 @@ fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
             scroll_sidebar_row_into_view_quietly(state);
         }
         ShellCommand::InsertSession => {
-            state.with_mut(|shell| shell.clear_alt_overlay());
+            state.with_mut_counted(|shell| shell.clear_alt_overlay());
             spawn_start_preferred_agent_session(state);
         }
         ShellCommand::InsertTerminal => {
-            state.with_mut(|shell| shell.clear_alt_overlay());
+            state.with_mut_counted(|shell| shell.clear_alt_overlay());
             spawn_start_terminal_session(state);
         }
         ShellCommand::NextSession => {
-            state.with_mut(|shell| shell.clear_alt_overlay());
+            state.with_mut_counted(|shell| shell.clear_alt_overlay());
             spawn_switch_live_session(state, true);
         }
         ShellCommand::PrevSession => {
-            state.with_mut(|shell| shell.clear_alt_overlay());
+            state.with_mut_counted(|shell| shell.clear_alt_overlay());
             spawn_switch_live_session(state, false);
         }
     }
@@ -47764,7 +47843,7 @@ fn feed_alt_overlay_char(mut state: Signal<ShellState>, ch: char) {
         (next.clone(), tree.resolve(&next))
     };
     match resolution {
-        ChordResolution::Pending => state.with_mut(|shell| {
+        ChordResolution::Pending => state.with_mut_counted(|shell| {
             shell.alt_overlay_active = true;
             shell.alt_overlay_sequence = next_sequence;
         }),
@@ -47774,7 +47853,7 @@ fn feed_alt_overlay_char(mut state: Signal<ShellState>, ch: char) {
             if !key.is_empty() {
                 dispatch_keytip_open(state, &key);
             }
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.alt_overlay_active = true;
                 shell.alt_overlay_sequence = next_sequence;
             });
@@ -47804,7 +47883,7 @@ fn feed_alt_overlay_char(mut state: Signal<ShellState>, ch: char) {
 /// do not call this: a flat chord is not a chord walk, and raising badges after
 /// `Ctrl+Shift+X` would be a surprise.
 fn follow_chord_into_modal(mut state: Signal<ShellState>) {
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         if shell.alt_overlay_active {
             return;
         }
@@ -47833,10 +47912,10 @@ fn feed_alt_derived_char(mut state: Signal<ShellState>, ch: char) {
     };
     match resolution {
         keytip::DerivedResolution::Pending => {
-            state.with_mut(|shell| shell.alt_derived_sequence = next);
+            state.with_mut_counted(|shell| shell.alt_derived_sequence = next);
         }
         keytip::DerivedResolution::Hit(id) => {
-            state.with_mut(|shell| shell.clear_alt_overlay());
+            state.with_mut_counted(|shell| shell.clear_alt_overlay());
             // The id shape was enforced at the bridge terminus (`d<N>`), so the
             // selector is literal. Focus-then-click: click activates a button,
             // focus is the useful half for an input/select.
@@ -47857,7 +47936,7 @@ fn feed_alt_derived_char(mut state: Signal<ShellState>, ch: char) {
             ));
         }
         keytip::DerivedResolution::Miss => {
-            state.with_mut(|shell| shell.clear_alt_overlay());
+            state.with_mut_counted(|shell| shell.clear_alt_overlay());
         }
     }
 }
@@ -47865,14 +47944,14 @@ fn feed_alt_derived_char(mut state: Signal<ShellState>, ch: char) {
 /// dismissing the overlay: it stays up so the descended scope's badges show.
 fn dispatch_keytip_open(mut state: Signal<ShellState>, key: &str) {
     match key {
-        "insert.menu" => state.with_mut(|shell| {
+        "insert.menu" => state.with_mut_counted(|shell| {
             shell.titlebar_session_menu_open = false;
             shell.titlebar_new_menu_open = true;
         }),
         "settings.toggle" => {
             // Descending into Settings OPENS the panel (never toggles it shut), so
             // the theme options are on screen to badge (spec §4).
-            state.with_mut(|shell| shell.set_right_panel_mode(RightPanelMode::Settings));
+            state.with_mut_counted(|shell| shell.set_right_panel_mode(RightPanelMode::Settings));
             // ...and focuses the head of its Tab chain, exactly as the Run arm in
             // `execute_shell_command` does. `settings.toggle` DESCENDS (registry
             // `descends_into: Some("settings")`), so ALT,G — the primary keyboard
@@ -47888,7 +47967,7 @@ fn dispatch_keytip_open(mut state: Signal<ShellState>, key: &str) {
         // surface, so it opens where a right-click on that row would have put it.
         "session.menu" => spawn_open_row_menu_here(state),
         // ALT,J — jump mode. The live list is walked, not badged (§8).
-        "session.jump" => state.with_mut(|shell| shell.begin_session_jump()),
+        "session.jump" => state.with_mut_counted(|shell| shell.begin_session_jump()),
         // ALT,E,<letter> onto a submenu opener — turn the drawn menu to that
         // page so the mouse and the keyboard are looking at the same list.
         //
@@ -47898,7 +47977,7 @@ fn dispatch_keytip_open(mut state: Signal<ShellState>, key: &str) {
         // parent list wearing the child's badges, which is the worst of both.
         key if key.starts_with("rowmenu:") => {
             let opener = key.trim_start_matches("rowmenu:").to_string();
-            state.with_mut(|shell| shell.turn_row_menu_page(Some(opener)));
+            state.with_mut_counted(|shell| shell.turn_row_menu_page(Some(opener)));
         }
         _ => {}
     }
@@ -47916,7 +47995,7 @@ fn dispatch_keytip_node(mut state: Signal<ShellState>, key: &str) {
     // takes, keyed by the same id (spec §3 — one command, two views).
     if let Some(id) = key.strip_prefix("rowmenu:") {
         let id = id.to_string();
-        let Some(row) = state.with_mut(|shell| {
+        let Some(row) = state.with_mut_counted(|shell| {
             shell.clear_alt_overlay();
             // The RESOLVED row, the same one the drawn menu was built from: a
             // chord must not act on an anchor that has left the tree.
@@ -47937,7 +48016,7 @@ fn dispatch_keytip_node(mut state: Signal<ShellState>, key: &str) {
         "theme.dark" => Some(UiTheme::ZedDark),
         _ => None,
     } {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.clear_alt_overlay();
             shell.set_ui_theme(theme);
         });
@@ -47945,7 +48024,7 @@ fn dispatch_keytip_node(mut state: Signal<ShellState>, key: &str) {
     }
     if let Some(rest) = key.strip_prefix("appverb:") {
         let Some((app_name, verb_id)) = rest.split_once(':') else {
-            state.with_mut(|shell| shell.clear_alt_overlay());
+            state.with_mut_counted(|shell| shell.clear_alt_overlay());
             return;
         };
         // Resolve against the registry of the machine "here" resolves to — the
@@ -47955,7 +48034,7 @@ fn dispatch_keytip_node(mut state: Signal<ShellState>, key: &str) {
             resolve_app_verb_for_row(shell, anchor.as_ref(), app_name, verb_id)
         });
         let Some((app, verb)) = entry else {
-            state.with_mut(|shell| shell.clear_alt_overlay());
+            state.with_mut_counted(|shell| shell.clear_alt_overlay());
             return;
         };
         // "Here" resolves identically for the KeyTip and for the mouse (invariant
@@ -47965,7 +48044,7 @@ fn dispatch_keytip_node(mut state: Signal<ShellState>, key: &str) {
         return;
     }
     // Unknown key: fail safe by dismissing rather than acting on nothing.
-    state.with_mut(|shell| shell.clear_alt_overlay());
+    state.with_mut_counted(|shell| shell.clear_alt_overlay());
 }
 fn execute_search_command(mut state: Signal<ShellState>, query: String) {
     let command = query.trim().to_ascii_lowercase();
@@ -47990,22 +48069,22 @@ fn execute_search_command(mut state: Signal<ShellState>, query: String) {
             );
         }
         "/settings" => {
-            state.with_mut(|shell| shell.toggle_settings_panel());
+            state.with_mut_counted(|shell| shell.toggle_settings_panel());
             sync_active_terminal_input_policy(state);
         }
         "/metadata" => {
-            state.with_mut(|shell| shell.toggle_metadata_panel());
+            state.with_mut_counted(|shell| shell.toggle_metadata_panel());
             sync_active_terminal_input_policy(state);
         }
         "/notifications" => {
-            state.with_mut(|shell| shell.toggle_notifications_panel());
+            state.with_mut_counted(|shell| shell.toggle_notifications_panel());
             sync_active_terminal_input_policy(state);
         }
         "/connect" => {
-            state.with_mut(|shell| shell.toggle_connect_panel());
+            state.with_mut_counted(|shell| shell.toggle_connect_panel());
             sync_active_terminal_input_policy(state);
         }
-        _ => state.with_mut(|shell| {
+        _ => state.with_mut_counted(|shell| {
             shell.push_notification(
                 NotificationTone::Warning,
                 "Unknown Command",
@@ -48013,7 +48092,7 @@ fn execute_search_command(mut state: Signal<ShellState>, query: String) {
             );
         }),
     }
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.set_search(String::new());
         shell.set_search_focus(false);
     });
@@ -48372,7 +48451,7 @@ fn remote_machine_for_session_path<'a>(
 fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: ManagedSessionView) {
     let session_path = session.session_path.clone();
     let session_id = session.id.clone();
-    let already_in_flight = state.with_mut(|shell| {
+    let already_in_flight = state.with_mut_counted(|shell| {
         if shell
             .active_copy_hydration_in_flight
             .contains(&session_path)
@@ -48455,7 +48534,7 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
             },
         )
         .await;
-        let persist_request = state.with_mut(|shell| {
+        let persist_request = state.with_mut_counted(|shell| {
             shell.active_copy_hydration_in_flight.remove(&session_path);
             shell
                 .store_copy_hydrated_session_ids
@@ -48664,7 +48743,7 @@ fn with_owned_native_clipboard<R>(
     kind: NativeClipboardOwnerKind,
     operation: impl FnOnce(&mut NativeClipboard) -> Result<R>,
 ) -> Result<R> {
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         if shell.native_clipboard_owner.is_none() {
             shell.native_clipboard_owner = Some(Rc::new(RefCell::new(NativeClipboardOwner {
                 clipboard: create_native_clipboard()?,
@@ -49160,7 +49239,7 @@ async fn stage_and_paste_terminal_clipboard_image(
     });
     let png_bytes = read_native_clipboard_png_off_main().await?;
     let fingerprint = terminal_clipboard_png_fingerprint(&png_bytes);
-    let claim = state.with_mut(|shell| {
+    let claim = state.with_mut_counted(|shell| {
         claim_terminal_image_paste(
             &mut shell.terminal_image_paste_in_flight,
             &mut shell.terminal_recent_image_pastes,
@@ -49201,7 +49280,7 @@ async fn stage_and_paste_terminal_clipboard_image(
         Err(error) => Err(error),
     };
     let path_for_recent = paste_result.as_ref().ok().cloned();
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         finish_terminal_image_paste_claim(
             &mut shell.terminal_image_paste_in_flight,
             &mut shell.terminal_recent_image_pastes,
@@ -49242,7 +49321,7 @@ async fn paste_terminal_native_clipboard(
     match read_native_clipboard_png_off_main().await {
         Ok(png_bytes) => {
             let fingerprint = terminal_clipboard_png_fingerprint(&png_bytes);
-            let claim = state.with_mut(|shell| {
+            let claim = state.with_mut_counted(|shell| {
                 claim_terminal_image_paste(
                     &mut shell.terminal_image_paste_in_flight,
                     &mut shell.terminal_recent_image_pastes,
@@ -49284,7 +49363,7 @@ async fn paste_terminal_native_clipboard(
                 Err(error) => Err(error),
             };
             let path_for_recent = paste_result.as_ref().ok().cloned();
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 finish_terminal_image_paste_claim(
                     &mut shell.terminal_image_paste_in_flight,
                     &mut shell.terminal_recent_image_pastes,
@@ -51702,7 +51781,7 @@ fn machine_key_from_labelish(value: &str) -> String {
 fn queue_remove_saved_ssh_target(mut state: Signal<ShellState>, row: BrowserRow) {
     let Some(machine_key) = saved_ssh_target_machine_key(&row, state.read().server.ssh_targets())
     else {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.close_context_menu();
             shell.push_notification(
                 NotificationTone::Info,
@@ -51712,7 +51791,7 @@ fn queue_remove_saved_ssh_target(mut state: Signal<ShellState>, row: BrowserRow)
         });
         return;
     };
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.select_tree_row(&row, TreeSelectionMode::Replace);
         shell.pending_delete = Some(PendingDeleteDialog {
             document_paths: Vec::new(),
@@ -51743,7 +51822,7 @@ fn apply_machine_health_suffix(label: &str, health: MachineHealth) -> String {
     )
 }
 fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("creating group in {}", row.label);
         shell.close_context_menu();
@@ -51769,7 +51848,7 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
                 Ok((virtual_path, store.load_codex_tree(&settings)?))
             })
             .await;
-        state.with_mut(|shell| match outcome {
+        state.with_mut_counted(|shell| match outcome {
             Ok(Ok((selected_path, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
                 shell.replace_browser_tree(browser_tree);
@@ -51843,7 +51922,7 @@ fn row_accepts_new_folder(row: &BrowserRow) -> bool {
         || (row.kind == BrowserRowKind::Group && remote_folder_cwd(row).is_some())
 }
 fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("adding separator in {}", row.label);
         shell.record_ui_telemetry(
@@ -51874,7 +51953,7 @@ fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
                 Ok((virtual_path, store.load_codex_tree(&settings)?))
             })
             .await;
-        state.with_mut(|shell| match outcome {
+        state.with_mut_counted(|shell| match outcome {
             Ok(Ok((selected_path, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
                 shell.replace_browser_tree(browser_tree);
@@ -51928,7 +52007,7 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
     }
     let trimmed = label.trim().to_string();
     if trimmed.is_empty() {
-        state.with_mut(|shell| shell.cancel_tree_rename());
+        state.with_mut_counted(|shell| shell.cancel_tree_rename());
         sync_active_terminal_input_policy(state);
         return;
     }
@@ -51938,11 +52017,11 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
             && trimmed == row.label.trim()
     };
     if unchanged_rename {
-        state.with_mut(|shell| shell.cancel_tree_rename());
+        state.with_mut_counted(|shell| shell.cancel_tree_rename());
         sync_active_terminal_input_policy(state);
         return;
     }
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("renaming {}", row.label);
         shell.suppress_sidebar_autoscroll_for_rename();
@@ -52166,7 +52245,7 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
             Ok((store.load_codex_tree(&settings)?, selected_path))
         })
         .await;
-        let persist_request = state.with_mut(|shell| match outcome {
+        let persist_request = state.with_mut_counted(|shell| match outcome {
             Ok(Ok((browser_tree, selected_path))) => {
                 let selected_hint = (!is_synthetic_sidebar_row_path(&selected_path)
                     && !is_hot_terminal_sidebar_path(&row.full_path))
@@ -52291,7 +52370,7 @@ fn queue_move_selected_items_to_group(
         )
     };
     if selected_rows.is_empty() {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.record_ui_telemetry(
                 "tree_drop_ignored",
                 json!({
@@ -52303,7 +52382,7 @@ fn queue_move_selected_items_to_group(
         return;
     }
     let Some(reorder_plan) = reorder_plan else {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.record_ui_telemetry(
                 "tree_drop_ignored",
                 json!({
@@ -52315,7 +52394,7 @@ fn queue_move_selected_items_to_group(
         });
         return;
     };
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.record_ui_telemetry(
             "tree_drop_requested",
             json!({
@@ -52330,7 +52409,7 @@ fn queue_move_selected_items_to_group(
             }),
         );
     });
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("moving {} item(s) to {}", selected_rows.len(), target_label);
         shell.close_context_menu();
@@ -52358,7 +52437,7 @@ fn queue_move_selected_items_to_group(
             },
         )
         .await;
-        state.with_mut(|shell| match outcome {
+        state.with_mut_counted(|shell| match outcome {
             Ok(Ok((moved_paths, browser_tree))) => {
                 shell.record_ui_telemetry(
                     "tree_drop_succeeded",
@@ -52526,7 +52605,7 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
     };
     if let Some((target, drag_paths)) = arrangement_drop {
         let mut changed = false;
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             changed = apply_row_set_drop(shell, &target, &drag_paths);
             if changed {
                 shell.record_ui_telemetry(
@@ -52551,7 +52630,7 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
         // detached the row and left it exactly where it started, which reads as
         // the gesture half-working.
         if changed && target.placement == DragDropPlacement::Into {
-            state.with_mut(ShellState::clear_drag_state);
+            state.with_mut_counted(ShellState::clear_drag_state);
             return;
         }
     }
@@ -52569,7 +52648,7 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
     if let Some((target, reordered_paths)) = live_reorder {
         let mut should_persist = false;
         let endpoint = state.read().bootstrap.server_endpoint.clone();
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             let update = shell.server.replace_live_session_order(&reordered_paths);
             let changed = update.changed;
             should_persist = changed;
@@ -52606,7 +52685,7 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
                     )
                 })
                 .await;
-                state.with_mut(|shell| match outcome {
+                state.with_mut_counted(|shell| match outcome {
                     Ok(Ok((snapshot, message))) => {
                         shell.server.apply_snapshot(snapshot);
                         shell.needs_initial_server_sync = false;
@@ -52656,7 +52735,7 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
         let shell = state.read();
         let Some(target) = shell.drag_hover_target.clone() else {
             drop(shell);
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.record_ui_telemetry(
                     "tree_drop_ignored",
                     json!({
@@ -52679,7 +52758,7 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
             .cloned()
         else {
             drop(shell);
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.record_ui_telemetry(
                     "tree_drop_ignored",
                     json!({
@@ -52692,7 +52771,7 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
         };
         let Some(placement) = resolve_workspace_drop_placement(&rows, &target) else {
             drop(shell);
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.record_ui_telemetry(
                     "tree_drop_ignored",
                     json!({
@@ -52946,7 +53025,7 @@ fn viewport_history_entry_app_control_value(entry: &ViewportHistoryEntry) -> Val
 }
 
 fn queue_delete_unkept_live_sessions(mut state: Signal<ShellState>) {
-    let ready = state.with_mut(|shell| {
+    let ready = state.with_mut_counted(|shell| {
         let Some(pending) = shell.pending_delete.clone() else {
             return false;
         };
@@ -53012,7 +53091,7 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
         }
         pending
     };
-    let (deletion_redirect_row, close_redirect_target) = state.with_mut(|shell| {
+    let (deletion_redirect_row, close_redirect_target) = state.with_mut_counted(|shell| {
         let close_redirect_target = shell.close_redirect_target_for_pending(&pending);
         (
             deletion_redirect_row_for_pending(shell, &pending),
@@ -53024,7 +53103,7 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
     // 2026-06-18): no "Closing Terminals" progress toast and no "Terminal Closed"
     // success toast — the row vanishes immediately and the daemon teardown runs in
     // the background. Only failures (the Err arms below) raise a notification.
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.server_busy = true;
         shell.pending_delete = None;
         shell.prepare_live_session_close_locally(&pending, "live_session_close_preflight");
@@ -53134,7 +53213,7 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
             },
         )
         .await;
-        state.with_mut(|shell| match outcome {
+        state.with_mut_counted(|shell| match outcome {
             Ok(Ok((deleted, maybe_browser_tree, maybe_daemon_result, redirect_error))) => {
                 if let Some(browser_tree) = maybe_browser_tree {
                     let expanded_paths = shell.browser.expanded_paths();
@@ -53229,7 +53308,7 @@ fn queue_document_save(
     input: WorkspaceDocumentInput,
     after_save: AfterSaveAction,
 ) {
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.server_busy = true;
         shell.last_action = format!(
             "saving {}",
@@ -53252,7 +53331,7 @@ fn queue_document_save(
         .await;
         let mut should_run_here = false;
         let mut run_new_session: Option<(Option<String>, String, String, String)> = None;
-        state.with_mut(|shell| match outcome {
+        state.with_mut_counted(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
                 shell.replace_browser_tree(browser_tree);
@@ -53336,7 +53415,7 @@ fn queue_document_save(
         } else if let Some((cwd, title, launch_command, source_title)) = run_new_session {
             let terminal_appearance =
                 state.with(|shell| shell.effective_terminal_identity_appearance().to_string());
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.server_busy = true;
                 shell.last_action = format!("starting {}", source_title);
             });
@@ -55152,7 +55231,7 @@ async fn apply_live_order_the_way_a_drag_does(
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     // Step 1 — the optimistic local apply, through the same one owner the
     // daemon uses. Same function, same honesty.
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.server.replace_live_session_order(&ordered_paths);
     });
     let paths_for_task = ordered_paths.clone();
@@ -55167,7 +55246,7 @@ async fn apply_live_order_the_way_a_drag_does(
     .await
     .map_err(|error| anyhow!("joining reorder task: {error}"))??;
     // Step 3.
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.server.apply_snapshot(snapshot);
         shell.needs_initial_server_sync = false;
         shell.refresh_tree_debug("app_control_live_session_reorder");
@@ -55932,6 +56011,22 @@ fn describe_app_state_snapshot(
                 "root_render_count": APP_ROOT_RENDER_COUNT.load(Ordering::SeqCst),
             },
         },
+        // ⛔ IS THE DOM STILL A FAITHFUL RENDERING OF THE STATE ABOVE?
+        // Everything else in this payload describes what the shell BELIEVES.
+        // That belief is only worth reading while the webview is still applying
+        // what it is sent, and it silently stops: a batch that throws partway
+        // through is acknowledged anyway (a withheld ack starves the whole
+        // VirtualDom — see `edits.rs`), the host's model records those
+        // mutations as landed, and nothing ever re-sends them. From that
+        // moment one subtree is frozen while every field here keeps reporting
+        // the mode it should be showing.
+        //
+        // ⇒ NON-ZERO INVALIDATES THE SCREENSHOT, NOT THE STATE. Before
+        // reporting that the app is drawing the wrong thing, read this: it is
+        // the difference between a bug in the code and a webview that stopped
+        // listening, and those have opposite fixes. Only a GUI restart clears
+        // it. Zero on every healthy instance, by construction.
+        "webview_edit_faults": dioxus_desktop::edit_faults(),
         "shell": {
             "sidebar_open": shell.sidebar_open,
             "sidebar_width": shell.sidebar_width,
@@ -56728,6 +56823,12 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
             let machine = remote_machine_for_sidebar_row(&shell, row);
             let busy_state = sidebar_row_busy_state(&snapshot, row);
             let busy = busy_state.visible;
+            // ⛔ NOT folded into `busy`/`busy_reason`. A deaf row is not busy and
+            // not idle — it is a THIRD state, and answering the busy question
+            // with it would make a wedged row render as working, which is a lie
+            // in the other direction. Separate question, separate field.
+            let input_unanswered_ms = sidebar_row_session_for_icon(&snapshot, row)
+                .and_then(|session| session.input_unanswered_ms);
             let live_member = snapshot.live_sessions.iter().any(|session| {
                 normalize_live_session_path(&session.session_path)
                     == normalize_live_session_path(&row.full_path)
@@ -56789,6 +56890,16 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "child_count": row.descendant_sessions,
                 "busy": busy,
                 "busy_reason": busy_state.reason,
+                // The FACT, and the SUSPICION derived from it by the one owner
+                // of the threshold. Both are emitted: a reader chasing "why is
+                // this row flagged" needs the gap, and a reader scanning for
+                // trouble needs the boolean. ⚠ Suspicion, never a verdict —
+                // `server app terminal input-check` settles it by marker and
+                // echo. `null`/`false` = answering, or a daemon too old to say.
+                "input_unanswered_ms": input_unanswered_ms,
+                "wedge_suspected": yggterm_core::input_unanswered_suggests_wedge(
+                    input_unanswered_ms,
+                ),
                 "icon_kind": ({
                     let base = tree_icon_kind(row);
                     if base == "terminal" && snapshot.live_sessions.iter().any(|s| s.session_path == row.full_path && s.kind == SessionKind::ClaudeCode) {
@@ -63835,7 +63946,7 @@ const WEB_SURFACE_DRIVE_LEASE_SECS: u64 = 15 * 60;
 fn renew_web_surface_drive_lease(state: &Signal<ShellState>, session: &str, tab_id: u64) {
     let now_ms = current_millis() as u64;
     let mut state = *state;
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         if let Some(surface) = shell.web_surfaces.get_mut(session)
             && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
             && let Some(renewed) = drive_lease_renewal(tab.lease_until_ms, now_ms)
@@ -63905,7 +64016,7 @@ async fn app_pane_fetch_schema(
         )
     };
     let Some(control_url) = control_url else {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.app_pane_apply_error(seq, "the app is no longer declaring a sidebar".to_string())
         });
         return;
@@ -63950,8 +64061,8 @@ async fn app_pane_fetch_schema(
         serde_json::from_value::<AppPaneSchema>(value)
             .map_err(|error| format!("pane schema is malformed: {error}"))
     }) {
-        Ok(schema) => state.with_mut(|shell| shell.app_pane_apply_schema(seq, &pane_id, schema)),
-        Err(error) => state.with_mut(|shell| shell.app_pane_apply_error(seq, error)),
+        Ok(schema) => state.with_mut_counted(|shell| shell.app_pane_apply_schema(seq, &pane_id, schema)),
+        Err(error) => state.with_mut_counted(|shell| shell.app_pane_apply_error(seq, error)),
     }
 }
 
@@ -63983,11 +64094,11 @@ async fn document_pane_fetch_schema(mut state: Signal<ShellState>, session_path:
         serde_json::from_value::<AppPaneSchema>(value)
             .map_err(|error| format!("document schema is malformed: {error}"))
     }) {
-        Ok(schema) => state.with_mut(|shell| {
+        Ok(schema) => state.with_mut_counted(|shell| {
             shell.document_pane_apply_schema(seq, &session_path, &pane_id, schema)
         }),
         Err(error) => {
-            state.with_mut(|shell| shell.document_pane_apply_error(seq, &session_path, error))
+            state.with_mut_counted(|shell| shell.document_pane_apply_error(seq, &session_path, error))
         }
     }
 }
@@ -64021,7 +64132,7 @@ async fn document_pane_run_action(
     // The draft we are sending becomes the echo baseline: the reply (or a later
     // stamp-driven refetch) will re-declare these very values, and that echo
     // must not remount the editor out from under a still-typing user.
-    let seq = state.with_mut(|shell| {
+    let seq = state.with_mut_counted(|shell| {
         shell.document_pane_mark_sent(&session_path);
         shell.document_pane_next_request(&session_path)
     });
@@ -64047,19 +64158,19 @@ async fn document_pane_run_action(
     }) {
         Ok(reply) => reply,
         Err(error) => {
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.push_notification(NotificationTone::Error, "App action failed", error);
             });
             return;
         }
     };
     if let Some(schema) = reply.schema {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.document_pane_apply_schema(seq, &session_path, &pane_id, schema)
         });
     }
     if let Some(toast) = reply.toast {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             let title = shell
                 .document_pane_channel(&session_path)
                 .and_then(|channel| channel.schema.as_ref())
@@ -64116,13 +64227,13 @@ async fn app_policy_fetch(
                     "user_agent": policy.user_agent,
                 }),
             );
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.apply_sidebar_policy(&session_path, &policy_version, policy)
             });
         }
         Err(error) => {
             let failed_at_ms = current_millis();
-            let exhausted = state.with_mut(|shell| {
+            let exhausted = state.with_mut_counted(|shell| {
                 shell.fail_sidebar_policy(&session_path, &policy_version, failed_at_ms)
             });
             append_trace_event(
@@ -64138,7 +64249,7 @@ async fn app_policy_fetch(
                 }),
             );
             if exhausted {
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     shell.push_notification(
                         NotificationTone::Error,
                         "Web policy unavailable",
@@ -64192,11 +64303,11 @@ async fn app_zoom_fetch(
                     "sites": overrides.len(),
                 }),
             );
-            state.with_mut(|shell| shell.apply_sidebar_zoom(&session_path, &zoom_version, overrides));
+            state.with_mut_counted(|shell| shell.apply_sidebar_zoom(&session_path, &zoom_version, overrides));
         }
         Err(error) => {
             let exhausted =
-                state.with_mut(|shell| shell.fail_sidebar_zoom(&session_path, &zoom_version));
+                state.with_mut_counted(|shell| shell.fail_sidebar_zoom(&session_path, &zoom_version));
             append_trace_event(
                 &trace_home,
                 "ui",
@@ -64246,7 +64357,7 @@ async fn app_appearance_fetch(
                     "sites": overrides.len(),
                 }),
             );
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.apply_sidebar_appearance(&session_path, &appearance_version, default, overrides)
             });
         }
@@ -64285,7 +64396,7 @@ fn resolve_fido2_dialog(
     approved: bool,
     credential_id: Option<String>,
 ) {
-    let (control_url, control_token) = state.with_mut(|shell| {
+    let (control_url, control_token) = state.with_mut_counted(|shell| {
         // Clear it whichever way the user answered, so a second click can't
         // double-POST and the modal closes immediately.
         if shell
@@ -64535,7 +64646,7 @@ async fn begin_media_capture_decision(
             // One prompt at a time. A second ask arriving while one is up is
             // DENIED rather than queued: a page that can stack prompts can wait
             // for one to be clicked through by accident.
-            let displaced = state.with_mut(|shell| {
+            let displaced = state.with_mut_counted(|shell| {
                 if shell.pending_media_capture.is_some() {
                     return true;
                 }
@@ -64605,7 +64716,7 @@ fn resolve_media_capture_dialog(
             "source": source,
         }),
     );
-    let (control_url, control_token) = state.with_mut(|shell| {
+    let (control_url, control_token) = state.with_mut_counted(|shell| {
         // Clear it whichever way the user answered, so a second click cannot
         // double-answer and the modal closes immediately.
         if shell
@@ -64849,7 +64960,7 @@ async fn app_pane_run_action_with_order(
     if let (Some(value), Some(map)) = (value, values.as_object_mut()) {
         map.insert("value".to_string(), serde_json::Value::String(value));
     }
-    let seq = state.with_mut(|shell| shell.app_pane_next_request());
+    let seq = state.with_mut_counted(|shell| shell.app_pane_next_request());
     let url = app_pane_action_url(&control_url);
     let body =
         json!({ "pane": pane_id, "action": action, "values": values, "value_keys": value_keys });
@@ -64866,17 +64977,17 @@ async fn app_pane_run_action_with_order(
     }) {
         Ok(reply) => reply,
         Err(error) => {
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.push_notification(NotificationTone::Error, "App action failed", error);
             });
             return;
         }
     };
     if let Some(schema) = reply.schema {
-        state.with_mut(|shell| shell.app_pane_apply_schema(seq, &pane_id, schema));
+        state.with_mut_counted(|shell| shell.app_pane_apply_schema(seq, &pane_id, schema));
     }
     if let Some(toast) = reply.toast {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             // The APP named this pane. yggterm hardcoding "Vault" here was the
             // same app-chrome-in-the-platform mistake `AppPane` exists to end.
             let title = shell.app_pane_toast_title(&pane_id);
@@ -64895,7 +65006,7 @@ async fn app_pane_run_action_with_order(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown failure")
                 .to_string();
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.push_notification(NotificationTone::Error, "App action failed", reason);
             });
         }
@@ -64909,7 +65020,7 @@ async fn app_pane_run_action_with_order(
         let Some(session) = session else {
             return;
         };
-        let version = state.with_mut(|shell| {
+        let version = state.with_mut_counted(|shell| {
             shell.invalidate_sidebar_policy(&session);
             shell.web_surface_reload_active_tab(&session);
             shell.sidebar_policy_version(&session)
@@ -64927,7 +65038,7 @@ async fn app_pane_run_action_with_order(
         // its own settings (the SSOT) and persists; the pane's next schema reads
         // the new value back out of the injected page context, so the two can
         // never disagree.
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             if let Some(vertical) = prefs.vertical_tabs {
                 shell.request_web_surface_vertical_tabs(vertical);
             }
@@ -64941,7 +65052,7 @@ async fn app_pane_run_action_with_order(
         // rather than a heartbeat later.
         let session = state.peek().server.active_session_path().map(str::to_string);
         if let Some(session) = session {
-            let seq = state.with_mut(|shell| shell.document_pane_next_request(&session));
+            let seq = state.with_mut_counted(|shell| shell.document_pane_next_request(&session));
             spawn(document_pane_fetch_schema(state, session, seq));
         }
     }
@@ -64953,7 +65064,7 @@ async fn app_pane_run_action_with_order(
         if let Some(session) = session {
             // Force the next fetch: the stamp has not moved yet (the ~4s declare
             // will catch up), so clear `zoom_loaded` to make the refetch land.
-            let version = state.with_mut(|shell| {
+            let version = state.with_mut_counted(|shell| {
                 if let Some(contribution) = shell.sidebar_contributions.get_mut(&session) {
                     contribution.zoom_loaded = false;
                     contribution.zoom_attempts = 0;
@@ -64973,7 +65084,7 @@ async fn app_pane_run_action_with_order(
         // ~4s declare will catch up — so clear `appearance_loaded` to force it).
         let session = state.peek().server.active_session_path().map(str::to_string);
         if let Some(session) = session {
-            let version = state.with_mut(|shell| {
+            let version = state.with_mut_counted(|shell| {
                 if let Some(contribution) = shell.sidebar_contributions.get_mut(&session) {
                     contribution.appearance_loaded = false;
                     contribution.appearance_attempts = 0;
@@ -66875,7 +66986,7 @@ fn web_surface_lease_for(
         secs => Some(now_ms.saturating_add(secs.saturating_mul(1000))),
     };
     let mut outcome: Option<(u64, Option<u64>)> = None;
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         if let Some(surface) = shell.web_surfaces.get_mut(&session) {
             let active_tab = surface.active_tab;
             if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == active_tab) {
@@ -72849,7 +72960,7 @@ async fn close_web_find_everywhere(
     desktop: dioxus::desktop::DesktopContext,
     session_path: &str,
 ) -> WebFindCloseOutcome {
-    let lender = state.with_mut(|shell| shell.close_web_find(session_path));
+    let lender = state.with_mut_counted(|shell| shell.close_web_find(session_path));
     let tore_down_a_bar = lender.is_some();
     if let Some(origin) = lender {
         restore_focus_after_web_find(state, &desktop, session_path, origin);
@@ -75833,7 +75944,7 @@ async fn process_pending_app_control_requests(
                     "query_trimmed_len": query_trimmed.len(),
                 }),
             );
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.set_search(query.clone());
                 if let Some(focused) = focused {
                     shell.set_search_focus(focused);
@@ -76408,7 +76519,7 @@ async fn process_pending_app_control_requests(
                     let progress = progress.map(|p| (p / 100.0).clamp(0.0, 1.0));
                     let delay = delay_ms.unwrap_or(0);
                     let deliver = move |mut state: Signal<ShellState>| {
-                        state.with_mut(|shell| match job.as_deref() {
+                        state.with_mut_counted(|shell| match job.as_deref() {
                             // A keyed notification UPSERTS, so a long job reports
                             // progress in one row instead of burying the rest.
                             Some(key) => shell.upsert_job_notification(
@@ -76800,7 +76911,7 @@ async fn process_pending_app_control_requests(
             },
         },
         AppControlCommand::SetFullscreen { enabled } => {
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 if shell.fullscreen != enabled {
                     shell.toggle_fullscreen();
                 }
@@ -76877,7 +76988,7 @@ async fn process_pending_app_control_requests(
             }
         }
         AppControlCommand::SetMaximized { enabled } => {
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 window().set_maximized(enabled);
                 shell.remember_window_maximized(enabled);
             });
@@ -76895,7 +77006,7 @@ async fn process_pending_app_control_requests(
         }
         AppControlCommand::BackgroundWindow => match background_app_window(&desktop) {
             Ok(data) => {
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     shell.set_window_focused(false);
                     shell.mark_app_control_backgrounded();
                 });
@@ -76919,7 +77030,7 @@ async fn process_pending_app_control_requests(
             },
         },
         AppControlCommand::SetForceForeground { enabled } => {
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.app_control_force_foreground = enabled;
                 if enabled {
                     // The override is itself the "user is paying attention"
@@ -76974,7 +77085,7 @@ async fn process_pending_app_control_requests(
         AppControlCommand::ResizeWindow { width, height } => {
             match resize_app_window(&desktop, width, height) {
                 Ok(data) => {
-                    state.with_mut(sync_window_frame_state);
+                    state.with_mut_counted(sync_window_frame_state);
                     AppControlResponse {
                         request_id: request.request_id.clone(),
                         handled_by_pid: std::process::id(),
@@ -76996,7 +77107,7 @@ async fn process_pending_app_control_requests(
         }
         AppControlCommand::CloseWindow => {
             let maximized = desktop.is_maximized();
-            state.with_mut(|shell| shell.remember_window_maximized(maximized));
+            state.with_mut_counted(|shell| shell.remember_window_maximized(maximized));
             let data = json!({
                 "close_requested": true,
                 "window": describe_window(&desktop),
@@ -77037,7 +77148,7 @@ async fn process_pending_app_control_requests(
                 }
             } else {
                 let maximized = desktop.is_maximized();
-                state.with_mut(|shell| shell.remember_window_maximized(maximized));
+                state.with_mut_counted(|shell| shell.remember_window_maximized(maximized));
                 let data = json!({
                     "close_requested": true,
                     "preserve_live_sessions": true,
@@ -77129,7 +77240,7 @@ async fn process_pending_app_control_requests(
                         session_path,
                         ttl_secs: *ttl_secs,
                     };
-                    state.with_mut(|shell| shell.click_grid = Some(params.clone()));
+                    state.with_mut_counted(|shell| shell.click_grid = Some(params.clone()));
                     (params, "show", String::new(), 0u8, 1u8, false, false)
                 }
                 AppControlGridCommand::Click {
@@ -77172,13 +77283,13 @@ async fn process_pending_app_control_requests(
                             session_path: None,
                             ttl_secs: 120,
                         });
-                    state.with_mut(|shell| shell.click_grid = None);
+                    state.with_mut_counted(|shell| shell.click_grid = None);
                     (params, "hide", String::new(), 0u8, 1u8, false, false)
                 }
             };
             // A completed (non-kept, non-refine) click retires the grid.
             if mode == "click" && !keep && !refine {
-                state.with_mut(|shell| shell.click_grid = None);
+                state.with_mut_counted(|shell| shell.click_grid = None);
             }
             let core = click_grid_core_script(&params, mode, &cell, button, count, refine, keep);
             if params.target_main {
@@ -77275,7 +77386,7 @@ async fn process_pending_app_control_requests(
             // activate/clear pair the clean ALT tap drives (§12's live-proof
             // instrument). Opening here also fires the bridge's open-edge
             // derive walk, exactly as a user tap would.
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 if open {
                     shell.activate_alt_overlay();
                 } else {
@@ -77416,7 +77527,7 @@ async fn process_pending_app_control_requests(
                             }
                         } else {
                             let pointer = app_control_drag_pointer(&row, None);
-                            state.with_mut(|shell| shell.begin_drag(&row, pointer));
+                            state.with_mut_counted(|shell| shell.begin_drag(&row, pointer));
                             let shell = state.read();
                             AppControlResponse {
                                 request_id: request.request_id.clone(),
@@ -77470,7 +77581,7 @@ async fn process_pending_app_control_requests(
                         Some(row) => {
                             let placement = drag_drop_placement_from_app_control(placement);
                             let pointer = app_control_drag_pointer(&row, Some(placement));
-                            state.with_mut(|shell| {
+                            state.with_mut_counted(|shell| {
                                 shell.set_drag_hover_target(&row, pointer, placement)
                             });
                             let shell = state.read();
@@ -77535,7 +77646,7 @@ async fn process_pending_app_control_requests(
                 }
             }
             AppControlDragCommand::Clear => {
-                state.with_mut(|shell| shell.clear_drag_state());
+                state.with_mut_counted(|shell| shell.clear_drag_state());
                 AppControlResponse {
                     request_id: request.request_id.clone(),
                     handled_by_pid: std::process::id(),
@@ -77550,7 +77661,7 @@ async fn process_pending_app_control_requests(
             }
         },
         AppControlCommand::ShowStartPage => {
-            let selected_paths = state.with_mut(|shell| {
+            let selected_paths = state.with_mut_counted(|shell| {
                 shell.remember_current_viewport_for_history();
                 shell.server.show_start_page();
                 shell.show_start_page_when_no_live_sessions = false;
@@ -77590,7 +77701,7 @@ async fn process_pending_app_control_requests(
                     "terminal"
                 }
                 AppControlStartAction::Ssh => {
-                    state.with_mut(|shell| shell.toggle_connect_panel());
+                    state.with_mut_counted(|shell| shell.toggle_connect_panel());
                     "ssh"
                 }
                 AppControlStartAction::Folder => {
@@ -77820,7 +77931,7 @@ async fn process_pending_app_control_requests(
                                 created_path.as_deref(),
                                 &seat,
                             );
-                            state.with_mut(|shell| {
+                            state.with_mut_counted(|shell| {
                                 shell.apply_created_terminal_snapshot(
                                     Ok((snapshot, message.clone())),
                                     preserved_view.clone(),
@@ -77918,7 +78029,7 @@ async fn process_pending_app_control_requests(
                                 created_path.as_deref(),
                                 &seat,
                             );
-                            state.with_mut(|shell| {
+                            state.with_mut_counted(|shell| {
                                 shell.apply_created_terminal_snapshot(
                                     Ok((snapshot, message.clone())),
                                     preserved_view.clone(),
@@ -78001,7 +78112,7 @@ async fn process_pending_app_control_requests(
             .and_then(|inner| inner);
             match outcome {
                 Ok((snapshot, message)) => {
-                    state.with_mut(|shell| {
+                    state.with_mut_counted(|shell| {
                         shell.server.apply_snapshot(snapshot);
                         shell.needs_initial_server_sync = false;
                     });
@@ -78259,9 +78370,13 @@ async fn process_pending_app_control_requests(
             // after it confirms the echo. It is the SAME function `CheckTerminalInput`
             // calls, so "is this row reading input" has one answer, not two.
             //
-            // The draft guard is OFF here on purpose: this caller has been told to send
-            // that text, so clearing the composer line is part of doing what was asked.
-            // A bare check turns it on.
+            // ⛔ The draft guard used to be OFF here, on the reasoning that this
+            // caller had been told to send the text so clearing the composer was
+            // part of doing what was asked. It is now unconditional: the send
+            // instruction comes from an agent, the half-typed sentence belongs to
+            // the person at the keyboard, and a submit that erases it has not
+            // done what was asked — it has destroyed something else. A draft
+            // yields a named refusal, which the caller must NOT retry.
             let verdict = probe_terminal_input_consumption(
                 endpoint.clone(),
                 runtime_session_path.clone(),
@@ -78269,7 +78384,6 @@ async fn process_pending_app_control_requests(
                 session_kind,
                 trace_home.as_path(),
                 timeout,
-                false,
             )
             .await;
             let waited_ms = verdict.waited_ms;
@@ -78406,7 +78520,6 @@ async fn process_pending_app_control_requests(
                 session_kind,
                 trace_home.as_path(),
                 timeout,
-                true,
             )
             .await;
             AppControlResponse {
@@ -78446,7 +78559,7 @@ async fn process_pending_app_control_requests(
             }
         }
         AppControlCommand::ReclaimTerminalFocus { session_path } => {
-            let should_sync_policy = state.with_mut(|shell| {
+            let should_sync_policy = state.with_mut_counted(|shell| {
                 let is_active_terminal = shell.server.active_view_mode()
                     == WorkspaceViewMode::Terminal
                     && shell.server.active_session_path() == Some(session_path.as_str());
@@ -79300,7 +79413,7 @@ async fn process_pending_app_control_requests(
                     // mints a fresh generation, which is precisely the
                     // healed-vs-corpse signal. A second destroy path here would
                     // be a second owner of surface teardown.
-                    state.with_mut(|shell| shell.web_surface_reload_active_tab(&session_path));
+                    state.with_mut_counted(|shell| shell.web_surface_reload_active_tab(&session_path));
                     reloaded = true;
                 }
             }
@@ -79337,7 +79450,7 @@ async fn process_pending_app_control_requests(
                     };
                 }
             }
-            let tabs = state.with_mut(|shell| {
+            let tabs = state.with_mut_counted(|shell| {
                 let tabs = shell
                     .web_surfaces
                     .get(&session_path)
@@ -79427,7 +79540,7 @@ async fn process_pending_app_control_requests(
             // destroy-and-recreate branch mints a fresh generation. Reported so
             // a caller can tell a healed surface from the same corpse.
             let before = web_surface_liveness_probe(&state, &desktop, &session_path).await;
-            let existed = state.with_mut(|shell| {
+            let existed = state.with_mut_counted(|shell| {
                 let existed = shell.web_surfaces.contains_key(&session_path);
                 if existed {
                     shell.web_surface_reload_active_tab(&session_path);
@@ -79455,7 +79568,7 @@ async fn process_pending_app_control_requests(
         }
         AppControlCommand::WebSurfaceClose { session_path } => {
             let before = web_surface_liveness_probe(&state, &desktop, &session_path).await;
-            let closed = state.with_mut(|shell| shell.close_web_surface(&session_path));
+            let closed = state.with_mut_counted(|shell| shell.close_web_surface(&session_path));
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -79607,7 +79720,7 @@ async fn process_pending_app_control_requests(
             let row = state.with(|shell| resolve_app_control_row(shell, &session_path));
             let (accepted, reason) = match (&row, trimmed.is_empty()) {
                 (Some(row), false) => {
-                    state.with_mut(|shell| shell.begin_tree_rename(row));
+                    state.with_mut_counted(|shell| shell.begin_tree_rename(row));
                     queue_tree_rename(state, row.clone(), trimmed.clone());
                     (true, None)
                 }
@@ -79667,7 +79780,7 @@ async fn process_pending_app_control_requests(
         AppControlCommand::RemoveSession { session_path } => {
             let endpoint = state.read().bootstrap.server_endpoint.clone();
             let (pending, close_redirect_target, runtime_pid_before, remote_machines_for_removal) =
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     let pending = app_control_remove_session_pending(shell, &session_path);
                     // Read the PTY pid BEFORE the removal: afterwards the row is
                     // gone and nothing can say what the session was running.
@@ -79780,7 +79893,7 @@ async fn process_pending_app_control_requests(
                         row_still_listed,
                         remote_runtime_after,
                     });
-                    let active_session_path = state.with_mut(|shell| {
+                    let active_session_path = state.with_mut_counted(|shell| {
                         shell.apply_interactive_snapshot_result(Ok((snapshot, message.clone())));
                         shell.prune_viewport_history_for_closed_paths(&pending.session_paths);
                         if let Some(target) = close_redirect_target.as_ref() {
@@ -79877,7 +79990,7 @@ async fn process_pending_app_control_requests(
                         .find(|session| session.session_path == session_path)
                         .map(snapshot_session_keep_alive);
                     let accepted = applied == Some(keep_alive);
-                    state.with_mut(|shell| {
+                    state.with_mut_counted(|shell| {
                         shell.apply_interactive_snapshot_result(Ok((snapshot, message.clone())));
                     });
                     AppControlResponse {
@@ -80068,7 +80181,7 @@ async fn process_pending_app_control_requests(
             match target {
                 Some(row) => {
                     let path = normalize_live_session_path(&row.full_path);
-                    let (applied, detail, refusal) = state.with_mut(|shell| {
+                    let (applied, detail, refusal) = state.with_mut_counted(|shell| {
                         if dissolve {
                             let members = shell.dissolve_row_set(&path);
                             (true, json!({ "dissolved": members }), None)
@@ -80093,7 +80206,7 @@ async fn process_pending_app_control_requests(
                         }
                     });
                     if applied {
-                        state.with_mut(ShellState::sync_browser_settings);
+                        state.with_mut_counted(ShellState::sync_browser_settings);
                     }
                     AppControlResponse {
                         request_id: request.request_id.clone(),
@@ -80125,7 +80238,7 @@ async fn process_pending_app_control_requests(
                 // arranges rows as easily as a hand does". A disclosure a hand
                 // can click and a verb cannot reach is half a feature.
                 Some(row) if row.kind == BrowserRowKind::Group || row_heads_a_row_set(&row) => {
-                    state.with_mut(|shell| {
+                    state.with_mut_counted(|shell| {
                         set_app_control_row_expanded(shell, &row, expanded);
                     });
                     AppControlResponse {
@@ -80170,7 +80283,7 @@ async fn process_pending_app_control_requests(
             }
         }
         AppControlCommand::SetTreeSelection { paths, anchor_path } => {
-            let data = state.with_mut(|shell| {
+            let data = state.with_mut_counted(|shell| {
                 let rows = shell.all_sidebar_rows_for_selection();
                 let mut rows_by_path = HashMap::<String, BrowserRow>::new();
                 for row in rows {
@@ -80273,7 +80386,7 @@ async fn process_pending_app_control_requests(
             );
             match maybe_row {
                 Some(row) if row.kind == BrowserRowKind::Group => {
-                    state.with_mut(|shell| {
+                    state.with_mut_counted(|shell| {
                         shell.prepare_app_control_foreground_open();
                         shell.select_tree_row(&row, TreeSelectionMode::Replace);
                         shell.show_start_page_for_sidebar_scope(
@@ -80300,7 +80413,7 @@ async fn process_pending_app_control_requests(
                 Some(row) => {
                     let mut terminal_open_attempt = None::<Value>;
                     if let Some(mode) = resolved_view_mode {
-                        state.with_mut(|shell| {
+                        state.with_mut_counted(|shell| {
                             shell.prepare_app_control_foreground_open();
                             shell.server.set_view_mode(mode);
                         });
@@ -80315,7 +80428,7 @@ async fn process_pending_app_control_requests(
                             });
                         }
                     } else {
-                        state.with_mut(|shell| {
+                        state.with_mut_counted(|shell| {
                             shell.prepare_app_control_foreground_open();
                         });
                         spawn_open_session_row(state, row.clone());
@@ -80361,7 +80474,7 @@ async fn process_pending_app_control_requests(
                             .and_then(Value::as_bool)
                     })
                     .unwrap_or(false);
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     if focused {
                         shell.clear_app_control_backgrounded();
                     }
@@ -80565,7 +80678,7 @@ async fn process_pending_app_control_requests(
                         })
                     });
                 trace_stage("describe_state_terminal_attempt_begin", json!({}));
-                let terminal_open_attempt = state.with_mut(|shell| {
+                let terminal_open_attempt = state.with_mut_counted(|shell| {
                     shell.observe_terminal_open_attempt_from_viewport(&viewport);
                     viewport
                         .get("active_session_path")
@@ -81643,7 +81756,7 @@ fn spawn_dock_sync(mut state: Signal<ShellState>, request: GhosttyDockRequest) {
     if state.read().dock_sync_in_flight {
         return;
     }
-    state.with_mut(|shell| shell.dock_sync_in_flight = true);
+    state.with_mut_counted(|shell| shell.dock_sync_in_flight = true);
     spawn(async move {
         let request_for_task = request.clone();
         let outcome = task::spawn_blocking(move || {
@@ -81656,7 +81769,7 @@ fn spawn_dock_sync(mut state: Signal<ShellState>, request: GhosttyDockRequest) {
         })
         .await;
         let mut retry_request = None;
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.dock_sync_in_flight = false;
             match outcome {
                 Ok(Ok(window)) => {
@@ -81718,13 +81831,13 @@ fn spawn_dock_hide(mut state: Signal<ShellState>, pid: Option<u32>, window_id: S
     if state.read().dock_sync_in_flight {
         return;
     }
-    state.with_mut(|shell| shell.dock_sync_in_flight = true);
+    state.with_mut_counted(|shell| shell.dock_sync_in_flight = true);
     spawn(async move {
         let outcome = task::spawn_blocking(move || {
             yggterm_platform::hide_docked_ghostty_window(pid, &window_id)
         })
         .await;
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.dock_sync_in_flight = false;
             shell.docked_window_id = None;
             shell.last_dock_signature = None;
@@ -83256,7 +83369,7 @@ fn app() -> Element {
                             || event.physical_key == TaoKeyCode::Escape)
                         && state.read().pending_delete.is_some()
                     {
-                        state.with_mut(|shell| shell.cancel_delete_dialog());
+                        state.with_mut_counted(|shell| shell.cancel_delete_dialog());
                         app_action_handled = true;
                     }
                     if event.state == ElementState::Pressed
@@ -83274,11 +83387,11 @@ fn app() -> Element {
                 DesktopWindowEvent::Moved(_)
                 | DesktopWindowEvent::Resized(_)
                 | DesktopWindowEvent::ScaleFactorChanged { .. } => {
-                    state.with_mut(sync_window_frame_state);
+                    state.with_mut_counted(sync_window_frame_state);
                     window_epoch.with_mut(|epoch| *epoch += 1);
                 }
                 DesktopWindowEvent::Focused(focused) => {
-                    state.with_mut(|shell| {
+                    state.with_mut_counted(|shell| {
                         sync_window_frame_state(shell);
                         shell.set_window_focused(*focused);
                         // KeyTips exit on focus change (spec decision c): a mode
@@ -83293,14 +83406,14 @@ fn app() -> Element {
                 }
                 DesktopWindowEvent::CloseRequested => {
                     INTENTIONAL_CLIENT_SHUTDOWN.store(true, Ordering::SeqCst);
-                    state.with_mut(sync_window_frame_state);
+                    state.with_mut_counted(sync_window_frame_state);
                     if linux_close_requires_terminal_detach()
                         && state.read().server.active_session_path().is_some()
                         && state.read().server.active_view_mode() == WorkspaceViewMode::Terminal
                     {
                         window().set_decorations(true);
                     }
-                    state.with_mut(|shell| {
+                    state.with_mut_counted(|shell| {
                         shell.closing_app = true;
                         shell.last_action = "closing yggterm".to_string();
                     });
@@ -83396,7 +83509,7 @@ fn app() -> Element {
             return;
         }
         last_terminal_mount_key.set(Some(mount_key.clone()));
-        let (mount_epoch, reused_live_host, settled_futile) = state.with_mut(|shell| {
+        let (mount_epoch, reused_live_host, settled_futile) = state.with_mut_counted(|shell| {
             // Open the reveal grace window BEFORE deciding reuse. A switch-back
             // to a host that previously reached ready is a REVEAL, not a fault:
             // the grace makes both the reuse predicate ignore a stale spurious
@@ -83751,7 +83864,7 @@ fn app() -> Element {
         let has_fetch_target =
             remote_preview_fetch_target(&state.read().server, &session).is_some();
         if has_fetch_target {
-            let scheduled = state.with_mut(|shell| {
+            let scheduled = state.with_mut_counted(|shell| {
                 shell.record_preview_issue_telemetry(if needs_refresh {
                     "preview_refresh_request_placeholder"
                 } else {
@@ -83772,7 +83885,7 @@ fn app() -> Element {
                 );
             }
         } else if needs_refresh {
-            let scheduled = state.with_mut(|shell| {
+            let scheduled = state.with_mut_counted(|shell| {
                 shell.record_preview_issue_telemetry("preview_refresh_no_target");
                 schedule_remote_preview_sync(
                     shell,
@@ -84051,7 +84164,7 @@ fn app() -> Element {
                                 );
                             }
                         }
-                        state.with_mut(|shell| shell.finish_hot_warm(&path));
+                        state.with_mut_counted(|shell| shell.finish_hot_warm(&path));
                     });
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(
@@ -84089,7 +84202,7 @@ fn app() -> Element {
                 if inert {
                     continue;
                 }
-                let restored = state.with_mut(|shell| {
+                let restored = state.with_mut_counted(|shell| {
                     // Same tick: a restore card that is up must keep telling the
                     // truth about which stage it is in, or its bar freezes at
                     // whatever the stage was when it was raised.
@@ -84392,7 +84505,7 @@ fn app() -> Element {
                 effective_shell_radius,
             ),
             onclick: move |_| {
-                let active_terminal_session = state.with_mut(|shell| {
+                let active_terminal_session = state.with_mut_counted(|shell| {
                     shell.clear_alt_overlay();
                     if shell.server.active_view_mode() != WorkspaceViewMode::Terminal {
                         return None;
@@ -84437,7 +84550,7 @@ fn app() -> Element {
             onmouseup: move |_| {
                 if !state.read().drag_paths.is_empty() {
                     queue_drop_current_drag_target(state);
-                    state.with_mut(|shell| shell.clear_drag_state());
+                    state.with_mut_counted(|shell| shell.clear_drag_state());
                 }
                 // The rail's gesture ends here too. Row → pane container → root:
                 // by the time this runs a real drop has already been taken and
@@ -84449,10 +84562,10 @@ fn app() -> Element {
                 // first, so this only catches a release that landed outside it.
                 // ONE gesture for both, so ONE exit.
                 if state.read().row_drag.is_some() {
-                    state.with_mut(|shell| shell.clear_app_pane_row_drag());
+                    state.with_mut_counted(|shell| shell.clear_app_pane_row_drag());
                 }
-                state.with_mut(|shell| shell.finish_sidebar_resize());
-                state.with_mut(|shell| shell.finish_rail_resize());
+                state.with_mut_counted(|shell| shell.finish_sidebar_resize());
+                state.with_mut_counted(|shell| shell.finish_rail_resize());
             },
             onmousemove: move |evt| {
                 let pointer = evt.client_coordinates();
@@ -84463,27 +84576,27 @@ fn app() -> Element {
                         .read()
                         .drag_pointer_update_needed((pointer.x, pointer.y))
                 {
-                    state.with_mut(|shell| shell.update_drag_pointer((pointer.x, pointer.y)));
+                    state.with_mut_counted(|shell| shell.update_drag_pointer((pointer.x, pointer.y)));
                 }
                 if !drag_active && primary_down && state.read().pending_tree_drag.is_some() {
-                    state.with_mut(|shell| {
+                    state.with_mut_counted(|shell| {
                         shell.update_pending_tree_drag_pointer((pointer.x, pointer.y))
                     });
                 }
                 if state.read().sidebar_resize_drag.is_some() {
-                    state.with_mut(|shell| {
+                    state.with_mut_counted(|shell| {
                         shell.handle_sidebar_resize_pointer(pointer.x, primary_down)
                     });
                 }
                 if state.read().rail_resize_drag.is_some() {
-                    state.with_mut(|shell| shell.handle_rail_resize_pointer(pointer.x));
+                    state.with_mut_counted(|shell| shell.handle_rail_resize_pointer(pointer.x));
                 }
                 // The row-drag ghost follows the pointer everywhere, not only
                 // over the rows that own the gesture — the cwd tree's ghost has
                 // always tracked from the window root, and a ghost that froze
                 // at the list edge would read as a dropped drag.
                 if primary_down && state.read().row_drag.is_some() {
-                    state.with_mut(|shell| {
+                    state.with_mut_counted(|shell| {
                         shell.track_row_drag_pointer((pointer.x, pointer.y));
                     });
                 }
@@ -84495,7 +84608,7 @@ fn app() -> Element {
                 // modal state: nothing else should read this key.
                 if evt.key() == Key::Escape && state.read().row_drag.is_some() {
                     evt.prevent_default();
-                    state.with_mut(|shell| shell.clear_app_pane_row_drag());
+                    state.with_mut_counted(|shell| shell.clear_app_pane_row_drag());
                     return;
                 }
                 // KeyTips chord walking now lives in the below-the-webview JS
@@ -84512,7 +84625,7 @@ fn app() -> Element {
                     && matches!(evt.key(), Key::Character(ref key) if key.eq_ignore_ascii_case("p"))
                 {
                     evt.prevent_default();
-                    state.with_mut(|shell| shell.set_search_focus(true));
+                    state.with_mut_counted(|shell| shell.set_search_focus(true));
                     focus_search_input(true);
                     return;
                 }
@@ -84611,12 +84724,12 @@ fn app() -> Element {
                 if evt.key() == Key::Escape {
                     if state.read().keymap_editor_open {
                         evt.prevent_default();
-                        state.with_mut(|shell| shell.close_keymap_editor());
+                        state.with_mut_counted(|shell| shell.close_keymap_editor());
                         return;
                     }
                     if state.read().pending_delete.is_some() {
                         evt.prevent_default();
-                        state.with_mut(|shell| shell.cancel_delete_dialog());
+                        state.with_mut_counted(|shell| shell.cancel_delete_dialog());
                         return;
                     }
                     let should_clear = {
@@ -84625,7 +84738,7 @@ fn app() -> Element {
                     };
                     if should_clear {
                         evt.prevent_default();
-                        state.with_mut(|shell| {
+                        state.with_mut_counted(|shell| {
                             shell.set_search(String::new());
                             shell.set_search_focus(false);
                         });
@@ -84639,7 +84752,7 @@ fn app() -> Element {
                     }
                     if state.read().fullscreen {
                         evt.prevent_default();
-                        state.with_mut(|shell| shell.toggle_fullscreen());
+                        state.with_mut_counted(|shell| shell.toggle_fullscreen());
                         return;
                     }
                 }
@@ -84652,7 +84765,7 @@ fn app() -> Element {
                         } else {
                             1
                         };
-                        if let Some(row) = state.with_mut(|shell| shell.next_search_sidebar_row(step)) {
+                        if let Some(row) = state.with_mut_counted(|shell| shell.next_search_sidebar_row(step)) {
                             spawn_open_session_row(state, row);
                         }
                         return;
@@ -84677,7 +84790,7 @@ fn app() -> Element {
                             "Copied the current UI selection to the clipboard.",
                         ),
                     };
-                    state.with_mut(|shell| {
+                    state.with_mut_counted(|shell| {
                         shell.push_notification(NotificationTone::Success, title, message);
                     });
                 }
@@ -84829,7 +84942,7 @@ fn app() -> Element {
                             "data-yggterm-modal-root": "keymap-editor",
                             style: "position:absolute; inset:0; z-index:500; display:flex; align-items:center; \
                                     justify-content:center; background:rgba(6,10,14,0.5); backdrop-filter:blur(2px);",
-                            onclick: move |_| state.with_mut(|shell| shell.close_keymap_editor()),
+                            onclick: move |_| state.with_mut_counted(|shell| shell.close_keymap_editor()),
                             div {
                                 style: format!(
                                     "width:min(460px, 92vw); max-height:82vh; overflow:auto; display:flex; \
@@ -84858,7 +84971,7 @@ fn app() -> Element {
                                              cursor:pointer; line-height:1; padding:2px 6px;",
                                             palette.muted
                                         ),
-                                        onclick: move |_| state.with_mut(|shell| shell.close_keymap_editor()),
+                                        onclick: move |_| state.with_mut_counted(|shell| shell.close_keymap_editor()),
                                         "✕"
                                     }
                                 }
@@ -84954,7 +85067,7 @@ fn app() -> Element {
                                                                     onfocus: move |_| { let _ = document::eval("if(document.activeElement&&document.activeElement.select)document.activeElement.select();"); },
                                                                     oninput: move |evt| {
                                                                         if let Some(ch) = evt.value().chars().rev().find(|c| c.is_ascii_alphanumeric()) {
-                                                                            state.with_mut(|shell| shell.set_keymap_override(id, ch));
+                                                                            state.with_mut_counted(|shell| shell.set_keymap_override(id, ch));
                                                                         }
                                                                     },
                                                                 }
@@ -84997,7 +85110,7 @@ fn app() -> Element {
                                                                             && Chord::parse(&trimmed)
                                                                                 .is_some_and(|chord| chord.is_pty_safe()));
                                                                     if complete {
-                                                                        state.with_mut(|shell| {
+                                                                        state.with_mut_counted(|shell| {
                                                                             shell.set_accel_override(id, &trimmed)
                                                                         });
                                                                     }
@@ -85028,7 +85141,7 @@ fn app() -> Element {
                                         ),
                                         onclick: move |evt| {
                                             evt.stop_propagation();
-                                            state.with_mut(|shell| shell.reset_keymap());
+                                            state.with_mut_counted(|shell| shell.reset_keymap());
                                         },
                                         "Reset to Excel preset"
                                     }
@@ -85171,10 +85284,10 @@ fn app() -> Element {
                             Titlebar {
                                 snapshot: titlebar_snapshot,
                                 hovered: hovered,
-                                on_toggle_sidebar: move || state.with_mut(|shell| shell.toggle_sidebar()),
-                                on_search: move |value: String| state.with_mut(|shell| shell.set_search_from_input(value)),
+                                on_toggle_sidebar: move || state.with_mut_counted(|shell| shell.toggle_sidebar()),
+                                on_search: move |value: String| state.with_mut_counted(|shell| shell.set_search_from_input(value)),
                                 on_clear_search: move |_| {
-                                    state.with_mut(|shell| {
+                                    state.with_mut_counted(|shell| {
                                         shell.set_search(String::new());
                                         shell.set_search_focus(false);
                                     });
@@ -85187,7 +85300,7 @@ fn app() -> Element {
                                 },
                                 on_execute_search_command: move |command: String| execute_search_command(state, command),
                                 on_set_search_focus: move |focused: bool| {
-                                    state.with_mut(|shell| shell.set_search_focus(focused));
+                                    state.with_mut_counted(|shell| shell.set_search_focus(focused));
                                     sync_active_terminal_input_policy(state);
                                     if focused {
                                         focus_search_input(false);
@@ -85196,7 +85309,7 @@ fn app() -> Element {
                                     }
                                 },
                                 on_prev_search_content: move |_| {
-                            if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(-1)) {
+                            if let Some(dom_id) = state.with_mut_counted(|shell| shell.next_search_content_dom_id(-1)) {
                                 if let Some(line_index) = dom_id.strip_prefix("__terminal_line__:") {
                                     let session_path = state
                                         .read()
@@ -85262,7 +85375,7 @@ fn app() -> Element {
                                 }
                             },
                             on_next_search_content: move |_| {
-                            if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(1)) {
+                            if let Some(dom_id) = state.with_mut_counted(|shell| shell.next_search_content_dom_id(1)) {
                                 if let Some(line_index) = dom_id.strip_prefix("__terminal_line__:") {
                                     let session_path = state
                                         .read()
@@ -85330,7 +85443,7 @@ fn app() -> Element {
                             on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
                             on_set_view_mode: move |mode: WorkspaceViewMode| spawn_set_view_mode(state, mode),
                             on_set_document_surface_visible: move |(path, visible): (String, bool)| {
-                                state.with_mut(|shell| {
+                                state.with_mut_counted(|shell| {
                                     // `document_surface_hidden` is the SSOT for the
                                     // user's toggle; the pane's own `visible` is a
                                     // derivation of it (`document_surface_visible_for`).
@@ -85341,10 +85454,10 @@ fn app() -> Element {
                                     }
                                 });
                             },
-                            on_toggle_session_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_session_menu()),
-                            on_toggle_new_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_new_menu()),
-                            on_toggle_overflow_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_overflow_menu()),
-                            on_close_overflow_menu: move |_| state.with_mut(|shell| shell.close_titlebar_overflow_menu()),
+                            on_toggle_session_menu: move |_| state.with_mut_counted(|shell| shell.toggle_titlebar_session_menu()),
+                            on_toggle_new_menu: move |_| state.with_mut_counted(|shell| shell.toggle_titlebar_new_menu()),
+                            on_toggle_overflow_menu: move |_| state.with_mut_counted(|shell| shell.toggle_titlebar_overflow_menu()),
+                            on_close_overflow_menu: move |_| state.with_mut_counted(|shell| shell.close_titlebar_overflow_menu()),
                             on_start_claude_code: move |_| {
                                 if !state.with(|shell| shell.titlebar_new_menu_open) {
                                     suppress_phantom_start_action(
@@ -85380,7 +85493,7 @@ fn app() -> Element {
                             on_refresh_summary: move |_| {
                             let active_session = { state.read().server.active_session().cloned() };
                             if let Some(session) = active_session {
-                                state.with_mut(|shell| {
+                                state.with_mut_counted(|shell| {
                                     shell.last_action = "queued copy regeneration for active session".to_string();
                                     shell.push_notification(
                                         NotificationTone::Info,
@@ -85394,7 +85507,7 @@ fn app() -> Element {
                             }
                             },
                             on_begin_active_rename: move |_| {
-                            let renamed = state.with_mut(|shell| shell.begin_active_titlebar_rename());
+                            let renamed = state.with_mut_counted(|shell| shell.begin_active_titlebar_rename());
                             if renamed {
                                 sync_active_terminal_input_policy(state);
                             }
@@ -85403,26 +85516,26 @@ fn app() -> Element {
                                 queue_copy_edit_for_active_session(state, CopyEditField::Summary);
                             },
                             on_toggle_meta: move || {
-                            state.with_mut(|shell| shell.toggle_metadata_panel());
+                            state.with_mut_counted(|shell| shell.toggle_metadata_panel());
                             sync_active_terminal_input_policy(state);
                             },
                             on_toggle_settings: move || {
-                            state.with_mut(|shell| shell.toggle_settings_panel());
+                            state.with_mut_counted(|shell| shell.toggle_settings_panel());
                             sync_active_terminal_input_policy(state);
                             },
                             on_toggle_connect: move || {
-                            state.with_mut(|shell| shell.toggle_connect_panel());
+                            state.with_mut_counted(|shell| shell.toggle_connect_panel());
                             sync_active_terminal_input_policy(state);
                             },
                             on_toggle_notifications: move || {
-                            state.with_mut(|shell| shell.toggle_notifications_panel());
+                            state.with_mut_counted(|shell| shell.toggle_notifications_panel());
                             sync_active_terminal_input_policy(state);
                             },
                             on_toggle_app_pane: move |pane_id: String| {
                             // Opening a contributed pane fetches its schema from
                             // the app's control endpoint; closing it needs no
                             // round trip.
-                            let opened = state.with_mut(|shell| shell.toggle_app_pane(&pane_id));
+                            let opened = state.with_mut_counted(|shell| shell.toggle_app_pane(&pane_id));
                             sync_active_terminal_input_policy(state);
                             if let Some((open_pane, seq)) = opened {
                                 spawn(app_pane_fetch_schema(
@@ -85434,19 +85547,19 @@ fn app() -> Element {
                             }
                             },
                             on_toggle_web_tabs: move || {
-                            state.with_mut(|shell| shell.toggle_web_tabs_panel());
+                            state.with_mut_counted(|shell| shell.toggle_web_tabs_panel());
                             sync_active_terminal_input_policy(state);
                             },
                             on_restart_update: move || restart_into_pending_update(state),
                             on_request_window_drag: move || {
-                            state.with_mut(|shell| shell.note_titlebar_drag_request());
+                            state.with_mut_counted(|shell| shell.note_titlebar_drag_request());
                             },
-                            on_toggle_maximized: move || state.with_mut(|shell| {
+                            on_toggle_maximized: move || state.with_mut_counted(|shell| {
                             shell.note_titlebar_maximize_toggle_request();
                             shell.toggle_maximized();
                             }),
-                            on_toggle_fullscreen: move || state.with_mut(|shell| shell.toggle_fullscreen()),
-                                on_toggle_always_on_top: move || state.with_mut(|shell| shell.toggle_always_on_top()),
+                            on_toggle_fullscreen: move || state.with_mut_counted(|shell| shell.toggle_fullscreen()),
+                                on_toggle_always_on_top: move || state.with_mut_counted(|shell| shell.toggle_always_on_top()),
                                 on_close_app: move || spawn_graceful_shutdown_and_close(state),
                                 maximized: maximized,
                                 fullscreen: fullscreen,
@@ -85462,12 +85575,12 @@ fn app() -> Element {
                         onmousemove: move |evt| {
                             let pointer = evt.client_coordinates();
                             let primary_down = evt.held_buttons().contains(MouseButton::Primary);
-                            state.with_mut(|shell| {
+                            state.with_mut_counted(|shell| {
                                 shell.handle_sidebar_resize_pointer(pointer.x, primary_down);
                             });
                         },
                         onmouseup: move |_| {
-                            state.with_mut(|shell| shell.finish_sidebar_resize());
+                            state.with_mut_counted(|shell| shell.finish_sidebar_resize());
                         },
                     }
                 }
@@ -85481,10 +85594,10 @@ fn app() -> Element {
                         onmousedown: |evt| evt.stop_propagation(),
                         onmousemove: move |evt| {
                             let pointer = evt.client_coordinates();
-                            state.with_mut(|shell| shell.handle_rail_resize_pointer(pointer.x));
+                            state.with_mut_counted(|shell| shell.handle_rail_resize_pointer(pointer.x));
                         },
                         onmouseup: move |_| {
-                            state.with_mut(|shell| shell.finish_rail_resize());
+                            state.with_mut_counted(|shell| shell.finish_rail_resize());
                         },
                     }
                 }
@@ -85525,9 +85638,9 @@ fn app() -> Element {
                             },
                             hovered: hovered(),
                             on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
-                            on_toggle_maximized: move || state.with_mut(|shell| shell.toggle_maximized()),
-                            on_toggle_fullscreen: move || state.with_mut(|shell| shell.toggle_fullscreen()),
-                            on_toggle_always_on_top: move || state.with_mut(|shell| shell.toggle_always_on_top()),
+                            on_toggle_maximized: move || state.with_mut_counted(|shell| shell.toggle_maximized()),
+                            on_toggle_fullscreen: move || state.with_mut_counted(|shell| shell.toggle_fullscreen()),
+                            on_toggle_always_on_top: move || state.with_mut_counted(|shell| shell.toggle_always_on_top()),
                             on_close_app: move || spawn_graceful_shutdown_and_close(state),
                             maximized: maximized,
                             fullscreen: fullscreen,
@@ -85556,20 +85669,20 @@ fn app() -> Element {
                         autohide_revealed: left_sidebar_revealed,
                         autohide_pinned: left_sidebar_pinned,
                         on_prev_search_row: move |_| {
-                            if let Some(row) = state.with_mut(|shell| shell.next_search_sidebar_row(-1)) {
+                            if let Some(row) = state.with_mut_counted(|shell| shell.next_search_sidebar_row(-1)) {
                                 spawn_open_session_row(state, row);
                             }
                         },
                         on_next_search_row: move |_| {
-                            if let Some(row) = state.with_mut(|shell| shell.next_search_sidebar_row(1)) {
+                            if let Some(row) = state.with_mut_counted(|shell| shell.next_search_sidebar_row(1)) {
                                 spawn_open_session_row(state, row);
                             }
                         },
                         on_select_all_rows: move |_| {
-                            state.with_mut(|shell| shell.select_all_tree_rows())
+                            state.with_mut_counted(|shell| shell.select_all_tree_rows())
                         },
                         on_navigate_rows: move |(delta, to_edge): (i32, bool)| {
-                            let focused = state.with_mut(|shell| {
+                            let focused = state.with_mut_counted(|shell| {
                                 shell.navigate_sidebar_selection(delta, to_edge)
                             });
                             // Keep the keyboard cursor visible + the sidebar the
@@ -85579,7 +85692,7 @@ fn app() -> Element {
                             }
                         },
                         on_start_sidebar_resize: move |client_x: f64| {
-                            state.with_mut(|shell| shell.start_sidebar_resize(client_x))
+                            state.with_mut_counted(|shell| shell.start_sidebar_resize(client_x))
                         },
                         on_focus_split_pane: move |path: String| {
                             focus_split_pane(state, &path);
@@ -85591,7 +85704,7 @@ fn app() -> Element {
                                     let mut continue_open = true;
                                     let mut should_reopen_selected_session = true;
                                     let mut terminal_activation = false;
-                                    state.with_mut(|shell| {
+                                    state.with_mut_counted(|shell| {
                                         if shell.consume_suppressed_tree_click() {
                                             continue_open = false;
                                             return;
@@ -85627,7 +85740,7 @@ fn app() -> Element {
                                     return;
                                 }
                                 match row.kind {
-                                    BrowserRowKind::Group | BrowserRowKind::Separator => state.with_mut(|shell| shell.select_row(&row)),
+                                    BrowserRowKind::Group | BrowserRowKind::Separator => state.with_mut_counted(|shell| shell.select_row(&row)),
                                     BrowserRowKind::Session | BrowserRowKind::Document => {
                                         spawn_open_session_row(state, row.clone());
                                         if terminal_activation {
@@ -85647,11 +85760,11 @@ fn app() -> Element {
                         },
                         on_press_highlight_row: move |(row, mode): (BrowserRow, TreeSelectionMode)| {
                             // #14: instant highlight on press (no session open/switch).
-                            state.with_mut(|shell| shell.select_tree_row(&row, mode));
+                            state.with_mut_counted(|shell| shell.select_tree_row(&row, mode));
                             claim_sidebar_focus_by_path(Some(&row.full_path));
                         },
                         on_set_row_expanded: move |(row, expanded): (BrowserRow, bool)| {
-                            state.with_mut(|shell| {
+                            state.with_mut_counted(|shell| {
                                 set_app_control_row_expanded(shell, &row, expanded);
                                 shell.last_action = if expanded {
                                     format!("expanded {}", row.label)
@@ -85663,11 +85776,11 @@ fn app() -> Element {
                         },
                         on_delete_selected_items: move |hard_delete: bool| queue_delete_selected_items(state, hard_delete),
                         on_delete_row: move |row: BrowserRow| {
-                            state.with_mut(|shell| shell.open_delete_dialog_for_row(&row, false));
+                            state.with_mut_counted(|shell| shell.open_delete_dialog_for_row(&row, false));
                         },
                         on_open_context_menu: move |(row, position): (BrowserRow, (f64, f64))| {
                             let focus_path = row.full_path.clone();
-                            state.with_mut(|shell| {
+                            state.with_mut_counted(|shell| {
                                 if !shell.selected_tree_paths.contains(&row.full_path) {
                                     shell.select_tree_row(&row, TreeSelectionMode::Replace);
                                 }
@@ -85676,32 +85789,32 @@ fn app() -> Element {
                             claim_sidebar_focus_by_path(Some(&focus_path));
                         },
                         on_start_drag: move |(row, pointer): (BrowserRow, (f64, f64))| {
-                            state.with_mut(|shell| shell.update_tree_drag_pointer(&row, pointer))
+                            state.with_mut_counted(|shell| shell.update_tree_drag_pointer(&row, pointer))
                         },
                         on_drag_hover: move |(row, pointer, placement): (BrowserRow, (f64, f64), DragDropPlacement)| {
                             if state.read().drag_hover_update_needed(&row, pointer, placement) {
-                                state.with_mut(|shell| shell.set_drag_hover_target(&row, pointer, placement))
+                                state.with_mut_counted(|shell| shell.set_drag_hover_target(&row, pointer, placement))
                             }
                         },
                         on_drag_move: move |pointer: (f64, f64)| {
                             if state.read().drag_pointer_update_needed(pointer) {
-                                state.with_mut(|shell| shell.update_drag_pointer(pointer))
+                                state.with_mut_counted(|shell| shell.update_drag_pointer(pointer))
                             } else if state.read().pending_tree_drag.is_some() {
-                                state.with_mut(|shell| shell.update_pending_tree_drag_pointer(pointer))
+                                state.with_mut_counted(|shell| shell.update_pending_tree_drag_pointer(pointer))
                             }
                         },
                         on_drag_leave: move |_row: BrowserRow| {},
                         on_drop_into_row: move |_| queue_drop_current_drag_target(state),
-                        on_end_drag: move |_| state.with_mut(|shell| shell.clear_drag_state()),
+                        on_end_drag: move |_| state.with_mut_counted(|shell| shell.clear_drag_state()),
                         on_begin_rename: move |row: BrowserRow| {
-                            state.with_mut(|shell| shell.begin_tree_rename(&row));
+                            state.with_mut_counted(|shell| shell.begin_tree_rename(&row));
                             sync_active_terminal_input_policy(state);
                         },
                         on_regenerate_row_title: move |row: BrowserRow| {
                             queue_rename_field_ai_title_generation(state, row);
                         },
-                        on_update_rename: move |value: String| state.with_mut(|shell| shell.update_tree_rename_value(value)),
-                        on_focus_rename: move |_| state.with_mut(|shell| shell.note_tree_rename_input_focus()),
+                        on_update_rename: move |value: String| state.with_mut_counted(|shell| shell.update_tree_rename_value(value)),
+                        on_focus_rename: move |_| state.with_mut_counted(|shell| shell.note_tree_rename_input_focus()),
                         on_commit_rename: move |row: BrowserRow| {
                             let label = {
                                 let shell = state.read();
@@ -85713,7 +85826,7 @@ fn app() -> Element {
                             queue_tree_rename(state, row, label);
                         },
                         on_cancel_rename: move |_| {
-                            state.with_mut(|shell| shell.cancel_tree_rename());
+                            state.with_mut_counted(|shell| shell.cancel_tree_rename());
                             sync_active_terminal_input_policy(state);
                         },
                         rename_depth: tree_rename_depth,
@@ -85753,7 +85866,7 @@ fn app() -> Element {
                             |endpoint| set_all_preview_blocks_folded(&endpoint, true),
                         ),
                         on_toggle_preview_block: move |ix: usize| {
-                            state.with_mut(|shell| {
+                            state.with_mut_counted(|shell| {
                                 shell.server.toggle_preview_block(ix);
                             });
                             spawn_surface_snapshot_action(
@@ -85769,7 +85882,7 @@ fn app() -> Element {
                                 move |endpoint| daemon_toggle_preview_block(&endpoint, ix),
                             )
                         },
-                        on_set_preview_layout: move |mode: PreviewLayoutMode| state.with_mut(|shell| shell.set_preview_layout(mode)),
+                        on_set_preview_layout: move |mode: PreviewLayoutMode| state.with_mut_counted(|shell| shell.set_preview_layout(mode)),
                         on_save_document: move |(path, input): (String, WorkspaceDocumentInput)| {
                             queue_document_save(state, path, input, AfterSaveAction::SaveOnly)
                         },
@@ -85794,13 +85907,13 @@ fn app() -> Element {
                             autohide_revealed: right_rail_revealed,
                             autohide_pinned: right_rail_pinned,
                             on_start_rail_resize: move |client_x: f64| {
-                                state.with_mut(|shell| shell.start_rail_resize(client_x))
+                                state.with_mut_counted(|shell| shell.start_rail_resize(client_x))
                             },
                             state,
-                            on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
-                            on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
-                            on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
-                            on_open_launch_flags: move |_| state.with_mut(|shell| shell.set_launch_flags_open(true)),
+                            on_endpoint_change: move |value: String| state.with_mut_counted(|shell| shell.update_litellm_endpoint(value)),
+                            on_api_key_change: move |value: String| state.with_mut_counted(|shell| shell.update_litellm_api_key(value)),
+                            on_model_change: move |value: String| state.with_mut_counted(|shell| shell.update_interface_llm_model(value)),
+                            on_open_launch_flags: move |_| state.with_mut_counted(|shell| shell.set_launch_flags_open(true)),
                             on_focus_input: move |field_key: String| {
                                 focus_settings_field(state, &field_key);
                             },
@@ -85808,44 +85921,44 @@ fn app() -> Element {
                                 reclaim_active_terminal_input_after_settings_blur(state);
                             },
                             on_set_ui_theme: move |theme: UiTheme| {
-                                state.with_mut(|shell| shell.set_ui_theme(theme));
+                                state.with_mut_counted(|shell| shell.set_ui_theme(theme));
                                 apply_active_terminal_zoom(state);
                             },
-                            on_open_theme_editor: move |_| state.with_mut(|shell| shell.open_theme_editor()),
-                            on_open_keymap_editor: move |_| state.with_mut(|shell| shell.open_keymap_editor()),
+                            on_open_theme_editor: move |_| state.with_mut_counted(|shell| shell.open_theme_editor()),
+                            on_open_keymap_editor: move |_| state.with_mut_counted(|shell| shell.open_keymap_editor()),
                             on_set_notification_delivery: move |mode: NotificationDeliveryMode| {
-                                state.with_mut(|shell| shell.update_notification_delivery(mode))
+                                state.with_mut_counted(|shell| shell.update_notification_delivery(mode))
                             },
                             on_set_notification_sound: move |enabled: bool| {
-                                state.with_mut(|shell| shell.update_notification_sound(enabled))
+                                state.with_mut_counted(|shell| shell.update_notification_sound(enabled))
                             },
                             on_set_terminal_telemetry: move |enabled: bool| {
-                                state.with_mut(|shell| shell.update_terminal_telemetry_enabled(enabled))
+                                state.with_mut_counted(|shell| shell.update_terminal_telemetry_enabled(enabled))
                             },
                             on_set_perf_profiling: move |enabled: bool| {
-                                state.with_mut(|shell| shell.update_perf_profiling_enabled(enabled))
+                                state.with_mut_counted(|shell| shell.update_perf_profiling_enabled(enabled))
                             },
                             on_set_titlebar_auto_hide: move |enabled: bool| {
-                                state.with_mut(|shell| shell.set_titlebar_auto_hide(enabled));
+                                state.with_mut_counted(|shell| shell.set_titlebar_auto_hide(enabled));
                                 if !enabled {
                                     titlebar_autohide_hovered.set(false);
                                 }
                             },
                             on_set_chrome_mirrored: move |mirrored: bool| {
-                                state.with_mut(|shell| shell.set_chrome_mirrored(mirrored));
+                                state.with_mut_counted(|shell| shell.set_chrome_mirrored(mirrored));
                             },
-                            on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
-                            on_set_ui_zoom: move |percent: i32| state.with_mut(|shell| shell.set_ui_zoom_percent(percent)),
+                            on_adjust_ui_zoom: move |delta: i32| state.with_mut_counted(|shell| shell.adjust_ui_zoom(delta)),
+                            on_set_ui_zoom: move |percent: i32| state.with_mut_counted(|shell| shell.set_ui_zoom_percent(percent)),
                             on_adjust_main_zoom: move |delta: i32| {
-                                state.with_mut(|shell| shell.adjust_main_zoom(delta));
+                                state.with_mut_counted(|shell| shell.adjust_main_zoom(delta));
                                 apply_active_terminal_zoom(state);
                             },
                             on_set_main_zoom: move |percent: i32| {
-                                state.with_mut(|shell| shell.set_main_zoom_percent(percent));
+                                state.with_mut_counted(|shell| shell.set_main_zoom_percent(percent));
                                 apply_active_terminal_zoom(state);
                             },
                             on_set_terminal_theme_name: move |(theme, value): (UiTheme, String)| {
-                                state.with_mut(|shell| shell.set_terminal_theme_name_for(theme, value));
+                                state.with_mut_counted(|shell| shell.set_terminal_theme_name_for(theme, value));
                                 if state.read().snapshot().settings.theme == theme {
                                     apply_active_terminal_zoom(state);
                                 }
@@ -85860,10 +85973,10 @@ fn app() -> Element {
                             },
                             on_daemon_hot_restart: move |_| spawn_manual_daemon_hot_restart(state),
                             on_connect_ssh_custom: move |_| spawn_connect_ssh_custom(state),
-                            on_ssh_target_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_target(value)),
-                            on_ssh_prefix_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_prefix(value)),
-                            on_clear_notification: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
-                            on_clear_notifications: move |_| state.with_mut(|shell| shell.clear_notifications()),
+                            on_ssh_target_change: move |value: String| state.with_mut_counted(|shell| shell.update_ssh_connect_target(value)),
+                            on_ssh_prefix_change: move |value: String| state.with_mut_counted(|shell| shell.update_ssh_connect_prefix(value)),
+                            on_clear_notification: move |id: u64| state.with_mut_counted(|shell| shell.clear_notification(id)),
+                            on_clear_notifications: move |_| state.with_mut_counted(|shell| shell.clear_notifications()),
                             on_app_pane_action: {
                                 let desktop = desktop.clone();
                                 move |(pane_id, action, value): (String, String, Option<String>)| {
@@ -85891,7 +86004,7 @@ fn app() -> Element {
                                 }
                             },
                             on_app_pane_value: move |(widget_id, value): (String, String)| {
-                                state.with_mut(|shell| shell.set_app_pane_value(&widget_id, value));
+                                state.with_mut_counted(|shell| shell.set_app_pane_value(&widget_id, value));
                             },
                         }
                     }
@@ -85929,7 +86042,7 @@ fn app() -> Element {
                             let (pane_id, row_id) = (menu.pane_id.clone(), menu.row_id.clone());
                             move |action: String| {
                                 let desktop = desktop.clone();
-                                state.with_mut(|shell| shell.close_app_pane_context_menu());
+                                state.with_mut_counted(|shell| shell.close_app_pane_context_menu());
                                 spawn(app_pane_run_action(
                                     state,
                                     desktop,
@@ -86055,7 +86168,7 @@ fn app() -> Element {
                                     return;
                                 };
                                 let profile = profile.to_string();
-                                state.with_mut(|shell| shell.close_web_profile_switcher());
+                                state.with_mut_counted(|shell| shell.close_web_profile_switcher());
                                 // Choosing the profile you are already on is a
                                 // dismissal, not a teardown-and-rebuild.
                                 if profile == current {
@@ -86146,7 +86259,7 @@ fn app() -> Element {
                     DeleteConfirmOverlay {
                         pending: pending_delete,
                         palette: snapshot.palette,
-                        on_cancel: move |_| state.with_mut(|shell| shell.cancel_delete_dialog()),
+                        on_cancel: move |_| state.with_mut_counted(|shell| shell.cancel_delete_dialog()),
                         on_confirm: move |_| queue_delete_selected_items(state, true),
                         on_confirm_unkept: move |_| queue_delete_unkept_live_sessions(state),
                     }
@@ -86164,8 +86277,8 @@ fn app() -> Element {
                             .as_ref()
                             .map(|overlay| overlay.tabs.iter().filter(|tab| tab.folder.is_some()).count())
                             .unwrap_or(0),
-                        on_cancel: move |_| state.with_mut(|shell| shell.cancel_classic_tabs_switch()),
-                        on_confirm: move |_| state.with_mut(|shell| shell.confirm_classic_tabs_switch()),
+                        on_cancel: move |_| state.with_mut_counted(|shell| shell.cancel_classic_tabs_switch()),
+                        on_confirm: move |_| state.with_mut_counted(|shell| shell.confirm_classic_tabs_switch()),
                     }
                 }
                 if let Some(dialog) = snapshot.copy_edit_dialog.clone() {
@@ -86217,9 +86330,9 @@ fn app() -> Element {
                 if snapshot.launch_flags_open {
                     LaunchFlagsOverlay {
                         snapshot: snapshot.clone(),
-                        on_close: move |_| state.with_mut(|shell| shell.set_launch_flags_open(false)),
-                        on_change: move |(slug, value): (String, String)| state.with_mut(|shell| shell.update_agent_cli_extra_args(slug, value)),
-                        on_reset: move |slug: String| state.with_mut(|shell| shell.reset_agent_cli_extra_args(&slug)),
+                        on_close: move |_| state.with_mut_counted(|shell| shell.set_launch_flags_open(false)),
+                        on_change: move |(slug, value): (String, String)| state.with_mut_counted(|shell| shell.update_agent_cli_extra_args(slug, value)),
+                        on_reset: move |slug: String| state.with_mut_counted(|shell| shell.reset_agent_cli_extra_args(&slug)),
                         // Same two handlers the settings rail's fields use, so
                         // typing in the modal releases the terminal's key grab
                         // and blurring hands it back — a modal that invented its
@@ -86231,22 +86344,22 @@ fn app() -> Element {
                 if snapshot.theme_editor_open {
                     ThemeEditorOverlay {
                         snapshot: snapshot.clone(),
-                        on_close: move |_| state.with_mut(|shell| shell.close_theme_editor()),
-                        on_reset: move |_| state.with_mut(|shell| shell.reset_theme_editor()),
-                        on_seed: move |_| state.with_mut(|shell| shell.seed_theme_editor()),
-                        on_set_ui_theme: move |theme: UiTheme| state.with_mut(|shell| shell.set_ui_theme(theme)),
-                        on_add_stop: move |_| state.with_mut(|shell| shell.add_theme_stop(None)),
-                        on_remove_stop: move |_| state.with_mut(|shell| shell.remove_selected_theme_stop()),
-                        on_pick_stop: move |index: usize| state.with_mut(|shell| shell.select_theme_stop(index)),
-                        on_begin_drag_stop: move |index: usize| state.with_mut(|shell| shell.begin_theme_drag(index)),
-                        on_drag_stop: move |(x, y): (f32, f32)| state.with_mut(|shell| shell.move_theme_stop(x, y)),
-                        on_end_drag_stop: move |_| state.with_mut(|shell| shell.end_theme_drag()),
-                        on_double_click_pad: move |(x, y): (f32, f32)| state.with_mut(|shell| shell.add_theme_stop_at(x, y)),
-                        on_update_stop_color: move |value: String| state.with_mut(|shell| shell.update_selected_theme_color(value)),
-                        on_pick_swatch: move |value: String| state.with_mut(|shell| shell.update_selected_theme_color(value)),
-                        on_set_brightness: move |value: f32| state.with_mut(|shell| shell.update_theme_brightness(value)),
-                        on_set_alpha: move |value: f32| state.with_mut(|shell| shell.update_theme_alpha(value)),
-                        on_set_grain: move |value: f32| state.with_mut(|shell| shell.update_theme_grain(value)),
+                        on_close: move |_| state.with_mut_counted(|shell| shell.close_theme_editor()),
+                        on_reset: move |_| state.with_mut_counted(|shell| shell.reset_theme_editor()),
+                        on_seed: move |_| state.with_mut_counted(|shell| shell.seed_theme_editor()),
+                        on_set_ui_theme: move |theme: UiTheme| state.with_mut_counted(|shell| shell.set_ui_theme(theme)),
+                        on_add_stop: move |_| state.with_mut_counted(|shell| shell.add_theme_stop(None)),
+                        on_remove_stop: move |_| state.with_mut_counted(|shell| shell.remove_selected_theme_stop()),
+                        on_pick_stop: move |index: usize| state.with_mut_counted(|shell| shell.select_theme_stop(index)),
+                        on_begin_drag_stop: move |index: usize| state.with_mut_counted(|shell| shell.begin_theme_drag(index)),
+                        on_drag_stop: move |(x, y): (f32, f32)| state.with_mut_counted(|shell| shell.move_theme_stop(x, y)),
+                        on_end_drag_stop: move |_| state.with_mut_counted(|shell| shell.end_theme_drag()),
+                        on_double_click_pad: move |(x, y): (f32, f32)| state.with_mut_counted(|shell| shell.add_theme_stop_at(x, y)),
+                        on_update_stop_color: move |value: String| state.with_mut_counted(|shell| shell.update_selected_theme_color(value)),
+                        on_pick_swatch: move |value: String| state.with_mut_counted(|shell| shell.update_selected_theme_color(value)),
+                        on_set_brightness: move |value: f32| state.with_mut_counted(|shell| shell.update_theme_brightness(value)),
+                        on_set_alpha: move |value: f32| state.with_mut_counted(|shell| shell.update_theme_alpha(value)),
+                        on_set_grain: move |value: f32| state.with_mut_counted(|shell| shell.update_theme_grain(value)),
                     }
                 }
                 if !snapshot.notifications.is_empty() {
@@ -86276,7 +86389,7 @@ fn app() -> Element {
                         // covering my screen"; the panel keeps the record. These
                         // were the same call until the user lost an agent's
                         // completion notice by closing its popup.
-                        on_clear: move |id: u64| state.with_mut(|shell| shell.dismiss_toast(id)),
+                        on_clear: move |id: u64| state.with_mut_counted(|shell| shell.dismiss_toast(id)),
                         on_activate: move |session_path: String| {
                             spawn_open_session_from_notification(state, session_path)
                         },
@@ -88072,6 +88185,7 @@ fn Sidebar(
                         }
                         .to_string();
                         let busy_icon = sidebar_row_shows_busy_icon(&snapshot, &row);
+                        let input_unanswered = sidebar_row_input_unanswered(&snapshot, &row);
                         let row_dragging = sidebar_row_dragging_for_projection(
                             snapshot.drag_paths.as_slice(),
                             &live_group_paths,
@@ -88119,6 +88233,7 @@ fn Sidebar(
                                 visible_label: visible_label.clone(),
                                 icon_kind: icon_kind.clone(),
                                 busy_icon,
+                                input_unanswered,
                                 selected: row_selected,
                                 drop_target: snapshot
                                     .drag_hover_target
@@ -88552,6 +88667,73 @@ fn terminal_input_uses_optimistic_busy_hint(session_path: &str) -> bool {
 }
 fn sidebar_row_shows_busy_icon(snapshot: &RenderSnapshot, row: &BrowserRow) -> bool {
     sidebar_row_busy_state(snapshot, row).visible
+}
+/// Has this row been written to with nothing said back for long enough to be
+/// worth a check?
+///
+/// ⛔ **Deliberately NOT part of [`sidebar_row_busy_state`].** Busy asks "is work
+/// happening here"; this asks "is this row still listening". A deaf row answers
+/// `false` to the first and `true` to the second, and folding them together
+/// would render it as working — swapping one wrong answer for another.
+///
+/// ⚠ A TRIGGER, NEVER A VERDICT: echo-off and password prompts legitimately
+/// consume input in silence. It marks the row as worth checking; `server app
+/// terminal input-check` settles it by marker and echo.
+fn sidebar_row_input_unanswered(snapshot: &RenderSnapshot, row: &BrowserRow) -> bool {
+    if row.kind == BrowserRowKind::Group {
+        // A group is COLLAPSED far more often than not, and a deaf row hidden
+        // inside one is invisible for exactly as long as it stays folded —
+        // which is the failure this whole signal exists to end, merely moved up
+        // one level. The busy state has aggregated over descendants since issue
+        // #3; attention has to, for the same reason and by the same walk.
+        return sidebar_group_has_input_unanswered_descendant(snapshot, row)
+            || sidebar_machine_row_has_input_unanswered_live_session(snapshot, row);
+    }
+    if row.kind != BrowserRowKind::Session {
+        return false;
+    }
+    yggterm_core::input_unanswered_suggests_wedge(
+        sidebar_row_session_for_icon(snapshot, row).and_then(|session| session.input_unanswered_ms),
+    )
+}
+
+/// Any session in this group's subtree that has stopped answering — the
+/// attention twin of [`sidebar_group_has_working_descendant`], walking the same
+/// flat depth-ordered descendant span so the two can never disagree about what
+/// "inside this group" means.
+fn sidebar_group_has_input_unanswered_descendant(
+    snapshot: &RenderSnapshot,
+    group_row: &BrowserRow,
+) -> bool {
+    let Some(start) = snapshot.rows.iter().position(|candidate| {
+        candidate.kind == BrowserRowKind::Group && candidate.full_path == group_row.full_path
+    }) else {
+        return false;
+    };
+    let group_depth = group_row.depth;
+    snapshot.rows[start + 1..]
+        .iter()
+        .take_while(|descendant| descendant.depth > group_depth)
+        .filter(|descendant| descendant.kind == BrowserRowKind::Session)
+        .any(|descendant| sidebar_row_input_unanswered(snapshot, descendant))
+}
+
+/// A machine ROOT row whose machine hosts a live session that has stopped
+/// answering. Live sessions hang off the flat "Live Sessions" group rather than
+/// the machine's cwd subtree, so the descendant walk above cannot see them —
+/// matched by host instead, exactly as the working twin does.
+fn sidebar_machine_row_has_input_unanswered_live_session(
+    snapshot: &RenderSnapshot,
+    row: &BrowserRow,
+) -> bool {
+    let Some(machine_key) = row.full_path.strip_prefix("__remote_machine__/") else {
+        return false;
+    };
+    snapshot.live_sessions.iter().any(|session| {
+        yggterm_core::input_unanswered_suggests_wedge(session.input_unanswered_ms)
+            && (session.ssh_target.as_deref() == Some(machine_key)
+                || session.host_label == machine_key)
+    })
 }
 /// Aggregate working state for a machine/cwd group row (issue #3): a group
 /// blinks when ANY session in its subtree is working, so a COLLAPSED machine or
@@ -89669,6 +89851,10 @@ fn SidebarRow(
     visible_label: String,
     icon_kind: String,
     busy_icon: bool,
+    /// This row has been written to and has said nothing back for longer than
+    /// any normal round trip — DESIGN.md's amber ATTENTION state. ⚠ A trigger,
+    /// never a verdict; `terminal input-check` settles it.
+    input_unanswered: bool,
     selected: bool,
     drop_target: Option<DragDropPlacement>,
     dragging: bool,
@@ -90114,6 +90300,34 @@ fn SidebarRow(
                     // is inserted ahead of it or the cluster is indented, which
                     // is exactly how the first build of row sets put a header's
                     // dot to the right of its own members'. Out here it cannot.
+                    if !show_live_close && row_is_group && input_unanswered {
+                        // A GROUP holding a row that has stopped answering.
+                        //
+                        // ⛔ It goes in THE GUTTER, not beside the group's own
+                        // dot, and the reason is a COLLISION rather than taste:
+                        // a machine row's dot already spends this exact amber
+                        // on `MachineHealth::Cached`
+                        // (`machine_indicator_color_value`), so repainting it
+                        // would make "this machine is a cached snapshot" and
+                        // "something inside has gone deaf" the same pixel. The
+                        // gutter is empty on every group row, is the column
+                        // DESIGN.md reserves for "the status dot, nothing
+                        // else", and lines this dot up with the session dots it
+                        // is standing in for.
+                        //
+                        // STEADY, never blinking: blink means work is
+                        // happening, and the whole claim here is that it has
+                        // stopped.
+                        span {
+                            "data-sidebar-live-session-status-rail": "1",
+                            style: session_row_dot_rail_style(SessionRowDensity::Sidebar),
+                            span {
+                                "data-sidebar-group-input-unanswered-dot": "1",
+                                title: "A session inside has been typed to with no response — expand to find it",
+                                style: live_session_status_dot_style_with_attention(palette, false, false, true),
+                            }
+                        }
+                    }
                     if show_live_close {
                         span {
                             "data-sidebar-live-session-status-rail": "1",
@@ -90125,13 +90339,25 @@ fn SidebarRow(
                                 "data-sidebar-live-session-status-dot": "1",
                                 "data-sidebar-live-session-keep-alive": if row_kept_alive { "1" } else { "0" },
                                 "data-sidebar-live-session-working": if busy_icon { "1" } else { "0" },
-                                title: match (row_kept_alive, busy_icon) {
-                                    (true, true) => "Keep-alive · working",
-                                    (true, false) => "Keep alive",
-                                    (false, true) => "Working",
-                                    (false, false) => "Live (closes with the app)",
+                                "data-sidebar-live-session-input-unanswered": if input_unanswered { "1" } else { "0" },
+                                // The attention state OWNS the tooltip when it
+                                // holds: the durability phrasings answer a
+                                // question nobody is asking of a row that has
+                                // stopped answering. It names the observation
+                                // and the next step, and it does NOT say
+                                // "wedged" — that is a verdict this signal is
+                                // not entitled to make.
+                                title: if input_unanswered {
+                                    "Typed to, no response yet — may not be listening. Check with: server app terminal input-check"
+                                } else {
+                                    match (row_kept_alive, busy_icon) {
+                                        (true, true) => "Keep-alive · working",
+                                        (true, false) => "Keep alive",
+                                        (false, true) => "Working",
+                                        (false, false) => "Live (closes with the app)",
+                                    }
                                 },
-                                style: live_session_status_dot_style(palette, row_kept_alive, busy_icon),
+                                style: live_session_status_dot_style_with_attention(palette, row_kept_alive, busy_icon, input_unanswered),
                             }
                         }
                     }
@@ -93613,7 +93839,7 @@ fn copy_preview_block_text(mut state: Signal<ShellState>, text: String) {
         return;
     }
     let copied = set_native_clipboard_contents(state, &YgguiClipboardContents::Text { text });
-    state.with_mut(|shell| match copied {
+    state.with_mut_counted(|shell| match copied {
         Ok(_) => shell.push_notification(
             NotificationTone::Success,
             "Message Copied",
@@ -93937,7 +94163,7 @@ fn PreviewReadingToolbar(
                 } else {
                     UiTheme::ZedDark
                 };
-                state.with_mut(|shell| shell.set_ui_theme(next));
+                state.with_mut_counted(|shell| shell.set_ui_theme(next));
             },
         }
     }
@@ -95010,7 +95236,7 @@ fn TerminalCanvas(
         format!("active-host:{bootstrap_identity}:{active_host_selected}:{latest_open_request_id}");
     if *active_terminal_host_identity.borrow() != active_host_key {
         *active_terminal_host_identity.borrow_mut() = active_host_key.clone();
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             if shell.server.active_view_mode() == WorkspaceViewMode::Terminal
                 && shell.server.active_session_path() == Some(session_path.as_str())
             {
@@ -96351,7 +96577,7 @@ fn TerminalCanvas(
             .read()
             .startup_terminal_restore_should_recover(&session_path, now_ms)
         {
-            state.with_mut(|shell| shell.recover_startup_terminal_restore(&session_path, now_ms))
+            state.with_mut_counted(|shell| shell.recover_startup_terminal_restore(&session_path, now_ms))
         } else {
             false
         }
@@ -96383,7 +96609,7 @@ fn TerminalCanvas(
         *bootstrap_task_identity.borrow_mut() = bootstrap_identity.clone();
     }
     let should_schedule_bootstrap = bootstrap_schedule_candidate
-        && state.with_mut(|shell| {
+        && state.with_mut_counted(|shell| {
             acquire_terminal_bootstrap_lease(
                 shell,
                 &session_path,
@@ -96420,7 +96646,7 @@ fn TerminalCanvas(
         );
         if *existing_lease_skip_identity.borrow() != skip_key {
             *existing_lease_skip_identity.borrow_mut() = skip_key;
-            let lease_context = state.with_mut(|shell| {
+            let lease_context = state.with_mut_counted(|shell| {
                 let context = shell.terminal_open_context_payload(&session_path);
                 // ⛔ AND NOW TELL THE WAITER — the same lesson the sibling
                 // `bootstrap_spawn_skipped_inactive_retained_host` branch
@@ -97815,7 +98041,7 @@ fn TerminalCanvas(
                                     // through the session's egress like any
                                     // surface URL, so remote loopback works).
                                     "pick" => {
-                                        let touched = state.with_mut(|shell| {
+                                        let touched = state.with_mut_counted(|shell| {
                                             shell.sweep_stale_web_surfaces(now_ms);
                                             shell
                                                 .web_surfaces
@@ -97856,7 +98082,7 @@ fn TerminalCanvas(
                                                     "forwarded": forward_child.is_some(),
                                                 }),
                                             );
-                                            state.with_mut(|shell| {
+                                            state.with_mut_counted(|shell| {
                                                 shell.upsert_web_surface_picker(
                                                     &surface_session_path,
                                                     effective_control,
@@ -97867,7 +98093,7 @@ fn TerminalCanvas(
                                         }
                                     }
                                     "open" | "heartbeat" | "seen" => {
-                                        let (touched, recently_closed) = state.with_mut(|shell| {
+                                        let (touched, recently_closed) = state.with_mut_counted(|shell| {
                                             // TOUCH BEFORE SWEEP. This heartbeat is proof THIS
                                             // session's app is alive right now, so refresh its
                                             // last_seen first — otherwise the sweep below would
@@ -97957,7 +98183,7 @@ fn TerminalCanvas(
                                         }
                                     }
                                     "close" => {
-                                        let closed = state.with_mut(|shell| {
+                                        let closed = state.with_mut_counted(|shell| {
                                             shell.close_web_surface(&surface_session_path)
                                         });
                                         append_trace_event(
@@ -98075,7 +98301,7 @@ fn TerminalCanvas(
                                         // lands.
                                         if refetch.document {
                                             let session = contribution_session_path.clone();
-                                            let seq = state.with_mut(|shell| {
+                                            let seq = state.with_mut_counted(|shell| {
                                                 shell.document_pane_next_request(&session)
                                             });
                                             spawn(document_pane_fetch_schema(state, session, seq));
@@ -98084,7 +98310,7 @@ fn TerminalCanvas(
                                         // same document set, so it went stale on
                                         // the very same bump (user bug #5).
                                         if refetch.document_rail
-                                            && let Some((pane_id, seq)) = state.with_mut(|shell| {
+                                            && let Some((pane_id, seq)) = state.with_mut_counted(|shell| {
                                                 shell.document_rail_pane_to_refetch(
                                                     &contribution_session_path,
                                                 )
@@ -98101,7 +98327,7 @@ fn TerminalCanvas(
                                         // its document (the ychrome tab-rail
                                         // shape) — once. A user-closed rail
                                         // stays closed; heartbeats never fight.
-                                        let auto_open_pane = state.with_mut(|shell| {
+                                        let auto_open_pane = state.with_mut_counted(|shell| {
                                             let is_active = shell.server.active_session_path()
                                                 == Some(contribution_session_path.as_str());
                                             let has_document = shell
@@ -98141,7 +98367,7 @@ fn TerminalCanvas(
                                         }
                                     }
                                     "close" => {
-                                        state.with_mut(|shell| {
+                                        state.with_mut_counted(|shell| {
                                             shell.close_sidebar_contribution(
                                                 &contribution_session_path,
                                             );
@@ -98211,7 +98437,7 @@ fn TerminalCanvas(
                                 let fido2_session_path = session_path.clone();
                                 match action.as_str() {
                                     "request" if !request_id.is_empty() && !rp_id.is_empty() => {
-                                        state.with_mut(|shell| {
+                                        state.with_mut_counted(|shell| {
                                             shell.pending_fido2 = Some(PendingFido2Dialog {
                                                 session_path: fido2_session_path.clone(),
                                                 request_id: request_id.clone(),
@@ -98240,7 +98466,7 @@ fn TerminalCanvas(
                                     // out on its side) — drop the dialog if it is
                                     // still the one showing.
                                     "cancel" => {
-                                        state.with_mut(|shell| {
+                                        state.with_mut_counted(|shell| {
                                             if shell
                                                 .pending_fido2
                                                 .as_ref()
@@ -100082,7 +100308,7 @@ fn TerminalCanvas(
                                         // fail on a healthy row at its 15s deadline. Pull the refresh
                                         // forward instead of widening the check's tolerance: the
                                         // check is right, its input was stale.
-                                        state.with_mut(|shell| {
+                                        state.with_mut_counted(|shell| {
                                             schedule_live_session_snapshot_refresh(
                                                 shell,
                                                 LIVE_SESSION_SNAPSHOT_POST_RESIZE_REFRESH_MS,
@@ -103146,7 +103372,7 @@ fn TerminalCanvas(
                                     &session_path,
                                     frame_budgeted_terminal_output,
                                 ) {
-                                    let should_sync = state.with_mut(|shell| {
+                                    let should_sync = state.with_mut_counted(|shell| {
                                         let now = current_millis();
                                         shell.remote_preview_dirty_epoch.insert(
                                             session_path.clone(),
@@ -103702,7 +103928,7 @@ fn TerminalCanvas(
                             evt.prevent_default();
                             evt.stop_propagation();
                             let coords = evt.client_coordinates();
-                            state.with_mut(|shell| {
+                            state.with_mut_counted(|shell| {
                                 shell.open_viewport_context_menu(
                                     ViewportMenuKind::Terminal,
                                     context_row.clone(),
@@ -103845,7 +104071,7 @@ fn TerminalCanvas(
                                                 title: "Close tab",
                                                 onclick: move |evt| {
                                                     evt.stop_propagation();
-                                                    state.with_mut(|shell| {
+                                                    state.with_mut_counted(|shell| {
                                                         shell.web_surface_close_tab(
                                                             &close_tab_path,
                                                             tab_id,
@@ -103913,7 +104139,7 @@ fn TerminalCanvas(
                                             ),
                                             title: "Tabs in folders ({filed.len()})",
                                             onclick: move |_| {
-                                                state.with_mut(|shell| shell.toggle_web_tab_overflow());
+                                                state.with_mut_counted(|shell| shell.toggle_web_tab_overflow());
                                             },
                                             "🗂 {filed.len()} ⌄"
                                         }
@@ -103977,7 +104203,7 @@ fn TerminalCanvas(
                                                                         ),
                                                                         onclick: move |_| {
                                                                             select_web_surface_tab(state, select_path.clone(), tab_id, WebTabSelect::User);
-                                                                            state.with_mut(|shell| shell.close_web_tab_overflow());
+                                                                            state.with_mut_counted(|shell| shell.close_web_tab_overflow());
                                                                         },
                                                                         "{tab_label}"
                                                                     }
@@ -104042,7 +104268,7 @@ fn TerminalCanvas(
                                         // can't heartbeat, and waiting out the
                                         // 15s stale sweep would strand a dead
                                         // overlay over the revealed terminal.
-                                        state.with_mut(|shell| {
+                                        state.with_mut_counted(|shell| {
                                             shell.close_web_surface(&suspend_path);
                                         });
                                         spawn(async move {
@@ -104068,7 +104294,7 @@ fn TerminalCanvas(
                                     move |_| {
                                         let close_path = close_path.clone();
                                         let endpoint = state.read().bootstrap.server_endpoint.clone();
-                                        state.with_mut(|shell| {
+                                        state.with_mut_counted(|shell| {
                                             shell.close_web_surface(&close_path);
                                         });
                                         spawn(async move {
@@ -106736,6 +106962,35 @@ const TERMINAL_INPUT_NO_COMPOSER_REASON: &str =
     "no agent composer row appeared within the timeout — the row is mid-output, in a menu, or is not an agent CLI, so input readiness is unanswerable rather than false";
 const TERMINAL_INPUT_DRAFT_REASON: &str =
     "the composer holds an unsent draft — refusing to probe, because the probe types a marker and clears the line with Ctrl+U and would destroy it";
+const TERMINAL_INPUT_UNREADABLE_COMPOSER_REASON: &str =
+    "the composer could not be read, so whether a human is mid-sentence is unknown — refusing to probe, because being wrong here costs somebody their line";
+
+/// How long to wait before the probe tries again, and the ceiling it climbs to.
+///
+/// ⛔ **The flat retry was the "viewport blinking" bug.** Writing the marker and
+/// then Ctrl+U every ~300 ms means ~100 injected markers and ~100 erased lines
+/// across a 30 s timeout, and the visible result is the composer being painted
+/// and wiped three times a second. A row that has not answered in seconds will
+/// not answer in the next 120 ms, so the interval doubles to a 2 s ceiling:
+/// the same deadline, ~12 writes instead of ~100, and the surface is left alone
+/// in between.
+const TERMINAL_INPUT_PROBE_RETRY_MIN: Duration = Duration::from_millis(120);
+const TERMINAL_INPUT_PROBE_RETRY_CEILING: Duration = Duration::from_secs(2);
+
+/// May the probe write into this composer?
+///
+/// ⛔ **`None` is NOT permission.** An unreadable composer is precisely the case
+/// where being wrong is least affordable: the probe's next act is a Ctrl+U, and
+/// a Ctrl+U into a sentence somebody is typing destroys it. Only a positive
+/// reading of "there is no draft here" authorises a write.
+fn probe_write_is_permitted(composer_holds_draft: Option<bool>) -> bool {
+    composer_holds_draft == Some(false)
+}
+
+/// The next retry interval, doubling to a fixed ceiling.
+fn probe_retry_backoff(previous: Duration) -> Duration {
+    (previous * 2).min(TERMINAL_INPUT_PROBE_RETRY_CEILING)
+}
 
 /// One verdict on one question: **is this row consuming input right now?**
 #[derive(Debug, Clone)]
@@ -106763,10 +107018,16 @@ struct TerminalInputProbeVerdict {
 /// [[finding-fresh-restarted-codex-no-input]]), and a WEDGED row draws one
 /// forever while reading nothing.
 ///
-/// `guard_draft` makes the probe refuse instead of running when the composer
-/// already holds typed text. `SubmitTerminalPrompt` leaves it off — its caller
-/// has asked for that text to be sent and the Ctrl+U is part of doing so — while
-/// a bare check must never cost the human a sentence for the sake of an answer.
+/// ⛔ **THE PROBE NEVER TYPES OVER A HUMAN, AND THAT IS NOT A CALLER'S CHOICE.**
+/// This used to take a `guard_draft` flag which `SubmitTerminalPrompt` set to
+/// `false`, reasoning that its caller had asked for the text to be sent so the
+/// Ctrl+U was part of doing what was asked. **That reasoning is what the owner's
+/// 2026-08-14 report refuted**: the instruction to send comes from an agent, the
+/// sentence in the composer belongs to the person at the keyboard, and one does
+/// not license destroying the other. The refusal is now unconditional, exactly
+/// as the daemon-side twin `submit_prompt_echo_verified_with` already does it —
+/// a caller that wants the text sent gets a NAMED refusal and stops. ⛔ It must
+/// not retry: a second attempt is a second barrage.
 async fn probe_terminal_input_consumption(
     endpoint: ServerEndpoint,
     runtime_session_path: String,
@@ -106774,7 +107035,6 @@ async fn probe_terminal_input_consumption(
     session_kind: Option<SessionKind>,
     trace_home: &Path,
     timeout: Duration,
-    guard_draft: bool,
 ) -> TerminalInputProbeVerdict {
     let started = Instant::now();
     let mut composer_shown = false;
@@ -106808,17 +107068,28 @@ async fn probe_terminal_input_consumption(
             reason: TERMINAL_INPUT_NO_COMPOSER_REASON,
         };
     }
-    if guard_draft && composer_held_draft {
-        return TerminalInputProbeVerdict {
-            consuming_input: false,
-            composer_shown: true,
-            composer_held_draft: true,
-            activity,
-            waited_ms: started.elapsed().as_millis() as u64,
-            reason: TERMINAL_INPUT_DRAFT_REASON,
-        };
-    }
+    // The freshest reading of "is somebody mid-sentence in there", carried across
+    // iterations so every write is authorised by a reading taken AFTER the last
+    // one. `Some(false)` is the only value that lets a write through.
+    let mut composer_draft_now = Some(composer_held_draft);
+    let mut retry_backoff = TERMINAL_INPUT_PROBE_RETRY_MIN;
     while started.elapsed() < timeout {
+        // ⛔ CHECKED BEFORE EVERY WRITE, never once at the top. A human can start
+        // typing at any point during a 30 s wait, and the whole failure being
+        // fixed here is a probe that kept writing while somebody was mid-word.
+        if !probe_write_is_permitted(composer_draft_now) {
+            return TerminalInputProbeVerdict {
+                consuming_input: false,
+                composer_shown: true,
+                composer_held_draft: composer_draft_now.unwrap_or(false),
+                activity,
+                waited_ms: started.elapsed().as_millis() as u64,
+                reason: match composer_draft_now {
+                    Some(true) => TERMINAL_INPUT_DRAFT_REASON,
+                    _ => TERMINAL_INPUT_UNREADABLE_COMPOSER_REASON,
+                },
+            };
+        }
         let _ = terminal_write_app_control_input_async(
             endpoint.clone(),
             runtime_session_path.clone(),
@@ -106829,22 +107100,24 @@ async fn probe_terminal_input_consumption(
         )
         .await;
         sleep(Duration::from_millis(180)).await;
-        let echoed = matches!(
-            terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home).await,
-            Ok((ref screen, ..)) if screen.contains(TERMINAL_INPUT_ECHO_PROBE)
-        );
-        // Clear the probe whether it echoed (consumed) or was buffered while the
-        // CLI wasn't reading yet — the composer is left clean either way.
-        let _ = terminal_write_app_control_input_async(
-            endpoint.clone(),
-            runtime_session_path.clone(),
-            session_path.clone(),
-            TERMINAL_INPUT_CLEAR_LINE.to_string(),
-            "submit_probe",
-            trace_home,
-        )
-        .await;
+        let screen = terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home)
+            .await
+            .ok()
+            .map(|(screen, ..)| screen);
+        let echoed = screen
+            .as_deref()
+            .is_some_and(|screen| screen.contains(TERMINAL_INPUT_ECHO_PROBE));
         if echoed {
+            // Our marker is on the screen and has to come off it again.
+            let _ = terminal_write_app_control_input_async(
+                endpoint.clone(),
+                runtime_session_path.clone(),
+                session_path.clone(),
+                TERMINAL_INPUT_CLEAR_LINE.to_string(),
+                "submit_probe",
+                trace_home,
+            )
+            .await;
             sleep(Duration::from_millis(60)).await;
             return TerminalInputProbeVerdict {
                 consuming_input: true,
@@ -106855,7 +107128,39 @@ async fn probe_terminal_input_consumption(
                 reason: TERMINAL_INPUT_CONSUMING_REASON,
             };
         }
-        sleep(Duration::from_millis(120)).await;
+        // ⭐ The marker did NOT echo, so it is not on this screen — which makes
+        // this reading a clean discriminator: any text in the composer now is
+        // somebody else's. Re-read before the Ctrl+U, because the echo wait is
+        // 180 ms and a person can easily start typing inside it.
+        composer_draft_now = screen
+            .as_deref()
+            .map(terminal_composer_row_holds_draft);
+        if !probe_write_is_permitted(composer_draft_now) {
+            // ⛔ Return WITHOUT the Ctrl+U. The clear is the destructive half.
+            return TerminalInputProbeVerdict {
+                consuming_input: false,
+                composer_shown: true,
+                composer_held_draft: composer_draft_now.unwrap_or(false),
+                activity,
+                waited_ms: started.elapsed().as_millis() as u64,
+                reason: match composer_draft_now {
+                    Some(true) => TERMINAL_INPUT_DRAFT_REASON,
+                    _ => TERMINAL_INPUT_UNREADABLE_COMPOSER_REASON,
+                },
+            };
+        }
+        // Clear the buffered probe so it cannot pile up, then back off.
+        let _ = terminal_write_app_control_input_async(
+            endpoint.clone(),
+            runtime_session_path.clone(),
+            session_path.clone(),
+            TERMINAL_INPUT_CLEAR_LINE.to_string(),
+            "submit_probe",
+            trace_home,
+        )
+        .await;
+        sleep(retry_backoff).await;
+        retry_backoff = probe_retry_backoff(retry_backoff);
     }
     TerminalInputProbeVerdict {
         consuming_input: false,
@@ -107778,7 +108083,7 @@ fn spawn_open_row_menu_here(mut state: Signal<ShellState>) {
             ),
             Err(_) => (18.0, 60.0),
         };
-        state.with_mut(|shell| shell.open_context_menu(row, position));
+        state.with_mut_counted(|shell| shell.open_context_menu(row, position));
     });
 }
 /// Scroll the jump-mode highlight into view WITHOUT focusing it. Jump mode's keys
@@ -108748,7 +109053,7 @@ fn sync_active_terminal_input_policy(state: Signal<ShellState>) {
     apply_active_terminal_input_policy(&signature, false, &trace_home);
 }
 fn dismiss_titlebar_transients_and_resync_active_terminal(mut state: Signal<ShellState>) {
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.dismiss_titlebar_transients();
         if shell.search_focused {
             shell.set_search_focus(false);
@@ -108819,7 +109124,7 @@ fn reclaim_active_terminal_input_from_viewport_click(mut state: Signal<ShellStat
     if document_surface_owns_viewport {
         return;
     }
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.dismiss_titlebar_transients();
         shell.terminal_input_override_active = true;
         if shell.search_focused {
@@ -108870,7 +109175,7 @@ fn reclaim_active_terminal_input_after_settings_blur(mut state: Signal<ShellStat
     let Some(session) = snapshot.active_session.as_ref() else {
         return;
     };
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.terminal_input_override_active = true;
     });
     clear_sidebar_keyboard_owner();
@@ -108910,7 +109215,7 @@ fn reclaim_active_terminal_input_after_search_blur(mut state: Signal<ShellState>
     let Some(session) = snapshot.active_session.as_ref() else {
         return;
     };
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.terminal_input_override_active = true;
     });
     clear_sidebar_keyboard_owner();
@@ -109230,7 +109535,7 @@ fn focus_web_omnibox(mut state: Signal<ShellState>) {
         .active_session_path()
         .map(str::to_string);
     if let Some(session) = session {
-        state.with_mut(|shell| shell.web_surface_begin_address_edit(&session));
+        state.with_mut_counted(|shell| shell.web_surface_begin_address_edit(&session));
     }
     let _ = document::eval(&focus_web_omnibox_script(&input_id));
 }
@@ -109245,7 +109550,7 @@ fn open_web_surface_tab(
     session_path: &str,
     request: WebTabOpenRequest,
 ) -> Option<u64> {
-    let opened = state.with_mut(|shell| shell.web_surface_open_tab(session_path, &request));
+    let opened = state.with_mut_counted(|shell| shell.web_surface_open_tab(session_path, &request));
     if opened.is_some() && web_tab_opens_typing_ready(&request) {
         focus_web_omnibox(state);
     }
@@ -109464,7 +109769,7 @@ fn dispatch_web_page_menu(state: Signal<ShellState>, id: &str, x: f64, y: f64) {
             _ => return,
         };
         let mut state = state;
-        state.with_mut(|shell| match outcome {
+        state.with_mut_counted(|shell| match outcome {
             Ok((path, w, h)) => shell.push_notification(
                 NotificationTone::Success,
                 "Screenshot Saved",
@@ -109635,7 +109940,7 @@ fn active_web_page_url(state: &Signal<ShellState>, session: &str) -> Option<Stri
 /// a tab whose address bar holds a half-typed draft is exactly when that matters.
 fn copy_active_web_page_url(mut state: Signal<ShellState>, session: &str) {
     let Some(url) = active_web_page_url(&state, session) else {
-        state.with_mut(|shell| {
+        state.with_mut_counted(|shell| {
             shell.push_notification(
                 NotificationTone::Warning,
                 "No Address To Copy",
@@ -109646,13 +109951,13 @@ fn copy_active_web_page_url(mut state: Signal<ShellState>, session: &str) {
     };
     match set_native_clipboard_contents(state, &YgguiClipboardContents::Text { text: url.clone() })
     {
-        Ok(_) => state.with_mut(|shell| {
+        Ok(_) => state.with_mut_counted(|shell| {
             shell.push_notification(NotificationTone::Success, "Address Copied", url)
         }),
         // Named, never swallowed: a failed copy leaves the user's OLD clipboard
         // in place, so reporting success would have them paste the wrong thing
         // into something that matters.
-        Err(error) => state.with_mut(|shell| {
+        Err(error) => state.with_mut_counted(|shell| {
             shell.push_notification(
                 NotificationTone::Error,
                 "Could Not Copy Address",
@@ -109673,7 +109978,7 @@ fn dispatch_web_page_chord(mut state: Signal<ShellState>, id: &str) -> bool {
     };
     match id {
         "web.reload" => {
-            state.with_mut(|shell| shell.web_surface_reload_active_tab(&session));
+            state.with_mut_counted(|shell| shell.web_surface_reload_active_tab(&session));
         }
         "web.reload.hard" => {
             // Straight to the engine, because the cache bypass has no `wry`
@@ -109684,7 +109989,7 @@ fn dispatch_web_page_chord(mut state: Signal<ShellState>, id: &str) -> bool {
             if let Ok((_, native_id)) = resolve_live_web_surface(&state, None)
                 && let Err(error) = window().reload_web_surface_bypass_cache(native_id)
             {
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     shell.push_notification(
                         NotificationTone::Warning,
                         "Could Not Hard Reload",
@@ -109716,7 +110021,7 @@ fn dispatch_web_page_chord(mut state: Signal<ShellState>, id: &str) -> bool {
                 .get(&session)
                 .map(|surface| surface.active_tab);
             if let Some(tab) = active {
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     shell.apply_web_tab_menu_action(&session, &WebTabMenuAction::CloseTab(tab))
                 });
             }
@@ -124077,7 +124382,7 @@ fn start_page_run_session_choice(
     }
     // Remembered BEFORE the spawn, so the face is right even if the launch
     // itself fails — the button records what you chose, not what succeeded.
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.remember_start_page_choice(StartPageFamily::Session, &id_owned);
     });
     match agent_kind {
@@ -124136,7 +124441,7 @@ fn start_page_run_app_choice(
         return;
     }
     let id_owned = id.to_string();
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.remember_start_page_choice(StartPageFamily::App, &id_owned);
     });
     let insert_after = row.as_ref().map(|row| row.full_path.clone());
@@ -124544,7 +124849,7 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                         open: snapshot.start_page_session_menu_open,
                         prefix: "New".to_string(),
                         on_open_change: move |open: bool| {
-                            state.with_mut(|shell| {
+                            state.with_mut_counted(|shell| {
                                 shell.close_start_page_menus();
                                 shell.start_page_session_menu_open = open;
                             });
@@ -124569,7 +124874,7 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                         // stutters into "Open New Ychrome". The session family
                         // takes one because its members are nouns.
                         on_open_change: move |open: bool| {
-                            state.with_mut(|shell| {
+                            state.with_mut_counted(|shell| {
                                 shell.close_start_page_menus();
                                 shell.start_page_app_menu_open = open;
                             });
@@ -124774,7 +125079,7 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                         evt.prevent_default();
                                         evt.stop_propagation();
                                         let coords = evt.client_coordinates();
-                                        state.with_mut(|shell| {
+                                        state.with_mut_counted(|shell| {
                                             shell.select_tree_row(&row_for_context_menu, TreeSelectionMode::Replace);
                                             shell.open_context_menu(
                                                 row_for_context_menu.clone(),
@@ -124873,7 +125178,7 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                             onclick: move |evt| {
                                                 evt.prevent_default();
                                                 evt.stop_propagation();
-                                                state.with_mut(|shell| {
+                                                state.with_mut_counted(|shell| {
                                                     shell.open_delete_dialog_for_row(&row_for_delete, false);
                                                 });
                                             },
@@ -125440,7 +125745,7 @@ fn WebOmniboxBar(
                         if web_nav_middle_click(&evt) {
                             return;
                         }
-                        state.with_mut(|shell| shell.web_surface_reload_active_tab(&nav_path));
+                        state.with_mut_counted(|shell| shell.web_surface_reload_active_tab(&nav_path));
                     }
                 },
                 onmouseup: {
@@ -125508,7 +125813,7 @@ fn WebOmniboxBar(
                     let nav_path = nav_path.clone();
                     let address_input_id = input_id.clone();
                     move |evt: FormEvent| {
-                        let completion = state.with_mut(|shell| {
+                        let completion = state.with_mut_counted(|shell| {
                             shell.web_surface_type_address(&nav_path, evt.value())
                         });
                         if let Some((completed, typed_len, completed_len)) = completion {
@@ -125538,7 +125843,7 @@ fn WebOmniboxBar(
                             if dropdown_rows > 0 {
                                 evt.prevent_default();
                                 let delta = if evt.key() == Key::ArrowDown { 1 } else { -1 };
-                                state.with_mut(|shell| {
+                                state.with_mut_counted(|shell| {
                                     shell.web_surface_move_address_suggestion(&nav_path, delta, dropdown_rows);
                                 });
                             }
@@ -125574,7 +125879,7 @@ fn WebOmniboxBar(
                                 navigate_web_surface_tab(state, nav_path.clone(), tab_id, url, nav_ssh.clone(), None);
                             }
                         } else if evt.key() == Key::Escape {
-                            state.with_mut(|shell| {
+                            state.with_mut_counted(|shell| {
                                 shell.web_surface_set_address_draft(&nav_path, None);
                             });
                         }
@@ -125843,7 +126148,7 @@ fn open_web_find_for_viewport(mut state: Signal<ShellState>) -> Option<String> {
     // The lender: whoever holds the keyboard right now. A terminal that is
     // typing-ready is the one that gets it back on Escape; a page lender is
     // given it back through the host focus verb when the bar closes.
-    let session = state.with_mut(|shell| {
+    let session = state.with_mut_counted(|shell| {
         let session = shell.server.active_session_path()?.to_string();
         // A picker-phase surface has no page to search.
         let overlay = shell.web_surface_overlay_for_session(&session, current_millis())?;
@@ -125947,7 +126252,7 @@ fn WebFindBar(
                 onfocus: {
                     let session_path = session_path.clone();
                     move |_| {
-                        state.with_mut(|shell| shell.set_web_find_focus(&session_path, true));
+                        state.with_mut_counted(|shell| shell.set_web_find_focus(&session_path, true));
                     }
                 },
                 onblur: {
@@ -125956,14 +126261,14 @@ fn WebFindBar(
                         // The bar owns keys ONLY while its input is focused: the
                         // instant the user clicks away, the terminal beneath is
                         // typing-ready again and the bar claims nothing.
-                        state.with_mut(|shell| shell.set_web_find_focus(&session_path, false));
+                        state.with_mut_counted(|shell| shell.set_web_find_focus(&session_path, false));
                     }
                 },
                 oninput: {
                     let session_path = session_path.clone();
                     move |evt: FormEvent| {
                         let value = evt.value();
-                        let asked = state.with_mut(|shell| {
+                        let asked = state.with_mut_counted(|shell| {
                             shell.set_web_find_query(&session_path, value)
                         });
                         // Incremental: every keystroke re-searches from the top,
@@ -126184,19 +126489,19 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                             onmousedown: move |evt: MouseEvent| evt.stop_propagation(),
                             oninput: move |evt: FormEvent| {
                                 let value = evt.value();
-                                state.with_mut(|shell| shell.web_tab_set_rename_draft(value));
+                                state.with_mut_counted(|shell| shell.web_tab_set_rename_draft(value));
                             },
                             onkeydown: move |evt: KeyboardEvent| {
                                 let commit_path = commit_path.clone();
                                 match evt.key() {
-                                    Key::Enter => state.with_mut(|shell| shell.web_tab_commit_rename(&commit_path)),
-                                    Key::Escape => state.with_mut(|shell| shell.web_tab_cancel_rename()),
+                                    Key::Enter => state.with_mut_counted(|shell| shell.web_tab_commit_rename(&commit_path)),
+                                    Key::Escape => state.with_mut_counted(|shell| shell.web_tab_cancel_rename()),
                                     _ => {}
                                 }
                             },
                             onblur: move |_| {
                                 let blur_path = blur_path.clone();
-                                state.with_mut(|shell| shell.web_tab_commit_rename(&blur_path));
+                                state.with_mut_counted(|shell| shell.web_tab_commit_rename(&blur_path));
                             },
                         }
                     }
@@ -126244,7 +126549,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                 onclick: move |evt: MouseEvent| {
                                     evt.stop_propagation();
                                     let (path, id) = (chevron_path.clone(), chevron_id.clone());
-                                    state.with_mut(|shell| shell.web_tab_toggle_folder(&path, &id));
+                                    state.with_mut_counted(|shell| shell.web_tab_toggle_folder(&path, &id));
                                 },
                                 RowDisclosureChevron { expanded }
                             }
@@ -126261,7 +126566,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                 onclick: move |evt: MouseEvent| {
                                     evt.stop_propagation();
                                     let (path, id) = (sub_path.clone(), sub_id.clone());
-                                    state.with_mut(|shell| {
+                                    state.with_mut_counted(|shell| {
                                         shell.web_tab_new_folder_in(&path, Some(id))
                                     });
                                 },
@@ -126307,14 +126612,14 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                 onclick: move |evt: MouseEvent| {
                                     evt.stop_propagation();
                                     let (path, id) = (delete_path.clone(), delete_id.clone());
-                                    state.with_mut(|shell| shell.web_tab_delete_folder(&path, &id));
+                                    state.with_mut_counted(|shell| shell.web_tab_delete_folder(&path, &id));
                                 },
                                 "🗑"
                             }
                         }),
                         EventHandler::new(move |_| {
                             let (path, id) = (toggle_path.clone(), toggle_id.clone());
-                            state.with_mut(|shell| {
+                            state.with_mut_counted(|shell| {
                                 // The release that commits a drag is also a
                                 // click. One drag must not also toggle the
                                 // folder it landed on.
@@ -126404,7 +126709,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                                             None,
                                         );
                                     } else {
-                                        state.with_mut(|shell| {
+                                        state.with_mut_counted(|shell| {
                                             shell.web_surface_close_tab(&close_path, tab_id);
                                             shell.persist_web_tabs(&close_path, WebTabSave::TreeEdit);
                                         });
@@ -126416,7 +126721,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         EventHandler::new(move |_| {
                             // A drag's own release is also a click: moving a
                             // tab must not also switch to it.
-                            if state.with_mut(|shell| shell.consume_suppressed_row_click()) {
+                            if state.with_mut_counted(|shell| shell.consume_suppressed_row_click()) {
                                 return;
                             }
                             select_web_surface_tab(
@@ -126474,7 +126779,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         // ARM only: a press that has not travelled is a click.
                         let pointer = evt.client_coordinates();
                         let (down_row, down_label) = (down_row.clone(), down_label.clone());
-                        state.with_mut(|shell| {
+                        state.with_mut_counted(|shell| {
                             shell.arm_web_tab_row_drag(down_row, down_label, (pointer.x, pointer.y));
                         });
                     },
@@ -126491,7 +126796,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                             is_folder,
                         );
                         let (move_row, spring_path) = (move_row.clone(), spring_path.clone());
-                        state.with_mut(|shell| {
+                        state.with_mut_counted(|shell| {
                             if !shell.maybe_begin_web_tab_row_drag((pointer.x, pointer.y)) {
                                 return;
                             }
@@ -126538,7 +126843,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                             let rename_target = rename_target.clone();
                             EventHandler::new(move |_| {
                                 let rename_target = rename_target.clone();
-                                state.with_mut(|shell| shell.web_tab_begin_rename(&rename_target));
+                                state.with_mut_counted(|shell| shell.web_tab_begin_rename(&rename_target));
                             })
                         }),
                         // Right-click raises the SHARED `ContextMenuOverlay`,
@@ -126576,7 +126881,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             // move to the root.
             onmouseup: move |_| {
                 let end_drag_tree = end_drag_tree.clone();
-                state.with_mut(|shell| shell.end_web_tab_row_drag(&end_drag_tree));
+                state.with_mut_counted(|shell| shell.end_web_tab_row_drag(&end_drag_tree));
             },
             // A drag that wanders out of the rail forgets its TARGET, so a
             // release outside lands nothing — but the gesture itself is ended
@@ -126585,7 +126890,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             // produces leave events too, and abandoning on those made the drag
             // impossible to complete.
             onmouseleave: move |_| {
-                state.with_mut(|shell| shell.forget_row_drag_target());
+                state.with_mut_counted(|shell| shell.forget_row_drag_target());
             },
             // Zen-style omnibox: in vertical-tabs mode the address bar leaves the
             // viewport and lives here, at the top of the tab tree. Same component
@@ -126685,7 +126990,7 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                         ),
                         title: "New folder",
                         onclick: move |_| {
-                            state.with_mut(|shell| shell.web_tab_new_folder(&new_folder_path));
+                            state.with_mut_counted(|shell| shell.web_tab_new_folder(&new_folder_path));
                         },
                         svg {
                             width: "13",
@@ -127061,7 +127366,7 @@ fn EditableMarkdownBody(
             spliced.push_str(&source[range.end..]);
             let mut state = state;
             let (session_path, pane_id) = (session_path.clone(), pane_id.clone());
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 // The splice IS an editor draft: same value id, same channel,
                 // same draft action the split editor uses — one write path.
                 shell.set_document_pane_value(&session_path, "editor", spliced);
@@ -127368,7 +127673,7 @@ fn DocumentSurfaceBody(
                             .cloned()
                     });
                     if let Some(row) = row {
-                        state.with_mut(|shell| {
+                        state.with_mut_counted(|shell| {
                             shell.open_viewport_context_menu(
                                 ViewportMenuKind::Document,
                                 row,
@@ -127466,7 +127771,7 @@ fn DocumentSurfaceBody(
                                             let id = id.clone();
                                             let session_path = session_path.clone();
                                             move |evt: FormEvent| {
-                                                state.with_mut(|shell| {
+                                                state.with_mut_counted(|shell| {
                                                     shell.set_document_pane_value(
                                                         &session_path,
                                                         &id,
@@ -127539,7 +127844,7 @@ fn DocumentSurfaceBody(
                                                 let id = id.clone();
                                                 let session_path = session_path.clone();
                                                 move |evt: FormEvent| {
-                                                    state.with_mut(|shell| {
+                                                    state.with_mut_counted(|shell| {
                                                         shell.set_document_pane_value(
                                                             &session_path,
                                                             &id,
@@ -127749,7 +128054,7 @@ fn DocumentSurfaceBody(
                                                 let id = id.clone();
                                                 let session_path = session_path.clone();
                                                 move |evt: FormEvent| {
-                                                    state.with_mut(|shell| {
+                                                    state.with_mut_counted(|shell| {
                                                         shell.set_document_pane_value(
                                                             &session_path,
                                                             &id,
@@ -127867,7 +128172,7 @@ fn DocumentSurfaceBody(
                                 let mut state = state;
                                 move |_| {
                                     let session_path = stale_overlay_session_path.clone();
-                                    state.with_mut(|shell| {
+                                    state.with_mut_counted(|shell| {
                                         shell.document_surface_hidden.insert(session_path);
                                     });
                                 }
@@ -127999,7 +128304,7 @@ fn AppPaneRailBody(
                 onmouseup: {
                     let mut state = state;
                     move |_: MouseEvent| {
-                        state.with_mut(|shell| shell.clear_app_pane_row_drag());
+                        state.with_mut_counted(|shell| shell.clear_app_pane_row_drag());
                     }
                 },
                 if let Some(error) = error {
@@ -128586,7 +128891,7 @@ fn AppPaneRailBody(
                                                 // when it travels, so a plain click
                                                 // stays a plain click.
                                                 let pointer = evt.client_coordinates();
-                                                state.with_mut(|shell| {
+                                                state.with_mut_counted(|shell| {
                                                     shell.arm_app_pane_row_drag(
                                                         pane_id.clone(),
                                                         row_id.clone(),
@@ -128625,7 +128930,7 @@ fn AppPaneRailBody(
                                                     evt.element_coordinates().y,
                                                     row_is_group,
                                                 );
-                                                let sprung = state.with_mut(|shell| {
+                                                let sprung = state.with_mut_counted(|shell| {
                                                     if !shell.maybe_begin_app_pane_row_drag((
                                                         pointer.x, pointer.y,
                                                     )) {
@@ -128695,7 +129000,7 @@ fn AppPaneRailBody(
                                         onmouseleave: {
                                             let mut state = state;
                                             move |_: MouseEvent| {
-                                                state.with_mut(|shell| {
+                                                state.with_mut_counted(|shell| {
                                                     shell.forget_row_drag_target();
                                                 });
                                             }
@@ -128712,7 +129017,7 @@ fn AppPaneRailBody(
                                                 }
                                                 evt.prevent_default();
                                                 let pos = evt.client_coordinates();
-                                                state.with_mut(|shell| {
+                                                state.with_mut_counted(|shell| {
                                                     shell.open_app_pane_context_menu(
                                                         pane_id.clone(),
                                                         row_id.clone(),
@@ -128771,7 +129076,7 @@ fn AppPaneRailBody(
                                                 // click. Moving a row must not
                                                 // also open it — the cwd tree
                                                 // has always swallowed this.
-                                                if state.with_mut(|shell| {
+                                                if state.with_mut_counted(|shell| {
                                                     shell.consume_suppressed_row_click()
                                                 }) {
                                                     return;
@@ -131145,7 +131450,7 @@ fn overlay_focus_giveback_session(
 /// PICK is deliberately not routed here — an action may open a field or a dialog
 /// that wants the keys, so it closes the menu on its own terms.
 fn dismiss_menu(mut state: Signal<ShellState>, menu: ShellMenu) {
-    let active_terminal_session = state.with_mut(|shell| {
+    let active_terminal_session = state.with_mut_counted(|shell| {
         match menu {
             ShellMenu::WebProfile => {
                 shell.close_web_profile_switcher();
@@ -131661,7 +131966,7 @@ fn terminal_viewport_get_selection_script(session_path: &str) -> String {
 /// the terminal menu owes to match). Paste reuses the terminal paste; Select
 /// All highlights the buffer.
 fn dispatch_viewport_menu_action(mut state: Signal<ShellState>, action: String) {
-    let (surface, session_path, trace_home) = state.with_mut(|shell| {
+    let (surface, session_path, trace_home) = state.with_mut_counted(|shell| {
         let surface = shell.context_menu_surface;
         let session = shell.server.active_session_path().map(str::to_string);
         let trace = perf_home_dir(&shell.bootstrap.settings_path);
@@ -131774,7 +132079,7 @@ fn open_web_tab_menu_from_event(
     evt.stop_propagation();
     let coords = evt.client_coordinates();
     let session_path = session_path.to_string();
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.open_web_tab_context_menu(&session_path, target, (coords.x, coords.y), anchor);
     });
 }
@@ -131793,7 +132098,7 @@ fn open_web_profile_switcher_from_event(
     evt.stop_propagation();
     let coords = evt.client_coordinates();
     let session_path = session_path.to_string();
-    state.with_mut(|shell| {
+    state.with_mut_counted(|shell| {
         shell.open_web_profile_switcher(&session_path, anchor, (coords.x, coords.y));
     });
 }
@@ -131813,16 +132118,16 @@ fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabConte
     // ([`web_tab_menu_page_turn`]) so which ids navigate is a list, not a shape
     // buried in this closure.
     if let Some(page) = web_tab_menu_page_turn(&id) {
-        state.with_mut(|shell| shell.turn_web_tab_menu_page(page));
+        state.with_mut_counted(|shell| shell.turn_web_tab_menu_page(page));
         return;
     }
     let Some(action) = web_tab_menu_action(&menu.target, &id) else {
-        state.with_mut(|shell| shell.close_web_tab_context_menu());
+        state.with_mut_counted(|shell| shell.close_web_tab_context_menu());
         return;
     };
     let session_path = menu.session_path.clone();
-    state.with_mut(|shell| shell.close_web_tab_context_menu());
-    if state.with_mut(|shell| shell.apply_web_tab_menu_action(&session_path, &action)) {
+    state.with_mut_counted(|shell| shell.close_web_tab_context_menu());
+    if state.with_mut_counted(|shell| shell.apply_web_tab_menu_action(&session_path, &action)) {
         return;
     }
     // The verbs that need the Signal.
@@ -131841,7 +132146,7 @@ fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabConte
         }
         WebTabMenuAction::ReopenClosedTabs => {
             let reopened =
-                state.with_mut(|shell| shell.web_surface_reopen_closed_tabs(&session_path));
+                state.with_mut_counted(|shell| shell.web_surface_reopen_closed_tabs(&session_path));
             // ONE selection for the batch: reopening twelve tabs must not walk
             // the user through twelve fronts, and the selection is what
             // resolves that tab's egress (the same reason the duplicate
@@ -131867,7 +132172,7 @@ fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabConte
                 state,
                 &YgguiClipboardContents::Text { text: url.clone() },
             );
-            state.with_mut(|shell| match copied {
+            state.with_mut_counted(|shell| match copied {
                 Ok(_) => shell.push_notification(
                     NotificationTone::Success,
                     "URL Copied",
@@ -131896,7 +132201,7 @@ fn dispatch_web_tab_menu_action(mut state: Signal<ShellState>, menu: WebTabConte
         // copy opened on about:blank wearing the source's title, and the page
         // observer then wrote that blank back into the saved tree.
         if let Some(new_id) =
-            state.with_mut(|shell| shell.web_surface_duplicate_tab(&session_path, tab_id))
+            state.with_mut_counted(|shell| shell.web_surface_duplicate_tab(&session_path, tab_id))
         {
             select_web_surface_tab(state, session_path.clone(), new_id, WebTabSelect::Opened);
         }
@@ -131954,7 +132259,7 @@ fn spawn_web_profile_switch(mut state: Signal<ShellState>, session_path: String,
             WebProfileSwitchPlan::Refuse(message) => {
                 // Nothing to apply, by construction: the refusal carries a
                 // sentence, never a profile. The surface stays exactly as it was.
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     shell.push_notification(
                         NotificationTone::Error,
                         "Profile In Use",
@@ -131966,7 +132271,7 @@ fn spawn_web_profile_switch(mut state: Signal<ShellState>, session_path: String,
                 let switched = state
                     .with_mut(|shell| shell.switch_web_surface_profile(&session_path, &profile));
                 if let Some(tabs) = switched.filter(|tabs| *tabs > 0) {
-                    state.with_mut(|shell| {
+                    state.with_mut_counted(|shell| {
                         shell.push_notification(
                             NotificationTone::Success,
                             "Profile Switched",
@@ -132000,7 +132305,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
             row_menu_page_turn(&items, &id)
         });
         if let Some(page) = turn {
-            state.with_mut(|shell| shell.turn_row_menu_page(page));
+            state.with_mut_counted(|shell| shell.turn_row_menu_page(page));
             return;
         }
     }
@@ -132055,7 +132360,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
             // An id naming a CLI that is not registered cannot have been drawn
             // by this menu; closing is the honest response to a verb that does
             // not exist.
-            None => state.with_mut(|shell| shell.close_context_menu()),
+            None => state.with_mut_counted(|shell| shell.close_context_menu()),
         }
         return;
     }
@@ -132082,7 +132387,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
         // bookkeeping and not to lose the rows inside it.
         "ungroup-row-set" => {
             let path = normalize_live_session_path(&row.full_path);
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 let members = shell.dissolve_row_set(&path);
                 shell.last_action = format!("ungrouped {} row(s)", members.len());
                 shell.sync_browser_settings();
@@ -132090,7 +132395,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
         }
         "leave-row-set" => {
             let path = normalize_live_session_path(&row.full_path);
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.row_arrangement.detach(&path);
                 shell.last_action = format!("removed {} from its group", row.label);
                 shell.sync_browser_settings();
@@ -132102,7 +132407,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
             }
         }
         "close-split-group" => {
-            let members: Vec<String> = state.with_mut(|shell| {
+            let members: Vec<String> = state.with_mut_counted(|shell| {
                 let members = split_group_member_labels(
                     &shell.split_groups,
                     &shell.server.live_sessions(),
@@ -132122,7 +132427,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
             }
         }
         "split-side-by-side" | "split-stacked" => {
-            let candidates = state.with_mut(|shell| {
+            let candidates = state.with_mut_counted(|shell| {
                 let candidates = split_candidate_paths_for(
                     &row,
                     &shell.selected_tree_paths.iter().cloned().collect::<Vec<_>>(),
@@ -132139,11 +132444,11 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
             create_split_group(state, candidates, axis);
         }
         "rename-session" => {
-            state.with_mut(|shell| shell.begin_tree_rename(&row));
+            state.with_mut_counted(|shell| shell.begin_tree_rename(&row));
             sync_active_terminal_input_policy(state);
         }
         "close-all-live-sessions" => {
-            state.with_mut(|shell| shell.open_live_sessions_close_all_dialog());
+            state.with_mut_counted(|shell| shell.open_live_sessions_close_all_dialog());
         }
         "refresh-remote-sessions" => {
             if let Some(machine_key) = row
@@ -132164,7 +132469,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
             if is_remote_machine_group_row(&row) {
                 queue_remove_saved_ssh_target(state, row.clone());
             } else {
-                state.with_mut(|shell| shell.open_context_menu_delete_for_row(&row, false));
+                state.with_mut_counted(|shell| shell.open_context_menu_delete_for_row(&row, false));
             }
         }
         "move-selected-here" => {
@@ -132186,7 +132491,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
             let keep_alive = id == "keep-alive";
             // Re-derive from the same function that labelled the item, so the
             // click can never write to a different set than the menu promised.
-            let Some(plan) = state.with_mut(|shell| {
+            let Some(plan) = state.with_mut_counted(|shell| {
                 let plan = shell.context_menu_keep_alive_plan();
                 if let Some(plan) = plan.as_ref() {
                     for path in &plan.paths {
@@ -132239,7 +132544,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
         "redraw-terminal" => {
             let path = row.full_path.clone();
             let label = row.label.clone();
-            state.with_mut(|shell| shell.close_context_menu());
+            state.with_mut_counted(|shell| shell.close_context_menu());
             spawn(async move {
                 // FIX C: re-fetch the daemon's authoritative vt100 screen FIRST,
                 // then re-fit the renderer. The plain renderer redraw only re-fits
@@ -132263,7 +132568,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
                     // A successful redraw used to silently succeed; without a toast
                     // "nothing happens" is the user-perceived response when the
                     // viewport did not actually need changing.
-                    state.with_mut(|shell| {
+                    state.with_mut_counted(|shell| {
                         shell.push_notification(
                             NotificationTone::Info,
                             "Redraw Terminal",
@@ -132289,7 +132594,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
                 } else {
                     ("Redraw Failed", format!("{label}: {reason}"))
                 };
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     shell.push_notification(NotificationTone::Error, title, message);
                 });
             });
@@ -132297,7 +132602,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
         "restart-session" => {
             let path = row.full_path.clone();
             let label = row.label.clone();
-            state.with_mut(|shell| shell.close_context_menu());
+            state.with_mut_counted(|shell| shell.close_context_menu());
             // Manual restart override for ANY live session.
             // terminal_force_remote_restart_async issues the daemon TerminalRestart
             // (force_remote=true): for a remote agent it terminates the remote
@@ -132310,7 +132615,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
                 )
             });
             let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.push_notification(
                     NotificationTone::Warning,
                     "Restart Session",
@@ -132329,7 +132634,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
                 )
                 .await
                 {
-                    state.with_mut(|shell| {
+                    state.with_mut_counted(|shell| {
                         shell.push_notification(
                             NotificationTone::Error,
                             "Restart Failed",
@@ -132350,10 +132655,10 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
         }
         "edit-summary" => queue_copy_edit_for_row(state, row, CopyEditField::Summary),
         "delete-session" => {
-            state.with_mut(|shell| shell.open_context_menu_delete_for_row(&row, false));
+            state.with_mut_counted(|shell| shell.open_context_menu_delete_for_row(&row, false));
         }
         _ => {
-            state.with_mut(|shell| shell.close_context_menu());
+            state.with_mut_counted(|shell| shell.close_context_menu());
         }
     }
 }
@@ -157317,7 +157622,7 @@ mod tests {
             .and_then(|body| body.split("_ => {}").next())
             .expect("CloseRequested handler should be present");
         let sync_ix = close_block
-            .find("state.with_mut(sync_window_frame_state);")
+            .find("state.with_mut_counted(sync_window_frame_state);")
             .expect("CloseRequested should sync the native frame state");
         let closing_ix = close_block
             .find("shell.closing_app = true;")
@@ -160260,6 +160565,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -160331,6 +160637,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -160532,6 +160839,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -160640,6 +160948,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -160726,6 +161035,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -160852,6 +161162,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -160941,6 +161252,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -161050,6 +161362,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -161552,6 +161865,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -161648,6 +161962,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162051,6 +162366,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162101,6 +162417,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162143,6 +162460,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162185,6 +162503,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162257,6 +162576,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162340,6 +162660,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162416,6 +162737,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162464,6 +162786,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162722,6 +163045,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162791,6 +163115,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162864,6 +163189,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -162934,6 +163260,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -163009,6 +163336,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -163088,6 +163416,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -163152,6 +163481,7 @@ mod tests {
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
                 working: None,
+                input_unanswered_ms: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
@@ -165700,6 +166030,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -165742,6 +166073,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -165831,6 +166163,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -165902,6 +166235,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -165955,6 +166289,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166310,6 +166645,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166364,6 +166700,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166429,6 +166766,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166497,6 +166835,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166563,6 +166902,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166623,6 +166963,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -166677,6 +167018,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -174945,6 +175287,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -174986,6 +175329,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -175789,6 +176133,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -175928,6 +176273,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             pty_cols: None,
             pty_rows: None,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -176175,6 +176521,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -177126,6 +177473,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -177195,6 +177543,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -177245,6 +177594,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -177418,6 +177768,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -178049,6 +178400,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -178131,6 +178483,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -178383,6 +178736,258 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             })
             .expect("live claude-code session row");
         assert!(sidebar_row_shows_busy_icon(&snapshot, row));
+    }
+    /// ⛔ EVERY WRITE TO `ShellState` MUST BE COUNTED, OR THE STORM AUTOPSY GOES
+    /// AMBIGUOUS AGAIN.
+    ///
+    /// The autopsy's `changed_fields` watches `SHELLSTATE_MUT_TOTAL`, so a write
+    /// shows up there — but only if the write path bumps it. When 485 of 615
+    /// write sites called `state.with_mut()` raw, an empty fingerprint could mean
+    /// *nothing wrote* OR *something wrote somewhere I cannot see*, and three
+    /// consecutive autopsies inside a real 21-minute storm died on exactly that
+    /// ambiguity.
+    ///
+    /// ⭐ **A source-level guard, deliberately.** The property that has to hold is
+    /// "no uncounted write exists ANYWHERE", which is a statement about the whole
+    /// file, not about one call — a behavioural test would pass while a newly
+    /// added raw write sat uncovered beside it. This is the shape that keeps the
+    /// discriminator true as the file grows.
+    #[test]
+    fn no_uncounted_raw_write_to_shell_state_survives_in_this_file() {
+        let source = include_str!("shell.rs");
+        // ⚠ Built from pieces so the needle does not appear literally in this
+        // file — a source-scanning test whose own pattern is scannable reports
+        // ITSELF, which is how this one first went red.
+        let needle = concat!("state", ".with_", "mut(");
+        let sanctioned_delegate = concat!("AssertUnwindSafe(|| state", ".with_", "mut(operation))");
+        let offenders: Vec<(usize, &str)> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim_start();
+                // Prose mentions are not writes.
+                !trimmed.starts_with("//")
+                    // `safe_shell_mut` and the counted trait each delegate to a
+                    // raw write AFTER counting it; they are the sanctioned two.
+                    && !trimmed.contains("self.with_mut(operation)")
+                    && !trimmed.contains(sanctioned_delegate)
+            })
+            .filter(|(_, line)| {
+                line.match_indices(needle).any(|(at, _)| {
+                    // Word boundary: `writable_state.with_mut(` is a DIFFERENT
+                    // signal and must not be caught. `_` is a word character, so
+                    // a preceding `_` or alphanumeric means this is not `state`.
+                    at == 0
+                        || !line[..at]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                })
+            })
+            .map(|(index, line)| (index + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "every write to ShellState must go through `with_mut_counted` (or \
+             `safe_shell_mut`), or the storm autopsy cannot tell 'nothing wrote' \
+             from 'something wrote where I cannot see'. Uncounted: {offenders:#?}"
+        );
+    }
+    /// ⛔ THE PROBE MAY NOT WRITE INTO A COMPOSER A HUMAN IS USING.
+    ///
+    /// The daemon-side twin was fixed in `b7b601b7`; this file kept a SECOND,
+    /// independent copy of the same loop, and `server app terminal submit` is an
+    /// app-control command handled by the GUI — so this copy is the one the
+    /// owner actually hits. Reported live 2026-08-14 as the viewport blinking
+    /// and being unable to type.
+    ///
+    /// ⭐ `None` is not permission. An unreadable composer is exactly where being
+    /// wrong costs somebody their sentence.
+    #[test]
+    fn the_probe_refuses_to_write_unless_the_composer_is_known_to_be_empty() {
+        assert!(
+            probe_write_is_permitted(Some(false)),
+            "a composer positively known to hold no draft is the ONLY case that \
+             authorises a write"
+        );
+        assert!(
+            !probe_write_is_permitted(Some(true)),
+            "a composer holding a human's unsent draft must refuse the probe — \
+             the probe's next act is a Ctrl+U, which erases that line"
+        );
+        assert!(
+            !probe_write_is_permitted(None),
+            "an UNREADABLE composer must refuse too: `None` means 'I do not know \
+             whether someone is mid-sentence', and guessing yes-write there is \
+             how the owner's keystrokes came back shredded"
+        );
+    }
+
+    /// ⛔ THE FLAT RETRY IS THE "VIEWPORT BLINKING" SYMPTOM, MEASURED AS A WRITE
+    /// COUNT.
+    ///
+    /// ⭐ Asserts on the WRITES, not on a verdict. A version that returns the
+    /// right enum after painting and wiping the composer a hundred times has
+    /// still produced the symptom — the damage IS the writes, so the writes are
+    /// what this counts.
+    #[test]
+    fn a_row_that_never_answers_is_written_to_about_a_dozen_times_not_a_hundred() {
+        let timeout = Duration::from_secs(30);
+        let mut elapsed = Duration::ZERO;
+        let mut backoff = TERMINAL_INPUT_PROBE_RETRY_MIN;
+        let mut writes = 0usize;
+        while elapsed < timeout {
+            // One iteration writes the marker and then clears it.
+            writes += 2;
+            elapsed += Duration::from_millis(180) + backoff;
+            backoff = probe_retry_backoff(backoff);
+        }
+        assert!(
+            writes <= 40,
+            "a 30 s probe against a silent row must cost about a dozen \
+             marker/clear pairs, not ~100. The flat 120 ms retry produced ~3 \
+             paint-and-wipe cycles a second, which is the blinking the owner \
+             reported. Writes: {writes}"
+        );
+        assert!(
+            backoff <= TERMINAL_INPUT_PROBE_RETRY_CEILING,
+            "the backoff must be bounded so the deadline is still honoured"
+        );
+    }
+
+    /// ⛔ THE GATE MUST BE CONSULTED BEFORE EVERY WRITE, AND THE RETRY MUST BACK
+    /// OFF — a structural guard, because the defect is a MISSING CALL.
+    ///
+    /// ⭐ The behavioural tests above lock what the gate MEANS; only a source
+    /// scan can lock that the loop still ASKS it. A probe that stopped calling
+    /// `probe_write_is_permitted` would pass both of them while typing over the
+    /// owner exactly as before, which is the whole failure being fixed here.
+    #[test]
+    fn every_probe_write_site_is_still_guarded_and_the_retry_still_backs_off() {
+        let source = include_str!("shell.rs");
+        let start = source
+            .find("async fn probe_terminal_input_consumption(")
+            .expect("the probe function must exist");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\nasync fn ")
+            .map(|at| at + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let guards = body.matches("probe_write_is_permitted").count();
+        assert!(
+            guards >= 2,
+            "the composer must be re-read and re-checked before EVERY write: \
+             once before the marker, and again before the Ctrl+U (the echo wait \
+             is 180 ms and a person can start typing inside it). Found {guards} \
+             guard call(s)"
+        );
+        assert!(
+            body.contains("sleep(retry_backoff)") && body.contains("probe_retry_backoff"),
+            "the retry must use the backing-off interval; a flat sleep here is \
+             the paint-and-wipe loop the owner sees as blinking"
+        );
+        assert!(
+            !body.contains("guard_draft"),
+            "refusing to type over a human is not a caller's option — the flag \
+             that let `SubmitTerminalPrompt` opt out is what caused the incident"
+        );
+    }
+
+    /// The owner's #1: a row that has stopped reading its PTY must stop looking
+    /// exactly like a healthy one.
+    ///
+    /// ⭐ Asserts BOTH halves in one test on purpose. The cheap way to make the
+    /// deaf-row half pass is to flag every row, which would paint the whole
+    /// sidebar amber and destroy the signal — so the control row (answering,
+    /// therefore NOT flagged) is what makes the positive assertion mean
+    /// anything. A detector that cannot say `false` has not been tested.
+    #[test]
+    fn sidebar_flags_a_row_that_was_typed_to_and_never_answered() {
+        let deaf_path = "remote-cc://dev/deaf";
+        let live_path = "remote-cc://dev/answering";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(deaf_path));
+
+        let mut deaf = test_live_shell_session(deaf_path);
+        deaf.id = "deaf".to_string();
+        deaf.title = "deaf row".to_string();
+        deaf.kind = SessionKind::ClaudeCode;
+        deaf.host_label = "dev".to_string();
+        deaf.source = SessionSource::LiveSsh;
+        deaf.terminal_foreground_active = Some(false);
+        // Idle-LOOKING and not working: this is precisely the row the sidebar
+        // used to render as plain `idle`, indistinguishable from a healthy one.
+        deaf.working = Some(false);
+        deaf.input_unanswered_ms = Some(yggterm_core::INPUT_UNANSWERED_WEDGE_SUSPECT_MS + 1);
+
+        // The control: same kind, same idle look, but it has answered.
+        let mut answering = test_live_shell_session(live_path);
+        answering.id = "answering".to_string();
+        answering.title = "healthy row".to_string();
+        answering.kind = SessionKind::ClaudeCode;
+        answering.host_label = "dev".to_string();
+        answering.source = SessionSource::LiveSsh;
+        answering.terminal_foreground_active = Some(false);
+        answering.working = Some(false);
+        answering.input_unanswered_ms = None;
+
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(deaf_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(deaf.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![
+                snapshot_session_view_for_ui(deaf),
+                snapshot_session_view_for_ui(answering),
+            ],
+            apps: Vec::new(),
+        });
+        shell.needs_initial_server_sync = false;
+
+        let snapshot = shell.snapshot();
+        let find = |path: &str| {
+            snapshot
+                .rows
+                .iter()
+                .find(|row| {
+                    normalize_live_session_path(&row.full_path)
+                        == normalize_live_session_path(path)
+                })
+                .unwrap_or_else(|| panic!("row for {path}"))
+        };
+        let deaf_row = find(deaf_path);
+        let answering_row = find(live_path);
+
+        assert!(
+            sidebar_row_input_unanswered(&snapshot, deaf_row),
+            "a row written to past the threshold with no answer must be flagged"
+        );
+        assert!(
+            !sidebar_row_input_unanswered(&snapshot, answering_row),
+            "a row that has answered must NOT be flagged — a detector that \
+             flags everything is not a detector"
+        );
+
+        // ⛔ And it must not be reported as BUSY. Answering the busy question
+        // with this signal would render the deaf row as working, which trades
+        // one wrong answer for another.
+        assert!(
+            !sidebar_row_shows_busy_icon(&snapshot, deaf_row),
+            "a deaf row is not working"
+        );
+
+        // DESIGN.md: amber, and STEADY — blink means working, and this row is
+        // the one thing certainly not working.
+        let amber =
+            live_session_status_dot_style_with_attention(palette(UiTheme::ZedDark), false, false, true);
+        assert!(amber.contains("#f59e0b"), "attention dot must be amber");
+        let blinking = status_dot_blink_opacity_css(true);
+        assert!(
+            !amber.contains(blinking.trim()),
+            "the attention dot must be steady, never blinking"
+        );
     }
     #[test]
     fn sidebar_busy_icon_marks_inactive_codex_working_status() {
@@ -178762,6 +179367,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -178800,6 +179406,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -179000,6 +179607,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -179200,6 +179808,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -179403,6 +180012,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -179610,6 +180220,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -179809,6 +180420,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -180008,6 +180620,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -180207,6 +180820,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -180245,6 +180859,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -180447,6 +181062,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -180647,6 +181263,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -180685,6 +181302,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -181410,6 +182028,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -183433,6 +184052,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -183658,6 +184278,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184389,6 +185010,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184430,6 +185052,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184638,6 +185261,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184700,6 +185324,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184830,6 +185455,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184925,6 +185551,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -184980,6 +185607,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186429,6 +187057,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186483,6 +187112,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: true,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186531,6 +187161,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186582,6 +187213,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186647,6 +187279,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186722,6 +187355,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186782,6 +187416,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -186957,6 +187592,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -187047,6 +187683,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -194217,7 +194854,7 @@ mod menu_dismissal_locks {
 
         for (menu, shell) in cases {
             with_live_shell(shell, |mut state| {
-                state.with_mut(|shell| {
+                state.with_mut_counted(|shell| {
                     shell.terminal_input_override_active = false;
                 });
                 assert_eq!(
@@ -194250,7 +194887,7 @@ mod menu_dismissal_locks {
     fn the_escape_terminus_refuses_a_menu_less_shell() {
         let (shell, _row) = shell_with_every_menu_available();
         with_live_shell(shell, |mut state| {
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.terminal_input_override_active = false;
             });
             assert_eq!(state.with(|shell| shell.top_menu()), None);
@@ -194275,7 +194912,7 @@ mod menu_dismissal_locks {
         shell.server.set_view_mode(WorkspaceViewMode::Rendered);
         shell.open_context_menu(row, (8.0, 9.0));
         with_live_shell(shell, |mut state| {
-            state.with_mut(|shell| {
+            state.with_mut_counted(|shell| {
                 shell.terminal_input_override_active = false;
             });
             assert!(dismiss_top_menu(state));

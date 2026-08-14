@@ -2103,6 +2103,19 @@ pub struct HotRestartBlocker {
     /// The idle window the session is being measured against.
     #[serde(default)]
     pub threshold_ms: u64,
+    /// How long this session has been WRITTEN TO without answering, when that
+    /// is outstanding at all. A large value beside a small `idle_ms` is the
+    /// signature of a row that has gone deaf: keystrokes are arriving and
+    /// nothing is coming back.
+    ///
+    /// ⚠ Suspicion, never a verdict — a child may legitimately consume input in
+    /// silence (echo off, a password prompt). It says where to point
+    /// `terminal input-check`, which settles it by marker and echo.
+    ///
+    /// `#[serde(default)]` = `None`, so an older daemon's blockers simply do not
+    /// carry the signal rather than claiming a row is answering.
+    #[serde(default)]
+    pub input_unanswered_ms: Option<u64>,
     /// `true` when waiting cannot clear this blocker — the session will still be
     /// unsafe to cold-kill in an hour, so a reader must not report it as "any
     /// moment now". Only [`HOT_RESTART_BLOCKER_NOT_RESTORABLE`] sets it.
@@ -3967,17 +3980,43 @@ impl DaemonRuntime {
     /// than pressing on, so a broken successor costs one session's worth of
     /// risk instead of all of them.
     #[cfg(target_os = "linux")]
-    fn hand_off_all_runtimes(&mut self, successor_version: &str) -> HandoffSweep {
+    fn hand_off_all_runtimes(&mut self, successor_version: &str) -> HandoffSweepOutcome {
         let keys = self.terminals.session_keys();
         let total = keys.len();
         if total == 0 {
-            return HandoffSweep::NoneMoved {
-                reason: "this daemon owns no live PTYs".to_string(),
-            };
+            return HandoffSweepOutcome::nothing_to_do("this daemon owns no live PTYs");
         }
+        // ⭐ STAND EVERY READER DOWN BEFORE THE FIRST DESCRIPTOR MOVES.
+        //
+        // Two things depend on this and they pull in opposite directions:
+        //
+        // - **Nothing is stolen.** Both processes hold the master for as long
+        //   as this daemon lives, and reads race: every chunk goes to exactly
+        //   one of them. A parked reader consumes nothing, so the bytes the
+        //   shell writes from here on wait in the kernel for the successor's
+        //   reader — they are not lost, and they are not raced for.
+        // - **We may therefore take our time.** Waiting for a successor to
+        //   survive is only safe once waiting costs the user nothing. Before
+        //   the park, a settle interval WAS a double-read interval, which is
+        //   why the old code could do no better than exit 250 ms after the
+        //   sweep.
+        //
+        // The screen each session carries as its seed is snapshotted after the
+        // park, so everything this daemon ever consumed travels with it.
+        let parked: Vec<(String, Arc<crate::terminal::ReaderPark>)> = keys
+            .iter()
+            .filter_map(|key| {
+                self.terminals
+                    .park_reader(key)
+                    .map(|park| (key.clone(), park))
+            })
+            .collect();
+        let stood_down = wait_for_parked_readers(&parked, READER_PARK_QUIESCE_MS);
         let socket =
             crate::pty_handoff::handoff_socket_path(self.store.home_dir(), successor_version);
         let mut moved = 0usize;
+        let mut moved_keys: Vec<String> = Vec::new();
+        let mut successor_identity = None::<(u32, u64)>;
         let mut first_failure = None::<String>;
         for key in keys {
             let Some(takeout) = self.terminals.handoff_takeout(&key) else {
@@ -3996,14 +4035,33 @@ impl DaemonRuntime {
                 screen: takeout.screen,
             };
             match crate::pty_handoff::send_session(&socket, &metadata, takeout.master_fd) {
-                Ok(()) => moved += 1,
+                Ok(ack) => {
+                    moved += 1;
+                    moved_keys.push(key.clone());
+                    successor_identity = ack.adopter_identity().or(successor_identity);
+                }
                 Err(error) => {
                     first_failure = Some(format!("{key}: {error}"));
                     break;
                 }
             }
         }
-        classify_handoff_sweep(total, moved, first_failure)
+        // Whatever did NOT move is still ours to serve, and a session nobody
+        // reads is a session that has stopped painting. Only the runtimes the
+        // successor now holds stay parked.
+        let (held, released): (Vec<_>, Vec<_>) = parked
+            .into_iter()
+            .partition(|(key, _)| moved_keys.contains(key));
+        for (_, park) in &released {
+            park.unpark();
+        }
+        HandoffSweepOutcome {
+            sweep: classify_handoff_sweep(total, moved, first_failure),
+            parked: held.into_iter().map(|(_, park)| park).collect(),
+            successor_identity,
+            stood_down,
+            resumed: released.len(),
+        }
     }
 
     /// Working flags for every live row, INCLUDING the ones this daemon only
@@ -4241,6 +4299,7 @@ impl DaemonRuntime {
                     kind: HOT_RESTART_BLOCKER_NOT_RESTORABLE.to_string(),
                     idle_ms: self.terminals.session_idle_for_ms(&runtime_path),
                     threshold_ms,
+                    input_unanswered_ms: self.terminals.input_unanswered_ms(&runtime_path),
                     permanent: true,
                 });
                 continue;
@@ -4261,6 +4320,7 @@ impl DaemonRuntime {
                     kind: HOT_RESTART_BLOCKER_ORCHESTRATING.to_string(),
                     idle_ms: self.terminals.session_idle_for_ms(&runtime_path),
                     threshold_ms,
+                    input_unanswered_ms: self.terminals.input_unanswered_ms(&runtime_path),
                     permanent: false,
                 });
                 continue;
@@ -4276,11 +4336,21 @@ impl DaemonRuntime {
                     kind: HOT_RESTART_BLOCKER_WORKING.to_string(),
                     idle_ms: self.terminals.session_idle_for_ms(&runtime_path),
                     threshold_ms,
+                    input_unanswered_ms: self.terminals.input_unanswered_ms(&runtime_path),
                     permanent: false,
                 });
                 continue;
             }
-            if let Some(idle_ms) = self.terminals.session_idle_for_ms(&runtime_path)
+            // ⛔ OUTPUT idle, not the conflated activity field. `idle_ms` is
+            // documented as "how long since this session last produced output"
+            // and used to read a timestamp the WRITER also stamps — so a row
+            // that had stopped reading its PTY reported near-zero idle for as
+            // long as someone kept typing at it, and blocked the deploy that
+            // would have cleared it. Being typed AT is not being in use.
+            // A drafted input line is protected separately and deliberately
+            // (`session_has_pending_input_draft`), so this does not expose an
+            // unsent prompt.
+            if let Some(idle_ms) = self.terminals.session_output_idle_for_ms(&runtime_path)
                 && idle_ms < threshold_ms
             {
                 blockers.push(HotRestartBlocker {
@@ -4288,6 +4358,7 @@ impl DaemonRuntime {
                     kind: HOT_RESTART_BLOCKER_RECENTLY_ACTIVE.to_string(),
                     idle_ms: Some(idle_ms),
                     threshold_ms,
+                    input_unanswered_ms: self.terminals.input_unanswered_ms(&runtime_path),
                     permanent: false,
                 });
             }
@@ -4474,6 +4545,13 @@ impl DaemonRuntime {
         session.terminal_foreground_active = self
             .terminals
             .session_foreground_process_active(&runtime_path);
+        // ⛔ EVERY KIND, and deliberately ABOVE the screen-scraping branch below.
+        // Going deaf is a property of the PTY, not of the screen — a row that has
+        // stopped reading is exactly the row whose screen has stopped changing, so
+        // gating this on "has a screen worth scraping" would hide it precisely
+        // when it matters. It is also the cheapest read here: two atomics, no
+        // screen snapshot, no process walk.
+        session.input_unanswered_ms = self.terminals.input_unanswered_ms(&runtime_path);
         // Observability (grid-squish): the PTY grid the running program sees, so a
         // squish (PTY grid < client xterm grid) is directly measurable in `server snapshot`.
         if let Some((cols, rows)) = self.terminals.session_size(&runtime_path) {
@@ -8040,7 +8118,7 @@ impl DaemonRuntime {
                     if pty_fd_handoff_enabled()
                         && let Some(successor) = live_successor_version.as_deref()
                     {
-                        let sweep = self.hand_off_all_runtimes(successor);
+                        let outcome = self.hand_off_all_runtimes(successor);
                         append_trace_event(
                             self.store.home_dir(),
                             "daemon",
@@ -8048,53 +8126,30 @@ impl DaemonRuntime {
                             "pty_fd_handoff_sweep",
                             serde_json::json!({
                                 "successor_version": successor,
-                                "outcome": format!("{sweep:?}"),
+                                "outcome": format!("{:?}", outcome.sweep),
+                                "readers_stood_down": outcome.stood_down,
+                                "readers_resumed": outcome.resumed,
                                 "pid": std::process::id(),
                             }),
                         );
-                        if let HandoffSweep::AllMoved { .. } = sweep {
-                            // ⭐ The same bequest as the superseded-retire sweep,
-                            // and for the same reason: this daemon's version name
-                            // is about to stop answering, and the successor is the
-                            // only thing that can carry it.
+                        if !outcome.parked.is_empty() {
+                            // ⛔ Accepting is not surviving. The watch holds our
+                            // descriptors — parked, serving nothing — until the
+                            // successor has lived out its settle window, and
+                            // wakes every reader again if it has not. Its own
+                            // thread, so this request's response still reaches
+                            // the caller.
+                            //
                             // `default_endpoint` IS this daemon's version-named
                             // socket — the one owner of "which socket am I", so
-                            // the bequest cannot name a different file from the
-                            // one we are about to release.
-                            let aliased = alias_own_socket_to_successor(
-                                self.store.home_dir(),
-                                &default_endpoint(self.store.home_dir()),
+                            // the bequest it eventually makes cannot name a
+                            // different file from the one we release.
+                            spawn_handoff_settle_watch(
+                                self.store.home_dir().to_path_buf(),
+                                default_endpoint(self.store.home_dir()),
+                                successor.to_string(),
+                                outcome,
                             );
-                            append_trace_event(
-                                self.store.home_dir(),
-                                "daemon",
-                                "lifecycle",
-                                "retiring_daemon_aliased_own_socket",
-                                serde_json::json!({
-                                    "successor_version": successor,
-                                    "successor_socket": aliased
-                                        .as_ref()
-                                        .map(|path| path.display().to_string()),
-                                    "aliased": aliased.is_some(),
-                                    "server_version": SERVER_PROTOCOL_VERSION,
-                                    "pid": std::process::id(),
-                                }),
-                            );
-                            // The successor holds every descriptor now. The ONLY
-                            // safe way to release ours is to EXIT: dropping
-                            // runtimes individually leaves their reader threads
-                            // holding cloned masters, and two daemons reading one
-                            // PTY means the shell never sees EOF. Exiting does not
-                            // signal the children — they re-parent to init, which
-                            // is what the spike proved.
-                            //
-                            // Delayed so this request's response still reaches the
-                            // caller; the descriptors are already gone, so nothing
-                            // is racing for them.
-                            std::thread::spawn(|| {
-                                std::thread::sleep(std::time::Duration::from_millis(250));
-                                std::process::exit(0);
-                            });
                         }
                     }
                     return Ok(ServerResponse::HotUpdateHandoff {
@@ -9744,7 +9799,7 @@ impl DaemonRuntime {
                 let initial_size = initial_cols
                     .zip(initial_rows)
                     .or_else(|| self.server.session_pty_grid(&path));
-                self.terminals.restart_session_with_size(
+                let restart_outcome = self.terminals.restart_session_with_size(
                     &runtime_path,
                     &launch_command,
                     cwd.as_deref(),
@@ -9764,8 +9819,14 @@ impl DaemonRuntime {
                         self.preserved_terminal_owners.entries.is_empty(),
                     );
                 }
+                // `replaced_existing=false` says the restart shut NOTHING down —
+                // the row's real owner is elsewhere (another daemon, or an
+                // orphaned key), so the process that was serving it is still
+                // alive. Without this the reply reads "restarted" either way,
+                // which is what let a wedged row survive its own remedy.
                 self.snapshot_response(Some(format!(
-                    "restarted {path}; launch_refreshed={launch_refreshed}; recovered_remote_scan={recovered_remote_scan}; force_remote={force_remote}"
+                    "restarted {path}; launch_refreshed={launch_refreshed}; recovered_remote_scan={recovered_remote_scan}; force_remote={force_remote}; replaced_existing={}",
+                    restart_outcome.replaced_existing
                 )))
             }
             ServerRequest::SyncExternalWindow => {
@@ -12268,7 +12329,7 @@ fn spawn_superseded_self_retire_sweep(
                 let Some(successor) = live_newer_daemon_version(&home_dir, &endpoint) else {
                     continue;
                 };
-                let sweep = {
+                let outcome = {
                     let mut rt = lock_daemon_runtime(&runtime, "superseded_self_retire");
                     // Nothing to move: the idle-shutdown path owns that case,
                     // and it can reach it now that we hold no sessions.
@@ -12284,39 +12345,273 @@ fn spawn_superseded_self_retire_sweep(
                     "superseded_self_retire_sweep",
                     serde_json::json!({
                         "successor_version": successor,
-                        "outcome": format!("{sweep:?}"),
+                        "outcome": format!("{:?}", outcome.sweep),
+                        "readers_stood_down": outcome.stood_down,
+                        "readers_resumed": outcome.resumed,
                         "server_version": SERVER_PROTOCOL_VERSION,
                         "pid": std::process::id(),
                     }),
                 );
-                if let HandoffSweep::AllMoved { .. } = sweep {
-                    // ⭐ Bequeath our NAME before we stop answering to it, or
-                    // every client pinned to this version strands the moment we
-                    // exit. This is the only place both names are known.
-                    let aliased = alias_own_socket_to_successor(&home_dir, &endpoint);
-                    append_trace_event(
-                        &home_dir,
-                        "daemon",
-                        "lifecycle",
-                        "retiring_daemon_aliased_own_socket",
-                        serde_json::json!({
-                            "successor_version": successor,
-                            "successor_socket": aliased
-                                .as_ref()
-                                .map(|path| path.display().to_string()),
-                            "aliased": aliased.is_some(),
-                            "server_version": SERVER_PROTOCOL_VERSION,
-                            "pid": std::process::id(),
-                        }),
+                if !outcome.parked.is_empty() {
+                    // ⛔ We do NOT exit here. The descriptors moved, but the
+                    // successor has only ACCEPTED them — see
+                    // [`spawn_handoff_settle_watch`], which lets go once it has
+                    // also SURVIVED, and wakes our readers if it has not.
+                    //
+                    // Watched on a PARTIAL sweep too: those runtimes are parked
+                    // whether or not the rest moved, and a park nobody watches
+                    // is a session that has silently stopped painting.
+                    spawn_handoff_settle_watch(
+                        home_dir.clone(),
+                        endpoint.clone(),
+                        successor.clone(),
+                        outcome,
                     );
-                    // The successor holds every descriptor. Exiting is the only
-                    // way to release ours — dropping runtimes individually
-                    // leaves reader threads on cloned masters, and two daemons
-                    // reading one PTY means the shell never sees EOF.
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                    std::process::exit(0);
+                    // Keep polling rather than returning: a settle that FAILS
+                    // leaves this daemon serving every session again, and a
+                    // daemon that has stopped asking whether it may retire is
+                    // exactly the immortal daemon this thread exists to end.
+                    continue;
                 }
             }
+        });
+}
+
+/// Everything one sweep leaves behind: what it concluded, the readers it stood
+/// down, and who it handed them to.
+///
+/// The parks are the load-bearing half. They are the predecessor's only way
+/// back: if the successor named here does not survive its settle interval,
+/// waking them restores a fully serving daemon, because nothing was ever
+/// dropped — only silenced.
+#[cfg(target_os = "linux")]
+pub(crate) struct HandoffSweepOutcome {
+    pub sweep: HandoffSweep,
+    /// One per runtime the successor now holds. Empty on every path that moved
+    /// nothing, so releasing them is unconditional and cannot be forgotten.
+    pub parked: Vec<Arc<crate::terminal::ReaderPark>>,
+    /// The adopting process, as `(pid, start_time)`. `None` from a successor
+    /// too old to name itself — the settle then falls back to asking whether a
+    /// daemon of that version still answers.
+    pub successor_identity: Option<(u32, u64)>,
+    /// How many readers were observed standing down before the first fd moved.
+    /// Not necessarily all of them: a session whose pty already died has no
+    /// reader left to answer, and blocking for one would hang the sweep.
+    pub stood_down: usize,
+    /// Readers woken again because their runtime did not move.
+    pub resumed: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl HandoffSweepOutcome {
+    fn nothing_to_do(reason: &str) -> Self {
+        Self {
+            sweep: HandoffSweep::NoneMoved {
+                reason: reason.to_string(),
+            },
+            parked: Vec::new(),
+            successor_identity: None,
+            stood_down: 0,
+            resumed: 0,
+        }
+    }
+
+    fn all_moved(&self) -> bool {
+        matches!(self.sweep, HandoffSweep::AllMoved { .. })
+    }
+
+    /// Bytes consumed after the park was requested, across every reader that
+    /// moved. Expected to be zero; reported rather than trusted.
+    fn stolen_after_park(&self) -> u64 {
+        self.parked.iter().map(|park| park.stolen_after_park()).sum()
+    }
+}
+
+/// How long a sweep waits for its readers to reach the gate before it starts
+/// moving descriptors. A reader blocked in `poll` answers in microseconds; this
+/// is the allowance for a machine under load, and it is an upper bound rather
+/// than a sleep — the wait returns as soon as every live reader has stood down.
+#[cfg(target_os = "linux")]
+const READER_PARK_QUIESCE_MS: u64 = 100;
+
+/// Poll the parked readers until they have all stood down, or the allowance
+/// runs out. Returns how many were observed.
+///
+/// ⛔ **Never waits for a reader that cannot answer.** A runtime whose pty
+/// already exited has no reader thread left, so "all of them" is not a
+/// reachable condition and a wait keyed to it would hang the whole retirement.
+#[cfg(target_os = "linux")]
+fn wait_for_parked_readers(
+    parked: &[(String, Arc<crate::terminal::ReaderPark>)],
+    allowance_ms: u64,
+) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(allowance_ms);
+    loop {
+        let stood_down = parked
+            .iter()
+            .filter(|(_, park)| park.has_stood_down())
+            .count();
+        if stood_down == parked.len() || std::time::Instant::now() >= deadline {
+            return stood_down;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// How long a successor must stay alive before the predecessor lets go.
+///
+/// ⛔ **This interval is the fix for a two-second window that destroyed seven
+/// agent sessions on 2026-08-13.** The predecessor used to exit 250 ms after
+/// the last descriptor moved, so it released on the successor's ACCEPTANCE and
+/// never on its SURVIVAL: anything that killed the young successor left no
+/// process holding anything, and the sessions were unrecoverable rather than
+/// merely stale.
+///
+/// It can afford to be generous only because the readers are parked
+/// ([`crate::terminal::ReaderPark`]). Before that, waiting meant two daemons
+/// reading one pty for the whole interval.
+#[cfg(target_os = "linux")]
+fn handoff_settle_window() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("YGGTERM_HANDOFF_SETTLE_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(10_000),
+    )
+}
+
+/// Whether the process that took our descriptors is still there.
+///
+/// Identity, not liveness-by-name: a pid alone can be reused, and "some daemon
+/// answers on that version's socket" can be a DIFFERENT daemon that does not
+/// hold our sessions. The `(pid, start_time)` pair is the same identity rule
+/// [`crate::pty_adoption`] applies to an adopted child.
+#[cfg(target_os = "linux")]
+fn successor_still_holding(identity: Option<(u32, u64)>, server_socket: &Path) -> bool {
+    match identity {
+        Some((pid, start_time)) => {
+            crate::pty_adoption::process_start_time(pid) == Some(start_time)
+        }
+        // A successor too old to name itself. Weaker — it proves only that a
+        // daemon of that version is answering, not that it is the same one —
+        // but it still catches what this mechanism exists for: the successor
+        // is gone.
+        //
+        // ⛔ Asked of the REQUEST socket, never the handoff socket. A bare
+        // connect to the handoff listener is an empty handoff, which the
+        // successor dutifully refuses and TRACES — one `pty_handoff_refused`
+        // per probe, an error line per second for a daemon that is healthy.
+        None => status(&ServerEndpoint::UnixSocket(server_socket.to_path_buf())).is_ok(),
+    }
+}
+
+/// The version-named request socket a daemon of `version` answers on.
+#[cfg(target_os = "linux")]
+fn versioned_server_socket_path(home_dir: &Path, version: &str) -> PathBuf {
+    home_dir.join(format!("server-{}.sock", version.replace('.', "-")))
+}
+
+/// Hold the descriptors until the successor has SURVIVED, then let go.
+///
+/// Runs on its own thread because both callers hold the daemon runtime lock and
+/// one of them is answering a request. Exits the process on success — that is
+/// still the only way to release our copies of the masters — and on failure
+/// wakes every parked reader, which turns this daemon back into a fully serving
+/// one with nothing lost.
+#[cfg(target_os = "linux")]
+fn spawn_handoff_settle_watch(
+    home_dir: PathBuf,
+    own_endpoint: ServerEndpoint,
+    successor_version: String,
+    outcome: HandoffSweepOutcome,
+) {
+    let _ = std::thread::Builder::new()
+        .name("yggterm-handoff-settle".to_string())
+        .spawn(move || {
+            let successor_socket = versioned_server_socket_path(&home_dir, &successor_version);
+            let window = handoff_settle_window();
+            let started = std::time::Instant::now();
+            let mut died_after_ms = None::<u128>;
+            while started.elapsed() < window {
+                if !successor_still_holding(outcome.successor_identity, &successor_socket) {
+                    died_after_ms = Some(started.elapsed().as_millis());
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            let settled = died_after_ms.is_none();
+            append_trace_event(
+                &home_dir,
+                "daemon",
+                "lifecycle",
+                "handoff_settle_window",
+                serde_json::json!({
+                    "successor_version": successor_version,
+                    "successor_pid": outcome.successor_identity.map(|(pid, _)| pid),
+                    "successor_identified": outcome.successor_identity.is_some(),
+                    "settled": settled,
+                    "window_ms": window.as_millis(),
+                    "waited_ms": started.elapsed().as_millis(),
+                    "died_after_ms": died_after_ms,
+                    "runtimes_held": outcome.parked.len(),
+                    "readers_stood_down": outcome.stood_down,
+                    // The park's own race, measured. Nonzero means a chunk that
+                    // belonged to the successor was consumed here instead, and
+                    // is a hole in that session's transcript.
+                    "bytes_stolen_after_park": outcome.stolen_after_park(),
+                    "all_moved": outcome.all_moved(),
+                    "server_version": SERVER_PROTOCOL_VERSION,
+                    "pid": std::process::id(),
+                }),
+            );
+            if !settled {
+                // ⭐ THE WHOLE POINT: nothing was dropped, only silenced. Waking
+                // the readers restores a daemon that owns and serves every one
+                // of these sessions, which is what the seven destroyed rows of
+                // 2026-08-13 needed and did not have.
+                for park in &outcome.parked {
+                    park.unpark();
+                }
+                return;
+            }
+            if !outcome.all_moved() {
+                // ⛔ A PARTIAL sweep that settles. The successor is alive and
+                // holds part of this daemon's sessions, so those readers stay
+                // parked — but this daemon still owns the rest and MUST NOT
+                // exit, because exiting would close their masters. It keeps
+                // serving what it kept, split across two owners, exactly as
+                // [`HandoffSweep::Partial`] requires.
+                //
+                // The watch exists for these runtimes too: without it, a
+                // successor that died would leave them parked for ever, which
+                // is a live session that has silently stopped painting.
+                return;
+            }
+            // ⭐ Bequeath our NAME before we stop answering to it, or every
+            // client pinned to this version strands the moment we exit. Done
+            // here rather than before the settle: while we might still have to
+            // come back, our own socket has to keep pointing at us.
+            let aliased = alias_own_socket_to_successor(&home_dir, &own_endpoint);
+            append_trace_event(
+                &home_dir,
+                "daemon",
+                "lifecycle",
+                "retiring_daemon_aliased_own_socket",
+                serde_json::json!({
+                    "successor_version": successor_version,
+                    "successor_socket": aliased.as_ref().map(|path| path.display().to_string()),
+                    "aliased": aliased.is_some(),
+                    "server_version": SERVER_PROTOCOL_VERSION,
+                    "pid": std::process::id(),
+                }),
+            );
+            // The successor holds every descriptor and has proved it can keep
+            // them. Exiting is the only way to release ours — dropping runtimes
+            // individually leaves reader threads on cloned masters, and two
+            // daemons reading one PTY means the shell never sees EOF. Exiting
+            // does not signal the children: they re-parent to init.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            std::process::exit(0);
         });
 }
 
@@ -12429,6 +12724,24 @@ fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntim
                             Some(metadata.screen.as_str()),
                         ) {
                             Ok(()) => {
+                                // ⛔⛔ PERSIST NOW, NOT ON THE NEXT ROUTINE TICK.
+                                // During a handover the PREDECESSOR's routine
+                                // persistence is muted for ever
+                                // (`superseded_routine_persist_muted`, so it
+                                // cannot clobber the successor's state file),
+                                // and the successor has not yet reached a tick.
+                                // ⇒ there is a window in which NO process on
+                                // the host will write the session state, and it
+                                // is exactly the window where every runtime is
+                                // in flight. Measured 2026-08-13: a successor
+                                // adopted 38 runtimes and was signalled 16 s
+                                // later; **seven agent sessions resolved to
+                                // nothing afterwards** because neither daemon
+                                // had recorded them. A row that was written
+                                // down can be re-resumed — that is what the
+                                // manual `resume-cc --require-existing`
+                                // recovery proved.
+                                let persisted = rt.persist_state_only().is_ok();
                                 append_trace_event(
                                     &home_dir,
                                     "daemon",
@@ -12440,6 +12753,10 @@ fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntim
                                         "cols": metadata.cols,
                                         "rows": metadata.rows,
                                         "screen_bytes": metadata.screen.len(),
+                                        // A failure here means the row is live
+                                        // but unrecoverable, which is worth
+                                        // seeing before someone kills a daemon.
+                                        "persisted": persisted,
                                     }),
                                 );
                                 (true, None)
@@ -12458,10 +12775,18 @@ fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntim
                         serde_json::json!({ "error": reason }),
                     );
                 }
-                let _ = crate::pty_handoff::send_ack(
-                    &stream,
-                    &crate::pty_handoff::HandoffAck { adopted, error },
-                );
+                // ⭐ The ack NAMES this daemon when it adopts. The predecessor
+                // is about to wait for a successor to survive, and "a live
+                // daemon of the right version" is not the same claim as "the
+                // process that took my descriptors is still there".
+                let ack = if adopted {
+                    crate::pty_handoff::HandoffAck::adopted_here()
+                } else {
+                    crate::pty_handoff::HandoffAck::refused(
+                        error.unwrap_or_else(|| "no reason given".to_string()),
+                    )
+                };
+                let _ = crate::pty_handoff::send_ack(&stream, &ack);
             }
         })
         .ok();
@@ -14895,6 +15220,7 @@ fn spawn_disk_binary_version_poll(
         // the trace: every 15th poll ≈ 5 minutes. Not silence — a stale daemon must
         // stay mineable — just not one identical line every 20 seconds forever.
         const SETTLED_DEFERRAL_HEARTBEAT_EVERY_N_POLLS: u32 = 15;
+        let mut no_successor_polls: u32 = 0;
         let mut stale_sweep_countdown = STALE_SWEEP_EVERY_N_POLLS;
         // Deferral bookkeeping: the reason we last WROTE, how many polls we have
         // deferred in total, and how many we have skipped writing since.
@@ -14974,6 +15300,58 @@ fn spawn_disk_binary_version_poll(
             } else if newer_daemon_version.is_some() {
                 "newer_daemon_live"
             } else {
+                // ⭐ NOBODY SUPERSEDES US — SO A MUTE SET EARLIER IS STALE, AND
+                // CLEARING IT HERE IS THE ONLY PLACE THAT CAN KNOW.
+                //
+                // `superseded_routine_persist_muted` is a HARD latch: once a
+                // newer daemon was seen, this daemon stops writing
+                // `server-state.json` for ever, so its stale view can never
+                // clobber the successor's file. Right — while the successor
+                // lives.
+                //
+                // ⛔ It becomes wrong the moment the successor does not. The
+                // handoff settle window (see [`spawn_handoff_settle_watch`])
+                // now hands the sessions BACK when a successor dies young: this
+                // daemon wakes its readers and is once again the only process
+                // serving them — and, latched, the only process that will never
+                // record them. Nothing on the host then writes their state, and
+                // a row that is live but unrecorded dies unrecoverably the
+                // moment anything signals its holder. That is precisely the
+                // condition immediate-persist-on-adoption was written to end,
+                // reappearing from the other side.
+                //
+                // This branch is reached only when the ONE owner of "who
+                // supersedes me" has just answered *nobody* — the same prober,
+                // in the same loop, that sets the latch a few lines below. So
+                // the latch is set and cleared by one authority, in one place,
+                // from one question, which is the only way the two answers
+                // cannot drift apart.
+                no_successor_polls = no_successor_polls.saturating_add(1);
+                {
+                    let mut rt = lock_daemon_runtime(&runtime, "superseded_persist_unmute");
+                    if should_clear_stale_persist_mute(
+                        rt.superseded_routine_persist_muted,
+                        no_successor_polls,
+                    ) {
+                        rt.superseded_routine_persist_muted = false;
+                        drop(rt);
+                        append_trace_event(
+                            &home_dir,
+                            "daemon",
+                            "lifecycle",
+                            "superseded_routine_persist_unmuted",
+                            serde_json::json!({
+                                "clear_polls": no_successor_polls,
+                                "current_version": SERVER_PROTOCOL_VERSION,
+                                "current_pid": std::process::id(),
+                                // Says WHY, not just that it happened: this
+                                // daemon is serving sessions again and had been
+                                // silently unable to write them down.
+                                "reason": "no newer daemon is live; this daemon owns its sessions again",
+                            }),
+                        );
+                    }
+                }
                 // We are the CURRENT daemon. Size-war lesson (2026-06-12): the
                 // startup-only takeover/retire leaves a stale OLDER daemon
                 // that survives that window (idle-gate defer) free to churn
@@ -15002,6 +15380,11 @@ fn spawn_disk_binary_version_poll(
                 }
                 continue;
             };
+            // A successor IS live (or our binary was replaced), so the run of
+            // clear polls is broken. Reset here rather than inside the mute
+            // block: the count is about what this poll SAW, not about what the
+            // latch happens to be.
+            no_successor_polls = 0;
             {
                 // GATE #8: a strictly newer daemon owns server-state.json from
                 // here on — mute this daemon's routine persists so its stale
@@ -15711,6 +16094,69 @@ static HOT_RESTART_SWAP_LANE_SETTLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 static HOT_RESTART_SWAP_LAST_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
 
+/// The version THIS process handed off to, remembered locally. `None` = we have
+/// never handed off.
+///
+/// ⛔⛔ THE MEMORY ABOVE COULD ONLY EVER BE SET BY READING THE FILE, WHICH IS THE
+/// ONE THING A PEER DELETES. `HOT_RESTART_SWAP_LANE_SETTLED`'s own comment
+/// predicts this failure exactly — *"reading its absence as 'nothing has
+/// happened yet' is how clearing the entry would make this daemon start asking
+/// for a brand-new swap on the very next poll, forever"* — but the only path
+/// that SET it ran inside `if let Some(queued)`, so a predecessor whose entry
+/// had already been cleared could never reach it. The guard against forgetting
+/// was itself reachable only through the thing that gets forgotten.
+///
+/// ⇒ Measured on dev 2026-08-14: one 3.0.151 daemon emitted **160
+/// `daemon_self_retire` polls, 11 handoffs and 11 fresh successor daemons in 53
+/// minutes** — one every five minutes, indefinitely — because each successor
+/// recognised itself as satisfying the queued entry and cleared the shared file
+/// (`satisfied_by: "self"`) before its predecessor's next poll could see it
+/// satisfied. The predecessor re-queued, spawned another successor, which
+/// cleared it again. **The generator, and the reason a daemon population grows
+/// on a host with no deploys at all.**
+///
+/// ⚠ It is also what disarms the cold-shutdown guard: `queued.is_some()` is the
+/// only thing keeping a preserved PTY owner out of the path that kills its PTY
+/// children, and that is the same deleted file.
+#[cfg(target_os = "linux")]
+static HOT_RESTART_SWAP_LOCAL_TARGET: Mutex<Option<String>> = Mutex::new(None);
+
+/// What this process handed off to, if anything.
+#[cfg(target_os = "linux")]
+fn hot_restart_swap_local_target() -> Option<String> {
+    HOT_RESTART_SWAP_LOCAL_TARGET
+        .lock()
+        .ok()
+        .and_then(|target| target.clone())
+}
+
+/// Should `incoming` replace what we already remember?
+///
+/// Pure, so it can be tested without mutating the process-global above — a test
+/// that wrote the real static would make every neighbour that reads it flaky,
+/// which is the same hazard the pty tests hold `env_test_guard` for.
+///
+/// Keep the HIGHEST target ever asked for: a later handoff aims at a newer
+/// build, and converging on the older one would report a swap satisfied while
+/// the newer request it was replaced by is still unanswered.
+#[cfg(target_os = "linux")]
+fn hot_restart_swap_target_supersedes(existing: Option<&str>, incoming: &str) -> bool {
+    match existing {
+        Some(existing) => hot_restart_queue::target_satisfied_by(existing, incoming),
+        None => true,
+    }
+}
+
+/// Remember the target across the file being cleared by anyone else.
+#[cfg(target_os = "linux")]
+fn remember_hot_restart_swap_target(target_version: &str) {
+    if let Ok(mut slot) = HOT_RESTART_SWAP_LOCAL_TARGET.lock()
+        && hot_restart_swap_target_supersedes(slot.as_deref(), target_version)
+    {
+        *slot = Some(target_version.to_string());
+    }
+}
+
 /// §5's clock: when this daemon's retire was FIRST held by a blocker. Zero = never.
 ///
 /// Set at the gate, not at the retire trigger, because that is what the ruling
@@ -15852,6 +16298,8 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
                     let write_path = runtime_path.clone();
                     let snapshot_runtime = Arc::clone(&runtime);
                     let snapshot_path = runtime_path.clone();
+                    let draft_runtime = Arc::clone(&runtime);
+                    let draft_path = runtime_path.clone();
                     let outcome = crate::terminal::submit_prompt_echo_verified_with(
                         move |text| {
                             // Locked per WRITE, released before every sleep —
@@ -15864,6 +16312,14 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
                             lock_daemon_runtime(&snapshot_runtime, "hot_restart_repair_snapshot")
                                 .terminals
                                 .session_screen_snapshot(&snapshot_path)
+                        },
+                        // §5's repair is the LAST thing that may stomp a human:
+                        // it fires on a just-re-resumed row, which is exactly
+                        // when someone is most likely to be typing at it.
+                        move || {
+                            lock_daemon_runtime(&draft_runtime, "hot_restart_repair_draft")
+                                .terminals
+                                .session_has_pending_input_draft(&draft_path)
                         },
                         "continue",
                         HOT_RESTART_REPAIR_SUBMIT_TIMEOUT,
@@ -15879,6 +16335,8 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
                                 Ok(crate::terminal::PromptSubmitOutcome::Submitted { .. }) => "submitted",
                                 Ok(crate::terminal::PromptSubmitOutcome::NotReady { .. }) => "not_ready",
                                 Ok(crate::terminal::PromptSubmitOutcome::NoSession) => "no_session",
+                                Ok(crate::terminal::PromptSubmitOutcome::HumanTyping { .. }) =>
+                                    "human_typing",
                                 Err(_) => "error",
                             },
                             "error": outcome.as_ref().err().map(|error| error.to_string()),
@@ -15886,9 +16344,15 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
                             "current_pid": std::process::id(),
                         }),
                     );
+                    // ⛔ `HumanTyping` requeues exactly like `NotReady`, and for
+                    // the same reason: NOTHING was written, so the record is not
+                    // spent and dropping it would lose the repair outright.
+                    // Deferring to the person at the keyboard must cost them
+                    // nothing.
                     if matches!(
                         outcome,
                         Ok(crate::terminal::PromptSubmitOutcome::NotReady { .. })
+                            | Ok(crate::terminal::PromptSubmitOutcome::HumanTyping { .. })
                     ) {
                         unsubmitted.push(session_key);
                     }
@@ -15929,7 +16393,18 @@ fn hot_restart_swap_step(
         return SwapStep::Lingering;
     }
     let queued = hot_restart_queue::load(home_dir);
-    if let Some(queued) = queued.as_ref() {
+    // ⛔ THE TARGET COMES FROM THE FILE **OR** FROM THIS PROCESS'S OWN MEMORY,
+    // and the memory is not a cache of the file — it is the half that survives a
+    // peer deleting it. The successor clears the entry the moment it recognises
+    // itself as satisfying it, which is routinely BEFORE its predecessor's next
+    // 20 s poll; asking only the file then answers "you never handed off" to a
+    // daemon that did, and it hands off again. See HOT_RESTART_SWAP_LOCAL_TARGET.
+    let local_target = hot_restart_swap_local_target();
+    let convergence_target = queued
+        .as_ref()
+        .map(|queued| queued.target_version.clone())
+        .or_else(|| local_target.clone());
+    if let Some(target) = convergence_target.as_deref() {
         // ⛔ The CHEAP probe, not a roster sweep. `live_newer_daemon_version`
         // filters on socket FILENAMES first, so this is 0-2 status calls rather
         // than one per daemon — and this loop plus the migration drain were
@@ -15937,7 +16412,7 @@ fn hot_restart_swap_step(
         let live_newer = live_newer_daemon_version(home_dir, endpoint);
         let satisfied = live_newer
             .as_deref()
-            .is_some_and(|live| hot_restart_queue::satisfied_by(queued, live));
+            .is_some_and(|live| hot_restart_queue::target_satisfied_by(target, live));
         if satisfied {
             append_trace_event(
                 home_dir,
@@ -15945,10 +16420,16 @@ fn hot_restart_swap_step(
                 "lifecycle",
                 "hot_restart_swap_queue_satisfied",
                 serde_json::json!({
-                    "target_version": queued.target_version,
+                    "target_version": target,
+                    // ⭐ WHICH HALF ANSWERED. When this reads "process_memory"
+                    // the entry was already gone and the old code would have
+                    // spawned another successor here instead of converging.
+                    "target_source": if queued.is_some() { "queue_file" } else { "process_memory" },
                     "live_successor_version": live_newer,
-                    "attempts": queued.attempts,
-                    "waited_ms": now_ms.saturating_sub(queued.requested_at_ms),
+                    "attempts": queued.as_ref().map(|queued| queued.attempts),
+                    "waited_ms": queued
+                        .as_ref()
+                        .map(|queued| now_ms.saturating_sub(queued.requested_at_ms)),
                     "current_version": SERVER_PROTOCOL_VERSION,
                     "current_pid": std::process::id(),
                 }),
@@ -15957,9 +16438,11 @@ fn hot_restart_swap_step(
             HOT_RESTART_SWAP_LANE_SETTLED.store(true, Ordering::Relaxed);
             return SwapStep::Converged;
         }
-        if !hot_restart_queue::attempt_is_due(queued, now_ms, HOT_RESTART_SWAP_RETRY_INTERVAL_MS) {
-            return SwapStep::Lingering;
-        }
+    }
+    if let Some(queued) = queued.as_ref()
+        && !hot_restart_queue::attempt_is_due(queued, now_ms, HOT_RESTART_SWAP_RETRY_INTERVAL_MS)
+    {
+        return SwapStep::Lingering;
     }
     // The process-local floor, checked whatever the file says — including when
     // the file is absent, which is the state a peer's convergence leaves behind.
@@ -15999,10 +16482,21 @@ fn hot_restart_swap_step(
     }
     match attempt_self_retire_preserving_handoff(endpoint, home_dir, exe_link, owned) {
         Some(handoff) => {
+            if let Some(target_version) = handoff.target_version.as_deref() {
+                remember_hot_restart_swap_target(target_version);
+            }
             queue_self_retire_swap(home_dir, &handoff, retire_trigger, now_ms);
             SwapStep::HandedOff
         }
-        None if queued.is_some() => SwapStep::Lingering,
+        // ⛔⛔ THE SAFETY PROPERTY IN `SwapStep`'s DOC COMMENT LIVES ON THIS LINE:
+        // a daemon that has already handed off is a preserved PTY owner, and
+        // dropping it into the cold path would kill the very PTYs the handoff
+        // preserved. It used to be answered by `queued.is_some()` alone — a
+        // HOST-SHARED file that any peer's convergence deletes — so a peer could
+        // disarm this guard for every other daemon on the machine. "Have I
+        // handed off?" is a fact about THIS process and is now answered by this
+        // process.
+        None if queued.is_some() || local_target.is_some() => SwapStep::Lingering,
         None => SwapStep::Failed,
     }
 }
@@ -17204,6 +17698,98 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
     }
 }
 
+/// How long a single wait must be before it earns its own trace record.
+///
+/// ⛔ **93.9 % of waits were reported as `waited_ms: 0`** — the field was
+/// integer milliseconds and nearly every wait is sub-millisecond, so the
+/// instrument built to measure contention printed zero for almost all the
+/// contention it recorded. The COUNT was the signal and the VALUE was blind.
+/// Everything is now counted in the aggregate below; only a wait a human could
+/// actually notice still writes a line of its own, which is what preserves the
+/// forensic case this function was built for (a 34.4 s hold, quoted below)
+/// while removing the volume.
+const LOCK_WAIT_INDIVIDUAL_TRACE_THRESHOLD: std::time::Duration =
+    std::time::Duration::from_millis(50);
+/// How often the aggregate is emitted.
+///
+/// ⭐ Flushed **lazily, by the next contention event** — never by a timer. A
+/// background thread waking to check whether it should flush is exactly the
+/// idle cost this campaign exists to remove, and a window with no contention in
+/// it has nothing to report anyway.
+const LOCK_WAIT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Powers of two in microseconds, 1 µs … ~1 s, then everything above.
+const LOCK_WAIT_BUCKETS: usize = 22;
+
+#[derive(Debug, Default, Clone)]
+struct LockWaitStats {
+    count: u64,
+    total_us: u64,
+    max_us: u64,
+    buckets: [u64; LOCK_WAIT_BUCKETS],
+}
+
+impl LockWaitStats {
+    fn record(&mut self, waited_us: u64) {
+        self.count += 1;
+        self.total_us += waited_us;
+        self.max_us = self.max_us.max(waited_us);
+        let bucket = (u64::BITS - waited_us.leading_zeros()) as usize;
+        self.buckets[bucket.min(LOCK_WAIT_BUCKETS - 1)] += 1;
+    }
+}
+
+/// The upper bound of the bucket the given fraction falls in, in microseconds.
+///
+/// ⚠ Reported as an UPPER BOUND, not an interpolated percentile, and named that
+/// way in the payload. A histogram cannot say more than which bucket a
+/// percentile landed in, and dressing a bucket edge up as an exact figure is how
+/// a rounded number gets quoted as a measurement.
+fn lock_wait_percentile_upper_us(stats: &LockWaitStats, fraction: f64) -> u64 {
+    if stats.count == 0 {
+        return 0;
+    }
+    let target = (stats.count as f64 * fraction).ceil() as u64;
+    let mut seen = 0u64;
+    for (index, hits) in stats.buckets.iter().enumerate() {
+        seen += hits;
+        if seen >= target {
+            return if index == 0 { 1 } else { 1u64 << index };
+        }
+    }
+    stats.max_us
+}
+
+#[derive(Debug, Default)]
+struct LockWaitWindow {
+    opened: Option<std::time::Instant>,
+    by_request: BTreeMap<&'static str, LockWaitStats>,
+}
+
+static LOCK_WAIT_WINDOW: LazyLock<Mutex<LockWaitWindow>> =
+    LazyLock::new(|| Mutex::new(LockWaitWindow::default()));
+
+/// Fold one wait into the open window, and hand back a window to emit if this
+/// event closed it.
+fn record_lock_wait(
+    window: &mut LockWaitWindow,
+    now: std::time::Instant,
+    request_name: &'static str,
+    waited_us: u64,
+) -> Option<(std::time::Duration, BTreeMap<&'static str, LockWaitStats>)> {
+    let opened = *window.opened.get_or_insert(now);
+    window
+        .by_request
+        .entry(request_name)
+        .or_default()
+        .record(waited_us);
+    let elapsed = now.duration_since(opened);
+    if elapsed < LOCK_WAIT_FLUSH_INTERVAL {
+        return None;
+    }
+    window.opened = Some(now);
+    Some((elapsed, std::mem::take(&mut window.by_request)))
+}
+
 /// Acquire the runtime lock **for a client request, measuring the wait.**
 ///
 /// `handle_request` emits its `request`/`begin` trace AFTER the lock is held,
@@ -17222,8 +17808,16 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
 /// (21:21:34.788, 21:21:57.275, 21:22:30.746) and were all parked right here.
 ///
 /// Fast path costs nothing: `status` alone runs 620k times per fleet-day, so an
-/// uncontended acquisition traces nothing and allocates nothing. Only a request
-/// that actually has to wait pays for — and reports — its own wait.
+/// uncontended acquisition traces nothing and allocates nothing.
+///
+/// ⛔ **THAT SENTENCE USED TO END "only a request that actually has to wait pays
+/// for — and reports — its own wait", AND IT IS HOW THIS BECAME THE LARGEST
+/// WRITER IN THE SYSTEM.** Every word of it was true; the implication that the
+/// paying path is therefore rare was not. `try_lock` FAILS 322.8 times a second
+/// on a busy host — 98.6 % of it `terminal_read`, because reading a PTY
+/// serialises against everything else through this one mutex — so the "only"
+/// path was the hot one. ⇒ **A cost argument about a fast path says nothing
+/// about the system until the slow path's RATE is measured.**
 fn lock_daemon_runtime_for_request<'a>(
     runtime: &'a Arc<Mutex<DaemonRuntime>>,
     request_name: &'static str,
@@ -17238,34 +17832,64 @@ fn lock_daemon_runtime_for_request<'a>(
         Err(std::sync::TryLockError::WouldBlock) => {}
     }
     let home = crate::resolve_yggterm_home().ok();
-    if let Some(home) = home.as_deref() {
+    let started = std::time::Instant::now();
+    // ⛔ NO PER-EVENT WRITES HERE. This branch used to emit THREE records across
+    // TWO files for every failed `try_lock` — `lock_wait_begin`, a drop-scoped
+    // `PerfGuard` into perf-telemetry, and `lock_wait_end` — and the branch runs
+    // 322.8 times a second on a busy host. Measured: 133 KB/s across the two
+    // files, ~11 GB/day, of which 98.8 % was this. The instrument was the
+    // largest writer in the system while reporting that its fast path was free,
+    // which was true and beside the point: it is the SLOW path that is hot.
+    let guard = lock_daemon_runtime(runtime, "handle_request");
+    let waited = started.elapsed();
+    let Some(home) = home.as_deref() else {
+        return guard;
+    };
+    // Microseconds, not milliseconds — see the threshold constant above.
+    let waited_us = waited.as_micros() as u64;
+    if waited >= LOCK_WAIT_INDIVIDUAL_TRACE_THRESHOLD {
+        // Rare by construction, and the only kind of wait anyone has ever
+        // needed a timestamp for.
         append_trace_event(
             home,
             "daemon",
             "request",
-            "lock_wait_begin",
-            serde_json::json!({ "request": request_name }),
+            "lock_wait_slow",
+            serde_json::json!({ "request": request_name, "waited_us": waited_us }),
         );
     }
-    let started = std::time::Instant::now();
-    let guard = {
-        // Drop-scoped so `perf-summary` ranks the wait per request name, beside
-        // the `daemon_request` row that measures the work itself. A request
-        // whose lock_wait dwarfs its own duration is being starved, not slow.
-        let _wait = home
-            .as_deref()
-            .map(|home| yggterm_core::PerfGuard::new(home, "daemon_lock_wait", request_name));
-        lock_daemon_runtime(runtime, "handle_request")
-    };
-    if let Some(home) = home.as_deref() {
+    let flushed = LOCK_WAIT_WINDOW
+        .lock()
+        .ok()
+        .and_then(|mut window| record_lock_wait(&mut window, started, request_name, waited_us));
+    if let Some((elapsed, by_request)) = flushed {
+        let requests: BTreeMap<&str, serde_json::Value> = by_request
+            .iter()
+            .map(|(name, stats)| {
+                (
+                    *name,
+                    serde_json::json!({
+                        "count": stats.count,
+                        "mean_us": stats.total_us / stats.count.max(1),
+                        "max_us": stats.max_us,
+                        "p50_upper_us": lock_wait_percentile_upper_us(stats, 0.50),
+                        "p95_upper_us": lock_wait_percentile_upper_us(stats, 0.95),
+                        "p99_upper_us": lock_wait_percentile_upper_us(stats, 0.99),
+                    }),
+                )
+            })
+            .collect();
         append_trace_event(
             home,
             "daemon",
             "request",
-            "lock_wait_end",
+            "lock_wait_window",
             serde_json::json!({
-                "request": request_name,
-                "waited_ms": started.elapsed().as_millis() as u64,
+                // ⭐ The window is printed with the numbers, always. A rate
+                // quoted without the interval it was taken over is how two
+                // different regimes get read as one.
+                "window_ms": elapsed.as_millis() as u64,
+                "requests": requests,
             }),
         );
     }
@@ -18462,6 +19086,33 @@ struct DaemonRequestOutcome {
 /// the hard mute). See [[finding-dead-sessions-revive-permanent-persist-mute]].
 const UPDATE_RESTART_PERSIST_MUTE_GRACE_MS: u64 = 120_000;
 
+/// How many CONSECUTIVE retire polls must find no newer daemon before a stale
+/// supersession persist mute is cleared. The poll runs every 20 s, so three is
+/// about a minute.
+///
+/// ⛔ **Not one.** [`live_newer_daemon_version`] asks a live successor for its
+/// status, and a successor that is merely slow answers late. Un-muting on a
+/// single missed probe would let this daemon's stale view clobber a HEALTHY
+/// successor's state file — the exact damage the mute exists to prevent, and it
+/// once brought 19 closed sessions back.
+const PERSIST_UNMUTE_AFTER_CLEAR_POLLS: u32 = 3;
+
+/// May a supersession persist mute be cleared on this poll?
+///
+/// Split out and pure for the reason [`classify_handoff_sweep`] is: the two
+/// answers drive opposite behaviour, and the dangerous one — clearing while a
+/// healthy successor owns the file — is the state a live test cannot produce on
+/// demand.
+///
+/// ⛔ **The mute is a LATCH, and it used to be permanent.** That was right while
+/// the successor lived and wrong the moment it did not: the handoff settle
+/// window ([`spawn_handoff_settle_watch`]) now hands sessions BACK to a
+/// predecessor whose successor died young, leaving it the only process serving
+/// them and — latched — the only process that would never record them.
+fn should_clear_stale_persist_mute(muted: bool, consecutive_clear_polls: u32) -> bool {
+    muted && consecutive_clear_polls >= PERSIST_UNMUTE_AFTER_CLEAR_POLLS
+}
+
 /// Should routine persists be suppressed right now?
 ///
 /// `superseded` (gate #8: a strictly newer daemon owns the file) is a HARD mute.
@@ -19344,6 +19995,77 @@ mod tests {
             .expect("the end of the function")
     }
 
+    /// A later handoff aims at a newer build; converging on the older target
+    /// would call the swap satisfied while the request that replaced it is
+    /// still outstanding.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_remembered_swap_target_keeps_the_highest_ever_asked_for() {
+        assert!(
+            super::hot_restart_swap_target_supersedes(None, "3.0.152"),
+            "the first handoff must be remembered"
+        );
+        assert!(
+            super::hot_restart_swap_target_supersedes(Some("3.0.152"), "3.0.153"),
+            "a newer target must supersede an older one"
+        );
+        assert!(
+            !super::hot_restart_swap_target_supersedes(Some("3.0.153"), "3.0.152"),
+            "an OLDER target must not overwrite a newer one — converging on it \
+             would report a swap satisfied while the newer one is unanswered"
+        );
+        assert!(
+            super::hot_restart_swap_target_supersedes(Some("3.0.152"), "3.0.152"),
+            "re-asking for the same target is not a regression"
+        );
+    }
+
+    /// ⛔⛔ THE REGRESSION THIS LOCKS OUT, measured on dev 2026-08-14: one 3.0.151
+    /// daemon spawned **11 successor daemons in 53 minutes**, one every five
+    /// minutes, indefinitely — because each successor cleared the HOST-SHARED
+    /// queue file on recognising itself (`satisfied_by: "self"`) before its
+    /// predecessor's next 20 s poll could read it as satisfied. Asking only the
+    /// file answers "you never handed off" to a daemon that did.
+    ///
+    /// The same deleted file was the ONLY thing keeping a preserved PTY owner
+    /// out of the cold-shutdown path that kills its PTY children, so a peer's
+    /// convergence disarmed that guard for every daemon on the machine.
+    ///
+    /// ⇒ Both questions are about THIS process and must be answerable without
+    /// the file. If this test fails because the names changed, re-point it —
+    /// do not delete it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_swap_lane_does_not_ask_a_peer_writable_file_what_this_process_did() {
+        let source = daemon_product_source();
+        let body = daemon_fn_body(source.as_str(), "fn hot_restart_swap_step(");
+        let code = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            code.contains("hot_restart_swap_local_target()"),
+            "the lane must consult this process's own memory of what it handed \
+             off to, not only the host-shared queue file"
+        );
+        // The cold-path fall-through: `Failed` is what kills preserved PTYs.
+        let failed_guard = code
+            .split("None if")
+            .nth(1)
+            .expect("the guard arm that keeps a preserved owner out of the cold path")
+            .split("=>")
+            .next()
+            .expect("the guard condition");
+        assert!(
+            failed_guard.contains("local_target"),
+            "the guard before SwapStep::Failed still rests on the shared file \
+             alone; a peer clearing it drops this daemon into the path that \
+             kills the PTYs its handoff preserved. Guard was: {failed_guard}"
+        );
+    }
+
     /// The ephemeral reap must ride an EXISTING chore tick. A timer of its own
     /// would be a standing idle cost on every host, for a feature most rows
     /// never opt into — the exact thing the GTA-5 doctrine forbids.
@@ -19740,6 +20462,7 @@ mod tests {
             kind: kind.to_string(),
             idle_ms,
             threshold_ms: 300_000,
+            input_unanswered_ms: None,
             permanent: kind == HOT_RESTART_BLOCKER_NOT_RESTORABLE,
         }
     }
@@ -20351,6 +21074,36 @@ mod tests {
         assert!(mute(false, true, Some(now + 5_000), now));
     }
 
+    /// ⛔ THE HARD MUTE IS NO LONGER PERMANENT, AND THE RUN LENGTH IS THE WHOLE
+    /// SAFETY ARGUMENT. Clearing it on a single clear poll would un-mute against
+    /// a successor that was merely slow to answer its status probe, and this
+    /// daemon would then overwrite a healthy successor's state file — worse than
+    /// the gap being fixed. Clearing it never leaves a daemon that has taken its
+    /// sessions back unable to record them, which is unrecoverable the moment
+    /// anything signals it.
+    #[test]
+    fn a_stale_persist_mute_clears_only_after_a_run_of_clear_polls() {
+        use super::PERSIST_UNMUTE_AFTER_CLEAR_POLLS as RUN;
+        use super::should_clear_stale_persist_mute as clear;
+
+        // Not muted: nothing to clear, however long the run.
+        assert!(!clear(false, 0));
+        assert!(!clear(false, RUN + 10));
+
+        // Muted, but the run is short — a slow successor must not be mistaken
+        // for a dead one.
+        for polls in 0..RUN {
+            assert!(
+                !clear(true, polls),
+                "{polls} clear poll(s) must not be enough to un-mute"
+            );
+        }
+
+        // The run is complete: the successor really is gone.
+        assert!(clear(true, RUN));
+        assert!(clear(true, RUN + 1));
+    }
+
     // Progressive migration is the mechanism that drains a handed-off daemon's
     // sessions "all but the busy few". It shipped dormant and never converged;
     // it is now on by default, with the env var demoted to a kill switch.
@@ -20543,6 +21296,76 @@ mod tests {
             super::classify_handoff_sweep(3, 2, None),
             super::HandoffSweep::Partial { moved: 2, .. }
         ));
+    }
+
+    /// ⛔ THE SETTLE WINDOW'S IDENTITY RULE. "A daemon answers on that version's
+    /// socket" is a WEAKER claim than "the process that took my descriptors is
+    /// still there", and a predecessor that lets go on the weaker one repeats
+    /// the bug this whole mechanism exists to close. A pid whose start time has
+    /// moved is a different process wearing a reused number.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_successor_is_identified_by_pid_and_start_time_together() {
+        let me = std::process::id();
+        let start = crate::pty_adoption::process_start_time(me)
+            .expect("this process must have a start time");
+        let unused_socket = std::path::Path::new("/nonexistent/server-0-0-0.sock");
+
+        assert!(
+            super::successor_still_holding(Some((me, start)), unused_socket),
+            "the live process must read as still holding"
+        );
+        assert!(
+            !super::successor_still_holding(Some((me, start.wrapping_add(1))), unused_socket),
+            "a pid whose start time disagrees is a DIFFERENT process — a reused \
+             number must never read as the successor"
+        );
+        assert!(
+            !super::successor_still_holding(None, unused_socket),
+            "with no identity the fallback asks the socket, and nothing is \
+             listening on that path"
+        );
+    }
+
+    /// The wait for readers to stand down is an upper bound, never a condition
+    /// that can hang. A runtime whose pty already exited has no reader thread
+    /// left to answer, so "wait until all of them" would stall the retirement of
+    /// a daemon holding one dead session.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn waiting_for_parked_readers_gives_up_rather_than_hanging() {
+        let silent = crate::terminal::ReaderPark::detached_for_test();
+        let started = std::time::Instant::now();
+        let stood_down =
+            super::wait_for_parked_readers(&[("local://never-answers".to_string(), silent)], 60);
+        assert_eq!(stood_down, 0, "a reader that cannot answer is not counted");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the wait must be bounded by its allowance, not by the reader"
+        );
+    }
+
+    /// The settle window's default has to outlive a young successor being
+    /// signalled — the incident's own window was two seconds — and has to be
+    /// shortenable, or every test that exercises it costs ten seconds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_settle_window_defaults_to_ten_seconds() {
+        assert_eq!(
+            super::handoff_settle_window(),
+            std::time::Duration::from_millis(10_000),
+        );
+    }
+
+    /// The socket a settle probe asks is the daemon's REQUEST socket, named the
+    /// same way the daemon names its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_settle_probe_asks_the_versioned_request_socket() {
+        assert_eq!(
+            super::versioned_server_socket_path(std::path::Path::new("/home/user/.yggterm"), "3.0.30"),
+            std::path::Path::new("/home/user/.yggterm/server-3-0-30.sock"),
+        );
     }
 
     /// The gate is ON unless explicitly disarmed.
@@ -22992,15 +23815,50 @@ mod tests {
             "the UNCONTENDED path must stay free of tracing and allocation — \
              `status` alone runs 620k times per fleet-day"
         );
+        // ⚠ Strip comments before scanning. The function's own comment explains
+        // which writes were REMOVED and therefore names them, so a raw
+        // `contains` reads the explanation as the offence — the same shape as
+        // the self-matching literal already documented above.
+        let code: String = waiter
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // ⛔ THE THREE PER-EVENT WRITES ARE GONE, AND MUST STAY GONE.
+        //
+        // This assertion used to REQUIRE them: `lock_wait_begin`,
+        // `lock_wait_end`, and a `PerfGuard` labelled `daemon_lock_wait`. The
+        // reasoning was right and the cost was never measured. `try_lock` fails
+        // 322.8 times a second on a busy host, so those three records across two
+        // files were 98.8 % of 133 KB/s — about 11 GB/day, making the instrument
+        // the largest writer in the system while its doc comment argued that its
+        // fast path was free. Both halves of the original intent survive below,
+        // by a mechanism that does not scale with contention.
+        for banned in ["lock_wait_begin", "lock_wait_end", "PerfGuard"] {
+            assert!(
+                !code.contains(banned),
+                "`{banned}` is a per-event write on a path that runs 322.8 times \
+                 a second; everything routine belongs in the aggregate"
+            );
+        }
         assert!(
-            waiter.contains("lock_wait_begin") && waiter.contains("lock_wait_end"),
-            "a contended acquisition must bracket its own wait, or the blocked \
-             request is still invisible"
+            code.contains("lock_wait_slow"),
+            "a contended acquisition long enough to STARVE a request must still \
+             leave its own timestamped record — that is the 34.4 s case this \
+             function was built for, and aggregating it away would re-create the \
+             blindness at a coarser grain"
         );
         assert!(
-            waiter.contains("\"daemon_lock_wait\""),
-            "the wait must also land in perf-summary, so contention is rankable \
-             next to the work it is being starved by"
+            code.contains("record_lock_wait") && code.contains("lock_wait_window"),
+            "every wait must still be COUNTED and the count must still be \
+             emitted, per request name, so contention stays rankable next to the \
+             work it is starving — removing the volume must not remove the signal"
+        );
+        assert!(
+            code.contains("as_micros()") && !code.contains("waited_ms"),
+            "the wait must be measured in MICROseconds: as integer milliseconds \
+             93.9 % of real waits recorded as exactly 0, so the instrument built \
+             to measure contention was blind to nearly all of it"
         );
     }
 
@@ -23238,6 +24096,7 @@ mod tests {
             pty_cols: None,
             pty_rows: None,
             working: None,
+            input_unanswered_ms: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
@@ -27577,6 +28436,113 @@ mod tests {
     /// Formatting/comment edits inside the enums re-trigger this; that
     /// over-trigger is deliberate — a spare version bump is cheap, a silent
     /// wire divergence is the lost-PTY latch storm of 2026-07-17.
+    /// ⛔ THE CONTENTION TRACER WAS THE LARGEST WRITER IN THE SYSTEM.
+    ///
+    /// Every failed `try_lock` wrote THREE records across TWO files, and the
+    /// branch runs 322.8 times a second on a busy host: 133 KB/s, ~11 GB/day,
+    /// 98.8 % of it this. This is the peer-supplied falsifier as a test — the
+    /// write count for a realistic minute of contention must fall by at least
+    /// 90×, or the attribution was wrong.
+    #[test]
+    fn a_minute_of_contention_writes_one_record_instead_of_sixty_thousand() {
+        use std::time::{Duration, Instant};
+
+        // Measured on the live daemon: 322.8 failed try_locks per second.
+        const PER_SECOND: u64 = 322;
+        const SECONDS: u64 = 60;
+        // ⚠ One event PAST the interval. The flush is lazy by design — it is
+        // driven by the next contention rather than by a timer, because a timer
+        // waking to check whether it should flush is the idle cost this lane
+        // removes. So a run of exactly one interval's events ends at 59.997 s
+        // and correctly flushes nothing.
+        let contentions = PER_SECOND * SECONDS + 1;
+        let old_writes = contentions * 3;
+
+        let mut window = super::LockWaitWindow::default();
+        let origin = Instant::now();
+        let mut new_writes = 0u64;
+        for tick in 0..contentions {
+            let now = origin + Duration::from_micros(tick * 1_000_000 / PER_SECOND);
+            // 93.9 % of real waits are sub-millisecond — the population that
+            // used to be recorded, three records at a time, as `waited_ms: 0`.
+            let waited_us = if tick % 100 < 94 { 180 } else { 4_200 };
+            if super::record_lock_wait(&mut window, now, "terminal_read", waited_us).is_some() {
+                new_writes += 1;
+            }
+        }
+        assert!(
+            new_writes >= 1,
+            "the aggregate must still be emitted — silence is not frugality, it \
+             is the blindness this instrument exists to prevent"
+        );
+        let reduction = old_writes / new_writes.max(1);
+        assert!(
+            reduction >= 90,
+            "a minute of contention must cost at least 90x fewer writes: was \
+             {old_writes} records, now {new_writes} (reduction {reduction}x)"
+        );
+    }
+
+    /// ⛔ A SUB-MILLISECOND WAIT MUST NOT REPORT ZERO.
+    ///
+    /// 93.9 % of recorded waits read `waited_ms: 0` because the field was
+    /// integer milliseconds. The instrument built to measure contention printed
+    /// zero for almost all the contention it recorded — the count was the only
+    /// surviving signal, and the value was blind.
+    #[test]
+    fn the_wait_histogram_still_sees_a_wait_too_short_for_a_millisecond() {
+        let mut stats = super::LockWaitStats::default();
+        for _ in 0..1000 {
+            stats.record(180); // 0.18 ms — reported as 0 by the old field
+        }
+        assert_eq!(stats.count, 1000);
+        assert!(
+            stats.max_us > 0 && stats.total_us / stats.count > 0,
+            "a 180 us wait must survive as a non-zero measurement: {stats:?}"
+        );
+        let p50 = super::lock_wait_percentile_upper_us(&stats, 0.50);
+        assert!(
+            (128..=256).contains(&p50),
+            "the median of a population of 180 us waits must land in the bucket \
+             that contains 180 us, got {p50} us"
+        );
+        // A histogram reports the bucket a percentile fell in, never more. The
+        // tail must still be visibly larger than the body.
+        stats.record(34_400_000); // the documented 34.4 s starvation case
+        assert!(
+            super::lock_wait_percentile_upper_us(&stats, 0.99)
+                < super::lock_wait_percentile_upper_us(&stats, 1.0),
+            "one enormous wait must move the top of the distribution and not the \
+             middle, or a starved daemon hides inside its own median"
+        );
+    }
+
+    /// ⭐ THE FORENSIC CASE MUST SURVIVE THE VOLUME FIX.
+    ///
+    /// This function exists because a 34.4 s hold left NO trace record at all
+    /// and a starved daemon read as an idle one. Aggregating everything would
+    /// re-create that blindness at a coarser grain, so a wait a human could
+    /// notice still writes its own timestamped line.
+    #[test]
+    fn a_wait_long_enough_to_starve_a_request_still_earns_its_own_record() {
+        use std::time::Duration;
+        assert!(
+            Duration::from_secs_f64(34.4) >= super::LOCK_WAIT_INDIVIDUAL_TRACE_THRESHOLD,
+            "the 34.4 s hold that motivated this function must still be traced \
+             individually"
+        );
+        assert!(
+            Duration::from_micros(180) < super::LOCK_WAIT_INDIVIDUAL_TRACE_THRESHOLD,
+            "a routine sub-millisecond wait must NOT write its own record — that \
+             population is 93.9 % of the volume"
+        );
+        assert!(
+            super::LOCK_WAIT_INDIVIDUAL_TRACE_THRESHOLD <= Duration::from_millis(250),
+            "the threshold must stay low enough to catch a wait a person would \
+             feel as a stall"
+        );
+    }
+
     #[test]
     fn protocol_shape_stamp_forces_version_bump() {
         // Re-stamped for 3.0.75: `StartRemoteAgentSession` arrived — the

@@ -108,6 +108,63 @@ if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
   fi
 fi
 
+# ⛔⛔ A DAEMON BUMP TYPES. THE GUI RELAUNCH DOES NOT. THAT IS THE OPPOSITE OF HOW
+# IT IS USUALLY TREATED, AND IT IS WHY THIS CHECK IS HERE RATHER THAN IN A DOC.
+#
+# The hot-restart repair submits `continue` to rows after a handover. On a build
+# without the draft guard that submit has no draft check, so a deploy can splice
+# `continue` and its retry barrage into a half-typed sentence a human is holding.
+# The ordering rule was written down — inside a bug entry — and a release was still
+# cut over it, because the person cutting a release does not read the bug queue
+# first. A rule is only load-bearing where the harmful act happens; this is it.
+#
+# ⚠ THE NARROWING, and it is what keeps this from becoming a freeze: the danger is
+# a handover that FAILS TO CONVERGE, not a bump as such. `continue` is submitted
+# only to sessions named in the interrupted-sessions record, and that record is
+# written on a FORCED cold shutdown. A handover that settles gracefully interrupts
+# nothing, records nothing and submits nothing. So:
+#   - the record EXISTS  ⇒ the last handover did not converge ⇒ REFUSE
+#   - attended rows exist ⇒ WARN, name them, and continue
+# ⛔ This never probes a row to find out whether a draft is open. The readiness
+# probe TYPES — probing for the hazard would BE the hazard, wearing a lab coat.
+ATTENDED_TSV="${YGGTERM_RELAY_DIR:-$HOME/.yggterm/relay}/never-arm.tsv"
+ATTENDED_N=0
+if [ -r "$ATTENDED_TSV" ]; then
+  ATTENDED_N=$(grep -cve '^[[:space:]]*\(#\|$\)' "$ATTENDED_TSV" || true)
+else
+  # An unreadable list is NOT an empty one. Say which, and treat it as attended.
+  echo "deploy-fleet: ⚠ cannot read $ATTENDED_TSV — attendance NOT verified, assuming attended." >&2
+  ATTENDED_N=unknown
+fi
+
+STRANDED=""
+for h in $HOSTS; do
+  if [ "$h" = "$(hostname -s 2>/dev/null)" ] || [ "$h" = dev ]; then
+    [ -e "${YGGTERM_HOME:-$HOME/.yggterm}/hot-restart-interrupted.json" ] && STRANDED="$STRANDED $h"
+  else
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$h" \
+      'test -e "${YGGTERM_HOME:-$HOME/.yggterm}/hot-restart-interrupted.json"' 2>/dev/null \
+      && STRANDED="$STRANDED $h"
+  fi
+done
+
+if [ -n "$STRANDED" ]; then
+  echo "⛔ REFUSING: an interrupted-sessions record is still present on:$STRANDED" >&2
+  echo "   That record is written on a FORCED cold shutdown and is the list of rows the" >&2
+  echo "   repair will TYPE \`continue\` into. Deploying now types into every one of them." >&2
+  echo "   Resolve the stranded handover first; do not delete the record to get past this." >&2
+  [ -n "${YGG_DRAFT_CLEARED:-}" ] || exit 1
+  echo "   ⚠ overridden by YGG_DRAFT_CLEARED=$YGG_DRAFT_CLEARED" >&2
+fi
+
+if [ "$ATTENDED_N" != 0 ]; then
+  echo "deploy-fleet: ⚠ $ATTENDED_N human-attended row(s) on the never-arm list." >&2
+  echo "   No interrupted-sessions record exists, so a graceful handover types nothing" >&2
+  echo "   and this is a warning, not a refusal. ⛔ But one graceful observation does not" >&2
+  echo "   license the general case: if the outgoing daemons cannot be shown to converge," >&2
+  echo "   hold the bump until the draft is sent or cleared." >&2
+fi
+
 # ⭐ --preflight answers the ancestry question and stops, so a caller can ask it
 #    in one second instead of after a three-minute build. Deliberately BEFORE the
 #    build-product check: at preflight time those products do not exist yet, and
