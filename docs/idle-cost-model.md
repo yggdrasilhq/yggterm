@@ -490,6 +490,50 @@ request that turned out to run **3.6 times a second forever**.
 - **Per-row.** 0.000337 cores/row / 3.6 polls/s = **~94 µs of CPU per row per
   reply** — a plausible price for cloning, sorting and serialising one record.
   For a 246-row daemon: 23 ms per poll, 0.083 cores continuous.
+  ⛔⛔ **DIRECTLY MEASURED AT ~11 µs/row, NOT 94 — SEE §6g. The inference above
+  is an order of magnitude high and §S5's headline rests on it.**
+
+### ⛔ 6g. THE PER-POLL COST WAS MEASURED, AND IT IS ~8x SMALLER THAN §6e INFERRED
+
+§6e derived ~94 µs/row by dividing the model's coefficient by the poll rate. The
+daemons already write a `PerfGuard` **duration per request**, so it can be read
+instead of inferred. 90 s window, grouped by pid, paired against each daemon's
+ROWS:
+
+| rows (band) | median handler duration |
+|---|---|
+| 70–101 (10 daemons) | **2.09–2.57 ms** |
+| 243–246 (3 daemons) | **2.92–3.17 ms** |
+
+    median_ms ~ ROWS:  slope 11.0 us/row,  intercept 1.32 ms,  r = +0.683
+
+⇒ **The row term is REAL and directly confirmed — duration rises monotonically
+with rows — but the slope is 11 µs/row against the 94 µs/row §6e inferred.**
+Serving one `status` costs ~2.4 ms, not the ~38 ms §6e assumed from §3.
+
+⇒ **If this holds, §S5 returns ≈0.08 cores, not ≈0.66**, and status handling is
+~5% of a daemon's idle cost rather than most of it — which reopens the larger
+question of **where the other ~95% of daemon CPU goes.**
+
+⛔ **WHY THIS IS FLAGGED AND NOT YET APPLIED TO §S5's HEADLINE.** The instrument
+records **`daemon_request/status` at 1.8/s against 49.7/s arriving — ~3.6% of
+requests** (n=5–22 per daemon where ~324 were served). `PerfGuard` has no
+sampling logic; the shortfall is unexplained, and an instrument recording 3.6% of
+events is not one to rewrite a headline on. ⚠ Two further scope limits: the guard
+drops when `handle_request` returns, so **JSON serialisation and the socket write
+are outside it** (serialising ~50 KB adds well under 1 µs/row, so this does not
+close the 8x gap); and `duration_ms` is **wall time, not CPU**, so it is an upper
+bound on handler CPU — which makes §S5 smaller still, never larger.
+
+⭐ **The SLOPE is the robust part.** A uniform under-recording factor cancels in a
+between-daemon comparison, and the low-row and high-row bands separate cleanly.
+⇒ **Treat 11 µs/row as the measurement and 94 µs/row as the refuted inference,
+while treating the absolute per-daemon share as unconfirmed.**
+
+**The check that settles it, before anyone builds §S5:** instrument the status
+path directly — a counter incremented per reply with the row count and elapsed
+CPU (not wall), read back over a known window — and confirm both the slope and
+what fraction of daemon CPU the path accounts for.
 
 ⇒ **§2b's per-row term is real and now attributed, and the refuted candidate
 stays refuted for a better reason than its period.** `run_background_copy_chore`
@@ -546,11 +590,20 @@ consumers call: reconcile, handover, adoption, retire-coverage. Concretely, drop
 vectors from the poll path, and stop rebuilding `persisted_state()` and running
 two sort/dedup passes per reply.
 
-**Expected effect, with the number:** removes the row-scaled term —
-0.000337 cores/row x **1,953 rows summed over the census** ⇒ **≈0.66 cores**,
-about **25% of the measured 2.64-core daemon footprint**, and it scales up with
-every row the fleet ever accumulates because ROWS is frozen at each daemon's
-birth. Per-reply work drops from O(R log R) to O(1).
+⛔⛔ **EXPECTED EFFECT IS DISPUTED BY §6g — MEASURE BEFORE YOU BUILD.** The
+figure below divides the model's per-row coefficient by the poll rate. A direct
+read of the handler's own `PerfGuard` duration gives **11 µs/row, not 94**, which
+would make this spec worth **≈0.08 cores, not ≈0.66** — an order of magnitude.
+§6g explains why that measurement is flagged rather than adopted (the instrument
+records ~3.6% of requests), and names the check that settles it. ⇒ **Run that
+check first.** The spec is still worth doing — the row term is directly confirmed
+and per-reply work does drop from O(R log R) to O(1) — but **do not promise 0.66
+cores for it**, and do not let it displace higher-value work on that number.
+
+**Expected effect, as originally derived (⚠ see above):** removes the row-scaled
+term — 0.000337 cores/row x **1,953 rows summed over the census** ⇒ **≈0.66
+cores**, about 25% of the measured 2.64-core daemon footprint, scaling with every
+row the fleet accumulates because ROWS is frozen at each daemon's birth.
 
 **Falsifier:** re-run the §6f paired comparison after the change — 1-owned
 legacy-shaped daemons, low rows vs high rows, both controls in the same run. If

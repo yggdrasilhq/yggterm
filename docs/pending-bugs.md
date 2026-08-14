@@ -62,8 +62,24 @@ sees an empty `stored_terminal_session_keys`, which reads as *"this peer holds n
 dormant rows"* — the exact input that has dropped rows in a handover before, and
 **14 daemons that will never restart still speak the old shape**.
 
-**Expected effect:** ≈**0.66 cores** (0.000337/row × 1,953 rows), ~25% of the
-2.64-core daemon footprint, growing with every row the fleet accumulates.
+⛔⛔ **EXPECTED EFFECT IS DISPUTED — MEASURE BEFORE BUILDING.** The 0.66 figure
+divides the model's per-row coefficient by the poll rate. Reading the handler's
+own `PerfGuard` duration instead gives **11 µs/row, not 94** (slope over 14
+daemons, r=+0.683; 70–101 rows → 2.09–2.57 ms, 243–246 rows → 2.92–3.17 ms),
+which makes this **≈0.08 cores** and puts status handling at ~5% of a daemon's
+idle cost rather than most of it. ⚠ Flagged not adopted: that instrument records
+`daemon_request/status` at 1.8/s against 49.7/s arriving — **~3.6% of requests**,
+unexplained, and `PerfGuard` has no sampling logic. The **slope** is robust (a
+uniform under-recording factor cancels between daemons); the absolute share is
+not. ⇒ **Instrument the status path directly — per-reply row count and elapsed
+CPU, not wall — and confirm both the slope and its share of daemon CPU before
+building.** The row term is directly confirmed and the O(R log R) → O(1) change
+is still right; ⛔ **do not promise 0.66 cores for it.**
+⇒ **And it reopens the bigger question: where does the other ~95% of daemon CPU
+go?** `idle-cost-model.md` §6g.
+
+**Expected effect, as originally derived (⚠ disputed above):** ≈**0.66 cores**
+(0.000337/row × 1,953 rows), ~25% of the 2.64-core daemon footprint.
 **Falsifier:** re-run the paired comparison (1-owned daemons, low vs high rows,
 both controls in one run). If the per-row coefficient does not fall to ~0,
 `status` was not what the row term was buying.
