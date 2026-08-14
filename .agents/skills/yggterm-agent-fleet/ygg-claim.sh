@@ -109,6 +109,21 @@ UUID="${SESSION##*/}"
 #   that is deliberately editing this tool must still be able to claim.
 # ⚠ Compares against whatever `origin/main` this checkout last fetched — a stale
 #   REF can still say "current". It is a smoke alarm, not a proof.
+# ⛔⛔ DEFINED HERE, NOT FURTHER DOWN, AND THE POSITION IS LOAD-BEARING. Bash
+# resolves a function name at CALL time, so `log` living below the staleness
+# check meant all five of its lines died with `log: command not found` — and the
+# function still returned 0, so nothing downstream could tell. The warning that
+# exists to say "your copy of this tool is stale" was the one warning that could
+# not speak, on the only path where it fires.
+#
+# ⇒ Reported by another campaign 2026-08-14, live: it fired during a real claim
+#   from a checkout that was genuinely SIX commits behind, printed five
+#   `command not found` lines, and exited 0. The same morning, this seat proved
+#   the exact hazard it was built to prevent — a lane whose two-hour-stale copy
+#   of the sibling tool silently rewrote a defect that had just been fixed.
+# ⚠ Do not "tidy" this back down beside the other helpers.
+log() { printf '%s ygg-claim %s\n' "$(date +%H:%M:%S)" "$*"; }
+
 claim_self_staleness_warning() {
   local here root rel behind
   here="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || return 0
@@ -118,11 +133,21 @@ claim_self_staleness_warning() {
   git -C "$root" cat-file -e "origin/main:$rel" 2>/dev/null || return 0
   git -C "$root" diff --quiet "origin/main" -- "$rel" 2>/dev/null && return 0
   behind="$(git -C "$root" rev-list --count HEAD..origin/main 2>/dev/null || echo '?')"
-  log "⛔ STALE TOOL — this copy of $(basename "$0") differs from origin/main's."
-  log "   This checkout is $behind commit(s) behind main, so DEFAULTS HERE MAY NOT"
-  log "   MATCH WHAT YOUR BRIEF DESCRIBES. Merge origin/main, then verify the arm"
-  log "   yourself — it is the part that fails silently:"
-  log "     ygg-booter.py list | grep ${UUID:0:8}"
+  # ⚠ DIFFERS AND BEHIND ARE TWO DIFFERENT FACTS. Saying "STALE TOOL — 0 commits
+  # behind" in the same breath reads as a broken check and gets ignored, which is
+  # the one thing a smoke alarm must not do. A seat editing this tool trips the
+  # diff every time and is not stale at all; a lane running an old copy is.
+  if [ "$behind" = "0" ]; then
+    log "⚠ LOCALLY MODIFIED — this copy of $(basename "$0") differs from origin/main's,"
+    log "   but is not BEHIND it. Expected if you are the seat editing this tool;"
+    log "   otherwise you have uncommitted changes here that nobody else has."
+  else
+    log "⛔ STALE TOOL — this copy of $(basename "$0") differs from origin/main's."
+    log "   This checkout is $behind commit(s) behind main, so DEFAULTS HERE MAY NOT"
+    log "   MATCH WHAT YOUR BRIEF DESCRIBES. Merge origin/main, then verify the arm"
+    log "   yourself — it is the part that fails silently:"
+    log "     ygg-booter.py list | grep ${UUID:0:8}"
+  fi
 }
 claim_self_staleness_warning
 
@@ -143,7 +168,7 @@ if [ -n "${REPLACE:-}" ] && [ "${REPLACE##*/}" = "$UUID" ]; then
   exit 64
 fi
 
-log() { printf '%s ygg-claim %s\n' "$(date +%H:%M:%S)" "$*"; }
+# (`log` is defined ABOVE the staleness check on purpose — see the note there.)
 
 # --- locate a binary that can talk to the GUI ------------------------------
 # App control is served by the GUI PROCESS, not the daemon, so it only answers on
