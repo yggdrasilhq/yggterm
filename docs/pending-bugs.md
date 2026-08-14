@@ -1633,6 +1633,42 @@ has no draft kind at all, and the rows the owner actually types in are not even 
 that daemon's population. **Blind is not clear**, and the cost of being wrong here
 is a person's unsent sentence.
 
+#### ✅ THE INSTRUMENT IS BUILT — AND ITS FIRST READING IS `blind`, WHICH IS WHY THE HOLD STILL STANDS
+
+`ServerRuntimeStatus.pending_input_drafts` + `server rows drafts` (read-only,
+fans out over every daemon on the host). The datum was always there — the flag
+`session_is_migratable` consults is an `AtomicBool` reconstructed from forwarded
+input, so reading it costs nothing and writes nothing. Only the exposure was
+missing.
+
+⭐ **The three-state encoding is the whole design, not a detail.** `None` = this
+daemon predates the field and CANNOT ANSWER; `Some([])` = asked, nothing drafted.
+A bare `Vec` with `#[serde(default)]` would have made an old daemon's silence
+deserialize to "clean" — silent, fail-OPEN, and indistinguishable from an answer.
+The verdict follows: `drafts_present` > `blind` > `clear`, and **`blind` is not
+`clear`**.
+
+⛔ **FIRST LIVE READING, and it is the finding: `verdict:"blind"` — 15 daemons,
+~60 sessions, ZERO able to answer.** Every daemon now running predates the field.
+⇒ **A naive build would have printed "0 drafts found" over that same sweep and
+read as a clean bill of health.** The instrument's own first answer is *you still
+cannot see*, which is correct, and is not a failure.
+
+⇒ **THE HOLD DOES NOT LIFT ON THIS COMMIT.** It lifts when a daemon carrying the
+field is serving and the sweep answers `clear` — not before, and never on the
+absence of a `drafts_present`.
+
+**Proven by discrimination, in an isolated home, on a daemon identified by md5 of
+`/proc/<pid>/exe` rather than by version** (both read 3.0.155):
+`clear` with two clean sessions → `drafts_present` naming the one drafted session
+after an unsent line was typed → `clear` again once the line was submitted. Same
+daemon, same population, so the difference is the draft and not the census.
+⭐ **A second, independent mechanism agreed on the same state**: `--refuse-if-draft`
+refused a write at exactly the moment the read-only sweep reported the draft.
+⚠ **Presence only — the payload was checked for the typed text and does not carry
+it.** A draft instrument that leaked what was typed would be worse than the
+unobservable hold it replaces.
+
 **Status of this entry: FIXED IN CODE, awaiting the measured ≥90× drop.**
 
 All three writes removed in one change, as the correction demanded — the two

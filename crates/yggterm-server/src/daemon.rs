@@ -2089,6 +2089,51 @@ fn represented_live_session_needs_preserved_owner(
             || server.live_session_is_temporary_update_restore(runtime_key))
 }
 
+/// One owned session's answer to "is there a typed-but-unsent line open here?".
+///
+/// ⛔ `has_pending_draft` is `Option<bool>` for the same reason the list around
+/// it is: the runtime that owns the PTY is the only thing that knows, and "it
+/// did not answer" must not read as "the line is clean". `None` here means this
+/// daemon lists the session but its terminal map produced no runtime for it —
+/// a state that should not occur (the keys are that map's own), so it is
+/// reported rather than swallowed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDraftState {
+    pub session_key: String,
+    pub has_pending_draft: Option<bool>,
+}
+
+/// Nothing on this host is holding an unsent line — a bump is safe on this count.
+pub const DRAFT_SWEEP_CLEAR: &str = "clear";
+/// Some daemon or row could not be asked. ⛔ NOT `clear`.
+pub const DRAFT_SWEEP_BLIND: &str = "blind";
+/// At least one session is holding an unsent line.
+pub const DRAFT_SWEEP_DRAFTS_PRESENT: &str = "drafts_present";
+
+/// The precedence `server rows drafts` reports, as a pure rule so it can be
+/// tested without a fleet.
+///
+/// ⛔ **THE ONLY INTERESTING CASE IS `(0, n>0)`, AND IT MUST NOT BE `clear`.**
+/// A sweep that found no drafts *and could not ask everyone* has not established
+/// that there are none; it has established that it did not look. Every daemon
+/// predating `ServerRuntimeStatus::pending_input_drafts` falls in that bucket,
+/// which on a host running a pile of them is most of them. Collapsing this into
+/// `clear` would rebuild the exact defect the field was added to remove, one
+/// layer up, and it would do it silently.
+///
+/// A known draft outranks blindness: partial sight that found something is still
+/// a finding, and there is no reading of "someone is mid-sentence" that permits
+/// the bump.
+pub fn draft_sweep_verdict(drafts_present: usize, unable_to_answer: usize) -> &'static str {
+    if drafts_present > 0 {
+        DRAFT_SWEEP_DRAFTS_PRESENT
+    } else if unable_to_answer > 0 {
+        DRAFT_SWEEP_BLIND
+    } else {
+        DRAFT_SWEEP_CLEAR
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerRuntimeStatus {
     pub server_version: String,
@@ -2112,6 +2157,28 @@ pub struct ServerRuntimeStatus {
     pub owned_terminal_session_count: usize,
     #[serde(default)]
     pub owned_terminal_session_keys: Vec<String>,
+    /// Per owned session: does it hold a typed-but-unsent input draft?
+    ///
+    /// The datum `session_is_migratable` already consults, exposed READ-ONLY.
+    /// Before this field the ONLY instrument that consulted draft state was
+    /// `--refuse-if-draft` on `server terminal write` — so learning whether a
+    /// draft existed required attempting the write a draft exists to forbid,
+    /// and "is anyone mid-sentence?" was an unanswerable question.
+    ///
+    /// ⛔ THE `Option` IS THE POINT — THREE STATES, NEVER TWO. `None` = this
+    /// daemon predates the field and CANNOT ANSWER; `Some(vec![])` = asked and
+    /// answered, nothing drafted anywhere. A pre-field daemon deserializing to
+    /// an empty list would read as *clean*, and that failure is silent, is
+    /// fail-OPEN, and its cost is a person's unsent sentence typed over. The
+    /// sibling `role_enforcement` may default to `false` precisely because
+    /// there the missing answer fails CLOSED; here it would not.
+    ///
+    /// ⚠ PRESENCE ONLY, NEVER CONTENT. The underlying flag is an `AtomicBool`
+    /// reconstructed from forwarded input — the bytes are not retained and must
+    /// never be put on this wire. A draft instrument that leaked what was typed
+    /// would be a worse violation than the one it fixes.
+    #[serde(default)]
+    pub pending_input_drafts: Option<Vec<SessionDraftState>>,
     #[serde(default)]
     pub terminal_session_count: usize,
     #[serde(default)]
@@ -4567,6 +4634,21 @@ impl DaemonRuntime {
         // table only to drop them. Same wire, less work; see that method.
         let live_terminal_sessions = self.server.persisted_live_sessions();
         let owned_terminal_session_keys = self.terminals.session_keys();
+        // ⛔ ASK THE MAP THE KEYS CAME FROM, with the key it gave us. The idle-gate
+        // blockers path re-resolves through `terminal_runtime_key_for_path` first,
+        // which is right there (it starts from row paths) and wrong here: these keys
+        // ARE `terminals.session_keys()`, so re-resolving can only move them off the
+        // map that produced them, and a key that misses reports `None` — an honest
+        // answer to the wrong question, which is how "no drafts" gets manufactured.
+        let pending_input_drafts = Some(
+            owned_terminal_session_keys
+                .iter()
+                .map(|key| SessionDraftState {
+                    session_key: key.clone(),
+                    has_pending_draft: self.terminals.session_has_pending_input_draft(key),
+                })
+                .collect::<Vec<_>>(),
+        );
         let mut terminal_session_keys = owned_terminal_session_keys.clone();
         terminal_session_keys.extend(preserved_owner_keys.iter().cloned());
         terminal_session_keys.sort();
@@ -4593,6 +4675,7 @@ impl DaemonRuntime {
             restored_remote_machines: self.restored_remote_machines,
             owned_terminal_session_count: owned_terminal_session_keys.len(),
             owned_terminal_session_keys,
+            pending_input_drafts,
             terminal_session_count: terminal_session_keys.len(),
             terminal_session_keys,
             preserved_terminal_owner_count: preserved_owner_keys.len(),
@@ -23394,6 +23477,91 @@ mod tests {
             "terminal_session_count": terminal.len(),
         }))
         .expect("test ServerRuntimeStatus")
+    }
+
+    // ⛔ THE DRAFT SWEEP'S WHOLE VALUE IS THAT "I DID NOT LOOK" CANNOT WEAR THE
+    // COSTUME OF "THERE IS NOTHING THERE". These four lock that, at both layers
+    // it could be lost: the wire encoding, and the verdict computed from it.
+    //
+    // The hold this instrument exists to end could never be shown to have ended
+    // because the only thing that consulted draft state was `--refuse-if-draft`
+    // on a WRITE — you had to perform the action a draft forbids in order to
+    // learn whether a draft forbade it. Re-collapsing either layer restores that
+    // condition while looking like it answers.
+
+    #[test]
+    fn a_pre_field_daemon_cannot_answer_and_must_not_read_as_clean() {
+        // Exactly the payload an older daemon sends: no `pending_input_drafts`
+        // key at all. `#[serde(default)]` on a bare Vec would make this `[]`,
+        // i.e. "asked, nothing drafted" — a silent, fail-OPEN lie.
+        let status = runtime_status_with_keys(&["local://a", "local://b"], &[]);
+        assert_eq!(
+            status.pending_input_drafts, None,
+            "a daemon that predates the field must deserialize to None, never to an empty list"
+        );
+        assert_ne!(
+            status.pending_input_drafts,
+            Some(Vec::new()),
+            "cannot-answer and answered-none must stay distinguishable on the wire"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_answers_none_drafted_is_not_the_same_value_as_one_that_cannot_answer() {
+        let answered: super::ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "test",
+            "host_kind": "test",
+            "host_detail": "test",
+            "embedded_surface_supported": false,
+            "bridge_enabled": false,
+            "pending_input_drafts": [],
+        }))
+        .expect("test ServerRuntimeStatus");
+        assert_eq!(answered.pending_input_drafts, Some(Vec::new()));
+        assert_ne!(
+            answered.pending_input_drafts,
+            runtime_status_with_keys(&[], &[]).pending_input_drafts
+        );
+    }
+
+    #[test]
+    fn a_draft_state_carries_presence_and_never_content() {
+        let state = super::SessionDraftState {
+            session_key: "local://drafting".to_string(),
+            has_pending_draft: Some(true),
+        };
+        let wire = serde_json::to_value(&state).expect("serialize draft state");
+        let object = wire.as_object().expect("draft state is an object");
+        // ⚠ A draft instrument that leaked what was typed would be a worse
+        // violation than the unobservable hold it replaces. Two fields, forever.
+        assert_eq!(
+            object.len(),
+            2,
+            "SessionDraftState must carry presence only: {object:?}"
+        );
+        assert!(object.contains_key("session_key"));
+        assert!(object.contains_key("has_pending_draft"));
+        // A row the owning runtime did not answer for is its own third state.
+        let unknown: super::SessionDraftState =
+            serde_json::from_value(serde_json::json!({"session_key": "local://x"}))
+                .expect("deserialize draft state");
+        assert_eq!(unknown.has_pending_draft, None);
+    }
+
+    #[test]
+    fn a_sweep_that_could_not_ask_everyone_is_blind_and_never_clear() {
+        use super::{
+            DRAFT_SWEEP_BLIND, DRAFT_SWEEP_CLEAR, DRAFT_SWEEP_DRAFTS_PRESENT, draft_sweep_verdict,
+        };
+        // The case the whole design turns on.
+        assert_eq!(draft_sweep_verdict(0, 1), DRAFT_SWEEP_BLIND);
+        // And the control that proves the assertion above discriminates rather
+        // than a verdict function degenerated into always answering "blind".
+        assert_eq!(draft_sweep_verdict(0, 0), DRAFT_SWEEP_CLEAR);
+        // A known draft outranks blindness; there is no reading of "someone is
+        // mid-sentence" that permits the bump.
+        assert_eq!(draft_sweep_verdict(1, 0), DRAFT_SWEEP_DRAFTS_PRESENT);
+        assert_eq!(draft_sweep_verdict(1, 9), DRAFT_SWEEP_DRAFTS_PRESENT);
     }
 
     // Per [[bug-class-old-daemon-never-retires]]: the guihost 2.8.87 lingering

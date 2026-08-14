@@ -1141,6 +1141,28 @@ def report_escalation_gap(subs):
         else:
             armed.add(u)
     watched = {s["uuid"][:8] for s in subs}
+    # ⛔⛔ A PARK *IS* THE RECORDED DECISION, AND THE ALARM BELOW WAS DEMANDING IT
+    #    WHILE PRINTING IT. `park` takes a MANDATORY `--reason` and an expiry, so
+    #    a parked row has already answered "arm it or never-arm it" — with a third
+    #    answer, the one `released_rows()` exists to name: it is neither an
+    #    unattended delegate nor a place a human types, it was DONE. One `list`
+    #    rendered both, four lines apart, and the next orchestrator re-decided it
+    #    every listing.
+    #    ⚠ Why the existing screens could not catch it: the row is ALIVE, so the
+    #    liveness check added for the reaped-row case passes it through — alive
+    #    and FINISHED is its own state. And both offered remedies are the two
+    #    this file forbids: arming it types into a row whose remaining work is
+    #    owner-gated, and never-arming it writes a permanent assertion that a
+    #    human types at a delegate's address into the one file whose whole job is
+    #    to stop a machine typing at a person.
+    #    ⇒ Reported by the 2.x orchestrator 2026-08-14, read from the source
+    #    rather than inferred, on its own publication lane.
+    # ⚠ A LAPSED park is deliberately NOT screened: the expiry is the point, and a
+    #   park that ran out is a row nobody came back for — exactly what the alarm is
+    #   for. Only a park still inside its window silences it.
+    now = time.time()
+    parked = {s["uuid"][:8] for s in subs
+              if s.get("parked") and (s.get("parked_until") or 0) > now}
     gap = sorted(armed - watched)
     if gap:
         log(f"⛔ {len(gap)} ROW(S) ARMED ON THE BOOTER BUT ESCALATING TO NOBODY — "
@@ -1173,7 +1195,13 @@ def report_escalation_gap(subs):
         log("   Refusing to name rows I cannot screen: an attended row listed here would")
         log("   invite arming it, and the booter's remedy is to TYPE INTO the row.")
     else:
-        unarmed = sorted(watched - armed - dying - attended - optedout)
+        unarmed = sorted(watched - armed - dying - attended - optedout - parked)
+        # Keep the state VISIBLE without demanding action on it — the point is to
+        # stop asking, not to stop showing.
+        silenced = sorted((watched - armed - dying - attended - optedout) & parked)
+        if silenced:
+            log(f"⏸ {len(silenced)} unarmed row(s) are PARKED with a reason — decision already "
+                f"recorded, not asked about: {' '.join(silenced)}")
         if unarmed:
             # ⛔⛔ A DEAD ROW IS A THIRD CASE, AND OFFERING ONLY TWO PUT A LIE IN
             #    THE GUARD FILE. This asked "arm it, or add it to never-arm.tsv"
