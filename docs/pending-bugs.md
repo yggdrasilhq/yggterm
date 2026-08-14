@@ -9975,6 +9975,34 @@ measurement was on the GUI host, and two of the four survivors are known to be
 environment-dependent, so *green here* is not *green everywhere*
 ([[finding-a-claim-proven-on-one-lane-is-not-proven]]).
 
+### ⛔⛔ TWO OF THOSE THREE ARE RED AGAIN ON `origin/main`, MEASURED 2026-08-14
+
+**`remote_resume_shell_command_wraps_prefix_and_cwd` and
+`stored_codex_litellm_sessions_use_litellm_resume_command` both FAIL** — the
+same *"the resume SUBCOMMAND has gone missing from the built launch string"*
+signature this section declared closed.
+
+Measured with the control run, not inferred: a **fresh detached worktree at
+`origin/main` (`bd5e7cc2`) with its own `CARGO_TARGET_DIR`**, both tests run
+`--exact`, on **dev — the same host the green verdict above was taken on**. So
+this is not the environment-dependence caveat; it is a regression on the branch.
+
+⭐ **What the code says the cause is.** `stored_session_launch_command` no longer
+routes through `legacy_agent_launch_command` at all — it goes to
+`agent_launch_command_with_options`, the per-CLI launch table. The assertions
+still describe the *legacy* string shape. ⇒ Either the table composes the resume
+subcommand differently (a real regression in what gets launched) or the tests
+are asserting against a path the product no longer takes (stale tests). **Those
+are opposite verdicts and the entry must not guess between them** — the
+falsifier is to print the composed string for `CodexLiteLlm` and compare it
+against what a manual `codex-litellm resume` needs.
+
+⚠ **Consequence for anyone landing work here: `main` is red before you start.**
+A full `cargo test -p yggterm-server --lib` will show these two failing and they
+are not yours. ⛔ Do not "fix" them by relaxing the assertion until the fork
+above is settled — the assertion may be the only thing still describing a
+working launch.
+
 ### The two that measure the network, which is the real defect
 
 Confirmed 2026-08-08 during the six-CLI intake, and confirmed NOT caused by it:
