@@ -54,6 +54,43 @@ being audited rather than merely edited.
 **Falsifier:** the identifiers are absent from `git log -p` over all refs, and the
 forge returns 404 for the pre-removal blob URLs.
 
+## ✅ [6.9→6.7] S6 IS BUILT — THE HANDLER NOW REPORTS CPU, END TO END, PER VERB
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+*sandbox-verified; the numbers and the three defects found on the way are in
+[`idle-cost-model.md`](idle-cost-model.md) §6l*
+
+`CLOCK_THREAD_CPUTIME_ID` around the **whole closure** at
+`spawn_unix_client_handler`, not `handle_request`'s wall-time `PerfGuard` — so
+the socket read, the deserialise, the serialise, the socket write and the
+thread's teardown are inside the span for the first time. ⭐ **Expected effect is
+ZERO cores; it attributes cost and removes none. Do not score it on cores.**
+
+Sandbox, 264 rows, no sessions, per verb over two 60 s windows:
+
+| verb | n | CPU µs/conn | kernel share |
+|---|---|---|---|
+| `status` | 10,184 | **1,385** | 7.6% |
+| `ping` | 5,092 | **126** | 3.3% |
+
+⭐ **`ping` is the per-connection floor, measured** — 126 µs for a request that
+does nothing. `status` at 264 rows is 1,385 µs against a 1,070 µs payload build,
+and the ~315 µs residual is that floor plus serialisation. **The three numbers
+close.**
+
+⚠⚠ **The kernel share here is 3–8%, not the ~94% that motivated the spec.** On a
+daemon with no sessions the handler is overwhelmingly *user* time. That locates
+the live figure rather than refuting it: whatever is 94% kernel is **not the
+connection handler on an idle daemon**. ⛔ **A named candidate the analysis lane
+supplied itself:** `TASK_COMM_LEN` is 16, `yggterm-daemon-client-…` truncates to
+`yggterm-daemon-c`, and unnamed spawned threads inherit the parent's `comm` — a
+by-name classifier can merge PTY reader threads into the handler bucket. **Open,
+and not settled by this lane.**
+
+**Live proof owed:** one `client_handler_cost` record from a daemon carrying real
+sessions, which is what tests the 94% claim.
+
 ## ⛔ [6.7] `status` SERVING IS ~1.6% OF DAEMON CPU — S5's PROTOCOL CHANGE IS NOT WORTH IT
 
 **Status:** OPEN
