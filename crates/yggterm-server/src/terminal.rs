@@ -1105,6 +1105,37 @@ impl TerminalManager {
             .and_then(|session| session.process_id())
     }
 
+    /// Did this runtime arrive by ADOPTION — i.e. do we SHARE its child with
+    /// whoever handed it to us?
+    ///
+    /// ⛔⛔ THE DISTINCTION IS FATAL AND IT IS WHY THIS EXISTS. A runtime we
+    /// spawned owns its child alone, so dropping it is cleanup. An ADOPTED
+    /// runtime is the same process on the same pty as the predecessor's copy —
+    /// so asking that predecessor to drop its side **kills the child we are
+    /// serving**, because a drop is `remove_session` → `shutdown` → `kill`.
+    ///
+    /// Measured 2026-08-14: the duplicate-prune fired twice with
+    /// `removed_terminal: true`, and the two outcomes were opposite. Against a
+    /// runtime created by a genuine re-launch it removed the STALE side and the
+    /// live process survived — correct. Against a runtime we had ADOPTED after a
+    /// lost handoff ack, it removed the side a live agent was mid-turn on, and
+    /// the transcript's last write lands in the same second as the drop.
+    ///
+    /// ⚠ In that second case **neither side was stale**, so "drop the duplicate"
+    /// had no right answer to give — which is exactly why the caller must not
+    /// ask the question rather than the prune trying to choose better.
+    #[cfg(target_os = "linux")]
+    pub fn session_is_adopted(&self, key: &str) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.child_is_adopted())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn session_is_adopted(&self, _key: &str) -> bool {
+        false
+    }
+
     /// The pid of the PTY's foreground process group leader — what the user
     /// would be typing at if they opened this row. Tenant accounting starts its
     /// "what is running in here" answer from this, and it is the only value the
@@ -2757,6 +2788,13 @@ impl PtySessionRuntime {
     fn process_id(&self) -> Option<u32> {
         let child = self.child.lock().expect("pty child lock poisoned");
         child.process_id()
+    }
+
+    /// Whether our child handle is an ADOPTED pid rather than one we forked.
+    #[cfg(target_os = "linux")]
+    fn child_is_adopted(&self) -> bool {
+        let child = self.child.lock().expect("pty child lock poisoned");
+        child.is_adopted()
     }
 
     #[cfg(unix)]
@@ -7814,6 +7852,71 @@ line-two on the real screen\r\n\
         );
 
         let _ = child_b.kill();
+        let _ = manager.shutdown_all(|_key| None::<String>);
+    }
+
+    /// ⛔⛔ THE DISCRIMINATOR THE DUPLICATE-PRUNE RESTS ON.
+    ///
+    /// A runtime we SPAWNED owns its child alone, so telling its other owner to
+    /// drop it is cleanup. An ADOPTED runtime is the same process on the same
+    /// pty as the predecessor's copy, and a drop is `remove_session` ->
+    /// `shutdown` -> `kill` — so pruning it kills the agent we are serving.
+    /// Measured fatal 2026-08-14: the prune fired against an adopted runtime
+    /// after a lost handoff ack and the transcript's last write lands in the
+    /// same second as the drop.
+    ///
+    /// If this ever reports `false` for an adopted runtime, the prune loses its
+    /// only way to tell "stale copy" from "the live process, twice".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_adopted_runtime_says_so_and_a_spawned_one_does_not() {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let _env = crate::codex_cli::env_test_guard();
+
+        let mut manager = TerminalManager::new();
+
+        // A runtime this manager spawned itself.
+        let spawned_key = "local://spawned-not-adopted";
+        manager
+            .ensure_session_with_size(spawned_key, "bash --norc -i", None, Some((80, 24)))
+            .expect("spawn a normal session");
+        assert!(
+            !manager.session_is_adopted(spawned_key),
+            "a session we forked ourselves must NOT report as adopted — the prune \
+             would then refuse to clean up a genuinely stale duplicate"
+        );
+
+        // A runtime adopted over the real wire.
+        let pair = native_pty_system()
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.arg("--norc");
+        cmd.arg("-i");
+        cmd.env("PS1", "");
+        let child = pair.slave.spawn_command(cmd).expect("spawn bash");
+        let pid = child.process_id().expect("bash pid");
+        let start = crate::pty_adoption::process_start_time(pid).expect("start time");
+        let (send, recv) = UnixStream::pair().expect("socketpair");
+        let raw = pair.master.as_raw_fd().expect("master raw fd");
+        crate::pty_handoff_wire::send_master_fd(&send, raw, b"t").expect("send");
+        let (received, _token) =
+            crate::pty_handoff_wire::recv_master_fd(&recv).expect("recv");
+        drop(pair);
+
+        let adopted_key = "local://adopted-shares-its-child";
+        manager
+            .adopt_session(adopted_key, "bash", None, 80, 24, received, pid, start, None)
+            .expect("adopt");
+        assert!(
+            manager.session_is_adopted(adopted_key),
+            "an ADOPTED session must say so — it shares its child with whoever \
+             handed it over, and the prune kills that child if it does not know"
+        );
+
         let _ = manager.shutdown_all(|_key| None::<String>);
     }
 }

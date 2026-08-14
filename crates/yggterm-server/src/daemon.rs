@@ -5787,6 +5787,16 @@ impl DaemonRuntime {
         if current_runtime_keys.is_empty() {
             return;
         }
+        // ⛔⛔ NEVER ASK AN OWNER TO DROP A RUNTIME WHOSE CHILD WE SHARE.
+        // An ADOPTED runtime is the predecessor's own process on the
+        // predecessor's own pty; a drop is `remove_session` -> `shutdown` ->
+        // `kill`, so the prune would kill the very agent we adopted. Measured
+        // fatal 2026-08-14 after a lost handoff ack.
+        let adopted_runtime_keys: HashSet<String> = current_runtime_keys
+            .iter()
+            .filter(|key| self.terminals.session_is_adopted(key))
+            .cloned()
+            .collect();
         if self
             .duplicate_runtime_prune_in_flight
             .swap(true, Ordering::SeqCst)
@@ -5818,6 +5828,7 @@ impl DaemonRuntime {
                     &home_dir,
                     reason,
                     &current_runtime_keys,
+                    &adopted_runtime_keys,
                     &registry_owner_endpoints,
                     &pending_removals,
                 );
@@ -12080,6 +12091,7 @@ fn run_duplicate_legacy_owned_runtime_prune(
     home_dir: &Path,
     reason: &'static str,
     current_runtime_keys: &HashSet<String>,
+    adopted_runtime_keys: &HashSet<String>,
     registry_owner_endpoints: &HashMap<String, ServerEndpoint>,
     pending_preserved_owner_removals: &Mutex<Vec<(String, &'static str)>>,
 ) {
@@ -12101,7 +12113,18 @@ fn run_duplicate_legacy_owned_runtime_prune(
         }
         let mut removed_runtime_keys = Vec::new();
         let mut errors = Vec::new();
+        let mut shared_child_skipped = Vec::new();
         for runtime_key in duplicate_runtime_keys {
+            // ⛔ THE ONE CASE WHERE "DROP THE DUPLICATE" HAS NO RIGHT ANSWER:
+            // we adopted this runtime FROM this owner, so both sides are the
+            // same live process and neither is stale. Dropping either kills it.
+            // Leave the duplicate standing; the handoff's own retry is what
+            // resolves it, and a duplicate costs bookkeeping while this costs
+            // the user their session.
+            if adopted_runtime_keys.contains(&runtime_key) {
+                shared_child_skipped.push(runtime_key);
+                continue;
+            }
             match drop_terminal_runtime(
                 &owner_endpoint,
                 &runtime_key,
@@ -12127,6 +12150,22 @@ fn run_duplicate_legacy_owned_runtime_prune(
                     "error": error.to_string(),
                 })),
             }
+        }
+        if !shared_child_skipped.is_empty() {
+            append_trace_event(
+                home_dir,
+                "daemon",
+                "lifecycle",
+                "duplicate_runtime_prune_skipped_shared_child",
+                serde_json::json!({
+                    "reason": "we ADOPTED these from this owner, so both sides are                                the same live process — dropping either would kill it",
+                    "runtime_keys": shared_child_skipped,
+                    "owner_server_pid": owner_status.server_pid,
+                    "owner_server_version": owner_status.server_version,
+                    "current_version": SERVER_PROTOCOL_VERSION,
+                    "current_pid": current_pid,
+                }),
+            );
         }
         let status_after = status(&owner_endpoint).ok();
         let remaining_duplicate_runtime_keys = status_after

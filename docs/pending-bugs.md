@@ -1609,7 +1609,86 @@ readings both fit the data, test the one that licenses the action you already
 wanted to take* — and a brief may carry MEASUREMENTS, never a causal theory
 dressed as fact.
 
-## ⛔⛔⛔ [6.1] A SEAT DIED TWO SECONDS AFTER ITS OWNING DAEMON WENT SILENT, AND THE EXIT PATH IS UNEXPLAINED
+## ⭐⭐ [6.1] ONE DEATH IS NOW EXPLAINED END TO END — THE DEADLOCK CREATES A DUPLICATE, AND THE DUPLICATE-PRUNE KILLS THE PTY
+
+**Status:** OPEN
+
+*The 464 s death after the 3.0.154 deploy, traced to its exact exit. This is the
+first session death this campaign can account for mechanically rather than by
+coincidence in time.*
+
+### The chain, every step evidenced
+
+| time (UTC) | what the trace says |
+|---|---|
+| 01:26:57 | 3.0.154 deployed; handover starts |
+| 01:28:17 | sweep: successor **accepted the fd but never acknowledged it (after the commit point)**. Predecessor books a failure and **resumes its own readers** |
+| 01:29:17 → 01:34:17 | **seven consecutive sweeps**, one a minute, every one `NoneMoved` on the same key, with the successor logging `pty_handoff_refused` — *"already runs a live PTY for it"* |
+| 01:33:02 | the seat's last assistant record, mid `tool_use` |
+| **01:34:41** | `terminal_runtime_dropped` on the **predecessor**, `reason: duplicate_legacy_owned_runtime_prune`, **`removed_terminal: true`** — driven by the successor's `duplicate_legacy_owned_runtimes_pruned` (`reason: terminal_ensure_new`) naming that predecessor as owner |
+| 01:34:41 | the transcript's last write. Same second. |
+
+⇒ **The lost ack leaves the key genuinely owned by BOTH daemons.** The
+duplicate-pruning path then does exactly what it is for — resolves a duplicate —
+and resolves it by dropping the runtime **with the terminal**, which is the PTY
+the agent was mid-turn on.
+
+⭐ **So the killer is not the handover and not the idle gate. It is the
+DEDUPLICATION of a duplicate that the handover's own failure created.** Every
+component behaved as designed; the defect is that one of them manufactures the
+input another one is entitled to destroy.
+
+### ⭐ THE SECOND FIX, AND IT IS THE ONE THAT TOUCHES THE KILLER (`d9966a7c`)
+
+The prune calls `drop_terminal_runtime` on the OWNER, and a drop is
+`remove_session` → `shutdown` → **`kill`**. So the prune does not merely forget a
+duplicate record — **it kills the child.** After a lost ack that child is the one
+the successor has just adopted and is serving.
+
+⚠ **The same code fired twice with opposite outcomes**, which is what narrows it:
+
+| | duplicate created by | prune dropped | outcome |
+|---|---|---|---|
+| the cut seat | a **lost ack** — successor took the fd, never acknowledged | the side a **live process was on** | **fatal, mid `tool_use`** |
+| an unrelated row | a **genuine re-launch** (resume started 2 s BEFORE the drop) | the **stale** side | **correct**, process survived 66 min |
+
+⇒ **In the lost-ack case neither side is stale**, so *"drop the duplicate"* has no
+right answer to give. The caller must not ask the question, rather than the prune
+trying to choose better.
+
+**Adoption is the discriminator, and it was already representable** —
+`PtyChildHandle::is_adopted` existed as dead code. A runtime we forked owns its
+child alone; an adopted one is the same process on the same pty as the
+predecessor's copy. The prune now skips adopted keys and **traces the skip**, so
+a standing duplicate is visible bookkeeping rather than a silent one.
+
+### What this means for the fix already landed
+
+`22f97c41` (idempotent re-adoption of the same child) **removes the
+precondition**: the 01:29:17 retry would have succeeded, the predecessor would
+have released cleanly, and there would never have been a duplicate to prune.
+⚠ That is an argument, not a measurement — it is unproven until a handover with
+a lost ack is observed converging.
+
+### ⛔ HONEST SCOPE — IT DOES NOT EXPLAIN THE OTHER DEATHS
+
+`removed_terminal: true` appears **exactly twice in the entire trace corpus**,
+both `duplicate_legacy_owned_runtime_prune`, both from the same predecessor:
+this key at 01:34:41, and `local://75445547…` at 01:28:18 (one second after the
+first failed sweep). ✅ **Checked: not a casualty.** Its `claude --resume`
+started **two seconds BEFORE** the drop, so the resume is what created that
+duplicate and the prune removed the **stale** side; the process was still alive
+66 minutes later, and its last assistant record predates the drop by 4.3 hours,
+so nothing was interrupted. ⚠ Its transcript mtime sits just after the drop and
+would have read as "died mid-stride" — the mtime-is-teardown trap.
+
+The 00:22:13 death has **zero** such events. ⇒ **Either a second mechanism
+exists, or that death predates trace coverage of this event.** Do not
+generalise this to the 272 s and 402 s instances; they remain unexplained, and
+the standing verdict on them is unchanged — coincidence in time with a matching
+signature.
+
+## ⛔⛔ [6.1] THE OTHER SEAT DEATHS: EXIT PATH STILL UNEXPLAINED
 
 **Status:** OPEN
 
