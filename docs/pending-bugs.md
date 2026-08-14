@@ -90,8 +90,20 @@ calls is 0.05% of a ~2.4 ms span**), and wrap the whole closure at
 `spawn_unix_client_handler` (`daemon.rs:785`) instead of just `handle_request`.
 
 **Expected effect: ZERO cores — do not promise any.** It converts an
-unattributable 1.8 cores into an attributed one. **Prediction it must satisfy:**
-~25 ms on a loaded daemon, ~0.7 ms on an empty one.
+unattributable 1.8 cores into an attributed one.
+
+⭐⭐ **AND IT IS NOW THE ONLY INSTRUMENT THAT CAN ANSWER THE LIVE QUESTION**
+(§6j-8). A baseline-subtracted external estimator was pointed at live daemons and
+came back **VOID**: bracketing baselines on one daemon moved 0.4240 → 1.1437
+cores and produced an impossible **negative** per-request cost. The baseline on a
+live daemon *is* the bursty per-session reader term, and it drifts ~35x faster
+than the signal. ⇒ **Per-request cost is below the noise floor of any external
+instrument; only an in-process span can reach it.** ⛔ Treat the remaining live
+figure (20–44 ms per dying thread) as **provisional** until S6's live record
+lands.
+
+**Prediction S6 must satisfy:** ~0.7 ms on an empty daemon, and a live figure that
+either confirms 20–44 ms or replaces it.
 
 ⛔ **Ruled out by measurement, so do not re-propose them:** `malloc_trim(0)` at
 `daemon.rs:19103` (**0.020–0.039 ms** at 30 threads/360 MB — ~600x too small),
