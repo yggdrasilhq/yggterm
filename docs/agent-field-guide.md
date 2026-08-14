@@ -246,6 +246,48 @@ fact and was one command from being falsified. A relayed measurement is a CLAIM 
 it yourself — and building a measurement on top of an instrument that does not exist is how a whole
 lane's numbers turn out to be about nothing.
 
+### ⛔⛔ THE ONE-WAY DOOR — a classification whose evidence stops updating once you classify
+
+**Two campaigns hit this in the same week, with the arrow pointing opposite ways, and
+neither instrument ever reported an error.** The generalisation is worth more than
+either bug:
+
+> **A classification derived from a signal that stops updating once the class is
+> entered is a one-way door.**
+
+- **Evidence FREEZES at classification.** A watchdog decided a session was rate-limited
+  by reading the tail of its transcript. A rate-limited session stops writing, so the
+  tail says the same thing forever — the class could be entered and never left, and
+  every re-read looked like fresh confirmation.
+- **Evidence ERODES as the work succeeds.** A repair tool selected its worklist with a
+  *what is still broken* query and then judged ordering from that same set. Rows left
+  the set as they were fixed and took their anchors with them, so **the tool grew more
+  confident the more of its own work had succeeded.**
+
+⭐ **Both get more confident the longer they are wrong, and neither can self-correct.**
+That is why both presented as *"the instrument reports healthy"* rather than as a
+failure — which is the hardest shape to find, because nothing is complaining.
+
+⇒ **THE QUESTION THAT CATCHES BOTH, cheap enough to ask of any state machine:**
+**_what writes the signal I classify on, and does it keep writing once I have
+classified?_** If the answer is *"the thing I just parked"*, the class has no exit.
+
+⚠ Companion, from the same pair of incidents: **any check whose input is a TODO query
+is suspect — ask what leaves the set when the work succeeds.**
+
+### ⛔ A WORKAROUND THAT ALWAYS WORKS HIDES THE THING IT WORKS AROUND
+
+Host discovery in the row-claiming script was broken outright — not flaky, **broken on
+every host, every time**. It went unnoticed for a long time because every brief and
+every pre-spawn checklist told sessions to pass the host explicitly, and that path
+always worked. **The workaround was load-bearing and nobody knew**, because a
+reliable workaround produces no failures to investigate.
+
+⇒ When a fix removes the need for a workaround, **go and correct the documents that
+mandated it**, recording that it is no longer load-bearing rather than quietly
+dropping the flag. Otherwise the next reader cannot tell a live requirement from a
+fossil, and the flag propagates forever.
+
 ### ⛔⛔ THE TWO PRIVACY GATES DISAGREED, AND THE WEAKER ONE GATED PUSHES
 
 **Fixed 2026-08-14. Recorded because the shape outlives the instance.**
