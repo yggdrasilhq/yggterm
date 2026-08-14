@@ -792,12 +792,288 @@ fn spawn_unix_client_handler(
     if let Err(error) = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
+            // ⭐ The measurement wraps the WHOLE closure, not `handle_request`.
+            // That is the entire point: the existing `PerfGuard` starts inside
+            // `handle_request` and drops when it returns, so the socket read,
+            // the request deserialise, the response serialise, the socket
+            // write and the thread's own teardown are all outside it. See
+            // [`ClientHandlerWindow`].
+            let started_cpu_us = thread_cpu_micros();
+            let started = std::time::Instant::now();
             let result = handle_unix_stream(stream, runtime, last_activity_ms);
             let _ = outcomes.send(result);
+            // ⭐ Both the closure's own delta AND the thread's LIFETIME total.
+            // The difference is what the thread cost before its closure began —
+            // stack setup and entry — which a closure-delta span cannot see and
+            // which a process-counter subtraction attributes without measuring.
+            // A note this file has carried says thread spawn is ~50 µs; this is
+            // the field that can check it rather than assume it.
+            let ended_cpu_us = thread_cpu_micros();
+            record_client_handler_cost(
+                ended_cpu_us.saturating_sub(started_cpu_us),
+                started.elapsed().as_micros() as u64,
+                ended_cpu_us,
+            );
         })
     {
         warn!(error=%error, "failed to spawn daemon client handler");
     }
+}
+
+/// How often the connection-handler cost aggregate is emitted. Flushed
+/// **lazily, by the next handler to finish** — never by a timer, for the same
+/// reason as every other window in this file: a thread waking to check whether
+/// it should flush is the idle cost this work exists to remove.
+const CLIENT_HANDLER_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What one connection handler costs **in CPU, end to end** — the span nothing
+/// was measuring.
+///
+/// ⛔ **Why the existing instrument cannot see this.** `handle_request`'s
+/// `PerfGuard` (a) starts *after* the socket read and the request deserialise
+/// and drops *before* the response serialise, the socket write and the thread's
+/// teardown, and (b) records **wall** time. A handler measured at ~2.4 ms of
+/// guarded wall has been measured at **25 ms of thread CPU**, and the missing
+/// 22 ms is where the daemon population's cost has been hiding — not because it
+/// was hard to find, but because no instrument was pointed at it.
+///
+/// **Two clocks, each used only where it is valid, and this is deliberate:**
+///
+/// - **Per-handler total: `CLOCK_THREAD_CPUTIME_ID`**, nanosecond-resolution.
+/// - **User/kernel split: `/proc/thread-self/stat` fields 14/15**, which are in
+///   `CLK_TCK` units — **10 ms granularity on this host**. ⛔ A single 0.7 ms
+///   handler therefore reads **zero ticks**, which is exactly the
+///   "field too coarse for its quantity" failure this campaign has already paid
+///   for once. It is only summed **across a whole window**, where hundreds of
+///   handlers make the ratio meaningful, and it is reported as a share rather
+///   than as a per-handler value. ⇒ Never read `user_ticks`/`kernel_ticks` off a
+///   short window.
+///
+/// ⚠ The split is read **once, at the end**, not differenced: the thread is
+/// spawned for this connection and has by construction accumulated no whole
+/// tick before its closure begins. That halves the instrument's own cost, which
+/// is ~10 µs of `/proc` read against a handler the prediction puts at
+/// 0.7–25 ms.
+#[derive(Debug, Default, Clone)]
+struct ClientHandlerStats {
+    handled: u64,
+    cpu_us_total: u64,
+    cpu_us_max: u64,
+    wall_us_total: u64,
+    wall_us_max: u64,
+    /// The thread's whole life, closure plus everything before it.
+    thread_total_cpu_us: u64,
+    user_us: u64,
+    kernel_us: u64,
+    split_samples: u64,
+}
+
+#[derive(Debug, Default)]
+struct ClientHandlerWindow {
+    opened: Option<std::time::Instant>,
+    opened_proc_cpu_us: u64,
+    by_request: BTreeMap<&'static str, ClientHandlerStats>,
+    /// The accept loop's OWN cost per connection — see
+    /// [`record_accept_spawn_cost`]. Kept in the same window so the two halves
+    /// of a connection are read off one record and cannot be paired across
+    /// different moments.
+    accept_spawn_count: u64,
+    accept_spawn_us_total: u64,
+    accept_spawn_us_max: u64,
+}
+
+/// What the accept loop spends handing one connection to a thread.
+///
+/// ⚠ This is the PARENT half. `clone()` charges most of a thread's creation to
+/// the caller, so a child-side span cannot see it.
+///
+/// ⛔ **It was built to look for a ~1.7 ms per-connection gap, and it refuted
+/// it.** Measured: **44–48 µs**, flat across row counts, with the count matching
+/// the handler count exactly. With the child's 39–55 µs pre-closure and a
+/// 61–126 µs do-nothing closure, the whole per-connection floor is
+/// **≈150–230 µs**. The 1.7 ms came from subtracting a closure span from a
+/// process counter that was charging concurrent background work to whatever
+/// connection happened to be open — **a difference of two instruments is not a
+/// measurement.**
+fn record_accept_spawn_cost(cpu_us: u64) {
+    let Ok(mut window) = CLIENT_HANDLER_WINDOW.lock() else {
+        return;
+    };
+    window.accept_spawn_count += 1;
+    window.accept_spawn_us_total += cpu_us;
+    window.accept_spawn_us_max = window.accept_spawn_us_max.max(cpu_us);
+}
+
+thread_local! {
+    /// The verb this handler thread served, stashed by `handle_request` so the
+    /// closure that wraps it can attribute its cost.
+    ///
+    /// ⛔ **Without this the aggregate is a mean over a MIXED verb population,
+    /// and it reads low.** The first run had `conns/s = 77` against
+    /// `replies/s = 51` — the extra connections were `ping` and `daemons` calls
+    /// from the harness itself, and averaging them in dragged the handler mean
+    /// *below* the cost of the `status` payload build it contains, which is
+    /// impossible and was the tell. A thread-local costs no lock and needs no
+    /// plumbing: same thread, written before the response is sent, read after.
+    static HANDLER_REQUEST_NAME: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+static CLIENT_HANDLER_WINDOW: LazyLock<Mutex<ClientHandlerWindow>> =
+    LazyLock::new(|| Mutex::new(ClientHandlerWindow::default()));
+
+/// The daemon's own home, resolved once.
+///
+/// ⛔ Deliberately NOT taken from the runtime: reaching for `DaemonRuntime` here
+/// would lock the global mutex on **every connection**, which is the contention
+/// this instrument exists to measure. An instrument that changes the quantity it
+/// reports is worse than none.
+static TRACE_HOME_DIR: LazyLock<Option<PathBuf>> =
+    LazyLock::new(|| yggterm_core::resolve_yggterm_home().ok());
+
+/// This thread's user and kernel time, in **microseconds**.
+///
+/// ⛔ **The obvious source is `/proc/thread-self/stat` fields 14/15, and it
+/// reports zero here — I shipped that version and it did.** Those fields are in
+/// `CLK_TCK` units, 10 ms on this host, and **every** connection handler is
+/// shorter than one tick, so each read truncated to 0. ⚠ The reasoning that
+/// justified it — *"summed across a window, hundreds of handlers make it
+/// meaningful"* — is wrong, and wrong in a way worth naming: **truncation is
+/// applied to each sample before the sum, so it does not average out. A sum of
+/// floors is not the floor of a sum.** The first live run read
+/// `ticks=0, kernel_share=n/a` across ~26,500 handlers carrying ~2.5 s of CPU.
+///
+/// `getrusage(RUSAGE_THREAD)` answers the same question at **microsecond**
+/// resolution, per thread, with the user/kernel split intact — which is the
+/// whole point, since the claim under test is that this path is ~94% kernel.
+#[cfg(target_os = "linux")]
+fn thread_cpu_split_micros() -> Option<(u64, u64)> {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is a valid, zeroed `rusage` we own; `RUSAGE_THREAD` is a
+    // compile-time constant.
+    if unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) } != 0 {
+        return None;
+    }
+    let to_us = |t: libc::timeval| (t.tv_sec as u64) * 1_000_000 + (t.tv_usec as u64);
+    Some((to_us(usage.ru_utime), to_us(usage.ru_stime)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_cpu_split_micros() -> Option<(u64, u64)> {
+    None
+}
+
+fn record_client_handler_cost(cpu_us: u64, wall_us: u64, thread_total_cpu_us: u64) {
+    let split = thread_cpu_split_micros();
+    let request_name = HANDLER_REQUEST_NAME.with(|name| name.take()).unwrap_or("unread");
+    let proc_cpu_us = process_cpu_micros();
+    let now = std::time::Instant::now();
+    let flush = {
+        let Ok(mut window) = CLIENT_HANDLER_WINDOW.lock() else {
+            return;
+        };
+        if window.opened.is_none() {
+            window.opened = Some(now);
+            window.opened_proc_cpu_us = proc_cpu_us;
+        }
+        let stats = window.by_request.entry(request_name).or_default();
+        stats.handled += 1;
+        stats.cpu_us_total += cpu_us;
+        stats.cpu_us_max = stats.cpu_us_max.max(cpu_us);
+        stats.wall_us_total += wall_us;
+        stats.wall_us_max = stats.wall_us_max.max(wall_us);
+        stats.thread_total_cpu_us += thread_total_cpu_us;
+        if let Some((user_us, kernel_us)) = split {
+            stats.user_us += user_us;
+            stats.kernel_us += kernel_us;
+            stats.split_samples += 1;
+        }
+        let elapsed = now.duration_since(window.opened.unwrap_or(now));
+        if elapsed < CLIENT_HANDLER_FLUSH_INTERVAL {
+            None
+        } else {
+            let emitted = std::mem::take(&mut window.by_request);
+            let accept = (
+                window.accept_spawn_count,
+                window.accept_spawn_us_total,
+                window.accept_spawn_us_max,
+            );
+            window.accept_spawn_count = 0;
+            window.accept_spawn_us_total = 0;
+            window.accept_spawn_us_max = 0;
+            window.opened = Some(now);
+            let previous_proc_cpu_us = window.opened_proc_cpu_us;
+            window.opened_proc_cpu_us = proc_cpu_us;
+            Some((
+                elapsed,
+                proc_cpu_us.saturating_sub(previous_proc_cpu_us),
+                emitted,
+                accept,
+            ))
+        }
+    };
+    let Some((elapsed, proc_cpu_us_delta, emitted, accept)) = flush else {
+        return;
+    };
+    let (accept_count, accept_us_total, accept_us_max) = accept;
+    let Some(home) = TRACE_HOME_DIR.as_ref() else {
+        return;
+    };
+    let window_ms = elapsed.as_millis().max(1) as u64;
+    let requests = emitted
+        .iter()
+        .map(|(name, stats)| {
+            let split_total = stats.user_us + stats.kernel_us;
+            (
+                (*name).to_string(),
+                serde_json::json!({
+                    "handled": stats.handled,
+                    "cpu_us_total": stats.cpu_us_total,
+                    "cpu_us_mean": stats.cpu_us_total / stats.handled.max(1),
+                    "cpu_us_max": stats.cpu_us_max,
+                    "wall_us_mean": stats.wall_us_total / stats.handled.max(1),
+                    "wall_us_max": stats.wall_us_max,
+                    // ⭐ Thread lifetime, not closure. The gap between this and
+                    // `cpu_us_mean` is the thread's pre-closure cost, measured.
+                    "thread_cpu_us_mean": stats.thread_total_cpu_us / stats.handled.max(1),
+                    // ⚠ A WINDOW share. Per handler it would be a ratio of two
+                    // microsecond figures on a sub-millisecond span, which is a
+                    // precision this does not have.
+                    "kernel_share": if split_total == 0 {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(stats.kernel_us as f64 / split_total as f64)
+                    },
+                    "kernel_us_total": stats.kernel_us,
+                    "user_us_total": stats.user_us,
+                    "split_samples": stats.split_samples,
+                    "handlers_per_s": stats.handled as f64 * 1000.0 / window_ms as f64,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let handled: u64 = emitted.values().map(|stats| stats.handled).sum();
+    let cpu_us_total: u64 = emitted.values().map(|stats| stats.cpu_us_total).sum();
+    append_trace_event(
+        home,
+        "daemon",
+        "perf",
+        "client_handler_cost",
+        serde_json::json!({
+            "window_ms": window_ms,
+            "handled": handled,
+            "cpu_us_total": cpu_us_total,
+            "proc_cpu_us_delta": proc_cpu_us_delta,
+            "handlers_per_s": handled as f64 * 1000.0 / window_ms as f64,
+            // The accept loop's own half of a connection, from the same window.
+            "accept_spawn_count": accept_count,
+            "accept_spawn_us_mean": accept_us_total / accept_count.max(1),
+            "accept_spawn_us_max": accept_us_max,
+            // ⛔ Per VERB. A single mean over every connection mixes a `ping`
+            // with a `status` carrying 264 rows, and reads low.
+            "requests": requests,
+        }),
+    );
 }
 
 #[cfg(unix)]
@@ -3601,6 +3877,22 @@ struct DaemonRuntime {
     /// [`PROXIED_WORKING_REFRESH_MS`]; the snapshot only reads it.
     proxied_working_flags: HashMap<String, bool>,
     proxied_working_refreshed_ms: u128,
+    /// Which live sibling daemon answered a working flag for a row this daemon
+    /// does not own, learned by the chore-thread discovery pass.
+    ///
+    /// It exists because `preserved_owner_endpoint_for_request` can only name an
+    /// owner this daemon already has a RECORD of, and most dark rows are owned
+    /// by a daemon it has no record of at all — so the proxy was skipping them
+    /// entirely and no amount of better transport could widen its coverage.
+    ///
+    /// ⛔ **NOT an ownership record, and it must never be written into
+    /// `preserved_terminal_owners`.** That registry drives hot-update handover;
+    /// "answered a question about a dot" is not a claim on the terminal. This is
+    /// in-memory only, rebuilt by discovery, and discarded on restart — so the
+    /// worst a stale entry can do is cost one refused request, after which the
+    /// unreachable backoff applies.
+    discovered_working_flag_owners: HashMap<String, ServerEndpoint>,
+    discovered_working_owners_scanned_ms: u64,
     /// The shared-scope ledger order AS THIS DAEMON BOOTED — the arrangement the
     /// user left behind on the daemon we are succeeding.
     ///
@@ -3856,6 +4148,8 @@ impl DaemonRuntime {
             preserved_terminal_owners,
             row_order_ledger,
             proxied_working_flags: HashMap::new(),
+            discovered_working_flag_owners: HashMap::new(),
+            discovered_working_owners_scanned_ms: 0,
             proxied_working_refreshed_ms: 0,
             booted_with_row_order,
             live_row_tombstones,
@@ -4125,6 +4419,21 @@ impl DaemonRuntime {
         self.proxied_working_flags = proxied;
     }
 
+    /// Local screens plus whatever the last refresh learned from siblings.
+    ///
+    /// Issues no peer request, so it cannot recurse and cannot be slowed by a
+    /// hung peer — see the note at the `WorkingFlags` request arm.
+    fn working_flags_from_local_and_cache(&self) -> Vec<(String, bool)> {
+        let mut flags = self.working_flags();
+        let answered: HashSet<String> = flags.iter().map(|(path, _)| path.clone()).collect();
+        for (path, working) in &self.proxied_working_flags {
+            if !answered.contains(path) {
+                flags.push((path.clone(), *working));
+            }
+        }
+        flags
+    }
+
     fn working_flags_including_proxied(&mut self) -> Vec<(String, bool)> {
         let mut flags = self.working_flags();
         let mut answered: HashSet<String> =
@@ -4144,7 +4453,15 @@ impl DaemonRuntime {
         let mut owners: Vec<ServerEndpoint> = Vec::new();
         for path in &unanswered {
             let runtime_key = self.terminal_runtime_key_for_path(path);
-            let Some(owner) = self.preserved_owner_endpoint_for_request(&runtime_key) else {
+            // The registry first: it is authoritative and free. Then what
+            // discovery learned, which is the only answer for a row whose owner
+            // this daemon holds no record of — measured to be MOST of them, and
+            // the reason wiring the proxy into the snapshot was necessary and
+            // not sufficient.
+            let owner = self
+                .preserved_owner_endpoint_for_request(&runtime_key)
+                .or_else(|| self.discovered_working_flag_owner(path));
+            let Some(owner) = owner else {
                 continue;
             };
             let label = owner_endpoint_label(&owner);
@@ -4168,7 +4485,66 @@ impl DaemonRuntime {
         flags
     }
 
+    /// Build the status reply, **and record what building it cost.**
+    ///
+    /// See [`StatusCostWindow`] for why this path needed its own counter rather
+    /// than the `PerfGuard` that already wraps every request: that guard drops
+    /// 98% of sub-8 ms `status` spans, and it drops them in a row-correlated
+    /// way, so the set it keeps cannot be read as the population.
     fn status(&self) -> ServerRuntimeStatus {
+        let started_cpu_us = thread_cpu_micros();
+        let started = std::time::Instant::now();
+        let payload = self.status_payload();
+        let cpu_us = thread_cpu_micros().saturating_sub(started_cpu_us);
+        let wall_us = started.elapsed().as_micros() as u64;
+        // Rows as the daemon listing counts them, so a reading pairs against the
+        // ROWS column a human sees rather than a second definition of "row".
+        let rows = payload.live_terminal_sessions.len() as u64;
+        let stored_rows = payload.stored_terminal_session_count as u64;
+        let flush = STATUS_COST_WINDOW.lock().ok().and_then(|mut window| {
+            record_status_cost(
+                &mut window,
+                std::time::Instant::now(),
+                process_cpu_micros(),
+                cpu_us,
+                wall_us,
+                rows,
+                stored_rows,
+            )
+        });
+        if let Some(flush) = flush {
+            let emitted = &flush.window;
+            let elapsed_us = flush.elapsed.as_micros().max(1) as u64;
+            append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "perf",
+                "status_cost",
+                serde_json::json!({
+                    "window_ms": flush.elapsed.as_millis() as u64,
+                    "replies": emitted.replies,
+                    // CPU, not wall — both are carried so the gap between them
+                    // (lock waits, descheduling) is visible instead of implied.
+                    "cpu_us_total": emitted.cpu_us_total,
+                    "cpu_us_mean": emitted.cpu_us_total / emitted.replies.max(1),
+                    "cpu_us_max": emitted.cpu_us_max,
+                    "wall_us_total": emitted.wall_us_total,
+                    "wall_us_mean": emitted.wall_us_total / emitted.replies.max(1),
+                    "rows_mean": emitted.rows_total / emitted.replies.max(1),
+                    "rows_last": emitted.rows_last,
+                    "stored_rows_last": emitted.stored_rows_last,
+                    // The denominator, from the same window, so the SHARE is a
+                    // property of one record and not of two measurements a
+                    // reader has to divide and hope were taken together.
+                    "proc_cpu_us_delta": flush.proc_cpu_us_delta,
+                    "replies_per_s": emitted.replies as f64 * 1_000_000.0 / elapsed_us as f64,
+                }),
+            );
+        }
+        payload
+    }
+
+    fn status_payload(&self) -> ServerRuntimeStatus {
         let terminal_stats = self.terminals.stats();
         let payload_stats = self.server.payload_stats();
         let preserved_owner_keys = self.preserved_terminal_owner_keys();
@@ -4185,7 +4561,11 @@ impl DaemonRuntime {
         // successor that had to clear its own file can adopt them from us rather
         // than from the file. No mirrored filter — `persisted_state()` IS the
         // filter, so the wire and the file cannot drift apart.
-        let live_terminal_sessions = self.server.persisted_state().live_sessions;
+        // ⚠ `persisted_live_sessions()`, not `persisted_state().live_sessions`
+        // — the same rows by the same filter, without also building the stored
+        // list a second time, sorting every PTY grid, and cloning the machine
+        // table only to drop them. Same wire, less work; see that method.
+        let live_terminal_sessions = self.server.persisted_live_sessions();
         let owned_terminal_session_keys = self.terminals.session_keys();
         let mut terminal_session_keys = owned_terminal_session_keys.clone();
         terminal_session_keys.extend(preserved_owner_keys.iter().cloned());
@@ -4969,6 +5349,57 @@ impl DaemonRuntime {
             return None;
         }
         Some(endpoint)
+    }
+
+    /// A sibling that answered for this row last time discovery ran, unless it
+    /// is inside the unreachable backoff.
+    ///
+    /// Shares that backoff with the registry deliberately: a peer that just
+    /// timed out is the same peer whichever map named it, and one negative
+    /// cache is one answer to "is this endpoint worth a request right now".
+    fn discovered_working_flag_owner(&self, session_path: &str) -> Option<ServerEndpoint> {
+        let endpoint = self.discovered_working_flag_owners.get(session_path)?.clone();
+        let label = owner_endpoint_label(&endpoint);
+        if let Some(until) = self.preserved_owner_unreachable_until_ms.get(&label)
+            && (crate::app_control::current_millis() as u64) < *until
+        {
+            return None;
+        }
+        Some(endpoint)
+    }
+
+    /// Record what a discovery pass learned. Rows nobody claimed are DROPPED
+    /// rather than remembered as unowned: an absent entry retries next pass,
+    /// and a remembered "nobody" would need its own expiry to ever recover.
+    fn adopt_discovered_working_flag_owners(
+        &mut self,
+        learned: HashMap<String, ServerEndpoint>,
+        scanned_ms: u64,
+    ) {
+        self.discovered_working_flag_owners = learned;
+        self.discovered_working_owners_scanned_ms = scanned_ms;
+    }
+
+    fn discovered_working_owners_scan_due(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.discovered_working_owners_scanned_ms)
+            >= WORKING_FLAG_OWNER_DISCOVERY_INTERVAL_MS
+    }
+
+    /// The live sibling daemons on this host: every listening versioned server
+    /// socket in this daemon's own home, minus itself.
+    ///
+    /// ⛔ Deliberately NOT a `status` probe per socket. That is the gate measured
+    /// to hang 16 live daemons at once, and the census answers the same question
+    /// from one `/proc/net/unix` read with no request at all. An INCOMPLETE
+    /// census yields nothing rather than a short list — "I could not look" must
+    /// never read as "nothing is alive".
+    fn live_sibling_endpoints(&self) -> Vec<ServerEndpoint> {
+        let home = self.store.home_dir();
+        let census = crate::socket_sweep::LiveDaemonCensus::gather(home);
+        if !census.is_complete() {
+            return Vec::new();
+        }
+        sibling_endpoints_from_census(census.listening_paths(), &default_endpoint(home))
     }
 
     fn mark_preserved_owner_unreachable(&mut self, owner_endpoint: &ServerEndpoint) {
@@ -7604,7 +8035,78 @@ impl DaemonRuntime {
     /// Remember that the user closed the row currently listed for `path`, so no
     /// peer daemon can hand it back. Call BEFORE the removal — the identity is
     /// read out of the live order, which the removal empties.
+    ///
+    /// It also writes the DEPARTURE record (`spec-app-row-survival.md` §3). Both
+    /// here, because both are read out of the live order the removal is about to
+    /// empty, and a record written after the fact would have nothing to name.
+    /// Write down that a row left the live set, and WHY.
+    ///
+    /// ⛔ THE DEFECT (`docs/spec-app-row-survival.md` §3). A group of app rows
+    /// evaporated on a GUI restart and `removed-rows.json` had no entry for any
+    /// of them — so nothing in the system could tell *"the user closed this"*
+    /// from *"this went on its own"*, and the loss was undiagnosable rather than
+    /// merely annoying. **An absence is not a record.** The row's own store said
+    /// it was live, the GUI's live set disagreed, and neither of them said what
+    /// had happened, because nothing had written it down.
+    ///
+    /// ⚠ Call BEFORE the removal. The identity and the title are read out of the
+    /// live order, which the removal empties — a recorder that runs afterwards
+    /// finds nothing to name and silently writes nothing, which is precisely the
+    /// failure it was added to end.
+    ///
+    /// Best-effort by design: a row leaving is not something to abort, so a
+    /// ledger write that fails is traced and the close proceeds.
+    fn record_row_departure(
+        &mut self,
+        path: &str,
+        reason: crate::live_row_tombstones::RowDeparture,
+    ) {
+        let Some(key) = self.server.live_session_row_key(path) else {
+            return;
+        };
+        let identity = crate::normalized_live_row_identity(&key);
+        let title = self
+            .server
+            .resolve_live_session_entry(&key)
+            .map(|(_resolved, session)| session.title)
+            .unwrap_or_default();
+        let departure = crate::live_row_tombstones::LiveRowDeparture {
+            identity: identity.clone(),
+            path: key.clone(),
+            title: title.clone(),
+            reason,
+            at: crate::live_row_tombstones::now_secs(),
+        };
+        let home = self.store.home_dir().to_path_buf();
+        match self.live_row_tombstones.record_departure(&home, departure) {
+            Ok(_) => append_trace_event(
+                &home,
+                "daemon",
+                "session",
+                "live_session_row_departed",
+                serde_json::json!({
+                    "path": key,
+                    "identity": identity,
+                    "title": title,
+                    "reason": reason.label(),
+                }),
+            ),
+            Err(error) => append_trace_event(
+                &home,
+                "daemon",
+                "session",
+                "live_session_row_departure_record_failed",
+                serde_json::json!({
+                    "path": key,
+                    "reason": reason.label(),
+                    "error": error.to_string(),
+                }),
+            ),
+        }
+    }
+
     fn tombstone_live_row(&mut self, path: &str) {
+        self.record_row_departure(path, crate::live_row_tombstones::RowDeparture::ExplicitClose);
         let Some(identity) = self
             .server
             .live_session_row_key(path)
@@ -7764,6 +8266,10 @@ impl DaemonRuntime {
         // prune (cheap; usually empty).
         self.drain_pending_preserved_owner_removals();
         let request_name = server_request_name(&request);
+        // Hand the verb to the connection-handler cost aggregate, which wraps
+        // this call and cannot know the name any other way — the request has
+        // not been read yet when its thread starts.
+        HANDLER_REQUEST_NAME.with(|name| name.set(Some(request_name)));
         // App profiling system: time every daemon request, tagged by name, so
         // `server perf-summary` surfaces the slow ones (the switch path is `terminal_ensure`).
         // Drop-based so `?` early returns and panics still record. No-op when the
@@ -7783,8 +8289,22 @@ impl DaemonRuntime {
         let response = match request {
             ServerRequest::Ping => ServerResponse::Pong,
             ServerRequest::Status => ServerResponse::Status(self.status()),
+            // ⛔ ANSWERED FROM THE CACHE, AND THAT IS WHAT MAKES THE FAN-OUT
+            // SAFE TO WIDEN. This request is served by the very path that
+            // proxies it, so a daemon that asks a sibling here would be asking
+            // something that asks back — and once discovery lets two daemons
+            // find each other, that is an unbounded mutual recursion, one
+            // request timeout per hop. It is invisible today only because
+            // proxying landed 2026-08-13 and exactly one daemon on the GUI host
+            // is new enough to do it; it would arrive with the fleet upgrade.
+            //
+            // Making the SERVE a pure read cuts it by construction, with no wire
+            // change and nothing for an older daemon to fail to understand.
+            // Fan-out now happens on exactly ONE path — the refresh below, which
+            // the snapshot drives — so the GUI's own poll still gets proxied
+            // answers, from a cache at most `PROXIED_WORKING_REFRESH_MS` old.
             ServerRequest::WorkingFlags => ServerResponse::WorkingFlags {
-                flags: self.working_flags_including_proxied(),
+                flags: self.working_flags_from_local_and_cache(),
             },
             ServerRequest::Snapshot => {
                 // The dot's answer for rows an older coexisting daemon owns.
@@ -7900,6 +8420,23 @@ impl DaemonRuntime {
                         Ok(false) => {}
                         Err(error) => errors.push(format!("{path}: {error}")),
                     }
+                    // ⛔ THE EVAPORATION, WRITTEN DOWN — and this is the one site
+                    // that had no record at all. Nobody named these rows; they
+                    // are taken for a property they have, so the user has no act
+                    // of their own to remember and nothing else in the system
+                    // says they went. That is why a group of app rows could
+                    // simply cease to exist here and leave `removed-rows.json`
+                    // empty (`spec-app-row-survival.md` §3).
+                    //
+                    // BEFORE the removal, like every other identity read here:
+                    // the live order is where the row's identity and title live,
+                    // and the next line empties it. NOT a tombstone — a veto
+                    // would stop a peer daemon offering the row back, and this
+                    // close does not carry the user's authority to forbid that.
+                    self.record_row_departure(
+                        &path,
+                        crate::live_row_tombstones::RowDeparture::GuiCloseDisposable,
+                    );
                     match self.server.remove_live_session(&path) {
                         Ok(true) => metadata_removed += 1,
                         Ok(false) => {}
@@ -11674,9 +12211,42 @@ fn daemon_should_idle_shutdown(
     idle_shutdown_ms: u64,
     terminal_session_count: usize,
 ) -> bool {
-    // Never retire a daemon that still owns live sessions (including preserved
-    // hot-update PTYs, which are counted here) — there is no fd-handoff, so a
-    // shutdown would interrupt them.
+    // Never retire a daemon that still owns live RUNNING sessions — there is no
+    // fd-handoff on this path, so a shutdown would interrupt them.
+    //
+    // ⛔⛔ THIS COMMENT USED TO SAY "including preserved hot-update PTYs, which
+    // are counted here". THEY ARE NOT COUNTED HERE, and the difference decides
+    // whether a handover can finish. Measured 2026-08-14 in an isolated home
+    // with a real predecessor/successor pair:
+    //
+    //   `terminal_session_count` (this argument) is
+    //   `runtime.terminals.stats().session_count` at both call sites — sessions
+    //   in THIS daemon's own registry that are `is_running()`. A preserved
+    //   owner record is not a running session here, so it contributes ZERO.
+    //
+    //   `ServerRuntimeStatus::terminal_session_count`, which shares the name, is
+    //   `terminal_session_keys.len()` and DOES include preserved keys. Two
+    //   different quantities, one name, and the doc described the other one.
+    //
+    // ⇒ A successor that has accepted a hot-update handoff and holds the runtime
+    // only as PRESERVED (owned = 0) passes this gate. Observed: successor
+    // 3.0.155 logged `idle shutdown` at its 90 s window while reporting
+    // `preserved_terminal_owner_count: 1`, and the 3.0.154 predecessor kept the
+    // session. **The NEW daemon retired and the OLD one stayed** — the drain
+    // inverted. ⚠ No session was lost; the pty child survived throughout. The
+    // failure is non-convergence, not data loss.
+    //
+    // ⚠ It needs gate 3 to also be open, so a successor with a live client
+    // record is protected. That is why the fleet does not see this constantly:
+    // the GUI registers with the new daemon. It bites when the successor has no
+    // client record — a headless deploy, or the window before the GUI registers.
+    //
+    // ⛔ DELIBERATELY NOT "FIXED" BY COUNTING PRESERVED HERE. That inverts into
+    // the other failure: bequeathed records outlive the daemons that made them,
+    // so a daemon holding a stale preserved key would never retire, and the
+    // measured cost of the daemon population is `N_reachable × a ~0.2-core
+    // floor`. Which way this should go is a design call recorded in
+    // `docs/pending-bugs.md`, not something to change under a held release.
     if terminal_session_count > 0 {
         return false;
     }
@@ -12169,6 +12739,150 @@ pub fn working_flags(endpoint: &ServerEndpoint) -> Result<Vec<(String, bool)>> {
 /// an owner left empty, and queue preserved-owner registry removals for the
 /// request loop to apply. Talks ONLY to other daemons' sockets + the trace
 /// file — never to this daemon's in-memory state.
+/// Which listening sockets are OTHER daemons worth asking — pure and total, so
+/// the selection can be tested without a running fleet.
+///
+/// Three rules, and each one has a way of going wrong that costs something:
+/// a name that is not a versioned server socket is not a daemon (the home holds
+/// other sockets); this daemon's own address must be dropped or it interrogates
+/// itself under its own lock; and the result is SORTED, because the census is a
+/// set and the first sibling to claim a row is the one recorded — unordered,
+/// that record would be a coin toss between passes.
+#[cfg(unix)]
+fn sibling_endpoints_from_census(
+    listening: &HashSet<PathBuf>,
+    own: &ServerEndpoint,
+) -> Vec<ServerEndpoint> {
+    let mut endpoints: Vec<ServerEndpoint> = Vec::new();
+    for path in listening {
+        if parse_versioned_server_socket_name(path).is_none() {
+            continue;
+        }
+        let endpoint = ServerEndpoint::UnixSocket(path.clone());
+        if server_endpoints_same_target(&endpoint, own) {
+            continue;
+        }
+        let label = owner_endpoint_label(&endpoint);
+        if endpoints
+            .iter()
+            .any(|seen| owner_endpoint_label(seen) == label)
+        {
+            continue;
+        }
+        endpoints.push(endpoint);
+    }
+    endpoints.sort_by_key(owner_endpoint_label);
+    endpoints
+}
+
+/// How often to re-learn which sibling owns a row this daemon cannot answer for.
+///
+/// Ownership changes only when a session is taken or lost, so this is rare work
+/// deliberately kept off the 1.5 s dot cadence. Once a row's owner is learned the
+/// refresh reaches it directly at that faster cadence — discovery is what makes
+/// the row reachable, not what keeps its flag fresh.
+const WORKING_FLAG_OWNER_DISCOVERY_INTERVAL_MS: u64 = 30_000;
+
+/// Learn which live sibling daemon owns each row this daemon holds no
+/// preserved-owner record for (background chore thread).
+///
+/// **The gap this closes.** `working_flags_including_proxied` asks
+/// `preserved_owner_endpoint_for_request`, which can only name an owner already
+/// in the registry — and measured on the GUI host at 3.0.135, 21 of 31 seated
+/// rows still reported `working: None` because their owner was not in it. Wiring
+/// the proxy into the snapshot was necessary and could never be sufficient: it
+/// improved the transport, and the coverage was the problem.
+///
+/// **Why a chore and not the request path.** `WorkingFlags` takes the default
+/// client IO timeout, so a single hung peer would stall a refresh that runs
+/// every 1.5 s. This follows `run_preserved_owner_revalidation_if_due`, the
+/// precedent in this file for exactly that, and obeys the same rule: it talks
+/// ONLY to other daemons' sockets and the trace file, never to this daemon's
+/// in-memory state while the I/O is in flight.
+///
+/// ⛔ It records a DOT answer, not an ownership claim — see
+/// `discovered_working_flag_owners`.
+#[cfg(unix)]
+fn run_working_flag_owner_discovery_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) {
+    let now_ms = current_millis_u64();
+    let (wanted, endpoints, home_dir) = {
+        let Ok(mut runtime) = runtime.lock() else {
+            return;
+        };
+        if !runtime.discovered_working_owners_scan_due(now_ms) {
+            return;
+        }
+        // Claim the window BEFORE the I/O, so a pass that outruns the interval
+        // cannot be entered a second time on the next tick.
+        runtime.discovered_working_owners_scanned_ms = now_ms;
+        let answered: HashSet<String> = runtime
+            .working_flags()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        let wanted: HashSet<String> = runtime
+            .server
+            .live_sessions()
+            .iter()
+            .map(|session| session.session_path.clone())
+            .filter(|path| !answered.contains(path))
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        (
+            wanted,
+            runtime.live_sibling_endpoints(),
+            runtime.store.home_dir().to_path_buf(),
+        )
+    };
+    if endpoints.is_empty() {
+        return;
+    }
+
+    let mut learned: HashMap<String, ServerEndpoint> = HashMap::new();
+    let mut unreachable: Vec<ServerEndpoint> = Vec::new();
+    for endpoint in &endpoints {
+        match working_flags(endpoint) {
+            Ok(flags) => {
+                for (path, _) in flags {
+                    // Only rows we could not answer for ourselves, and the first
+                    // sibling to claim one keeps it — `live_sibling_endpoints`
+                    // is sorted so "first" is the same across passes.
+                    if wanted.contains(&path) {
+                        learned.entry(path).or_insert_with(|| endpoint.clone());
+                    }
+                }
+            }
+            Err(_) => unreachable.push(endpoint.clone()),
+        }
+    }
+
+    let Ok(mut runtime) = runtime.lock() else {
+        return;
+    };
+    let learned_count = learned.len();
+    runtime.adopt_discovered_working_flag_owners(learned, now_ms);
+    for endpoint in &unreachable {
+        runtime.mark_preserved_owner_unreachable(endpoint);
+    }
+    // ⛔ The counts are traced rather than capped. A host with far more live
+    // daemons than the five measured here has a drain problem, and silently
+    // asking a subset would hide it while still reporting a healthy dot.
+    append_trace_event(
+        &home_dir,
+        "daemon",
+        "working_flags",
+        "owner_discovery",
+        serde_json::json!({
+            "siblings_asked": endpoints.len(),
+            "siblings_unreachable": unreachable.len(),
+            "rows_wanted": wanted.len(),
+            "rows_learned": learned_count,
+        }),
+    );
+}
+
 const PRESERVED_OWNER_REVALIDATE_INTERVAL_MS: u64 = 5 * 60_000;
 static PRESERVED_OWNER_LAST_REVALIDATE_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -17490,6 +18204,10 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 run_preserved_owner_revalidation_if_due(&runtime);
+                // Rides this EXISTING tick for the same reason the reap below
+                // does: a timer of its own would be a standing idle cost, and
+                // this pass is a no-op on any daemon that owns all its rows.
+                run_working_flag_owner_discovery_if_due(&runtime);
                 // Pre-declared ephemerality (docs/pending-bugs.md, the immortal
                 // tenant class): rides this EXISTING tick rather than adding a
                 // timer, so an installation where nothing is ever declared
@@ -17759,11 +18477,26 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             }
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // ⭐ THE PARENT SIDE OF A CONNECTION, MEASURED RATHER THAN
+                    // INFERRED. The handler span covers the child thread; this
+                    // covers what the accept loop itself spends per connection —
+                    // the `clone()`, the argument clones, the channel sender.
+                    // It was previously only reachable as a DIFFERENCE between a
+                    // closure span and a process counter, which is the shape
+                    // this lane keeps getting wrong, and which is unmeasurable
+                    // on a live daemon anyway: an external estimator needs a
+                    // stationary baseline, and a live daemon's baseline drifts
+                    // faster than this signal — substantially because the
+                    // measurer's own load generator is part of it.
+                    let spawn_started_cpu_us = thread_cpu_micros();
                     spawn_unix_client_handler(
                         stream,
                         runtime.clone(),
                         last_activity_ms.clone(),
                         client_outcome_tx.clone(),
+                    );
+                    record_accept_spawn_cost(
+                        thread_cpu_micros().saturating_sub(spawn_started_cpu_us),
                     );
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -18052,6 +18785,137 @@ fn record_lock_wait(
     }
     window.opened = Some(now);
     Some((elapsed, std::mem::take(&mut window.by_request)))
+}
+
+/// How often the `status` cost aggregate is emitted. Flushed **lazily, by the
+/// next reply** — same rule as the lock-wait window above, and for the same
+/// reason: a thread waking to check whether it should flush is precisely the
+/// idle cost this lane exists to remove.
+const STATUS_COST_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// CPU consumed by the calling thread, microseconds.
+///
+/// ⚠ Priced on this host before being used, because the fleet spread on this
+/// call is 45.8x and a probe can cost more than the thing it measures:
+/// `CLOCK_THREAD_CPUTIME_ID` is **578 ns** here (a real syscall) against
+/// **26.7 ns** for `CLOCK_MONOTONIC` (vDSO, `tsc`). Two calls per reply at the
+/// measured 3.4–4.2 replies/s is ~4 µs/s — 0.000004 cores — so the instrument
+/// is four orders of magnitude below the ~2.5 ms it is measuring.
+fn thread_cpu_micros() -> u64 {
+    cpu_clock_micros(libc::CLOCK_THREAD_CPUTIME_ID)
+}
+
+/// CPU consumed by every thread of this process, microseconds — **including
+/// threads that have already exited.**
+///
+/// That last part is the whole point of using this rather than summing live
+/// threads: this daemon spawns one OS thread per connection and lets it die, so
+/// an instrument that can only see live threads reports a fraction of the work.
+fn process_cpu_micros() -> u64 {
+    cpu_clock_micros(libc::CLOCK_PROCESS_CPUTIME_ID)
+}
+
+fn cpu_clock_micros(clock: libc::clockid_t) -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, fully initialised `timespec` we own, and the
+    // clock ids used are compile-time constants.
+    if unsafe { libc::clock_gettime(clock, &mut ts) } != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(ts.tv_nsec as u64 / 1_000)
+}
+
+/// What one `status` reply actually costs, measured directly and **sampled not
+/// at all.**
+///
+/// ⛔ **Why the existing instrument could not answer this.** `handle_request`
+/// wraps every request in a [`yggterm_core::PerfGuard`], but
+/// `("daemon_request", "status")` is on `perf_span_is_high_frequency_noise`'s
+/// list, so a span is written only when it ran **≥ 8 ms** *or* wins a **1-in-50**
+/// sample. Over one live `perf-telemetry.jsonl`: 5,604 sub-floor records (each
+/// standing for ~50 replies) and 2,769 tail records (each standing for one) —
+/// the recorded set is **33% tail against a true tail of 0.98%, an enrichment of
+/// ~34x**. ⛔ And the enrichment is *row-correlated*: the 243–246-row daemons
+/// showed 13.5–16.8% of their records above the floor where the 70–101-row
+/// daemons showed 3.5–7.6%, because more rows push more replies past 8 ms. So it
+/// does **not** cancel in a between-daemon comparison, which is what a mean read
+/// off that set was assumed to do. Re-fitting the same daemons with each record
+/// inverse-probability weighted moved the per-row slope from **10.2 µs/row to
+/// 4.7 µs/row**. Hence a counter that samples nothing.
+///
+/// ⚠ And it records **CPU**, not wall. Every other `duration_ms` in this system
+/// is wall time between two `Instant`s; a cost model that wants cores needs the
+/// CPU actually burned, and wall time over-reads it whenever the handler was
+/// descheduled or parked on the runtime lock — which happens here, `status` has
+/// been observed waiting 3.0 s for that lock.
+#[derive(Debug, Default)]
+struct StatusCostWindow {
+    opened: Option<std::time::Instant>,
+    /// Process CPU when the window opened, so the flush can report the SHARE —
+    /// `cpu_us_total / proc_cpu_us_delta` — instead of a bare rate that only
+    /// means something next to a separately-measured denominator.
+    opened_proc_cpu_us: u64,
+    replies: u64,
+    cpu_us_total: u64,
+    cpu_us_max: u64,
+    wall_us_total: u64,
+    /// Σ rows over the window's replies. Carried as a sum rather than a snapshot
+    /// so the reader can pair mean CPU against mean ROWS without assuming the
+    /// row count held still across the minute.
+    rows_total: u64,
+    rows_last: u64,
+    stored_rows_last: u64,
+}
+
+static STATUS_COST_WINDOW: LazyLock<Mutex<StatusCostWindow>> =
+    LazyLock::new(|| Mutex::new(StatusCostWindow::default()));
+
+/// One emitted `status` cost window: what the flushing reply should write.
+struct StatusCostFlush {
+    elapsed: std::time::Duration,
+    proc_cpu_us_delta: u64,
+    window: StatusCostWindow,
+}
+
+/// Fold one reply into the open window, and hand back a window to emit if this
+/// reply closed it.
+fn record_status_cost(
+    window: &mut StatusCostWindow,
+    now: std::time::Instant,
+    proc_cpu_us: u64,
+    cpu_us: u64,
+    wall_us: u64,
+    rows: u64,
+    stored_rows: u64,
+) -> Option<StatusCostFlush> {
+    if window.opened.is_none() {
+        window.opened = Some(now);
+        window.opened_proc_cpu_us = proc_cpu_us;
+    }
+    window.replies += 1;
+    window.cpu_us_total += cpu_us;
+    window.cpu_us_max = window.cpu_us_max.max(cpu_us);
+    window.wall_us_total += wall_us;
+    window.rows_total += rows;
+    window.rows_last = rows;
+    window.stored_rows_last = stored_rows;
+    let elapsed = now.duration_since(window.opened.unwrap_or(now));
+    if elapsed < STATUS_COST_FLUSH_INTERVAL {
+        return None;
+    }
+    let emitted = std::mem::take(window);
+    window.opened = Some(now);
+    window.opened_proc_cpu_us = proc_cpu_us;
+    Some(StatusCostFlush {
+        elapsed,
+        proc_cpu_us_delta: proc_cpu_us.saturating_sub(emitted.opened_proc_cpu_us),
+        window: emitted,
+    })
 }
 
 /// Acquire the runtime lock **for a client request, measuring the wait.**
@@ -20001,6 +20865,8 @@ mod tests {
         hot_restart_deadline_verdict, hot_update_handoff_would_refuse_binary, role_gate,
     };
     use crate::live_row_tombstones::LiveRowTombstones;
+    #[cfg(unix)]
+    use super::{ServerEndpoint, owner_endpoint_label, sibling_endpoints_from_census};
 
     /// The live case, fed to the guard exactly as it occurred: GUI 3.0.96
     /// promising itself as the handoff target while
@@ -20199,6 +21065,45 @@ mod tests {
             1_000 + crate::live_row_tombstones::TOMBSTONE_TTL_SECS,
             super::PeerRowAdmission::OwnedOrAgentStore,
         ));
+    }
+
+    /// ⛔ THE EVAPORATION SITE HAS TO WRITE ITS OWN RECORD, AND IT IS THE ONE
+    /// SITE THAT DID NOT (`docs/spec-app-row-survival.md` §3).
+    ///
+    /// `PrepareClientClose` does not go through `close_live_session_row` — it
+    /// removes each non-keep-alive row itself, which is how a group of app rows
+    /// left the live set with no entry anywhere saying they had gone. Structural
+    /// for the same reason the tombstone test is: the ORDERING is the part that
+    /// breaks in silence, because the identity and title are read out of the live
+    /// order the very next line empties, and a recorder that runs afterwards
+    /// finds nothing to name and writes nothing at all.
+    #[test]
+    fn the_gui_close_records_why_each_row_left_before_it_removes_it() {
+        let source = daemon_product_source();
+        let arm = source
+            .split("ServerRequest::PrepareClientClose => {")
+            .nth(1)
+            .expect("the PrepareClientClose request arm")
+            .split("\n            ServerRequest::")
+            .next()
+            .expect("the end of the arm");
+
+        let recorded = arm
+            .find("RowDeparture::GuiCloseDisposable")
+            .expect("the GUI close must say WHY the row left, not merely remove it");
+        let removed = arm
+            .find("self.server.remove_live_session(&path)")
+            .expect("the GUI close must still remove the row");
+        assert!(
+            recorded < removed,
+            "the record is read out of the live order, so it must be written \
+             BEFORE the removal empties it"
+        );
+        assert!(
+            !arm.contains("RowDeparture::ExplicitClose"),
+            "nobody named these rows: reporting them as an explicit close would \
+             erase the only distinction this ledger exists to make"
+        );
     }
 
     /// The tombstone is only worth having if something WRITES it. A close must
@@ -20504,6 +21409,140 @@ mod tests {
         assert!(
             !pass.contains("std::thread::spawn") && !pass.contains("sleep"),
             "the pass must do its work on the caller's tick, not start anything"
+        );
+    }
+
+    /// ⛔⛔ THE SERVED REQUEST MUST NOT ASK A PEER.
+    ///
+    /// `WorkingFlags` is served by the same code that PROXIES it, so the moment
+    /// two daemons can discover each other, each ask makes the other ask back —
+    /// an unbounded mutual recursion at one client IO timeout per hop. It is
+    /// invisible today only because proxying landed 2026-08-13 and one daemon on
+    /// the GUI host is new enough to do it; the fleet upgrade is what would
+    /// deliver it.
+    ///
+    /// Cutting it in the SERVE rather than on the wire is what keeps every older
+    /// daemon reachable — and they are the ones that own the dark rows, so a
+    /// protocol change here would have missed the whole point.
+    #[test]
+    fn the_served_working_flags_request_issues_no_peer_request() {
+        let source = daemon_product_source();
+        let arm = source
+            .as_str()
+            .split("ServerRequest::WorkingFlags => ServerResponse::WorkingFlags {")
+            .nth(1)
+            .expect("the WorkingFlags request arm")
+            .split("},")
+            .next()
+            .expect("the body of that arm");
+        assert!(
+            arm.contains("working_flags_from_local_and_cache"),
+            "the served request must answer from local screens plus the cache; \
+             arm was: {arm}"
+        );
+        assert!(
+            !arm.contains("working_flags_including_proxied"),
+            "the served request fans out again — two discovering daemons will \
+             now ask each other without bound. Arm was: {arm}"
+        );
+    }
+
+    /// Discovery rides the EXISTING chore tick, for the reason the ephemeral
+    /// reap does, plus one of its own: a peer that hangs must never be able to
+    /// stall the 1.5 s refresh the dot is drawn from.
+    #[test]
+    fn working_flag_owner_discovery_rides_the_chore_tick_and_never_the_request_loop() {
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let chore = source
+            .split("run_preserved_owner_revalidation_if_due(&runtime);")
+            .nth(1)
+            .expect("the chore tick that already exists")
+            .split("match run_background_copy_chore(")
+            .next()
+            .expect("the end of that tick's preamble");
+        assert!(
+            chore.contains("run_working_flag_owner_discovery_if_due(&runtime)"),
+            "discovery must be CALLED from the existing chore tick, or no row \
+             whose owner is unknown is ever asked about"
+        );
+        let call_sites = source
+            .matches("run_working_flag_owner_discovery_if_due(&runtime)")
+            .count();
+        assert_eq!(
+            call_sites, 1,
+            "one caller only — a second scheduler for this is a second policy"
+        );
+        // ⚠ NOT `daemon_fn_body`: it terminates on the next 4-space-indented
+        // `fn`, which is a METHOD. This is a free function, so that helper reads
+        // straight past its end and into code that legitimately sleeps and
+        // spawns — the assertions below would then be about the wrong bytes and
+        // would fail for a reason that has nothing to do with this pass.
+        let pass = source
+            .split("fn run_working_flag_owner_discovery_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) {")
+            .nth(1)
+            .expect("the discovery pass is gone; the lock over it is stale")
+            .split("\nconst ")
+            .next()
+            .expect("the end of the pass")
+            .split("\nfn ")
+            .next()
+            .expect("the end of the pass");
+        assert!(
+            !pass.contains("std::thread::spawn") && !pass.contains("sleep"),
+            "the pass must do its work on the caller's tick, not start anything"
+        );
+        // ⛔ `status` is the gate measured to hang 16 live daemons at once. The
+        // census answers the same question from one /proc/net/unix read.
+        assert!(
+            !pass.contains("ServerRequest::Status") && !pass.contains("status("),
+            "discovery must not probe peers with `status`; the socket census is \
+             the cheap positive proof of liveness"
+        );
+    }
+
+    /// Self is dropped, non-daemon sockets are ignored, and the order is stable.
+    ///
+    /// ⚠ The self case is the one that bites: this runs on the chore thread
+    /// while the request loop may hold the runtime lock, so a daemon that asked
+    /// its own socket would be waiting on itself.
+    #[cfg(unix)]
+    #[test]
+    fn sibling_endpoints_from_census_drops_self_and_anything_that_is_not_a_daemon() {
+        use std::path::PathBuf;
+        let own = ServerEndpoint::UnixSocket(PathBuf::from("/h/.yggterm/server-3-0-9.sock"));
+        let listening: std::collections::HashSet<PathBuf> = [
+            "/h/.yggterm/server-3-0-9.sock",  // self
+            "/h/.yggterm/server-3-0-70.sock", // sibling
+            "/h/.yggterm/server-2-10-2.sock", // sibling, older
+            "/h/.yggterm/app-control.sock",   // not a daemon
+            "/h/.yggterm/server-nope.sock",   // unparseable version
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+
+        let siblings = sibling_endpoints_from_census(&listening, &own);
+        let labels: Vec<String> = siblings.iter().map(owner_endpoint_label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                owner_endpoint_label(&ServerEndpoint::UnixSocket(PathBuf::from(
+                    "/h/.yggterm/server-2-10-2.sock"
+                ))),
+                owner_endpoint_label(&ServerEndpoint::UnixSocket(PathBuf::from(
+                    "/h/.yggterm/server-3-0-70.sock"
+                ))),
+            ],
+            "exactly the two sibling daemons, self excluded, sorted"
+        );
+
+        // A set has no order of its own; the same input must produce the same
+        // list twice, or "the first sibling to claim a row" is a coin toss.
+        assert_eq!(
+            siblings,
+            sibling_endpoints_from_census(&listening, &own),
+            "the selection must be stable across passes"
         );
     }
 

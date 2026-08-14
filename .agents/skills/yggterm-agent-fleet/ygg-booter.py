@@ -86,6 +86,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -352,6 +353,33 @@ def ygg(host, *args):
         return {}
 
 
+def _host_serves_rows(host):
+    """TRI-STATE: True serves a row plane · False answered-and-does-not · None could-not-ask.
+
+    ⛔ `ygg()` returns {} for a transport failure AND for a host that replied with
+    nothing useful, so it cannot answer this question. The distinction decides
+    whether a bad `--host` is refused (it should be) or a network blip leaves a
+    live row unarmed (it must not)."""
+    try:
+        if host == this_host():
+            cmd = [str(Path.home() / ".local" / "bin" / "yggterm"), "server", "app", "rows"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        else:
+            r = subprocess.run(["ssh", "-o", "ConnectTimeout=10", host,
+                                "$HOME/.yggterm/bin/yggterm server app rows"],
+                               capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None                       # could not ask
+    body = r.stdout[r.stdout.find("{"):] if "{" in r.stdout else ""
+    if not body:
+        return None                       # no JSON at all ⇒ we never reached the verb
+    try:
+        d = json.loads(body)
+    except Exception:
+        return None
+    return ((d.get("data") or {}).get("rows") is not None)
+
+
 def sub_path(uuid):
     SUBS.mkdir(parents=True, exist_ok=True)
     return SUBS / f"{uuid}.json"
@@ -446,10 +474,38 @@ def cmd_arm(args):
 # ─── the account ran out of quota ──────────────────────────────────────────────
 
 def rate_limit_hold():
-    """The active fleet-wide quota hold, or None. Expiry evaluated HERE, once."""
+    """The active fleet-wide quota hold, or None. Expiry evaluated HERE, once.
+
+    ⛔⛔ A HOLD WRITTEN BY PRE-FIX CODE IS NOT HONOURED, AND THAT IS THE POINT.
+
+    This file lives in the repo, so **every worktree carries its own copy** and a
+    watcher runs whichever copy sits in the directory it was started from.
+    Measured 2026-08-14, within minutes of shipping the anti-re-arm fix: a second
+    watcher was started from a checkout whose tree predated it, and **it pinned
+    the whole fleet again** — its record advanced `until` on every tick from the
+    same frozen tail, exactly as before, while `git log` showed the fix landed and
+    a reader would have believed it was live. 13 of 14 checkouts on that host were
+    still pre-fix at the time.
+
+    ⇒ A record with no `counted` key was written by code that **cannot honour the
+    invariant that ends a hold**. It is therefore not merely stale, it is
+    *unbounded* — nothing in it will ever stop growing. Refusing it costs at worst
+    one probe boot during a genuine outage, and the next refusal re-arms a proper
+    hold through the fixed path. Honouring it has no exit at all.
+
+    ⚠ This is a floor, not the fix. The real defect is that a watcher's code comes
+    from wherever it was launched; see the queue entry on the supervision watcher's
+    deploy path.
+    """
     try:
         d = json.loads(RLHOLDFILE.read_text())
     except Exception:
+        return None
+    if "counted" not in d:
+        log("⛔ discarding a quota hold written by pre-fix code — it has no "
+            "evidence ledger, so nothing in it can ever stop it growing. "
+            "A stale watcher wrote this; check for a second watcher.")
+        RLHOLDFILE.unlink(missing_ok=True)
         return None
     if time.time() >= (d.get("until") or 0):
         RLHOLDFILE.unlink(missing_ok=True)
@@ -511,16 +567,210 @@ def row_process_absent(uuid):
     return True
 
 
+# ⭐⭐ THE RESET TIME WAS IN THE MESSAGE ALL ALONG — measured 2026-08-14.
+# The comment above RATE_LIMIT_HOLD_SECS asserted "the refusal carries no reset
+# timestamp ('try again later')" and held the fleet on a blind timer because of
+# it. That premise was false, and this tool's own evidence file disproved it: a
+# stored hold record read
+#     "tail": "You've hit your session limit · resets 12:20pm (Asia/Kolkata)"
+# The reset moment was captured, persisted, and printed in `status` — and nothing
+# ever parsed it. Cost, measured live: last refusal 12:35:54 held the fleet to
+# 13:05:54 against a reset that had already happened at 12:20, leaving 17
+# subscribers unwakeable while the account was healthy.
+# ⭐ THE CLASS: an answer the system already holds, discarded because a comment
+# said it did not exist. Nobody re-read the artefact the comment was about.
+#
+# ⚠ IT MAY ONLY SHORTEN THE HOLD, NEVER EXTEND IT. The two failure directions
+# are not symmetric: holding too SHORT costs one refused probe boot and
+# self-corrects on the next tick, while holding too LONG is a dead fleet. So the
+# timer stays as a CEILING and a parsed reset can only release earlier. A
+# misparse therefore cannot invent a long hold, which is the only way this change
+# could have made things worse.
+RESET_GRACE_SECS = 90          # clocks disagree; come back just after, not on the tick
+RESET_MAX_AHEAD_SECS = 6 * 3600  # further out than this is a misparse, not a reset
+RESET_PAST_WINDOW_SECS = 6 * 3600  # how far back a "already reset" claim stays credible
+
+
+def reset_time_from_tail(tail, now=None):
+    """The reset moment the CLI already told us, as an epoch — or None.
+
+    ⛔ None means *nothing trustworthy here*, and every caller must fall back to
+    the blind timer. That is the safe direction: an unparsed tail leaves today's
+    behaviour exactly as it was.
+
+    ⚠ A time-of-day with no date is ambiguous across midnight, so a reset that
+    has already passed rolls to tomorrow — and a "reset" more than a few hours
+    out is far more likely a STALE TAIL being re-read than a real quota window.
+    Both collapse to None, which is why a stale screen cannot pin the fleet.
+    """
+    if not tail:
+        return None
+    m = re.search(r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?"
+                  r"(?:\s*\(([^)]+)\))?", tail, re.I)
+    if not m:
+        return None
+    hour, minute, ampm, tzname = m.group(1), m.group(2), m.group(3), m.group(4)
+    hour, minute = int(hour), int(minute or 0)
+    if ampm:
+        ampm = ampm.replace(".", "").lower()
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    import datetime
+    tz = None
+    if tzname:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tzname.strip())
+        except Exception:
+            tz = None            # unknown zone ⇒ local, not a failure
+    now_dt = datetime.datetime.fromtimestamp(now or time.time(), tz)
+    cand = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if cand <= now_dt:
+        cand += datetime.timedelta(days=1)
+    epoch = cand.timestamp()
+    if epoch - (now or time.time()) > RESET_MAX_AHEAD_SECS:
+        return None              # stale tail or misparse ⇒ let the timer decide
+    return epoch
+
+
+def tail_reset_has_passed(tail, now=None):
+    """True when the tail names a reset time that is already BEHIND us.
+
+    ⛔ Deliberately narrow. Only answers True for a time within the last
+    `RESET_PAST_WINDOW_SECS`, so a tail whose reset is far in the past — a row
+    parked overnight, a clock skewed by a day — falls through to the ordinary
+    path instead of silently disarming the fleet on a wild parse.
+    """
+    if not tail:
+        return False
+    now = now or time.time()
+    m = re.search(r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?"
+                  r"(?:\s*\(([^)]+)\))?", tail, re.I)
+    if not m:
+        return False
+    hour, minute, ampm, tzname = m.group(1), m.group(2), m.group(3), m.group(4)
+    hour, minute = int(hour), int(minute or 0)
+    if ampm:
+        ampm = ampm.replace(".", "").lower()
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return False
+    import datetime
+    tz = None
+    if tzname:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tzname.strip())
+        except Exception:
+            tz = None
+    now_dt = datetime.datetime.fromtimestamp(now, tz)
+    cand = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    delta = now - cand.timestamp()
+    return 0 < delta <= RESET_PAST_WINDOW_SECS
+
+
+def _evidence_marker(uuid):
+    """`(size, mtime)` of this row's transcript — *has it written anything since?*
+
+    ⛔ Returns None when it cannot be read, and **None must never be treated as
+    fresh evidence.** See `note_rate_limit`: an unreadable marker releases the
+    hold early, which costs one refused probe boot, whereas treating it as fresh
+    re-arms the fleet forever. Same asymmetry as everywhere else in this file.
+    """
+    import glob
+    for p in glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl")):
+        try:
+            st = os.stat(p)
+            return [st.st_size, int(st.st_mtime)]
+        except OSError:
+            continue
+    return None
+
+
 def note_rate_limit(uuid, tail):
     """A subscriber was refused on quota ⇒ hold the whole fleet.
 
-    Refreshing rather than accumulating: each fresh sighting pushes the window
-    out, so a long outage holds continuously without anyone tracking rounds."""
+    ⛔⛔ THE HOLD USED TO RE-ARM FROM THE ARTEFACT IT HAD ITSELF FROZEN, AND SO
+    COULD NEVER END. Reported and reproduced by a sibling campaign 2026-08-14.
+
+    A quota limit is detected by reading the row's transcript TAIL. A row parked
+    on the limit **stops writing**, so its tail keeps saying the same thing — and
+    every tick re-read that same frozen message, refreshed `last_seen`, and
+    pushed `until` out another 30 minutes. **The hold could not expire while rows
+    were parked, and the rows were parked because of the hold.** Measured live:
+    the feeding transcript had not changed size or mtime for 34 minutes while
+    `until` walked 70 minutes past a reset that had already happened.
+
+    ⚠ Deleting the state file does NOT fix it — the next tick re-arms from the
+    same stale tail. That was verified by the reporting campaign before filing.
+
+    ⇒ **A sighting may only extend the hold if the row has WRITTEN SOMETHING
+    since the sighting we already counted.** The tail is evidence about a moment;
+    re-reading it is not a new moment. This is the load-bearing half — parsing the
+    reset time out of the tail (above) helps only while the reset is still in the
+    future, and a stale tail parses to nothing and falls straight through to the
+    timer, which *is* the deadlock.
+
+    ⭐ Same class as the corpse-tail guard below it: **a stale artefact read as a
+    live signal.**
+    """
     prev = rate_limit_hold()
+    now = time.time()
+    # ⛔⛔ A TAIL IS SELF-DATING, AND A RESET THAT HAS PASSED IS EVIDENCE THE
+    #    OUTAGE ENDED — not evidence to keep holding. If the message says it
+    #    resets at a time that is now behind us, and the row has written nothing
+    #    since, then the account is presumptively back and this row is merely
+    #    PARKED on an old message. Arming from it is how the fleet stayed held
+    #    70 minutes past a reset that had already happened.
+    # ⚠ Cheap to be wrong in this direction: we probe once, and a genuine refusal
+    #    writes a NEW message with a new marker, which arms a proper hold. The
+    #    opposite error has no exit at all.
+    if tail_reset_has_passed(tail, now):
+        log(f"{uuid[:8]} quota tail names a reset that has already passed — "
+            f"treating it as a PARKED row, not a live outage. Not arming.")
+        return prev
+    marker = _evidence_marker(uuid)
+    counted = dict((prev or {}).get("counted") or {})
+    # ⛔ `marker is not None` is required: an unreadable transcript is NOT new
+    #    evidence. Without that clause a row whose transcript cannot be found
+    #    would extend the hold on every single tick, which is the original bug
+    #    wearing a different hat.
+    is_new_evidence = marker is not None and counted.get(uuid) != marker
+    if prev and not is_new_evidence:
+        # Nothing has moved. Keep the existing deadline exactly as it was — do
+        # not extend, and do not shorten either; another row's live sighting may
+        # legitimately own this window.
+        until = prev.get("until", now + RATE_LIMIT_HOLD_SECS)
+        last_seen = prev.get("last_seen", now)
+    else:
+        timer_until = now + RATE_LIMIT_HOLD_SECS
+        reset_at = reset_time_from_tail(tail, now)
+        until = timer_until
+        if reset_at:
+            # ⛔ min(), never max() — see the note above. The timer is the ceiling.
+            until = max(now + 60, min(timer_until, reset_at + RESET_GRACE_SECS))
+        last_seen = now
+        if marker is not None:
+            counted[uuid] = marker
+    reset_at = reset_time_from_tail(tail, now)
     rec = {
-        "since": (prev or {}).get("since", time.time()),
-        "last_seen": time.time(),
-        "until": time.time() + RATE_LIMIT_HOLD_SECS,
+        "since": (prev or {}).get("since", now),
+        "last_seen": last_seen,
+        "until": until,
+        "counted": counted,
+        "stale_sighting": bool(prev and not is_new_evidence),
+        # ⭐ Recorded so `status` can SAY why it will lift when it does. The
+        # owner's complaint about the last outage was never the hold, it was
+        # "I do not know how all the sessions recovered."
+        "reset_at": reset_at,
+        "released_by": "reset-time" if reset_at else "timer",
         "seen_on": uuid,
         "tail": (tail or "")[:200],
     }
@@ -715,6 +965,56 @@ def cmd_subscribe(args):
     if not uuid:
         log("no row given and $YGGTERM_SESSION_ID is unset — nothing to subscribe")
         return 2
+    # ⛔⛔ AN ADDRESS THIS WATCHDOG CANNOT RESOLVE IS A SUBSCRIPTION THAT DELETES
+    # ITSELF, AND IT READS AS ARMED THE WHOLE TIME. `row_presence` asks the row
+    # plane at `--host`; a bare uuid or a host with no GUI client makes the plane
+    # answer, truthfully, that nothing lives at that address. That is `False`, not
+    # `None` — so the tri-state below behaves perfectly, counts three consecutive
+    # absences, and unsubscribes a live row with the line "GONE — absent from 3
+    # consecutive row listings". Indistinguishable from a genuine retirement.
+    #
+    # Reported 2026-08-14 by an orchestrator who repaired a live instance: a
+    # delegate stored `row=<bare-uuid>, host=dev` while the GUI runs elsewhere.
+    # ⚠ AND THE ROOT IS STRUCTURAL, NOT CARELESSNESS. Their spawn wrapper raced
+    # (the transcript takes ~75 s to appear, the check waited 60), exited non-zero
+    # on a spawn that had SUCCEEDED, and never reached its arming step — so a human
+    # compensated with a hand-rolled subscribe, and the hand-rolled call reproduced
+    # the exact failure the wrapper existed to prevent. **Whenever a wrapper fails,
+    # the fallback is a hand-rolled call.** That is why this check belongs here, at
+    # the moment someone can still fix it, rather than in the wrapper.
+    if args.row:
+        if not re.match(r"^[a-z][a-z0-9+.-]*://[^/]+/[0-9a-fA-F-]{36}$", args.row.rstrip("/")):
+            log(f"⛔ REFUSING to arm — --row {args.row!r} is not an addressable row.")
+            log("   It must be <scheme>://<machine>/<full-uuid>, e.g.")
+            log("     remote-cc://dev/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+            log("   A bare uuid resolves ABSENT on every tick, and this watchdog")
+            log("   then unsubscribes it as retired — silently, and looking healthy")
+            log("   in `list` until it vanishes. Fix the address, not this check.")
+            return 6
+    host = args.host or resolve_gui_host(None)
+    # ⛔⛔ TRI-STATE, AND I GOT THIS WRONG ON THE FIRST WRITE. The first version
+    # refused whenever the probe came back empty — collapsing "this host answered
+    # and has no row plane" (a bad address, refuse) into "I could not reach this
+    # host at all" (a blip, which must NOT leave a live row unarmed). That is the
+    # exact collapse this file's own `row_presence` exists to prevent, committed
+    # one screen away from the comment warning about it.
+    # ⇒ `ygg()` returns {} for BOTH, so ask the transport directly.
+    presence = _host_serves_rows(host)
+    if presence is False:
+        log(f"⛔ REFUSING to arm {uuid[:8]} — host {host!r} answered, and serves no row plane.")
+        log("   App control resolves ONLY where the GUI runs, so a subscription")
+        log("   pointed at a host with no GUI client can never see its own row.")
+        log("   It would read absent on every tick and lapse as 'GONE'.")
+        log("   Pass --host <the GUI host>.")
+        return 6
+    if presence is None:
+        # ⚠ Store, and say so. An unwatched row is the failure this tool exists to
+        #   prevent; a possibly-misaddressed one now LAPSES VISIBLY rather than
+        #   vanishing, so storing is the safer side of this particular blindness.
+        log(f"⚠ COULD NOT VERIFY host {host!r} (transport failed, not a refusal).")
+        log("   Arming anyway — an unwatched row is the worse failure. If the")
+        log("   address is wrong you will see it LAPSE in `list` rather than")
+        log("   silently disappear.")
     opted_out = disarmed_rows()
     if opted_out is None:
         log(f"⛔ REFUSING to arm {uuid[:8]} — {DISARMED_LEDGER} is unreadable.")
@@ -772,6 +1072,14 @@ def cmd_subscribe(args):
         prior = json.loads(sub_path(uuid).read_text())
     except Exception:
         prior = {}
+    # ⭐ SAY THAT A LAPSE IS BEING CLEARED. `rec` is built fresh, so `lapsed` drops
+    #   out on its own — but a re-arm that silently un-lapses is the same
+    #   invisibility running backwards, and it hides how long the row went
+    #   unwatched. That interval is the whole cost of the incident this records.
+    if prior.get("lapsed"):
+        mins = int((time.time() - prior.get("lapsed_at", time.time())) // 60)
+        log(f"⭐ CLEARING A LAPSE on {uuid[:8]} — it was unwatched for ~{mins}m "
+            f"({prior.get('lapsed_reason', 'no reason recorded')})")
     rec = {
         "uuid": uuid,
         "row": row,
@@ -797,6 +1105,10 @@ def cmd_subscribe(args):
         "kind": getattr(args, "kind", None)
         or ("task" if uuid == own_uuid() else "monitor"),
         "boots": 0,
+        # Consecutive ticks refused because WE could not read the screen. Kept
+        # apart from `boots` because it counts a failure of our instrument, not
+        # an observation about the row -- see the escalation in the tick loop.
+        "blind_skips": 0,
         "last_size": 0,
         "escalated": False,
     }
@@ -1404,8 +1716,13 @@ def cmd_list(args):
         log(f"⛔ DISARMED ({left}) — {d.get('note') or 'no reason given'}")
     rl = rate_limit_hold()
     if rl:
+        # ⛔⛔ NAME THE CONSEQUENCE, NOT JUST THE CONDITION. "QUOTA HOLD, seen on
+        #    <row>" reads as a fact about THAT row, and a campaign checking its
+        #    own seat concluded it was fine. The hold is FLEET-WIDE: while it is
+        #    up, nothing can be delivered to anybody.
         log(f"⏸ QUOTA HOLD {(rl['until'] - time.time()) / 60:.0f}m left "
-            f"(429 seen on {rl['seen_on'][:8]})")
+            f"(429 seen on {rl['seen_on'][:8]}) — ⛔ NO BOOT CAN BE DELIVERED TO "
+            f"ANY ROW, INCLUDING YOURS, WHILE THIS IS UP")
     # ⭐ Name the directory this reads. A sibling campaign lost minutes concluding
     #   "no subscription file exists" while looking in the relay root — which also
     #   holds per-uuid .json files of a DIFFERENT kind, so the wrong directory
@@ -1413,22 +1730,48 @@ def cmd_list(args):
     if not subs:
         log(f"no subscribers (reading {SUBS})")
         return 0
+    lapsed = 0
     for s in subs:
         age_h = (time.time() - s["subscribed_at"]) / 3600
+        # ⛔ A LAPSE MUST READ AS A LAPSE. Deleting the record made "it expired"
+        #   and "it was never armed" the same observation.
+        mark = ""
+        if s.get("lapsed"):
+            lapsed += 1
+            mins = int((time.time() - s.get("lapsed_at", 0)) // 60)
+            mark = (f"  ⛔ LAPSED {mins}m ago — {s.get('lapsed_reason', 'no reason recorded')}"
+                    f" · NOT WATCHED; re-subscribe to clear")
+        # ⛔⛔ THE SUPPRESSION MUST BE ON THE ROW'S OWN LINE, reported 2026-08-14
+        #    by a campaign that had been reading its seat as healthy for hours.
+        #    Everybody runs `list | grep <their-uuid>`, which throws away the
+        #    header — so a row reads `boots=0`, its subscription JSON is perfect,
+        #    its own tick prints ✅, and nothing can reach it. That is what makes
+        #    a watchdog unfalsifiable, and it is how one outage ran 7.5 hours
+        #    with every instrument green.
+        held = "  ⏸ SUPPRESSED — fleet quota hold, no boot can be delivered" if rl else ""
         log(f"{s['uuid'][:8]}  {s.get('campaign') or '-':<12} "
-            f"age={age_h:4.1f}h boots={s['boots']} {s['row']}")
-    log(f"{len(subs)} subscription(s) in {SUBS}")
+            f"age={age_h:4.1f}h boots={s['boots']} {s['row']}{held}{mark}")
+    log(f"{len(subs)} subscription(s) in {SUBS}"
+        + (f" — ⛔ {lapsed} LAPSED and no longer watched" if lapsed else ""))
     return 0
 
 
-def _run(host, argv, stdin_text):
-    """Run a yggterm CLI verb with text on stdin, wherever the row lives."""
+def _run(host, argv, stdin_text, remote_binary=None):
+    """Run a yggterm CLI verb with text on stdin, wherever the row lives.
+
+    ⚠ The two binaries do NOT expose the same verbs. Locally this drives the
+    HEADLESS binary; remotely it drives the GUI one, because that is the one
+    that can reach the display plane. A verb that only the headless binary
+    serves must say so with `remote_binary`, or it answers "unsupported"
+    over ssh while working perfectly on this host — which is indistinguishable
+    from the verb being missing everywhere."""
     if host == this_host():
         cmd = [str(Path.home() / ".local" / "bin" / "yggterm-headless"), *argv]
         return subprocess.run(cmd, input=stdin_text, capture_output=True,
                               text=True, timeout=180)
     joined = " ".join(f"'{a}'" for a in argv)
-    return subprocess.run(["ssh", host, f"$HOME/.yggterm/bin/yggterm {joined}"],
+    binary = remote_binary or "$HOME/.yggterm/bin/yggterm"
+    return subprocess.run(["ssh", host, f"{binary} {joined}"],
                           input=stdin_text, capture_output=True, text=True, timeout=180)
 
 
@@ -1505,6 +1848,116 @@ def boot(host, row, dry):
     return ""
 
 
+CHOICE_PROMPT_MARKERS = (
+    "hit your session limit", "session limit", "usage limit", "upgrade to max",
+    "switch to a team account", "team account", "api billing", "pay per token",
+    "select an option", "choose an option", "1. stop and wait", "stop and wait",
+)
+
+
+_CSI = re.compile(r"\x1b\[([0-9;]*)([A-Za-z])")
+
+
+def _plain_screen(text):
+    """Screen bytes -> matchable text.
+
+    ⛔ A RAW SCREEN DOES NOT CONTAIN THE WORDS YOU ARE LOOKING FOR. A terminal
+    writes runs of spaces as CURSOR-FORWARD (`ESC[<n>C`) and sprays colour SGR
+    mid-word, so `stop and wait` arrives as `stop\\x1b[Cand\\x1b[C\\x1b[1mwait`
+    and a plain substring test finds nothing. A guard that silently matches
+    nothing is worse than no guard: it reports "no prompt on screen" for a
+    screen that is entirely a prompt.
+    ⇒ Cursor-forward becomes a space (it IS whitespace on a rendered screen),
+      every other CSI is dropped, and runs of blanks collapse."""
+    def sub(m):
+        return " " if m.group(2) == "C" else ""
+    return re.sub(r"\s+", " ", _CSI.sub(sub, text))
+
+
+def _daemon_screen_text(host, row):
+    """The DAEMON's own vt100 screen for one row, or None if it cannot look.
+
+    Independent of the GUI binary's verb surface — the daemon owns the PTY, so
+    this keeps working when the app-control arm the other reader uses is
+    missing. `screen_available: false` is a real "could not look" and is
+    reported as such rather than as an empty screen, because the caller
+    distinguishes them and refuses on doubt."""
+    uuid = row.rsplit("/", 1)[-1]
+    # ⛔⛔ ASK THE ROW'S OWN MACHINE, NOT THE GUI HOST. `boot` is handed the GUI
+    #    host because that is where a WRITE is proxied from -- but the daemon
+    #    that owns this PTY, and therefore the only one holding its screen, is
+    #    on the machine the row lives on. Asking the GUI host answered
+    #    "unsupported" for every remote row, which reads exactly like the verb
+    #    being missing everywhere and kept the whole fleet blind after the
+    #    fallback was added. Caught by watching the log after the fix and
+    #    finding it changed nothing.
+    rhost = BB.row_host(row, host) or host
+    r = _run(rhost, ["server", "gate-screen", f"cc-runtime://{uuid}",
+                     "--tail", "60", "--json"], "",
+             remote_binary="$HOME/.local/bin/yggterm-headless")
+    try:
+        entries = json.loads((r.stdout or "").strip() or "[]")
+    except Exception:
+        return None
+    if not isinstance(entries, list):
+        return None
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if (e.get("session_key") or "").rsplit("/", 1)[-1] != uuid:
+            continue
+        if not e.get("screen_available"):
+            return None                  # it said plainly that it could not look
+        return "\n".join(e.get("screen_tail") or [])
+    return None                          # the daemon has no screen for this row
+
+
+def _screen_shows_a_choice(host, row):
+    """TRI-STATE: True a prompt is on screen · False none · None could not look.
+
+    ⛔⛔ THE DEFECT THIS EXISTS FOR, RAISED BY THE OWNER 2026-08-14. When the plan's
+    limit is hit the CLI parks on a three-option prompt -- stop and wait, switch to
+    a team account, or use API billing -- and the first is dismissed with Enter.
+    `_pty_type_and_enter` finishes with a **lone `\\r`**, which does not "dismiss"
+    anything: **it selects whatever option is highlighted.** If the highlight is not
+    on the harmless one, a timer silently changes billing on the owner's account.
+    Nobody decided that; a watchdog did.
+
+    ⚠ `--refuse-if-draft` does NOT cover this. It guards a half-typed DRAFT, and a
+    modal is not a draft — so the existing guard passes and the Enter still lands.
+
+    ⚠ Nor does the `RATE_LIMITED` classifier: that keys on the CLI's own
+    `apiErrorStatus: 429` record in the TRANSCRIPT, and a row parked on a modal has
+    not necessarily written one. **The dialog is only visible on the SCREEN**, which
+    is why this reads the screen and not the transcript.
+
+    ⛔ REFUSE ON DOUBT. `None` (could not look) is treated as a refusal by the
+    caller, for the same reason the never-arm ledger is: this thing types."""
+    r = _run(host, ["server", "app", "terminal", "read-buffer", row,
+                    "--mode", "screen"], "")
+    body = (r.stdout or "")
+    if not body.strip():
+        # ⛔⛔ THE GUI-SIDE ARM CAN VANISH, AND WHEN IT DID THE WHOLE FLEET
+        #    STOPPED WAKING. `server app terminal read-buffer` was dropped from
+        #    the CLI dispatcher by a refactor that collapsed two per-binary
+        #    `match` blocks into one; the handler and its tests stayed, so the
+        #    verb looks present in the source and is absent from every built
+        #    binary. This guard then answered "could not look" on every tick,
+        #    the caller refused on doubt, and NO ROW ON THE FLEET WAS BOOTED FOR
+        #    AN HOUR. Measured 2026-08-14.
+        # ⇒ Ask the DAEMON instead. It owns the PTY, so its vt100 screen is the
+        #   more direct source for this question anyway, and it does not depend
+        #   on the GUI binary's verb surface at all.
+        # ⚠ This is a SECOND instrument, not a second source of truth: both
+        #   read the same screen, and the fallback only runs when the first
+        #   could not answer. Refusing on doubt is unchanged.
+        body = _daemon_screen_text(host, row) or ""
+    if not body.strip():
+        return None                      # could not look, either way
+    low = _plain_screen(body).lower()
+    return any(m in low for m in CHOICE_PROMPT_MARKERS)
+
+
 def _pty_type_and_enter(host, row):
     """Type the boot text, pause, then press Enter — as TWO writes.
 
@@ -1520,6 +1973,18 @@ def _pty_type_and_enter(host, row):
     ⚠ A pre-3.0.83 owner ignores the flag, so acceptance is not proof the guard
     ran. That is the honest limit and it is why the return distinguishes a
     refusal rather than folding it into failure."""
+    # ⛔⛔ SCREEN FIRST. The Enter below SELECTS a highlighted option, so a row
+    # parked on a choice prompt must never be typed into. Refuse on doubt.
+    choice = _screen_shows_a_choice(host, row)
+    if choice is True:
+        log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — its SCREEN is showing a "
+            f"prompt awaiting a choice (plan limit / billing). A bare Enter here "
+            f"SELECTS an option; that decision is the owner's, not a timer's.")
+        return "refused-choice-prompt"
+    if choice is None:
+        log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — could not read its screen, "
+            f"so it cannot be ruled out that a prompt is waiting. Blind is not clear.")
+        return "refused-screen-unreadable"
     typed = _run(host, ["server", "terminal", "write", row, "--stdin",
                         "--refuse-if-draft"], BOOT_TEXT)
     if _field(typed.stdout or "", "refused_for_draft") is True:
@@ -1637,9 +2102,23 @@ def tick(args):
     for s in subs:
         uuid, row, host = s["uuid"], s["row"], s.get("host", args.host)
         age_h = (time.time() - s["subscribed_at"]) / 3600
+        if s.get("lapsed"):
+            # Already reported once; stay quiet but stay VISIBLE in `list`.
+            continue
         if s.get("max_hours") and age_h > s["max_hours"]:
-            log(f"{uuid[:8]} EXPIRED after {age_h:.1f}h — unsubscribing")
-            sub_path(uuid).unlink(missing_ok=True)
+            # ⛔⛔ THE SECOND SILENT-UNLINK PATH, and the likelier cause of the
+            # nine-hour outage: a campaign found all three of its subscriptions
+            # simply absent, with max_hours=12.0 and ~10.6h elapsed, and could not
+            # tell expiry from loss because BOTH leave the same nothing. An expiry
+            # is a legitimate decision; deleting the evidence of it is not.
+            s["lapsed"] = True
+            s["lapsed_at"] = int(time.time())
+            s["lapsed_reason"] = f"max_hours {s['max_hours']} exceeded at {age_h:.1f}h"
+            log(f"{uuid[:8]} LAPSED — EXPIRED after {age_h:.1f}h (max_hours "
+                f"{s['max_hours']}); keeping the record so this is visible. "
+                f"Re-subscribe to clear it.")
+            if not args.dry_run:
+                update_sub(uuid, s)
             continue
         # ⛔ ROW LIST FIRST. A retired row's transcript is frozen mid-turn forever
         #    and is indistinguishable from a live wedge; booting a corpse is a
@@ -1652,9 +2131,26 @@ def tick(args):
         if presence is False:
             s["gone_sightings"] = s.get("gone_sightings", 0) + 1
             if s["gone_sightings"] >= GONE_SIGHTINGS:
-                log(f"{uuid[:8]} GONE — absent from {GONE_SIGHTINGS} consecutive "
-                    f"row listings, unsubscribing")
-                sub_path(uuid).unlink(missing_ok=True)
+                # ⛔⛔ LAPSE LOUDLY. This used to DELETE the record, and an arm that
+                # lapses then becomes indistinguishable from an arm that was never
+                # set — the same failure signature as the thing this tool exists to
+                # eliminate. Reported 2026-08-14 by a campaign that lost all three
+                # of its subscriptions overnight: a seat hit its plan's session
+                # limit at 01:44, the limit reset at 02:20, nothing woke it, and it
+                # was found dead at 10:49 with a release unshipped. Nine hours. The
+                # subscriptions had not been refused, they had simply gone, and
+                # `list` showed an absence rather than a story.
+                # ⇒ Keep the record, mark it, and let `list` show it. A subscriber
+                #   that can vanish without a trace is not a safety net.
+                s["lapsed"] = True
+                s["lapsed_at"] = int(time.time())
+                s["lapsed_reason"] = (f"absent from {GONE_SIGHTINGS} consecutive row "
+                                      f"listings on host {host!r}")
+                log(f"{uuid[:8]} LAPSED — absent from {GONE_SIGHTINGS} consecutive "
+                    f"row listings; keeping the record so this is visible. "
+                    f"Re-subscribe to clear it.")
+                if not args.dry_run:
+                    update_sub(uuid, s)
                 continue
             log(f"{uuid[:8]} absent from the row list "
                 f"({s['gone_sightings']}/{GONE_SIGHTINGS}) — waiting for confirmation")
@@ -1702,9 +2198,47 @@ def tick(args):
                                     f"No boot can clear this; relay the campaign to a "
                                     f"fresh session.")
                 s["escalated"] = True
-            log(f"{uuid[:8]} CONTEXT-DEAD — unsubscribing (a boot cannot fix this)")
-            sub_path(uuid).unlink(missing_ok=True)
+            # ⛔⛔ THE THIRD SILENT-UNLINK PATH, AND IT SURVIVED THE FIX TO THE
+            # OTHER TWO. GONE and EXPIRED were both taught to lapse loudly on
+            # 2026-08-14 because a subscription that vanishes without a trace is
+            # indistinguishable from one that was never set. This one does the
+            # same thing for the same reason and was left deleting the record —
+            # the shape where one case is handled and its sibling is not, which
+            # this fleet has now paid for four times in a week.
+            # ⇒ Context exhaustion is the MOST common death here, so the path
+            #   most likely to erase the evidence was the one still doing it.
+            # ⚠ Lapse rather than retire: the SESSION is unrecoverable, but the
+            #   ROW is routinely re-claimed by a successor, and re-subscribing
+            #   clears the lapse and reports how long it went uncovered.
+            s["lapsed"] = True
+            s["lapsed_at"] = int(time.time())
+            s["lapsed_reason"] = "context exhausted and unrecoverable; escalated"
+            log(f"{uuid[:8]} LAPSED — CONTEXT-DEAD (a boot cannot fix this); "
+                f"keeping the record so this is visible. Re-subscribe to clear it.")
+            if not args.dry_run:
+                update_sub(uuid, s)
             continue
+        # ⛔⛔ A QUOTA MESSAGE WHOSE OWN RESET TIME HAS PASSED IS HISTORY, NOT A
+        #    LIVE LIMIT — demote it to IDLE *before* dispatch, or the row stays
+        #    parked forever. `RATE_LIMITED` is deliberately never booted (correct:
+        #    do not boot into a live wall), but the classification is read off a
+        #    frozen tail, and a parked row never writes anything to change it. So
+        #    a row that hit a limit ONCE is skipped on every tick thereafter.
+        #    ⇒ Measured by a sibling campaign: a subscription present the whole
+        #    time, a reset 74 minutes past, `boots=0`, and a live runtime that a
+        #    single carriage return then woke on the first try. The row was
+        #    perfectly wakeable; nothing ever asked it.
+        # ⚠ Typing here is still guarded and that is what makes this safe: the
+        #    boot reads the SCREEN first and refuses on a choice prompt or an
+        #    unreadable screen, so a row sitting on the plan-limit DIALOG is
+        #    still never typed into, and `--refuse-if-draft` still protects a
+        #    half-typed sentence.
+        if state == "RATE_LIMITED" and tail_reset_has_passed(c.get("tail")):
+            log(f"{uuid[:8]} quota message is HISTORY — its own reset time has "
+                f"passed and nothing has been written since. Treating as IDLE so "
+                f"it can be woken rather than skipped forever.")
+            state = "IDLE"
+
         if state == "RATE_LIMITED":
             # ⛔⛔ THE PREMISE BELOW WAS FALSE FOR 7.5 HOURS AND TOOK THE WHOLE
             #    WAKE PLANE DOWN WITH IT. "The account is out of quota, not this
@@ -1724,18 +2258,25 @@ def tick(args):
             if row_process_absent(uuid):
                 log(f"{uuid[:8]} QUOTA-DEAD — no process; its quota tail is history, "
                     f"not a live refusal. Unsubscribing instead of holding the fleet.")
-                try:
-                    STATE.mkdir(parents=True, exist_ok=True)
-                    with RETIRED_LEDGER.open("a") as fh:
-                        fh.write("%s\t%s\t%s\t%s\n" % (
-                            time.strftime("%Y-%m-%dT%H:%M:%S%z"), uuid,
-                            "booter tick (auto)",
-                            "classified RATE_LIMITED with no process running as this row: "
-                            "a corpse whose last words were a quota message. Retrying it "
-                            "re-armed the fleet-wide hold on every tick."))
-                except Exception as exc:
-                    log(f"   ⚠ could not record the retirement: {exc}")
-                sub_path(uuid).unlink(missing_ok=True)
+                # ⛔ A DRY RUN MUST NOT MUTATE, and this path did both things a
+                # dry run is promised not to do: it appended to the retired
+                # ledger and deleted the subscription. Every other mutation in
+                # this tick is guarded; this one was missed, so `tick --dry-run`
+                # — the command someone reaches for precisely BECAUSE they are
+                # unsure — was the one that quietly retired rows.
+                if not args.dry_run:
+                    try:
+                        STATE.mkdir(parents=True, exist_ok=True)
+                        with RETIRED_LEDGER.open("a") as fh:
+                            fh.write("%s\t%s\t%s\t%s\n" % (
+                                time.strftime("%Y-%m-%dT%H:%M:%S%z"), uuid,
+                                "booter tick (auto)",
+                                "classified RATE_LIMITED with no process running as this row: "
+                                "a corpse whose last words were a quota message. Retrying it "
+                                "re-armed the fleet-wide hold on every tick."))
+                    except Exception as exc:
+                        log(f"   ⚠ could not record the retirement: {exc}")
+                    sub_path(uuid).unlink(missing_ok=True)
                 continue
             # A LIVE row refused on quota is the real thing: hold the FLEET, do
             # not escalate (a human cannot grant quota), and do not unsubscribe
@@ -1752,6 +2293,9 @@ def tick(args):
         elif state in ("WORKING", "JUST_ENDED"):
             s["boots"] = 0                     # progress clears the stall counter
             s["escalated"] = False
+            # The row moved, so whatever we could not read no longer strands it.
+            s["blind_skips"] = 0
+            s["blind_escalated"] = False
         elif state == "UNREACHABLE":
             action = "CANNOT-SEE"              # never a verdict about the row
         elif state == "NO_TRANSCRIPT":
@@ -1771,6 +2315,8 @@ def tick(args):
         elif state == "IDLE" and c["age"] >= (boot_after := boot_after_for(s)[0]):
             if grew:
                 s["boots"] = 0                 # it worked since last tick
+                s["blind_skips"] = 0
+                s["blind_escalated"] = False
             if rl:
                 # ⛔ A BOOT INTO AN EXHAUSTED QUOTA IS REFUSED BEFORE THE AGENT
                 #    RUNS. It spends the wake, changes nothing, and — because the
@@ -1796,7 +2342,8 @@ def tick(args):
             else:
                 s["boots"] += 1
                 via = boot(host, row, args.dry_run)
-                if via == "refused-draft":
+                if via in ("refused-draft", "refused-choice-prompt",
+                           "refused-screen-unreadable"):
                     # ⛔ A refusal is NOT a failed boot and must not count as one.
                     # The row is idle because its owner is mid-sentence, which is
                     # the one state where booting is worse than waiting — so give
@@ -1804,8 +2351,64 @@ def tick(args):
                     # tick. ⚠ Do NOT `continue` here: the state write and the
                     # window log at the bottom of the loop are what make a
                     # skipped row visible instead of merely absent.
+                    # ⛔⛔ THE OTHER TWO REFUSALS WERE MISSING FROM THIS LIST AND
+                    #    THAT COST A LANE ITS WHOLE BUDGET. A row parked on the
+                    #    plan-limit dialog is refused by OUR OWN screen guard on
+                    #    every tick — and each refusal was counted as a boot, so
+                    #    after MAX_BOOTS the watchdog escalated "did not wake
+                    #    after N boots" about a session **nobody ever asked
+                    #    anything**. Measured 2026-08-14 on the lane holding the
+                    #    owner's top item.
+                    # ⭐ The rule the original comment states is the right one; it
+                    #    was simply applied to one refusal out of three. **If the
+                    #    guard stopped the write, the row was never asked** —
+                    #    which is true of a draft, a choice prompt, and an
+                    #    unreadable screen alike.
                     s["boots"] -= 1
-                    action = "SKIP:drafting"
+                    action = {"refused-draft": "SKIP:drafting",
+                              "refused-choice-prompt": "SKIP:choice-prompt",
+                              "refused-screen-unreadable": "SKIP:blind"}[via]
+                    # ⛔⛔ THE MIRROR IMAGE OF THE DOUBLE-CHARGE ABOVE, AND IT IS
+                    #    WORSE: a refund means `boots` never rises, so the row
+                    #    can never reach MAX_BOOTS, so it can NEVER ESCALATE. A
+                    #    row refused forever is a row silent forever, and
+                    #    `SKIP:blind` is invisible to every instrument except
+                    #    this log line. Measured 2026-08-14: a lane slept
+                    #    through a hard external deadline while the watchdog
+                    #    refused it every tick and told nobody.
+                    #
+                    # ⚖ THE REFUND STAYS CORRECT — the row was never asked, so
+                    #   charging it a wake would be a lie. What was missing is
+                    #   that the SILENCE is the defect, not the refusal.
+                    #
+                    # ⭐ WHY ONLY THIS ONE OF THE THREE ESCALATES. A draft and a
+                    #   choice prompt are OBSERVATIONS OF THE ROW: something is
+                    #   genuinely in front of it, waiting is the right answer,
+                    #   and the condition clears itself when the row moves on.
+                    #   An unreadable screen is an observation of OUR OWN
+                    #   INSTRUMENT, and it does not clear itself — if the verb
+                    #   the guard reads with is missing from the running build,
+                    #   it is unreadable on every tick from now until someone is
+                    #   told. So it is bounded in time and then escalated.
+                    #
+                    # ⛔ It still does NOT type. "Blind is not clear" remains the
+                    #   right rule for WRITING into a row; relaxing that is the
+                    #   owner's call and is logged for him, not taken here.
+                    if via == "refused-screen-unreadable":
+                        s["blind_skips"] = s.get("blind_skips", 0) + 1
+                        if s["blind_skips"] >= MAX_BOOTS and not s.get("blind_escalated"):
+                            rc = max(rc, 4)
+                            escalate(host, row,
+                                     f"screen unreadable for {s['blind_skips']} ticks "
+                                     f"({c['age']/60:.0f} min idle) — the guard cannot rule "
+                                     f"out a waiting prompt, so it will not boot this row. "
+                                     f"This is our instrument failing, not the row: check "
+                                     f"that the running build still exposes the screen-read "
+                                     f"verb. The row is NOT being woken by anything.")
+                            s["blind_escalated"] = True
+                            action = "SKIP:blind→ESCALATED"
+                    else:
+                        s["blind_skips"] = 0
                 else:
                     # Say WHICH door delivered it. A watchdog that reports
                     # "booted" without saying how cannot be debugged when it

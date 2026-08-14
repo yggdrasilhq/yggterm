@@ -28,6 +28,81 @@ This file tracks user-visible changes in `yggterm`.
   of the two programs; the other reported the command as unknown, though the
   answer involves no window and nothing that program lacks. Both answer it now.
 
+- **A row you opened an app in no longer disappears when you close the window.**
+  Rows made by launching an app were treated as scratch: the software decided
+  what was worth keeping from the row's type, and an app runs inside an ordinary
+  shell, so a whole group of app rows someone had deliberately arranged could be
+  cleared away by closing the window. Nothing on screen said those rows were
+  disposable, and from the outside nothing about them was. A row created by
+  launching an app is now kept by default, exactly like an agent session. Rows
+  you did not ask for — a scratch shell, or one a tool explicitly marked as
+  temporary — still close with the window, which is what that tier is for.
+- **An app row now comes back as the app, instead of as an empty prompt.** The
+  record kept which app and which action the row was, but it used that
+  information once, on the first restart, and then forgot to write it down
+  again — so the row survived one restart and came back blank on the next. A
+  second fault hid underneath: the step that rebuilds the app's command only ran
+  for rows that keep a transcript on disk, which agent sessions do and app rows
+  do not, so the rebuild never ran for the only rows it was written for. Both
+  are fixed; a restarted app row returns running its own app.
+- **You can now ask where a row went.** When a row leaves the list, the software
+  writes down which row it was, what it was called, when it went, and why —
+  either somebody closed it, or the window closed and the row was not marked to
+  be kept. Until now the only trace of a row being cleared away was its absence,
+  which reads the same as never having existed, and that is what turned one
+  accidental loss into a permanent mystery. Ask with `server rows departed`.
+- **The document editor's page is back.** Opening a document row showed an empty
+  viewport — or, worse, the row's own shell output apparently rendered as the
+  document — while the file list beside it, the word and character counts and the
+  view controls were all correct. The page itself never drew a single character.
+  Three of the page's internal markers were written in a form the browser engine
+  rejects outright, and refusing one of them made it abandon everything it was
+  told to draw afterwards, permanently, without reporting a failure anywhere a
+  person could see. The markers are now written in a form it accepts, and a test
+  fails the build if that form is ever reintroduced anywhere in the interface.
+  The two long-standing reports of "the document area is blank" and "the document
+  area is full of garbled text" were one fault, not two.
+- **A terminal no longer keeps drawing underneath the document that covers it.**
+  It had been made unclickable but was still painting, which is why a page that
+  failed to draw showed the terminal instead of showing nothing.
+- **Screenshots of a document page now show the document.** A document row is
+  still a shell underneath, so the screenshot tool treated it as a terminal and
+  painted the terminal's contents over the page — meaning the one instrument used
+  to confirm what is on screen was showing something else.
+
+- **The diagnostic that was supposed to watch for slowdowns was itself one of
+  the biggest things running.** Every time two parts of the background service
+  wanted the same resource at the same moment, it wrote three lines to disk
+  about it — tens of thousands of times a minute, and to a file nobody was
+  reading. It now keeps a running tally in memory and writes a single summary
+  once a minute, while still writing a full line for any delay long enough that
+  a person would notice it. Measured on the live machine: **493 times less
+  written**, with the rare, genuinely slow events still recorded individually.
+  It also records those delays in microseconds rather than milliseconds — the
+  old unit was too coarse for what it was measuring, so nearly every entry read
+  as exactly zero.
+- **A background service can no longer retire while a program is still attached
+  to it, and a leftover staging folder no longer stops commands from working.**
+  The set of attached programs is kept as one small file each inside a folder,
+  and the write that publishes them stages through a `tmp` sub-folder in that
+  same place. Two parts of the software walked that folder and disagreed about
+  what a sub-folder means: one skipped anything that was not a plain file, the
+  other tried to read it as a record. That produced two failures that look
+  unrelated and share one cause. On a freshly created setup, every agent and
+  script command failed outright — reporting that a directory is not a file —
+  until the empty staging folder was deleted by hand. And because "I could not
+  read the list" is deliberately treated as "do not retire, something may still
+  be attached", a service whose staging folder happened to exist could never
+  retire at all, which is the one thing a shutdown rule is not allowed to do.
+  Underneath both sat a third problem pointing the other way: an unreadable
+  folder used to be reported as an empty one, so a service could conclude that
+  nothing was attached and shut down while a program was still using it. There
+  is now a single walk of that folder shared by both parts. It skips only what
+  it can prove is not a file, and anything it genuinely cannot read is reported
+  as a failure to read rather than as an absence, so the three different
+  questions — nothing is attached, this is not a record, I could not tell —
+  get three different answers instead of one.
+
 - **A running agent session appears in its folder again.** The sidebar shows a
   session twice on purpose: once under Live Sessions, and once inside the folder
   it is working in. The second one had quietly stopped appearing. Two separate

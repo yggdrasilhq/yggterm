@@ -3629,6 +3629,20 @@ fn main_should_retire_superseded_clients_before_shell(_args: &[String]) -> bool 
     false
 }
 
+/// Is this client running a binary that no longer exists on disk?
+///
+/// A deploy REPLACES the file rather than removing it, so the path still
+/// resolves while the running process keeps the old inode — which is why a path
+/// existence check cannot answer this and `/proc/<pid>/exe` must be read
+/// directly. The kernel appends `(deleted)` to that link, and it is the one
+/// unambiguous statement that a process can no longer be the build that is
+/// installed.
+fn client_process_runs_a_deleted_binary(pid: u32) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|target| target.to_string_lossy().ends_with(" (deleted)"))
+        .unwrap_or(false)
+}
+
 fn should_retire_superseded_client(
     record: &ClientInstanceRecord,
     current_pid: u32,
@@ -3640,6 +3654,25 @@ fn should_retire_superseded_client(
     }
     if !signal_client_record_scope_matches(record, current_scope) {
         return false;
+    }
+    // ⛔ A GUI on a DELETED binary is stale no matter what its recorded path
+    // says, and this is the case that cost a user half a day.
+    //
+    // Retirement used to require the executable PATH to differ, which reads as
+    // "a new version supersedes an old one". A deploy that overwrites the
+    // binary in place leaves the path IDENTICAL while the running process keeps
+    // the old inode, so the orphan matched `record_matches_executable`, was
+    // read as the current build, and was kept. It then owned the user's window
+    // for 12.4 hours across several restarts — each of which added another GUI
+    // instead of replacing it — while painting a surface whose sidebars never
+    // came back. Measured cost: 3.63 core-hours, 63% of all GUI CPU that day,
+    // at an entirely NORMAL per-second rate. The waste was DURATION.
+    //
+    // ⚠ Deliberately narrower than "retire any older same-scope client": two
+    // GUIs of the SAME LIVE build on one display may or may not be legitimate,
+    // that question is open, and answering it is not this fix's job.
+    if client_process_runs_a_deleted_binary(record.pid) {
+        return true;
     }
     !record
         .executable_path
@@ -4534,7 +4567,8 @@ mod tests {
         BuiltinCliCommand, FILE_DESCRIPTOR_SOFT_LIMIT_TARGET, LinuxWindowProfileInput,
         SignalClientScope, app_control_launch_state_timeout_ms,
         app_control_state_settled_for_launch, classify_builtin_cli_command,
-        compatible_signal_client_count, linux_window_profile_from_input,
+        client_process_runs_a_deleted_binary, compatible_signal_client_count,
+        linux_window_profile_from_input,
         main_should_retire_superseded_clients_before_shell, raised_file_descriptor_soft_limit,
         record_matches_executable, server_app_subcommand_owns_its_help,
         should_handoff_to_preferred_executable, should_retire_superseded_client,
@@ -6132,6 +6166,45 @@ mod tests {
         assert!(should_retire_superseded_client(
             &old, 9999, &current, &scope
         ));
+    }
+
+    #[test]
+    fn a_deleted_binary_is_detected_and_a_live_one_is_not() {
+        // ⛔ BOTH CONTROLS, SAME RUN. A positive control alone cannot tell a
+        // working detector from one that has collapsed to a constant `true`,
+        // and this project has shipped exactly that mistake before.
+
+        // Negative control: this test's own process is very much not deleted.
+        assert!(
+            !client_process_runs_a_deleted_binary(std::process::id()),
+            "the running test binary must not read as deleted"
+        );
+
+        // Positive control: copy a real binary, run it, delete the copy. The
+        // process survives its own file, which is precisely the orphan's state.
+        let dir = std::env::temp_dir().join(format!("ygg-deleted-exe-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let copy = dir.join("sleeper");
+        let Ok(_) = fs::copy("/bin/sleep", &copy) else {
+            // No /bin/sleep (or an unwritable temp dir) means the positive
+            // control could not be established. Say so rather than passing on
+            // the negative control alone, which would prove nothing.
+            eprintln!("skipping positive control: could not stage a copy of /bin/sleep");
+            return;
+        };
+        let mut child = std::process::Command::new(&copy)
+            .arg("30")
+            .spawn()
+            .expect("spawn the staged binary");
+        let _ = fs::remove_file(&copy);
+        let observed = client_process_runs_a_deleted_binary(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            observed,
+            "a process whose binary was unlinked must read as deleted"
+        );
     }
 
     #[test]

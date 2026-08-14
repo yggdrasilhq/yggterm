@@ -159,6 +159,25 @@ m.live_rows = rows([("9.2", HEIR, "9.2 one claimant"), ("9.2", TWIN, "9.2 anothe
 m._seat_handover_repair("h", False)
 out["one_holder_only"] = not m.sub_path(HEIR).exists() and not m.sub_path(TWIN).exists()
 
+# 3d. ⛔⛔ A SEAT SOMEBODY ALREADY HOLDS NEEDS NO REPAIR. Restoring a SECOND row
+#     onto a covered seat is the duplicate-claimant state, reached by counting only
+#     the unsubscribed side.
+m.sub_path(HEIR).unlink(missing_ok=True)
+sub(HEIR, "9.2", BOSS)                       # a live, SUBSCRIBED holder
+OTHER = "0the0000-5050-4a50-8a50-0the0000aaaa"
+m.live_rows = rows([("9.2", HEIR, "9.2 the live holder"),
+                    ("9.2", OTHER, "9.2 an unsubscribed second row")])
+m._seat_handover_repair("h", False)
+out["skips_covered_seat"] = not m.sub_path(OTHER).exists()
+
+# 3e. ⛔⛔ A STAND-DOWN IS NOT A HANDOVER. The same uuid leaving the plane on
+#     purpose must not be put back from a stale memory of it.
+m.live_rows = rows([("9.2", HEIR, "9.2 the live holder")])
+m._seat_handover_repair("h", False)          # record membership FOR HEIR
+m.sub_path(HEIR).unlink()                    # it stands down and unsubscribes
+m._seat_handover_repair("h", False)          # same uuid still holds the seat
+out["standdown_is_not_handover"] = not m.sub_path(HEIR).exists()
+
 # 4. an ATTENDED row is refused even with a remembered seat
 m.sub_path(HEIR).unlink(missing_ok=True)
 m.live_rows = rows([("9.2", HEIR)]); m.screen_ledgers = lambda: ({HEIR[:8]}, set())
@@ -189,6 +208,8 @@ print(json.dumps(out))
         ("restored", "⛔ tick RESTORES membership to the seat's next holder"),
         ("never_invents", "⛔ tick NEVER invents membership for a seat that had none"),
         ("skips_retired", "⛔⛔ tick NEVER restores to a row whose title says RETIRED"),
+        ("skips_covered_seat", "⛔⛔ tick SKIPS a seat a subscribed row already holds"),
+        ("standdown_is_not_handover", "⛔⛔ tick treats the SAME uuid as a STAND-DOWN, not a handover"),
         ("one_holder_only", "⛔ tick restores to NO ONE when a seat has two claimants"),
         ("skips_attended", "⛔ tick REFUSES an attended row even with a remembered seat"),
         ("blind_is_not_empty", "⛔ a BLIND row plane repairs nothing"),

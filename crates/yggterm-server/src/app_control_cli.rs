@@ -430,7 +430,10 @@ pub fn run_app_control_cli(
             let output_path = cli_positional_args(&args, 3).into_iter().next();
             run_screenrecord_capture("app", output_path, timeout_ms, duration_secs)
         }
-        "launch" => host.launch_app(&args, home_dir, timeout_ms),
+        "launch" => {
+            app_launch_duplicate_guard_check(&args, home_dir)?;
+            host.launch_app(&args, home_dir, timeout_ms)
+        }
         "clients" => run_app_control_list_clients(),
         "desktop-identity" => run_app_control_desktop_identity(),
         // A LOCAL /proc walk, not an app-control round trip: the profile is
@@ -1905,5 +1908,286 @@ pub fn run_app_control_cli(
         // binaries; do not inline a verb here.
         "web" => crate::run_app_control_web_cli(&args, timeout_ms),
         other => anyhow::bail!("unsupported app control command: {other}"),
+    }
+}
+
+/// What `server app launch` should do when a GUI is already live.
+///
+/// ⛔ **A launch used to ADD a GUI unconditionally**, with no existing-instance
+/// check and no retirement of the incumbent. The old process kept its window,
+/// kept painting and kept its rows, so the user's own remedy compounded the
+/// fault: restarting to escape a broken window added a second one, and the
+/// window they were looking at was still the OLD one. Measured cost of one such
+/// orphan: 3.63 core-hours over 12.4 hours, 63% of all GUI CPU that day — at a
+/// rate (29.2% of a core) that was entirely NORMAL. **The waste was duration,
+/// not a runaway**, which is why this is a lifecycle guard and not an
+/// optimisation.
+///
+/// ⚠ Shadows are not duplicates. An agent's read-only shadow client exists
+/// precisely so probes stay off the user's seat, and several may be live at
+/// once; only an **Active** client owns the window this guard protects.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AppLaunchDuplicateDecision {
+    /// No live Active GUI, or the caller accepted the consequence explicitly.
+    Launch,
+    /// An Active GUI already owns the display; naming it is the whole point,
+    /// because "a GUI is already running" without a pid is unactionable.
+    Refuse { incumbent_pids: Vec<u32> },
+}
+
+/// `--replace` and `--allow-duplicate` are the two ways to say "I meant it".
+///
+/// They differ in intent and the difference is deliberate: `--allow-duplicate`
+/// is the sandbox's flag (a throwaway GUI with its own env is a legitimate
+/// second instance), while `--replace` retires the incumbent first. Neither is
+/// the default, because the default is what a confused user reaches for.
+///
+/// ⛔ **`--replace` must actually replace.** A flag that only suppresses the
+/// refusal while leaving both GUIs alive would be a verb that lies — the exact
+/// class this project keeps cataloguing — and it would recreate the bug the
+/// guard exists to stop, behind a name that reads as the fix.
+fn app_launch_duplicate_override(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--replace" | "--allow-duplicate"))
+}
+
+fn app_launch_replace_requested(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--replace")
+}
+
+/// Retire the incumbent GUI before the replacement starts.
+///
+/// ⚠ **This leaves a few seconds with no window**, and that is deliberate
+/// rather than hidden: it is exactly the gap the existing manual restart ritual
+/// has (kill, then launch), and the daemon owns every PTY, so no session, no
+/// scrollback and no agent's work is lost with the GUI. Retiring AFTER the new
+/// one paints would be better, but this call path spawns the companion and
+/// waits on it, so there is no moment between "started" and "painted" to act
+/// in. Naming the limitation beats shipping a flag that quietly does neither.
+fn app_launch_retire_incumbents(pids: &[u32]) {
+    for pid in pids {
+        // SIGTERM, never SIGKILL: the GUI's own shutdown path deregisters it
+        // from the client registry, and a killed process leaves the record for
+        // the liveness sweep to reap instead.
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+        eprintln!("server app launch: retired incumbent GUI pid {pid} (--replace)");
+    }
+}
+
+/// The pids that own a window. `client_role` of `None` reads as **Active** —
+/// that is the legacy record shape, and treating it as a shadow would silently
+/// disarm the guard on exactly the records that predate the role field.
+fn active_gui_pids(records: &[crate::ClientInstanceRecord]) -> Vec<u32> {
+    records
+        .iter()
+        .filter(|record| {
+            record
+                .client_role
+                .as_deref()
+                .map(|role| role.eq_ignore_ascii_case("active"))
+                .unwrap_or(true)
+        })
+        .map(|record| record.pid)
+        .collect()
+}
+
+/// Pure half, so the decision is testable without a daemon, a display or a
+/// filesystem.
+pub fn app_launch_duplicate_decision(
+    records: &[crate::ClientInstanceRecord],
+    args: &[String],
+) -> AppLaunchDuplicateDecision {
+    if app_launch_duplicate_override(args) {
+        return AppLaunchDuplicateDecision::Launch;
+    }
+    let incumbent_pids = active_gui_pids(records);
+    if incumbent_pids.is_empty() {
+        AppLaunchDuplicateDecision::Launch
+    } else {
+        AppLaunchDuplicateDecision::Refuse { incumbent_pids }
+    }
+}
+
+/// Effectful half: ask who is live, then apply the decision.
+///
+/// ⛔ **An unreadable answer must never read as "nobody is running".** That is
+/// the same seam `active_client_instance_records_from_dir` documents, from the
+/// other side: there, mistaking unreadable for empty retires a daemon that
+/// still has clients; here it would launch a second GUI over a live one. So a
+/// query error is NOT swallowed into a permissive default — but it is also not
+/// fatal, because refusing to launch on a host that cannot answer would leave a
+/// user with no window at all. It warns and proceeds, which is the direction
+/// that cannot strand them.
+fn app_launch_duplicate_guard_check(
+    args: &[String],
+    home_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let endpoint = crate::default_endpoint(home_dir);
+    let records = match crate::active_client_instance_records(home_dir, &endpoint) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!(
+                "server app launch: could not read the client registry ({error}); \
+                 launching anyway rather than leaving you with no window. \
+                 If a GUI was already running, there are now two."
+            );
+            return Ok(());
+        }
+    };
+    // `--replace` still has to find out WHO it is replacing, so the incumbent
+    // scan happens before the decision short-circuits on the override.
+    if app_launch_replace_requested(args) {
+        let incumbents = active_gui_pids(&records);
+        app_launch_retire_incumbents(&incumbents);
+        return Ok(());
+    }
+    match app_launch_duplicate_decision(&records, args) {
+        AppLaunchDuplicateDecision::Launch => Ok(()),
+        AppLaunchDuplicateDecision::Refuse { incumbent_pids } => {
+            let pids = incumbent_pids
+                .iter()
+                .map(|pid| pid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "a yggterm GUI is already running (pid {pids}) and launching would ADD a second \
+                 one rather than replace it — the window you are looking at would still be the \
+                 old one. Re-run with --replace to retire the incumbent, or --allow-duplicate if \
+                 you genuinely want two (a sandbox GUI does)."
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod app_launch_duplicate_guard_tests {
+    use super::*;
+    use crate::ClientInstanceRecord;
+
+    fn record(pid: u32, role: Option<&str>) -> ClientInstanceRecord {
+        ClientInstanceRecord {
+            pid,
+            started_at_ms: 0,
+            client_id: None,
+            client_role: role.map(str::to_string),
+            linux_desktop_app_id: None,
+            process_start_ticks: None,
+            executable_path: None,
+            build_commit: None,
+            display: None,
+            wayland_display: None,
+            xdg_session_id: None,
+            xdg_runtime_dir: None,
+            xauthority: None,
+            webkit_gl_environment: Default::default(),
+        }
+    }
+
+    fn args(extra: &[&str]) -> Vec<String> {
+        std::iter::once("launch")
+            .chain(extra.iter().copied())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn an_empty_registry_launches() {
+        assert_eq!(
+            app_launch_duplicate_decision(&[], &args(&[])),
+            AppLaunchDuplicateDecision::Launch
+        );
+    }
+
+    #[test]
+    fn a_live_active_gui_refuses_and_names_the_incumbent() {
+        // The whole point of naming it: "a GUI is already running" with no pid
+        // leaves the caller nothing to act on.
+        assert_eq!(
+            app_launch_duplicate_decision(&[record(4004668, Some("active"))], &args(&[])),
+            AppLaunchDuplicateDecision::Refuse {
+                incumbent_pids: vec![4004668]
+            }
+        );
+    }
+
+    #[test]
+    fn a_legacy_record_with_no_role_counts_as_active() {
+        // ⛔ Reading `None` as a shadow would disarm the guard on exactly the
+        // records that predate the role field.
+        assert_eq!(
+            app_launch_duplicate_decision(&[record(1234, None)], &args(&[])),
+            AppLaunchDuplicateDecision::Refuse {
+                incumbent_pids: vec![1234]
+            }
+        );
+    }
+
+    #[test]
+    fn shadows_are_not_duplicates() {
+        // Agent shadows exist so probes stay off the user's seat; several may
+        // be live and none of them owns the window.
+        assert_eq!(
+            app_launch_duplicate_decision(
+                &[record(11, Some("shadow")), record(12, Some("Shadow"))],
+                &args(&[])
+            ),
+            AppLaunchDuplicateDecision::Launch
+        );
+    }
+
+    #[test]
+    fn both_overrides_launch_past_a_live_gui() {
+        for flag in ["--replace", "--allow-duplicate"] {
+            assert_eq!(
+                app_launch_duplicate_decision(&[record(99, Some("active"))], &args(&[flag])),
+                AppLaunchDuplicateDecision::Launch,
+                "{flag} should launch past a live GUI"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_targets_exactly_the_window_owners_and_never_a_shadow() {
+        // `--replace` SIGTERMs whatever this returns. An agent's read-only
+        // shadow must never be in that list: killing one would take out
+        // another lane's probe surface as a side effect of a routine restart.
+        let records = [
+            record(10, Some("active")),
+            record(11, Some("shadow")),
+            record(12, None),
+            record(13, Some("SHADOW")),
+        ];
+        assert_eq!(active_gui_pids(&records), vec![10, 12]);
+    }
+
+    #[test]
+    fn replace_on_a_quiet_host_retires_nothing() {
+        // The kill-then-launch ritual reaches here with an empty registry, and
+        // it must not turn into an error or a stray signal.
+        assert!(active_gui_pids(&[]).is_empty());
+        assert!(app_launch_replace_requested(&args(&["--replace"])));
+        assert!(!app_launch_replace_requested(&args(&[])));
+    }
+
+    #[test]
+    fn every_active_incumbent_is_named_not_just_the_first() {
+        // The failure this guard exists for produced TWO live GUIs; a message
+        // naming one of them would have sent the reader after the wrong pid.
+        assert_eq!(
+            app_launch_duplicate_decision(
+                &[
+                    record(1, Some("active")),
+                    record(2, Some("shadow")),
+                    record(3, None),
+                ],
+                &args(&[])
+            ),
+            AppLaunchDuplicateDecision::Refuse {
+                incumbent_pids: vec![1, 3]
+            }
+        );
     }
 }
