@@ -25,6 +25,7 @@ use yggterm_core::{
     install_release_update, refresh_desktop_integration,
 };
 use yggterm_platform::configure_gui_entry_process;
+use yggterm_server::server_cli::{cli_server_endpoint, ensure_local_server_ready_for_cli};
 use yggterm_server::{
     AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, ClientInstanceRecord,
     PersistedDaemonState, ProbeTerminalViewportInputMode, ScreenshotPostProcess, SessionKind,
@@ -845,6 +846,12 @@ fn print_server_help() {
   yggterm server order [--json]
   yggterm server reorder <session-path>... | --stdin [--scope <scope>]
   yggterm server ledger [--scope <scope>]
+  yggterm server daemons [--json]
+  yggterm server write-lock <acquire|release|status> [--holder <who>]
+  yggterm server gate-screen [<session-key>] [--tail <n>] [--json]
+  yggterm server relay-boundary [--by <who>] [--wait-secs <n>] [--json]
+  yggterm server wpe <verb> [--key value ...]
+  yggterm server wpe agent <status|restart|stop>
   yggterm server ping
   yggterm server status
   yggterm server snapshot
@@ -924,30 +931,7 @@ fn run_sessions_regenerate_copy_cli(store: &SessionStore, args: &[String]) -> Re
     Ok(())
 }
 
-/// The daemon this CLI invocation talks to.
-///
-/// NEVER `default_endpoint` — that is OUR OWN version's socket. A CLI binary
-/// newer than the running daemon finds nothing there, and the old code then let
-/// `ensure_local_daemon_running` spawn a RIVAL daemon at our version. The rival
-/// cold-restores `server-state.json`, which resurrects sessions the user closed
-/// under the live daemon, silently drops keep-alive on every session whose
-/// terminal runtime the rival does not own, and re-seeds the row order. The GUI
-/// already avoids this via `resolve_client_daemon_endpoint`; CLI verbs must use
-/// the same resolver or a single `yggterm-headless server ...` call from a
-/// freshly built binary forks the world.
-fn cli_server_endpoint(home_dir: &std::path::Path) -> yggterm_server::ServerEndpoint {
-    yggterm_server::resolve_client_daemon_endpoint(home_dir).endpoint
-}
 
-fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
-    let resolved = yggterm_server::resolve_client_daemon_endpoint(store.home_dir());
-    if resolved.version_mismatch.is_some() {
-        // A daemon of another version is live and owns this home's sessions.
-        // It is the source of truth; attach to it rather than spawning a peer.
-        return Ok(());
-    }
-    ensure_local_daemon_running(&resolved.endpoint)
-}
 
 /// The trailing session identifier of a session path (`.../<uuid>` → `<uuid>`),
 /// used to match a requested path against the daemon's canonical key regardless
@@ -1169,65 +1153,6 @@ fn run_server_connect(
     Ok(())
 }
 
-/// `yggterm server reorder <path>...`: set the Live Sessions row order. The
-/// daemon places the listed rows first and appends every unlisted live row after
-/// them (see `replace_live_session_order`), so a partial list only promotes the
-/// rows you name and can never drop one. Dormant rows (no runtime) reorder like
-/// any other row.
-///
-/// The report is the DAEMON's account, not an echo of the request: `applied` and
-/// `skipped` come off the wire. The old output printed `requested: N` and the
-/// caller's own list, which read as success even when the daemon had silently
-/// dropped every row (field guide §4.5).
-fn run_server_reorder(
-    endpoint: &yggterm_server::ServerEndpoint,
-    ordered_paths: &[String],
-    client_scope: Option<&str>,
-) -> Result<()> {
-    let (before, _) = snapshot(endpoint)?;
-    let before_order: Vec<String> = before
-        .live_sessions
-        .iter()
-        .map(|session| session.session_path.clone())
-        .collect();
-    let (after, message) = reorder_live_sessions_scoped(endpoint, ordered_paths, client_scope)?;
-    let after_order: Vec<String> = after
-        .live_sessions
-        .iter()
-        .map(|session| session.session_path.clone())
-        .collect();
-    let update = message
-        .as_deref()
-        .and_then(yggterm_server::LiveSessionOrderUpdate::from_message);
-    let mut report = serde_json::json!({
-        "requested": ordered_paths,
-        "live_session_count": after_order.len(),
-        "changed": before_order != after_order,
-        "order": after_order,
-    });
-    match &update {
-        Some(update) => {
-            report["applied"] = serde_json::json!(update.applied);
-            report["skipped"] = serde_json::json!(update.skipped);
-            report["message"] = serde_json::json!(update.summary());
-        }
-        // An older daemon cannot say what it applied. Report the gap rather
-        // than inventing an `applied` list out of the request.
-        None => {
-            report["applied"] = serde_json::Value::Null;
-            report["skipped"] = serde_json::Value::Null;
-            report["applied_unreported_by_daemon"] = serde_json::json!(true);
-            report["message"] = serde_json::json!(message);
-        }
-    }
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    if let Some(update) = update
-        && !update.skipped.is_empty()
-    {
-        anyhow::bail!("{}", update.summary());
-    }
-    Ok(())
-}
 
 /// `yggterm server connect --list`: enumerate sessions that EXIST (remote scans)
 /// but are NOT currently in the live set — the connectable "void", newest first.
@@ -1550,49 +1475,8 @@ fn main() -> Result<()> {
     // process alive holding the lock (SIGTERM/Ctrl-C to release), to stand up a
     // live holder for a preemption test. See docs/agent-control-plane.md.
     if args.len() >= 2 && args[0] == "server" && args[1] == "write-lock" {
-        ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = cli_server_endpoint(store.home_dir());
-        let verb = args.get(2).map(String::as_str).unwrap_or("");
-        let profile = cli_flag_value(&args, "--profile");
-        let pid = std::process::id();
-        match verb {
-            "acquire" | "hold" => {
-                let status = yggterm_server::acquire_profile_write_lock(&endpoint, profile, pid)?;
-                println!("{}", serde_json::to_string_pretty(&status)?);
-                if verb == "hold" {
-                    if !status.writable {
-                        // Did not get the lock (a peer holds it): nothing to hold.
-                        std::process::exit(1);
-                    }
-                    // Flush before parking: stdout is block-buffered when piped, so
-                    // without this the JSON above never reaches a redirected log.
-                    use std::io::Write as _;
-                    let _ = std::io::stdout().flush();
-                    eprintln!(
-                        "holding profile write-lock {:?} as pid {} — SIGTERM/Ctrl-C to release",
-                        status.profile, pid
-                    );
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_secs(3600));
-                    }
-                }
-                return Ok(());
-            }
-            "report" => {
-                let status = yggterm_server::profile_write_lock_report(&endpoint)?;
-                println!("{}", serde_json::to_string_pretty(&status)?);
-                return Ok(());
-            }
-            "release" => {
-                let status = yggterm_server::release_profile_write_lock(&endpoint, profile, pid)?;
-                println!("{}", serde_json::to_string_pretty(&status)?);
-                return Ok(());
-            }
-            other => anyhow::bail!(
-                "usage: yggterm server write-lock <acquire|hold|report|release> \
-                 [--profile <name>] (got {other:?})"
-            ),
-        }
+        // ONE owner, both binaries — `yggterm_server::server_cli`.
+        return yggterm_server::server_cli::run_server_write_lock_cli(&store, &args);
     }
     // `yggterm server order [--json]` — dump the Live Sessions row order, one
     // path per line. Round-trips with `server reorder --stdin`, so an order can
@@ -1600,46 +1484,30 @@ fn main() -> Result<()> {
     //   yggterm server order > order.txt
     //   yggterm server reorder --stdin < order.txt
     if args.len() >= 2 && args[0] == "server" && args[1] == "order" {
-        ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = cli_server_endpoint(store.home_dir());
-        let (snapshot, _) = snapshot(&endpoint)?;
-        let order: Vec<String> = snapshot
-            .live_sessions
-            .iter()
-            .map(|session| session.session_path.clone())
-            .collect();
-        if args.iter().any(|arg| arg == "--json") {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "live_session_count": order.len(),
-                    "order": order,
-                }))?
-            );
-        } else {
-            for path in &order {
-                println!("{path}");
-            }
-        }
-        return Ok(());
+        // ONE owner, both binaries — `yggterm_server::server_cli`.
+        return yggterm_server::server_cli::run_server_order_cli(&store, &args);
     }
     // `yggterm server ledger [--scope <scope>]` — dump the durable row-order
     // ledger (per-client-scope memory of row slots, including rows that are
     // not currently live). Read-only.
+    // ⛔ THIS VERB ANSWERED ON THE HEADLESS BINARY ONLY, and the census it
+    // reports is a host fact with no GUI in it — so `yggterm server daemons`
+    // answering "unsupported server command: daemons" was an accident of which
+    // file it was typed into, not a property of this binary. Both route to the
+    // one owner now. ⚠ The `server` surface is still dispatched twice; the
+    // triage of which of its other divergences are accidental and which are
+    // real is filed in docs/pending-bugs.md.
+    if args.first().is_some_and(|arg| arg == "server")
+        && args.get(1).is_some_and(|arg| arg == "daemons")
+    {
+        return yggterm_server::run_server_daemons_census(
+            store.home_dir(),
+            args.iter().any(|arg| arg == "--json"),
+        );
+    }
     if args.len() >= 2 && args[0] == "server" && args[1] == "ledger" {
-        let scope = args
-            .iter()
-            .position(|arg| arg == "--scope")
-            .and_then(|ix| args.get(ix + 1))
-            .map(String::as_str);
-        ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = cli_server_endpoint(store.home_dir());
-        let report = row_order_ledger_report(&endpoint, scope)?;
-        match serde_json::from_str::<serde_json::Value>(&report) {
-            Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
-            Err(_) => println!("{report}"),
-        }
-        return Ok(());
+        // ONE owner, both binaries — `yggterm_server::server_cli`.
+        return yggterm_server::server_cli::run_server_ledger_cli(&store, &args);
     }
     // `yggterm server reorder <path>... | --stdin [--scope <scope>]` — set the
     // Live Sessions row order. Paths are placed in the given order at the TOP;
@@ -1648,41 +1516,32 @@ fn main() -> Result<()> {
     // a row. `--scope` also records the order into that client's row-order
     // ledger scope (multi-GUI arrangements).
     if args.len() >= 2 && args[0] == "server" && args[1] == "reorder" {
-        let scope = args
-            .iter()
-            .position(|arg| arg == "--scope")
-            .and_then(|ix| args.get(ix + 1))
-            .cloned();
-        let scope_value_ix = args
-            .iter()
-            .position(|arg| arg == "--scope")
-            .map(|ix| ix + 1);
-        let ordered: Vec<String> = if args.iter().any(|arg| arg == "--stdin") {
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .context("reading reorder stdin")?;
-            buf.lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        } else {
-            args[2..]
-                .iter()
-                .enumerate()
-                .filter(|(ix, arg)| !arg.starts_with('-') && Some(ix + 2) != scope_value_ix)
-                .map(|(_, arg)| arg.clone())
-                .collect()
-        };
-        if ordered.is_empty() {
-            anyhow::bail!(
-                "usage: yggterm server reorder <session-path>... | --stdin [--scope <scope>]"
-            );
-        }
-        ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = cli_server_endpoint(store.home_dir());
-        return run_server_reorder(&endpoint, &ordered, scope.as_deref());
+        // ONE owner, both binaries — `yggterm_server::server_cli`.
+        return yggterm_server::server_cli::run_server_reorder_cli(&store, &args);
+    }
+    // ⛔ THE LAST THREE `server` DIVERGENCES, AND THEY WERE ACCIDENTAL TOO.
+    // These three were read as deploy/relay machinery that belonged to the
+    // headless CLI by design — the one real fork this surface was said to
+    // have, and the reason it was not collapsed wholesale. Reading their
+    // bodies refutes it: `wpe` opens with `ensure_local_server_ready_for_cli`
+    // + `cli_server_endpoint` and talks to the daemon, which is the very test
+    // that convicted the four before it; `gate-screen` is a read-only daemon
+    // query; and `relay-boundary` reads and writes a file under the home dir
+    // and touches no daemon at all, which is the `daemons` census's shape.
+    // None of them needs a window, and none of them is unavailable to this
+    // binary for any reason but which file it was typed into.
+    // ⇒ A relay declaring its own hand-off is the case that stung: the binary
+    // on an agent's PATH is this one.
+    if args.len() >= 2 && args[0] == "server" && args[1] == "gate-screen" {
+        return yggterm_server::server_cli::run_server_gate_screen_cli(&store, &args);
+    }
+    if args.first().is_some_and(|arg| arg == "server")
+        && args.get(1).is_some_and(|arg| arg == "relay-boundary")
+    {
+        return yggterm_server::server_cli::run_server_relay_boundary_cli(&store, &args);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "wpe" {
+        return yggterm_server::server_cli::run_server_wpe_cli(&store, &args[2..]);
     }
     if args.len() >= 5 && args[0] == "server" && args[1] == "terminal" && args[2] == "write" {
         ensure_local_server_ready_for_cli(&store)?;
@@ -4746,6 +4605,109 @@ mod tests {
     /// The tell of a local dispatcher is its own failure message, so that is
     /// what is banned: exactly one file in the tree may say
     /// `unsupported app control command`, and it is the owner.
+    /// ⛔ `server daemons` IS A HOST FACT, SO BOTH BINARIES MUST ANSWER IT.
+    ///
+    /// It answered on the headless CLI only, and the census has no GUI in it —
+    /// which binary a verb reaches was decided by which file it was typed
+    /// into. Same accident as `server app audio`, on the `server` surface
+    /// rather than the `server app` one.
+    ///
+    /// ⚠ This is a per-verb lock, deliberately, and NOT the structural ban
+    /// that `server app` gets. The `server` surface is still dispatched in
+    /// both binaries and its divergences are NOT uniformly accidental — some
+    /// verbs really are headless-only. Banning a second dispatcher there would
+    /// be wrong until each verb has been triaged; the triage is in
+    /// `docs/pending-bugs.md`.
+    /// ⛔ THE FOUR DAEMON-SOCKET VERBS ANSWER FROM BOTH BINARIES.
+    ///
+    /// `write-lock`, `order`, `ledger` and `reorder` answered on the GUI binary
+    /// only, and every line of each talks to the daemon over the local socket —
+    /// there is no window in any of them. This is a PER-VERB lock, like the
+    /// census one below and unlike `server app`'s structural ban, because the
+    /// `server` surface genuinely does contain headless-only verbs.
+    #[test]
+    fn both_binaries_answer_the_daemon_socket_verbs() {
+        for (binary, source) in [
+            ("yggterm", include_str!("main.rs")),
+            ("yggterm-headless", include_str!("bin/yggterm-headless.rs")),
+        ] {
+            // ⭐ The last three were added 2026-08-14, and adding them is the
+            // finding: they were the FORK this surface was said to have, and
+            // reading their bodies refuted it. `server` has no measured fork
+            // left — only `connect`, whose move is deferred on size, not on a
+            // verdict.
+            for verb in [
+                "write_lock",
+                "order",
+                "ledger",
+                "reorder",
+                "gate_screen",
+                "relay_boundary",
+                "wpe",
+            ] {
+                assert!(
+                    source.contains(&format!("server_cli::run_server_{verb}_cli(")),
+                    "{binary} must route `server {verb}` to its one owner"
+                );
+            }
+            // ⛔ And the bodies must be GONE, not merely also-dispatched. A
+            // binary that kept its inline copy beside the call would pass the
+            // assertion above while the two copies drifted, which is the exact
+            // failure this whole entry is about. `run_server_wpe` was the local
+            // one; the other two were inline blocks whose distinctive strings
+            // are checked instead.
+            let product = source
+                .split("mod tests {")
+                .next()
+                .expect("the binary has a product half above its tests");
+            for needle in [
+                "fn run_server_wpe(",
+                "no sessions owned by this daemon match",
+                "declare_relay_boundary(",
+            ] {
+                assert!(
+                    !product.contains(needle),
+                    "{binary} kept its own copy of a moved `server` verb ({needle})"
+                );
+            }
+            // ⛔ And the helpers those verbs need are shared too. Both binaries
+            // carried byte-identical private copies; adding a third in the
+            // shared crate while leaving those in place would have been worse
+            // than the duplication it was fixing.
+            //
+            // ⚠ PRODUCT HALF ONLY. A ban that greps the whole file matches the
+            // banned string in THIS assertion and fails the file that obeys it
+            // — the same prose-vs-code trap the payload lock above records.
+            let product = source
+                .split("mod tests {")
+                .next()
+                .expect("the binary has a product half above its tests");
+            assert!(
+                !product.contains("fn cli_server_endpoint("),
+                "{binary} grew its own `cli_server_endpoint` back"
+            );
+            assert!(
+                !product.contains("fn ensure_local_server_ready_for_cli("),
+                "{binary} grew its own `ensure_local_server_ready_for_cli` back"
+            );
+        }
+    }
+
+    #[test]
+    fn both_binaries_answer_the_daemon_census() {
+        for (binary, source) in [
+            ("yggterm", include_str!("main.rs")),
+            ("yggterm-headless", include_str!("bin/yggterm-headless.rs")),
+        ] {
+            assert!(
+                source.contains("run_server_daemons_census("),
+                "{binary} must route `server daemons` to its one owner — the \
+                 census is a host fact and answering it on one binary only is \
+                 how `yggterm server daemons` came to report the verb unknown"
+            );
+        }
+    }
+
     #[test]
     fn neither_binary_dispatches_server_app_itself() {
         for (binary, source) in [

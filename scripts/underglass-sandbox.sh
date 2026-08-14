@@ -295,6 +295,18 @@ EOF
         "YGGTERM_HOME=$SANDBOX_HOME/.yggterm") kill "$pid" 2>/dev/null || true ;;
       esac
     done
+    # ⛔ AND THE COMPOSITOR, WHICH THE PID FILE DOES NOT RELIABLY NAME. `setpid`
+    # is written by `setsid sway …`, and util-linux `setsid` only forks when it
+    # is already a process-group leader — so `$!` is sometimes sway and
+    # sometimes a parent that has already exited, in which case `is_running`
+    # answers false and the compositor is never killed. Observed leaking one
+    # sway PER STOP on one host while cleaning up correctly on another, which
+    # is exactly how an intermittent leak survives review. Sweep by the config
+    # path, which names THIS sandbox and nothing else — the same shape as the
+    # YGGTERM_HOME-scoped sweep above, and for the same reason.
+    for pid in $(pgrep -f "sway -c $CONF" 2>/dev/null || true); do
+      kill "$pid" 2>/dev/null || true
+    done
     echo "sandbox '$NAME' stopped (home preserved at $SANDBOX_HOME)"
     ;;
   *)

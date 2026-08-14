@@ -1420,6 +1420,268 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⚠ [6.6] TWO FUNCTIONS NAMED `live_session_default_summary`, ONE PER CRATE, AND ONLY ONE IS EVER READ
+
+**Status:** OPEN
+
+*Found 2026-08-14 while fixing the cwd-fallback row description — by editing
+the wrong one and watching the live sidebar not change.*
+
+`live_session_default_summary` exists twice:
+
+- `crates/yggterm-server/src/lib.rs` — writes the row's summary at BIRTH, and
+  that stored string is what the sidebar shows;
+- `crates/yggterm-shell/src/shell.rs` — the sidebar's own fallback, reached
+  only when no stored or generated summary exists.
+
+They answer the same question in different words for the same row kind
+("Interactive shell rooted at X; use it for…" versus "Local shell rooted at
+X."), which is exactly the second encoding this project forbids. Editing either
+one compiles, passes its own tests, and changes nothing the user sees.
+
+⚠ **The trap is the shared NAME, not the duplication alone.** Grep, jump-to-
+definition and a memory of "the summary builder" all land on whichever one the
+tool reaches first, and the wrong one looks right — same signature shape, same
+match arms, same sentences to within a few words.
+
+⇒ Collapse to one owner. The birth-time write is the load-bearing copy; the
+shell-side fallback should call it rather than re-spell it.
+
+⛔ Whoever takes this must check what else reads the stored summary before
+changing its wording: it is persisted, so existing rows keep the old sentence
+until something rewrites them, and a test that asserts the new wording against
+a restored row will be red for reasons that have nothing to do with the change.
+
+## ⛔⛔ [6.6] REAL-KEY INPUT DELIVERS NOTHING ON THE GUI HOST, AND A RESTART WILL NOT FIX IT
+
+**Status:** OPEN
+
+*Measured by seat 3.6, relayed via 3.0 and 6.0. The build-age half was tested
+here 2026-08-14 and it REFUTES the leading hypothesis.*
+
+```
+web do type                       -> delivered:false, nothing lands
+web do fill --mechanism real-keys  -> delivered:false, nothing lands
+web do click                       -> delivered:true,  works
+```
+
+0/6 against two unrelated targets (a six-box OTP group, and a plain single input
+on a freshly reloaded page), so it is not a property of one component.
+
+**Ruled OUT by test — do not repeat these:** not `--selector-set` wedging the
+component (fresh nonce, pristine boxes, still 0/6); not activation
+(`server app open` first, still 0/6); not a missing lease (`web lease` returned
+`leased:true`, still 0/6).
+
+### ⛔ AND "IT IS PROBABLY A STALE BINARY" IS REFUTED — the code is unchanged
+
+The running GUI was build `5f76dcb0` (3.0.148) while `origin/main` was **224
+commits ahead**, so the staleness was real. It is not the cause:
+
+- **No commit in those 224 touches `real_keys` or `real-keys` anywhere in
+  `crates/`.** The three files that implement the mechanism
+  (`app_control.rs`, `app_control_web_cli.rs`, `shell.rs`) are unchanged on that
+  string; `shell.rs` has 8 commits in the window but none of them touch it.
+- ⭐ Re-run 2026-08-14 with the scope WIDENED to `vendor/`, where the injection
+  actually lives (`vendor/dioxus-desktop/src/web_surface.rs` — `inject_key`,
+  `synth_key`, the focus loan, the map plan). One commit in the window touches
+  `vendor/dioxus-desktop` at all and it is not that file. The original grep had
+  stopped at `crates/`, which does NOT contain the mechanism.
+
+### ⛔⛔ AND "SO DIAGNOSE IT AS CODE, IT IS LIVE IN MAIN" IS ALSO REFUTED — measured, six arms
+
+That was an inference from the staleness refutation, not a measurement, and the
+measurement disagrees. `scripts/web-real-keys-ab.sh` brings up a private
+sandbox GUI, gets a live web surface, and runs `do type` with `do click` as the
+**control on the same surface in the same run**. Every arm below answered
+`delivered:true` for BOTH verbs and read the typed value back:
+
+| # | build | machine | surface state |
+|---|---|---|---|
+| 1 | current `main` | build host | active, mapped |
+| 2 | current `main` | build host | hidden after being born visible (`visibilityState:hidden`, `mapped:false`) |
+| 3 | current `main` | build host | born headless (`engine_visible:false`), the same shape the failing surface had |
+| 4 | the OLD build the GUI was running | build host | active, mapped |
+| 5 | current `main` | **the GUI host itself**, private sandbox | active, mapped |
+| 6 | current `main` | build host, harness self-check | active, mapped |
+
+⇒ The mechanism is **not** broken in `main`, not broken in the older build, not
+broken by the hidden/headless states agents actually drive, and not broken on
+the GUI host's hardware, compositor or IM configuration. The IM guard was
+checked separately and had applied on the live GUI
+(`linux_im_module_policy` → `gtk-im-context-simple`, `im_already_set:false`),
+so the ibus route is not open there either.
+
+⚠ **What is therefore still open is narrower and harder:** the failure is
+conditional on the live GUI PROCESS or on the specific third-party page that
+was being driven — not on the code path, the build, or the machine.
+
+### ⛔ AND THE REPRODUCTION IS GONE — the process that carried it has been replaced
+
+Checked by identity rather than by version, 2026-08-14: the GUI now serving is
+a NEW process whose `/proc/<pid>/exe` is byte-identical to the installed
+binary (same md5), and both report 3.0.154. The window that produced the six
+failures was the older build recorded above, and it is no longer running.
+
+⇒ Only one of the two remaining candidates can still be tested — the page —
+and only if the same site is driven again. **A probe against the live GUI now
+would exercise the same configuration the six arms already cleared and prove
+nothing**, so this is NOT an owner gate and was deliberately not parked as one.
+
+⇒ **Status is therefore "open, not reproducible".** It stays here because
+`delivered:false` on a credential path is worth catching if it returns, and the
+harness makes that one command. ⛔ Do not re-derive the six arms; run
+`scripts/web-real-keys-ab.sh`, which reports its own control. ⛔ And do not
+cycle the owner's desktop for it — that was already shown not to answer the
+question, and now there is nothing on that desktop left to answer it with.
+
+### ⭐ WHY THIS OUTRANKS ONE BROKEN VERB
+
+`delivered:false` is the verb being HONEST, and that is luck rather than design.
+Every credential-injection path on that host routes through real keys, so any
+caller that reads `delivered` as advisory — or does not read it — types nothing
+into a payment field and reports success. There is a recorded instance of that
+exact shape elsewhere in the fleet, where a fill wrote a credential into a hidden
+decoy and its own length check passed.
+
+⇒ Whoever fixes the mechanism should also ask what would have happened had the
+verb lied, because the honest field is the only thing that made this visible.
+
+## ⚠ [6.6] THE `server` USAGE TEXT IS A THIRD COPY OF "WHICH VERBS EXIST", AND IT DRIFTED THE SAME WAY
+
+**Status:** OPEN
+
+*Found 2026-08-14 immediately after making three `server` verbs answer from both
+binaries: they worked, and the binary you typed them into still said they did
+not exist.*
+
+Each binary prints its own hand-maintained `server` usage block. Measured after
+the verbs were shared: **23 lines on one, 31 on the other**, for the same
+surface. **Five verbs that answer from both** (`daemons`, `write-lock`,
+`gate-screen`, `relay-boundary`, `wpe`) were listed by one binary only —
+including two that had *just* been moved specifically so both could serve them.
+
+⚠ **And the drift runs BOTH ways**, which is why "the GUI's help is behind" is
+the wrong summary: `write-lock` has answered from both binaries since the first
+round of this work and was missing from the HEADLESS block. A one-directional
+reading would have fixed one side and left the other, and then reported the
+surface as reconciled.
+
+⚠ **This is the same defect one layer up, and it is the more dangerous layer.**
+A missing dispatch fails loudly (`unsupported server command`). A missing usage
+LINE fails silently and teaches the wrong thing: the user reads the help, does
+not see the verb, and concludes it is not available here — which is exactly the
+belief the dispatch fix exists to remove. ⇒ A surface can be shared and still
+be undiscoverable.
+
+The six lines were added by hand so the fix is not self-contradicting, and that
+hand-add is the bug: **the next verb will drift again.** One owner should
+generate both texts, the way `app_control_cli` owns the `server app` help.
+
+⛔ Do not "fix" this by copying one block over the other. They are not identical
+by design — each names its own binary in every line — so the shared thing is the
+verb list, not the text.
+
+## ⚠ [6.6] ONE `server` VERB STILL ANSWERS FROM ONE BINARY ONLY — AND THE "REAL FORK" NEVER EXISTED
+
+**Status:** OPEN
+
+*Measured and mostly closed 2026-08-14, after collapsing `server app`. The last
+three verdicts were taken the same day and they overturned this entry's own
+premise.*
+
+`server <verb>` is dispatched in both binaries, and nine verbs answered from one
+only. This entry used to say the finding was that **`server` mixes planes** —
+deploy and relay machinery that is *genuinely* headless-only sitting beside
+daemon operations that are not — so a blanket ban would forbid a real fork.
+
+⛔⛔ **THAT PREMISE IS WITHDRAWN. THE FORK WAS THREE READINGS, AND ALL THREE WERE
+WRONG.** `gate-screen`, `relay-boundary` and `wpe` were the entire evidence for
+it. Read end to end, every one is accidental (below), and all three now answer
+from both binaries. **Eight of nine divergences measured, eight accidental, zero
+forks found.**
+
+⚠ **The per-verb rule still stands — but on its own merits, not on a
+counter-example.** Asking per verb is right because a fork *could* exist and a
+structural ban would forbid it silently. What nobody may do any more is cite a
+measured one, because there isn't one. ⇒ If the ninth verb also comes back
+accidental, the honest move is to reopen the wholesale question rather than keep
+a rule whose only justification has evaporated.
+
+⭐ **The transferable half: a READING is not a VERDICT, and this entry said so
+about itself and was still believed.** The three were filed as "reads as
+deploy/relay machinery … that is a reading of their callsites and usage text,
+**not a verdict**". Everything downstream — this entry's framing, and the shared
+module's own header — then quoted them as the established fork. **A caveat
+attached to a claim does not travel with it.**
+
+### ✅ CLOSED — five accidental divergences, fixed
+
+| verb | why it was accidental |
+|---|---|
+| `daemons` | the census reads a home dir and nothing else |
+| `write-lock` · `order` · `ledger` · `reorder` | each opens with `ensure_local_server_ready_for_cli` + `cli_server_endpoint` and then talks to the DAEMON over the local socket — no window in any of them |
+
+All five now have one owner (`yggterm_server::server_cli`, plus the census in
+`daemon.rs`) and answer from both binaries. Locked per verb by
+`both_binaries_answer_the_daemon_census` and
+`both_binaries_answer_the_daemon_socket_verbs`. Verified before/after against
+the shipped binary: `unsupported server command: order` becomes a dispatch.
+
+⭐ **And the helpers went with them.** `cli_server_endpoint` and
+`ensure_local_server_ready_for_cli` were byte-identical private copies in BOTH
+binaries. Sharing the verbs while leaving those in place would have made a
+THIRD copy — worse than the duplication being fixed — so the locals are gone and
+both binaries import the shared pair. The lock bans either growing one back.
+
+### ✅ CLOSED — the three that were the "real fork"
+
+| verb | the reading | what the body says |
+|---|---|---|
+| `wpe` | deploy/relay machinery, headless by design | opens with `ensure_local_server_ready_for_cli` + `cli_server_endpoint` and talks to the daemon — **the exact test that convicted the four above it** |
+| `gate-screen` | ditto | a read-only daemon query over the socket; no ensure, deliberately, for the same reason `terminal resize` has none |
+| `relay-boundary` | ditto | touches **no daemon at all** — reads and writes a host fact in a file under the home dir, which is the `daemons` census's own shape, and the census was closed as accidental |
+
+All three now answer from both binaries, and their bodies are GONE from the
+headless binary rather than merely also-dispatched — the lock checks for the
+copies, not just for the calls, because a binary that kept its inline block
+beside the new call would pass a call-only assertion while the two drifted.
+Before/after against the shipped binary: all three went from
+`unsupported server command: <verb>` to a real dispatch.
+
+⭐ **`relay-boundary` is the one that stung.** It exists so a relay session can
+declare its own hand-off — and the binary on an agent's `PATH` is `yggterm`,
+which was the one that could not answer it.
+
+### ⏳ STILL OPEN — one verb, and it is a size problem, not a verdict
+
+- **`connect`** (GUI-only) — ⭐ **READ END-TO-END, AND THE VERDICT IS
+  ACCIDENTAL.** It reads a snapshot and asks the daemon to place a row: no
+  window, no app-control round trip, no process spawn. The earlier note here
+  said it "may reasonably need the GUI" and that it "spawns" — both were guesses
+  from its name and from a grep that matched the word in a comment. It does
+  neither.
+  ⛔ **But it is NOT a bounded move, which is why it is still open.** Attempting
+  it showed `connect` drags a private cluster with it — `ConnectPlacement`,
+  `run_server_connect`, `run_server_connect_list`, plus
+  `connect_desired_order`, `connect_path_session_uuid`, `connect_scanned_metadata`,
+  `connect_session_is_active`, `connect_session_key_is_known`,
+  `connect_session_kind_for_path` and `parse_remote_scanned_connect_path`. That
+  is ~190 lines of verb over seven more helpers, against ~120 lines for the four
+  already moved. The attempt was reverted rather than half-landed.
+  ⇒ Whoever takes it should move the cluster as one commit, and should expect
+  the helper count, not the verb, to be the work.
+
+### ⚠ THE INSTRUMENT LIED FIRST, AND THE CONTROL CAUGHT IT
+
+The first extractor scanned only `args[1] == "verb"` and produced verb lists
+that **omitted `daemons` entirely** — that verb is dispatched as
+`args.get(1).is_some_and(...)`. A live observation of `daemons` happened to be
+in hand as a control; without it a confidently wrong inventory would have been
+published. ⇒ **Validate a source scanner against a case whose answer you already
+know.** That enumerating this dispatch needs four different spellings is itself
+evidence for the entry.
+
 ## ⚠ [6.6] A PROCESS-GLOBAL ENV WRITE MAKES THE LAUNCH-COMMAND TESTS FLAKY IN PARALLEL
 
 **Status:** OPEN
@@ -5180,6 +5442,36 @@ on a branch with **no** upstream is still worth fixing), and the corrected text 
 `lane/dev/6.7-resource` (`87394d0a`, *"the guard defect is real, 'every lane push fails' is
 not"*), which is unmerged pending the release. **That lane's version supersedes this entry
 on merge.** Until then: do not treat this as a reason not to push.
+
+### ⛔ A SECOND RESIDUAL, MEASURED 2026-08-14 — A BRANCH **WITH** AN UPSTREAM THAT IS BEHIND `main`
+
+⚠ Added as a new instance, not a rewrite of the text above; the supersession from 6.7's
+lane still applies to everything before this heading.
+
+The range is derived from the remote ref of the branch being pushed. For a lane whose
+remote tip is behind `main`, that range therefore contains **every commit `main` gained
+since the lane was last pushed** — including other lanes' commits. So:
+
+- another lane added a personal home path in `docs/pending-bugs.md` and **a later commit on
+  `main` removed it again**;
+- both are already public on `main`;
+- the tree being pushed does not contain it, and `scripts/check-privacy.sh` passes on it;
+- and the lane push is refused anyway, because an added line inside the range is still an
+  added line. ⇒ **An already-remediated leak blocks every later lane push, for everyone.**
+
+⛔ **It is self-perpetuating**: the push that would advance the lane ref is the one being
+refused, so the lane can never catch up on its own.
+
+⭐ **THE WORKAROUND THAT NEEDS NO OVERRIDE, AND IT IS ORDERING, NOT A BYPASS.** Push
+`HEAD:main` **first**, then the lane. `main`'s range is only the lane's own work, so it
+scans the right thing and passes; the content published is byte-identical either way. Only
+the question the guard is asked changes. Landing this way is what got 16 commits onto
+`main` after four refusals.
+
+⇒ The fix is for the guard to scan the **resulting tree**, or to exclude commits already
+reachable from another remote ref, rather than every added line in a range it did not
+author. ⛔ `YGG_PRIVACY_ALLOW=1` is NOT the answer here even though it would work: the
+whole point of this shape is that it teaches the override to people whose tree is clean.
 
 *found 2026-08-13 while pushing a lane branch; affects every cluster in this batch*
 
