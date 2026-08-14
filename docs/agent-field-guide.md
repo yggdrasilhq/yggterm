@@ -37,8 +37,11 @@ Every entry below cost a session at least once.
 | `shell_mut_hist` | **Always, for raw writes.** It counts only `safe_shell_mut`; a bare `state.with_mut` is INVISIBLE to it. A no-op raw write therefore reads as *"unattributed render, empty histogram"* — which says "nothing I can see wrote", not "nothing wrote". Three render-storm autopsies in a row reported exactly that and all three died undiagnosed | Grep for raw `with_mut` callsites directly, and treat an empty histogram beside a real render as an ATTRIBUTION GAP, never as an absence of writes |
 | `web_surface_contexts` | A surface has no profile dir. It counts only the KEYED map, and `WebContext::new_ephemeral()` is never inserted — so `0 contexts, 41 surfaces live` is indistinguishable from 41 UNSHARED contexts, the exact failure its own doc says it catches. Reached in ordinary operation: the shell passes `profile_dir: None` whenever another client holds the profile write-lock | Count surfaces and contexts together and compare; a zero count beside live surfaces is a BLIND instrument, not a clean result |
 | `app_render_rate` | Never — and that is the point. It is **always on** (no env gate) and had already recorded 739 samples over 12.3 h showing the rate FLAT at ~2/s while CPU climbed 3.6×. Nobody read it, and a cluster was briefed to chase the re-render as the growth | Read the always-on probes BEFORE forming a hypothesis. A constant-rate loop cannot be what grows |
+| Any statistic over `perf-telemetry.jsonl` `daemon_request` durations — mean, median, or a fit — for `status`, `ping`, `terminal_read`, `terminal_write`, `terminal_snapshot` or `working_flags` | **Always.** Those six are `perf_span_is_high_frequency_noise`'s list, so a span is written only when it ran **≥ 8 ms** *or* wins a **1-in-50** sample. One live stream held 5,604 sub-floor records (each standing for ~50 replies) against 2,769 tail records (each standing for one): a recorded tail share of **33% against a true 0.98% — 34× enrichment.** ⛔ And it does **not** cancel between processes, which is the assumption that makes a cross-daemon comparison look safe: the 243–246-row daemons put **13.5–16.8%** of their records above the floor where the 70–101-row daemons put **3.5–7.6%**, because more rows push more replies past 8 ms. A per-row slope read straight off the recorded set came out **10.2 µs/row**; the same daemons with each record inverse-probability weighted gave **4.7 µs/row** | Weight each record by its sampling probability (50 below the floor, 1 at or above it) before computing anything, or read a counter that samples nothing. ⚠ And these durations are **wall**, not CPU — an upper bound on the CPU a handler burned, and `status` has been seen waiting 9.89 s for the runtime lock |
 | `yggterm --version` | You need the **protocol** version. It reports the `yggterm` package; the daemon uses `yggterm-server`'s, which a version-only bump may not recompile | The daemon's own socket name, `server-<v>.sock` |
 | A `FAILED` / `test result:` grep over `cargo test --workspace` | **The workspace does not COMPILE.** A build error yields no failures *and no results*, so every "is it green?" grep reads clean — an empty set wearing a pass. Reached in ordinary operation: a struct gained a field and three test fixtures were not updated, and the suite was unbuildable until someone tried to run one specific test. Every workspace run between that commit and the fix was reading a non-result as a pass | Assert the run HAPPENED before reading its silence: require a non-zero `test result: ok. N passed` with **N > 0**, and check the exit status. A grep that can only ever find bad news cannot distinguish "no bad news" from "no news" |
+| *"It passes individually, so it is flaky in parallel"* — as a reason to stop looking | **Always, in this workspace.** The phrase has been standing in for a diagnosis, and the mechanism turns out to be a real defect: `sync_claude_extra_args_for_request` (`daemon.rs:10007`) does `unsafe { std::env::set_var(…) }` **process-wide** and the launch builder reads it back, so in a test binary — one process, every test — launches race. Measured: **4 parallel runs → 2 green, 2 red on DIFFERENT tests; serial ×2 → 1096/1096 both times.** Passing serially proves the failure is not in the test's own subject; it does **not** prove nothing is wrong | Re-run with `--test-threads=1` and treat a parallel red that does not reproduce as **evidence about that `set_var`**, not as noise. ⚠ Same shape as the launch-flag bug beside it: a per-launch value carried in process-global state, outliving its launch — so the tell is *"a red that moves between tests between runs"* |
+| `cargo test … <name> -- --exact`, to confirm one test individually | **The test lives in a module and you passed its bare name.** The filter matches nothing and prints `test result: ok. 0 passed; 0 failed; 1112 filtered out` — a **pass line for a run that did not happen**, and it reads as green at a glance. Three tests known to be failing all printed exactly that; the finding would have been inverted. The module path is required: `tests::…`, `terminal::tests::…` | **Read the count, not the verdict.** Require `1 passed` (or N>0) before believing any individual-test result, exactly as the workspace-build entry above requires it before believing a silence. Same family, different costume: not an unbuildable workspace, but a filter that silently matches zero |
 | A row-plane verb failing with *"connecting to `~/.yggterm/server-<v>.sock`: No such file or directory"* | **You will read it as an addressing failure.** It is a CONNECTION failure — the CLI is pinned to a version-stamped socket the daemons never bound. Three rows on one campaign each hit this, each concluded *"that row's uuid is not addressable from here / the peer list is incomplete"*, each filed it as **their own limitation**, and each routed around it by guessing a reachable row — so cross-row messages went to the wrong recipient and were relayed by hand. ⚠ It is **invisible** to anyone using the remote form (`ssh <guihost> '…yggterm-headless …'` reaches the GUI process and never touches the socket) and **total** for anyone using the local one, which is why it presents as a patchy peer list rather than a missing file | Read the error's own noun. **The error names the socket; the symptom names the peer list.** Check `ls ~/.yggterm/server-*.sock` before believing anything about reachability, and note an alias may mask it: a `server-<old>.sock` symlink pointing at a NEWER socket is the design; pointing at an older one is a proxy wearing the design's clothes. ⛔ Enumerate an alias set from the versions that EXIST, never from the files that happen to REMAIN — 73 stale socket files on one host, **757** on another |
 | `git reset --mixed origin/main` in a SHARED checkout, to drop a commit you already landed elsewhere | **Upstream has moved since you landed it.** The reset resurrects your commit's content as an *uncommitted* diff against the newer upstream — so your now-stale copy of a shared file silently **reverts every entry that landed after yours**. Measured: `git diff --stat origin/main -- docs/pending-bugs.md` → **64 deletions**, all another lane's, staged and ready for the next `git add -A`. ⚠ The file was NOT dirty before the reset; the reset is what dirtied it | Confirm patch-equivalence first (`git cherry origin/main HEAD` → a leading `-`), then **`git checkout origin/main -- <path>`** for every shared file the commit touched, and re-read `git status` — the lane's own dirty files must be the only thing left. ⛔ Never `git add -A` in a shared checkout; stage by explicit path |
 | A column index into another tool's **human** output (`awk '{print $3}'`, `split($3,a,":")`) | **The column means something else.** A repair tool read `$3` of `ss` output as an address; in that output `$3` is **Send-Q**, so it extracted nothing — and fell through to the *reassuring* branch, printing `GUI <pid> has no edit socket; not the flush-gate freeze` about a GUI that was holding a listening edit socket the whole time. ⇒ A parse failure that lands on "you're fine" is worse than a crash: it exonerates the thing it was asked to diagnose, in a specific and plausible sentence | Match by **shape**, not position (pull the address out of the LISTENING line by pattern), and prefer a machine-readable mode where one exists. Make the failure branch say *"could not parse"* — never *"nothing found"* |
@@ -68,6 +71,7 @@ Every entry below cost a session at least once.
 | `/proc/<daemon-pid>/exe` as "where the installed binary is" | Whenever a deploy RENAMED rather than replaced in place. The link follows a rename, so after `mv yggterm-headless yggterm-headless.old.$$ ; cp new yggterm-headless ; rm -f *.old.*` it reads `…/yggterm-headless.old.4121874 (deleted)` — the grave of the OLD binary, not the install sitting beside it. It names where this process's file WAS. Reading it as the install is what skipped the PTY handoff on `dev` 2026-08-09 and cold-killed **55 live terminals** | The canonical name in that directory (`…/yggterm-headless`), with the exe link as one candidate among several — never as the answer. `disk_replace_handoff_candidates` is the one place that decides this |
 | **`observations` on a terminal open attempt** | **Almost always, and it reads as a fault.** Nothing in the GUI produces one: the only caller of `observe_terminal_open_attempt_from_viewport` is the app-control `DescribeState` handler, so the counter measures **how often an agent asked the GUI to describe itself**, not the surface's health. Measured on the desktop host 2026-08-11: **24 of 33 attempts had `observations: 0` and 15 of those reached Ready anyway.** Reading `observations: 0` as "this attempt never got a surface reading" points an investigation at an ingest path that is working exactly as built | The attempt's own `state` and `ready_at_ms`, and the `terminal_open_attempt/ready` event's `extra` — which names the latch (`reason: …` for a `mark_ready`, or the `settled_kind`/`interactive` fields when the viewport observation did it). ⚠ And note what that distinction exposes: an attempt latched by the viewport path became usable **because an agent was watching**, so polling `describe-state` while investigating this area changes the outcome you are measuring |
 | The **unsuffixed** `~/.yggterm/event-trace.jsonl` as "the current GUI's trace" | Whenever a short-lived CLI has run — it writes there too, and the GUI is usually on a generation-suffixed file. Following the name instead of the process sends you through a dead pid's history (twice now, ~10 minutes each) | Identify the writer: the file whose fd is held by the `yggterm` GUI process. `for fd in /proc/$(pgrep -x yggterm)/fd/*; do readlink -f $fd; done \| grep event-trace` |
+| `pgrep -f "<the GUI's home path>"` as "find the GUI process" | **Always, and it is a different failure from `pgrep` matching your own shell.** A launch command exports the home directory into the environment it hands down, so that string is present in the command line of **every PTY child the GUI ever spawned**. The pattern does not fail to match — it matches a crowd, and the first hit is whichever descendant happened to sort first. Found 2026-08-14 while checking whether the running window was stale, which is precisely the question a wrong answer here settles backwards | **Identify by BINARY, not by any string the process inherited.** `pgrep -x yggterm`, then confirm with `/proc/<pid>/exe` and its md5 against the installed file. Anything a child could have inherited is not an identity |
 | A directory listing of `~/.yggterm/server-*.sock` | Always, if you read it as litter. guihost holds **633** of them going back to 2.1.x and **every one accepts a connection**: all but the current version are SYMLINKS the daemon retargets to its live socket at startup (`refresh_legacy_server_socket_aliases`) so an older client can still find it. Sweeping them deletes the cross-version compatibility plane | `ls -l` (they are symlinks, not sockets), or connect and read `server_version` |
 | **`server app update restart`** used to make the DAEMON current | **Whenever the GUI is already the newest build — i.e. after every successful deploy.** It is a GUI verb: `RestartPendingUpdate` → `restart_into_pending_update`, which **returns silently** when no newer GUI is staged, and the reply is still `error: null` with a full state dump. So on a host whose GUI is current and whose daemon is three builds behind, the correct-looking call changes nothing, reports success, and leaves the same pid. Two clusters read that as "the update gate is stuck" and went looking for the gate; the gate was never consulted | The daemon swap is a different mechanism entirely — the metadata rail's hot-restart (`ServerRequest::HotRestart`, no idle gate, preserves every runtime). To see whether a swap is owed, read `server daemons` (3.0.124+ prints the queued swap and what it waits for); to see the two versions, `daemon_update_state.current_gui_version` vs `.active_daemon_version` |
 | `hot_update_handoff_prepared {spawn_ok: true}` | **Always, as evidence a successor exists.** It records that the *spawn syscall* worked. A child that re-execs to the wrong version, finds the socket bound and exits 0 produces exactly this line, and the daemon then lingers as a preserved owner waiting for an adopter that was never created | The next `spawned_daemon_exit`, and — the fact that actually answers it — whether a daemon at or above the target version is now live (`server daemons`) |
@@ -241,6 +245,223 @@ which is the single owner of the threshold that gate, row payload and sidebar al
 fact and was one command from being falsified. A relayed measurement is a CLAIM until you have run
 it yourself — and building a measurement on top of an instrument that does not exist is how a whole
 lane's numbers turn out to be about nothing.
+
+### ⛔⛔ `git log -S` SKIPS MERGES, SO A DELETION THAT ARRIVED VIA A MERGE READS AS "NEVER EXISTED"
+
+**This is the correction to a law this campaign already carried, and the missing
+half is what resurrected a queue entry on `main`.**
+
+The standing rule was: *a conflict whose upstream side is EMPTY is textually
+identical to a deliberate deletion — `git log -S '<phrase>' -- <file>` settles
+it.* True, **and only with `--full-history -m`.** Plain `git log -S` does not
+walk merge commits, so a deletion that reached `main` *through* a merge is
+invisible to it and the command answers **"this was never here"** — which is
+exactly the answer that tells a lane to keep its own side.
+
+⇒ Measured 2026-08-14: a lane hit three empty-upstream conflicts, ran the bare
+form, got zero commits for each, correctly concluded "never had it" for two —
+and **wrong for the third**, which `main` had held and deleted as fixed. The
+entry came back. The instrument was right, the invocation was not, and the
+failure direction is always toward resurrection.
+
+```sh
+git log --oneline --full-history -m -S '<distinctive phrase>' -- <file>
+```
+
+⭐ **The general form: a history query that silently excludes a class of commit
+answers a narrower question than the one you asked** — and here the excluded
+class is *precisely* the one that performs integrations, which is where
+deletions cross branches.
+
+### ⭐⭐ THE HEADING DIFF — catch a resurrection WHILE THE CONFLICT IS OPEN, not after
+
+`check-queue-resurrection.sh --strict` catches a resurrection **after** it is
+committed. This catches it while you can still fix it for free, and it is immune
+to the merge hole that `git log -S` has, because it compares **whole files**
+rather than querying history:
+
+```sh
+git show origin/main:docs/pending-bugs.md | grep "^## " | sort -u > /tmp/main-h.txt
+grep "^## " docs/pending-bugs.md                | sort -u > /tmp/mine-h.txt
+comm -23 /tmp/main-h.txt /tmp/mine-h.txt   # on main, gone from mine → MY deliberate deletions, and nothing else
+comm -13 /tmp/main-h.txt /tmp/mine-h.txt   # mine, not on main   → MY new entries,      and nothing else
+```
+
+⭐ **Both lists must be exactly what you intended**, and the **first** is the one
+that matters: anything in it you did not mean to delete is a deletion you are
+about to perform, and anything *missing* from it is an upstream deletion you are
+about to undo. A correct queue merge usually shows one line each way.
+
+⇒ **The instance that earned it, within an hour of the gate being fixed:** a lane
+resolving its own conflict took *ours* on the hunk it was editing, which would
+have resurrected a different lane's entry that upstream had deleted as fixed.
+**The conflict gave no sign** — the resurrection was a side effect of a correct
+resolution to the hunk actually in dispute. Only the whole-file audit saw it.
+
+### ⛔⛔ A GATE THAT REPORTS A VIOLATION AND EXITS 0 IS DECORATION
+
+`check-queue-resurrection.sh` defaults to **report-and-pass**; `--strict` is what
+makes it exit 1. That default is right for a human reading output and wrong for
+every automated caller — and the campaign's own standing instruction (*"run this
+after any queue merge"*) never mentioned the flag.
+
+⇒ **A resurrection therefore sat on `main` through several push loops**, each of
+which ran the check, saw exit 0, and reported the push clean. Three separate
+sessions "ran the gate" and none of them gated.
+
+- ⛔ **In any script or push loop: `--strict`.** Without it the check is a
+  comment.
+- ⚠ It now prints `EXITING 0 ANYWAY — findings above are REAL` on the default
+  path, because the previous output was indistinguishable from a pass to
+  everything except a careful human.
+- ⭐ **The pattern to look for elsewhere:** any checker whose *default* is
+  advisory. Its findings are invisible to exactly the callers that cannot read.
+
+### ⛔⛔⛔ A "FAITHFUL" FRAME OF A DOCUMENT SURFACE SHOWED THE TERMINAL, NOT THE DOCUMENT
+
+**Found 2026-08-14 while root-causing the document surface that painted garbage.
+This is the instrument an agent is instructed to trust for any visual claim, and
+on this surface it was compositing the wrong pane.**
+
+Two independent things made it lie, and each alone was enough:
+
+1. **The screenshot compositor painted the xterm canvas over a document surface.**
+   The row's own state reads `active_view_mode: Terminal`, so the compositing
+   path drew shell output across the document it was asked to photograph.
+2. **`terminal_host_visibility_style` returns `opacity:1; visibility:visible;`
+   unconditionally**, so a terminal *covered* by another surface keeps painting.
+
+⇒ ⭐ **The consequence is the part to remember: when the document body failed to
+mount, the terminal WAS the document** — and the owner's "corrupted glyph
+clusters" were simply shell output showing through an empty pane. **The reported
+symptom was the instrument, not the subject.** Two frames 24 s apart, same row,
+`Document` selected in both, settle it: the "clean" frame shows the identical
+lines the "garbled" one renders as mojibake.
+
+⛔ **So `capture_faithful: true` answers "was the xterm canvas composited", NOT
+"is this what the user sees".** On a terminal view those coincide. On a document
+surface they came apart completely, and nothing in the reply said so.
+
+✅ **BOTH HALVES FIXED 2026-08-14 — but read what was fixed, because one of them
+was not fixed where you would look for it.** The compositor now refuses to
+composite the xterm canvas when a document surface owns the viewport.
+`terminal_host_visibility_style` **still returns `opacity:1; visibility:visible;`
+unconditionally** and is *correct* to: the standdown is a CSS rule keyed on
+`[data-document-surface-owns-viewport="true"]`, beside the `pointer-events` rule
+that was already there. ⚠ So a reader who greps that function will conclude the
+second half is still open. It is not — grep `DOCUMENT_SURFACE_STANDDOWN_CSS`.
+
+- ⚠ **The fix is in the BINARY, so the question is which binary is running.** On
+  a GUI older than this landing, both halves are still live and a
+  document-surface screenshot still lies. Settle it by identity
+  (`docs/deploy-spec.md` §1), never by version.
+- ⭐ **`webview_edit_faults` remains the field to read** whenever a surface
+  renders nothing while its state reports healthy — it was the only one that
+  moved throughout (4 in the repro, 0 after) while
+  `has_schema: true, error: null, visible: true` all reported fine. That is not
+  specific to this defect: it is the general tell that a subtree stopped
+  tracking its state, and it is monotonic, so a non-zero reading means damage
+  has happened even if the screen currently looks right.
+- ⭐ **The general rule this belongs to:** *an instrument that composites more
+  than one source must say which source it drew.* A boolean that means "the
+  compositor ran" reads as "the picture is true", and those are different claims.
+
+### ⛔⛔ `cmd | tail -1 && echo OK` REPORTS THE PIPE'S SUCCESS, NOT THE COMMAND'S
+
+**Caught 2026-08-14 in a push-retry loop that had been used all session.** A bash
+pipeline's exit status is its **last** stage, so:
+
+```sh
+git push origin HEAD:main 2>&1 | tail -1 && echo PUSHED     # ⛔ prints PUSHED on a REJECTED push
+```
+
+`tail` succeeded, therefore the `&&` fired, therefore the loop announced success
+and broke out — on a push the remote had refused. The retry loop that existed
+precisely to survive a busy `main` was the thing that stopped retrying.
+
+- ⭐ **The failure is silent and it reads as diligence**, because the loop *looks*
+  like careful engineering and its log line says the right word.
+- ⇒ **Capture the status, do not pipe it:**
+  `if out=$(git push … 2>&1); then …; else …; fi` — or `set -o pipefail`.
+- ⛔⛔ **AND THEN VERIFY THE EFFECT, NOT THE VERB.** Even a correct exit code is
+  the command's opinion. The check that cannot lie is
+  `git merge-base --is-ancestor HEAD origin/main` after a fetch. Same rule as
+  every row verb in this fleet: **read the state back**.
+- ⚠ The saving grace here was that the *earlier* pushes were verified by ancestry
+  when the discrepancy surfaced, which is how it was established that only the
+  last one had been lost rather than an afternoon of them.
+
+### ⛔⛔ THE ONE-WAY DOOR — a classification whose evidence stops updating once you classify
+
+**Two campaigns hit this in the same week, with the arrow pointing opposite ways, and
+neither instrument ever reported an error.** The generalisation is worth more than
+either bug:
+
+> **A classification derived from a signal that stops updating once the class is
+> entered is a one-way door.**
+
+- **Evidence FREEZES at classification.** A watchdog decided a session was rate-limited
+  by reading the tail of its transcript. A rate-limited session stops writing, so the
+  tail says the same thing forever — the class could be entered and never left, and
+  every re-read looked like fresh confirmation.
+- **Evidence ERODES as the work succeeds.** A repair tool selected its worklist with a
+  *what is still broken* query and then judged ordering from that same set. Rows left
+  the set as they were fixed and took their anchors with them, so **the tool grew more
+  confident the more of its own work had succeeded.**
+
+⭐ **Both get more confident the longer they are wrong, and neither can self-correct.**
+That is why both presented as *"the instrument reports healthy"* rather than as a
+failure — which is the hardest shape to find, because nothing is complaining.
+
+⇒ **THE QUESTION THAT CATCHES BOTH, cheap enough to ask of any state machine:**
+**_what writes the signal I classify on, and does it keep writing once I have
+classified?_** If the answer is *"the thing I just parked"*, the class has no exit.
+
+⚠ Companion, from the same pair of incidents: **any check whose input is a TODO query
+is suspect — ask what leaves the set when the work succeeds.**
+
+### ⛔ A WORKAROUND THAT ALWAYS WORKS HIDES THE THING IT WORKS AROUND
+
+Host discovery in the row-claiming script was broken outright — not flaky, **broken on
+every host, every time**. It went unnoticed for a long time because every brief and
+every pre-spawn checklist told sessions to pass the host explicitly, and that path
+always worked. **The workaround was load-bearing and nobody knew**, because a
+reliable workaround produces no failures to investigate.
+
+⇒ When a fix removes the need for a workaround, **go and correct the documents that
+mandated it**, recording that it is no longer load-bearing rather than quietly
+dropping the flag. Otherwise the next reader cannot tell a live requirement from a
+fossil, and the flag propagates forever.
+
+### ⛔⛔ THE TWO PRIVACY GATES DISAGREED, AND THE WEAKER ONE GATED PUSHES
+
+**Fixed 2026-08-14. Recorded because the shape outlives the instance.**
+
+A relay brief carrying an absolute personal home path reached a public lane
+branch, and the pre-push guard returned a green tick. The repo-local gate
+(`scripts/check-privacy.sh`) refuses that class as its **first** rule. So a class
+one checker treats as rule one, the other did not implement **at all** — not a
+weak version, none — and the one that runs on every push, in every repo, on every
+host was the blind one.
+
+- ⛔ **When two checkers disagree, the question is not which is right — it is
+  which one GATES.** A strict checker nobody's push runs through is a document.
+- ⭐ **The fix has to go in the WRITER, not the repo that noticed.** A rule added
+  to one repo's checker protects one repo; the same rule in the shared pre-push
+  guard protects every repo on every host, which is where a backstop belongs.
+- ⚠ **A rule that fires on its own prescribed remedy is worse than no rule.** The
+  cure for this finding is to write `/home/user`, so the pattern needs a
+  placeholder allowlist and a left anchor — without the anchor a URL ending
+  `/gp/w/home/activity` reads as a personal home path. **A check that cannot see
+  its own remedy becomes noise, and the noise is what teaches the override.**
+- ⭐ **Falsify a guard in both directions before trusting it:** that it now
+  catches the exact commit it previously passed, *and* that it stays silent
+  across a large body of already-public history. Verified here at 3,788 added
+  lines over 40 commits of `main`.
+
+⇒ And the standing consequence: **`scripts/check-privacy.sh` is the stricter gate
+and it is repo-local.** Run it before pushing docs. A green pre-push guard is a
+statement about the classes that guard implements, not about your file.
 
 ### ⛔⛔ A CLEAN PRIVACY-GUARD RUN IS NOT EVIDENCE THE FILE IS CLEAN
 
@@ -653,6 +874,29 @@ Three traps in those four lines, all of which have bitten:
 Rows reappear 5–10 s later. Re-check the count **again once the predecessor has
 actually exited** — the drop can be delayed: the predecessor holds dormant rows
 until its own disk-binary poll retires it, which can be ~20 minutes later.
+
+⭐ **AND DO NOT DIAGNOSE A MISSING ROW FROM ITS ABSENCE — ASK WHAT HAPPENED TO IT**
+(added 2026-08-14):
+
+```bash
+yggterm-headless server rows departed --limit 50   # read-only, safe on a live fleet
+```
+
+Every row that leaves the live set now records which row, its title, when, and
+**why**: `explicit-close` (somebody named it and closed it — a user close, an
+agent `session remove`, or the ephemeral reaper) or `gui-close-disposable` (the
+GUI window closed and the row was not keep-alive, so it went for what it WAS
+rather than because anyone asked). ⚠ **The three-way answer is the point:**
+
+| what you see | what it means |
+|---|---|
+| an entry saying `explicit-close` | somebody closed it. Not a bug. |
+| an entry saying `gui-close-disposable` | it was disposable and a GUI close took it. Working as designed — and if the user made that row on purpose, `docs/spec-app-row-survival.md` says it should not have been disposable. |
+| **no entry at all** | ⛔ **it did not leave through any path that knows it left.** That is its own defect, and it is the state the whole ledger exists to make visible — an absence used to be the ONLY evidence, and an absence reads identically to "never existed". |
+
+⚠ It is machine-wide (`~/.yggterm/removed-rows.json`, shared by every daemon on
+the host), so it answers for rows a peer daemon owned too — which is what makes
+it usable when two daemons' state files disagree about whether a row exists.
 
 ## 5. Destructive operations — know before you type
 

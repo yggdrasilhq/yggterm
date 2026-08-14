@@ -2254,6 +2254,77 @@ root instructions, or the onboarding skill. A repair that lives only in a runnin
 session's context is lost at the handover, which is the failure it was meant to
 prevent.
 
+### ⛔⛔ THE 8-HOURLY ORCHESTRATOR HEALTH CHECK — every orchestrator keeps the OTHERS alive
+
+**Standing duty of every orchestrator, owner-directed 2026-08-14.** Roughly every
+**8 hours**, sweep the *other* orchestrators — not your own lanes — find any that
+are in trouble, **root-cause it and fix it**. Keeping the orchestrator layer
+healthy is an orchestrator's job, not the owner's.
+
+**⭐ WHY IT HAS TO BE A SCHEDULED DUTY AND CANNOT BE LEFT TO NOTICING.** An
+orchestrator's failure is the only failure on this fleet that is **silent in both
+directions**. Its lanes escalate *to it*, so when it dies they escalate into a
+corpse and go quiet in a way that looks like calm. And it has no orchestrator of
+its own to notice — that is what being at the top of a cluster means. ⇒ **a dead
+orchestrator takes an entire cluster's supervision with it and nothing rings.**
+The N.x rows cannot see it: from inside a lane, an orchestrator that has stopped
+answering is indistinguishable from one that is busy. It is visible only from a
+peer at the same level, which is why the duty is *lateral*.
+
+**⛔⛔ THE COLD-CACHE RULE IS PART OF THE SPEC, NOT A REFINEMENT OF IT.**
+
+> **Do NOT wake a cold, stale orchestrator to ask it what it is doing.**
+
+**The asking IS the expense.** A cold row with a large context pays a full
+re-read to answer, and what you get back is an unverifiable self-report — you buy
+the wake, not the answer. Worse, prompting it makes it *warm*, so a later decision
+to succeed it wastes exactly what you just spent. ⇒ **EXTRACT, DO NOT INGEST**,
+and never send a message whose content is a question about status.
+
+**The ladder — cheapest instrument first, and stop as soon as it is decided:**
+
+| # | instrument | what it actually answers |
+|---|---|---|
+| 1 | the **last TIMESTAMPED record** in its transcript | when it last *worked*. ⛔ NOT the file's mtime — mtime is when the row **died**, not when it last worked |
+| 2 | transcript **bytes** | what a wake would cost, if you end up wanting one |
+| 3 | **monitor + booter state** | is it subscribed, is it armed, and **who does it escalate to** |
+| 4 | its **last prose turn** | a working row's own status report, already written and free to read |
+| 5 | its **`Write`/`Edit` targets** and `git log` | what it *did*, which is the half a transcript cannot fake |
+| 6 | a **targeted grep** | only for the specific term you already care about |
+
+Then cross-check against what cannot lie — the commit, the queue entry, the
+memory file. **A transcript says what a session BELIEVED; a commit says what it
+DID, and the artefact wins.**
+
+**⚖ THREE OUTCOMES, AND ONLY ONE OF THEM IS A FAULT:**
+
+1. ✅ **Warm and working** — leave it entirely alone. Do not announce the sweep.
+2. ✅ **Cold, idle, and FINISHED** — *this is not a fault.* An orchestrator that
+   completed its duty and stopped is behaving correctly, and the sweep's most
+   common true finding is "nothing is wrong here". Decide whether to reap it or
+   let it sit; **do not manufacture a problem to justify the check.**
+3. ⛔ **Cold, idle, and work UNFINISHED** — the real case. Root-cause it: a stall,
+   a quota window, an exhausted context, an escalation pointing at a retired row,
+   armed-but-unsubscribed or subscribed-but-unarmed. Fix the cause, not the
+   symptom, and record it.
+
+⚠ **Distinguishing 2 from 3 is the whole skill of this duty**, and it is decided
+from artefacts — an unfinished queue item, an unlanded lane, a brief with steps
+left — never from asking. A finished orchestrator and a stalled one look
+identical from outside; only the *work* tells them apart.
+
+**⛔ The failure modes worth looking for specifically**, because each is invisible
+to the row that has it:
+- **escalating to a retired row** — a live orchestrator whose alarm rings nowhere;
+- **armed but not subscribed** (a stall wakes it but nothing is told) or
+  **subscribed but not armed** (something is told but nothing wakes it);
+- **an unmerged lane holding a finished result**, which makes the queue lie in the
+  direction that costs most: a completed result still reading as outstanding;
+- **an unpushed commit**, which is a divergence someone reconciles by hand later.
+
+⭐ **Report it as a sweep even when it finds nothing**, in one line. A health check
+whose silence is indistinguishable from not having run is not a health check.
+
 ---
 
 ## 11. ⭐⭐ PER-CLI NUANCES — the quirk register, and it is written to GROW

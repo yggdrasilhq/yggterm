@@ -58,7 +58,7 @@ use yggterm_server::{
     run_app_control_check_terminal_input, run_app_control_submit_terminal_prompt, run_app_control_trigger_update_check,
     run_app_control_ungroup_split_group, run_attach, run_daemon, run_screenrecord_capture,
     run_screenshot_capture, run_screenshot_capture_with_post_process, run_trace_bundle,
-    run_trace_follow, run_trace_tail, run_trace_transitions,
+    run_row_departures, run_trace_follow, run_trace_tail, run_trace_transitions,
     scan_remote_machine_sessions_for_target, shutdown, snapshot, status, terminal_resize,
     terminal_restart, terminal_write, try_run_remote_server_command,
 };
@@ -1491,6 +1491,16 @@ fn main() -> Result<()> {
     }
     if try_run_remote_server_command(&args)? {
         return Ok(());
+    }
+    // "Where did my row go?" — the one question `docs/spec-app-row-survival.md`
+    // §3 was written because nothing could answer. Reads the shared departure
+    // ledger and writes nothing, so it is safe to run against a live fleet.
+    if args.len() >= 3 && args[0] == "server" && args[1] == "rows" && args[2] == "departed" {
+        let limit = args
+            .windows(2)
+            .find_map(|window| (window[0] == "--limit").then(|| window[1].parse::<usize>().ok())?)
+            .unwrap_or(50);
+        return run_row_departures(limit);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "tail" {
         let lines = args

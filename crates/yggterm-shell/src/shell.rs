@@ -11039,8 +11039,26 @@ fn web_surface_tab_create_rect(
 /// invariant — every rule keyed on the `:root[data-under-glass="1"]` stamp, so a
 /// runtime probe demotion restores all of it with no re-render — and this rule is
 /// not keyed on it and must apply whether or not the shell is under glass.
+/// ⛔ AND IT STANDS DOWN VISUALLY, NOT ONLY FOR THE POINTER.
+///
+/// Until 2026-08-14 this rule surrendered input and nothing else:
+/// [`terminal_host_visibility_style`] returns `opacity:1; visibility:visible;`
+/// unconditionally, so a covered host kept painting. That was survivable only
+/// while the document body painted OVER it — and the day the body failed to
+/// mount, what the user got was not a blank page but THE TERMINAL, presented as
+/// their document. The reported symptom was "the document view renders a
+/// screenful of corrupted glyph clusters"; it was the row's own six lines of
+/// shell output, drawn by the canvas that was never told to stand down.
+///
+/// A document surface is opaque and full-bleed, so it owes the terminal
+/// nothing. `visibility` (never `display`) keeps the host's geometry, so the
+/// PTY grid does not resize on every toggle — the same choice, for the same
+/// reason, as the web-surface rules below.
 const DOCUMENT_SURFACE_STANDDOWN_CSS: &str = r#"
 [data-document-surface-owns-viewport="true"] { pointer-events: none; }
+[data-document-surface-owns-viewport="true"] .xterm { visibility: hidden; }
+[data-document-surface-owns-viewport="true"] .yggterm-reveal-ghost { visibility: hidden; }
+[data-document-surface-owns-viewport="true"] .yggterm-cold-mount-veil { visibility: hidden; }
 "#;
 
 const WEB_UNDER_GLASS_CSS: &str = r#"
@@ -76709,9 +76727,24 @@ async fn process_pending_app_control_requests(
             // blind to them. No fallback: a silent DOM frame would lie about what's
             // on screen, so a refusal (e.g. window could not be focused on Wayland)
             // is returned as an error the agent can see.
+            // ⛔ A DOCUMENT SURFACE IS NOT A TERMINAL, WHATEVER THE VIEW MODE
+            // SAYS. An app row is a shell, so `active_view_mode` reads
+            // `Terminal` even while yedit owns the whole viewport — and
+            // compositing the xterm canvas over that frame paints the row's
+            // shell output across the document, in the ONE instrument an agent
+            // is told to trust for a visual claim. The chrome snapshot alone is
+            // the faithful frame here: the document surface is ordinary DOM.
+            let document_owns_viewport = {
+                let shell = state.read();
+                shell
+                    .server
+                    .active_session_path()
+                    .is_some_and(|path| shell.document_surface_visible_for(path))
+            };
             let prefer_terminal_composite = !compositor
                 && matches!(target, ScreenshotTarget::App)
                 && terminal_xterm_canvas_renderer_enabled()
+                && !document_owns_viewport
                 && state.read().server.active_view_mode() == WorkspaceViewMode::Terminal;
             // (backend, faithful, faithful_reason, is_terminal_region, attempts, output_path)
             let mut success: Option<(String, bool, String, bool, Vec<String>, String)> = None;
@@ -127967,7 +128000,22 @@ fn DocumentSurfaceBody(
                 for (index, widget) in body_widgets.iter().enumerate() {
                     div {
                         key: "half-{widget.key(index, &value_epochs)}",
-                        "{yggui_contract::document_split_stamps::HALF}": if split_view {
+                        // ⛔ SPELLED OUT, NOT INTERPOLATED, AND THAT IS LOAD-BEARING.
+                        // An RSX attribute NAME is a literal: `"{EXPR}"` interpolates
+                        // a VALUE, never a name, so this written as
+                        // `"{yggui_contract::document_split_stamps::HALF}"` emitted an
+                        // attribute called `{yggui_contract::…::HALF}` — braces, colons
+                        // and all — which `setAttribute` refuses outright
+                        // (`InvalidCharacterError: Invalid qualified name`). The throw
+                        // killed the whole edit batch, so EVERY mutation after it was
+                        // dropped and never re-sent: the halves, the gutter, the editor
+                        // and the reader all failed to mount while the container's own
+                        // `style` (emitted before the throw) kept tracking the data.
+                        // That is why the viewport painted nothing while the rail, the
+                        // footer counts and `document_surfaces.has_schema` all reported
+                        // success — they come from a different pane and a different
+                        // batch. Locked by `document_split_stamp_attribute_names_are_literal`.
+                        "data-yggui-doc-split-half": if split_view {
                             if index == 0 { "first" } else { "second" }
                         } else { "" },
                         style: if split_view {
@@ -128187,8 +128235,10 @@ fn DocumentSurfaceBody(
                 // of naming them in yggui-contract rather than inline here.
                 if split_view {
                     div {
-                        "{yggui_contract::document_split_stamps::GUTTER}": "1",
-                        "{yggui_contract::document_split_stamps::RATIO}": "{split_ratio}",
+                        // Literal names — see the half stamp above for why an
+                        // interpolated attribute NAME silently destroys this subtree.
+                        "data-yggui-doc-split-gutter": "1",
+                        "data-yggui-doc-split-ratio": "{split_ratio}",
                         role: "separator",
                         "aria-orientation": "vertical",
                         "aria-valuenow": "{(split_ratio * 100.0) as i64}",
@@ -138033,6 +138083,78 @@ mod tests {
             }),
             "and the RSS floor still holds"
         );
+    }
+
+    // ── RSX attribute-name locks (queue 6.8) ───────────────────────────────
+
+    /// ⛔ AN RSX ATTRIBUTE NAME CANNOT BE INTERPOLATED, AND GETTING IT WRONG IS
+    /// SILENT AND TOTAL.
+    ///
+    /// `"{EXPR}": value` reads as "name this attribute after EXPR" and does not
+    /// mean that: RSX interpolates VALUES, so the emitted attribute is literally
+    /// called `{EXPR}`, braces and colons included. `setAttribute` refuses it
+    /// (`InvalidCharacterError: Invalid qualified name`), the webview abandons
+    /// the REST of that edit batch, and Dioxus never re-sends it — it diffs
+    /// against a model in which those mutations landed. So the subtree being
+    /// built never appears, permanently, while every field around it reports
+    /// success and `webview_edit_faults` is the only thing that moves.
+    ///
+    /// It cost the document surface its entire body: three such names, and the
+    /// viewport painted nothing while the rail, the word counts and
+    /// `document_surfaces.has_schema` were all correct (they come from a
+    /// different pane, in a different batch). The class is worth a structural
+    /// lock rather than a comment, because the mistake LOOKS like the fix for a
+    /// hardcoded string.
+    #[test]
+    fn no_rsx_attribute_name_is_interpolated() {
+        let source = include_str!("shell.rs");
+        let offenders: Vec<(usize, &str)> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with(concat!('"', '{')))
+            .filter(|(_, line)| {
+                line.split_once(concat!('}', '"'))
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with(':'))
+            })
+            .map(|(index, line)| (index + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these RSX attribute NAMES are interpolated, so setAttribute rejects them \
+             and the rest of the edit batch is silently dropped — spell the name out \
+             and lock it against its contract constant instead: {offenders:?}"
+        );
+    }
+
+    /// The split-view stamps are spelled out as literal attribute names above
+    /// because of the rule the previous test enforces. `yggui-contract` stays
+    /// the one owner of the spelling; this is what makes copying it safe, and
+    /// what fails if either side is renamed alone.
+    #[test]
+    fn document_split_stamp_attribute_names_match_the_contract() {
+        assert_eq!(
+            yggui_contract::document_split_stamps::HALF,
+            "data-yggui-doc-split-half"
+        );
+        assert_eq!(
+            yggui_contract::document_split_stamps::GUTTER,
+            "data-yggui-doc-split-gutter"
+        );
+        assert_eq!(
+            yggui_contract::document_split_stamps::RATIO,
+            "data-yggui-doc-split-ratio"
+        );
+        let source = include_str!("shell.rs");
+        for stamp in [
+            yggui_contract::document_split_stamps::HALF,
+            yggui_contract::document_split_stamps::GUTTER,
+            yggui_contract::document_split_stamps::RATIO,
+        ] {
+            assert!(
+                source.contains(&format!("\"{stamp}\":")),
+                "the document surface must carry `{stamp}` as a LITERAL attribute name"
+            );
+        }
     }
 
     // ── Store-registry locks (harness spec §3 / §8 phase 1b) ───────────────
@@ -187795,6 +187917,69 @@ Shared connection to 192.0.2.14 closed.\r\n";
                  — that is the per-view duplicate"
             );
         }
+    }
+
+    /// ⛔ THE LIVE-RAIL COPY COMES FIRST, AND ~150 LOOKUPS DEPEND ON IT.
+    ///
+    /// Dual presence means one session owns TWO rows sharing one `full_path` —
+    /// deliberately, because that path is the SESSION's identity. So a
+    /// `find(|row| row.full_path == …)` cannot express which ROW it wants, and
+    /// what it silently gets is the first match. That is correct today only
+    /// because `push_live_session_rows` runs before the stored rows are
+    /// extended in, which is an ORDER, not a stated rule — and it has already
+    /// misfired once, when a force-expanded list handed `resolve_app_control_row`
+    /// the cwd-tree copy, which heads no set, and `row-expanded` began refusing.
+    ///
+    /// This pins the order so the resolvers' assumption is a contract. ⚠ It is
+    /// deliberately NOT a de-duplication: removing a copy is the regression this
+    /// lane just took out of the cwd tree, and `AGENTS.md` calls it a spec
+    /// violation in as many words.
+    #[test]
+    fn the_live_rail_copy_of_a_dual_present_session_is_the_one_a_path_lookup_finds() {
+        let cwd = "/home/user";
+        let uuid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let live_path = format!("local://{uuid}");
+        let session = live_local_session_fixture("one", uuid, cwd);
+        let live_sessions = vec![session];
+        let stored = vec![cwd_group_fixture("local", 0), cwd_group_fixture(cwd, 1)];
+
+        let rows = merged_sidebar_rows_uncached(
+            &stored,
+            &[],
+            &[],
+            &[],
+            &live_sessions,
+            &HashSet::from(["__live_sessions__".to_string()]),
+            &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
+        );
+
+        let hits: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.full_path == live_path)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            2,
+            "the fixture must actually be dual-present, or this test pins nothing"
+        );
+
+        let local_group_at = rows
+            .iter()
+            .position(|row| row.full_path == "local")
+            .expect("the local cwd root");
+        assert!(
+            hits[0] < local_group_at,
+            "the FIRST copy must be the Live Sessions one — every `find` by \
+             full_path resolves to it, so a tree-first order would silently \
+             re-point ~150 lookups at a row that heads no set"
+        );
+        assert!(
+            hits[1] > local_group_at,
+            "and the second copy is the cwd-tree one, inside the tree"
+        );
     }
 
     // XTERM-BUG: idle-auto-webview (Bug7) — coerce an EMPTY Rendered webview to Terminal
