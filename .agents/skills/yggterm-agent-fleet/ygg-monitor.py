@@ -538,6 +538,7 @@ def _seat_handover_repair(host, dry):
     subs = {s["uuid"]: s for s in load_subs()}
     repaired = []
     candidates = collections.defaultdict(list)
+    covered = set()          # seats already held by a SUBSCRIBED live row
     for r in rows:
         seat = (r.get("outline_prefix") or "").strip()
         uuid = _bare_uuid(r.get("full_path") or "")
@@ -547,7 +548,13 @@ def _seat_handover_repair(host, dry):
             s = subs[uuid]
             mem[seat] = {"role": s.get("role"), "campaign": s.get("campaign"),
                          "escalate_to": s.get("escalate_to"),
-                         "escalate_host": s.get("escalate_host"), "host": s.get("host")}
+                         "escalate_host": s.get("escalate_host"), "host": s.get("host"),
+                         # ⛔⛔ WHOSE membership this was. THIS FIELD IS THE WHOLE FIX.
+                         # A HANDOVER IS A CHANGE OF HOLDER; without the previous
+                         # holder's identity this cannot tell a handover from a
+                         # STAND-DOWN, and it re-nets rows that deliberately left.
+                         "for_uuid": uuid}
+            covered.add(seat)                  # somebody live already holds it
             continue
         # ⛔⛔ A RETIRED ROW IS STILL A LISTED ROW, AND IT STILL HOLDS ITS SEAT.
         # The first version of this restored membership to EVERY unsubscribed
@@ -572,6 +579,28 @@ def _seat_handover_repair(host, dry):
             candidates[seat].append(uuid)
     for seat, uuids in candidates.items():
         prev = mem.get(seat)
+        # ⛔⛔ A SEAT SOMEBODY ALREADY HOLDS NEEDS NO REPAIR. Restoring a SECOND row
+        # onto a covered seat is the duplicate-claimant state this function has a
+        # screen against — and I walked straight past that screen by counting only
+        # the UNSUBSCRIBED candidates. Measured 2026-08-14: a lane stood down and
+        # unsubscribed itself, its successor was seated two minutes later, and the
+        # tick then restored the RETIRED predecessor alongside the live successor,
+        # which promptly escalated the corpse as an idle lane needing a decision.
+        if seat in covered:
+            continue
+        # ⛔⛔ AND A STAND-DOWN IS NOT A HANDOVER. If the row still holding the seat
+        # is the SAME uuid the membership was recorded for, nothing was handed over
+        # — that row simply left the plane on purpose, and putting it back overrides
+        # a deliberate decision with a stale memory of it. Third misfire of this
+        # repair in one session, and the through-line is that I kept writing screens
+        # about STATES when the thing being repaired is a TRANSITION.
+        same = [u for u in uuids if prev and _same_uuid(u, prev.get("for_uuid") or "")]
+        if same:
+            log(f"  ⏭ seat {seat}: {same[0][:8]} is the SAME row the membership was "
+                f"recorded for — a stand-down, not a handover; leaving it off the plane")
+            uuids = [u for u in uuids if u not in same]
+            if not uuids:
+                continue
         # ⛔ AT MOST ONE HOLDER PER SEAT. Two live claimants on one seat is a state
         # that needs a person, not a broadcast — restoring to both would point two
         # rows at one escalation target and make the duplicate look sanctioned.
