@@ -4172,25 +4172,53 @@ under the same webview workload and compare crash counts. If the software arm
 crashes at the same rate, the GL path is incidental and the abort cluster is the
 real story.
 
-## ⚠ [6.6] GROK BUILD MAY NEVER FILL THE TITLE FIELD IT HAS
+## ⚠ [6.6] GROK BUILD: THE TITLE FIELD IS REAL, AND WE WERE READING THE OTHER ONE
 
 **Status:** OPEN
 
-*The last of the 2026-08-13 intake's declared unknowns, and it is small.*
+*The last of the 2026-08-13 intake's declared unknowns. The falsifier ran
+2026-08-14 and answered something the entry had not asked.*
 
-Grok's `summary.json` carries a `session_summary` field, and its `--resume` help
-matches "session titles for the current directory" and speaks of a *"sole renamed
-match"* — so the CLI plainly has titles. **In every session observed the field was
-EMPTY**, and every one of those sessions had a single message.
+### ⭐ ANSWERED — AND `Generated` STAYS, FOR A BETTER REASON
 
-`title_authority` therefore stays `Generated`: a field that exists is not evidence
-the CLI fills it, and declaring `Store` on a field NAME would make yggterm respect
-a title that is not there and leave the row nameless. The store reader already
-returns the summary when it is non-empty, so nothing is lost either way.
+The entry asked whether `session_summary` is a placeholder grok never fills. It
+is not. Grok's shipped binary carries a title generator
+(`crates/codegen/xai-grok-shell/src/session/summary.rs`, `goal_summarizer.rs`), a
+`session_summary_generated` event, and — decisively — a log line for exactly the
+state observed: **"session closed before its title was generated"**. The field is
+written asynchronously and a short session simply ends first.
 
-**Falsifier:** one grok session with several real turns. If `session_summary` is
-populated, flip `title_authority` to `Store`. If it stays empty, the field is a
-placeholder and this entry closes as a fact about grok.
+⇒ `title_authority` stays **`Generated`**, but the reason changes: not *"the CLI
+may never fill this"*, but *"the CLI often has not filled it YET"*. A `Store`
+authority would leave those rows nameless. Unchanged conclusion, different fact.
+
+### ⛔ AND THE READER WAS TAKING THE WRONG FIELD — fixed
+
+Grok writes **two**, and its own binary names them together: *"`session_summary`
+and `generated_title` — the session summary and its model-generated title"*.
+yggterm read the **summary**, so a row would have been named with a paragraph
+whenever grok had an actual title for it. The reader now prefers
+`generated_title` and keeps the summary as a fallback; empty stays absent.
+Pinned by `the_grok_reader_prefers_the_title_over_the_summary`.
+
+### What was measured, and the honest limit
+
+Two sessions on a signed-in fleet host, two turns each: no title/summary events
+fired, `session_summary` empty, `generated_title` absent entirely.
+
+⛔ **What is still NOT observed is a POPULATED field.** The generator's existence
+is established from the shipped binary, not from a filled `summary.json`, so the
+preference order above is implemented on grok's own documentation of its schema
+rather than on a sighting. **This entry stays OPEN for that one observation**: a
+grok session long enough to generate a title. If `generated_title` appears where
+expected, this closes as a fact about grok; if the title lands somewhere else,
+the reader needs the real path.
+
+⭐ **The instrument worth reusing:** the answer came from `strings` on the
+vendor's own binary, asking whether anything WRITES the field — the same
+setter-grep that settled a launch-flag leak the same day. A field's emptiness
+says nothing; the presence of a generator and its "closed before generated" log
+line says everything.
 
 ### ✅ Closed 2026-08-13, both by their own falsifiers
 
@@ -4211,30 +4239,6 @@ placeholder and this entry closes as a fact about grok.
 
 ⇒ **The lesson worth keeping: the gap was written as an owner gate and was never
 one.** Nobody had asked the hosts. An inherited "blocked" is a claim, not a fact.
-
-## ⛔ [6.6] `server app` IS DISPATCHED IN TWO FILES, SO A NEW VERB IS ABSENT FROM THE ONE AGENTS CALL
-
-**Status:** OPEN
-
-*Found 2026-08-13 by shipping a verb into one of them.*
-
-`apps/yggterm/src/main.rs` and `apps/yggterm/src/bin/yggterm-headless.rs` each
-carry their own `match args[2]` over the whole `server app` verb surface. They
-are not a shared function with two entry points; they are two copies.
-
-**The failure is silent and every instrument agrees with it.** A verb added to
-the GUI binary alone answers `unsupported app control command: <verb>` from the
-headless CLI — which is the copy agents actually drive — while the deployed
-binary's `--build-commit` matches the deploy, the arm is visibly in the source,
-and the running GUI's `/proc/<pid>/exe` md5 matches the disk.
-
-⭐ **What settled it was two controls in one `strings` run:** the binary carried
-`unsupported app theme-editor action` (so the probe worked) and **zero**
-occurrences of the new verb (so it was genuinely absent). The positive control
-alone would have proven nothing.
-
-⇒ Collapse the two onto one dispatcher. Until then a new verb must be added to
-both, and the headless copy carries a comment saying so.
 
 ## ⛔ THE BINARY ROSTER REPLACED A HARDCODED LIST WITH A NAME PREFIX, AND STRANDS THE SAME WAY
 
