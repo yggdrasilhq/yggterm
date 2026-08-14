@@ -1513,6 +1513,109 @@ output says "silent 5 s" — so a reader wired to either field alone cannot pass
 human remains the only detector of the state the daemon can now see. That is the
 next wiring, and `input_unanswered_ms()` is already there to read.
 
+## ⛔⛔ [6.8] THE YEDIT DOCUMENT SURFACE PAINTS GARBAGE WHILE ITS MODEL HOLDS 34 CHARACTERS
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-14 with two screenshots, on a FRESH GUI at 3.0.154 — so it
+is **not** the stale-binary defect fixed the same morning.*
+
+**The Document view of a `New Yedit` row renders a screenful of corrupted glyph
+clusters** -- dense mojibake laid out in terminal-like rows across the top of the
+canvas -- while the surface's own status bar reads:
+
+```
+7 words · 4 lines · 34 chars
+```
+
+⇒ **The model is tiny and the RENDER is garbage.** Whatever is being painted is not
+the document.
+
+### ⭐ The discriminating evidence, and it is already in hand
+
+- **The Terminal view of the SAME row is clean.** It shows the launch cleanly:
+  `yedit: document surface opened` preceded by a secrets-fetch failure the app
+  emits at startup. So the row, the PTY and the terminal renderer are all fine.
+- ⇒ **The corruption is confined to the Document surface**, and the layout of the
+  garbage is terminal-shaped -- cells, not prose.
+
+### Falsifier / where to start
+
+1. Open a document surface on a scratch row and capture a **faithful** frame
+   (`capture_faithful: true`, backend `xterm_canvas_composite_over_dom`). ⛔ A
+   `faithful:false` frame is canvas-blind and cannot settle this.
+2. ⚠ **Suspect the compositing path before the text path.** The screenshot backend
+   composites the xterm canvas with the DOM; a Document view should not be painting
+   terminal cells at all, and what is on screen looks like exactly that -- a cell
+   grid full of uninitialised or mis-decoded content.
+3. Check whether the status-bar counts and the painted content come from the same
+   buffer. They disagree by three orders of magnitude, so at least one of them is
+   reading something it does not own.
+
+⚠ **The owner also reports a recurring dropped-glyph issue alongside this.** Do not
+assume the two are one defect: dropped glyphs were also visible on the stale
+12-hour GUI and improved when it was retired, so there may be a render-path bug
+that the stale binary made worse rather than caused.
+
+## ⛔⛔ [6.7] THE BOOTER TYPES A BARE `\r` INTO A ROW THAT MAY BE SHOWING A BILLING CHOICE
+
+**Status:** OPEN
+
+*Owner-raised 2026-08-14, and the owner named the mechanism himself.*
+
+*His question: when a session hits the plan limit, the CLI shows a three-option
+prompt -- stop and wait for the reset, switch to a team account, or use API
+billing -- and the first must be dismissed with Enter. "I was thinking when booter
+hits such a session, what happens. Maybe only the question gets dissolved with the
+passed return key and on the next booter the actual booting happens ... It happened
+to us last night and I do not know how all the sessions recovered."*
+
+### ⛔ THE ANSWER IS WORSE THAN THE HYPOTHESIS, AND THAT IS WHY THIS IS FILED HIGH
+
+`wake()` writes a message and then a **lone `\r`**. Against a row parked on a
+modal choice, that `\r` **selects whatever option is highlighted**. The owner's
+model -- one boot spent dismissing the dialog, the real boot on the next tick -- is
+correct *only if the highlighted option is the harmless one*.
+
+⇒ **If the highlight is not on "stop and wait", a watchdog silently selects a
+BILLING CHANGE on the owner's account.** No agent decided that; a timer did. That
+is categorically different from a wasted boot, and it is the reason this cannot sit
+behind "it seemed to recover".
+
+### ⚠ THE EXISTING QUOTA GUARD DOES NOT COVER THIS
+
+The booter already classifies `RATE_LIMITED` and holds the whole fleet on one
+sighting -- but it is keyed on the CLI's own `apiErrorStatus: 429` record, **not on
+the interactive dialog**. A row parked on the choice prompt has not necessarily
+recorded a 429 in the shape the classifier reads, so the guard can be entirely
+correct and still not fire on the state the owner is describing.
+
+⛔ **And the shapes are indistinguishable from outside:** a row sitting on a modal
+is idle, its transcript is not growing, and its last record is a completed turn.
+That is the same signature as a stall, which is exactly what the booter exists to
+act on.
+
+### Falsifier / where to start
+
+1. Reproduce the dialog on a scratch row (never the owner's) and read what the
+   screen holds -- `terminal read-buffer <row> --mode screen`. The dialog text is
+   on the screen even when the transcript says nothing.
+2. ⭐ **Screen-content detection is the discriminator, and it is cheap.** The
+   classifier reads the transcript; this state is only visible in the *screen*.
+3. ⛔ **Then REFUSE, do not get clever.** A row showing a choice the user must make
+   is a row the watchdog must not touch -- the same rule as the never-arm ledger,
+   for the same reason: this thing types.
+
+### ⇒ THE SPEC, so it is settled before the code is
+
+- ⛔ **Never send a bare `\r` into a row whose screen is showing a prompt this
+  watchdog did not put there.** Detect, hold, and report.
+- ⛔ **A quota window is not a stall and must never be booted** -- the account
+  cannot spend, so waking the session buys a refused turn and burns a boot.
+- ⭐ **Recovery must be OBSERVABLE.** The owner's real complaint is not the boot,
+  it is *"I do not know how all the sessions recovered."* Whatever the booter does
+  here has to leave a record that answers that afterwards.
+
 ## ⛔⛔ [6.7] APP ROWS ARE BORN `keep_alive: false`, SO A GUI RESTART DESTROYS THE USER'S OWN GROUP
 
 **Status:** OPEN
