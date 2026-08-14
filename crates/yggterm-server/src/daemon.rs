@@ -19519,9 +19519,11 @@ fn daemon_request_outcome_for_response(
 /// an *idle* 3.0.85 daemon was issuing **~7,000 `sendto`/second**, in exactly
 /// that shape:
 ///
-///     sendto(8, "{",    1, MSG_NOSIGNAL, NULL, 0) = 1
-///     sendto(8, "\"",   1, MSG_NOSIGNAL, NULL, 0) = 1
-///     sendto(8, "kind", 4, MSG_NOSIGNAL, NULL, 0) = 4
+/// ```text
+/// sendto(8, "{",    1, MSG_NOSIGNAL, NULL, 0) = 1
+/// sendto(8, "\"",   1, MSG_NOSIGNAL, NULL, 0) = 1
+/// sendto(8, "kind", 4, MSG_NOSIGNAL, NULL, 0) = 4
+/// ```
 ///
 /// ⭐ The tell was sitting in this very function's twin: `read_request` wraps
 /// its side in a `BufReader`, and this one wrapped nothing. **An asymmetry
