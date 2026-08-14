@@ -1712,8 +1712,13 @@ def cmd_list(args):
         log(f"⛔ DISARMED ({left}) — {d.get('note') or 'no reason given'}")
     rl = rate_limit_hold()
     if rl:
+        # ⛔⛔ NAME THE CONSEQUENCE, NOT JUST THE CONDITION. "QUOTA HOLD, seen on
+        #    <row>" reads as a fact about THAT row, and a campaign checking its
+        #    own seat concluded it was fine. The hold is FLEET-WIDE: while it is
+        #    up, nothing can be delivered to anybody.
         log(f"⏸ QUOTA HOLD {(rl['until'] - time.time()) / 60:.0f}m left "
-            f"(429 seen on {rl['seen_on'][:8]})")
+            f"(429 seen on {rl['seen_on'][:8]}) — ⛔ NO BOOT CAN BE DELIVERED TO "
+            f"ANY ROW, INCLUDING YOURS, WHILE THIS IS UP")
     # ⭐ Name the directory this reads. A sibling campaign lost minutes concluding
     #   "no subscription file exists" while looking in the relay root — which also
     #   holds per-uuid .json files of a DIFFERENT kind, so the wrong directory
@@ -1732,8 +1737,16 @@ def cmd_list(args):
             mins = int((time.time() - s.get("lapsed_at", 0)) // 60)
             mark = (f"  ⛔ LAPSED {mins}m ago — {s.get('lapsed_reason', 'no reason recorded')}"
                     f" · NOT WATCHED; re-subscribe to clear")
+        # ⛔⛔ THE SUPPRESSION MUST BE ON THE ROW'S OWN LINE, reported 2026-08-14
+        #    by a campaign that had been reading its seat as healthy for hours.
+        #    Everybody runs `list | grep <their-uuid>`, which throws away the
+        #    header — so a row reads `boots=0`, its subscription JSON is perfect,
+        #    its own tick prints ✅, and nothing can reach it. That is what makes
+        #    a watchdog unfalsifiable, and it is how one outage ran 7.5 hours
+        #    with every instrument green.
+        held = "  ⏸ SUPPRESSED — fleet quota hold, no boot can be delivered" if rl else ""
         log(f"{s['uuid'][:8]}  {s.get('campaign') or '-':<12} "
-            f"age={age_h:4.1f}h boots={s['boots']} {s['row']}{mark}")
+            f"age={age_h:4.1f}h boots={s['boots']} {s['row']}{held}{mark}")
     log(f"{len(subs)} subscription(s) in {SUBS}"
         + (f" — ⛔ {lapsed} LAPSED and no longer watched" if lapsed else ""))
     return 0
