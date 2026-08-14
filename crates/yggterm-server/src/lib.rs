@@ -33,6 +33,10 @@ mod app_control_web_cli;
 // COPIED into each binary, so a verb added to one answered "unsupported app
 // control command" from the other. See `app_control_cli`.
 pub mod app_control_cli;
+// THE `server <verb>` surface's shared implementations. ⛔ Per-verb, NOT a
+// wholesale collapse — see the module note for why this surface differs from
+// `server app`.
+pub mod server_cli;
 // NATIVE notification audio. It lived in the GUI binary's own module tree,
 // which is why `server app audio` did not exist on the headless CLI — the one
 // agents drive — even though the verb needs no GUI at all and its own help

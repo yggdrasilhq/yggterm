@@ -16,6 +16,7 @@ use yggterm_core::{
     best_effort_title_from_context, detect_install_context, looks_like_generated_fallback_title,
     looks_like_low_signal_generated_copy,
 };
+use yggterm_server::server_cli::{cli_server_endpoint, ensure_local_server_ready_for_cli};
 use yggterm_server::{
     AppControlRightPanelMode, AppControlViewMode, ProbeTerminalViewportInputMode,
     RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
@@ -437,19 +438,7 @@ fn print_wpe_failure(verb: &str, outcome: &yggterm_server::wpe_agent::WpeOutcome
     Ok(())
 }
 
-fn cli_server_endpoint(home_dir: &std::path::Path) -> yggterm_server::ServerEndpoint {
-    yggterm_server::resolve_client_daemon_endpoint(home_dir).endpoint
-}
 
-fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
-    let resolved = yggterm_server::resolve_client_daemon_endpoint(store.home_dir());
-    if resolved.version_mismatch.is_some() {
-        // A daemon of another version is live and owns this home's sessions.
-        // It is the source of truth; attach to it rather than spawning a peer.
-        return Ok(());
-    }
-    ensure_local_daemon_running(&resolved.endpoint)
-}
 
 /// `server update-daemons [--force]` — bring every reachable local daemon onto
 /// this binary's version while PRESERVING their live terminal runtimes.
@@ -1777,6 +1766,23 @@ fn main() -> Result<()> {
             store.home_dir(),
             &host,
         );
+    }
+    // ⛔ THESE FOUR ANSWERED ON THE GUI BINARY ONLY, and every line of each
+    // talks to the DAEMON over the local socket — there is no window in any of
+    // them. This is the binary agents drive, and the one that most wants to
+    // reorder rows and hold a write lock, so their absence here was an accident
+    // of which file they were typed into. One owner: `server_cli`.
+    if args.len() >= 2 && args[0] == "server" && args[1] == "write-lock" {
+        return yggterm_server::server_cli::run_server_write_lock_cli(&store, &args);
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "order" {
+        return yggterm_server::server_cli::run_server_order_cli(&store, &args);
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "ledger" {
+        return yggterm_server::server_cli::run_server_ledger_cli(&store, &args);
+    }
+    if args.len() >= 2 && args[0] == "server" && args[1] == "reorder" {
+        return yggterm_server::server_cli::run_server_reorder_cli(&store, &args);
     }
     if args.as_slice() == ["server", "shutdown"] {
         let endpoint = cli_server_endpoint(store.home_dir());
