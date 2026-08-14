@@ -12,6 +12,45 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [6.3] ONE SESSION RENDERS AS TWO ROWS, AT TWO DIFFERENT NESTING DEPTHS
+
+**Status:** OPEN
+
+*Found by the coverage report's row count, not by looking at the sidebar — which is
+why it survived: an off-by-one in a 378-row listing reads as a rounding artefact.*
+
+**378 session rows, 377 distinct paths.** One session path is emitted twice:
+
+```
+local://<a session id>   x2      outline_prefix 6.2
+  depth=2   kind=Session  live_member=true  expanded=true  hidden_by_collapsed_set=false
+  depth=4   kind=Session  live_member=true  expanded=true  hidden_by_collapsed_set=false
+```
+
+Both entries claim to be live members, both expanded, both unhidden, identical labels —
+they differ **only in `depth`**. So this is not a collapsed-set artefact and not one row
+shadowing another; the same session is genuinely placed at two points in the tree.
+
+⚠ **It may not be a display bug at all.** The duplicated session is also the one whose
+transcript **does not exist** — a row that was created and never inhabited. *"A row that
+never lived"* and *"a row that renders twice"* are plausibly one birth defect rather than
+two, and if so the interesting half is in row creation, not in rendering. **Do not assume
+the rendering half is the bug.**
+
+⛔ **Single source of truth is the law here** and this is a direct violation: the sidebar
+tree and the row inventory must not be able to answer "where does this session sit" two
+ways. Whatever emits the second entry is a second encoding of placement.
+
+**Falsifier / where to start:** `server app rows` and count `row_count` against
+`len({r.path})` — they must be equal. Then find the front-insert or re-parent path that
+can place an existing session without removing its previous placement; the
+*"A NEW ROW ALWAYS LANDS AT THE HEAD — ten front-insert sites, one missing owner"* entry
+is the nearest known relative and may share the owner.
+
+⚠ **No live 6.3 seat.** Row identity is the sidebar-truth lane's subject and that lane is
+dead (last assistant record ends on `tool_use` in the 2026-08-13 mass cut). This entry is
+filed rather than fixed, and needs that seat spawned before anyone edits placement code.
+
 ## ⛔⛔ [6.4] THREE PRIVATE IDENTIFIERS REACHED origin/main AND ARE STILL IN HISTORY
 
 **Status:** OPEN
