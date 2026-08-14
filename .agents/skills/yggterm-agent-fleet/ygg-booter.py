@@ -1847,6 +1847,53 @@ CHOICE_PROMPT_MARKERS = (
 )
 
 
+_CSI = re.compile(r"\x1b\[([0-9;]*)([A-Za-z])")
+
+
+def _plain_screen(text):
+    """Screen bytes -> matchable text.
+
+    ⛔ A RAW SCREEN DOES NOT CONTAIN THE WORDS YOU ARE LOOKING FOR. A terminal
+    writes runs of spaces as CURSOR-FORWARD (`ESC[<n>C`) and sprays colour SGR
+    mid-word, so `stop and wait` arrives as `stop\\x1b[Cand\\x1b[C\\x1b[1mwait`
+    and a plain substring test finds nothing. A guard that silently matches
+    nothing is worse than no guard: it reports "no prompt on screen" for a
+    screen that is entirely a prompt.
+    ⇒ Cursor-forward becomes a space (it IS whitespace on a rendered screen),
+      every other CSI is dropped, and runs of blanks collapse."""
+    def sub(m):
+        return " " if m.group(2) == "C" else ""
+    return re.sub(r"\s+", " ", _CSI.sub(sub, text))
+
+
+def _daemon_screen_text(host, row):
+    """The DAEMON's own vt100 screen for one row, or None if it cannot look.
+
+    Independent of the GUI binary's verb surface — the daemon owns the PTY, so
+    this keeps working when the app-control arm the other reader uses is
+    missing. `screen_available: false` is a real "could not look" and is
+    reported as such rather than as an empty screen, because the caller
+    distinguishes them and refuses on doubt."""
+    uuid = row.rsplit("/", 1)[-1]
+    r = _run(host, ["server", "gate-screen", f"cc-runtime://{uuid}",
+                    "--tail", "60", "--json"], "")
+    try:
+        entries = json.loads((r.stdout or "").strip() or "[]")
+    except Exception:
+        return None
+    if not isinstance(entries, list):
+        return None
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if (e.get("session_key") or "").rsplit("/", 1)[-1] != uuid:
+            continue
+        if not e.get("screen_available"):
+            return None                  # it said plainly that it could not look
+        return "\n".join(e.get("screen_tail") or [])
+    return None                          # the daemon has no screen for this row
+
+
 def _screen_shows_a_choice(host, row):
     """TRI-STATE: True a prompt is on screen · False none · None could not look.
 
@@ -1872,8 +1919,24 @@ def _screen_shows_a_choice(host, row):
                     "--mode", "screen"], "")
     body = (r.stdout or "")
     if not body.strip():
-        return None                      # could not look
-    low = body.lower()
+        # ⛔⛔ THE GUI-SIDE ARM CAN VANISH, AND WHEN IT DID THE WHOLE FLEET
+        #    STOPPED WAKING. `server app terminal read-buffer` was dropped from
+        #    the CLI dispatcher by a refactor that collapsed two per-binary
+        #    `match` blocks into one; the handler and its tests stayed, so the
+        #    verb looks present in the source and is absent from every built
+        #    binary. This guard then answered "could not look" on every tick,
+        #    the caller refused on doubt, and NO ROW ON THE FLEET WAS BOOTED FOR
+        #    AN HOUR. Measured 2026-08-14.
+        # ⇒ Ask the DAEMON instead. It owns the PTY, so its vt100 screen is the
+        #   more direct source for this question anyway, and it does not depend
+        #   on the GUI binary's verb surface at all.
+        # ⚠ This is a SECOND instrument, not a second source of truth: both
+        #   read the same screen, and the fallback only runs when the first
+        #   could not answer. Refusing on doubt is unchanged.
+        body = _daemon_screen_text(host, row) or ""
+    if not body.strip():
+        return None                      # could not look, either way
+    low = _plain_screen(body).lower()
     return any(m in low for m in CHOICE_PROMPT_MARKERS)
 
 
