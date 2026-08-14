@@ -273,6 +273,31 @@ answers a narrower question than the one you asked** — and here the excluded
 class is *precisely* the one that performs integrations, which is where
 deletions cross branches.
 
+### ⭐⭐ THE HEADING DIFF — catch a resurrection WHILE THE CONFLICT IS OPEN, not after
+
+`check-queue-resurrection.sh --strict` catches a resurrection **after** it is
+committed. This catches it while you can still fix it for free, and it is immune
+to the merge hole that `git log -S` has, because it compares **whole files**
+rather than querying history:
+
+```sh
+git show origin/main:docs/pending-bugs.md | grep "^## " | sort -u > /tmp/main-h.txt
+grep "^## " docs/pending-bugs.md                | sort -u > /tmp/mine-h.txt
+comm -23 /tmp/main-h.txt /tmp/mine-h.txt   # on main, gone from mine → MY deliberate deletions, and nothing else
+comm -13 /tmp/main-h.txt /tmp/mine-h.txt   # mine, not on main   → MY new entries,      and nothing else
+```
+
+⭐ **Both lists must be exactly what you intended**, and the **first** is the one
+that matters: anything in it you did not mean to delete is a deletion you are
+about to perform, and anything *missing* from it is an upstream deletion you are
+about to undo. A correct queue merge usually shows one line each way.
+
+⇒ **The instance that earned it, within an hour of the gate being fixed:** a lane
+resolving its own conflict took *ours* on the hunk it was editing, which would
+have resurrected a different lane's entry that upstream had deleted as fixed.
+**The conflict gave no sign** — the resurrection was a side effect of a correct
+resolution to the hunk actually in dispute. Only the whole-file audit saw it.
+
 ### ⛔⛔ A GATE THAT REPORTS A VIOLATION AND EXITS 0 IS DECORATION
 
 `check-queue-resurrection.sh` defaults to **report-and-pass**; `--strict` is what
