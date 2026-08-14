@@ -4104,6 +4104,25 @@ measurable half above stands on its own and does not wait on it.
 
 **Status:** OPEN
 
+⛔⛔ **THE HEADLINE CLAIM — "EVERY LANE PUSH FAILS" — WAS MEASURED FALSE ON 2026-08-14,
+AND THIS ENTRY'S OWN FALSIFIER IS WHAT REFUTED IT.** The falsifier below says *push a
+branch and the guard must pass without an override.* A lane did exactly that: **15 commits
+pushed first try, clean, `YGG_PRIVACY_ALLOW` never used**, on a branch **with** an upstream.
+The guard reported `scanned <range> → …` — **it scans the pushed RANGE, not the tip's
+ancestry.**
+
+⚠ **This entry was CLOSED once already** (`2d81b5a1`, *"both fixed and live-proven"*) and
+**came back through a lane merge** — `scripts/check-queue-resurrection.sh` has been
+reporting it ever since and nobody ran it. ⛔ **It then cost a lane an entire session of
+not pushing**, because the block was inherited as fact from this entry and a relayed note,
+and nobody ran the one command that refutes it. *An inherited "blocked" is a claim.*
+
+⇒ **NOT deleted here, deliberately:** a real residual defect remains (the range derivation
+on a branch with **no** upstream is still worth fixing), and the corrected text lives on
+`lane/dev/6.7-resource` (`87394d0a`, *"the guard defect is real, 'every lane push fails' is
+not"*), which is unmerged pending the release. **That lane's version supersedes this entry
+on merge.** Until then: do not treat this as a reason not to push.
+
 *found 2026-08-13 while pushing a lane branch; affects every cluster in this batch*
 
 `ygg-privacy-guard hook` derives its scan range from the pre-push stdin line:
