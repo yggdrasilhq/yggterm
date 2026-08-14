@@ -86,10 +86,33 @@ must leave a record saying which reason.**
 > still evaporated after the user recreates it, and "it is back now" is exactly
 > the answer that made the first loss undiagnosable.
 >
-> ⚠ **Still open, and separable:** the observation that a *peer* daemon's
-> `server-state.json` can list rows the current GUI's live set does not. The
-> ledger is machine-wide, so it now answers which is true — but a stale peer
-> advertising rows it no longer owns is daemon-handover territory, not this spec.
+> ### ⭐⭐ AND THE LEDGER'S FIRST JOB WAS TO IDENTIFY THE INCIDENT THAT CAUSED IT
+>
+> **The rows were never closed.** Reading the desktop host's trace for the third
+> departure path — `live_session_persist_dropped` — found four local rows dropped
+> in a single update-restart persist, `not_in_protected_runtime_keys`, and two of
+> those uuids are named elsewhere in the trace by the titles of the app rows that
+> were lost. **He had closed nothing.**
+>
+> A dropped row is not removed. It stays in the running daemon's live order and
+> is simply left OUT of the state file, so the SUCCESSOR daemon never learns it
+> existed. That accounts for every symptom in this section, which the close-path
+> theory did not:
+>
+> | symptom | what a persist drop explains |
+> |---|---|
+> | `removed-rows.json` empty | nothing was closed, so no close path ran |
+> | `sessions restore` → `not_found` | the successor never received the ids |
+> | **`server-state.json` still listing them under `live_sessions` while the GUI's live set did not** | ⭐ the daemon that dropped them **still holds them in memory and still lists them** — only its successor's state file omits them. The two stores were not disagreeing about one daemon; they were two different daemons, and that is what "the stores disagree" actually was. |
+>
+> ⇒ The persist filter records a departure too (`persist-dropped`, carrying which
+> of the three gates took it). And §2.1 already prevents the recurrence for app
+> rows without anyone noticing it would: **the drop gate begins `!keep_alive`, so
+> a row that is born protected never reaches it.** The fix was right for a reason
+> the diagnosis had not found.
+>
+> ⚠ **What is genuinely still open** is the instrument question, not the loss:
+> whether `server app close` performs a close at all (queue entry `[6.2]`).
 
 ## §4 WHAT MAY STILL BE REAPED
 
