@@ -132,6 +132,66 @@ changing today.
 **Falsifier:** if `/tmp` on that host is ever NOT a tmpfs, the RAM half of this
 entry is void and only the unbounded-growth half stands.
 
+## ⛔⛔⛔ [6.7] THE RENDER FAULTS ARE IN SESSIONS AND NOT IN PLAIN SHELLS — THE CANVAS IS PROBABLY THE WRONG SUSPECT
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-14, and it discriminates between hypotheses the
+instruments could not separate.*
+
+His words: the broken bottom paint and the TUI rendering breaks **"are only in
+sessions and not in plain shells"**, so *"some very old code … breaks the session
+renderings and glyphs."*
+
+⛔ **THAT OBSERVATION REFUTES THE STANDING ATTRIBUTION.** The entries below assign
+all three faults to the xterm WebGL canvas and the GL stack under it. **A plain
+shell and an agent session render through the SAME canvas, the same WebGL
+renderer, the same Mesa.** If the canvas were the fault, a plain shell would break
+identically. It does not. ⇒ The discriminator is not the renderer; it is what
+feeds it.
+
+**Corroborated, unprompted, by this seat's own captures before he said it:**
+
+| frame | kind of row | result |
+|---|---|---|
+| `canvas-probe.sh` test card, twice | **plain shell** | perfect — full glyph sweep, six coloured runs, three control lines |
+| usability capture 16:12 | **agent session** | cells punched out mid-word |
+| usability capture 16:13 | **agent session** | clean (the fault is intermittent) |
+
+⇒ Two clean plain-shell cards were read as *"a clean sample of a transient
+fault"*. Under his frame they are the **control arm**, and they were sitting in
+the record unrecognised. ⚠ Not proof on their own — n is small and the fault is
+intermittent — but the two readings are no longer equally likely.
+
+⭐ **AND THERE IS A SESSION-ONLY CODE PATH TO SUSPECT, named in our own source.**
+`is_remote_resume_agent_session()` is exactly the "agent session, not plain shell"
+predicate, and `agent_arm_shell_matrix.rs` states that it **gates ~8 downstream
+signals**: `terminal_has_meaningful_output`, `terminal_overlay_dismissed`,
+`attach_ready`, `stalled_remote_resume`, **and the read-poll cadence**.
+
+⇒ **The read-poll cadence is the first thing to measure.** A different cadence
+means the vt100 byte stream reaches the emulator in different CHUNK BOUNDARIES for
+sessions than for shells — and a TUI that repaints by cursor addressing is far
+more sensitive to chunking than a shell printing whole lines. Torn cursor
+addressing during a partial repaint looks exactly like *"the bottom paint is
+broken"* and like glyphs going wrong in place.
+⇒ **`terminal_overlay_dismissed` is the second.** An overlay that lingers or
+dismisses late leaves a viewport partly painted, in sessions only.
+
+⛔ **THE SAME PREDICATE HAS ALREADY PRODUCED ONE PROVEN, SILENT, SESSION-ONLY
+FAILURE TODAY** — it gated the KEYBOARD, so switching to a session and being
+unable to type was the same family: a session-only path, biased shut, invisible
+from outside. That one is fixed. It is a reason to distrust the rest of the
+cluster, not a reason to assume they share a cause.
+
+**How to settle it, cheaply and without touching his viewport:**
+`scripts/canvas-probe.sh` already draws a card in a plain-shell probe row. The
+missing arm is the same card rendered through an AGENT row. Run both, compare,
+and the answer is a picture rather than an argument.
+
+**Falsifier:** if a plain shell is ever seen with the bottom-paint or glyph fault,
+this reframe is wrong and the canvas attribution stands.
+
 ## ⛔⛔⛔ [6.7] THE TERMINAL PAINTS THE WRONG GLYPH FOR EVERY CHARACTER
 
 **Status:** OPEN
