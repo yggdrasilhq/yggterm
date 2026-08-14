@@ -404,7 +404,17 @@ static FORCED_WAKE_TOTAL: AtomicU64 = AtomicU64::new(0);
 // fingerprint as "shellstate_mut"; per-context histogram emitted each render so
 // the hot write reasons during a load are nameable. Gated YGGTERM_TRACE_RENDER=1.
 static SHELLSTATE_MUT_TOTAL: AtomicU64 = AtomicU64::new(0);
-static SHELLSTATE_MUT_HIST: OnceCell<Mutex<HashMap<&'static str, u64>>> = OnceCell::new();
+/// ⛔ THE KEY IS A `String` AND THAT IS THE WHOLE POINT (2026-08-14). It was
+/// `&'static str`, which is exactly what a labelled `safe_shell_mut` context is
+/// and exactly what a raw `with_mut` call site is NOT — so every raw write
+/// collapsed into the single bucket `raw_unlabelled`, and four storm autopsies
+/// on the live host reported `raw_unlabelled: 517` against 512 renders without
+/// being able to name one line. `#[track_caller]` on
+/// [`ShellStateWriteCounted::with_mut_counted`] turns that into `file:line`, but
+/// a `Location` cannot be borrowed as `&'static str`, so the map had to own its
+/// keys. The allocation only happens while the probe or the bounded autopsy
+/// window is armed.
+static SHELLSTATE_MUT_HIST: OnceCell<Mutex<HashMap<String, u64>>> = OnceCell::new();
 // Storm autopsy (telemetry campaign run 4): the render-cause probe above is
 // env-gated, so it has never been on when a storm actually happened — 21
 // `app_render_storm` detections between 2026-07-10 and 2026-07-20 were all
@@ -32370,26 +32380,47 @@ fn clear_terminal_resume_notification(state: Signal<ShellState>, session_path: &
 /// this in place, `changed_fields: {}` means *nothing wrote to ShellState at
 /// all*, and the remaining explanation is a Dioxus-internal waker.
 ///
-/// ⚠ It counts but does not NAME the writer — the histogram bucket is
-/// `raw_unlabelled`. Naming 485 sites is a separate, larger job; knowing whether
-/// a write happened at all is what discriminates the hypotheses, and that is the
-/// question actually blocking the diagnosis. Convert a site to
-/// [`safe_shell_mut`] with a real context string when you need to know WHICH.
+/// ⭐ IT NAMES THE WRITER, and it does so without converting 485 call sites.
+/// The bucket used to be the literal `raw_unlabelled`, on the reasoning that
+/// naming the sites was "a separate, larger job". It was not: `#[track_caller]`
+/// makes the compiler pass the caller's `file:line` through for free, so the
+/// histogram key becomes the exact source line of the write. That is the
+/// difference between an autopsy that says *something wrote 517 times* and one
+/// that says *this line wrote 517 times*, which is the whole question the storm
+/// investigation has been stuck on since 2026-08-01.
+///
+/// ⚠ The label is a LOCATION, not a meaning — a hot line still needs reading to
+/// learn why it writes. Convert a site to [`safe_shell_mut`] with a real context
+/// string when the intent, not the address, is what a future reader needs.
 trait ShellStateWriteCounted {
     fn with_mut_counted<R>(&mut self, operation: impl FnOnce(&mut ShellState) -> R) -> R;
 }
 impl ShellStateWriteCounted for Signal<ShellState> {
+    #[track_caller]
     fn with_mut_counted<R>(&mut self, operation: impl FnOnce(&mut ShellState) -> R) -> R {
         // Same accounting as `safe_shell_mut`: the total is always counted (one
         // relaxed add beside a signal write), the histogram only while a probe
-        // or the bounded autopsy window is armed.
+        // or the bounded autopsy window is armed. `Location::caller()` is read
+        // INSIDE that gate — resolving and formatting it per write on the quiet
+        // path would tax every write in the app to serve a window that is armed
+        // for a few seconds a day.
         SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
         if render_trace_enabled() || storm_autopsy_armed() {
+            let caller = std::panic::Location::caller();
+            let key = format!(
+                "{}:{}",
+                caller
+                    .file()
+                    .rsplit_once('/')
+                    .map(|(_, name)| name)
+                    .unwrap_or_else(|| caller.file()),
+                caller.line()
+            );
             if let Ok(mut hist) = SHELLSTATE_MUT_HIST
                 .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
             {
-                *hist.entry("raw_unlabelled").or_insert(0) += 1;
+                *hist.entry(key).or_insert(0) += 1;
             }
         }
         self.with_mut(operation)
@@ -32411,7 +32442,7 @@ fn safe_shell_mut<R>(
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
         {
-            *hist.entry(context).or_insert(0) += 1;
+            *hist.entry(context.to_string()).or_insert(0) += 1;
         }
     }
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.with_mut(operation))).map_err(
@@ -49601,19 +49632,90 @@ fn merged_sidebar_rows_with_projection_rows(
     );
     rows
 }
+/// ⛔⛔ A RECORDER THAT FIRES ON MACHINE SIZE RATHER THAN ON ANOMALY BILLS THE
+/// RENDER THREAD, AND IT BILLS IT WORST EXACTLY WHEN THE APP IS ALREADY IN
+/// TROUBLE (measured 2026-08-14).
+///
+/// `remote_session_count >= 500` is a fact about how many sessions the fleet has,
+/// not about anything being wrong, so on the live host (640 remote sessions) it
+/// was permanently true and every merge wrote to disk. The merge runs inside
+/// [`ShellState::snapshot`], which runs in the render body — so during an
+/// `app_render_storm` at ~60 renders/s the GUI's render thread performed **~142
+/// synchronous JSONL appends per second** (this event plus `merge_rows`), each
+/// one a `create_dir_all` + metadata stat + open + write. The instrument for the
+/// storm was charging its own cost to the storm.
+///
+/// ⇒ The size condition now COALESCES instead of emitting: slow merges (the
+/// actual signal, `>= 4 ms`) still emit immediately and unchanged, and the rest
+/// are folded into one event per second that carries `sampled_count`. **No rate
+/// information is lost** — a reader who wants renders-per-second sums
+/// `sampled_count` instead of counting lines — which is the difference between
+/// coalescing and sampling, and the reason this is not a downgrade of the data.
+/// What to do with one sidebar-merge measurement. ONE owner for the decision,
+/// read by both the `merge_rows` and the `merge_rows_breakdown` recorders — they
+/// used to carry the same condition written two different ways
+/// (`>= 4.0 || >= 500` against `< 500 && < 4.0`), which is two encodings of one
+/// rule and therefore two things that can drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarMergeRecordPolicy {
+    /// Write the event now: this merge is SLOW, which is the anomaly the event
+    /// exists to catch, and it is rare enough to cost nothing.
+    Immediate,
+    /// Fold into the once-a-second aggregate: an ordinary merge on a big fleet.
+    Coalesce,
+    /// Say nothing: an ordinary merge on an ordinary machine.
+    Drop,
+}
+
+/// A merge at or above this is an outlier worth a line of its own.
+const SIDEBAR_MERGE_SLOW_MS: f64 = 4.0;
+/// Above this many remote sessions the ordinary merges are worth counting — but
+/// only counting. Emitting one line each is what billed the render thread.
+const SIDEBAR_MERGE_LARGE_FLEET_SESSIONS: usize = 500;
+
+fn sidebar_merge_record_policy(
+    duration_ms: f64,
+    remote_session_count: usize,
+) -> SidebarMergeRecordPolicy {
+    if duration_ms >= SIDEBAR_MERGE_SLOW_MS {
+        SidebarMergeRecordPolicy::Immediate
+    } else if remote_session_count >= SIDEBAR_MERGE_LARGE_FLEET_SESSIONS {
+        SidebarMergeRecordPolicy::Coalesce
+    } else {
+        SidebarMergeRecordPolicy::Drop
+    }
+}
+
 fn maybe_record_sidebar_merge_breakdown(remote_session_count: usize, payload: Value) {
     let total_ms = payload
         .get("total_ms")
         .and_then(Value::as_f64)
         .unwrap_or_default();
-    if remote_session_count < 500 && total_ms < 4.0 {
-        return;
+    match sidebar_merge_record_policy(total_ms, remote_session_count) {
+        SidebarMergeRecordPolicy::Drop => return,
+        SidebarMergeRecordPolicy::Coalesce => {
+            SIDEBAR_MERGE_BREAKDOWN_COALESCED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        SidebarMergeRecordPolicy::Immediate => {}
     }
     let Ok(home) = resolve_yggterm_home() else {
         return;
     };
     append_perf_event(&home, "sidebar", "merge_rows_breakdown", payload);
 }
+
+/// Merges folded away by [`maybe_record_sidebar_merge_breakdown`] since the last
+/// flush. Reported as `sampled_breakdown_count` on the coalesced `merge_rows`
+/// event so the count survives even though the lines do not.
+static SIDEBAR_MERGE_BREAKDOWN_COALESCED: AtomicU64 = AtomicU64::new(0);
+/// Merges folded away by [`merged_sidebar_rows_traced`], with the wall time they
+/// spent and the worst single one, flushed at most once a second.
+static SIDEBAR_MERGE_COALESCED: AtomicU64 = AtomicU64::new(0);
+static SIDEBAR_MERGE_COALESCED_US: AtomicU64 = AtomicU64::new(0);
+static SIDEBAR_MERGE_COALESCED_MAX_US: AtomicU64 = AtomicU64::new(0);
+static SIDEBAR_MERGE_COALESCED_FLUSH_MS: AtomicU64 = AtomicU64::new(0);
+const SIDEBAR_MERGE_COALESCE_FLUSH_MS: u64 = 1_000;
 fn merged_sidebar_rows_traced(
     settings_path: &Path,
     source: &str,
@@ -49660,26 +49762,72 @@ fn merged_sidebar_rows_traced(
         row_arrangement,
     );
     let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
-    if duration_ms >= 4.0 || remote_session_count >= 500 {
-        append_perf_event(
-            &perf_home,
-            "sidebar",
-            "merge_rows",
-            json!({
-                "duration_ms": duration_ms,
-                "meta": {
-                    "source": source,
-                    "stored_row_count": stored_rows.len(),
-                    "stored_projection_row_count": stored_projection_rows.len(),
-                    "remote_machine_count": remote_machines.len(),
-                    "remote_session_count": remote_session_count,
-                    "ssh_target_count": ssh_targets.len(),
-                    "live_session_count": live_sessions.len(),
-                    "expanded_path_count": expanded_paths.len(),
-                    "merged_row_count": rows.len(),
-                }
-            }),
-        );
+    let meta = || {
+        json!({
+            "source": source,
+            "stored_row_count": stored_rows.len(),
+            "stored_projection_row_count": stored_projection_rows.len(),
+            "remote_machine_count": remote_machines.len(),
+            "remote_session_count": remote_session_count,
+            "ssh_target_count": ssh_targets.len(),
+            "live_session_count": live_sessions.len(),
+            "expanded_path_count": expanded_paths.len(),
+            "merged_row_count": rows.len(),
+        })
+    };
+    match sidebar_merge_record_policy(duration_ms, remote_session_count) {
+        SidebarMergeRecordPolicy::Drop => {}
+        SidebarMergeRecordPolicy::Immediate => {
+            // The outlier path, unchanged: a slow merge is the thing this event
+            // was added to catch, and it is rare enough to cost nothing.
+            append_perf_event(
+                &perf_home,
+                "sidebar",
+                "merge_rows",
+                json!({ "duration_ms": duration_ms, "meta": meta() }),
+            );
+        }
+        SidebarMergeRecordPolicy::Coalesce => {
+            // See `maybe_record_sidebar_merge_breakdown` for why writing one line
+            // per merge here is a defect rather than thoroughness.
+            let micros = (duration_ms * 1000.0).round().max(0.0) as u64;
+            SIDEBAR_MERGE_COALESCED.fetch_add(1, Ordering::Relaxed);
+            SIDEBAR_MERGE_COALESCED_US.fetch_add(micros, Ordering::Relaxed);
+            SIDEBAR_MERGE_COALESCED_MAX_US.fetch_max(micros, Ordering::Relaxed);
+            let now_ms = current_millis() as u64;
+            let last = SIDEBAR_MERGE_COALESCED_FLUSH_MS.load(Ordering::Relaxed);
+            // First call seeds the clock rather than flushing a window of one,
+            // so the first reported window is a real second and not a startup
+            // artefact.
+            if last == 0 {
+                SIDEBAR_MERGE_COALESCED_FLUSH_MS.store(now_ms, Ordering::Relaxed);
+            } else if now_ms.saturating_sub(last) >= SIDEBAR_MERGE_COALESCE_FLUSH_MS
+                && SIDEBAR_MERGE_COALESCED_FLUSH_MS
+                    .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let count = SIDEBAR_MERGE_COALESCED.swap(0, Ordering::Relaxed);
+                let total_us = SIDEBAR_MERGE_COALESCED_US.swap(0, Ordering::Relaxed);
+                let max_us = SIDEBAR_MERGE_COALESCED_MAX_US.swap(0, Ordering::Relaxed);
+                let breakdowns = SIDEBAR_MERGE_BREAKDOWN_COALESCED.swap(0, Ordering::Relaxed);
+                append_perf_event(
+                    &perf_home,
+                    "sidebar",
+                    "merge_rows",
+                    json!({
+                        // Kept as the window's total so a reader summing
+                        // `duration_ms` across the file still gets the true CPU
+                        // cost.
+                        "duration_ms": total_us as f64 / 1000.0,
+                        "sampled_count": count,
+                        "sampled_window_ms": now_ms.saturating_sub(last),
+                        "sampled_max_ms": max_us as f64 / 1000.0,
+                        "sampled_breakdown_count": breakdowns,
+                        "meta": meta(),
+                    }),
+                );
+            }
+        }
     }
     rows
 }
@@ -82658,10 +82806,8 @@ fn app() -> Element {
                 );
                 if let Some(hist) = SHELLSTATE_MUT_HIST.get() {
                     if let Ok(hist) = hist.lock() {
-                        let snapshot: serde_json::Map<String, Value> = hist
-                            .iter()
-                            .map(|(k, v)| ((*k).to_string(), json!(*v)))
-                            .collect();
+                        let snapshot: serde_json::Map<String, Value> =
+                            hist.iter().map(|(k, v)| (k.clone(), json!(*v))).collect();
                         append_trace_event(
                             &trace_home,
                             "ui",
@@ -82747,12 +82893,12 @@ fn app() -> Element {
                 .get()
                 .and_then(|hist| hist.lock().ok())
                 .map(|hist| {
-                    let mut entries: Vec<(&&'static str, &u64)> = hist.iter().collect();
+                    let mut entries: Vec<(&String, &u64)> = hist.iter().collect();
                     entries.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
                     entries
                         .into_iter()
                         .take(24)
-                        .map(|(k, v)| ((*k).to_string(), json!(*v)))
+                        .map(|(k, v)| (k.clone(), json!(*v)))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -155474,6 +155620,47 @@ mod tests {
             shell.effective_right_panel_mode(false, current_millis()),
             RightPanelMode::Hidden
         );
+    }
+
+    // ⛔ The sidebar-merge recorder runs INSIDE the render body, so its policy is
+    // a per-frame cost. On the live host it fired on fleet SIZE
+    // (`remote_session_count >= 500`, permanently true at 640 sessions), which
+    // put ~142 synchronous JSONL appends per second on the GUI's render thread
+    // during an `app_render_storm` — the instrument billing the thread it was
+    // measuring. The fix must keep the SLOW case immediate on every machine,
+    // because that outlier is the signal the event was added for; only the
+    // ordinary-merge-on-a-big-fleet case may be folded away.
+    #[test]
+    fn a_sidebar_merge_is_recorded_immediately_only_when_it_is_actually_slow() {
+        // Slow is slow everywhere — fleet size must not be able to suppress it.
+        assert_eq!(
+            sidebar_merge_record_policy(SIDEBAR_MERGE_SLOW_MS, 0),
+            SidebarMergeRecordPolicy::Immediate
+        );
+        assert_eq!(
+            sidebar_merge_record_policy(50.0, SIDEBAR_MERGE_LARGE_FLEET_SESSIONS + 1),
+            SidebarMergeRecordPolicy::Immediate
+        );
+        // An ordinary merge on a big fleet is COUNTED, never written per call.
+        assert_eq!(
+            sidebar_merge_record_policy(0.4, SIDEBAR_MERGE_LARGE_FLEET_SESSIONS),
+            SidebarMergeRecordPolicy::Coalesce
+        );
+        // ...and on an ordinary machine it is not even counted.
+        assert_eq!(
+            sidebar_merge_record_policy(0.4, SIDEBAR_MERGE_LARGE_FLEET_SESSIONS - 1),
+            SidebarMergeRecordPolicy::Drop
+        );
+        // The regression this exists to catch: a big fleet must NOT restore the
+        // per-call write for ordinary merges, however the condition is spelt.
+        for sessions in [500usize, 640, 5_000] {
+            assert_ne!(
+                sidebar_merge_record_policy(0.1, sessions),
+                SidebarMergeRecordPolicy::Immediate,
+                "fleet size alone must never make an ordinary merge write a line \
+                 ({sessions} sessions)"
+            );
+        }
     }
 
     // The end-to-end path the renderer reads: the snapshot shows the vault pane
