@@ -365,6 +365,62 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⚠ [6.6] A PROCESS-GLOBAL ENV WRITE MAKES THE LAUNCH-COMMAND TESTS FLAKY IN PARALLEL
+
+**Status:** OPEN
+
+Mechanism identified, deliberately not fixed here: it is the Claude Code
+daemon-runtime lane's designed round-trip, not the arsenal lane's to change.
+
+`sync_claude_extra_args_for_request` (`daemon.rs`) carries one request's
+configured flags by writing them into the **whole process's** environment:
+
+```rust
+unsafe { std::env::set_var(ENV_YGGTERM_CC_EXTRA_ARGS, args); }
+```
+
+and the launch builder reads them back out of that same environment. The comment
+calls it *"same process-wide-env pattern as terminal identity"*, so it is a
+pattern rather than an oversight — but a test binary runs every test in ONE
+process, so any test that drives a CC daemon-runtime request mutates state that
+every other test's launch composition then reads. Which tests lose the race
+depends on scheduling.
+
+**Measured 2026-08-14**, same binary, same code, no rebuild between runs:
+
+| run | result |
+|---|---|
+| parallel ×4 | 2 green; 2 red, on **different** tests each time (`local_cc_relaunch_rebuild_collapses_poisoned_identity_to_row_id`, `refresh_terminal_identity_updates_restored_remote_launch_commands`) |
+| `--test-threads=1` ×2 | 1096 passed, 0 failed, both times |
+
+Every test named above passes when run individually.
+
+⇒ **The queue's "flaky in parallel" category is not one property of one test.**
+At least this slice of it is a single mechanism with a name, and it is the same
+shape as the kind-blind leak fixed alongside this entry: **a per-launch value
+carried in process-global state outlives the launch it belonged to.** The
+durable fix is to pass the value as a request field the whole way down — which
+the generic (non-CC) lane already does, via `configured_override`.
+
+### ⭐ UPDATE 2026-08-14 — THE HARNESS HALF IS MITIGATED, THE PRODUCT HALF IS NOT
+
+`codex_cli::env_test_guard()` (a single mutex over every env-touching test, with
+a source scan that fails the build if a *second* rival lock appears) now
+serialises the tests that were racing. Re-measured on the merged tree:
+**3 parallel runs, 1114 passed / 0 failed, all three** — where the same suite
+gave 2-of-4 red before.
+
+⛔ **That is a harness fix, and this entry is not about the harness.** The
+production pattern is untouched: a per-request value is still written into the
+**whole process's** environment and read back by the launch composer. The guard
+makes the tests stop *reporting* it; nothing stops a second request from
+overwriting the first request's value in a live daemon. ⇒ Keep OPEN. The durable
+fix remains passing the value as a request field the whole way down, which the
+generic (non-CC) lane now does via `configured_override`.
+
+⚠ A red parallel run is still not, by itself, evidence of a regression. Re-run
+the named test individually before believing it, and quote which way you ran it.
+
 ## ⛔⛔⛔ [6.3] A SUBTREE STOPS TRACKING ITS STATE FOREVER — THE BLANK RIGHT RAIL, ROOT-CAUSED
 
 **Status:** OPEN
@@ -10159,33 +10215,58 @@ measurement was on the GUI host, and two of the four survivors are known to be
 environment-dependent, so *green here* is not *green everywhere*
 ([[finding-a-claim-proven-on-one-lane-is-not-proven]]).
 
-### ⛔⛔ TWO OF THOSE THREE ARE RED AGAIN ON `origin/main`, MEASURED 2026-08-14
+### ✅ SETTLED AND FIXED 2026-08-14 [6.6] — THE FORK IS RETIRED, THE ANSWER WAS A THIRD OPTION
 
-**`remote_resume_shell_command_wraps_prefix_and_cwd` and
-`stored_codex_litellm_sessions_use_litellm_resume_command` both FAIL** — the
-same *"the resume SUBCOMMAND has gone missing from the built launch string"*
-signature this section declared closed.
+⛔ **Do not carry the two-way fork forward.** This section offered *"either the
+table composes the resume subcommand differently (a live regression), or the
+tests assert a path the product no longer takes (stale tests)"*, and instructed
+that the entry must not guess between them. That was the right refusal and the
+wrong menu — **the answer was on neither branch**:
 
-Measured with the control run, not inferred: a **fresh detached worktree at
-`origin/main` (`bd5e7cc2`) with its own `CARGO_TARGET_DIR`**, both tests run
-`--exact`, on **dev — the same host the green verdict above was taken on**. So
-this is not the environment-dependence caveat; it is a regression on the branch.
+- **"Stale tests" is FALSE.** The path is very much live; every agent CLI resumes
+  through it.
+- **"Live regression" is TRUE**, but it was not the table composing the
+  subcommand differently.
+- ⭐ **THE THIRD OPTION, which is the finding:** the assertion encoded a **FALSE
+  INVARIANT** — `<binary>` immediately followed by `<subcommand>`, which the
+  composer never promised — so it **read ambient HOST state**, from two
+  independent sources. Its greenness was a fact about who ran it and on what
+  machine, not about the code. That is why it oscillated for months with nobody
+  changing it, and why "it fixed itself" kept being recorded.
 
-⭐ **What the code says the cause is.** `stored_session_launch_command` no longer
-routes through `legacy_agent_launch_command` at all — it goes to
-`agent_launch_command_with_options`, the per-CLI launch table. The assertions
-still describe the *legacy* string shape. ⇒ Either the table composes the resume
-subcommand differently (a real regression in what gets launched) or the tests
-are asserting against a path the product no longer takes (stale tests). **Those
-are opposite verdicts and the entry must not guess between them** — the
-falsifier is to print the composed string for `CodexLiteLlm` and compare it
-against what a manual `codex-litellm resume` needs.
+⇒ **A test that reads ambient state is not flaky — it is measuring the host.**
 
-⚠ **Consequence for anyone landing work here: `main` is red before you start.**
-A full `cargo test -p yggterm-server --lib` will show these two failing and they
-are not yours. ⛔ Do not "fix" them by relaxing the assertion until the fork
-above is settled — the assertion may be the only thing still describing a
-working launch.
+- **The live bug.** `configured_cli_extra_arg_tokens` read
+  `YGGTERM_AGENT_EXTRA_ARGS` out of ambient process environment for **every**
+  `SessionKind` — one variable, nine CLIs — so one CLI's permission flag was
+  returned verbatim for another. Nothing in the daemon ever *sets* that variable
+  (unlike its Claude Code sibling, which is written from the request and guarded
+  on kind), so an ambient value could only ever be pollution inherited from the
+  spawning process.
+  ⛔⛔ **AND THE POLLUTION IS LIVE, NOT LATENT — say it that way.** Measured
+  independently by two seats: **3 of 20 running daemons carry
+  `YGGTERM_AGENT_EXTRA_ARGS` set to a Claude-only permission flag, and one of
+  them is the current-release daemon serving by default**; another owns nine
+  sessions. The interactive shells that spawned them carry it too, which closes
+  the inheritance chain. ⇒ **It is one non-Claude launch away from real.** The
+  code path is fixed here, but a running process keeps its frozen environment:
+  **the fix reaches those daemons only on a bump**, and a bump is held. A reader
+  who sees "latent" will not know that.
+- **Why the subcommand "went missing".** Extra args compose BETWEEN binary and
+  subcommand by design, so the injected flag displaced the adjacency the
+  assertion required. Nothing was ever missing.
+- **Why it oscillated for months.** The needle `codex resume -C "$PWD"` encoded a
+  false invariant, so it read ambient host state — the settings store
+  (long-standing: configuring extra args for a CLI, a *supported* setting, turns
+  it red with zero code change) and the env var (added the day before). "It fixed
+  itself" was always someone running it from a different shell.
+
+Fixed in `6574d385`: forwarded flags travel only as the request field both
+wrapper entrypoints already pass (`configured_override`), and the tests are
+re-pinned to the real invariants. Verified across five ambient conditions
+(variable set/unset × settings empty/configured), two of which were red before.
+⇒ `main` is no longer red here. Full account:
+[[finding-a-test-that-reads-ambient-host-state-is-not-flaky]].
 
 ### The two that measure the network, which is the real defect
 

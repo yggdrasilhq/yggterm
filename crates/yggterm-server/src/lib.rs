@@ -33446,7 +33446,15 @@ mod tests {
         );
         assert!(command.contains("export NPM_CONFIG_PREFIX="));
         assert!(command.contains("export CODEX_HOME="));
-        assert!(command.contains("codex-litellm resume"));
+        // Binary and resume tokens pinned separately — a CLI's extra args are
+        // composed between them, so their adjacency is not an invariant. See
+        // `remote_resume_shell_command_wraps_prefix_and_cwd`.
+        assert!(command.contains("&& codex-litellm "), "{command}");
+        // The LiteLLM fork does not re-root, so the id follows `resume` directly.
+        assert!(
+            command.contains("resume '019caa6f-b32c-7a73-b4d3-db83225663dc'"),
+            "{command}"
+        );
     }
 
     #[test]
@@ -33698,8 +33706,56 @@ mod tests {
         assert!(command.contains("tmux new-session -A -s yggterm &&"));
         assert!(command.contains("__yggterm_requested='/srv/workspace'"));
         assert!(command.contains("export NPM_CONFIG_PREFIX="));
-        assert!(command.contains("codex resume -C \"$PWD\""));
-        assert!(command.contains("'019caa6f-b32c-7a73-b4d3-db83225663dc'"));
+        // ⚠ The needle was once `codex resume -C "$PWD"` — binary IMMEDIATELY
+        // followed by subcommand — which is not an invariant of the launch
+        // table: a CLI's extra args are composed BETWEEN the binary and the
+        // resume tokens, by design. That made the assertion read whatever the
+        // host happened to hold (the settings store, and for one day an ambient
+        // environment variable), so it flipped red and green with nobody
+        // changing the code, and was twice mistaken for a regression that had
+        // fixed itself. Pin the two things that ARE invariants instead: the
+        // binary opens the invocation, and the resume tokens arrive in order.
+        assert!(command.contains("&& codex "), "{command}");
+        assert!(
+            command.contains("resume -C \"$PWD\" '019caa6f-b32c-7a73-b4d3-db83225663dc'"),
+            "{command}"
+        );
+    }
+
+    /// A CLI's forwarded flags arrive as a PARAMETER, and they belong to the
+    /// kind the caller names — never to whichever kind happens to be composing.
+    ///
+    /// This is the contract that lets the composer stay out of the process
+    /// environment. `YGGTERM_AGENT_EXTRA_ARGS` used to be read ambiently, for
+    /// every kind at once, which meant one CLI's permission flag was returned
+    /// verbatim for another and displaced the resume subcommand while doing it
+    /// — the two tests above went red exactly when the suite was run from a
+    /// process that carried the variable, which is why they read as flaky
+    /// rather than as the regression they were reporting.
+    #[test]
+    fn forwarded_cli_flags_arrive_as_a_parameter_not_from_the_environment() {
+        use crate::codex_cli;
+        let launch = AgentLaunchOptions::default();
+        // Supplied by the caller ⇒ honoured, for the kind the caller named.
+        let forwarded =
+            codex_cli::composed_cli_extra_args_with(SessionKind::Codex, &launch, Some("--fictional-flag"))
+                .expect("an override composes");
+        assert!(
+            forwarded.contains("--fictional-flag"),
+            "the request field is the live path for forwarded flags: {forwarded}"
+        );
+        // Not supplied ⇒ the local lane's one owner is the settings store, and
+        // an empty override is NOT a licence to go looking in the environment.
+        let empty_override = codex_cli::composed_cli_extra_args_with(
+            SessionKind::Codex,
+            &launch,
+            Some(""),
+        )
+        .expect("an empty override composes");
+        assert!(
+            empty_override.trim().is_empty(),
+            "an empty override must compose to nothing at all: {empty_override:?}"
+        );
     }
 
     #[test]
