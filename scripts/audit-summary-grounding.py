@@ -32,6 +32,10 @@ USAGE
     scripts/audit-summary-grounding.py --json             # machine-readable
     scripts/audit-summary-grounding.py --limit 50
     scripts/audit-summary-grounding.py --clear            # delete what it found
+    scripts/audit-summary-grounding.py --peer dev         # on the GUI host: ask
+                                                          # dev for the sessions
+                                                          # whose transcripts
+                                                          # live there
 """
 from __future__ import annotations
 
@@ -129,25 +133,78 @@ def session_text(headless: str, transcript: Path) -> str:
     return out.stdout if out.returncode == 0 else ""
 
 
-def find_headless() -> str | None:
+def find_headless(explicit: str | None = None) -> str | None:
+    """Where the one owner of "what this session said" lives.
+
+    ⚠ `--headless` exists because this script is useful on hosts that have the
+    binary installed but not on `PATH` (the GUI host is one), and a tool that can
+    only find its instrument by convention refuses to run exactly where the
+    answer is needed.
+    """
+    if explicit:
+        return explicit if Path(explicit).exists() else None
     local = Path(__file__).resolve().parent.parent / "target" / "release" / "yggterm-headless"
     if local.exists():
         return str(local)
+    for candidate in (
+        Path.home() / ".local" / "bin" / "yggterm-headless",
+        Path.home() / ".yggterm" / "bin" / "yggterm-headless",
+    ):
+        if candidate.exists():
+            return str(candidate)
     return shutil.which("yggterm-headless")
 
 
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+STORE_ROOTS = (".codex/sessions", ".codex-litellm/sessions", ".claude/projects")
+
+
 def index_transcripts(roots: list[Path]) -> dict[str, Path]:
-    uuid = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
     index: dict[str, Path] = {}
     for root in roots:
         if not root.exists():
             continue
         for path in root.rglob("*.jsonl"):
-            for found in uuid.findall(path.name):
+            for found in UUID.findall(path.name):
                 current = index.get(found)
                 if current is None or path.stat().st_size > current.stat().st_size:
                     index[found] = path
     return index
+
+
+def index_peer_transcripts(peer: str) -> dict[str, str]:
+    """The same index, on another host.
+
+    ⚠ This is not an optimisation, it is the difference between a usable tool
+    and a blind one. A summary for a session running on another machine is
+    persisted on BOTH hosts — the machine that owns the session and the machine
+    whose GUI generated the copy — but the TRANSCRIPT exists only on the owner.
+    Run without this on the GUI host and 87% of its store is skipped for "no
+    transcript", which reads like a clean audit and is an empty one.
+    """
+    finds = " ".join(f"$HOME/{root}" for root in STORE_ROOTS)
+    out = subprocess.run(
+        ["ssh", peer, f"find {finds} -name '*.jsonl' 2>/dev/null"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    index: dict[str, str] = {}
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        for found in UUID.findall(Path(line).name):
+            index[found] = line
+    return index
+
+
+def peer_session_text(peer: str, headless: str, transcript: str) -> str:
+    out = subprocess.run(
+        ["ssh", peer, f"{headless} server remote generation-context {transcript}"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    return out.stdout if out.returncode == 0 else ""
 
 
 # ===== the detector's own proof, on invented sessions =====
@@ -216,6 +273,19 @@ def selftest() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", default=os.path.expanduser("~/.yggterm"))
+    parser.add_argument("--headless", default=None, help="path to yggterm-headless")
+    parser.add_argument(
+        "--peer",
+        action="append",
+        default=[],
+        help="ssh target holding transcripts this host does not have "
+        "(repeatable). Without it, a GUI host skips almost its whole store.",
+    )
+    parser.add_argument(
+        "--peer-headless",
+        default="$HOME/.yggterm/bin/yggterm-headless",
+        help="path to yggterm-headless ON the peer",
+    )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
@@ -233,7 +303,7 @@ def main() -> int:
     if args.selftest:
         return selftest()
 
-    headless = find_headless()
+    headless = find_headless(args.headless)
     if headless is None:
         print(
             "no yggterm-headless on PATH or in target/release — it is the one "
@@ -250,6 +320,16 @@ def main() -> int:
 
     home = Path(os.path.expanduser("~"))
     index = index_transcripts([home / ".codex", home / ".codex-litellm", home / ".claude" / "projects"])
+    peer_index: dict[str, tuple[str, str]] = {}
+    for peer in args.peer:
+        for session, path in index_peer_transcripts(peer).items():
+            peer_index.setdefault(session, (peer, path))
+    if args.peer:
+        # stderr: --json output must stay parseable.
+        print(
+            f"peers {', '.join(args.peer)} contributed {len(peer_index)} transcripts",
+            file=sys.stderr,
+        )
 
     connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
     # A hand-written summary is the owner's own words, not generated copy. It is
@@ -263,10 +343,14 @@ def main() -> int:
     ungrounded, checked, skipped = [], 0, 0
     for session_id, summary, model in rows:
         transcript = index.get(session_id)
-        if transcript is None:
+        if transcript is not None:
+            text = session_text(headless, transcript)
+        elif session_id in peer_index:
+            peer, remote_path = peer_index[session_id]
+            text = peer_session_text(peer, args.peer_headless, remote_path)
+        else:
             skipped += 1
             continue
-        text = session_text(headless, transcript)
         if len(text) < 200:
             skipped += 1
             continue
