@@ -176264,6 +176264,67 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
+    /// ⛔ THE RESUME GATE MUST NEVER AGAIN REFUSE A KEYSTROKE.
+    ///
+    /// Owner-ruled 2026-08-14 after switching to a session and being unable to
+    /// type: the gate is an OBSERVATION now, not a veto. It stays computed and
+    /// traced — that part is a useful diagnostic — but it may not set
+    /// `allow_input = false`.
+    ///
+    /// A source guard, because the behaviour it locks is a REMOVAL: there is no
+    /// value to assert, only a mutation that must not come back. The sibling
+    /// test below asserts the predicate still works, which is a different
+    /// question and is why its name saying "blocks" is now misleading — it
+    /// checks readiness, never the keyboard.
+    ///
+    /// ⚠ The failure this prevents is silent and total: the flag is cleared on
+    /// EVERY row open, and its one restore path rides on the first meaningful
+    /// output byte, which an agent idling at its prompt never emits. Re-adding
+    /// the block gives back a row that "renders perfectly and accepts no
+    /// keystrokes for the rest of its life".
+    #[test]
+    fn the_resume_gate_is_an_observation_and_cannot_block_input() {
+        // ⛔ Scan the PRODUCT half only: the anchor below appears in this test
+        //    too, and a source guard that can match itself guards nothing.
+        let source = include_str!("shell.rs");
+        let product = source
+            .split("mod tests {")
+            .next()
+            .expect("shell.rs has a product half above its tests");
+        let start = product
+            .find("fn apply_active_terminal_input_policy(")
+            .expect("the input policy entry point moved — move this lock with it");
+        let rest = &product[start..];
+        let end = rest[1..]
+            .find("\nfn ")
+            .map(|at| at + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        assert!(
+            !body.contains("if !signature.remote_resume_input_ready {"),
+            "the resume gate is refusing keystrokes again. It was removed because \
+             it is cleared on every row open and restored only by output an idle \
+             agent never emits, so the row renders perfectly and accepts nothing. \
+             If a surface truly cannot take input, gate it in \
+             `terminal_runtime_input_policy`, where the explicit override is \
+             still weighed — this ran AFTER that policy, so the override could \
+             not win."
+        );
+        // ⭐ …and it must still be REPORTED. Dropping the veto is not a reason to
+        // stop observing it: the trace field is how the next person diagnoses a
+        // resume that never revealed.
+        assert!(
+            body.contains("remote_resume_input_ready"),
+            "the gate must still be observed and traced, or a real resume fault \
+             becomes invisible along with the bug that was removed"
+        );
+    }
+
+    /// ⚠ NAME OVERSTATES IT: this asserts the READINESS PREDICATE, not that
+    /// input is blocked. The block was removed 2026-08-14 (see the guard above);
+    /// this test is unaffected because the predicate itself is unchanged.
+    #[test]
     fn remote_resume_input_policy_blocks_missing_active_session_snapshot() {
         let session_path = "remote-session://dev/019dbdc7-7e63-7211-a7f8-51eb4d6e80b2";
         let bootstrap = test_shell_bootstrap_with_active_session(session_path);
