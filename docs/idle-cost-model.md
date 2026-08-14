@@ -685,6 +685,83 @@ machine table at all — three terms this harness seeds EMPTY and the live fleet
 does not, so the A/B above understates the change on a real daemon while
 overstating nothing.
 
+### ⛔ 6i. THE NEGATIVE CONTROL: A LONE DAEMON SPENDS NOTHING — AND IN COMPANY IT CANNOT EXIT
+
+*2026-08-14, fleet host. The control §6h needs: same binary, same seeded row
+counts, own `YGGTERM_HOME` so nobody polls it — and **no request sent**. If the
+cost is request serving, this reads ~0. If it is intrinsic, this is where it
+shows up.*
+
+| seeded ROWS | idle cores over 60 s | ticks of CPU |
+|---|---|---|
+| 0 | 0.00017 | 1 |
+| 100 | 0.00000 | 0 |
+| 264 | 0.00017 | 1 |
+| 1000 | 0.00100 | 6 |
+
+⚠ **Read the resolution before the numbers.** `CLK_TCK` is 100, so one tick is
+10 ms and the floor of this instrument over a 60 s window is **0.00017 cores**.
+Three of the four arms are at or below one tick — **indistinguishable from
+zero**, not measured as zero. That blindness does not matter here only because
+the bound it gives is already **~680x below** the 0.116-core floor being tested.
+Only the 1000-row arm (4x the fleet's largest daemon) rises clear of it, at
+0.001 cores.
+
+⇒ **There is no intrinsic per-daemon floor.** A daemon holding up to 264 rows
+and no sessions, that nobody talks to, costs less than 0.0002 cores.
+⇒ Combined with §6h — a served poll costs 383 µs, so 3.6/s is **0.0014
+cores/daemon** — **neither existing nor being polled explains 0.116.**
+⇒ **So the intercept is either attached to owned sessions, or it is a fitting
+artefact.** §2a already said the fit cannot separate a per-daemon floor from a
+step paid by the first session, because no census daemon owns zero; and the
+replication that took R² from 0.939 to 0.109 is what a spurious intercept looks
+like. ⛔ **§2a's ✅ "ANSWERED IN §6e — the floor is the cost of answering peer
+polls" is withdrawn.** Answering peer polls is 1.2% of it.
+
+#### ⭐ And the control found the mechanism that keeps the population alive
+
+Every arm **retired itself after 75 s**, logging `daemon idle shutdown,
+idle_shutdown_ms=90000`. That is not a fault — it is
+`daemon_should_idle_shutdown` (`crates/yggterm-server/src/daemon.rs:11589`)
+doing exactly what it says. Two gates:
+
+1. `if terminal_session_count > 0 { return false }` — **a daemon owning any
+   session, including a preserved hot-update PTY, never idle-retires.**
+2. Otherwise it needs **90 s with no request**. And `mark_daemon_activity` is
+   called on **every** request, unconditionally, before dispatch
+   (`daemon.rs:19423`).
+
+⇒ **In a population, gate 2 is unreachable.** Peers poll each daemon at
+**3.4–4.2/s** against a 90 s window, so the timer is reset roughly 300 times
+over before it could ever fire. **A daemon drained to zero sessions still would
+not idle-retire while any peer remains** — the population keeps its own members
+alive, and this control is the proof of the converse: remove the peers and the
+same binary exits in 90 s having burned nothing.
+
+⚠ **Scope, stated so it is not over-read.** This is the *idle-shutdown* path,
+not the *successor-retire* path (`daemon.rs:15274`, 20 s poll), which is what
+actually drains superseded daemons and carries its own deferral gate. The claim
+is that **idle-shutdown cannot be the drain's mechanism in a live fleet** — not
+that nothing can retire a daemon. ⇒ It matters to §S1: a drain that migrates
+sessions off a daemon and then waits for it to notice it is idle will wait
+forever.
+
+#### ⚠ What this control does NOT cover — the OUTBOUND half of a poll
+
+§6h measured the daemon **serving** a `status`. Nothing has measured a daemon
+**sending** one, and the population sends as many as it receives (~3.4/s each).
+A first bound, through the nearest available proxy: `server daemons` — a CLI
+that runs the same fan-out over all 15 peers and then does strictly more
+(`/proc/<pid>/exe` per daemon, formatting) — costs **0.117 s of CPU, ~7.8 ms per
+peer**.
+
+⛔ **That is an UPPER BOUND obtained through a proxy, and it is DERIVED when
+multiplied by a rate — treat it as neither measured nor attributed.** Even taken
+at the bound, 7.8 ms × 3.4/s × 15 daemons is **0.40 cores, ~11%** of the daemon
+population. ⇒ **The outbound half does not close the gap either**, but it is the
+largest unmeasured term left in the request path and it should be measured in
+the daemon rather than bounded from outside.
+
 ### 6f. Honest limits on this section
 
 1. ⛔ **The exact periodic call site is NOT located.** The fan-out helper is
