@@ -4251,30 +4251,6 @@ placeholder and this entry closes as a fact about grok.
 ⇒ **The lesson worth keeping: the gap was written as an owner gate and was never
 one.** Nobody had asked the hosts. An inherited "blocked" is a claim, not a fact.
 
-## ⛔ [6.6] `server app` IS DISPATCHED IN TWO FILES, SO A NEW VERB IS ABSENT FROM THE ONE AGENTS CALL
-
-**Status:** OPEN
-
-*Found 2026-08-13 by shipping a verb into one of them.*
-
-`apps/yggterm/src/main.rs` and `apps/yggterm/src/bin/yggterm-headless.rs` each
-carry their own `match args[2]` over the whole `server app` verb surface. They
-are not a shared function with two entry points; they are two copies.
-
-**The failure is silent and every instrument agrees with it.** A verb added to
-the GUI binary alone answers `unsupported app control command: <verb>` from the
-headless CLI — which is the copy agents actually drive — while the deployed
-binary's `--build-commit` matches the deploy, the arm is visibly in the source,
-and the running GUI's `/proc/<pid>/exe` md5 matches the disk.
-
-⭐ **What settled it was two controls in one `strings` run:** the binary carried
-`unsupported app theme-editor action` (so the probe worked) and **zero**
-occurrences of the new verb (so it was genuinely absent). The positive control
-alone would have proven nothing.
-
-⇒ Collapse the two onto one dispatcher. Until then a new verb must be added to
-both, and the headless copy carries a comment saying so.
-
 ## ⛔ THE BINARY ROSTER REPLACED A HARDCODED LIST WITH A NAME PREFIX, AND STRANDS THE SAME WAY
 
 **Status:** OPEN
