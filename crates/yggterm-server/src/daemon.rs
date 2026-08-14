@@ -4151,7 +4151,66 @@ impl DaemonRuntime {
         flags
     }
 
+    /// Build the status reply, **and record what building it cost.**
+    ///
+    /// See [`StatusCostWindow`] for why this path needed its own counter rather
+    /// than the `PerfGuard` that already wraps every request: that guard drops
+    /// 98% of sub-8 ms `status` spans, and it drops them in a row-correlated
+    /// way, so the set it keeps cannot be read as the population.
     fn status(&self) -> ServerRuntimeStatus {
+        let started_cpu_us = thread_cpu_micros();
+        let started = std::time::Instant::now();
+        let payload = self.status_payload();
+        let cpu_us = thread_cpu_micros().saturating_sub(started_cpu_us);
+        let wall_us = started.elapsed().as_micros() as u64;
+        // Rows as the daemon listing counts them, so a reading pairs against the
+        // ROWS column a human sees rather than a second definition of "row".
+        let rows = payload.live_terminal_sessions.len() as u64;
+        let stored_rows = payload.stored_terminal_session_count as u64;
+        let flush = STATUS_COST_WINDOW.lock().ok().and_then(|mut window| {
+            record_status_cost(
+                &mut window,
+                std::time::Instant::now(),
+                process_cpu_micros(),
+                cpu_us,
+                wall_us,
+                rows,
+                stored_rows,
+            )
+        });
+        if let Some(flush) = flush {
+            let emitted = &flush.window;
+            let elapsed_us = flush.elapsed.as_micros().max(1) as u64;
+            append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "perf",
+                "status_cost",
+                serde_json::json!({
+                    "window_ms": flush.elapsed.as_millis() as u64,
+                    "replies": emitted.replies,
+                    // CPU, not wall — both are carried so the gap between them
+                    // (lock waits, descheduling) is visible instead of implied.
+                    "cpu_us_total": emitted.cpu_us_total,
+                    "cpu_us_mean": emitted.cpu_us_total / emitted.replies.max(1),
+                    "cpu_us_max": emitted.cpu_us_max,
+                    "wall_us_total": emitted.wall_us_total,
+                    "wall_us_mean": emitted.wall_us_total / emitted.replies.max(1),
+                    "rows_mean": emitted.rows_total / emitted.replies.max(1),
+                    "rows_last": emitted.rows_last,
+                    "stored_rows_last": emitted.stored_rows_last,
+                    // The denominator, from the same window, so the SHARE is a
+                    // property of one record and not of two measurements a
+                    // reader has to divide and hope were taken together.
+                    "proc_cpu_us_delta": flush.proc_cpu_us_delta,
+                    "replies_per_s": emitted.replies as f64 * 1_000_000.0 / elapsed_us as f64,
+                }),
+            );
+        }
+        payload
+    }
+
+    fn status_payload(&self) -> ServerRuntimeStatus {
         let terminal_stats = self.terminals.stats();
         let payload_stats = self.server.payload_stats();
         let preserved_owner_keys = self.preserved_terminal_owner_keys();
@@ -17695,6 +17754,137 @@ fn record_lock_wait(
     }
     window.opened = Some(now);
     Some((elapsed, std::mem::take(&mut window.by_request)))
+}
+
+/// How often the `status` cost aggregate is emitted. Flushed **lazily, by the
+/// next reply** — same rule as the lock-wait window above, and for the same
+/// reason: a thread waking to check whether it should flush is precisely the
+/// idle cost this lane exists to remove.
+const STATUS_COST_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// CPU consumed by the calling thread, microseconds.
+///
+/// ⚠ Priced on this host before being used, because the fleet spread on this
+/// call is 45.8x and a probe can cost more than the thing it measures:
+/// `CLOCK_THREAD_CPUTIME_ID` is **578 ns** here (a real syscall) against
+/// **26.7 ns** for `CLOCK_MONOTONIC` (vDSO, `tsc`). Two calls per reply at the
+/// measured 3.4–4.2 replies/s is ~4 µs/s — 0.000004 cores — so the instrument
+/// is four orders of magnitude below the ~2.5 ms it is measuring.
+fn thread_cpu_micros() -> u64 {
+    cpu_clock_micros(libc::CLOCK_THREAD_CPUTIME_ID)
+}
+
+/// CPU consumed by every thread of this process, microseconds — **including
+/// threads that have already exited.**
+///
+/// That last part is the whole point of using this rather than summing live
+/// threads: this daemon spawns one OS thread per connection and lets it die, so
+/// an instrument that can only see live threads reports a fraction of the work.
+fn process_cpu_micros() -> u64 {
+    cpu_clock_micros(libc::CLOCK_PROCESS_CPUTIME_ID)
+}
+
+fn cpu_clock_micros(clock: libc::clockid_t) -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, fully initialised `timespec` we own, and the
+    // clock ids used are compile-time constants.
+    if unsafe { libc::clock_gettime(clock, &mut ts) } != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(ts.tv_nsec as u64 / 1_000)
+}
+
+/// What one `status` reply actually costs, measured directly and **sampled not
+/// at all.**
+///
+/// ⛔ **Why the existing instrument could not answer this.** `handle_request`
+/// wraps every request in a [`yggterm_core::PerfGuard`], but
+/// `("daemon_request", "status")` is on `perf_span_is_high_frequency_noise`'s
+/// list, so a span is written only when it ran **≥ 8 ms** *or* wins a **1-in-50**
+/// sample. Over one live `perf-telemetry.jsonl`: 5,604 sub-floor records (each
+/// standing for ~50 replies) and 2,769 tail records (each standing for one) —
+/// the recorded set is **33% tail against a true tail of 0.98%, an enrichment of
+/// ~34x**. ⛔ And the enrichment is *row-correlated*: the 243–246-row daemons
+/// showed 13.5–16.8% of their records above the floor where the 70–101-row
+/// daemons showed 3.5–7.6%, because more rows push more replies past 8 ms. So it
+/// does **not** cancel in a between-daemon comparison, which is what a mean read
+/// off that set was assumed to do. Re-fitting the same daemons with each record
+/// inverse-probability weighted moved the per-row slope from **10.2 µs/row to
+/// 4.7 µs/row**. Hence a counter that samples nothing.
+///
+/// ⚠ And it records **CPU**, not wall. Every other `duration_ms` in this system
+/// is wall time between two `Instant`s; a cost model that wants cores needs the
+/// CPU actually burned, and wall time over-reads it whenever the handler was
+/// descheduled or parked on the runtime lock — which happens here, `status` has
+/// been observed waiting 3.0 s for that lock.
+#[derive(Debug, Default)]
+struct StatusCostWindow {
+    opened: Option<std::time::Instant>,
+    /// Process CPU when the window opened, so the flush can report the SHARE —
+    /// `cpu_us_total / proc_cpu_us_delta` — instead of a bare rate that only
+    /// means something next to a separately-measured denominator.
+    opened_proc_cpu_us: u64,
+    replies: u64,
+    cpu_us_total: u64,
+    cpu_us_max: u64,
+    wall_us_total: u64,
+    /// Σ rows over the window's replies. Carried as a sum rather than a snapshot
+    /// so the reader can pair mean CPU against mean ROWS without assuming the
+    /// row count held still across the minute.
+    rows_total: u64,
+    rows_last: u64,
+    stored_rows_last: u64,
+}
+
+static STATUS_COST_WINDOW: LazyLock<Mutex<StatusCostWindow>> =
+    LazyLock::new(|| Mutex::new(StatusCostWindow::default()));
+
+/// One emitted `status` cost window: what the flushing reply should write.
+struct StatusCostFlush {
+    elapsed: std::time::Duration,
+    proc_cpu_us_delta: u64,
+    window: StatusCostWindow,
+}
+
+/// Fold one reply into the open window, and hand back a window to emit if this
+/// reply closed it.
+fn record_status_cost(
+    window: &mut StatusCostWindow,
+    now: std::time::Instant,
+    proc_cpu_us: u64,
+    cpu_us: u64,
+    wall_us: u64,
+    rows: u64,
+    stored_rows: u64,
+) -> Option<StatusCostFlush> {
+    if window.opened.is_none() {
+        window.opened = Some(now);
+        window.opened_proc_cpu_us = proc_cpu_us;
+    }
+    window.replies += 1;
+    window.cpu_us_total += cpu_us;
+    window.cpu_us_max = window.cpu_us_max.max(cpu_us);
+    window.wall_us_total += wall_us;
+    window.rows_total += rows;
+    window.rows_last = rows;
+    window.stored_rows_last = stored_rows;
+    let elapsed = now.duration_since(window.opened.unwrap_or(now));
+    if elapsed < STATUS_COST_FLUSH_INTERVAL {
+        return None;
+    }
+    let emitted = std::mem::take(window);
+    window.opened = Some(now);
+    window.opened_proc_cpu_us = proc_cpu_us;
+    Some(StatusCostFlush {
+        elapsed,
+        proc_cpu_us_delta: proc_cpu_us.saturating_sub(emitted.opened_proc_cpu_us),
+        window: emitted,
+    })
 }
 
 /// Acquire the runtime lock **for a client request, measuring the wait.**
