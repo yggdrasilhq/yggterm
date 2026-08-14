@@ -539,16 +539,97 @@ def row_process_absent(uuid):
     return True
 
 
+# ⭐⭐ THE RESET TIME WAS IN THE MESSAGE ALL ALONG — measured 2026-08-14.
+# The comment above RATE_LIMIT_HOLD_SECS asserted "the refusal carries no reset
+# timestamp ('try again later')" and held the fleet on a blind timer because of
+# it. That premise was false, and this tool's own evidence file disproved it: a
+# stored hold record read
+#     "tail": "You've hit your session limit · resets 12:20pm (Asia/Kolkata)"
+# The reset moment was captured, persisted, and printed in `status` — and nothing
+# ever parsed it. Cost, measured live: last refusal 12:35:54 held the fleet to
+# 13:05:54 against a reset that had already happened at 12:20, leaving 17
+# subscribers unwakeable while the account was healthy.
+# ⭐ THE CLASS: an answer the system already holds, discarded because a comment
+# said it did not exist. Nobody re-read the artefact the comment was about.
+#
+# ⚠ IT MAY ONLY SHORTEN THE HOLD, NEVER EXTEND IT. The two failure directions
+# are not symmetric: holding too SHORT costs one refused probe boot and
+# self-corrects on the next tick, while holding too LONG is a dead fleet. So the
+# timer stays as a CEILING and a parsed reset can only release earlier. A
+# misparse therefore cannot invent a long hold, which is the only way this change
+# could have made things worse.
+RESET_GRACE_SECS = 90          # clocks disagree; come back just after, not on the tick
+RESET_MAX_AHEAD_SECS = 6 * 3600  # further out than this is a misparse, not a reset
+
+
+def reset_time_from_tail(tail, now=None):
+    """The reset moment the CLI already told us, as an epoch — or None.
+
+    ⛔ None means *nothing trustworthy here*, and every caller must fall back to
+    the blind timer. That is the safe direction: an unparsed tail leaves today's
+    behaviour exactly as it was.
+
+    ⚠ A time-of-day with no date is ambiguous across midnight, so a reset that
+    has already passed rolls to tomorrow — and a "reset" more than a few hours
+    out is far more likely a STALE TAIL being re-read than a real quota window.
+    Both collapse to None, which is why a stale screen cannot pin the fleet.
+    """
+    if not tail:
+        return None
+    m = re.search(r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?"
+                  r"(?:\s*\(([^)]+)\))?", tail, re.I)
+    if not m:
+        return None
+    hour, minute, ampm, tzname = m.group(1), m.group(2), m.group(3), m.group(4)
+    hour, minute = int(hour), int(minute or 0)
+    if ampm:
+        ampm = ampm.replace(".", "").lower()
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    import datetime
+    tz = None
+    if tzname:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tzname.strip())
+        except Exception:
+            tz = None            # unknown zone ⇒ local, not a failure
+    now_dt = datetime.datetime.fromtimestamp(now or time.time(), tz)
+    cand = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if cand <= now_dt:
+        cand += datetime.timedelta(days=1)
+    epoch = cand.timestamp()
+    if epoch - (now or time.time()) > RESET_MAX_AHEAD_SECS:
+        return None              # stale tail or misparse ⇒ let the timer decide
+    return epoch
+
+
 def note_rate_limit(uuid, tail):
     """A subscriber was refused on quota ⇒ hold the whole fleet.
 
     Refreshing rather than accumulating: each fresh sighting pushes the window
     out, so a long outage holds continuously without anyone tracking rounds."""
     prev = rate_limit_hold()
+    now = time.time()
+    timer_until = now + RATE_LIMIT_HOLD_SECS
+    reset_at = reset_time_from_tail(tail, now)
+    until = timer_until
+    if reset_at:
+        # ⛔ min(), never max() — see the note above. The timer is the ceiling.
+        until = max(now + 60, min(timer_until, reset_at + RESET_GRACE_SECS))
     rec = {
-        "since": (prev or {}).get("since", time.time()),
-        "last_seen": time.time(),
-        "until": time.time() + RATE_LIMIT_HOLD_SECS,
+        "since": (prev or {}).get("since", now),
+        "last_seen": now,
+        "until": until,
+        # ⭐ Recorded so `status` can SAY why it will lift when it does. The
+        # owner's complaint about the last outage was never the hold, it was
+        # "I do not know how all the sessions recovered."
+        "reset_at": reset_at,
+        "released_by": "reset-time" if reset_at else "timer",
         "seen_on": uuid,
         "tail": (tail or "")[:200],
     }
