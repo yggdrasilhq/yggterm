@@ -62,24 +62,35 @@ sees an empty `stored_terminal_session_keys`, which reads as *"this peer holds n
 dormant rows"* — the exact input that has dropped rows in a handover before, and
 **14 daemons that will never restart still speak the old shape**.
 
-⛔⛔ **EXPECTED EFFECT IS DISPUTED — MEASURE BEFORE BUILDING.** The 0.66 figure
-divides the model's per-row coefficient by the poll rate. Reading the handler's
-own `PerfGuard` duration instead gives **11 µs/row, not 94** (slope over 14
-daemons, r=+0.683; 70–101 rows → 2.09–2.57 ms, 243–246 rows → 2.92–3.17 ms),
-which makes this **≈0.08 cores** and puts status handling at ~5% of a daemon's
-idle cost rather than most of it. ⚠ Flagged not adopted: that instrument records
-`daemon_request/status` at 1.8/s against 49.7/s arriving — **~3.6% of requests**,
-unexplained, and `PerfGuard` has no sampling logic. The **slope** is robust (a
-uniform under-recording factor cancels between daemons); the absolute share is
-not. ⇒ **Instrument the status path directly — per-reply row count and elapsed
-CPU, not wall — and confirm both the slope and its share of daemon CPU before
-building.** The row term is directly confirmed and the O(R log R) → O(1) change
-is still right; ⛔ **do not promise 0.66 cores for it.**
-⇒ **And it reopens the bigger question: where does the other ~95% of daemon CPU
-go?** `idle-cost-model.md` §6g.
+⛔⛔ **S5 IS DECIDED AGAINST — DO NOT BUILD IT. THE COST IS NOT HERE.** Three
+successive estimates of the per-row cost of a `status` reply, each refuting the
+last: **94 µs/row** (coefficient ÷ poll rate — a ratio), **~11 µs/row** (naive
+fit on `PerfGuard` records), **≈4.65 µs/row** (inverse-probability-weighted
+re-fit at 4.71, and an independent unsampled sandbox counter at 4.645 on CPU not
+wall, r=+0.9981 — agreeing within 1.4%).
 
-**Expected effect, as originally derived (⚠ disputed above):** ≈**0.66 cores**
-(0.000337/row × 1,953 rows), ~25% of the 2.64-core daemon footprint.
+⛔ **The naive fit was biased by the sampling predicate.** `("daemon_request",
+"status")` is on `perf_span_is_high_frequency_noise`, and
+`perf_span_should_record` keeps a span when `duration_ms >=
+NOISY_SPAN_RECORD_FLOOR_MS` (8.0) **or** on a 1-in-50 sample
+(`crates/yggterm-core/src/perf.rs:54–116`). ⇒ **records are kept for being SLOW**,
+high-row daemons clear the floor more often (13.5–16.8% vs 3.5–7.6%), and the
+sampling therefore correlates with the variable being fitted. **It cannot cancel.**
+⭐ **Rule: read the sampling predicate before deciding whether sampling cancels —
+a duration threshold is a filter on the dependent variable.**
+
+⇒ **All of status serving is ≈0.057 cores of the 3.47-core population (1.6%), and
+request serving explains under 1% of the fitted floor. Neither unattributed term
+is `status`.** The census split would buy ~1.5% while paying with a version-gated
+protocol change whose `#[serde(default)]` failure mode is a documented row-loss
+hazard at handover. ⚠ **Reversal condition:** re-open if status serving ever
+exceeds ~10% of daemon cost (a far larger population, or rows well beyond ~260).
+
+⭐ **What survives:** the row inventory *is* rebuilt on every reply (O(R log R)
+plus `persisted_state()`), which was worth establishing — it is simply cheap.
+⇒ **The real question is now open and unowned: ~93% of daemon CPU is
+unattributed.** Not request serving (<1%), not daemon churn (5.7%, measured).
+`idle-cost-model.md` §6g and §6h.
 **Falsifier:** re-run the paired comparison (1-owned daemons, low vs high rows,
 both controls in one run). If the per-row coefficient does not fall to ~0,
 `status` was not what the row term was buying.

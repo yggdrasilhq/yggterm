@@ -472,7 +472,13 @@ status "because the reconcile already fetches status" — and that is exactly th
 trap: a field placed where a *rare* operation would find it convenient, on a
 request that turned out to run **3.6 times a second forever**.
 
-### 6e. Both terms of the model, derived
+### ⛔⛔ 6e. REFUTED BY §6g — "both terms are `status`" is FALSE. Kept for the derivation trail only.
+
+**All of status serving is ≈1.6% of the population's cost and under 1% of the
+fitted floor.** Neither the floor nor the per-row term is the peer poll. The
+arithmetic below "closed" because both of its inputs were derived quantities
+(§6e's own 94 µs/row, and §3's 38 ms/handler) — two ratios agreeing is not
+corroboration when both inherit the same unexamined assumption.
 
     cost ~= (N-1)/T x (fixed + k x ROWS)
 
@@ -525,15 +531,51 @@ are outside it** (serialising ~50 KB adds well under 1 µs/row, so this does not
 close the 8x gap); and `duration_ms` is **wall time, not CPU**, so it is an upper
 bound on handler CPU — which makes §S5 smaller still, never larger.
 
-⭐ **The SLOPE is the robust part.** A uniform under-recording factor cancels in a
-between-daemon comparison, and the low-row and high-row bands separate cleanly.
-⇒ **Treat 11 µs/row as the measurement and 94 µs/row as the refuted inference,
-while treating the absolute per-daemon share as unconfirmed.**
+⛔⛔ **AND THE SLOPE WAS WRONG TOO — THE SAMPLING IS A FILTER ON THE DEPENDENT
+VARIABLE.** I kept 11 µs/row on the grounds that *"a uniform under-recording
+factor cancels in a between-daemon comparison"*. **The fragile/robust split was
+the right question; my assignment was wrong, because the keep-rule is not
+uniform.** Read from source (`crates/yggterm-core/src/perf.rs:54–116`):
 
-**The check that settles it, before anyone builds §S5:** instrument the status
-path directly — a counter incremented per reply with the row count and elapsed
-CPU (not wall), read back over a known window — and confirm both the slope and
-what fraction of daemon CPU the path accounts for.
+    const NOISY_SPAN_RECORD_FLOOR_MS: f64 = 8.0;
+    const NOISY_SPAN_SAMPLE_RATE: u64 = 50;
+
+    fn perf_span_should_record(category, name, duration_ms) -> bool {
+        if !perf_span_is_high_frequency_noise(category, name) { return true }
+        if duration_ms >= NOISY_SPAN_RECORD_FLOOR_MS { return true }   // <-- the trap
+        COUNTER.fetch_add(1) % NOISY_SPAN_SAMPLE_RATE == 0
+    }
+
+`("daemon_request", "status")` is on that noise list. ⇒ **A record is kept when
+it is SLOW.** High-row daemons are slower, so a larger share of their replies
+clears the 8 ms floor and they are preferentially recorded — **the sampling
+correlates with the very variable being fitted, so it cannot cancel.** Measured
+enrichment on one live stream: 243–246-row daemons put **13.5–16.8%** of records
+above the floor against **3.5–7.6%** for the 70–101-row ones.
+
+| estimate | method | µs/row |
+|---|---|---|
+| §6e inference | coefficient ÷ poll rate | 94 |
+| naive fit on sampled records | this section, as first written | ~10–11 |
+| **inverse-probability weighted re-fit** | same field data, corrected | **4.71** |
+| **independent sandbox counter** | CPU not wall, six seeded row counts, unsampled | **4.645** (r=+0.9981) |
+
+⇒ **~4.65 µs/row is the measurement**; 94 and 11 are both refuted, and the two
+sound methods agree within 1.4%.
+
+⛔⛔ **THEREFORE §6e's HEADLINE IS REFUTED: NEITHER TERM IS `status`.** All of
+status serving is **≈0.057 cores of the 3.47-core population — 1.6%**, and
+request serving explains **under 1%** of the fitted floor. The floor is not the
+cost of answering peers, and the per-row term is not the row inventory on the
+poll path. ⇒ **§S5 has been decided AGAINST** (see its entry): a census split
+buys ~1.5% while paying with a version-gated protocol change whose
+`#[serde(default)]` failure mode is a documented row-loss hazard at handover.
+
+⭐ **THE RULE, WHICH IS BIGGER THAN THIS FIT: read the sampling predicate before
+deciding whether sampling cancels.** A rule that keeps records above a duration
+threshold is not a uniform filter — it is a **filter on the dependent variable**,
+and any slope fitted through it is biased toward whatever makes the quantity
+large.
 
 ⇒ **§2b's per-row term is real and now attributed, and the refuted candidate
 stays refuted for a better reason than its period.** `run_background_copy_chore`
@@ -570,12 +612,55 @@ mattered was a **request rate**, and it was visible in the trace the whole time.
    244/246 mean 0.207 ⇒ **0.00036 cores/row**, reproducing 0.000337. Quote the
    per-row coefficient from the paired comparison, ⛔ **never the R².**
 
+## 6h. THE POPULATION IS NOT A STANDING SET — IT CHURNS, AND A CENSUS CANNOT SEE IT
+
+A census samples daemons that exist at the moment it runs. A daemon spawned,
+handed off and retired between two census reads is invisible to it — the same
+blindness as §3's CPU hiding in exited *threads*, one level up, in exited
+**processes**. Sampling the `server daemon` process set at 4 Hz (subcommand, not
+`comm`), two runs, both controls in each:
+
+| window | census start → end | BORN | DIED | standing cores | transient cores | churn share |
+|---|---|---|---|---|---|---|
+| 180 s | 19 → 19 | 3 (60/h) | 3 (60/h) | — | **0.189** | — |
+| 240 s | 19 → 19 | 3 (45/h) | 3 (45/h) | **2.798** | **0.170** | **5.7%** |
+
+⇒ **One daemon is born and one retires roughly every minute, while the census
+reads a perfectly stable 19.** Independently root-caused by the hot-restart lane
+as a non-terminating self-retire loop: a per-process fact stored in a host-shared
+file makes a predecessor hand off, see the successor clear the entry, and hand
+off again — **11 successors from one process in 53 minutes**, on any host with a
+replaced binary. Fixed there; this section is the cost side.
+
+⇒ **Confirmed as a real phenomenon and priced at ~5.7% of daemon CPU** — a young
+daemon burns 0.02–0.30 cores while alive, comparable to a standing one.
+⛔ **But it is NOT the missing majority.** Standing daemons still account for
+~94%, and their cost is not request serving (§6g: under 1% of the floor).
+⇒ **After §6g and §6h, roughly 93% of daemon CPU remains unattributed.** That is
+the open question, and it is now the only one worth the next window.
+⚠ Churn *would* fit three of the model's unexplained properties at once — kernel-
+heavy, not growing with age, invisible to a per-request instrument — which is
+exactly why it needed pricing rather than adoption. It fits the shape and does
+not fill the magnitude.
+
 ## 7. The specs this justifies
 
 Ordered by cores returned per unit of risk. Each carries the number it should
 move and the falsifier that would show it did nothing.
 
-### S5 — Take the row inventory off `status` (≈0.66 cores, no lifecycle risk) ⭐ DO THIS FIRST
+### ⛔ S5 — DECIDED AGAINST (was: take the row inventory off `status`)
+
+**Do not build this.** §6g measures all of status serving at **≈0.057 cores of
+3.47 — 1.6%** of the population, so the census split buys ~1.5% while paying with
+a version-gated protocol change whose `#[serde(default)]` failure mode is a
+documented row-loss hazard at handover. **The cost is not where this spec aimed.**
+⚠ **Reversal condition:** if a future measurement puts status serving above ~10%
+of daemon cost — a much larger population, or a row count far beyond today's
+~260 — re-open it; the O(R log R) per reply is still real, it is just cheap.
+⭐ **What it got right and what to keep:** the row inventory *is* rebuilt on every
+reply, and that was worth knowing. The error was pricing it from a ratio.
+
+### S5 — the original spec, kept for the trail (⛔ superseded above)
 
 **Why it outranks S1.** S1 is worth more but belongs to another lane, needs a
 drain, and cannot be retrofitted to the daemons that carry the cost. S5 is a
