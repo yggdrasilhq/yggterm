@@ -58,6 +58,7 @@ use yggterm_server::{
     run_app_control_check_terminal_input, run_app_control_submit_terminal_prompt, run_app_control_trigger_update_check,
     run_app_control_ungroup_split_group, run_attach, run_daemon, run_screenrecord_capture,
     run_screenshot_capture, run_screenshot_capture_with_post_process, run_trace_bundle,
+    parse_trace_limit, parse_trace_poll_ms,
     run_row_departures, run_trace_follow, run_trace_tail, run_trace_transitions,
     scan_remote_machine_sessions_for_target, shutdown, snapshot, status, terminal_resize,
     terminal_restart, terminal_write, try_run_remote_server_command,
@@ -1503,21 +1504,11 @@ fn main() -> Result<()> {
         return run_row_departures(limit);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "tail" {
-        let lines = args
-            .get(3)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(200);
-        return run_trace_tail(lines);
+        return run_trace_tail(parse_trace_limit(&args, 200)?);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "follow" {
-        let lines = args
-            .get(3)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(200);
-        let poll_ms = args
-            .get(4)
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(500);
+        let lines = parse_trace_limit(&args, 200)?;
+        let poll_ms = parse_trace_poll_ms(&args, 500)?;
         return run_trace_follow(lines, poll_ms);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "transitions" {
@@ -1528,17 +1519,12 @@ fn main() -> Result<()> {
             .windows(2)
             .find_map(|window| (window[0] == "--last-ms").then(|| window[1].parse::<u64>().ok())?)
             .unwrap_or(180_000);
-        let limit = args
-            .windows(2)
-            .find_map(|window| (window[0] == "--limit").then(|| window[1].parse::<usize>().ok())?)
-            .unwrap_or(200);
+        // ONE owner for `--limit` across every `trace` verb and BOTH binaries.
+        let limit = parse_trace_limit(&args, 200)?;
         return run_trace_transitions(session_filter.as_deref(), last_ms, limit);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "bundle" {
-        let lines = args
-            .get(3)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(200);
+        let lines = parse_trace_limit(&args, 200)?;
         let include_screenshot = args.iter().any(|value| value == "--screenshot");
         return run_trace_bundle(lines, include_screenshot);
     }

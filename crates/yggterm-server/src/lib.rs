@@ -21675,6 +21675,71 @@ fn trace_bundle(lines: usize, include_screenshot: bool) -> anyhow::Result<serde_
     }))
 }
 
+/// How many lines a `server trace …` verb was asked for.
+///
+/// ⛔ **THE SILENT DEFAULT WAS THE BUG, NOT THE MISSING FLAG.** These verbs read
+/// `args[3]` and parsed it as a bare number, so `server trace tail --limit 500`
+/// parsed the literal `"--limit"`, failed, and fell back to 200. Requesting 50
+/// and requesting 2000 both returned exactly 200, and the only way to find out
+/// was to count the output — on a busy host those 200 events span about
+/// **14 seconds**, which is a diagnostic window narrow enough to make "the trace
+/// shows no such event" meaningless.
+///
+/// ⚠ **What hid it is that the flag was REAL on a sibling verb.** `trace
+/// transitions --limit` parsed it correctly all along, so the flag is learned
+/// from one verb of the noun and is silently ignored on three others
+/// (`tail`, `follow`, `bundle`). A flag that works next door is not a flag anyone
+/// thinks to doubt.
+///
+/// ⇒ Both forms are accepted, and **anything unparseable is now refused out
+/// loud**. A wrong count that looks like an answer is worse than an error.
+pub fn parse_trace_limit(args: &[String], default: usize) -> anyhow::Result<usize> {
+    if let Some(at) = args.iter().position(|value| value == "--limit") {
+        let Some(value) = args.get(at + 1) else {
+            anyhow::bail!("--limit needs a value, e.g. `--limit 500`");
+        };
+        return value
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("--limit expects a positive integer, got {value:?}"));
+    }
+    match args.get(3) {
+        None => Ok(default),
+        // A different flag (`--screenshot`) is not a malformed count.
+        Some(value) if value.starts_with("--") => Ok(default),
+        Some(value) => value.parse::<usize>().map_err(|_| {
+            anyhow::anyhow!("`server trace` expects a line count or `--limit N`, got {value:?}")
+        }),
+    }
+}
+
+/// The poll interval for `server trace follow`.
+///
+/// ⛔ **Guards a second way the positional form goes wrong:** with `--limit N`
+/// present, the old code read `args[4]` — the limit's own VALUE — as the poll
+/// interval, so `trace follow --limit 500` would have polled every 500 ms by
+/// coincidence and `--limit 50` every 50 ms. Positional parsing is only trusted
+/// when the argument before it was also positional.
+pub fn parse_trace_poll_ms(args: &[String], default: u64) -> anyhow::Result<u64> {
+    if let Some(at) = args.iter().position(|value| value == "--poll-ms") {
+        let Some(value) = args.get(at + 1) else {
+            anyhow::bail!("--poll-ms needs a value, e.g. `--poll-ms 500`");
+        };
+        return value
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("--poll-ms expects a positive integer, got {value:?}"));
+    }
+    if args.get(3).is_some_and(|value| value.starts_with("--")) {
+        return Ok(default);
+    }
+    match args.get(4) {
+        None => Ok(default),
+        Some(value) if value.starts_with("--") => Ok(default),
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            anyhow::anyhow!("`server trace follow` expects a poll interval or `--poll-ms N`, got {value:?}")
+        }),
+    }
+}
+
 pub fn run_trace_tail(lines: usize) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let path = event_trace_path(&home);
