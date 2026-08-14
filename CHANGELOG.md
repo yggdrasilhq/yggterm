@@ -4,6 +4,22 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Five commands came back that had silently stopped existing.** A change
+  earlier the same day merged two copies of the command dispatcher into one, and
+  five commands did not survive the merge — reading a session's screen,
+  scrolling it, switching the reading view's layout, setting the theme, and the
+  whole sound surface. Nothing failed while they were gone: they simply answered
+  "unsupported command", the code that implemented them was still there and still
+  compiled, and the built-in help had been rewritten in the same change, so it no
+  longer promised them either. The most expensive one was reading a session's
+  screen, because the watchdog that wakes stalled sessions uses it to check what
+  a session is showing before typing anything into it — with no way to look, it
+  correctly refused to type, and stopped waking anything at all.
+- **A command that nothing can invoke now fails the build.** Two checks: every
+  command handler must be reachable from the dispatcher, and every command module
+  must be reached at all. Run against the change that lost the five, they name
+  all five and nothing else.
+
 - **A row you opened an app in no longer disappears when you close the window.**
   Rows made by launching an app were treated as scratch: the software decided
   what was worth keeping from the row's type, and an app runs inside an ordinary
