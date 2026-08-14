@@ -1756,14 +1756,22 @@ def cmd_list(args):
     return 0
 
 
-def _run(host, argv, stdin_text):
-    """Run a yggterm CLI verb with text on stdin, wherever the row lives."""
+def _run(host, argv, stdin_text, remote_binary=None):
+    """Run a yggterm CLI verb with text on stdin, wherever the row lives.
+
+    ⚠ The two binaries do NOT expose the same verbs. Locally this drives the
+    HEADLESS binary; remotely it drives the GUI one, because that is the one
+    that can reach the display plane. A verb that only the headless binary
+    serves must say so with `remote_binary`, or it answers "unsupported"
+    over ssh while working perfectly on this host — which is indistinguishable
+    from the verb being missing everywhere."""
     if host == this_host():
         cmd = [str(Path.home() / ".local" / "bin" / "yggterm-headless"), *argv]
         return subprocess.run(cmd, input=stdin_text, capture_output=True,
                               text=True, timeout=180)
     joined = " ".join(f"'{a}'" for a in argv)
-    return subprocess.run(["ssh", host, f"$HOME/.yggterm/bin/yggterm {joined}"],
+    binary = remote_binary or "$HOME/.yggterm/bin/yggterm"
+    return subprocess.run(["ssh", host, f"{binary} {joined}"],
                           input=stdin_text, capture_output=True, text=True, timeout=180)
 
 
@@ -1875,8 +1883,18 @@ def _daemon_screen_text(host, row):
     reported as such rather than as an empty screen, because the caller
     distinguishes them and refuses on doubt."""
     uuid = row.rsplit("/", 1)[-1]
-    r = _run(host, ["server", "gate-screen", f"cc-runtime://{uuid}",
-                    "--tail", "60", "--json"], "")
+    # ⛔⛔ ASK THE ROW'S OWN MACHINE, NOT THE GUI HOST. `boot` is handed the GUI
+    #    host because that is where a WRITE is proxied from -- but the daemon
+    #    that owns this PTY, and therefore the only one holding its screen, is
+    #    on the machine the row lives on. Asking the GUI host answered
+    #    "unsupported" for every remote row, which reads exactly like the verb
+    #    being missing everywhere and kept the whole fleet blind after the
+    #    fallback was added. Caught by watching the log after the fix and
+    #    finding it changed nothing.
+    rhost = BB.row_host(row, host) or host
+    r = _run(rhost, ["server", "gate-screen", f"cc-runtime://{uuid}",
+                     "--tail", "60", "--json"], "",
+             remote_binary="$HOME/.local/bin/yggterm-headless")
     try:
         entries = json.loads((r.stdout or "").strip() or "[]")
     except Exception:
