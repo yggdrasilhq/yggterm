@@ -1065,6 +1065,15 @@ def cmd_coverage(args):
         return 2
 
     buckets = {"watched": [], "never_arm": [], "opted_out": [], "retired": [], "unknown": []}
+    # ⛔ COUNT SESSIONS, NOT ROWS. The listing can render ONE session as SEVERAL
+    #    rows — measured 2026-08-14: one key appearing twice, at depth 2 and
+    #    depth 4, both `live_rail` and `live_member`. Counting rows made a
+    #    seven-entry ledger report as eight, which is the kind of off-by-one that
+    #    gets explained away rather than chased. The duplication is a sidebar
+    #    defect and belongs to whoever owns row identity; here it is reported and
+    #    then collapsed, never silently summed.
+    seen = set()
+    duplicated = []
     for r in rows:
         if r.get("kind") != "Session":
             continue
@@ -1072,6 +1081,10 @@ def cmd_coverage(args):
         uuid = path.rstrip("/").split("/")[-1]
         if not uuid or "://" not in path:
             continue
+        if uuid in seen:
+            duplicated.append(f"{uuid[:8]} (depth {r.get('depth')})")
+            continue
+        seen.add(uuid)
         label = (r.get("outline_prefix") or "").strip()
         who = f"{uuid[:8]}{(' [' + label + ']') if label else ''}"
         if uuid in blocked:
@@ -1085,6 +1098,12 @@ def cmd_coverage(args):
         else:
             buckets["unknown"].append(who)
 
+    if duplicated:
+        log(f"⚠ {len(duplicated)} row(s) render a session that is ALREADY LISTED: "
+            f"{', '.join(duplicated)}")
+        log("   Counted once here. A session appearing twice at different depths "
+            "is a row-identity defect, not a booter one — report it to whoever "
+            "owns the sidebar rather than tolerating the double count.")
     if not dead_readable:
         log("⚠ the retired ledger is UNREADABLE — dead rows will appear as UNKNOWN.")
     if not ledger_readable:
