@@ -42292,18 +42292,25 @@ fn live_terminal_generation_context(
         None
     }
 }
+/// The context a title/précis/summary is written from, best source first.
+///
+/// ⛔ **The scan excerpt is LAST, not first, and that ordering is the fix to a
+/// user-visible defect.** `remote_context` is the machine scan's preview line —
+/// built from a 12-message tail for a one-line row preview, and measured on a
+/// live host at **120 to 243 BYTES**: the opening sentence of the session's
+/// first message and nothing else. Handed that and asked for "the objective,
+/// the progress, the blocker", the model has exactly one real fact and writes
+/// four sentences, so it keeps the genuine opening and invents the rest. That
+/// is precisely the shape the reported summaries had — a real ACK token or a
+/// real first line, followed by a confident paragraph about a project nobody
+/// here is working on.
+///
+/// The transcript fetch costs an ssh round trip. It is worth it: generation is
+/// already an LLM call, and a cheap wrong answer is the thing being fixed.
 fn generation_context_for_target(
     endpoint: &ServerEndpoint,
     target: &CopyGenerationTarget,
 ) -> Option<String> {
-    if let Some(context) = target
-        .remote_context
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(context.to_string());
-    }
     if let (Some(machine), Some(storage_path)) = (
         target.remote_machine.as_ref(),
         target.storage_path.as_deref(),
@@ -42329,6 +42336,9 @@ fn generation_context_for_target(
     {
         return Some(context);
     }
+    // The preview excerpt, as a last resort. It is better than nothing for a
+    // row that has no transcript to read, and `generate_summary_for_context`
+    // refuses anything too thin to summarise before it reaches a model.
     target
         .remote_context
         .as_deref()

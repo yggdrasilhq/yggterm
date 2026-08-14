@@ -778,7 +778,9 @@ impl SessionTitleResolver {
         }
 
         let context = extract_tail_context(file_path)?;
-        if context.is_empty() {
+        // Too thin to summarise is NOT a smaller version of enough: the model
+        // keeps whatever real sentence it was given and invents the rest.
+        if context.trim().chars().count() < MIN_SUMMARY_CONTEXT_CHARS {
             return Ok(None);
         }
         if !settings_ready(settings) {
@@ -834,7 +836,10 @@ impl SessionTitleResolver {
             let _ = self.store.delete_summary(session_id);
         }
 
-        if context.trim().is_empty() {
+        // Same floor as the by-path arm: see MIN_SUMMARY_CONTEXT_CHARS. This is
+        // the arm the remote rows go through, and the one that was handed a
+        // 120-byte preview excerpt and asked for a paragraph.
+        if context.trim().chars().count() < MIN_SUMMARY_CONTEXT_CHARS {
             return Ok(None);
         }
         if !settings_ready(settings) {
@@ -872,6 +877,23 @@ impl SessionTitleResolver {
         Ok(Some(summary))
     }
 }
+
+/// The least context a 3-to-5 sentence summary may be written from.
+///
+/// ⛔ **A summariser given almost nothing does not return almost nothing — it
+/// invents.** The prompt asks for an objective, concrete progress, and the
+/// current blocker; hand it one real sentence and it keeps that sentence and
+/// makes up the other three, which is why the fabricated summaries read as
+/// convincing rather than broken. Measured on a live host: the fabrications
+/// were generated from contexts of **120 to 243 bytes**, while summaries that
+/// described their session correctly came from 2.6 KB and up.
+///
+/// ⚠ The floor is deliberately far below that band. It is here to catch "there
+/// is nothing to summarise", not to judge quality, and refusing a real session
+/// would leave a row blank for no reason. An absent summary is the honest
+/// outcome and the user's stated preference: a wrong one answers the question
+/// and gives no sign it is guessing.
+pub const MIN_SUMMARY_CONTEXT_CHARS: usize = 400;
 
 pub fn settings_ready(settings: &AppSettings) -> bool {
     !settings.litellm_endpoint.trim().is_empty()
@@ -1273,7 +1295,7 @@ fn strip_auxiliary_image_sentences(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionTitleResolver, SessionTitleStore, best_effort_precis_from_context,
+        MIN_SUMMARY_CONTEXT_CHARS, SessionTitleResolver, SessionTitleStore, best_effort_precis_from_context,
         best_effort_summary_from_context, best_effort_title_from_context, extract_tail_context,
         heuristic_title_from_context, looks_like_generated_fallback_title,
         looks_like_low_signal_generated_title, sanitize_generated_summary,
@@ -1347,6 +1369,59 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    /// The second half of the fabricated-summary defect, and the one that
+    /// survived the first fix.
+    ///
+    /// Remote rows were summarised from the machine scan's PREVIEW excerpt —
+    /// measured at 120 to 243 bytes, the opening sentence of the session's
+    /// first message. That is not an empty context, so the empty check passed
+    /// it straight to the model, which kept the one real sentence and invented
+    /// an objective, a result and a blocker to go with it.
+    ///
+    /// ⚠ The store must be left untouched on refusal. Writing a placeholder
+    /// would be the same defect wearing a different string, and it would also
+    /// satisfy the "summary present" check that gates regeneration — so the row
+    /// could never recover once real context arrived.
+    #[test]
+    fn a_context_too_thin_to_summarise_yields_no_summary_rather_than_an_invented_one() -> Result<()>
+    {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-thin-context-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&home)?;
+        let resolver = SessionTitleResolver::new(&home)?;
+        let mut settings = AppSettings::default();
+        settings.litellm_endpoint = "https://llm.invalid.test".to_string();
+        settings.litellm_api_key = "unused-because-we-never-get-there".to_string();
+        settings.interface_llm_model = "unused".to_string();
+
+        // The real shape: an ACK token and the first line of a brief.
+        let thin = "ACK-EXAMPLE-TOKEN — quote this back so the relay is proven.\n\nYou are the successor at seat 4.2, taking over from a lane that";
+        assert!(
+            thin.chars().count() < MIN_SUMMARY_CONTEXT_CHARS,
+            "the fixture must actually be thin, or this test proves nothing",
+        );
+
+        let summary =
+            resolver.generate_summary_for_context(&settings, "session-thin", "/tmp", thin, true)?;
+        assert_eq!(
+            summary, None,
+            "a context this thin must produce NO summary; the model would keep \
+             the one real sentence and invent the rest",
+        );
+        assert_eq!(
+            resolver.resolve_summary_for_session("session-thin")?,
+            None,
+            "refusing must leave the store empty — a placeholder would gate the \
+             regeneration that happens once real context arrives",
+        );
+
+        let _ = fs::remove_dir_all(&home);
         Ok(())
     }
 
