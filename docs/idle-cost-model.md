@@ -1031,14 +1031,83 @@ its arms owned nothing, so for them gate 1 was open and gate 2 decided.
 of *existing*; the live population prices the cost of *being used*. Both can be
 true, and both are.
 
-⚠ **One genuine anomaly, logged not explained.** The fourth daemon reports
-`stored_sessions=0, live_sessions=0` in its own state file, holds **only LISTEN
-sockets with zero established connections**, and its home's single
-client-instance record is filed under a *different* endpoint version than the one
-it serves — so all three gates appear open, and it has nonetheless been alive for
-48 minutes against a 90 s window. Either the check is not reached on that path or
-one of the three inputs is not what its state file says. ⇒ **queue item, not a
-conclusion.**
+### ⛔ 6k-1. THE 48-MINUTE "COUNTER-EXAMPLE" IS WITHDRAWN — there was no defect
+
+I logged a fourth daemon as an anomaly: zero sessions, **only LISTEN sockets with
+no established connections**, its home's one client-instance record filed under a
+*different* endpoint version than the one it serves — all three gates apparently
+open, alive 48 minutes against a 90 s window.
+
+**Two source reads dissolve it.**
+
+1. `client_instance_dirs_for_scan` scans the current endpoint's directory **plus
+   every other directory under the client-instances root**. So a record filed
+   under a *different* endpoint version **is still in scope**. "Filed under
+   another endpoint" was my error, not the daemon's.
+2. `daemon_is_superseded` requires a **live** newer daemon. That home had exactly
+   one live daemon — the one in question — so it was **not** superseded.
+
+⇒ records non-empty **and** not superseded ⇒ gate 3 returns `false` **correctly,
+indefinitely**. The record named a client process that is **still alive**.
+
+**Demonstrated causally**, two arms differing only in whether a live record is in
+scope, each daemon's own lifecycle trace as the witness:
+
+| arm | client record | outcome |
+|---|---|---|
+| A | none | **`idle_shutdown` at +90.2 s** |
+| B | one naming a live process | **no `idle_shutdown`; still running at +204.8 s** |
+
+⇒ **The idle path is correct and 90 s means 90 s.** ⛔ **The queue item is closed
+as "not a defect".**
+
+### ⛔⛔ 6k-2. AND THE PROBE THAT MANUFACTURED THE ANOMALY: `/proc/<pid>` IS NOT LIVENESS
+
+My harness reported arm A **"STILL ALIVE after 200 s"** while that same daemon's
+own trace recorded `idle_shutdown` at **+90.2 s**. Both readings were of the same
+pid, in the same run.
+
+**`os.path.isdir('/proc/<pid>')` is true for a ZOMBIE.** The daemon was a child of
+the harness; it exited on schedule, was never `wait()`ed, and its `/proc` entry
+therefore persisted for the whole watch. Caught by running the two instruments
+side by side:
+
+    t+95s   /proc/<pid> exists = True      Popen.poll() = 0   <- already exited
+    t+120s  /proc/<pid> exists = False     Popen.poll() = 0   <- poll() reaped it
+
+⇒ **`/proc/<pid>` existence answers "has this been reaped", not "is this
+running".** ⚠ And the fix is not to poll harder: **calling `poll()` is itself what
+reaped the zombie**, so the observer changed the thing observed.
+
+⭐⭐ **THIS IS THE ONE THAT NEARLY SHIPPED A FALSE DEFECT.** I reported "my
+counter-example is NOT dissolved" on the strength of that probe, against a
+correct explanation from another lane — **a wrong instrument overturning a right
+answer.** The rule that saved it is the campaign's oldest: **ask the subject what
+it did.** A daemon writes its own `idle_shutdown` event with a timestamp; that
+record beat my external probe, and it existed the whole time.
+⇒ **Prefer a subject's own lifecycle record over any external liveness probe**,
+and when a probe and a trace disagree, the trace is reporting a decision while
+the probe is reporting a kernel bookkeeping artefact.
+
+### ⚠ 6k-3. A correction owed the other way: the "never retires" error path is UNREACHABLE
+
+The build lane reported that `active_client_instance_records` returning **`Err`**
+makes `daemon_should_idle_shutdown` return `false`, so a daemon whose
+client-record read keeps failing would never retire.
+
+**The caller's arm exists, but the callee cannot reach it.**
+`active_client_instance_records_from_dir` ends every failure in
+`let Ok(entries) = entries else { return Ok(()) };`, and per-entry errors are
+dropped by `.flatten()`. It has no path that returns `Err`, so neither does its
+caller. ⇒ **that specific hazard cannot fire today.**
+
+⛔ **The live hazard is the INVERSE, and it is worth filing.** Because every read
+failure is swallowed as `Ok(empty)`, an unreadable client-instances directory —
+permissions, fd exhaustion, ENOMEM — reads as **"no clients"** and therefore
+*permits* retirement. The caller's `Err => return false` says plainly *if you
+cannot tell, do not retire*; the callee guarantees it can never say "I cannot
+tell". **Two halves of one decision disagree about what an unreadable directory
+means, and the careless half wins.**
 
 Ordered by cores returned per unit of risk. Each carries the number it should
 move and the falsifier that would show it did nothing.
