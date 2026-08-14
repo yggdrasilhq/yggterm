@@ -69,7 +69,16 @@ emit() {
     echo "=== yggterm usability check - host=$HOST $(date -Iseconds)"
     for n in ${NOTES+"${NOTES[@]}"}; do echo "  $n"; done
     if [ "$FAIL_LEVEL" -eq 0 ]; then
-      echo "PASS - all checked levels green"
+      # ⛔ "PASS" MUST NOT BE READ AS "THE TERMINAL RENDERS". When no session is
+      # open, levels 2 and 3 never saw a canvas, and the open render faults are
+      # untested rather than absent. Saying "all checked levels green" without
+      # this qualifier is how a green tick comes to stand for a surface nobody
+      # looked at.
+      if [ "${TERMINAL_EXERCISED:-unknown}" = "yes" ]; then
+        echo "PASS - all checked levels green"
+      else
+        echo "PASS - all checked levels green, but THE TERMINAL CANVAS WAS NOT EXERCISED (no session open): the render faults are untested this tick, not absent"
+      fi
     else
       echo "FAIL at level $FAIL_LEVEL: $FAIL_WHAT"
     fi
@@ -230,6 +239,36 @@ $SSH "mkdir -p ~/.yggterm/usability" >/dev/null 2>&1
 SHOT_JSON="$($SSH "~/.local/bin/yggterm server app screenshot ~/.yggterm/usability/shot.png" 2>/dev/null)"
 FAITHFUL="$(grep -o '"capture_faithful": *[a-z]*' <<<"$SHOT_JSON" | head -1 | grep -o '[a-z]*$')"
 note "L2/3 capture_faithful=${FAITHFUL:-unknown}"
+# ⛔⛔ `capture_faithful` DOES NOT MEAN "THE TERMINAL WAS CAPTURED".
+#
+# It means "this frame is an honest picture of what was on screen". With no
+# session open the GUI shows the start page, the capture falls back to a
+# compositor grab that never touches the xterm canvas, and it still reports
+# `capture_faithful: true`. Measured 2026-08-14 17:30:
+#   active_session_path = null
+#   capture_backend     = linux_wayland_spectacle
+#   capture_faithful    = true      <- on a frame with no terminal in it
+#
+# ⇒ Levels 2 and 3 exist to catch the three open RENDER faults, and all three
+#   live in the xterm canvas. So this check could go green on a frame where the
+#   canvas was never drawn — structurally blind to the only thing it is for.
+#   ⛔ Blind is not clear, for the third time in this file.
+BACKEND="$(grep -o '"capture_backend": *"[^"]*"' <<<"$SHOT_JSON" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+SESSION_PATH="$(grep -o '"active_session_path": *[^,}]*' <<<"$SHOT_JSON" | head -1 | sed 's/.*: *//')"
+# ⭐ THE BACKEND ALONE DECIDES, and deliberately so. Only the canvas-composite
+# backend draws the xterm surface, so its presence is sufficient evidence that
+# the canvas was exercised. `active_session_path` is carried as CONTEXT only —
+# gating on it as well would turn a field that is merely absent, rather than
+# null, into a false "not exercised" on a frame that genuinely did draw the
+# terminal. An instrument built to report blindness must not invent it.
+case "${BACKEND:-unknown}" in
+  xterm_canvas_composite*) TERMINAL_EXERCISED=yes ;;
+  *)                       TERMINAL_EXERCISED=no  ;;
+esac
+note "L2/3 terminal_exercised=$TERMINAL_EXERCISED backend=${BACKEND:-unknown} active_session_path=${SESSION_PATH:-absent}"
+if [ "$TERMINAL_EXERCISED" = "no" ]; then
+  note "L2/3 ⛔ THE CANVAS WAS NOT CAPTURED - the render faults are UNTESTED this tick, not absent. Open a session and re-run to exercise them."
+fi
 if [ "$FAITHFUL" != "true" ]; then
   fail 2 "screenshot is not faithful (capture_faithful=${FAITHFUL:-unknown}) - cannot verify the surface, so treat as broken"
 else
