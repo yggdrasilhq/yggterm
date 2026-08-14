@@ -42,25 +42,38 @@ FROM="target/release"
 #   short list that looks complete.
 HOSTS="dev $("$(dirname "$0")/ygg-live-host.sh" 2>/dev/null || true) oc"
 HOSTS="$(printf '%s\n' $HOSTS | awk 'NF && !seen[$0]++' | tr '\n' ' ')"
-if [ "$(printf '%s\n' $HOSTS | awk 'NF' | wc -l)" -lt 3 ]; then
-  echo "deploy-fleet: ⛔ could not resolve the live GUI host — ygg-live-host.sh gave nothing." >&2
-  echo "  Deploying to '$HOSTS' would SKIP the only host a UI change can be proven on." >&2
-  echo "  Pass --hosts explicitly if that is really what you want." >&2
-  exit 2
-fi
 DRY=0
 ALLOW_BEHIND=0
 PREFLIGHT=0
+HOSTS_EXPLICIT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from) FROM="$2"; shift 2;;
-    --hosts) HOSTS="$2"; shift 2;;
+    --hosts) HOSTS="$2"; HOSTS_EXPLICIT=1; shift 2;;
     --dry-run) DRY=1; shift;;
     --allow-behind) ALLOW_BEHIND=1; shift;;
     --preflight) PREFLIGHT=1; shift;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
+
+# ⛔ THIS REFUSAL USED TO RUN **BEFORE** ARGUMENT PARSING, so it exited on the
+# DEFAULT list and `--hosts` could never be read — while the refusal's own last
+# line told you to pass `--hosts`. **Advice the code made unreachable**, and it
+# is the same shape as a caution whose callee can never return the error it
+# guards: the words were right and nothing could act on them.
+# ⇒ Measured cost: `deploy_fleet_guard`'s two ancestry tests passed `--hosts local`,
+# were refused before it was parsed, and sat RED long enough to be filed as a
+# known-failing pair — a real gate whose tests nobody could read.
+# ⚠ The refusal itself is CORRECT and stays: resolving to fewer than three hosts
+# silently skips the only host a UI change can be proven on. It simply must not
+# fire when the caller has already answered the question.
+if [ "$HOSTS_EXPLICIT" = 0 ] && [ "$(printf '%s\n' $HOSTS | awk 'NF' | wc -l)" -lt 3 ]; then
+  echo "deploy-fleet: ⛔ could not resolve the live GUI host — ygg-live-host.sh gave nothing." >&2
+  echo "  Deploying to '$HOSTS' would SKIP the only host a UI change can be proven on." >&2
+  echo "  Pass --hosts explicitly if that is really what you want." >&2
+  exit 2
+fi
 
 # ⛔⛔ A DEPLOY FROM A PRE-REBASE TREE SILENTLY REVERTS ANOTHER CLUSTER'S FIX.
 # Measured 2026-08-13: `3.0.117`–`3.0.120` were each allocated TWICE within
