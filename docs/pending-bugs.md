@@ -12,6 +12,45 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔ [6.0] THE SUPERVISION WATCHER IS DEPLOYED BY WHICHEVER CHECKOUT IT HAPPENED TO START IN
+
+**Status:** OPEN
+
+*Found 2026-08-14 while shipping a fix to the booter and trying to prove it was live.*
+
+`.agents/skills/` is tracked in this repository, so **every worktree carries its own
+copy of `ygg-booter.py`** — and the long-running watcher runs whichever copy was
+present in the directory it was started from. Measured on one host: **five distinct
+md5s of that file across fourteen checkouts**, with the running watcher on a copy
+that was neither the newest nor on the default branch.
+
+⇒ **A fix can be committed, reviewed, merged and pushed, and the watcher will keep
+running the old code indefinitely.** Nothing reports the difference. `git log` says
+the fix shipped; the process disagrees, and the process is the one that types into
+rows.
+
+⚠ **This is the supervision tool, so the failure is self-concealing.** The instrument
+that would tell you the watcher is stale is the watcher, and it reports on the code
+it is running, not the code that exists.
+
+### What good looks like
+
+- **One owner for "which file does the watcher execute"**, the way every other
+  concept in this repo has a single source of truth.
+- A watcher that can **state its own build identity** — a hash it prints on request
+  — so a deploy can be proved by identity rather than assumed from a merge, which
+  `docs/deploy-spec.md` §0 already requires of every other component.
+- ⛔ **Restarting it must stay safe under a live hold.** The rate-limit hold is
+  persisted outside any checkout, so it survives a restart today; any redesign must
+  keep that property, and must not leave two watchers running — a duplicate doubles
+  every boot.
+
+### Falsifier
+
+Compare the md5 of the file the watcher process actually executes (resolve its cwd,
+then the relative path from its command line) against the file on the default
+branch. Equal on every host, or this is open.
+
 ## ⛔⛔⛔ [6.7] THE GUI SIGSEGVs IN THE GL COMPOSITING PATH, ~4x A DAY, AND NOTHING REPORTS IT
 
 **Status:** OPEN
