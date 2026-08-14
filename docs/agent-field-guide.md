@@ -21,6 +21,7 @@ Every entry below cost a session at least once.
 | `server status` | It pins to its own version's socket and can answer from — or spawn — an empty orphan daemon | `server app …` (PID-routed) |
 | `server status` → `terminal_session_count` **as "how many sessions are on this host"** | **Always during a handover, which is exactly when you are watching.** It counts what the ONE daemon you reached OWNS, and a handover changes which daemon that is: a fresh successor answers with a handful while the rest are still owned by, or preserved on, its predecessors. Measured 2026-08-14 — a watch on this field alerted `53 → 29` on a host that had just gained sessions (host-wide **57**, 261 rows, nothing lost). It fires the loudest false alarm precisely on the event it is meant to police | Sum the `OWNED` column of `server daemons` across every daemon, or read `ROWS` from the newest — both are host-wide. Never compare one daemon's count taken before a swap with another's taken after |
 | `server status --endpoint <pid>` → `terminal_session_keys` **as "which sessions this daemon OWNS"** | **Always, and it looks right because it is a superset.** It is `owned + preserved`, and on an old daemon the preserved half dominates: a 3.0.62 daemon answered 28 keys while owning **1** and preserving 27. Attributing a session to a daemon on this field credits the PTY to whichever daemon merely holds a bridge record — so "which daemon owned the row that died" comes out wrong, in the direction of blaming the oldest daemon present. Checked against `server daemons` on 14 daemons: `terminal_session_keys` == `OWNED + PRESV`, 14/14 | `owned_terminal_session_keys` / `owned_terminal_session_count`, which are separate fields in the same payload. `preserved_terminal_owner_keys` is the other half if you want it |
+| `ygg-privacy-guard scan --rev-range <R>` → `✅ no private data found` | **The range yielded no added lines.** The report is honest — it prints `0 added lines` in the same breath — but the ✅ is what gets read, and an empty range passes for the same reason a clean one does. Measured 2026-08-14 scanning a reflog-only range (`--all --reflog --not --all`, 3,094 commits) : green, over nothing. This is the third time a scan of an empty range has been quoted as a clean bill of health | **Read the `N added lines` figure before the verdict**; zero means the scan is vacuous, not clean. Give it a range that produces a diff (`<parent>..<commit>`), and confirm the count is non-zero — the tool's own §2 lesson is that *an absence must describe its own boundary*, so use the boundary it prints |
 | `server rows drafts` → `drafts_present: 0` **read as "nobody is mid-sentence, the bump is safe"** | **Any daemon on the host predates the field.** The sweep asks each daemon for `pending_input_drafts`; one that does not carry it answers nothing, and nothing is not none. Zero drafts over a host where zero daemons could answer is a report that **it did not look** — on its first live run that was 15 daemons and ~60 sessions, every one unasked. The whole verb exists because the previous instrument (`--refuse-if-draft`) required performing the write a draft forbids in order to learn whether a draft forbade it | Read **`verdict`**, never the count. `clear` is the only safe answer; `blind` means some daemon could not be asked and is NOT `clear`; `drafts_present` outranks both. Cross-check `can_answer` per daemon — all-false means the reading is vacuous |
 | `strings <binary> \| grep <a literal your change adds>` **used to prove your build is in** | The literal you picked is a `serde_json::json!` **KEY**. Measured 2026-08-14: a new `"target_source"` key read **0 occurrences** by raw byte search in a binary that unambiguously contained the line — while `"queue_file"` and `"process_memory"`, the two VALUES on that same line and unique to it in the whole tree, were both present and adjacent to the neighbouring key in rodata. Two forced rebuilds and an rlib hunt were spent on a false negative that nearly binned a correct build | Pick a literal that is unique to your change **and appears as a VALUE**, then confirm with `nm -C <binary> \| grep <your new fn>`. ⚠ The presence direction still works — this entry is about the ABSENCE direction being unsound |
 | `grep <event> ~/.yggterm/event-trace.*.jsonl` **as "what the live daemons did"** | **You have run `cargo test` on this host.** The test binaries write into the SAME trace directory as the daemons, so a corpus-wide count silently mixes fixtures with production. Measured 2026-08-14 while harvesting a proof: `live_session_persist_dropped` returned exactly 2 events over 2 distinct keys — *precisely the fixed behaviour* — and every one came from a test pid, with sibling events carrying fixture paths (`wedge-signal-probe`, `remote-session://dev/sized-restart`). Live daemons had emitted **none**, so the real reading was *vacuous*, not *fixed* | Filter by pid and confirm each pid is a daemon (`server daemons`), or bound the window to after the last test run. ⚠ A count that matches your hypothesis exactly is the case to check hardest |
@@ -990,6 +991,28 @@ it usable when two daemons' state files disagree about whether a row exists.
   screen. On a healthy session it collapses scrollback and can blank the
   viewport. Run it only on a surface already confirmed broken.
 - Never type into a live agent prompt to "test" it.
+- ⛔ **A GUI RELAUNCH IS NOT A DAEMON SWAP, AND ONLY ONE OF THEM COSTS ANYTHING.**
+  Text typed into a ROW is not in the GUI at all — it lives in a PTY the daemon
+  owns. Measured: type an unsent line into a row, kill the GUI process outright,
+  and the daemon still holds it with no GUI running; relaunch against the same
+  home and daemon and the text and the row are both back. **What re-resumes
+  sessions is a DAEMON SWAP**, and a swap taken alongside a relaunch is what
+  gets blamed on the relaunch. ⚠ The exception is a **yggterm-side** input — a
+  search box, an SSH field, a document buffer — which IS in the page and does not
+  survive. ⇒ Five owner-gated items once queued for days behind the untested
+  claim that a relaunch destroys a draft; it does not.
+  ⭐ Ask which is pending before either: **`server rows drafts`** (§1) answers
+  read-only, and its `blind` verdict is not `clear`.
+- ⛔ **`git reflog expire --expire=now --all` EMPTIES `git stash list`.** The stash
+  is reflog-backed, so a cleanup that only meant to drop unreachable history takes
+  the stash entries with it — and it is not announced. Measured 2026-08-14: a
+  guarded reap (refusing on a dirty tree, on unpushed commits, on a
+  non-fast-forward) ran on a repo whose stash held another session's WIP; `stash
+  list` read empty afterwards while the commit itself survived, unlisted, one
+  `gc --prune=now` from gone. ⇒ **Before any `reflog expire --all`, record
+  `git rev-parse refs/stash` and `git stash list`**, and treat a stash as work to
+  be preserved rather than as history to be pruned. Recovery, while the object
+  lives: `git stash store -m '<why>' <sha>`.
 - Restore the user's active session after any probe that had to switch away.
 - ⛔ **`yggterm <unknown-verb>` LAUNCHES THE APP. It does not print help.** Running
   `~/.yggterm/bin/yggterm update --help` to read a usage string instead started a
