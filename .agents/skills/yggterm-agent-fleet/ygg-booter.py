@@ -553,19 +553,41 @@ def never_arm():
     test is that the filter excludes it from METADATA ALONE**, which needs no
     write and is therefore both safe and cheap. If an arming path ever classifies
     one of these as armable, that path is wrong and nothing downstream ships.
+
+    ⛔⛔ **UNREADABLE IS NOT EMPTY, AND THIS LIST IS THE ONE WHERE THAT COSTS
+    MOST.** Until 2026-08-14 every read error here returned `{}` — so a list that
+    could not be read (permissions, a truncated write, fd exhaustion, ENOMEM)
+    reported *nobody is attended*, and the very next line of every caller is an
+    arming decision. The weaker ledger beside it already failed closed, so the
+    two halves of one decision disagreed about what unreadable meant and the
+    careless half owned the stronger list.
+
+    ⇒ **Absent stays a real answer** (`{}` — there is no list, and that is a fact
+    a caller may act on), **unreadable travels as `None`**, and so does a line
+    this parser cannot make sense of: a corrupted entry is one person's row
+    silently unprotected, which is indistinguishable from the entry never having
+    been written. Every caller must treat `None` as *refuse to act* — see
+    `tick()`, which is the only place that types.
     """
     out = {}
     try:
-        for line in NEVERARM.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("\t", 1)
-            out[parts[0].strip()] = (parts[1].strip() if len(parts) > 1 else "")
+        raw = NEVERARM.read_text()
     except FileNotFoundError:
         return {}
     except Exception:
-        return {}
+        return None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t", 1)
+        uuid = parts[0].strip()
+        # A first field that is not uuid-shaped means this file is not the file
+        # we think it is, or a write landed torn. Either way the screen cannot be
+        # trusted, and a half-trusted screen is the failure being fixed here.
+        if len(uuid) < 8 or any(c not in "0123456789abcdefABCDEF-" for c in uuid):
+            return None
+        out[uuid] = (parts[1].strip() if len(parts) > 1 else "")
     return out
 
 
@@ -663,6 +685,12 @@ def cmd_subscribe(args):
         log("   Not refused: a boot at a dead pid is useless, not dangerous. But")
         log("   if it really is a corpse this buys wasted wakes; check first.")
     blocked = never_arm()
+    if blocked is None:
+        log(f"⛔ REFUSING to arm {uuid[:8]} — {NEVERARM} is UNREADABLE.")
+        log("   That list is the only thing standing between this watchdog and")
+        log("   typing into a row a person is using, and an unreadable list is")
+        log("   not an empty one. Fix the file; there is deliberately no flag.")
+        return 4
     if uuid in blocked:
         log(f"⛔ REFUSING to arm {uuid[:8]} — {blocked[uuid] or 'human-attended row'}")
         log("   This watchdog TYPES INTO what it wakes. Arming a row a person is")
@@ -996,6 +1024,11 @@ def cmd_retire(args):
         log("   ⚠ A decision with no evidence is the thing this ledger replaces.")
         return 2
     blocked = never_arm()
+    if blocked is None:
+        log(f"⛔ REFUSING — {NEVERARM} is UNREADABLE, so I cannot tell whether a")
+        log("   person attends this row, and declaring someone's live row dead is")
+        log("   how it stops being watched by anything at all.")
+        return 4
     if uuid in blocked:
         log(f"⛔ REFUSING — {uuid[:8]} is on never-arm ({blocked[uuid]}).")
         log("   A row a person attends is not yours to declare dead.")
@@ -1017,6 +1050,131 @@ def cmd_retire(args):
         sub_path(uuid).unlink(missing_ok=True)
         log(f"  and dropped its subscription — a boot would have typed at a corpse")
     return 0
+
+
+def _drop_sub(uuid, why):
+    """Remove a booter subscription that a just-recorded decision contradicts."""
+    if not sub_path(uuid).exists():
+        return
+    sub_path(uuid).unlink(missing_ok=True)
+    log(f"  and dropped its booter subscription — {why}")
+
+
+def cmd_never_arm(args):
+    """⛔ RECORD THAT A PERSON ATTENDS THIS ROW. The answer is always no.
+
+    ⭐ **This verb exists because `coverage` names three decisions and the CLI
+    only offered instruments for two of them.** A triage session could
+    `subscribe` a delegate and `retire` a corpse, but the third — *a person types
+    here* — meant hand-appending to a TSV. So the decision that matters most was
+    the one the tool made hardest, and hand-assembling it two dozen times is how
+    a wrong uuid or a lost tab reaches the list that stops this watchdog typing
+    into someone's composer.
+
+    ⚠ Recording is deliberately one-way here: there is no `--remove`. Taking a
+    row OFF this list is a decision about a person's keyboard and it should cost
+    an explicit, deliberate edit of the file, not a flag someone reaches for
+    while tidying."""
+    uuid = (args.row or "").rstrip("/").split("/")[-1]
+    if not uuid:
+        log("never-arm needs --row <uuid>")
+        return 2
+    if not args.note:
+        log("⛔ never-arm needs --note: who attends this row, and how you know.")
+        log("   e.g. --note 'owner types here; first turn is a person, not a brief'")
+        return 2
+    blocked = never_arm()
+    if blocked is None:
+        log(f"⛔ {NEVERARM} is UNREADABLE — refusing to append to it.")
+        log("   Appending to a file this parser cannot make sense of would bury")
+        log("   the damage under a record that looks like protection.")
+        return 4
+    if uuid in blocked:
+        log(f"{uuid[:8]} is already on never-arm ({blocked[uuid] or 'no reason recorded'})")
+        _drop_sub(uuid, "an attended row must never carry one")
+        return 0
+    dead = retired_rows()
+    if dead and uuid in dead:
+        log(f"⚠ {uuid[:8]} was previously recorded DEAD ({dead[uuid]}).")
+        log("   Listing it as attended anyway — a corpse and a person are")
+        log("   different claims, and the attended one is the safe way to be wrong.")
+    note = args.note.strip().replace("\t", " ")
+    if args.decided_by:
+        note = f"{note} (recorded by {args.decided_by})"
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with NEVERARM.open("a") as fh:
+            fh.write(f"{uuid}\t{note}\n")
+    except Exception as exc:
+        log(f"⛔ could not record: {exc}")
+        return 1
+    back = never_arm()
+    if back is None:
+        log(f"⛔ READ-BACK FAILED — {NEVERARM} no longer parses after that write.")
+        return 1
+    log(f"recorded {uuid[:8]} as human-attended")
+    log(f"read-back: {'present' if uuid in back else '⛔ ABSENT — it did not land'}")
+    _drop_sub(uuid, "this watchdog types into what it wakes")
+    return 0 if uuid in back else 1
+
+
+def cmd_optout(args):
+    """Record that a row is not to be watched, WITHOUT claiming a person attends it.
+
+    The weaker of the two refusals, and the distinction is the point: never-arm
+    says *a person types here*; this says *this row has nothing to continue*.
+    A delegate that finished its work and is waiting on a decision belongs here —
+    arming it would resurrect a row that stopped on purpose, which is the
+    write-back-recreates-a-deletion shape this fleet has already paid for once.
+
+    ⚠ `ygg-claim.sh --no-booter` writes the same ledger from inside a row that is
+    standing itself down. This is the same record made from outside, which is the
+    only way it can be made ABOUT a row whose session will never run again."""
+    uuid = (args.row or "").rstrip("/").split("/")[-1]
+    if not uuid:
+        log("optout needs --row <uuid>")
+        return 2
+    if not args.note:
+        log("⛔ optout needs --note: why this row is not to be watched.")
+        log("   e.g. --note 'work complete, waiting on a decision; nothing to continue'")
+        return 2
+    if args.note.strip().startswith(REARM_MARK):
+        log(f"⛔ a reason may not begin with {REARM_MARK} — that prefix is how the")
+        log("   ledger records a RE-ARM, so such a line would read as the opposite")
+        log("   of what you meant.")
+        return 2
+    blocked = never_arm()
+    if blocked is None:
+        log(f"⛔ {NEVERARM} is UNREADABLE — refusing to record an opt-out while the")
+        log("   stronger list cannot be screened; the two are read together.")
+        return 4
+    if uuid in blocked:
+        log(f"{uuid[:8]} is already NEVER-ARM ({blocked[uuid]}), which is stronger.")
+        log("   Nothing recorded: an opt-out beneath a never-arm reads as though")
+        log("   the row could ask to be watched again, and it cannot.")
+        return 0
+    existing = disarmed_rows()
+    if existing is None:
+        log(f"⛔ {DISARMED_LEDGER} is UNREADABLE — refusing to append to it.")
+        return 4
+    note = args.note.strip().replace("\t", " ")
+    who = args.decided_by or own_uuid() or "shell"
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with DISARMED_LEDGER.open("a") as fh:
+            fh.write("%s\t%s\t%s\t%s\n" % (
+                time.strftime("%Y-%m-%dT%H:%M:%S%z"), uuid, who, note))
+    except Exception as exc:
+        log(f"⛔ could not record: {exc}")
+        return 1
+    back = disarmed_rows()
+    if back is None:
+        log(f"⛔ READ-BACK FAILED — {DISARMED_LEDGER} no longer parses after that write.")
+        return 1
+    log(f"recorded {uuid[:8]} as opted out of the booter")
+    log(f"read-back: {'present' if uuid in back else '⛔ ABSENT — it did not land'}")
+    _drop_sub(uuid, "a row that opted out must not carry one")
+    return 0 if uuid in back else 1
 
 
 def cmd_coverage(args):
@@ -1049,6 +1207,16 @@ def cmd_coverage(args):
     """
     subs = {s["uuid"]: s for s in load_subs()}
     blocked = never_arm()
+    if blocked is None:
+        # ⛔ Refusing to report, for the same reason the empty row listing below
+        #    refuses: this report's whole output is a to-arm list, and with the
+        #    attended list unreadable every attended row would appear in the
+        #    UNKNOWN bucket, whose printed remedy is `subscribe`. A report that
+        #    cannot screen is not a partial answer, it is a trap.
+        log(f"⛔ {NEVERARM} is UNREADABLE — refusing to report.")
+        log("   Attended rows would land in UNKNOWN, and UNKNOWN's remedy is to")
+        log("   arm. Fix the file, then ask again.")
+        return 2
     opted_out = disarmed_rows()
     ledger_readable = opted_out is not None
     opted_out = opted_out or {}
@@ -1322,6 +1490,20 @@ def tick(args):
     #    subscription; it can no longer cause anyone to be typed over, and the
     #    bad record is purged on sight rather than left to be re-found.
     blocked = never_arm()
+    if blocked is None:
+        # ⛔⛔ THE TICK IS THE ONLY THING THAT TYPES, SO IT IS WHERE A BLIND
+        #    SCREEN MUST STOP. Booting with the attended list unreadable is the
+        #    fail-open move in the place it does the damage: this tick's remedy
+        #    is to write into somebody's composer. A watchdog that cannot see
+        #    who it must never wake does not get to wake anyone.
+        #    ⚠ Yes, an unreadable list therefore disables the booter until it is
+        #    fixed. That is the safe direction, and it is not silent: the watch
+        #    loop keeps heartbeating and this refusal is logged on every tick,
+        #    so the outage is visible in the same place a boot would have been.
+        log(f"⛔ {NEVERARM} is UNREADABLE — BOOTING NOTHING this tick.")
+        log("   An unreadable attended-row list is not an empty one, and the")
+        log("   remedy this tick would apply is typing into a live person.")
+        return 0
     if blocked:
         for s in list(subs):
             if s["uuid"] in blocked:
@@ -1661,7 +1843,8 @@ def main():
     ap = argparse.ArgumentParser(description="boot a stalled session that subscribed")
     ap.add_argument("action",
                     choices=["subscribe", "unsubscribe", "defer", "list", "tick",
-                             "watch", "status", "disarm", "arm", "coverage", "retire"])
+                             "watch", "status", "disarm", "arm", "coverage", "retire",
+                             "never-arm", "optout"])
     ap.add_argument("--secs", type=int, default=0,
                     help=f"defer: boot window for one long wait, clamped to "
                          f"{MIN_BOOT_AFTER_SECS}-{MAX_BOOT_AFTER_SECS}s "
@@ -1674,7 +1857,7 @@ def main():
     ap.add_argument("--evidence", default="",
                     help="retire: what makes you say this row is dead")
     ap.add_argument("--decided-by", default="",
-                    help="retire: who decided (a seat number or name)")
+                    help="retire/never-arm/optout: who decided (a seat number or name)")
     ap.add_argument("--verbose", action="store_true",
                     help="coverage: list every bucket, not only UNKNOWN")
     ap.add_argument("--rearm", default="",
@@ -1710,7 +1893,14 @@ def main():
                          "and a transcript read per subscriber, so it is opt-in")
     args = ap.parse_args()
     # ⛔ Never carry a placeholder host into a boot decision.
-    args.host = resolve_gui_host(args.host)
+    # ⭐ But a LEDGER WRITE IS NOT A BOOT DECISION, and making it wait on the GUI
+    #    host is how recording a decision fails on a host that cannot reach the
+    #    desktop — which is precisely the moment someone gives up and edits the
+    #    file by hand. These verbs touch only local state, so they never ask.
+    if args.action in ("never-arm", "optout", "retire", "arm", "disarm"):
+        args.host = args.host or this_host()
+    else:
+        args.host = resolve_gui_host(args.host)
     return {
         "subscribe": cmd_subscribe,
         "unsubscribe": cmd_unsubscribe,
@@ -1721,6 +1911,8 @@ def main():
         "status": cmd_status,
         "coverage": cmd_coverage,
         "retire": cmd_retire,
+        "never-arm": cmd_never_arm,
+        "optout": cmd_optout,
         "disarm": cmd_disarm,
         "arm": cmd_arm,
     }[args.action](args)
