@@ -855,8 +855,9 @@ struct ClientHandlerWindow {
     cpu_us_max: u64,
     wall_us_total: u64,
     wall_us_max: u64,
-    user_ticks: u64,
-    kernel_ticks: u64,
+    user_us: u64,
+    kernel_us: u64,
+    split_samples: u64,
 }
 
 static CLIENT_HANDLER_WINDOW: LazyLock<Mutex<ClientHandlerWindow>> =
@@ -871,22 +872,40 @@ static CLIENT_HANDLER_WINDOW: LazyLock<Mutex<ClientHandlerWindow>> =
 static TRACE_HOME_DIR: LazyLock<Option<PathBuf>> =
     LazyLock::new(|| yggterm_core::resolve_yggterm_home().ok());
 
-/// This thread's user and kernel time, in `CLK_TCK` ticks.
+/// This thread's user and kernel time, in **microseconds**.
 ///
-/// ⚠ `comm` is parenthesised and may itself contain spaces and parens, so the
-/// fields are taken after the LAST `)` — after which the next token is field 3
-/// (state), putting `utime` at offset 11 and `stime` at 12.
-fn thread_cpu_split_ticks() -> Option<(u64, u64)> {
-    let raw = std::fs::read_to_string("/proc/thread-self/stat").ok()?;
-    let rest = raw.rsplit_once(')')?.1;
-    let fields = rest.split_whitespace().collect::<Vec<_>>();
-    let utime = fields.get(11)?.parse().ok()?;
-    let stime = fields.get(12)?.parse().ok()?;
-    Some((utime, stime))
+/// ⛔ **The obvious source is `/proc/thread-self/stat` fields 14/15, and it
+/// reports zero here — I shipped that version and it did.** Those fields are in
+/// `CLK_TCK` units, 10 ms on this host, and **every** connection handler is
+/// shorter than one tick, so each read truncated to 0. ⚠ The reasoning that
+/// justified it — *"summed across a window, hundreds of handlers make it
+/// meaningful"* — is wrong, and wrong in a way worth naming: **truncation is
+/// applied to each sample before the sum, so it does not average out. A sum of
+/// floors is not the floor of a sum.** The first live run read
+/// `ticks=0, kernel_share=n/a` across ~26,500 handlers carrying ~2.5 s of CPU.
+///
+/// `getrusage(RUSAGE_THREAD)` answers the same question at **microsecond**
+/// resolution, per thread, with the user/kernel split intact — which is the
+/// whole point, since the claim under test is that this path is ~94% kernel.
+#[cfg(target_os = "linux")]
+fn thread_cpu_split_micros() -> Option<(u64, u64)> {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is a valid, zeroed `rusage` we own; `RUSAGE_THREAD` is a
+    // compile-time constant.
+    if unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) } != 0 {
+        return None;
+    }
+    let to_us = |t: libc::timeval| (t.tv_sec as u64) * 1_000_000 + (t.tv_usec as u64);
+    Some((to_us(usage.ru_utime), to_us(usage.ru_stime)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_cpu_split_micros() -> Option<(u64, u64)> {
+    None
 }
 
 fn record_client_handler_cost(cpu_us: u64, wall_us: u64) {
-    let (user_ticks, kernel_ticks) = thread_cpu_split_ticks().unwrap_or((0, 0));
+    let split = thread_cpu_split_micros();
     let proc_cpu_us = process_cpu_micros();
     let now = std::time::Instant::now();
     let flush = {
@@ -902,8 +921,11 @@ fn record_client_handler_cost(cpu_us: u64, wall_us: u64) {
         window.cpu_us_max = window.cpu_us_max.max(cpu_us);
         window.wall_us_total += wall_us;
         window.wall_us_max = window.wall_us_max.max(wall_us);
-        window.user_ticks += user_ticks;
-        window.kernel_ticks += kernel_ticks;
+        if let Some((user_us, kernel_us)) = split {
+            window.user_us += user_us;
+            window.kernel_us += kernel_us;
+            window.split_samples += 1;
+        }
         let elapsed = now.duration_since(window.opened.unwrap_or(now));
         if elapsed < CLIENT_HANDLER_FLUSH_INTERVAL {
             None
@@ -924,7 +946,7 @@ fn record_client_handler_cost(cpu_us: u64, wall_us: u64) {
     let Some(home) = TRACE_HOME_DIR.as_ref() else {
         return;
     };
-    let ticks = emitted.user_ticks + emitted.kernel_ticks;
+    let split_total = emitted.user_us + emitted.kernel_us;
     append_trace_event(
         home,
         "daemon",
@@ -938,14 +960,17 @@ fn record_client_handler_cost(cpu_us: u64, wall_us: u64) {
             "cpu_us_max": emitted.cpu_us_max,
             "wall_us_mean": emitted.wall_us_total / emitted.handled.max(1),
             "wall_us_max": emitted.wall_us_max,
-            // ⚠ A WINDOW share, never a per-handler one — the underlying field
-            // is 10 ms-granular and a single short handler reads zero.
-            "kernel_share": if ticks == 0 {
+            // ⚠ Reported as a WINDOW share. Per handler it would be a ratio of
+            // two microsecond figures on a sub-millisecond span, which is a
+            // precision this does not have.
+            "kernel_share": if split_total == 0 {
                 serde_json::Value::Null
             } else {
-                serde_json::json!(emitted.kernel_ticks as f64 / ticks as f64)
+                serde_json::json!(emitted.kernel_us as f64 / split_total as f64)
             },
-            "cpu_ticks_sampled": ticks,
+            "kernel_us_total": emitted.kernel_us,
+            "user_us_total": emitted.user_us,
+            "split_samples": emitted.split_samples,
             "proc_cpu_us_delta": proc_cpu_us_delta,
             "handlers_per_s": emitted.handled as f64 * 1000.0 / elapsed.as_millis().max(1) as f64,
         }),
