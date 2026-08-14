@@ -3424,9 +3424,26 @@ fn memory_scope_command_args(
 fn enter_memory_scope_if_requested() {
     use std::os::unix::process::CommandExt;
 
-    if !matches!(
+    // ⛔ DEFAULT ON. This shipped opt-in and therefore bounded nothing.
+    //
+    // The leak it exists to cap is real, monotonic and measured on every single
+    // web process: 8 of 8 sampled over 24 h started at ~260 MB and climbed
+    // without plateau, one reaching **1,504 MB in 12.4 h**. Meanwhile the
+    // owner's laptop sat at 11 GB of 15 GB swap and he reported the machine
+    // burning. The GUI was in the plain login-session scope with
+    // `memory.high = max`, `memory.swap.max = max` — no bound of any kind —
+    // because this function returned on its first line.
+    //
+    // ⚠ A remedy that is switched off is not a remedy, and this one had already
+    // been designed, derived, tested and documented. The only thing missing was
+    // anyone getting it.
+    //
+    // Opting OUT is still one variable, and every failure path below already
+    // falls through to a normal start, which is what makes defaulting this on
+    // safe: no systemd, no user manager or a refused property costs nothing.
+    if matches!(
         std::env::var(ENV_YGGTERM_MEMORY_SCOPE).ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
+        Some("0") | Some("false") | Some("no")
     ) {
         return;
     }
@@ -4617,7 +4634,7 @@ mod tests {
     /// start*, and neither an absent opt-in nor a failed `systemd-run` may ever
     /// produce it.
     #[test]
-    fn the_memory_scope_is_opt_in_and_a_failure_to_enter_it_still_starts_the_gui() {
+    fn the_memory_scope_is_default_on_and_a_failure_to_enter_it_still_starts_the_gui() {
         let source = include_str!("main.rs");
         let start = source
             .find("fn enter_memory_scope_if_requested() {")
@@ -4629,10 +4646,27 @@ mod tests {
             .unwrap_or(body.len());
         let body = &body[..end];
 
+        // ⛔ DEFAULT ON, opt-OUT only. This assertion used to require the
+        // opposite — and it kept passing when the default was flipped, because
+        // it only checked that the variable and a `return` both appeared
+        // somewhere in the body. A test that passes under both behaviours
+        // asserts neither; its NAME was the only thing that still claimed the
+        // old contract, which is worse than having no test, because the name is
+        // what a reader trusts.
+        //
+        // The bound this gates was measured off: the owner's laptop ran at
+        // 11 GB of 15 GB swap with `memory.high = max`, while every sampled web
+        // process climbed monotonically past 1.5 GB. A remedy that ships
+        // switched off is not a remedy.
         assert!(
-            body.contains("ENV_YGGTERM_MEMORY_SCOPE") && body.contains("return;"),
-            "the scope must be opt-in: with the variable unset the function has \
-             to return before touching the launch"
+            body.contains("Some(\"0\") | Some(\"false\") | Some(\"no\")"),
+            "the scope must be DEFAULT ON: the early return has to fire only on \
+             an explicit opt-OUT, never on an unset variable"
+        );
+        assert!(
+            !body.contains("Some(\"1\") | Some(\"true\") | Some(\"yes\")"),
+            "an opt-IN gate would leave the leak unbounded for everyone who \
+             never sets the variable, which is everyone"
         );
         assert!(
             body.contains("ENV_YGGTERM_MEMORY_SCOPE_ACTIVE"),

@@ -12,6 +12,48 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔⛔ [6.7] A CLI PROVISIONER LEAKS 78 MB OF **RAM** PER AUTO-UPDATE, INTO tmpfs
+
+**Status:** OPEN — the leak is in a package we do not own; our half is shipped
+
+*Owner-reported 2026-08-14 as memory pressure; measured on the desktop host*
+
+`/tmp` on the desktop host is a **tmpfs**, so anything written there is RAM. The
+managed CLI `codex-litellm` stages its release download with
+`fs.mkdtempSync(path.join(os.tmpdir(), 'codex-litellm-'))` and **never removes
+the directory** — its installer cleans the destination and not the staging area.
+
+Each leak is one 78 MB tarball plus its checksum. Measured:
+
+| | |
+|---|---|
+| leaked staging dirs | **51** |
+| total | **2.85 GB** |
+| oldest | 2026-08-02 (12 days) |
+| held open by any process | **none** |
+
+⇒ **2.85 GB of a 14 GB laptop's RAM, held by nothing, while the machine sat at
+11 GB of 15 GB swap.** Reclaimed in-session; it returns on the next auto-update,
+and the owner's own ruling is that yggterm auto-updates every CLI on every host.
+
+**Ours, and shipped:** `install_npm_batch` now sets `TMPDIR`/`npm_config_tmp` to
+a disk-backed `~/.yggterm/cli-staging`, and sweeps that directory **before** each
+install rather than after — the leak belongs to a script that may fail or be
+killed, so a sweep on the happy path would miss exactly the runs that leak.
+
+⚠ **This does not fix the leak, it relocates it off RAM.** The package still
+needs its own `rmSync(tmpDir)`, which is a change in `@avikalpa/codex-litellm`,
+not here. Until then the sweep is what bounds it.
+
+⭐ **The general rule, because `/tmp` is not free anywhere on this fleet:** a
+tmpfs is RAM wearing a filesystem's clothes. Never stage a large download, a
+screenshot loop, or any recurring artefact there. `scripts/usability-check.sh`
+was doing it too — writing a screenshot into `/tmp` on that host every hour —
+and now writes under `~/.yggterm/usability`.
+
+**Falsifier:** if `/tmp` on that host is ever NOT a tmpfs, the RAM half of this
+entry is void and only the unbounded-growth half stands.
+
 ## ⛔⛔⛔ [6.7] THE TERMINAL PAINTS THE WRONG GLYPH FOR EVERY CHARACTER
 
 **Status:** OPEN

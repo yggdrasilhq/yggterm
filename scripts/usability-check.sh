@@ -7,12 +7,12 @@
 # and the check STOPS at the first failure, because a ranked list of six is how
 # the load-bearing item gets buried.
 #
-# ⛔ It never touches a human's session. Levels 1-3 and 6 are pure reads. Levels
-#    4-5 need a probe row and are therefore opt-in behind --deep.
+# ⛔ It never touches a human's session, and it never writes to a tmpfs. Level 4
+#    creates its OWN ephemeral probe row with --no-activate, so the owner's
+#    viewport never moves, and removes it with a read-back.
 #
 # Usage:
-#   scripts/usability-check.sh            # levels 1,2,3,6 - safe, non-invasive
-#   scripts/usability-check.sh --deep     # also 4,5 - creates an ephemeral probe row
+#   scripts/usability-check.sh            # levels 1, 1b, 1c, 2, 3, 4, 6
 #   scripts/usability-check.sh --json     # one JSON object, for the relay/booter
 #
 # Exit code == the number of the first failing level, 0 if all pass.
@@ -205,13 +205,17 @@ fi
 # BOTH SIDEBARS RENDER, and THE VIEWPORT IS FAITHFUL. A visual symptom needs a
 # faithful pixel: capture_faithful=false means the frame is a lie about the
 # terminal, and telemetry has never once settled a rendering question here.
-SHOT_JSON="$($SSH "~/.local/bin/yggterm server app screenshot /tmp/ygg-usability.png" 2>/dev/null)"
+# ⛔ NOT /tmp. On the desktop host /tmp is a tmpfs, so every hourly screenshot
+#    would be written into RAM on a machine already under memory pressure. A
+#    check that costs the user memory to run is not a health check.
+$SSH "mkdir -p ~/.yggterm/usability" >/dev/null 2>&1
+SHOT_JSON="$($SSH "~/.local/bin/yggterm server app screenshot ~/.yggterm/usability/shot.png" 2>/dev/null)"
 FAITHFUL="$(grep -o '"capture_faithful": *[a-z]*' <<<"$SHOT_JSON" | head -1 | grep -o '[a-z]*$')"
 note "L2/3 capture_faithful=${FAITHFUL:-unknown}"
 if [ "$FAITHFUL" != "true" ]; then
   fail 2 "screenshot is not faithful (capture_faithful=${FAITHFUL:-unknown}) - cannot verify the surface, so treat as broken"
 else
-  scp -q "$HOST:/tmp/ygg-usability.png" "$WORKDIR/shot.png" 2>/dev/null
+  scp -q "$HOST:.yggterm/usability/shot.png" "$WORKDIR/shot.png" 2>/dev/null
   if [ -s "$WORKDIR/shot.png" ]; then
     note "L2/3 screenshot=$WORKDIR/shot.png (READ IT - levels 2 and 3 are an EYE check, not a field check)"
     cp "$WORKDIR/shot.png" "${TMPDIR:-/tmp}/ygg-usability-latest.png" 2>/dev/null
