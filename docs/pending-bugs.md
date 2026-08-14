@@ -649,7 +649,19 @@ that 95%. ⭐ **The row term is now settled three ways at ~4.5 µs/row** (a caus
 seeded arm, an IPW re-fit of field data, and the optimisation lane's own arm), so
 rows are ~1.2 ms of a 25 ms thread.
 
-✅ **THE SESSIONS ARM IS RUN (§6j-7) AND THE BURSTY TERM IS NAMED: one PTY READER
+⛔⛔ **THE LEDGER INVERTED 2026-08-14 (§6j-9) — READ THIS FIRST.** Daemon cost is
+**N_reachable x a ~0.2-core floor**, not session work. Per daemon, legacy and
+current are **indistinguishable (0.94–1.05x)**; the legacy population costs
+2.6–3.3 cores because there are **14 of them**, and the owner's subtree
+measurement shows their subtrees are **idle**. ⇒ **"The population is expensive
+because it is BUSY" and "the drain moves work rather than removing it" are BOTH
+WITHDRAWN — the drain genuinely reclaims ~2.6–3.3 cores.** ⭐ **S1's original
+−2.60 is vindicated by an independent route and now has a mechanism.**
+⛔ My reader-thread headline came from a sandbox where I flooded ptys with `yes`:
+**that is the ceiling, not the operating point.** In quiet live data the handler
+term is 57–75% and readers are the remainder.
+
+✅ **THE SESSIONS ARM IS RUN (§6j-7) AND THE PER-SESSION TERM IS NAMED: one PTY READER
 THREAD PER SESSION**, cost proportional to that session's OUTPUT VOLUME. On a
 sandbox with 4 flooding sessions the long-lived threads hold **3.364 of 3.449
 cores (97.5%)**, and the top four are **0.838/0.837/0.836/0.836 — exactly one per
