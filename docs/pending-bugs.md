@@ -788,6 +788,43 @@ not from the existing helpers.
 ⇒ **Order of work:** (1) read the disarm ledger, (2) agent-row filter with a proven negative case
 against a human row, (3) enumerate-and-arm on `list`/`tick`/`status`, (4) run the falsifier above.
 
+### ⛔⛔⛔ STEP (2) IS NOT IMPLEMENTABLE AS SPECIFIED — MEASURED 2026-08-14, AND IT STOPS THE DESIGN
+
+The proven negative case was run, and **the filter fails it.** `server app rows`
+was pulled on the GUI host (378 rows) and the human-attended row was compared
+field-by-field against a delegate agent row. Every one of the 31 fields is
+either identical, free text, identity, or transient:
+
+| identical on both | `kind` (`Session`) · **`icon_kind` (`claude-code`)** · `presence` · `live_member` · `live_keep_alive` · `remote_deploy_state` · `depth` · `child_count` · `document_kind` · `group_kind` · `draggable` · `machine_*` · `host_label` |
+|---|---|
+| differ, but useless | `busy`/`busy_reason` (**transient** — the human row was merely idle at that second) · `hidden_by_collapsed_set` (a UI folding state) · `outline_prefix` (a seat number an agent types itself) · `label`/`session_title`/`session_cwd`/`session_id`/`path` (identity and free text) |
+
+⇒ **There is no field that says "a person types here."** The owner's copilot row
+and an unattended delegate are the same `kind`, the same `icon_kind`, the same
+tenancy, the same everything a machine can see. The entry above guessed the
+discriminator would be "kind, tenancy provenance" in the raw JSON; **it is not
+there.**
+
+⛔ **So `never-arm.tsv` is not a backstop UNDER the filter — it IS the filter**,
+and that makes enumerate-and-arm **fail-open**: any human-attended row nobody
+has hand-listed yet gets armed, and the remedy for being armed is being typed
+over. `never_arm()`'s own docstring already rules on this — *"if an arming path
+ever classifies one of these as armable, that path is wrong and nothing
+downstream ships"* — and a metadata enumerator classifies every unlisted human
+row as armable by construction.
+
+⇒ **Invert it: arm from a POSITIVE ATTESTATION, never from enumeration minus a
+deny-list.** Something has to record "this row is an unattended delegate" at the
+moment such a row is created, by the thing that knows — the spawner. Enumeration
+then still satisfies the owner's *armed by the act of EXISTING* ruling, because
+it sweeps for **attested rows whose subscribe never landed** (the real gap the
+entry opened with) instead of inventing agenthood for everything it can see.
+A row with no attestation is left alone, which is the safe direction to fail.
+
+⚠ **Do not "fix" this by widening the deny-list.** The safety it replaced was an
+accident of omission; a hand-maintained list that must be COMPLETE before an
+automatic sweep runs is the same accident with more steps.
+
 ## ⚠ `terminal submit`'s "no agent composer row appeared" HAS TWO OPPOSITE CAUSES AND ONE MESSAGE
 
 **Status:** OPEN
