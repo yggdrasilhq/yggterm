@@ -131,42 +131,6 @@ from inside in three pieces (parent accept+spawn 44–48 µs · child pre-closur
 measurement; schedule S4 on stability and observability, NEVER on cores**
 (<0.001 cores/daemon).
 
-## ⛔ ONE DIRECTORY, TWO READERS, AND ONLY ONE WAS TOLD ABOUT THE STAGING DIR
-
-**Status:** OPEN
-
-*Found 2026-08-14 by the sidebar lane, which could not run a single app-control
-verb against a freshly created GUI until it deleted a directory by hand.*
-
-`client-instances/<scope>/` holds one JSON record per attached client, published
-by an atomic write that stages into a `tmp/` subdirectory of that same folder.
-**Two functions enumerate that directory and they disagree about what a
-non-file entry means:**
-
-| reader | on a directory entry |
-|---|---|
-| `cleanup_stale_client_instances` (yggterm-shell) | skips it — *"the atomic-write staging dir (and anything else that is not a plain file) is never a record"*, with a test that pins it |
-| `collect_client_instance_records` (yggterm-server) | `fs::read` returns **EISDIR (os error 21)**, which is neither `NotFound` nor a parse failure, so it **propagates and fails the whole enumeration** |
-
-**Reproduced twice, on two independently created sandbox homes at 3.0.154.**
-Every `server app` verb died with `reading client instance record …/tmp: Is a
-directory`, and `rmdir` on that one empty directory made them all work.
-
-⛔ **The consequence is larger than a failed verb, and it is the drain's.** The
-comment directly above that read explains that an error there is deliberately
-NOT treated as "no clients": `daemon_should_idle_shutdown` reads an error as *"I
-could not ask, so do not retire."* ⇒ **a daemon whose staging directory exists at
-the sampling moment can never retire**, and that gate is the one the constitution
-rests the drain on.
-
-**Fix:** the one-line `entry.file_type()` skip the other reader already has. ⚠
-Two readers of one directory is the second encoding; the durable fix is one
-traversal both call, since this is exactly the shape where a rule learned on one
-side does not reach the other.
-
-**Falsifier:** create `client-instances/<scope>/tmp/` on a live home and run any
-`server app` verb.
-
 ## ⛔ A LOCAL LAUNCH INTO A DIRECTORY THAT DOES NOT EXIST LEAVES A KEEP-ALIVE HUSK
 
 **Status:** OPEN
@@ -253,75 +217,6 @@ being audited rather than merely edited.
 
 **Falsifier:** the identifiers are absent from `git log -p` over all refs, and the
 forge returns 404 for the pre-removal blob URLs.
-
-## ⛔ [6.9→6.1] AN UNREADABLE CLIENT-RECORD DIRECTORY READS AS "NO CLIENTS" AND PERMITS RETIREMENT
-
-**Status:** OPEN
-
-*source reading, and the withdrawal of the anomaly that led here, in
-[`idle-cost-model.md`](idle-cost-model.md) §6k-1..§6k-3*
-
-`daemon_should_idle_shutdown` (`daemon.rs:11537`) is careful: if
-`active_client_instance_records` returns `Err` it returns `false` — *if you
-cannot tell whether clients exist, do not retire.*
-
-**The callee guarantees that arm never fires.**
-`active_client_instance_records_from_dir` (`lib.rs:20737`) ends every failure in
-`let Ok(entries) = entries else { return Ok(()) };`, and drops per-entry errors
-with `.flatten()`. It has no `Err` path, so neither does its caller.
-
-⇒ An unreadable client-instances directory — permissions, fd exhaustion, ENOMEM —
-is reported as **an empty set of clients**, which satisfies gate 3 and **permits
-retirement while a client may be connected**. Two halves of one decision disagree
-about what an unreadable directory means and the careless half wins.
-
-⚠ **This is the INVERSE of the "a failing read means it never retires" reading.**
-That one cannot happen today; this one can. Both come from the same `Result` being
-vestigial.
-
-### ⛔⛔ AND ONCE THE FIX LANDED, THE INVERSE BECAME REACHABLE — AND IT DID FIRE
-
-**2026-08-14, routed from the sidebar lane.** Making the error travel is right,
-and it turns any PERMANENT read failure into a permanent refusal to retire. There
-was one: `<scope>/tmp` is the atomic-write staging directory, sitting among the
-records. The shell's cleanup pass skipped non-files; this reader did not, so
-`fs::read` hit a directory, got **`EISDIR`**, and the whole enumeration failed —
-measured killing every `server app` verb on two fresh homes until the directory
-was removed by hand. ⇒ **A daemon whose staging dir existed at sampling time
-could never retire**: not a wrong answer once, a silent permanent block on the
-drain's own gate, which is precisely the non-converging gate the constitution
-forbids.
-
-✅ **Fixed with the durable form rather than the one-line skip:** a single
-`client_instance_record_paths` traversal that both crates call, because a second
-encoding of *how do I enumerate this directory* is what let the two drift while
-each looked correct alone. It skips only what it can PROVE is not a file — an
-entry whose `file_type()` is unreadable is kept, so the caller's fail-closed
-semantics still decide. Falsified: removing the skip reproduces
-`Is a directory (os error 21)` in the new test.
-
-⭐ **The shape, third instance this week and worth the name:** one function
-handles a case and its sibling does not — an unreachable owner pruned by one and
-skipped by the other, an identifier compared by the reporter but not the router,
-and now a directory skipped by the cleaner and read by the reader. **The cost is
-never in the function you are looking at.**
-
-**Fix:** let the callee distinguish *absent* (legitimately no clients ⇒ `Ok`) from
-*unreadable* (⇒ `Err`), so the caller's existing caution becomes reachable.
-
-⛔ **NOT A DEFECT, CLOSED: "a daemon with all three retire gates open did not
-retire".** I filed that and it was wrong twice over. `client_instance_dirs_for_scan`
-scans **every** directory under the client-instances root, so a record filed under
-another endpoint version is still in scope; and `daemon_is_superseded` needs a
-**live** newer daemon, which that home did not have. Records non-empty and not
-superseded ⇒ gate 3 correctly returns `false` indefinitely. Demonstrated: a daemon
-with no record retires at **+90.2 s**, one with a record naming a live process was
-still running at **+204.8 s**.
-⛔⛔ **And the probe that manufactured it: `/proc/<pid>` existence is TRUE FOR A
-ZOMBIE.** The harness called a daemon "still alive at 200 s" that its own trace
-shows retiring at +90.2 s. `/proc/<pid>` answers *has this been reaped*, not *is
-this running* — and calling `poll()` to check is itself what reaps it. **Prefer
-the subject's own lifecycle record over any external liveness probe.**
 
 ## ⛔⛔⛔ [6.9→6.7] EVERY PEER `status` POLL REBUILDS THE WHOLE ROW INVENTORY
 
