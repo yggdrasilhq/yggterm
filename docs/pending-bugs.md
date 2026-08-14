@@ -495,9 +495,14 @@ WORKING AGENT.** A 10-second parent-rate sample gave a clean 5x separation on tw
 rows and would still have been wrong here: an agent running `cargo test` sits
 near the idle rate **while its child burns the CPU**. ⇒ The parent rate is
 structurally blind to exactly the case that matters. **Measure the children —
-`pgrep -P <pid>` — and watch whether they CYCLE.** Children that come and go are
-an agent advancing; one child pinned for a long time is a wedged call; no
-children plus a quiet parent is the only reading that means residue.
+`pgrep -P <pid>` — and watch whether they CYCLE ACROSS MANY READS.** Children
+that come and go are an agent advancing; one child pinned for a long time is a
+wedged call.
+
+⛔ **THIS SENTENCE USED TO END "…and no children plus a quiet parent is the only
+reading that means residue." That was wrong and it is corrected here rather than
+deleted, because it is the shape the correction below had to break.** A childless
+read is not a residue signature at all — see the control immediately following.
 
 ⛔⛔ **AND A CHILDLESS SAMPLE IS NOT RESIDUE — THE GAPS BETWEEN TOOL CALLS ARE
 CHILDLESS BY CONSTRUCTION.** Caught on the live pair at 19:22: two consecutive
