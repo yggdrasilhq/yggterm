@@ -83,6 +83,7 @@ it are one call — a two-step arm is a step somebody skips.
 Exit: 0 nothing to do · 3 something was booted · 4 a human is needed.
 """
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -1105,6 +1106,10 @@ def cmd_subscribe(args):
         "kind": getattr(args, "kind", None)
         or ("task" if uuid == own_uuid() else "monitor"),
         "boots": 0,
+        # Consecutive ticks refused because WE could not read the screen. Kept
+        # apart from `boots` because it counts a failure of our instrument, not
+        # an observation about the row -- see the escalation in the tick loop.
+        "blind_skips": 0,
         "last_size": 0,
         "escalated": False,
     }
@@ -1752,14 +1757,22 @@ def cmd_list(args):
     return 0
 
 
-def _run(host, argv, stdin_text):
-    """Run a yggterm CLI verb with text on stdin, wherever the row lives."""
+def _run(host, argv, stdin_text, remote_binary=None):
+    """Run a yggterm CLI verb with text on stdin, wherever the row lives.
+
+    ⚠ The two binaries do NOT expose the same verbs. Locally this drives the
+    HEADLESS binary; remotely it drives the GUI one, because that is the one
+    that can reach the display plane. A verb that only the headless binary
+    serves must say so with `remote_binary`, or it answers "unsupported"
+    over ssh while working perfectly on this host — which is indistinguishable
+    from the verb being missing everywhere."""
     if host == this_host():
         cmd = [str(Path.home() / ".local" / "bin" / "yggterm-headless"), *argv]
         return subprocess.run(cmd, input=stdin_text, capture_output=True,
                               text=True, timeout=180)
     joined = " ".join(f"'{a}'" for a in argv)
-    return subprocess.run(["ssh", host, f"$HOME/.yggterm/bin/yggterm {joined}"],
+    binary = remote_binary or "$HOME/.yggterm/bin/yggterm"
+    return subprocess.run(["ssh", host, f"{binary} {joined}"],
                           input=stdin_text, capture_output=True, text=True, timeout=180)
 
 
@@ -1843,6 +1856,63 @@ CHOICE_PROMPT_MARKERS = (
 )
 
 
+_CSI = re.compile(r"\x1b\[([0-9;]*)([A-Za-z])")
+
+
+def _plain_screen(text):
+    """Screen bytes -> matchable text.
+
+    ⛔ A RAW SCREEN DOES NOT CONTAIN THE WORDS YOU ARE LOOKING FOR. A terminal
+    writes runs of spaces as CURSOR-FORWARD (`ESC[<n>C`) and sprays colour SGR
+    mid-word, so `stop and wait` arrives as `stop\\x1b[Cand\\x1b[C\\x1b[1mwait`
+    and a plain substring test finds nothing. A guard that silently matches
+    nothing is worse than no guard: it reports "no prompt on screen" for a
+    screen that is entirely a prompt.
+    ⇒ Cursor-forward becomes a space (it IS whitespace on a rendered screen),
+      every other CSI is dropped, and runs of blanks collapse."""
+    def sub(m):
+        return " " if m.group(2) == "C" else ""
+    return re.sub(r"\s+", " ", _CSI.sub(sub, text))
+
+
+def _daemon_screen_text(host, row):
+    """The DAEMON's own vt100 screen for one row, or None if it cannot look.
+
+    Independent of the GUI binary's verb surface — the daemon owns the PTY, so
+    this keeps working when the app-control arm the other reader uses is
+    missing. `screen_available: false` is a real "could not look" and is
+    reported as such rather than as an empty screen, because the caller
+    distinguishes them and refuses on doubt."""
+    uuid = row.rsplit("/", 1)[-1]
+    # ⛔⛔ ASK THE ROW'S OWN MACHINE, NOT THE GUI HOST. `boot` is handed the GUI
+    #    host because that is where a WRITE is proxied from -- but the daemon
+    #    that owns this PTY, and therefore the only one holding its screen, is
+    #    on the machine the row lives on. Asking the GUI host answered
+    #    "unsupported" for every remote row, which reads exactly like the verb
+    #    being missing everywhere and kept the whole fleet blind after the
+    #    fallback was added. Caught by watching the log after the fix and
+    #    finding it changed nothing.
+    rhost = BB.row_host(row, host) or host
+    r = _run(rhost, ["server", "gate-screen", f"cc-runtime://{uuid}",
+                     "--tail", "60", "--json"], "",
+             remote_binary="$HOME/.local/bin/yggterm-headless")
+    try:
+        entries = json.loads((r.stdout or "").strip() or "[]")
+    except Exception:
+        return None
+    if not isinstance(entries, list):
+        return None
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if (e.get("session_key") or "").rsplit("/", 1)[-1] != uuid:
+            continue
+        if not e.get("screen_available"):
+            return None                  # it said plainly that it could not look
+        return "\n".join(e.get("screen_tail") or [])
+    return None                          # the daemon has no screen for this row
+
+
 def _screen_shows_a_choice(host, row):
     """TRI-STATE: True a prompt is on screen · False none · None could not look.
 
@@ -1868,8 +1938,24 @@ def _screen_shows_a_choice(host, row):
                     "--mode", "screen"], "")
     body = (r.stdout or "")
     if not body.strip():
-        return None                      # could not look
-    low = body.lower()
+        # ⛔⛔ THE GUI-SIDE ARM CAN VANISH, AND WHEN IT DID THE WHOLE FLEET
+        #    STOPPED WAKING. `server app terminal read-buffer` was dropped from
+        #    the CLI dispatcher by a refactor that collapsed two per-binary
+        #    `match` blocks into one; the handler and its tests stayed, so the
+        #    verb looks present in the source and is absent from every built
+        #    binary. This guard then answered "could not look" on every tick,
+        #    the caller refused on doubt, and NO ROW ON THE FLEET WAS BOOTED FOR
+        #    AN HOUR. Measured 2026-08-14.
+        # ⇒ Ask the DAEMON instead. It owns the PTY, so its vt100 screen is the
+        #   more direct source for this question anyway, and it does not depend
+        #   on the GUI binary's verb surface at all.
+        # ⚠ This is a SECOND instrument, not a second source of truth: both
+        #   read the same screen, and the fallback only runs when the first
+        #   could not answer. Refusing on doubt is unchanged.
+        body = _daemon_screen_text(host, row) or ""
+    if not body.strip():
+        return None                      # could not look, either way
+    low = _plain_screen(body).lower()
     return any(m in low for m in CHOICE_PROMPT_MARKERS)
 
 
@@ -2208,6 +2294,9 @@ def tick(args):
         elif state in ("WORKING", "JUST_ENDED"):
             s["boots"] = 0                     # progress clears the stall counter
             s["escalated"] = False
+            # The row moved, so whatever we could not read no longer strands it.
+            s["blind_skips"] = 0
+            s["blind_escalated"] = False
         elif state == "UNREACHABLE":
             action = "CANNOT-SEE"              # never a verdict about the row
         elif state == "NO_TRANSCRIPT":
@@ -2227,6 +2316,8 @@ def tick(args):
         elif state == "IDLE" and c["age"] >= (boot_after := boot_after_for(s)[0]):
             if grew:
                 s["boots"] = 0                 # it worked since last tick
+                s["blind_skips"] = 0
+                s["blind_escalated"] = False
             if rl:
                 # ⛔ A BOOT INTO AN EXHAUSTED QUOTA IS REFUSED BEFORE THE AGENT
                 #    RUNS. It spends the wake, changes nothing, and — because the
@@ -2278,6 +2369,47 @@ def tick(args):
                     action = {"refused-draft": "SKIP:drafting",
                               "refused-choice-prompt": "SKIP:choice-prompt",
                               "refused-screen-unreadable": "SKIP:blind"}[via]
+                    # ⛔⛔ THE MIRROR IMAGE OF THE DOUBLE-CHARGE ABOVE, AND IT IS
+                    #    WORSE: a refund means `boots` never rises, so the row
+                    #    can never reach MAX_BOOTS, so it can NEVER ESCALATE. A
+                    #    row refused forever is a row silent forever, and
+                    #    `SKIP:blind` is invisible to every instrument except
+                    #    this log line. Measured 2026-08-14: a lane slept
+                    #    through a hard external deadline while the watchdog
+                    #    refused it every tick and told nobody.
+                    #
+                    # ⚖ THE REFUND STAYS CORRECT — the row was never asked, so
+                    #   charging it a wake would be a lie. What was missing is
+                    #   that the SILENCE is the defect, not the refusal.
+                    #
+                    # ⭐ WHY ONLY THIS ONE OF THE THREE ESCALATES. A draft and a
+                    #   choice prompt are OBSERVATIONS OF THE ROW: something is
+                    #   genuinely in front of it, waiting is the right answer,
+                    #   and the condition clears itself when the row moves on.
+                    #   An unreadable screen is an observation of OUR OWN
+                    #   INSTRUMENT, and it does not clear itself — if the verb
+                    #   the guard reads with is missing from the running build,
+                    #   it is unreadable on every tick from now until someone is
+                    #   told. So it is bounded in time and then escalated.
+                    #
+                    # ⛔ It still does NOT type. "Blind is not clear" remains the
+                    #   right rule for WRITING into a row; relaxing that is the
+                    #   owner's call and is logged for him, not taken here.
+                    if via == "refused-screen-unreadable":
+                        s["blind_skips"] = s.get("blind_skips", 0) + 1
+                        if s["blind_skips"] >= MAX_BOOTS and not s.get("blind_escalated"):
+                            rc = max(rc, 4)
+                            escalate(host, row,
+                                     f"screen unreadable for {s['blind_skips']} ticks "
+                                     f"({c['age']/60:.0f} min idle) — the guard cannot rule "
+                                     f"out a waiting prompt, so it will not boot this row. "
+                                     f"This is our instrument failing, not the row: check "
+                                     f"that the running build still exposes the screen-read "
+                                     f"verb. The row is NOT being woken by anything.")
+                            s["blind_escalated"] = True
+                            action = "SKIP:blind→ESCALATED"
+                    else:
+                        s["blind_skips"] = 0
                 else:
                     # Say WHICH door delivered it. A watchdog that reports
                     # "booted" without saying how cannot be debugged when it
@@ -2326,6 +2458,62 @@ def watcher_alive():
     return pid if "ygg-booter" in cmd else None
 
 
+def _source_is_current():
+    """(ok, detail): is THIS copy of the booter the one on `origin/main`?
+
+    ⛔⛔ THE DEFECT THIS EXISTS FOR, measured 2026-08-14. `ensure_watcher`
+    spawns the watcher from `HERE` -- the copy of whichever checkout happened to
+    run a `subscribe`. There are fourteen checkouts of this repo on one host and
+    NINE of them carried a superseded booter at the moment this was written, so
+    any of them arming the fleet installs old supervision code, silently, and
+    the fleet then runs whichever copy was launched last rather than the newest.
+    It is not theoretical: minutes after the screen-read outage was fixed, a
+    watcher respawned from a stale checkout and the fleet stayed blind.
+
+    ⚠ AND THE STALE PATH IS THE HABITUAL ONE. The copy an agent invokes by hand
+    is the one in its own cwd and its own shell history; the copy that is
+    actually supervising is discoverable only from /proc. Three sessions were
+    caught by this in one afternoon, INCLUDING two that had the identify-which-
+    copy-is-executing law in memory at the time. Knowing the law does not
+    protect you, so the tool has to say it.
+
+    ⚖ Compares against the last-fetched `origin/main` and does NOT fetch: this
+    runs at watcher startup, and a network call there would make arming depend
+    on the network. A stale answer here is still worth having -- the failure is
+    a copy that is hours behind, not seconds."""
+    src = Path(__file__).resolve()
+    try:
+        top = subprocess.run(["git", "-C", str(src.parent), "rev-parse",
+                              "--show-toplevel"], capture_output=True,
+                             text=True, timeout=20).stdout.strip()
+        if not top:
+            return (None, "not inside a git checkout")
+        rel = str(src.relative_to(Path(top)))
+        r = subprocess.run(["git", "-C", top, "show", f"origin/main:{rel}"],
+                           capture_output=True, timeout=20)
+        if r.returncode != 0:
+            return (None, f"origin/main carries no {rel} to compare against")
+        mine = hashlib.sha256(src.read_bytes()).hexdigest()[:12]
+        theirs = hashlib.sha256(r.stdout).hexdigest()[:12]
+        return (mine == theirs,
+                f"this copy {mine} ({top}) vs origin/main {theirs}")
+    except Exception as exc:                     # never block arming on this
+        return (None, f"could not compare: {exc}")
+
+
+def _warn_if_stale_source(where):
+    ok, detail = _source_is_current()
+    if ok is False:
+        log(f"⛔⛔ STALE BOOTER — {where} is running a copy that does NOT match "
+            f"origin/main. {detail}. It will supervise the fleet with whatever "
+            f"this checkout last pulled; a fix that has shipped is not "
+            f"necessarily in it. Pull this checkout, or arm from one that is "
+            f"current, and keep exactly ONE watcher.")
+    elif ok is None:
+        log(f"⚠ could not tell whether {where}'s booter is current: {detail}")
+    return ok
+
+
 def ensure_watcher(args):
     alive = watcher_alive()
     if alive:
@@ -2344,6 +2532,9 @@ def ensure_watcher(args):
                     f"ygg-booter.py subscribe …")
         return f"already running (pid {alive})"
     STATE.mkdir(parents=True, exist_ok=True)
+    # ⛔ Say it BEFORE spawning, while the agent arming the fleet is still here
+    #    to read it. After the spawn this is a line in a log nobody opens.
+    _warn_if_stale_source("the checkout arming this watcher")
     logf = open(LOGPATH, "a")
     p = subprocess.Popen(
         [sys.executable, str(HERE / "ygg-booter.py"), "watch",
@@ -2360,6 +2551,11 @@ def cmd_watch(args):
     PIDFILE.parent.mkdir(parents=True, exist_ok=True)
     PIDFILE.write_text(str(os.getpid()))
     log(f"watcher up (pid {os.getpid()}, interval {args.interval}s, gui host {args.host})")
+    # ⛔ WHICH COPY IS SUPERVISING? Recorded at startup so the log answers it
+    #    without anyone having to read /proc — the question that cost three
+    #    sessions an afternoon.
+    _warn_if_stale_source(f"this watcher (pid {os.getpid()})")
+    log(f"  source: {Path(__file__).resolve()}")
     try:
         while True:
             # ⛔ THE HEARTBEAT ASSERTS THE LOG IS BREATHING, NOT ONLY THAT WE ARE.

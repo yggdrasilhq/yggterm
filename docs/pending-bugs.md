@@ -12,6 +12,81 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⚠ [6.0] A FINISHED LANE'S ROW HOLDS ITS SEAT FOREVER, AND NOTHING RETIRES IT
+
+**Status:** OPEN
+
+*Found 2026-08-14 root-causing an owner report that three separate seat numbers
+were each worn by two or three rows at once.*
+
+The seat a row wears lives in `outline_prefix`. Nothing ever clears it, and
+nothing retires the row of a session that has stopped. So a lane that finished
+yesterday still holds its number today, indistinguishable in the row table from
+a lane that is mid-flight — two of the squatters in the reported case had been
+dead for sixteen hours, and one was a **husk**: a row whose session has no
+process and no transcript on any host.
+
+**Half of this is fixed and is not what this entry is about.** `ygg-claim.sh`
+exempted an explicit `--number` from its held-seat check, so a relay handing a
+seat down in a brief never noticed the seat was taken; that guard now runs on
+both paths and refuses by name. What remains is the condition it now refuses
+*over*: **the seats are genuinely held by rows nobody will ever use again**, so
+the refusal is correct and still leaves a human to clear it by hand.
+
+⇒ **The uncomfortable half — there are TWO registries of seat numbers and
+neither is authoritative:**
+
+| registry | knows about | read by |
+|---|---|---|
+| the GUI row table (`outline_prefix`) | every row, live or dead | the user, and now the claim guard |
+| the supervision board (`seat`) | only rows that SUBSCRIBED | orchestrators writing briefs |
+
+An orchestrator asks the board "is this seat free?", the board cannot see the
+five finished lanes still wearing numbers, and it answers yes. That is how every
+duplicate in the reported case was created — not by carelessness, but by asking
+the registry that structurally cannot know.
+
+**What would close this:** a row's seat is released when its session ends, OR
+the board reports seats it cannot account for so the answer stops being
+confidently wrong. ⚠ **Not by reaping finished rows automatically** — the owner
+ruled plainly on the reported case (*do not blindly delete*), and a finished
+lane's row is how he reads back what it did.
+
+⭐ **The renumbering that cleared the reported case moved the FINISHED lanes and
+left every live and owner-visible row where it was**, which is the ordering to
+repeat: a number a person is currently looking at is the one that should not
+move.
+
+## ⚠ [6.0] ONE SESSION, TWO ROWS, SAME VIEW — a husk rendered at two depths
+
+**Status:** OPEN
+
+*Found 2026-08-14 in the same sweep, and it is a different defect from the seat
+collision above: these two rows agree on their number because they are the same
+session twice.*
+
+A single session path appears **twice in one `server app rows` payload**, both
+entries carrying `presence: live_rail` and `live_member: true`, identical
+`path` and `full_path`, identical label — and differing only in `depth` (2 and
+4). The tree builder emitted it under two parents.
+
+⛔ **This is a single-source-of-truth violation in the row table itself**, not a
+rendering nicety: any consumer that keys rows by `path` sees one row, any
+consumer that counts sees two, and the sweep that found it initially
+mis-attributed the duplicate to a seat-numbering bug because the two rows also
+share a number — which they must, being one row.
+
+The instance is a husk (no process, no transcript on any host), so a reasonable
+first hypothesis is that a session which has died while a member of a row set is
+emitted both as a live-rail member and as a set descendant. **Not yet tested**,
+and the husk should be preserved rather than cleared until it is — it is
+currently the only known reproduction.
+
+⚠ It also wears a **legacy number inside its title text** while carrying a
+different one in `outline_prefix`, so it renders with two numbers. That is the
+already-documented double-numbering trap and is cosmetic here, but it is why the
+row reads as more broken than it is.
+
 ## ⚠ [6.2] `server app close` MAY NOT RUN THE GRACEFUL CLOSE PATH AT ALL
 
 **Status:** OPEN
@@ -265,6 +340,41 @@ force anywhere the verification did not look.
 discarded on read, since it carries no evidence ledger and therefore nothing that
 can ever stop it growing) but **that is a defence against the symptom, not a fix for
 the deploy path.**
+
+### ⛔ IT COST A SECOND SAFETY FIX THE SAME DAY — and a PARTIAL fix is now in
+
+Same shape, hours later. The fleet's entire wake path was down; the fix was
+committed, pushed and proved live on a tick. **Killing that watcher caused
+another to respawn from a different checkout whose copy predated the fix, and
+the fleet went straight back to refusing every boot.** Nine of fourteen
+checkouts were superseded at that moment.
+
+⚠ **The aggravating detail, and it is the one worth keeping: the stale path is
+the HABITUAL one.** The copy an agent invokes by hand is the one in its own cwd
+and its own shell history; the copy that is actually supervising is discoverable
+only from `/proc`. **Three sessions were caught by this in one afternoon,
+including two that had the identify-which-copy-is-executing law in memory at the
+time.** ⇒ Knowing the law does not protect you, because the wrong copy is the one
+every habit reaches for. The tool has to say it.
+
+**Shipped:** the booter now compares its own bytes against `origin/main`'s copy
+and says so loudly — **before** spawning, while the agent arming the fleet is
+still there to read it, and again at watcher startup, so the log answers *which
+copy is supervising* without anyone reading `/proc`. It compares against the
+last-fetched ref and deliberately does not fetch, so arming never depends on the
+network; an unavailable comparison reports *could not tell* rather than passing
+quietly.
+
+⛔ **THE LIMIT, STATED PLAINLY: THIS ONLY PROTECTS A CHECKOUT THAT HAS ALREADY
+PULLED IT.** A copy stale enough to lack the check cannot warn about itself, and
+a watcher armed from one is silent exactly as before. Verified both ways: a
+current checkout answers `True` with matching hashes; a superseded one has no
+such function at all. ⇒ **The entry stays OPEN**, because the deploy path is
+still the real defect and this only shortens the window.
+
+⚖ Not done, deliberately: pulling the other checkouts. Several carry lanes'
+uncommitted work, and a relay refreshing another lane's tree to fix its own
+tooling problem risks the work it was protecting.
 
 ### ⭐ THE CHEAP TEST THAT WAS BEING SKIPPED
 

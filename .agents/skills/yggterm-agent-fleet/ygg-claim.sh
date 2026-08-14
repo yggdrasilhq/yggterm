@@ -22,7 +22,10 @@
 #   ygg-claim.sh --title "<topic>: <what this session is for>" [options]
 #
 #     --title T          required; the human-facing name for this row
-#     --number N         seat number. Omit to derive one (see --campaign)
+#     --number N         seat number. Omit to derive one (see --campaign).
+#                        REFUSED if another row already holds it — a seat handed
+#                        down in a relay brief is not evidence the seat is free
+#     --force-number     take --number even if another row holds it (overlaps)
 #     --campaign TOKEN   sibling-matching token used to derive the number and to
 #                        find a predecessor; defaults to the first word of --title
 #     --replace UUID     retire this predecessor row after claiming the seat
@@ -42,7 +45,7 @@
 set -uo pipefail
 STATE_DIR="$HOME/.yggterm/relay"
 
-TITLE=""; NUMBER=""; CAMPAIGN=""; REPLACE=""; INHERIT=0
+TITLE=""; NUMBER=""; CAMPAIGN=""; REPLACE=""; INHERIT=0; FORCE_NUMBER=0
 SESSION="${YGGTERM_SESSION_ID:-}"; WATCH=240; HOST="${YGG_GUI_HOST:-}"; DRY=0
 # ⛔⛔ AUTO-ARM. OWNER RULING 2026-08-13, and it REPLACES the 2026-08-10 inversion
 # outright — do not reconcile the two, the newer ruling wins:
@@ -67,6 +70,7 @@ while [ $# -gt 0 ]; do
     --campaign)       CAMPAIGN="${2:-}"; shift 2 ;;
     --replace)        REPLACE="${2:-}"; shift 2 ;;
     --inherit-number) INHERIT=1; shift ;;
+    --force-number)   FORCE_NUMBER=1; shift ;;
     --booter)         BOOTER=1; shift ;;   # no-op: armed by default since 2026-08-13
     --no-booter)
       # ⛔ A REASON IS REQUIRED. Disarming silently is what produced 42 unwatched
@@ -263,7 +267,7 @@ rows_json() { ygg server app rows; }
 
 # --- find my row, my siblings, and a free number ---------------------------
 PLAN="$(rows_json | UUID="$UUID" CAMPAIGN="$CAMPAIGN" REPLACE="$REPLACE" \
-        NUMBER="$NUMBER" INHERIT="$INHERIT" python3 -c '
+        NUMBER="$NUMBER" INHERIT="$INHERIT" FORCE_NUMBER="$FORCE_NUMBER" python3 -c '
 import json,os,re,sys
 d=json.load(sys.stdin)["data"]["rows"]
 sess=[r for r in d if r.get("kind")=="Session"]
@@ -320,21 +324,55 @@ if not n:
 # row TITLE — and titles are now stored CLEAN, so which rows mention the
 # campaign word is arbitrary. Rather than make that heuristic cleverer, make the
 # OUTCOME safe: a derived number is a suggestion, and a held seat is a fact.
-# ⚠ Only for DERIVED numbers. An explicit --number is an instruction, and a
-# caller re-running claim on their own row must be a no-op, not a renumber.
-if not os.environ.get("NUMBER",""):
-    held={}
-    for r in others:
-        p=str(r.get("outline_prefix") or "").strip()
-        if p: held[p]=title(r)
-    if n in held:
-        head,_,tail = n.rpartition(".")
-        k = int(tail) + 1 if tail.isdigit() else 1
-        base = head if head else n
-        while (f"{base}.{k}" if head else f"{base}.{k}") in held: k += 1
-        was, n = n, (f"{base}.{k}")
+#
+# ⛔⛔ THIS USED TO SKIP ENTIRELY FOR AN EXPLICIT --number, on the reasoning that
+# "an explicit number is an instruction, and a caller re-running claim on their
+# own row must be a no-op, not a renumber". The second half is true; the
+# exemption did not follow from it. `others` ALREADY excludes this row (isme)
+# and the --replace predecessor (ispred), so a caller re-claiming their own seat
+# never appears as a collision and never could. The bypass therefore bought
+# nothing and cost this, reported 2026-08-14: three separate seats each worn by
+# two or three rows at once, so the sidebar showed (invented, same shape)
+#
+#     4.7 alpha …    4.7 beta …    4.7 gamma …
+#
+# Every one arrived by an explicit --number handed down in a relay brief, while
+# the seat was still held by a FINISHED lane whose row was never retired — and
+# the orchestrator writing that brief had read the seat off `ygg-monitor.py
+# list`, which knows only SUBSCRIBED rows and so reported the seat free.
+# ⇒ Two registries answer "is 6.9 taken?" and neither is authoritative. The GUI
+#   row table is the one the owner actually reads, so it is the one that decides.
+#
+# ⚖ A DERIVED number is a suggestion ⇒ advance silently past a held seat.
+#   An EXPLICIT number is an instruction ⇒ REFUSE and name the holder, because
+#   silently moving a seat someone asked for by name is its own surprise. The
+#   caller can insist with --force-number.
+held={}
+for r in others:
+    p=str(r.get("outline_prefix") or "").strip()
+    if p: held[p]=title(r)
+if n in held:
+    head,_,tail = n.rpartition(".")
+    k = int(tail) + 1 if tail.isdigit() else 1
+    base = head if head else n
+    while (f"{base}.{k}" if head else f"{base}.{k}") in held: k += 1
+    free = f"{base}.{k}"
+    if not os.environ.get("NUMBER",""):
+        was, n = n, free
         print(f"NOTE=derived seat {was} is already held by "
               f"{held[was][:40]}; taking {n} instead")
+    elif os.environ.get("FORCE_NUMBER")=="1":
+        print(f"NOTE=seat {n} is ALREADY HELD by {held[n][:40]} — taking it anyway "
+              f"(--force-number). Two rows will wear one seat.")
+    else:
+        print(f"ERR seat {n} is already held by another row: {held[n][:60]}\n"
+              f"  A relay brief handing down a seat number is not evidence the seat "
+              f"is free — the holder may be a finished lane whose row was never "
+              f"retired, and `ygg-monitor.py list` cannot see it if it never "
+              f"subscribed.\n"
+              f"  Next free seat is {free}. Re-run with --number {free}, or retire "
+              f"the holder first, or --force-number to overlap deliberately.")
+        sys.exit(0)
 print("OK")
 print("MINE="+mine["full_path"])
 print("MINE_LABEL="+(mine.get("session_title") or mine.get("label") or ""))
