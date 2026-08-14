@@ -36803,6 +36803,46 @@ terminal_window_id: None,
     /// Asserts all three halves: the first drop IS logged (the diagnostic the
     /// 2026-06-11 incident needed), the repeat is NOT, and a different reason
     /// for the same key IS — because that is a new fact, not a repetition.
+    /// The cheap live-only path and the full persistence payload must report
+    /// the SAME rows, in the same order, forever.
+    ///
+    /// `status` takes the cheap one several times a second on every daemon;
+    /// the file and every handover take the full one. They share a body today,
+    /// and this test exists for the day somebody optimises one of them: a live
+    /// row present in the file and absent from the wire reads to a successor as
+    /// *"this peer holds no such row"*, which is how rows get dropped at a
+    /// handover. Divergence must fail here, not in production.
+    #[test]
+    fn the_cheap_live_session_path_reports_exactly_what_the_full_persist_does() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let kept = server.start_local_session(
+            SessionKind::ClaudeCode,
+            Some("/srv/example/alpha"),
+            Some("alpha"),
+        );
+        server
+            .set_live_session_keep_alive(&kept, true)
+            .expect("keep the row");
+        // A second row that is NOT keep-alive, and a third of a different kind:
+        // the filter treats these differently, so a divergence in any of the
+        // three branches shows up.
+        server.start_local_session(SessionKind::Codex, Some("/srv/example/beta"), Some("beta"));
+        server.start_local_session(SessionKind::Shell, Some("/srv/example/gamma"), Some("gamma"));
+
+        let cheap = server.persisted_live_sessions();
+        let full = server.persisted_state().live_sessions;
+        assert!(!cheap.is_empty(), "the fixture must produce live rows");
+        assert_eq!(
+            serde_json::to_string(&cheap).expect("serialize cheap"),
+            serde_json::to_string(&full).expect("serialize full"),
+            "persisted_live_sessions() and persisted_state().live_sessions have diverged"
+        );
+    }
+
     #[test]
     fn an_explicitly_renamed_row_keeps_its_name_across_a_daemon_restart() {
         let mut server = YggtermServer::new(
