@@ -274,6 +274,38 @@ copies.
   binary is on the fleet, so the app is usable now either way. **To reverse:**
   one visibility change; nothing else depends on it.
 
+## ⛔ Five rows are parked on the plan-limit dialog, and the watchdog is right not to touch them
+
+**What is needed from him: may the watchdog dismiss that dialog by explicitly
+selecting "stop and wait for the reset", after reading the option off the screen?**
+
+After the quota window, five rows are sitting on the CLI's three-way plan-limit
+prompt — stop and wait, switch to a team account, or use API billing. The
+watchdog now correctly reaches them (a quota message whose reset has passed is no
+longer skipped forever) and then **refuses to type**, because a bare Enter
+*selects whatever option is highlighted* and that could change billing on his
+account. Measured live: five of six boot attempts returned
+`refused-choice-prompt`, which is the guard working exactly as specified.
+
+⇒ **The refusal is correct and must not be weakened. The consequence is that
+those rows stay parked until a human dismisses the prompt.** Nothing is lost —
+every lane had committed and pushed — but the seats are idle meanwhile.
+
+**Recommendation: authorise a screen-verified dismissal, not a blind one.** Read
+the prompt, locate the option whose text says stop-and-wait, navigate to it
+explicitly, and refuse outright if the text cannot be read or the option cannot
+be identified. That keeps the standing rule — never send a bare Enter into a
+prompt this watchdog did not put there — while ending the park. ⛔ It is his call
+and not the relay's, because the failure mode is a billing change on his account
+made by a timer, which is categorically different from a wasted boot.
+
+**Done meanwhile:** nothing is typed into any of them, by us or by the watchdog;
+the rows are safe and resume the moment the prompt is dismissed by hand. The
+half that was ours — a row parked on an *expired* quota message being skipped
+forever — is fixed and live. → `docs/pending-bugs.md`, the supervision-watcher
+entry, and the campaign memory door on the quota-hold deadlock.
+**To reverse:** one flag; no data change either way.
+
 ## The working dot: what should a CLOSED row's dot say?
 
 **One line, and it unblocks the render.** The dot can only mean "working" for
