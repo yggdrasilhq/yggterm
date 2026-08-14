@@ -783,7 +783,19 @@ def cmd_subscribe(args):
         # ⭐ WHAT KIND OF WATCH THIS IS. "task" has a terminal state and may
         #    unsubscribe itself when the work is done; "monitor" does not --
         #    see cmd_unsubscribe.
-        "kind": getattr(args, "kind", None) or "task",
+        # ⛔ A WATCH PLACED BY SOMEBODY ELSE DEFAULTS TO `monitor`, AND THAT IS
+        #    NOT A STYLE CHOICE. Measured 2026-08-14: a triage session armed
+        #    another campaign's stalled delegate, the booter woke it 20 minutes
+        #    later (`boots=1`, and the `continue` is in that row's transcript),
+        #    and the woken row unsubscribed ITSELF four seconds afterwards --
+        #    the exact "am I done?" answer `cmd_unsubscribe` exists to refuse,
+        #    which it only refuses for monitors. So the wake worked and the
+        #    watch died in the same minute, and the NEXT stall had nobody.
+        #    ⇒ "Is this finished?" is not the subscriber's question to answer
+        #    when the subscriber is not the row. Pass --kind explicitly to
+        #    override in either direction.
+        "kind": getattr(args, "kind", None)
+        or ("task" if uuid == own_uuid() else "monitor"),
         "boots": 0,
         "last_size": 0,
         "escalated": False,
@@ -1994,7 +2006,7 @@ def main():
     ap.add_argument("--host", default=None,   # ⛔ resolved, never a placeholder
                     help="the GUI host — app control resolves only there")
     ap.add_argument("--max-hours", type=float, default=12.0)
-    ap.add_argument("--kind", choices=("task", "monitor"), default="task",
+    ap.add_argument("--kind", choices=("task", "monitor"), default=None,
                     help="task: has a terminal state, may unsubscribe itself when done. "
                          "monitor: watches something still live, so 'done' is never true — "
                          "unsubscribing one needs --force")
