@@ -246,6 +246,39 @@ fact and was one command from being falsified. A relayed measurement is a CLAIM 
 it yourself — and building a measurement on top of an instrument that does not exist is how a whole
 lane's numbers turn out to be about nothing.
 
+### ⛔⛔⛔ A "FAITHFUL" FRAME OF A DOCUMENT SURFACE SHOWED THE TERMINAL, NOT THE DOCUMENT
+
+**Found 2026-08-14 while root-causing the document surface that painted garbage.
+This is the instrument an agent is instructed to trust for any visual claim, and
+on this surface it was compositing the wrong pane.**
+
+Two independent things made it lie, and each alone was enough:
+
+1. **The screenshot compositor painted the xterm canvas over a document surface.**
+   The row's own state reads `active_view_mode: Terminal`, so the compositing
+   path drew shell output across the document it was asked to photograph.
+2. **`terminal_host_visibility_style` returns `opacity:1; visibility:visible;`
+   unconditionally**, so a terminal *covered* by another surface keeps painting.
+
+⇒ ⭐ **The consequence is the part to remember: when the document body failed to
+mount, the terminal WAS the document** — and the owner's "corrupted glyph
+clusters" were simply shell output showing through an empty pane. **The reported
+symptom was the instrument, not the subject.** Two frames 24 s apart, same row,
+`Document` selected in both, settle it: the "clean" frame shows the identical
+lines the "garbled" one renders as mojibake.
+
+⛔ **So `capture_faithful: true` answers "was the xterm canvas composited", NOT
+"is this what the user sees".** On a terminal view those coincide. On a document
+surface they came apart completely, and nothing in the reply said so.
+
+- ⚠ **Until the compositor fix is live, do not settle a document-surface render
+  claim from a screenshot.** Read the DOM, and read `webview_edit_faults` — it
+  was the only field that moved throughout (4 in the repro) while
+  `has_schema: true, error: null, visible: true` all reported healthy.
+- ⭐ **The general rule this belongs to:** *an instrument that composites more
+  than one source must say which source it drew.* A boolean that means "the
+  compositor ran" reads as "the picture is true", and those are different claims.
+
 ### ⛔⛔ `cmd | tail -1 && echo OK` REPORTS THE PIPE'S SUCCESS, NOT THE COMMAND'S
 
 **Caught 2026-08-14 in a push-retry loop that had been used all session.** A bash
