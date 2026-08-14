@@ -1092,6 +1092,45 @@ idle cost in the strict sense** — a daemon whose sessions are quiet costs
 expensive because it is BUSY, and the drain (§S1) remains the action, because it
 moves that work onto fewer, current daemons rather than removing it.**
 
+### ⛔ 6j-8. VOID: per-request cost CANNOT be measured from outside a live daemon
+
+The estimator that survived every other test — measure the background rate, drive
+a known load, subtract rate x elapsed — was finally pointed at live daemons, with
+baselines **bracketing** the load so drift could not pass as request cost.
+
+**The brackets refused, and that is the result:**
+
+| pid | version | baseline before | baseline after | net ms/request |
+|---|---|---|---|---|
+| 3.0.62 | legacy | 0.2220 | 0.2390 | 248.69 |
+| 2.12.14 | legacy | **0.4240** | **1.1437** | **−254.87** |
+| 3.0.154 | current | 0.2940 | 0.2890 | 18.83 |
+
+⇒ A **negative** per-request cost is impossible, so the arm is VOID. ⛔ **No number
+from it is quoted, including the two that look plausible** — the same run produced
+the impossible one.
+
+⭐⭐ **WHY IT CANNOT WORK, AND THIS CLOSES THE APPROACH RATHER THAN DEFERRING IT.**
+A baseline-subtracted estimator needs a **stationary** baseline. On a live daemon
+the baseline **is** the bursty per-session reader term of §6j-7, which swings 25x
+between adjacent windows. The signal being sought (100 requests x ~2 ms ≈ 0.2
+core-seconds) is roughly **35x smaller than the baseline's own drift** over the
+same 10 s (0.7 cores x 10 s ≈ 7 core-seconds). **The quantity is below the noise
+floor of the only instrument that can reach it from outside.**
+
+⇒ **This retro-explains every failed live measurement in this file**: the
+withdrawn two-point dose slope, the withdrawn version/RSS split, and this. They
+were not three unlucky arms; they were one arm attempted three ways against a
+baseline that moves faster than the signal.
+
+⇒ ⭐ **THE QUESTION IS NOW THE BUILD LANE'S BY CONSTRUCTION, NOT BY PREFERENCE.**
+Only an **in-process per-request span** — S6, already built and measuring on a
+sandbox — can price a live daemon's requests, because it measures the request
+rather than the process and is therefore immune to what the rest of the daemon is
+doing. ⛔ **The remaining live figure in this file (20–44 ms per dying thread,
+§6j-3) is a process-level residual divided by a measured death rate, and should
+be treated as provisional until S6's live record lands.**
+
 ## 6k. WHY AN UNPOLLED DAEMON DOES NOT RETIRE — the answer owed to the build lane
 
 The optimisation lane's sandbox arms all exited after ~75 s
