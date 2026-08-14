@@ -54,77 +54,79 @@ being audited rather than merely edited.
 **Falsifier:** the identifiers are absent from `git log -p` over all refs, and the
 forge returns 404 for the pre-removal blob URLs.
 
-## ⛔⛔⛔ [6.9→6.7] EVERY PEER `status` POLL REBUILDS THE WHOLE ROW INVENTORY, AND THE POLLS GO AS N²
+## ⛔ [6.7] `status` SERVING IS ~1.6% OF DAEMON CPU — S5's PROTOCOL CHANGE IS NOT WORTH IT
 
 **Status:** OPEN
 
-*measured 2026-08-14; derivation, controls and the N=1 arm in
-[`idle-cost-model.md`](idle-cost-model.md) §6 — spec is §S5*
+*What remains open is the live proof of the safe half. The `census` split is
+**decided against by this lane** on the measurement below — reversing that needs
+only this entry's numbers to be wrong, not a new discussion.*
 
-**`status` is 70% of every request the daemons serve** (49.7–56.0/s fleet-wide
-across two 60 s windows), and each daemon receives **3.4–4.2/s regardless of what
-it owns** — a 261-row daemon is polled no more often than a 73-row one.
+*measured directly on dev 2026-08-14, unsampled, on `CLOCK_THREAD_CPUTIME_ID`;
+harness and both fits in [`idle-cost-model.md`](idle-cost-model.md) §6h*
 
-- ⛔⛔ **"THE COST IS QUADRATIC IN N" WAS FILED HERE AND IS WITHDRAWN.** The
-  single-daemon control that supported it also had `OWNED=0, PRESV=0, ROWS=0`, so
-  it never separated "no peers" from "nothing to poll about"; and a deliberate
-  causal arm (five daemon versions, isolated home, zero sessions, only N varied)
-  measured **0.00/s at N=1 and 0.17/s at N=2** against 0.57 predicted — peer
-  polling is real but **46x too small** to be the fleet's 3.9/s per daemon.
-  ⚠ N could not be raised past 2: a daemon owning no sessions retires.
-  ⇒ **What sets the poll rate is OPEN.** Ruled out: bare N (arm), the receiver's
-  own sessions/rows (flat across OWNED 1–9, ROWS 70–261), the sender's preserved
-  owners (outbound churn flat across PRESV 0–29), client count (3 clients, 1 GUI
-  on this host). Untested candidate: the **density of cross-daemon references**.
-  ⛔ **Do not plan a drain around an early-payoff curve** — nothing measured
-  supports it.
-- ⛔ **`fn status(&self)` (`daemon.rs:4154`) is unconditional and rebuilds, per
-  call:** `stored_sessions_persisted()`, a clone per row, **`.sort()`+`.dedup()`
-  (O(R log R))**, `persisted_state()` — *the entire persistence payload* — and a
-  second sort/dedup pass. The reply carries four `*_keys` vectors **and the full
-  `PersistedStoredSession` records** (path, kind, id, cwd, title).
-- ⇒ **This is BOTH unattributed terms of the cost model at once.** The floor =
-  poll rate × per-poll fixed cost (3.6 × ~38 ms = 0.137 cores, against a fitted
-  0.116). The per-row term = poll rate × per-row cost (**≈94 µs of CPU per row
-  per reply**). ROWS is frozen at each daemon's birth, so a 261-row daemon
-  serialises 261 rows on every poll while owning 5.
-- ⭐ **The four zero-cost daemons are not a "bare process" baseline** — they are
-  on unreachable socket paths, so nobody polls them. **The floor is the cost of
-  being REACHABLE, not of existing.**
-- ⚠ **It is not demand-driven.** A lead-lag test against a shuffled null puts
-  `working_flags`→`status` at ratio **0.82, below its own null**. It is a timer.
-  ⛔ **The exact periodic call site is NOT located**: the fan-out helper is
-  `reachable_versioned_daemon_statuses[_excluding_endpoint]` (`daemon.rs:13144`)
-  and it has **18 call sites**. Finding which one ticks is the first build step.
+**What is still true and was measured, not derived:** `status` is 70% of every
+request the daemons serve, each daemon receives **3.4–4.2/s regardless of what it
+owns**, and `fn status()` rebuilt the whole row inventory on every call.
 
-**Fix (§S5):** move the row inventory off `status` onto a separate `census`
-request that only reconcile/handover/adoption call. ⚠ **Version-gate it** — the
-fields are `#[serde(default)]`, so a pre-split daemon reading a slimmed reply
-sees an empty `stored_terminal_session_keys`, which reads as *"this peer holds no
-dormant rows"* — the exact input that has dropped rows in a handover before, and
-**14 daemons that will never restart still speak the old shape**.
+⛔ **What is refuted: that this is where the daemon's CPU goes.** A counter in
+the status path itself — no sampling, CPU not wall — over six seeded row counts
+on isolated daemons:
 
-⛔⛔ **EXPECTED EFFECT IS DISPUTED — MEASURE BEFORE BUILDING.** The 0.66 figure
-divides the model's per-row coefficient by the poll rate. Reading the handler's
-own `PerfGuard` duration instead gives **11 µs/row, not 94** (slope over 14
-daemons, r=+0.683; 70–101 rows → 2.09–2.57 ms, 243–246 rows → 2.92–3.17 ms),
-which makes this **≈0.08 cores** and puts status handling at ~5% of a daemon's
-idle cost rather than most of it. ⚠ Flagged not adopted: that instrument records
-`daemon_request/status` at 1.8/s against 49.7/s arriving — **~3.6% of requests**,
-unexplained, and `PerfGuard` has no sampling logic. The **slope** is robust (a
-uniform under-recording factor cancels between daemons); the absolute share is
-not. ⇒ **Instrument the status path directly — per-reply row count and elapsed
-CPU, not wall — and confirm both the slope and its share of daemon CPU before
-building.** The row term is directly confirmed and the O(R log R) → O(1) change
-is still right; ⛔ **do not promise 0.66 cores for it.**
-⇒ **And it reopens the bigger question: where does the other ~95% of daemon CPU
-go?** `idle-cost-model.md` §6g.
+| ROWS | CPU µs / reply (payload) | CPU µs / reply (whole request) |
+|---|---|---|
+| 0 | 36 | 383 |
+| 100 | 409 | 898 |
+| 250 | 955 | 1,582 |
+| 1000 | 4,676 | 6,247 |
 
-**Expected effect, as originally derived (⚠ disputed above):** ≈**0.66 cores**
-(0.000337/row × 1,953 rows), ~25% of the 2.64-core daemon footprint.
-**Falsifier:** re-run the paired comparison (1-owned daemons, low vs high rows,
-both controls in one run). If the per-row coefficient does not fall to ~0,
-`status` was not what the row term was buying.
+    payload build   4.645 us/row   r = +0.9981
+    whole request   5.857 us/row   r = +0.9985
+
+⇒ At the measured poll rate over the census's **1,956 rows**: the row term is
+**0.033–0.041 cores** and the whole of status serving is **≈0.057 cores of the
+3.47-core daemon population — 1.6%.** Against §2's fitted floor, request serving
+explains **under 1%** of it.
+
+⭐ **Three independent numbers for the same slope, and only the naive one is
+wrong:** 94 µs/row (inferred from the model — refuted), 10.2–11.0 µs/row (mean
+over `PerfGuard` records — biased, see below), **4.6–4.7 µs/row** (this counter,
+and the same field data inverse-probability weighted, agreeing to 1.4%).
+
+⛔ **Why the `PerfGuard` reading was 2.2x high, and why "it cancels" was wrong.**
+`("daemon_request", "status")` is on `perf_span_is_high_frequency_noise`'s list:
+a span is written only at **≥ 8 ms** or on a **1-in-50** sample. Recorded tail
+share **33% against a true 0.98%**. And the enrichment tracks rows — 13.5–16.8%
+of records above the floor on the 243–246-row daemons against 3.5–7.6% on the
+70–101-row ones — so it does not cancel between daemons. Full entry in the field
+guide.
+
+### ✅ THE SAFE HALF IS DONE — same wire, less work, no version gate
+
+`status` kept `persisted_state().live_sessions`, so every reply also walked and
+cloned every stored row (**a second time** — it had already called
+`stored_sessions_persisted()` itself), cloned and **sorted** every PTY grid,
+cloned `ssh_targets`, ran `clear_remote_machine_live_runtime_flags` over every
+remote machine, and built a `HashSet` to resolve an active path it discarded.
+Split out as `persisted_live_sessions()`, **sharing the filter body** so which
+live sessions persist keeps one owner, guarded by a test that fails if the two
+paths ever disagree.
+
+### ⛔ RECOMMENDED AGAINST: the `census` split as spec'd (owner decision)
+
+It buys the row term — **0.033–0.041 cores, ~1.2–1.6% of the daemon
+population** — and pays for it with a version-gated protocol change whose
+failure mode is already documented: the fields are `#[serde(default)]`, so a
+slimmed reply reads to a pre-split daemon as *"this peer holds no dormant
+rows"*, **the exact input that has dropped rows in a handover before**, and 14
+daemons that will never restart still speak the old shape. ⇒ **A documented
+row-loss hazard for 1.5% of daemon CPU is a bad trade.** ⚠ Generous allowance
+for the two known biases in the measurement (synthetic rows have shorter strings
+than real ones; 69–290 replies/s keeps caches warmer than 3.6/s) still leaves it
+under ~4.5%.
+
+⭐ **Reopened, and this is the load-bearing question now: where do the other
+~98% of daemon CPU go?** Not the request path. `idle-cost-model.md` §6h.
 
 ## ⛔⛔ [6.9→6.1] THE DAEMON POPULATION IS 83% OF THE IDLE FOOTPRINT, AND ITS COST IS PER-DAEMON
 
