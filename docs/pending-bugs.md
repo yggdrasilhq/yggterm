@@ -132,6 +132,59 @@ changing today.
 **Falsifier:** if `/tmp` on that host is ever NOT a tmpfs, the RAM half of this
 entry is void and only the unbounded-growth half stands.
 
+## ⛔⛔⛔ [6.7] AUDIT THE SESSION-ONLY RE-ATTACH MACHINERY — ONE SUBSYSTEM BEHIND THE GATES, THE RENDER DIVERGENCE AND THE RESTART STORM
+
+**Status:** OPEN
+
+*Owner-directed 2026-08-14: audit and fix this whole layer, with the campaign's
+resource-frugality intent, rather than patching its symptoms one at a time.*
+
+**The claim to test, and three independent things already point at it:** the
+gating layer, the session-vs-plain-shell rendering divergence, and the cost of a
+restart are **the same code** — the path an agent row takes on attach that a plain
+shell never enters.
+
+| symptom | what is already established |
+|---|---|
+| switching to a session and being unable to type | ✅ FIXED. `remote_resume_input_ready` gated the keyboard, cleared on every row open, restorable only by output an idle agent never emits |
+| bottom paint broken · TUI breaks · glyph damage | **sessions only, never plain shells** — so the canvas and the GL stack cannot be the discriminator |
+| a restart costs minutes of unresponsiveness and a loud fan | the restart re-attaches EVERY live row through this same path at once (`attach_ready` × 270 in one generation, ~58 rows) |
+
+⇒ **The common branch is already named**: `retained_rehydrate_should_skip_before_read`
+returns before seeding the viewport when the host is already live, and that is the
+same "skipped as redundant" branch the input-gate comment blamed for losing
+readiness. One branch, two starvations.
+
+**Where the map is.** `crates/yggterm-shell/src/agent_arm_shell_matrix.rs` tables
+this layer and states the invariant to audit against: **every axis must be a
+property of WHERE THE PTY LIVES, never of WHICH CLI is talking — an axis that
+reads the CLI is a hole.** A "codex-only geometry fence" still reads the CLI.
+`is_remote_resume_agent_session` gates ~8 signals from there
+(`terminal_has_meaningful_output`, `terminal_overlay_dismissed`, `attach_ready`,
+`stalled_remote_resume`, the read-poll cadence).
+
+**The frugality angle is not separate from the correctness one.** A restart that
+re-seeds ~58 rows pays for every skipped-then-recovered seed twice, and the fan is
+the visible half of that. Making the attach path do the right thing ONCE is the
+same change as making it cheap.
+
+⛔ **TWO THEORIES ALREADY REFUTED — do not re-run them.**
+1. **Duplicate agent processes are NOT the restart storm on the laptop.** Measured
+   2026-08-14 19:5x: **zero duplicate session uuids there.** (The integrator host
+   had one, which is a different defect.)
+2. **`SIGTERM` is not a repro handle for the GL SIGSEGV** — a killed GUI cored
+   with a byte-identical stack once and exited cleanly the next time.
+
+**How to measure the restart cost without guessing:** the trace already carries
+`attach_ready`, `retained_rehydrate_begin`, `retained_rehydrate_skipped_*` and
+`terminal_mount` events per row. Count them across one restart, with timestamps,
+and the storm's shape is a histogram rather than an impression. ⛔ Do it with the
+now-working `server trace tail --limit N` — before its fix the window was ~4
+seconds and could not span a restart at all.
+
+**Falsifier:** if a plain shell is ever seen with the bottom-paint fault, or if a
+restart is slow with the re-attach path disabled, this framing is wrong.
+
 ## ⛔⛔⛔ [6.7] THE RENDER FAULTS ARE IN SESSIONS AND NOT IN PLAIN SHELLS — THE CANVAS IS PROBABLY THE WRONG SUSPECT
 
 **Status:** OPEN
