@@ -730,6 +730,29 @@ Rows reappear 5–10 s later. Re-check the count **again once the predecessor ha
 actually exited** — the drop can be delayed: the predecessor holds dormant rows
 until its own disk-binary poll retires it, which can be ~20 minutes later.
 
+⭐ **AND DO NOT DIAGNOSE A MISSING ROW FROM ITS ABSENCE — ASK WHAT HAPPENED TO IT**
+(added 2026-08-14):
+
+```bash
+yggterm-headless server rows departed --limit 50   # read-only, safe on a live fleet
+```
+
+Every row that leaves the live set now records which row, its title, when, and
+**why**: `explicit-close` (somebody named it and closed it — a user close, an
+agent `session remove`, or the ephemeral reaper) or `gui-close-disposable` (the
+GUI window closed and the row was not keep-alive, so it went for what it WAS
+rather than because anyone asked). ⚠ **The three-way answer is the point:**
+
+| what you see | what it means |
+|---|---|
+| an entry saying `explicit-close` | somebody closed it. Not a bug. |
+| an entry saying `gui-close-disposable` | it was disposable and a GUI close took it. Working as designed — and if the user made that row on purpose, `docs/spec-app-row-survival.md` says it should not have been disposable. |
+| **no entry at all** | ⛔ **it did not leave through any path that knows it left.** That is its own defect, and it is the state the whole ledger exists to make visible — an absence used to be the ONLY evidence, and an absence reads identically to "never existed". |
+
+⚠ It is machine-wide (`~/.yggterm/removed-rows.json`, shared by every daemon on
+the host), so it answers for rows a peer daemon owned too — which is what makes
+it usable when two daemons' state files disagree about whether a row exists.
+
 ## 5. Destructive operations — know before you type
 
 - Any `reconcile` / daemon-screen replay is a full reset + re-seed to the current
