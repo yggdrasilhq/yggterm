@@ -92,11 +92,31 @@ print(f"⛔ queue-resurrection: {len(hits)} entry(ies) deleted earlier are prese
 for h, c in hits:
     print(f"  {h}", file=sys.stderr)
     print(f"      deleted by: {' '.join(x[:8] for x in c)}", file=sys.stderr)
-    print(f"      settle it:  git log -S {h[3:40]!r} -- {QUEUE}\n", file=sys.stderr)
+    # ⛔⛔ `git log -S` SKIPS MERGE COMMITS BY DEFAULT, and a deletion that
+    #    reached main THROUGH a merge is therefore invisible to it — so it
+    #    answers "this was never here", which is precisely the answer that tells
+    #    a lane to keep its own side and resurrect the entry. Measured
+    #    2026-08-14: a lane settled three empty-upstream conflicts with the bare
+    #    form, concluded "never had it" for all three, and brought one back.
+    print(f"      settle it:  git log --full-history -m -S {h[3:40]!r} -- {QUEUE}",
+          file=sys.stderr)
+    print(f"      ⚠ --full-history -m is NOT optional: without them a deletion "
+          f"that arrived via a MERGE reads as 'never existed'.\n", file=sys.stderr)
 print("If the entry was deliberately RE-OPENED, add a line `**Re-opened:** <why>` to\n"
       "the entry body — this check reads it and will stop reporting that entry.\n"
       "⛔ Say it in the entry, not in a commit message: the next reader has the file,\n"
       "not the history. Otherwise it is a stale whole-file write — delete it again\n"
       "and check what else that commit reverted.", file=sys.stderr)
+if os.environ["STRICT"] != "1":
+    # ⛔⛔ SAY THAT THIS EXIT IS A LIE ABOUT THE FINDING. The default is
+    #    report-and-pass, which is right for a human reading the output and
+    #    WRONG for every automated caller — and the campaign's own standing
+    #    instruction ("run this after any queue merge") does not mention the
+    #    flag. Measured 2026-08-14: a resurrection sat on main through several
+    #    push loops, each of which ran this check and treated exit 0 as clean.
+    #    A gate that reports a violation and exits 0 is decoration.
+    print("\n⚠ EXITING 0 ANYWAY — this is the default. Findings above are REAL.\n"
+          "  ⛔ In a script or a push loop, run `--strict` or this check gates nothing.",
+          file=sys.stderr)
 sys.exit(1 if os.environ["STRICT"] == "1" else 0)
 PY
