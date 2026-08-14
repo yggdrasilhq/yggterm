@@ -12,6 +12,159 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔⛔⛔ [6.7] THE GUI SIGSEGVs IN THE GL COMPOSITING PATH, ~4x A DAY, AND NOTHING REPORTS IT
+
+**Status:** OPEN
+
+*found 2026-08-14 from the system coredump log; definition and ordering in
+[`usability-contract.md`](usability-contract.md)*
+
+Five yggterm GUI coredumps in 24 hours on the desktop host. Four are one bug
+class — the GL/EGL compositing readback:
+
+```
+gdk_cairo_draw_from_gl  (libgdk-3)  <- libwebkit2gtk-4.1   x2
+libEGL_mesa -> libgallium-26.1.5                            x2
+```
+
+The fifth is a separate Rust `abort_internal` and is NOT this entry.
+
+⛔ **The armed presentation policy is CORRECT, so this is not an agent flag-flip.**
+Read from the on-disk trace for the running GUI's own pid:
+`policy=kde_wayland_native_default`, `gdk_backend=wayland`,
+`winit_unix_backend=wayland`, `gl_probe_class=hardware`, `gl_probe_driver=radeonsi`,
+`libgl_always_software=null`, `webkit_disable_dmabuf_renderer=null`. That is the
+sanctioned `linux-wayland` row exactly. **The crash happens on the configuration
+the policy prescribes**, which means "restore the policy" is not available as a fix
+and the sandbox is where any arm must be tried.
+
+⚠ **The crash rate is older than the coredump retention.** 16 leaked
+`drkonqi-coredump-launcher` processes are alive with ages of 5 to 12 days, one per
+crash. That count is a crash counter reaching further back than `coredumpctl` does,
+and it says this has been going on for at least twelve days.
+
+**Why it reads to a user as "janky as hell":** a crash is followed by a relaunch
+that passes every other check, and nothing in the app reports having died. Combined
+with the entry below, each crash also leaves an extra GUI behind.
+
+**Falsifier:** if a build with the DMABuf renderer disabled *in the sandbox* still
+takes `gdk_cairo_draw_from_gl` faults, the compositing arm is not the trigger and
+this is a Mesa/radeonsi issue to be reported upstream rather than configured around.
+⛔ Do not test that arm against the user's GUI — `presentation-policy.md` is the law.
+
+## ⛔⛔ [6.7] `server app launch` ADDS A GUI RATHER THAN REPLACING ONE, SO RESTARTING MAKES IT WORSE
+
+**Status:** OPEN
+
+*read from source 2026-08-14; cost measured from the resource recorder's per-pid history*
+
+`run_app_launch_via_gui_companion` (`apps/yggterm/src/bin/yggterm-headless.rs`)
+spawns the GUI companion unconditionally. There is **no existing-instance check and
+no retirement of the previous GUI**. The old process keeps its window, keeps
+painting, and keeps its PTYs.
+
+⇒ **The user's own remedy compounds the fault.** Restarting to escape a broken
+window adds a second broken window; the one they are looking at is the OLD one. A
+user cannot escape this by themselves, which is what "no sidebars for twelve hours
+across several restarts" was.
+
+**The cost of a single orphan, measured per-pid over its whole life:**
+
+| | rate | lifetime | total |
+|---|---|---|---|
+| orphaned GUI | 29.2% of a core | 12.4 h | **3.63 core-hours** |
+| all GUIs, same 24 h | | | 5.75 core-hours |
+
+⇒ **63% of all GUI CPU in the day was one process that should not have been alive.**
+
+⚠ **And 29.2% is a NORMAL rate** — healthy GUIs in the same window ran 20-38% of a
+core. The orphan was not a runaway. **The waste is duration times an ordinary rate,
+so the fix is retirement, not optimisation**, and a profiler pointed at that process
+would correctly have found nothing wrong with it.
+
+**Fix options, cheapest first.** (1) `app launch` refuses, and says so, when a live
+GUI already owns the display, unless given an explicit `--replace`. (2) `--replace`
+retires the incumbent after the new one paints. ⚠ **Neither may evict a GUI that
+still owns another agent's sessions** — the constitution's version-coexistence
+guarantee applies to GUIs as much as to daemons, so retirement has to be a handover,
+not a kill.
+
+**Falsifier:** if a second `app launch` on a host with a healthy GUI ever results in
+exactly one GUI, the guard exists somewhere this reading missed.
+
+## ⛔⛔ [6.7] `server trace tail --limit N` IGNORES N — THE DIAGNOSTIC WINDOW IS ~14 SECONDS
+
+**Status:** OPEN
+
+*measured 2026-08-14 on the desktop host*
+
+```
+requested=50   returned=200
+requested=200  returned=200
+requested=500  returned=200
+requested=2000 returned=200
+```
+
+⇒ **`--limit` is ignored, not capped** — requesting *fewer* than 200 also returns
+200, which is what distinguishes the two. On a busy host those 200 events spanned
+**14 seconds** (oldest 11:04:05, newest 11:04:19).
+
+⭐ **The data is NOT lost — only the verb is blind.** `~/.yggterm/event-trace.*.jsonl`
+held 17 files totalling 19 MB, and the running GUI's own startup event was recovered
+from them after `trace tail` could no longer see it. So the fix is to serve the
+requested limit from the on-disk journal, and it is cheap.
+
+⚠ **This compounds with the entry below**, which floods the same ring.
+
+⛔ **An absence produced by retention supports nothing.** Any reasoning of the form
+"the trace shows no such event" taken through `trace tail` on a busy host is
+worthless over a horizon longer than a few seconds.
+
+## ⛔ [6.7] THE PRESENTATION-POLICY TRACE EVENT IS EMITTED BY EVERY CLI INVOCATION
+
+**Status:** OPEN
+
+*measured 2026-08-14; the instrument the presentation law names as authoritative*
+
+`presentation-policy.md` law 4 says `/proc/<pid>/environ` cannot tell you what is in
+force and the `gui/startup/linux_desktop_backend_policy` trace event is the decision
+reporting itself. That is right. But **a bare CLI invocation emits it too**:
+
+```
+policy_events_before=2   ->   yggterm --version   ->   after=4
+```
+
+Two events per invocation, carrying `display_present:false`,
+`wayland_display_present:false`, `gdk_backend:null`, `policy:null` — a description of
+a process with no display, indistinguishable at a glance from the GUI's own event.
+
+⇒ **An agent doing the sanctioned thing** — `trace tail | grep
+linux_desktop_backend_policy | tail -1` — **gets a CLI invocation's answer and
+concludes the GUI armed a null policy.** This was hit while writing the usability
+contract: the running GUI's real event had already been evicted from the ring by CLI
+copies of itself, and had to be recovered from disk by selecting on the GUI's pid.
+
+**Fix:** either do not emit the policy event when there is no display, or tag it with
+the role so the GUI's event is selectable. Until then, read it from
+`~/.yggterm/event-trace.*.jsonl` filtered by the GUI's pid.
+
+## ⛔ [6.7] THE DAEMON LEAKS ZOMBIE `ssh` CHILDREN
+
+**Status:** OPEN
+
+*measured 2026-08-14 on the desktop host*
+
+12 `ssh <defunct>` processes, all parented to one `yggterm-headless server daemon`,
+all **5 days old**. The daemon spawns `ssh` and never reaps it, so the entries
+accumulate in the process table for the daemon's whole life.
+
+Small in isolation — a zombie holds a PID and a table entry, not CPU or memory. It
+is filed because it is unbounded in the one direction that matters: the daemons are
+long-lived by design, so the count only grows, and the fleet runs many of them.
+
+**Falsifier:** if the count on a daemon of comparable age is stable rather than
+monotonic, this is a burst at a known event rather than a missing reap.
+
 ## ⚠ [9.2→6.x] `session rename` IS ASYNC W.R.T. `rows`, SO THE DOCUMENTED VERIFY STEP RETURNS A FALSE NEGATIVE
 
 **Status:** OPEN
