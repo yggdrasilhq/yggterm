@@ -15,13 +15,33 @@ use crate::retention::{
 
 pub const EVENT_TRACE_FILENAME: &str = "event-trace.jsonl";
 const EVENT_TRACE_MAX_BYTES: u64 = 8 * 1024 * 1024;
-/// Rotated event-trace generations: up to 3 days of history, hard-capped at
-/// 256 MiB total so a trace flood (a reveal loop, a render storm) cannot eat
-/// the disk. On a heavy day that budget still holds ~3 days at the observed
-/// ~80 MiB/day write rate.
+/// Rotated event-trace generations, hard-capped so a trace flood (a reveal
+/// loop, a render storm) cannot eat the disk.
+///
+/// ⛔ **THE AGE RULE DOES NOT SET THE WINDOW — THE BYTE BUDGET DOES, AND IT
+/// SHRINKS WITH THE DAEMON POPULATION.** The budget is per HOME; the write rate
+/// is per DAEMON, and every daemon on the host writes into the same file, so the
+/// retained window is roughly `cap / (per-daemon rate x N daemons)`. The old
+/// comment here claimed "~3 days at ~80 MiB/day" and was measured wrong by more
+/// than an order of magnitude on 2026-08-14: **83.1 MiB/HOUR (1.95 GiB/day)
+/// across ~20 daemons on one host, retaining 247.9 MiB over 2.98 h.** The
+/// window was therefore ~3 hours, not 72, and the 3-day `max_age_ms` had never
+/// once been the binding rule.
+///
+/// ⚠ That is not a cosmetic error. Four session deaths that a release was being
+/// judged on had already aged out of the trace before anyone came to look, so
+/// the investigation could only report an absence — and an absence that is
+/// structural says nothing about what happened. A diagnostic window shorter
+/// than the time it takes to notice a problem is not a diagnostic.
+///
+/// 1 GiB buys ~12 h at the measured rate. It is still a budget, not a promise:
+/// if the daemon population doubles, the window halves. ⭐ On a pool with
+/// transparent compression this costs far less disk than it reserves — the same
+/// 247.9 MiB of trace occupied 17 MiB on disk when measured — but the cap is
+/// counted in logical bytes, so it binds either way.
 const EVENT_TRACE_RETENTION: JsonlRetention = JsonlRetention {
     live_max_bytes: EVENT_TRACE_MAX_BYTES,
-    generations_max_bytes: 256 * 1024 * 1024,
+    generations_max_bytes: 1024 * 1024 * 1024,
     max_age_ms: DIAGNOSTIC_RETENTION_MAX_AGE_MS,
 };
 

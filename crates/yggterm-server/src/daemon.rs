@@ -18730,6 +18730,44 @@ fn linux_socket_inode(path: &Path) -> Option<u64> {
     fs::metadata(path).ok().map(|metadata| metadata.ino())
 }
 
+/// Everything the stale-daemon sweep knows about one candidate before it decides
+/// whether to signal it. ⛔ Two of these five fields are NOT observations — they
+/// are admissions that the sweep could not observe, and they are kept apart from
+/// the other three for exactly that reason.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+struct DaemonReapProtection {
+    /// A client instance record names this daemon's endpoint.
+    has_gui_clients: bool,
+    /// The daemon answered, and what it answered says it owns live work.
+    has_recoverable_runtime_activity: bool,
+    /// It is this process's own startup bridge sidecar.
+    is_startup_bridge_sidecar: bool,
+    /// ⛔ The client list could not be READ. Not "there are no clients".
+    clients_unreadable: bool,
+    /// ⛔ The daemon did not ANSWER a status probe. Not "it holds nothing" —
+    /// a daemon serves one request at a time, so the busiest daemons are the
+    /// likeliest to be silent, and a release makes every daemon busy at once.
+    status_unavailable: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl DaemonReapProtection {
+    /// ⭐ AMBIGUITY PROTECTS. The remedy on the other side of this predicate is
+    /// SIGTERM followed by SIGKILL 120 ms later, which drops every PTY the
+    /// daemon owns and cuts each agent session mid-command. A gate that cannot
+    /// see must therefore refuse, exactly like the retire path one layer up: the
+    /// cost of being wrong in this direction is a mute daemon nobody reaped
+    /// automatically, and in the other direction it is somebody's work.
+    fn protects(self) -> bool {
+        self.has_gui_clients
+            || self.has_recoverable_runtime_activity
+            || self.is_startup_bridge_sidecar
+            || self.clients_unreadable
+            || self.status_unavailable
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn cleanup_legacy_linux_daemon_processes(
     endpoint: &ServerEndpoint,
@@ -18836,6 +18874,8 @@ fn cleanup_legacy_linux_daemon_processes(
     let mut skipped_runtime_activity_legacy = 0usize;
     let mut skipped_startup_bridge_sidecar_legacy = 0usize;
     let mut skipped_cross_home_orphan = 0usize;
+    let mut skipped_unreadable_clients = 0usize;
+    let mut skipped_no_status = 0usize;
     let proc_entries = fs::read_dir("/proc").context("reading /proc for stale daemon cleanup")?;
     for entry in proc_entries {
         let entry = entry?;
@@ -18883,13 +18923,29 @@ fn cleanup_legacy_linux_daemon_processes(
             .get(&pid)
             .cloned()
             .or_else(|| daemon_home.as_deref().map(default_endpoint));
+        // ⛔⛔ AN UNREADABLE CLIENT LIST IS NOT AN EMPTY ONE, AND THIS CALLER
+        // KILLS. `active_client_instance_records_for_endpoint_scope` was taught
+        // on 2026-08-14 to return `Err` when it cannot read, instead of `Ok`
+        // with nothing in it — and this call site threw that away with `.ok()`,
+        // so the error arrived as "no clients are attached" at the one place
+        // that answers with SIGTERM and then SIGKILL 120 ms later. The sibling
+        // caller only had to be stopped from letting a daemon retire itself;
+        // this one drops every PTY the daemon owns.
+        let clients_unreadable = std::cell::Cell::new(false);
         let has_gui_clients = daemon_home
             .as_deref()
             .zip(candidate_endpoint.as_ref())
             .and_then(|(home, endpoint)| {
-                active_client_instance_records_for_endpoint_scope(home, endpoint).ok()
+                match active_client_instance_records_for_endpoint_scope(home, endpoint) {
+                    Ok(records) => Some(records),
+                    Err(_) => {
+                        clients_unreadable.set(true);
+                        None
+                    }
+                }
             })
             .is_some_and(|records| !records.is_empty());
+        let clients_unreadable = clients_unreadable.get();
         let home_has_live_bridge_process = daemon_home
             .as_deref()
             .is_some_and(linux_home_has_live_bridge_process);
@@ -18904,8 +18960,43 @@ fn cleanup_legacy_linux_daemon_processes(
             home_has_live_bridge_process,
         );
         let is_startup_bridge_sidecar = startup_bridge_sidecar_pid == Some(pid);
-        let has_clients =
-            has_gui_clients || has_recoverable_runtime_activity || is_startup_bridge_sidecar;
+        // ⛔⛔ NO ANSWER IS NOT AN EMPTY ANSWER — AND ON THIS FLEET IT IS THE
+        // ONLY GATE LEFT STANDING. `reachable_versioned_daemon_statuses` drops a
+        // daemon whose `status` call errors (`.ok()?`), so a daemon that is
+        // merely BUSY is absent from the map, and every protective branch of
+        // `linux_daemon_runtime_activity_protected_for_cleanup` requires a
+        // status to be present. A daemon serves one request at a time, so the
+        // daemons most likely to miss a status probe are the ones mid-handover
+        // — which is exactly what a release makes every daemon do at once.
+        //
+        // ⚠ Measured on dev, 8 sweeps on 2026-08-14: `skipped_active_client_legacy`
+        // was 0 in every one while `skipped_runtime_activity_legacy` was 16. The
+        // client gate contributed NOTHING; sixteen live daemons were each one
+        // unanswered status probe away from SIGTERM, and their PTYs with them.
+        //
+        // ⇒ Treat "I could not ask, or was not answered" as evidence of
+        // something to protect, not evidence of an empty daemon. The cost is
+        // that a permanently mute same-home daemon is no longer reaped
+        // automatically; that is the safe direction, it is counted below, and
+        // the constitution's whole point is that a daemon which is still working
+        // outlives our tidying.
+        let protection = DaemonReapProtection {
+            has_gui_clients,
+            has_recoverable_runtime_activity,
+            is_startup_bridge_sidecar,
+            clients_unreadable,
+            status_unavailable: runtime_status_by_pid.get(&pid).is_none(),
+        };
+        let has_clients = protection.protects();
+        if protection.clients_unreadable {
+            skipped_unreadable_clients += 1;
+        }
+        if protection.status_unavailable
+            && !protection.has_gui_clients
+            && !protection.has_recoverable_runtime_activity
+        {
+            skipped_no_status += 1;
+        }
         let age_ms = linux_proc_pid_age_ms(pid).unwrap_or_default();
         let is_legacy_binary =
             legacy_daemon_reap_applies_to_home(current_home.as_deref(), daemon_home.as_deref())
@@ -18960,6 +19051,13 @@ fn cleanup_legacy_linux_daemon_processes(
                 "skipped_runtime_activity_legacy": skipped_runtime_activity_legacy,
                 "skipped_startup_bridge_sidecar_legacy": skipped_startup_bridge_sidecar_legacy,
                 "skipped_cross_home_orphan": skipped_cross_home_orphan,
+                // ⭐ Both of these are "I could not tell", not "there was
+                // nothing there". They are reported separately from the
+                // skipped_* gates above precisely so a sweep that protects
+                // everything because it could see nothing cannot be read as a
+                // sweep that found nothing to do.
+                "skipped_unreadable_clients": skipped_unreadable_clients,
+                "skipped_no_status": skipped_no_status,
                 "same_home_daemon_count": same_home_daemon_count,
                 "oldest_same_home_pid": oldest_same_home_pid,
                 "reap_after_ms": reap_after_ms,
@@ -27513,6 +27611,65 @@ mod tests {
     // A placeholder path cannot be handed to a predicate that stats it. Real
     // files in a tempdir make the resolver work and keep the public repo free of
     // a hard-coded home path.
+    // ⛔⛔ THE SWEEP'S REMEDY IS SIGTERM THEN SIGKILL, SO EVERY AMBIGUITY MUST
+    // PROTECT. Both of the sweep's evidence sources used to swallow their errors
+    // (`.ok()` on the client-instance read, `.ok()?` on the status probe), and
+    // the second one is load-bearing: measured across 8 sweeps on dev,
+    // `skipped_active_client_legacy` was 0 every time while
+    // `skipped_runtime_activity_legacy` was 16 — the client gate protected
+    // nobody, so sixteen live daemons were each one unanswered status probe away
+    // from being signalled, along with every PTY they owned.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reap_candidate_the_sweep_could_not_ask_is_protected() {
+        use crate::daemon::DaemonReapProtection;
+
+        // The three positive signals protect, one at a time.
+        for signal in [
+            DaemonReapProtection {
+                has_gui_clients: true,
+                ..Default::default()
+            },
+            DaemonReapProtection {
+                has_recoverable_runtime_activity: true,
+                ..Default::default()
+            },
+            DaemonReapProtection {
+                is_startup_bridge_sidecar: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(signal.protects(), "{signal:?} should protect");
+        }
+
+        // ⛔ And so does each ADMISSION, alone and with nothing else set. This
+        // is the half that regressed: an unreadable client list read as "no
+        // clients", and an unanswered daemon read as "owns nothing".
+        assert!(
+            DaemonReapProtection {
+                clients_unreadable: true,
+                ..Default::default()
+            }
+            .protects(),
+            "an unreadable client list is not an empty one"
+        );
+        assert!(
+            DaemonReapProtection {
+                status_unavailable: true,
+                ..Default::default()
+            }
+            .protects(),
+            "a daemon that did not answer is not a daemon with nothing to lose"
+        );
+
+        // The only shape that may be signalled: every source answered, and every
+        // answer said there is nothing here.
+        assert!(
+            !DaemonReapProtection::default().protects(),
+            "a fully-answered, fully-empty candidate is the one reapable case"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn daemon_binary_is_legacy_allows_deleted_current_install_path() {
