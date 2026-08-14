@@ -2882,6 +2882,26 @@ subsystem and must never be written into `preserved_terminal_owners` — that
 registry drives hot-update handover, and a learned dot-owner is not an ownership
 claim.
 
+### ⚠ THAT SHAPE IS NOW BUILT, AND THE ENTRY STAYS OPEN UNTIL IT IS MEASURED
+
+Landed: `run_working_flag_owner_discovery_if_due` on the existing chore tick,
+the `discovered_working_flag_owners` memo consulted after the registry, and the
+recursion cut — `WorkingFlags` is now served from local screens plus the cache
+and issues no peer request, so fan-out happens on the refresh path alone. Unit
+tests cover the selection (self excluded, non-daemon sockets ignored, stable
+order) and both structural rules, and both structural tests were confirmed
+FAILING against the pre-fix shape.
+
+⛔ **None of that is the defect's own falsifier, which is why this is still
+OPEN.** What is proven is that the mechanism exists and cannot recurse. What is
+NOT proven is the number this entry is actually about: whether the 21-of-31 rows
+reporting `working: None` becomes near-zero. That needs the transcript-growth
+run above, against rows this session did not start, on a GUI old enough to have
+the dark rows — and the sidebar is drawn by the GUI process, so it needs a GUI
+carrying the build. ⚠ **Do not mark this fixed on the strength of the tests**;
+they measure the wiring, and the wiring was already measured necessary and
+insufficient once.
+
 ⚠ **And the ground truth got coarser as the fleet grew.** Two rows now read as
 false positives against the growth test, which the earlier 21-row sample did not
 show. A row mid-turn inside one long tool call appends nothing for 30s, so

@@ -174,6 +174,17 @@ impl LiveDaemonCensus {
     pub(crate) fn live_socket_count(&self) -> usize {
         self.listening.len()
     }
+
+    /// The listening paths themselves, not just the tally.
+    ///
+    /// The sweep only ever needed to know whether a name is alive.
+    /// `working_flag_owner_discovery` needs to ADDRESS the live daemons, and
+    /// this census is the one place on the host that knows which they are
+    /// without issuing a single request — which is the whole reason discovery
+    /// reads it rather than probing `status` per socket.
+    pub(crate) fn listening_paths(&self) -> &HashSet<PathBuf> {
+        &self.listening
+    }
 }
 
 /// Linux's `/proc/net/unix`, or `None` on any platform/read where it cannot be
