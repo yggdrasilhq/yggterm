@@ -12,9 +12,66 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔⛔⛔ [6.9→6.7] EVERY PEER `status` POLL REBUILDS THE WHOLE ROW INVENTORY, AND THE POLLS GO AS N²
+## ⛔⛔⛔ [6.9→6.7] THE HANDLER SPAN MEASURES 9% OF THE HANDLER, IN THE WRONG UNIT
 
 **Status:** OPEN
+
+*measured 2026-08-14; instrument, controls and the two refuted candidates in
+[`idle-cost-model.md`](idle-cost-model.md) §6j — spec is §S6*
+
+A connection-handler thread burns **25.0 ms of CPU (1.6 user + 23.4 kernel,
+93.8% kernel)**. The `PerfGuard` span over it covers **2.3 ms**, because the
+guard **drops when `handle_request` returns** and records **wall time**, which
+cannot distinguish work from waiting.
+
+⇒ **~1.8–1.9 cores of the daemon population are spent where no instrument
+looks.** That number is stable: two 60 s runs over 20 daemons put the
+dead-thread term at 1.793 and 1.944 cores, per-daemon reproducible to ~5–10%.
+
+**Fix (§S6), two small parts:** add a `CLOCK_THREAD_CPUTIME_ID` reading to
+`PerfGuard` beside the wall reading (**priced at 570 ns/call on this host — two
+calls is 0.05% of a 2.3 ms span**), and wrap the whole closure at
+`spawn_unix_client_handler` (`daemon.rs:785`) instead of just `handle_request`.
+
+**Expected effect: ZERO cores — do not promise any.** It converts an
+unattributable 1.8 cores into an attributed one. **Prediction it must satisfy:**
+~25 ms on a loaded daemon, ~2.3 ms on an empty one.
+
+⛔ **Ruled out by measurement, so do not re-propose them:** `malloc_trim(0)` at
+`daemon.rs:19103` (**0.020–0.039 ms** at 30 threads/360 MB — ~600x too small),
+the page-faults it induces (353–852/request ≈ 0.5–1.7 ms), the lock wait itself
+(`try_lock` then a **blocking** `lock`; a block costs no CPU), and the trace
+writer (handles cached, no stat or reopen per call).
+
+## ⛔ [6.9] A DAEMON WITH ALL THREE RETIRE GATES OPEN DID NOT RETIRE
+
+**Status:** OPEN
+
+*source reading and the three gates in [`idle-cost-model.md`](idle-cost-model.md) §6k*
+
+`daemon_should_idle_shutdown` (`daemon.rs:11526`) requires three conditions:
+zero terminal sessions (owned **and** preserved), idle beyond
+`idle_shutdown_ms` (default 90 s), and no active client-instance records for
+**its own endpoint** (or being superseded).
+
+One sandbox daemon satisfies all three by observation — its own state file reports
+`stored_sessions=0, live_sessions=0`, it holds **only LISTEN sockets with zero
+established connections**, and the single client-instance record in its home is
+filed under a *different* endpoint version than the one it serves — yet it had
+been alive **48 minutes** against a 90 s window.
+
+⇒ Either the check is not reached on that path, or one of the three inputs is not
+what the state file says. **Not a cost item** (it measures 0.0002 cores); it
+matters because the drain in §S1 depends on emptied daemons actually retiring.
+
+## ⛔⛔⛔ [6.9→6.7] EVERY PEER `status` POLL REBUILDS THE WHOLE ROW INVENTORY
+
+**Status:** OPEN
+
+⛔ **This heading used to end "AND THE POLLS GO AS N²". That half is RETRACTED
+(see below) and was removed from the title on 2026-08-14** — it had been left
+standing over a body that withdrew it, which is the most quotable line in the
+entry contradicting the entry.
 
 *measured 2026-08-14; derivation, controls and the N=1 arm in
 [`idle-cost-model.md`](idle-cost-model.md) §6 — spec is §S5*
@@ -234,8 +291,17 @@ threads and `/proc/<pid>/task` cannot. **Any per-thread profile of a daemon is
 currently missing ~80% of its CPU.**
 
 ⚠ **Do not promise cores for the pool fix.** Thread spawn is ~50 µs, so 4/s is
-~0.0002 cores. The **38 ms per handler is the work, not the spawn.** The value
+~0.0002 cores. The **~25 ms per handler is the work, not the spawn.** The value
 is that CPU stops being invisible to per-thread instruments.
+
+⛔ **UPDATED §6j — the "38 ms" in this entry was a retracted ratio; the measured
+figure is ~25 ms** (1.6 ms user + 23.4 ms kernel, direct per-thread, 93.8%
+kernel). ⭐ **And a handler on an EMPTY daemon costs 2.3 ms**, so ~90% of the cost
+travels with what the daemon HOLDS, not with the connection — a pool would keep
+that 90%. The conclusion of this entry is unchanged and now rests on measurement.
+⛔ **A version/RSS split of the per-request cost was measured, then FAILED TO
+REPLICATE (8.5 ms then 33.3 ms on the same daemon) and is withdrawn** — do not
+resurrect it from the first run.
 
 
 # THE 2026-08-13 BATCH — reported after a restart lost the campaign rows
