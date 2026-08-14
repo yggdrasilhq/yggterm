@@ -991,6 +991,42 @@ pub fn live_row_departures(
     .departures()
 }
 
+/// Write one departure into the machine-wide ledger, best-effort.
+///
+/// The write side of [`live_row_departures`], and the ONLY door for a caller
+/// that is not the daemon's own close path. It goes through
+/// [`crate::live_row_tombstones::LiveRowTombstones::record_departure`] — the
+/// same shared read-modify-write under the same file lock. A caller that reached
+/// for the in-memory primitives instead would publish a private snapshot over
+/// every peer daemon's records, which is the bug that module was rewritten to
+/// prevent.
+///
+/// ⚖ Best-effort on purpose: a row leaving is not something to abort over, and a
+/// ledger that could fail a persist would be worse than the silence it replaces.
+/// A failed write is traced beside the departure it could not record.
+pub fn record_live_row_departure(
+    home_dir: &std::path::Path,
+    departure: crate::live_row_tombstones::LiveRowDeparture,
+) {
+    let reason = departure.reason.label();
+    let path = departure.path.clone();
+    if let Err(error) = crate::live_row_tombstones::LiveRowTombstones::default()
+        .record_departure(home_dir, departure)
+    {
+        append_trace_event(
+            home_dir,
+            "server",
+            "session",
+            "live_session_row_departure_record_failed",
+            serde_json::json!({
+                "path": path,
+                "reason": reason,
+                "error": error.to_string(),
+            }),
+        );
+    }
+}
+
 /// **A genuinely closed row, for a test in ANOTHER crate.** Not compiled into
 /// any shipping binary: it exists only under the `test-support` feature, which
 /// nothing but a `[dev-dependencies]` edge turns on.
@@ -6550,9 +6586,33 @@ impl YggtermServer {
         // kept vanishing at swaps even after the mapper fix; the unit test
         // passed while the live path failed). Every live key that does NOT
         // make it into the persisted state traces WHICH gate dropped it.
-        let trace_drop = |key: &str, reason: &str, detail: serde_json::Value| {
+        // ⛔⛔ THIS IS THE PATH THAT TOOK THE OWNER'S ROW GROUP, and it took a
+        // departure ledger and a trace hunt to find out, because it is the ONE
+        // way a row leaves that neither close path knows about.
+        //
+        // A dropped row is still in THIS daemon's live order — it is simply not
+        // written to the state file, so the SUCCESSOR daemon never learns it
+        // existed. From the user's side that is a row vanishing at the next
+        // restart; from the system's side nothing was closed, so
+        // `removed-rows.json` stays empty and no `client_close_prepared` is
+        // traced. It also explains the two-stores-disagree symptom in
+        // `spec-app-row-survival.md` §3 exactly: the OLD daemon still holds the
+        // row in memory and still lists it, while the new one never had it.
+        //
+        // Measured on the desktop host: four `local://` rows dropped in one
+        // update-restart persist at `protect_all_live: true`, two of them titled
+        // for the app rows the owner reported losing. He had closed nothing.
+        //
+        // ⇒ SO THE DROP RECORDS A DEPARTURE TOO. §3's rule is *a row leaving the
+        // live set for any reason other than an explicit user close must leave a
+        // record saying which reason*, and a trace event is not that record: it
+        // is keyed by time, in a file that rotates per GUI launch, rather than by
+        // row in a store that outlives the daemon which wrote it.
+        let trace_drop = |key: &str, title: &str, reason: &str, detail: serde_json::Value| {
             // Log the first occurrence, never the repetitions — see
-            // `persist_drop_already_traced`.
+            // `persist_drop_already_traced`. The departure rides the same gate:
+            // one record per row per reason is a ledger, one per persist tick
+            // would be a treadmill.
             if persist_drop_already_traced(key, reason) {
                 return;
             }
@@ -6569,6 +6629,20 @@ impl YggtermServer {
                         "protect_all_live": protect_all_live,
                     }),
                 );
+                record_live_row_departure(
+                    &home,
+                    crate::live_row_tombstones::LiveRowDeparture {
+                        identity: normalized_live_row_identity(key),
+                        path: key.to_string(),
+                        title: title.to_string(),
+                        reason: crate::live_row_tombstones::RowDeparture::PersistDropped,
+                        at: crate::live_row_tombstones::now_secs(),
+                        // WHICH gate took it. The three read very differently to
+                        // somebody asking why their row is gone, and without this
+                        // the ledger sends them back to a rotating trace.
+                        detail: Some(reason.to_string()),
+                    },
+                );
             }
         };
         self.live_session_order
@@ -6579,6 +6653,7 @@ impl YggtermServer {
                 if !recoverable {
                     trace_drop(
                         key,
+                        &session.title,
                         "not_recoverable",
                         serde_json::json!({
                             "kind": format!("{:?}", session.kind),
@@ -6636,6 +6711,7 @@ impl YggtermServer {
                     if !protected {
                         trace_drop(
                             key,
+                            &session.title,
                             "not_in_protected_runtime_keys",
                             serde_json::json!({
                                 "resolved_runtime_key": runtime_key,
@@ -6657,6 +6733,7 @@ impl YggtermServer {
                 if persisted.is_none() {
                     trace_drop(
                         key,
+                        &session.title,
                         "mapper_returned_none",
                         serde_json::json!({
                             "kind": format!("{:?}", session.kind),
@@ -32544,6 +32621,92 @@ mod tests {
     /// and daemon #3 had nothing left to re-derive from. A row outlives many
     /// daemons; a fact that survives one of them is not persisted.
     ///
+    /// ⛔⛔ THE THIRD WAY A ROW LEAVES, AND IT IS THE ONE THAT TOOK THE OWNER'S
+    /// GROUP: it is never closed, it is left OUT of the state file.
+    ///
+    /// Both close paths write a departure now. This one is not a close at all —
+    /// the row stays in the running daemon's live order and simply is not
+    /// persisted, so the SUCCESSOR daemon never learns it existed. Nothing is
+    /// removed, so `removed-rows.json` stays empty and no close is traced; the
+    /// row just is not there after the next restart, while the old daemon still
+    /// lists it. That is the two-stores-disagree symptom in
+    /// `spec-app-row-survival.md` §3, and it is what the trace on the desktop
+    /// host showed: four `local://` rows dropped in one update-restart persist,
+    /// two of them titled for the app rows the owner reported losing.
+    ///
+    /// Driven through the REAL filter against a temp `YGGTERM_HOME`, because the
+    /// claim is that a write reaches a shared file — a test that built the record
+    /// itself would assert nothing about the path that failed to write one.
+    #[test]
+    fn a_row_dropped_from_the_state_file_leaves_a_record_saying_so() {
+        use crate::live_row_tombstones::{LiveRowTombstones, RowDeparture};
+
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-persist-drop-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&home).expect("create temp home");
+        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
+        unsafe {
+            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
+        }
+
+        let mut server = test_server();
+        let row = server.start_command_session(
+            Some("/home/user"),
+            Some("a shell the user made"),
+            "/bin/bash -i",
+            None,
+        );
+        // The update-restart persist: `protect_all_live`, and a protected set
+        // that does NOT carry this row's runtime. That is the exact gate the
+        // owner's rows fell through.
+        let protected: HashSet<String> = HashSet::new();
+        let persisted =
+            server.persisted_live_sessions_with_update_protection(true, Some(&protected));
+
+        let departures =
+            LiveRowTombstones::load(&home, crate::live_row_tombstones::now_secs()).departures();
+
+        if let Some(previous_home) = previous_home {
+            unsafe {
+                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+
+        assert!(
+            !persisted.iter().any(|live| live.key == row),
+            "the row must actually have been dropped, or this test proves nothing \
+             about what a drop records"
+        );
+        let recorded = departures
+            .iter()
+            .find(|departure| departure.path == row)
+            .expect(
+                "a row that leaves the live set must leave a record saying which \
+                 reason -- an absence is not a record, and an absence is all this \
+                 path used to leave",
+            );
+        assert_eq!(recorded.reason, RowDeparture::PersistDropped);
+        assert_eq!(
+            recorded.title, "a shell the user made",
+            "the record has to name the row the way the user knew it, or it \
+             cannot answer the question it exists for"
+        );
+        assert_eq!(
+            recorded.detail.as_deref(),
+            Some("not_in_protected_runtime_keys"),
+            "WHICH gate took it: the three drop reasons mean different things, \
+             and without this the reader is sent back to a rotating trace file"
+        );
+    }
+
     /// ⛔ AND THE COMMAND HAS TO BE RE-DERIVED FOR EVERY APP ROW, not only for
     /// one that happens to have a transcript.
     ///
