@@ -457,6 +457,42 @@ def rate_limit_hold():
     return d
 
 
+def row_process_absent(uuid):
+    """True only when NOTHING is running as this row. ⛔ Biased toward "alive".
+
+    ⭐ ARGV[0]-ANCHORED, because every weaker form failed in one night: a bare
+    `pgrep -f <uuid>` matches the shell that asked; *"exclude grep"* does not
+    exclude `bash -c`; and *"the cmdline contains `claude`"* matches every probe
+    this fleet runs, since their command lines carry a `…/.claude/…` path. Read
+    the FIRST NUL-separated field and judge its basename.
+
+    ⚠ An EMPTY cmdline is a zombie or a kernel thread — `/proc/<pid>` exists for
+    a reaped-but-unwaited child, so directory existence answers *has this been
+    reaped*, not *is this running*. Empty ⇒ not this row.
+
+    ⛔ The bias is deliberate and it is the safe direction. A false "absent"
+    would skip a fleet hold during a REAL outage; a false "present" merely keeps
+    today's behaviour. So anything that is not clearly a shell counts as alive,
+    and only a total absence counts as dead."""
+    shells = {"bash", "sh", "zsh", "dash", "ssh", "grep", "awk", "sed", "xargs"}
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except Exception:
+        return False                      # cannot tell ⇒ treat as alive
+    needle = uuid.encode()
+    for d in pids:
+        try:
+            cl = Path(f"/proc/{d}/cmdline").read_bytes()
+        except Exception:
+            continue
+        if not cl or needle not in cl:
+            continue
+        a0 = os.path.basename(cl.split(b"\0")[0].decode("utf8", "ignore"))
+        if a0 not in shells:
+            return False
+    return True
+
+
 def note_rate_limit(uuid, tail):
     """A subscriber was refused on quota ⇒ hold the whole fleet.
 
@@ -1613,10 +1649,41 @@ def tick(args):
             sub_path(uuid).unlink(missing_ok=True)
             continue
         if state == "RATE_LIMITED":
-            # ⛔ THE ACCOUNT IS OUT OF QUOTA, NOT THIS ROW. Hold the FLEET, do
-            #    not escalate (a human cannot grant quota), and do not unsubscribe
-            #    — unlike CONTEXT_DEAD this ends by itself, and the row is meant
-            #    to still be watched when it does.
+            # ⛔⛔ THE PREMISE BELOW WAS FALSE FOR 7.5 HOURS AND TOOK THE WHOLE
+            #    WAKE PLANE DOWN WITH IT. "The account is out of quota, not this
+            #    row" is inferred from the row's TAIL — and a DEAD row's tail
+            #    never changes. Eight rows had died on quota hours earlier; the
+            #    account had long since reset and other sessions were running
+            #    normally, but each tick re-read those frozen last words,
+            #    re-classified RATE_LIMITED, and re-armed a 30-minute FLEET-WIDE
+            #    hold. The mechanism that ends the hold was the one renewing it,
+            #    and every instrument still reported "✅ armed".
+            #    ⭐ THE CLASS: a STALE ARTEFACT READ AS A LIVE SIGNAL — the same
+            #    shape as a transcript's mtime being when a row DIED rather than
+            #    when it last worked. A quota tail is evidence about a MOMENT;
+            #    treating it as evidence about NOW needs the row to still exist.
+            #    ⇒ Ask whether anything is actually running as this row before
+            #    holding the entire fleet on its behalf.
+            if row_process_absent(uuid):
+                log(f"{uuid[:8]} QUOTA-DEAD — no process; its quota tail is history, "
+                    f"not a live refusal. Unsubscribing instead of holding the fleet.")
+                try:
+                    STATE.mkdir(parents=True, exist_ok=True)
+                    with RETIRED_LEDGER.open("a") as fh:
+                        fh.write("%s\t%s\t%s\t%s\n" % (
+                            time.strftime("%Y-%m-%dT%H:%M:%S%z"), uuid,
+                            "booter tick (auto)",
+                            "classified RATE_LIMITED with no process running as this row: "
+                            "a corpse whose last words were a quota message. Retrying it "
+                            "re-armed the fleet-wide hold on every tick."))
+                except Exception as exc:
+                    log(f"   ⚠ could not record the retirement: {exc}")
+                sub_path(uuid).unlink(missing_ok=True)
+                continue
+            # A LIVE row refused on quota is the real thing: hold the FLEET, do
+            # not escalate (a human cannot grant quota), and do not unsubscribe
+            # — unlike CONTEXT_DEAD this ends by itself, and the row is meant
+            # to still be watched when it does.
             rl = note_rate_limit(uuid, c["tail"])
             # ⭐ GIVE THE LAST ATTEMPT BACK. That boot was refused by the API
             #    before the agent ran, so counting it toward MAX_BOOTS would
@@ -1831,9 +1898,22 @@ def cmd_status(args):
                   else f" {(d['until'] - time.time()) / 60:.0f}m left")
         if d.get("note"):
             armed += f" ({d['note']})"
+    # ⛔⛔ "armed" AND "QUOTA HOLD" USED TO APPEAR IN THE SAME LINE, and "armed"
+    #    came first — so wrapping tools grepped it and reported ✅ ARMED through
+    #    a 7.5-hour fleet-wide blackout in which no boot could be delivered to
+    #    anybody. The hold was printed the whole time and nobody read past the
+    #    first word. ⇒ The instruments knew SUBSCRIBED (wakeable) and ADDRESSABLE
+    #    (namable); none of them knew DELIVERABLE, which is the only one a caller
+    #    asking "am I watched" actually cares about.
+    #    ⇒ A held booter must not describe itself as armed AT ALL. One state, one
+    #    word, and the word says what a boot would actually do right now.
     rl = rate_limit_hold()
-    hold = "" if not rl else (f" · ⏸ QUOTA HOLD {(rl['until'] - time.time()) / 60:.0f}m "
-                              f"left, 429 seen on {rl['seen_on'][:8]}")
+    hold = ""
+    if rl:
+        armed = (f"⏸ HELD — NO BOOT CAN BE DELIVERED TO ANY ROW "
+                 f"({(rl['until'] - time.time()) / 60:.0f}m left)")
+        hold = (f" · quota refusal last seen on {rl['seen_on'][:8]}; "
+                f"{len(load_subs())} subscriber(s) are unwakeable meanwhile")
     log(f"watcher: {'alive pid ' + str(alive) if alive else 'NOT RUNNING'} · "
         f"{armed} · heartbeat {hb} · subscribers {len(load_subs())}{hold}{mute}")
     return 0 if (alive and not mute) else 1
