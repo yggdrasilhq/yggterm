@@ -802,9 +802,17 @@ fn spawn_unix_client_handler(
             let started = std::time::Instant::now();
             let result = handle_unix_stream(stream, runtime, last_activity_ms);
             let _ = outcomes.send(result);
+            // ⭐ Both the closure's own delta AND the thread's LIFETIME total.
+            // The difference is what the thread cost before its closure began —
+            // stack setup and entry — which a closure-delta span cannot see and
+            // which a process-counter subtraction attributes without measuring.
+            // A note this file has carried says thread spawn is ~50 µs; this is
+            // the field that can check it rather than assume it.
+            let ended_cpu_us = thread_cpu_micros();
             record_client_handler_cost(
-                thread_cpu_micros().saturating_sub(started_cpu_us),
+                ended_cpu_us.saturating_sub(started_cpu_us),
                 started.elapsed().as_micros() as u64,
+                ended_cpu_us,
             );
         })
     {
@@ -853,6 +861,8 @@ struct ClientHandlerStats {
     cpu_us_max: u64,
     wall_us_total: u64,
     wall_us_max: u64,
+    /// The thread's whole life, closure plus everything before it.
+    thread_total_cpu_us: u64,
     user_us: u64,
     kernel_us: u64,
     split_samples: u64,
@@ -924,7 +934,7 @@ fn thread_cpu_split_micros() -> Option<(u64, u64)> {
     None
 }
 
-fn record_client_handler_cost(cpu_us: u64, wall_us: u64) {
+fn record_client_handler_cost(cpu_us: u64, wall_us: u64, thread_total_cpu_us: u64) {
     let split = thread_cpu_split_micros();
     let request_name = HANDLER_REQUEST_NAME.with(|name| name.take()).unwrap_or("unread");
     let proc_cpu_us = process_cpu_micros();
@@ -943,6 +953,7 @@ fn record_client_handler_cost(cpu_us: u64, wall_us: u64) {
         stats.cpu_us_max = stats.cpu_us_max.max(cpu_us);
         stats.wall_us_total += wall_us;
         stats.wall_us_max = stats.wall_us_max.max(wall_us);
+        stats.thread_total_cpu_us += thread_total_cpu_us;
         if let Some((user_us, kernel_us)) = split {
             stats.user_us += user_us;
             stats.kernel_us += kernel_us;
@@ -983,6 +994,9 @@ fn record_client_handler_cost(cpu_us: u64, wall_us: u64) {
                     "cpu_us_max": stats.cpu_us_max,
                     "wall_us_mean": stats.wall_us_total / stats.handled.max(1),
                     "wall_us_max": stats.wall_us_max,
+                    // ⭐ Thread lifetime, not closure. The gap between this and
+                    // `cpu_us_mean` is the thread's pre-closure cost, measured.
+                    "thread_cpu_us_mean": stats.thread_total_cpu_us / stats.handled.max(1),
                     // ⚠ A WINDOW share. Per handler it would be a ratio of two
                     // microsecond figures on a sub-millisecond span, which is a
                     // precision this does not have.
