@@ -113,10 +113,27 @@ for K in "${ROWS[@]}"; do
   fi
 
   if [ "$MODE" = served ]; then
+    # ⛔ THE ZERO-REQUEST BASELINE, TAKEN IN THE SAME RUN. A daemon burns CPU
+    # whether or not anyone sends it a request, and dividing a process-wide
+    # delta by your own request count charges that background to the requests
+    # you sent — a denominator you caused against a numerator you did not. That
+    # error was worth 29x on a neighbouring arm. Measure it; never assume zero.
+    BG_A="$(proc_cpu_us "$DPID")"; BG_T0="$(date +%s)"
+    sleep 20
+    BG_B="$(proc_cpu_us "$DPID")"; BG_T1="$(date +%s)"
+    BG_CORES="$(python3 -c "print(f'{(${BG_B:-0}-${BG_A:-0})/1e6/max(${BG_T1}-${BG_T0},1):.5f}')")"
+
     END=$(( $(date +%s) + DWELL ))
+    FAILED=0
     while [ "$(date +%s)" -lt "$END" ]; do
-      YGGTERM_HOME="$HOME_DIR" timeout 10 "$BIN" server status >/dev/null 2>&1 || break
+      # ⚠ Count failures, never break on one. A single transient refusal used to
+      # end the arm silently, and the only symptom was "no window flushed" —
+      # a truncated run wearing the costume of an instrument that did not fire.
+      YGGTERM_HOME="$HOME_DIR" timeout 10 "$BIN" server status >/dev/null 2>&1 || FAILED=$((FAILED + 1))
+      [ "$FAILED" -gt 20 ] && { echo "rows=$K ABORTED after $FAILED failed requests"; break; }
     done
+    [ "$FAILED" -gt 0 ] && echo "      ⚠ $FAILED requests failed during this arm"
+    echo "      background (zero-request) = $BG_CORES cores"
     # The cost window flushes lazily, by the NEXT reply — without one more
     # request past the boundary the window this run paid for is never emitted.
     sleep 1
