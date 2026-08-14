@@ -122,13 +122,14 @@ live rate is **0.37/s** (unsampled, and §6a's independent trace figure of
 `status`/`ping`/`working_flags`/`terminal_read` spans are **sampled** (kept at
 ≥8 ms or 1-in-50) so their `perf-summary` counts are undercounts; `snapshot` is
 not on that list, and the event trace is never sampled at all.
-⭐ **And a per-connection cost sits OUTSIDE the handler closure:** the in-process
-span reads 118–126 µs for `ping` where a process-level arm reads **1.80 ms**, so
-~1.7 ms per connection is accept + thread create/teardown + outcome channel.
-⛔ **That contradicts S4's note that "thread spawn is ~50 µs so a pool buys
-nothing"** — that priced `clone()` alone. Do not quote it as a reason not to
-build S4; do not yet treat this as a reason TO build it either, because 1.7 ms is
-a difference between two instruments, not a direct measurement.
+⛔⛔ **AND A "~1.7 ms PER-CONNECTION COST OUTSIDE THE CLOSURE" THAT DOES NOT
+EXIST** — I got it by subtracting a closure span from a process counter that was
+charging concurrent reader/chore work to whatever connection was open. Measured
+from inside in three pieces (parent accept+spawn 44–48 µs · child pre-closure
+39–55 µs · closure 61–126 µs), the **whole per-connection floor is ≈150–230 µs**,
+~8x smaller. ⇒ **S4's old note was right, but by luck at ~50 µs and now by
+measurement; schedule S4 on stability and observability, NEVER on cores**
+(<0.001 cores/daemon).
 
 ## ⛔ [6.3] ONE SESSION RENDERS AS TWO ROWS, AT TWO DIFFERENT NESTING DEPTHS
 
