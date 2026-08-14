@@ -298,7 +298,37 @@ a mode change or relaunch corrupts whatever it is measuring.
 
 No `perf` on a typical desktop host (`perf_event_paranoid=3`), but these do:
 
-### ⛔⛔ FIRST: an EXTERNAL estimator is unusable when the baseline IS what you subtract
+### ⛔⛔⛔ THE UNIT LAW — when every instrument agrees and the answer is still missing, suspect the UNIT
+
+**Four lanes spent a day refining precision inside units that could not express
+the answer.** Every instrument was honest, every control passed, and the quantity
+was not in frame. That is not a precision problem and no amount of care inside
+the unit finds it.
+
+**Three faces, all from one day, all invisible to every instrument because every
+instrument shared the unit:**
+
+| face | the unit | what it cost |
+|---|---|---|
+| **STORAGE** | an identifier held at two lengths (8 vs 36) | a `succeed` silently skipped rows and reported a clean count; one seat escalated into a void for hours while the board rendered it healthy |
+| **ACCOUNT** | process vs process **SUBTREE** | a sandbox daemon spawns no children, so it has **no subtree to carry the floor** — `0.00017 cores` was reproducible, honest, and missed a **0.2-core** term because *the quantity was never inside the process being sampled* |
+| **REGIME** | saturated vs idle | flooding a pty with `yes(1)` measured the reader path's **ceiling**; carried to a fleet whose sessions are idle it inverted the whole ledger |
+
+⭐ **A fourth face is the observer's own:** a unit that silently *includes the
+measurer* — a counter charging your load to the subject, a probe reading back its
+own write, an "after" window taken in the wake of your own generator.
+
+⇒ **The tell is agreement without resolution.** When independent instruments
+converge and the number still will not appear, stop improving the instruments and
+ask **what quantity they all decline to express.** Change the unit — measure the
+subtree, not the process; the regime the subject actually occupies, not the one
+that saturates it; compare identifiers by prefix, not equality.
+
+⚠ **And a harness that cannot express the term should say so in its own
+documentation**, or it goes on looking general-purpose while being blind by
+construction.
+
+### ⛔⛔ an EXTERNAL estimator is unusable when the baseline IS what you subtract
 
 **Read this before pointing any `/proc`-based profiler at a busy process.** It
 cost the resource campaign four measurements, and they failed as one class rather
