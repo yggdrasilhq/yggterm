@@ -868,11 +868,53 @@ impl TerminalManager {
         shell_start_time: u64,
         seed: Option<&str>,
     ) -> Result<()> {
-        if self
-            .sessions
-            .get(key)
-            .is_some_and(|session| session.is_running())
+        if let Some(existing) = self.sessions.get(key)
+            && existing.is_running()
         {
+            // ⛔⛔ IDENTITY, NOT PRESENCE — AND THE DIFFERENCE PINS WHOLE DAEMONS.
+            //
+            // The handoff has a window between the successor SEATING a pty and
+            // the predecessor receiving the ack. When the ack is lost, the
+            // predecessor books a failure and keeps its runtime, then retries —
+            // and every retry landed here, where "I already have this key" was
+            // read as a conflict. **It is the opposite: it is proof the earlier
+            // adoption succeeded.** The predecessor could therefore never
+            // complete the move, and because one failure aborts the whole sweep
+            // (`classify_handoff_sweep`), a single key in this state pinned
+            // EVERY other session on that daemon and it could never reach the
+            // empty hands that let it retire.
+            //
+            // Measured live on dev 2026-08-14 during the 3.0.154 bump: the same
+            // key failing once a minute, `NoneMoved`, `readers_stood_down: 11`
+            // and `moved: 0` — eleven healthy runtimes held hostage by one.
+            //
+            // ⚠ The check must be IDENTITY. "A live pty exists under this key"
+            // is also true when the successor built its OWN pty for the session
+            // (an independent re-resume), and returning success there would let
+            // the predecessor drop a runtime whose child is still on the far end
+            // — closing a pty out from under a live process. So compare the
+            // CHILD: same pid, and the same start time so a recycled pid cannot
+            // impersonate it.
+            let same_child = existing.process_id() == Some(shell_pid)
+                && crate::pty_adoption::process_start_time(shell_pid)
+                    .is_some_and(|start| start == shell_start_time);
+            if same_child {
+                // Idempotent success. `fd` drops here, closing this duplicate
+                // descriptor for a pty we already hold open — which is why it
+                // cannot hang up on the child.
+                trace_terminal_event(
+                    "adopt_already_seated",
+                    serde_json::json!({
+                        "path": key,
+                        "shell_pid": shell_pid,
+                        "shell_start_time": shell_start_time,
+                        "reason": "this key is already seated on the very process being \
+                                   handed over — the earlier adoption succeeded and only \
+                                   its acknowledgement was lost",
+                    }),
+                );
+                return Ok(());
+            }
             bail!("refusing to adopt {key}: this daemon already runs a live PTY for it");
         }
         if let Some(runtime) = self.sessions.remove(key) {
@@ -1061,6 +1103,37 @@ impl TerminalManager {
         self.sessions
             .get(key)
             .and_then(|session| session.process_id())
+    }
+
+    /// Did this runtime arrive by ADOPTION — i.e. do we SHARE its child with
+    /// whoever handed it to us?
+    ///
+    /// ⛔⛔ THE DISTINCTION IS FATAL AND IT IS WHY THIS EXISTS. A runtime we
+    /// spawned owns its child alone, so dropping it is cleanup. An ADOPTED
+    /// runtime is the same process on the same pty as the predecessor's copy —
+    /// so asking that predecessor to drop its side **kills the child we are
+    /// serving**, because a drop is `remove_session` → `shutdown` → `kill`.
+    ///
+    /// Measured 2026-08-14: the duplicate-prune fired twice with
+    /// `removed_terminal: true`, and the two outcomes were opposite. Against a
+    /// runtime created by a genuine re-launch it removed the STALE side and the
+    /// live process survived — correct. Against a runtime we had ADOPTED after a
+    /// lost handoff ack, it removed the side a live agent was mid-turn on, and
+    /// the transcript's last write lands in the same second as the drop.
+    ///
+    /// ⚠ In that second case **neither side was stale**, so "drop the duplicate"
+    /// had no right answer to give — which is exactly why the caller must not
+    /// ask the question rather than the prune trying to choose better.
+    #[cfg(target_os = "linux")]
+    pub fn session_is_adopted(&self, key: &str) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.child_is_adopted())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn session_is_adopted(&self, _key: &str) -> bool {
+        false
     }
 
     /// The pid of the PTY's foreground process group leader — what the user
@@ -2715,6 +2788,13 @@ impl PtySessionRuntime {
     fn process_id(&self) -> Option<u32> {
         let child = self.child.lock().expect("pty child lock poisoned");
         child.process_id()
+    }
+
+    /// Whether our child handle is an ADOPTED pid rather than one we forked.
+    #[cfg(target_os = "linux")]
+    fn child_is_adopted(&self) -> bool {
+        let child = self.child.lock().expect("pty child lock poisoned");
+        child.is_adopted()
     }
 
     #[cfg(unix)]
@@ -7651,6 +7731,190 @@ line-two on the real screen\r\n\
             transcript.contains("RESULT-42"),
             "the adopted shell must still EVALUATE and answer, not merely echo; \
              transcript: {transcript}"
+        );
+
+        let _ = manager.shutdown_all(|_key| None::<String>);
+    }
+
+    /// ⛔⛔ A RE-SENT ADOPTION OF THE **SAME CHILD** IS A LOST ACK, NOT A CONFLICT.
+    ///
+    /// The handoff has a window between the successor seating a pty and the
+    /// predecessor receiving the ack. When that ack is lost the predecessor
+    /// retries — and the retry used to be refused with *"this daemon already
+    /// runs a live PTY for it"*, which is not a conflict at all: it is proof the
+    /// first adoption worked. Because one failure aborts the whole sweep, a
+    /// single key stuck in that state pinned every other session on the daemon,
+    /// and it could never reach the empty hands that let it retire.
+    ///
+    /// Both arms, because presence and identity are exactly what must not be
+    /// confused: the same child re-adopts idempotently, a DIFFERENT child under
+    /// the same key is still refused. The second arm is the one that keeps this
+    /// fix from becoming "close whatever pty someone names".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn re_adopting_the_same_child_succeeds_but_a_different_child_is_still_refused() {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        // ⛔ A TEST THAT SPAWNS A PTY READS THE PROCESS-WIDE TERMINAL-IDENTITY ENV,
+        // and without this guard it does not break itself — it breaks the identity
+        // tests in `lib.rs`, which is far harder to attribute. Caught here: the
+        // full suite went red on
+        // `local_cc_relaunch_rebuild_collapses_poisoned_identity_to_row_id` while
+        // that test passed alone AND passed paired with this one, so only the
+        // whole-suite run showed it.
+        let _env = crate::codex_cli::env_test_guard();
+
+        fn spawn_shell_on_a_pty() -> (portable_pty::PtyPair, Box<dyn portable_pty::Child + Send + Sync>, u32, u64)
+        {
+            let pair = native_pty_system()
+                .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+                .expect("openpty");
+            let mut cmd = CommandBuilder::new("bash");
+            cmd.arg("--norc");
+            cmd.arg("-i");
+            cmd.env("PS1", "");
+            let child = pair.slave.spawn_command(cmd).expect("spawn bash");
+            let pid = child.process_id().expect("bash pid");
+            let start = crate::pty_adoption::process_start_time(pid).expect("bash start time");
+            (pair, child, pid, start)
+        }
+
+        fn ferry_master(pair: &portable_pty::PtyPair) -> std::os::fd::OwnedFd {
+            let (send, recv) = UnixStream::pair().expect("socketpair");
+            let raw = pair.master.as_raw_fd().expect("master raw fd");
+            crate::pty_handoff_wire::send_master_fd(&send, raw, b"t").expect("send_master_fd");
+            crate::pty_handoff_wire::recv_master_fd(&recv).expect("recv_master_fd").0
+        }
+
+        let (pair_a, _child_a, pid_a, start_a) = spawn_shell_on_a_pty();
+        let first = ferry_master(&pair_a);
+        // A second descriptor for the SAME pty — what the predecessor still holds
+        // and re-sends when it never hears the ack.
+        let again = first.try_clone().expect("dup the master fd");
+        drop(pair_a);
+
+        let mut manager = TerminalManager::new();
+        let key = "local://readopt-in-test";
+        manager
+            .adopt_session(key, "bash", None, 80, 24, first, pid_a, start_a, None)
+            .expect("the first adoption seats the pty");
+
+        // THE FIX: the retry is idempotent success, not a refusal.
+        manager
+            .adopt_session(key, "bash", None, 80, 24, again, pid_a, start_a, None)
+            .expect(
+                "re-adopting the SAME live child must succeed — the predecessor is \
+                 retrying a handoff whose ack was lost, and refusing it pins the \
+                 whole daemon",
+            );
+
+        // ⭐ And the duplicate descriptor closing must not hang up the child:
+        // the shell has to still EVALUATE, not merely echo.
+        manager
+            .write(key, "printf 'READOPT-%s\\n' $((6*7))\n")
+            .expect("write to re-adopted pty");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut transcript = String::new();
+        while std::time::Instant::now() < deadline {
+            if let Ok(result) = manager.read(key, 0) {
+                transcript = result
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.data.as_str())
+                    .collect::<String>();
+            }
+            if transcript.contains("READOPT-42") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            transcript.contains("READOPT-42"),
+            "the shell must survive the redundant adoption and still answer; \
+             transcript: {transcript}"
+        );
+
+        // THE NEGATIVE ARM: a DIFFERENT live child under the same key is still a
+        // real conflict. Accepting it would let a predecessor drop a runtime
+        // whose child is still on the far end of its own pty.
+        let (pair_b, mut child_b, pid_b, start_b) = spawn_shell_on_a_pty();
+        assert_ne!(pid_a, pid_b, "the two shells must be distinct processes");
+        let other = ferry_master(&pair_b);
+        drop(pair_b);
+        let refused =
+            manager.adopt_session(key, "bash", None, 80, 24, other, pid_b, start_b, None);
+        assert!(
+            refused.is_err(),
+            "a DIFFERENT child under an occupied key must still be refused — \
+             identity is the check, not presence"
+        );
+
+        let _ = child_b.kill();
+        let _ = manager.shutdown_all(|_key| None::<String>);
+    }
+
+    /// ⛔⛔ THE DISCRIMINATOR THE DUPLICATE-PRUNE RESTS ON.
+    ///
+    /// A runtime we SPAWNED owns its child alone, so telling its other owner to
+    /// drop it is cleanup. An ADOPTED runtime is the same process on the same
+    /// pty as the predecessor's copy, and a drop is `remove_session` ->
+    /// `shutdown` -> `kill` — so pruning it kills the agent we are serving.
+    /// Measured fatal 2026-08-14: the prune fired against an adopted runtime
+    /// after a lost handoff ack and the transcript's last write lands in the
+    /// same second as the drop.
+    ///
+    /// If this ever reports `false` for an adopted runtime, the prune loses its
+    /// only way to tell "stale copy" from "the live process, twice".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_adopted_runtime_says_so_and_a_spawned_one_does_not() {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let _env = crate::codex_cli::env_test_guard();
+
+        let mut manager = TerminalManager::new();
+
+        // A runtime this manager spawned itself.
+        let spawned_key = "local://spawned-not-adopted";
+        manager
+            .ensure_session_with_size(spawned_key, "bash --norc -i", None, Some((80, 24)))
+            .expect("spawn a normal session");
+        assert!(
+            !manager.session_is_adopted(spawned_key),
+            "a session we forked ourselves must NOT report as adopted — the prune \
+             would then refuse to clean up a genuinely stale duplicate"
+        );
+
+        // A runtime adopted over the real wire.
+        let pair = native_pty_system()
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.arg("--norc");
+        cmd.arg("-i");
+        cmd.env("PS1", "");
+        let child = pair.slave.spawn_command(cmd).expect("spawn bash");
+        let pid = child.process_id().expect("bash pid");
+        let start = crate::pty_adoption::process_start_time(pid).expect("start time");
+        let (send, recv) = UnixStream::pair().expect("socketpair");
+        let raw = pair.master.as_raw_fd().expect("master raw fd");
+        crate::pty_handoff_wire::send_master_fd(&send, raw, b"t").expect("send");
+        let (received, _token) =
+            crate::pty_handoff_wire::recv_master_fd(&recv).expect("recv");
+        drop(pair);
+
+        let adopted_key = "local://adopted-shares-its-child";
+        manager
+            .adopt_session(adopted_key, "bash", None, 80, 24, received, pid, start, None)
+            .expect("adopt");
+        assert!(
+            manager.session_is_adopted(adopted_key),
+            "an ADOPTED session must say so — it shares its child with whoever \
+             handed it over, and the prune kills that child if it does not know"
         );
 
         let _ = manager.shutdown_all(|_key| None::<String>);

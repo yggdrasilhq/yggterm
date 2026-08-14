@@ -10,7 +10,7 @@
 # An agent's discipline resets every session; a verb's does not.
 #
 #   scripts/deploy-fleet.sh [--from <dir>] [--hosts "dev guihost oc"] [--dry-run]
-#                           [--allow-behind] [--preflight]
+#                           [--allow-behind] [--preflight] [--no-pin]
 #
 # ⭐ `--preflight` runs ONLY the ancestry check and exits, without needing build
 # products. Run it BEFORE the release build. The ancestry gate is correct and is
@@ -42,25 +42,40 @@ FROM="target/release"
 #   short list that looks complete.
 HOSTS="dev $("$(dirname "$0")/ygg-live-host.sh" 2>/dev/null || true) oc"
 HOSTS="$(printf '%s\n' $HOSTS | awk 'NF && !seen[$0]++' | tr '\n' ' ')"
-if [ "$(printf '%s\n' $HOSTS | awk 'NF' | wc -l)" -lt 3 ]; then
-  echo "deploy-fleet: ⛔ could not resolve the live GUI host — ygg-live-host.sh gave nothing." >&2
-  echo "  Deploying to '$HOSTS' would SKIP the only host a UI change can be proven on." >&2
-  echo "  Pass --hosts explicitly if that is really what you want." >&2
-  exit 2
-fi
 DRY=0
 ALLOW_BEHIND=0
 PREFLIGHT=0
+HOSTS_EXPLICIT=0
+NO_PIN=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from) FROM="$2"; shift 2;;
-    --hosts) HOSTS="$2"; shift 2;;
+    --hosts) HOSTS="$2"; HOSTS_EXPLICIT=1; shift 2;;
+    --no-pin) NO_PIN=1; shift;;
     --dry-run) DRY=1; shift;;
     --allow-behind) ALLOW_BEHIND=1; shift;;
     --preflight) PREFLIGHT=1; shift;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
+
+# ⛔ THIS REFUSAL USED TO RUN **BEFORE** ARGUMENT PARSING, so it exited on the
+# DEFAULT list and `--hosts` could never be read — while the refusal's own last
+# line told you to pass `--hosts`. **Advice the code made unreachable**, and it
+# is the same shape as a caution whose callee can never return the error it
+# guards: the words were right and nothing could act on them.
+# ⇒ Measured cost: `deploy_fleet_guard`'s two ancestry tests passed `--hosts local`,
+# were refused before it was parsed, and sat RED long enough to be filed as a
+# known-failing pair — a real gate whose tests nobody could read.
+# ⚠ The refusal itself is CORRECT and stays: resolving to fewer than three hosts
+# silently skips the only host a UI change can be proven on. It simply must not
+# fire when the caller has already answered the question.
+if [ "$HOSTS_EXPLICIT" = 0 ] && [ "$(printf '%s\n' $HOSTS | awk 'NF' | wc -l)" -lt 3 ]; then
+  echo "deploy-fleet: ⛔ could not resolve the live GUI host — ygg-live-host.sh gave nothing." >&2
+  echo "  Deploying to '$HOSTS' would SKIP the only host a UI change can be proven on." >&2
+  echo "  Pass --hosts explicitly if that is really what you want." >&2
+  exit 2
+fi
 
 # ⛔⛔ A DEPLOY FROM A PRE-REBASE TREE SILENTLY REVERTS ANOTHER CLUSTER'S FIX.
 # Measured 2026-08-13: `3.0.117`–`3.0.120` were each allocated TWICE within
@@ -106,6 +121,63 @@ if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     [ "$ALLOW_BEHIND" = 1 ] || exit 1
     echo "⚠ --allow-behind: proceeding with a build that is behind origin/main" >&2
   fi
+fi
+
+# ⛔⛔ A DAEMON BUMP TYPES. THE GUI RELAUNCH DOES NOT. THAT IS THE OPPOSITE OF HOW
+# IT IS USUALLY TREATED, AND IT IS WHY THIS CHECK IS HERE RATHER THAN IN A DOC.
+#
+# The hot-restart repair submits `continue` to rows after a handover. On a build
+# without the draft guard that submit has no draft check, so a deploy can splice
+# `continue` and its retry barrage into a half-typed sentence a human is holding.
+# The ordering rule was written down — inside a bug entry — and a release was still
+# cut over it, because the person cutting a release does not read the bug queue
+# first. A rule is only load-bearing where the harmful act happens; this is it.
+#
+# ⚠ THE NARROWING, and it is what keeps this from becoming a freeze: the danger is
+# a handover that FAILS TO CONVERGE, not a bump as such. `continue` is submitted
+# only to sessions named in the interrupted-sessions record, and that record is
+# written on a FORCED cold shutdown. A handover that settles gracefully interrupts
+# nothing, records nothing and submits nothing. So:
+#   - the record EXISTS  ⇒ the last handover did not converge ⇒ REFUSE
+#   - attended rows exist ⇒ WARN, name them, and continue
+# ⛔ This never probes a row to find out whether a draft is open. The readiness
+# probe TYPES — probing for the hazard would BE the hazard, wearing a lab coat.
+ATTENDED_TSV="${YGGTERM_RELAY_DIR:-$HOME/.yggterm/relay}/never-arm.tsv"
+ATTENDED_N=0
+if [ -r "$ATTENDED_TSV" ]; then
+  ATTENDED_N=$(grep -cve '^[[:space:]]*\(#\|$\)' "$ATTENDED_TSV" || true)
+else
+  # An unreadable list is NOT an empty one. Say which, and treat it as attended.
+  echo "deploy-fleet: ⚠ cannot read $ATTENDED_TSV — attendance NOT verified, assuming attended." >&2
+  ATTENDED_N=unknown
+fi
+
+STRANDED=""
+for h in $HOSTS; do
+  if [ "$h" = "$(hostname -s 2>/dev/null)" ] || [ "$h" = dev ]; then
+    [ -e "${YGGTERM_HOME:-$HOME/.yggterm}/hot-restart-interrupted.json" ] && STRANDED="$STRANDED $h"
+  else
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$h" \
+      'test -e "${YGGTERM_HOME:-$HOME/.yggterm}/hot-restart-interrupted.json"' 2>/dev/null \
+      && STRANDED="$STRANDED $h"
+  fi
+done
+
+if [ -n "$STRANDED" ]; then
+  echo "⛔ REFUSING: an interrupted-sessions record is still present on:$STRANDED" >&2
+  echo "   That record is written on a FORCED cold shutdown and is the list of rows the" >&2
+  echo "   repair will TYPE \`continue\` into. Deploying now types into every one of them." >&2
+  echo "   Resolve the stranded handover first; do not delete the record to get past this." >&2
+  [ -n "${YGG_DRAFT_CLEARED:-}" ] || exit 1
+  echo "   ⚠ overridden by YGG_DRAFT_CLEARED=$YGG_DRAFT_CLEARED" >&2
+fi
+
+if [ "$ATTENDED_N" != 0 ]; then
+  echo "deploy-fleet: ⚠ $ATTENDED_N human-attended row(s) on the never-arm list." >&2
+  echo "   No interrupted-sessions record exists, so a graceful handover types nothing" >&2
+  echo "   and this is a warning, not a refusal. ⛔ But one graceful observation does not" >&2
+  echo "   license the general case: if the outgoing daemons cannot be shown to converge," >&2
+  echo "   hold the bump until the draft is sent or cleared." >&2
 fi
 
 # ⭐ --preflight answers the ancestry question and stops, so a caller can ask it
@@ -249,6 +321,21 @@ for host in $HOSTS; do
   echo "     Or for this run:       --hosts local" >&2
   FAILED=1
 done
+
+# ⛔ PIN THE TRACE BEFORE THE SWAP, BECAUSE RETENTION WILL NOT KEEP IT.
+# Sessions have died 166-464 s after a release, and every investigation but one
+# arrived to find the trace covering the death already pruned: the byte budget is
+# per home while the write rate is per daemon, so the measured window was ~3 h,
+# not the 3 days the constant advertised. Pinning costs nothing (hard links) and
+# is the difference between the next death being explainable and being another
+# structural absence. ⚠ Deliberately NOT gated on success — a diagnostic that can
+# fail a deploy is a diagnostic that gets switched off.
+if [ "$NO_PIN" = 0 ] && [ "$DRY" = 0 ]; then
+  "$(dirname "$0")/pin-trace-window.sh" --label "$VERSION" --hosts "$HOSTS" \
+    --follow-mins 15 2>&1 | sed 's/^/  /' || \
+    echo "  ⚠ trace pin failed — the deploy continues, but a death in the next" \
+         "15 min may not be explainable afterwards." >&2
+fi
 
 for host in $HOSTS; do
   [ "${HOST_UNREACHABLE[$host]:-0}" = 1 ] && continue

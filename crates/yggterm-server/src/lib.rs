@@ -28,6 +28,16 @@ pub use web_collection_cli::{run_web_collection_cli, web_collection_usage_block}
 // been a second encoding of one concept; there is now one owner and both
 // binaries route to it.
 mod app_control_web_cli;
+// THE `server app …` CLI ITSELF — one owner, both binaries, for the same
+// reason `app_control_web_cli` exists: the top-level dispatch was a `match`
+// COPIED into each binary, so a verb added to one answered "unsupported app
+// control command" from the other. See `app_control_cli`.
+pub mod app_control_cli;
+// NATIVE notification audio. It lived in the GUI binary's own module tree,
+// which is why `server app audio` did not exist on the headless CLI — the one
+// agents drive — even though the verb needs no GUI at all and its own help
+// says so. Nothing here touches a webview.
+pub mod audio_cli;
 // THE `web-import …` verb plane — history and bookmarks out of other browsers.
 // A thin shell over `yggterm_core::browser_import`; every decision (epoch,
 // copy-then-open, dedupe) belongs to the library so the GUI, ychrome and the
@@ -20772,20 +20782,49 @@ fn active_client_instance_records_from_dir(
     active: &mut Vec<ClientInstanceRecord>,
     seen: &mut std::collections::BTreeSet<(u32, Option<u64>, u128)>,
 ) -> anyhow::Result<()> {
-    let entries = fs::read_dir(&dir).or_else(|error| {
-        if error.kind() == ErrorKind::NotFound {
-            Ok(fs::read_dir(dir.join(".missing-client-instances-dir"))?)
-        } else {
-            Err(error)
+    // ⛔⛔ ABSENT AND UNREADABLE ARE DIFFERENT ANSWERS, AND THE CALLER BETS A
+    // DAEMON'S LIFE ON THE DIFFERENCE.
+    //
+    // `daemon_should_idle_shutdown` reads an empty result as "no clients are
+    // connected, this daemon may retire". Its error arm says the opposite — if
+    // you cannot tell, do not retire — but this function used to end EVERY
+    // failure in `return Ok(())`, so that arm was unreachable and an unreadable
+    // directory (permissions, fd exhaustion, ENOMEM) reported **no clients**.
+    // ⇒ The careless half of the decision won, and the consequence is a daemon
+    // retiring while a client is still attached to it.
+    //
+    // Absent is a real answer and stays `Ok`: there are no records because
+    // there is no directory. Anything else is "I could not ask", and must
+    // travel to the caller as an error so its caution becomes reachable.
+    // Reported by the resource lane 2026-08-14, against a finding of mine that
+    // named the same seam from the wrong side.
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "reading client instance records from {}",
+                dir.display()
+            )));
         }
-    });
-    let Ok(entries) = entries else {
-        return Ok(());
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        // An iteration error means the listing is INCOMPLETE, so a live client
+        // may be exactly the record we did not reach.
+        let entry = entry.with_context(|| {
+            format!("listing client instance records in {}", dir.display())
+        })?;
         let path = entry.path();
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
+        // A record we cannot READ may name a live client. A record we cannot
+        // PARSE is a real answer — it is not a valid record — and is deleted
+        // below, which is why only this one propagates.
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("reading client instance record {}", path.display())));
+            }
         };
         let Ok(record) = serde_json::from_slice::<ClientInstanceRecord>(&bytes) else {
             let _ = fs::remove_file(&path);
@@ -33479,7 +33518,15 @@ mod tests {
         );
         assert!(command.contains("export NPM_CONFIG_PREFIX="));
         assert!(command.contains("export CODEX_HOME="));
-        assert!(command.contains("codex-litellm resume"));
+        // Binary and resume tokens pinned separately — a CLI's extra args are
+        // composed between them, so their adjacency is not an invariant. See
+        // `remote_resume_shell_command_wraps_prefix_and_cwd`.
+        assert!(command.contains("&& codex-litellm "), "{command}");
+        // The LiteLLM fork does not re-root, so the id follows `resume` directly.
+        assert!(
+            command.contains("resume '019caa6f-b32c-7a73-b4d3-db83225663dc'"),
+            "{command}"
+        );
     }
 
     #[test]
@@ -33731,8 +33778,56 @@ mod tests {
         assert!(command.contains("tmux new-session -A -s yggterm &&"));
         assert!(command.contains("__yggterm_requested='/srv/workspace'"));
         assert!(command.contains("export NPM_CONFIG_PREFIX="));
-        assert!(command.contains("codex resume -C \"$PWD\""));
-        assert!(command.contains("'019caa6f-b32c-7a73-b4d3-db83225663dc'"));
+        // ⚠ The needle was once `codex resume -C "$PWD"` — binary IMMEDIATELY
+        // followed by subcommand — which is not an invariant of the launch
+        // table: a CLI's extra args are composed BETWEEN the binary and the
+        // resume tokens, by design. That made the assertion read whatever the
+        // host happened to hold (the settings store, and for one day an ambient
+        // environment variable), so it flipped red and green with nobody
+        // changing the code, and was twice mistaken for a regression that had
+        // fixed itself. Pin the two things that ARE invariants instead: the
+        // binary opens the invocation, and the resume tokens arrive in order.
+        assert!(command.contains("&& codex "), "{command}");
+        assert!(
+            command.contains("resume -C \"$PWD\" '019caa6f-b32c-7a73-b4d3-db83225663dc'"),
+            "{command}"
+        );
+    }
+
+    /// A CLI's forwarded flags arrive as a PARAMETER, and they belong to the
+    /// kind the caller names — never to whichever kind happens to be composing.
+    ///
+    /// This is the contract that lets the composer stay out of the process
+    /// environment. `YGGTERM_AGENT_EXTRA_ARGS` used to be read ambiently, for
+    /// every kind at once, which meant one CLI's permission flag was returned
+    /// verbatim for another and displaced the resume subcommand while doing it
+    /// — the two tests above went red exactly when the suite was run from a
+    /// process that carried the variable, which is why they read as flaky
+    /// rather than as the regression they were reporting.
+    #[test]
+    fn forwarded_cli_flags_arrive_as_a_parameter_not_from_the_environment() {
+        use crate::codex_cli;
+        let launch = AgentLaunchOptions::default();
+        // Supplied by the caller ⇒ honoured, for the kind the caller named.
+        let forwarded =
+            codex_cli::composed_cli_extra_args_with(SessionKind::Codex, &launch, Some("--fictional-flag"))
+                .expect("an override composes");
+        assert!(
+            forwarded.contains("--fictional-flag"),
+            "the request field is the live path for forwarded flags: {forwarded}"
+        );
+        // Not supplied ⇒ the local lane's one owner is the settings store, and
+        // an empty override is NOT a licence to go looking in the environment.
+        let empty_override = codex_cli::composed_cli_extra_args_with(
+            SessionKind::Codex,
+            &launch,
+            Some(""),
+        )
+        .expect("an empty override composes");
+        assert!(
+            empty_override.trim().is_empty(),
+            "an empty override must compose to nothing at all: {empty_override:?}"
+        );
     }
 
     #[test]
@@ -43845,6 +43940,59 @@ terminal_window_id: None,
         let error = choose_app_control_pid(&records, None, Some("shadow-a"), false)
             .expect_err("two clients under one name is ambiguous");
         assert!(error.to_string().contains("more than one live Yggterm GUI client"));
+    }
+
+    /// ⛔⛔ AN UNREADABLE CLIENT LIST MUST NOT READ AS "NO CLIENTS".
+    ///
+    /// `daemon_should_idle_shutdown` retires a daemon when this returns an
+    /// empty set, and refuses when it errors — *"if you cannot tell, do not
+    /// retire"*. This function used to end every failure in `Ok(())`, so an
+    /// unreadable directory (permissions, fd exhaustion, ENOMEM) reported **no
+    /// clients** and PERMITTED retirement while a client was still attached.
+    /// Two halves of one decision disagreed about what unreadable means, and
+    /// the careless half won.
+    ///
+    /// Both arms, because the distinction is the whole fix: **absent** is a real
+    /// answer and stays `Ok`; **unreadable** must travel as `Err`.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_client_instances_dir_is_an_error_but_an_absent_one_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "yggterm-unreadable-clients-{}-{}",
+            std::process::id(),
+            current_millis_u64()
+        ));
+
+        // ABSENT — a real answer: there are no records because there is no dir.
+        let mut active = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        super::active_client_instance_records_from_dir(
+            &base.join("never-created"),
+            &mut active,
+            &mut seen,
+        )
+        .expect("an absent directory is 'no clients', not a failure");
+        assert!(active.is_empty(), "absent must yield no records");
+
+        // UNREADABLE — "I could not ask".
+        let unreadable = base.join("unreadable");
+        fs::create_dir_all(&unreadable).expect("create dir");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        let mut active = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let result =
+            super::active_client_instance_records_from_dir(&unreadable, &mut active, &mut seen);
+        // Restore before asserting, so a failure cannot leave an undeletable dir.
+        let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755));
+        let _ = fs::remove_dir_all(&base);
+        assert!(
+            result.is_err(),
+            "an unreadable client-instances directory must be an ERROR — reporting \
+             it as 'no clients' lets a daemon retire out from under a live client"
+        );
     }
 
     #[cfg(unix)]
