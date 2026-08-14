@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The diagnostic that was supposed to watch for slowdowns was itself one of
+  the biggest things running.** Every time two parts of the background service
+  wanted the same resource at the same moment, it wrote three lines to disk
+  about it — tens of thousands of times a minute, and to a file nobody was
+  reading. It now keeps a running tally in memory and writes a single summary
+  once a minute, while still writing a full line for any delay long enough that
+  a person would notice it. Measured on the live machine: **493 times less
+  written**, with the rare, genuinely slow events still recorded individually.
+  It also records those delays in microseconds rather than milliseconds — the
+  old unit was too coarse for what it was measuring, so nearly every entry read
+  as exactly zero.
+
 - **A machine that takes its terminals back starts writing them down again.**
   Once a newer background service appeared, the older one stopped recording the
   state of its sessions for good — correct, because the newer one owned that

@@ -282,6 +282,51 @@ and it does.
 complaint came from.** Fix it on its own merits — CPU, IO and SSD wear on the
 host that carries the fleet. **Do not offer it as the explanation for his fan.**
 
+### ✅ 4a. S2 IS MEASURED AND PASSES — 493x, against a 90x threshold
+
+*dev, 2026-08-14, on the one daemon that carries `670fa66d` (pid 2945182,
+build `4e801c13`, confirmed by `git merge-base --is-ancestor`, never by version
+number).*
+
+| | |
+|---|---|
+| windows emitted | 31, covering **1,861 s** |
+| contentions **counted by the aggregate itself** | **131,243** (70.5/s) |
+| bytes the new code actually wrote | **116,344 B — 62.5 B/s** |
+| bytes the old code would have written | 131,243 × 437 B = **30.1 KB/s** |
+| **reduction** | **493x** |
+
+⭐ **The control the entry demanded turned out to be unnecessary, because the
+fix's own record carries the number of events it replaced.** An aggregate that
+reports `count` makes its own counterfactual *countable* — old volume is
+`count × bytes-per-old-event`, measured on the same daemon in the same window,
+with no second daemon, no earlier baseline, and no session-population confound
+to argue about. ⇒ **When a fix replaces N events with one summary, put N in the
+summary.** That is what turned an unrunnable comparison into a one-daemon
+measurement.
+
+⚠ **The one inherited constant is 437 B/contention** (§4's 141.1 KB/s ÷ 322.8/s),
+and the verdict does not depend on it being right: at a deliberately pessimistic
+**100 B**/contention the reduction is still **113x**, above the threshold. So a
+4.4x error in the constant would not change the answer.
+
+⛔ **And the cross-daemon control that was specified would have MISLED, for a
+reason worth keeping.** Run at the same moment over 180 s, the 14 pre-fix
+daemons wrote **no `lock_wait` records at all** — their entire trace volume is
+`begin`/`end` request tracing. There was nothing on the control arm to compare
+against, because contention is a property of *load*, and the load had moved to
+the one busy daemon. A per-owned-session normalisation on top of that would have
+been worse than useless: total write volume was roughly **flat at 1.0–2.5 KB/s
+regardless of owned count (1 to 10)**, so dividing a near-constant by a varying
+denominator manufactures a trend that is not there. ⇒ **Normalise only by a
+quantity the numerator has been shown to scale with.**
+
+⭐ **Residual, and it is not this defect:** `lock_wait_slow` — the deliberately
+preserved forensic path — is **84% of the remaining 62.5 B/s**, and it is
+earning its keep. In one hour: **520 slow `terminal_read` waits, 79 slow
+`status` waits, and a `status` that waited 9.89 s** for the runtime lock. That
+is §S3's evidence, now visible where it previously rounded to `waited_ms: 0`.
+
 ## 5. A SHIPPED fix is not a RUNNING fix — the outlier, identified
 
 §2a excluded one daemon as a user-time outlier (3 sessions, 0.648 cores, 0.396
