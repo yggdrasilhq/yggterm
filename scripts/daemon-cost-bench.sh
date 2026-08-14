@@ -185,7 +185,9 @@ for i, h in enumerate(handler):
     # ⛔ Per VERB. A single mean mixes a ping with a status carrying 264 rows.
     for name, r in sorted(h["requests"].items(), key=lambda kv: -kv[1]["cpu_us_total"]):
         ks = r["kernel_share"]
+        pre = r.get("thread_cpu_us_mean", 0) - r["cpu_us_mean"]
         print(f"        {name:<16} n={r['handled']:<6} cpu_us/conn={r['cpu_us_mean']:<7}"
+              f" thread_total={r.get('thread_cpu_us_mean', 0):<7} pre_closure={pre:<6}"
               f" wall_us/conn={r['wall_us_mean']:<7} max={r['cpu_us_max']:<7}"
               f" kernel={'n/a' if ks is None else f'{100*ks:.1f}%'}")
 PY
