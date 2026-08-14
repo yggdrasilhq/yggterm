@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The command that pulls a lost session back into the list now works from
+  either program.** Reconnecting a session that has dropped out of Live
+  Sessions answered from one of the two programs only, and reported the command
+  as unknown from the other — which is the program most people have on their
+  path. It was the last command on that surface that still differed between
+  them; all of them now answer from both.
+
 - **Three more commands now work from whichever program you type.** The
   command that shows what the restart gate is looking at, the one that declares
   a hand-off so a pending upgrade can land at a quiet moment, and the headless

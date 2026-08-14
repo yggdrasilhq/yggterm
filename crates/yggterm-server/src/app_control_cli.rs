@@ -2276,22 +2276,48 @@ mod dispatch_reachability_lock {
         // fire on a module that is perfectly reachable.
         //
         // It went red the moment two lanes met on `main`: one added this lock,
-        // the other added `server_cli` — a module BOTH BINARIES dispatch
-        // (`main.rs` and `yggterm-headless.rs` each call `server_cli::run_*`),
-        // not one app-control routes to. Neither lane was wrong on its own and
+        // the other added `server_cli` — a module BOTH BINARIES dispatch, not
+        // one app-control routes to. Neither lane was wrong on its own and
         // neither could have seen it, because the collision exists only in the
-        // merge.
+        // merge. (Both lanes then fixed it independently and identically, and
+        // this text is their merge.)
         //
-        // ⛔ The alternative was an exclusion list naming `server_cli`, which is
+        // ⛔ The alternative was an exclusion list naming the module, which is
         // exactly the hand-list this test's own doc argues against: a module
-        // added tomorrow would then be excused by nobody's decision. Naming the
+        // added tomorrow would be excused by nobody's decision. Naming the
         // dispatchers is a fact about the code; naming the exceptions is a guess
-        // that rots.
+        // that rots. It would also blind the lock to that module going dark,
+        // which is a live risk the day nine verbs moved into it.
+        //
+        // ⛔⛔ SCANNED PRODUCT-HALF ONLY, WITH COMMENTS STRIPPED, and both halves
+        // of that were paid for. A whole-file scan matches the binaries' own TEST
+        // assertions, which are written against these very strings. Stripping
+        // tests alone is still not enough: the paragraph you are reading once
+        // NAMED the needle it scans for, so the lock matched the prose describing
+        // the defect it was suffering from. Reworded prose fixes that once; a
+        // stripped scan fixes it for every future comment.
+        //
+        // ⭐ Neither blindness was visible from a green suite. Both were caught
+        // by a decoy control — mutate both binaries to dispatch a module that
+        // does not exist, and require this test to go RED. If it stays green,
+        // the lock is reading something other than the code.
+        let scannable = |source: &'static str| -> String {
+            source
+                .split("mod tests {")
+                .next()
+                .expect("a source has a product half above its tests")
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let dispatchers = [
-            include_str!("app_control_cli.rs"),
-            include_str!("app_control_web_cli.rs"),
-            include_str!("../../../apps/yggterm/src/main.rs"),
-            include_str!("../../../apps/yggterm/src/bin/yggterm-headless.rs"),
+            scannable(include_str!("app_control_cli.rs")),
+            scannable(include_str!("app_control_web_cli.rs")),
+            scannable(include_str!("../../../apps/yggterm/src/main.rs")),
+            scannable(include_str!(
+                "../../../apps/yggterm/src/bin/yggterm-headless.rs"
+            )),
         ];
         let mut modules: Vec<&str> = Vec::new();
         for line in LIB.lines() {
