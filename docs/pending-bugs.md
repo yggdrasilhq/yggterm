@@ -1345,6 +1345,154 @@ gate turned out to be a bystander.
 readings both fit the data, test the one that licenses the action you already
 wanted to take* — and a brief may carry MEASUREMENTS, never a causal theory
 dressed as fact.
+
+## ⛔⛔⛔ [6.1] A SEAT DIED TWO SECONDS AFTER ITS OWNING DAEMON WENT SILENT, AND THE EXIT PATH IS UNEXPLAINED
+
+**Status:** OPEN — root cause NOT established. Read the falsification below
+before adopting any mechanism.
+
+*Measured 2026-08-14 from the dev trace corpus. This entry replaces the
+"deploys converge the idle window and release PTYs" theory, which is refuted.*
+
+### What was actually observed
+
+| | |
+|---|---|
+| `cc-runtime://1c7780ea-…` (a delegate seat) | last `tool_use` at **00:22:13Z**, no tool result — cut mid-command |
+| its recorded owner | **pid 1099216, version 3.0.151**, which named it in `handoff_runtime_keys` on every handoff |
+| pid 1099216's last trace event | `daemon_self_retire` at **00:22:11Z**, then total silence |
+
+Two seconds, and the owner is the daemon that names that session as one of the
+41 live runtimes it was preserving. The ownership link and the timing link are
+both solid. **What is not established is how 1099216 exited.**
+
+### ⛔ THE INHERITED MECHANISM IS REFUTED — do not re-adopt it
+
+The carried theory was: *a release starts a handover, the predecessor defers
+while sessions look active (300 s idle window), converges, exits, and releases
+the PTYs it still owns.* Against the record:
+
+- pid 1099216 emitted **160 `daemon_self_retire` events and ZERO
+  `daemon_cold_shutdown_deferred_idle_gate` events.** The idle gate **never
+  deferred it once**. There was no 300 s convergence to wait for, because the
+  gate was never engaged — a daemon only reaches the gate on a poll where the
+  swap lane returns `Failed`, and that happened at most once in 53 minutes.
+- `hot_restart_forced_past_deadline` fired **0 times** in the whole corpus
+  (positive control: 175 `daemon_self_retire` hits by the same grep), and
+  `hot-restart-interrupted.json` does not exist. The forced-past-deadline path
+  did not run.
+- At 00:22:11 the two `Lingering` short-circuits both applied — the lane's
+  retry interval (last attempt 00:19:11, 180 s < the 300 s
+  `HOT_RESTART_SWAP_RETRY_INTERVAL_MS`) returns `Lingering` before the
+  cold-shutdown gate is reachable at all. **So the cold path was not reached,
+  and the tidy diagnosis dies on its own timing.**
+
+### ⚠ What has NOT been tested, and why the obvious instrument is blind
+
+`dmesg` is **not readable in this container** (`read kernel buffer failed:
+Operation not permitted`) — an earlier "no OOM kills" reading here was a blind
+instrument, not a negative result. **An OOM or an external kill of pid 1099216
+remains untested and is currently the leading rival.** The falsifier: capture
+the exit of a preserved-owner daemon with an instrument that survives it
+(process accounting, a `PR_SET_PDEATHSIG`-free supervisor, or a cgroup event
+reader), not by inferring from the trace going quiet.
+
+⇒ **Silence in the trace is not an exit path.** The cold shutdown emits no
+trace event of its own, so "no shutdown event" cannot distinguish a cold
+shutdown from a SIGKILL. Give the shutdown path its own event before the next
+attempt to attribute a death.
+
+## ⛔⛔ [6.1] THE GUARD PROTECTING A PRESERVED PTY OWNER IS A HOST-SHARED FILE, SO A PEER CAN ERASE IT
+
+**Status:** OPEN — code-cited, not yet observed firing.
+
+The safety property is stated outright at `crates/yggterm-server/src/daemon.rs`
+(the `SwapStep` doc comment):
+
+> *Only `SwapStep::Failed` falls through to the cold-shutdown gate … a daemon
+> that has ALREADY handed off is a preserved PTY owner, and letting a later
+> failed retry drop it into the cold path would kill the very PTYs the first
+> handoff preserved.*
+
+The thing that implements it is one arm of one match:
+
+```rust
+None if queued.is_some() => SwapStep::Lingering,   // the whole protection
+None                     => SwapStep::Failed,      // → cold shutdown → PTYs die
+```
+
+`queued` is `hot_restart_queue::load(home_dir)` — **a file in the host's
+`~/.yggterm`, shared by every daemon on the machine.** The adjacent `Converged`
+arm calls `hot_restart_queue::clear(home_dir)` on that same shared file. The
+process-local backstop (`HOT_RESTART_SWAP_LANE_SETTLED`) is set **only in the
+process that converged**.
+
+⇒ **One daemon's convergence deletes every peer's proof that it already handed
+off.** Measured on dev tonight: pid 2410824 fired
+`hot_restart_swap_queue_satisfied` **12 times** in ~90 minutes, on a host
+carrying 15 daemons — twelve chances to disarm fourteen peers.
+
+**The fix:** "have I already handed off?" is a fact about **this process**, and
+must be answered from this process's own state (it is a preserved PTY owner /
+it holds live PTY children) — never from a host-shared file that a peer writes.
+⛔ And the deeper form: **a daemon that still parents live PTY children must
+never take the cold-shutdown exit at all**, whatever any flag says. Ownership of
+a child process is the only fact that matters there, and it is directly
+observable.
+
+## ⛔ [6.1] A HANDED-OFF fd CAN BE ACCEPTED AND NEVER ACKNOWLEDGED, PAST THE POINT OF NO RETURN
+
+**Status:** OPEN — observed exactly once, with the sweep naming its own victim.
+
+The only `superseded_self_retire_sweep` in the dev corpus:
+
+```
+Partial { moved: 6, reason: "local://…: successor accepted the fd but never
+          acknowledged it (AFTER the commit point — the fd is gone)" }
+readers_stood_down: 7   readers_resumed: 1   all_moved: false
+```
+
+⚠ **The settle window still reported `settled: true` with
+`bytes_stolen_after_park: 0` ten seconds later** — both true, and both
+irrelevant to the session whose fd went missing. A green settle window is not a
+statement that every runtime moved; `all_moved` is the field that says that, and
+it was `false`.
+
+⇒ Two things are owed: a **commit point that is not reached until the successor
+acknowledges** (or a reclaim path for the window between accept and ack), and a
+settle-window verdict that **cannot read as success while `all_moved` is false.**
+
+## ⛔ [6.1] THE SELF-RETIRE LOOP NEVER TERMINATES — A FRESH DAEMON EVERY ~5 MINUTES, INDEFINITELY
+
+**Status:** OPEN
+
+`retire_trigger: "disk_binary_replaced"` is derived from `exe_link` reading
+`… (deleted)`, which stays true forever once the binary on disk is replaced. So
+the retire poll re-fires every 20 s for the life of the process and the handoff
+re-fires every `HOT_RESTART_SWAP_RETRY_INTERVAL_MS` (300 s), **each time
+spawning a brand-new successor daemon**.
+
+Measured on one daemon (pid 1099216, 3.0.151) over ~53 minutes:
+
+| `daemon_self_retire` | 160 (every 20 s) |
+|---|---|
+| `daemon_self_retire_handoff_ok` | 11 |
+| successor daemons spawned | 11 |
+| `progressive_migration_drain_already_running` | 11 (the drain refuses each retry) |
+| `daemon_cold_shutdown_deferred_idle_gate` | **0** |
+
+Each successor is born, reads the row ledger, reconciles, and is itself
+superseded ~5 minutes later. ⭐ **The retry interval's own doc comment names the
+fork-bomb risk and prices it at "one successor every five minutes" as the safe
+rate — but that rate is only safe if the loop TERMINATES**, and nothing here
+terminates it: convergence clears the queue file, the trigger re-derives `true`
+from the same deleted `exe_link`, and the next interval spawns another.
+
+⇒ This is a standing contributor to the daemon population the drain lane exists
+to reduce, and it runs on every host with a replaced binary, not just after a
+deploy. **A retire that has handed off must stop retiring**, and the terminating
+condition has to be durable across the queue file being cleared by a peer.
+
 ## ⚠ NOTHING CALLS `sync-terms`, SO THE PRIVACY GUARD'S WORDLIST CAN DRIFT AGAIN BETWEEN RUNS
 
 **Status:** OPEN
