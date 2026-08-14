@@ -67,10 +67,18 @@ and if so this is a control-plane-wide clause and not a `rename` note.
 *measured 2026-08-14; instrument, controls and the two refuted candidates in
 [`idle-cost-model.md`](idle-cost-model.md) §6j — spec is §S6*
 
-A connection-handler thread burns **25.0 ms of CPU (1.6 user + 23.4 kernel,
-93.8% kernel)**. The `PerfGuard` span over it covers **~2.4 ms**, because the
-guard **drops when `handle_request` returns** and records **wall time**, which
-cannot distinguish work from waiting.
+A connection-handler thread on a LIVE daemon burns **20–44 ms of CPU**. The
+`PerfGuard` span over it covers **~2.4 ms**, because the guard **drops when
+`handle_request` returns** and records **wall time**, which cannot distinguish
+work from waiting.
+
+⛔⛔ **THE "93.8% KERNEL" THAT MOTIVATED THIS ENTRY IS RETRACTED** (§6j-3). It came
+from `/proc/<tid>/stat` utime/stime — 10 ms ticks, **each truncated
+independently** — which annihilates the smaller component below ~10 ms and drives
+the share to 100% for the larger. Against `getrusage(RUSAGE_THREAD)` on a known
+4 ms/20 ms mix: true 83.3%, ticks report **100.0%**. ⇒ **Do not describe this cost
+as kernel time.** The magnitude survives (two methods agree); the composition does
+not, and S6's in-process span is the instrument that can answer it.
 
 ⇒ **~1.8–1.9 cores of the daemon population are spent where no instrument
 looks.** That number is stable: two 60 s runs over 20 daemons put the
@@ -601,8 +609,9 @@ currently missing ~80% of its CPU.**
 is that CPU stops being invisible to per-thread instruments.
 
 ⛔ **UPDATED §6j — the "38 ms" in this entry was a retracted ratio; the measured
-figure is ~25 ms** (1.6 ms user + 23.4 ms kernel, direct per-thread, 93.8%
-kernel). ⭐ **And a handler on an EMPTY daemon costs 0.70 ms**, so ~95% of the cost
+figure is 20–44 ms** on a live daemon, ~1.4 ms on a sandbox. ⛔ **The "93.8%
+kernel" is RETRACTED** — per-thread tick fields truncate user and kernel
+independently and annihilate the smaller below ~10 ms (§6j-3). ⭐ **And a handler on an EMPTY daemon costs 0.70 ms**, so ~95% of the cost
 travels with what the daemon HOLDS, not with the connection — a pool would keep
 that 95%. ⭐ **The row term is now settled three ways at ~4.5 µs/row** (a causal
 seeded arm, an IPW re-fit of field data, and the optimisation lane's own arm), so

@@ -774,21 +774,62 @@ daemons' 0.08–0.20**, which is what licenses reading R as signal at all.
 
 ⛔ **Neither §3 nor §6i was wrong; each had measured a real half and generalised.**
 
-### 6j-3. What a handler thread spends, measured directly rather than divided
+### 6j-3. What a handler thread spends — ⛔⛔ THE "93.8% KERNEL" IS RETRACTED
 
-Per dying handler thread (100 Hz, 40 s, spinner 0.9997):
+Per dying handler thread (100 Hz, 40 s, spinner 0.9997) this section originally
+read **1.6 ms user + 23.4 ms kernel = 25.0 ms, 93.8% KERNEL**.
 
-| | per thread |
-|---|---|
-| user | **1.6 ms** |
-| kernel | **23.4 ms** |
-| total | **25.0 ms — 93.8% KERNEL** |
+⛔⛔ **THE SHARE IS AN ARTEFACT OF THE INSTRUMENT AND IS WITHDRAWN.** It came from
+`/proc/<tid>/stat` fields 14/15 — `utime` and `stime`, each in **10 ms CLK_TCK
+units, each truncated INDEPENDENTLY**. Measured against
+`getrusage(RUSAGE_THREAD)` on threads built with a known mix:
 
-and 75.8% of handler samples read *on-CPU*, not blocked — so this is kernel work
-being **done**, not waited on. ⭐ The syscall census separates the long-lived
-threads cleanly at the same time: exactly one thread each parked in `read`,
-`accept4` and `futex`, and ~6 in `clock_nanosleep` — the chores of §6i — leaving
-`recvfrom` and on-CPU as the handler population.
+| known mix | true share (µs) | share from ticks |
+|---|---|---|
+| 100 ms / 100 ms | 76.5% | 78.9% ✓ |
+| **4 ms / 20 ms** | **83.3%** | **100.0%** — user annihilated |
+| 1 ms / 2 ms | 100% | *both zero* |
+| 0.5 ms / 1 ms | 0% | *both zero* |
+
+⇒ **Below ~10 ms the smaller component is truncated to nothing and the share is
+driven to 100% for the larger one.** A handler with ~1.6 ms of user time loses it
+entirely. ⛔ **Do not read a user/kernel share from per-thread tick fields at this
+timescale; use `getrusage(RUSAGE_THREAD)` or an in-process CPU clock.** The build
+lane's in-process span measures **3–8% kernel** on a session-less sandbox, and
+that instrument is sound where this one is not.
+
+⭐ **The same run proved the point on a subject where the answer was known:** on a
+sandbox at 264 rows, **622 and 824 dying handler threads each read ZERO ticks** —
+not "small", zero — while genuinely consuming ~1.4 ms apiece. **An instrument
+that reports nothing for 622 consecutive events is not measuring the events.**
+
+✅ **WHAT SURVIVES: THE MAGNITUDE.** Truncation is a floor, so a mean of
+**2.12 charged ticks is a LOWER BOUND of ≥21.2 ms** per live-daemon handler, and
+the independent subtraction of §6j-2 gives **0.09–0.20 cores at ~4.5 deaths/s =
+20–44 ms/thread**. Two methods agree on the size. ⚠ The subtraction was
+separately re-validated at this timescale (below), which is what licenses it.
+
+⇒ **The live-vs-sandbox gap is REAL and is the open question**: a sandbox handler
+is sub-tick (~1.4 ms, agreeing with the build lane's 1,385 µs at 264 rows), a
+live-daemon handler is **20–44 ms**. ⛔ **But it can no longer be described as
+kernel time** — that description died with the instrument.
+
+### ⚠ 6j-3a. The control that had NOT bracketed the subject
+
+§6j-1's positive control burned **250 ms per thread — 25 ticks**, and recovered
+100.2%. The subjects it was validating burn **1.4–25 ms**, some a seventh of one
+tick. **A control that does not bracket the subject's regime has not validated
+it**, and this one did not. Swept properly:
+
+| ms/thread | 250 | 25 | 5 | 1.5 | 0.5 |
+|---|---|---|---|---|---|
+| recovered / known | 1.000 | 1.004 | 1.023 | **1.058** | 1.167 |
+
+⇒ **The process-level SUBTRACTION survives** at the subject's scale (within
+0.4–5.8%), because a process-level counter difference rounds once at each end
+rather than per sample. ⭐ **That is exactly why the subtraction lived and the
+per-thread split died in the same session: a sum of floors is not the floor of a
+sum.** The aggregate was never per-sample truncated; the per-thread split was.
 
 ⛔ **The identity rests on the spawn-site census, NOT on `comm`.** `comm`
 truncates at 16 bytes, so every `yggterm-daemon-*` thread wears one label; the
