@@ -243,9 +243,7 @@ use yggterm_core::{
     event_trace_path, follow_trace_lines, generation_context_from_messages,
     looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
     read_cc_session_identity_fields, read_cc_session_title,
-    read_codex_session_identity_fields, read_codex_transcript_messages,
-    read_codex_transcript_messages_limited, read_codex_transcript_messages_tail_limited,
-    read_trace_tail, resolve_yggterm_home,
+    read_codex_session_identity_fields, read_trace_tail, resolve_yggterm_home,
 };
 use yggterm_core::session_outline::{
     OutlineKey, normalize_outline_prefix, outline_key_from_title, parse_outline_key,
@@ -5397,14 +5395,49 @@ impl YggtermServer {
     }
 
     pub fn set_session_summary_hint(&mut self, session_path: &str, summary: &str) {
+        self.apply_session_summary_hint(session_path, Some(summary));
+    }
+
+    /// Set a session's cached summary, or CLEAR it when the store has none.
+    ///
+    /// ⛔ **The `None` arm is the load-bearing half, and its absence was a bug.**
+    /// A scan reads the owning host's title store and reports what it found;
+    /// `None` there is not "no news", it is "there is no summary". Every caller
+    /// used to drop that answer (`if let Some(summary) = …`), so a summary
+    /// deleted from the store went on being served by whichever process had
+    /// already cached it.
+    ///
+    /// ⚠ That is worse than an ordinary stale cache, because this particular
+    /// value GATES its own replacement: a regeneration job is only queued when
+    /// the cached summary is absent or looks like junk, so a wrong-but-fluent
+    /// one suppressed the very work that would have replaced it. Deleting it
+    /// from the store — the documented repair — changed nothing the user saw.
+    ///
+    /// ⚠ Do NOT route a LIVE session view through the clearing arm. A live view
+    /// that carries no summary really does mean "this view does not carry one",
+    /// and treating that as an authoritative absence would wipe a good summary
+    /// on every refresh. Only a store scan knows the difference.
+    pub fn apply_session_summary_hint(&mut self, session_path: &str, summary: Option<&str>) {
         if let Some(session) = self.sessions.get_mut(session_path) {
-            upsert_session_metadata(&mut session.preview.summary, "Summary", summary.to_string());
-            upsert_session_metadata(&mut session.metadata, "Summary", summary.to_string());
+            match summary {
+                Some(summary) => {
+                    upsert_session_metadata(
+                        &mut session.preview.summary,
+                        "Summary",
+                        summary.to_string(),
+                    );
+                    upsert_session_metadata(&mut session.metadata, "Summary", summary.to_string());
+                }
+                None => {
+                    session.preview.summary.retain(|entry| entry.label != "Summary");
+                    session.metadata.retain(|entry| entry.label != "Summary");
+                }
+            }
         }
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
                 if scanned.session_path == session_path {
-                    scanned.cached_summary = Some(summary.to_string());
+                    scanned.cached_summary = summary.map(ToOwned::to_owned);
                     return;
                 }
             }
@@ -14280,9 +14313,8 @@ fn apply_remote_preview_payload_for_path_with_hydration(
         if let Some(precis) = refreshed_precis.as_deref() {
             server.set_session_precis_hint(session_path, precis);
         }
-        if let Some(summary) = refreshed_summary.as_deref() {
-            server.set_session_summary_hint(session_path, summary);
-        }
+        // Same store-scan answer as the sibling above: carry the absence.
+        server.apply_session_summary_hint(session_path, refreshed_summary.as_deref());
     }
     applied
 }
@@ -14547,9 +14579,10 @@ pub fn apply_remote_preview_payload_for_path(
         if let Some(precis) = refreshed_precis.as_deref() {
             server.set_session_precis_hint(session_path, precis);
         }
-        if let Some(summary) = refreshed_summary.as_deref() {
-            server.set_session_summary_hint(session_path, summary);
-        }
+        // The payload's summary comes straight from the owning host's title
+        // store, so `None` is an ANSWER — "there is none" — not a gap. Passing
+        // the Option through is what lets a deleted summary actually go away.
+        server.apply_session_summary_hint(session_path, refreshed_summary.as_deref());
     }
     applied
 }
@@ -15421,13 +15454,26 @@ fn overlay_mirrored_remote_sessions(
                     {
                         session.cached_precis = mirrored.cached_precis.clone();
                     }
-                    if mirrored
-                        .cached_summary
-                        .as_ref()
-                        .is_some_and(|value| !value.trim().is_empty())
-                    {
-                        session.cached_summary = mirrored.cached_summary.clone();
-                    }
+                    // Summary precedence, for the same reason as the title rule
+                    // above and caught the same way. The summary a scan carries
+                    // was read from the owning host's title store — the ONE
+                    // owner of that question — so the SCAN is the SSOT,
+                    // including when it says there is none. Letting the mirror
+                    // overwrite it made a deleted summary immortal: the
+                    // post-overlay re-mirror wrote the stale value straight
+                    // back, exactly the self-perpetuating loop the title
+                    // comment describes.
+                    //
+                    // ⚠ And a summary is worse than a title here, because this
+                    // value GATES ITS OWN REPLACEMENT — a regeneration job is
+                    // only queued when the cached summary is absent or looks
+                    // like junk, so a wrong-but-fluent one suppressed the work
+                    // that would have replaced it. Rows kept describing
+                    // projects that do not exist, and clearing the store could
+                    // not reach them.
+                    //
+                    // A session this pass did not scan is not in `sessions` at
+                    // all, so it keeps its mirrored value by not being here.
                 }
                 session
             })
@@ -32396,6 +32442,65 @@ mod tests {
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         )
+    }
+
+    /// A summary deleted from the store must be able to reach a running server.
+    ///
+    /// ⛔ Every refresh path used to be `if let Some(summary) = …`, so a scan
+    /// reporting that the store has NO summary changed nothing: whichever
+    /// process had already cached one went on serving it. That is worse than an
+    /// ordinary stale cache, because this value gates its own replacement — a
+    /// regeneration job is only queued when the cached summary is absent or
+    /// looks like junk, so a wrong-but-fluent one suppressed the work that
+    /// would have replaced it. Rows kept describing projects that do not exist
+    /// and the documented repair could not reach them.
+    #[test]
+    fn a_summary_the_store_no_longer_has_is_cleared_not_kept() {
+        let mut server = test_server();
+        let session_path = "remote-session://alpha-host/0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        server.remote_machines.push(RemoteMachineSnapshot {
+            apps: Vec::new(),
+            machine_key: "alpha-host".to_string(),
+            label: "Alpha".to_string(),
+            ssh_target: "alpha-host".to_string(),
+            prefix: None,
+            remote_binary_expr: None,
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![RemoteScannedSession {
+                session_path: session_path.to_string(),
+                session_id: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
+                cwd: "/home/operator/workspace".to_string(),
+                started_at: "May 1, 2026 10:00 AM".to_string(),
+                modified_epoch: 1,
+                event_count: 4,
+                user_message_count: 2,
+                assistant_message_count: 2,
+                title_hint: "Widget Cache Investigation".to_string(),
+                recent_context: "USER: trace the stale cache key".to_string(),
+                cached_precis: None,
+                cached_summary: Some("a summary the store has since dropped".to_string()),
+                live_runtime: false,
+                title_is_explicit: false,
+                storage_path: String::new(),
+            }],
+        });
+
+        // Coverage floor: the value must really be there, or clearing it proves
+        // nothing.
+        assert_eq!(
+            server.remote_machines[0].sessions[0].cached_summary.as_deref(),
+            Some("a summary the store has since dropped"),
+        );
+
+        server.apply_session_summary_hint(session_path, None);
+
+        assert_eq!(
+            server.remote_machines[0].sessions[0].cached_summary, None,
+            "a scan that found no summary must clear the cached one, or the \
+             deleted summary keeps being served and keeps suppressing its own \
+             regeneration",
+        );
     }
 
     /// The scope vocabulary, including the one property that makes a sentinel

@@ -17,6 +17,15 @@ This file tracks user-visible changes in `yggterm`.
   and `--clear` deletes them, after which they regenerate from the real
   transcript.
 
+- **Removing a wrong summary now actually removes it.** A row's cached
+  description had three homes, and deleting it from the one that generates it
+  left the other two serving the old text — so a summary that was wrong stayed
+  on screen no matter what was cleared. Worse, that stale copy was the reason
+  nothing replaced it: a new summary is only written when the old one is missing
+  or obviously junk, and a wrong-but-fluent one is neither, so it kept itself
+  alive. A refresh that finds no summary now clears the cached one, and a
+  freshly read summary outranks the cache instead of the other way round.
+
 - **A summary can no longer be the request that asked for it.** Some rows wore
   a fragment of the summariser's own instructions as their description; that
   text is now recognised as the placeholder it is.
