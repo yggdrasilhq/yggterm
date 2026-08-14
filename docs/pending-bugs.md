@@ -1385,8 +1385,10 @@ dressed as fact.
 
 ## ⛔⛔⛔ [6.1] A SEAT DIED TWO SECONDS AFTER ITS OWNING DAEMON WENT SILENT, AND THE EXIT PATH IS UNEXPLAINED
 
-**Status:** OPEN — root cause NOT established. Read the falsification below
-before adopting any mechanism.
+**Status:** OPEN
+
+⛔ Root cause NOT established. Read the falsification below before adopting
+any mechanism.
 
 *Measured 2026-08-14 from the dev trace corpus. This entry replaces the
 "deploys converge the idle window and release PTYs" theory, which is refuted.*
@@ -1441,8 +1443,9 @@ attempt to attribute a death.
 
 ## ⛔⛔ [6.1] THE GUARD PROTECTING A PRESERVED PTY OWNER IS A HOST-SHARED FILE, SO A PEER CAN ERASE IT
 
-**Status:** FIXED IN CODE (`544b11c0`) — LIVE PROOF OWED. ⚠ It ships in a daemon
-built from this commit; **the 15 daemons already running on dev keep the old
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Fixed by `544b11c0`. ⚠ It ships in a daemon built from this commit; **the 15 daemons already running on dev keep the old
 behaviour and cannot be retrofitted**, so the live proof must come from a
 daemon born after the deploy, not from the current population.
 
@@ -1492,7 +1495,9 @@ observable.
 
 ## ⛔ [6.1] A HANDED-OFF fd CAN BE ACCEPTED AND NEVER ACKNOWLEDGED, PAST THE POINT OF NO RETURN
 
-**Status:** OPEN — observed exactly once, with the sweep naming its own victim.
+**Status:** OPEN
+
+Observed exactly once, with the sweep naming its own victim.
 
 The only `superseded_self_retire_sweep` in the dev corpus:
 
@@ -1514,7 +1519,9 @@ settle-window verdict that **cannot read as success while `all_moved` is false.*
 
 ## ⛔ [6.1] THE SELF-RETIRE LOOP NEVER TERMINATES — A FRESH DAEMON EVERY ~5 MINUTES, INDEFINITELY
 
-**Status:** FIXED IN CODE (`544b11c0`) — LIVE PROOF OWED.
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Fixed by `544b11c0`.
 
 ### The mechanism, settled
 
