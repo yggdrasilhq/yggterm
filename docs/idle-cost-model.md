@@ -751,21 +751,47 @@ Two 60 s runs over all 20 daemons, all three controls held in both
 | total daemon population | 3.150 | 5.744 |
 
 ⛔⛔ **I FIRST WROTE THIS AS "43% chores / 57% handlers". THAT SHARE IS NOT A
-PROPERTY OF THE SYSTEM.** The replication moved it to 66%/34% — not because the
-handlers changed, but because **the chore term nearly tripled while the handler
-term moved 8%.** Per daemon:
+PROPERTY OF THE SYSTEM** — the replication moved it to 66%/34%. **The rule that
+follows is right and stands: report cores, never a share.**
 
-| term | reproducibility across the two runs |
-|---|---|
-| **handlers (DIED)** | **stable — every daemon within ~5–10%** (0.1774→0.1896, 0.1971→0.2151, 0.0965→0.1005) |
-| **chores (LONGLIVED)** | **bursty — 0.0368→0.9215 (25x), 0.0512→0.7046 (14x), 0.0228→0.2021 (9x)** on individual daemons, flat on others |
+⛔⛔⛔ **BUT THE MECHANISM I GAVE FOR IT WAS MY OWN LOAD, AND THAT IS WITHDRAWN.**
+I wrote that the handler term is stable while *"the chore term is bursty — 25x,
+14x, 9x on individual daemons"*. **Run 2 was taken immediately after my own dose
+generators had been driving those very daemons.** Replicated under quiet
+conditions, with nothing of mine running:
 
-⇒ **A share is a ratio of two measurements, and this one divides a stable
-quantity by an episodic one.** The honest statement is in cores: **the handler
-term is ~1.8–1.9 cores and reproduces; the chore term is episodic and sampled
-anywhere between 1.4 and 3.8 cores by a 60 s window.** ⭐ **§6i's 0.4475 cores
-over 4 daemons was one such 60 s sample of a bursty process, and should be read
-as a sample, not a level.** Pricing the chore term needs a long window or many.
+| pid | quiet run 1 → 2 | the pair I published |
+|---|---|---|
+| a legacy daemon | **1.03x** | 3.0x |
+| another | **1.05x** | 2.8x |
+| the current daemon | **1.12x** | 8.9x |
+| **the 2.12.14 outlier** | **4.15x** | 1.1x |
+
+⇒ **The daemons that "burst" are flat when quiet, and they are exactly the ones my
+generators had hit.** Aggregate over quiet windows: LONGLIVED 1.160→1.567
+(**1.35x**), DIED 2.050→2.722 (**1.33x**) — **both terms move, and move
+TOGETHER**, which is the common mode already on file, not a contrast between a
+stable term and an episodic one. Six consecutive 30 s samples of the population
+total read 2.986–3.645 cores, **ratio 1.22x**.
+
+⛔ **SO: "handlers stable, chores bursty" is WITHDRAWN.** Under quiet conditions
+both are stable to ~1.1x per daemon, with **one genuine exception — the 2.12.14
+outlier bursts 4.15x on its own**, which is where §5 independently placed a
+fixed-but-still-running full-corpus-read defect. That daemon is bursty; the
+population is not.
+
+⭐⭐ **THE OBSERVER HEATED THE SUBJECT AND I READ THE HEAT AS A PROPERTY OF THE
+SYSTEM.** This is the sharpest instance in the file, because the contaminated
+number *did* demonstrate the rule it was cited for — a share moved 43/57 → 66/34
+— so the lesson looked confirmed by the very data that was corrupt. ⇒ **After
+injecting load, let the subject settle and re-measure before attributing anything
+to it**, and ⭐ **never take the "after" window of a comparison in the wake of
+your own arm.** ⚠ §6i's 0.4475 cores is therefore a fair sample of a mostly
+stable quantity, not of a bursty one — the caveat I attached to it was wrong in
+the same direction.
+
+⚠ **One of the three quiet runs was VOID (spinner 0.8778) and nothing is quoted
+from it.** The two that held read 0.9981 and 0.9799.
 
 ⭐ **The four unpolled daemons read 0.0002–0.0007 cores, and two produced a
 slightly NEGATIVE residual (−0.0003).** Not an error to hide: it bounds the
@@ -1465,14 +1491,18 @@ than widening the span again.
 
 ### S7 — The chore term must be measured over a LONG window, and two chores are named
 
-**Not a code change yet — a measurement contract, because the seat kept sampling
-a bursty process with a 60 s window and reading the sample as a level.** Per-
-daemon chore CPU moved **25x between two adjacent 60 s runs** (§6j-2) while the
-handler term moved 8%.
+⛔ **REWRITTEN — its original premise was my own contamination.** This spec
+said chore CPU "moved 25x between adjacent 60 s runs" and demanded 10-minute
+windows. **That 25x was my own load generators** (§6j-2). Under quiet conditions
+the chore term is stable to ~1.1x per daemon and the population total to 1.22x
+over six windows.
 
-⇒ **Any claim about chore cost must quote a window of at least 10 minutes, or a
-distribution over many windows — never a single 60 s figure.** §6i's 0.4475 cores
-is hereby re-labelled a *sample*.
+⇒ **The surviving contract is narrower and different: a measurement taken in the
+wake of your own injected load is not a measurement of the system.** Let the
+subject settle and re-measure. ⭐ **And the one daemon that IS bursty (4.15x on
+its own, quiet) is the 2.12.14 outlier**, which §5 independently identifies as
+running a fixed-but-still-shipped defect — so burstiness here is a **property of
+one known-bad daemon**, and a reason to drain it, not a property of chores.
 
 **Where to look first,** from the daemons' own aggregate: `background_copy_chore`
 (p50 44.5 ms but **p95 11.2 s**) and `background/local_tree_scan` (**p50 11.6 s**,
