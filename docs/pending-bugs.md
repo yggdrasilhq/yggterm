@@ -1511,6 +1511,54 @@ output says "silent 5 s" — so a reader wired to either field alone cannot pass
 human remains the only detector of the state the daemon can now see. That is the
 next wiring, and `input_unanswered_ms()` is already there to read.
 
+## ⛔⛔ [6.7] APP ROWS ARE BORN `keep_alive: false`, SO A GUI RESTART DESTROYS THE USER'S OWN GROUP
+
+**Status:** OPEN
+
+*Owner-hit 2026-08-14. He lost a row group he had built -- one `New Yedit` header and
+four `New Ychrome` rows -- to a GUI restart, and reported it in those words: "a row
+group of mine is gone ... I cannot see it after the restart".*
+
+**The rows were `kind: shell`, `keep_alive: false`.** Second-class rows die with the
+GUI by design, and that design is correct for a scratch shell. It is wrong for a row
+the user **deliberately created from an app verb** and arranged into a group: from his
+side there is nothing "scratch" about it, and nothing in the UI says it is disposable.
+
+```
+"title": "New Ychrome", "kind": "shell", "keep_alive": false, "cwd": "/home/pi"
+```
+
+⛔ **THE CONSTITUTION SAYS THE OPPOSITE IN AS MANY WORDS:** *"Plain shells are
+first-class and must survive a bump like anything else."* These did not.
+
+⚠ **It is not recorded as a removal either.** `removed-rows.json` has no entry for
+them, so nothing distinguishes "the user closed this" from "this evaporated" -- and
+`sessions restore` answers `not_found`, because the ids are gone from the GUI's live
+set even though `server-state.json` still lists them under `live_sessions`. **Two
+stores disagree about whether the row exists**, which is its own defect.
+
+### What is NOT lost, and what is
+
+- ✅ **Profile data is safe.** Each row was a shell running `ychrome`; the profile
+  directories persist on disk. Nothing the user had stored was destroyed.
+- ⛔ **Which profiles were open is NOT recoverable** from state: the persisted record
+  carries `title`, `kind`, `cwd` and `ssh_target` and **no app arguments**, so a
+  restore cannot reconstruct which profile each row held.
+
+### Falsifier / where to start
+
+1. `server app launch-app ychrome new`, then read the row back out of
+   `~/.yggterm/server-state.json` -- it must not be born `keep_alive: false`.
+2. There is **no CLI verb to set keep-alive on an existing row** (`--keep-alive` is
+   documented only as unnecessary for agent-CLI kinds, which are born keep-alive).
+   A user who wants to protect a row they already have cannot.
+3. The persisted record needs to carry the app **verb and args**, or a restore can
+   only ever produce a blank instance of the app.
+
+⇒ **Three separable fixes, and the first is the one the owner felt:** rows created
+from an app verb are born keep-alive; a keep-alive toggle exists for any row; and the
+stored record round-trips the launch arguments.
+
 ## ⛔⛔ [6.7] THE GUI IS BURNING A WHOLE CORE, AND IT IS USER-TIME, NOT SYSCALLS
 
 **Status:** OPEN
