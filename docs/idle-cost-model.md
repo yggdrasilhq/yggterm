@@ -1165,13 +1165,11 @@ handler's composition stays open and **S6 remains the spec that would close it**
 what changed is that it is now the *smaller* of the two terms, so it should be
 scheduled as an instrument fix rather than as a cost hunt.
 
-⇒ **The ledger, finally, in cores and without a share:** per-session reader
-threads are the large, episodic term and the handler term is the small, stable
-one (~1.8–1.9 cores fleet-wide). ⛔ **Nothing here is a leak and nothing here is
-idle cost in the strict sense** — a daemon whose sessions are quiet costs
-0.67 ms/request and its readers cost nearly nothing. **The population is
-expensive because it is BUSY, and the drain (§S1) remains the action, because it
-moves that work onto fewer, current daemons rather than removing it.**
+⛔⛔ **I THEN WROTE "THE POPULATION IS EXPENSIVE BECAUSE IT IS BUSY" AND THAT IS
+WRONG — RETRACTED 2026-08-14, §6j-9.** I had flooded ptys with `yes` to saturate
+the reader path, measured reader threads at 97.5% of a sandbox's cost, and
+carried that to the live fleet. **It is the CEILING, not the operating point.**
+On this fleet the sessions are idle, and the ledger inverts (§6j-9).
 
 ### ⛔ 6j-8. VOID: per-request cost CANNOT be measured from outside a live daemon
 
@@ -1211,6 +1209,59 @@ rather than the process and is therefore immune to what the rest of the daemon i
 doing. ⛔ **The remaining live figure in this file (20–44 ms per dying thread,
 §6j-3) is a process-level residual divided by a measured death rate, and should
 be treated as provisional until S6's live record lands.**
+
+## 6j-9. ⛔⛔ THE LEDGER INVERTS: N REACHABLE DAEMONS x A FLOOR, NOT SESSION WORK
+
+The owner measured each daemon against **its whole process subtree**, which is the
+one view none of my arms had, and it contradicts my headline. Reproduced here
+independently from the two quiet split runs:
+
+| group | n | population cores | **per daemon** |
+|---|---|---|---|
+| legacy (2.12.14 – 3.0.62) | 14 | **2.643 / 3.345** | **0.189 / 0.239** |
+| current (3.0.153–154) | 2 | 0.401 / 0.455 | **0.201 / 0.227** |
+| unreachable (no socket bound) | 3–4 | **0.000** | 0.000 |
+
+⭐⭐ **PER DAEMON THE TWO GROUPS ARE INDISTINGUISHABLE — ratio 0.94–1.05x.** The
+legacy population is expensive because there are **FOURTEEN of them**, not because
+any one of them is worse. ⚠ **Honest limit: n=2 on the current side**, and its
+range (0.116–0.285) overlaps legacy's entirely — the same thinness that killed the
+version split (§6j-5), so this says "no detectable difference", not "identical".
+
+⇒ **AND THE OWNER'S SUBTREE VIEW SUPPLIES WHAT MINE COULD NOT:** the legacy
+daemons' subtrees are **idle** while the current pair's carry **2.3 cores of real
+work**. So the legacy population's ~2.6–3.3 cores is **not session work at all.**
+
+### ⛔ THREE OF MY CLAIMS FALL, AND THE SPEC GETS BETTER
+
+1. ⛔ **"The population is expensive because it is BUSY" — WITHDRAWN.** It is
+   expensive because it is **NUMEROUS AND REACHABLE**. I generalised from a
+   sandbox where I had flooded the ptys with `yes`; that measured the reader
+   path's **ceiling** and I reported it as the fleet's operating point.
+2. ⛔ **"Per-session reader threads are the only large term standing" —
+   WITHDRAWN.** In my own quiet data the handler term is **57–75%** of daemon
+   cost and readers are the remainder. Readers dominate only under saturated
+   output, which this fleet does not have.
+3. ⛔ **"The drain moves work rather than removing it" — WITHDRAWN for the legacy
+   population.** Their cost is not work done for anybody: their sessions are idle.
+   **Draining them genuinely reclaims it.**
+
+⭐⭐ **WHAT REPLACES ALL THREE, and it is simpler than any of them:**
+
+    daemon population cost  ≈  N_reachable  x  floor(~0.2 cores)
+
+with the **floor being the price of being REACHABLE while holding a row
+inventory** — §2a's finding, which turns out to be the load-bearing one. Every
+other measurement now fits it without strain: the optimisation lane's unpolled
+daemon at **0.00017 cores**, the unreachable daemons here at **0.000**, the whole
+request path at **<1%** on current code, and §6j-8's failure to find a
+per-request signal — **because the floor is not spent per request.**
+
+⇒ ⭐ **S1's original −2.60 cores is vindicated by a route that shares nothing with
+its derivation**, and now has a mechanism instead of a correlation:
+**14 legacy daemons x ~0.19–0.24 cores = 2.64–3.35 cores, reclaimable, because
+nobody is being served by it.** ⇒ **Reduce N_reachable. That is the whole
+optimisation.**
 
 ## 6k. WHY AN UNPOLLED DAEMON DOES NOT RETIRE — the answer owed to the build lane
 
