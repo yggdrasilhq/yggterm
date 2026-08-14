@@ -12,6 +12,44 @@ that would falsify it) · **AWAITING A DECISION** (name who decides).
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⚠ [6.16] A DELETED SUMMARY CANNOT REACH A RUNNING DAEMON — ABSENCE IS DROPPED AS "NO NEWS"
+
+**Status:** OPEN
+
+*Found 2026-08-14 repairing the fabricated summaries, when the repair did not
+reach the screen.*
+
+A remote session's summary is cached on the machine that renders it
+(`RemoteScannedSession::cached_summary`, and the session's `Summary` metadata).
+Every path that refreshes it from a scan is shaped
+`if let Some(summary) = refreshed_summary { set_session_summary_hint(...) }` —
+so a scan that reports **no** summary leaves the old one in place. There is no
+clear path: `set_session_summary_hint` has no counterpart that removes one.
+
+⇒ **The consequence is a cache that suppresses its own repair.** A summary job
+is only queued when `summary_missing`, which requires `cached_summary` to be
+absent or to look like junk. A fluent-but-wrong summary is neither. So deleting
+it from the title store — the documented repair — changes nothing the user sees:
+the running daemon still serves the deleted value, and because it serves it,
+nothing regenerates. Measured after clearing 785 summaries across two hosts: the
+store was empty and the rows were **unchanged**, still 98% ungrounded.
+
+⚠ **It is not persisted** (`server-state.json` carries no `Summary` metadata), so
+the stale values do go away when that daemon retires onto a newer build on its
+own poll. That is the only thing currently clearing them, and it means the repair
+lands on the daemon's schedule rather than when it is run.
+
+**Careful, because one nearby `is_some()` guard is CORRECT:**
+`promote_remote_codex_live_session_to_scanned` builds its `scanned` from a LIVE
+session view, where a missing summary really does mean "this view does not carry
+one". The authoritative-absence paths are the ones fed by a store scan
+(`apply_remote_preview_payload_for_path_with_hydration` and its siblings), where
+`None` means the store was asked and said there is none.
+
+**What would falsify it:** delete a summary from a remote host's title store
+while its row is visible, wait for a scan, and see whether the row's description
+changes.
+
 ## ⚠ [6.16] CLAUDE CODE SESSIONS ARE ABSENT FROM SIDEBAR TRANSCRIPT SEARCH
 
 **Status:** OPEN
