@@ -264,6 +264,18 @@ die. A correct suspicion with a wrong mechanism is still a wrong claim; it was
 sent as a candidate rather than filed as a cause, which is the only reason it
 cost nothing.
 
+⭐⭐ **AND THIS INSTRUMENT IS IMMUNE TO THE BLINDNESS THAT VOIDS THE OBVIOUS
+ALTERNATIVE FOR THE FLOOR QUESTION.** A `/proc/<pid>/task` walk sees only ~20% of
+a daemon's process total here (0.054 against 0.281 cores) because **the cost
+hides in exited threads** — and a connection handler thread is precisely a thread
+that exits. This span reads `CLOCK_THREAD_CPUTIME_ID` **inside the thread, before
+it dies**, so nothing is lost to reaping. ⇒ **It is therefore a candidate
+instrument for "what spends the ~0.2-core reachability floor", not only for the
+request path** — the same widening that measured the accept loop can be pointed
+at any short-lived thread the daemon spawns. ⚠ Not a claim that it *will* find
+the floor: the request path it already prices is three orders of magnitude too
+small, so whatever spends the floor is a different thread population.
+
 **Live proof owed, and it is now load-bearing for the whole partition:** one
 `client_handler_cost` record from a daemon carrying real sessions. This
 instrument uses `getrusage(RUSAGE_THREAD)`, in microseconds, so it is not subject
