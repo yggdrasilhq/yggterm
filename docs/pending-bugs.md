@@ -182,6 +182,18 @@ and the storm's shape is a histogram rather than an impression. ⛔ Do it with t
 now-working `server trace tail --limit N` — before its fix the window was ~4
 seconds and could not span a restart at all.
 
+⚠ **THE THIRD ROW OF THAT TABLE NOW HAS A MEASURED MECHANISM, AND IT IS NOT
+OBVIOUSLY IN THIS PLANE.** Measured on his laptop 2026-08-14: the post-restart
+cost is `app_render_storm` — the Dioxus root at **54–64 renders/s** (calm
+0.7–1.2/s) pinning **exactly one core** for nine minutes, driven by **one
+`ShellState` write per render that changes no watched field**. The daemon-side
+event rate is FLAT across it (13.1/s storming vs 12.1/s calm), so it is not
+"58 rows re-attaching at once" producing work — whatever the write is, it fires
+per frame. ⇒ **Do not assume the restart third shares a root with the other two
+until the write line is named**; the instrument that names it shipped the same
+day. Detail, numbers and the retraction it forced: §THE RENDER-PIPELINE BATCH →
+*the storm is driven by one ShellState write per render*.
+
 **Falsifier:** if a plain shell is ever seen with the bottom-paint fault, or if a
 restart is slow with the re-attach path disabled, this framing is wrong.
 
@@ -15262,7 +15274,10 @@ entry above; not otherwise re-examined.
  Eliminated, each with the measurement that killed it:
  - **Terminal output forwarding** — 2.0 forwards/s while the root rendered at
    85/s. Decoupled.
- - **`safe_shell_mut` / any ShellState field** — 1–6 mutations per 512 renders.
+ - ⛔ ~~**`safe_shell_mut` / any ShellState field** — 1–6 mutations per 512
+   renders.~~ **RETRACTED 2026-08-14 — see the correction below. This
+   elimination was measured through an instrument that could not see 485 of the
+   615 write sites, and once they were counted the answer inverted.**
  - **The handover veil** — 191 of 202 storm windows fall outside every paint
    suspension (19% storm rate inside vs 5% outside: enriched, not causal).
 
@@ -15276,6 +15291,87 @@ entry above; not otherwise re-examined.
  hook), not to guess. Strongest correlate to chase first:
  `terminal_mount/forward_protocol_only_output` runs **75× higher** during
  storms (15.1/min vs 0.2/min) while `terminal_io/dispatch` is flat.
+
+### ⛔⛔ 2026-08-14, ON HIS LAPTOP: THE STORM IS DRIVEN BY ONE ShellState WRITE PER RENDER, AND THE ELIMINATION ABOVE WAS AN INSTRUMENT ARTEFACT
+
+**This is the owner's own symptom.** His words, the same day: *"after restart I
+have to meditate for 5 mins as I know that nothing will respond to input and the
+fan will heavily spin."* That is this entry, measured.
+
+**What the storm costs, which was never attached to it before.** From the
+always-on 60 s CPU sampler (`render/gui`, `core_fraction`, one GUI pid
+throughout): the GUI sat at **1.005 – 1.014 cores for nine unbroken minutes**
+(18:46:59 → 18:54:59) and again 19:00 → 19:02. `hot_cpu_ms` ≈ 60,400 against a
+60,040 ms interval, i.e. **exactly one saturated core** — not the 42% of a core
+measured on guihost, and flat to ±1% for nine minutes, which is the signature of
+a spin rather than of load. Calm focused baseline on the same pid: **0.087 –
+0.36 cores**. Unfocused: **0.042 – 0.060** with `gpu_ms` exactly 0.
+
+**The rate, from the always-on instrument** (`perf/app_render_rate`, emitted
+every 60 s regardless of threshold): **54.2 – 63.9 renders/s sustained**, against
+a calm baseline of **0.7 – 1.2/s**. 37 `app_render_storm` detections and 16
+autopsies on that host.
+
+⛔ **AND THE AUTOPSIES NOW NAME THE CAUSE'S SHAPE, BECAUSE THE INSTRUMENT WAS
+WIDENED IN BETWEEN.** Four consecutive autopsies inside the storm:
+
+| autopsy | renders | renders/s | `shellstate_mut` histogram | `changed_fields` |
+|---|---|---|---|---|
+| 18:50:11 | 512 | 77.1 | `raw_unlabelled: 517` | `{}` |
+| 18:56:12 | 512 | 66.8 | `raw_unlabelled: 517` | `{last_action: 1}` |
+| 19:01:21 | 512 | 63.0 | `raw_unlabelled: 515` | `{}` |
+| 19:52:30 | 512 | 63.7 | `raw_unlabelled: 510` | `{last_action: 1, sidebar_samples: 1}` |
+
+⇒ **~1.00 ShellState writes per render, and they change nothing.** The 2026-08-01
+elimination read `shellstate_mut: 1–6` because only `safe_shell_mut` counted, and
+that path covered **130 of 615 write sites**; the `with_mut_counted` wrapper that
+counts the other 485 landed afterwards. **The old number was not wrong, it was
+partial — and a partial count of writes reads exactly like an absence of writes.**
+
+⇒ It also kills the *"Dioxus-internal wake"* half of the remaining hypothesis as
+the primary explanation: `unattributed: 0` in every window above. A write is
+happening, on our side, once per frame.
+
+⭐ **The mechanism this implies, and the reason it is self-sustaining:**
+`Signal::with_mut` marks the signal dirty **unconditionally**, whether or not the
+new value differs. A write of an unchanged value therefore schedules a render,
+which runs the same code, which writes again. `changed_fields: {}` is not the
+absence of a cause — it is **the fingerprint of the cause**: a write that dirties
+without changing.
+
+✅ **SHIPPED THE ATTRIBUTION, 2026-08-14** — `#[track_caller]` on
+`with_mut_counted`, so the histogram key is the write's own `file:line` instead
+of the constant `raw_unlabelled`. The previous note called naming those sites "a
+separate, larger job"; it is one attribute and a `String` key, because the
+compiler already threads the caller's location through. **Next autopsy on the
+deployed build names the line.** ⚠ Do not convert 485 sites by hand.
+
+⛔ **THE CORRELATE NAMED ABOVE DOES NOT REPRODUCE ON A SECOND HOST.**
+`terminal_mount/forward_protocol_only_output` was 8.14/min inside the pin and
+5.14/min in a matched calm window on the same host — **1.6×, not 75×** —
+while `terminal_io/dispatch` stayed flat (132/min vs 104/min), which does
+reproduce. ⇒ Chase the named write line, not the forward events.
+
+### ⛔ AND THE INSTRUMENT WAS BILLING THE RENDER THREAD IT WAS MEASURING — FIXED
+
+`sidebar/merge_rows` and `merge_rows_breakdown` recorded on
+`remote_session_count >= 500`, which is a fact about **fleet size**, not about
+anything being wrong — permanently true on the live host (640 remote sessions).
+The merge runs inside `ShellState::snapshot()`, which runs in the render body, so
+at 60 renders/s the GUI's **render thread performed ~142 synchronous JSONL
+appends per second**, each a `create_dir_all` + metadata stat + open + write.
+
+✅ Fixed by **coalescing, not sampling**: a merge `>= 4 ms` still emits
+immediately and unchanged, and the rest fold into one event per second carrying
+`sampled_count`, `sampled_max_ms` and `sampled_breakdown_count`. Summing
+`sampled_count` recovers the exact rate, so nothing that could be measured before
+becomes unmeasurable — the reason this is a fix and not a downgrade.
+
+⭐ **The reusable half:** that recorder was also, accidentally, the best storm
+detector on the machine — it is always on, needs no arming, and tracked the storm
+at 71.25 merges/s vs 5.79/s calm (12×) while `app_render_storm` needs a ≥20/s
+threshold and a 5-minute cooldown. **An instrument added for cost accounting saw
+the anomaly the dedicated detector was built for.**
 
 
 ## A HOVER-REVEALED CONTRIBUTED RAIL PANE DRAWS ITS HEADER AND NONE OF ITS ROWS
