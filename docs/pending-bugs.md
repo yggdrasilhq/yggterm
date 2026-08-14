@@ -1533,6 +1533,30 @@ trace event of its own, so "no shutdown event" cannot distinguish a cold
 shutdown from a SIGKILL. Give the shutdown path its own event before the next
 attempt to attribute a death.
 
+### ⛔⛔ A THIRD INSTANCE, 2026-08-14 — AND MY "NO ROWS DIED" WAS WRONG
+
+The 3.0.154 deploy (01:26:57Z) was reported by me as causing no deaths. **It
+did.** A delegate seat's last assistant record is `01:33:02Z` **ending on
+`tool_use`**, its transcript stops at `01:34:41Z`, and its process is gone —
+with a positive control in the same sweep (the identical scan for a live uuid
+returned three processes, so the absence is real and not a collapsed probe).
+
+    release 01:26:57Z → last write 01:34:41Z → gap 464 s
+
+⛔ **The instrument, not the observation, was the mistake.** I watched "past" the
+danger window and said so — but my window was fitted to the two known deaths at
+**272 s and 402 s**, and this one landed at **464 s**. The recorded gaps are now
+272 / 402 / 464, all ending on `tool_use`, and **they are not converging
+downward**, so a window fitted to the previous maximum will always be one
+instance behind.
+
+⇒ **"No rows died" cannot be established by watching for a fixed interval.** The
+honest form is a **census by uuid before and after, re-checked at the next relay
+boundary** — a row that dies at 600 s is invisible to any watch that ends at 500.
+⚠ Same evidential standing as the first two and no stronger: coincidence in time
+with a matching signature. Cause is still **not established**, an independent
+crash is still not excluded, and `dmesg` is still unreadable here.
+
 ## ⛔⛔ [6.1] THE GUARD PROTECTING A PRESERVED PTY OWNER IS A HOST-SHARED FILE, SO A PEER CAN ERASE IT
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
