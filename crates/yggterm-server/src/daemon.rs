@@ -4227,7 +4227,11 @@ impl DaemonRuntime {
         // successor that had to clear its own file can adopt them from us rather
         // than from the file. No mirrored filter — `persisted_state()` IS the
         // filter, so the wire and the file cannot drift apart.
-        let live_terminal_sessions = self.server.persisted_state().live_sessions;
+        // ⚠ `persisted_live_sessions()`, not `persisted_state().live_sessions`
+        // — the same rows by the same filter, without also building the stored
+        // list a second time, sorting every PTY grid, and cloning the machine
+        // table only to drop them. Same wire, less work; see that method.
+        let live_terminal_sessions = self.server.persisted_live_sessions();
         let owned_terminal_session_keys = self.terminals.session_keys();
         let mut terminal_session_keys = owned_terminal_session_keys.clone();
         terminal_session_keys.extend(preserved_owner_keys.iter().cloned());
