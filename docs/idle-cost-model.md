@@ -933,8 +933,8 @@ because n=2 felt thin enough to widen — the replication was the whole instrume
 ⇒ **WHAT SURVIVES, and it is the number the specs need:** across 12 daemon-arms
 the per-request cost is **~25–30 ms**, spread 8–48, with **no established
 dependence on version, RSS, or row count**. That central value is independently
-confirmed by the direct per-thread measurement of §6j-3 (**25.0 ms**, a different
-instrument that never sees a request rate) and by the flatness of the DIED term
+confirmed by §6j-3's per-thread lower bound (**≥21.2 ms**, a different instrument
+that never sees a request rate; ⚠ **provisional** per §6j-8) and by the flatness of the DIED term
 across daemons spanning 36–690 MB of heap and 70–263 rows.
 
 ⚠ **THE RETRACTED "38 ms" SITS INSIDE THAT SPREAD, AND ITS RETRACTION STILL
@@ -942,7 +942,8 @@ STANDS.** It came from dividing all daemon CPU by the thread rate, which assumes
 the whole of daemon CPU is handler work — false, and it would have produced the
 same figure whatever the truth was. ⇒ *A number can land in the right range and
 still deserve its retraction, because a method that cannot be wrong about the
-right things is not evidence.* Quote §6j-3's 25.0 ms, which was measured.
+right things is not evidence.* Quote §6j-3's **20–44 ms**, ⚠ **provisional**
+until an in-process span measures it on a live daemon (§6j-8).
 
 ### 6j-6. ⭐⭐ THE EMPTY-DAEMON CONTROL: the request PATH is ~1.7 ms; the rest is CARGO
 
@@ -1062,20 +1063,32 @@ different quantities.** The span covers the handler closure; the process counter
 covers *everything the daemon does per connection* — `accept`, thread create
 (2 MiB stack `mmap`), the outcome channel, thread teardown, poll wakeup.
 
-⇒ **~1.7 ms per connection is spent OUTSIDE the handler**, roughly **14x the
-handler's own cost for a request that does nothing.**
+⇒ I read this as **~1.7 ms per connection spent OUTSIDE the handler**.
+⛔⛔ **THAT NUMBER DOES NOT EXIST, AND THIS IS THE CLEANEST INSTANCE OF §6j-8 IN
+THE FILE.** It was a closure span subtracted from a process counter, and that
+counter was charging **concurrent background work — reader threads, chores — to
+whatever connection happened to be open.** Measured from inside, in three pieces
+from one window, with the connection count matching the handler count exactly:
 
-⚠ **This contradicts S4's standing note that "thread spawn is ~50 µs, so a pool
-buys ~0.0002 cores".** That figure priced `clone()` alone. If the true
-per-connection non-handler cost is ~1.7 ms at ~4 connections/s per daemon, a pool
-addresses ~0.007 cores/daemon — still small, but **an order of magnitude more
-than the note claims, and the note should stop being quoted as a reason not to
-build it.** ⛔ **NOT yet a recommendation to build S4**: this is one arm on one
-host, the 1.7 ms is a difference between two instruments rather than a direct
-measurement of the gap, and **a difference of two measurements is exactly the
-shape this seat keeps getting wrong.** ⇒ the honest next step is an in-process
-span around the *accept-to-teardown* path, which is S6's instrument widened by
-one more frame.
+| piece | cost |
+|---|---|
+| parent accept + spawn | 44–48 µs |
+| child pre-closure | 39–55 µs |
+| child closure (`ping`) | 61–126 µs |
+| **whole per-connection floor** | **≈150–230 µs** |
+
+⇒ **The real floor is ~8x smaller than my subtraction, and none of the 1.7 ms is
+in the request path.**
+
+⇒ **S4's standing note ("thread spawn is ~50 µs, so a pool buys ~0.0002 cores")
+turns out RIGHT, but it was right by luck at ~50 µs and is now right by
+measurement at 150–230 µs.** At ~4 connections/s that is **under 0.001
+cores/daemon**. ⛔ **Schedule S4 on stability and observability, never on cores** —
+and do not invert this into an argument for it, which is what my 1.7 ms briefly
+did. ⭐ **I proposed the widened accept-to-teardown span and then withdrew the
+offer to build it**, because §6j-8 had just shown I cannot reach it from outside;
+the build lane took it and measured it from inside. **That is the correct
+division and the reason the number exists at all.**
 
 ⇒ **WHAT THE RESIDUAL TRACKS IS SESSIONS, NOT ROWS AND NOT THE VERB.** It is the
 one dimension the sandbox never reproduced: `snapshot` gathers terminal state per
@@ -1461,7 +1474,8 @@ inference.
 
 **The problem is an instrument, not a regression.** `PerfGuard` records **wall
 time** and its guard **drops when `handle_request` returns**. So for a handler
-thread that burns 25.0 ms of CPU, the existing span covers **~2.4 ms** — under 10%
+thread that burns **20–44 ms** of CPU (⚠ provisional, §6j-8), the existing span
+covers **~2.4 ms** — under 10%
 — and reports it in a unit that cannot tell 25 ms of work from 25 ms of waiting.
 **That is why §6j-4 could refute candidates but not name the cost**, and why four
 sections of this file have argued about a quantity nothing measures.
