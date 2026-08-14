@@ -6432,12 +6432,100 @@ impl YggtermServer {
         self.persisted_state_with_update_protection(true, Some(runtime_keys))
     }
 
+    /// Just the live rows, without building the rest of the persistence
+    /// payload around them.
+    ///
+    /// ⭐ **Exists because a `status` reply wanted exactly this and had to ask
+    /// for everything to get it.** `status` called [`Self::persisted_state`]
+    /// and kept `.live_sessions`, so every reply also walked and cloned every
+    /// stored row (a **second** time — `status` had already called
+    /// [`Self::stored_sessions_persisted`] itself), cloned and **sorted** every
+    /// PTY grid, cloned `ssh_targets`, ran `clear_remote_machine_live_runtime_
+    /// flags` over every remote machine, and built a `HashSet` of live keys to
+    /// resolve an active path — then dropped all of it. At the measured
+    /// 3.4–4.2 status replies/s per daemon that is paid continuously, on every
+    /// daemon, forever.
+    ///
+    /// ⛔ It shares the filter body with [`Self::persisted_state`] rather than
+    /// restating it. Which live sessions persist has ONE owner; a second copy
+    /// tuned for the cheap path is exactly how the wire and the file come to
+    /// disagree about who holds a row, which is the failure that loses rows at
+    /// a handover.
+    pub fn persisted_live_sessions(&self) -> Vec<PersistedLiveSession> {
+        self.persisted_live_sessions_with_update_protection(false, None)
+    }
+
     fn persisted_state_with_update_protection(
         &self,
         protect_all_live: bool,
         protected_runtime_keys: Option<&HashSet<String>>,
     ) -> PersistedDaemonState {
         let stored_sessions = self.stored_sessions_persisted();
+        let live_sessions = self
+            .persisted_live_sessions_with_update_protection(protect_all_live, protected_runtime_keys);
+        let persisted_live_keys: HashSet<_> =
+            live_sessions.iter().map(|live| live.key.as_str()).collect();
+        let active_points_at_excluded_live = self
+            .active_session_path
+            .as_deref()
+            .and_then(|active_path| {
+                self.sessions
+                    .get(active_path)
+                    .map(|session| (active_path, session))
+            })
+            .is_some_and(|(active_path, session)| {
+                managed_session_is_promoted_live_session(active_path, session)
+                    && !persisted_live_keys.contains(active_path)
+            });
+        let active_session_path = if active_points_at_excluded_live {
+            live_sessions.first().map(|live| live.key.clone())
+        } else {
+            self.active_session_path.clone()
+        };
+        let active_view_mode = if active_session_path.is_none()
+            && self.active_view_mode == WorkspaceViewMode::Terminal
+        {
+            WorkspaceViewMode::Rendered
+        } else {
+            self.active_view_mode
+        };
+
+        // Persist the last-known PTY grid for every session we still know about, so a
+        // daemon-PROCESS restart re-resumes each at its real grid (squish fix, Bug 10).
+        // Keyed by session key, this covers BOTH local-live (no ssh_target, so absent
+        // from live_sessions) AND remote/stored — the squish hits both. Filtering to
+        // keys still present in `self.sessions` prunes deleted sessions so the map
+        // can't grow unbounded.
+        let mut session_pty_grids: Vec<PersistedSessionGrid> = self
+            .session_pty_grids
+            .iter()
+            .filter(|(key, _)| self.sessions.contains_key(key.as_str()))
+            .map(|(key, (cols, rows))| PersistedSessionGrid {
+                key: key.clone(),
+                cols: *cols,
+                rows: *rows,
+            })
+            .collect();
+        session_pty_grids.sort_by(|a, b| a.key.cmp(&b.key));
+
+        PersistedDaemonState {
+            active_session_path,
+            active_view_mode,
+            ssh_targets: self.ssh_targets.clone(),
+            remote_machines: clear_remote_machine_live_runtime_flags(&self.remote_machines),
+            stored_sessions,
+            live_sessions,
+            session_pty_grids,
+        }
+    }
+
+    /// The ONE owner of which live sessions persist — see
+    /// [`Self::persisted_live_sessions`] for why it is separable at all.
+    fn persisted_live_sessions_with_update_protection(
+        &self,
+        protect_all_live: bool,
+        protected_runtime_keys: Option<&HashSet<String>>,
+    ) -> Vec<PersistedLiveSession> {
         // Persistence-drop telemetry (live incident 2026-06-11: local rows
         // kept vanishing at swaps even after the mapper fix; the unit test
         // passed while the live path failed). Every live key that does NOT
@@ -6463,8 +6551,7 @@ impl YggtermServer {
                 );
             }
         };
-        let live_sessions: Vec<_> = self
-            .live_session_order
+        self.live_session_order
             .iter()
             .filter_map(|key| self.sessions.get(key).map(|session| (key, session)))
             .filter(|(key, session)| {
@@ -6559,61 +6646,7 @@ impl YggtermServer {
                 }
                 persisted
             })
-            .collect();
-        let persisted_live_keys: HashSet<_> =
-            live_sessions.iter().map(|live| live.key.as_str()).collect();
-        let active_points_at_excluded_live = self
-            .active_session_path
-            .as_deref()
-            .and_then(|active_path| {
-                self.sessions
-                    .get(active_path)
-                    .map(|session| (active_path, session))
-            })
-            .is_some_and(|(active_path, session)| {
-                managed_session_is_promoted_live_session(active_path, session)
-                    && !persisted_live_keys.contains(active_path)
-            });
-        let active_session_path = if active_points_at_excluded_live {
-            live_sessions.first().map(|live| live.key.clone())
-        } else {
-            self.active_session_path.clone()
-        };
-        let active_view_mode = if active_session_path.is_none()
-            && self.active_view_mode == WorkspaceViewMode::Terminal
-        {
-            WorkspaceViewMode::Rendered
-        } else {
-            self.active_view_mode
-        };
-
-        // Persist the last-known PTY grid for every session we still know about, so a
-        // daemon-PROCESS restart re-resumes each at its real grid (squish fix, Bug 10).
-        // Keyed by session key, this covers BOTH local-live (no ssh_target, so absent
-        // from live_sessions) AND remote/stored — the squish hits both. Filtering to
-        // keys still present in `self.sessions` prunes deleted sessions so the map
-        // can't grow unbounded.
-        let mut session_pty_grids: Vec<PersistedSessionGrid> = self
-            .session_pty_grids
-            .iter()
-            .filter(|(key, _)| self.sessions.contains_key(key.as_str()))
-            .map(|(key, (cols, rows))| PersistedSessionGrid {
-                key: key.clone(),
-                cols: *cols,
-                rows: *rows,
-            })
-            .collect();
-        session_pty_grids.sort_by(|a, b| a.key.cmp(&b.key));
-
-        PersistedDaemonState {
-            active_session_path,
-            active_view_mode,
-            ssh_targets: self.ssh_targets.clone(),
-            remote_machines: clear_remote_machine_live_runtime_flags(&self.remote_machines),
-            stored_sessions,
-            live_sessions,
-            session_pty_grids,
-        }
+            .collect()
     }
 
     pub fn restore_persisted_state(
@@ -37111,6 +37144,46 @@ terminal_window_id: None,
     /// Asserts all three halves: the first drop IS logged (the diagnostic the
     /// 2026-06-11 incident needed), the repeat is NOT, and a different reason
     /// for the same key IS — because that is a new fact, not a repetition.
+    /// The cheap live-only path and the full persistence payload must report
+    /// the SAME rows, in the same order, forever.
+    ///
+    /// `status` takes the cheap one several times a second on every daemon;
+    /// the file and every handover take the full one. They share a body today,
+    /// and this test exists for the day somebody optimises one of them: a live
+    /// row present in the file and absent from the wire reads to a successor as
+    /// *"this peer holds no such row"*, which is how rows get dropped at a
+    /// handover. Divergence must fail here, not in production.
+    #[test]
+    fn the_cheap_live_session_path_reports_exactly_what_the_full_persist_does() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let kept = server.start_local_session(
+            SessionKind::ClaudeCode,
+            Some("/srv/example/alpha"),
+            Some("alpha"),
+        );
+        server
+            .set_live_session_keep_alive(&kept, true)
+            .expect("keep the row");
+        // A second row that is NOT keep-alive, and a third of a different kind:
+        // the filter treats these differently, so a divergence in any of the
+        // three branches shows up.
+        server.start_local_session(SessionKind::Codex, Some("/srv/example/beta"), Some("beta"));
+        server.start_local_session(SessionKind::Shell, Some("/srv/example/gamma"), Some("gamma"));
+
+        let cheap = server.persisted_live_sessions();
+        let full = server.persisted_state().live_sessions;
+        assert!(!cheap.is_empty(), "the fixture must produce live rows");
+        assert_eq!(
+            serde_json::to_string(&cheap).expect("serialize cheap"),
+            serde_json::to_string(&full).expect("serialize full"),
+            "persisted_live_sessions() and persisted_state().live_sessions have diverged"
+        );
+    }
+
     #[test]
     fn an_explicitly_renamed_row_keeps_its_name_across_a_daemon_restart() {
         let mut server = YggtermServer::new(

@@ -123,7 +123,9 @@ daemon) moves per-row only to **0.000322**. ⇒ **The term survives every single
 deletion.**
 
 **What it is worth.** Rows summed over the 15 census daemons = **1,953**, at
-0.000337 cores/row ⇒ **≈0.66 cores spent on row-scaled work**. ⛔ **And each
+0.000337 cores/row ⇒ **≈0.66 cores spent on row-scaled work**. ⛔ **SUPERSEDED —
+that figure is a fitted coefficient, and the quantity was later measured directly
+at 4.6–4.7 µs/row (§6h), which makes the term ≈0.033 cores.** Do not quote 0.66. ⛔ **And each
 daemon's ROWS is frozen at its birth** (the bequest carries the list forward), so
 a 261-row daemon owning 23 sessions is carrying 238 rows it does not own.
 
@@ -286,6 +288,51 @@ and it does.
 ⛔ **But it means this defect is close to absent on the machine the fan
 complaint came from.** Fix it on its own merits — CPU, IO and SSD wear on the
 host that carries the fleet. **Do not offer it as the explanation for his fan.**
+
+### ✅ 4a. S2 IS MEASURED AND PASSES — 493x, against a 90x threshold
+
+*2026-08-14, on the fleet host, on the one daemon whose build carries
+`670fa66d` — confirmed by `git merge-base --is-ancestor`, never by version
+number.*
+
+| | |
+|---|---|
+| windows emitted | 31, covering **1,861 s** |
+| contentions **counted by the aggregate itself** | **131,243** (70.5/s) |
+| bytes the new code actually wrote | **116,344 B — 62.5 B/s** |
+| bytes the old code would have written | 131,243 × 437 B = **30.1 KB/s** |
+| **reduction** | **493x** |
+
+⭐ **The control the entry demanded turned out to be unnecessary, because the
+fix's own record carries the number of events it replaced.** An aggregate that
+reports `count` makes its own counterfactual *countable* — old volume is
+`count × bytes-per-old-event`, measured on the same daemon in the same window,
+with no second daemon, no earlier baseline, and no session-population confound
+to argue about. ⇒ **When a fix replaces N events with one summary, put N in the
+summary.** That is what turned an unrunnable comparison into a one-daemon
+measurement.
+
+⚠ **The one inherited constant is 437 B/contention** (§4's 141.1 KB/s ÷ 322.8/s),
+and the verdict does not depend on it being right: at a deliberately pessimistic
+**100 B**/contention the reduction is still **113x**, above the threshold. So a
+4.4x error in the constant would not change the answer.
+
+⛔ **And the cross-daemon control that was specified would have MISLED, for a
+reason worth keeping.** Run at the same moment over 180 s, the 14 pre-fix
+daemons wrote **no `lock_wait` records at all** — their entire trace volume is
+`begin`/`end` request tracing. There was nothing on the control arm to compare
+against, because contention is a property of *load*, and the load had moved to
+the one busy daemon. A per-owned-session normalisation on top of that would have
+been worse than useless: total write volume was roughly **flat at 1.0–2.5 KB/s
+regardless of owned count (1 to 10)**, so dividing a near-constant by a varying
+denominator manufactures a trend that is not there. ⇒ **Normalise only by a
+quantity the numerator has been shown to scale with.**
+
+⭐ **Residual, and it is not this defect:** `lock_wait_slow` — the deliberately
+preserved forensic path — is **84% of the remaining 62.5 B/s**, and it is
+earning its keep. In one hour: **520 slow `terminal_read` waits, 79 slow
+`status` waits, and a `status` that waited 9.89 s** for the runtime lock. That
+is §S3's evidence, now visible where it previously rounded to `waited_ms: 0`.
 
 ## 5. A SHIPPED fix is not a RUNNING fix — the outlier, identified
 
@@ -590,6 +637,469 @@ was never going to be it: the row term is not background work at all, it is
 of ~655 KB. Reads were already known not to proxy this cost (§2b's own caution:
 a 0-session control read 4.5 MB while costing 0.001 cores). The quantity that
 mattered was a **request rate**, and it was visible in the trace the whole time.
+
+### ✅ 6h. MEASURED DIRECTLY: 4.645 µs/row, and status serving is 1.6% of the daemon population
+
+*2026-08-14, fleet host. A counter in `fn status()` itself — every reply, nothing
+sampled, `CLOCK_THREAD_CPUTIME_ID` rather than wall. Six seeded row counts,
+isolated homes, one variable.*
+
+⚠ **The probe was priced on the host before it was trusted**, because the fleet
+spread on this call is 45.8×: `CLOCK_THREAD_CPUTIME_ID` **578 ns**,
+`CLOCK_PROCESS_CPUTIME_ID` **619 ns**, `CLOCK_MONOTONIC` **26.7 ns** (vDSO,
+`tsc`). Two calls per reply at 3.6 replies/s is ~4 µs/s — four orders of
+magnitude below what it measures.
+
+| ROWS | CPU µs/reply (payload build) | CPU µs/reply (whole request) |
+|---|---|---|
+| 0 | 36 | 383 |
+| 50 | 236 | 664 |
+| 100 | 409 | 898 |
+| 250 | 955 | 1,582 |
+| 500 | 2,133 | 3,089 |
+| 1000 | 4,676 | 6,247 |
+
+    payload build   slope 4.645 us/row   intercept  -63 us   r = +0.9981
+    whole request   slope 5.857 us/row   intercept  289 us   r = +0.9985
+
+⇒ **The row term is real, linear over the fleet's range, and small.** At the
+measured poll rate across the census's **1,956 rows**: **0.033–0.041 cores**.
+Adding the per-reply floor (289 µs × 3.6/s × 15 daemons = 0.016 cores), **all of
+status serving is ≈0.057 cores of the 3.47-core daemon population — 1.6%**, and
+request serving explains **under 1%** of §2's fitted per-daemon floor.
+
+⭐ **Three numbers for one slope, and the two that agree were reached
+independently.** 94 µs/row (§6e, inferred from the model — refuted);
+**10.2–11.0 µs/row** (§6g, mean over `PerfGuard` records — biased, below);
+**4.645 µs/row** here, against **4.71 µs/row** from re-fitting §6g's own field
+data with each record inverse-probability weighted. Field-plus-reweighting and a
+controlled counter are not the same instrument, and they land 1.4% apart.
+
+⛔ **§6g's shortfall was not unexplained, and its slope does not survive
+either.** `("daemon_request", "status")` is on
+`perf_span_is_high_frequency_noise`'s list (`crates/yggterm-core/src/perf.rs:60`):
+a span is written only at **≥ 8 ms** or on a **1-in-50** sample — which is where
+the "~3.6% of requests" comes from. One live stream held 5,604 sub-floor records
+against 2,769 tail records: recorded tail share **33% against a true 0.98%**.
+§6g kept the slope on the grounds that *"a uniform under-recording factor
+cancels in a between-daemon comparison."* **The factor is not uniform** — the
+keep-rule is a threshold on duration, and duration is what rows drive: the
+243–246-row daemons put **13.5–16.8%** of their records above the floor where
+the 70–101-row daemons put **3.5–7.6%**. Each daemon is biased differently, in
+the same direction as the effect being estimated.
+
+⛔ ⇒ **§6e's headline claim — that `status` is BOTH unattributed terms of the
+model — is refuted. It is neither.** The row term is attributed to it and is
+worth ~1.5%; the floor is not, and **where the daemon's CPU actually goes is
+open**.
+
+**Two known biases, both stated because both make the number an under-read:**
+the seeded rows carry short synthetic strings where real ones carry longer
+titles and cwds; and the harness drives 69–290 replies/s where the fleet runs at
+3.6/s, so caches stay warmer. Generous allowance for both still leaves status
+serving under ~4.5%. ⚠ The harness also seeds **empty** `session_pty_grids`,
+`ssh_targets` and `remote_machines`, which zeroes three terms the live path
+pays — they are tens of µs per reply, under 0.001 cores fleet-wide.
+
+⇒ **What was built instead of §S5** is in the queue entry: `status` was asking
+for the whole persistence payload to use one field of it. Splitting out
+`persisted_live_sessions()` removes a second full stored-row walk, a PTY-grid
+clone and sort, two table clones and a `HashSet` per reply — **same wire, no
+version gate, no protocol risk.**
+
+**Its paired A/B, on the identical harness, same host, same seeds, binary the
+only difference:**
+
+| ROWS | CPU µs/reply before | after | | whole request before | after |
+|---|---|---|---|---|---|
+| 0 | 36 | 31 | | 383 | 353 |
+| 100 | 409 | 386 | | 898 | 842 |
+| 250 | 955 | 943 | | 1,582 | 1,564 |
+| 1000 | 4,676 | 4,402 | | 6,247 | 5,912 |
+
+    payload build   4.645 -> 4.365 us/row   (-6.0%)   both fits r = 0.998
+    whole request   5.857 -> 5.530 us/row   (-5.6%)
+
+⚠ **Read this as code hygiene, not as a performance win, and the numbers say so
+themselves.** Six percent of a path that is 1.6% of the daemon population is
+~0.002 cores — below anything a user could perceive, and **no CHANGELOG entry
+was written for it.** ⛔ **Quote the paired SLOPE, never a single arm:** the
+per-arm deltas run −1.3% to −13.9% and are not monotone in ROWS, which is
+run-to-run noise of a few percent; the slope over six paired points is the only
+part that survives it.
+
+⭐ **The durable half is a dependency removed, not microseconds saved.** The
+reply path no longer scales with the PTY-grid table, the ssh-target list or the
+machine table at all — three terms this harness seeds EMPTY and the live fleet
+does not, so the A/B above understates the change on a real daemon while
+overstating nothing.
+
+### ⛔ 6i. THE NEGATIVE CONTROL: A LONE DAEMON SPENDS NOTHING — AND IN COMPANY IT CANNOT EXIT
+
+*2026-08-14, fleet host. The control §6h needs: same binary, same seeded row
+counts, own `YGGTERM_HOME` so nobody polls it — and **no request sent**. If the
+cost is request serving, this reads ~0. If it is intrinsic, this is where it
+shows up.*
+
+| seeded ROWS | idle cores over 60 s | ticks of CPU |
+|---|---|---|
+| 0 | 0.00017 | 1 |
+| 100 | 0.00000 | 0 |
+| 264 | 0.00017 | 1 |
+| 1000 | 0.00100 | 6 |
+
+⚠ **Read the resolution before the numbers.** `CLK_TCK` is 100, so one tick is
+10 ms and the floor of this instrument over a 60 s window is **0.00017 cores**.
+Three of the four arms are at or below one tick — **indistinguishable from
+zero**, not measured as zero. That blindness does not matter here only because
+the bound it gives is already **~680x below** the 0.116-core floor being tested.
+Only the 1000-row arm (4x the fleet's largest daemon) rises clear of it, at
+0.001 cores.
+
+⇒ **There is no intrinsic per-daemon floor.** A daemon holding up to 264 rows
+and no sessions, that nobody talks to, costs less than 0.0002 cores.
+⇒ Combined with §6h — a served poll costs 383 µs, so 3.6/s is **0.0014
+cores/daemon** — **neither existing nor being polled explains 0.116.**
+⇒ **So the intercept is either attached to owned sessions, or it is a fitting
+artefact.** §2a already said the fit cannot separate a per-daemon floor from a
+step paid by the first session, because no census daemon owns zero; and the
+replication that took R² from 0.939 to 0.109 is what a spurious intercept looks
+like. ⛔ **§2a's ✅ "ANSWERED IN §6e — the floor is the cost of answering peer
+polls" is withdrawn.** Answering peer polls is 1.2% of it.
+
+⚠⚠ **READ THE SCOPE, BECAUSE THE HEADLINE IS EASY TO OVER-READ.** *"A lone
+daemon spends nothing"* is **not** *"daemons spend nothing"*. This daemon owns
+**zero sessions and zero preserved owners**, and that is where the difference
+with the live population lives:
+
+- The machine-wide corpus walk is **not** the difference — `daemon_background_
+  copy_chore_enabled()` reads an env var that is **unset by default**
+  (`daemon.rs:11354`), so it is off in this sandbox *and* off on the live
+  daemons alike.
+- What IS different is the part of the same chore that is **not** gated: the
+  per-owned-session halves — the CC title sync, the live/remote candidate
+  collection, the preserved-owner revalidation — which that function's own doc
+  says *"keep running regardless"*. A daemon owning nothing does none of it.
+
+⇒ **This control rules out an intrinsic per-DAEMON cost. It says nothing about
+per-SESSION cost, by construction** — and the live-population arm's finding
+(periodic chore threads carrying the bulk) sits exactly there. The two results
+agree rather than compete: the standing cost tracks what a daemon **owns**, not
+that it exists and not that it is polled.
+
+#### ⭐ And the control found the mechanism that keeps the population alive
+
+Every arm **retired itself after 75 s**, logging `daemon idle shutdown,
+idle_shutdown_ms=90000`. That is not a fault — it is
+`daemon_should_idle_shutdown` (`crates/yggterm-server/src/daemon.rs:11589`)
+doing exactly what it says. Two gates:
+
+1. `if terminal_session_count > 0 { return false }` — **a daemon owning any
+   session, including a preserved hot-update PTY, never idle-retires.**
+2. Otherwise it needs **90 s with no request**. And `mark_daemon_activity` is
+   called on **every** request, unconditionally, before dispatch
+   (`daemon.rs:19423`).
+
+⇒ **In a population, gate 2 is unreachable.** Peers poll each daemon at
+**3.4–4.2/s** against a 90 s window, so the timer is reset roughly 300 times
+over before it could ever fire. **A daemon drained to zero sessions still would
+not idle-retire while any peer remains** — the population keeps its own members
+alive, and this control is the proof of the converse: remove the peers and the
+same binary exits in 90 s having burned nothing.
+
+⚠ **Scope, stated so it is not over-read.** This is the *idle-shutdown* path,
+not the *successor-retire* path (`daemon.rs:15274`, 20 s poll), which is what
+actually drains superseded daemons and carries its own deferral gate. The claim
+is that **idle-shutdown cannot be the drain's mechanism in a live fleet** — not
+that nothing can retire a daemon. ⇒ It matters to §S1: a drain that migrates
+sessions off a daemon and then waits for it to notice it is idle will wait
+forever.
+
+#### ⚠ What this control does NOT cover — the OUTBOUND half of a poll
+
+§6h measured the daemon **serving** a `status`. Nothing has measured a daemon
+**sending** one, and the population sends as many as it receives (~3.4/s each).
+A first bound, through the nearest available proxy: `server daemons` — a CLI
+that runs the same fan-out over all 15 peers and then does strictly more
+(`/proc/<pid>/exe` per daemon, formatting) — costs **0.117 s of CPU, ~7.8 ms per
+peer**.
+
+⛔ **That is an UPPER BOUND obtained through a proxy, and it is DERIVED when
+multiplied by a rate — treat it as neither measured nor attributed.** Even taken
+at the bound, 7.8 ms × 3.4/s × 15 daemons is **0.40 cores, ~11%** of the daemon
+population. ⇒ **The outbound half does not close the gap either**, but it is the
+largest unmeasured term left in the request path and it should be measured in
+the daemon rather than bounded from outside.
+
+### ✅ 6l. S6 BUILT — THE HANDLER, MEASURED END TO END IN CPU, PER VERB
+
+*The instrument §S6 asked for: `CLOCK_THREAD_CPUTIME_ID` around the WHOLE closure
+at `spawn_unix_client_handler`, not `handle_request`'s wall-time `PerfGuard`.
+Expected effect **zero cores** — it attributes cost, it removes none.*
+
+Sandbox, 264 seeded rows, no sessions, two consecutive 60 s windows:
+
+| verb | n | CPU µs/conn | wall µs/conn | kernel share |
+|---|---|---|---|---|
+| `status` | 10,184 | **1,385** | 1,423 | **7.6%** |
+| `ping` | 5,092 | **126** | 128 | 3.3% |
+
+⭐ **`ping` is the per-connection FLOOR, measured: 126 µs** — accept, spawn the
+thread, read, dispatch, serialise, write, tear down, for a request that does
+nothing. And `status` at 264 rows costs **1,385 µs**, of which §6h's payload
+build is 1,070 µs; the residual ~315 µs is that floor plus serialising the
+reply. **The three numbers close.**
+
+⛔ **PER VERB, AND THE FIRST VERSION WAS NOT — the tell was arithmetic, not
+suspicion.** A single mean over every connection came out **below the cost of
+the payload build it contains**, which is impossible: 3,385 `status` handlers at
+1,374 µs were being averaged with 1,694 `ping` handlers at 125 µs. ⇒ **A mean
+over a mixed population of verbs is not a handler cost**, and it reads low by
+whatever fraction of traffic is cheap.
+
+⛔⛔ **THE ~94% KERNEL FIGURE THAT MOTIVATED §S6 IS RETRACTED — and the reason is
+this section's own coarse-field trap, one level down.** It came from
+`/proc/<tid>/stat` fields 14/15, where **`utime` and `stime` are each floored to
+a 10 ms tick INDEPENDENTLY**. Flooring the two components of one thread
+separately annihilates the smaller and drives the share to 100% for the larger.
+Measured against `getrusage(RUSAGE_THREAD)` on threads built with a known mix:
+
+| true mix | true kernel share | what the ticks said |
+|---|---|---|
+| 100 ms user / 100 ms kernel | 76.5% | 78.9% — fine |
+| 4 ms user / 20 ms kernel | 83.3% | **100.0% — user annihilated** |
+| 1 ms / 2 ms | — | **both components read ZERO** |
+
+⇒ A handler carrying ~1.6 ms of user time loses all of it. ⭐ **My 3–8% and that
+94% were never in conflict about the same thing:** on a sandbox at 264 rows the
+tick instrument recorded **622 and 824 consecutive dying handler threads each
+reading ZERO ticks** while genuinely burning ~1.4 ms apiece. *An instrument that
+reports nothing for 622 consecutive events is not measuring the events.*
+
+⚠ **What survives, and what does not.** The **magnitude** stands and the
+**composition** does not: truncation is a floor, so the live figure is a *lower
+bound* of ≥21.2 ms per handler, and an independent process-level subtraction
+gives 20–44 ms. Two methods agree on size. ⇒ **A sandbox handler is ~1.4 ms and a
+live-daemon handler is 20–44 ms — a real 15–30× gap — but it can no longer be
+called kernel time. What that gap IS, is open**, and this instrument's live
+record is what settles it.
+
+⛔ **And my own proposed explanation for the gap was WRONG, which is worth more
+than the guess was.** I offered `comm` truncation — `TASK_COMM_LEN` is 16, so
+`yggterm-daemon-client-…` truncates and unnamed threads inherit the parent's
+`comm`, letting a by-name classifier merge reader threads into the handler
+bucket. It does not apply: that bucket is defined by **lifetime**, not by name —
+every thread that *dies* in-window — and reader threads do not die, so they
+cannot be in a dying-thread bucket. ⇒ **The observation that actually killed the
+figure was the coarse-field one, not the mechanism I attached to it.** A correct
+suspicion with a wrong mechanism is still a wrong claim; it was right to send it
+as a candidate rather than file it as a cause.
+
+#### ⛔ THE FAN-OUT HYPOTHESIS FOR THE 15–30× GAP — MINE, TESTED, REFUTED
+
+`ServerRequest::Snapshot` calls `refresh_proxied_working_flags`
+(`daemon.rs:8024` → `:4308`), which makes **one outbound round trip per
+preserved owner, inside the connection-handler thread**. A live daemon carries up
+to 29 preserved owners, and 29 × ~1.4 ms lands squarely on the 20–44 ms live
+figure. The arithmetic fitted, the code path is real, and it explained why a lone
+sandbox daemon could not reproduce the gap.
+
+**The control says no.** Driven on a sandbox with **zero peers and zero preserved
+owners**, so the fan-out cannot fire at all:
+
+| verb | n | CPU µs/conn | max | kernel share |
+|---|---|---|---|---|
+| `snapshot` | 1,715 | **9,633** | 33,225 | 11.3% |
+| `status` | 5,147 | 1,533 | 3,577 | 8.0% |
+| `ping` | 5,146 | 118 | 428 | 3.6% |
+
+⇒ **`snapshot` costs 6.3× a `status` and 82× a `ping` with nothing to fan out
+to.** The verb is intrinsically expensive; the fan-out is not needed to explain
+it. ⭐ **A mean over a live request mix that contains snapshots reaches 20–44 ms
+without needing any fan-out story — or any kernel-time story.**
+
+⛔ **That is the second mechanism I have proposed for this gap and had refuted,
+and both were sent as candidates rather than filed as causes.** The first
+(`comm` truncation) died to a bucket defined by lifetime; this one died to its
+own control. **The cheap part was proposing them; the part that cost anything
+would have been believing them.**
+
+### ⭐ 6m. `snapshot` IS A PER-ROW VERB, AND IT COSTS 6.5x WHAT `status` DOES PER ROW
+
+*Two arms, **sessions held at zero in both**, so ROWS is the only variable.
+Warm windows, per-verb thread CPU, nothing sampled.*
+
+| verb | rows=0 | rows=264 | per-row |
+|---|---|---|---|
+| `ping` | 61 µs | 116 µs | — (no row work) |
+| `status` | 101 µs | 1,421 µs | **5.0 µs/row** |
+| `snapshot` | 123 µs | **8,720 µs** | **32.6 µs/row** |
+
+⭐ **The status column is an internal consistency check and it passes:** 5.0 µs/row
+against the 4.645 measured independently in §6h and 4.71 from the field re-fit.
+The same run therefore prices `snapshot` on a scale already validated.
+
+⇒ **`snapshot` is a per-ROW verb.** Both arms carry **no sessions**, so a
+per-session explanation cannot account for any of this. ⛔ It was proposed that
+*"snapshot is cheap without sessions and expensive with them, so the aggregate's
+p50 is a session effect wearing a verb's name"* — **rows alone are sufficient**,
+measured with sessions held at zero. A session effect may exist on top; it is not
+needed.
+
+⇒ **And per row it is a far larger term than §S5's.** `status` at 4.6 µs/row was
+declined at ~1.5% of daemon CPU; `snapshot` costs **6.5x that per row**, and ROWS
+is frozen at each daemon's birth — so a 264-row daemon owning one session pays
+**8.7 ms per snapshot for rows it does not own.**
+
+### ⛔ AND THE RATE PRICES IT OUT — SAME VERDICT AS §S5, FOR THE SAME REASON
+
+**The multiplier was asked for before any cores figure was quoted, and it kills
+the optimisation.** Live, fleet-wide: **`snapshot` runs at 0.37/s.**
+
+    0.37/s x 8,720 us = 0.0032 cores  ->  ~0.1% of daemon CPU
+
+⇒ **Do not build a fix for it.** Even allowing a live snapshot to cost 10x the
+sandbox figure it is ~1%. ⭐ **The finding survives as a fact about the verb and
+dies as an optimisation** — which is exactly why the rate was asked for first.
+
+⭐ **That rate is quotable where the others are not, and the asymmetry is
+load-bearing.** `perf_span_is_high_frequency_noise` lists
+`("daemon_request", "terminal_snapshot")` — **not** `("daemon_request",
+"snapshot")`. So snapshot counts are **complete and unsampled**, while `status`,
+`ping`, `working_flags` and `terminal_read` are kept only at ≥8 ms or 1-in-50 and
+their counts are **undercounts**. ⇒ **A status:snapshot ratio read off that
+aggregate is not real**, because only one side is fully recorded.
+
+⚠ **One gap not hidden:** live snapshots show **320.9 ms p50 WALL** against
+8.7 ms of sandbox CPU — 37x. Wall ≥ CPU and live snapshots carry sessions, so
+live snapshot CPU is probably higher than the sandbox figure. At 100 ms of CPU
+the term would be 0.037 cores, ~1%. **Still not worth a version-gated change**,
+and the live CPU figure cannot currently be measured from outside the process
+(below).
+
+⛔ **THE PRIOR ORDERING WAS OBTAINED BY A KNOWN DEFECT, ON BOTH SIDES OF THE
+DISAGREEMENT.** The "snapshot is cheaper than status" figure (3.67 vs 5.07 ms)
+came from dividing process CPU by a request count with **no zero-request
+baseline** — and worse than a constant offset, the two verbs ran at different
+wall rates, so the windows had different durations and a constant background
+loads the longer one more, which can invert an ordering on its own. ⚠ A
+re-measurement with the baseline subtracted found the background was 0.00000
+cores, so that defect did not bite — **the ordering survived by luck, not by
+method.** ⇒ Neither figure should have been quoted from the weaker instrument.
+
+### ⛔⛔ 6o. AN EXTERNAL ESTIMATOR CANNOT PRICE A LIVE DAEMON'S REQUESTS — THE SIGNAL IS BELOW THE BASELINE'S DRIFT
+
+A baseline-subtracted estimator pointed at live daemons, with baselines
+**bracketing** the load so drift could not pass as request cost, **refused**: the
+brackets moved 0.4240 → 1.1437 cores across one arm and the net came out
+**negative, −254 ms/request**. Impossible ⇒ the arm is void and nothing is quoted
+from it, including the rungs that looked plausible.
+
+⭐ **The reason is structural, and it retro-explains three separate failed
+arms.** A baseline-subtracted estimator needs a **stationary** baseline. The
+signal (100 requests × ~2 ms = 0.2 core-seconds) is ~35x smaller than the
+baseline's observed drift over the same 10 s (~7 core-seconds). ⇒ **The quantity
+sits below the noise floor of any external instrument.** Not three unlucky arms:
+one arm attempted three ways against a baseline moving faster than the signal.
+
+⛔⛔ **AND THE FIRST VERSION OF THIS PARAGRAPH BLAMED THE WRONG BASELINE — MINE
+TO CORRECT, BECAUSE I WROTE IT.** It said the baseline *is* "the bursty
+per-session reader term, swinging 25x between adjacent 60 s windows". **That 25x
+is WITHDRAWN.** It was measured immediately after the measurer's own load
+generators had been driving those daemons; re-measured with nothing of the
+measurer's running, the daemons that "burst" are flat — **1.03x, 1.05x, 1.12x**
+against the 3.0x/2.8x/8.9x published, and six consecutive 30 s samples of the
+population total span only **1.22x**.
+
+⇒ **The void above is real and directly observed; its EXPLANATION was not.** The
+drift that swamped the signal was substantially **the observer's own load**, not
+an intrinsic property of the daemons. ⭐ **That is the same error as §6n's
+~1.7 ms, from the other direction:** a process-level counter charging concurrent
+work to whatever the measurer happened to be doing. There it charged reader
+threads to open connections; here it charged the measurer's own generators to the
+daemons' chores. ⇒ **The version where you contaminate yourself is the one nobody
+checks for**, and it is a clause of its own in the field guide.
+
+⚠ **One burst survives quiet conditions, and it is a single daemon:** the
+2.12.14 outlier, **4.15x** — the same daemon §5 independently identifies as
+running a fixed-but-still-shipped full-corpus-read defect. ⇒ **Burstiness is a
+property of ONE KNOWN-BAD DAEMON, not of chores.** Another argument for the
+drain, not for a chore fix.
+
+⇒ **§6l's in-process span is therefore not merely the better instrument, it is
+the ONLY one that can price a live daemon's requests**, because it measures the
+REQUEST rather than the PROCESS and is immune to what the rest of the daemon is
+doing. ⚠ The remaining live figure (20–44 ms per dying thread) is **PROVISIONAL**
+until that record lands.
+
+### ⛔ 6n. THE THREAD'S PRE-CLOSURE COST IS ~50 µs, MEASURED — SO THE ~1.7 ms GAP IS NOT THE CHILD
+
+Recording `CLOCK_THREAD_CPUTIME_ID`'s **absolute** value at closure end, beside
+the closure delta, makes the thread's pre-closure life a measured field:
+
+    pre_closure = 39-55 us, flat across all three verbs and both row counts
+
+⇒ **The standing note that thread spawn is ~50 µs is vindicated on the child
+side**, and it was measured rather than assumed.
+
+#### ✅ AND THE PARENT SIDE IS NOW MEASURED TOO — THE PATH IS CLOSED
+
+The accept loop's own cost per connection, from the same window as the handlers,
+so the two halves cannot be paired across different moments:
+
+    accept + spawn = 44-48 us/conn, flat across row counts, max 280-662 us
+    n matches the handler count EXACTLY (8,207/8,207 - 13,126/13,126)
+
+⭐ That exact match is the record's own completeness check: every connection is
+accounted for on both sides.
+
+**The whole per-connection floor, measured in three pieces:**
+
+| piece | cost |
+|---|---|
+| parent accept + spawn | **44–48 µs** |
+| child pre-closure (thread entry) | **39–55 µs** |
+| child closure, `ping` — a request that does nothing | **61–126 µs** |
+| **total** | **≈150–230 µs** |
+
+⛔⛔ **So the ~1.7 ms "spent outside the closure" is NOT in the request path at
+all.** It came from subtracting a closure span from a process counter, and the
+process counter was charging concurrent background work — reader threads, chores
+— to connections that merely happened to be open at the time. ⇒ **Same lesson as
+§6o from the other direction: a process-level counter cannot isolate a
+per-connection quantity while anything else in the daemon is running.** ⚠ **A
+difference between two instruments is not a measurement**, and here both halves
+of the difference are now measured directly and they do not add up to it.
+
+⇒ **§S4 should be scheduled on stability and observability grounds, not on
+cores.** The per-connection overhead it would remove is ~150–230 µs at ~4
+connections/s — under **0.001 cores per daemon** — and the note that said so was
+right for a better reason than it gave.
+
+**Two harness defects fixed in the same pass, both of which report a fired
+instrument as one that did not fire:**
+- ⛔ A single failed request used to `break` the arm; the only symptom was
+  *"no window flushed"*. It now counts failures and says so.
+- ⛔ The reader ignored **rotated** trace siblings. At a high drive rate the file
+  rotates mid-arm and carries the flushed windows out with it — same symptom,
+  different cause, and it cost an arm.
+
+⭐ **And the zero-request BASELINE is now taken in the same run, warm**
+(`0.00000 cores` at both 0 and 264 rows). A daemon burns CPU whether or not
+anyone asks it anything, so dividing a process-wide delta by your own request
+count charges that background to requests you caused — an error worth 29× on a
+neighbouring arm. ⚠ Warm matters: taken immediately after start it read
+**0.029 cores**, which is state restore, not background.
+
+⛔ **A field too coarse for its quantity, walked into while documenting the
+trap.** The user/kernel split first shipped on `/proc/thread-self/stat` fields
+14/15, justified as *"summed across a window, hundreds of handlers make it
+meaningful"*. Those are `CLK_TCK` units — 10 ms — and **every** handler is
+shorter than one tick, so each sample truncated to zero and the sum was zero:
+`ticks=0, kernel_share=n/a` across ~26,500 handlers carrying ~2.5 s of CPU.
+⇒ **Truncation is applied per sample BEFORE the sum: a sum of floors is not the
+floor of a sum.** `getrusage(RUSAGE_THREAD)` answers the same question per
+thread at microsecond resolution.
 
 ### 6f. Honest limits on this section
 
@@ -1262,6 +1772,47 @@ its derivation**, and now has a mechanism instead of a correlation:
 **14 legacy daemons x ~0.19–0.24 cores = 2.64–3.35 cores, reclaimable, because
 nobody is being served by it.** ⇒ **Reduce N_reachable. That is the whole
 optimisation.**
+
+#### ⛔⛔ AND THE FLOOR IS IN THE DAEMON PROCESS — a gloss of mine, published and then refuted
+
+*Filed by the optimisation lane against its own claim.* I wrote that the
+~0.2-core floor lives in the daemon's process **SUBTREE** rather than in the
+process, reasoning that sandbox daemons spawn no children. A read-only two-sample
+`/proc` walk over all 16 daemons and their 172 descendants, 45 s:
+
+| version | owned | presv | rows | **daemon process alone** | children |
+|---|---|---|---|---|---|
+| 2.12.14 | 3 | 0 | 73 | **0.3320** | 0.0000 |
+| 3.0.62 | 1 | 27 | 246 | 0.2207 | 0.0000 |
+| 3.0.53 | 1 | 28 | 244 | 0.2076 | 0.0089 |
+| 3.0.26 | 1 | 17 | 90 | 0.1267 | 0.0093 |
+
+**Eleven of sixteen sit at 0.13–0.25 cores of their OWN CPU with essentially
+empty subtrees.** The subtree balloons only on the two daemons hosting working
+agents — `rustc` at 6.78 cores and `claude` at 1.84 in that window, a compile and
+a live turn, **not daemon overhead**.
+
+⇒ **The two framings agree numerically and the distinction was invented:**
+0.19–0.24 measured per subtree *is* the daemon process, because a quiet daemon's
+subtree is nearly empty. **A seeded sandbox reads ~0 because it has no sessions
+and no peers**, not because the cost sits in children.
+
+⚠ **Do not quote that window's totals or class breakdown** — a `cargo` build was
+52% of it. Only the daemon-only column is trustworthy, and only on the quiet
+daemons.
+
+⛔⛔ **THE RULE THIS COST, AND IT IS THE TRANSFERABLE PART: A MECHANISM IS A
+CANDIDATE UNTIL A MEASUREMENT IT COULD HAVE FAILED HAS BEEN RUN.** Two earlier
+mechanisms from the same lane were also refuted and cost nothing, because they
+went out as hypotheses. This one reached a document and two lanes first — and
+that was the *only* difference between them. Not carefulness, not plausibility:
+**publication before falsification.** ⚠ The tell was that it explained everything
+and predicted nothing.
+
+⇒ **OPEN: what does a daemon PROCESS spend 0.2 cores on while owning one idle
+session?** `scripts/daemon-cost-bench.sh` is blind to it by construction — it
+seeds neither sessions nor peers — and the in-process span is the only instrument
+class that has worked on a live daemon.
 
 ## 6k. WHY AN UNPOLLED DAEMON DOES NOT RETIRE — the answer owed to the build lane
 
