@@ -260,7 +260,7 @@ bootstrapping. The campaign already records that a re-resume onto a fresh PTY is
 when the squish/broken-bottom artefacts appear, so the first-paint window is
 where the renderer is most stressed and is the cheapest place to try to reproduce
 this.
-## ⛔⛔⛔ [6.0] A DAEMON BUMP RE-RESUMES EVERY AGENT ROW AND LEAVES THE OLD AGENT RUNNING
+## ⛔⛔⛔ [6.0] A DAEMON BUMP RE-RESUMES EVERY AGENT ROW AND LEAVES THE OLD AGENT RUNNING — SOMETIMES STILL WORKING
 
 **Status:** OPEN
 
@@ -306,11 +306,46 @@ confirm the twin is idle (`top -b -n 2 -d 2` — the orphan moved 0.03 s of CPU 
 cross over, then `kill -TERM` **by explicit pid**. ⛔ **Never `pkill -f <uuid>`:
 the pattern is in the killing shell's own command line.**
 
-*Meanwhile:* the orchestrator reaped its own twin (814 MB reclaimed, verified
-alive and still on the board afterwards) and routed the other three to the rows
-that own them. **That is three instances handled, not the cause.** The fix
-belongs in whatever performs the re-resume: it must either hand the existing
-process its new PTY, or retire the predecessor it has just replaced.
+### ⛔⛔ CORRECTED WITHIN THE HOUR — "ORPHAN" WAS THE WRONG WORD, AND THE FIRST WRITE-UP INVERTED THE KILL TARGET
+
+**Both corrections came from a peer measuring its own row from the inside, and
+both are load-bearing.**
+
+⛔ **THE `--resume` PROCESS IS THE LIVE AGENT; THE `--session-id` PROCESS IS THE
+ONE LEFT BEHIND.** That follows directly from the mechanism above — the
+re-resume is what builds the new PTY — but the first write-up called the
+`--session-id` process the "original" and the `--resume` process the "twin", and
+then said *kill the twin*. **Followed literally that kills the live agent.** The
+peer resolved its own pid from inside first, as instructed, and so did not.
+⇒ *The action taken was right and the prose describing it was backwards*, which
+is the more dangerous of the two failures because only the prose travels.
+
+⛔⛔ **AND "IDLE" DOES NOT HOLD. THE LEFT-BEHIND PROCESS CAN STILL BE WORKING.**
+On one row it was **not** residue: ~8 % of a core, a **cycling child**, and
+`cargo test` running **in that row's own worktree** — work that appeared nowhere
+in the live agent's conversation. Measured across four rows: one left-behind
+process confirmed idle (no CPU sample, no children), one confirmed **BUSY**, two
+apparently idle. **There is no fleet-wide rule here.**
+
+⇒ ⭐⭐ **A DUPLICATE IS AN ALARM, NOT A KILL ORDER.** The detector says *look*;
+only the row that owns the uuid may decide, and only after measuring from inside:
+1. resolve your own pid — `ps -o ppid=` upward from `$$` until `comm=claude`;
+2. measure the other — `top -b -n 2 -d 5 -p <pid>` **and** `pgrep -P <pid>`.
+   Non-trivial CPU or a cycling child means it is working. Leave it and report;
+3. only then `kill -TERM` by explicit pid.
+
+⚠ **AND THE WORST CONSEQUENCE IS NOT MEMORY.** Two live agents can share one
+session uuid **and one worktree**, both running cargo against the same `target/`.
+That is the shared-checkout clobber hazard, live — it surfaces as *"file modified
+on disk since you last read it"* warnings that get misattributed to one's own
+edits. RAM is the least of it.
+
+*Meanwhile:* the orchestrator reaped its own left-behind process after measuring
+it quiet (814 MB reclaimed, verified alive and still on the board afterwards),
+retracted the inverted instruction to the rows it had sent it to, and routed the
+rest per-row. **That is instances handled, not the cause.** The fix belongs in
+whatever performs the re-resume: it must either hand the existing process its new
+PTY, or retire the predecessor it has just replaced.
 
 ## ⛔⛔ [6.0] THE FLEET'S SUPERVISION TOOLS HAVE NO DEPLOYMENT STEP — A FIX ON `main` REACHES ALMOST NOBODY
 
