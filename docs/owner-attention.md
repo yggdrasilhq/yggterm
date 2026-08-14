@@ -211,6 +211,19 @@ copies.
   constitution's **unsolved per-viewer-geometry problem** from blocker to
   feature. The read-only pinned shadow viewer does not solve it, it dodges it.
 
+- **May a user deliberately run TWO yggterm windows of the same live build on one
+  display?** Today the GUI keeps them: `should_retire_superseded_client` retires an
+  older same-display client only when its executable differs, and a test asserts the
+  same-build case is kept. That decision is now load-bearing, because the crash-plus-
+  restart tangle produces same-build duplicates and the user cannot escape one by
+  restarting. **Recommendation: no — one window per display, and a second launch
+  either refuses or replaces.** It is his call because "I want two windows side by
+  side" is a product answer that no reading of the code can supply.
+  *Meanwhile:* the unambiguous half is fixed and needs no ruling — a GUI running a
+  **deleted** binary is now retired on sight, which is the case that cost the day.
+  The same-build question is filed in [`pending-bugs.md`](pending-bugs.md) and
+  nothing waits on it. **Reversing this is one predicate**, not a redesign.
+
 ## Third parties only he can chase
 
 - **Google Play identity verification is his, and it gates every listing** — the
@@ -321,6 +334,38 @@ is older than the fix, and the blinking is drawn by the running window.
 
 ⛔ Nothing here asks him to hurry it — the draft is the thing being protected.
 This entry exists only so the five are not weighed as separate costs.
+
+### ⚠ MEASURED 2026-08-14: A RELAUNCH DOES NOT REACH A DRAFT HELD IN A ROW
+
+The premise under all five is *"a relaunch discards the half-typed text"*. It had
+been carried across relays without being tested, so it was tested, in a sandbox,
+on a throwaway session:
+
+```
+type unsubmitted text into a row      → daemon screen holds it
+kill the GUI process                  → daemon STILL holds it, with no GUI running at all
+relaunch the GUI, same home + daemon  → text still there, row back in the sidebar
+```
+
+⇒ **Text typed into a ROW is not in the GUI.** It lives in a PTY the daemon owns,
+the agent CLI never learns the window restarted, and the campaign's own
+draft-detector reads it off the terminal SCREEN for exactly that reason.
+
+⚠ **What this does NOT cover, and it is the whole question:** text typed into a
+**yggterm-side input** — the search box, an SSH field, a document buffer — lives
+in the page and a relaunch does lose it. So the answer depends on *where* the
+draft is, which only he can say.
+
+**Recommendation: tell us which one it is.** If it is a row's composer, the
+relaunch costs nothing and the five items clear on his next convenient moment
+rather than waiting on the draft at all. If it is a yggterm input, nothing
+changes and the gate stands exactly as written. ⛔ The relay has not relaunched
+anything and will not — this narrows the question, it does not answer it.
+
+⚠ One caveat that survives either answer: the risk in a relaunch was never the
+window, it is a DAEMON swap taken alongside it, which re-resumes sessions. A GUI
+relaunch against the same daemon is the case measured above; a relaunch that also
+moves the daemon is not.
 
 ## The right sidebar comes back when you next relaunch the GUI — and cannot before then
 
