@@ -657,6 +657,11 @@ def cmd_subscribe(args):
     if args.rearm and opted_out and uuid in opted_out:
         log(f"⭐ re-arming {uuid[:8]}, which had opted out ({opted_out[uuid]})")
         record_rearm(uuid, args.rearm)
+    dead = retired_rows() or {}
+    if uuid in dead:
+        log(f"⚠ {uuid[:8]} was recorded DEAD ({dead[uuid]}) — arming it anyway.")
+        log("   Not refused: a boot at a dead pid is useless, not dangerous. But")
+        log("   if it really is a corpse this buys wasted wakes; check first.")
     blocked = never_arm()
     if uuid in blocked:
         log(f"⛔ REFUSING to arm {uuid[:8]} — {blocked[uuid] or 'human-attended row'}")
@@ -931,6 +936,89 @@ def fleet_state(args):
     }
 
 
+RETIRED_LEDGER = STATE / "booter-retired.tsv"
+
+
+def retired_rows():
+    """⛔ ROWS DECIDED TO BE DEAD — a THIRD state, distinct from both others.
+
+    `coverage` first shipped with three buckets and one of them was doing two
+    jobs: **UNKNOWN meant both "nobody has decided" and "decided: this row is a
+    corpse."** Every coverage run therefore reported settled rows as undecided,
+    and the next reader re-derived their liveness from transcripts by hand — the
+    exact absent-vs-refused ambiguity `disarmed_rows()` exists to kill,
+    reappearing one level up. Reported by the orchestrator 2026-08-14 with
+    process-level evidence for seven rows.
+
+    ⛔ **It cannot live in the opt-out ledger, and the reason is that ledger's own
+    docstring: *"this row asked not to be watched."* A CORPSE NEVER ASKED.**
+    Folding a death into a record of consent misdescribes both, so this is its
+    own file and "asked" stays pure.
+
+    ⚠ Arming one of these is not dangerous, it is merely useless — a boot types
+    into a process that no longer exists. So `subscribe` WARNS rather than
+    refuses: the danger direction is typing into a live person, not a dead pid,
+    and a refusal here would be a floor with nothing under it.
+
+    Same append-only shape as the other ledgers, latest record wins, because the
+    decision and who made it are the durable part.
+    """
+    out = {}
+    try:
+        for line in RETIRED_LEDGER.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            uuid = parts[1].strip()
+            if uuid:
+                who = parts[2].strip() if len(parts) > 2 else "unrecorded"
+                why = parts[3].strip() if len(parts) > 3 else "no evidence recorded"
+                out[uuid] = f"{why} (decided by {who})"
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return None
+    return out
+
+
+def cmd_retire(args):
+    """Record that a row is DEAD, with who decided and on what evidence."""
+    uuid = (args.row or "").rstrip("/").split("/")[-1]
+    if not uuid:
+        log("retire needs --row <uuid>")
+        return 2
+    if not args.evidence:
+        log("⛔ retire needs --evidence: what makes you say this row is dead?")
+        log("   e.g. 'cut mid tool_use 16:55:04Z, no process carries its uuid'")
+        log("   ⚠ A decision with no evidence is the thing this ledger replaces.")
+        return 2
+    blocked = never_arm()
+    if uuid in blocked:
+        log(f"⛔ REFUSING — {uuid[:8]} is on never-arm ({blocked[uuid]}).")
+        log("   A row a person attends is not yours to declare dead.")
+        return 3
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with RETIRED_LEDGER.open("a") as fh:
+            fh.write("%s\t%s\t%s\t%s\n" % (
+                time.strftime("%Y-%m-%dT%H:%M:%S%z"), uuid,
+                args.decided_by or "unrecorded", args.evidence))
+    except Exception as exc:
+        log(f"⛔ could not record: {exc}")
+        return 1
+    back = retired_rows()
+    log(f"recorded {uuid[:8]} as decided-dead")
+    log(f"read-back: {'present' if back and uuid in back else '⛔ ABSENT — it did not land'}")
+    # A dead row has no business holding a live subscription.
+    if sub_path(uuid).exists():
+        sub_path(uuid).unlink(missing_ok=True)
+        log(f"  and dropped its subscription — a boot would have typed at a corpse")
+    return 0
+
+
 def cmd_coverage(args):
     """⭐ WHICH LIVE ROWS ARE WATCHED, AND — THE POINT — WHICH NOBODY HAS DECIDED.
 
@@ -964,6 +1052,9 @@ def cmd_coverage(args):
     opted_out = disarmed_rows()
     ledger_readable = opted_out is not None
     opted_out = opted_out or {}
+    dead = retired_rows()
+    dead_readable = dead is not None
+    dead = dead or {}
 
     d = BB.ygg(args.host, "server", "app", "rows")
     rows = (d.get("data", {}) or {}).get("rows", []) or []
@@ -973,7 +1064,7 @@ def cmd_coverage(args):
             "report.")
         return 2
 
-    buckets = {"watched": [], "never_arm": [], "opted_out": [], "unknown": []}
+    buckets = {"watched": [], "never_arm": [], "opted_out": [], "retired": [], "unknown": []}
     for r in rows:
         if r.get("kind") != "Session":
             continue
@@ -989,17 +1080,22 @@ def cmd_coverage(args):
             buckets["watched"].append(f"{who} — campaign={subs[uuid].get('campaign') or '-'}")
         elif uuid in opted_out:
             buckets["opted_out"].append(f"{who} — {opted_out[uuid]}")
+        elif uuid in dead:
+            buckets["retired"].append(f"{who} — {dead[uuid]}")
         else:
             buckets["unknown"].append(who)
 
+    if not dead_readable:
+        log("⚠ the retired ledger is UNREADABLE — dead rows will appear as UNKNOWN.")
     if not ledger_readable:
         log("⚠ the opt-out ledger is UNREADABLE — rows that opted out will appear "
             "as UNKNOWN below. Treat this report as incomplete.")
     log(f"watched   {len(buckets['watched']):>3}")
     log(f"never-arm {len(buckets['never_arm']):>3}  (a person attends these; the answer is always no)")
     log(f"opted-out {len(buckets['opted_out']):>3}  (asked not to be watched, with a reason)")
+    log(f"retired   {len(buckets['retired']):>3}  (decided dead, with evidence — a corpse never asked)")
     log(f"UNKNOWN   {len(buckets['unknown']):>3}  ⭐ nobody has decided about these")
-    for name in ("unknown", "opted_out", "never_arm", "watched"):
+    for name in ("unknown", "retired", "opted_out", "never_arm", "watched"):
         if not buckets[name] or (name != "unknown" and not args.verbose):
             continue
         log(f"  -- {name} --")
@@ -1010,6 +1106,7 @@ def cmd_coverage(args):
             "can decide for you:")
         log("     an unattended delegate  → ygg-booter.py subscribe --row <uuid>")
         log("     a row a person types in → add it to never-arm.tsv")
+        log("     a row that is DEAD      → ygg-booter.py retire --row <uuid> --evidence '…'")
         log("   ⛔ Do not bulk-arm this list. That is the fail-open move this "
             "report exists to replace.")
     return 0
@@ -1545,7 +1642,7 @@ def main():
     ap = argparse.ArgumentParser(description="boot a stalled session that subscribed")
     ap.add_argument("action",
                     choices=["subscribe", "unsubscribe", "defer", "list", "tick",
-                             "watch", "status", "disarm", "arm", "coverage"])
+                             "watch", "status", "disarm", "arm", "coverage", "retire"])
     ap.add_argument("--secs", type=int, default=0,
                     help=f"defer: boot window for one long wait, clamped to "
                          f"{MIN_BOOT_AFTER_SECS}-{MAX_BOOT_AFTER_SECS}s "
@@ -1555,6 +1652,10 @@ def main():
     ap.add_argument("--row", default="")
     ap.add_argument("--campaign", default="")
     ap.add_argument("--note", default="")
+    ap.add_argument("--evidence", default="",
+                    help="retire: what makes you say this row is dead")
+    ap.add_argument("--decided-by", default="",
+                    help="retire: who decided (a seat number or name)")
     ap.add_argument("--verbose", action="store_true",
                     help="coverage: list every bucket, not only UNKNOWN")
     ap.add_argument("--rearm", default="",
@@ -1600,6 +1701,7 @@ def main():
         "watch": cmd_watch,
         "status": cmd_status,
         "coverage": cmd_coverage,
+        "retire": cmd_retire,
         "disarm": cmd_disarm,
         "arm": cmd_arm,
     }[args.action](args)
