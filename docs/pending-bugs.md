@@ -425,8 +425,19 @@ the pattern is in the killing shell's own command line.**
 **Both corrections came from a peer measuring its own row from the inside, and
 both are load-bearing.**
 
-⛔ **THE `--resume` PROCESS IS THE LIVE AGENT; THE `--session-id` PROCESS IS THE
-ONE LEFT BEHIND.** That follows directly from the mechanism above — the
+⛔⛔ **THE FLAG IS PROVENANCE, NOT LIVENESS — AND AS A RULE IT KILLS A HEALTHY
+ROW.** `--session-id` means *started as a fresh claim*; `--resume` means *created
+by a re-resume*. **Within the twin case** the `--resume` process is therefore the
+live one and the `--session-id` process is what was left behind. **Outside it the
+flag says nothing about liveness at all** — a row that was never re-resumed runs
+its live agent under `--session-id`, as the sole process. Refuted within the hour
+of being written, by a relayed row: fresh claim, `--session-id`, only process for
+its uuid, transcript growing. ⇒ **THE DISCRIMINATOR IS NEVER THE FLAG.** Resolve
+identity from INSIDE (`ps -o ppid=` upward from `$$`), then measure. ⚠ The twin
+case is exactly the context in which someone reaches for this, which is what made
+the over-broad version dangerous rather than merely imprecise.
+
+⛔ **The original, over-broad form of that sentence read:** That follows directly from the mechanism above — the
 re-resume is what builds the new PTY — but the first write-up called the
 `--session-id` process the "original" and the `--resume` process the "twin", and
 then said *kill the twin*. **Followed literally that kills the live agent.** The
@@ -595,9 +606,18 @@ AFTER THE FACT.** A row that kept working after its leftover was killed is
 demonstrated by its transcript continuing to grow, which no sample taken before
 the kill can establish.
 
-**Falsifier:** if a `--session-id` process is ever found serving a row's CURRENT
-turn, the age/flag mapping is wrong and only the resolve-from-inside rule
-survives.
+**Falsifier — ALREADY FIRED, AND THE ENTRY IS AMENDED ABOVE.** It read: *if a
+`--session-id` process is ever found serving a row's CURRENT turn, the age/flag
+mapping is wrong and only the resolve-from-inside rule survives.* A relayed row
+was found doing exactly that within the hour. **Only the resolve-from-inside rule
+survives.**
+
+⭐ **SCOPE, MEASURED RATHER THAN ASSUMED: THIS IS A DEPLOY DEFECT, NOT A RELAY
+ONE.** A clean `ygg-claim.sh --replace` handover produced **no twin** — it reaped
+its predecessor outright (`row_still_listed=False verified=True`, both old pids
+confirmed gone, monitor re-pointed). ⇒ **A relay is not a re-infection vector**,
+and the population of affected rows is bounded by daemon bumps rather than
+growing with ordinary campaign traffic.
 
 ## ⛔⛔ [6.0] THE FLEET'S SUPERVISION TOOLS HAVE NO DEPLOYMENT STEP — A FIX ON `main` REACHES ALMOST NOBODY
 
