@@ -16,10 +16,21 @@ Closed narratives from before 2026-08-02 are in
 
 **Status:** OPEN
 
-⭐ **DIRECTION RULED 2026-08-14 by 6.0 — implementation is owed, not the
-decision. COUNT PRESERVED, AND GIVE A PRESERVED RECORD AN EXIT. Both halves or
-neither**, because shipping the count alone trades non-convergence for a
-permanent pin, which is the worse direction.
+⭐ **DIRECTION RULED 2026-08-14 by 6.0, THEN AMENDED THE SAME DAY when the
+falsifier below disproved a premise of it. The amended ruling is the one to
+build:**
+
+> **The exit comes FIRST and it has a named target — clear a preserved record
+> whose owner is dead. It is independently worth shipping even if the count
+> never lands.** The count follows.
+
+⛔ **The original ruling said "count preserved AND give it an exit, both halves
+or neither", on the reasoning that the permanent pin would be a cost of the
+change. It is not: it is the status quo** (see the falsifier below — a dead
+owner's record already pins a daemon today). Counting would *widen* an existing
+pin rather than create one, which is a materially different trade. ⇒ **Do not
+implement the original form, and do not re-argue it: it was amended on
+measurement, not on preference.**
 
 **The reasoning, which generalises past this entry:** both horns end in a stuck
 daemon and differ in one property. Today's failure (preserved counts zero) is
