@@ -3237,6 +3237,34 @@ tests cover the selection (self excluded, non-daemon sockets ignored, stable
 order) and both structural rules, and both structural tests were confirmed
 FAILING against the pre-fix shape.
 
+### ⭐ THE PRE-FIX BASELINE, MEASURED ON THE BUILD HOST — and it separates perfectly
+
+Taken read-only from the build host's own daemon, 2026-08-14, 272 live rows:
+
+| `working` | has a local pid | `launch_phase` | rows |
+|---|---|---|---|
+| **`None`** | **no** | **`RemoteBootstrap`** | **215** |
+| `false` | no | `Running` | 20 |
+| `true` | yes | `Running` | 17 |
+| `true` | no | `Running` | 11 |
+| `false` | yes | `Running` | 9 |
+
+**79% of live rows have no working answer at all, and the split is exact:**
+every one of the 215 unknowns is a row this daemon does not own, and **not a
+single row with a local pid is unknown**. So the dot is not failing to read a
+screen — it is never being told there is a screen to read.
+
+⭐ **The 31 rows answered WITHOUT a local pid are the proxy already working**, for
+the rows whose owner happens to be in the preserved-owner registry. That is the
+number that makes the gap precise rather than rhetorical: **26 answered locally,
+31 answered by proxy, 215 not asked about at all.** Discovery's whole job is that
+last column, and this is what an after-measurement must be compared against.
+
+⚠ Both figures are one instant on one host. The GUI host's own earlier sample was
+21 of 31 unknown; this host is larger and worse. **Compare like with like** — a
+count taken on a different host, or with a different live-row population, is not
+this baseline moving.
+
 ⛔ **None of that is the defect's own falsifier, which is why this is still
 OPEN.** What is proven is that the mechanism exists and cannot recurse. What is
 NOT proven is the number this entry is actually about: whether the 21-of-31 rows
