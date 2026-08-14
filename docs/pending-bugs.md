@@ -96,8 +96,9 @@ unattributable 1.8 cores into an attributed one.
 (§6j-8). A baseline-subtracted external estimator was pointed at live daemons and
 came back **VOID**: bracketing baselines on one daemon moved 0.4240 → 1.1437
 cores and produced an impossible **negative** per-request cost. The baseline on a
-live daemon *is* the bursty per-session reader term, and it drifts ~35x faster
-than the signal. ⇒ **Per-request cost is below the noise floor of any external
+live daemon *is* the per-session reader term, and it drifts ~35x faster than the
+signal. (⚠ that term is **not** episodic — see the correction below; it is simply
+large enough that its ordinary variation swamps a per-request quantity.) ⇒ **Per-request cost is below the noise floor of any external
 instrument; only an in-process span can reach it.** ⛔ Treat the remaining live
 figure (20–44 ms per dying thread) as **provisional** until S6's live record
 lands.
@@ -651,7 +652,13 @@ rows are ~1.2 ms of a 25 ms thread.
 THREAD PER SESSION**, cost proportional to that session's OUTPUT VOLUME. On a
 sandbox with 4 flooding sessions the long-lived threads hold **3.364 of 3.449
 cores (97.5%)**, and the top four are **0.838/0.837/0.836/0.836 — exactly one per
-session**. That closes the loop on the 25x swings between adjacent windows, on
+session**. ⛔ **CORRECTED: the "25x swings between adjacent windows" that this
+originally closed the loop on were MY OWN LOAD GENERATORS** — quiet replication
+reads 1.03–1.12x on the same daemons, and only the 2.12.14 outlier bursts (4.15x)
+on its own. The per-session reader thread is still the term; the burstiness it was
+said to explain was contamination. ⭐ **The observer is part of the baseline: never
+take the "after" window of a comparison in the wake of your own generator.**
+That closes the loop on
 §6i's threads alternating `clock_nanosleep` with on-CPU bursts, and on §4's
 contention being 98.6% `terminal_read`.
 ⚠ **Do not quote 0.84 cores as the cost of a session** — `yes` saturates a pty at
