@@ -7556,9 +7556,65 @@ impl YggtermServer {
         local_agent_cli_missing_binary_refusal(tool)
     }
 
+    /// The cwd this row asks for, when the launch will run HERE and that
+    /// directory does not exist here — `None` when there is nothing to say.
+    ///
+    /// ⛔ Reported by seat 6.3 2026-08-14 as "a launch into a cwd that exists
+    /// only on another host leaves a row that looks healthy forever". The
+    /// launch does not fail: `best_effort_cwd_shell_prefix` walks up to the
+    /// nearest existing ancestor and falls back to `$HOME`, deliberately, so
+    /// the CLI really does start — just somewhere else. What was missing is
+    /// that the ROW went on advertising the requested directory, so its
+    /// detail line said "rooted at <dir>" about a directory the process had
+    /// never been in.
+    ///
+    /// ⚠ This is NOT a second encoding of the walk-up rule. The walk-up
+    /// decides where to LAND, which is the shell's job and stays there
+    /// (a remote row runs the same prefix on the remote host, where this
+    /// process cannot look). This answers the one question the mark needs and
+    /// the shell cannot answer for us: was the request honourable HERE.
+    pub fn local_launch_cwd_fallback_for_path(&self, path: &str) -> Option<String> {
+        let key = self.resolve_session_storage_key(path)?;
+        let session = self.sessions.get(key)?;
+        if !session_launch_runs_locally(path, session.source) {
+            return None;
+        }
+        let (_, cwd) = self.terminal_spec(path)?;
+        let requested = cwd.map(|value| value.trim().to_string())?;
+        if requested.is_empty() || std::path::Path::new(&requested).is_dir() {
+            return None;
+        }
+        Some(requested)
+    }
+
+    /// Mark a row whose launch could not be given the directory it asked for.
+    ///
+    /// Deliberately NOT a refusal: the session is running and usable, so
+    /// `launch_phase` stays whatever the launch made it and the viewport is
+    /// left alone (the CLI is painting into it). What changes is that the row
+    /// stops presenting the requested directory as a fact.
+    pub fn record_launch_cwd_fallback_for_path(&mut self, path: &str, requested: &str) {
+        let Some(key) = self.resolve_session_storage_key(path).map(str::to_string) else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return;
+        };
+        let message = format!(
+            "{requested} does not exist on this machine — this session started somewhere else"
+        );
+        upsert_session_metadata(&mut session.metadata, "Cwd Warning", message.clone());
+        session.status_line = format!("cwd not found here · {message}");
+    }
+
     /// Record a refused launch ON THE ROW, so the failure is readable without
     /// reading the terminal screen — the instrument gap the owner's report named.
-    pub fn record_launch_refusal_for_path(&mut self, path: &str, message: &str) {
+    ///
+    /// `status` names the CAUSE. It used to be the literal "CLI binary not
+    /// installed", which was true of the only caller and would have quietly
+    /// become a lie the moment a second reason to refuse arrived — a fork
+    /// wearing a shared recorder's clothes.
+    pub fn record_launch_refusal_for_path(&mut self, path: &str, message: &str, status: &str) {
         let Some(key) = self.resolve_session_storage_key(path).map(str::to_string) else {
             return;
         };
@@ -7572,11 +7628,7 @@ impl YggtermServer {
         // line existed. `Failed` is the only value that is not a promise.
         session.launch_phase = TerminalLaunchPhase::Failed;
         upsert_session_metadata(&mut session.metadata, "Launch Error", message.to_string());
-        upsert_session_metadata(
-            &mut session.metadata,
-            "Status",
-            "CLI binary not installed".to_string(),
-        );
+        upsert_session_metadata(&mut session.metadata, "Status", status.to_string());
         session.status_line = format!("launch refused · {message}");
         // ⛔ And say it IN THE VIEWPORT. The owner's report was about what the
         // screen showed; a refusal recorded only in metadata trades a shell that
@@ -16772,6 +16824,19 @@ fn remote_cc_session_path(machine_key: &str, session_id: &str) -> String {
 /// `ensure_managed_cli_for_session_path`.
 fn session_path_uses_local_managed_cli(path: &str) -> bool {
     !(path.starts_with("remote-session://") || path.starts_with("remote-cc://"))
+}
+
+/// Does this row's launch — its `cd`, its exec, its cwd — happen on THIS
+/// machine? The two facts that decide it are the same two
+/// [`local_managed_cli_tool_for`] uses, and for the same reasons: a
+/// `remote-*://` row resumes on the other machine, and a `LiveSsh` row carries
+/// a local-looking path while its runtime is on the other machine too.
+///
+/// Separate from `local_managed_cli_tool_for` because that one also asks WHICH
+/// CLI, and answers `None` for a plain shell — which runs locally like any
+/// other row and is exactly the case a cwd question must not skip.
+fn session_launch_runs_locally(path: &str, source: SessionSource) -> bool {
+    session_path_uses_local_managed_cli(path) && source != SessionSource::LiveSsh
 }
 
 /// Which LOCAL managed CLI a session will exec, from the three facts that decide
@@ -33771,6 +33836,63 @@ mod tests {
         assert!(status.contains("remote terminal attached"));
         assert!(!status.contains("blocked"));
         assert!(!status.contains("stale resolve error"));
+    }
+
+    #[test]
+    fn a_cwd_that_does_not_exist_here_is_announced_by_the_launch_itself() {
+        // The walk-up is deliberate — a launch into a missing directory still
+        // starts, in the nearest existing ancestor or `$HOME`. What was
+        // missing is that it said nothing, so the row named a directory the
+        // process had never been in and looked healthy forever.
+        let prefix = crate::best_effort_cwd_shell_prefix(Some("/workspace/only-on-another-host"))
+            .expect("a cwd yields a prefix");
+        assert!(
+            prefix.contains(crate::codex_cli::CWD_FALLBACK_NOTICE_MARKER),
+            "{prefix}"
+        );
+        // ⛔ The notice must be conditional on the LOOP's own verdict, not on
+        // `$PWD`. `cd /tmp/` leaves `$PWD` as `/tmp`, so a `$PWD`-keyed
+        // comparison announces a fallback that never happened for any path
+        // written with a trailing slash.
+        assert!(
+            prefix.contains("if [ \"$__yggterm_cwd\" != \"$__yggterm_requested\" ]"),
+            "{prefix}"
+        );
+        // And it goes to stderr, so it cannot be mistaken for the CLI's own
+        // first line of output by anything reading the stream.
+        assert!(prefix.contains(">&2"), "{prefix}");
+        // A launch with no cwd asks for nothing and so can be denied nothing.
+        assert!(crate::best_effort_cwd_shell_prefix(None).is_none());
+        assert!(crate::best_effort_cwd_shell_prefix(Some("   ")).is_none());
+    }
+
+    #[test]
+    fn a_launch_that_runs_on_another_machine_is_not_ours_to_judge_a_cwd_for() {
+        // The cwd mark asks `is_dir()` on THIS machine, so it may only ever be
+        // asked about a launch that happens here. Both `None` arms below have
+        // a live counterpart: a remote row's directory is on the other
+        // machine, and a LiveSsh row carries a local-looking path while its
+        // runtime is elsewhere too.
+        assert!(crate::session_launch_runs_locally(
+            "local://aaaa",
+            SessionSource::LiveLocal
+        ));
+        assert!(crate::session_launch_runs_locally(
+            "cc-runtime://bbbb",
+            SessionSource::Stored
+        ));
+        assert!(!crate::session_launch_runs_locally(
+            "remote-cc://box/cccc",
+            SessionSource::LiveLocal
+        ));
+        assert!(!crate::session_launch_runs_locally(
+            "remote-session://box/dddd",
+            SessionSource::LiveLocal
+        ));
+        assert!(!crate::session_launch_runs_locally(
+            "local://eeee",
+            SessionSource::LiveSsh
+        ));
     }
 
     #[test]

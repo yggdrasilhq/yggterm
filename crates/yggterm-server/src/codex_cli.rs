@@ -3273,6 +3273,12 @@ pub(crate) fn shell_join_tokens(tokens: &[String]) -> String {
     }
 }
 
+/// The marker the fallback notice opens with. The daemon greps for it, so it
+/// is a constant rather than a phrase repeated in two places — a notice whose
+/// wording only the shell knew would be a second encoding of the same event,
+/// and the reader would go quiet the first time anyone reworded it.
+pub const CWD_FALLBACK_NOTICE_MARKER: &str = "yggterm: requested directory not found here";
+
 pub(crate) fn best_effort_cwd_shell_prefix(cwd: Option<&str>) -> Option<String> {
     let requested = cwd.map(str::trim).filter(|value| !value.is_empty())?;
     Some(format!(
@@ -3292,8 +3298,13 @@ pub(crate) fn best_effort_cwd_shell_prefix(cwd: Option<&str>) -> Option<String> 
            if [ \"$__yggterm_next\" = \"$__yggterm_cwd\" ]; then break; fi; \
            __yggterm_cwd=\"$__yggterm_next\"; \
          done; \
-         if [ \"$__yggterm_cwd_ok\" != 1 ] && [ -n \"$HOME\" ]; then cd \"$HOME\" 2>/dev/null || true; fi",
-        requested = shell_single_quote(requested)
+         if [ \"$__yggterm_cwd_ok\" != 1 ] && [ -n \"$HOME\" ]; then cd \"$HOME\" 2>/dev/null || true; fi; \
+         if [ \"$__yggterm_cwd\" != \"$__yggterm_requested\" ]; then \
+           printf '%s\\n' \"{marker}: $__yggterm_requested\" \
+             \"yggterm: starting in $PWD instead — work done here is NOT in the directory this row names.\" >&2; \
+         fi",
+        requested = shell_single_quote(requested),
+        marker = CWD_FALLBACK_NOTICE_MARKER,
     ))
 }
 
