@@ -81,18 +81,24 @@ json.dump({"active_session_path": None, "active_view_mode": "Terminal",
 PY
 }
 
-start_daemon() {  # $1=home -> echoes pid, or empty on failure
-  local home="$1" pid
+LAUNCHER=""
+start_daemon() {  # $1=home -> echoes the DAEMON's pid, or empty on failure
+  local home="$1"
   YGGTERM_HOME="$home" "$BIN" server daemon >"$home/daemon.log" 2>&1 &
-  pid=$!
+  LAUNCHER=$!
   for _ in $(seq 1 40); do
-    if kill -0 "$pid" 2>/dev/null &&
-       YGGTERM_HOME="$home" timeout 5 "$BIN" server ping >/dev/null 2>&1; then
-      echo "$pid"; return 0
+    if YGGTERM_HOME="$home" timeout 5 "$BIN" server ping >/dev/null 2>&1; then
+      # ⛔ Ask the daemon who it is. The pid the shell just backgrounded is NOT
+      # reliably the daemon's, and a harness that assumes it reads an EMPTY
+      # second sample later and reports a parse error where a measurement
+      # should have been.
+      YGGTERM_HOME="$home" timeout 10 "$BIN" server daemons --json 2>/dev/null |
+        python3 -c "import json,sys; d=json.load(sys.stdin)['daemons']; print(d[0]['pid'] if d else '')"
+      return 0
     fi
     sleep 0.5
   done
-  kill "$pid" 2>/dev/null || true
+  kill "$LAUNCHER" 2>/dev/null || true
   return 1
 }
 
@@ -133,19 +139,32 @@ PY
   else
     # Startup work — state restore, scans — is not the idle cost. Settle first.
     sleep 20
-    A="$(proc_cpu_us "$DPID")"; T0="$(date +%s)"
-    sleep "$DWELL"
-    B="$(proc_cpu_us "$DPID")"; T1="$(date +%s)"
+    A="$(proc_cpu_us "$DPID")"; T0="$(date +%s)"; LAST="$A"; LAST_T="$T0"
+    END=$(( T0 + DWELL )); DIED_AT=""
+    # ⛔ Sampled at intervals, not just at the ends: an unpolled daemon may
+    # RETIRE ITSELF mid-window, and that is a finding, not an error. A harness
+    # that only reads the ends turns it into an empty variable.
+    while [ "$(date +%s)" -lt "$END" ]; do
+      sleep 15
+      NOW="$(proc_cpu_us "$DPID")"
+      if [ -z "$NOW" ] || [ "$NOW" = 0 ] && ! kill -0 "$DPID" 2>/dev/null; then
+        DIED_AT=$(( $(date +%s) - T0 )); break
+      fi
+      LAST="$NOW"; LAST_T="$(date +%s)"
+    done
     RSS="$(awk '/VmRSS/{print $2}' "/proc/$DPID/status" 2>/dev/null || echo 0)"
     THREADS="$(awk '/Threads/{print $2}' "/proc/$DPID/status" 2>/dev/null || echo 0)"
     python3 -c "
-a,b,t0,t1 = $A,$B,$T0,$T1
-print(f'rows=$K'.ljust(12) + f'idle_cores={(b-a)/1e6/max(t1-t0,1):<10.5f}'
-      f' cpu_us={b-a:<10} over={t1-t0}s rss_kb=${RSS:<9} threads=${THREADS}')
+a,b,e = $A,$LAST,$(( LAST_T - T0 ))
+died = '$DIED_AT'
+note = f'  RETIRED ITSELF after {died}s with nobody polling it' if died else ''
+print(f'rows=$K'.ljust(12) + f'idle_cores={(b-a)/1e6/max(e,1):<10.5f}'
+      f' cpu_us={b-a:<10} over={e}s rss_kb=${RSS:-0} threads=${THREADS:-0}{note}')
 "
+    [ -n "$DIED_AT" ] && tail -3 "$HOME_DIR/daemon.log" | sed 's/^/        log: /'
   fi
 
   YGGTERM_HOME="$HOME_DIR" "$BIN" server shutdown >/dev/null 2>&1 || true
   sleep 1
-  kill "$DPID" 2>/dev/null || true
+  kill "$LAUNCHER" 2>/dev/null || true
 done
