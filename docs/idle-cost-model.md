@@ -1261,21 +1261,47 @@ Two 60 s runs over all 20 daemons, all three controls held in both
 | total daemon population | 3.150 | 5.744 |
 
 ⛔⛔ **I FIRST WROTE THIS AS "43% chores / 57% handlers". THAT SHARE IS NOT A
-PROPERTY OF THE SYSTEM.** The replication moved it to 66%/34% — not because the
-handlers changed, but because **the chore term nearly tripled while the handler
-term moved 8%.** Per daemon:
+PROPERTY OF THE SYSTEM** — the replication moved it to 66%/34%. **The rule that
+follows is right and stands: report cores, never a share.**
 
-| term | reproducibility across the two runs |
-|---|---|
-| **handlers (DIED)** | **stable — every daemon within ~5–10%** (0.1774→0.1896, 0.1971→0.2151, 0.0965→0.1005) |
-| **chores (LONGLIVED)** | **bursty — 0.0368→0.9215 (25x), 0.0512→0.7046 (14x), 0.0228→0.2021 (9x)** on individual daemons, flat on others |
+⛔⛔⛔ **BUT THE MECHANISM I GAVE FOR IT WAS MY OWN LOAD, AND THAT IS WITHDRAWN.**
+I wrote that the handler term is stable while *"the chore term is bursty — 25x,
+14x, 9x on individual daemons"*. **Run 2 was taken immediately after my own dose
+generators had been driving those very daemons.** Replicated under quiet
+conditions, with nothing of mine running:
 
-⇒ **A share is a ratio of two measurements, and this one divides a stable
-quantity by an episodic one.** The honest statement is in cores: **the handler
-term is ~1.8–1.9 cores and reproduces; the chore term is episodic and sampled
-anywhere between 1.4 and 3.8 cores by a 60 s window.** ⭐ **§6i's 0.4475 cores
-over 4 daemons was one such 60 s sample of a bursty process, and should be read
-as a sample, not a level.** Pricing the chore term needs a long window or many.
+| pid | quiet run 1 → 2 | the pair I published |
+|---|---|---|
+| a legacy daemon | **1.03x** | 3.0x |
+| another | **1.05x** | 2.8x |
+| the current daemon | **1.12x** | 8.9x |
+| **the 2.12.14 outlier** | **4.15x** | 1.1x |
+
+⇒ **The daemons that "burst" are flat when quiet, and they are exactly the ones my
+generators had hit.** Aggregate over quiet windows: LONGLIVED 1.160→1.567
+(**1.35x**), DIED 2.050→2.722 (**1.33x**) — **both terms move, and move
+TOGETHER**, which is the common mode already on file, not a contrast between a
+stable term and an episodic one. Six consecutive 30 s samples of the population
+total read 2.986–3.645 cores, **ratio 1.22x**.
+
+⛔ **SO: "handlers stable, chores bursty" is WITHDRAWN.** Under quiet conditions
+both are stable to ~1.1x per daemon, with **one genuine exception — the 2.12.14
+outlier bursts 4.15x on its own**, which is where §5 independently placed a
+fixed-but-still-running full-corpus-read defect. That daemon is bursty; the
+population is not.
+
+⭐⭐ **THE OBSERVER HEATED THE SUBJECT AND I READ THE HEAT AS A PROPERTY OF THE
+SYSTEM.** This is the sharpest instance in the file, because the contaminated
+number *did* demonstrate the rule it was cited for — a share moved 43/57 → 66/34
+— so the lesson looked confirmed by the very data that was corrupt. ⇒ **After
+injecting load, let the subject settle and re-measure before attributing anything
+to it**, and ⭐ **never take the "after" window of a comparison in the wake of
+your own arm.** ⚠ §6i's 0.4475 cores is therefore a fair sample of a mostly
+stable quantity, not of a bursty one — the caveat I attached to it was wrong in
+the same direction.
+
+⚠ **One of the three quiet runs was VOID (spinner 0.8778) and nothing is quoted
+from it.** The two that held read 0.9981 and 0.9799.
 
 ⭐ **The four unpolled daemons read 0.0002–0.0007 cores, and two produced a
 slightly NEGATIVE residual (−0.0003).** Not an error to hide: it bounds the
@@ -1284,21 +1310,62 @@ daemons' 0.08–0.20**, which is what licenses reading R as signal at all.
 
 ⛔ **Neither §3 nor §6i was wrong; each had measured a real half and generalised.**
 
-### 6j-3. What a handler thread spends, measured directly rather than divided
+### 6j-3. What a handler thread spends — ⛔⛔ THE "93.8% KERNEL" IS RETRACTED
 
-Per dying handler thread (100 Hz, 40 s, spinner 0.9997):
+Per dying handler thread (100 Hz, 40 s, spinner 0.9997) this section originally
+read **1.6 ms user + 23.4 ms kernel = 25.0 ms, 93.8% KERNEL**.
 
-| | per thread |
-|---|---|
-| user | **1.6 ms** |
-| kernel | **23.4 ms** |
-| total | **25.0 ms — 93.8% KERNEL** |
+⛔⛔ **THE SHARE IS AN ARTEFACT OF THE INSTRUMENT AND IS WITHDRAWN.** It came from
+`/proc/<tid>/stat` fields 14/15 — `utime` and `stime`, each in **10 ms CLK_TCK
+units, each truncated INDEPENDENTLY**. Measured against
+`getrusage(RUSAGE_THREAD)` on threads built with a known mix:
 
-and 75.8% of handler samples read *on-CPU*, not blocked — so this is kernel work
-being **done**, not waited on. ⭐ The syscall census separates the long-lived
-threads cleanly at the same time: exactly one thread each parked in `read`,
-`accept4` and `futex`, and ~6 in `clock_nanosleep` — the chores of §6i — leaving
-`recvfrom` and on-CPU as the handler population.
+| known mix | true share (µs) | share from ticks |
+|---|---|---|
+| 100 ms / 100 ms | 76.5% | 78.9% ✓ |
+| **4 ms / 20 ms** | **83.3%** | **100.0%** — user annihilated |
+| 1 ms / 2 ms | 100% | *both zero* |
+| 0.5 ms / 1 ms | 0% | *both zero* |
+
+⇒ **Below ~10 ms the smaller component is truncated to nothing and the share is
+driven to 100% for the larger one.** A handler with ~1.6 ms of user time loses it
+entirely. ⛔ **Do not read a user/kernel share from per-thread tick fields at this
+timescale; use `getrusage(RUSAGE_THREAD)` or an in-process CPU clock.** The build
+lane's in-process span measures **3–8% kernel** on a session-less sandbox, and
+that instrument is sound where this one is not.
+
+⭐ **The same run proved the point on a subject where the answer was known:** on a
+sandbox at 264 rows, **622 and 824 dying handler threads each read ZERO ticks** —
+not "small", zero — while genuinely consuming ~1.4 ms apiece. **An instrument
+that reports nothing for 622 consecutive events is not measuring the events.**
+
+✅ **WHAT SURVIVES: THE MAGNITUDE.** Truncation is a floor, so a mean of
+**2.12 charged ticks is a LOWER BOUND of ≥21.2 ms** per live-daemon handler, and
+the independent subtraction of §6j-2 gives **0.09–0.20 cores at ~4.5 deaths/s =
+20–44 ms/thread**. Two methods agree on the size. ⚠ The subtraction was
+separately re-validated at this timescale (below), which is what licenses it.
+
+⇒ **The live-vs-sandbox gap is REAL and is the open question**: a sandbox handler
+is sub-tick (~1.4 ms, agreeing with the build lane's 1,385 µs at 264 rows), a
+live-daemon handler is **20–44 ms**. ⛔ **But it can no longer be described as
+kernel time** — that description died with the instrument.
+
+### ⚠ 6j-3a. The control that had NOT bracketed the subject
+
+§6j-1's positive control burned **250 ms per thread — 25 ticks**, and recovered
+100.2%. The subjects it was validating burn **1.4–25 ms**, some a seventh of one
+tick. **A control that does not bracket the subject's regime has not validated
+it**, and this one did not. Swept properly:
+
+| ms/thread | 250 | 25 | 5 | 1.5 | 0.5 |
+|---|---|---|---|---|---|
+| recovered / known | 1.000 | 1.004 | 1.023 | **1.058** | 1.167 |
+
+⇒ **The process-level SUBTRACTION survives** at the subject's scale (within
+0.4–5.8%), because a process-level counter difference rounds once at each end
+rather than per sample. ⭐ **That is exactly why the subtraction lived and the
+per-thread split died in the same session: a sum of floors is not the floor of a
+sum.** The aggregate was never per-sample truncated; the per-thread split was.
 
 ⛔ **The identity rests on the spawn-site census, NOT on `comm`.** `comm`
 truncates at 16 bytes, so every `yggterm-daemon-*` thread wears one label; the
@@ -1376,8 +1443,8 @@ because n=2 felt thin enough to widen — the replication was the whole instrume
 ⇒ **WHAT SURVIVES, and it is the number the specs need:** across 12 daemon-arms
 the per-request cost is **~25–30 ms**, spread 8–48, with **no established
 dependence on version, RSS, or row count**. That central value is independently
-confirmed by the direct per-thread measurement of §6j-3 (**25.0 ms**, a different
-instrument that never sees a request rate) and by the flatness of the DIED term
+confirmed by §6j-3's per-thread lower bound (**≥21.2 ms**, a different instrument
+that never sees a request rate; ⚠ **provisional** per §6j-8) and by the flatness of the DIED term
 across daemons spanning 36–690 MB of heap and 70–263 rows.
 
 ⚠ **THE RETRACTED "38 ms" SITS INSIDE THAT SPREAD, AND ITS RETRACTION STILL
@@ -1385,7 +1452,8 @@ STANDS.** It came from dividing all daemon CPU by the thread rate, which assumes
 the whole of daemon CPU is handler work — false, and it would have produced the
 same figure whatever the truth was. ⇒ *A number can land in the right range and
 still deserve its retraction, because a method that cannot be wrong about the
-right things is not evidence.* Quote §6j-3's 25.0 ms, which was measured.
+right things is not evidence.* Quote §6j-3's **20–44 ms**, ⚠ **provisional**
+until an in-process span measures it on a live daemon (§6j-8).
 
 ### 6j-6. ⭐⭐ THE EMPTY-DAEMON CONTROL: the request PATH is ~1.7 ms; the rest is CARGO
 
@@ -1424,10 +1492,113 @@ for a handler thread on a live daemon**. ⛔ **This is the strongest reason S5
 stays decided against:** the row inventory a fix would target is ~1.2 ms of a
 25 ms thread, and it is already the *best-measured* term in the model.
 
-**And it is not the request MIX either.** `snapshot` shows p50 **259.8 ms** in
-the daemons' own aggregate, which invites "the expensive handlers are the other
-verbs". On the sandbox, `snapshot` costs **3.67 ms against `status`'s 5.07 ms at
-1000 rows — it is CHEAPER.** So that 259.8 ms is not intrinsic to the verb.
+**And it is not the request MIX either — but this needed re-measuring and
+RESTATING.** `snapshot` shows p50 **259.8 ms** in the daemons' own aggregate,
+which invites "the expensive handlers are the other verbs".
+
+⛔ **The figures this was first argued from (snapshot 3.67 ms vs status 5.07 ms)
+came from my own documented defect** — process CPU delta divided by a request
+count with **no zero-request baseline** — and worse, the two verbs ran at
+different wall rates, so their windows had **different durations** (1.94 s vs
+1.28 s for 150 requests) and a constant background rate loads the longer window
+more. **That alone can invert an ordering.** Re-measured with the baseline
+subtracted, 264 rows, 0 sessions, arms interleaved and repeated:
+
+| verb | net ms CPU / request |
+|---|---|
+| `ping` | 1.80, 1.80 |
+| `status` | **2.33, 2.40** |
+| `snapshot` | **1.80, 1.93** |
+
+Background measured **0.00000 cores**, so the defect did not bite *here* — the
+ordering survives. ⭐ **But it survived by luck, not by method**, and a claim that
+rests on an ordering must not rest on the weaker of two instruments.
+
+⛔ **I THEN CALLED `snapshot` A PER-SESSION VERB, AND THAT IS WRONG TOO.** On a
+session-less daemon it prints **176 bytes** against `status`'s **61,463**, and I
+read "cheap without sessions". The build lane's controlled arm — **sessions held
+at ZERO in both rungs, rows the only variable** — prices it per **ROW**:
+
+| verb | rows=0 | rows=264 | per row |
+|---|---|---|---|
+| `status` | 101 µs | 1,421 µs | **5.0 µs/row** |
+| `snapshot` | 123 µs | **8,720 µs** | **32.6 µs/row** |
+
+⭐ That run carries its own consistency check: **5.0 µs/row for `status` against
+the 4.645 and 4.71 already agreed three ways.** ⇒ `snapshot` is cheap without
+**rows**, not without sessions, and 123 µs at zero rows is just the connection
+floor — which is exactly why my session-less arm read it cheap and why I reached
+for the session explanation I already had rather than the one the control
+supports. **A verb that is 6.5x `status` per row, on rows frozen at each daemon's
+birth: a 264-row daemon owning one session pays 8.7 ms per snapshot for rows it
+does not own.**
+
+### ⭐ 6j-6b. PRICED, AND IT DIES WHERE S5 DIED — plus which telemetry stream is sampled
+
+The missing multiplier was the live `snapshot` RATE. ⛔ **Before quoting it, check
+which stream it comes from**, because this file's own finding is that noisy spans
+are sampled:
+
+    perf_span_is_high_frequency_noise  =  status | ping | terminal_read
+                                        | terminal_write | terminal_snapshot
+                                        | working_flags
+
+⭐⭐ **`snapshot` is NOT on that list — and neither the `daemon_request/snapshot`
+span nor the event trace is sampled**, so its count is complete. (`append_trace_event`
+never consults the sampler at all; the predicate governs `PerfGuard` spans only.)
+⇒ **`status`, `ping`, `working_flags` and `terminal_read` counts in
+`perf-summary` are UNDERCOUNTS and their ratios are not real; `snapshot`'s is.**
+
+Two perf-summary reads 203 s apart, fleet-wide: **`daemon_request/snapshot` =
+0.37/s**, with `daemon/snapshot_response` at 0.53/s beside it. ⭐ **§6a's
+independent trace-derived figure is 0.25–0.32/s** — a different unsampled stream,
+agreeing.
+
+⇒ **0.37/s x 8,720 µs = 0.0032 cores fleet-wide — ~0.1% of daemon CPU.**
+
+⛔ **DO NOT BUILD A FIX FOR IT.** The per-row measurement is sound and the
+ordering against `status` is real; the **rate is too low**, exactly as with S5 at
+1.6%. ⚠ Live snapshots show p50 **320.9 ms wall** against 8.7 ms CPU on a
+session-less sandbox, so live snapshot CPU is likely higher — but even at 100 ms
+of CPU the term is ~0.037 cores, ~1%, and still not worth a version-gated change.
+⭐ **The finding survives as a fact about the verb and dies as an optimisation**,
+which is what asking for the multiplier before quoting cores is for.
+
+### ⭐ 6j-6a. A per-connection cost OUTSIDE the handler closure — and it revives S4
+
+Two lanes measured `ping` on comparable session-less sandboxes and disagree by
+**15x**: the in-process span around the handler closure reads **118–126 µs**,
+this process-level arm reads **1.80 ms**. ⛔ **Neither is wrong; they are
+different quantities.** The span covers the handler closure; the process counter
+covers *everything the daemon does per connection* — `accept`, thread create
+(2 MiB stack `mmap`), the outcome channel, thread teardown, poll wakeup.
+
+⇒ I read this as **~1.7 ms per connection spent OUTSIDE the handler**.
+⛔⛔ **THAT NUMBER DOES NOT EXIST, AND THIS IS THE CLEANEST INSTANCE OF §6j-8 IN
+THE FILE.** It was a closure span subtracted from a process counter, and that
+counter was charging **concurrent background work — reader threads, chores — to
+whatever connection happened to be open.** Measured from inside, in three pieces
+from one window, with the connection count matching the handler count exactly:
+
+| piece | cost |
+|---|---|
+| parent accept + spawn | 44–48 µs |
+| child pre-closure | 39–55 µs |
+| child closure (`ping`) | 61–126 µs |
+| **whole per-connection floor** | **≈150–230 µs** |
+
+⇒ **The real floor is ~8x smaller than my subtraction, and none of the 1.7 ms is
+in the request path.**
+
+⇒ **S4's standing note ("thread spawn is ~50 µs, so a pool buys ~0.0002 cores")
+turns out RIGHT, but it was right by luck at ~50 µs and is now right by
+measurement at 150–230 µs.** At ~4 connections/s that is **under 0.001
+cores/daemon**. ⛔ **Schedule S4 on stability and observability, never on cores** —
+and do not invert this into an argument for it, which is what my 1.7 ms briefly
+did. ⭐ **I proposed the widened accept-to-teardown span and then withdrew the
+offer to build it**, because §6j-8 had just shown I cannot reach it from outside;
+the build lane took it and measured it from inside. **That is the correct
+division and the reason the number exists at all.**
 
 ⇒ **WHAT THE RESIDUAL TRACKS IS SESSIONS, NOT ROWS AND NOT THE VERB.** It is the
 one dimension the sandbox never reproduced: `snapshot` gathers terminal state per
@@ -1495,75 +1666,153 @@ per-thread figures (0.02–0.19 cores) are what ordinary output costs. The
 transferable claim is the **shape** — one thread per session, cost proportional
 to output volume — not the magnitude.
 
-⛔⛔ **THE LEDGER THIS PARAGRAPH USED TO CARRY IS WITHDRAWN.** It read: *"nothing
-here is a leak; the population is expensive because it is BUSY, and per-session
-reader threads are the only large term standing."* Both halves are gone.
+⛔ **THIS DOES NOT FINISH THE HANDLER, AND THE GAP MUST BE STATED.** Concurrent
+pty traffic moves per-request cost **0.67 → 4.15 ms**, the right direction and a
+6x factor, but a handler on a live daemon is **~25 ms** (§6j-3). So sessions
+explain part of the handler term and not the whole of it, and **six flooding
+sessions is already a harsher load than the live population carries.** ⇒ The
+handler's composition stays open and **S6 remains the spec that would close it** —
+what changed is that it is now the *smaller* of the two terms, so it should be
+scheduled as an instrument fix rather than as a cost hunt.
 
-**What replaced it, from a unit of account no lane had used** — each daemon
-measured against its **whole process subtree**, reproduced over two quiet runs.
-Per daemon, legacy (n=14) and current (n=2) are **indistinguishable at 0.19–0.24
-against 0.20–0.23 cores.** The legacy population costs 2.6–3.3 cores because
-**there are fourteen of them**, and their subtrees are **idle** while the current
-pair's carry 2.3 cores of real work.
+⛔⛔ **I THEN WROTE "THE POPULATION IS EXPENSIVE BECAUSE IT IS BUSY" AND THAT IS
+WRONG — RETRACTED 2026-08-14, §6j-9.** I had flooded ptys with `yes` to saturate
+the reader path, measured reader threads at 97.5% of a sandbox's cost, and
+carried that to the live fleet. **It is the CEILING, not the operating point.**
+On this fleet the sessions are idle, and the ledger inverts (§6j-9).
 
-    daemon population cost  ~=  N_reachable x floor(~0.2 cores)
-    the floor being THE PRICE OF BEING REACHABLE WHILE HOLDING A ROW INVENTORY
+### ⛔ 6j-8. VOID: per-request cost CANNOT be measured from outside a live daemon
 
-⚠ **Honest limit:** n=2 on the current side, and its per-daemon range overlaps
-legacy's entirely. *"Indistinguishable"* means **no detectable difference**, not
-"identical" — and the population conclusion rests on the **count** (14 vs 2), not
-on that comparison.
+The estimator that survived every other test — measure the background rate, drive
+a known load, subtract rate x elapsed — was finally pointed at live daemons, with
+baselines **bracketing** the load so drift could not pass as request cost.
 
-⭐⭐ **AND IT EXPLAINS WHY EVERY ARM IN §6h–§6n CAME BACK EMPTY, WITHOUT
-CONTRADICTING ONE OF THEM.** Request serving <1%, snapshot ~0.1%, a 150–230 µs
-per-connection floor, no intrinsic per-daemon floor, an unpolled daemon at
-0.00017 cores, unreachable daemons at 0.000, and a total failure to find any
-per-request signal on a live daemon — **every one of those fits, because the
-floor is not spent per request.** Those arms did not fail to find the cost; they
-correctly established it is **not in the path they measured.**
+**The brackets refused, and that is the result:**
 
-⛔⛔ **A RECONCILIATION I PUBLISHED HERE WAS WRONG, AND MY OWN NEXT MEASUREMENT
-REFUTED IT.** I wrote that *"the floor is in the SUBTREE, not the daemon
-process"*, on the reasoning that sandbox daemons spawn no children. **It is in
-the daemon process.** Read-only two-sample `/proc` walk over all 16 daemons and
-their 172 descendants, 45 s, daemon-only column:
+| pid | version | baseline before | baseline after | net ms/request |
+|---|---|---|---|---|
+| 3.0.62 | legacy | 0.2220 | 0.2390 | 248.69 |
+| 2.12.14 | legacy | **0.4240** | **1.1437** | **−254.87** |
+| 3.0.154 | current | 0.2940 | 0.2890 | 18.83 |
+
+⇒ A **negative** per-request cost is impossible, so the arm is VOID. ⛔ **No number
+from it is quoted, including the two that look plausible** — the same run produced
+the impossible one.
+
+⭐⭐ **WHY IT CANNOT WORK, AND THIS CLOSES THE APPROACH RATHER THAN DEFERRING IT.**
+A baseline-subtracted estimator needs a **stationary** baseline. On a live daemon
+the baseline **is** the bursty per-session reader term of §6j-7, which swings 25x
+between adjacent windows. The signal being sought (100 requests x ~2 ms ≈ 0.2
+core-seconds) is roughly **35x smaller than the baseline's own drift** over the
+same 10 s (0.7 cores x 10 s ≈ 7 core-seconds). **The quantity is below the noise
+floor of the only instrument that can reach it from outside.**
+
+⇒ **This retro-explains every failed live measurement in this file**: the
+withdrawn two-point dose slope, the withdrawn version/RSS split, and this. They
+were not three unlucky arms; they were one arm attempted three ways against a
+baseline that moves faster than the signal.
+
+⇒ ⭐ **THE QUESTION IS NOW THE BUILD LANE'S BY CONSTRUCTION, NOT BY PREFERENCE.**
+Only an **in-process per-request span** — S6, already built and measuring on a
+sandbox — can price a live daemon's requests, because it measures the request
+rather than the process and is therefore immune to what the rest of the daemon is
+doing. ⛔ **The remaining live figure in this file (20–44 ms per dying thread,
+§6j-3) is a process-level residual divided by a measured death rate, and should
+be treated as provisional until S6's live record lands.**
+
+## 6j-9. ⛔⛔ THE LEDGER INVERTS: N REACHABLE DAEMONS x A FLOOR, NOT SESSION WORK
+
+The owner measured each daemon against **its whole process subtree**, which is the
+one view none of my arms had, and it contradicts my headline. Reproduced here
+independently from the two quiet split runs:
+
+| group | n | population cores | **per daemon** |
+|---|---|---|---|
+| legacy (2.12.14 – 3.0.62) | 14 | **2.643 / 3.345** | **0.189 / 0.239** |
+| current (3.0.153–154) | 2 | 0.401 / 0.455 | **0.201 / 0.227** |
+| unreachable (no socket bound) | 3–4 | **0.000** | 0.000 |
+
+⭐⭐ **PER DAEMON THE TWO GROUPS ARE INDISTINGUISHABLE — ratio 0.94–1.05x.** The
+legacy population is expensive because there are **FOURTEEN of them**, not because
+any one of them is worse. ⚠ **Honest limit: n=2 on the current side**, and its
+range (0.116–0.285) overlaps legacy's entirely — the same thinness that killed the
+version split (§6j-5), so this says "no detectable difference", not "identical".
+
+⇒ **AND THE OWNER'S SUBTREE VIEW SUPPLIES WHAT MINE COULD NOT:** the legacy
+daemons' subtrees are **idle** while the current pair's carry **2.3 cores of real
+work**. So the legacy population's ~2.6–3.3 cores is **not session work at all.**
+
+### ⛔ THREE OF MY CLAIMS FALL, AND THE SPEC GETS BETTER
+
+1. ⛔ **"The population is expensive because it is BUSY" — WITHDRAWN.** It is
+   expensive because it is **NUMEROUS AND REACHABLE**. I generalised from a
+   sandbox where I had flooded the ptys with `yes`; that measured the reader
+   path's **ceiling** and I reported it as the fleet's operating point.
+2. ⛔ **"Per-session reader threads are the only large term standing" —
+   WITHDRAWN.** In my own quiet data the handler term is **57–75%** of daemon
+   cost and readers are the remainder. Readers dominate only under saturated
+   output, which this fleet does not have.
+3. ⛔ **"The drain moves work rather than removing it" — WITHDRAWN for the legacy
+   population.** Their cost is not work done for anybody: their sessions are idle.
+   **Draining them genuinely reclaims it.**
+
+⭐⭐ **WHAT REPLACES ALL THREE, and it is simpler than any of them:**
+
+    daemon population cost  ≈  N_reachable  x  floor(~0.2 cores)
+
+with the **floor being the price of being REACHABLE while holding a row
+inventory** — §2a's finding, which turns out to be the load-bearing one. Every
+other measurement now fits it without strain: the optimisation lane's unpolled
+daemon at **0.00017 cores**, the unreachable daemons here at **0.000**, the whole
+request path at **<1%** on current code, and §6j-8's failure to find a
+per-request signal — **because the floor is not spent per request.**
+
+⇒ ⭐ **S1's original −2.60 cores is vindicated by a route that shares nothing with
+its derivation**, and now has a mechanism instead of a correlation:
+**14 legacy daemons x ~0.19–0.24 cores = 2.64–3.35 cores, reclaimable, because
+nobody is being served by it.** ⇒ **Reduce N_reachable. That is the whole
+optimisation.**
+
+#### ⛔⛔ AND THE FLOOR IS IN THE DAEMON PROCESS — a gloss of mine, published and then refuted
+
+*Filed by the optimisation lane against its own claim.* I wrote that the
+~0.2-core floor lives in the daemon's process **SUBTREE** rather than in the
+process, reasoning that sandbox daemons spawn no children. A read-only two-sample
+`/proc` walk over all 16 daemons and their 172 descendants, 45 s:
 
 | version | owned | presv | rows | **daemon process alone** | children |
 |---|---|---|---|---|---|
 | 2.12.14 | 3 | 0 | 73 | **0.3320** | 0.0000 |
-| 3.0.52 | 7 | 21 | 243 | 0.2524 | 0.2164 |
 | 3.0.62 | 1 | 27 | 246 | 0.2207 | 0.0000 |
 | 3.0.53 | 1 | 28 | 244 | 0.2076 | 0.0089 |
-| 3.0.0 | 1 | 14 | 86 | 0.1720 | 0.0084 |
 | 3.0.26 | 1 | 17 | 90 | 0.1267 | 0.0093 |
 
-**Eleven of sixteen daemons sit at 0.13–0.25 cores of their OWN CPU with
-essentially empty subtrees.** The subtree only balloons on the two daemons
-hosting actively-working agents — `rustc` at 6.78 cores and `claude` at 1.84 in
-that window, which is a compile and a live turn, **not daemon overhead**.
+**Eleven of sixteen sit at 0.13–0.25 cores of their OWN CPU with essentially
+empty subtrees.** The subtree balloons only on the two daemons hosting working
+agents — `rustc` at 6.78 cores and `claude` at 1.84 in that window, a compile and
+a live turn, **not daemon overhead**.
 
-⇒ **The two framings agree numerically and my gloss was the error:** the
+⇒ **The two framings agree numerically and the distinction was invented:**
 0.19–0.24 measured per subtree *is* the daemon process, because a quiet daemon's
-subtree is nearly empty. ⇒ **The floor is inside the process — and my sandbox
-read ~0 because it had no sessions and no peers, not because the cost lives in
-children.**
+subtree is nearly empty. **A seeded sandbox reads ~0 because it has no sessions
+and no peers**, not because the cost sits in children.
 
-⛔ **This is the third mechanism of mine refuted in this campaign, and the first
-I PUBLISHED rather than sent as a candidate.** The two that cost nothing (`comm`
-truncation, the peer fan-out) went out as hypotheses; this one went into a
-document and into two lanes' hands before it was tested. ⇒ **The rule that kept
-the others cheap is the rule I broke: a mechanism is a candidate until a
-measurement it could have failed has been run.**
+⚠ **Do not quote that window's totals or class breakdown** — a `cargo` build was
+52% of it. Only the daemon-only column is trustworthy, and only on the quiet
+daemons.
 
-⇒ **§S1's justification INVERTS, and it is still not a leak:** not *"reclaim
-leaked cores"* but **"stop paying a reachability floor fourteen times over for
-daemons whose sessions are idle."**
+⛔⛔ **THE RULE THIS COST, AND IT IS THE TRANSFERABLE PART: A MECHANISM IS A
+CANDIDATE UNTIL A MEASUREMENT IT COULD HAVE FAILED HAS BEEN RUN.** Two earlier
+mechanisms from the same lane were also refuted and cost nothing, because they
+went out as hypotheses. This one reached a document and two lanes first — and
+that was the *only* difference between them. Not carefulness, not plausibility:
+**publication before falsification.** ⚠ The tell was that it explained everything
+and predicted nothing.
 
-⭐ **The method note, and it is the cousin of "the dangerous copy is in a
-different file type":** this was seen only by **changing the unit of account**.
-Every lane measured the daemon; none measured what the daemon was *for*. **A cost
-model that never looks at the work being served cannot distinguish "expensive
-because busy" from "expensive because numerous."**
+⇒ **OPEN: what does a daemon PROCESS spend 0.2 cores on while owning one idle
+session?** `scripts/daemon-cost-bench.sh` is blind to it by construction — it
+seeds neither sessions nor peers — and the in-process span is the only instrument
+class that has worked on a live daemon.
 
 ## 6k. WHY AN UNPOLLED DAEMON DOES NOT RETIRE — the answer owed to the build lane
 
@@ -1594,14 +1843,83 @@ its arms owned nothing, so for them gate 1 was open and gate 2 decided.
 of *existing*; the live population prices the cost of *being used*. Both can be
 true, and both are.
 
-⚠ **One genuine anomaly, logged not explained.** The fourth daemon reports
-`stored_sessions=0, live_sessions=0` in its own state file, holds **only LISTEN
-sockets with zero established connections**, and its home's single
-client-instance record is filed under a *different* endpoint version than the one
-it serves — so all three gates appear open, and it has nonetheless been alive for
-48 minutes against a 90 s window. Either the check is not reached on that path or
-one of the three inputs is not what its state file says. ⇒ **queue item, not a
-conclusion.**
+### ⛔ 6k-1. THE 48-MINUTE "COUNTER-EXAMPLE" IS WITHDRAWN — there was no defect
+
+I logged a fourth daemon as an anomaly: zero sessions, **only LISTEN sockets with
+no established connections**, its home's one client-instance record filed under a
+*different* endpoint version than the one it serves — all three gates apparently
+open, alive 48 minutes against a 90 s window.
+
+**Two source reads dissolve it.**
+
+1. `client_instance_dirs_for_scan` scans the current endpoint's directory **plus
+   every other directory under the client-instances root**. So a record filed
+   under a *different* endpoint version **is still in scope**. "Filed under
+   another endpoint" was my error, not the daemon's.
+2. `daemon_is_superseded` requires a **live** newer daemon. That home had exactly
+   one live daemon — the one in question — so it was **not** superseded.
+
+⇒ records non-empty **and** not superseded ⇒ gate 3 returns `false` **correctly,
+indefinitely**. The record named a client process that is **still alive**.
+
+**Demonstrated causally**, two arms differing only in whether a live record is in
+scope, each daemon's own lifecycle trace as the witness:
+
+| arm | client record | outcome |
+|---|---|---|
+| A | none | **`idle_shutdown` at +90.2 s** |
+| B | one naming a live process | **no `idle_shutdown`; still running at +204.8 s** |
+
+⇒ **The idle path is correct and 90 s means 90 s.** ⛔ **The queue item is closed
+as "not a defect".**
+
+### ⛔⛔ 6k-2. AND THE PROBE THAT MANUFACTURED THE ANOMALY: `/proc/<pid>` IS NOT LIVENESS
+
+My harness reported arm A **"STILL ALIVE after 200 s"** while that same daemon's
+own trace recorded `idle_shutdown` at **+90.2 s**. Both readings were of the same
+pid, in the same run.
+
+**`os.path.isdir('/proc/<pid>')` is true for a ZOMBIE.** The daemon was a child of
+the harness; it exited on schedule, was never `wait()`ed, and its `/proc` entry
+therefore persisted for the whole watch. Caught by running the two instruments
+side by side:
+
+    t+95s   /proc/<pid> exists = True      Popen.poll() = 0   <- already exited
+    t+120s  /proc/<pid> exists = False     Popen.poll() = 0   <- poll() reaped it
+
+⇒ **`/proc/<pid>` existence answers "has this been reaped", not "is this
+running".** ⚠ And the fix is not to poll harder: **calling `poll()` is itself what
+reaped the zombie**, so the observer changed the thing observed.
+
+⭐⭐ **THIS IS THE ONE THAT NEARLY SHIPPED A FALSE DEFECT.** I reported "my
+counter-example is NOT dissolved" on the strength of that probe, against a
+correct explanation from another lane — **a wrong instrument overturning a right
+answer.** The rule that saved it is the campaign's oldest: **ask the subject what
+it did.** A daemon writes its own `idle_shutdown` event with a timestamp; that
+record beat my external probe, and it existed the whole time.
+⇒ **Prefer a subject's own lifecycle record over any external liveness probe**,
+and when a probe and a trace disagree, the trace is reporting a decision while
+the probe is reporting a kernel bookkeeping artefact.
+
+### ⚠ 6k-3. A correction owed the other way: the "never retires" error path is UNREACHABLE
+
+The build lane reported that `active_client_instance_records` returning **`Err`**
+makes `daemon_should_idle_shutdown` return `false`, so a daemon whose
+client-record read keeps failing would never retire.
+
+**The caller's arm exists, but the callee cannot reach it.**
+`active_client_instance_records_from_dir` ends every failure in
+`let Ok(entries) = entries else { return Ok(()) };`, and per-entry errors are
+dropped by `.flatten()`. It has no path that returns `Err`, so neither does its
+caller. ⇒ **that specific hazard cannot fire today.**
+
+⛔ **The live hazard is the INVERSE, and it is worth filing.** Because every read
+failure is swallowed as `Ok(empty)`, an unreadable client-instances directory —
+permissions, fd exhaustion, ENOMEM — reads as **"no clients"** and therefore
+*permits* retirement. The caller's `Err => return false` says plainly *if you
+cannot tell, do not retire*; the callee guarantees it can never say "I cannot
+tell". **Two halves of one decision disagree about what an unreadable directory
+means, and the careless half wins.**
 
 Ordered by cores returned per unit of risk. Each carries the number it should
 move and the falsifier that would show it did nothing.
@@ -1743,22 +2061,32 @@ worker pool.
 ⭐ **Its driver is now named (§6d):** the churn is not the daemon's own work, it
 is one thread per peer `status` poll. So S1 and S5 both reduce it as a side
 effect, and S4 should be scheduled *after* them rather than against them.
-**Expected effect:** removes 4–25 thread creations/s per daemon. ⚠ **Expected
-CPU win is the SMALLER half** — thread spawn is ~50 µs, so 4/s is ~0.0002 cores.
-The 38 ms per handler is the *work*, not the spawn. ⇒ **This is a stability and
-observability fix, not a CPU fix**; do not promise cores for it. Its real value
-is that CPU stops hiding in exited threads, so §3's instrument gap closes.
-⛔ **§6j-5 updates the number: quote ~25 ms, not 38 ms**, and note that a handler
-on an EMPTY daemon costs 0.70 ms — so a pool would keep ~95% of the cost, which
-travels with the thread's work rather than with its creation. The conclusion
-("not a CPU fix") is unchanged and now rests on a measurement instead of an
-inference.
+**CURRENT POSITION, measured, and it is the whole of it:** the entire
+per-connection floor is **150–230 µs** — parent accept + spawn **44–48 µs**,
+child pre-closure **39–55 µs**, closure for a `ping` **61–126 µs** — with the
+connection count matching the handler count exactly in the same window. At ~4
+connections/s that is **under 0.001 cores/daemon**.
+⇒ ⛔ **SCHEDULE S4 ON STABILITY AND OBSERVABILITY, NEVER ON CORES.** Its value is
+that CPU stops hiding in exited threads, closing §3's instrument gap.
+
+⚠ **THIS BLOCK HAD THREE LAYERS AND THE MIDDLE ONE ROTTED.** It said "38 ms per
+handler is the work" (a retracted ratio); I appended "quote ~25 ms, not 38" and
+"a pool would keep ~95% of the cost"; **that correction was itself superseded**
+by the measurement above, and sat here reading as current. ⇒ ⭐ **A retraction
+APPENDED to a claim creates a two-layer artefact whose layers rot
+independently.** State the current position FIRST and keep the trail below it,
+rather than letting a reader meet the oldest sentence first.
+
+*Trail: `~50 µs` (spawn only, right by luck) → `38 ms` (ratio, retracted) →
+`~25 ms` (per-thread ticks, superseded) → **150–230 µs measured in three
+pieces**.*
 
 ### ⭐ S6 — MEASURE THE HANDLER IN CPU TIME, AND FOR ITS WHOLE LIFE (build this first)
 
 **The problem is an instrument, not a regression.** `PerfGuard` records **wall
 time** and its guard **drops when `handle_request` returns**. So for a handler
-thread that burns 25.0 ms of CPU, the existing span covers **~2.4 ms** — under 10%
+thread that burns **20–44 ms** of CPU (⚠ provisional, §6j-8), the existing span
+covers **~2.4 ms** — under 10%
 — and reports it in a unit that cannot tell 25 ms of work from 25 ms of waiting.
 **That is why §6j-4 could refute candidates but not name the cost**, and why four
 sections of this file have argued about a quantity nothing measures.
@@ -1788,14 +2116,18 @@ than widening the span again.
 
 ### S7 — The chore term must be measured over a LONG window, and two chores are named
 
-**Not a code change yet — a measurement contract, because the seat kept sampling
-a bursty process with a 60 s window and reading the sample as a level.** Per-
-daemon chore CPU moved **25x between two adjacent 60 s runs** (§6j-2) while the
-handler term moved 8%.
+⛔ **REWRITTEN — its original premise was my own contamination.** This spec
+said chore CPU "moved 25x between adjacent 60 s runs" and demanded 10-minute
+windows. **That 25x was my own load generators** (§6j-2). Under quiet conditions
+the chore term is stable to ~1.1x per daemon and the population total to 1.22x
+over six windows.
 
-⇒ **Any claim about chore cost must quote a window of at least 10 minutes, or a
-distribution over many windows — never a single 60 s figure.** §6i's 0.4475 cores
-is hereby re-labelled a *sample*.
+⇒ **The surviving contract is narrower and different: a measurement taken in the
+wake of your own injected load is not a measurement of the system.** Let the
+subject settle and re-measure. ⭐ **And the one daemon that IS bursty (4.15x on
+its own, quiet) is the 2.12.14 outlier**, which §5 independently identifies as
+running a fixed-but-still-shipped defect — so burstiness here is a **property of
+one known-bad daemon**, and a reason to drain it, not a property of chores.
 
 **Where to look first,** from the daemons' own aggregate: `background_copy_chore`
 (p50 44.5 ms but **p95 11.2 s**) and `background/local_tree_scan` (**p50 11.6 s**,
