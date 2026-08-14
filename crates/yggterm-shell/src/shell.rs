@@ -109106,10 +109106,36 @@ fn apply_active_terminal_input_policy(
         signature.app_control_backgrounded,
         signature.web_find_bar_focused,
     );
-    if !signature.remote_resume_input_ready {
-        allow_input = false;
-        focus_input = false;
-    }
+    // ⛔⛔ THE RESUME GATE NO LONGER BLOCKS THE KEYBOARD — owner-ruled 2026-08-14:
+    // *"The input block gate needs to be reassessed and maybe dropped from
+    // design. It has only caused misery. I switch to a session and cannot
+    // type."*
+    //
+    // It is kept as an OBSERVATION (still computed, still traced below), because
+    // it is a genuinely useful diagnostic. What is removed is its power to
+    // refuse a keystroke.
+    //
+    // ⇒ THE ASYMMETRY THAT DECIDES IT. The gate protected against typing into a
+    // remote-resume surface before its visual reveal. But the PTY is live the
+    // whole time and consumes input correctly — `terminal input-check` answers
+    // `consuming_input: true` on exactly these rows. So the worst case of NOT
+    // gating is a keystroke that is not echoed for a moment. The worst case of
+    // gating is stated by this file's own comment on the flag: the row "renders
+    // perfectly and accepts no keystrokes for the rest of its life, and nothing
+    // says why."
+    //
+    // ⇒ AND IT WAS STRUCTURALLY BIASED SHUT: cleared on EVERY row open, with
+    // ~20 removal sites and one narrow restore path that an idle agent never
+    // reaches, because the restore rides on the first meaningful output byte and
+    // an agent waiting at its prompt emits none. A 5 s rescue deadline was added
+    // rather than changing the design, and the owner was still unable to type
+    // with `terminal_input_override_active: true` — the explicit override could
+    // not win, because this ran AFTER the policy that honours it.
+    //
+    // ⛔ Do not re-add this as a block. If a surface genuinely cannot accept
+    // input, that belongs in `terminal_runtime_input_policy` above, where the
+    // override and the other gates can still be weighed against it.
+    let _resume_gate_observed_shut = !signature.remote_resume_input_ready;
     // A live web surface covers the viewport: the overlay owns the keyboard.
     if signature.web_surface_active {
         allow_input = false;
