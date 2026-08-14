@@ -54,15 +54,33 @@ SWAP_USED_PANIC_GB=6          # memory: the owner's report was 11 of 15 GB
 MEM_AVAIL_PANIC_GB=2
 GUI_COMMITTED_PANIC_MB=2500   # rss+swap. ⛔ NEVER rss alone: it FALLS while the
                               #   footprint climbs, which is how the leak hid.
+MEM_PRESSURE_PANIC=5.0        # PSI `some avg60`, %. Above this, tasks are
+                              #   actually stalling on memory — which is what a
+                              #   human feels. Swap USED is not that; see below.
 PPT_AVG_PANIC_W=25            # fan proxy: sustained package watts
 TCTL_PANIC_C=85
 YGG_CORES_PANIC=2.0           # cpu: our whole family, as a rate not a lifetime avg
+RENDER_STORM_PANIC=20         # renders/s. Deliberately the SAME number as the
+                              #   app's own `app_render_storm` arm rate, so the
+                              #   watch and the app cannot disagree about the
+                              #   word. Rest is 0.7-1.2/s; storms run 54-64/s.
 TMPFS_OURS_PANIC_MB=256       # space: our footprint on any RAM-backed mount
 
 M="$($SSH '
 sw_t=$(awk "/^SwapTotal/{print \$2}" /proc/meminfo); sw_f=$(awk "/^SwapFree/{print \$2}" /proc/meminfo)
 echo "swap_used_gb=$(echo "scale=2; ($sw_t-$sw_f)/1048576" | bc)"
 echo "mem_avail_gb=$(awk "/^MemAvailable/{printf \"%.2f\", \$2/1048576}" /proc/meminfo)"
+# ⛔ SWAP USED IS AN ACCUMULATION, NOT A PRESSURE, AND THE TWO NEED DIFFERENT
+# ANSWERS. Measured 2026-08-14: 6.35 GB of swap with 9.8 GB available, no
+# process near a limit and the GUI cgroup at memory.events high=0 — cold pages
+# the kernel parked at swappiness=60 and never needed back. That is not the
+# same event as a machine paging to keep up, and reporting one number for both
+# makes the alarm fire hardest when nothing is wrong. PSI is the discriminator:
+# `some avg60` is the share of the last minute in which at least one task
+# STALLED waiting for memory. An empty file (no PSI in this kernel) reports
+# blind rather than 0 — BLIND IS NOT CALM.
+psi=$(awk "/^some /{for(i=1;i<=NF;i++) if (\$i ~ /^avg60=/) {sub(/avg60=/,\"\",\$i); print \$i; exit}}" /proc/pressure/memory 2>/dev/null)
+echo "mem_pressure_avg60=${psi:-blind}"
 ppt=$(sensors 2>/dev/null | grep -m1 "PPT:" | grep -oE "avg =[ ]*[0-9.]+" | grep -oE "[0-9.]+")
 echo "ppt_avg_w=${ppt:-0}"
 tctl=$(sensors 2>/dev/null | grep -m1 "Tctl:" | grep -oE "[0-9.]+" | head -1)
@@ -92,17 +110,26 @@ else
   echo "gui_committed_mb=0"; echo "web_committed_mb=0"; echo "gui_memory_high=no-gui"
 fi
 # our CPU as a RATE over 8s (ps %CPU is a LIFETIME average and would lie)
-pids=$(pgrep -f "yggterm|WebKitWebProcess" | tr "\n" " ")
-s1=0; for q in $pids; do v=$(awk "{print \$14+\$15}" /proc/$q/stat 2>/dev/null); s1=$((s1+${v:-0})); done
-t1=$(awk "/^cpu /{print \$2+\$3+\$4+\$5+\$6+\$7+\$8}" /proc/stat); sleep 8
-s2=0; for q in $pids; do v=$(awk "{print \$14+\$15}" /proc/$q/stat 2>/dev/null); s2=$((s2+${v:-0})); done
-t2=$(awk "/^cpu /{print \$2+\$3+\$4+\$5+\$6+\$7+\$8}" /proc/stat)
-# A process that EXITS between the two samples takes its ticks out of s2, so a
-# naive difference goes NEGATIVE and reports as a tiny or negative core count -
-# observed as "-.06 cores" while the family was busy. Clamp at zero: under-
-# reporting a rate is a missed alarm, but a negative one is a broken instrument
-# that quietly can never trip a threshold.
-echo "ygg_cores=$(echo "scale=2; d=($s2-$s1); if (d<0) d=0; d/(($t2-$t1)/$(nproc))" | bc)"
+#
+# ⛔⛔ DIFFERENCE PER PID, NEVER TWO SUMS. A process that exits between the two
+# samples takes its whole lifetime of ticks OUT of the second sum, so a
+# sum-to-sum difference goes negative — once seen as "-.06 cores" while the
+# family was busy. That was cured by clamping at zero, and the clamp is a WORSE
+# instrument than the bug: on this host the pattern also matches every
+# short-lived `yggterm` CLI invocation, of which there are dozens a minute, so
+# an exit inside the window is the common case and the clamp turns it into a
+# confident `0 cores` — a reading that can never trip its own threshold and
+# reads as "the GUI is free" while it burns a core. Measured 2026-08-14: this
+# printed `0` in the same run in which the GUI own sampler reported 0.39 cores.
+# ⇒ Intersecting the two samples costs nothing and loses only the share of
+#   the process that exited, which is the honest amount to lose.
+sample() { for q in $(pgrep -f "yggterm|WebKitWebProcess" 2>/dev/null); do
+    v=$(awk "{print \$14+\$15}" /proc/$q/stat 2>/dev/null) && echo "$q $v"; done; }
+a=$(sample); t1=$(awk "/^cpu /{print \$2+\$3+\$4+\$5+\$6+\$7+\$8}" /proc/stat); sleep 8
+b=$(sample); t2=$(awk "/^cpu /{print \$2+\$3+\$4+\$5+\$6+\$7+\$8}" /proc/stat)
+d=$(awk "NR==FNR{first[\$1]=\$2; next} (\$1 in first){s+=\$2-first[\$1]} END{print s+0}" \
+      <(echo "$a") <(echo "$b"))
+echo "ygg_cores=$(echo "scale=2; d=$d; if (d<0) d=0; d/(($t2-$t1)/$(nproc))" | bc)"
 # ⛔ du COUNTS AN UNREADABLE DIRECTORY AS ZERO, AND THAT IS THE FAILURE THIS
 # BLOCK EXISTS TO SURVIVE. The pattern below already matched the CLI staging
 # dirs; they were owned by root, `du` running as us could not descend into them,
@@ -124,6 +151,19 @@ for m in $(awk "\$3==\"tmpfs\"{print \$2}" /proc/mounts | sort -u); do
 done
 echo "tmpfs_ours_mb=$ours"
 echo "tmpfs_blind_entries=$blind"
+# ⛔ THE FAN AND THE UNRESPONSIVE MINUTES AFTER A RESTART ARE A RENDER STORM, AND
+# THIS WATCH COULD NOT SEE IT. The Dioxus root renders at 0.7-1.2/s at rest and
+# has been measured at 54-64/s for nine unbroken minutes, pinning exactly one
+# core. `ygg_cores` above does catch that as CPU — but only while it is
+# happening, and it cannot say the cost is RENDERING rather than work. The GUI
+# already publishes the rate every 60s whether or not anything is wrong; this
+# just reads the last one it wrote.
+tf=$(ls -t ~/.yggterm/event-trace*.jsonl 2>/dev/null | head -1)
+if [ -n "$tf" ]; then
+  rr=$(tail -c 400000 "$tf" 2>/dev/null | grep -o "\"renders_per_sec\":[0-9.]*" | tail -1 | cut -d: -f2)
+fi
+# ⛔ An empty tail is not a calm GUI — it is a window with no sample in it.
+echo "renders_per_sec=${rr:-blind}"
 ' 2>/dev/null)"
 
 g() { sed -n "s/^$1=//p" <<<"$M" | head -1; }
@@ -133,14 +173,28 @@ lt() { awk -v a="${1:-0}" -v b="$2" 'BEGIN{exit !(a+0 < b+0)}'; }
 PANICS=""
 p() { PANICS="${PANICS}  PANIC $1"$'\n'; }
 
-SWAP=$(g swap_used_gb);   AVAIL=$(g mem_avail_gb)
+SWAP=$(g swap_used_gb);   AVAIL=$(g mem_avail_gb); PSI=$(g mem_pressure_avg60)
 GUIC=$(g gui_committed_mb); WEBC=$(g web_committed_mb); HIGH=$(g gui_memory_high)
 PPT=$(g ppt_avg_w);       TCTL=$(g tctl_c)
-CORES=$(g ygg_cores);     TMPO=$(g tmpfs_ours_mb)
+CORES=$(g ygg_cores);     TMPO=$(g tmpfs_ours_mb); RENDERS=$(g renders_per_sec)
 TMPBLIND=$(g tmpfs_blind_entries)
 
 # 1 MEMORY
-gt "$SWAP" "$SWAP_USED_PANIC_GB"       && p "swap ${SWAP}GB used (> ${SWAP_USED_PANIC_GB}GB)"
+gt "$SWAP" "$SWAP_USED_PANIC_GB"       && p "swap ${SWAP}GB used (> ${SWAP_USED_PANIC_GB}GB)$(
+  case "$PSI" in
+    blind) echo " — ⚠ memory pressure UNREADABLE, cannot say whether this is felt";;
+    *) if gt "$PSI" "$MEM_PRESSURE_PANIC"; then
+         echo " — AND pressure avg60=${PSI}%: the machine is paging to keep up"
+       else
+         echo " — but pressure avg60=${PSI}%, ${AVAIL}GB available: COLD swap, not a stall"
+       fi;;
+  esac)"
+# The other half, and the one that is actually felt: stalling. It can fire with
+# swap far below the threshold above, which is why it is its own line.
+case "$PSI" in
+  blind) ;;
+  *) gt "$PSI" "$MEM_PRESSURE_PANIC" && p "memory pressure avg60=${PSI}% — tasks are STALLING on memory";;
+esac
 lt "$AVAIL" "$MEM_AVAIL_PANIC_GB"      && p "only ${AVAIL}GB available (< ${MEM_AVAIL_PANIC_GB}GB)"
 gt "$GUIC" "$GUI_COMMITTED_PANIC_MB"   && p "GUI committed ${GUIC}MB (> ${GUI_COMMITTED_PANIC_MB}MB)"
 gt "$WEBC" "$GUI_COMMITTED_PANIC_MB"   && p "web process committed ${WEBC}MB — the known unbounded leak"
@@ -149,6 +203,13 @@ gt "$WEBC" "$GUI_COMMITTED_PANIC_MB"   && p "web process committed ${WEBC}MB —
 gt "$PPT" "$PPT_AVG_PANIC_W"           && p "package power ${PPT}W sustained (> ${PPT_AVG_PANIC_W}W) — this is what spins the fan"
 gt "$TCTL" "$TCTL_PANIC_C"             && p "die temperature ${TCTL}C (> ${TCTL_PANIC_C}C)"
 gt "$CORES" "$YGG_CORES_PANIC"         && p "yggterm family ${CORES} cores (> ${YGG_CORES_PANIC})"
+# The render storm, by its own always-on instrument rather than by inference
+# from CPU. Its threshold matches the app's own `app_render_storm` arm rate, so
+# the two agree on what the word means instead of disagreeing quietly.
+case "$RENDERS" in
+  blind) p "the GUI's render rate is UNREADABLE (no app_render_rate sample in the trace tail) — the storm cannot be ruled out, only unmeasured";;
+  *) gt "$RENDERS" "$RENDER_STORM_PANIC"  && p "the GUI is rendering ${RENDERS}/s (rest is ~1/s) — this is the render storm: one core, the fan, and the minutes of unresponsiveness after a restart";;
+esac
 # 1b MEMORY, ON THIS HOST — TWO AGENT PROCESSES ON ONE SESSION UUID
 #
 # ⛔ A version bump re-resumes a live row into a NEW process and does not reap
@@ -185,7 +246,7 @@ gt "$TMPO" "$TMPFS_OURS_PANIC_MB"      && p "${TMPO}MB of ours on tmpfs (> ${TMP
 # measurement, so say so rather than letting a small number read as safety.
 gt "$TMPBLIND" 0                       && p "${TMPBLIND} tmpfs entr(ies) of ours are UNREADABLE — ${TMPO}MB is a FLOOR, not a measurement (no passwordless sudo here)"
 
-SUMMARY="mem: swap ${SWAP}GB, avail ${AVAIL}GB, gui ${GUIC}MB, web ${WEBC}MB, cap ${HIGH} | cpu: ${CORES} cores, ${PPT}W, ${TCTL}C | space: ${TMPO}MB on tmpfs"
+SUMMARY="mem: swap ${SWAP}GB, avail ${AVAIL}GB, pressure ${PSI}%, gui ${GUIC}MB, web ${WEBC}MB, cap ${HIGH} | cpu: ${CORES} cores, ${PPT}W, ${TCTL}C, render ${RENDERS}/s | space: ${TMPO}MB on tmpfs"
 
 if [ "$JSON" -eq 1 ]; then
   printf '{"host":"%s","panic":%s,"summary":"%s","panics":"%s"}\n' \
