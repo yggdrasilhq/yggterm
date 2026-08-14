@@ -875,14 +875,61 @@ and both were sent as candidates rather than filed as causes.** The first
 own control. **The cheap part was proposing them; the part that cost anything
 would have been believing them.**
 
-⚠⚠ **AND IT REOPENS SOMETHING RECORDED AS PRICED AND REFUTED.** The request mix
-was set aside on the grounds that *"snapshot is CHEAPER than status on a sandbox,
-3.67 vs 5.07 ms"*. **This measurement inverts that ordering — 9.6 ms against
-1.5 ms — on per-verb thread CPU, unsampled.** Two sandboxes, two instruments, one
-ordering reversed. ⇒ **The request-mix explanation should not be treated as
-closed**, and the disagreement is about the instrument, not the conclusion: a
-wall-time figure over a mixed population and a per-verb CPU figure are not the
-same quantity.
+### ⭐ 6m. `snapshot` IS A PER-ROW VERB, AND IT COSTS 6.5x WHAT `status` DOES PER ROW
+
+*Two arms, **sessions held at zero in both**, so ROWS is the only variable.
+Warm windows, per-verb thread CPU, nothing sampled.*
+
+| verb | rows=0 | rows=264 | per-row |
+|---|---|---|---|
+| `ping` | 61 µs | 116 µs | — (no row work) |
+| `status` | 101 µs | 1,421 µs | **5.0 µs/row** |
+| `snapshot` | 123 µs | **8,720 µs** | **32.6 µs/row** |
+
+⭐ **The status column is an internal consistency check and it passes:** 5.0 µs/row
+against the 4.645 measured independently in §6h and 4.71 from the field re-fit.
+The same run therefore prices `snapshot` on a scale already validated.
+
+⇒ **`snapshot` is a per-ROW verb.** Both arms carry **no sessions**, so a
+per-session explanation cannot account for any of this. ⛔ It was proposed that
+*"snapshot is cheap without sessions and expensive with them, so the aggregate's
+p50 is a session effect wearing a verb's name"* — **rows alone are sufficient**,
+measured with sessions held at zero. A session effect may exist on top; it is not
+needed.
+
+⇒ **And this is a far larger row-scaled term than §S5's was.** `status` at
+4.6 µs/row was declined at ~1.5% of daemon CPU; `snapshot` costs **6.5x that per
+row**, and ROWS is frozen at each daemon's birth — so a 264-row daemon owning one
+session pays **8.7 ms per snapshot for rows it does not own.** ⛔ **The missing
+multiplier is the live snapshot RATE, which this lane has not measured** — the
+per-row cost is settled, the fleet total is not, and no cores figure should be
+quoted until it is.
+
+⛔ **THE PRIOR ORDERING WAS OBTAINED BY A KNOWN DEFECT, ON BOTH SIDES OF THE
+DISAGREEMENT.** The "snapshot is cheaper than status" figure (3.67 vs 5.07 ms)
+came from dividing process CPU by a request count with **no zero-request
+baseline** — and worse than a constant offset, the two verbs ran at different
+wall rates, so the windows had different durations and a constant background
+loads the longer one more, which can invert an ordering on its own. ⚠ A
+re-measurement with the baseline subtracted found the background was 0.00000
+cores, so that defect did not bite — **the ordering survived by luck, not by
+method.** ⇒ Neither figure should have been quoted from the weaker instrument.
+
+### ⛔ 6n. THE THREAD'S PRE-CLOSURE COST IS ~50 µs, MEASURED — SO THE ~1.7 ms GAP IS NOT THE CHILD
+
+Recording `CLOCK_THREAD_CPUTIME_ID`'s **absolute** value at closure end, beside
+the closure delta, makes the thread's pre-closure life a measured field:
+
+    pre_closure = 39-55 us, flat across all three verbs and both row counts
+
+⇒ **The standing note that thread spawn is ~50 µs is vindicated on the child
+side**, and it was measured rather than assumed. ⛔ **So a ~1.7 ms per-connection
+gap between a closure span and a process counter is NOT the thread's own startup.
+It is parent-side or attribution** — accept, `clone()`, the outcome channel, the
+poll wakeup — and that half is still unmeasured. ⚠ **A difference between two
+instruments is not a measurement**, which is exactly why this field exists: it
+converts one of the two candidate halves into a number and leaves the other
+honestly open.
 
 **Two harness defects fixed in the same pass, both of which report a fired
 instrument as one that did not fire:**
