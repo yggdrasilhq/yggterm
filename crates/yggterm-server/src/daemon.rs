@@ -16394,9 +16394,12 @@ fn dispatch_interrupted_session_repairs(home_dir: &Path, runtime: &Arc<Mutex<Dae
                         move |text| {
                             // Locked per WRITE, released before every sleep —
                             // the whole reason this is not the registry method.
+                            // ⛔ daemon-originated: see TerminalManager::
+                            //    write_daemon_originated. The repair's own
+                            //    writes must not be counted as the human's.
                             lock_daemon_runtime(&write_runtime, "hot_restart_repair_write")
                                 .terminals
-                                .write(&write_path, text)
+                                .write_daemon_originated(&write_path, text)
                         },
                         move || {
                             lock_daemon_runtime(&snapshot_runtime, "hot_restart_repair_snapshot")
