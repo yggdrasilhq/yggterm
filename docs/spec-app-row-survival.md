@@ -7,6 +7,22 @@ libyggterm apps was lost. This is the spec."*
 
 ---
 
+> ### ✅ IMPLEMENTED 2026-08-14 — and two of §2's three claims were already stale
+> when this was written. The RULE below is unchanged; only the diagnosis moved.
+>
+> | §2 claim | as measured |
+> |---|---|
+> | 1. born disposable | **was true, now fixed.** The birth rule asked `kind.is_agent()` and an app row is a `SessionKind::Shell`. It now also reads the row's app stamp. |
+> | 2. no way to protect one | ⚠ **already false.** `server app terminal keep\|unkeep <row>` exists, and the GUI has a "Keep Alive" / "Stop Keeping Alive" context-menu item. Driven live in both directions with a read-back after each. |
+> | 3. launch args not stored | ⚠ **half false, and the other half was invisible.** The `app:<name>:<verb>` token was already persisted. But the restore SPENT it without stamping it back, so the round-trip survived exactly one restart; and the re-derivation sat inside the transcript branch, which an app row never enters, so a protected row with a valid token still restored as bare bash. Both fixed. |
+> | §3 no departure record | **was true, now fixed.** See the §3 note below. |
+>
+> ⭐ **The lesson worth keeping is the shape of claim 3.** It read as shipped
+> because the half that was easy to check — does the token survive? — did
+> survive, and the half nobody checked was the one the user sees. A round-trip
+> test that restores ONCE cannot see a fact that dies on the second restart, and
+> a token that round-trips proves nothing about the command derived from it.
+
 ## §1 THE RULE
 
 > **A row the user created deliberately survives a GUI restart. Always. Whatever
@@ -55,6 +71,26 @@ a record.**
 ⇒ **A row leaving the live set for any reason other than an explicit user close
 must leave a record saying which reason.**
 
+> ✅ **Done 2026-08-14.** Root cause was one line: `PrepareClientClose` removed
+> each non-keep-alive row itself instead of going through the close chokepoint,
+> so it never reached the only code that writes anything down — the second close
+> path that file's own comment forbids. `removed-rows.json` now carries a
+> `departures` ledger beside its veto set: which row, its title, the reason
+> (`explicit-close` or `gui-close-disposable`), and when. **Ask it with
+> `yggterm-headless server rows departed [--limit N]`.**
+>
+> ⚖ The two are different questions and are kept apart on purpose. The veto set
+> answers *"may this row be imported back?"* and is cleared the moment the row
+> legitimately returns. The ledger answers *"what happened to the row that is not
+> here?"*, and a return must NOT erase it — a row that evaporated an hour ago
+> still evaporated after the user recreates it, and "it is back now" is exactly
+> the answer that made the first loss undiagnosable.
+>
+> ⚠ **Still open, and separable:** the observation that a *peer* daemon's
+> `server-state.json` can list rows the current GUI's live set does not. The
+> ledger is machine-wide, so it now answers which is true — but a stale peer
+> advertising rows it no longer owns is daemon-handover territory, not this spec.
+
 ## §4 WHAT MAY STILL BE REAPED
 
 This spec does not forbid reaping. It forbids *silent, unasked* reaping of the
@@ -66,6 +102,19 @@ user's own rows.
 - ⛔ Anything else, on a GUI restart, is a bug against this spec.
 
 ## §5 THE OPERATIONAL RULE UNTIL §2 IS FIXED
+
+> ✅ **§2.1 is fixed, so this section has expired for rows created from
+> 2026-08-14 onwards** — a new app row is born keep-alive and a GUI close leaves
+> it alone. It still applies to any app row created by an OLDER build, because
+> the flag is persisted per row and nothing retroactively upgrades one: protect
+> such a row with `server app terminal keep <row>`, which is the affordance
+> §2.2 said did not exist.
+>
+> ⭐ **And the check itself is now cheap and needs no memory of what was there:**
+> `server rows departed` names every row that has left and why. A row missing
+> with a `gui-close-disposable` entry went because it was disposable; a row
+> missing with NO entry did not leave through any path that knows it left, which
+> is a bug in its own right.
 
 ⚠ **Until app rows are born keep-alive, treat a GUI kill as destructive to them.**
 
