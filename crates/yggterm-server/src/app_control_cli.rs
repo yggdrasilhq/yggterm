@@ -2190,11 +2190,25 @@ mod dispatch_reachability_lock {
     #[test]
     fn every_app_control_handler_is_dispatched() {
         const LIB: &str = include_str!("lib.rs");
-        // Both owners: the general surface and the `web` plane, which was
-        // collapsed onto its own file first and is the precedent this file cites.
+        // The general surface, the `web` plane that was collapsed onto its own
+        // file first, AND BOTH BINARIES.
+        //
+        // ⚠ The binaries were missing here for the same reason they were missing
+        // from the twin below, and leaving them out is a LATENT RED rather than a
+        // present one: no handler is dispatched only from a binary *today*, so
+        // this list looked complete. The twin proved it is not — it fired on
+        // `main` the moment a module both binaries dispatch met the lock — and a
+        // lock whose blindness is waiting for the next commit is worse than one
+        // that fails now, because it will fail in someone else's lane.
+        //
+        // ⇒ Both halves of this lock now name the same four sources. A scanner
+        // that cannot see one of the dispatchers is the exact defect this file
+        // exists to prevent, and it had it.
         let dispatchers = [
             include_str!("app_control_cli.rs"),
             include_str!("app_control_web_cli.rs"),
+            include_str!("../../../apps/yggterm/src/main.rs"),
+            include_str!("../../../apps/yggterm/src/bin/yggterm-headless.rs"),
         ];
         let mut handlers: Vec<&str> = Vec::new();
         for (index, _) in LIB.match_indices("pub fn run_app_control_") {
