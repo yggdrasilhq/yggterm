@@ -33,6 +33,7 @@ observation would falsify it**.
 |---|---|---|---|
 | **1** | **The window is the product** | Exactly ONE **Active client** in the registry; its `/proc/<pid>/exe` is not `(deleted)`; its build matches the installed binary | two Active clients, a deleted exe, or an md5 mismatch |
 | **1b** | **It has not crashed** | No yggterm coredump in the window since the last check | `coredumpctl list` naming yggterm |
+| **1c** | **The chrome is live, not frozen** | `webview_edit_faults == 0` | any non-zero value |
 | **2** | **Both sidebars render** | The cwd/session tree AND the session-metadata panel are painted | reading the screenshot and not seeing them |
 | **3** | **The viewport is faithful** | No dropped glyphs, squish, broken bottom, or stuck restore toast | reading the screenshot |
 | **4** | **Input lands** | A keystroke reaches a session and echoes | probe row does not echo |
@@ -70,6 +71,39 @@ and must fail loudly rather than read as zero.
 ⭐ The general form: **the most load-bearing alarm is the one that must never cry
 wolf**, because a level-1 alert that fires on ordinary fleet traffic is how a real
 duplicate GUI gets waved through.
+
+### ⛔ THE RECORD THIS CONTRACT HAS TO ANSWER FOR
+
+**On its first day, three user-visible failures were reported and this check
+returned PASS on all three.** A frozen "ghost" sidebar whose buttons did nothing,
+a terminal rendering the wrong glyph for every character, and a general judgement
+of *bogus*. Not one was caught.
+
+The reason is structural and worth stating rather than patching around: **levels
+1, 1b, 2, 3 and 6 are all things you can measure about a process — that it
+exists, has not dumped core, produced a frame, and is not spinning.** None of
+them is a claim that the app *works*. A check assembled only from those reports
+PASS on a broken product, which is worse than having no check, because it is
+quotable.
+
+⇒ Two consequences, both now built in:
+
+- **Level 1c** turns the ghost sidebar from invisible into a one-field failure.
+  A frozen subtree paints perfectly and `capture_faithful` stays true throughout,
+  so no screenshot could ever have caught it.
+- **Level 4 runs by default.** It is the only level that establishes the app
+  responds to a human at all, and it was originally deferred behind `--deep`,
+  which is precisely how the check came to certify a product nobody could use.
+
+⚠ **Level 2/3's blindness is still real and is not fixed.** The screenshot shows
+the ACTIVE row only, so a rendering fault on any other row is invisible to this
+check by construction — which is exactly how the glyph bug passed. Do not read a
+green level 3 as "the app renders correctly"; read it as "the row that happened
+to be focused rendered correctly".
+
+⚠ **Level 5 is not implemented.** It is reported as unimplemented rather than
+skipped silently, because a level that is quietly absent reads as a level that
+passed.
 
 ### Level 1b exists because a crash is invisible to every other level
 
@@ -138,10 +172,14 @@ Every one of these was checked before being trusted, and three failed:
 ## Running it
 
 ```sh
-scripts/usability-check.sh          # levels 1, 1b, 2, 3, 6 - safe, non-invasive
+scripts/usability-check.sh          # levels 1, 1b, 1c, 2, 3, 6 AND 4
 scripts/usability-check.sh --json   # one JSON object, for a relay or watcher
-scripts/usability-check.sh --deep   # adds 4 and 5 - creates an ephemeral probe row
 ```
+
+**Level 4 is not opt-in.** It creates its own ephemeral shell row with
+`--no-activate` (so the owner's viewport never moves), sends a marker, reads it
+back, and removes the row with a read-back. It never touches a live session. Both
+directions are controlled: with the send it passes, without it fails.
 
 Exit code is the number of the first failing level, 0 if all pass. **Levels 2 and
 3 require a human or an agent to READ the screenshot it saves** — they are an eye

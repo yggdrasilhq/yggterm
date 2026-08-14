@@ -165,6 +165,42 @@ note "L1b crashes_last_hour=$CRASHES"
 
 [ "$FAIL_LEVEL" -ne 0 ] && emit
 
+# ---------------------------------------------------------------- level 1c
+# ⛔ THE CHROME IS FROZEN BUT STILL PAINTED. This is the one that caught nothing
+#    for three hours while the owner sat in front of it.
+#
+#    Edits reach the webview in batches over a websocket, acked per batch. A
+#    batch that throws is acked ANYWAY (deliberately — a withheld ack starves
+#    the whole VirtualDom). The host then records those mutations as landed and
+#    diffs against that model forever, so nothing re-sends them: one subtree is
+#    frozen at whatever it held, and every state field keeps confidently
+#    reporting what it SHOULD be showing.
+#
+#    ⇒ The screenshot cannot catch this — a frozen sidebar paints perfectly, it
+#    just paints the past. `capture_faithful` is true throughout. The owner
+#    reported it as a "ghost" sidebar: visible, inert, buttons dead.
+#    ⛔ Non-zero INVALIDATES THE SCREENSHOT, not the state. Only a GUI restart
+#    clears it, so this level's remedy is a restart, not an investigation.
+FAULTS="$($SSH "timeout 25 ~/.local/bin/yggterm server app state 2>/dev/null" \
+  | python3 -c "
+import sys, json
+try:
+    print(json.load(sys.stdin)['data'].get('webview_edit_faults', 'unknown'))
+except Exception:
+    print('unknown')
+")"
+note "L1c webview_edit_faults=${FAULTS:-unknown}"
+# ⛔ UNREADABLE IS BLIND, NOT CLEAR — the same trap as level 1, and it was
+#    reintroduced here within the hour of being fixed there, which is why it is
+#    spelled out at both sites rather than assumed.
+if [ "${FAULTS:-unknown}" = "unknown" ]; then
+  fail 1 "could not read webview_edit_faults - the frozen-chrome check is BLIND, not clear"
+elif [ "${FAULTS:-0}" -gt 0 ] 2>/dev/null; then
+  fail 1 "webview_edit_faults=$FAULTS - the chrome is FROZEN and still painting; the screenshot is a lie. Restart the GUI, which is the only thing that clears it"
+fi
+
+[ "$FAIL_LEVEL" -ne 0 ] && emit
+
 # ---------------------------------------------------------------- levels 2+3
 # BOTH SIDEBARS RENDER, and THE VIEWPORT IS FAITHFUL. A visual symptom needs a
 # faithful pixel: capture_faithful=false means the frame is a lie about the
@@ -220,9 +256,61 @@ if [ -n "${ZOMBIES:-}" ] && [ "${ZOMBIES:-0}" -gt 20 ]; then
   fail 6 "${ZOMBIES} zombie processes - something is spawning children and never reaping them"
 fi
 
-# ---------------------------------------------------------------- levels 4+5
+# ---------------------------------------------------------------- level 4
+# INPUT LANDS. ⛔ THIS IS THE LEVEL THAT MAKES THIS A USABILITY CHECK AT ALL.
+#
+# Levels 1-3 and 6 are structural: a process exists, it has not crashed, a frame
+# is faithful, CPU is sane. **All of them passed while the owner was looking at
+# an app he could not use.** A check built only from those reports PASS on a
+# broken product, which is worse than no check, because it is quotable.
+#
+# ⛔ It never touches a live session. The probe is its own ephemeral shell row,
+#    created with --no-activate so the owner's viewport does not move, carrying
+#    an idle TTL so an abandoned probe reaps itself, and removed with
+#    `server app session remove` (⛔ NOT `session remove`) with a read-back.
+if [ "$FAIL_LEVEL" -eq 0 ]; then
+  MARK="yggusab$$"
+  PROBE="$($SSH "timeout 30 ~/.local/bin/yggterm server app terminal new --kind shell \
+      --no-activate --purpose 'usability level-4 input probe' \
+      --ephemeral --ephemeral-idle-ttl-secs 180 2>/dev/null" \
+    | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin); d = d.get('data') or d
+    print(d.get('session_path') or d.get('path') or '')
+except Exception:
+    print('')
+")"
+  if [ -z "$PROBE" ]; then
+    fail 4 "could not create a probe session at all - the app cannot open a new terminal"
+  else
+    # ⛔ The Enter key is a SEPARATE write of a lone newline, after a beat. A
+    #    command and its terminator sent as one write is not what a keyboard does.
+    $SSH "timeout 25 ~/.local/bin/yggterm server app terminal send '$PROBE' --data 'echo $MARK'" >/dev/null 2>&1
+    sleep 1
+    $SSH "timeout 25 ~/.local/bin/yggterm server app terminal send '$PROBE' --data '
+'" >/dev/null 2>&1
+    sleep 2
+    HITS="$($SSH "timeout 25 ~/.local/bin/yggterm server app terminal read-buffer '$PROBE' --mode screen 2>/dev/null" \
+      | grep -c "$MARK" || true)"
+    note "L4 probe=$PROBE marker_hits=${HITS:-0}"
+    # >=1 proves the write reached the PTY and produced output. A healthy
+    # interactive shell shows 2 (the echoed command and its result), but not
+    # every shell config echoes, so 1 is the honest bar for "input lands".
+    if [ "${HITS:-0}" -lt 1 ]; then
+      fail 4 "a keystroke sent to a fresh probe session never came back - INPUT DOES NOT LAND"
+    fi
+    # Cleanup runs whether or not the assertion passed: a failed probe that
+    # leaves a row behind turns one bad hour into a growing pile.
+    $SSH "timeout 25 ~/.local/bin/yggterm server app session remove '$PROBE'" >/dev/null 2>&1
+    LEFT="$($SSH "timeout 20 ~/.local/bin/yggterm server app rows 2>/dev/null" | grep -c "${PROBE##*/}" || true)"
+    [ "${LEFT:-0}" -gt 0 ] && note "L4 ⚠ probe row SURVIVED removal ($PROBE) - remove it by hand"
+  fi
+fi
+
+# ---------------------------------------------------------------- level 5
 if [ "$DEEP" -eq 1 ] && [ "$FAIL_LEVEL" -eq 0 ]; then
-  note "L4/5 deep probe requested - see docs/usability-contract.md for why this is opt-in"
+  note "L5 click-open timing is still unimplemented - saying so beats implying it ran"
 fi
 
 emit
