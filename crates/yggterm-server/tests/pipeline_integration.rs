@@ -114,6 +114,52 @@ fn submit_prompt_waits_for_readiness_then_delivers() {
 }
 
 #[test]
+fn the_probe_is_not_counted_as_the_human_but_a_client_keystroke_is() {
+    // ⛔⛔ THE REGRESSION THIS PAIR EXISTS TO CATCH, at the seam where it lived.
+    // The unsent-draft flag is reconstructed from whatever passes through
+    // `write`, and the readiness probe wrote its marker through that same
+    // `write` — so the probe was recorded as a person typing and the next draft
+    // check refused the probe's own submit. Both directions are asserted here,
+    // because a fix that simply stopped tracking drafts would pass the first
+    // assertion alone and silently re-open the bug the flag exists for: a probe
+    // typing over somebody's half-written line.
+    //
+    // ⚠ THIS TEST DOES NOT GUARD THE WIRING, AND THAT IS MEASURED, NOT ASSUMED:
+    // re-point the echo-verified submit back at `write` and this test still
+    // PASSES, while `echo_verified_submit_waits_until_input_is_actually_consumed`
+    // and `..._refuses_when_input_never_consumed` both fail. The two halves cover
+    // different things — those two prove the submit path uses the daemon-
+    // originated write, this one proves that write means what its name says.
+    // Deleting either as redundant leaves a real hole.
+    let mut mgr = TerminalManager::new();
+    let key = "test://draft-attribution";
+    mgr.ensure_session(key, &launch("--scenario composer --ready-after-ms 0 --hold-ms 4000"), None)
+        .expect("ensure_session");
+    wait_for_output(&mgr, key);
+
+    assert_eq!(
+        mgr.session_has_pending_input_draft(key),
+        Some(false),
+        "a fresh composer has no draft"
+    );
+
+    mgr.write_daemon_originated(key, "yggterm_ready_probe")
+        .expect("daemon-originated write");
+    assert_eq!(
+        mgr.session_has_pending_input_draft(key),
+        Some(false),
+        "⛔ the daemon's own probe must NOT register as a human's unsent draft"
+    );
+
+    mgr.write(key, "half a sentence").expect("client write");
+    assert_eq!(
+        mgr.session_has_pending_input_draft(key),
+        Some(true),
+        "⛔ a client keystroke MUST still register — this is what the probe refuses to type over"
+    );
+}
+
+#[test]
 fn echo_verified_submit_waits_until_input_is_actually_consumed() {
     use yggterm_server::PromptSubmitOutcome;
     let mut mgr = TerminalManager::new();

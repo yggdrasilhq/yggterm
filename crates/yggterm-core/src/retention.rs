@@ -15,6 +15,21 @@
 //! the first write per process, so the per-event I/O cost is unchanged: one
 //! append. The legacy single `.previous.jsonl` file is treated as a generation
 //! (aged by mtime) so it drains out of existence on its own.
+//!
+//! ⛔⛔ **WHICH RULE ACTUALLY BINDS IS NOT A DETAIL, AND IT IS ALMOST NEVER THE
+//! AGE ONE.** The age cap is a ceiling; the byte budget is what decides how far
+//! back a stream really reaches, and **the budget is per HOME while the write
+//! rate is per PROCESS** — every daemon on the host writes the same event-trace.
+//! So the retained window is roughly `budget / (per-process rate x N processes)`
+//! and it collapses as the population grows. Measured on a 20-daemon host,
+//! 2026-08-14: **247.9 MiB retained over 2.98 h** — a window of about three
+//! hours under a rule captioned "3 days", and four session deaths a release was
+//! being judged on had aged out before anyone came to look.
+//!
+//! ⇒ A caller sizing one of these budgets must state the window it wants in
+//! **bytes at the observed rate**, never in days, and should say what the rate
+//! was when it chose. `EVENT_TRACE_RETENTION` in `trace.rs` carries that
+//! reasoning for the stream where it was measured.
 
 use serde_json::Value;
 use std::fs::{self, OpenOptions, create_dir_all};

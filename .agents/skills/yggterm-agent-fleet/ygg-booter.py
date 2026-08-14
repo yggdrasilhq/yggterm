@@ -474,22 +474,40 @@ def row_process_absent(uuid):
     would skip a fleet hold during a REAL outage; a false "present" merely keeps
     today's behaviour. So anything that is not clearly a shell counts as alive,
     and only a total absence counts as dead."""
+    # ⛔ A DENYLIST OF SHELLS WAS THE WRONG SHAPE AND I SHIPPED IT. `python3` was
+    #    not on it, so a probe of the form `python3 -c "…<uuid>…"` — which is how
+    #    every sweep in this fleet is written — matched ITSELF and reported the
+    #    row alive. That is the FIFTH costume of one trap in a single night:
+    #    `pgrep -f <uuid>` · "exclude grep" · "cmdline contains claude" ·
+    #    "argv[0] is not a shell" · and now the querying interpreter.
+    #    ⇒ Stop enumerating what ISN'T the row. Exclude THIS process explicitly,
+    #    and treat an inline interpreter invocation (`-c`) as what it always is:
+    #    somebody asking the question, never the row being asked about.
+    #    ⚠ The alive-bias is deliberately KEPT — anything else still counts as
+    #    running — because a false "absent" would skip a fleet hold during a real
+    #    outage, while a false "present" merely preserves today's behaviour.
     shells = {"bash", "sh", "zsh", "dash", "ssh", "grep", "awk", "sed", "xargs"}
     try:
         pids = [d for d in os.listdir("/proc") if d.isdigit()]
     except Exception:
         return False                      # cannot tell ⇒ treat as alive
-    needle = uuid.encode()
+    needle, me = uuid.encode(), str(os.getpid())
     for d in pids:
+        if d == me:
+            continue                      # the querying process is not the row
         try:
             cl = Path(f"/proc/{d}/cmdline").read_bytes()
         except Exception:
             continue
         if not cl or needle not in cl:
             continue
-        a0 = os.path.basename(cl.split(b"\0")[0].decode("utf8", "ignore"))
-        if a0 not in shells:
-            return False
+        parts = cl.split(b"\0")
+        a0 = os.path.basename(parts[0].decode("utf8", "ignore"))
+        if a0 in shells:
+            continue
+        if a0.startswith(("python", "perl", "ruby")) and b"-c" in parts[1:2]:
+            continue                      # an inline script is a probe, not a row
+        return False
     return True
 
 
@@ -765,7 +783,19 @@ def cmd_subscribe(args):
         # ⭐ WHAT KIND OF WATCH THIS IS. "task" has a terminal state and may
         #    unsubscribe itself when the work is done; "monitor" does not --
         #    see cmd_unsubscribe.
-        "kind": getattr(args, "kind", None) or "task",
+        # ⛔ A WATCH PLACED BY SOMEBODY ELSE DEFAULTS TO `monitor`, AND THAT IS
+        #    NOT A STYLE CHOICE. Measured 2026-08-14: a triage session armed
+        #    another campaign's stalled delegate, the booter woke it 20 minutes
+        #    later (`boots=1`, and the `continue` is in that row's transcript),
+        #    and the woken row unsubscribed ITSELF four seconds afterwards --
+        #    the exact "am I done?" answer `cmd_unsubscribe` exists to refuse,
+        #    which it only refuses for monitors. So the wake worked and the
+        #    watch died in the same minute, and the NEXT stall had nobody.
+        #    ⇒ "Is this finished?" is not the subscriber's question to answer
+        #    when the subscriber is not the row. Pass --kind explicitly to
+        #    override in either direction.
+        "kind": getattr(args, "kind", None)
+        or ("task" if uuid == own_uuid() else "monitor"),
         "boots": 0,
         "last_size": 0,
         "escalated": False,
@@ -1100,6 +1130,18 @@ def cmd_retire(args):
     if sub_path(uuid).exists():
         sub_path(uuid).unlink(missing_ok=True)
         log(f"  and dropped its subscription — a boot would have typed at a corpse")
+    # ⛔ AND THE OTHER PLANE. `retire` used to clean the booter and leave the
+    #    MONITOR subscription standing, so a row recorded decided-dead kept
+    #    escalating a corpse to a live orchestrator forever. Found because the
+    #    monitor's coverage crossing started reporting the retired set as
+    #    "subscribed here but not armed" — the gap was invisible until an
+    #    instrument looked in both directions at once.
+    #    ⇒ A death is a fact about the ROW, not about one watcher's bookkeeping;
+    #    every plane that watches it has to hear the same answer.
+    mon = STATE / "monitor" / f"{uuid}.json"
+    if mon.exists():
+        mon.unlink(missing_ok=True)
+        log(f"  and dropped its monitor subscription — a corpse escalates to nobody")
     return 0
 
 
@@ -1964,7 +2006,7 @@ def main():
     ap.add_argument("--host", default=None,   # ⛔ resolved, never a placeholder
                     help="the GUI host — app control resolves only there")
     ap.add_argument("--max-hours", type=float, default=12.0)
-    ap.add_argument("--kind", choices=("task", "monitor"), default="task",
+    ap.add_argument("--kind", choices=("task", "monitor"), default=None,
                     help="task: has a terminal state, may unsubscribe itself when done. "
                          "monitor: watches something still live, so 'done' is never true — "
                          "unsubscribing one needs --force")

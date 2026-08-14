@@ -544,6 +544,20 @@ if [ -x "$(dirname "$0")/ygg-monitor.py" ]; then
     | sed 's/^/  /' || log "⚠ monitor succession failed — re-point subscribers by hand"
 fi
 
+# --- and DISARM it on the booter -------------------------------------------
+# ⛔ THE OTHER HALF OF THE SAME HANDOVER, AND IT WAS MISSED BECAUSE THE TWO PLANES
+# HAVE SEPARATE STORES. `succeed` above unsubscribes the predecessor from the
+# MONITOR; nothing touched the BOOTER, so a row this script had just reaped stayed
+# armed — a corpse standing in the list of things the safety net is meant to wake,
+# escalating to nobody. `ygg-monitor.py list` flags it (armed-but-unwatched), which
+# is how it was caught 2026-08-14, one claim after the crossing check shipped.
+# ⇒ The net must not be left holding the dead. Same shape as the succession above:
+#   run it HERE, above the process-reap gate that can `exit 4`.
+if [ -x "$(dirname "$0")/ygg-booter.py" ]; then
+  "$(dirname "$0")/ygg-booter.py" unsubscribe --row "$PRED" --force 2>&1 \
+    | sed 's/^/  /' || log "⚠ booter disarm failed — run: ygg-booter.py unsubscribe --row $PRED --force"
+fi
+
 # `verified:false` with the row already delisted means the ROW is gone but the
 # agent PROCESS survived — typically because only the local transport was reaped.
 # Identify by cmdline, requiring BOTH a plausible agent binary and the uuid;
