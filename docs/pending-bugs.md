@@ -3356,6 +3356,19 @@ measurable half above stands on its own and does not wait on it.
 
 *found 2026-08-13 while pushing a lane branch; affects every cluster in this batch*
 
+⚠ **RE-TESTED 2026-08-14, AND THE SCOPE IS NARROWER THAN THIS ENTRY WAS BEING
+READ AS.** It bites **only on a branch the remote has never seen**. Once the
+branch has an upstream, `rsha` is a real sha, the range is correct, and the
+guard behaves: pushing `lane/dev/6.7-resource` scanned `4e801c13..e579a6b1`
+— *"1452 added lines … ✅ no private data found in what is being pushed"* — and
+succeeded first try, with no override.
+
+⛔ **The reason this note exists is that the entry had hardened into "that lane
+cannot push", which was carried across sessions and relays as a fact and cost a
+lane a session of not pushing.** Nobody re-ran the command. ⇒ **An inherited
+"blocked" is a claim.** The defect below is real; *"every lane push fails"* is
+not, and a title that overstates a condition is how a bug becomes folklore.
+
 `ygg-privacy-guard hook` derives its scan range from the pre-push stdin line:
 
 ```python
