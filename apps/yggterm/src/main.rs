@@ -1094,7 +1094,8 @@ fn main() -> Result<()> {
         "linux_memory_scope",
         serde_json::json!({
             "outcome": memory_scope.label(),
-            "bounded": matches!(memory_scope, MemoryScopeOutcome::Entered),
+            "bounded": memory_scope.bounded(),
+            "inherited_unit": memory_scope.inherited_unit(),
             "fallback_reason": memory_scope.fallback_reason(),
         }),
     );
@@ -3006,6 +3007,23 @@ fn memory_scope_command_args(
 enum MemoryScopeOutcome {
     /// Inside the scope: the marker the re-exec stamps on its child is present.
     Entered,
+    /// ⛔ INHERITED, NOT ARMED — and the difference is the whole point of this
+    /// field. A GUI relaunched by a running GUI (`server app update restart`) is
+    /// forked from a process that is already inside a scope, so it inherits BOTH
+    /// the cgroup and the `…_SCOPE_ACTIVE` marker, takes the idempotent early
+    /// return, and never runs `systemd-run` at all. That used to report
+    /// `entered` / `bounded: true`, identically to a GUI that armed its own —
+    /// which made the one field added to answer *"is this GUI capped"* unable to
+    /// answer *"did this GUI cap itself"*.
+    ///
+    /// ⚠ The two halves of the inheritance travel by DIFFERENT mechanisms: the
+    /// marker rides the environment, the bound rides the cgroup. They coincide
+    /// for a plain fork and can come apart for anything that carries an
+    /// environment further than it carries a process — at which point trusting
+    /// the marker alone reports `bounded: true` for a GUI in the plain login
+    /// scope. So this variant does not trust it: it carries what
+    /// `/proc/self/cgroup` + `memory.high` actually say.
+    Inherited { unit: String, bounded: bool },
     /// `YGGTERM_MEMORY_SCOPE=0` — a bound was declined, so its absence is not a
     /// fault.
     OptedOut,
@@ -3020,9 +3038,31 @@ impl MemoryScopeOutcome {
     fn label(&self) -> &'static str {
         match self {
             Self::Entered => "entered",
+            Self::Inherited { .. } => "inherited",
             Self::OptedOut => "opted_out",
             Self::NotAttempted => "not_attempted",
             Self::Fallback(_) => "fallback",
+        }
+    }
+
+    /// Whether this process is actually capped. An inherited scope answers from
+    /// the cgroup rather than from the marker that put it on this path.
+    fn bounded(&self) -> bool {
+        match self {
+            Self::Entered => true,
+            Self::Inherited { bounded, .. } => *bounded,
+            _ => false,
+        }
+    }
+
+    /// The scope this process is in, when it did not create it. Named because
+    /// the unit carries the pid of whoever DID create it, which is how "the
+    /// scope name does not match my pid" reads as inheritance rather than as
+    /// the mystery it was.
+    fn inherited_unit(&self) -> Option<&str> {
+        match self {
+            Self::Inherited { unit, .. } => Some(unit.as_str()),
+            _ => None,
         }
     }
 
@@ -3031,6 +3071,40 @@ impl MemoryScopeOutcome {
             Self::Fallback(reason) => Some(reason.as_str()),
             _ => None,
         }
+    }
+}
+
+/// Read the cgroup this process is in and whether it carries a real memory
+/// bound. ⛔ A `memory.high` of `max` is a cgroup with no bound, which is
+/// exactly what an environment marker carried past its process would land in.
+#[cfg(target_os = "linux")]
+fn current_cgroup_memory_bound() -> (String, bool) {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.rsplit_once(':').map(|(_, path)| path.to_string()))
+        })
+        .unwrap_or_default();
+    let unit = cgroup
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let high = std::fs::read_to_string(format!("/sys/fs/cgroup{cgroup}/memory.high")).ok();
+    (unit, cgroup_memory_high_is_a_bound(high.as_deref()))
+}
+
+/// Whether a `memory.high` reading is an actual ceiling.
+///
+/// ⛔ `max` is the kernel's word for NO limit, and it is what an unbounded
+/// cgroup returns — so a reader that only checks "did the file exist and parse"
+/// calls the login scope bounded. Unreadable is also not bounded: a missing file
+/// means the question could not be answered, and BLIND IS NOT BOUNDED.
+fn cgroup_memory_high_is_a_bound(reading: Option<&str>) -> bool {
+    match reading.map(str::trim) {
+        None | Some("") | Some("max") => false,
+        Some(value) => value.parse::<u64>().is_ok_and(|bytes| bytes > 0),
     }
 }
 
@@ -3127,8 +3201,22 @@ fn enter_memory_scope_if_requested() -> MemoryScopeOutcome {
         return MemoryScopeOutcome::OptedOut;
     }
     // Idempotent: the child we exec carries this, so it never re-enters.
+    //
+    // ⛔ BUT THE MARKER IS NOT PROOF OF A BOUND — it only proves that SOMETHING
+    // upstream entered a scope. A GUI relaunched by a running GUI inherits the
+    // marker and the cgroup together and lands here without running
+    // `systemd-run` once; anything that carries the environment further than the
+    // process would land here with no bound at all. So the answer comes from the
+    // cgroup, and the outcome says which of the two happened.
     if std::env::var_os(ENV_YGGTERM_MEMORY_SCOPE_ACTIVE).is_some() {
-        return MemoryScopeOutcome::Entered;
+        let (unit, bounded) = current_cgroup_memory_bound();
+        if !bounded {
+            eprintln!(
+                "yggterm: the memory-scope marker is set but this process is in an unbounded \
+                 cgroup ({unit}); running unbounded"
+            );
+        }
+        return MemoryScopeOutcome::Inherited { unit, bounded };
     }
     let Ok(exe) = std::env::current_exe() else {
         return MemoryScopeOutcome::Fallback(String::from(
@@ -4247,6 +4335,32 @@ mod tests {
             "an unknown machine still must not put a media page in permanent \
              pressure: {unknown:?}"
         );
+    }
+
+    /// ⛔ AN INHERITED MARKER IS NOT AN INHERITED BOUND.
+    ///
+    /// `server app update restart` relaunches the GUI from inside the running
+    /// GUI, so the successor inherits `…_SCOPE_ACTIVE` and reports itself
+    /// bounded without running `systemd-run`. Caught live on the desktop host
+    /// 2026-08-14: the trace said `entered` / `bounded: true` while the process
+    /// sat in `yggterm-gui-<the dead pid>.scope`. The bound was real THAT time
+    /// because the cgroup came with the fork — but the marker travels by
+    /// environment and the bound travels by cgroup, and the reading below is the
+    /// only one of the two that can tell them apart.
+    #[test]
+    fn a_cgroup_is_bounded_only_when_memory_high_names_a_ceiling() {
+        assert!(super::cgroup_memory_high_is_a_bound(Some("3959422976")));
+        assert!(super::cgroup_memory_high_is_a_bound(Some("3959422976\n")));
+        // The kernel's word for "no limit" — the login scope's own answer, and
+        // the reading that must never be mistaken for a cap.
+        assert!(!super::cgroup_memory_high_is_a_bound(Some("max")));
+        assert!(!super::cgroup_memory_high_is_a_bound(Some("max\n")));
+        // BLIND IS NOT BOUNDED: no cgroup file is an unanswered question.
+        assert!(!super::cgroup_memory_high_is_a_bound(None));
+        assert!(!super::cgroup_memory_high_is_a_bound(Some("")));
+        // A zero ceiling is not a working bound either, and neither is garbage.
+        assert!(!super::cgroup_memory_high_is_a_bound(Some("0")));
+        assert!(!super::cgroup_memory_high_is_a_bound(Some("unlimited")));
     }
 
     /// ⛔ THE SCOPE THROTTLES, IT NEVER KILLS.
