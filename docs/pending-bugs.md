@@ -461,15 +461,52 @@ floor from inside the request path. Both are right, and this reconciles them:
 
 ⇒ **A daemon nobody can reach costs nothing at all**, so the floor is not a
 property of *being a daemon*; it is paid by daemons that are reachable while
-holding a row inventory. ⇒ **The current daemons are the cheap ones**, despite
-owning the most: the expensive population is idle-but-burning, not busy.
+holding a row inventory.
+
+⛔⛔ **AND I WITHDRAW MY OWN NEXT SENTENCE, WHICH READ "the current daemons are
+the cheap ones".** Corrected 2026-08-14 against two independent quiet runs (6.9,
+`3cb42114`): **per daemon the groups are indistinguishable — legacy 0.189/0.239,
+current 0.201/0.227, a ratio of 0.94–1.05x.** My table above is TOTALS, and
+reading a per-daemon conclusion out of a total is the arithmetic error the
+column headings invite. My single window happened to catch the current pair low,
+one of them at 0.077 while it was still starting up.
+
+⇒ **What is actually true: the legacy population costs more because there are
+FOURTEEN of them.** The model that survives is
+
+    daemon population cost  ≈  N_reachable × floor(~0.2 cores)
+
+and every other measurement fits it without strain — an unpolled daemon at
+0.00017 cores, the unreachable daemons here at 0.000, the request path under 1%,
+and the failure of any lane to find a per-request signal, because **the floor is
+not spent per request.**
+
+⚠ **The honest limit, carried rather than dropped:** n=2 on the current side and
+its per-daemon range (0.116–0.285) overlaps legacy's entirely, so
+*indistinguishable* means **no detectable difference**, not *identical*. The
+population conclusion does not rest on that comparison — it rests on the count,
+14 vs 2, which is not in doubt.
+
+⭐ **The part of my measurement that stands, because it changed the unit of
+account:** the legacy subtrees are IDLE while the current pair's carry 2.3 cores
+of real work. Every arm before this measured the daemon; none measured what the
+daemon was FOR, and a cost model that never looks at the work being served cannot
+tell *expensive because busy* from *expensive because numerous*.
 
 ⛔ **THIS CORRECTS "THE DRAIN MOVES WORK, IT DOES NOT REMOVE IT."** For the
 legacy population the work is not session work — nothing they own is asking for
 it — so draining them **reclaims** it rather than relocating it. The earlier
 warning stands only for the sessions themselves.
 
-⚠ **The mechanism is NOT established and I am not guessing it.** 6.7's
+⭐⭐ **S1'S −2.60 CORES IS THEREFORE VINDICATED BY A ROUTE SHARING NOTHING WITH
+ITS DERIVATION, AND IT NOW HAS A MECHANISM RATHER THAN A CORRELATION:** 14 legacy
+daemons × ~0.19–0.24 cores = **2.64–3.35 cores, genuinely reclaimable**, because
+nobody is being served by them. ⛔ The claim to make is NOT "reclaim leaked
+cores" — there is still no leak — but **"stop paying a reachability floor
+fourteen times over for daemons whose sessions are idle."**
+
+⚠ **The MODEL is settled; the CODE PATH is not, and I am not guessing it.**
+Knowing the floor is paid for reachability does not say what spends it. 6.7's
 per-connection figure (150–230 µs) is three orders of magnitude too small to
 reach 0.2 cores at any poll rate I can justify, and *what sets the poll rate* is
 already an open question in the 6.9 lane. Two facts constrain whoever takes it:
