@@ -1123,6 +1123,14 @@ daemon retries forever at 0.8/s for one `remote-cc` session, but it is not this.
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
+⛔ **HARVEST ATTEMPTED IN THE 3.0.154 WINDOW — NOT TAKEN.** The verb itself is
+unreachable from the CLI on dev: `server terminal restart` fails with *"local
+yggterm daemon did not become reachable"* — and so does `server terminal restart
+--help`, before it parses anything — while `server daemons` and `server status`
+answer normally from the same binary against the same running daemons. ⇒ The
+proof is blocked on a second defect in the verb's own reachability, not on the
+fix. **That blocker is now the thing to fix first**, and it is not this entry.
+
 *Found by using the remedy above and watching it fail, 2026-08-13.*
 
 `input-check` diagnoses a wedge and recommends
@@ -3398,6 +3406,12 @@ nothing and removes the false belief that caused this entry.
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
+⛔ **HARVEST ATTEMPTED IN THE 3.0.154 WINDOW — NOT TAKEN, AND DELIBERATELY SO.**
+The observation needs a web process born from the new build, which means
+relaunching the GUI. The running GUI holds the owner's **unsent half-typed
+draft**, and restarting it would destroy that. ⇒ Owed until the GUI is next
+restarted for a reason of its own; do not schedule a restart to collect it.
+
 *Found by reading the consumer of the policy the entry above configures, 2026-08-13.*
 
 The entry above shows the memory bound is too weak to fire. On one path it was
@@ -3455,6 +3469,16 @@ introduces, and it is the half that a source scan cannot settle.
 ## ⛔ [6.7] A DEAD PTY'S WRITER THREAD — FIXED IN CODE, LIVE PROOF OWED
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
+
+⛔ **HARVEST ATTEMPTED IN THE 3.0.154 WINDOW — NOT TAKEN, BECAUSE THE CONTROL
+ALSO PASSED.** Counting `pty-writer-*` against `pty-reader-*` in
+`/proc/<pid>/task/*/comm` on six live daemons: 3.0.154 gave 2 = 2, and so did
+every **pre-fix** control — 3.0.153 (10 = 10), 3.0.62, 3.0.52, 2.12.24 and
+2.12.14, at 100-450 h uptime. ⚠ **A favourable reading against a negative
+control that also passes supports nothing**: the leak is simply not reproducing
+on this host, so the run cannot separate "the fix works" from "there was nothing
+to see". The original defect was measured as 22 writers against 19 readers on
+the GUI host ⇒ **take this proof there, on a daemon with real session churn.**
 
 *Falsified by: a daemon that has served and closed sessions for hours showing
 `pty-writer-*` and `pty-reader-*` thread counts that disagree. They are created
@@ -3587,6 +3611,17 @@ one.
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
+⛔ **HARVEST ATTEMPTED IN THE 3.0.154 WINDOW — NOT TAKEN, AND THE FIRST READING
+WAS CONTAMINATED.** A corpus-wide count of `live_session_persist_dropped`
+returned 2 events over 2 distinct keys, which looks exactly like the fixed
+behaviour. **It is not a daemon.** Every one of those events came from pid
+3516098, a **`cargo test` binary** writing into the same `~/.yggterm` trace
+directory — its sibling events carry fixture paths like `wedge-signal-probe`.
+Live daemons emitted **none**, so the measurement is vacuous: with no
+unrecoverable session on the host, a fixed and a broken daemon both print zero.
+⇒ Needs a daemon that actually holds an unrecoverable key. See the field guide
+on the shared trace directory.
+
 *Falsified by: `grep -c live_session_persist_dropped` on a fresh daemon's
 `event-trace.jsonl` after an hour at rest. It must equal the number of DISTINCT
 unrecoverable keys, not grow with time.*
@@ -3670,6 +3705,12 @@ tied to a condition that no longer exists.
 ## ⛔ [6.7] AN UNCORKED AUDIO STREAM HELD FOREVER — FIXED IN CODE, LIVE PROOF OWED
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
+
+⛔ **HARVEST ATTEMPTED IN THE 3.0.154 WINDOW — NOT TAKEN.** Same constraint as
+the jar-less web context above: it needs the GUI running the new build, and the
+running GUI holds the owner's unsent draft. The entry's own warning still
+stands and now names the release: the deployed **binary** is 3.0.154, but the
+**running GUI process** is not.
 
 *Falsified by: with no notification playing and the GUI idle past the awake
 window, `pactl list sink-inputs` must show no uncorked yggterm stream and the
