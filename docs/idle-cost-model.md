@@ -373,18 +373,58 @@ a live GUI attached to it. Both arms measured over the same 60 s:
 status polls.** The load is not the GUI's and not the clients'. It appears only
 when there is a *population*, which means the daemons are polling each other.
 
-**The arithmetic closes on that reading and on no other.** If each of N daemons
-sweeps its N−1 peers every T seconds, each daemon receives (N−1)/T:
+If each of N daemons swept its N−1 peers every T seconds, each daemon would
+receive (N−1)/T, and the fleet numbers fit that: 4.0/s at N=15 ⇒ T = 3.5 s,
+predicting 60/s against 51–56/s measured. The independently observed burst
+period is **3.24 s** (19 bursts in 60 s, median 121 requests over 14 *distinct*
+daemons) — the same T, arrived at without assuming it.
 
-    measured 4.0/s at N=15  =>  T = 14 / 4.0 = 3.5 s
-    predicted fleet total    =  N(N-1)/T = 15 x 14 / 3.5 = 60/s   (measured 51-56/s)
-    predicted at N=1         =  0                                  (measured 0.00)
+### ⛔⛔ RETRACTED: "the cost is quadratic in N". THE CONTROL WAS CONFOUNDED AND THE CAUSAL ARM DID NOT REPRODUCE IT
 
-The independently observed burst period is **3.24 s** (19 bursts in 60 s, median
-121 requests landing on 14 *distinct* daemons per burst) — the same T, arrived at
-without assuming it.
+**This section first claimed the cost goes as N(N−1). That claim is withdrawn.**
+Two failures, both mine, found by continuing to test my own result:
 
-⇒ **THE COST IS QUADRATIC IN THE DAEMON POPULATION, NOT LINEAR.**
+1. ⛔ **The N=1 arm above is CONFOUNDED.** That installation has
+   **`OWNED=0, PRESV=0, ROWS=0`** as well as N=1. "No peers" and "nothing to poll
+   about" are not separated by it, so its 0.00/s supports the quadratic reading
+   no better than it supports a session-driven or reference-driven one.
+2. ⛔ **A deliberate causal arm failed to reproduce the scaling.** Daemons of five
+   distinct versions were started in an **isolated home with zero sessions**,
+   varying only N:
+
+   | N | sessions | status/s | N(N−1)/3.5 predicts |
+   |---|---|---|---|
+   | 1 | 0 | **0.00** | 0 |
+   | 2 | 0 | **0.17** | 0.57 |
+
+   Peer polling is **real but small**: two daemons with nothing to do poll each
+   other at 0.085/s each, against the fleet's **3.9/s — 46x higher**. Scaling
+   N=2 → N=15 by N(N−1) predicts 17.9/s; the fleet measures 51–56/s.
+   ⚠ **N could not be pushed past 2:** a daemon owning no sessions retires, which
+   is precisely why the fleet's legacy daemons persist — their sessions block it.
+   Adding sessions to raise N would have reintroduced the confound the arm
+   existed to remove.
+
+⇒ **What the poll rate scales with is NOT ESTABLISHED.** It is not bare N (arm),
+not the receiving daemon's own sessions or rows (flat across OWNED 1–9, ROWS
+70–261), not the sender's preserved-owner count (outbound churn is flat across
+PRESV 0–29, and the daemon with **zero** preserved owners has among the highest),
+and not client count (this host carries **3** client processes and **1** GUI,
+which has its own home). The remaining candidate — untested — is the **density of
+cross-daemon references**: preserved owners and rows whose runtime lives on
+another daemon. That grows with the population *and* with accumulated state,
+which would explain the arm reading ~zero while the fleet reads 3.9/s.
+
+⭐ **WHAT SURVIVES, AND IT IS THE PART THE SPECS REST ON.** Every claim in §6d–§6e
+is about **cost per poll at an observed poll rate**, and none of it depends on
+knowing who polls or how the count scales:
+
+- `status` is 70% of requests at 51–56/s fleet-wide — a measured count.
+- Every daemon receives 3.4–4.2/s — a measured count.
+- `fn status(&self)` rebuilds the whole row inventory per call — read from source.
+
+⇒ **§S5 is unaffected** (it cuts the cost of each poll). **§S1 keeps its original
+linear justification and loses the revision this section briefly gave it.**
 
 ### 6c. It is not demand-driven — a null control says so
 
@@ -532,27 +572,23 @@ requester's advertised version; do not let absence mean zero.**
 can be migrated, and make the retirement path converge without a quiet window
 (the settle-window mechanism is already production-proven for exactly this).
 
-⭐ **REVISED BY §6 — the saving is QUADRATIC, and the old estimate understated
-it.** The joint model extrapolated linearly to ~0.86 cores. But peer polls go as
-N(N−1)/T, so draining does not remove a per-daemon floor N times — it removes the
-*population* term outright:
+⛔⛔ **A "REVISED BY §6, THE SAVING IS QUADRATIC" CLAIM STOOD HERE AND IS
+WITHDRAWN.** It gave a table showing 15→8 daemons banking −73% and 15→4 banking
+−94%, on the strength of `polls = N(N−1)/T`. **§6b now retracts that scaling** —
+its N=1 control was confounded and a deliberate causal arm did not reproduce it.
+⇒ **S1 stands on its ORIGINAL linear estimate (−2.60 cores) and on the two
+independent arguments below.** ⚠ **Do not plan a drain around an early-payoff
+curve**: nothing measured supports "most of the win arrives on the first few
+retirements", and stopping a drain early on that belief would bank less than
+expected.
 
-| daemons | peer polls/s (N(N−1)/3.5) | vs today |
-|---|---|---|
-| 15 | 60 | — |
-| 8 | 16 | −73% |
-| 4 | 3.4 | −94% |
-| **1** | **0** | **−100%** |
-
-⇒ Halving the population does not halve this cost, it quarters it. And the N=1
-control in §6b measured **0.00 status/s with a GUI attached**, so the endpoint of
-the curve is observed, not extrapolated.
-**Expected effect:** unchanged headline (**−2.60 cores**), but the *shape* is
-now known: most of the win arrives early, on the first few retirements.
-**Falsifier:** drain to N and re-count `status`/s in the trace. If it does not
-track N(N−1)/3.5 within ~20%, §6b is wrong. ⭐ **Count the polls, not the
-cores** — a trace count is immune to the host contention that voided four of
-this session's CPU windows.
+**Expected effect:** 3.468 → ~0.86 cores on this host, **−2.60 cores (−75%)**.
+**Falsifier:** consolidate and re-run §1. If total daemon cores do not fall by
+≥2.0, the per-daemon floor is not per-daemon and §2 is wrong.
+⭐ **Prefer a falsifier denominated in COUNTS**: drain to N and re-count
+`status`/s in the trace alongside the cores. A trace count is immune to the host
+contention that voided four of this session's CPU windows, and it is the
+measurement that would settle §6b's open question at the same time.
 ⚠ **Owner boundary:** daemon lifecycle belongs to the hot-restart lane, not to
 6.7. This spec is the *justification* for that work, priced. It is not a licence
 to reap daemons holding other agents' live sessions.
