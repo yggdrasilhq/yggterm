@@ -148,6 +148,65 @@ class Sandbox:
 
 
 
+def reset_time_screens(booter_path, sb):
+    """The quota hold must use the reset time the CLI already gave us.
+
+    ⛔ The screen that matters most is the LAST one. The other three could all
+    pass while the change still made things worse, because the only way this
+    edit could hurt is by INVENTING A LONGER HOLD than the blind timer would
+    have taken. A dead fleet is the expensive direction; one refused probe boot
+    is not. So the ceiling is asserted separately from the parsing."""
+    code = r'''
+import importlib.util, sys, datetime, json
+spec = importlib.util.spec_from_file_location("bb", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+base = datetime.datetime.now().replace(hour=12, minute=0, second=0,
+                                       microsecond=0).timestamp()
+def hhmm(e):
+    return None if e is None else datetime.datetime.fromtimestamp(e).strftime("%H:%M")
+out = {}
+
+# 1. the real message this was written for — the reset is 20 minutes away
+out["parses_real_tail"] = hhmm(m.reset_time_from_tail(
+    "You've hit your session limit · resets 12:20pm (Asia/Kolkata)", base)) == "12:20"
+
+# 2. ⛔ A TAIL WHOSE RESET HAS ALREADY PASSED IS A STALE SCREEN, NOT A RESET
+#    TOMORROW. It must decline to answer so the blind timer decides.
+out["stale_tail_declines"] = m.reset_time_from_tail("resets 9am", base) is None
+
+# 3. no reset time in the message at all ⇒ decline, today's behaviour unchanged
+out["no_time_declines"] = m.reset_time_from_tail("try again later", base) is None
+
+# 4. ⛔⛔ THE CEILING. Across every shape, the hold may only ever be SHORTER
+#    than the blind timer would have made it.
+timer = base + m.RATE_LIMIT_HOLD_SECS
+worst = 0.0
+for tail in ["resets 12:20pm (Asia/Kolkata)", "resets 1:05pm", "resets 9am",
+             "resets 14:30", "resets 11:59pm", "try again later", "",
+             "resets 12:00pm", "resets 25:99", "resets 12:20pm (Not/AZone)"]:
+    r = m.reset_time_from_tail(tail, base)
+    until = timer if not r else max(base + 60, min(timer, r + m.RESET_GRACE_SECS))
+    worst = max(worst, until - timer)
+out["never_exceeds_timer"] = worst <= 0
+print(json.dumps(out))
+'''
+    env = dict(os.environ, HOME=str(sb.home))
+    r = subprocess.run([sys.executable, "-c", code, str(booter_path)],
+                       capture_output=True, text=True, timeout=90, env=env)
+    try:
+        got = json.loads((r.stdout or "").strip().splitlines()[-1])
+    except Exception:
+        got = {}
+    for k, label in (
+        ("parses_real_tail", "the quota hold READS the reset time the CLI gave it"),
+        ("stale_tail_declines", "⛔ a reset time already past reads as a STALE TAIL, not tomorrow"),
+        ("no_time_declines", "a message with no reset time falls back to the timer"),
+        ("never_exceeds_timer", "⛔⛔ a parsed reset may only SHORTEN the hold, never extend it"),
+    ):
+        check(label, got.get(k) is True,
+              f"got={got.get(k)!r} rc={r.returncode} {(r.stderr or r.stdout)[-200:]}")
+
+
 def choice_prompt_screens(booter_path, sb):
     """`_pty_type_and_enter` must refuse a row whose SCREEN shows a choice prompt.
 
@@ -325,6 +384,7 @@ def main():
               f"rc={r.returncode} {(r.stdout + r.stderr)[-200:]}")
 
         choice_prompt_screens(a.booter, sb)
+        reset_time_screens(a.booter, sb)
 
         sb.unreadable()
         r = sb.monitor("tick", "--dry-run")
