@@ -426,6 +426,51 @@ def check_generation_context_reads_every_agent_cli() -> None:
                 )
 
 
+def check_the_preview_excerpt_is_the_last_context_source() -> None:
+    """The scan's preview excerpt may not be the FIRST thing a summary is written from.
+
+    `remote_context` is the machine scan's one-line row preview, built from a
+    12-message tail. Measured on a live host it was **120 to 243 bytes** — the
+    opening sentence of the session's first message. It used to be returned
+    before the transcript was even considered, so remote rows were summarised
+    from one real sentence, and the model kept that sentence and invented an
+    objective, a result and a blocker to sit around it. That is the exact shape
+    the reported summaries had.
+
+    ⚠ It stays as a LAST resort on purpose — a row with no readable transcript
+    is better served by a thin hint than by nothing, and the generator's own
+    floor refuses anything too thin before it reaches a model.
+    """
+    text = read("crates/yggterm-shell/src/shell.rs")
+    if not text:
+        return
+    marker = "fn generation_context_for_target("
+    if marker not in text:
+        fail(
+            "crates/yggterm-shell/src/shell.rs: "
+            f"{marker!r} is gone — the rule that the transcript outranks the "
+            "preview excerpt is now unenforced. Re-point it, or delete it and "
+            "say where the invariant went."
+        )
+        return
+    body = text.split(marker, 1)[1].split("\nfn ", 1)[0]
+    if "fetch_remote_generation_context(" not in body:
+        fail(
+            "crates/yggterm-shell/src/shell.rs: could not capture the body of "
+            f"{marker!r} ({len(body)} bytes)"
+        )
+        return
+    first_excerpt = body.find("remote_context")
+    transcript = body.find("fetch_remote_generation_context(")
+    if first_excerpt < transcript:
+        fail(
+            "crates/yggterm-shell/src/shell.rs: generation_context_for_target "
+            "reads remote_context before it tries the transcript. That excerpt "
+            "is a 120-byte row preview; summarising from it is what produced "
+            "confident descriptions of projects that do not exist."
+        )
+
+
 def check_mirror_never_outranks_a_scan_on_the_summary() -> None:
     """The remote-metadata mirror may not overwrite a scanned summary.
 
@@ -573,6 +618,7 @@ def main() -> int:
     check_session_copy_policy_contract()
     check_generation_context_reads_every_agent_cli()
     check_mirror_never_outranks_a_scan_on_the_summary()
+    check_the_preview_excerpt_is_the_last_context_source()
     check_terminal_retained_replay_policy_contract()
     check_gui_binary_resolution_contract()
     if FAILURES:

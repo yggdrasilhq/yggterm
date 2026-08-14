@@ -24,6 +24,19 @@ This file tracks user-visible changes in `yggterm`.
   and `--clear` deletes them, after which they regenerate from the real
   transcript.
 
+- **A row on another machine is now summarised from the session, not from its
+  first sentence.** Summaries for those rows were written from the one-line
+  preview the machine list uses — measured at around 120 characters, the opening
+  of the session's first message. Asked for a paragraph about the objective, the
+  progress and the blocker with a single real sentence to go on, the model kept
+  that sentence and made up the rest, which is why the results read as
+  convincing rather than obviously wrong. The transcript is now read first, and
+  the preview is a last resort.
+
+- **When there is genuinely too little to summarise, there is now no summary.**
+  A description that is missing is honest; one that is invented answers the
+  question wrongly and gives no sign it is guessing.
+
 - **Removing a wrong summary now actually removes it.** A row's cached
   description had three homes, and deleting it from the one that generates it
   left the other two serving the old text — so a summary that was wrong stayed
