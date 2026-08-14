@@ -560,6 +560,7 @@ def row_process_absent(uuid):
 # could have made things worse.
 RESET_GRACE_SECS = 90          # clocks disagree; come back just after, not on the tick
 RESET_MAX_AHEAD_SECS = 6 * 3600  # further out than this is a misparse, not a reset
+RESET_PAST_WINDOW_SECS = 6 * 3600  # how far back a "already reset" claim stays credible
 
 
 def reset_time_from_tail(tail, now=None):
@@ -608,23 +609,135 @@ def reset_time_from_tail(tail, now=None):
     return epoch
 
 
+def tail_reset_has_passed(tail, now=None):
+    """True when the tail names a reset time that is already BEHIND us.
+
+    ⛔ Deliberately narrow. Only answers True for a time within the last
+    `RESET_PAST_WINDOW_SECS`, so a tail whose reset is far in the past — a row
+    parked overnight, a clock skewed by a day — falls through to the ordinary
+    path instead of silently disarming the fleet on a wild parse.
+    """
+    if not tail:
+        return False
+    now = now or time.time()
+    m = re.search(r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?"
+                  r"(?:\s*\(([^)]+)\))?", tail, re.I)
+    if not m:
+        return False
+    hour, minute, ampm, tzname = m.group(1), m.group(2), m.group(3), m.group(4)
+    hour, minute = int(hour), int(minute or 0)
+    if ampm:
+        ampm = ampm.replace(".", "").lower()
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return False
+    import datetime
+    tz = None
+    if tzname:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tzname.strip())
+        except Exception:
+            tz = None
+    now_dt = datetime.datetime.fromtimestamp(now, tz)
+    cand = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    delta = now - cand.timestamp()
+    return 0 < delta <= RESET_PAST_WINDOW_SECS
+
+
+def _evidence_marker(uuid):
+    """`(size, mtime)` of this row's transcript — *has it written anything since?*
+
+    ⛔ Returns None when it cannot be read, and **None must never be treated as
+    fresh evidence.** See `note_rate_limit`: an unreadable marker releases the
+    hold early, which costs one refused probe boot, whereas treating it as fresh
+    re-arms the fleet forever. Same asymmetry as everywhere else in this file.
+    """
+    import glob
+    for p in glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl")):
+        try:
+            st = os.stat(p)
+            return [st.st_size, int(st.st_mtime)]
+        except OSError:
+            continue
+    return None
+
+
 def note_rate_limit(uuid, tail):
     """A subscriber was refused on quota ⇒ hold the whole fleet.
 
-    Refreshing rather than accumulating: each fresh sighting pushes the window
-    out, so a long outage holds continuously without anyone tracking rounds."""
+    ⛔⛔ THE HOLD USED TO RE-ARM FROM THE ARTEFACT IT HAD ITSELF FROZEN, AND SO
+    COULD NEVER END. Reported and reproduced by a sibling campaign 2026-08-14.
+
+    A quota limit is detected by reading the row's transcript TAIL. A row parked
+    on the limit **stops writing**, so its tail keeps saying the same thing — and
+    every tick re-read that same frozen message, refreshed `last_seen`, and
+    pushed `until` out another 30 minutes. **The hold could not expire while rows
+    were parked, and the rows were parked because of the hold.** Measured live:
+    the feeding transcript had not changed size or mtime for 34 minutes while
+    `until` walked 70 minutes past a reset that had already happened.
+
+    ⚠ Deleting the state file does NOT fix it — the next tick re-arms from the
+    same stale tail. That was verified by the reporting campaign before filing.
+
+    ⇒ **A sighting may only extend the hold if the row has WRITTEN SOMETHING
+    since the sighting we already counted.** The tail is evidence about a moment;
+    re-reading it is not a new moment. This is the load-bearing half — parsing the
+    reset time out of the tail (above) helps only while the reset is still in the
+    future, and a stale tail parses to nothing and falls straight through to the
+    timer, which *is* the deadlock.
+
+    ⭐ Same class as the corpse-tail guard below it: **a stale artefact read as a
+    live signal.**
+    """
     prev = rate_limit_hold()
     now = time.time()
-    timer_until = now + RATE_LIMIT_HOLD_SECS
+    # ⛔⛔ A TAIL IS SELF-DATING, AND A RESET THAT HAS PASSED IS EVIDENCE THE
+    #    OUTAGE ENDED — not evidence to keep holding. If the message says it
+    #    resets at a time that is now behind us, and the row has written nothing
+    #    since, then the account is presumptively back and this row is merely
+    #    PARKED on an old message. Arming from it is how the fleet stayed held
+    #    70 minutes past a reset that had already happened.
+    # ⚠ Cheap to be wrong in this direction: we probe once, and a genuine refusal
+    #    writes a NEW message with a new marker, which arms a proper hold. The
+    #    opposite error has no exit at all.
+    if tail_reset_has_passed(tail, now):
+        log(f"{uuid[:8]} quota tail names a reset that has already passed — "
+            f"treating it as a PARKED row, not a live outage. Not arming.")
+        return prev
+    marker = _evidence_marker(uuid)
+    counted = dict((prev or {}).get("counted") or {})
+    # ⛔ `marker is not None` is required: an unreadable transcript is NOT new
+    #    evidence. Without that clause a row whose transcript cannot be found
+    #    would extend the hold on every single tick, which is the original bug
+    #    wearing a different hat.
+    is_new_evidence = marker is not None and counted.get(uuid) != marker
+    if prev and not is_new_evidence:
+        # Nothing has moved. Keep the existing deadline exactly as it was — do
+        # not extend, and do not shorten either; another row's live sighting may
+        # legitimately own this window.
+        until = prev.get("until", now + RATE_LIMIT_HOLD_SECS)
+        last_seen = prev.get("last_seen", now)
+    else:
+        timer_until = now + RATE_LIMIT_HOLD_SECS
+        reset_at = reset_time_from_tail(tail, now)
+        until = timer_until
+        if reset_at:
+            # ⛔ min(), never max() — see the note above. The timer is the ceiling.
+            until = max(now + 60, min(timer_until, reset_at + RESET_GRACE_SECS))
+        last_seen = now
+        if marker is not None:
+            counted[uuid] = marker
     reset_at = reset_time_from_tail(tail, now)
-    until = timer_until
-    if reset_at:
-        # ⛔ min(), never max() — see the note above. The timer is the ceiling.
-        until = max(now + 60, min(timer_until, reset_at + RESET_GRACE_SECS))
     rec = {
         "since": (prev or {}).get("since", now),
-        "last_seen": now,
+        "last_seen": last_seen,
         "until": until,
+        "counted": counted,
+        "stale_sighting": bool(prev and not is_new_evidence),
         # ⭐ Recorded so `status` can SAY why it will lift when it does. The
         # owner's complaint about the last outage was never the hold, it was
         # "I do not know how all the sessions recovered."

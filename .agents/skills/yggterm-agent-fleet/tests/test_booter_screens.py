@@ -188,6 +188,36 @@ for tail in ["resets 12:20pm (Asia/Kolkata)", "resets 1:05pm", "resets 9am",
     until = timer if not r else max(base + 60, min(timer, r + m.RESET_GRACE_SECS))
     worst = max(worst, until - timer)
 out["never_exceeds_timer"] = worst <= 0
+
+# 5. ⛔⛔ THE DEADLOCK. A parked row's tail never changes, so re-reading it must
+#    NOT push the deadline out. Without this the hold can never expire, because
+#    the rows are parked BECAUSE of the hold.
+import os, tempfile
+U = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+tp = os.path.expanduser("~/.claude/projects/p")
+os.makedirs(tp, exist_ok=True)
+tf = os.path.join(tp, U + ".jsonl")
+open(tf, "w").write('{"t":1}\n')
+FUTURE = "You've hit your session limit · resets 11:59pm"
+r1 = m.note_rate_limit(U, FUTURE)
+r2 = m.note_rate_limit(U, FUTURE)                 # same frozen tail, nothing written
+out["frozen_tail_does_not_extend"] = abs(r2["until"] - r1["until"]) < 0.01
+out["frozen_tail_is_flagged"] = r2.get("stale_sighting") is True
+open(tf, "a").write('{"t":2}\n')                  # the row actually wrote something
+os.utime(tf, None)
+r3 = m.note_rate_limit(U, FUTURE)
+out["real_outage_still_extends"] = r3["until"] > r2["until"]
+
+# 6. ⛔ A TAIL IS SELF-DATING. A reset already behind us is evidence the outage
+#    ENDED, so it must not arm a hold at all -- otherwise clearing the state file
+#    simply re-arms from the same stale message, which is what was measured.
+import datetime
+base = datetime.datetime.now().replace(hour=13, minute=30, second=0,
+                                       microsecond=0).timestamp()
+out["passed_reset_reads_as_parked"] = m.tail_reset_has_passed(
+    "You've hit your session limit · resets 12:20pm (Asia/Kolkata)", base) is True
+out["future_reset_is_a_real_outage"] = m.tail_reset_has_passed("resets 2:00pm", base) is False
+out["wild_past_parse_does_not_disarm"] = m.tail_reset_has_passed("resets 3:00am", base) is False
 print(json.dumps(out))
 '''
     env = dict(os.environ, HOME=str(sb.home))
@@ -202,6 +232,12 @@ print(json.dumps(out))
         ("stale_tail_declines", "⛔ a reset time already past reads as a STALE TAIL, not tomorrow"),
         ("no_time_declines", "a message with no reset time falls back to the timer"),
         ("never_exceeds_timer", "⛔⛔ a parsed reset may only SHORTEN the hold, never extend it"),
+        ("frozen_tail_does_not_extend", "⛔⛔ a FROZEN tail does not push the hold out — the deadlock"),
+        ("frozen_tail_is_flagged", "a stale sighting is recorded as one, not silently ignored"),
+        ("real_outage_still_extends", "a row that WROTE since the last sighting still extends the hold"),
+        ("passed_reset_reads_as_parked", "⛔ a reset already behind us reads as PARKED, and does not arm"),
+        ("future_reset_is_a_real_outage", "a reset still ahead is a real outage and does arm"),
+        ("wild_past_parse_does_not_disarm", "⛔ a reset far in the past does NOT disarm the fleet"),
     ):
         check(label, got.get(k) is True,
               f"got={got.get(k)!r} rc={r.returncode} {(r.stderr or r.stdout)[-200:]}")
