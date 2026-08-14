@@ -97,14 +97,33 @@ s1=0; for q in $pids; do v=$(awk "{print \$14+\$15}" /proc/$q/stat 2>/dev/null);
 t1=$(awk "/^cpu /{print \$2+\$3+\$4+\$5+\$6+\$7+\$8}" /proc/stat); sleep 8
 s2=0; for q in $pids; do v=$(awk "{print \$14+\$15}" /proc/$q/stat 2>/dev/null); s2=$((s2+${v:-0})); done
 t2=$(awk "/^cpu /{print \$2+\$3+\$4+\$5+\$6+\$7+\$8}" /proc/stat)
-echo "ygg_cores=$(echo "scale=2; ($s2-$s1)/(($t2-$t1)/$(nproc))" | bc)"
-ours=0
+# A process that EXITS between the two samples takes its ticks out of s2, so a
+# naive difference goes NEGATIVE and reports as a tiny or negative core count -
+# observed as "-.06 cores" while the family was busy. Clamp at zero: under-
+# reporting a rate is a missed alarm, but a negative one is a broken instrument
+# that quietly can never trip a threshold.
+echo "ygg_cores=$(echo "scale=2; d=($s2-$s1); if (d<0) d=0; d/(($t2-$t1)/$(nproc))" | bc)"
+# ⛔ du COUNTS AN UNREADABLE DIRECTORY AS ZERO, AND THAT IS THE FAILURE THIS
+# BLOCK EXISTS TO SURVIVE. The pattern below already matched the CLI staging
+# dirs; they were owned by root, `du` running as us could not descend into them,
+# and the total came back as a confident small number rather than an error.
+# Measured 2026-08-14: this reported 269 MB while the true figure was 1,323 MB,
+# of which ~1,079 MB was ours. The instrument named the right files and called
+# them empty, which is worse than not finding them.
+# ⇒ Prefer passwordless sudo. Where it is unavailable, COUNT what we cannot read
+# and let the caller report BLIND instead of a number.
+DU="du"; sudo -n true 2>/dev/null && DU="sudo -n du"
+ours=0; blind=0
 for m in $(awk "\$3==\"tmpfs\"{print \$2}" /proc/mounts | sort -u); do
   [ -d "$m" ] || continue
-  v=$(find "$m" -maxdepth 2 \( -name "ygg*" -o -name "*yggterm*" -o -name "codex-litellm-*" -o -name "claude-*" \) -print0 2>/dev/null | du -sm --files0-from=- 2>/dev/null | awk "{s+=\$1} END{print s+0}")
+  while IFS= read -r -d "" e; do
+    [ "$DU" = "du" ] && [ ! -r "$e" ] && blind=$((blind+1))
+  done < <(find "$m" -maxdepth 2 \( -name "ygg*" -o -name "*yggterm*" -o -name "codex-litellm-*" -o -name "claude-*" \) -print0 2>/dev/null)
+  v=$(find "$m" -maxdepth 2 \( -name "ygg*" -o -name "*yggterm*" -o -name "codex-litellm-*" -o -name "claude-*" \) -print0 2>/dev/null | $DU -sm --files0-from=- 2>/dev/null | awk "{s+=\$1} END{print s+0}")
   ours=$((ours+${v:-0}))
 done
 echo "tmpfs_ours_mb=$ours"
+echo "tmpfs_blind_entries=$blind"
 ' 2>/dev/null)"
 
 g() { sed -n "s/^$1=//p" <<<"$M" | head -1; }
@@ -118,6 +137,7 @@ SWAP=$(g swap_used_gb);   AVAIL=$(g mem_avail_gb)
 GUIC=$(g gui_committed_mb); WEBC=$(g web_committed_mb); HIGH=$(g gui_memory_high)
 PPT=$(g ppt_avg_w);       TCTL=$(g tctl_c)
 CORES=$(g ygg_cores);     TMPO=$(g tmpfs_ours_mb)
+TMPBLIND=$(g tmpfs_blind_entries)
 
 # 1 MEMORY
 gt "$SWAP" "$SWAP_USED_PANIC_GB"       && p "swap ${SWAP}GB used (> ${SWAP_USED_PANIC_GB}GB)"
@@ -131,6 +151,9 @@ gt "$TCTL" "$TCTL_PANIC_C"             && p "die temperature ${TCTL}C (> ${TCTL_
 gt "$CORES" "$YGG_CORES_PANIC"         && p "yggterm family ${CORES} cores (> ${YGG_CORES_PANIC})"
 # 3 SPACE
 gt "$TMPO" "$TMPFS_OURS_PANIC_MB"      && p "${TMPO}MB of ours on tmpfs (> ${TMPFS_OURS_PANIC_MB}MB) — that is RAM"
+# BLIND IS NOT CLEAR. An unreadable entry makes the figure above a FLOOR, not a
+# measurement, so say so rather than letting a small number read as safety.
+gt "$TMPBLIND" 0                       && p "${TMPBLIND} tmpfs entr(ies) of ours are UNREADABLE — ${TMPO}MB is a FLOOR, not a measurement (no passwordless sudo here)"
 
 SUMMARY="mem: swap ${SWAP}GB, avail ${AVAIL}GB, gui ${GUIC}MB, web ${WEBC}MB, cap ${HIGH} | cpu: ${CORES} cores, ${PPT}W, ${TCTL}C | space: ${TMPO}MB on tmpfs"
 
