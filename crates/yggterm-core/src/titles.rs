@@ -1,6 +1,6 @@
 use crate::{
     AppSettings, generation_context_from_messages,
-    transcript::read_codex_transcript_messages_tail_limited,
+    transcript::read_agent_transcript_messages_tail_limited,
 };
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
@@ -879,9 +879,17 @@ pub fn settings_ready(settings: &AppSettings) -> bool {
         && !settings.interface_llm_model.trim().is_empty()
 }
 
+/// The context every generated title, précis and summary is written from.
+///
+/// ⛔ It must go through the AGENT reader, never a per-CLI one. This function
+/// read Codex rollouts unconditionally until 2026-08-14, so for a Claude Code
+/// session it returned an empty string — silently, because a decoder that
+/// recognises none of a file's record types reports no error. Generation then
+/// fell through to whatever the terminal was showing, and the model wrote a
+/// confident timeline entry about a project that does not exist.
 fn extract_tail_context(path: &Path) -> Result<String> {
     Ok(generation_context_from_messages(
-        &read_codex_transcript_messages_tail_limited(path, 96)?,
+        &read_agent_transcript_messages_tail_limited(path, 96)?,
     ))
 }
 
@@ -1295,6 +1303,48 @@ mod tests {
         assert!(context.contains("USER: first prompt"));
         assert!(context.contains("ASSISTANT: first answer"));
         assert!(context.contains("USER: follow-up"));
+
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    /// The defect this lane was opened for, stated at the layer that caused it.
+    ///
+    /// Every generated title, précis and summary is written from
+    /// `extract_tail_context`. It read Codex rollouts unconditionally, and a
+    /// Claude Code transcript shares no record type with one, so it returned an
+    /// EMPTY string for every Claude Code session — no error, nothing in the
+    /// log, just a summariser with nothing to summarise. What reached the
+    /// sidebar was a fluent paragraph about a project that does not exist.
+    ///
+    /// ⚠ The assertion that matters is the CONTENT one. A test that only
+    /// checked "not empty" would pass on a context built from the wrong half of
+    /// the file, which is the same silent-wrong-answer wearing a green tick.
+    #[test]
+    fn extract_tail_context_reads_a_claude_code_transcript_not_only_codex() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "yggterm-titles-claude-code-{}-{}.jsonl",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::write(
+            &path,
+            [
+                r#"{"type":"user","timestamp":"2026-08-14T10:00:00.000Z","message":{"role":"user","content":"trace why the widget cache never invalidates on rename"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-08-14T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"The rename path writes the new key without evicting the old one."}]}}"#,
+            ]
+            .join("\n"),
+        )?;
+
+        let context = extract_tail_context(&path)?;
+        assert!(
+            context.contains("trace why the widget cache never invalidates on rename"),
+            "the session's own words must reach the generator: {context:?}"
+        );
+        assert!(
+            context.contains("The rename path writes the new key without evicting the old one."),
+            "the assistant half is context too: {context:?}"
+        );
 
         let _ = fs::remove_file(path);
         Ok(())
@@ -3043,6 +3093,17 @@ pub fn looks_like_low_signal_generated_copy(text: &str) -> bool {
         return true;
     }
     [
+        // ===== OUR OWN PROMPT, HANDED BACK =====
+        // A model with nothing to summarise sometimes answers with the request
+        // instead: these are the section headers `generation_context_from_messages`
+        // writes and the wording the summary prompt uses, so copy containing
+        // them is the generator talking about its instructions rather than
+        // about the session. Measured on the live store: several rows wore
+        // "RECENT SUBSTANTIVE TURNS." as their sidebar summary.
+        "recent substantive turns",
+        "primary user goals",
+        "dated timeline paragraph",
+        "dated timeline entry",
         "collaboration mode:",
         "filesystem sandboxing",
         "request_user_input",

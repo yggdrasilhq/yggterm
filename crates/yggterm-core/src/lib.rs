@@ -153,6 +153,7 @@ pub use transcript::{
     generation_context_from_messages, message_lines_from_payload,
     newest_transcript_writer, newest_transcript_writer_in_tail, read_agent_transcript_entries,
     read_agent_transcript_entries_tail_limited, read_agent_transcript_messages,
+    read_agent_transcript_messages_limited, read_agent_transcript_messages_tail_limited,
     read_claude_code_transcript_entries, read_claude_code_transcript_messages,
     read_codex_transcript_entries, read_codex_transcript_messages,
     read_codex_transcript_messages_limited, read_codex_transcript_messages_tail_limited,
