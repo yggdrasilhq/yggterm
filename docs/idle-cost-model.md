@@ -718,6 +718,26 @@ replication that took R² from 0.939 to 0.109 is what a spurious intercept looks
 like. ⛔ **§2a's ✅ "ANSWERED IN §6e — the floor is the cost of answering peer
 polls" is withdrawn.** Answering peer polls is 1.2% of it.
 
+⚠⚠ **READ THE SCOPE, BECAUSE THE HEADLINE IS EASY TO OVER-READ.** *"A lone
+daemon spends nothing"* is **not** *"daemons spend nothing"*. This daemon owns
+**zero sessions and zero preserved owners**, and that is where the difference
+with the live population lives:
+
+- The machine-wide corpus walk is **not** the difference — `daemon_background_
+  copy_chore_enabled()` reads an env var that is **unset by default**
+  (`daemon.rs:11354`), so it is off in this sandbox *and* off on the live
+  daemons alike.
+- What IS different is the part of the same chore that is **not** gated: the
+  per-owned-session halves — the CC title sync, the live/remote candidate
+  collection, the preserved-owner revalidation — which that function's own doc
+  says *"keep running regardless"*. A daemon owning nothing does none of it.
+
+⇒ **This control rules out an intrinsic per-DAEMON cost. It says nothing about
+per-SESSION cost, by construction** — and the live-population arm's finding
+(periodic chore threads carrying the bulk) sits exactly there. The two results
+agree rather than compete: the standing cost tracks what a daemon **owns**, not
+that it exists and not that it is polled.
+
 #### ⭐ And the control found the mechanism that keeps the population alive
 
 Every arm **retired itself after 75 s**, logging `daemon idle shutdown,
