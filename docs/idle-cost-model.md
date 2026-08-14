@@ -955,10 +955,59 @@ for a handler thread on a live daemon**. ⛔ **This is the strongest reason S5
 stays decided against:** the row inventory a fix would target is ~1.2 ms of a
 25 ms thread, and it is already the *best-measured* term in the model.
 
-**And it is not the request MIX either.** `snapshot` shows p50 **259.8 ms** in
-the daemons' own aggregate, which invites "the expensive handlers are the other
-verbs". On the sandbox, `snapshot` costs **3.67 ms against `status`'s 5.07 ms at
-1000 rows — it is CHEAPER.** So that 259.8 ms is not intrinsic to the verb.
+**And it is not the request MIX either — but this needed re-measuring and
+RESTATING.** `snapshot` shows p50 **259.8 ms** in the daemons' own aggregate,
+which invites "the expensive handlers are the other verbs".
+
+⛔ **The figures this was first argued from (snapshot 3.67 ms vs status 5.07 ms)
+came from my own documented defect** — process CPU delta divided by a request
+count with **no zero-request baseline** — and worse, the two verbs ran at
+different wall rates, so their windows had **different durations** (1.94 s vs
+1.28 s for 150 requests) and a constant background rate loads the longer window
+more. **That alone can invert an ordering.** Re-measured with the baseline
+subtracted, 264 rows, 0 sessions, arms interleaved and repeated:
+
+| verb | net ms CPU / request |
+|---|---|
+| `ping` | 1.80, 1.80 |
+| `status` | **2.33, 2.40** |
+| `snapshot` | **1.80, 1.93** |
+
+Background measured **0.00000 cores**, so the defect did not bite *here* — the
+ordering survives. ⭐ **But it survived by luck, not by method**, and a claim that
+rests on an ordering must not rest on the weaker of two instruments.
+
+⭐⭐ **THE SUBSTANTIVE FACT, which reframes the item rather than closing it:
+`snapshot`'s payload is PER-SESSION.** On a session-less daemon it returns
+**176 bytes** (`live_sessions: []`, `active_session: null`) against `status`'s
+**61,463 bytes** of row inventory. So `snapshot` is cheap when there are no
+sessions and expensive when there are — **the aggregate's 259.8 ms is a SESSION
+effect wearing a verb's name.** ⇒ Not "the verb is innocent" but "the verb is a
+per-session verb", which is the same conclusion §6j-7 reached from the other end.
+
+### ⭐ 6j-6a. A per-connection cost OUTSIDE the handler closure — and it revives S4
+
+Two lanes measured `ping` on comparable session-less sandboxes and disagree by
+**15x**: the in-process span around the handler closure reads **118–126 µs**,
+this process-level arm reads **1.80 ms**. ⛔ **Neither is wrong; they are
+different quantities.** The span covers the handler closure; the process counter
+covers *everything the daemon does per connection* — `accept`, thread create
+(2 MiB stack `mmap`), the outcome channel, thread teardown, poll wakeup.
+
+⇒ **~1.7 ms per connection is spent OUTSIDE the handler**, roughly **14x the
+handler's own cost for a request that does nothing.**
+
+⚠ **This contradicts S4's standing note that "thread spawn is ~50 µs, so a pool
+buys ~0.0002 cores".** That figure priced `clone()` alone. If the true
+per-connection non-handler cost is ~1.7 ms at ~4 connections/s per daemon, a pool
+addresses ~0.007 cores/daemon — still small, but **an order of magnitude more
+than the note claims, and the note should stop being quoted as a reason not to
+build it.** ⛔ **NOT yet a recommendation to build S4**: this is one arm on one
+host, the 1.7 ms is a difference between two instruments rather than a direct
+measurement of the gap, and **a difference of two measurements is exactly the
+shape this seat keeps getting wrong.** ⇒ the honest next step is an in-process
+span around the *accept-to-teardown* path, which is S6's instrument widened by
+one more frame.
 
 ⇒ **WHAT THE RESIDUAL TRACKS IS SESSIONS, NOT ROWS AND NOT THE VERB.** It is the
 one dimension the sandbox never reproduced: `snapshot` gathers terminal state per
