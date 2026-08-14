@@ -732,6 +732,109 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
+## ⛔⛔ [6.6] A LAUNCH INTO A CWD THAT EXISTS ONLY ELSEWHERE LEAVES A ROW THAT LOOKS HEALTHY FOREVER
+
+**Status:** OPEN
+
+*Found by seat 6.3, routed here 2026-08-14 because it is launch validation with
+no row-identity component. Source claims re-verified here before filing.*
+
+A LOCAL launch into a cwd that exists only on another host creates a keep-alive
+row that **never had a process**, and the row then reads as healthy indefinitely.
+
+### ⭐ 6.3's OWN RETRACTION IS THE LOAD-BEARING PART
+
+They first reported that the husk's `session_id` "stays the daemon runtime key
+rather than an agent conversation id", then **retracted it against source**. The
+retraction is right, and it is why this is launch validation and not identity:
+
+- the CC descriptor carries `id_assigned_at_birth: true`
+  (`crates/yggterm-core/src/agent_cli.rs:1412`);
+- the launch hands that id to the CLI — `claude --session-id <uuid>` fresh,
+  `--resume <uuid>` resumed — so **the row id IS the transcript id from birth**,
+  with no rebind poll.
+
+⇒ The transcript is absent because **nothing ever ran**, not because the id names
+another namespace.
+
+### ⛔ THE DETECTOR ALREADY EXISTS, IS CORRECTLY NAMED, AND IS SWALLOWED
+
+This is the half to fix. Because the id is born-identity,
+`local_cc_session_jsonl_path(&session.id)` returning `None` on a **live** CC row
+means the CLI wrote nothing. `daemon.rs` says so in as many words — the comment
+at `crates/yggterm-server/src/daemon.rs:10532` names exactly this case as a
+**"stuck launch hint"** — and the next statement is:
+
+```rust
+let Some(jsonl) = local_cc_session_jsonl_path(&session.id) else {
+    continue;
+};
+```
+
+inside a loop that only wanted a **title**. The condition is detected, named, and
+discarded, and the row goes on looking healthy.
+
+⇒ **Validating the cwd at launch would fix this instance and leave the swallow in
+place for every other way a launch can fail to start.** Fix both: refuse (or
+mark) a local launch into a cwd that does not exist here, AND give the
+already-named signal somewhere to go other than `continue`.
+
+⚠ Whoever takes the second half should check what else that loop's `continue`s
+hide — a title poll is a poor place for a health signal to live, and it is where
+this one ended up.
+
+## ⛔⛔ [6.6] REAL-KEY INPUT DELIVERS NOTHING ON THE GUI HOST, AND A RESTART WILL NOT FIX IT
+
+**Status:** OPEN
+
+*Measured by seat 3.6, relayed via 3.0 and 6.0. The build-age half was tested
+here 2026-08-14 and it REFUTES the leading hypothesis.*
+
+```
+web do type                       -> delivered:false, nothing lands
+web do fill --mechanism real-keys  -> delivered:false, nothing lands
+web do click                       -> delivered:true,  works
+```
+
+0/6 against two unrelated targets (a six-box OTP group, and a plain single input
+on a freshly reloaded page), so it is not a property of one component.
+
+**Ruled OUT by test — do not repeat these:** not `--selector-set` wedging the
+component (fresh nonce, pristine boxes, still 0/6); not activation
+(`server app open` first, still 0/6); not a missing lease (`web lease` returned
+`leased:true`, still 0/6).
+
+### ⛔ AND "IT IS PROBABLY A STALE BINARY" IS REFUTED — the code is unchanged
+
+The running GUI is build `5f76dcb0` (3.0.148, 2026-08-13 22:25) and `origin/main`
+is **224 commits ahead**, so the staleness is real. It is not the cause:
+
+- **No commit in those 224 touches `real_keys` or `real-keys` anywhere in
+  `crates/`.** The three files that implement the mechanism
+  (`app_control.rs`, `app_control_web_cli.rs`, `shell.rs`) are unchanged on that
+  string; `shell.rs` has 8 commits in the window but none of them touch it.
+
+⇒ **Relaunching that GUI would change nothing about this symptom.** The defect is
+live in current `main`. Diagnose it as code, not as an install.
+
+⚠ The staleness is still worth fixing on its own account, and it is already
+consolidated with the other GUI-gated items in `docs/owner-attention.md` as ONE
+relaunch. ⛔ Do not cycle that desktop to test this — it is the owner's, he holds
+an unsent draft on it, and this entry now says the restart would not answer the
+question anyway.
+
+### ⭐ WHY THIS OUTRANKS ONE BROKEN VERB
+
+`delivered:false` is the verb being HONEST, and that is luck rather than design.
+Every credential-injection path on that host routes through real keys, so any
+caller that reads `delivered` as advisory — or does not read it — types nothing
+into a payment field and reports success. There is a recorded instance of that
+exact shape elsewhere in the fleet, where a fill wrote a credential into a hidden
+decoy and its own length check passed.
+
+⇒ Whoever fixes the mechanism should also ask what would have happened had the
+verb lied, because the honest field is the only thing that made this visible.
+
 ## ⚠ [6.6] FOUR `server` VERBS STILL ANSWER FROM ONE BINARY ONLY, AND EACH NEEDS ITS OWN VERDICT
 
 **Status:** OPEN
