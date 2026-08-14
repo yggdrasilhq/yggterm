@@ -402,9 +402,24 @@ carried in process-global state outlives the launch it belonged to.** The
 durable fix is to pass the value as a request field the whole way down — which
 the generic (non-CC) lane already does, via `configured_override`.
 
-⚠ Until it is fixed, a red parallel run is not evidence of a regression on its
-own. Re-run the named test individually before believing it, and quote which
-way you ran it.
+### ⭐ UPDATE 2026-08-14 — THE HARNESS HALF IS MITIGATED, THE PRODUCT HALF IS NOT
+
+`codex_cli::env_test_guard()` (a single mutex over every env-touching test, with
+a source scan that fails the build if a *second* rival lock appears) now
+serialises the tests that were racing. Re-measured on the merged tree:
+**3 parallel runs, 1114 passed / 0 failed, all three** — where the same suite
+gave 2-of-4 red before.
+
+⛔ **That is a harness fix, and this entry is not about the harness.** The
+production pattern is untouched: a per-request value is still written into the
+**whole process's** environment and read back by the launch composer. The guard
+makes the tests stop *reporting* it; nothing stops a second request from
+overwriting the first request's value in a live daemon. ⇒ Keep OPEN. The durable
+fix remains passing the value as a request field the whole way down, which the
+generic (non-CC) lane now does via `configured_override`.
+
+⚠ A red parallel run is still not, by itself, evidence of a regression. Re-run
+the named test individually before believing it, and quote which way you ran it.
 
 ## ⛔⛔⛔ [6.3] A SUBTREE STOPS TRACKING ITS STATE FOREVER — THE BLANK RIGHT RAIL, ROOT-CAUSED
 
