@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **`--limit` on the trace commands was ignored, so every request returned the
+  same 200 lines.** Asking for 50 and asking for 2000 both gave 200, with no
+  error to say so, which left about **four seconds** of history to diagnose
+  from on a busy machine. The flag is now honoured on all four trace commands
+  and on both programs, and a value that is not a number is refused out loud
+  instead of quietly becoming 200. Asking for 5,000 lines now reaches back
+  **100 seconds** instead of 3.7.
+
 - **Three more commands now work from whichever program you type.** The
   command that shows what the restart gate is looking at, the one that declares
   a hand-off so a pending upgrade can land at a quiet moment, and the headless

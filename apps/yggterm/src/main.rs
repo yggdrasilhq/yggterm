@@ -68,6 +68,7 @@ use yggterm_server::{
     run_app_control_start_action, run_app_control_check_terminal_input, run_app_control_submit_terminal_prompt,
     run_app_control_trigger_update_check, run_attach, run_daemon,
     run_screenrecord_capture, run_screenshot_capture, run_screenshot_capture_with_post_process,
+    parse_trace_limit, parse_trace_poll_ms,
     run_trace_bundle, run_trace_follow, run_trace_tail, run_trace_transitions, shutdown, snapshot,
     start_local_session, status, terminal_history, terminal_resize, terminal_restart,
     terminal_retained_snapshot, terminal_snapshot, terminal_write, try_run_remote_server_command,
@@ -1744,21 +1745,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "tail" {
-        let lines = args
-            .get(3)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(200);
-        return run_trace_tail(lines);
+        return run_trace_tail(parse_trace_limit(&args, 200)?);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "follow" {
-        let lines = args
-            .get(3)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(200);
-        let poll_ms = args
-            .get(4)
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(500);
+        let lines = parse_trace_limit(&args, 200)?;
+        let poll_ms = parse_trace_poll_ms(&args, 500)?;
         return run_trace_follow(lines, poll_ms);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "transitions" {
@@ -1769,17 +1760,13 @@ fn main() -> Result<()> {
             .windows(2)
             .find_map(|window| (window[0] == "--last-ms").then(|| window[1].parse::<u64>().ok())?)
             .unwrap_or(180_000);
-        let limit = args
-            .windows(2)
-            .find_map(|window| (window[0] == "--limit").then(|| window[1].parse::<usize>().ok())?)
-            .unwrap_or(200);
+        // ONE owner for `--limit` across every `trace` verb. This one already
+        // worked; sharing the parser is what stops the four drifting apart again.
+        let limit = parse_trace_limit(&args, 200)?;
         return run_trace_transitions(session_filter.as_deref(), last_ms, limit);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "bundle" {
-        let lines = args
-            .get(3)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(200);
+        let lines = parse_trace_limit(&args, 200)?;
         let include_screenshot = args.iter().any(|value| value == "--screenshot");
         return run_trace_bundle(lines, include_screenshot);
     }
@@ -4731,6 +4718,118 @@ mod tests {
             body.contains("MemoryScopeOutcome::Fallback"),
             "every fall-through must RETURN its reason: an unbounded GUI that \
              does not say so is the defect this exists to prevent"
+        );
+    }
+
+    /// ⛔ BOTH BINARIES MUST ROUTE `trace` THROUGH THE ONE PARSER.
+    ///
+    /// The `--limit` defect survived because the dispatch was **duplicated**:
+    /// `yggterm` and `yggterm-headless` each carried their own copy, and
+    /// `yggterm-headless` is the one agents actually type. Fixing the GUI binary
+    /// alone would have left the bug exactly where it was being hit, and the
+    /// suite would have gone green over it. ⇒ What is locked here is not the
+    /// behaviour (the test below does that) but the **absence of a second
+    /// implementation to drift from**.
+    #[test]
+    fn both_binaries_route_every_trace_verb_through_one_limit_parser() {
+        for (binary, source) in [
+            ("yggterm", include_str!("main.rs")),
+            ("yggterm-headless", include_str!("bin/yggterm-headless.rs")),
+        ] {
+            let product = source
+                .split("mod tests {")
+                .next()
+                .expect("a product half above the tests");
+            assert!(
+                product.contains("parse_trace_limit(&args, 200)"),
+                "{binary} must ask the shared parser for its trace limit"
+            );
+            // The idiom that WAS the bug: a bare positional parse with a silent
+            // fallback, which reads `--limit` as a line count and returns 200.
+            assert!(
+                !product.contains(".and_then(|value| value.parse::<usize>().ok())\n            .unwrap_or(200)"),
+                "{binary} still parses a trace limit positionally with a silent \
+                 default — that idiom IS the defect: it reads the literal \
+                 \"--limit\" as a count, fails, and returns 200 for every request"
+            );
+        }
+    }
+
+    /// ⛔ `--limit N` MUST BE HONOURED, NOT MERELY ACCEPTED.
+    ///
+    /// The bug this locks was invisible precisely because nothing failed:
+    /// `server trace tail --limit 500` parsed the literal `"--limit"` as a line
+    /// count, failed, and silently fell back to 200. Asking for 50 and asking
+    /// for 2000 both returned 200. So the assertion that matters is not "does it
+    /// accept the flag" but **"does a different request produce a different
+    /// number"**.
+    #[test]
+    fn the_trace_limit_flag_changes_the_answer_and_a_bad_one_is_refused() {
+        let argv = |raw: &[&str]| raw.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // The exact invocation that used to be ignored, on all four verbs that
+        // share the parser.
+        for verb in ["tail", "follow", "bundle", "transitions"] {
+            let args = argv(&["server", "trace", verb, "--limit", "500"]);
+            assert_eq!(
+                super::parse_trace_limit(&args, 200).ok(),
+                Some(500),
+                "`server trace {verb} --limit 500` must ask for 500, not the default"
+            );
+        }
+
+        // Two different requests must not collapse to the same answer — the
+        // property that a silent default breaks.
+        let fifty = super::parse_trace_limit(&argv(&["server", "trace", "tail", "--limit", "50"]), 200);
+        let many = super::parse_trace_limit(&argv(&["server", "trace", "tail", "--limit", "2000"]), 200);
+        assert_ne!(
+            fifty.ok(),
+            many.ok(),
+            "asking for 50 and asking for 2000 returned the same count, which is \
+             the original defect exactly"
+        );
+
+        // The positional form still works, because it is what the verb took first.
+        assert_eq!(
+            super::parse_trace_limit(&argv(&["server", "trace", "tail", "750"]), 200).ok(),
+            Some(750)
+        );
+        // An unrelated flag is not a malformed count.
+        assert_eq!(
+            super::parse_trace_limit(&argv(&["server", "trace", "bundle", "--screenshot"]), 200).ok(),
+            Some(200)
+        );
+        // ⛔ Garbage must be REFUSED, never defaulted: a wrong count that looks
+        // like an answer is worse than an error.
+        assert!(
+            super::parse_trace_limit(&argv(&["server", "trace", "tail", "--limit", "lots"]), 200)
+                .is_err(),
+            "an unparseable --limit must fail loudly rather than silently return the default"
+        );
+        assert!(
+            super::parse_trace_limit(&argv(&["server", "trace", "tail", "--limit"]), 200).is_err(),
+            "`--limit` with no value must fail rather than fall through"
+        );
+
+        // ⛔ And the poll interval must not swallow the limit's value:
+        // `follow --limit 500` polled every 500 ms under the old positional read.
+        assert_eq!(
+            super::parse_trace_poll_ms(&argv(&["server", "trace", "follow", "--limit", "500"]), 500)
+                .ok(),
+            Some(500),
+            "the default, NOT the limit's value read as a poll interval"
+        );
+        assert_eq!(
+            super::parse_trace_poll_ms(&argv(&["server", "trace", "follow", "--limit", "50"]), 500)
+                .ok(),
+            Some(500),
+            "with a limit of 50 the poll interval must stay 500ms, not become 50ms"
+        );
+        assert_eq!(
+            super::parse_trace_poll_ms(&argv(&["server", "trace", "follow", "100", "250"]), 500)
+                .ok(),
+            Some(250),
+            "the positional pair still works when neither argument is a flag"
         );
     }
 

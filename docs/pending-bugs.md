@@ -819,34 +819,6 @@ process is still alive afterwards the `(deleted)` arm did not fire.
 **Falsifier for 2:** if a second `app launch` against a healthy GUI still yields two
 GUIs, the guard is not on the path both binaries take.
 
-## ⛔⛔ [6.7] `server trace tail --limit N` IGNORES N — THE DIAGNOSTIC WINDOW IS ~14 SECONDS
-
-**Status:** OPEN
-
-*measured 2026-08-14 on the desktop host*
-
-```
-requested=50   returned=200
-requested=200  returned=200
-requested=500  returned=200
-requested=2000 returned=200
-```
-
-⇒ **`--limit` is ignored, not capped** — requesting *fewer* than 200 also returns
-200, which is what distinguishes the two. On a busy host those 200 events spanned
-**14 seconds** (oldest 11:04:05, newest 11:04:19).
-
-⭐ **The data is NOT lost — only the verb is blind.** `~/.yggterm/event-trace.*.jsonl`
-held 17 files totalling 19 MB, and the running GUI's own startup event was recovered
-from them after `trace tail` could no longer see it. So the fix is to serve the
-requested limit from the on-disk journal, and it is cheap.
-
-⚠ **This compounds with the entry below**, which floods the same ring.
-
-⛔ **An absence produced by retention supports nothing.** Any reasoning of the form
-"the trace shows no such event" taken through `trace tail` on a busy host is
-worthless over a horizon longer than a few seconds.
-
 ## ⛔ [6.7] THE PRESENTATION-POLICY TRACE EVENT IS EMITTED BY EVERY CLI INVOCATION
 
 **Status:** OPEN
