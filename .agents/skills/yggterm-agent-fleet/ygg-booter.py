@@ -514,6 +514,121 @@ def rate_limit_hold():
     return d
 
 
+def parse_until(spec, now):
+    """`5d` / `36h` / `90m`, or an absolute local `YYYY-MM-DDTHH:MM`. -> epoch.
+
+    ⭐ **RESOLVED TO AN ABSOLUTE INSTANT ONCE, HERE**, per the owner's standing
+    design note: *a relative delay decays, an absolute one is idempotent.* A
+    duration is a convenience at the keyboard; what gets STORED is the moment, so
+    re-running the same command does not walk the deadline forward, and a hold
+    survives a watcher restart without gaining time.
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        raise ValueError("empty --until")
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([dhm])", spec, re.I)
+    if m:
+        n, unit = float(m.group(1)), m.group(2).lower()
+        return now + n * {"d": 86400, "h": 3600, "m": 60}[unit]
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return time.mktime(time.strptime(spec, fmt))
+        except ValueError:
+            pass
+    raise ValueError(f"cannot read --until {spec!r}: use 5d / 36h / 90m or 2026-08-19T09:00")
+
+
+def cmd_hold(args):
+    """Declare a fleet-wide boot hold BEFORE anything gets banged.
+
+    ⛔⛔ WHY THIS EXISTS AND WHY THE REACTIVE PATH IS NOT ENOUGH. `note_rate_limit`
+    arms a hold by reading a row's transcript tail — which means **a row has to be
+    booted and refused first**. That is fine for a session limit nobody saw
+    coming; it is exactly the wrong shape for a limit the OWNER KNOWS IS ABOUT TO
+    BE HIT. Waiting for the detector costs one wasted wake per subscriber, on an
+    account with nothing left to spend, and each of those wakes is the "banging"
+    this verb removes.
+
+    ⭐ It writes the SAME file the reactive path uses, so the suppression is the
+    one already proven in `tick` — one hold mechanism, not two. What it adds is
+    `declared_until`, a FLOOR that a later tail sighting may raise and never
+    lower (see `note_rate_limit`), because a session-limit tail would otherwise
+    shorten a week-long hold to thirty minutes.
+
+    ⚠ `counted` is written empty and that is deliberate: `rate_limit_hold()`
+    discards any record lacking the key as pre-fix code, and a declared hold has
+    no per-row evidence to carry.
+
+    ⭐ IT ENDS BY ITSELF. `rate_limit_hold()` unlinks the file the moment `until`
+    passes, so the next tick boots normally — and because every subscriber has
+    been idle throughout, they are all past their boot window and go on the FIRST
+    tick after expiry. That is the intended behaviour, not a side effect: sit out
+    the outage, then wake everyone promptly.
+    """
+    now = time.time()
+    cur = rate_limit_hold()
+    if args.clear:
+        if not cur:
+            log("no hold in force — nothing to clear")
+            return 0
+        RLHOLDFILE.unlink(missing_ok=True)
+        log(f"⭐ hold CLEARED (was {(cur['until'] - now) / 3600:.1f}h remaining). "
+            f"Boots resume on the next tick.")
+        return 0
+    if not args.until:
+        if not cur:
+            log("no hold in force — the booter is free to wake stalled rows")
+            return 0
+        left = (cur["until"] - now) / 3600
+        kind = "DECLARED" if cur.get("declared_until") else "detected from a tail"
+        log(f"⏸ hold in force: {left:.1f}h left, until "
+            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(cur['until']))} ({kind})")
+        if cur.get("declared_reason"):
+            log(f"   reason: {cur['declared_reason']}")
+        return 0
+    until = parse_until(args.until, now)
+    if until <= now:
+        log(f"⛔ refusing: {args.until} is in the past. A hold that has already "
+            f"expired is not a hold, and writing one would read as protection.")
+        return 2
+    # ⛔ Never SHORTEN an existing hold by accident — say so and keep the longer.
+    if cur and cur.get("until", 0) > until:
+        log(f"⚠ an existing hold runs longer "
+            f"({(cur['until'] - now) / 3600:.1f}h vs {(until - now) / 3600:.1f}h) — keeping it. "
+            f"Use `hold --clear` first if you really mean to shorten it.")
+        until = cur["until"]
+    rec = {
+        "since": (cur or {}).get("since", now),
+        "last_seen": now,
+        "until": until,
+        "counted": dict((cur or {}).get("counted") or {}),
+        "declared_until": until,
+        "declared_reason": args.reason or args.note or "declared by hand",
+        "declared_by": args.decided_by or this_host(),
+        "stale_sighting": False,
+        "reset_at": None,
+        "released_by": "declared-deadline",
+        "seen_on": None,
+        "tail": None,
+    }
+    RLHOLDFILE.parent.mkdir(parents=True, exist_ok=True)
+    RLHOLDFILE.write_text(json.dumps(rec, indent=1))
+    # ⛔ READ IT BACK. Every verb in this fleet reports the REQUEST, not the
+    #    effect, and a hold nobody can prove is in force is worth nothing.
+    back = rate_limit_hold()
+    if not back or abs((back.get("until") or 0) - until) > 1:
+        log("⛔ hold did NOT read back — the fleet is still free to boot.")
+        return 1
+    subs = load_subs()
+    log(f"⏸ FLEET HOLD ARMED until "
+        f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(until))} "
+        f"({(until - now) / 3600:.1f}h) — {len(subs)} subscriber(s) will not be booted.")
+    log(f"   reason: {rec['declared_reason']}")
+    log("   ⭐ it releases itself at that instant; the next tick then wakes every")
+    log("      row that is past its window, which is all of them by definition.")
+    return 0
+
+
 def row_process_absent(uuid):
     """True only when NOTHING is running as this row. ⛔ Biased toward "alive".
 
@@ -761,11 +876,26 @@ def note_rate_limit(uuid, tail):
         if marker is not None:
             counted[uuid] = marker
     reset_at = reset_time_from_tail(tail, now)
+    # ⛔⛔ A DECLARED HOLD IS A FLOOR THE REACTIVE PATH MAY RAISE AND NEVER LOWER.
+    #    Everything above computes a window for a SESSION limit — at most
+    #    RATE_LIMIT_HOLD_SECS, i.e. half an hour. A weekly limit is declared by
+    #    hand and runs for days, and without this clause the first tail sighting
+    #    during that window would overwrite `until` with `now + 1800` and the
+    #    fleet would start banging again inside the outage it was told to sit
+    #    out. The declaration is the owner's instruction; a tail is a guess about
+    #    a moment, and a guess does not get to shorten an instruction.
+    declared_until = (prev or {}).get("declared_until") or 0
+    if declared_until > until:
+        until = declared_until
     rec = {
         "since": (prev or {}).get("since", now),
         "last_seen": last_seen,
         "until": until,
         "counted": counted,
+        # Carried forward so the floor survives every reactive rewrite.
+        "declared_until": declared_until or None,
+        "declared_reason": (prev or {}).get("declared_reason"),
+        "declared_by": (prev or {}).get("declared_by"),
         "stale_sighting": bool(prev and not is_new_evidence),
         # ⭐ Recorded so `status` can SAY why it will lift when it does. The
         # owner's complaint about the last outage was never the hold, it was
@@ -2393,8 +2523,14 @@ def tick(args):
                 #    becomes unfalsifiable.
                 action = "HOLD:rate-limit"
                 held_m = (rl["until"] - time.time()) / 60
+                # ⚠ `seen_on` exists only on a hold armed by a TAIL SIGHTING. A
+                #   declared hold has no row to name, and indexing it blindly
+                #   turned the suppression path into a crash on the one code
+                #   path whose whole job is to do nothing quietly.
+                why = (f"seen on {rl['seen_on'][:8]}" if rl.get("seen_on")
+                       else f"declared: {rl.get('declared_reason') or 'no reason given'}")
                 log(f"{'RATE-HOLD':<14} {c['age'] / 60:>6.1f}m  {action:<12} {uuid[:8]}  "
-                    f"quota hold {held_m:.0f}m left (seen on {rl['seen_on'][:8]})")
+                    f"quota hold {held_m:.0f}m left ({why})")
                 if not args.dry_run:
                     update_sub(uuid, s)
                 continue
@@ -2714,13 +2850,21 @@ def main():
     ap.add_argument("action",
                     choices=["subscribe", "unsubscribe", "defer", "list", "tick",
                              "watch", "status", "disarm", "arm", "coverage", "retire",
-                             "never-arm", "optout"])
+                             "never-arm", "optout", "hold"])
     ap.add_argument("--secs", type=int, default=0,
                     help=f"defer: boot window for one long wait, clamped to "
                          f"{MIN_BOOT_AFTER_SECS}-{MAX_BOOT_AFTER_SECS}s "
                          f"(the ceiling is the prompt-cache limit)")
     ap.add_argument("--clear", action="store_true",
-                    help="defer: drop the deferral and return to the default window")
+                    help="defer: drop the deferral and return to the default window. "
+                         "hold: lift the fleet-wide boot hold now")
+    ap.add_argument("--until", default="",
+                    help="hold: when the hold expires — `5d`/`36h`/`90m`, or an "
+                         "absolute local `2026-08-19T09:00`. Stored as an ABSOLUTE "
+                         "instant either way, so re-running does not walk it forward. "
+                         "With no --until, `hold` reports the current hold")
+    ap.add_argument("--reason", default="",
+                    help="hold: why the fleet is being held (recorded and logged)")
     ap.add_argument("--row", default="")
     ap.add_argument("--campaign", default="")
     ap.add_argument("--note", default="")
@@ -2767,7 +2911,7 @@ def main():
     #    host is how recording a decision fails on a host that cannot reach the
     #    desktop — which is precisely the moment someone gives up and edits the
     #    file by hand. These verbs touch only local state, so they never ask.
-    if args.action in ("never-arm", "optout", "retire", "arm", "disarm"):
+    if args.action in ("never-arm", "optout", "retire", "arm", "disarm", "hold"):
         args.host = args.host or this_host()
     else:
         args.host = resolve_gui_host(args.host)
@@ -2785,6 +2929,7 @@ def main():
         "optout": cmd_optout,
         "disarm": cmd_disarm,
         "arm": cmd_arm,
+        "hold": cmd_hold,
     }[args.action](args)
 
 
