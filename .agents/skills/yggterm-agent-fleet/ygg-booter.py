@@ -569,11 +569,94 @@ def never_arm():
     return out
 
 
+DISARMED_LEDGER = STATE / "booter-disarmed.tsv"
+REARM_MARK = "__rearmed__:"
+
+
+def disarmed_rows():
+    """⛔⛔ THE LEDGER THAT NOTHING READ. Rows that opted OUT, with a reason.
+
+    `ygg-claim.sh --no-booter <reason>` has always APPENDED here, and until now
+    **nothing read it back**. A row that deliberately opted out was therefore
+    indistinguishable from one nobody had ever armed — the same
+    absent-vs-refused ambiguity that let 42 of 47 rows run unwatched without
+    anyone noticing, except pointing the other way.
+
+    ⇒ That made it the load-bearing prerequisite for ANY automatic arming:
+    enumerate-and-arm shipped over a write-only ledger would re-arm every
+    deliberately disarmed row one tick later, while looking like it honoured
+    them.
+
+    **Append-only, latest record per uuid wins.** A re-arm is a new line whose
+    reason begins with `__rearmed__:`, so the decision history is kept rather
+    than rewritten — the file is evidence, not state to be edited.
+
+    ⚠ Distinct from `never_arm()` and weaker on purpose: never-arm is *a person
+    attends this row, the answer is always no*; this is *this row asked not to be
+    watched, and can ask again*.
+    """
+    out = {}
+    try:
+        for line in DISARMED_LEDGER.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            uuid = parts[1].strip()
+            reason = parts[3].strip() if len(parts) > 3 else ""
+            if not uuid:
+                continue
+            if reason.startswith(REARM_MARK):
+                out.pop(uuid, None)
+            else:
+                out[uuid] = reason or "no reason recorded"
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        # ⛔ UNREADABLE IS NOT EMPTY. Treating a damaged ledger as "nobody opted
+        # out" is the failure that re-arms everyone; refuse to answer instead.
+        return None
+    return out
+
+
+def record_rearm(uuid, why):
+    """Append the re-arm so the ledger keeps the whole decision history."""
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with DISARMED_LEDGER.open("a") as fh:
+            fh.write("%s\t%s\t%s\t%s%s\n" % (
+                time.strftime("%Y-%m-%dT%H:%M:%S%z"), uuid, "", REARM_MARK, why))
+        return True
+    except Exception as exc:
+        log(f"⛔ could not record the re-arm: {exc}")
+        return False
+
+
 def cmd_subscribe(args):
     uuid = (args.row or "").rstrip("/").split("/")[-1] or own_uuid()
     if not uuid:
         log("no row given and $YGGTERM_SESSION_ID is unset — nothing to subscribe")
         return 2
+    opted_out = disarmed_rows()
+    if opted_out is None:
+        log(f"⛔ REFUSING to arm {uuid[:8]} — {DISARMED_LEDGER} is unreadable.")
+        log("   An unreadable opt-out ledger is not an empty one. Fix the file,")
+        log("   or pass --rearm '<why>' if you know this row never opted out.")
+        if not args.rearm:
+            return 4
+    elif uuid in opted_out and not args.rearm:
+        log(f"⛔ REFUSING to arm {uuid[:8]} — it opted OUT of the booter:")
+        log(f"     {opted_out[uuid]}")
+        log("   ⭐ This is the ledger `ygg-claim.sh --no-booter` writes, and it is")
+        log("     now read. Re-arming is deliberate: pass --rearm '<why>', which")
+        log("     appends the decision rather than editing the record away.")
+        log("   ⚠ If you meant 'busy for a while', use `ygg-booter.py defer`.")
+        return 5
+    if args.rearm and opted_out and uuid in opted_out:
+        log(f"⭐ re-arming {uuid[:8]}, which had opted out ({opted_out[uuid]})")
+        record_rearm(uuid, args.rearm)
     blocked = never_arm()
     if uuid in blocked:
         log(f"⛔ REFUSING to arm {uuid[:8]} — {blocked[uuid] or 'human-attended row'}")
@@ -1051,6 +1134,30 @@ def tick(args):
                 if not args.dry_run:
                     sub_path(s["uuid"]).unlink(missing_ok=True)
                 subs.remove(s)
+    # ⛔ AND ENFORCE THE OPT-OUT LEDGER AT THE TICK TOO, for the same reason the
+    #    never-arm list is enforced here: `subscribe` runs from a LANE's own
+    #    checkout, which is routinely many commits behind, while the tick runs
+    #    from exactly one. A guard that lives only in `subscribe` is as many
+    #    guards as there are copies of this script.
+    #    ⚠ Weaker remedy than never-arm, deliberately: a row that opted out is
+    #    unsubscribed, not treated as a person's keyboard. The re-arm path
+    #    (`subscribe --rearm`) is what puts it back, and it leaves a record.
+    opted_out = disarmed_rows()
+    if opted_out is None:
+        log(f"⚠ {DISARMED_LEDGER} is UNREADABLE — opt-outs NOT verified this tick. "
+            f"Treating every subscription as armable is the unsafe direction, so "
+            f"nothing is purged, but do not read a quiet tick as consent.")
+    elif opted_out:
+        for s in list(subs):
+            if s["uuid"] in opted_out:
+                log(f"⛔ {s['uuid'][:8]} OPTED OUT of the booter "
+                    f"({opted_out[s['uuid']]}) yet was SUBSCRIBED — unsubscribing.")
+                log("   Most likely a re-claim: relabelling a row through "
+                    "ygg-claim.sh re-subscribes it, so standing a row down and "
+                    "then renaming it silently armed it again.")
+                if not args.dry_run:
+                    sub_path(s["uuid"]).unlink(missing_ok=True)
+                subs.remove(s)
     rc = 0
     for s in subs:
         uuid, row, host = s["uuid"], s["row"], s.get("host", args.host)
@@ -1364,6 +1471,12 @@ def main():
     ap.add_argument("--row", default="")
     ap.add_argument("--campaign", default="")
     ap.add_argument("--note", default="")
+    ap.add_argument("--rearm", default="",
+                    metavar="WHY",
+                    help="subscribe: arm a row that previously opted out via "
+                         "`ygg-claim.sh --no-booter`. Requires a reason, which is "
+                         "APPENDED to the ledger so the decision history survives. "
+                         "⛔ Not a way past never-arm.tsv, which refuses regardless.")
     ap.add_argument("--host", default=None,   # ⛔ resolved, never a placeholder
                     help="the GUI host — app control resolves only there")
     ap.add_argument("--max-hours", type=float, default=12.0)
