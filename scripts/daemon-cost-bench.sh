@@ -134,6 +134,11 @@ for K in "${ROWS[@]}"; do
       # end the arm silently, and the only symptom was "no window flushed" —
       # a truncated run wearing the costume of an instrument that did not fire.
       YGGTERM_HOME="$HOME_DIR" timeout 10 "$BIN" server status >/dev/null 2>&1 || FAILED=$((FAILED + 1))
+      # ⭐ `snapshot` is driven too because its handler fans OUT: it calls
+      # `refresh_proxied_working_flags`, one round trip per preserved owner,
+      # inside the connection-handler thread. With zero peers that costs
+      # nothing — which is the control that isolates the fan-out from the verb.
+      YGGTERM_HOME="$HOME_DIR" timeout 10 "$BIN" server snapshot >/dev/null 2>&1 || FAILED=$((FAILED + 1))
       [ "$FAILED" -gt 20 ] && { echo "rows=$K ABORTED after $FAILED failed requests"; break; }
     done
     [ "$FAILED" -gt 0 ] && echo "      ⚠ $FAILED requests failed during this arm"

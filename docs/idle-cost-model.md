@@ -846,6 +846,44 @@ figure was the coarse-field one, not the mechanism I attached to it.** A correct
 suspicion with a wrong mechanism is still a wrong claim; it was right to send it
 as a candidate rather than file it as a cause.
 
+#### ⛔ THE FAN-OUT HYPOTHESIS FOR THE 15–30× GAP — MINE, TESTED, REFUTED
+
+`ServerRequest::Snapshot` calls `refresh_proxied_working_flags`
+(`daemon.rs:8024` → `:4308`), which makes **one outbound round trip per
+preserved owner, inside the connection-handler thread**. A live daemon carries up
+to 29 preserved owners, and 29 × ~1.4 ms lands squarely on the 20–44 ms live
+figure. The arithmetic fitted, the code path is real, and it explained why a lone
+sandbox daemon could not reproduce the gap.
+
+**The control says no.** Driven on a sandbox with **zero peers and zero preserved
+owners**, so the fan-out cannot fire at all:
+
+| verb | n | CPU µs/conn | max | kernel share |
+|---|---|---|---|---|
+| `snapshot` | 1,715 | **9,633** | 33,225 | 11.3% |
+| `status` | 5,147 | 1,533 | 3,577 | 8.0% |
+| `ping` | 5,146 | 118 | 428 | 3.6% |
+
+⇒ **`snapshot` costs 6.3× a `status` and 82× a `ping` with nothing to fan out
+to.** The verb is intrinsically expensive; the fan-out is not needed to explain
+it. ⭐ **A mean over a live request mix that contains snapshots reaches 20–44 ms
+without needing any fan-out story — or any kernel-time story.**
+
+⛔ **That is the second mechanism I have proposed for this gap and had refuted,
+and both were sent as candidates rather than filed as causes.** The first
+(`comm` truncation) died to a bucket defined by lifetime; this one died to its
+own control. **The cheap part was proposing them; the part that cost anything
+would have been believing them.**
+
+⚠⚠ **AND IT REOPENS SOMETHING RECORDED AS PRICED AND REFUTED.** The request mix
+was set aside on the grounds that *"snapshot is CHEAPER than status on a sandbox,
+3.67 vs 5.07 ms"*. **This measurement inverts that ordering — 9.6 ms against
+1.5 ms — on per-verb thread CPU, unsampled.** Two sandboxes, two instruments, one
+ordering reversed. ⇒ **The request-mix explanation should not be treated as
+closed**, and the disagreement is about the instrument, not the conclusion: a
+wall-time figure over a mixed population and a per-verb CPU figure are not the
+same quantity.
+
 **Two harness defects fixed in the same pass, both of which report a fired
 instrument as one that did not fire:**
 - ⛔ A single failed request used to `break` the arm; the only symptom was
