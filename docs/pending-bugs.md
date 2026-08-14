@@ -1998,50 +1998,6 @@ output says "silent 5 s" — so a reader wired to either field alone cannot pass
 human remains the only detector of the state the daemon can now see. That is the
 next wiring, and `input_unanswered_ms()` is already there to read.
 
-## ⛔⛔ [6.8] THE YEDIT DOCUMENT SURFACE PAINTS GARBAGE WHILE ITS MODEL HOLDS 34 CHARACTERS
-
-**Status:** OPEN
-
-*Owner-reported 2026-08-14 with two screenshots, on a FRESH GUI at 3.0.154 — so it
-is **not** the stale-binary defect fixed the same morning.*
-
-**The Document view of a `New Yedit` row renders a screenful of corrupted glyph
-clusters** -- dense mojibake laid out in terminal-like rows across the top of the
-canvas -- while the surface's own status bar reads:
-
-```
-7 words · 4 lines · 34 chars
-```
-
-⇒ **The model is tiny and the RENDER is garbage.** Whatever is being painted is not
-the document.
-
-### ⭐ The discriminating evidence, and it is already in hand
-
-- **The Terminal view of the SAME row is clean.** It shows the launch cleanly:
-  `yedit: document surface opened` preceded by a secrets-fetch failure the app
-  emits at startup. So the row, the PTY and the terminal renderer are all fine.
-- ⇒ **The corruption is confined to the Document surface**, and the layout of the
-  garbage is terminal-shaped -- cells, not prose.
-
-### Falsifier / where to start
-
-1. Open a document surface on a scratch row and capture a **faithful** frame
-   (`capture_faithful: true`, backend `xterm_canvas_composite_over_dom`). ⛔ A
-   `faithful:false` frame is canvas-blind and cannot settle this.
-2. ⚠ **Suspect the compositing path before the text path.** The screenshot backend
-   composites the xterm canvas with the DOM; a Document view should not be painting
-   terminal cells at all, and what is on screen looks like exactly that -- a cell
-   grid full of uninitialised or mis-decoded content.
-3. Check whether the status-bar counts and the painted content come from the same
-   buffer. They disagree by three orders of magnitude, so at least one of them is
-   reading something it does not own.
-
-⚠ **The owner also reports a recurring dropped-glyph issue alongside this.** Do not
-assume the two are one defect: dropped glyphs were also visible on the stale
-12-hour GUI and improved when it was retired, so there may be a render-path bug
-that the stale binary made worse rather than caused.
-
 ## ⛔⛔ [6.7] APP ROWS ARE BORN `keep_alive: false`, SO A GUI RESTART DESTROYS THE USER'S OWN GROUP
 
 **Status:** OPEN
@@ -3102,76 +3058,6 @@ host's name and reporting success.
 
 **Falsifier:** a deploy run on a host whose alias does not resolve there writes
 that host's four copies, or refuses in a way no reader can mistake for success.
-
-## ⛔⛔ [6.3] yedit's VIEWPORT PAINTS NOTHING WHILE ITS FILE RAIL IS FULL
-
-**Status:** OPEN
-
-*reported 2026-08-13 with a screenshot*
-
-The document area is solid black. The right rail beside it is fully populated —
-the Markdown/Split/Text toggle, the regex search box, and a FILES list of ~28
-named documents, one of them selected and highlighted. The status bar under the
-empty viewport reads a real measurement: **8570 words · 457 lines · 61018
-chars**.
-
-⇒ **The document is loaded and measured; only the paint is missing.** This is
-the metadata-vouches-for-clipped-content shape: every instrument around the
-viewport reports success, and the viewport is empty.
-
-**Cost:** this is why the report that produced this batch was composed in an
-external editor rather than in yedit.
-
-**Falsifier:** a viewport reporting a non-zero line and character count must
-paint at least one glyph. If it cannot, it must say so rather than render black.
-
-⭐⭐ **A CHEAP, DETERMINISTIC REPRO — 2026-08-13, deploy-identity cluster.** The
-original sighting needed a 61,018-character document, which makes every check
-expensive and every difference arguable. The same state reproduces with a
-**152-character** file authored for the purpose, in four commands, provided the
-shell is ON THE GUI HOST (see the loopback entry below — a surface driven from
-another machine reads a daemon that does not exist there, which is what made
-this look unreproducible):
-
-```sh
-# on the GUI host
-printf '# probe\n\nOne paragraph.\n\n- a\n- b\n' > /tmp/<probe>.md
-yggterm server app terminal new --kind shell --cwd /tmp --purpose '<why>' --pid $GUI
-yggterm server app terminal send <row> --data 'yedit /tmp/<probe>.md' --pid $GUI
-# then a LONE carriage return — the text alone sits at the prompt unsubmitted
-yggterm server terminal write <row> --data "$(printf '\r')"
-```
-
-Measured result: the FILES rail fills, the probe appears **selected and
-highlighted**, and the status bar reads **30 words · 10 lines · 152 chars** —
-the file's true measurement. So the loading half is sound and the discrepancy is
-downstream of it, on a document small enough to hold in the head.
-
-⚠ **A clean document-VIEW frame is still owed** and was not taken here: another
-lane held a modal over the viewport at capture time, and closing another
-session's dialog mid-flight is not a thing to do for a screenshot. One
-`server app open <row> --view preview --pid $GUI` plus one screenshot completes
-it from the state above.
-
-⭐ **THE APP PLANE ITSELF PAINTS ON THE REAL GUI — measured 2026-08-13 by the
-deploy-identity cluster at 3.0.133, on the desktop host, faithful frame.** A
-freshly launched yedit surface rendered its whole rail: the toolbar icons, the
-regex search field, the Markdown/Split/Text toggle, the FILES heading with its
-`+` control, the empty-state line, and the Wrap control. ⇒ **Whatever is wrong
-here is not "a document surface cannot render on a real GUI"**, which is worth
-knowing before anyone spends a session on the widget layer.
-
-⚠ **AND THE LOADED STATE COULD NOT BE REACHED, for a reason that turned out to
-be neither the CLI nor the paint** (own entry below): the shell driving that
-surface was on a different machine from the GUI, and a surface declares a
-**loopback** control URL — so the GUI resolved it on its own host, found nothing
-listening, and rendered *No files open* with every widget healthy. The file had
-been stored correctly the whole time, in the other host's daemon.
-
-⇒ So this sighting says nothing about the black viewport: an EMPTY rail pointed
-at the wrong daemon is a different state from the full rail above. **Recorded
-so the next reader does not mistake it for one**, and because the first version
-of that entry blamed the CLI for dropping the path, which it does not do.
 
 ## ⛔⛔ A DOCUMENT SURFACE DECLARES A LOOPBACK URL, SO A CROSS-MACHINE SURFACE RENDERS EMPTY AND HEALTHY
 
@@ -7023,6 +6909,47 @@ a width table. This also means the 3.0.105/106 atlas work has NOT closed the
 family — prevention on the rAF-gap edge is not catching every route to a stale
 atlas, and the next investigation should start from which route this frame took,
 not from whether the atlas is the mechanism.
+
+### ⭐ A SIGHTING THAT RECOVERED WITH NOTHING TOUCHED, BOUNDED AT 24 SECONDS
+
+*Added 2026-08-14 by the lane that root-caused the document-surface mount
+failure. Contributed here rather than filed separately: this entry already owns
+the question, and a second copy is how a queue rots.*
+
+**Two frames of the SAME row, 24 seconds apart, on the GUI host.** The first is
+the full-amplitude form — the whole viewport a cell-aligned substitution garble.
+The second is legible, and it carries the **identical line count, the identical
+wrap points and the identical trailing block cursor**, which is what proves the
+two frames show one screen and not two.
+
+⇒ **Between them: no scroll, no keystroke, no remount, no resize, nothing sent
+to that row.** The recovery was spontaneous.
+
+⛔ **That contradicts this entry's own title, and the title is the part to
+distrust.** "Clear on scroll" was the reported remedy, and a remedy is not a
+mechanism — scrolling forces a full repaint, so it *reveals* recovery rather
+than causing it. Something else already re-rasterizes on its own within seconds.
+**Whoever picks this up should find what that is before adding another
+repair path** — a heal that races an existing spontaneous recovery is precisely
+how the 3.0.106 regression above was manufactured.
+
+**The mild and full forms were both present on one host in one morning**, which
+is independent support for this entry's claim that they are one mechanism at
+different atlas-staleness depths, from a day nobody was testing for it.
+
+⚠ **AND THE CONFOUND, STATED RATHER THAN RESOLVED, BECAUSE IT CANNOT BE
+RESOLVED FROM THESE FRAMES.** That morning the host also carried a twelve-hour
+`(deleted)` GUI process alongside a current one (`docs/deploy-spec.md` §2, which
+attributes dropped glyphs to exactly that). **Nothing in these frames says which
+process painted them.** So they establish the *shape* of the fault and the
+spontaneous recovery, and they establish nothing about uptime as a cause.
+⇒ **Re-sight it on a host proven to be running exactly ONE GUI instance** before
+drawing any conclusion about age or eviction pressure.
+
+⛔ **Do not fold this into the document-surface defect it was reported beside.**
+That one was a dead edit batch and is fixed; this fires on an ordinary terminal
+view with no app surface involved, and merging them would bury a live render bug
+inside a closed entry.
 
 ## ⛔⛔ 3.0.106 CAUSED A SECOND RENDER BUG, AND THE HONEST TRACE IS WHAT CAUGHT IT
 
