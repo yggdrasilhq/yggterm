@@ -931,6 +931,90 @@ def fleet_state(args):
     }
 
 
+def cmd_coverage(args):
+    """⭐ WHICH LIVE ROWS ARE WATCHED, AND — THE POINT — WHICH NOBODY HAS DECIDED.
+
+    ⛔ THIS DELIBERATELY DOES NOT ARM ANYTHING, and that is the design, not a
+    missing feature. The obvious next step, *enumerate live rows and arm the
+    unwatched ones*, was measured and is not implementable safely: across all 31
+    fields of the row listing, a human-attended row and an unattended delegate
+    are identical — same `kind`, same `icon_kind`, same tenancy, same presence.
+    The only separators are free text, identity, a folding flag, transient
+    `busy`, and a seat number an agent types about itself. **No field says a
+    person types here.**
+
+    ⇒ So `never-arm.tsv` is not a backstop beneath a filter, it IS the filter,
+    and auto-arming would be fail-open: any attended row nobody has hand-listed
+    is armable by construction, and the remedy for being armed is being typed
+    over. The whole watchdog's function is to TYPE INTO what it wakes.
+
+    ⇒ What IS decidable is the BOOKKEEPING, and that is what the original
+    complaint was really about — 42 of 47 rows ran unwatched and nothing said
+    so. This turns an undecidable arming question into a decidable reporting
+    one: every live row lands in exactly one bucket, and the UNKNOWN bucket is
+    the one a person acts on.
+
+    ⚠ It is also why auto-arm stays unbuilt rather than merely unfinished: an
+    attestation-driven re-arm would resurrect rows that deliberately
+    unsubscribed when their work finished, which is the write-back-recreates-a
+    -deletion shape this fleet has already paid for once.
+    """
+    subs = {s["uuid"]: s for s in load_subs()}
+    blocked = never_arm()
+    opted_out = disarmed_rows()
+    ledger_readable = opted_out is not None
+    opted_out = opted_out or {}
+
+    d = BB.ygg(args.host, "server", "app", "rows")
+    rows = (d.get("data", {}) or {}).get("rows", []) or []
+    if not rows:
+        log("⛔ the row listing came back EMPTY — that is 'I could not ask', not "
+            "'there are no rows'. Nothing below would mean anything; refusing to "
+            "report.")
+        return 2
+
+    buckets = {"watched": [], "never_arm": [], "opted_out": [], "unknown": []}
+    for r in rows:
+        if r.get("kind") != "Session":
+            continue
+        path = r.get("path") or ""
+        uuid = path.rstrip("/").split("/")[-1]
+        if not uuid or "://" not in path:
+            continue
+        label = (r.get("outline_prefix") or "").strip()
+        who = f"{uuid[:8]}{(' [' + label + ']') if label else ''}"
+        if uuid in blocked:
+            buckets["never_arm"].append(f"{who} — {blocked[uuid]}")
+        elif uuid in subs:
+            buckets["watched"].append(f"{who} — campaign={subs[uuid].get('campaign') or '-'}")
+        elif uuid in opted_out:
+            buckets["opted_out"].append(f"{who} — {opted_out[uuid]}")
+        else:
+            buckets["unknown"].append(who)
+
+    if not ledger_readable:
+        log("⚠ the opt-out ledger is UNREADABLE — rows that opted out will appear "
+            "as UNKNOWN below. Treat this report as incomplete.")
+    log(f"watched   {len(buckets['watched']):>3}")
+    log(f"never-arm {len(buckets['never_arm']):>3}  (a person attends these; the answer is always no)")
+    log(f"opted-out {len(buckets['opted_out']):>3}  (asked not to be watched, with a reason)")
+    log(f"UNKNOWN   {len(buckets['unknown']):>3}  ⭐ nobody has decided about these")
+    for name in ("unknown", "opted_out", "never_arm", "watched"):
+        if not buckets[name] or (name != "unknown" and not args.verbose):
+            continue
+        log(f"  -- {name} --")
+        for line in buckets[name]:
+            log(f"     {line}")
+    if buckets["unknown"]:
+        log("⇒ For each UNKNOWN row, decide and RECORD it — there is no probe that "
+            "can decide for you:")
+        log("     an unattended delegate  → ygg-booter.py subscribe --row <uuid>")
+        log("     a row a person types in → add it to never-arm.tsv")
+        log("   ⛔ Do not bulk-arm this list. That is the fail-open move this "
+            "report exists to replace.")
+    return 0
+
+
 def cmd_list(args):
     if args.json:
         print(json.dumps(fleet_state(args), indent=1))
@@ -1461,7 +1545,7 @@ def main():
     ap = argparse.ArgumentParser(description="boot a stalled session that subscribed")
     ap.add_argument("action",
                     choices=["subscribe", "unsubscribe", "defer", "list", "tick",
-                             "watch", "status", "disarm", "arm"])
+                             "watch", "status", "disarm", "arm", "coverage"])
     ap.add_argument("--secs", type=int, default=0,
                     help=f"defer: boot window for one long wait, clamped to "
                          f"{MIN_BOOT_AFTER_SECS}-{MAX_BOOT_AFTER_SECS}s "
@@ -1471,6 +1555,8 @@ def main():
     ap.add_argument("--row", default="")
     ap.add_argument("--campaign", default="")
     ap.add_argument("--note", default="")
+    ap.add_argument("--verbose", action="store_true",
+                    help="coverage: list every bucket, not only UNKNOWN")
     ap.add_argument("--rearm", default="",
                     metavar="WHY",
                     help="subscribe: arm a row that previously opted out via "
@@ -1513,6 +1599,7 @@ def main():
         "tick": tick,
         "watch": cmd_watch,
         "status": cmd_status,
+        "coverage": cmd_coverage,
         "disarm": cmd_disarm,
         "arm": cmd_arm,
     }[args.action](args)
