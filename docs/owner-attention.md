@@ -302,6 +302,36 @@ that names.
 is *also* the composer's own prompt glyph, so "is a `❯` on screen" is not the
 test. The test is `❯` adjacent to a numbered option, and exactly one of them.
 
+### ⭐ A SECOND, NARROWER QUESTION ARRIVED WITH IT — may a WAKE proceed when the screen is unreadable?
+
+**One line settles it, and it is separate from the Enter question above.** The
+guard treats *"I could not read the screen"* as *"a prompt might be waiting"* and
+refuses. That is plainly right for **typing content into** a row. The argument
+raised against applying it to a **bare wake** is that the failure it prevents is
+selecting a highlighted option, and a `continue` sent to a row that is merely
+idle selects nothing.
+
+⇒ **The case for relaxing it is real: on 2026-08-14 that refusal took the whole
+fleet's wake path down for over an hour** — every row refused, every tick, in
+silence — because the screen-read verb had gone missing from the built binary.
+
+**Recommendation: do NOT relax it, and the reason is not caution.** The bytes a
+wake writes are **queued, not discarded**, so a wake that lands on a row parked
+mid-prompt is not a no-op — it is content arriving at a prompt that will consume
+it. The failure mode is the same family as typing over a live composer, which is
+the one class of defect that has repeatedly cost real work here. ⛔ A cheaper
+answer exists and is already shipped, so nothing is bought by taking the risk.
+
+**Done meanwhile — the outage is fixed without touching this rule:** the guard
+now falls back to the **daemon's own screen** when the app-control arm is
+unavailable, so it can look again; and an unreadable screen now **escalates**
+instead of skipping silently, which is what actually failed. The fleet is
+booting normally. **To reverse:** one predicate either way; no data change.
+
+⚠ **Note on the ruling below: it was moot for part of 2026-08-14** and is not any
+more. While the screen could not be read at all, the watchdog could never satisfy
+its own precondition, so authorising it would have changed nothing.
+
 **Recommendation: authorise it, narrowly.** The watchdog may send Enter *only*
 when it can read the screen, finds exactly one highlighted numbered option, and
 that option's text is a stop-and-wait. Anything else — unreadable screen, more
