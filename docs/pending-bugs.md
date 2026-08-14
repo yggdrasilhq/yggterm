@@ -99,6 +99,18 @@ the page-faults it induces (353–852/request ≈ 0.5–1.7 ms), the lock wait i
 (`try_lock` then a **blocking** `lock`; a block costs no CPU), and the trace
 writer (handles cached, no stat or reopen per call).
 
+⚠ **The request MIX is RESTATED, not refuted** (§6j-6): `snapshot`'s payload is
+**per-SESSION** — 176 bytes on a session-less daemon against `status`'s 61,463 of
+row inventory — so it is cheap without sessions and expensive with them, and its
+p50 of 259.8 ms in the aggregate is a **session effect wearing a verb's name**.
+⭐ **And a per-connection cost sits OUTSIDE the handler closure:** the in-process
+span reads 118–126 µs for `ping` where a process-level arm reads **1.80 ms**, so
+~1.7 ms per connection is accept + thread create/teardown + outcome channel.
+⛔ **That contradicts S4's note that "thread spawn is ~50 µs so a pool buys
+nothing"** — that priced `clone()` alone. Do not quote it as a reason not to
+build S4; do not yet treat this as a reason TO build it either, because 1.7 ms is
+a difference between two instruments, not a direct measurement.
+
 ## ⛔ [6.3] ONE SESSION RENDERS AS TWO ROWS, AT TWO DIFFERENT NESTING DEPTHS
 
 **Status:** OPEN
