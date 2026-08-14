@@ -1493,6 +1493,75 @@ never take the cold-shutdown exit at all**, whatever any flag says. Ownership of
 a child process is the only fact that matters there, and it is directly
 observable.
 
+## ⛔⛔⛔ [6.1] ONE POISONED SESSION BLOCKS A WHOLE DAEMON'S DRAIN, PERMANENTLY — THIS IS WHY DAEMONS NEVER EMPTY THEIR HANDS
+
+**Status:** OPEN
+
+⭐ **Caught live during the 3.0.154 deploy, reproducing once a minute**, which is
+what makes it the drain lane's central defect rather than a curiosity. The
+one-off "accepted but never acknowledged" filed below is the FIRST HALF of it;
+this entry is what that failure turns into on the next attempt.
+
+### The two-step deadlock, from the trace
+
+```
+01:28:17  3.0.153 → 3.0.154  stood_down=11 resumed=11
+  NoneMoved { "cc-runtime://<key>: successor accepted the fd but never
+               acknowledged it (AFTER the commit point — the fd is gone)" }
+01:29:17  3.0.153 → 3.0.154  stood_down=10 resumed=10
+  NoneMoved { "cc-runtime://<key>: successor took the fd and refused to seat it:
+               refusing to adopt <key>: this daemon already runs a live PTY for it" }
+```
+
+1. The successor **takes the fd and seats it**, but the ack does not get back.
+   The predecessor books it as a failure and keeps its own runtime.
+2. On every retry the successor now **refuses**, because it already runs a live
+   PTY for that key — *which is proof that step 1 actually succeeded.*
+
+⇒ **The refusal reason is the evidence that the move worked**, and the code
+reads it as the reason the move failed. The state is stable, so it never clears.
+
+### ⛔ AND ONE FAILURE ABORTS THE WHOLE SWEEP
+
+`readers_stood_down: 11` with `moved: 0`: eleven runtimes were parked, the first
+one failed, and **all eleven were resumed**. `classify_handoff_sweep` takes a
+`first_failure` and the sweep stops there. So a single permanently-poisoned
+session pins **every other session on that daemon**, and the daemon can never
+reach the empty hands that would let it retire.
+
+⇒ **This is the mechanism behind the standing hazard.** The 14 pre-settle-window
+daemons are not lingering because their sessions are busy; a daemon needs only
+ONE key in this state to be pinned for ever. It also explains the zero
+`progressive_migration_session_released` events in the whole corpus.
+
+### The fix — and why the obvious one is NOT safe as written
+
+The tempting change is to treat *"this daemon already runs a live PTY for it"*
+as a **success**. It usually is. ⛔ But the message cannot distinguish:
+
+- the successor is holding **the fd we sent it** (dropping ours is correct and
+  harmless — same PTY, one redundant descriptor), from
+- the successor has **its own, different PTY** for that key (it re-resumed the
+  session independently). Dropping ours then closes a PTY whose child is still
+  on it.
+
+⇒ **The predecessor must confirm IDENTITY, not just presence** before counting
+it moved — compare the seated runtime's child pid or pty device against the one
+it handed over (`terminal_process_id` is already in the status payload). With
+identity confirmed, "already seated" is the success it looks like.
+
+**Independently worth doing:** the sweep should attempt **every** session and
+classify at the end, rather than abandoning ten good moves because the first one
+failed. ⚠ That makes `Partial` more common, and `Partial` is the outcome that
+must never exit the process — which the code already knows.
+
+⭐ **Deeper fix, upstream of both:** the ack is the only thing that makes the
+commit point meaningful, and it is being lost after the fd has already
+transferred. Either the seat-and-ack must be atomic from the predecessor's point
+of view, or the predecessor needs a **re-query** path — *"do you have this key,
+and is it the one I sent?"* — so a lost ack costs a round trip instead of
+permanently poisoning the session.
+
 ## ⛔ [6.1] A HANDED-OFF fd CAN BE ACCEPTED AND NEVER ACKNOWLEDGED, PAST THE POINT OF NO RETURN
 
 **Status:** OPEN
