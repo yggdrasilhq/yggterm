@@ -1916,8 +1916,15 @@ def cmd_list(args):
         #    <row>" reads as a fact about THAT row, and a campaign checking its
         #    own seat concluded it was fine. The hold is FLEET-WIDE: while it is
         #    up, nothing can be delivered to anybody.
+        # ⚠ A DECLARED hold has no row to name — `seen_on` is None — and this
+        #   line indexed it unconditionally, so arming one CRASHED `list`, the
+        #   fleet's main status verb, at the exact moment it had most to report.
+        #   Same defect as the tick's RATE-HOLD line; fixed there first and not
+        #   grepped for, which is how the second and third copies survived.
+        why = (f"429 seen on {rl['seen_on'][:8]}" if rl.get("seen_on")
+               else f"DECLARED: {rl.get('declared_reason') or 'no reason given'}")
         log(f"⏸ QUOTA HOLD {(rl['until'] - time.time()) / 60:.0f}m left "
-            f"(429 seen on {rl['seen_on'][:8]}) — ⛔ NO BOOT CAN BE DELIVERED TO "
+            f"({why}) — ⛔ NO BOOT CAN BE DELIVERED TO "
             f"ANY ROW, INCLUDING YOURS, WHILE THIS IS UP")
     # ⭐ Name the directory this reads. A sibling campaign lost minutes concluding
     #   "no subscription file exists" while looking in the relay root — which also
@@ -2838,7 +2845,9 @@ def cmd_status(args):
     if rl:
         armed = (f"⏸ HELD — NO BOOT CAN BE DELIVERED TO ANY ROW "
                  f"({(rl['until'] - time.time()) / 60:.0f}m left)")
-        hold = (f" · quota refusal last seen on {rl['seen_on'][:8]}; "
+        why = (f"quota refusal last seen on {rl['seen_on'][:8]}" if rl.get("seen_on")
+               else f"DECLARED: {rl.get('declared_reason') or 'no reason given'}")
+        hold = (f" · {why}; "
                 f"{len(load_subs())} subscriber(s) are unwakeable meanwhile")
     log(f"watcher: {'alive pid ' + str(alive) if alive else 'NOT RUNNING'} · "
         f"{armed} · heartbeat {hb} · subscribers {len(load_subs())}{hold}{mute}")
