@@ -763,10 +763,38 @@ stand for a surface nobody looked at. ⭐ The backend alone decides;
 **Still open, and it is the harder half:** the check cannot *exercise* the canvas
 on its own. It captures whatever is on screen, and opening a session to force a
 terminal into view would take over the owner's viewport, which is forbidden.
-⇒ Wanted: a way to render a terminal surface for capture **without** stealing the
-foreground — an off-screen or shadow capture of a probe row's canvas. Level 4
-already creates a probe session, so the row exists; what is missing is drawing
-and capturing ITS canvas rather than whatever the user happens to be looking at.
+
+### ⭐ THE CAPABILITY ALREADY EXISTS — tested 2026-08-14 17:36, and it moved the problem rather than solving it
+
+*This paragraph previously said "Wanted: an off-screen or shadow capture of a
+probe row's canvas." It exists.* `scripts/shadow-client.sh` runs a second view
+client under its own headless compositor at `--client-role shadow`, which the
+daemon role-gates against every ownership-claiming request, and `capture` grabs
+it with **grim — the compositor's own pixels**, which cannot lie about
+compositing the way an in-process composite can.
+
+**Verified end to end, then torn down:** it rendered a full terminal canvas —
+dense text, syntax highlighting, coloured diff runs, i.e. exactly the conditions
+these faults involve — while the owner's client stayed untouched (`active=1` on
+one Wayland display, `shadow=1` on another, throughout). ⇒ **A canvas CAN be
+drawn and photographed without going near the foreground.**
+
+⛔⛔ **BUT RUNNING IT SURFACED A CONSTRAINT THAT BLOCKS THE OBVIOUS WIRING.** The
+shadow attaches to whatever session is current, so an hourly automated capture
+would be **photographing arbitrary live session content** — other agents' work,
+and whatever private material happens to be on their screens — and storing it on
+disk every hour. ⇒ **The check must drive the shadow onto a probe row IT OWNS,
+never onto "whatever is open".** That is a hard requirement, and it is why this
+is not a five-minute wiring job. Level 4 already creates a probe row, so the row
+exists; targeting the shadow at it is the missing piece.
+
+⚠ **AND A SHADOW FRAME CANNOT EXONERATE THE OWNER'S CANVAS.** It renders under
+headless sway, not the owner's desktop compositor and GL path, so a clean shadow
+frame is *inconclusive, not exonerating* — the same rule that governs the
+sandbox. ⇒ Wiring the shadow in would let levels 2/3 honestly answer **"a canvas
+was drawn and here is a faithful frame of it"**, which is strictly better than
+today's silence; it would **not** answer *"the owner's terminal is rendering
+correctly"*. Do not let a green shadow frame retire this entry.
 
 **Falsifier:** if a capture ever reports `xterm_canvas_composite*` while no
 terminal is on screen, the backend is not the right signal and this fix names the
