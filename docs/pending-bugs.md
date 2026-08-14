@@ -454,6 +454,25 @@ background-fill pass is overdrawing coloured runs specifically. **The damage is 
 confined to coloured backgrounds**, so a fix aimed only at fill-vs-glyph ordering
 inside coloured runs would leave this case untouched.
 
+#### ⭐ 2026-08-14 20:13 — A FOURTH SIGHTING, IN THE HOURLY CHECK'S OWN FRAME
+
+The routine usability capture (an agent row, not a plain shell) shows
+`· Bunning…  7  13s` where the CLI writes `Running`, and `⛔But itas copy lacks
+the floor` for *its*. **Substitution this time, not blanking**, in the same
+session as clean prose either side of it, with the sidebar and the metadata panel
+pixel-perfect in the same image.
+
+⇒ It adds two things and neither is a new hypothesis. **The two forms alternate
+on the same surface within hours** (blanking at 16:12, substitution at 20:13), so
+a fix that addresses only one has not been shown to address the family. And it is
+**a fourth agent-session sighting with still no plain-shell one**, which is the
+count that matters for the sessions-vs-shells discriminator above — that is now
+4–0, on samples nobody collected deliberately.
+
+⚠ **The hourly check reported `PASS` on the frame that contains it**, correctly:
+levels 2/3 are explicitly an eye check and the script says so in its own output.
+Worth stating anyway, because `PASS` in a log is what a future reader will find.
+
 ⇒ **Three symptoms now sit in one subsystem**, all on the arm the policy selects
 (`xterm_webgl_enabled_for_wayland`): a SIGSEGV in the GL compositing path, a
 whole-screen glyph substitution, and this per-cell blanking. Treating them as one
@@ -15488,6 +15507,35 @@ of the constant `raw_unlabelled`. The previous note called naming those sites "a
 separate, larger job"; it is one attribute and a `String` key, because the
 compiler already threads the caller's location through. **Next autopsy on the
 deployed build names the line.** ⚠ Do not convert 485 sites by hand.
+
+### ⭐ WHAT THE ONSET COINCIDES WITH — 8 onsets against 8 matched calm windows
+
+Onset defined mechanically as an `app_render_rate` sample `>= 20/s` whose
+predecessor was `< 20/s`; the counted window is the 60 s containing the
+transition. Calm controls are windows sampled at `< 2/s` from the same trace.
+
+| event | onset | calm | ratio |
+|---|---|---|---|
+| `session/live_session_birth` | 111 | 0 | ∞ |
+| `terminal_mount/bootstrap_spawn_skipped_inactive_retained_host` | 28 | 0 | ∞ |
+| `terminal_mount/js_debug` | 952 | 40 | 23.2 |
+| `session/request_terminal_launch` | 35 | 1 | 18.0 |
+| `input_policy/applied` | 33 | 1 | 18.0 |
+| `ui_telemetry/terminal_open_attempt` | 51 | 5 | 8.7 |
+
+⇒ **Storms begin in a burst of SESSION BIRTHS and terminal launches** — which is
+the re-attach event this queue already suspects, and it is the first measurement
+tying the two together rather than assuming it. ⚠ But **only one of the eight
+onsets follows a GUI start** (18:45, after the 18:43 launch); the rest —
+11:17, 11:52, 12:34, 13:58, 15:29, 18:41, 19:52 — happen mid-life. **So "the
+restart storm" is the loudest instance of the thing, not its definition**, and a
+fix that only makes restarts cheaper would leave seven of eight in place.
+
+⚠ **Correlation over 8 windows, with the observer inside the experiment**: agent
+row operations create sessions too, so some of these onsets are ours. That does
+not weaken the association (the point is what accompanies a storm, not who
+caused it) but it forbids reading the table as *the user's own activity storms
+his GUI*.
 
 ⛔ **THE CORRELATE NAMED ABOVE DOES NOT REPRODUCE ON A SECOND HOST.**
 `terminal_mount/forward_protocol_only_output` was 8.14/min inside the pin and
