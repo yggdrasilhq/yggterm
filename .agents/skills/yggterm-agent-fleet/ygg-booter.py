@@ -508,6 +508,12 @@ def rate_limit_hold():
             "A stale watcher wrote this; check for a second watcher.")
         RLHOLDFILE.unlink(missing_ok=True)
         return None
+    # ⛔⛔ AN INDEFINITE HOLD NEVER EXPIRES, AND `until` IS ABSENT ON ONE. Without
+    #    this clause `(d.get("until") or 0)` is 0, `time.time() >= 0` is always
+    #    true, and the strongest hold available would delete ITSELF on the very
+    #    next read — the failure would look exactly like "no hold was ever set".
+    if d.get("indefinite"):
+        return d
     if time.time() >= (d.get("until") or 0):
         RLHOLDFILE.unlink(missing_ok=True)
         return None
@@ -536,6 +542,21 @@ def parse_until(spec, now):
         except ValueError:
             pass
     raise ValueError(f"cannot read --until {spec!r}: use 5d / 36h / 90m or 2026-08-19T09:00")
+
+
+def hold_remaining(rl):
+    """How long a hold has left, in words. ⛔ ONE owner for this question.
+
+    Six call sites rendered `(rl['until'] - now)` inline, and every one of them
+    would divide `None` on an indefinite hold — the same shape as the `seen_on`
+    crash, which was fixed in one place and left in two. A hold that cannot be
+    DISPLAYED is a hold nobody can confirm, and this file's whole job is to be
+    confirmable.
+    """
+    if rl.get("indefinite"):
+        return "INDEFINITE — it will NEVER lift by itself"
+    left = (rl.get("until") or 0) - time.time()
+    return f"{left / 60:.0f}m left" if left < 5400 else f"{left / 3600:.1f}h left"
 
 
 def cmd_hold(args):
@@ -572,17 +593,73 @@ def cmd_hold(args):
             log("no hold in force — nothing to clear")
             return 0
         RLHOLDFILE.unlink(missing_ok=True)
-        log(f"⭐ hold CLEARED (was {(cur['until'] - now) / 3600:.1f}h remaining). "
+        log(f"⭐ hold CLEARED (was {hold_remaining(cur)}). "
             f"Boots resume on the next tick.")
+        return 0
+    if args.forever:
+        # ⛔⛔ A HOLD WITH NO EXIT IS THE SHAPE THIS PROJECT KEEPS PAYING FOR, so
+        #    it is allowed only because it is LOUD. It never lifts by itself, it
+        #    says so on every listing and every status line, and the only way out
+        #    is a person typing `hold --clear`. That is the point: after a weekly
+        #    reset EVERY session is cold, so an automatic wake would spend a full
+        #    cold context re-read per subscriber before any work happened — the
+        #    fleet would burn a large share of the fresh window on re-reading
+        #    itself. Recovery is meant to start with ONE master orchestrator,
+        #    chosen by a human, which then decides who comes back.
+        rec = {
+            "since": (cur or {}).get("since", now),
+            "last_seen": now,
+            # ⛔⛔ BELT AND BRACES, AND THE BELT IS FOR READERS THAT PREDATE THE
+            #    BRACES. An `until: null` record is not merely misread by older
+            #    code — it is DESTROYED by it: `time.time() >= (d.get("until")
+            #    or 0)` is `>= 0`, always true, so the old reader UNLINKS the
+            #    strongest hold available and the fleet resumes booting. Measured
+            #    the hard way: an indefinite hold armed while a pre-indefinite
+            #    watcher was still alive vanished within twenty seconds, and the
+            #    aftermath is indistinguishable from "no hold was ever set".
+            #    ⚠ This host carries a dozen checkouts of this script and any of
+            #    them running `list` would have done the same.
+            # ⇒ A far-future deadline makes an OLD reader honour it; the flag
+            #    makes a NEW reader describe it honestly. Neither alone is enough,
+            #    and the ordering lesson stands on its own: DEPLOY THE READER
+            #    EVERYWHERE BEFORE WRITING A RECORD ONLY THE NEW ONE UNDERSTANDS.
+            "until": now + 10 * 365 * 86400,
+            "indefinite": True,
+            "counted": dict((cur or {}).get("counted") or {}),
+            "declared_until": None,
+            "declared_reason": args.reason or args.note or "declared by hand, indefinite",
+            "declared_by": args.decided_by or this_host(),
+            "stale_sighting": False,
+            "reset_at": None,
+            "released_by": "a human running `ygg-booter.py hold --clear`",
+            "seen_on": None,
+            "tail": None,
+        }
+        RLHOLDFILE.parent.mkdir(parents=True, exist_ok=True)
+        RLHOLDFILE.write_text(json.dumps(rec, indent=1))
+        back = rate_limit_hold()
+        if not back or not back.get("indefinite"):
+            log("⛔ indefinite hold did NOT read back — the fleet is still free to boot.")
+            return 1
+        subs = load_subs()
+        log(f"⏸ FLEET HOLD ARMED — ⛔ INDEFINITE. {len(subs)} subscriber(s) will not be "
+            f"booted, and nothing will lift this on its own.")
+        log(f"   reason: {rec['declared_reason']}")
+        log("   ⛔ IT WILL NOT EXPIRE. Release is deliberate: `ygg-booter.py hold --clear`.")
+        log("   ⭐ RECOVERY IS THE OWNER'S TO START — he starts one master orchestrator")
+        log("      himself. Nothing here should wake anybody: after a limit reset every")
+        log("      session is COLD, so an automatic wake pays a full context re-read per")
+        log("      row before any work happens, and 7 of those land at once.")
         return 0
     if not args.until:
         if not cur:
             log("no hold in force — the booter is free to wake stalled rows")
             return 0
-        left = (cur["until"] - now) / 3600
-        kind = "DECLARED" if cur.get("declared_until") else "detected from a tail"
-        log(f"⏸ hold in force: {left:.1f}h left, until "
-            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(cur['until']))} ({kind})")
+        kind = ("DECLARED INDEFINITE" if cur.get("indefinite")
+                else "DECLARED" if cur.get("declared_until") else "detected from a tail")
+        when = ("" if cur.get("indefinite") else
+                f", until {time.strftime('%Y-%m-%d %H:%M', time.localtime(cur['until']))}")
+        log(f"⏸ hold in force: {hold_remaining(cur)}{when} ({kind})")
         if cur.get("declared_reason"):
             log(f"   reason: {cur['declared_reason']}")
         return 0
@@ -592,7 +669,12 @@ def cmd_hold(args):
             f"expired is not a hold, and writing one would read as protection.")
         return 2
     # ⛔ Never SHORTEN an existing hold by accident — say so and keep the longer.
-    if cur and cur.get("until", 0) > until:
+    if cur and cur.get("indefinite"):
+        log("⛔ an INDEFINITE hold is already in force — refusing to replace it with a "
+            "dated one, because that would silently give the fleet an expiry it was "
+            "deliberately denied. Run `hold --clear` first if you mean to.")
+        return 2
+    if cur and (cur.get("until") or 0) > until:
         log(f"⚠ an existing hold runs longer "
             f"({(cur['until'] - now) / 3600:.1f}h vs {(until - now) / 3600:.1f}h) — keeping it. "
             f"Use `hold --clear` first if you really mean to shorten it.")
@@ -839,6 +921,18 @@ def note_rate_limit(uuid, tail):
     """
     prev = rate_limit_hold()
     now = time.time()
+    # ⛔⛔ AN INDEFINITE HOLD IS NOT NEGOTIABLE BY THIS PATH. It is the strongest
+    #    statement available — "wake nobody until a human says so" — and every
+    #    line below computes a dated window at most RATE_LIMIT_HOLD_SECS wide.
+    #    Rewriting the record here silently DROPPED the flag, so one tail
+    #    sighting downgraded an indefinite hold to a 30-minute one and the fleet
+    #    would resume banging into a dead account. Caught by the test that
+    #    asserts the flag survives a sighting, not by reading the code.
+    #    ⇒ Same class as `declared_until` immediately below: a reactive rewrite
+    #    must carry every field that expresses an INSTRUCTION, not just the one
+    #    that was noticed first.
+    if prev and prev.get("indefinite"):
+        return prev
     # ⛔⛔ A TAIL IS SELF-DATING, AND A RESET THAT HAS PASSED IS EVIDENCE THE
     #    OUTAGE ENDED — not evidence to keep holding. If the message says it
     #    resets at a time that is now behind us, and the row has written nothing
@@ -1482,7 +1576,8 @@ def fleet_state(args):
         "rate_limit_hold": None if not rl else {
             "since": rl.get("since"), "until": rl.get("until"),
             "seen_on": rl.get("seen_on"), "tail": rl.get("tail"),
-            "secs_left": round(rl["until"] - now),
+            "indefinite": bool(rl.get("indefinite")),
+            "secs_left": None if rl.get("indefinite") else round((rl.get("until") or 0) - now),
         },
         "subscribers": subs,
     }
@@ -1923,7 +2018,7 @@ def cmd_list(args):
         #   grepped for, which is how the second and third copies survived.
         why = (f"429 seen on {rl['seen_on'][:8]}" if rl.get("seen_on")
                else f"DECLARED: {rl.get('declared_reason') or 'no reason given'}")
-        log(f"⏸ QUOTA HOLD {(rl['until'] - time.time()) / 60:.0f}m left "
+        log(f"⏸ QUOTA HOLD {hold_remaining(rl)} "
             f"({why}) — ⛔ NO BOOT CAN BE DELIVERED TO "
             f"ANY ROW, INCLUDING YOURS, WHILE THIS IS UP")
     # ⭐ Name the directory this reads. A sibling campaign lost minutes concluding
@@ -2529,7 +2624,7 @@ def tick(args):
                 #    for an hour" with no line explaining it is how a watchdog
                 #    becomes unfalsifiable.
                 action = "HOLD:rate-limit"
-                held_m = (rl["until"] - time.time()) / 60
+                held = hold_remaining(rl)
                 # ⚠ `seen_on` exists only on a hold armed by a TAIL SIGHTING. A
                 #   declared hold has no row to name, and indexing it blindly
                 #   turned the suppression path into a crash on the one code
@@ -2537,7 +2632,7 @@ def tick(args):
                 why = (f"seen on {rl['seen_on'][:8]}" if rl.get("seen_on")
                        else f"declared: {rl.get('declared_reason') or 'no reason given'}")
                 log(f"{'RATE-HOLD':<14} {c['age'] / 60:>6.1f}m  {action:<12} {uuid[:8]}  "
-                    f"quota hold {held_m:.0f}m left ({why})")
+                    f"quota hold {held} ({why})")
                 if not args.dry_run:
                     update_sub(uuid, s)
                 continue
@@ -2844,7 +2939,7 @@ def cmd_status(args):
     hold = ""
     if rl:
         armed = (f"⏸ HELD — NO BOOT CAN BE DELIVERED TO ANY ROW "
-                 f"({(rl['until'] - time.time()) / 60:.0f}m left)")
+                 f"({hold_remaining(rl)})")
         why = (f"quota refusal last seen on {rl['seen_on'][:8]}" if rl.get("seen_on")
                else f"DECLARED: {rl.get('declared_reason') or 'no reason given'}")
         hold = (f" · {why}; "
@@ -2906,7 +3001,11 @@ def main():
     ap.add_argument("--forever", action="store_true",
                     help="disarm: stay off until `arm` is run by hand. ⛔ A safety "
                          "net switched off and forgotten is worse than none, so "
-                         "this is deliberately not the default")
+                         "this is deliberately not the default. "
+                         "hold: hold the fleet with NO expiry — nothing lifts it but "
+                         "`hold --clear`. For a limit reset, after which every session "
+                         "is cold and recovery should start one master orchestrator "
+                         "rather than waking everyone")
     ap.add_argument("--json", action="store_true",
                     help="list/status: the machine-readable state, for a surface "
                          "to render and drive")
