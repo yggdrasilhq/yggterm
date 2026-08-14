@@ -474,22 +474,40 @@ def row_process_absent(uuid):
     would skip a fleet hold during a REAL outage; a false "present" merely keeps
     today's behaviour. So anything that is not clearly a shell counts as alive,
     and only a total absence counts as dead."""
+    # ⛔ A DENYLIST OF SHELLS WAS THE WRONG SHAPE AND I SHIPPED IT. `python3` was
+    #    not on it, so a probe of the form `python3 -c "…<uuid>…"` — which is how
+    #    every sweep in this fleet is written — matched ITSELF and reported the
+    #    row alive. That is the FIFTH costume of one trap in a single night:
+    #    `pgrep -f <uuid>` · "exclude grep" · "cmdline contains claude" ·
+    #    "argv[0] is not a shell" · and now the querying interpreter.
+    #    ⇒ Stop enumerating what ISN'T the row. Exclude THIS process explicitly,
+    #    and treat an inline interpreter invocation (`-c`) as what it always is:
+    #    somebody asking the question, never the row being asked about.
+    #    ⚠ The alive-bias is deliberately KEPT — anything else still counts as
+    #    running — because a false "absent" would skip a fleet hold during a real
+    #    outage, while a false "present" merely preserves today's behaviour.
     shells = {"bash", "sh", "zsh", "dash", "ssh", "grep", "awk", "sed", "xargs"}
     try:
         pids = [d for d in os.listdir("/proc") if d.isdigit()]
     except Exception:
         return False                      # cannot tell ⇒ treat as alive
-    needle = uuid.encode()
+    needle, me = uuid.encode(), str(os.getpid())
     for d in pids:
+        if d == me:
+            continue                      # the querying process is not the row
         try:
             cl = Path(f"/proc/{d}/cmdline").read_bytes()
         except Exception:
             continue
         if not cl or needle not in cl:
             continue
-        a0 = os.path.basename(cl.split(b"\0")[0].decode("utf8", "ignore"))
-        if a0 not in shells:
-            return False
+        parts = cl.split(b"\0")
+        a0 = os.path.basename(parts[0].decode("utf8", "ignore"))
+        if a0 in shells:
+            continue
+        if a0.startswith(("python", "perl", "ruby")) and b"-c" in parts[1:2]:
+            continue                      # an inline script is a probe, not a row
+        return False
     return True
 
 
