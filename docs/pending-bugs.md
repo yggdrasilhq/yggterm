@@ -1149,6 +1149,40 @@ and a daemon bump is the action the readiness-probe entry forbids while a human
 has an unsent draft open — see that entry's ordering clause. The hold ends when
 the draft is sent or cleared.
 
+### ⛔⛔ THE HOLD'S END CONDITION IS NOT OBSERVABLE, SO THE HOLD CAN NEVER BE SHOWN TO HAVE ENDED
+
+*Measured 2026-08-14 while testing the gate rather than the items behind it.*
+
+**"The draft is sent or cleared" is the condition, and nothing can report it.**
+The only instrument that consults draft state is `--refuse-if-draft`, a flag on
+`server terminal write` — so the sole way to learn whether a draft exists is to
+**attempt the write the hold exists to forbid**. `server app --help` is explicit
+that the readiness probe "clears the line", i.e. the instrument is destructive to
+the very thing being asked about.
+
+⇒ **This is a permanent hold wearing a temporary one's clothes.** It is the same
+shape as the constitution's own named failure — *a gate that only converges when
+nothing is active can never converge on a machine that is always active* — and it
+currently gates the drain lane, which the campaign calls its highest-value work.
+
+⭐ **THE DATUM ALREADY EXISTS, NON-DESTRUCTIVELY, AND IS SIMPLY NOT EXPOSED.** The
+daemon carries `has_pending_draft` on a session signature and consults it in
+`session_is_migratable` (`daemon.rs`, and the lock
+`not_migratable_when_draft_present` asserts *"a typed-but-unsent draft must
+protect the session from release"*). So the server already knows, on every
+session, without typing anything.
+
+**Owed, and it is small:** a read-only way to ask — either a `has_pending_draft`
+field on the rows/gate-screen payload, or a `server rows drafts` verb. That
+converts an unobservable end condition into a measurable one and lets the hold
+lift on evidence instead of on someone's recollection.
+
+⚠ **Until then the hold STANDS and must not be lifted on inference.** A read of
+the live plane found no draft-shaped blocker anywhere — but the blocker vocabulary
+has no draft kind at all, and the rows the owner actually types in are not even in
+that daemon's population. **Blind is not clear**, and the cost of being wrong here
+is a person's unsent sentence.
+
 **Status of this entry: FIXED IN CODE, awaiting the measured ≥90× drop.**
 
 All three writes removed in one change, as the correction demanded — the two
