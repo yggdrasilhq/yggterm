@@ -875,22 +875,52 @@ component (fresh nonce, pristine boxes, still 0/6); not activation
 
 ### ⛔ AND "IT IS PROBABLY A STALE BINARY" IS REFUTED — the code is unchanged
 
-The running GUI is build `5f76dcb0` (3.0.148, 2026-08-13 22:25) and `origin/main`
-is **224 commits ahead**, so the staleness is real. It is not the cause:
+The running GUI was build `5f76dcb0` (3.0.148) while `origin/main` was **224
+commits ahead**, so the staleness was real. It is not the cause:
 
 - **No commit in those 224 touches `real_keys` or `real-keys` anywhere in
   `crates/`.** The three files that implement the mechanism
   (`app_control.rs`, `app_control_web_cli.rs`, `shell.rs`) are unchanged on that
   string; `shell.rs` has 8 commits in the window but none of them touch it.
+- ⭐ Re-run 2026-08-14 with the scope WIDENED to `vendor/`, where the injection
+  actually lives (`vendor/dioxus-desktop/src/web_surface.rs` — `inject_key`,
+  `synth_key`, the focus loan, the map plan). One commit in the window touches
+  `vendor/dioxus-desktop` at all and it is not that file. The original grep had
+  stopped at `crates/`, which does NOT contain the mechanism.
 
-⇒ **Relaunching that GUI would change nothing about this symptom.** The defect is
-live in current `main`. Diagnose it as code, not as an install.
+### ⛔⛔ AND "SO DIAGNOSE IT AS CODE, IT IS LIVE IN MAIN" IS ALSO REFUTED — measured, six arms
 
-⚠ The staleness is still worth fixing on its own account, and it is already
-consolidated with the other GUI-gated items in `docs/owner-attention.md` as ONE
-relaunch. ⛔ Do not cycle that desktop to test this — it is the owner's, he holds
-an unsent draft on it, and this entry now says the restart would not answer the
-question anyway.
+That was an inference from the staleness refutation, not a measurement, and the
+measurement disagrees. `scripts/web-real-keys-ab.sh` brings up a private
+sandbox GUI, gets a live web surface, and runs `do type` with `do click` as the
+**control on the same surface in the same run**. Every arm below answered
+`delivered:true` for BOTH verbs and read the typed value back:
+
+| # | build | machine | surface state |
+|---|---|---|---|
+| 1 | current `main` | build host | active, mapped |
+| 2 | current `main` | build host | hidden after being born visible (`visibilityState:hidden`, `mapped:false`) |
+| 3 | current `main` | build host | born headless (`engine_visible:false`), the same shape the failing surface had |
+| 4 | the OLD build the GUI was running | build host | active, mapped |
+| 5 | current `main` | **the GUI host itself**, private sandbox | active, mapped |
+| 6 | current `main` | build host, harness self-check | active, mapped |
+
+⇒ The mechanism is **not** broken in `main`, not broken in the older build, not
+broken by the hidden/headless states agents actually drive, and not broken on
+the GUI host's hardware, compositor or IM configuration. The IM guard was
+checked separately and had applied on the live GUI
+(`linux_im_module_policy` → `gtk-im-context-simple`, `im_already_set:false`),
+so the ibus route is not open there either.
+
+⚠ **What is therefore still open is narrower and harder:** the failure is
+conditional on the live GUI PROCESS or on the specific third-party page that
+was being driven — not on the code path, the build, or the machine. Nothing
+short of a probe against that process can separate those two, which is why the
+next step is owner-gated (`docs/owner-attention.md`).
+
+⛔ **Do not re-derive the six arms.** Run the script instead; it takes a minute
+and reports its own control. ⛔ And do not cycle the owner's desktop to test
+this — the relaunch was already shown not to answer the question.
 
 ### ⭐ WHY THIS OUTRANKS ONE BROKEN VERB
 

@@ -88,6 +88,22 @@ copies.
   and reversal is two calls at any later time.
   *Meanwhile:* untouched, and the campaign keeps working on it.
 
+- **May the relay run ONE real-key probe against the live GUI before it is next
+  relaunched — and does that probe come before the relaunch below?** Real-key
+  input failed six times on his window and the mechanism has now been cleared in
+  six controlled arms (both builds, both machines, every surface state, with a
+  click control in each), so what is left is conditional on that PROCESS or on
+  the page it was driving — and **a relaunch destroys the only known
+  reproduction**, which is the opposite of what the five relaunch-gated items
+  want. → `docs/pending-bugs.md` § *REAL-KEY INPUT DELIVERS NOTHING ON THE GUI
+  HOST*. **Recommendation: yes, and run it first** — it is one new throwaway row
+  driven with `--purpose`/`--ephemeral` and removed afterwards, it never touches
+  his composer or his draft, and it costs seconds; if he would rather not,
+  relaunch first and the entry closes as unreproducible rather than open forever.
+  *Meanwhile:* the harness is landed and self-contained
+  (`scripts/web-real-keys-ab.sh`) so the probe is one command whenever he says,
+  and the relay is not waiting on it.
+
 - **The laptop boots with no usable TSC, so every `clock_gettime` costs 45.8×
   what it should (1222.5 ns on `hpet` vs 26.7 ns on `tsc`) — may we add
   `tsc=reliable` to its kernel command line?** It is a boot-config change on his
