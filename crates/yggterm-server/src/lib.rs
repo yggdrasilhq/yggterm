@@ -21890,6 +21890,24 @@ pub fn run_row_drafts() -> anyhow::Result<()> {
     write_stdout_payload(&serde_json::to_string_pretty(&serde_json::json!({
         "home": home.display().to_string(),
         "verdict": verdict,
+        // ⛔ THE SAME FIELD ANSWERS TWO DIFFERENT QUESTIONS DEPENDING ON WHICH
+        // HOST YOU ASK, AND NOTHING ELSE SAYS SO. A row worked on a server but
+        // displayed on a laptop exists on BOTH: the GUI host holds it as
+        // `remote-*` and the work host holds the PTY as `local://`/`cc-runtime://`.
+        // `PtySessionRuntime::write` is the only path the client drives, so the
+        // GUI host reconstructs the draft for what the PERSON typed, while the
+        // PTY host's copy is what a MIGRATION would disturb. Both are real and
+        // they are not interchangeable — asking the wrong one is how "clear"
+        // gets read off a host that was never going to hold the answer.
+        "scope": "this host only",
+        "answers": if drafted.is_empty() && unable == 0 {
+            "no unsent line in any session this host's daemons own"
+        } else {
+            "see per-daemon rows; an unasked daemon is not a clean one"
+        },
+        "ask_also": "the OTHER hosts holding these rows — a `remote-*` key here is \
+                     a `local://` or `cc-runtime://` key there, and only the PTY \
+                     host's answer bears on migrating it",
         "daemons_seen": daemons.len(),
         "daemons_or_rows_unable_to_answer": unable,
         "sessions_answered": answered_sessions,
