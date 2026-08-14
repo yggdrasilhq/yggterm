@@ -1256,10 +1256,28 @@ which is exactly what he reported, with the frozen content being whichever rail
 was painted last. **It is the same discriminator as the 2026-08-08 sighting and
 the blank body: the model advances, the subtree does not.**
 
-⭐ **And it refines the damage.** His rail is NOT blank right now — it is
-populated and frozen, so this is a LATER truncation point than the placeholder
-case above, on a GUI carrying two faults. ⇒ The repair below has a live target
-today, and a repair that only handles a placeholder body would not cure this one.
+⭐ **And it refined the damage:** his rail was not blank, it was populated and
+frozen — a LATER truncation point than the placeholder case above, on a GUI
+carrying two faults. A repair that only handles a placeholder body would not have
+cured it.
+
+### ✅ THAT GUI IS CURED, AND THE CURE CONFIRMS THE MODEL — 2026-08-14 11:27
+
+**The window turned over on its own** (verified by IDENTITY, not version: the
+process's `/proc/<pid>/exe` md5sums byte-identical to the installed binary).
+Re-measured on the new process with the same bracketed instrument:
+
+```
+before the relaunch  webview_edit_faults: 2   model says one rail, glass shows another
+after  the relaunch  webview_edit_faults: 0   model and glass AGREE, rail fully painted
+```
+
+⇒ **The divergence is bounded by the GUI PROCESS**, which this entry asserted
+from a sandbox and which has now been seen on the machine that had the damage.
+⛔ It does not close anything: recurrence was already fixed, and **the open work
+is still REPAIR** — a resync for the next GUI that takes a fault, since the only
+cure available today remains killing the page. There is simply no damaged
+surface to test a repair against at this moment.
 
 ⚠ **`rendered_mode` is not a report about the screen.** It names the mode the
 host believes it rendered; on a diverged webview it is confidently wrong, and it
