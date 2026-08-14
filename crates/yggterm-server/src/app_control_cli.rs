@@ -2258,9 +2258,26 @@ mod dispatch_reachability_lock {
     #[test]
     fn every_cli_module_is_reached_by_a_dispatcher() {
         const LIB: &str = include_str!("lib.rs");
+        // ⚠ THE BINARIES ARE DISPATCHERS TOO, and leaving them out made this lock
+        // fire on a module that is perfectly reachable.
+        //
+        // It went red the moment two lanes met on `main`: one added this lock,
+        // the other added `server_cli` — a module BOTH BINARIES dispatch
+        // (`main.rs` and `yggterm-headless.rs` each call `server_cli::run_*`),
+        // not one app-control routes to. Neither lane was wrong on its own and
+        // neither could have seen it, because the collision exists only in the
+        // merge.
+        //
+        // ⛔ The alternative was an exclusion list naming `server_cli`, which is
+        // exactly the hand-list this test's own doc argues against: a module
+        // added tomorrow would then be excused by nobody's decision. Naming the
+        // dispatchers is a fact about the code; naming the exceptions is a guess
+        // that rots.
         let dispatchers = [
             include_str!("app_control_cli.rs"),
             include_str!("app_control_web_cli.rs"),
+            include_str!("../../../apps/yggterm/src/main.rs"),
+            include_str!("../../../apps/yggterm/src/bin/yggterm-headless.rs"),
         ];
         let mut modules: Vec<&str> = Vec::new();
         for line in LIB.lines() {
