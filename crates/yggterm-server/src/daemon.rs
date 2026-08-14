@@ -11551,6 +11551,10 @@ fn daemon_copy_chore_should_scan_local_tree(generation_enabled: bool, is_superse
     generation_enabled && !is_superseded
 }
 
+/// Whether the client-instance read is CURRENTLY failing, so the trace records
+/// the transition rather than one line per poll.
+static IDLE_SHUTDOWN_CLIENT_READ_FAILING: AtomicBool = AtomicBool::new(false);
+
 fn daemon_should_idle_shutdown(
     home_dir: &Path,
     endpoint: &ServerEndpoint,
@@ -11569,9 +11573,39 @@ fn daemon_should_idle_shutdown(
         return false;
     }
     let clients_empty = match active_client_instance_records(home_dir, endpoint) {
-        Ok(records) => records.is_empty(),
+        Ok(records) => {
+            IDLE_SHUTDOWN_CLIENT_READ_FAILING.store(false, Ordering::Relaxed);
+            records.is_empty()
+        }
         Err(error) => {
             warn!(error=%error, "failed to read active client instances during daemon idle check");
+            // ⛔⛔ THIS IS A SILENT-FOREVER PATH AND IT SITS IN THE DRAIN'S
+            // CRITICAL CLAUSE. Refusing to retire on an unreadable client list
+            // is the right call — "I could not ask" must never be read as "no
+            // clients" — but until now it returned `false` with nothing in the
+            // trace, so a daemon whose read keeps failing never retires and
+            // NOTHING SAYS WHY. The drain's whole second half is "then the
+            // emptied daemon retires on its own"; this is one of the two ways
+            // that silently does not happen.
+            //
+            // Traced on the TRANSITION only. A per-poll event here would be the
+            // re-logged-forever shape that already cost this project 15% of its
+            // trace volume — the fact is "it started failing", not "it is still
+            // failing".
+            if !IDLE_SHUTDOWN_CLIENT_READ_FAILING.swap(true, Ordering::Relaxed) {
+                append_trace_event(
+                    home_dir,
+                    "daemon",
+                    "lifecycle",
+                    "idle_shutdown_blocked_by_unreadable_clients",
+                    serde_json::json!({
+                        "error": error.to_string(),
+                        "consequence": "this daemon will not retire while the read keeps failing",
+                        "current_version": SERVER_PROTOCOL_VERSION,
+                        "current_pid": std::process::id(),
+                    }),
+                );
+            }
             return false;
         }
     };
