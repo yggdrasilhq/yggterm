@@ -3,7 +3,6 @@
 /// The NATIVE notification audio path (`server app audio`). Not the webview:
 /// WebKitGTK's autoplay gate streams silent samples without a user gesture,
 /// which an agent cannot produce.
-mod audio_cli;
 mod build_identity;
 mod supervisor;
 
@@ -506,16 +505,6 @@ fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     yggterm_core::cli_flag_value(args, flag)
 }
 
-/// A `server app` verb's free-form payload, read position-independently.
-///
-/// ⛔ The RULE lives in [`yggterm_core::cli_payload_arg`], beside the positional
-/// reader it is built on, because `bin/yggterm-headless.rs` has the same arms
-/// and a second copy of an argv rule is exactly how the two binaries drift.
-/// This is only the `anyhow` adapter.
-fn app_control_payload_arg<'a>(args: &'a [String], start: usize, what: &str) -> Result<&'a str> {
-    yggterm_core::cli_payload_arg(args, start, what).map_err(|error| anyhow::anyhow!(error))
-}
-
 /// Refuse a payload that is really a flag. Adapter over
 /// [`yggterm_core::refuse_flag_shaped_payload`]; see there for why the guard
 /// exists at all (the LIE-OF-SUCCESS shape, not a wrong answer).
@@ -874,148 +863,6 @@ fn print_server_help() {
     );
 }
 
-fn print_server_app_help() {
-    println!(
-        "usage:
-  yggterm server app audio play [--tone info|success|warning|error] [--repeat n]
-                                [--gap-ms n] [--preroll on|off|auto] [--volume 0..1]
-  yggterm server app audio tune --notes '[[startSec,freqHz,peak], …]'
-    NATIVE audio (no webview, no GUI needed): WebKitGTK's autoplay gate streams
-    silent samples without a user gesture, which an agent cannot produce.
-    `server app audio --help` has the tone patterns and the tune's provenance
-  yggterm server app clients
-  yggterm server app desktop-identity
-  yggterm server app launch [--wait-visible] [--wait-settled] [--allow-multi-window]
-  yggterm server app state [--pid <pid>]
-  yggterm server app rows [--pid <pid>]
-  yggterm server app sessions reorder <order.json>
-    sets the order on the GUI — the process that RENDERS it — and answers with
-    the resulting `rendered_order`. `server sessions reorder` writes to whichever
-    daemon the CLI resolved, which is not always the one the GUI reads.
-  yggterm server app sessions restore <session-path>... [--dry-run] [--include-closed]
-    puts NAMED rows back through the same open a click takes, one at a time, and
-    REFUSES any the user closed — the deny-list is consulted once for the batch
-    and the reply carries `declined_closed_count` plus the paths.
-  yggterm server app sessions sort [--dry-run]
-    re-derives the Live order from the rows' outline numbers and applies it.
-    Segments compare as INTEGERS (1 · 1.1 · 2 · 10), unnumbered rows sort last
-    and stably, and sorting a sorted list reports changed:false — which is the
-    success case, not a no-op to chase.
-  yggterm server app session outline <session-path> <prefix>
-    numbers a row that already exists and RE-SEATS it (an empty prefix clears
-    it). The number is stored apart from the title and composed at render time,
-    so a CLI re-titling itself can no longer destroy a position.
-  yggterm server app update <check|restart> [--force]
-    restart REFUSES while an agent web-surface lease is live (agent_lease_active);
-    pre-flight with `server app state | jq .agent_leases`
-  yggterm server app screenshot [output] [--pid <pid>] [--region terminal|full] [--crop x,y,w,h] [--scale n] [--backend os]
-  yggterm server app open <session-path> [--view <terminal|preview>] [--pid <pid>]
-  yggterm server app session <remove|delete> <session-path> [--pid <pid>]
-    answers verified:true only when the row left the live order AND every
-    process the session owned is gone; otherwise verified:false with a named
-    refusal and the surviving pids in live_processes
-  yggterm server app session rename <session-path> <title> [--pid <pid>]
-  yggterm server app start-page [--pid <pid>]
-  yggterm server app notify <title> [message] [--tone info|success|warning|error]
-      [--job <key>] [--progress 0..100] [--session <session-path>]
-      [--persistent] [--silent] [--in <dur>|--at <clock>] [--pid <pid>]
-    THE door for an agent, a cron job or a libyggterm app to reach the user.
-    ⛔ It targets the ACTIVE GUI by default — an agent testing one MUST pass
-    --pid/--client or its toast lands on the user's own screen.
-    --job upserts one row (that is how a long job reports progress without
-    burying everything else) and --progress draws the bar; --progress without
-    --job is DROPPED. --session makes the card clickable through to that row.
-    ⚠ $YGGTERM_SESSION_ID is NOT a row path — match its UUID against
-    `server app rows` first, or the card is inert.
-  yggterm server app launch-app <app> [verb] [--cwd <dir>] [--insert-after <session-path>]
-    launch a libyggterm app's verb through the SAME owner the titlebar `+`,
-    the row menu and the start page use. <app> is the registry key
-    (`ychrome`, `yedit`); no verb given means the app's first, which is what
-    a menu shows first. The reply's `shell.launch_app` block reports what was
-    accepted and the real launch command the row was born with.
-  yggterm server app pane <pane-id> <action> [value]
-    press something in a contributed pane, exactly as a click does —
-    `panel pane:<id>` opens one, this is what can act on it. value is
-    what the widget would carry: a row id for a row_action, a tab id
-    for tabs, absent for a plain button
-  yggterm server app terminal <new|send|input-check|focus|scroll|probe-type|probe-scroll|probe-select|probe-context-menu> ...
-  yggterm server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|<agent-cli>>] [--title <title>] [--purpose <what-for>] [--no-activate]
-    --kind takes `shell` or any registered agent CLI slug. The refusal message
-    lists them all, and it is generated from the registry — so it is the surface
-    to read, never this line.
-  yggterm server app launch-flags <open|close|set|reset> [--cli <slug>] [--args <flags>]
-    opens the agent-CLI launch-flags modal, or writes one CLI's flags without
-    opening it. `set --cli codex --args '-s danger-full-access'` stores; `reset
-    --cli codex` forgets the stored value so the box falls back to that CLI's
-    default tier. Answers with `open` read BACK off the shell, not echoed.
-      [--outline <prefix> | --insert-after <session-path>]
-    with no --title the row is named for the driving agent and its purpose.
-    --outline seats the row at a stored number that survives restarts and
-    re-titles; --insert-after places it below an anchor row this once. The seat
-    is applied INSIDE the create, and the reply's `seat.honoured` is RE-READ
-    from the rendered order rather than echoed from the request. Passing both,
-    or a prefix that is not a dotted number, is refused BY NAME before the row
-    is created.
-  yggterm server app terminal scroll <session> --to <top|bottom|±N>
-  yggterm server app terminal read-buffer <session> [--mode screen|full|cells]
-  yggterm server app terminal input-check <session> [--check-timeout-ms <ms>]
-    Is this row CONSUMING INPUT? Answers and submits NOTHING, so it is safe to
-    point at a row the owner is using. A wedged agent row is ALIVE, its turn has
-    ENDED and it draws its composer, so every other signal calls it healthy and
-    `send` into it answers `error: null` while delivering nothing. `wedged:true`
-    is a POSITIVE claim (composer displayed AND no echo), never merely quiet;
-    a busy row mid-output answers `composer_shown:false` instead. Refuses by
-    name when the composer holds an unsent draft — the probe clears the line.
-  yggterm server app terminal send <session> (--data <data>|--stdin) [--allow-multiline]
-    a payload with interior line breaks is REFUSED for an agent CLI row: its
-    composer reads every \r as Enter, so line 1 submits alone and the rest
-    become queued messages. Use `terminal submit` for a brief, or
-    --allow-multiline to fire N separate submits deliberately. Shell rows are
-    unaffected — there N lines are N commands.
-  yggterm server app terminal new [--kind <shell|<agent-cli>>] [--cwd <dir>] [--title <t>]
-      [--machine-key <k>] [--no-activate] [--purpose <text>]
-      [--model <id>] [--permission-mode <default|plan|accept-edits|bypass>]
-      [--prompt <text>|--prompt-stdin]
-      [--ephemeral (--ephemeral-owner-pid <pid> | --ephemeral-idle-ttl-secs <n>)]
-{delegate_usage}
-  yggterm server app keytips <audit [--json]|show|hide>
-  yggterm server app media answer <allow|deny-once|block-site> [--request <id>]
-    answers the camera/microphone prompt `server app state` reports under
-    pending_media_capture; non-zero exit + a named reason when it was NOT applied
-  yggterm server app command <list|invoke <id>>
-  yggterm server app dom-eval <script>
-    evaluates the script in the GUI's OWN dom (the app chrome; a page inside a
-    web surface is `web eval`). The body is spliced into an async function, so
-    `return` whatever you want back
-{web_usage}
-row tenancy (server app terminal new): these flags are parsed by the SAME reader
-  as the headless binary's, so they mean one thing on either. Every create from
-  this CLI records the creating pid, this host and --purpose; read it back with
-  `yggterm-headless server terminal tenants` (that verb lives on the headless
-  binary). --ephemeral OPTS IN to reaping and is REFUSED on its own: name
-  --ephemeral-owner-pid <pid> (a process you KNOW outlives the create, i.e. your
-  own pid — under `bash -c` or `ssh host \"<cli>\"` the parent is a wrapper that
-  dies immediately, which is why there is no default), or
-  --ephemeral-idle-ttl-secs <n> for a TTL-only rule, or both. Keep-alive does not
-  shield a declared row — it governs GUI-window-close survival, not an explicit
-  close. Rows made any other way are never reaped. Every flag takes
-  --flag value or --flag=value.
-
-targeting (any app verb): [--pid <pid>] or [--client <name>] picks which GUI
-  worker handles the verb; --client names a client by its --client-id (a shadow
-  view client, slice 4.3) — see `server app clients`. --pid wins if both given;
-  with one GUI and no target it routes there automatically. These flags may be
-  written BEFORE or AFTER a verb's value: `dom-eval --client shadow '<js>'` and
-  `dom-eval '<js>' --client shadow` are the same command, and a value that
-  itself looks like a flag is refused rather than acted on.",
-        // The web usage block is rendered by the plane's OWNER, so this help
-        // and the headless binary's cannot document different verb sets.
-        web_usage = yggterm_server::web_usage_block("yggterm"),
-        // Same rule for the delegate-launch flags: one owner renders
-        // them, both binaries print them under their own name.
-        delegate_usage = yggterm_server::delegate_launch_usage_block("yggterm")
-    );
-}
 
 fn print_server_sessions_help() {
     println!(
@@ -1617,7 +1464,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             BuiltinCliCommand::ServerAppHelp => {
-                print_server_app_help();
+                yggterm_server::app_control_cli::print_server_app_help("yggterm");
                 return Ok(());
             }
             BuiltinCliCommand::ServerSessionsHelp => {
@@ -2118,84 +1965,23 @@ fn main() -> Result<()> {
         return run_screenrecord_capture(&args[2], output_path, timeout_ms, duration_secs);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "app" {
-        // ONE owner for how a verb names its GUI target: an explicit
-        // `--pid`/`--client` on this invocation wins (`--pid` beats `--client`
-        // downstream in `choose_app_control_pid`), and with no flag the
-        // exported YGGTERM_APP_CONTROL_PID/_CLIENT stands. The inline block
-        // this replaces REMOVED the exported variable whenever the flag was
-        // absent, which is why it worked for one verb and not another
-        // (field report A5, 2026-07-28).
-        yggterm_server::apply_app_control_target_overrides(&args);
-        let timeout_ms = args
-            .windows(2)
-            .find_map(|window| {
-                if window[0] == "--timeout-ms" {
-                    window[1].parse::<u64>().ok()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(15_000);
-        return match args[2].as_str() {
-            "--help" | "-h" | "help" => {
-                print_server_app_help();
-                Ok(())
+        // ONE OWNER for the whole `server app` surface — see
+        // `yggterm_server::app_control_cli`. The 1,308-line `match` that stood
+        // here was a second copy of the headless binary's, and the pair had
+        // drifted by six verbs. Do not inline a verb here.
+        struct GuiHost;
+        impl yggterm_server::app_control_cli::AppControlHost for GuiHost {
+            fn binary_name(&self) -> &'static str {
+                "yggterm"
             }
-            "screenshot" => {
-                let target = args
-                    .windows(2)
-                    .find_map(|window| {
-                        if window[0] == "--target" {
-                            Some(window[1].as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or("app");
-                let output_path = cli_positional_args(&args, 3)
-                    .into_iter()
-                    .find(|value| *value != target);
-                let compositor = screenshot_backend_is_compositor(&args);
-                if compositor || parse_screenshot_post_process(&args).is_some() {
-                    let post =
-                        parse_screenshot_post_process(&args).unwrap_or(ScreenshotPostProcess {
-                            region: None,
-                            crop: None,
-                            scale: 1.0,
-                            grid: None,
-                        });
-                    run_screenshot_capture_with_post_process(
-                        target,
-                        output_path,
-                        timeout_ms,
-                        post,
-                        compositor,
-                    )
-                } else {
-                    run_screenshot_capture(target, output_path, timeout_ms)
-                }
-            }
-            "audio" => audio_cli::run_audio_command(&args),
-            "screenrecord" => {
-                let duration_secs = args
-                    .windows(2)
-                    .find_map(|window| {
-                        if window[0] == "--duration-sec" {
-                            window[1].parse::<u64>().ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(10);
-                let output_path = cli_positional_args(&args, 3).into_iter().next();
-                run_screenrecord_capture("app", output_path, timeout_ms, duration_secs)
-            }
-            "launch" => {
-                let wait_visible = args.iter().any(|arg| arg == "--wait-visible");
-                let wait_settled = args.iter().any(|arg| arg == "--wait-settled");
-                let allow_multi_window = args.iter().any(|arg| arg == "--allow-multi-window");
-                let skip_active_exec_handoff =
-                    args.iter().any(|arg| arg == "--skip-active-exec-handoff");
+            // The one genuine fork: this binary IS the app, so it spawns the
+            // window itself instead of asking a companion.
+            fn launch_app(
+                &self,
+                args: &[String],
+                home_dir: &std::path::Path,
+                timeout_ms: u64,
+            ) -> anyhow::Result<()> {
                 let log_path = args.windows(2).find_map(|window| {
                     if window[0] == "--log" {
                         Some(window[1].as_str())
@@ -2204,1227 +1990,21 @@ fn main() -> Result<()> {
                     }
                 });
                 launch_app_background(
-                    store.home_dir(),
+                    home_dir,
                     timeout_ms,
-                    wait_visible,
-                    wait_settled,
-                    allow_multi_window,
-                    skip_active_exec_handoff,
+                    args.iter().any(|arg| arg == "--wait-visible"),
+                    args.iter().any(|arg| arg == "--wait-settled"),
+                    args.iter().any(|arg| arg == "--allow-multi-window"),
+                    args.iter().any(|arg| arg == "--skip-active-exec-handoff"),
                     log_path,
                 )
             }
-            "clients" => run_app_control_list_clients(),
-            "desktop-identity" => run_app_control_desktop_identity(),
-            // A LOCAL /proc walk, not an app-control round trip: the profile is
-            // most needed when the GUI is too loaded to answer a socket.
-            "memory" | "mem" => {
-                run_app_control_memory_profile(
-                    args.iter().any(|arg| arg == "--json"),
-                    args.iter().any(|arg| arg == "--sweep"),
-                )
-            }
-            "state" => run_app_control_describe_state(timeout_ms),
-            "dump" => {
-                let output_path = cli_positional_args(&args, 3)
-                    .into_iter()
-                    .next()
-                    .context("missing output path for server app dump")?;
-                run_app_control_dump_state(output_path, timeout_ms)
-            }
-            "rows" => run_app_control_describe_rows(timeout_ms),
-            "sessions" if args.get(3).map(String::as_str) == Some("reorder") => {
-                // `server app sessions reorder <order.json>` — the APP-path twin
-                // of `server sessions reorder`. Same file format; the difference
-                // is which process it reaches, and only this one reaches the
-                // list the user is looking at.
-                let order_path = args
-                    .get(4)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "usage: server app sessions reorder <order.json>"
-                    ))?;
-                let raw = std::fs::read_to_string(order_path)
-                    .with_context(|| format!("reading order file {order_path}"))?;
-                let ordered_paths: Vec<String> = serde_json::from_str(&raw)
-                    .with_context(|| format!("{order_path} must be a JSON array of session paths"))?;
-                if ordered_paths.is_empty() {
-                    anyhow::bail!("{order_path} is empty; refusing to clear the row order");
-                }
-                run_app_control_reorder_sessions(ordered_paths, timeout_ms)
-            }
-            // `server app sessions sort [--dry-run]` — the owner's shortcut:
-            // re-derive the Live order from the rows' outline numbers and apply
-            // it, through the same path a manual drag takes.
-            // `server app sessions restore <session-path>... [--dry-run]` —
-            // the recovery verb, with the user's deletions honoured. Every path
-            // is checked against the tombstone plane BEFORE anything is opened,
-            // and the reply names how many it declined; without that a restore
-            // hands back the rows the user deliberately deleted.
-            "sessions" if args.get(3).map(String::as_str) == Some("restore") => {
-                let dry_run = args.iter().any(|arg| arg == "--dry-run");
-                // ⚖ The override is NAMED, not implied. A relay legitimately
-                // retires its predecessor's row with `session remove`, so a
-                // deliberately-closed row is sometimes exactly the one someone
-                // wants back — but the default must stay the deny-list, or the
-                // verb is back to being the loop it replaced.
-                let include_closed = args.iter().any(|arg| arg == "--include-closed");
-                let session_paths = cli_positional_args(&args, 4)
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
-                yggterm_server::run_app_control_restore_sessions(
-                    session_paths,
-                    dry_run,
-                    include_closed,
-                    timeout_ms,
-                )
-            }
-            "sessions" if args.get(3).map(String::as_str) == Some("sort") => {
-                yggterm_server::run_app_control_sort_sessions(
-                    args.iter().any(|arg| arg == "--dry-run"),
-                    timeout_ms,
-                )
-            }
-            "preview" | "web-view" | "webview" => {
-                let action = args.get(3).map(String::as_str).unwrap_or("scroll");
-                match action {
-                    "scroll" => {
-                        let top_px = args.windows(2).find_map(|window| {
-                            if window[0] == "--top" {
-                                window[1].parse::<f64>().ok()
-                            } else {
-                                None
-                            }
-                        });
-                        let ratio = args.windows(2).find_map(|window| {
-                            if window[0] == "--ratio" {
-                                window[1].parse::<f64>().ok()
-                            } else {
-                                None
-                            }
-                        });
-                        run_app_control_scroll_preview(top_px, ratio, timeout_ms)
-                    }
-                    "layout" => {
-                        let layout = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .unwrap_or("chat");
-                        let layout = match layout {
-                            "chat" => AppControlPreviewLayout::Chat,
-                            "graph" | "overview" => AppControlPreviewLayout::Graph,
-                            other => anyhow::bail!("unsupported app web view layout: {other}"),
-                        };
-                        run_app_control_set_preview_layout(layout, timeout_ms)
-                    }
-                    other => anyhow::bail!("unsupported app web view action: {other}"),
-                }
-            }
-            "zoom" => {
-                let value = args
-                    .windows(2)
-                    .find_map(|window| {
-                        (window[0] == "--value").then(|| window[1].parse::<f32>().ok())
-                    })
-                    .flatten()
-                    .context("missing --value for server app zoom")?;
-                let view_mode = args.windows(2).find_map(|window| {
-                    if window[0] != "--view" {
-                        return None;
-                    }
-                    match window[1].as_str() {
-                        "preview" | "rendered" | "web-view" | "webview" => {
-                            Some(AppControlViewMode::Preview)
-                        }
-                        "terminal" => Some(AppControlViewMode::Terminal),
-                        _ => None,
-                    }
-                });
-                run_app_control_set_main_zoom(value, view_mode, timeout_ms)
-            }
-            "expand" | "collapse" => {
-                let row_path = cli_positional_args(&args, 3)
-                    .into_iter()
-                    .next()
-                    .context("missing row path for server app expand/collapse")?;
-                run_app_control_set_row_expanded(row_path, args[2] == "expand", timeout_ms)
-            }
-            "focus" => run_app_control_focus_window(timeout_ms),
-            "background" | "minimize" => run_app_control_background_window(timeout_ms),
-            "move-window" | "move-by" | "nudge" => {
-                let delta_x = args.windows(2).find_map(|window| {
-                    if window[0] == "--delta-x" || window[0] == "--dx" {
-                        window[1].parse::<f64>().ok()
-                    } else {
-                        None
-                    }
-                });
-                let delta_y = args.windows(2).find_map(|window| {
-                    if window[0] == "--delta-y" || window[0] == "--dy" {
-                        window[1].parse::<f64>().ok()
-                    } else {
-                        None
-                    }
-                });
-                run_app_control_move_window_by(
-                    delta_x.context("missing --delta-x/--dx for server app move-window")?,
-                    delta_y.context("missing --delta-y/--dy for server app move-window")?,
-                    timeout_ms,
-                )
-            }
-            "resize-window" | "set-window-size" | "size" => {
-                let width = args.windows(2).find_map(|window| {
-                    if window[0] == "--width" || window[0] == "--w" {
-                        window[1].parse::<f64>().ok()
-                    } else {
-                        None
-                    }
-                });
-                let height = args.windows(2).find_map(|window| {
-                    if window[0] == "--height" || window[0] == "--h" {
-                        window[1].parse::<f64>().ok()
-                    } else {
-                        None
-                    }
-                });
-                run_app_control_resize_window(
-                    width.context("missing --width/--w for server app resize-window")?,
-                    height.context("missing --height/--h for server app resize-window")?,
-                    timeout_ms,
-                )
-            }
-            "close" | "quit" | "exit" => {
-                if app_control_close_preserve_flag(&args) {
-                    run_app_control_close_window_preserving_sessions(
-                        timeout_ms,
-                        Some("manual-preserve-close".to_string()),
-                        args.iter().any(|arg| arg == "--force"),
-                    )
-                } else {
-                    run_app_control_close_window(timeout_ms)
-                }
-            }
-            "chrome-hover" | "titlebar-hover" => {
-                let active = cli_positional_args(&args, 3)
-                    .into_iter()
-                    .next()
-                    .map(|value| match value {
-                        "on" | "true" | "1" | "hover" | "enter" => Some(true),
-                        "off" | "false" | "0" | "leave" => Some(false),
-                        _ => None,
-                    })
-                    .flatten()
-                    .context("missing or invalid hover state for server app chrome-hover")?;
-                run_app_control_set_window_chrome_hover(active, timeout_ms)
-            }
-            "clipboard" => {
-                let action = args.get(3).map(String::as_str).unwrap_or("text");
-                match action {
-                    "text" | "set" => {
-                        let value = cli_flag_value(&args, "--value")
-                            .or_else(|| cli_flag_value(&args, "--text"))
-                            .or_else(|| cli_positional_args(&args, 4).into_iter().next())
-                            .unwrap_or("");
-                        run_app_control_set_clipboard_text(value, timeout_ms)
-                    }
-                    "png" | "image" | "png-base64" => {
-                        let value = cli_flag_value(&args, "--base64")
-                            .or_else(|| cli_flag_value(&args, "--value"))
-                            .or_else(|| cli_positional_args(&args, 4).into_iter().next())
-                            .context("missing --base64/--value for server app clipboard image")?;
-                        run_app_control_set_clipboard_png_base64(value, timeout_ms)
-                    }
-                    other => anyhow::bail!("unsupported app clipboard action: {other}"),
-                }
-            }
-            "search" => {
-                let action = args.get(3).map(String::as_str).unwrap_or("set");
-                match action {
-                    "set" => {
-                        let query = cli_flag_value(&args, "--query")
-                            .or_else(|| cli_flag_value(&args, "--value"))
-                            .or_else(|| cli_positional_args(&args, 4).into_iter().next())
-                            .unwrap_or("");
-                        let focused = args.windows(2).find_map(|window| {
-                            if window[0] != "--focus" {
-                                return None;
-                            }
-                            match window[1].as_str() {
-                                "on" | "true" | "1" => Some(true),
-                                "off" | "false" | "0" => Some(false),
-                                _ => None,
-                            }
-                        });
-                        run_app_control_set_search(query, focused, timeout_ms)
-                    }
-                    "clear" => run_app_control_set_search("", Some(false), timeout_ms),
-                    other => anyhow::bail!("unsupported app search action: {other}"),
-                }
-            }
-            "launch-app" | "app-launch" => {
-                let positional = cli_positional_args(&args, 3);
-                let mut positional = positional.into_iter();
-                let app = positional.next().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "usage: server app launch-app <app> [verb] [--cwd <dir>] [--insert-after <session-path>]"
-                    )
-                })?
-                .to_string();
-                let verb = positional.next().map(ToOwned::to_owned);
-                let cwd = cli_flag_value(&args, "--cwd").map(ToOwned::to_owned);
-                let insert_after = cli_flag_value(&args, "--insert-after").map(ToOwned::to_owned);
-                run_app_control_launch_app(app, verb, cwd, insert_after, timeout_ms)
-            }
-            "panel" | "right-panel" => {
-                let mode = cli_positional_args(&args, 3)
-                    .into_iter()
-                    .next()
-                    .unwrap_or("hidden");
-                if mode == "scroll" {
-                    let top_px = args.windows(2).find_map(|window| {
-                        if window[0] == "--top" {
-                            window[1].parse::<f64>().ok()
-                        } else {
-                            None
-                        }
-                    });
-                    let ratio = args.windows(2).find_map(|window| {
-                        if window[0] == "--ratio" {
-                            window[1].parse::<f64>().ok()
-                        } else {
-                            None
-                        }
-                    });
-                    return run_app_control_scroll_right_panel(top_px, ratio, timeout_ms);
-                }
-                let mode = match mode {
-                    "hidden" | "hide" | "close" | "none" => AppControlRightPanelMode::Hidden,
-                    "connect" => AppControlRightPanelMode::Connect,
-                    "notifications" | "notification" => AppControlRightPanelMode::Notifications,
-                    "settings" => AppControlRightPanelMode::Settings,
-                    "metadata" | "session-metadata" => AppControlRightPanelMode::Metadata,
-                    // `pane:<id>` opens a pane the ACTIVE APP contributed over
-                    // OSC 7717 (e.g. `pane:vault`). yggterm does not know the
-                    // ids; the app declares them.
-                    pane if pane.starts_with("pane:") => AppControlRightPanelMode::AppPane {
-                        id: pane.trim_start_matches("pane:").to_string(),
-                    },
-                    other => anyhow::bail!(
-                        "unsupported app right panel mode: {other} \
-                         (try hidden|connect|notifications|settings|metadata|pane:<id>)"
-                    ),
-                };
-                run_app_control_set_right_panel_mode(mode, timeout_ms)
-            }
-            // Press something IN a contributed pane. `panel pane:<id>` opens
-            // one; this is the verb that could then do nothing to it.
-            "pane" => {
-                let positional = cli_positional_args(&args, 3);
-                let mut positional = positional.into_iter();
-                let pane = positional
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "usage: server app pane <pane-id> <action> [value]"
-                    ))?
-                    .to_string();
-                let action = positional
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "usage: server app pane <pane-id> <action> [value]"
-                    ))?
-                    .to_string();
-                // The value a widget would have carried: a row's id for a
-                // `row_action`, a tab's id for `tabs`, absent for a button.
-                let value = positional.next().map(str::to_string);
-                run_app_control_app_pane_action(pane, action, value, timeout_ms)
-            }
-            "theme" => {
-                let theme = cli_positional_args(&args, 3)
-                    .into_iter()
-                    .next()
-                    .unwrap_or("light");
-                let theme = match theme {
-                    "light" => UiTheme::ZedLight,
-                    "dark" => UiTheme::ZedDark,
-                    other => anyhow::bail!("unsupported app theme: {other}"),
-                };
-                run_app_control_set_ui_theme(theme, timeout_ms)
-            }
-            // The launch-flags modal. `spec-agent-cli-extra-args-modal.md` §7
-            // makes this verb part of the modal's work rather than a follow-up:
-            // a settings surface app control cannot open is one that ships with
-            // no pixel of proof, which has already happened once here.
-            "launch-flags" => {
-                let positional = cli_positional_args(&args, 3);
-                let action = positional.first().copied().unwrap_or("open");
-                let slug = cli_flag_value(&args, "--cli").map(str::to_string);
-                let flags = cli_flag_value(&args, "--args").map(str::to_string);
-                match action {
-                    "open" | "show" | "on" | "true" | "1" => {
-                        run_app_control_set_launch_flags(Some(true), slug, flags, timeout_ms)
-                    }
-                    "close" | "hide" | "off" | "false" | "0" => {
-                        run_app_control_set_launch_flags(Some(false), slug, flags, timeout_ms)
-                    }
-                    // `set` writes without touching whether the modal is up, so
-                    // a headless caller can configure a CLI and a human caller
-                    // can watch it change in an already-open modal.
-                    "set" => {
-                        let slug = slug.context(
-                            "server app launch-flags set needs --cli <slug> (and --args to \
-                             store; omit --args to reset that CLI to its default)",
-                        )?;
-                        run_app_control_set_launch_flags(None, Some(slug), flags, timeout_ms)
-                    }
-                    "reset" => {
-                        let slug = slug
-                            .context("server app launch-flags reset needs --cli <slug>")?;
-                        run_app_control_set_launch_flags(None, Some(slug), None, timeout_ms)
-                    }
-                    other => anyhow::bail!("unsupported app launch-flags action: {other}"),
-                }
-            }
-            "theme-editor" => {
-                let action = cli_positional_args(&args, 3)
-                    .into_iter()
-                    .next()
-                    .unwrap_or("open");
-                match action {
-                    "open" | "show" | "on" | "true" | "1" => {
-                        run_app_control_set_theme_editor_open(true, timeout_ms)
-                    }
-                    "close" | "hide" | "off" | "false" | "0" => {
-                        run_app_control_set_theme_editor_open(false, timeout_ms)
-                    }
-                    "reset" | "defaults" => run_app_control_reset_theme_editor(timeout_ms),
-                    "set" | "values" => {
-                        let brightness = cli_flag_value(&args, "--brightness")
-                            .map(str::parse::<f32>)
-                            .transpose()
-                            .context("invalid --brightness for server app theme-editor set")?;
-                        let alpha = cli_flag_value(&args, "--alpha")
-                            .map(str::parse::<f32>)
-                            .transpose()
-                            .context("invalid --alpha for server app theme-editor set")?;
-                        let grain = cli_flag_value(&args, "--grain")
-                            .map(str::parse::<f32>)
-                            .transpose()
-                            .context("invalid --grain for server app theme-editor set")?;
-                        run_app_control_set_theme_editor_values(
-                            brightness, alpha, grain, timeout_ms,
-                        )
-                    }
-                    other => anyhow::bail!("unsupported app theme-editor action: {other}"),
-                }
-            }
-            // NOTIFICATIONS. One verb for every plane: an agent, a cron job, a
-            // /loop waking up, or a libyggterm app. `--in`/`--at` is the alarm clock.
-            "notify" => {
-                let positional = cli_positional_args(&args, 3);
-                let title = positional
-                    .first()
-                    .map(|s| s.to_string())
-                    .or_else(|| cli_flag_value(&args, "--title").map(str::to_string))
-                    .context("missing title for server app notify")?;
-                let message = positional
-                    .get(1)
-                    .map(|s| s.to_string())
-                    .or_else(|| cli_flag_value(&args, "--message").map(str::to_string))
-                    .unwrap_or_default();
-                let delay_ms = match (cli_flag_value(&args, "--in"), cli_flag_value(&args, "--at")) {
-                    (Some(spec), _) => Some(yggterm_server::parse_duration_ms(spec)?),
-                    (None, Some(when)) => Some(yggterm_server::parse_clock_delay_ms(when)?),
-                    (None, None) => None,
-                };
-                let progress = cli_flag_value(&args, "--progress")
-                    .map(|v| v.parse::<f32>())
-                    .transpose()
-                    .map_err(|_| anyhow::anyhow!("--progress takes a number 0..100"))?;
-                yggterm_server::run_app_control_notify(
-                    &title,
-                    &message,
-                    cli_flag_value(&args, "--tone").as_deref(),
-                    cli_flag_value(&args, "--job").as_deref(),
-                    progress,
-                    args.iter().any(|a| a == "--persistent"),
-                    args.iter().any(|a| a == "--silent"),
-                    delay_ms,
-                    cli_flag_value(&args, "--session").as_deref(),
-                    timeout_ms,
-                )
-            }
-            "update" => {
-                let action = cli_positional_args(&args, 3)
-                    .into_iter()
-                    .next()
-                    .unwrap_or("check");
-                match action {
-                    "check" | "trigger" => run_app_control_trigger_update_check(timeout_ms),
-                    // N5: refuses while an agent holds a live web-surface
-                    // lease — a deploy that lands mid-flow kills the flow.
-                    // `--force` says you mean it.
-                    "restart" => run_app_control_restart_pending_update(
-                        args.iter().any(|arg| arg == "--force"),
-                        timeout_ms,
-                    ),
-                    other => anyhow::bail!("unsupported app update action: {other}"),
-                }
-            }
-            "fullscreen" => {
-                let action = cli_positional_args(&args, 3)
-                    .into_iter()
-                    .next()
-                    .unwrap_or("toggle");
-                let enabled = match action {
-                    "on" | "true" | "1" => true,
-                    "off" | "false" | "0" => false,
-                    "toggle" => {
-                        let current_state = yggterm_server::request_app_control(
-                            store.home_dir(),
-                            yggterm_server::AppControlCommand::DescribeState,
-                            timeout_ms,
-                        )?;
-                        let currently_fullscreen = current_state
-                            .data
-                            .as_ref()
-                            .and_then(|data| data.get("shell"))
-                            .and_then(|shell| shell.get("fullscreen"))
-                            .and_then(|value| value.as_bool())
-                            .unwrap_or(false);
-                        !currently_fullscreen
-                    }
-                    other => anyhow::bail!("unsupported fullscreen action: {other}"),
-                };
-                run_app_control_set_fullscreen(enabled, timeout_ms)
-            }
-            "maximize" | "maximized" => {
-                let action = cli_positional_args(&args, 3)
-                    .into_iter()
-                    .next()
-                    .unwrap_or("toggle");
-                let enabled = match action {
-                    "on" | "true" | "1" => true,
-                    "off" | "false" | "0" => false,
-                    "toggle" => {
-                        let current_state = yggterm_server::request_app_control(
-                            store.home_dir(),
-                            yggterm_server::AppControlCommand::DescribeState,
-                            timeout_ms,
-                        )?;
-                        let currently_maximized = current_state
-                            .data
-                            .as_ref()
-                            .and_then(|data| data.get("window"))
-                            .and_then(|window| window.get("maximized"))
-                            .and_then(|value| value.as_bool())
-                            .unwrap_or(false);
-                        !currently_maximized
-                    }
-                    other => anyhow::bail!("unsupported maximize action: {other}"),
-                };
-                run_app_control_set_maximized(enabled, timeout_ms)
-            }
-            "force-foreground" | "force-fg" => {
-                let action = cli_positional_args(&args, 3)
-                    .into_iter()
-                    .next()
-                    .unwrap_or("on");
-                let enabled = match action {
-                    "on" | "true" | "1" => true,
-                    "off" | "false" | "0" => false,
-                    other => anyhow::bail!("unsupported force-foreground action: {other}"),
-                };
-                run_app_control_set_force_foreground(enabled, timeout_ms)
-            }
-            "open" => {
-                let session_path = cli_positional_args(&args, 3)
-                    .into_iter()
-                    .next()
-                    .context("missing session path for server app open")?;
-                let view_mode = args.windows(2).find_map(|window| {
-                    if window[0] != "--view" {
-                        return None;
-                    }
-                    match window[1].as_str() {
-                        "preview" | "rendered" | "web-view" | "webview" => {
-                            Some(AppControlViewMode::Preview)
-                        }
-                        "terminal" => Some(AppControlViewMode::Terminal),
-                        _ => None,
-                    }
-                });
-                run_app_control_open_path(session_path, view_mode, timeout_ms)
-            }
-            "drag" => {
-                let action = args
-                    .get(3)
-                    .map(String::as_str)
-                    .context("missing action for server app drag")?;
-                let row_path = cli_positional_args(&args, 4).into_iter().next();
-                let placement = args.windows(2).find_map(|window| {
-                    if window[0] == "--placement" {
-                        Some(window[1].as_str())
-                    } else {
-                        None
-                    }
-                });
-                run_app_control_drag(action, row_path, placement, timeout_ms)
-            }
-            "pointer" => {
-                let action = args
-                    .get(3)
-                    .map(String::as_str)
-                    .context("missing action for server app pointer")?;
-                let x = args.windows(2).find_map(|window| {
-                    if window[0] == "--x" {
-                        window[1].parse::<f64>().ok()
-                    } else {
-                        None
-                    }
-                });
-                let y = args.windows(2).find_map(|window| {
-                    if window[0] == "--y" {
-                        window[1].parse::<f64>().ok()
-                    } else {
-                        None
-                    }
-                });
-                let start_x = args.windows(2).find_map(|window| {
-                    if window[0] == "--start-x" {
-                        window[1].parse::<f64>().ok()
-                    } else {
-                        None
-                    }
-                });
-                let start_y = args.windows(2).find_map(|window| {
-                    if window[0] == "--start-y" {
-                        window[1].parse::<f64>().ok()
-                    } else {
-                        None
-                    }
-                });
-                let end_x = args.windows(2).find_map(|window| {
-                    if window[0] == "--end-x" {
-                        window[1].parse::<f64>().ok()
-                    } else {
-                        None
-                    }
-                });
-                let end_y = args.windows(2).find_map(|window| {
-                    if window[0] == "--end-y" {
-                        window[1].parse::<f64>().ok()
-                    } else {
-                        None
-                    }
-                });
-                let button = args.windows(2).find_map(|window| {
-                    if window[0] == "--button" {
-                        Some(window[1].as_str())
-                    } else {
-                        None
-                    }
-                });
-                let count = args.windows(2).find_map(|window| {
-                    if window[0] == "--count" {
-                        window[1].parse::<u8>().ok()
-                    } else {
-                        None
-                    }
-                });
-                let steps = args.windows(2).find_map(|window| {
-                    if window[0] == "--steps" {
-                        window[1].parse::<u16>().ok()
-                    } else {
-                        None
-                    }
-                });
-                let step_delay_ms = args.windows(2).find_map(|window| {
-                    if window[0] == "--step-delay-ms" {
-                        window[1].parse::<u64>().ok()
-                    } else {
-                        None
-                    }
-                });
-                run_app_control_pointer(
-                    action,
-                    x,
-                    y,
-                    start_x,
-                    start_y,
-                    end_x,
-                    end_y,
-                    button,
-                    count,
-                    steps,
-                    step_delay_ms,
-                    timeout_ms,
-                )
-            }
-            "grid" => {
-                let action = args
-                    .get(3)
-                    .map(String::as_str)
-                    .context("missing action for server app grid")?;
-                let cell = cli_positional_args(&args, 4).into_iter().next();
-                let cols = cli_flag_value(&args, "--cols").and_then(|v| v.parse::<u32>().ok());
-                let rows = cli_flag_value(&args, "--rows").and_then(|v| v.parse::<u32>().ok());
-                let region = cli_flag_value(&args, "--region");
-                let target = cli_flag_value(&args, "--target");
-                let ttl_secs =
-                    cli_flag_value(&args, "--ttl-secs").and_then(|v| v.parse::<u64>().ok());
-                let button = cli_flag_value(&args, "--button");
-                let count = cli_flag_value(&args, "--count").and_then(|v| v.parse::<u8>().ok());
-                let refine = args.iter().any(|arg| arg == "--refine");
-                let keep = args.iter().any(|arg| arg == "--keep");
-                run_app_control_grid(
-                    action, cell, cols, rows, region, target, ttl_secs, button, count, refine,
-                    keep, timeout_ms,
-                )
-            }
-            "dom-eval" => {
-                // The script is a POSITIONAL among global flags, not `args[3]`:
-                // `dom-eval --client shadow '<script>'` must mean the same as
-                // `dom-eval '<script>' --client shadow`, because the `--client`
-                // that picks the GUI worker is already read wherever it sits.
-                let script =
-                    app_control_payload_arg(&args, 3, "script for server app dom-eval")?;
-                run_app_control_dom_eval(script, timeout_ms)
-            }
-            "keytips" => {
-                let action = args.get(3).map(String::as_str).unwrap_or("audit");
-                match action {
-                    // The §12 no-orphan-affordance audit. The GUI runs the ONE
-                    // interactable walk (the same JS the ALT overlay's derive
-                    // pass runs — KEYTIP_INTERACTABLE_WALK_JS in yggterm-shell)
-                    // in count-instead-of-skip mode; this CLI only asks and
-                    // formats. §12.1: the definition of done is `excused` SMALL
-                    // and individually justified, with zero violations.
-                    "audit" => {
-                        let json = args.iter().any(|arg| arg == "--json");
-                        yggterm_server::run_app_control_keytips_audit(json, timeout_ms)
-                    }
-                    // Thin verbs on the GUI's one overlay terminus — agents
-                    // open the layer to see/verify it (live-proof instrument).
-                    "show" => yggterm_server::run_app_control_keytips_overlay(true, timeout_ms),
-                    "hide" => yggterm_server::run_app_control_keytips_overlay(false, timeout_ms),
-                    other => anyhow::bail!("unsupported app keytips action: {other}"),
-                }
-            }
-            // CAMERA / MICROPHONE. The twin of yggterm-headless's arm — both
-            // binaries or neither. Read the prompt from `server app state`
-            // (`pending_media_capture`), answer it here.
-            "media" => {
-                let action = args.get(3).map(String::as_str).unwrap_or("answer");
-                match action {
-                    "answer" => {
-                        let answer = app_control_payload_arg(
-                            &args,
-                            4,
-                            "answer for server app media answer \
-                             (allow | deny-once | block-site)",
-                        )?
-                        .to_string();
-                        let request_id = cli_flag_value(&args, "--request")
-                            .map(|value| value.parse::<u64>())
-                            .transpose()
-                            .map_err(|_| {
-                                anyhow::anyhow!("--request takes the numeric request_id")
-                            })?;
-                        yggterm_server::run_app_control_media_answer(
-                            answer, request_id, timeout_ms,
-                        )
-                    }
-                    other => anyhow::bail!("unsupported app media action: {other}"),
-                }
-            }
-            // The `command invoke <id>` probe that `execute_shell_command`'s doc
-            // comment has always promised. Both handlers were already plumbed
-            // through to the shell (`AppControlCommand::InvokeCommand`); only the
-            // CLI arm was missing, so the one dispatch every ALT+ KeyTip runs
-            // through had no probe and keyboard-path fixes could not be exercised
-            // live. Routing here means a probe drives the SAME terminus as the
-            // chord, rather than a lookalike.
-            "command" | "commands" => {
-                let action = args.get(3).map(String::as_str).unwrap_or("list");
-                match action {
-                    "list" => yggterm_server::run_app_control_list_commands(timeout_ms),
-                    "invoke" => {
-                        let id = app_control_payload_arg(
-                            &args,
-                            4,
-                            "command id for server app command invoke",
-                        )?;
-                        yggterm_server::run_app_control_invoke_command(id.to_string(), timeout_ms)
-                    }
-                    other => anyhow::bail!("unsupported app command action: {other}"),
-                }
-            }
-            "start-action" | "start" => {
-                let action = args
-                    .get(3)
-                    .map(String::as_str)
-                    .context("missing action for server app start-action")?;
-                run_app_control_start_action(action, timeout_ms)
-            }
-            "start-page" | "show-start-page" | "home" => {
-                yggterm_server::run_app_control_show_start_page(timeout_ms)
-            }
-            "tree" => {
-                let action = args
-                    .get(3)
-                    .map(String::as_str)
-                    .context("missing action for server app tree")?;
-                match action {
-                    "select" | "selection" => {
-                        let paths = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .map(ToOwned::to_owned)
-                            .collect::<Vec<_>>();
-                        let anchor_path = cli_flag_value(&args, "--anchor").map(ToOwned::to_owned);
-                        run_app_control_set_tree_selection(paths, anchor_path, timeout_ms)
-                    }
-                    other => anyhow::bail!("unsupported app tree action: {other}"),
-                }
-            }
-            "key" => {
-                let action = args
-                    .get(3)
-                    .map(String::as_str)
-                    .context("missing action for server app key")?;
-                let positional = cli_positional_args(&args, 4);
-                let positional_owned = positional
-                    .iter()
-                    .map(|value| (*value).to_string())
-                    .collect::<Vec<_>>();
-                let text = args.windows(2).find_map(|window| {
-                    if window[0] == "--text" {
-                        Some(window[1].as_str())
-                    } else {
-                        None
-                    }
-                });
-                let keys = if action == "press" {
-                    positional_owned.clone()
-                } else {
-                    Vec::new()
-                };
-                run_app_control_key(
-                    action,
-                    &keys,
-                    text.or_else(|| positional.first().copied()),
-                    timeout_ms,
-                )
-            }
-            "terminal" => {
-                let action = args
-                    .get(3)
-                    .map(String::as_str)
-                    .context("missing action for server app terminal")?;
-                match action {
-                    "new" => {
-                        let machine_key = args.windows(2).find_map(|window| {
-                            if window[0] == "--machine-key" {
-                                Some(window[1].as_str())
-                            } else {
-                                None
-                            }
-                        });
-                        let cwd = args.windows(2).find_map(|window| {
-                            if window[0] == "--cwd" {
-                                Some(window[1].as_str())
-                            } else {
-                                None
-                            }
-                        });
-                        let title_hint = args.windows(2).find_map(|window| {
-                            if window[0] == "--title" {
-                                Some(window[1].as_str())
-                            } else {
-                                None
-                            }
-                        });
-                        let purpose = args.windows(2).find_map(|window| {
-                            if window[0] == "--purpose" {
-                                Some(window[1].as_str())
-                            } else {
-                                None
-                            }
-                        });
-                        let kind = args.windows(2).find_map(|window| {
-                            if window[0] == "--kind" {
-                                Some(window[1].as_str())
-                            } else {
-                                None
-                            }
-                        });
-                        let activate = !args.iter().any(|arg| arg == "--no-activate");
-                        // Per-launch model / permission mode + the initial
-                        // prompt, all through the SHARED readers — a flag must
-                        // mean the same thing typed at either binary.
-                        let launch = yggterm_core::agent_launch_options_from_args(&args)
-                            .map_err(|message| anyhow::anyhow!(message))?;
-                        let prompt = yggterm_server::read_prompt(&args)?;
-                        // WHERE the row lands, applied INSIDE the create. Same
-                        // shared reader at both binaries.
-                        let seat = yggterm_server::read_row_seat(&args);
-                        run_app_control_create_terminal_with_tenancy(
-                            machine_key,
-                            cwd,
-                            title_hint,
-                            purpose,
-                            kind,
-                            activate,
-                            // Provenance + opt-in ephemerality, parsed by the
-                            // ONE shared reader both binaries call.
-                            Some(yggterm_server::session_tenancy::agent_cli_create_terminal_tenancy(
-                                &args,
-                            )?),
-                            &launch,
-                            &seat,
-                            prompt.as_deref(),
-                            timeout_ms,
-                        )
-                    }
-                    "send" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app terminal send")?;
-                        let data = if args.iter().any(|arg| arg == "--stdin") {
-                            let mut value = String::new();
-                            std::io::stdin()
-                                .read_to_string(&mut value)
-                                .context("reading app terminal send stdin")?;
-                            value
-                        } else {
-                            args.windows(2)
-                                .find_map(|window| {
-                                    if window[0] == "--data" {
-                                        Some(window[1].as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .context("missing --data or --stdin for server app terminal send")?
-                                .to_string()
-                        };
-                        let allow_multiline =
-                            args.iter().any(|arg| arg == "--allow-multiline");
-                        run_app_control_send_terminal_input(
-                            session_path,
-                            &data,
-                            allow_multiline,
-                            timeout_ms,
-                        )
-                    }
-                    "submit" => {
-                        // Readiness-gated prompt insertion (waits for an idle prompt
-                        // before sending; refuses if never ready).
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "missing session path for server app terminal submit"
-                                )
-                            })?;
-                        let data = if args.iter().any(|arg| arg == "--stdin") {
-                            let mut value = String::new();
-                            std::io::stdin()
-                                .read_to_string(&mut value)
-                                .context("reading app terminal submit stdin")?;
-                            value
-                        } else {
-                            args.windows(2)
-                                .find_map(|window| {
-                                    if window[0] == "--data" {
-                                        Some(window[1].as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "missing --data or --stdin for server app terminal submit"
-                                    )
-                                })?
-                                .to_string()
-                        };
-                        let ready_timeout_ms = args
-                            .windows(2)
-                            .find_map(|window| {
-                                if window[0] == "--ready-timeout-ms" {
-                                    window[1].parse::<u64>().ok()
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(30_000);
-                        run_app_control_submit_terminal_prompt(
-                            session_path,
-                            &data,
-                            ready_timeout_ms,
-                            timeout_ms,
-                        )
-                    }
-                    "input-check" => {
-                        // The wedge question, asked without submitting anything:
-                        // is this row consuming input? A wedged agent row is
-                        // alive, idle-looking and deaf, and `send` into it
-                        // reports success while delivering nothing.
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "missing session path for server app terminal input-check"
-                                )
-                            })?;
-                        let check_timeout_ms = args
-                            .windows(2)
-                            .find_map(|window| {
-                                if window[0] == "--check-timeout-ms" {
-                                    window[1].parse::<u64>().ok()
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(6_000);
-                        run_app_control_check_terminal_input(
-                            session_path,
-                            check_timeout_ms,
-                            timeout_ms,
-                        )
-                    }
-                    "focus" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app terminal focus")?;
-                        run_app_control_reclaim_terminal_focus(session_path, timeout_ms)
-                    }
-                    "redraw" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app terminal redraw")?;
-                        run_app_control_redraw_terminal(session_path, timeout_ms)
-                    }
-                    "paste" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app terminal paste")?;
-                        run_app_control_paste_terminal_clipboard(session_path, timeout_ms)
-                    }
-                    "paste-image" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app terminal paste-image")?;
-                        run_app_control_paste_terminal_clipboard_image(session_path, timeout_ms)
-                    }
-                    "keep" | "keep-alive" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app terminal keep")?;
-                        run_app_control_set_session_keep_alive(session_path, true, timeout_ms)
-                    }
-                    "unkeep" | "stop-keep-alive" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app terminal unkeep")?;
-                        run_app_control_set_session_keep_alive(session_path, false, timeout_ms)
-                    }
-                    "probe-type" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app terminal probe-type")?;
-                        let data = args
-                            .windows(2)
-                            .find_map(|window| {
-                                if window[0] == "--data" {
-                                    Some(window[1].as_str())
-                                } else {
-                                    None
-                                }
-                            })
-                            .context("missing --data for server app terminal probe-type")?;
-                        let press_enter = args.iter().any(|arg| arg == "--enter");
-                        let press_tab = args.iter().any(|arg| arg == "--tab");
-                        let press_ctrl_c = args.iter().any(|arg| arg == "--ctrl-c");
-                        let press_ctrl_e = args.iter().any(|arg| arg == "--ctrl-e");
-                        let press_ctrl_u = args.iter().any(|arg| arg == "--ctrl-u");
-                        let per_char = args.iter().any(|arg| arg == "--per-char");
-                        let mode = args
-                            .windows(2)
-                            .find_map(|window| {
-                                if window[0] != "--mode" {
-                                    return None;
-                                }
-                                match window[1].as_str() {
-                                    "auto" => Some(ProbeTerminalViewportInputMode::Auto),
-                                    "keyboard" => Some(ProbeTerminalViewportInputMode::Keyboard),
-                                    "xterm" => Some(ProbeTerminalViewportInputMode::Xterm),
-                                    _ => None,
-                                }
-                            })
-                            .unwrap_or(ProbeTerminalViewportInputMode::Auto);
-                        run_app_control_probe_terminal_viewport_input(
-                            session_path,
-                            data,
-                            mode,
-                            per_char,
-                            press_enter,
-                            press_tab,
-                            press_ctrl_c,
-                            press_ctrl_e,
-                            press_ctrl_u,
-                            timeout_ms,
-                        )
-                    }
-                    "probe-scroll" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app terminal probe-scroll")?;
-                        let lines = args
-                            .windows(2)
-                            .find_map(|window| {
-                                if window[0] == "--lines" {
-                                    window[1].parse::<i32>().ok()
-                                } else {
-                                    None
-                                }
-                            })
-                            .context("missing --lines for server app terminal probe-scroll")?;
-                        run_app_control_probe_terminal_viewport_scroll(
-                            session_path,
-                            lines,
-                            timeout_ms,
-                        )
-                    }
-                    "scroll" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app terminal scroll")?;
-                        let to = cli_flag_value(&args, "--to").context(
-                            "missing --to (top|bottom|±N lines) for server app terminal scroll",
-                        )?;
-                        run_app_control_scroll_terminal_viewport(session_path, to, timeout_ms)
-                    }
-                    "read-buffer" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app terminal read-buffer")?;
-                        let mode = cli_flag_value(&args, "--mode").unwrap_or("screen");
-                        run_app_control_read_terminal_buffer(session_path, mode, timeout_ms)
-                    }
-                    "probe-select" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app terminal probe-select")?;
-                        run_app_control_probe_terminal_viewport_select(session_path, timeout_ms)
-                    }
-                    "probe-primary-paste" | "probe-primary-selection-paste" => {
-                        let session_path =
-                            cli_positional_args(&args, 4).into_iter().next().context(
-                                "missing session path for server app terminal probe-primary-paste",
-                            )?;
-                        let data = args
-                            .windows(2)
-                            .find_map(|window| {
-                                if window[0] == "--data" {
-                                    Some(window[1].as_str())
-                                } else {
-                                    None
-                                }
-                            })
-                            .context(
-                                "missing --data for server app terminal probe-primary-paste",
-                            )?;
-                        run_app_control_probe_terminal_primary_selection_paste(
-                            session_path,
-                            data,
-                            timeout_ms,
-                        )
-                    }
-                    "probe-context-menu" | "probe-right-click-menu" => {
-                        let session_path =
-                            cli_positional_args(&args, 4).into_iter().next().context(
-                                "missing session path for server app terminal probe-context-menu",
-                            )?;
-                        run_app_control_probe_terminal_context_menu(session_path, timeout_ms)
-                    }
-                    other => anyhow::bail!("unsupported app terminal action: {other}"),
-                }
-            }
-            // THE web verb plane lives in ONE owner (crates/yggterm-server/src/app_control_web_cli.rs)
-            // so this binary and yggterm-headless cannot disagree about what a
-            // `server app web <verb>` means. Do not inline a verb here.
-            "web" => yggterm_server::run_app_control_web_cli(&args, timeout_ms),
-            "session" => {
-                let action = args
-                    .get(3)
-                    .map(String::as_str)
-                    .context("missing action for server app session")?;
-                match action {
-                    "remove" | "delete" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app session remove")?;
-                        run_app_control_remove_session(session_path, timeout_ms)
-                    }
-                    "rename" => {
-                        let positionals = cli_positional_args(&args, 4);
-                        let session_path = positionals
-                            .first()
-                            .copied()
-                            .context("missing session path for server app session rename")?;
-                        let title = positionals
-                            .get(1)
-                            .copied()
-                            .context("missing title for server app session rename")?;
-                        run_app_control_rename_session(session_path, title, timeout_ms)
-                    }
-                    "restart" => {
-                        let session_path = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing session path for server app session restart")?;
-                        run_app_control_restart_session(session_path, timeout_ms)
-                    }
-                    // `server app session outline <path> <prefix>` — number a
-                    // row that already exists. The prefix is stored SEPARATELY
-                    // from the title and composed at render time, so a CLI
-                    // re-title can no longer destroy a position. An empty
-                    // prefix clears it.
-                    "outline" => {
-                        let positionals = cli_positional_args(&args, 4);
-                        let session_path = positionals.first().copied().ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "usage: server app session outline <session-path> <prefix>  \
-                                 (an empty prefix clears it)"
-                            )
-                        })?;
-                        let prefix = positionals.get(1).copied().unwrap_or("");
-                        yggterm_server::run_app_control_set_session_outline(
-                            session_path,
-                            prefix,
-                            timeout_ms,
-                        )
-                    }
-                    other => anyhow::bail!("unsupported app session action: {other}"),
-                }
-            }
-            other => anyhow::bail!("unsupported app control command: {other}"),
-        };
+        }
+        return yggterm_server::app_control_cli::run_app_control_cli(
+            &args,
+            store.home_dir(),
+            &GuiHost,
+        );
     }
     if args.as_slice() == ["server", "shutdown"] {
         let endpoint = cli_server_endpoint(store.home_dir());
@@ -5241,15 +3821,6 @@ fn superseded_client_retirement_strategy_label() -> &'static str {
     "kill_process_only_no_client_cleanup"
 }
 
-fn app_control_close_preserve_flag(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "--preserve-live-sessions" | "--preserve-sessions" | "--handoff" | "--restart-safe"
-        )
-    })
-}
-
 fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -6123,18 +4694,76 @@ mod tests {
     // which is exactly the drift the inversion killed. The new-model ordering
     // lock (declared credit before the per-element exempt test, no closest())
     // lives beside the walk in yggterm-shell.
+    /// The ONE owner of the `server app` verb surface, read as source so the
+    /// locks below can scan the arms themselves.
+    const APP_CONTROL_CLI_SOURCE: &str =
+        include_str!("../../../crates/yggterm-server/src/app_control_cli.rs");
+
+    /// ⛔⛔ NEITHER BINARY MAY DISPATCH `server app` ITSELF.
+    ///
+    /// This is the structural form of every "both binaries route X" lock
+    /// around it, and it exists because those locks were necessary at all:
+    /// the whole dispatch was a `match` copied into both binaries, and the
+    /// copies had drifted by six top-level verbs before anyone noticed —
+    /// `audio` and `theme` reachable only from the GUI binary, `chrome`,
+    /// `row-set`, `row-expanded` and `split` only from the headless one, which
+    /// is the binary every agent skill says to drive.
+    ///
+    /// The tell of a local dispatcher is its own failure message, so that is
+    /// what is banned: exactly one file in the tree may say
+    /// `unsupported app control command`, and it is the owner.
+    #[test]
+    fn neither_binary_dispatches_server_app_itself() {
+        for (binary, source) in [
+            ("yggterm", include_str!("main.rs")),
+            ("yggterm-headless", include_str!("bin/yggterm-headless.rs")),
+        ] {
+            assert!(
+                source.contains("app_control_cli::run_app_control_cli("),
+                "{binary} must route the whole `server app` surface to its one \
+                 owner (`yggterm_server::app_control_cli`)"
+            );
+            let product = source
+                .split("mod tests {")
+                .next()
+                .expect("the binary has a product half above its tests");
+            assert!(
+                !product.contains("unsupported app control command"),
+                "{binary} carries a `server app` dispatcher of its own. Two copies \
+                 diverge on the first new verb and the failure is silent — the verb \
+                 answers \"unsupported app control command\" from the other binary \
+                 while --build-commit matches the deploy and the arm is visibly in \
+                 the source. Add the verb to the owner instead."
+            );
+        }
+        // The owner really does dispatch, so the ban above cannot pass by the
+        // surface having quietly disappeared.
+        assert!(
+            APP_CONTROL_CLI_SOURCE.contains("unsupported app control command"),
+            "the one owner no longer dispatches anything — this lock just went blind"
+        );
+    }
+
     #[test]
     fn the_keytips_cli_carries_no_walk_of_its_own() {
-        let source = include_str!("main.rs");
+        // Scans the ONE owner. This used to read `main.rs`, and the comment
+        // below records that the headless twin shipped without the arm — the
+        // duplication that made a "both binaries" lock necessary is gone, so
+        // the lock now watches the single dispatcher instead of two copies.
+        let source = APP_CONTROL_CLI_SOURCE;
         let arm_start = source
             .find("\"keytips\" => {")
             .expect("the keytips CLI arm exists");
         // The arm ends where the next subcommand arm begins.
-        let arm = &source[arm_start
-            ..arm_start
-                + source[arm_start..]
-                    .find("\"command\" | \"commands\" => {")
-                    .expect("the command arm follows the keytips arm")];
+        // Bounded at THIS arm's own close brace, never at whichever arm
+        // happens to follow it — the lesson the media lock below already
+        // records, and the ordering did change when the dispatchers were
+        // collapsed onto one owner.
+        let rest = &source[arm_start..];
+        let arm = &rest[..rest
+            .find("\n        }")
+            .map(|offset| offset + "\n        }".len())
+            .expect("the keytips arm has no close brace")];
         assert!(
             !arm.contains("querySelectorAll"),
             "the keytips CLI must ask the GUI's one walk, never carry its own:\n{arm}"
@@ -6150,28 +4779,16 @@ mod tests {
             );
         }
 
-        // BOTH binaries, verb-for-verb: the headless twin is the binary agents
-        // actually call, and it shipped WITHOUT this arm the first time — the
-        // audit answered "unsupported app control command" on a fresh daemon
-        // while every lock here was green, because nothing pinned the twin.
-        // Same split-dispatch class the app-control target work closed.
-        let headless = include_str!("bin/yggterm-headless.rs");
-        let headless_arm_start = headless
-            .find("\"keytips\" => {")
-            .expect("the headless keytips arm exists — agents reach app control through yggterm-headless");
-        let headless_arm = &headless[headless_arm_start..headless_arm_start + 1_400];
-        assert!(!headless_arm.contains("querySelectorAll"));
-        for verb in [
-            "run_app_control_keytips_audit",
-            "run_app_control_keytips_overlay(true",
-            "run_app_control_keytips_overlay(false",
-        ] {
-            assert!(
-                headless_arm.contains(verb),
-                "the HEADLESS keytips arm must route `{verb}` — a verb on one \
-                 binary only is the split-dispatch trap"
-            );
-        }
+        // ⭐ THE "BOTH BINARIES, VERB-FOR-VERB" HALF THAT STOOD HERE IS GONE,
+        // and its disappearance is the point. It existed because the headless
+        // twin shipped WITHOUT this arm the first time, answering "unsupported
+        // app control command" on a fresh daemon while every lock here was
+        // green. A per-verb parity assertion is the right answer to two
+        // dispatchers; it is the wrong answer to one. There is now a single
+        // dispatcher, so parity is not checked verb-by-verb — it is structural,
+        // and `neither_binary_dispatches_server_app_itself` is what holds it.
+        // ⛔ Do not re-add a per-verb twin check here: a lock that scans a copy
+        // is a lock that expects a copy to exist.
     }
 
     /// ★ THE CAPTURE-ANSWER PARITY LOCK. `server app media answer` is how an
@@ -6185,10 +4802,7 @@ mod tests {
     /// grow two spellings of "allow".
     #[test]
     fn both_binaries_route_the_capture_answer_to_its_one_owner() {
-        for (binary, source) in [
-            ("yggterm", include_str!("main.rs")),
-            ("yggterm-headless", include_str!("bin/yggterm-headless.rs")),
-        ] {
+        for (binary, source) in [("the one server-app dispatcher", APP_CONTROL_CLI_SOURCE)] {
             let start = source.find("\"media\" => {").unwrap_or_else(|| {
                 panic!(
                     "{binary} has no `server app media` arm — a page blocked on a \
@@ -6209,7 +4823,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{binary}'s media arm has no close brace"));
             let arm = &rest[..end];
             assert!(
-                arm.contains("yggterm_server::run_app_control_media_answer("),
+                arm.contains("crate::run_app_control_media_answer("),
                 "{binary}'s media arm does not route the ONE owner; a dispatch of \
                  its own here is the split-dispatch trap"
             );
@@ -6266,8 +4880,7 @@ mod tests {
     /// render from the owner's block.
     #[test]
     fn both_binaries_route_the_web_plane_to_its_one_owner() {
-        const DELEGATION: &str =
-            "\"web\" => yggterm_server::run_app_control_web_cli(&args, timeout_ms),";
+        const DELEGATION: &str = "\"web\" => crate::run_app_control_web_cli(&args, timeout_ms),";
 
         // DERIVED, never hand-listed. A floor, because a verb list that went
         // empty would satisfy every loop below while proving nothing.
@@ -6278,10 +4891,7 @@ mod tests {
              WEB_ACTIONS/drift lock rather than lowering this floor",
             verbs.len()
         );
-        for (binary, source) in [
-            ("yggterm", include_str!("main.rs")),
-            ("yggterm-headless", include_str!("bin/yggterm-headless.rs")),
-        ] {
+        for (binary, source) in [("the one server-app dispatcher", APP_CONTROL_CLI_SOURCE)] {
             assert_eq!(
                 web_arm_line(binary, source),
                 DELEGATION,
@@ -6290,10 +4900,9 @@ mod tests {
                  diverge on the first new verb, which is how this plane came to \
                  exist on one binary only."
             );
+            let _ = binary;
             assert!(
-                source.contains(&format!(
-                    "web_usage = yggterm_server::web_usage_block(\"{binary}\")"
-                )),
+                source.contains("web_usage = crate::web_usage_block(binary)"),
                 "{binary} must render the OWNER's usage block in `server app --help`, \
                  under its OWN name — an agent that reads --help and does not see a \
                  verb concludes the build lacks it, which is the misdiagnosis this \
@@ -6301,7 +4910,7 @@ mod tests {
             );
             // The usage this binary actually prints, verb by verb, against the
             // list the owner routes.
-            let usage = yggterm_server::web_usage_block(binary);
+            let usage = yggterm_server::web_usage_block("yggterm");
             for verb in &verbs {
                 assert!(
                     usage.contains(verb),
@@ -6865,7 +5474,7 @@ mod tests {
 
     #[test]
     fn app_cli_help_exposes_settled_open_path_command() {
-        let source = include_str!("main.rs");
+        let source = APP_CONTROL_CLI_SOURCE;
         assert!(source.contains("server app open <session-path>"));
         assert!(source.contains("\"open\" =>"));
         assert!(source.contains("run_app_control_open_path(session_path, view_mode, timeout_ms)"));
@@ -6897,7 +5506,7 @@ mod tests {
         ];
         for args in &spellings {
             assert_eq!(
-                super::app_control_payload_arg(args, 3, "script for server app dom-eval")
+                yggterm_server::app_control_cli::app_control_payload_arg(args, 3, "script for server app dom-eval")
                     .expect("the script resolves wherever the flags sit"),
                 script,
                 "{args:?} must resolve the same script as its sibling spellings"
@@ -6939,7 +5548,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                super::app_control_payload_arg(&args, start, "value")
+                yggterm_server::app_control_cli::app_control_payload_arg(&args, start, "value")
                     .expect("the payload resolves wherever the flags sit"),
                 expected,
                 "{args:?} must resolve the same payload as its sibling spelling"
@@ -6963,7 +5572,7 @@ mod tests {
         // And through argv, with the script left out entirely: the arm must
         // still refuse rather than reach for whatever sits at the fixed index.
         let args = payload_argv(&["server", "app", "dom-eval", "--client", "shadow"]);
-        let error = super::app_control_payload_arg(&args, 3, "script for server app dom-eval")
+        let error = yggterm_server::app_control_cli::app_control_payload_arg(&args, 3, "script for server app dom-eval")
             .expect_err("a bare flag is not a script");
         let message = format!("{error}");
         assert!(
@@ -6975,7 +5584,7 @@ mod tests {
         assert!(
             format!(
                 "{}",
-                super::app_control_payload_arg(&bare, 3, "script for server app dom-eval")
+                yggterm_server::app_control_cli::app_control_payload_arg(&bare, 3, "script for server app dom-eval")
                     .expect_err("no script at all")
             )
             .contains("missing script for server app dom-eval")
@@ -6987,15 +5596,21 @@ mod tests {
     /// exactly how this bug shipped.
     #[test]
     fn every_free_form_app_payload_arm_reads_through_the_one_positional_reader() {
-        let source = include_str!("main.rs");
+        let source = APP_CONTROL_CLI_SOURCE;
         let product = source
             .split("mod tests {")
             .next()
             .expect("main.rs has a product half above its tests");
+        // ⚠ The close markers are INDENTATION-SENSITIVE and the arms moved one
+        // level out when the two dispatchers were collapsed onto one owner. A
+        // marker that no longer matches does not fail loudly — it runs on to
+        // the NEXT arm's close and sweeps in code that is allowed to use a
+        // fixed index (`start-action` reads `args.get(3)` legitimately), which
+        // reads as this lock catching a bug it did not catch.
         for (marker, close, index) in [
-            ("\"dom-eval\" => {", "\n            }", "3"),
-            ("\"answer\" => {", "\n                    }", "4"),
-            ("\"invoke\" => {", "\n                    }", "4"),
+            ("\"dom-eval\" => {", "\n        }", "3"),
+            ("\"answer\" => {", "\n                }", "4"),
+            ("\"invoke\" | \"run\" => {", "\n                }", "4"),
         ] {
             let rest = product
                 .split(marker)
@@ -7005,12 +5620,28 @@ mod tests {
                 .find(close)
                 .unwrap_or_else(|| panic!("the {marker} arm has no close brace"))];
             assert!(
-                arm.contains("app_control_payload_arg("),
+                // Either spelling of the ONE reader — `cli_payload_arg`
+                // directly, this crate's `app_control_payload_arg` adapter over
+                // it, or the positional list `cli_positional_args` returns.
+                // All three scan flags out of the argv first, which is the
+                // property being locked; what is banned is a RAW index into
+                // argv, asserted separately below.
+                arm.contains("payload_arg(") || arm.contains("positional.get("),
                 "{marker} does not read its payload through the one reader:\n{arm}"
             );
+            // ⛔ SCAN CODE, NOT PROSE. These arms carry a comment that says
+            // "NOT `args.get(3)`" precisely because the fixed-index read was
+            // the bug — so a naive `contains` matches the warning against it
+            // and fails the arm that heeded it. The media lock above records
+            // the same trap from the other direction.
+            let code: String = arm
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
             assert!(
-                !arm.contains(&format!(".get({index})")),
-                "{marker} still reads a payload at a fixed index:\n{arm}"
+                !code.contains(&format!("args.get({index})")),
+                "{marker} still reads a payload at a fixed index:\n{code}"
             );
         }
     }
