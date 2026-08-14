@@ -152,7 +152,7 @@ pub use daemon::{
     HOT_RESTART_BLOCKER_WORKING,
     hot_update_handoff_would_refuse_binary,
     HotRestartBlocker, HotRestartResult, SERVER_PROTOCOL_VERSION, ServerEndpoint, ServerRequest,
-    ServerResponse, ServerRuntimeStatus, hot_restart_block_reason_summary,
+    ServerResponse, ServerRuntimeStatus, SessionDraftState, hot_restart_block_reason_summary,
     TerminalStreamChunk, cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint,
     resolve_client_daemon_endpoint,
     ensure_remote_runtime_codex_session as daemon_ensure_remote_runtime_codex_session, focus_live,
@@ -21710,6 +21710,85 @@ pub fn run_row_departures(limit: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `server rows drafts` — which live rows hold a typed-but-unsent line, host-wide.
+///
+/// **The question it exists to answer is "may a daemon bump be taken right now?"**
+/// A bump re-resumes sessions and destroys exactly these drafts. Until this verb
+/// the only instrument that consulted draft state was `--refuse-if-draft` on
+/// `server terminal write`, so the sole way to learn whether a draft existed was
+/// to attempt the write a draft exists to forbid — an end condition that could
+/// never be shown to have been met, on a hold that gated the drain lane.
+///
+/// ⛔ IT FANS OUT OVER EVERY DAEMON, AND THAT IS LOAD-BEARING. A draft lives in
+/// whichever daemon owns that PTY, a host runs many, and the rows a person
+/// actually types in need not be in the newest one's population. A single-daemon
+/// answer would report "clear" while a neighbour held the sentence.
+///
+/// ⛔ A DAEMON THAT CANNOT ANSWER IS COUNTED APART, NEVER AS CLEAN. Every daemon
+/// predating `pending_input_drafts` returns no answer at all, and its silence
+/// deserializes to `None` rather than to an empty list precisely so it cannot be
+/// mistaken for "nothing drafted here". `verdict:"blind"` is the honest reply,
+/// and it is not `"clear"`: **blind is not clear**, and the cost of confusing
+/// them is a person's unsent sentence.
+///
+/// ⚠ PRESENCE ONLY. Neither this verb nor the field it reads ever carries what
+/// was typed.
+pub fn run_row_drafts() -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let mut daemons = Vec::new();
+    let mut drafted = Vec::<serde_json::Value>::new();
+    let mut unable = 0usize;
+    let mut answered_sessions = 0usize;
+    for (endpoint, runtime) in daemon::reachable_versioned_daemon_statuses(&home) {
+        let states = runtime.pending_input_drafts.clone();
+        let can_answer = states.is_some();
+        if !can_answer {
+            unable += 1;
+        }
+        let mut here = 0usize;
+        for state in states.iter().flatten() {
+            match state.has_pending_draft {
+                Some(true) => {
+                    here += 1;
+                    drafted.push(serde_json::json!({
+                        "session_key": state.session_key,
+                        "daemon_pid": runtime.server_pid,
+                        "daemon_version": runtime.server_version,
+                    }));
+                }
+                // A listed session whose runtime did not answer is not clean
+                // either — the daemon can answer, this row could not.
+                None => unable += 1,
+                Some(false) => answered_sessions += 1,
+            }
+        }
+        answered_sessions += here;
+        daemons.push(serde_json::json!({
+            "endpoint": format!("{endpoint:?}"),
+            "pid": runtime.server_pid,
+            "version": runtime.server_version,
+            "owned_terminal_session_count": runtime.owned_terminal_session_count,
+            // ⛔ Not a boolean "clean": a daemon that cannot answer must look
+            // different from one that answered "none", at a glance, per row.
+            "can_answer": can_answer,
+            "drafts_here": can_answer.then_some(here),
+        }));
+    }
+    // The precedence is a tested rule, not a local `if` — see `draft_sweep_verdict`.
+    let verdict = daemon::draft_sweep_verdict(drafted.len(), unable);
+    write_stdout_payload(&serde_json::to_string_pretty(&serde_json::json!({
+        "home": home.display().to_string(),
+        "verdict": verdict,
+        "daemons_seen": daemons.len(),
+        "daemons_or_rows_unable_to_answer": unable,
+        "sessions_answered": answered_sessions,
+        "drafts_present": drafted.len(),
+        "drafts": drafted,
+        "daemons": daemons,
+    }))?)?;
+    Ok(())
+}
+
 pub fn run_trace_follow(lines: usize, poll_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let path = event_trace_path(&home);
@@ -31677,6 +31756,7 @@ mod tests {
         terminal_session_keys: Vec<String>,
     ) -> ServerRuntimeStatus {
         ServerRuntimeStatus {
+            pending_input_drafts: None,
             server_build_commit: String::new(),
             daemon_started_at_ms: 0,
             daemon_uptime_ms: 0,
@@ -44926,6 +45006,7 @@ terminal_window_id: None,
         std::os::unix::fs::symlink(&legacy_socket, &current_socket).expect("link current socket");
         let endpoint = ServerEndpoint::UnixSocket(current_socket.clone());
         let status = ServerRuntimeStatus {
+            pending_input_drafts: None,
             server_build_commit: String::new(),
             daemon_started_at_ms: 0,
             daemon_uptime_ms: 0,

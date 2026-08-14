@@ -187,6 +187,13 @@ fn print_server_help() {
   yggterm-headless server connect --list
   yggterm-headless server write-lock <acquire|release|status> [--holder <who>]
   yggterm-headless server relay-boundary [--by <who>] [--wait-secs <n>] [--json]
+  yggterm-headless server rows departed [--limit <n>]
+    where a row went and why. Reads the shared departure ledger; writes nothing.
+  yggterm-headless server rows drafts
+    which live rows hold a typed-but-unsent line, across EVERY daemon on this
+    host — i.e. may a daemon bump be taken right now. Read-only, and it reports
+    presence only, never what was typed. `verdict:\"blind\"` means some daemon
+    predates the field and could not answer; that is NOT `\"clear\"`.
   yggterm-headless server gate-screen [<session-key>] [--tail <n>] [--json]
     what the hot-restart idle gate is CLASSIFYING FROM, per owned session — the
     live in-daemon screen plus the blocker it produced. This is not
@@ -1506,6 +1513,13 @@ fn main() -> Result<()> {
             .find_map(|window| (window[0] == "--limit").then(|| window[1].parse::<usize>().ok())?)
             .unwrap_or(50);
         return run_row_departures(limit);
+    }
+    // "May I bump a daemon right now?" — the question the 3.0.155 hold could not
+    // answer, because the only instrument that consulted draft state was a flag
+    // on a WRITE. Fans out over every daemon on the host and reports presence
+    // only; see `yggterm_server::run_row_drafts`.
+    if args.len() >= 3 && args[0] == "server" && args[1] == "rows" && args[2] == "drafts" {
+        return yggterm_server::run_row_drafts();
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "tail" {
         let lines = args
