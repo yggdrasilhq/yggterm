@@ -81,8 +81,35 @@ emit() {
 # THE WINDOW IS THE PRODUCT. Exactly one GUI, running a live binary that
 # matches what is installed. Everything below is meaningless if this fails,
 # because a second GUI paints a window the user cannot escape by restarting.
+#
+# ⛔ NOT `pgrep -x yggterm`. THE CLI AND THE GUI ARE THE SAME BINARY, so counting
+#    by process name counts every `yggterm server …` verb any agent on the fleet
+#    happens to be running. Measured: baseline 2, **3** during one deliberate
+#    `yggterm --version`, 1 once it exited. This check FAILED on that false
+#    positive within its first two hours, and a level-1 alarm that cries wolf on
+#    a busy fleet is worse than no alarm — it is how a real duplicate GUI gets
+#    waved through.
+#
+# ⇒ Ask the product's own client registry, which is the SSOT for "which GUIs are
+#   live" and which a CLI invocation never enters. Verified: it answers 1 while a
+#   concurrent CLI call is in flight. Shadows are excluded deliberately — an
+#   agent's read-only client is not a second window (same rule the launch guard
+#   uses), and counting one would make every agent probe look like this failure.
 L1="$($SSH 'set -o pipefail
-  pids=$(pgrep -x yggterm | tr "\n" " ")
+  pids=$(~/.local/bin/yggterm server app clients 2>/dev/null \
+    | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(9)                      # unreadable != none; the caller must know
+cl = d.get(\"clients\") or (d.get(\"data\") or {}).get(\"clients\") or []
+for c in cl:
+    role = (c.get(\"client_role\") or \"active\").lower()
+    if role == \"active\":            # legacy record with no role reads as Active
+        print(c.get(\"pid\"))
+" | tr "\n" " ")
+  if [ $? -eq 9 ]; then echo "count=unreadable"; exit 0; fi
   n=$(echo $pids | wc -w)
   echo "count=$n"
   for p in $pids; do
@@ -95,10 +122,16 @@ L1="$($SSH 'set -o pipefail
 ' 2>/dev/null)"
 
 GUI_COUNT="$(sed -n 's/^count=//p' <<<"$L1")"
-GUI_COUNT="${GUI_COUNT:-0}"
-note "L1 gui_count=$GUI_COUNT"
+GUI_COUNT="${GUI_COUNT:-unreadable}"
+note "L1 active_gui_clients=$GUI_COUNT"
 
-if [ "$GUI_COUNT" -eq 0 ]; then
+# ⛔ "I could not ask" is not "there are none", and the two demand opposite
+#    reactions: none means the user has no window, unreadable means this check
+#    is blind. Reporting the second as the first would send someone to relaunch
+#    a GUI that is running perfectly well.
+if [ "$GUI_COUNT" = "unreadable" ]; then
+  fail 1 "the client registry could not be read - this check is BLIND, not clear"
+elif [ "$GUI_COUNT" -eq 0 ]; then
   fail 1 "no GUI process is running - the user has no window at all"
 elif [ "$GUI_COUNT" -gt 1 ]; then
   # This is the failure that produced this whole contract. Name the oldest,
