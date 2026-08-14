@@ -146,6 +146,32 @@ def main():
               sb.read_sub(LANE)["escalate_to"] == BOSS_NEW,
               f"escalate_to={sb.read_sub(LANE)['escalate_to']!r} {r.stdout[-240:]}")
 
+        # --- succession must hand the PLANE over, not just the seat ----------
+        # ⛔ Deleting the predecessor's own subscription without adding the
+        # successor's mints a fresh orphan on EVERY relay: a live seat, armed on
+        # the booter, escalating to nobody. Two campaigns reported it the same
+        # hour; one relays hourly and regenerated it every time.
+        sb.write_sub(BOSS_OLD, "", seat="9.2", role="relay")
+        p = sb.subs / f"{BOSS_OLD}.json"
+        import json as _j
+        rec = _j.loads(p.read_text()); rec["escalate_to"] = BOSS_NEW; p.write_text(_j.dumps(rec))
+        HEIR = "aaaabbbb-7777-4777-8777-aaaabbbbcccc"
+        r = sb.monitor("succeed", "--from", BOSS_OLD, "--to", HEIR)
+        got = sb.read_sub(HEIR) if (sb.subs / f"{HEIR}.json").exists() else {}
+        check("⛔ succeed HANDS THE PLANE to the successor, not only the seat",
+              got.get("role") == "relay" and got.get("seat") == "9.2"
+              and got.get("escalate_to") == BOSS_NEW
+              and not (sb.subs / f"{BOSS_OLD}.json").exists(),
+              f"heir={got!r} rc={r.returncode} {r.stdout[-240:]}")
+
+        # ...and it must never clobber a successor that already knows its own job.
+        sb.write_sub(BOSS_OLD, BOSS_NEW, seat="9.2", role="relay")
+        sb.write_sub(HEIR, BOSS_NEW, seat="9.9", role="orchestrator")
+        r = sb.monitor("succeed", "--from", BOSS_OLD, "--to", HEIR)
+        check("⛔ succeed does NOT clobber a successor that already subscribed",
+              sb.read_sub(HEIR)["seat"] == "9.9" and "left alone" in r.stdout,
+              f"heir={sb.read_sub(HEIR)!r} {r.stdout[-240:]}")
+
         # --- and it must decline to guess -----------------------------------
         # ⛔ A PREFIX THAT NAMES NOBODY MUST BE LEFT ALONE, not resolved to the
         # nearest thing. Silently repointing a lane at the wrong orchestrator is

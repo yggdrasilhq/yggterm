@@ -587,8 +587,38 @@ def cmd_succeed(a):
     for who in moved:
         log(f"  re-pointed {who} -> {new[:8]}")
     log(f"succeeded {old[:8]} -> {new[:8]}: {len(moved)} row(s) re-pointed")
+    # ⛔⛔ A SUCCESSOR INHERITS THE SEAT AND NOT THE PLANE, SO EVERY RELAY MINTS A
+    # FRESH ORPHAN. This used to just DELETE the predecessor's own subscription:
+    # the retiring row left the plane, the incoming row was never added, and the
+    # board then showed a live seat armed on the booter and escalating to nobody.
+    #
+    # Reported independently by TWO campaigns within an hour, 2026-08-14. One
+    # orchestrator ran `succeed` correctly, saw its subscribers re-point, and did
+    # not notice it had never subscribed ITSELF. The other relays roughly hourly
+    # and said it plainly: *each relay leaves the predecessor subscribed and the
+    # successor unsubscribed, so the gap is generated fresh every time.* An
+    # orchestrator backfilling those by hand is treating a symptom that the tool
+    # re-creates on the next handover.
+    #
+    # ⇒ MIGRATE the record instead of deleting it. Role, campaign and escalate_to
+    #   are properties of the SEAT, not of the session sitting in it.
+    # ⚠ Never clobber: a successor that already subscribed itself knows more about
+    #   its own intent than the corpse does.
     p = sub_path(old)
     if p.exists() and old != new:
+        try:
+            rec = json.loads(p.read_text())
+        except Exception:
+            rec = None
+        if rec and not sub_path(new).exists():
+            rec["uuid"] = new
+            rec["since"] = int(time.time())
+            rec["intent"] = (rec.get("intent") or "") + " (inherited at succession)"
+            sub_path(new).write_text(json.dumps(rec, indent=1))
+            log(f"  ⭐ successor {new[:8]} INHERITED the seat's subscription "
+                f"(role={rec.get('role')}, seat={rec.get('seat') or '-'})")
+        elif rec:
+            log(f"  successor {new[:8]} was already subscribed — left alone")
         p.unlink()
         log(f"  unsubscribed the retired orchestrator {old[:8]}")
     return 0
