@@ -792,12 +792,164 @@ fn spawn_unix_client_handler(
     if let Err(error) = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
+            // ⭐ The measurement wraps the WHOLE closure, not `handle_request`.
+            // That is the entire point: the existing `PerfGuard` starts inside
+            // `handle_request` and drops when it returns, so the socket read,
+            // the request deserialise, the response serialise, the socket
+            // write and the thread's own teardown are all outside it. See
+            // [`ClientHandlerWindow`].
+            let started_cpu_us = thread_cpu_micros();
+            let started = std::time::Instant::now();
             let result = handle_unix_stream(stream, runtime, last_activity_ms);
             let _ = outcomes.send(result);
+            record_client_handler_cost(
+                thread_cpu_micros().saturating_sub(started_cpu_us),
+                started.elapsed().as_micros() as u64,
+            );
         })
     {
         warn!(error=%error, "failed to spawn daemon client handler");
     }
+}
+
+/// How often the connection-handler cost aggregate is emitted. Flushed
+/// **lazily, by the next handler to finish** — never by a timer, for the same
+/// reason as every other window in this file: a thread waking to check whether
+/// it should flush is the idle cost this work exists to remove.
+const CLIENT_HANDLER_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What one connection handler costs **in CPU, end to end** — the span nothing
+/// was measuring.
+///
+/// ⛔ **Why the existing instrument cannot see this.** `handle_request`'s
+/// `PerfGuard` (a) starts *after* the socket read and the request deserialise
+/// and drops *before* the response serialise, the socket write and the thread's
+/// teardown, and (b) records **wall** time. A handler measured at ~2.4 ms of
+/// guarded wall has been measured at **25 ms of thread CPU**, and the missing
+/// 22 ms is where the daemon population's cost has been hiding — not because it
+/// was hard to find, but because no instrument was pointed at it.
+///
+/// **Two clocks, each used only where it is valid, and this is deliberate:**
+///
+/// - **Per-handler total: `CLOCK_THREAD_CPUTIME_ID`**, nanosecond-resolution.
+/// - **User/kernel split: `/proc/thread-self/stat` fields 14/15**, which are in
+///   `CLK_TCK` units — **10 ms granularity on this host**. ⛔ A single 0.7 ms
+///   handler therefore reads **zero ticks**, which is exactly the
+///   "field too coarse for its quantity" failure this campaign has already paid
+///   for once. It is only summed **across a whole window**, where hundreds of
+///   handlers make the ratio meaningful, and it is reported as a share rather
+///   than as a per-handler value. ⇒ Never read `user_ticks`/`kernel_ticks` off a
+///   short window.
+///
+/// ⚠ The split is read **once, at the end**, not differenced: the thread is
+/// spawned for this connection and has by construction accumulated no whole
+/// tick before its closure begins. That halves the instrument's own cost, which
+/// is ~10 µs of `/proc` read against a handler the prediction puts at
+/// 0.7–25 ms.
+#[derive(Debug, Default)]
+struct ClientHandlerWindow {
+    opened: Option<std::time::Instant>,
+    opened_proc_cpu_us: u64,
+    handled: u64,
+    cpu_us_total: u64,
+    cpu_us_max: u64,
+    wall_us_total: u64,
+    wall_us_max: u64,
+    user_ticks: u64,
+    kernel_ticks: u64,
+}
+
+static CLIENT_HANDLER_WINDOW: LazyLock<Mutex<ClientHandlerWindow>> =
+    LazyLock::new(|| Mutex::new(ClientHandlerWindow::default()));
+
+/// The daemon's own home, resolved once.
+///
+/// ⛔ Deliberately NOT taken from the runtime: reaching for `DaemonRuntime` here
+/// would lock the global mutex on **every connection**, which is the contention
+/// this instrument exists to measure. An instrument that changes the quantity it
+/// reports is worse than none.
+static TRACE_HOME_DIR: LazyLock<Option<PathBuf>> =
+    LazyLock::new(|| yggterm_core::resolve_yggterm_home().ok());
+
+/// This thread's user and kernel time, in `CLK_TCK` ticks.
+///
+/// ⚠ `comm` is parenthesised and may itself contain spaces and parens, so the
+/// fields are taken after the LAST `)` — after which the next token is field 3
+/// (state), putting `utime` at offset 11 and `stime` at 12.
+fn thread_cpu_split_ticks() -> Option<(u64, u64)> {
+    let raw = std::fs::read_to_string("/proc/thread-self/stat").ok()?;
+    let rest = raw.rsplit_once(')')?.1;
+    let fields = rest.split_whitespace().collect::<Vec<_>>();
+    let utime = fields.get(11)?.parse().ok()?;
+    let stime = fields.get(12)?.parse().ok()?;
+    Some((utime, stime))
+}
+
+fn record_client_handler_cost(cpu_us: u64, wall_us: u64) {
+    let (user_ticks, kernel_ticks) = thread_cpu_split_ticks().unwrap_or((0, 0));
+    let proc_cpu_us = process_cpu_micros();
+    let now = std::time::Instant::now();
+    let flush = {
+        let Ok(mut window) = CLIENT_HANDLER_WINDOW.lock() else {
+            return;
+        };
+        if window.opened.is_none() {
+            window.opened = Some(now);
+            window.opened_proc_cpu_us = proc_cpu_us;
+        }
+        window.handled += 1;
+        window.cpu_us_total += cpu_us;
+        window.cpu_us_max = window.cpu_us_max.max(cpu_us);
+        window.wall_us_total += wall_us;
+        window.wall_us_max = window.wall_us_max.max(wall_us);
+        window.user_ticks += user_ticks;
+        window.kernel_ticks += kernel_ticks;
+        let elapsed = now.duration_since(window.opened.unwrap_or(now));
+        if elapsed < CLIENT_HANDLER_FLUSH_INTERVAL {
+            None
+        } else {
+            let emitted = std::mem::take(&mut *window);
+            window.opened = Some(now);
+            window.opened_proc_cpu_us = proc_cpu_us;
+            Some((
+                elapsed,
+                proc_cpu_us.saturating_sub(emitted.opened_proc_cpu_us),
+                emitted,
+            ))
+        }
+    };
+    let Some((elapsed, proc_cpu_us_delta, emitted)) = flush else {
+        return;
+    };
+    let Some(home) = TRACE_HOME_DIR.as_ref() else {
+        return;
+    };
+    let ticks = emitted.user_ticks + emitted.kernel_ticks;
+    append_trace_event(
+        home,
+        "daemon",
+        "perf",
+        "client_handler_cost",
+        serde_json::json!({
+            "window_ms": elapsed.as_millis() as u64,
+            "handled": emitted.handled,
+            "cpu_us_total": emitted.cpu_us_total,
+            "cpu_us_mean": emitted.cpu_us_total / emitted.handled.max(1),
+            "cpu_us_max": emitted.cpu_us_max,
+            "wall_us_mean": emitted.wall_us_total / emitted.handled.max(1),
+            "wall_us_max": emitted.wall_us_max,
+            // ⚠ A WINDOW share, never a per-handler one — the underlying field
+            // is 10 ms-granular and a single short handler reads zero.
+            "kernel_share": if ticks == 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(emitted.kernel_ticks as f64 / ticks as f64)
+            },
+            "cpu_ticks_sampled": ticks,
+            "proc_cpu_us_delta": proc_cpu_us_delta,
+            "handlers_per_s": emitted.handled as f64 * 1000.0 / elapsed.as_millis().max(1) as f64,
+        }),
+    );
 }
 
 #[cfg(unix)]

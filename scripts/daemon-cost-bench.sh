@@ -124,17 +124,30 @@ for K in "${ROWS[@]}"; do
     python3 - "$HOME_DIR/event-trace.jsonl" "$K" <<'PY'
 import json, sys
 path, k = sys.argv[1], sys.argv[2]
-rows = [json.loads(l)["payload"] for l in open(path, errors="replace")
-        if '"status_cost"' in l]
-if not rows:
+status, handler = [], []
+for line in open(path, errors="replace"):
+    if '"status_cost"' in line:
+        status.append(json.loads(line)["payload"])
+    elif '"client_handler_cost"' in line:
+        handler.append(json.loads(line)["payload"])
+if not status:
     print(f"rows={k} no window flushed — raise --dwell above the flush interval")
 else:
-    p = rows[-1]
+    p = status[-1]
     share = 100 * p["cpu_us_total"] / max(p["proc_cpu_us_delta"], 1)
     print(f"rows={p['rows_mean']:<6} cpu_us/reply={p['cpu_us_mean']:<7}"
           f" wall_us/reply={p['wall_us_mean']:<7}"
           f" proc_cpu_us/reply={p['proc_cpu_us_delta'] // max(p['replies'], 1):<7}"
           f" replies/s={p['replies_per_s']:<7.0f} share={share:.1f}%")
+# ⚠ The LAST window, not the first: the first covers process start, so it
+# reports a control that was never warm.
+for i, h in enumerate(handler):
+    ks = h["kernel_share"]
+    warm = "warm " if i else "COLD "
+    print(f"      {warm}handler: cpu_us/conn={h['cpu_us_mean']:<7}"
+          f" wall_us/conn={h['wall_us_mean']:<7} max={h['cpu_us_max']:<8}"
+          f" kernel_share={'n/a' if ks is None else f'{100*ks:.1f}%'}"
+          f" ticks={h['cpu_ticks_sampled']:<5} conns/s={h['handlers_per_s']:.0f}")
 PY
   else
     # Startup work — state restore, scans — is not the idle cost. Settle first.
