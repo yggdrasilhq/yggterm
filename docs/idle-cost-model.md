@@ -88,9 +88,14 @@ model: **0.864 cores against 3.468 today — 2.60 cores reclaimable, 75%.**
    (they are build-tree binaries on unreachable socket paths). They measure
    **0.000 cores** — a clean natural zero. But no *census* daemon owns zero
    sessions, so the fit cannot separate "a per-daemon floor" from "a step paid
-   by the first session". ⇒ The experiment that settles it: park a census
-   daemon at zero owned sessions and re-measure. Until then the floor term is
-   real but its cause is not attributed.
+   by the first session".
+   ✅ **ANSWERED IN §6e — and it is NEITHER of those.** The floor is the cost of
+   answering peer `status` polls, paid at a rate set by the daemon *population*.
+   The four zero-cost daemons are unreachable, so nobody polls them.
+   ⛔ **The experiment proposed here would have given the wrong answer:** a
+   reachable census daemon parked at zero owned sessions still pays the full
+   floor, which would have been recorded as a per-daemon constant rather than as
+   a per-poll cost — the right number attached to the wrong cause.
 2. **One daemon is excluded** (3 sessions, 0.648 cores, 0.396 of it user time
    — 12x the user time of its peers). Including it drops R² from 0.863 to 0.240
    on its own. It is a genuine outlier with a different shape, ⇒ **now
@@ -145,6 +150,16 @@ linearly.
 every ~5–6 s per daemon and re-reads a constant ~655 KB. ⭐ Take the rate over
 the whole window rather than off the first few timestamps — three clustered
 samples are not a period, a mistake this campaign has already paid for once.
+
+✅ **ATTRIBUTED IN §6d/§6e — and the period hunt was the wrong quarry.** The
+per-row term is not background work on a timer at all. It is **per-request work
+multiplied by a request rate the daemon does not set**: every peer `status` poll
+rebuilds and sorts the daemon's entire row inventory, ~3.6 times a second.
+⛔ **The ~5–6 s / 655 KB read spike remains unexplained and no longer matters** —
+this section had already established that reads do not proxy this cost (the
+0-session control read 4.5 MB while costing 0.001 cores), which was the standing
+reason not to spend another window on bytes. The quantity that mattered was a
+**request rate**, and it was in the trace the whole time.
 
 ## 3. The mechanism: one OS thread per connection, and the CPU hides in the dead ones
 
@@ -313,19 +328,231 @@ fixes a legacy daemon is missing grows with every release.
 monitor reads. So §4 inflates the very corpus §5 pays to parse — fixing §S2
 reduces §5's cost on every daemon, including the ones that cannot be fixed.
 
-## 6. The specs this justifies
+## 6. THE POPULATION POLLS ITSELF — one mechanism behind BOTH unattributed terms
+
+§2a left the floor unattributed and §2b left the per-row term unattributed. They
+are **the same mechanism**, and it is not work the daemon does for itself: it is
+work the daemon does *for its peers*.
+
+### 6a. `status` is 70% of everything the daemons are asked
+
+Parsing the trace as it was written, two independent 60 s windows:
+
+| | window A | window B |
+|---|---|---|
+| `request/begin`, all daemons | 70.5/s | 82.7/s |
+| of which **`status`** | **49.7/s (70%)** | **56.0/s (68%)** |
+| of which `working_flags` | 20.5/s | 26.4/s |
+| `snapshot` | 0.25/s | 0.32/s |
+
+⛔ **And the per-daemon rate is FLAT.** Every census daemon receives
+**3.4–4.2 `status`/s**, and the spread does not track anything the daemon owns:
+
+| daemon | owned | rows | status/s |
+|---|---|---|---|
+| oldest legacy | 3 | 73 | 3.85 |
+| mid legacy | 1 | 90 | 4.03 |
+| late legacy | 1 | 246 | 4.07 |
+| current | 5 | 261 | 4.70 |
+
+⇒ A daemon carrying 261 rows is polled at the same rate as one carrying 73.
+Whatever sets this rate is **outside** the daemon.
+
+### 6b. The N=1 control — the poller is the daemon population itself
+
+The same host runs an **isolated single-daemon installation** (a sandbox arm with
+its own `YGGTERM_HOME`), same binaries, same kernel, same `tsc` clocksource, with
+a live GUI attached to it. Both arms measured over the same 60 s:
+
+| arm | daemons | request rate | **`status`/s** |
+|---|---|---|---|
+| isolated installation | **1** | 0.07/s | **0.00** |
+| census installation | **15** | 82.7/s | **56.0** |
+
+⇒ **A single-daemon installation with a GUI running against it receives zero
+status polls.** The load is not the GUI's and not the clients'. It appears only
+when there is a *population*, which means the daemons are polling each other.
+
+**The arithmetic closes on that reading and on no other.** If each of N daemons
+sweeps its N−1 peers every T seconds, each daemon receives (N−1)/T:
+
+    measured 4.0/s at N=15  =>  T = 14 / 4.0 = 3.5 s
+    predicted fleet total    =  N(N-1)/T = 15 x 14 / 3.5 = 60/s   (measured 51-56/s)
+    predicted at N=1         =  0                                  (measured 0.00)
+
+The independently observed burst period is **3.24 s** (19 bursts in 60 s, median
+121 requests landing on 14 *distinct* daemons per burst) — the same T, arrived at
+without assuming it.
+
+⇒ **THE COST IS QUADRATIC IN THE DAEMON POPULATION, NOT LINEAR.**
+
+### 6c. It is not demand-driven — a null control says so
+
+The obvious story is that a client request fans out. It does not. Lead-lag over
+60 s, counting `status` begins at *other* pids within 300 ms of each candidate
+trigger, against a null built by jittering the trigger timestamps:
+
+| trigger | n | observed | null | ratio |
+|---|---|---|---|---|
+| `working_flags` | 1,408 | 13.16 | 16.14 | **0.82** |
+| `snapshot` | 16 | 10.38 | 15.62 | 0.66 |
+| `status` | 3,203 | 20.73 | 15.83 | 1.31 |
+
+⇒ `working_flags` sits **below** its null, so it triggers nothing. Only the mild
+`status`→`status` self-clustering survives, which is the burst shape itself. **It
+is a timer inside each daemon, not a reaction to a request.** ⚠ Without the null,
+"13 statuses follow every working_flags" would have read as a smoking gun.
+
+### 6d. Each poll costs a thread AND the whole row inventory
+
+**The thread.** Thread births are as flat as the poll rate — 2.37–3.80/s across
+all 15 daemons, matching status/s one-for-one. Every poll is a fresh unix
+connection and a fresh OS thread at `daemon.rs:785` (§3's mechanism, now with its
+driver named: §3 asked what churns threads on an idle daemon, and the answer is
+that the daemon is not idle — it is answering its peers).
+
+**The rows.** `fn status(&self)` (`daemon.rs:4154`) is unconditional and, on
+*every* call, rebuilds:
+
+    let stored_terminal_sessions = self.server.stored_sessions_persisted();
+    let mut stored_terminal_session_keys = stored_terminal_sessions
+        .iter().map(|s| s.path.clone()).collect::<Vec<_>>();
+    stored_terminal_session_keys.sort();          // O(R log R), every poll
+    stored_terminal_session_keys.dedup();
+    let live_terminal_sessions = self.server.persisted_state().live_sessions;
+    //                            ^ the ENTIRE persistence payload, rebuilt
+
+plus a second clone/extend/sort/dedup for `terminal_session_keys`. The response
+struct carries `owned_/terminal_/preserved_/stored_terminal_session_keys` **and
+the full `PersistedStoredSession` records** (path, kind, id, cwd, title).
+
+⇒ **Every peer poll reconstructs and serialises the daemon's whole row
+inventory.** The doc comment explains the design honestly — the records ride on
+status "because the reconcile already fetches status" — and that is exactly the
+trap: a field placed where a *rare* operation would find it convenient, on a
+request that turned out to run **3.6 times a second forever**.
+
+### 6e. Both terms of the model, derived
+
+    cost ~= (N-1)/T x (fixed + k x ROWS)
+
+- **Floor.** 3.6 polls/s x per-poll fixed cost. The model fitted floor 0.116;
+  §3's independently measured ~38 ms per connection handler gives
+  3.6 x 38 ms = **0.137 cores**. Same quantity, two routes.
+- ⭐ **And this is why the four zero-owned daemons measure exactly 0.000.** §2a
+  read that as a clean natural zero for a bare process. It is not: those four sit
+  on **unreachable socket paths**, so no peer can poll them. **The floor is not
+  the cost of existing — it is the cost of being REACHABLE.** That is §2a's open
+  question answered, and it answers it in a way the proposed experiment (park a
+  census daemon at zero owned) would have got **wrong**: a reachable daemon owning
+  nothing would still have paid the floor, and the floor would have been recorded
+  as per-daemon rather than per-poll.
+- **Per-row.** 0.000337 cores/row / 3.6 polls/s = **~94 µs of CPU per row per
+  reply** — a plausible price for cloning, sorting and serialising one record.
+  For a 246-row daemon: 23 ms per poll, 0.083 cores continuous.
+
+⇒ **§2b's per-row term is real and now attributed, and the refuted candidate
+stays refuted for a better reason than its period.** `run_background_copy_chore`
+was never going to be it: the row term is not background work at all, it is
+**per-request work multiplied by a request rate the daemon does not control**.
+⛔ **The period hunt in §2b was the wrong quarry** — chasing a ~5–6 s read spike
+of ~655 KB. Reads were already known not to proxy this cost (§2b's own caution:
+a 0-session control read 4.5 MB while costing 0.001 cores). The quantity that
+mattered was a **request rate**, and it was visible in the trace the whole time.
+
+### 6f. Honest limits on this section
+
+1. ⛔ **The exact periodic call site is NOT located.** The fan-out helper is
+   `reachable_versioned_daemon_statuses[_excluding_endpoint]`
+   (`daemon.rs:13144`/`13166`) — one call issues one `status()` per versioned
+   socket — and it has **18 call sites**. §6c rules out request-driven fan-out,
+   so the driver is one of the periodic paths, but which one is unestablished.
+   Nothing above depends on knowing it; the fix in §S5 does.
+2. ⚠ **Core figures come from the one VALID window** (8 x 20 s, spinner 1.000 /
+   sleeper 0.000). **Four later attempts were VOID** — spinner 0.75–0.87 under a
+   load average of 83.8 on 32 CPUs — and none of their numbers are quoted here.
+   ⭐ **The structural claims do not depend on that**: §6a–§6d are trace
+   *counts*, which host contention cannot bias.
+3. ⚠ **Cost and rate are not from the identical window.** Status rate was stable
+   at 3.4–4.7/s in every run across ~40 minutes, so the combination is
+   defensible — but it is a combination, and `ms/status` inherits it.
+4. ⚠ **The joint model did not replicate cross-sectionally.** Re-fit on the same
+   host six hours later: `cores ~ OWNED+ROWS` fell from **R²=0.939 to 0.109**,
+   and the AGE slope flipped sign. The population had lost its highest-leverage
+   point (a 23-session daemon; tonight's maximum was 9), and per-daemon CV is
+   ~18% with a **common mode** — all daemons swing together window to window.
+   ⇒ **The like-for-like comparison survives and the cross-sectional fit does
+   not.** Among 1-owned legacy daemons: rows 86–101 mean 0.151 cores, rows
+   244/246 mean 0.207 ⇒ **0.00036 cores/row**, reproducing 0.000337. Quote the
+   per-row coefficient from the paired comparison, ⛔ **never the R².**
+
+## 7. The specs this justifies
 
 Ordered by cores returned per unit of risk. Each carries the number it should
 move and the falsifier that would show it did nothing.
 
-### S1 — Cap the daemon population (2.60 cores, highest value, lowest code risk)
+### S5 — Take the row inventory off `status` (≈0.66 cores, no lifecycle risk) ⭐ DO THIS FIRST
+
+**Why it outranks S1.** S1 is worth more but belongs to another lane, needs a
+drain, and cannot be retrofitted to the daemons that carry the cost. S5 is a
+request-handler change in 6.7's own lane, touches no daemon lifecycle, and
+**helps every future daemon including the ones S1 can never reach.**
+
+**Change:** split `ServerRuntimeStatus` in two. `status` keeps the scalars a
+peer poll actually reads — version, build id, pid, counts, block reason. The
+**row inventory moves to a separate request** (`census`) that only the rare
+consumers call: reconcile, handover, adoption, retire-coverage. Concretely, drop
+`stored_terminal_sessions`, `live_terminal_sessions` and the four `*_keys`
+vectors from the poll path, and stop rebuilding `persisted_state()` and running
+two sort/dedup passes per reply.
+
+**Expected effect, with the number:** removes the row-scaled term —
+0.000337 cores/row x **1,953 rows summed over the census** ⇒ **≈0.66 cores**,
+about **25% of the measured 2.64-core daemon footprint**, and it scales up with
+every row the fleet ever accumulates because ROWS is frozen at each daemon's
+birth. Per-reply work drops from O(R log R) to O(1).
+
+**Falsifier:** re-run the §6f paired comparison after the change — 1-owned
+legacy-shaped daemons, low rows vs high rows, both controls in the same run. If
+the per-row coefficient does not fall to ~0, `status` was not what the row term
+was buying and §6e is wrong.
+
+⚠ **Compatibility is the whole risk, and it is a real one.** A pre-split daemon
+asked for `status` by a post-split peer must still receive what it expects, and
+§5's lesson applies with force: **14 daemons that will never restart still speak
+the old shape.** The fields are `#[serde(default)]`, so an old daemon reading a
+slimmed reply gets empty vectors — and an empty `stored_terminal_session_keys`
+reads as *"this peer holds no dormant rows"*, which is exactly the input that
+made a handover drop rows before. ⛔ **Version-gate the slimming on the
+requester's advertised version; do not let absence mean zero.**
+
+### S1 — Cap the daemon population (highest value, lowest code risk)
 
 **Change:** nothing in the hot path. Retire census daemons whose owned sessions
 can be migrated, and make the retirement path converge without a quiet window
 (the settle-window mechanism is already production-proven for exactly this).
-**Expected effect:** 3.468 → ~0.86 cores on this host, **−2.60 cores (−75%)**.
-**Falsifier:** consolidate and re-run §1. If total daemon cores do not fall by
-≥2.0, the per-daemon floor is not per-daemon and §2 is wrong.
+
+⭐ **REVISED BY §6 — the saving is QUADRATIC, and the old estimate understated
+it.** The joint model extrapolated linearly to ~0.86 cores. But peer polls go as
+N(N−1)/T, so draining does not remove a per-daemon floor N times — it removes the
+*population* term outright:
+
+| daemons | peer polls/s (N(N−1)/3.5) | vs today |
+|---|---|---|
+| 15 | 60 | — |
+| 8 | 16 | −73% |
+| 4 | 3.4 | −94% |
+| **1** | **0** | **−100%** |
+
+⇒ Halving the population does not halve this cost, it quarters it. And the N=1
+control in §6b measured **0.00 status/s with a GUI attached**, so the endpoint of
+the curve is observed, not extrapolated.
+**Expected effect:** unchanged headline (**−2.60 cores**), but the *shape* is
+now known: most of the win arrives early, on the first few retirements.
+**Falsifier:** drain to N and re-count `status`/s in the trace. If it does not
+track N(N−1)/3.5 within ~20%, §6b is wrong. ⭐ **Count the polls, not the
+cores** — a trace count is immune to the host contention that voided four of
+this session's CPU windows.
 ⚠ **Owner boundary:** daemon lifecycle belongs to the hot-restart lane, not to
 6.7. This spec is the *justification* for that work, priced. It is not a licence
 to reap daemons holding other agents' live sessions.
@@ -381,13 +608,16 @@ not move, `terminal_read` contention was not what that term was buying.
 
 **Change:** replace thread-per-connection at `daemon.rs:785` with a bounded
 worker pool.
+⭐ **Its driver is now named (§6d):** the churn is not the daemon's own work, it
+is one thread per peer `status` poll. So S1 and S5 both reduce it as a side
+effect, and S4 should be scheduled *after* them rather than against them.
 **Expected effect:** removes 4–25 thread creations/s per daemon. ⚠ **Expected
 CPU win is the SMALLER half** — thread spawn is ~50 µs, so 4/s is ~0.0002 cores.
 The 38 ms per handler is the *work*, not the spawn. ⇒ **This is a stability and
 observability fix, not a CPU fix**; do not promise cores for it. Its real value
 is that CPU stops hiding in exited threads, so §3's instrument gap closes.
 
-## 7. What this file does NOT claim
+## 8. What this file does NOT claim
 
 - **Nothing here measures the GUI.** The GUI runs on another host; the
   12 "gui/client" processes in §1 are CLI clients, not the shell.

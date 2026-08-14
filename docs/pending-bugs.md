@@ -54,9 +54,59 @@ being audited rather than merely edited.
 **Falsifier:** the identifiers are absent from `git log -p` over all refs, and the
 forge returns 404 for the pre-removal blob URLs.
 
+## ⛔⛔⛔ [6.9→6.7] EVERY PEER `status` POLL REBUILDS THE WHOLE ROW INVENTORY, AND THE POLLS GO AS N²
+
+**Status:** OPEN
+
+*measured 2026-08-14; derivation, controls and the N=1 arm in
+[`idle-cost-model.md`](idle-cost-model.md) §6 — spec is §S5*
+
+**`status` is 70% of every request the daemons serve** (49.7–56.0/s fleet-wide
+across two 60 s windows), and each daemon receives **3.4–4.2/s regardless of what
+it owns** — a 261-row daemon is polled no more often than a 73-row one.
+
+- ⭐ **The poller is the daemon population itself.** An isolated single-daemon
+  installation on the same host, same binaries, **with a live GUI attached**,
+  receives **0.00 `status`/s**. The load appears only when there is a population.
+  ⇒ polls = N(N−1)/T with T≈3.5 s: predicts 60/s at N=15 (measured 51–56/s) and
+  0 at N=1 (measured 0.00). **The cost is QUADRATIC in the daemon population.**
+- ⛔ **`fn status(&self)` (`daemon.rs:4154`) is unconditional and rebuilds, per
+  call:** `stored_sessions_persisted()`, a clone per row, **`.sort()`+`.dedup()`
+  (O(R log R))**, `persisted_state()` — *the entire persistence payload* — and a
+  second sort/dedup pass. The reply carries four `*_keys` vectors **and the full
+  `PersistedStoredSession` records** (path, kind, id, cwd, title).
+- ⇒ **This is BOTH unattributed terms of the cost model at once.** The floor =
+  poll rate × per-poll fixed cost (3.6 × ~38 ms = 0.137 cores, against a fitted
+  0.116). The per-row term = poll rate × per-row cost (**≈94 µs of CPU per row
+  per reply**). ROWS is frozen at each daemon's birth, so a 261-row daemon
+  serialises 261 rows on every poll while owning 5.
+- ⭐ **The four zero-cost daemons are not a "bare process" baseline** — they are
+  on unreachable socket paths, so nobody polls them. **The floor is the cost of
+  being REACHABLE, not of existing.**
+- ⚠ **It is not demand-driven.** A lead-lag test against a shuffled null puts
+  `working_flags`→`status` at ratio **0.82, below its own null**. It is a timer.
+  ⛔ **The exact periodic call site is NOT located**: the fan-out helper is
+  `reachable_versioned_daemon_statuses[_excluding_endpoint]` (`daemon.rs:13144`)
+  and it has **18 call sites**. Finding which one ticks is the first build step.
+
+**Fix (§S5):** move the row inventory off `status` onto a separate `census`
+request that only reconcile/handover/adoption call. ⚠ **Version-gate it** — the
+fields are `#[serde(default)]`, so a pre-split daemon reading a slimmed reply
+sees an empty `stored_terminal_session_keys`, which reads as *"this peer holds no
+dormant rows"* — the exact input that has dropped rows in a handover before, and
+**14 daemons that will never restart still speak the old shape**.
+
+**Expected effect:** ≈**0.66 cores** (0.000337/row × 1,953 rows), ~25% of the
+2.64-core daemon footprint, growing with every row the fleet accumulates.
+**Falsifier:** re-run the paired comparison (1-owned daemons, low vs high rows,
+both controls in one run). If the per-row coefficient does not fall to ~0,
+`status` was not what the row term was buying.
+
 ## ⛔⛔⛔ [6.9→6.7] THE LOCK-CONTENTION INSTRUMENT IS THE LARGEST WRITER IN THE SYSTEM, AND IT REPORTS ZERO
 
 **Status:** OPEN
+
+⭐ **S2 landed on `main` (670fa66d) — the falsifier below is UNRUN and unclaimed.**
 
 *measured 2026-08-14; derivation and controls in [`idle-cost-model.md`](idle-cost-model.md) §4*
 
@@ -134,6 +184,17 @@ and did not cover a comment. (2) A `cargo test <filter>` that matched a
 *different* test was read as a passing mutant check. **Prove the run happened
 before reading its silence** — the mutant was in fact caught the moment the real
 test name was used.
+
+⛔⛔ **THE BASELINE HAS MOVED, AND MEASURING AGAINST 141.1 KB/s WOULD CREDIT S2
+WITH SOMETHING ELSE.** Re-measured 2026-08-14 over 30 s with **S2 not running**
+(the live daemon's build predates 670fa66d — checked by ancestry, not by version
+number): **event-trace 22.2 KB/s + perf-telemetry 1.4 KB/s = 23.6 KB/s.** That
+is already a **6x fall with the fix absent**, because the session population went
+57 → 39 and contention is 98.6% `terminal_read`, which is per-session.
+⇒ **The falsifier needs a same-moment control, not a historical baseline:**
+compare a daemon carrying 670fa66d against one that does not, **at the same
+moment, normalised per owned session.** A before/after across hours on this host
+measures the session count as much as the fix.
 
 ## ⛔⛔ [6.9→6.1] THE DAEMON POPULATION IS 83% OF THE IDLE FOOTPRINT, AND ITS COST IS PER-DAEMON
 
