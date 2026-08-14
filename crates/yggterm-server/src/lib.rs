@@ -33,6 +33,10 @@ mod app_control_web_cli;
 // COPIED into each binary, so a verb added to one answered "unsupported app
 // control command" from the other. See `app_control_cli`.
 pub mod app_control_cli;
+// THE `server <verb>` surface's shared implementations. ⛔ Per-verb, NOT a
+// wholesale collapse — see the module note for why this surface differs from
+// `server app`.
+pub mod server_cli;
 // NATIVE notification audio. It lived in the GUI binary's own module tree,
 // which is why `server app audio` did not exist on the headless CLI — the one
 // agents drive — even though the verb needs no GUI at all and its own help
@@ -134,6 +138,7 @@ pub use codex_cli::{
     ManagedCliTool, ManagedCliToolStatus, TerminalIdentityColorProfile, managed_cli_refresh_ttl_ms,
 };
 pub use daemon::{
+    run_server_daemons_census,
     ClientDaemonEndpoint, ClientIdentity, ClientRequestEnvelope, ClientRole, SHADOW_CANNOT_OWN,
     ShadowAccess, daemon_enforces_client_roles, role_gate,
     ProfileWriteLockStatus, acquire_profile_write_lock, profile_write_lock_report,
@@ -971,6 +976,62 @@ pub fn live_row_closes_remembered_among<'a>(
         .collect()
 }
 
+/// *"Where did my row go?"* — the ledger, newest first.
+///
+/// A record nobody can read is not a record, and that is not a figure of speech
+/// here: `docs/spec-app-row-survival.md` §3 exists because rows vanished and the
+/// system held nothing that said so. Writing the departures without a door to
+/// ask them through would reproduce the same silence one layer up.
+///
+/// Read-only, like the two doors above, and for the same reason — this file is
+/// shared by every daemon on the machine, so a reader that published its own
+/// copy would erase peers' records.
+pub fn live_row_departures(
+    home_dir: &std::path::Path,
+) -> Vec<crate::live_row_tombstones::LiveRowDeparture> {
+    crate::live_row_tombstones::LiveRowTombstones::load(
+        home_dir,
+        crate::live_row_tombstones::now_secs(),
+    )
+    .departures()
+}
+
+/// Write one departure into the machine-wide ledger, best-effort.
+///
+/// The write side of [`live_row_departures`], and the ONLY door for a caller
+/// that is not the daemon's own close path. It goes through
+/// [`crate::live_row_tombstones::LiveRowTombstones::record_departure`] — the
+/// same shared read-modify-write under the same file lock. A caller that reached
+/// for the in-memory primitives instead would publish a private snapshot over
+/// every peer daemon's records, which is the bug that module was rewritten to
+/// prevent.
+///
+/// ⚖ Best-effort on purpose: a row leaving is not something to abort over, and a
+/// ledger that could fail a persist would be worse than the silence it replaces.
+/// A failed write is traced beside the departure it could not record.
+pub fn record_live_row_departure(
+    home_dir: &std::path::Path,
+    departure: crate::live_row_tombstones::LiveRowDeparture,
+) {
+    let reason = departure.reason.label();
+    let path = departure.path.clone();
+    if let Err(error) = crate::live_row_tombstones::LiveRowTombstones::default()
+        .record_departure(home_dir, departure)
+    {
+        append_trace_event(
+            home_dir,
+            "server",
+            "session",
+            "live_session_row_departure_record_failed",
+            serde_json::json!({
+                "path": path,
+                "reason": reason,
+                "error": error.to_string(),
+            }),
+        );
+    }
+}
+
 /// **A genuinely closed row, for a test in ANOTHER crate.** Not compiled into
 /// any shipping binary: it exists only under the `test-support` feature, which
 /// nothing but a `[dev-dependencies]` edge turns on.
@@ -1112,13 +1173,17 @@ fn session_keep_alive(session: &ManagedSessionView) -> bool {
         .is_some_and(|entry| entry.value == RUNTIME_PERSISTENCE_KEEP_ALIVE)
 }
 
-/// Does this session kind persist by default — i.e. is it born keep-alive?
+/// Does this session KIND persist by default — the kind half of the birth rule.
 ///
-/// CLAUDE.md's first-class/second-class split, expressed as one predicate:
-/// agent CLI sessions (Codex, Codex-LiteLLM, Claude Code) are first-class and
-/// "persist by default"; plain shells (local and ssh) are second-class and
-/// survive a GUI close only when the user explicitly marks them keep-alive.
-/// Remote agent rows resolve to the same agent kinds, so they are covered too.
+/// The first-class/second-class split, expressed as one predicate: agent CLI
+/// sessions (Codex, Codex-LiteLLM, Claude Code) are first-class and "persist by
+/// default"; a bare shell nobody asked for is second-class and survives a GUI
+/// close only when it is explicitly marked keep-alive. Remote agent rows resolve
+/// to the same agent kinds, so they are covered too.
+///
+/// ⚠ KIND IS NOT THE WHOLE ANSWER — see [`apply_birth_keep_alive`]. An app row
+/// is a `SessionKind::Shell` and is still first-class, so nothing outside that
+/// function may treat this predicate as "is this row protected".
 fn session_kind_persists_by_default(kind: SessionKind) -> bool {
     // Registry-derived: first-class IS "is an agent CLI", so a CLI cannot be
     // registered and then quietly born second-class because a hand-list here
@@ -1163,14 +1228,39 @@ fn apply_session_tenancy_metadata(
 /// stated flatly that agent CLI kinds are born keep-alive. Two agents measured
 /// the two lanes and reported opposite "facts"; both were right.
 ///
-/// It reads `session.kind` rather than taking it as an argument so a caller
-/// cannot pass a kind the row does not have, and it is a no-op for the kinds
-/// that are second-class by design — which is why it is safe to call at EVERY
-/// birth site rather than at the ones someone remembered.
+/// It reads the SESSION rather than taking a kind as an argument so a caller
+/// cannot pass a kind the row does not have, and it is a no-op for the rows that
+/// are second-class by design — which is why it is safe to call at EVERY birth
+/// site rather than at the ones someone remembered.
+///
+/// ⛔ KIND IS NOT THE WHOLE RULE, and reading it as though it were is the defect
+/// `docs/spec-app-row-survival.md` was written against. A row created from an app
+/// verb is a `SessionKind::Shell`, so the kind half alone made it disposable —
+/// and a GUI restart then destroyed a group of app rows the user had deliberately
+/// built. The spec's rule is one sentence: *a row the user created deliberately
+/// survives a GUI restart, always, whatever its kind*. An app row is exactly such
+/// a row: nothing in the UI says it is scratch, and it took an explicit menu
+/// choice to make. So the birth rule reads the row's PURPOSE, not only its kind.
+///
+/// ⚖ What is still reapable is unchanged (spec §4): an `--ephemeral` row is taken
+/// by the reaper whether or not it is keep-alive, and an explicit close destroys
+/// any row. This protects a row from the GUI WINDOW closing, nothing more.
 fn apply_birth_keep_alive(session: &mut ManagedSessionView) {
-    if session_kind_persists_by_default(session.kind) {
+    if session_kind_persists_by_default(session.kind) || session_is_app_row(session) {
         set_session_keep_alive_metadata(session, true);
     }
+}
+
+/// Was this row created from a libyggterm APP verb?
+///
+/// ONE encoding, and it is the one `persisted_live_session_from_managed` already
+/// reads for `app_launch`: the row's `Source` stamp IS the `app:<name>:<verb>`
+/// token every launcher menu speaks, parsed by its one parser. So "which app is
+/// this row" and "is this row an app row" cannot answer differently, and adding a
+/// launcher surface never means teaching a second field about apps.
+fn session_is_app_row(session: &ManagedSessionView) -> bool {
+    session_metadata_value(session, "Source")
+        .is_some_and(|source| app_verb_token_parts(&source).is_some())
 }
 
 fn set_session_keep_alive_metadata(session: &mut ManagedSessionView, keep_alive: bool) {
@@ -6501,9 +6591,33 @@ impl YggtermServer {
         // kept vanishing at swaps even after the mapper fix; the unit test
         // passed while the live path failed). Every live key that does NOT
         // make it into the persisted state traces WHICH gate dropped it.
-        let trace_drop = |key: &str, reason: &str, detail: serde_json::Value| {
+        // ⛔⛔ THIS IS THE PATH THAT TOOK THE OWNER'S ROW GROUP, and it took a
+        // departure ledger and a trace hunt to find out, because it is the ONE
+        // way a row leaves that neither close path knows about.
+        //
+        // A dropped row is still in THIS daemon's live order — it is simply not
+        // written to the state file, so the SUCCESSOR daemon never learns it
+        // existed. From the user's side that is a row vanishing at the next
+        // restart; from the system's side nothing was closed, so
+        // `removed-rows.json` stays empty and no `client_close_prepared` is
+        // traced. It also explains the two-stores-disagree symptom in
+        // `spec-app-row-survival.md` §3 exactly: the OLD daemon still holds the
+        // row in memory and still lists it, while the new one never had it.
+        //
+        // Measured on the desktop host: four `local://` rows dropped in one
+        // update-restart persist at `protect_all_live: true`, two of them titled
+        // for the app rows the owner reported losing. He had closed nothing.
+        //
+        // ⇒ SO THE DROP RECORDS A DEPARTURE TOO. §3's rule is *a row leaving the
+        // live set for any reason other than an explicit user close must leave a
+        // record saying which reason*, and a trace event is not that record: it
+        // is keyed by time, in a file that rotates per GUI launch, rather than by
+        // row in a store that outlives the daemon which wrote it.
+        let trace_drop = |key: &str, title: &str, reason: &str, detail: serde_json::Value| {
             // Log the first occurrence, never the repetitions — see
-            // `persist_drop_already_traced`.
+            // `persist_drop_already_traced`. The departure rides the same gate:
+            // one record per row per reason is a ledger, one per persist tick
+            // would be a treadmill.
             if persist_drop_already_traced(key, reason) {
                 return;
             }
@@ -6520,6 +6634,20 @@ impl YggtermServer {
                         "protect_all_live": protect_all_live,
                     }),
                 );
+                record_live_row_departure(
+                    &home,
+                    crate::live_row_tombstones::LiveRowDeparture {
+                        identity: normalized_live_row_identity(key),
+                        path: key.to_string(),
+                        title: title.to_string(),
+                        reason: crate::live_row_tombstones::RowDeparture::PersistDropped,
+                        at: crate::live_row_tombstones::now_secs(),
+                        // WHICH gate took it. The three read very differently to
+                        // somebody asking why their row is gone, and without this
+                        // the ledger sends them back to a rotating trace.
+                        detail: Some(reason.to_string()),
+                    },
+                );
             }
         };
         self.live_session_order
@@ -6530,6 +6658,7 @@ impl YggtermServer {
                 if !recoverable {
                     trace_drop(
                         key,
+                        &session.title,
                         "not_recoverable",
                         serde_json::json!({
                             "kind": format!("{:?}", session.kind),
@@ -6587,6 +6716,7 @@ impl YggtermServer {
                     if !protected {
                         trace_drop(
                             key,
+                            &session.title,
                             "not_in_protected_runtime_keys",
                             serde_json::json!({
                                 "resolved_runtime_key": runtime_key,
@@ -6608,6 +6738,7 @@ impl YggtermServer {
                 if persisted.is_none() {
                     trace_drop(
                         key,
+                        &session.title,
                         "mapper_returned_none",
                         serde_json::json!({
                             "kind": format!("{:?}", session.kind),
@@ -7584,9 +7715,65 @@ impl YggtermServer {
         local_agent_cli_missing_binary_refusal(tool)
     }
 
+    /// The cwd this row asks for, when the launch will run HERE and that
+    /// directory does not exist here — `None` when there is nothing to say.
+    ///
+    /// ⛔ Reported by seat 6.3 2026-08-14 as "a launch into a cwd that exists
+    /// only on another host leaves a row that looks healthy forever". The
+    /// launch does not fail: `best_effort_cwd_shell_prefix` walks up to the
+    /// nearest existing ancestor and falls back to `$HOME`, deliberately, so
+    /// the CLI really does start — just somewhere else. What was missing is
+    /// that the ROW went on advertising the requested directory, so its
+    /// detail line said "rooted at <dir>" about a directory the process had
+    /// never been in.
+    ///
+    /// ⚠ This is NOT a second encoding of the walk-up rule. The walk-up
+    /// decides where to LAND, which is the shell's job and stays there
+    /// (a remote row runs the same prefix on the remote host, where this
+    /// process cannot look). This answers the one question the mark needs and
+    /// the shell cannot answer for us: was the request honourable HERE.
+    pub fn local_launch_cwd_fallback_for_path(&self, path: &str) -> Option<String> {
+        let key = self.resolve_session_storage_key(path)?;
+        let session = self.sessions.get(key)?;
+        if !session_launch_runs_locally(path, session.source) {
+            return None;
+        }
+        let (_, cwd) = self.terminal_spec(path)?;
+        let requested = cwd.map(|value| value.trim().to_string())?;
+        if requested.is_empty() || std::path::Path::new(&requested).is_dir() {
+            return None;
+        }
+        Some(requested)
+    }
+
+    /// Mark a row whose launch could not be given the directory it asked for.
+    ///
+    /// Deliberately NOT a refusal: the session is running and usable, so
+    /// `launch_phase` stays whatever the launch made it and the viewport is
+    /// left alone (the CLI is painting into it). What changes is that the row
+    /// stops presenting the requested directory as a fact.
+    pub fn record_launch_cwd_fallback_for_path(&mut self, path: &str, requested: &str) {
+        let Some(key) = self.resolve_session_storage_key(path).map(str::to_string) else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return;
+        };
+        let message = format!(
+            "{requested} does not exist on this machine — this session started somewhere else"
+        );
+        upsert_session_metadata(&mut session.metadata, "Cwd Warning", message.clone());
+        session.status_line = format!("cwd not found here · {message}");
+    }
+
     /// Record a refused launch ON THE ROW, so the failure is readable without
     /// reading the terminal screen — the instrument gap the owner's report named.
-    pub fn record_launch_refusal_for_path(&mut self, path: &str, message: &str) {
+    ///
+    /// `status` names the CAUSE. It used to be the literal "CLI binary not
+    /// installed", which was true of the only caller and would have quietly
+    /// become a lie the moment a second reason to refuse arrived — a fork
+    /// wearing a shared recorder's clothes.
+    pub fn record_launch_refusal_for_path(&mut self, path: &str, message: &str, status: &str) {
         let Some(key) = self.resolve_session_storage_key(path).map(str::to_string) else {
             return;
         };
@@ -7600,11 +7787,7 @@ impl YggtermServer {
         // line existed. `Failed` is the only value that is not a promise.
         session.launch_phase = TerminalLaunchPhase::Failed;
         upsert_session_metadata(&mut session.metadata, "Launch Error", message.to_string());
-        upsert_session_metadata(
-            &mut session.metadata,
-            "Status",
-            "CLI binary not installed".to_string(),
-        );
+        upsert_session_metadata(&mut session.metadata, "Status", status.to_string());
         session.status_line = format!("launch refused · {message}");
         // ⛔ And say it IN THE VIEWPORT. The owner's report was about what the
         // screen showed; a refusal recorded only in metadata trades a shell that
@@ -8514,6 +8697,14 @@ impl YggtermServer {
                 "Source",
                 source_label.unwrap_or("recipe-session").to_string(),
             );
+            // ⛔ AFTER the `Source` stamp, and that ordering is the whole fix.
+            // The birth rule reads the row's purpose off that stamp, and the row
+            // was inserted a few lines above without one — so a rule applied at
+            // insert time can only ever see `SessionKind::Shell` and be wrong
+            // about an app row. Re-applying here is idempotent for every other
+            // caller (a recipe shell has no app token, so this is a no-op) and it
+            // is the only place in the birth path where the row knows what it is.
+            apply_birth_keep_alive(session);
             upsert_session_metadata(
                 &mut session.metadata,
                 "Launch",
@@ -9476,25 +9667,64 @@ impl YggtermServer {
                         session.kind == SessionKind::Codex && session_id == id.as_str()
                     })
                 {
-                    // ⛔ AN APP ROW IS NOT A PLAIN SHELL, and this line is where
-                    // it used to become one. `stored_session_launch_command`
-                    // answers `exec '<shell>' -i` for a `Shell`, which is the
-                    // correct derivation for a row that IS a shell and a total
-                    // loss for a row that is ychrome. Re-derive the app's own
-                    // command from the token the row persisted, against the
-                    // CURRENT registry (reported, 2026-08-08).
-                    session.launch_command = app_launch
-                        .as_deref()
-                        .and_then(restored_app_verb_launch_command)
-                        .unwrap_or_else(|| {
-                            stored_session_launch_command(session.kind, &cwd, &id)
-                        });
+                    // A row with a STORAGE path is an agent CLI row: its command
+                    // is the resume its transcript names. An app row's command is
+                    // re-derived from its own token in the block below, which runs
+                    // for every app row rather than only the ones that happen to
+                    // have a transcript.
+                    session.launch_command =
+                        stored_session_launch_command(session.kind, &cwd, &id);
                 }
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Launch",
                     user_visible_launch_command(&session.launch_command),
                 );
+            }
+            // ⛔ PUT THE TOKEN BACK ON THE ROW, or the round-trip survives
+            // exactly ONE restart. `persisted_live_session_from_managed` reads
+            // `app_launch` out of the row's `Source` stamp — that is the one
+            // encoding, deliberately — but the restore above consumed the token
+            // to re-derive `launch_command` and never wrote it anywhere the next
+            // PERSIST can see. So daemon #2 restored the app faithfully and then
+            // saved a row with `app_launch: None`, and daemon #3 brought it back
+            // as bare bash. The identity has to be re-stamped, not just spent.
+            //
+            // Unconditional on the loopback branch above: that branch decides
+            // which COMMAND a row gets, which is a different question from what
+            // the row IS. A row that says it is an app must keep saying so even
+            // when its app is uninstalled and the command falls back to a shell.
+            if let Some(app_launch) = app_launch
+                .as_deref()
+                .filter(|token| app_verb_token_parts(token).is_some())
+            {
+                upsert_session_metadata(&mut session.metadata, "Source", app_launch.to_string());
+                // ⛔ AN APP ROW IS NOT A PLAIN SHELL, AND THIS IS WHERE IT USED
+                // TO BECOME ONE — twice over, and the second one was hidden by
+                // the first. Re-deriving the app's command lived INSIDE the
+                // `Storage` branch above, and an app row has no storage path,
+                // so the branch never ran for the only kind of row it was added
+                // for. Live-caught in a sandbox 2026-08-14: a row persisted with
+                // `app_launch: app:<name>:<verb>` and `keep_alive: true`
+                // restored, correctly protected, as `exec '/bin/bash' -i` — the
+                // owner's "it came back as bare bash" symptom, still there,
+                // under a fix that looked shipped because the TOKEN round-tripped.
+                //
+                // The token, re-derived against the registry AS IT IS NOW: a
+                // manifest's binary path is a fact about the machine. An app that
+                // has been uninstalled resolves to nothing and the row keeps the
+                // shell `build_live_session` gave it, which is a visible empty
+                // prompt rather than an exec of a path that has moved.
+                if is_loopback_ssh_target(&target.ssh_target)
+                    && let Some(command) = restored_app_verb_launch_command(app_launch)
+                {
+                    session.launch_command = command;
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "Launch",
+                        user_visible_launch_command(&session.launch_command),
+                    );
+                }
             }
             // Restore is authoritative — see the note at the sibling site above.
             set_session_keep_alive_metadata(session, keep_alive);
@@ -10296,9 +10526,15 @@ impl YggtermServer {
         // `terminal_reuse_needs_restart`, so an unprotected agent session had its
         // PTY re-spawned (and its CLI re-resumed) on any transient
         // stale/blank-remote-attach reading. Born-green closes both.
-        if session_kind_persists_by_default(kind) {
-            set_session_keep_alive_metadata(&mut session, true);
-        }
+        //
+        // ⛔ Through the ONE owner, not a second copy of the predicate: this
+        // callsite spelled the rule out inline, which is how it stayed a
+        // kind-only rule here while `apply_birth_keep_alive` grew the app-row
+        // half. A row born through this chokepoint has no `Source` stamp yet —
+        // `start_command_session` writes it and re-applies the rule — so this is
+        // the kind half in practice, but it is no longer a private restatement
+        // of it.
+        apply_birth_keep_alive(&mut session);
         // Creation hook (phantom-spawn investigation, TODO-2/Bug-3 family):
         // every live-session birth through this chokepoint is traced with the
         // prior active pointer so a phantom UUIDv4 spawn (user clicked an
@@ -16802,6 +17038,19 @@ fn session_path_uses_local_managed_cli(path: &str) -> bool {
     !(path.starts_with("remote-session://") || path.starts_with("remote-cc://"))
 }
 
+/// Does this row's launch — its `cd`, its exec, its cwd — happen on THIS
+/// machine? The two facts that decide it are the same two
+/// [`local_managed_cli_tool_for`] uses, and for the same reasons: a
+/// `remote-*://` row resumes on the other machine, and a `LiveSsh` row carries
+/// a local-looking path while its runtime is on the other machine too.
+///
+/// Separate from `local_managed_cli_tool_for` because that one also asks WHICH
+/// CLI, and answers `None` for a plain shell — which runs locally like any
+/// other row and is exactly the case a cwd question must not skip.
+fn session_launch_runs_locally(path: &str, source: SessionSource) -> bool {
+    session_path_uses_local_managed_cli(path) && source != SessionSource::LiveSsh
+}
+
 /// Which LOCAL managed CLI a session will exec, from the three facts that decide
 /// it — nothing else about the session matters, so this is a pure function and
 /// the `&self` method is a lookup in front of it.
@@ -21432,6 +21681,26 @@ pub fn run_trace_tail(lines: usize) -> anyhow::Result<()> {
     for line in tail_text_file_lines(&path, lines) {
         println!("{line}");
     }
+    Ok(())
+}
+
+/// `server rows departed` — what left the live set, why, and when.
+///
+/// The reason is the column that matters: `explicit-close` means somebody named
+/// this row and closed it, `gui-close-disposable` means the GUI window closed
+/// and the row was not keep-alive, so it went for what it was rather than
+/// because anyone asked. Before this ledger existed the two were indistinguish-
+/// able from an absence, which is how a group of app rows could vanish with
+/// nothing anywhere recording that it had.
+pub fn run_row_departures(limit: usize) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let departures = live_row_departures(&home);
+    let shown: Vec<_> = departures.into_iter().take(limit).collect();
+    write_stdout_payload(&serde_json::to_string_pretty(&serde_json::json!({
+        "home": home.display().to_string(),
+        "count": shown.len(),
+        "departures": shown,
+    }))?)?;
     Ok(())
 }
 
@@ -32335,6 +32604,282 @@ mod tests {
         }
     }
 
+    /// ⛔ `docs/spec-app-row-survival.md` §1, as the ONE set that decides it.
+    ///
+    /// A GUI restart does not consult a flag on the row — it closes exactly
+    /// `non_keep_alive_live_session_paths()`, one by one, in `PrepareClientClose`.
+    /// So the way to verify the prohibition is to TRY TO VIOLATE IT: build the
+    /// reap set and look for the app row in it. Asserting the metadata reads back
+    /// would only prove the write landed, which was never the question.
+    ///
+    /// The row a group of these was lost from was `kind: shell, keep_alive: false`
+    /// — a plain shell to the code, an arranged group of app surfaces to the user.
+    /// Both halves are asserted here, because the kind is what made it look
+    /// disposable and the kind has not changed.
+    #[test]
+    fn an_app_row_is_born_protected_from_the_gui_close_reap_but_a_scratch_shell_is_not() {
+        let mut server = test_server();
+        let app_row = server.start_command_session(
+            Some("/home/user"),
+            Some("New Ychrome"),
+            &local_app_verb_launch_command("'/home/user/.local/bin/ychrome' 'new'"),
+            Some("app:ychrome:new"),
+        );
+        // No app token: a recipe/scratch shell, which is second-class BY DESIGN
+        // and must stay that way — the spec protects rows somebody made on
+        // purpose, it does not abolish the disposable tier.
+        let scratch_row = server.start_command_session(
+            Some("/home/user"),
+            Some("recipe shell"),
+            "/bin/bash -i",
+            None,
+        );
+
+        let app_session = server.sessions.get(&app_row).expect("the app row exists");
+        assert_eq!(
+            app_session.kind,
+            SessionKind::Shell,
+            "the row is still a shell — the fix is that KIND stopped being the \
+             whole answer, not that app rows got a new kind"
+        );
+        assert!(
+            super::session_is_app_row(app_session),
+            "an app row is recognised by its `Source` stamp, the same token the \
+             persisted `app_launch` is read from"
+        );
+
+        let reaped = server.non_keep_alive_live_session_paths();
+        assert!(
+            !reaped.contains(&app_row),
+            "a GUI close closes exactly this set; an app row inside it is the \
+             data loss the spec was written against"
+        );
+        assert!(
+            reaped.contains(&scratch_row),
+            "a scratch shell with no app identity is still second-class"
+        );
+
+        // …and it has to SURVIVE THE DAEMON too, or it comes back protected but
+        // blank. The persisted record carries both halves: the flag that keeps
+        // the GUI from taking it, and the token the command is re-derived from.
+        let persisted =
+            persisted_live_session_from_managed(
+                &app_row,
+                app_session,
+                super::session_keep_alive(app_session),
+                None,
+                false,
+            )
+                .expect("a local app row is persistable");
+        assert!(
+            persisted.keep_alive,
+            "born keep-alive must reach the state file, or the protection dies \
+             with the daemon that granted it"
+        );
+        assert_eq!(persisted.app_launch.as_deref(), Some("app:ychrome:new"));
+    }
+
+    /// ⛔ THE ROUND-TRIP HAS TO CLOSE, AND IT DID NOT — it survived exactly one
+    /// restart, which is the number of restarts a test that restores once can
+    /// see.
+    ///
+    /// `persisted_live_session_from_managed` reads `app_launch` out of the row's
+    /// `Source` stamp — one encoding, deliberately. But `restore_live_session`
+    /// SPENT the token (re-deriving `launch_command` from it) without stamping it
+    /// back, so the restored row no longer said which app it was. Daemon #2
+    /// therefore restored the app perfectly and then persisted `app_launch: None`,
+    /// and daemon #3 had nothing left to re-derive from. A row outlives many
+    /// daemons; a fact that survives one of them is not persisted.
+    ///
+    /// ⛔⛔ THE THIRD WAY A ROW LEAVES, AND IT IS THE ONE THAT TOOK THE OWNER'S
+    /// GROUP: it is never closed, it is left OUT of the state file.
+    ///
+    /// Both close paths write a departure now. This one is not a close at all —
+    /// the row stays in the running daemon's live order and simply is not
+    /// persisted, so the SUCCESSOR daemon never learns it existed. Nothing is
+    /// removed, so `removed-rows.json` stays empty and no close is traced; the
+    /// row just is not there after the next restart, while the old daemon still
+    /// lists it. That is the two-stores-disagree symptom in
+    /// `spec-app-row-survival.md` §3, and it is what the trace on the desktop
+    /// host showed: four `local://` rows dropped in one update-restart persist,
+    /// two of them titled for the app rows the owner reported losing.
+    ///
+    /// Driven through the REAL filter against a temp `YGGTERM_HOME`, because the
+    /// claim is that a write reaches a shared file — a test that built the record
+    /// itself would assert nothing about the path that failed to write one.
+    #[test]
+    fn a_row_dropped_from_the_state_file_leaves_a_record_saying_so() {
+        use crate::live_row_tombstones::{LiveRowTombstones, RowDeparture};
+
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-persist-drop-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&home).expect("create temp home");
+        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
+        unsafe {
+            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
+        }
+
+        let mut server = test_server();
+        let row = server.start_command_session(
+            Some("/home/user"),
+            Some("a shell the user made"),
+            "/bin/bash -i",
+            None,
+        );
+        // The update-restart persist: `protect_all_live`, and a protected set
+        // that does NOT carry this row's runtime. That is the exact gate the
+        // owner's rows fell through.
+        let protected: HashSet<String> = HashSet::new();
+        let persisted =
+            server.persisted_live_sessions_with_update_protection(true, Some(&protected));
+
+        let departures =
+            LiveRowTombstones::load(&home, crate::live_row_tombstones::now_secs()).departures();
+
+        if let Some(previous_home) = previous_home {
+            unsafe {
+                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+
+        assert!(
+            !persisted.iter().any(|live| live.key == row),
+            "the row must actually have been dropped, or this test proves nothing \
+             about what a drop records"
+        );
+        let recorded = departures
+            .iter()
+            .find(|departure| departure.path == row)
+            .expect(
+                "a row that leaves the live set must leave a record saying which \
+                 reason -- an absence is not a record, and an absence is all this \
+                 path used to leave",
+            );
+        assert_eq!(recorded.reason, RowDeparture::PersistDropped);
+        assert_eq!(
+            recorded.title, "a shell the user made",
+            "the record has to name the row the way the user knew it, or it \
+             cannot answer the question it exists for"
+        );
+        assert_eq!(
+            recorded.detail.as_deref(),
+            Some("not_in_protected_runtime_keys"),
+            "WHICH gate took it: the three drop reasons mean different things, \
+             and without this the reader is sent back to a rotating trace file"
+        );
+    }
+
+    /// ⛔ AND THE COMMAND HAS TO BE RE-DERIVED FOR EVERY APP ROW, not only for
+    /// one that happens to have a transcript.
+    ///
+    /// The re-derivation was nested inside `restore_live_session`'s `Storage`
+    /// branch. `Storage` is an agent CLI's transcript path; an app row has none,
+    /// so the branch never ran for the only kind of row it was added for, and
+    /// an app row restored — correctly protected, token intact — as bare bash.
+    /// Live-caught in a private sandbox 2026-08-14, under a fix that read as
+    /// shipped because the TOKEN round-tripped and only the COMMAND did not.
+    ///
+    /// Structural, because the defect is nesting: the re-derivation must sit
+    /// with the identity re-stamp, which is deliberately outside that branch, so
+    /// putting it back inside would move it BEFORE the stamp in the source.
+    #[test]
+    fn the_app_command_re_derivation_is_not_nested_inside_the_transcript_branch() {
+        let source = include_str!("lib.rs");
+        let body = source
+            .split("pub fn restore_live_session(")
+            .nth(1)
+            .expect("restore_live_session")
+            .split("\n    pub fn ")
+            .next()
+            .expect("the end of restore_live_session");
+        let storage_branch = body
+            .find("if let Some(storage_path) = storage_path.as_deref()")
+            .expect("the transcript branch");
+        let identity_restamp = body
+            .rfind("\"Source\", app_launch.to_string()")
+            .expect("the app identity must be re-stamped on restore");
+        let re_derivation = body
+            .find("restored_app_verb_launch_command(app_launch)")
+            .expect("an app row's command must be re-derived from its token");
+        assert!(
+            storage_branch < identity_restamp,
+            "the identity re-stamp belongs OUTSIDE the transcript branch"
+        );
+        assert!(
+            identity_restamp < re_derivation,
+            "the command re-derivation must sit with the identity re-stamp, not \
+             back inside the transcript branch where no app row ever reaches it"
+        );
+    }
+
+    /// Two restarts is the whole point of this test. One is not enough to catch
+    /// it, and one is what the create-side test above does.
+    #[test]
+    fn an_app_rows_identity_survives_a_second_daemon_restart_not_just_the_first() {
+        let mut server = test_server();
+        let key = crate::local_live_runtime_key("00000000-0000-4000-8000-00000000a99a");
+        let mut record = PersistedLiveSession {
+            key: key.clone(),
+            id: "00000000-0000-4000-8000-00000000a99a".to_string(),
+            title: "New Ychrome".to_string(),
+            kind: SessionKind::Shell,
+            keep_alive: true,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/home/user".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: None,
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: AgentLaunchOptions::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+            app_launch: Some("app:ychrome:new".to_string()),
+        };
+
+        for restart in 1..=2 {
+            server.restore_live_session(record.clone());
+            let session = server
+                .sessions
+                .get(&key)
+                .unwrap_or_else(|| panic!("restart {restart}: the row must restore"));
+            assert!(
+                super::session_is_app_row(session),
+                "restart {restart}: a restored app row must still SAY it is an app \
+                 row — the stamp is the identity, not a spent input"
+            );
+            assert!(
+                super::session_keep_alive(session),
+                "restart {restart}: and it must come back protected, or the next \
+                 GUI close takes it"
+            );
+            // What the NEXT daemon would be handed.
+            record = persisted_live_session_from_managed(
+                &key,
+                session,
+                super::session_keep_alive(session),
+                None,
+                false,
+            )
+            .unwrap_or_else(|| panic!("restart {restart}: the row must re-persist"));
+            assert_eq!(
+                record.app_launch.as_deref(),
+                Some("app:ychrome:new"),
+                "restart {restart}: the token must ride the NEXT persist too — \
+                 this is the assertion that was false at restart 2"
+            );
+        }
+    }
+
     /// ⛔⛔ reported 2026-08-09: working sessions showing NO blink, on a
     /// GUI whose current daemon owned 3 of 45 rows. The snapshot writes `None`
     /// for every session its answering daemon does not own, and `apply_snapshot`
@@ -33799,6 +34344,78 @@ mod tests {
         assert!(status.contains("remote terminal attached"));
         assert!(!status.contains("blocked"));
         assert!(!status.contains("stale resolve error"));
+    }
+
+    #[test]
+    fn a_cwd_that_does_not_exist_here_is_announced_by_the_launch_itself() {
+        // The walk-up is deliberate — a launch into a missing directory still
+        // starts, in the nearest existing ancestor or `$HOME`. What was
+        // missing is that it said nothing, so the row named a directory the
+        // process had never been in and looked healthy forever.
+        let prefix = crate::best_effort_cwd_shell_prefix(Some("/workspace/only-on-another-host"))
+            .expect("a cwd yields a prefix");
+        assert!(
+            prefix.contains(crate::codex_cli::CWD_FALLBACK_NOTICE_MARKER),
+            "{prefix}"
+        );
+        // ⛔ The notice must be conditional on the LOOP's own verdict, not on
+        // `$PWD`. `cd /tmp/` leaves `$PWD` as `/tmp`, so a `$PWD`-keyed
+        // comparison announces a fallback that never happened for any path
+        // written with a trailing slash.
+        assert!(
+            prefix.contains("if [ \"$__yggterm_cwd\" != \"$__yggterm_requested\" ]"),
+            "{prefix}"
+        );
+        // And it goes to stderr, so it cannot be mistaken for the CLI's own
+        // first line of output by anything reading the stream.
+        assert!(prefix.contains(">&2"), "{prefix}");
+        // ⛔⛔ AND IT CANNOT BE ALLOWED TO FAIL THE LAUNCH. The prefix is joined
+        // onto the rest of the command with ` && `, so whatever it ends with
+        // GATES the exec. Before this notice existed the prefix ended in a
+        // `… || true; fi`, which is always 0; a bare `printf … >&2` at the end
+        // hands the whole launch a non-zero status the one time stderr is not
+        // writable, and the CLI simply never starts — a silent non-launch,
+        // which is a worse version of the bug this notice exists to report.
+        assert!(
+            prefix.trim_end().ends_with("fi"),
+            "the prefix must still end in an `if`, whose status is 0: {prefix}"
+        );
+        assert!(
+            prefix.contains(">&2 || true"),
+            "the fallback notice can fail the launch it was added to explain: {prefix}"
+        );
+        // A launch with no cwd asks for nothing and so can be denied nothing.
+        assert!(crate::best_effort_cwd_shell_prefix(None).is_none());
+        assert!(crate::best_effort_cwd_shell_prefix(Some("   ")).is_none());
+    }
+
+    #[test]
+    fn a_launch_that_runs_on_another_machine_is_not_ours_to_judge_a_cwd_for() {
+        // The cwd mark asks `is_dir()` on THIS machine, so it may only ever be
+        // asked about a launch that happens here. Both `None` arms below have
+        // a live counterpart: a remote row's directory is on the other
+        // machine, and a LiveSsh row carries a local-looking path while its
+        // runtime is elsewhere too.
+        assert!(crate::session_launch_runs_locally(
+            "local://aaaa",
+            SessionSource::LiveLocal
+        ));
+        assert!(crate::session_launch_runs_locally(
+            "cc-runtime://bbbb",
+            SessionSource::Stored
+        ));
+        assert!(!crate::session_launch_runs_locally(
+            "remote-cc://box/cccc",
+            SessionSource::LiveLocal
+        ));
+        assert!(!crate::session_launch_runs_locally(
+            "remote-session://box/dddd",
+            SessionSource::LiveLocal
+        ));
+        assert!(!crate::session_launch_runs_locally(
+            "local://eeee",
+            SessionSource::LiveSsh
+        ));
     }
 
     #[test]
@@ -43855,17 +44472,19 @@ terminal_window_id: None,
         }
 
         // The one owner, at the one place that now dispatches for both binaries.
-        let dispatcher = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/app_control_cli.rs");
-        let source = std::fs::read_to_string(&dispatcher)
-            .unwrap_or_else(|error| panic!("read app_control_cli.rs: {error}"));
+        // The dispatcher's source is read through its own `SOURCE_FOR_LOCKS`
+        // const (an `include_str!` of itself) rather than off disk: the file
+        // already owns the answer to "what is my source", and a second reader
+        // built from a manifest path would be a copy that can drift when the
+        // file moves.
         assert!(
-            source.contains("apply_app_control_target_overrides(&args)"),
+            crate::app_control_cli::SOURCE_FOR_LOCKS
+                .contains("apply_app_control_target_overrides(&args)"),
             "the shared `server app` dispatcher no longer routes targeting \
              through the one owner"
         );
         assert_eq!(
-            source
+            crate::app_control_cli::SOURCE_FOR_LOCKS
                 .matches("apply_app_control_target_overrides(&args)")
                 .count(),
             1,

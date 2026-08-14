@@ -4,6 +4,94 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Three more commands now work from whichever program you type.** The
+  command that shows what the restart gate is looking at, the one that declares
+  a hand-off so a pending upgrade can land at a quiet moment, and the headless
+  browser plane all answered from one of the two programs and reported the
+  command as unknown from the other. None of them involves a window, and the
+  hand-off one is typed by the very sessions that had the wrong program on
+  their path. All three answer from both now.
+
+- **A session opened in a folder that only exists on another machine now says
+  so, instead of quietly starting somewhere else.** Opening a session in a
+  directory this machine does not have has always been allowed to proceed —
+  it falls back to the nearest folder that does exist, and then to your home
+  directory — but nothing said that had happened. The row went on describing
+  itself as being in the folder you picked, so a session that was really
+  running in your home directory looked, indefinitely, like one that was
+  working where you meant. The launch now prints what it did, and the row's
+  description leads with the correction instead of the claim.
+
+- **Asking either program for the list of running background services now
+  works.** The census that reports every service on the machine — which
+  versions are running, how long, how much they hold — answered from only one
+  of the two programs; the other reported the command as unknown, though the
+  answer involves no window and nothing that program lacks. Both answer it now.
+
+- **Five commands came back that had silently stopped existing.** A change
+  earlier the same day merged two copies of the command dispatcher into one, and
+  five commands did not survive the merge — reading a session's screen,
+  scrolling it, switching the reading view's layout, setting the theme, and the
+  whole sound surface. Nothing failed while they were gone: they simply answered
+  "unsupported command", the code that implemented them was still there and still
+  compiled, and the built-in help had been rewritten in the same change, so it no
+  longer promised them either. The most expensive one was reading a session's
+  screen, because the watchdog that wakes stalled sessions uses it to check what
+  a session is showing before typing anything into it — with no way to look, it
+  correctly refused to type, and stopped waking anything at all.
+- **A command that nothing can invoke now fails the build.** Two checks: every
+  command handler must be reachable from the dispatcher, and every command module
+  must be reached at all. Run against the change that lost the five, they name
+  all five and nothing else.
+
+- **A row you opened an app in no longer disappears when you close the window.**
+  Rows made by launching an app were treated as scratch: the software decided
+  what was worth keeping from the row's type, and an app runs inside an ordinary
+  shell, so a whole group of app rows someone had deliberately arranged could be
+  cleared away by closing the window. Nothing on screen said those rows were
+  disposable, and from the outside nothing about them was. A row created by
+  launching an app is now kept by default, exactly like an agent session. Rows
+  you did not ask for — a scratch shell, or one a tool explicitly marked as
+  temporary — still close with the window, which is what that tier is for.
+- **An app row now comes back as the app, instead of as an empty prompt.** The
+  record kept which app and which action the row was, but it used that
+  information once, on the first restart, and then forgot to write it down
+  again — so the row survived one restart and came back blank on the next. A
+  second fault hid underneath: the step that rebuilds the app's command only ran
+  for rows that keep a transcript on disk, which agent sessions do and app rows
+  do not, so the rebuild never ran for the only rows it was written for. Both
+  are fixed; a restarted app row returns running its own app.
+- **You can now ask where a row went.** When a row leaves the list, the software
+  writes down which row it was, what it was called, when it went, and why —
+  either somebody closed it, or the window closed and the row was not marked to
+  be kept. Until now the only trace of a row being cleared away was its absence,
+  which reads the same as never having existed, and that is what turned one
+  accidental loss into a permanent mystery. Ask with `server rows departed`.
+- **And the rows lost on 13 August were never closed at all.** They were left out
+  of the file the next background service reads when it takes over, so that
+  service never learned they existed — while the old one still had them and still
+  listed them, which is why the two disagreed and why nothing recorded a closure.
+  Rows kept by default no longer reach that step, and any row that does now leaves
+  a record naming which check dropped it.
+- **The document editor's page is back.** Opening a document row showed an empty
+  viewport — or, worse, the row's own shell output apparently rendered as the
+  document — while the file list beside it, the word and character counts and the
+  view controls were all correct. The page itself never drew a single character.
+  Three of the page's internal markers were written in a form the browser engine
+  rejects outright, and refusing one of them made it abandon everything it was
+  told to draw afterwards, permanently, without reporting a failure anywhere a
+  person could see. The markers are now written in a form it accepts, and a test
+  fails the build if that form is ever reintroduced anywhere in the interface.
+  The two long-standing reports of "the document area is blank" and "the document
+  area is full of garbled text" were one fault, not two.
+- **A terminal no longer keeps drawing underneath the document that covers it.**
+  It had been made unclickable but was still painting, which is why a page that
+  failed to draw showed the terminal instead of showing nothing.
+- **Screenshots of a document page now show the document.** A document row is
+  still a shell underneath, so the screenshot tool treated it as a terminal and
+  painted the terminal's contents over the page — meaning the one instrument used
+  to confirm what is on screen was showing something else.
+
 - **The diagnostic that was supposed to watch for slowdowns was itself one of
   the biggest things running.** Every time two parts of the background service
   wanted the same resource at the same moment, it wrote three lines to disk

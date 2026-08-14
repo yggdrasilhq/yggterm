@@ -127,6 +127,36 @@ that has been up for hours keeps running its old binary; §2 and §3 still apply
 
 ---
 
+## §4b THE FLEET IS NOT THE PATH — INSTALL WHERE THE CONSUMER LOOKS
+
+**Measured 2026-08-14, on a fix whose whole purpose was to unblock a script.**
+A restored CLI verb was installed to `~/.yggterm/bin/yggterm-headless` and
+`~/.local/bin/yggterm` on all three hosts, byte-compared against the artefact on
+each, and reported deployed by identity. Every one of those checks was true.
+
+⛔ **The consumer runs `~/.local/bin/yggterm-headless`, which was never
+installed to.** It still answered `unsupported app terminal action` on all three
+hosts — and on one host it was a *different* stale build from the other two, so
+even the staleness was not uniform.
+
+⇒ **§0 says "the process now serving the user". When the user is a SCRIPT, the
+process serving it is whatever its hardcoded path resolves to** — not the path
+you think of as the install location, and not the one `which` answers.
+
+- ⭐ **Read the consumer for its path before installing, and verify from THAT
+  path afterwards.** One `grep` of the caller is the whole check:
+  `grep -oE '[~$][A-Za-z_/.{}]*/yggterm[a-z-]*' <the script>`.
+- ⚠ **Two copies of a binary on one host is the norm here, not an anomaly** —
+  `~/.local/bin` and `~/.yggterm/bin` both exist and drift independently. Sweep
+  every copy, on every host, and print the hashes side by side; a census that
+  shows two different stale hashes is telling you the deploy has been partial
+  for a while.
+- ⛔ **A verb answering correctly from a binary nobody invokes is not a fix.**
+  This one read as fully proven — identity checked, hashes matched, the verb
+  demonstrated live — while the blocked script stayed blocked.
+
+---
+
 ## §5 ORDER OF OPERATIONS
 
 1. **Build where the toolchain is** (`dev`), **deploy to where the thing runs.**

@@ -72,6 +72,12 @@ pub const TOMBSTONE_TTL_SECS: u64 = 3 * 24 * 60 * 60;
 /// Hard cap on remembered closes. Oldest recorded entries are evicted first.
 pub const MAX_TOMBSTONES: usize = 512;
 
+/// Hard cap on remembered departures, evicted oldest-first. Deliberately larger
+/// than [`MAX_TOMBSTONES`]: a veto set is asked about one row at a time and is
+/// emptied by re-entries, while this is a log somebody reads backwards, and the
+/// GUI close of a busy machine can retire many rows in one act.
+pub const MAX_DEPARTURES: usize = 2_048;
+
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -108,11 +114,90 @@ impl EnteredLiveRows {
     }
 }
 
+/// WHY a row left the live set.
+///
+/// `docs/spec-app-row-survival.md` §3: *a row leaving the live set for any
+/// reason other than an explicit user close must leave a record saying which
+/// reason.* The distinction that matters is exactly this two-way one — was this
+/// row NAMED and closed, or did it go because of what it was?
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RowDeparture {
+    /// Somebody named this row and closed it: the user's own close, an agent's
+    /// `session remove`, or the ephemeral reaper taking a row whose own creator
+    /// declared it disposable. All three are deliberate acts on a named row, and
+    /// the reaper additionally traces its own reap reason.
+    ExplicitClose,
+    /// The GUI window closed and this row was not keep-alive, so
+    /// `PrepareClientClose` took it. **Nobody asked for THIS row to go** — it
+    /// went because of a property it had. This is the evaporation the spec was
+    /// written against, and telling it apart from the line above is the whole
+    /// point of this ledger.
+    GuiCloseDisposable,
+    /// ⛔ **The row was never closed at all — it was left OUT of the state file.**
+    /// It is still in the running daemon's live order; the SUCCESSOR daemon
+    /// simply never learns it existed, so the row vanishes at the next restart
+    /// with nothing having closed it.
+    ///
+    /// This is the one that actually took the owner's row group on 2026-08-13,
+    /// and it is why the two stores disagreed: the old daemon still held the rows
+    /// and still listed them, while the new one had never had them. Neither close
+    /// path runs, so before this variant existed the departure left no record
+    /// anywhere except a trace event in a file that rotates per GUI launch.
+    PersistDropped,
+}
+
+impl RowDeparture {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ExplicitClose => "explicit-close",
+            Self::GuiCloseDisposable => "gui-close-disposable",
+            Self::PersistDropped => "persist-dropped",
+        }
+    }
+}
+
+/// One row's departure, in the words a human asking *"where did my row go?"*
+/// needs: which row, what it was called, why it went, and when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveRowDeparture {
+    pub identity: String,
+    pub path: String,
+    pub title: String,
+    pub reason: RowDeparture,
+    pub at: u64,
+    /// The finer-grained cause, when the reason has one. A persist drop has
+    /// three of them and they mean different things — `not_recoverable`,
+    /// `not_in_protected_runtime_keys`, `mapper_returned_none` — so a reader who
+    /// only learns "it was dropped" still has to go to the trace to find out
+    /// which gate took it. `Option` because the close paths have no sub-cause:
+    /// an invented one would be worse than none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct LiveRowTombstones {
     /// normalized row identity -> unix seconds the close was recorded.
     /// `BTreeMap` so iteration and eviction are ordering-stable.
     entries: BTreeMap<String, u64>,
+    /// Every departure, including the ones `entries` vetoes.
+    ///
+    /// ⚖ TWO QUESTIONS, ONE FILE, AND THEY ARE NOT THE SAME QUESTION.
+    /// `entries` answers *"may this row be imported back?"* — a veto set that is
+    /// cleared the moment the row legitimately returns, because a deny-list that
+    /// only grows is worse than the bug it fixes. This answers *"what happened to
+    /// the row that is not here?"*, which a re-entry must NOT erase: the record
+    /// that a row evaporated an hour ago is still true after the user recreates
+    /// it, and erasing it is how the loss became undiagnosable the first time.
+    ///
+    /// Same file because the shared read-modify-write discipline above is the
+    /// hard part and duplicating it into a second file is how the whole-map
+    /// clobber comes back. `#[serde(default)]` so a daemon of any vintage still
+    /// reads the veto set; an older one drops this field when it writes, which
+    /// costs history and never costs a veto.
+    #[serde(default)]
+    departures: Vec<LiveRowDeparture>,
 }
 
 impl LiveRowTombstones {
@@ -187,8 +272,14 @@ impl LiveRowTombstones {
         let _guard = TombstoneFileLock::acquire(home_dir);
         let mut shared = Self::read_shared(home_dir);
         let before = shared.entries.clone();
+        let departures_before = shared.departures.len();
         mutate(&mut shared);
-        let changed = shared.entries != before;
+        // ⛔ BOTH halves, or the ledger is write-only. This compared `entries`
+        // alone, so a mutation that recorded ONLY a departure computed
+        // `changed = false` and never reached `save` — the record would have
+        // been dropped on the floor by the one function that exists to publish
+        // it, which is the same shape of silence the ledger is here to end.
+        let changed = shared.entries != before || shared.departures.len() != departures_before;
         if changed {
             shared.save(home_dir)?;
         }
@@ -202,6 +293,48 @@ impl LiveRowTombstones {
         self.mutate_shared(home_dir, |shared| {
             shared.record(identity, now);
         })
+    }
+
+    /// Write down that a row left, and why. Shared read-modify-write like every
+    /// other write here, because this file has N daemons behind it.
+    pub fn record_departure(
+        &mut self,
+        home_dir: &Path,
+        departure: LiveRowDeparture,
+    ) -> Result<bool> {
+        self.mutate_shared(home_dir, |shared| {
+            shared.push_departure(departure.clone());
+        })
+    }
+
+    /// Newest first — the order the question is asked in.
+    pub fn departures(&self) -> Vec<LiveRowDeparture> {
+        let mut ordered = self.departures.clone();
+        ordered.sort_by(|left, right| right.at.cmp(&left.at));
+        ordered
+    }
+
+    fn push_departure(&mut self, departure: LiveRowDeparture) {
+        self.departures.push(departure);
+        self.gc_departures(0);
+    }
+
+    /// Expire and cap the ledger. `now = 0` only caps, which is what a fresh
+    /// append wants: a record must not be evicted by the clock of the daemon
+    /// that happens to be appending next to it.
+    fn gc_departures(&mut self, now: u64) -> bool {
+        let before = self.departures.len();
+        if now != 0 {
+            self.departures
+                .retain(|departure| !Self::expired(departure.at, now));
+        }
+        if self.departures.len() > MAX_DEPARTURES {
+            // Oldest first, and the tail is what we keep.
+            self.departures.sort_by_key(|departure| departure.at);
+            let excess = self.departures.len() - MAX_DEPARTURES;
+            self.departures.drain(..excess);
+        }
+        self.departures.len() != before
     }
 
     /// Expire old closes and forget the closes of rows that just re-entered the
@@ -253,7 +386,7 @@ impl LiveRowTombstones {
         self.entries
             .retain(|_, recorded| !Self::expired(*recorded, now));
         let changed = self.entries.len() != before;
-        changed | self.evict_over_cap()
+        changed | self.evict_over_cap() | self.gc_departures(now)
     }
 
     /// The set is asked about ONE identity at a time in production (`blocks`);
@@ -389,6 +522,97 @@ mod tests {
         // A second close much later must not extend the original deadline.
         assert!(!tombstones.record("id::row", TOMBSTONE_TTL_SECS - 1));
         assert!(!tombstones.blocks("id::row", TOMBSTONE_TTL_SECS));
+    }
+
+    /// ⛔ A DEPARTURE-ONLY WRITE MUST REACH THE FILE. `mutate_shared` decided
+    /// "did anything change?" by comparing `entries` alone, so recording a
+    /// departure and nothing else computed `changed = false` and skipped `save`
+    /// — the ledger would have been silently write-only, which is the exact
+    /// failure it exists to end, reproduced one layer down.
+    ///
+    /// The round-trip through the shared file is the point; asserting on the
+    /// in-memory copy would pass either way.
+    #[test]
+    fn a_departure_reaches_the_shared_file_even_when_no_tombstone_changed() {
+        let dir = std::env::temp_dir().join(format!(
+            "yggterm-departure-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let mut ledger = LiveRowTombstones::default();
+        ledger
+            .record_departure(
+                &dir,
+                LiveRowDeparture {
+                    identity: "id::vanished".to_string(),
+                    path: "local://vanished".to_string(),
+                    title: "New Ychrome".to_string(),
+                    reason: RowDeparture::GuiCloseDisposable,
+                    at: 1_000,
+                    detail: None,
+                },
+            )
+            .expect("record the departure");
+
+        let reloaded = LiveRowTombstones::load(&dir, 1_000);
+        let recorded = reloaded.departures();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the departure must be on disk — no tombstone changed, and that is \
+             what made this write invisible"
+        );
+        assert_eq!(recorded[0].reason, RowDeparture::GuiCloseDisposable);
+        assert_eq!(recorded[0].title, "New Ychrome");
+        assert!(
+            !reloaded.blocks("id::vanished", 1_000),
+            "a departure is a RECORD, not a veto: the GUI close does not carry \
+             the user's authority to forbid a peer offering the row back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two reasons are the whole point, and a re-entry must not erase the
+    /// history the way it erases the veto. A row that evaporated an hour ago
+    /// still evaporated after the user recreates it — and "it is back now" is
+    /// exactly the answer that made the first loss undiagnosable.
+    #[test]
+    fn a_reopened_row_lifts_its_veto_and_keeps_its_history() {
+        let mut ledger = LiveRowTombstones::default();
+        ledger.record("id::row", 10);
+        ledger.push_departure(LiveRowDeparture {
+            identity: "id::row".to_string(),
+            path: "local://row".to_string(),
+            title: "a row".to_string(),
+            reason: RowDeparture::ExplicitClose,
+            at: 10,
+            detail: None,
+        });
+        ledger.push_departure(LiveRowDeparture {
+            identity: "id::row".to_string(),
+            path: "local://row".to_string(),
+            title: "a row".to_string(),
+            reason: RowDeparture::GuiCloseDisposable,
+            at: 20,
+            detail: None,
+        });
+
+        assert!(ledger.clear("id::row"));
+        assert!(!ledger.blocks("id::row", 20));
+        let history = ledger.departures();
+        assert_eq!(history.len(), 2, "clearing a veto must not clear the record");
+        assert_eq!(
+            history[0].reason,
+            RowDeparture::GuiCloseDisposable,
+            "newest first — the order the question is asked in"
+        );
+        assert_eq!(history[1].reason, RowDeparture::ExplicitClose);
+        assert_ne!(
+            RowDeparture::ExplicitClose.label(),
+            RowDeparture::GuiCloseDisposable.label(),
+            "if the two reasons read alike, the ledger answers nothing"
+        );
     }
 
     #[test]

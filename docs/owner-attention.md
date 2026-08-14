@@ -54,6 +54,71 @@ copies.
   *Meanwhile:* the corrected form was run across all 17 checkouts — everything is pushed, nothing
   is outstanding, and the relay will keep running the corrected version by hand each session.
 
+- **The public lore corpus maps which services he uses, even after every listed private term is
+  scrubbed — remove the corpus, or keep the feature?** The term-list rewrite catches the names on
+  the guard list; it cannot catch the COLLECTION, and a set of site-lore entries for portals and
+  vendors is a map of a person's affairs by the standing definition, with no single entry being
+  private. Removing it guts a working feature; keeping it leaves the map. **It is a product call,
+  not a leak call** — which is why it is here even though he ruled that leaks themselves are not an
+  owner gate. → `~/gh/ychrome/docs/pending-bugs.md` and the campaign memory
+  `finding-ychrome-public-lore-maps-a-private-life` (already recorded as owner-decision-owed).
+  **Recommendation: run the term-list rewrite now and decide the corpus separately** — the first is
+  unambiguously in mandate and the second is not, and bundling them would put an unasked product
+  decision inside an irreversible force-push.
+  *Meanwhile:* the term-list rewrite proceeds and nothing waits on this.
+
+- **Was the adopted row `Agent unnamed shell` (uuid tail `0462c0fb66e1`) one you created, or a
+  stray a delegate was entitled to take?** A campaign seated it under a sub-seat, re-titled it, and
+  is now driving a live surface on it — and adopting a row is the same act as renaming one, so it
+  needs the same permission. → `docs/pending-bugs.md` § *A ROW ADOPTED BY A CAMPAIGN MAY HAVE BEEN
+  THE OWNER'S*. **Recommendation: leave it as it is** — it is in active use, the title is accurate,
+  and reversal is two calls at any later time.
+  *Meanwhile:* untouched, and the campaign keeps working on it.
+
+- **The laptop boots with no usable TSC, so every `clock_gettime` costs 45.8×
+  what it should (1222.5 ns on `hpet` vs 26.7 ns on `tsc`) — may we add
+  `tsc=reliable` to its kernel command line?** It is a boot-config change on his
+  personal machine and a wrong TSC makes time jump backwards, so it is his call,
+  not the relay's. **Recommendation: try it**, measured payoff is most of a core
+  at idle. → `docs/pending-bugs.md`, the 6.7 idle-CPU entry.
+  *Meanwhile:* the relay is fixing the half that is ours — the ~481,000 clock
+  syscalls per second — which is the real defect either way.
+
+- **Should the desktop host's *AC* power profile be `balanced` instead of
+  `performance`? It is pinned to `balanced` right now and that needs his ruling.**
+  Owner-reported the machine "very hot" while charging; an interleaved A/B
+  (arms alternating every 5 min, mains throughout, both arms sharing the same
+  charge drift) settles it:
+
+  | arm | n | mean | peak | **>85°C** |
+  |---|---|---|---|---|
+  | `performance` | 90 | 71.9°C | 92°C | **10.0%** |
+  | `balanced` | 71 | 65.2°C | 83°C | **0.0%** |
+
+  **`balanced` eliminates the >85°C band entirely (0/71 vs 9/90, Fisher exact
+  p≈0.004)**, cuts >80°C from 27.8% to 2.8%, and drops the peak 9°C. Thermals
+  there are uncorrelated with our CPU (r=0.071, n=1,170), so **no code change can
+  substitute for this.** **Recommendation: keep `balanced` on AC.** ⚠ It is his
+  call because it caps sustained power and he may want the headroom.
+  ⛔ **What is in force now:** `balanced`, set at 19:54 after he reported the
+  heat. It is a runtime setting — **any power-source transition rewrites it**, and
+  `echo performance | sudo tee /sys/firmware/acpi/platform_profile` restores it.
+  Nothing persists across a reboot. → `docs/pending-bugs.md` § *THE HOST RUNS AT
+  90+°C WITH 14 OF ITS 16 CORES IDLE*.
+  *Meanwhile:* the relay is on the half that is ours — the web process growing
+  ~366 MB/h whose bound cannot fire, and a daemon leaking a thread per dead PTY.
+
+- **Repair the GUI close path, or retire the tier it serves?** Nine GUI launches
+  in the retained traces produced ZERO events from any step of the shutdown path,
+  so nothing has been reaping "dies with the GUI" rows at all — and repairing it
+  would START destroying rows that survive today. → yggterm `docs/pending-bugs.md`
+  § *THE GUI CLOSE PATH NEVER RUNS, SO THE "DIES WITH THE GUI" TIER IS VESTIGIAL*
+  (`Status: AWAITING A DECISION`).
+  *Meanwhile:* nothing repaired, and the row group he lost is already fixed by a
+  different route — it was never closed, it was dropped from the state file. My
+  recommendation is in the entry: retire the tier rather than start enforcing a
+  promise the product has not been keeping.
+
 - **The response-layer rule, or five separate patches?** — five verbs report the
   request rather than the effect, and he framed the fix's SHAPE as the open
   question. → yggterm `docs/pending-bugs.md` § *FIVE VERBS REPORT THE REQUEST,
@@ -110,16 +175,92 @@ copies.
 
 - **He decides the licence before anything goes public** — step 0 of the launch
   gate, owner-set 2026-08-07. → `docs/settled-calls.md`.
-- **The GUI DID relaunch on 2026-08-14, so the deaf-row proof is now takeable —
-  but the relaunch was forced and a draft may have been lost.** This entry
-  previously said the relay would not relaunch while a live composer held
-  half-typed text. It relaunched anyway, because the owner reported the chrome
-  frozen (`webview_edit_faults=4`, the acked-edit-batch bug) and a GUI restart is
-  the only thing that clears it — the app was unusable, which outranks preserving
-  a draft. ⚠ **Stated rather than assumed: nobody verified the composer was empty
-  first, so if he lost text at ~11:26, that is where it went.**
-  *Meanwhile:* the deaf-row screenshot can now be taken against the running
-  build with nothing further needed from him.
+- **Windows and macOS builds are 3.x milestones and are not to be opened
+  unprompted** (user directive). Listed here only so a session that trips over a
+  cross-platform failure knows it is parked on purpose rather than forgotten.
+- **`yggtopo` is published PRIVATE and the flip to public is his.** The new
+  fleet app is built, tested and pushed to its own repo under the org, with the
+  org-wide platform licence already settled (GPL-3.0-or-later, so nothing is
+  owed on that question). It was NOT made public: publishing indexes a repo and
+  is not reversible by deleting it, and the sibling apps' visibility was his
+  call each time. **Recommendation: make it public, matching the other platform
+  apps** — nothing in it is private, the guard passes, and every example in it is
+  invented. **Done meanwhile:** the repo is private with full history and the
+  binary is on the fleet, so the app is usable now either way. **To reverse:**
+  one visibility change; nothing else depends on it.
+
+## May the WATCHDOG dismiss a plan-limit dialog? (the rows themselves are already freed)
+
+**What is needed from him: one standing ruling — may the automated watchdog send
+Enter to a plan-limit prompt when it has read the screen and confirmed the
+highlight sits on the no-op option?** Nothing is waiting on him operationally.
+
+**The rows are no longer parked.** Four lanes were freed by hand, each with a
+read-verify-write-verify loop, and three resumed to WORKING on their own
+immediately after. The dialog offers three options and the screen states plainly
+which is selected:
+
+```
+What do you want to do?❯1. Stop and wait for limit to reset
+                        2. Add funds to continue with usage credits
+                        3. Switch to Team plan
+```
+
+⭐ **The highlight was on option 1 in every case — the option that changes
+nothing.** Options 2 and 3 are the ones that would spend money, which is exactly
+why the guard exists. ⇒ the earlier concern was right, *and* the discriminator
+turns out to be readable rather than assumed: `❯` immediately followed by a
+numbered option is the dialog's selection, and a bare Enter confirms whatever
+that names.
+
+⚠ **The one trap, recorded because it would break a naive implementation:** `❯`
+is *also* the composer's own prompt glyph, so "is a `❯` on screen" is not the
+test. The test is `❯` adjacent to a numbered option, and exactly one of them.
+
+### ⭐ A SECOND, NARROWER QUESTION ARRIVED WITH IT — may a WAKE proceed when the screen is unreadable?
+
+**One line settles it, and it is separate from the Enter question above.** The
+guard treats *"I could not read the screen"* as *"a prompt might be waiting"* and
+refuses. That is plainly right for **typing content into** a row. The argument
+raised against applying it to a **bare wake** is that the failure it prevents is
+selecting a highlighted option, and a `continue` sent to a row that is merely
+idle selects nothing.
+
+⇒ **The case for relaxing it is real: on 2026-08-14 that refusal took the whole
+fleet's wake path down for over an hour** — every row refused, every tick, in
+silence — because the screen-read verb had gone missing from the built binary.
+
+**Recommendation: do NOT relax it, and the reason is not caution.** The bytes a
+wake writes are **queued, not discarded**, so a wake that lands on a row parked
+mid-prompt is not a no-op — it is content arriving at a prompt that will consume
+it. The failure mode is the same family as typing over a live composer, which is
+the one class of defect that has repeatedly cost real work here. ⛔ A cheaper
+answer exists and is already shipped, so nothing is bought by taking the risk.
+
+**Done meanwhile — the outage is fixed without touching this rule:** the guard
+now falls back to the **daemon's own screen** when the app-control arm is
+unavailable, so it can look again; and an unreadable screen now **escalates**
+instead of skipping silently, which is what actually failed. The fleet is
+booting normally. **To reverse:** one predicate either way; no data change.
+
+⚠ **Note on the ruling below: it was moot for part of 2026-08-14** and is not any
+more. While the screen could not be read at all, the watchdog could never satisfy
+its own precondition, so authorising it would have changed nothing.
+
+**Recommendation: authorise it, narrowly.** The watchdog may send Enter *only*
+when it can read the screen, finds exactly one highlighted numbered option, and
+that option's text is a stop-and-wait. Anything else — unreadable screen, more
+than one highlight, a highlight on a spend option — refuses as it does today.
+⛔ It stays his ruling rather than the relay's because the failure mode is a
+billing change made by a timer, and that is a different category from a wasted
+boot regardless of how good the check is.
+
+**Done meanwhile:** the lanes are running, and two defects that this exposed are
+fixed and live — a row parked on an *expired* quota message was being skipped
+forever, and a boot the guard itself refused was still being charged to the row,
+so a lane could exhaust its budget and escalate "did not wake" without a single
+byte ever reaching it. → `docs/pending-bugs.md` and the campaign memory door on
+the quota-hold deadlock. **To reverse:** one flag; no data change either way.
 
 ## The working dot: what should a CLOSED row's dot say?
 
@@ -141,81 +282,78 @@ does not otherwise show, and reserves the blink for real work.
 and filed (there is no detector defect), so the render lands as soon as this is
 answered. **To reverse:** it is a view-layer rule; no data change either way.
 
-## ⭐ ONE RELAUNCH CLEARS ALL FIVE GUI-GATED ITEMS — they are not five decisions
+## ✅ THE RELAUNCH HAPPENED ON ITS OWN — four of the five are settled, and none of them needs him
 
-The deaf-row sidebar proof (above), the right rail (below), **the viewport
-blinking he reported live on 2026-08-14**, and **two release proofs that need a
-web process born from the current build** are **the same single action**, waiting
-on the same draft. Whenever that draft is no longer worth protecting, one
-relaunch delivers all five: the rail paints again on the first frame, the
-deaf-row rendering becomes visible for its proof, the blinking stops, and the
-two web-process proofs below can be taken in the same minutes.
+**He does not have to do anything here.** The window turned over at **11:27:34 on
+2026-08-14**, not at anyone's request, and the five items that were consolidated
+behind "one relaunch" are resolved or reclassified below. ⛔ Nothing in this
+section is a gate any more.
 
-⭐ **The two newest are release proofs, not new defects, and they cost him
-nothing extra.** Both fixes are landed and shipped in 3.0.154; what is owed is
-only the observation, and neither can be observed until a web process starts
-from that build. They were deliberately NOT collected during the 3.0.154 deploy
-precisely because collecting them meant restarting the GUI.
-→ `docs/pending-bugs.md` § *THE JAR-LESS WEB CONTEXT GOT NO MEMORY BOUND AT ALL*
-and § *AN UNCORKED AUDIO STREAM HELD FOREVER*.
+**Verified by IDENTITY rather than by version**, which is the only check that
+settles which code is actually running: the GUI process's `/proc/<pid>/exe`
+md5sums **byte-identical to the installed binary**. A version string is a claim
+the process makes about itself; the hash is what it is executing.
 
-⭐ **The blinking is the new one, and it is the reason this list grew rather than
-shrank.** Its fix was believed shipped; the GUI held a SECOND copy of the probe
-that types over him, and that copy is the one every automated submit reaches.
-Now fixed and deployed to disk on every host at 3.0.152 — but the running window
-is older than the fix, and the blinking is drawn by the running window.
-→ `docs/pending-bugs.md`, the readiness-probe entry.
+⚠ **ONE THING HERE MAY STILL HAVE COST HIM SOMETHING, and two lanes disagree
+about it.** This section records the 11:27:34 turnover as happening *on its own*;
+the resource lane recorded the same turnover as **forced**, on the grounds that
+the chrome was frozen (`webview_edit_faults=4`, the acked-edit-batch bug) and a
+restart is the only thing that clears it. Both accounts are of the same event and
+only one can be right, but the consequence is the same either way and is the part
+worth his attention: **nobody verified the composer was empty first**, so if
+half-typed text disappeared at around 11:26, that is where it went. Stated rather
+than assumed — no draft is known to have been lost. ⛔ Not a gate; he does not
+need to answer it. It is here because a lost draft is his to notice, not ours to
+quietly write off, and because a settled-looking table should not absorb a
+disagreement without saying so.
 
-⛔ Nothing here asks him to hurry it — the draft is the thing being protected.
-This entry exists only so the five are not weighed as separate costs.
+| item | outcome |
+|---|---|
+| the right rail | ✅ **collected — it paints** |
+| "every sidebar button opens the notification rail" | ✅ **collected — cured by the same frame** |
+| the deaf-row sidebar rendering | ⛔ **not collectible today** — see below; no longer HIS |
+| the viewport blinking | the fix is in the running process; only he can say it stopped |
+| the two web-process release proofs | still owed, and unchanged by this |
 
-### ⚠ MEASURED 2026-08-14: A RELAUNCH DOES NOT REACH A DRAFT HELD IN A ROW
+### ✅ THE RIGHT RAIL PAINTS, AND THE FROZEN SUBTREE IS GONE
 
-The premise under all five is *"a relaunch discards the half-typed text"*. It had
-been carried across relays without being tested, so it was tested, in a sandbox,
-on a throwaway session:
+One faithful frame settles both (`capture_faithful: true`, the xterm canvas
+composited over the DOM snapshot — a `faithful:false` frame is canvas-blind and
+could not have). The rail renders its header, its controls and a populated,
+scrollable list. **And the model AGREES with the glass**: a state read taken
+before *and* after the capture both reported the same rail the frame shows.
 
-```
-type unsubmitted text into a row      → daemon screen holds it
-kill the GUI process                  → daemon STILL holds it, with no GUI running at all
-relaunch the GUI, same home + daemon  → text still there, row back in the sidebar
-```
+⭐ That is the same instrument that convicted the bug 70 minutes earlier, run
+again: on the PREVIOUS process, `webview_edit_faults` was **2** and the model said
+one rail while the glass showed another. On this one it is **0** and they agree.
+⇒ The divergence really was bounded by the GUI process, exactly as the entry
+predicted, and a relaunch really is a complete cure.
 
-⇒ **Text typed into a ROW is not in the GUI.** It lives in a PTY the daemon owns,
-the agent CLI never learns the window restarted, and the campaign's own
-draft-detector reads it off the terminal SCREEN for exactly that reason.
+### ⛔ THE DEAF-ROW SIDEBAR PROOF CANNOT BE TAKEN, AND THE REASON IS NOT A FAILURE
 
-⚠ **What this does NOT cover, and it is the whole question:** text typed into a
-**yggterm-side input** — the search box, an SSH field, a document buffer — lives
-in the page and a relaunch does lose it. So the answer depends on *where* the
-draft is, which only he can say.
+Its gate is gone — the window it needed has already happened. But the proof needs
+a **wedged row to look at**, and there is not one: across 378 rows, **zero carry
+an `input_unanswered_ms` value at all**. A wedged row is what renders the state
+this fix exists to show, so with none in the fleet there is nothing to photograph.
 
-**Recommendation: tell us which one it is.** If it is a row's composer, the
-relaunch costs nothing and the five items clear on his next convenient moment
-rather than waiting on the draft at all. If it is a yggterm input, nothing
-changes and the gate stands exactly as written. ⛔ The relay has not relaunched
-anything and will not — this narrows the question, it does not answer it.
+⇒ **It leaves this file.** It is no longer waiting on him — it is an ordinary
+queue item waiting on a wedged row to occur, or on one being induced deliberately.
+→ `docs/pending-bugs.md`, the deaf-row entry, whose own "still open: the SIDEBAR"
+clause already says so.
 
-⚠ One caveat that survives either answer: the risk in a relaunch was never the
-window, it is a DAEMON swap taken alongside it, which re-resumes sessions. A GUI
-relaunch against the same daemon is the case measured above; a relaunch that also
-moves the daemon is not.
+### ⇒ AND THE DRAFT QUESTION IS MOOT
 
-## The right sidebar comes back when you next relaunch the GUI — and cannot before then
+The question this file was carrying — *which composer holds his draft* — no longer
+needs an answer. The relaunch happened either way. **If it was in a row it
+survived**, which was measured directly: text typed into a row lives in a PTY the
+daemon owns, survives the GUI process dying outright with no GUI running at all,
+and returns on relaunch against the same home and daemon. If it was in a
+yggterm-side input it is already gone, and nothing he says now changes that.
 
-**What he does:** relaunch yggterm, whenever the unsent draft in his composer is
-no longer worth protecting. **What he gets:** the rail paints again immediately.
-
-Measured, not inferred: a webview that threw while applying an edit batch was
-told it had applied, so the running GUI's model of the screen is self-consistent
-and wrong, and nothing can re-send what was lost. Killing and relaunching the GUI
-against the SAME home and daemon restored the rail on the first frame — same
-sessions, same rows, only the page rebuilt. ⇒ This is a GATE, not an open bug:
-no code change reaches the running process, and the fix that stops it recurring
-is already on `main` and arrives with the same relaunch.
-
-⛔ The relaunch is his call and his alone — it is the draft that is being
-protected, not the rail.
+⚠ **The one thing worth keeping from it**, because it will otherwise be
+re-learned: the risk in a relaunch was never the WINDOW. It is a **daemon swap
+taken alongside one**, which re-resumes sessions. A relaunch against the same
+daemon — the case measured, and the case that just occurred — costs nothing.
 
 ---
 
