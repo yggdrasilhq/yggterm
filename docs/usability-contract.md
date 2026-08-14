@@ -31,7 +31,7 @@ observation would falsify it**.
 
 | # | Level | PASS means | Falsified by |
 |---|---|---|---|
-| **1** | **The window is the product** | Exactly ONE GUI process; its `/proc/<pid>/exe` is not `(deleted)`; its build matches the installed binary | two GUIs, a deleted exe, or an md5 mismatch |
+| **1** | **The window is the product** | Exactly ONE **Active client** in the registry; its `/proc/<pid>/exe` is not `(deleted)`; its build matches the installed binary | two Active clients, a deleted exe, or an md5 mismatch |
 | **1b** | **It has not crashed** | No yggterm coredump in the window since the last check | `coredumpctl list` naming yggterm |
 | **2** | **Both sidebars render** | The cwd/session tree AND the session-metadata panel are painted | reading the screenshot and not seeing them |
 | **3** | **The viewport is faithful** | No dropped glyphs, squish, broken bottom, or stuck restore toast | reading the screenshot |
@@ -58,6 +58,18 @@ retired in seconds and instead lived half a day. **The waste is duration times a
 normal rate, so the fix is retirement, not optimisation** — an important
 distinction, because a profiler pointed at that process would have found nothing
 wrong with it.
+
+⛔ **And level 1 must NOT be counted with `pgrep -x yggterm`.** The CLI and the GUI
+are the same binary, so a process-name count counts every `yggterm` verb any agent
+on the fleet is running. **This check failed on that false positive within two
+hours of being written** — baseline 2, 3 during one deliberate `yggterm --version`,
+1 three seconds later. The registry (`server app clients`) is the instrument; a
+CLI invocation never enters it. ⚠ An unreadable registry is **blind, not clear**,
+and must fail loudly rather than read as zero.
+
+⭐ The general form: **the most load-bearing alarm is the one that must never cry
+wolf**, because a level-1 alert that fires on ordinary fleet traffic is how a real
+duplicate GUI gets waved through.
 
 ### Level 1b exists because a crash is invisible to every other level
 
