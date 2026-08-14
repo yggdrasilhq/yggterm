@@ -32,6 +32,7 @@ use std::io::Read;
 /// has exactly one dispatcher and that it is this one.
 pub(crate) const SOURCE_FOR_LOCKS: &str = include_str!("app_control_cli.rs");
 use crate::{
+    AppControlPreviewLayout,
     AppControlRightPanelMode,
     AppControlViewMode,
     ProbeTerminalViewportInputMode,
@@ -69,6 +70,7 @@ use crate::{
     run_app_control_probe_terminal_viewport_scroll,
     run_app_control_probe_terminal_viewport_select,
     run_app_control_reclaim_terminal_focus,
+    run_app_control_read_terminal_buffer,
     run_app_control_reconcile_terminal_from_daemon,
     run_app_control_redraw_terminal,
     run_app_control_remove_session,
@@ -79,6 +81,7 @@ use crate::{
     run_app_control_restart_session,
     run_app_control_scroll_preview,
     run_app_control_scroll_right_panel,
+    run_app_control_scroll_terminal_viewport,
     run_app_control_send_terminal_input,
     run_app_control_set_clipboard_png_base64,
     run_app_control_set_clipboard_text,
@@ -96,7 +99,9 @@ use crate::{
     run_app_control_set_split_group_ratio,
     run_app_control_set_theme_editor_open,
     run_app_control_set_theme_editor_values,
+    run_app_control_set_preview_layout,
     run_app_control_set_tree_selection,
+    run_app_control_set_ui_theme,
     run_app_control_set_window_chrome_hover,
     run_app_control_show_start_page,
     run_app_control_split_web_tab,
@@ -110,6 +115,7 @@ use crate::{
     run_screenshot_capture_with_post_process,
 };
 use yggterm_core::{cli_flag_value, cli_positional_args};
+use yggui_contract::UiTheme;
 
 
 /// The one genuinely per-binary operation behind `server app`.
@@ -287,7 +293,16 @@ pub fn server_app_usage_block(binary: &str) -> String {
     the difference between them may be time rather than the typing. The reply
     also carries value_before/value_after: `accepted:true` with the value
     unchanged is a field that REFUSED the input, not a success.
-  {binary} server app terminal <new|send|input-check|focus|probe-type|probe-scroll|probe-select|probe-context-menu> ...
+  {binary} server app terminal <new|send|input-check|focus|scroll|read-buffer|probe-type|probe-scroll|probe-select|probe-context-menu> ...
+  {binary} server app terminal read-buffer <session> [--mode screen|full|cells]
+    READ a row's screen without touching it — the only way to see what a row is
+    showing before deciding whether to type into it. The watchdog's plan-limit
+    guard is built on this: a row parked on a billing dialog must be READ, never
+    guessed at. ⛔ It answers `terminal_host_missing` for a `--no-activate` row
+    that nothing has ever mounted.
+  {binary} server app terminal scroll <session> --to <top|bottom|±N>
+  {binary} server app theme <light|dark>
+  {binary} server app web-view layout <chat|graph|overview>
   {binary} server app terminal new [--machine-key <key>] [--cwd <dir>] [--kind <shell|codex|claude-code>] [--title <title>] [--purpose <what-for>] [--no-activate]
       [--outline <prefix> | --insert-after <session-path>]
     with no --title the row is named for the driving agent and its purpose.
@@ -578,6 +593,23 @@ pub fn run_app_control_cli(
                         }
                     });
                     run_app_control_scroll_preview(top_px, ratio, timeout_ms)
+                }
+                // Lost in the same consolidation as `terminal read-buffer`.
+                // `AppControlCommand::SetPreviewLayout` survived it, so the
+                // protocol could still carry the request and nothing could
+                // send one — which is the shape the reachability lock below
+                // now refuses.
+                "layout" => {
+                    let layout = cli_positional_args(&args, 4)
+                        .into_iter()
+                        .next()
+                        .unwrap_or("chat");
+                    let layout = match layout {
+                        "chat" => AppControlPreviewLayout::Chat,
+                        "graph" | "overview" => AppControlPreviewLayout::Graph,
+                        other => anyhow::bail!("unsupported app web view layout: {other}"),
+                    };
+                    run_app_control_set_preview_layout(layout, timeout_ms)
                 }
                 other => anyhow::bail!("unsupported app web view action: {other}"),
             }
@@ -904,6 +936,27 @@ pub fn run_app_control_cli(
         // `neither_binary_dispatches_server_app_itself` fails the build if a
         // second one appears. A new verb goes here and is reachable from both
         // binaries by construction.
+        // ⛔ AND `audio` AND `theme` ARE THE TWO THIS FILE'S OWN COMMIT NAMED
+        // AND THEN DROPPED. The consolidation existed because they answered
+        // only from the GUI binary; both came out of it answering from
+        // NEITHER, and the comment above still described the fix. A verb named
+        // in a commit message is not a verb that shipped.
+        // ⚠ `audio` left the cleanest signature of the five: `pub mod
+        // audio_cli;` still declared, the module still compiled, and not one
+        // reference to it from any dispatcher.
+        "audio" => crate::audio_cli::run_audio_command(&args),
+        "theme" => {
+            let theme = cli_positional_args(&args, 3)
+                .into_iter()
+                .next()
+                .unwrap_or("light");
+            let theme = match theme {
+                "light" => UiTheme::ZedLight,
+                "dark" => UiTheme::ZedDark,
+                other => anyhow::bail!("unsupported app theme: {other}"),
+            };
+            run_app_control_set_ui_theme(theme, timeout_ms)
+        }
         "launch-flags" => {
             let positional = cli_positional_args(&args, 3);
             let action = positional.first().copied().unwrap_or("open");
@@ -1676,6 +1729,40 @@ pub fn run_app_control_cli(
                         timeout_ms,
                     )
                 }
+                // ⛔ READ-BUFFER AND SCROLL ARE THE BOOTER'S EYES AND HANDS.
+                // Both were lost in the dispatcher consolidation and neither
+                // failed at build or deploy time — the watchdog's
+                // plan-limit guard reads a row's screen with `read-buffer`,
+                // got "unsupported app terminal action", and correctly took
+                // that as *could not look*, so it refused to wake anything on
+                // the fleet. Restored together because the manual recovery
+                // path used both.
+                "read-buffer" => {
+                    let session_path = cli_positional_args(&args, 4)
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "missing session path for server app terminal read-buffer"
+                            )
+                        })?;
+                    let mode = cli_flag_value(&args, "--mode").unwrap_or("screen");
+                    run_app_control_read_terminal_buffer(session_path, mode, timeout_ms)
+                }
+                "scroll" => {
+                    let session_path = cli_positional_args(&args, 4)
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("missing session path for server app terminal scroll")
+                        })?;
+                    let to = cli_flag_value(&args, "--to").ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "missing --to (top|bottom|±N lines) for server app terminal scroll"
+                        )
+                    })?;
+                    run_app_control_scroll_terminal_viewport(session_path, to, timeout_ms)
+                }
                 "probe-select" => {
                     let session_path = cli_positional_args(&args, 4)
                         .into_iter()
@@ -2059,6 +2146,151 @@ fn app_launch_duplicate_guard_check(
                  you genuinely want two (a sandbox GUI does)."
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_reachability_lock {
+    /// Handlers that exist on purpose and are dispatched by nobody. Each entry
+    /// is a promise that its absence from the CLI is intended; the list should
+    /// only ever shrink.
+    const UNDISPATCHED_ON_PURPOSE: &[(&str, &str)] = &[(
+        "run_app_control_create_terminal",
+        "a thin legacy wrapper that only forwards to \
+         run_app_control_create_terminal_with_tenancy, which is what the CLI calls",
+    )];
+
+    /// ⛔ EVERY APP-CONTROL HANDLER MUST BE REACHABLE FROM A DISPATCHER.
+    ///
+    /// The existing lock (`neither_binary_dispatches_server_app_itself`) bans a
+    /// SECOND dispatcher appearing. It cannot see the failure that actually
+    /// happened: collapsing the two dispatchers into one **silently dropped
+    /// four verbs on the way**, and nothing anywhere failed.
+    ///
+    /// `terminal read-buffer`, `terminal scroll`, `web-view layout` and `theme`
+    /// all stopped existing while their handlers stayed compiled, still `pub`,
+    /// and still IMPORTED by the GUI binary. The protocol kept carrying
+    /// `SetPreviewLayout` and `SetUiTheme` that nothing could ever send.
+    /// ⚠ `theme` is the sharpest instance: the consolidation commit named it in
+    /// its own message as a verb that answered from only one binary, and
+    /// shipped it answering from neither, with the comment above still
+    /// describing the fix.
+    ///
+    /// ⭐ The cost was not cosmetic. The fleet watchdog reads a parked row's
+    /// screen with `terminal read-buffer` to check whether it is sitting on a
+    /// billing dialog before typing into it. The verb answered "unsupported",
+    /// the guard read that as *could not look* — correctly, and fail-safe — and
+    /// refused to wake anything at all. **A lost verb took out the whole wake
+    /// plane, and the direction it failed in is the only reason it was merely
+    /// a stall.**
+    ///
+    /// ⇒ A handler with no caller is a verb that has stopped existing. This
+    /// lock is cheap, it is structural, and it does not care how the verb was
+    /// lost — refactor, bad merge, or a deletion nobody re-read.
+    #[test]
+    fn every_app_control_handler_is_dispatched() {
+        const LIB: &str = include_str!("lib.rs");
+        // Both owners: the general surface and the `web` plane, which was
+        // collapsed onto its own file first and is the precedent this file cites.
+        let dispatchers = [
+            include_str!("app_control_cli.rs"),
+            include_str!("app_control_web_cli.rs"),
+        ];
+        let mut handlers: Vec<&str> = Vec::new();
+        for (index, _) in LIB.match_indices("pub fn run_app_control_") {
+            let rest = &LIB[index + "pub fn ".len()..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            handlers.push(&rest[..end]);
+        }
+        handlers.sort_unstable();
+        handlers.dedup();
+        assert!(
+            handlers.len() > 50,
+            "the handler scan found only {} — it has gone blind and this lock \
+             would pass on an empty CLI",
+            handlers.len()
+        );
+        let orphans: Vec<&str> = handlers
+            .into_iter()
+            .filter(|name| {
+                !UNDISPATCHED_ON_PURPOSE
+                    .iter()
+                    .any(|(allowed, _)| allowed == name)
+            })
+            .filter(|name| {
+                // A CALL, not a `use` line: the four lost verbs were imported
+                // by the GUI binary the whole time they were unreachable, so
+                // "the name appears" is exactly the check that would have
+                // passed while they were gone.
+                let call = format!("{name}(");
+                !dispatchers.iter().any(|source| {
+                    source.match_indices(&call).any(|(at, _)| {
+                        let line_start =
+                            source[..at].rfind('\n').map(|nl| nl + 1).unwrap_or(0);
+                        !source[line_start..at].trim_start().starts_with("use ")
+                    })
+                })
+            })
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "these app-control handlers are compiled, exported and reachable from \
+             no CLI verb — the command exists and nothing can send it: {orphans:?}"
+        );
+    }
+
+    /// ⛔ AND THE TWIN, BECAUSE THE HANDLER SCAN ABOVE CANNOT SEE IT.
+    ///
+    /// `audio` was lost the same way as the rest and left no orphaned
+    /// `run_app_control_*` behind, because its whole surface lives in its own
+    /// module and the dispatcher reached it with one line
+    /// (`audio_cli::run_audio_command(&args)`). Delete that line and you get a
+    /// module that still compiles, still exports, still has its help text — and
+    /// answers nothing. **An entire CLI module can go dark without a single
+    /// symbol becoming unused.**
+    ///
+    /// ⚠ This is why "the help still documents it" is not an available oracle
+    /// either: the help was rewritten in the same commit, so help and
+    /// dispatcher lost the verb TOGETHER and any consistency check between
+    /// them stays green. Reachability is the only property that noticed.
+    #[test]
+    fn every_cli_module_is_reached_by_a_dispatcher() {
+        const LIB: &str = include_str!("lib.rs");
+        let dispatchers = [
+            include_str!("app_control_cli.rs"),
+            include_str!("app_control_web_cli.rs"),
+        ];
+        let mut modules: Vec<&str> = Vec::new();
+        for line in LIB.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("pub mod ")
+                && let Some(name) = rest.strip_suffix(';')
+                && name.ends_with("_cli")
+                // The owner cannot be asked to reference itself.
+                && name != "app_control_cli"
+            {
+                modules.push(name);
+            }
+        }
+        assert!(
+            !modules.is_empty(),
+            "the CLI-module scan found none — it has gone blind"
+        );
+        let dark: Vec<&str> = modules
+            .into_iter()
+            .filter(|name| {
+                let path = format!("{name}::");
+                !dispatchers.iter().any(|source| source.contains(&path))
+            })
+            .collect();
+        assert!(
+            dark.is_empty(),
+            "these CLI modules compile and export a surface that no dispatcher \
+             can reach — every verb they define answers \"unsupported app control \
+             command\": {dark:?}"
+        );
     }
 }
 
