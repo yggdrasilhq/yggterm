@@ -589,6 +589,75 @@ of ~655 KB. Reads were already known not to proxy this cost (§2b's own caution:
 a 0-session control read 4.5 MB while costing 0.001 cores). The quantity that
 mattered was a **request rate**, and it was visible in the trace the whole time.
 
+### ✅ 6h. MEASURED DIRECTLY: 4.645 µs/row, and status serving is 1.6% of the daemon population
+
+*dev, 2026-08-14. A counter in `fn status()` itself — every reply, nothing
+sampled, `CLOCK_THREAD_CPUTIME_ID` rather than wall. Six seeded row counts,
+isolated homes, one variable.*
+
+⚠ **The probe was priced on the host before it was trusted**, because the fleet
+spread on this call is 45.8×: `CLOCK_THREAD_CPUTIME_ID` **578 ns**,
+`CLOCK_PROCESS_CPUTIME_ID` **619 ns**, `CLOCK_MONOTONIC` **26.7 ns** (vDSO,
+`tsc`). Two calls per reply at 3.6 replies/s is ~4 µs/s — four orders of
+magnitude below what it measures.
+
+| ROWS | CPU µs/reply (payload build) | CPU µs/reply (whole request) |
+|---|---|---|
+| 0 | 36 | 383 |
+| 50 | 236 | 664 |
+| 100 | 409 | 898 |
+| 250 | 955 | 1,582 |
+| 500 | 2,133 | 3,089 |
+| 1000 | 4,676 | 6,247 |
+
+    payload build   slope 4.645 us/row   intercept  -63 us   r = +0.9981
+    whole request   slope 5.857 us/row   intercept  289 us   r = +0.9985
+
+⇒ **The row term is real, linear over the fleet's range, and small.** At the
+measured poll rate across the census's **1,956 rows**: **0.033–0.041 cores**.
+Adding the per-reply floor (289 µs × 3.6/s × 15 daemons = 0.016 cores), **all of
+status serving is ≈0.057 cores of the 3.47-core daemon population — 1.6%**, and
+request serving explains **under 1%** of §2's fitted per-daemon floor.
+
+⭐ **Three numbers for one slope, and the two that agree were reached
+independently.** 94 µs/row (§6e, inferred from the model — refuted);
+**10.2–11.0 µs/row** (§6g, mean over `PerfGuard` records — biased, below);
+**4.645 µs/row** here, against **4.71 µs/row** from re-fitting §6g's own field
+data with each record inverse-probability weighted. Field-plus-reweighting and a
+controlled counter are not the same instrument, and they land 1.4% apart.
+
+⛔ **§6g's shortfall was not unexplained, and its slope does not survive
+either.** `("daemon_request", "status")` is on
+`perf_span_is_high_frequency_noise`'s list (`crates/yggterm-core/src/perf.rs:60`):
+a span is written only at **≥ 8 ms** or on a **1-in-50** sample — which is where
+the "~3.6% of requests" comes from. One live stream held 5,604 sub-floor records
+against 2,769 tail records: recorded tail share **33% against a true 0.98%**.
+§6g kept the slope on the grounds that *"a uniform under-recording factor
+cancels in a between-daemon comparison."* **The factor is not uniform** — the
+keep-rule is a threshold on duration, and duration is what rows drive: the
+243–246-row daemons put **13.5–16.8%** of their records above the floor where
+the 70–101-row daemons put **3.5–7.6%**. Each daemon is biased differently, in
+the same direction as the effect being estimated.
+
+⛔ ⇒ **§6e's headline claim — that `status` is BOTH unattributed terms of the
+model — is refuted. It is neither.** The row term is attributed to it and is
+worth ~1.5%; the floor is not, and **where the daemon's CPU actually goes is
+open**.
+
+**Two known biases, both stated because both make the number an under-read:**
+the seeded rows carry short synthetic strings where real ones carry longer
+titles and cwds; and the harness drives 69–290 replies/s where the fleet runs at
+3.6/s, so caches stay warmer. Generous allowance for both still leaves status
+serving under ~4.5%. ⚠ The harness also seeds **empty** `session_pty_grids`,
+`ssh_targets` and `remote_machines`, which zeroes three terms the live path
+pays — they are tens of µs per reply, under 0.001 cores fleet-wide.
+
+⇒ **What was built instead of §S5** is in the queue entry: `status` was asking
+for the whole persistence payload to use one field of it. Splitting out
+`persisted_live_sessions()` removes a second full stored-row walk, a PTY-grid
+clone and sort, two table clones and a `HashSet` per reply — **same wire, no
+version gate, no protocol risk.**
+
 ### 6f. Honest limits on this section
 
 1. ⛔ **The exact periodic call site is NOT located.** The fan-out helper is
