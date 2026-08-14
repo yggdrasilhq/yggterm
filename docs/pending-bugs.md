@@ -317,47 +317,6 @@ fix this.
 is live-proven from the documented path on `dev`. That is a patch of one
 instance, not of the class.
 
-## ⚠ [6.16] A DELETED SUMMARY COULD NOT REACH A RUNNING DAEMON
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-*Falsified by: clear a summary from the owning host's title store, wait for a
-scan, and watch whether the row's description changes. It did not, before this.*
-
-A cached summary had THREE homes, and the repair reached one of them: the owning
-host's title store, the rendering host's title store, and a sqlite mirror
-(`remote-session-cache.db`, `remote_session_metadata.cached_summary`) that also
-feeds the running process. Two compounding defects kept a deleted summary alive
-in the last:
-
-1. **Every scan-refresh path dropped an absence.** `if let Some(summary) = …`,
-   so a scan reporting that the store has no summary changed nothing.
-   `set_session_summary_hint` had no counterpart that removes one.
-2. **The mirror outranked the scan.** `overlay_mirrored_remote_sessions`
-   assigned `cached_summary` from the mirror whenever the mirror had one — and
-   the pass re-mirrors what it overlaid, so the stale value wrote itself back
-   every round. ⚠ The comment directly above it records this EXACT trap being
-   caught for the title field, which froze every Claude Code title at its first
-   scanned value. The summary sat one field below with the bug still in it.
-
-⇒ **Worse than an ordinary stale cache, because the value GATES ITS OWN
-REPLACEMENT.** A regeneration job is only queued when the cached summary is
-absent or looks like junk; a wrong-but-fluent one is neither, so it suppressed
-the work that would have replaced it. Measured: 785 summaries cleared across two
-hosts, both stores empty, rows **unchanged** at 98% ungrounded.
-
-⛔ **A CORRECTION TO AN EARLIER READING OF THIS, recorded because it was acted
-on.** This entry first said the stale values were not persisted and would clear
-when the daemon retired. That was wrong: `server-state.json` carries no `Summary`
-metadata, which is where it was checked, but the mirror is a separate sqlite
-store and held 72 of them. **A negative from one store is not a negative from
-persistence.**
-
-**Careful, because one nearby guard is CORRECT and must stay:**
-`promote_remote_codex_live_session_to_scanned` is fed by a LIVE session view,
-where a missing summary really does mean "this view does not carry one". Only a
-store scan holds an authoritative absence.
-
 ## ⚠ [6.16] CLAUDE CODE SESSIONS ARE ABSENT FROM SIDEBAR TRANSCRIPT SEARCH
 
 **Status:** OPEN
