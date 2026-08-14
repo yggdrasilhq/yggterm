@@ -516,6 +516,21 @@ distinguishes "between tool calls" from "finished". ⚠ This is the same defect 
 the parent-rate blindness one level down: both read an instantaneous value where
 the question is about a rate.
 
+⛔⛔ **AND THAT PHRASE IS LITERAL — A ROW CANNOT TAKE THIS CONTROL OF ITSELF, AND
+TRYING PRODUCES A CONFIDENT WRONG ANSWER.** Attempted from inside at 19:30: the
+leftover read children on **0 of 6**, and the row's own process on **6 of 6** —
+apparently a clean separation, and the opposite of the external result. It is an
+artefact. **The sampling loop runs in a shell that IS a direct child of the
+measuring process**, so the control is guaranteed to find the child it is
+counting, on every read, forever. ⇒ The self-control cannot return anything but
+100 %, which is why it looked decisive.
+
+⚠ Same family as `pgrep -f <pattern>` matching the searching shell, but wearing a
+CONTROL's clothes rather than a search's — and therefore trusted more, not less.
+⇒ **A child-count control is only valid from an EXTERNAL observer.** The external
+4-of-6 reading stands; the internal 6-of-6 is uninterpretable and must not be
+quoted as agreement.
+
 ⭐ **CORROBORATED FROM OUTSIDE, AND THE DECISIVE READING IS THE ONE THE ROW
 CANNOT TAKE OF ITSELF.** Sampling both processes of that pair six times over
 ~12 s: the suspected leftover returned **zero children on 5 of 6 reads** while a
