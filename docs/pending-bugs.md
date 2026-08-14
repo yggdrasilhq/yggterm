@@ -271,8 +271,16 @@ this.
 uuid, and nothing reaped the predecessor.** 4 of 4 live armed rows, no
 exceptions: an original `--session-id` process and a `--resume` twin whose age
 lands inside the deploy window in every case. **`rss+swap` on the four orphans:
-787 + 707 + 955 + 814 MB = 3,263 MB** — and memory is the owner's stated
-first priority.
+787 + 707 + 955 + 814 MB = 3,263 MB.**
+
+⚠ **THAT NUMBER WAS THE FIRST FRAMING OF THIS ENTRY AND IT WAS THE WRONG ONE.**
+3,263 MB is **0.63 % of this host's RAM**, on a machine sitting at **40.5 %
+available with `/proc/pressure/memory` reading 0.00 across all three windows.**
+The original write-up attached "and memory is the owner's stated first priority"
+to it, which turns a priority ORDERING into an urgency AMPLIFIER for a cost that
+is not being felt. ⇒ **RAM was simply the cheapest thing to measure, and the
+cheap measurement became the headline.** The real cost is two paragraphs down and
+it is the shared worktree.
 
 **Mechanism, read from `/proc` rather than reasoned about.** The re-resume builds
 a **new PTY** and abandons the old one with its agent still alive. The pair are
@@ -351,11 +359,31 @@ neither `--session-id` nor `--resume`, so a naive grouping files them together
 under an **empty key** and reports them as a duplicate. **Treat a missing key as
 UNCLASSIFIED, never as a match.**
 
-⚠ **AND THE WORST CONSEQUENCE IS NOT MEMORY.** Two live agents can share one
-session uuid **and one worktree**, both running cargo against the same `target/`.
-That is the shared-checkout clobber hazard, live — it surfaces as *"file modified
-on disk since you last read it"* warnings that get misattributed to one's own
-edits. RAM is the least of it.
+⛔⛔ **THE WORST CONSEQUENCE IS NOT MEMORY, AND IT IS NOW PROVEN RATHER THAN
+PREDICTED.** Two live agents can share one session uuid **and one worktree**. On
+the one row where this persisted, `git status` showed:
+
+```
+ M crates/yggterm-shell/src/shell.rs      <- the OTHER agent's in-flight edit
+ M docs/pending-bugs.md                   <- the live agent's own work
+```
+
+The live agent had never opened `shell.rs` that session; the file matches the
+`yggterm-shell` tests the left-behind process was observed running. ⇒ **It is not
+only cargo contention over a shared `target/`. It is UNCOMMITTED SOURCE from
+another agent sitting in a tree someone is about to commit from.**
+
+⛔⛔⛔ **THEREFORE, IN ANY WORKTREE THAT MIGHT BE SHARED, COMMIT BY EXPLICIT PATH.
+`git add -A` IS A CLOBBER WAITING FOR A WITNESS** — it would have committed
+another agent's half-written work **under the committer's authorship, into main,
+under a message describing something else entirely.** It was caught only by a
+habitual `git status` before committing. This is the concrete, live instance of
+the standing shared-checkout rule, and it arrived through a route nobody had
+named: not two people editing one tree, but **one session's own predecessor
+still editing it.**
+
+⚠ It also surfaces as *"file modified on disk since you last read it"* warnings
+that get misattributed to one's own merges.
 
 ### ⛔⛔ CAUGHT IN THE ACT, 19:40 — AND `git add -A` IS THE LOADED GUN
 
