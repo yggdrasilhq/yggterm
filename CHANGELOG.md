@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A running agent session appears in its folder again.** The sidebar shows a
+  session twice on purpose: once under Live Sessions, and once inside the folder
+  it is working in. The second one had quietly stopped appearing. Two separate
+  pieces of code were each removing one of the two candidates for that slot —
+  one dropped the saved-transcript row because the running row was going to
+  cover it, and the other dropped the running row because a saved-transcript row
+  existed — so between them they removed both and the folder came out empty
+  while still displaying a count of what it contained. The only sessions that
+  escaped were the ones with no transcript on disk at all, which is why the
+  folder looked merely inconsistent rather than broken. One rule now decides
+  what fills that slot.
+
 - **Every app-control verb now works from both programs.** The command surface
   that agents and scripts drive was written out twice, once in each of the two
   programs that answer it, and the two copies had drifted: six commands existed
