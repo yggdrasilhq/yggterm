@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **A session opened in a folder that only exists on another machine now says
+  so, instead of quietly starting somewhere else.** Opening a session in a
+  directory this machine does not have has always been allowed to proceed —
+  it falls back to the nearest folder that does exist, and then to your home
+  directory — but nothing said that had happened. The row went on describing
+  itself as being in the folder you picked, so a session that was really
+  running in your home directory looked, indefinitely, like one that was
+  working where you meant. The launch now prints what it did, and the row's
+  description leads with the correction instead of the claim.
+
 - **Asking either program for the list of running background services now
   works.** The census that reports every service on the machine — which
   versions are running, how long, how much they hold — answered from only one

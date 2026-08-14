@@ -801,56 +801,37 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
-## ⛔⛔ [6.6] A LAUNCH INTO A CWD THAT EXISTS ONLY ELSEWHERE LEAVES A ROW THAT LOOKS HEALTHY FOREVER
+## ⚠ [6.6] TWO FUNCTIONS NAMED `live_session_default_summary`, ONE PER CRATE, AND ONLY ONE IS EVER READ
 
 **Status:** OPEN
 
-*Found by seat 6.3, routed here 2026-08-14 because it is launch validation with
-no row-identity component. Source claims re-verified here before filing.*
+*Found 2026-08-14 while fixing the cwd-fallback row description — by editing
+the wrong one and watching the live sidebar not change.*
 
-A LOCAL launch into a cwd that exists only on another host creates a keep-alive
-row that **never had a process**, and the row then reads as healthy indefinitely.
+`live_session_default_summary` exists twice:
 
-### ⭐ 6.3's OWN RETRACTION IS THE LOAD-BEARING PART
+- `crates/yggterm-server/src/lib.rs` — writes the row's summary at BIRTH, and
+  that stored string is what the sidebar shows;
+- `crates/yggterm-shell/src/shell.rs` — the sidebar's own fallback, reached
+  only when no stored or generated summary exists.
 
-They first reported that the husk's `session_id` "stays the daemon runtime key
-rather than an agent conversation id", then **retracted it against source**. The
-retraction is right, and it is why this is launch validation and not identity:
+They answer the same question in different words for the same row kind
+("Interactive shell rooted at X; use it for…" versus "Local shell rooted at
+X."), which is exactly the second encoding this project forbids. Editing either
+one compiles, passes its own tests, and changes nothing the user sees.
 
-- the CC descriptor carries `id_assigned_at_birth: true`
-  (`crates/yggterm-core/src/agent_cli.rs:1412`);
-- the launch hands that id to the CLI — `claude --session-id <uuid>` fresh,
-  `--resume <uuid>` resumed — so **the row id IS the transcript id from birth**,
-  with no rebind poll.
+⚠ **The trap is the shared NAME, not the duplication alone.** Grep, jump-to-
+definition and a memory of "the summary builder" all land on whichever one the
+tool reaches first, and the wrong one looks right — same signature shape, same
+match arms, same sentences to within a few words.
 
-⇒ The transcript is absent because **nothing ever ran**, not because the id names
-another namespace.
+⇒ Collapse to one owner. The birth-time write is the load-bearing copy; the
+shell-side fallback should call it rather than re-spell it.
 
-### ⛔ THE DETECTOR ALREADY EXISTS, IS CORRECTLY NAMED, AND IS SWALLOWED
-
-This is the half to fix. Because the id is born-identity,
-`local_cc_session_jsonl_path(&session.id)` returning `None` on a **live** CC row
-means the CLI wrote nothing. `daemon.rs` says so in as many words — the comment
-at `crates/yggterm-server/src/daemon.rs:10532` names exactly this case as a
-**"stuck launch hint"** — and the next statement is:
-
-```rust
-let Some(jsonl) = local_cc_session_jsonl_path(&session.id) else {
-    continue;
-};
-```
-
-inside a loop that only wanted a **title**. The condition is detected, named, and
-discarded, and the row goes on looking healthy.
-
-⇒ **Validating the cwd at launch would fix this instance and leave the swallow in
-place for every other way a launch can fail to start.** Fix both: refuse (or
-mark) a local launch into a cwd that does not exist here, AND give the
-already-named signal somewhere to go other than `continue`.
-
-⚠ Whoever takes the second half should check what else that loop's `continue`s
-hide — a title poll is a poor place for a health signal to live, and it is where
-this one ended up.
+⛔ Whoever takes this must check what else reads the stored summary before
+changing its wording: it is persisted, so existing rows keep the old sentence
+until something rewrites them, and a test that asserts the new wording against
+a restored row will be red for reasons that have nothing to do with the change.
 
 ## ⛔⛔ [6.6] REAL-KEY INPUT DELIVERS NOTHING ON THE GUI HOST, AND A RESTART WILL NOT FIX IT
 
@@ -914,13 +895,26 @@ so the ibus route is not open there either.
 
 ⚠ **What is therefore still open is narrower and harder:** the failure is
 conditional on the live GUI PROCESS or on the specific third-party page that
-was being driven — not on the code path, the build, or the machine. Nothing
-short of a probe against that process can separate those two, which is why the
-next step is owner-gated (`docs/owner-attention.md`).
+was being driven — not on the code path, the build, or the machine.
 
-⛔ **Do not re-derive the six arms.** Run the script instead; it takes a minute
-and reports its own control. ⛔ And do not cycle the owner's desktop to test
-this — the relaunch was already shown not to answer the question.
+### ⛔ AND THE REPRODUCTION IS GONE — the process that carried it has been replaced
+
+Checked by identity rather than by version, 2026-08-14: the GUI now serving is
+a NEW process whose `/proc/<pid>/exe` is byte-identical to the installed
+binary (same md5), and both report 3.0.154. The window that produced the six
+failures was the older build recorded above, and it is no longer running.
+
+⇒ Only one of the two remaining candidates can still be tested — the page —
+and only if the same site is driven again. **A probe against the live GUI now
+would exercise the same configuration the six arms already cleared and prove
+nothing**, so this is NOT an owner gate and was deliberately not parked as one.
+
+⇒ **Status is therefore "open, not reproducible".** It stays here because
+`delivered:false` on a credential path is worth catching if it returns, and the
+harness makes that one command. ⛔ Do not re-derive the six arms; run
+`scripts/web-real-keys-ab.sh`, which reports its own control. ⛔ And do not
+cycle the owner's desktop for it — that was already shown not to answer the
+question, and now there is nothing on that desktop left to answer it with.
 
 ### ⭐ WHY THIS OUTRANKS ONE BROKEN VERB
 
