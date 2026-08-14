@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Every app-control verb now works from both programs.** The command surface
+  that agents and scripts drive was written out twice, once in each of the two
+  programs that answer it, and the two copies had drifted: six commands existed
+  in one and simply did not exist in the other, including playing a notification
+  sound and setting the light or dark theme — neither of which needs a window at
+  all. Asking for one of them from the wrong program reported that the command
+  was unknown, while every other sign said the software was up to date, so it
+  read as a missing feature rather than a missing copy. There is one list now,
+  so a command that exists, exists everywhere. Two things that were quietly
+  broken came out with it: answering a camera or microphone prompt with the
+  request number written first failed as though no answer had been given, and
+  the help text listed different commands depending on which program printed it.
+
 - **One agent CLI can no longer be launched with another one's flags.** The
   flags a session is started with are configured per CLI, and they were being
   carried between machines in a single environment variable that named no CLI at

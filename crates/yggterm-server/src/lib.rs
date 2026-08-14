@@ -28,6 +28,16 @@ pub use web_collection_cli::{run_web_collection_cli, web_collection_usage_block}
 // been a second encoding of one concept; there is now one owner and both
 // binaries route to it.
 mod app_control_web_cli;
+// THE `server app …` CLI ITSELF — one owner, both binaries, for the same
+// reason `app_control_web_cli` exists: the top-level dispatch was a `match`
+// COPIED into each binary, so a verb added to one answered "unsupported app
+// control command" from the other. See `app_control_cli`.
+pub mod app_control_cli;
+// NATIVE notification audio. It lived in the GUI binary's own module tree,
+// which is why `server app audio` did not exist on the headless CLI — the one
+// agents drive — even though the verb needs no GUI at all and its own help
+// says so. Nothing here touches a webview.
+pub mod audio_cli;
 // THE `web-import …` verb plane — history and bookmarks out of other browsers.
 // A thin shell over `yggterm_core::browser_import`; every decision (epoch,
 // copy-then-open, dedupe) belongs to the library so the GUI, ychrome and the
