@@ -49681,9 +49681,11 @@ fn sidebar_rows_for_selection(
 ///   `inject_local_live_session_rows`.
 /// - Remote live sessions stay in `machine.scanned_sessions`; no
 ///   live-vs-scanned dedup at this layer.
-/// - Same-session dedup within a single tree view is done by
-///   `inject_cc_sessions_into_stored_rows` (by session_id) and by the
-///   `promoted_storage_paths` filter in the extend step (by storage path).
+/// - Same-session dedup within a single tree view has ONE owner: the
+///   `promoted_storage_paths` filter in the extend step, keyed by storage path.
+///   ⛔ `inject_cc_sessions_into_stored_rows` used to dedup by `session_id` as
+///   well; that was a cross-view rule wearing a per-view costume, and the two
+///   cancelled — see the block comment inside it.
 fn merged_sidebar_rows_uncached(
     stored_rows: &[BrowserRow],
     stored_projection_rows: &[BrowserRow],
@@ -49818,8 +49820,9 @@ fn merged_sidebar_rows_uncached(
     // display surfaces are dual.
     //
     // Local Codex/CC live sessions get injected under their cwd folder via
-    // inject_local_live_session_rows. Dedup against same-session_id file-backed
-    // stored rows is handled inside the injection.
+    // inject_local_live_session_rows — UNCONDITIONALLY, whether or not the
+    // session also has a scanned transcript leaf in this tree. The scanned leaf
+    // is what yields the slot, below, at `promoted_storage_paths`.
     let local_tree_live_sessions = promoted_live_sessions
         .iter()
         .copied()
@@ -50520,13 +50523,35 @@ fn inject_cc_sessions_into_stored_rows(
             .map(|s| (s.session_path.clone(), s.id.clone()))
             .collect::<Vec<_>>(),
     );
-    // Skip live CC sessions that already have a file-backed row in stored_rows (same session_id).
-    // Without this check, a running CC session appears twice: once from the file-backed row
-    // injected by inject_file_backed_cc_session_rows and again from this live injection.
-    let stored_session_ids: HashSet<String> = stored_rows
-        .iter()
-        .filter_map(|row| row.session_id.clone())
-        .collect();
+    // ⛔ THERE IS NO session_id SKIP HERE, AND ADDING ONE BACK IS A SPEC VIOLATION.
+    //
+    // One used to live here. It skipped any live session whose `session_id`
+    // already appeared on a stored row, and its stated reason was
+    // `inject_file_backed_cc_session_rows` — a post-hoc injector **deleted on
+    // 2026-05-26** (see the note below this function). Once that producer was
+    // gone the guard kept firing, now against the ordinary SCANNED leaf that
+    // `build_local_cwd_tree` emits for the session's own transcript. So the
+    // live row was dropped here while `promoted_storage_paths` in
+    // `merged_sidebar_rows_uncached` independently dropped the scanned leaf,
+    // and the two suppressions CANCELLED: a live agent session with a
+    // transcript on disk vanished from the cwd tree altogether.
+    //
+    // ⚠ It survived because the symptom inverts on a condition nobody varies:
+    // a live session with NO transcript matches nothing here, so it is the only
+    // one the tree still shows — and it was that lone survivor, not the 56
+    // missing rows, that got filed as the bug.
+    //
+    // `AGENTS.md` "Session display = dual presence" rules on this directly:
+    // *"Never silently filter a live session out of the cwd tree just because it
+    // also appears in Live Sessions; if you find dedup code that does this, that
+    // is a SPEC VIOLATION. Acceptable dedup is per-view (one row per logical
+    // session within the same tree), not cross-view."*
+    //
+    // ⇒ Per-view dedup has exactly ONE owner, and it is not here: the
+    // `promoted_storage_paths` filter, which drops the scanned leaf because the
+    // injected live row already occupies that slot in the SAME tree. Keying on
+    // the storage path is what makes it per-view — a `session_id` is shared by
+    // every view, so a `session_id` key can only ever express a cross-view rule.
     let seats = live_session_seats(sessions.iter().copied());
     // ⛔ THE ORDER OF THESE ROWS IS PART OF THE CONTRACT — see
     // `docs/pending-bugs.md`, "the start page cannot be used to find a session".
@@ -50550,9 +50575,6 @@ fn inject_cc_sessions_into_stored_rows(
     });
     let mut insertions: Vec<(usize, usize, BrowserRow)> = Vec::new();
     for (rank, session) in ordered_sessions.into_iter().map(|(_, s)| s).enumerate() {
-        if stored_session_ids.contains(&session.id) {
-            continue;
-        }
         let cwd = metadata_value(session, "Cwd");
         let Some((group_idx, group_depth)) = find_best_group_for_cwd_in_rows(stored_rows, &cwd)
         else {
@@ -80974,16 +80996,12 @@ fn remove_stale_client_instance_record(
 fn cleanup_stale_client_instances(dir: &Path, keep_path: Option<&Path>) -> Result<Vec<PathBuf>> {
     fs::create_dir_all(dir)?;
     let mut active = Vec::new();
-    let entries = fs::read_dir(dir)
-        .with_context(|| format!("reading client instances dir {}", dir.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        // The atomic-write staging dir (and anything else that is not a
-        // plain file) is never a record.
-        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
-            continue;
-        }
+    // ⛔ ONE TRAVERSAL, shared with the server's reader. This side knew to skip
+    //    the atomic-write staging dir and the other side did not, and the drift
+    //    was invisible because each copy looked right on its own: there, an
+    //    `EISDIR` from that same directory failed the whole enumeration, which
+    //    the retire gate reads as "I could not ask, do not retire".
+    for path in yggterm_server::client_instance_record_paths(dir)? {
         if keep_path.is_some_and(|keep| keep == path.as_path()) {
             active.push(path);
             continue;
@@ -187521,6 +187539,125 @@ Shared connection to 192.0.2.14 closed.\r\n";
             vec!["one", "two"],
             "and it must carry its sessions, in the Live Sessions order"
         );
+    }
+
+    /// A live agent session appears in its cwd folder whether or not its
+    /// transcript happens to have been scanned off disk — and exactly once.
+    ///
+    /// ⚠ **Both arms, one built list, and the ONLY thing that varies is whether
+    /// the scanned leaf is present.** The no-transcript arm on its own proves
+    /// nothing: it passed all the way through the defect. It was the single
+    /// surviving row, and it is what got filed — as *"one session renders as
+    /// two rows"* — while every session that DID have a transcript had silently
+    /// dropped out of the tree. So the arm that fails on the pre-fix code is
+    /// the one WITH the leaf, and a test carrying only the other arm would have
+    /// certified the bug.
+    ///
+    /// The two rows the healthy tree holds are the dual presence `AGENTS.md`
+    /// requires: one under Live Sessions, one under the cwd folder. They share
+    /// a `full_path` because that path is the SESSION's identity — single
+    /// source of truth is the session object, not its display location.
+    #[test]
+    fn a_live_agent_session_keeps_its_cwd_row_whether_or_not_a_transcript_was_scanned() {
+        let cwd = "/home/user";
+        let uuid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let live_path = format!("local://{uuid}");
+        let storage = format!("/home/user/.claude/projects/-home-user/{uuid}.jsonl");
+
+        let mut session = live_local_session_fixture("one", uuid, cwd);
+        session.metadata.push(yggterm_server::SessionMetadataEntry {
+            label: "Storage",
+            value: storage.clone(),
+        });
+        let live_sessions = vec![session];
+
+        let scanned_leaf = BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: storage.clone(),
+            label: "scanned transcript".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 2,
+            host_label: "local".to_string(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: Some("one".to_string()),
+            session_cwd: Some(cwd.to_string()),
+            session_kind: Some(SessionKind::ClaudeCode),
+        };
+        let groups = vec![cwd_group_fixture("local", 0), cwd_group_fixture(cwd, 1)];
+
+        // The rail's own group must be open, or `push_live_session_rows` emits
+        // the header alone and the arm below would be asserting against a
+        // collapsed rail rather than a missing row.
+        let expanded = HashSet::from(["__live_sessions__".to_string()]);
+        let merge = |stored: &[BrowserRow]| -> Vec<BrowserRow> {
+            merged_sidebar_rows_uncached(
+                stored,
+                &[],
+                &[],
+                &[],
+                &live_sessions,
+                &expanded,
+                &HashSet::new(),
+                &yggterm_core::row_set_outline::RowArrangement::default(),
+            )
+        };
+
+        for (arm, stored) in [
+            ("transcript scanned", {
+                let mut rows = groups.clone();
+                rows.push(scanned_leaf.clone());
+                rows
+            }),
+            ("no transcript on disk", groups.clone()),
+        ] {
+            let rows = merge(&stored);
+
+            let in_folder = rows
+                .iter()
+                .filter(|row| {
+                    row.kind == BrowserRowKind::Session
+                        && row.session_id.as_deref() == Some("one")
+                        && row.session_cwd.as_deref() == Some(cwd)
+                        && row.depth > 1
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                in_folder.len(),
+                1,
+                "[{arm}] the cwd folder holds exactly one row for a live session, \
+                 not zero (cross-view dedup) and not two (the scanned leaf left behind)"
+            );
+            assert_eq!(
+                in_folder[0].full_path, live_path,
+                "[{arm}] the LIVE row occupies the slot; the scanned leaf yields to it"
+            );
+
+            let shape = rows
+                .iter()
+                .map(|row| format!("d{} {:?} {}", row.depth, row.kind, row.full_path))
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            let local_group_at = rows
+                .iter()
+                .position(|row| row.full_path == "local")
+                .unwrap_or(rows.len());
+            assert!(
+                rows.iter()
+                    .take(local_group_at)
+                    .any(|row| row.full_path == live_path),
+                "[{arm}] and the session is still in the Live Sessions rail, above the \
+                 cwd tree. rows:\n  {shape}"
+            );
+            assert!(
+                !rows.iter().any(|row| row.full_path == storage),
+                "[{arm}] the scanned leaf must not survive alongside the live row \
+                 — that is the per-view duplicate"
+            );
+        }
     }
 
     // XTERM-BUG: idle-auto-webview (Bug7) — coerce an EMPTY Rendered webview to Terminal

@@ -472,6 +472,25 @@ log "claimed and verified by read-back: seat=$NUM title=$FINAL_TITLE"
 # ⛔ Unsubscribing is the SUBSCRIBER's job when the work is done
 # (`ygg-booter.py unsubscribe --row <path>`); the booter retires a row only on
 # facts it can see for itself — the row is gone, or the subscription expired.
+# ⛔⛔ A ROW BEING MARKED DEAD MUST NOT BE ARMED BY THE ACT OF MARKING IT. Retiring
+# a row is done by RETITLING it "<seat> RETIRED, succeeded by <uuid>" — and this
+# script arms whatever row it just titled, so **the retitle re-subscribed the
+# corpse**. Measured 2026-08-14: a seat stood down, unsubscribed from both planes
+# and read back 0/0; its successor relabelled the old row at ~11:22; the booter
+# re-subscribed it and WOKE IT at 11:26 with `boots=1`. Harmless that time because
+# the row had already handed off cleanly — but it is exactly the mechanism that
+# sets a retired lane racing its live successor over the same files.
+# ⭐ The retitle itself carries the intent, so no ledger read is needed: the same
+#   string the monitor's restore screen already trusts, because a retiring row
+#   writes it about ITSELF.
+case "$FINAL_TITLE" in
+  *RETIRED*|*"succeeded by"*)
+    log "⛔ NOT ARMING — this title marks the row RETIRED:"
+    log "     $FINAL_TITLE"
+    log "   Arming a row as a side effect of declaring it dead is how a corpse gets"
+    log "   woken to race its own successor. Retire it, do not watch it."
+    BOOTER=0 ;;
+esac
 if [ "${BOOTER:-0}" = 1 ] && [ -x "$(dirname "$0")/ygg-booter.py" ]; then
   # ⛔ `cmd | sed || log` CANNOT DETECT A FAILED ARM — the pipeline's exit status
   # is `sed`'s, which succeeds on any input. Same family as the documented

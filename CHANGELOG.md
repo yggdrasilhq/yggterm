@@ -15,6 +15,40 @@ This file tracks user-visible changes in `yggterm`.
   It also records those delays in microseconds rather than milliseconds — the
   old unit was too coarse for what it was measuring, so nearly every entry read
   as exactly zero.
+- **A background service can no longer retire while a program is still attached
+  to it, and a leftover staging folder no longer stops commands from working.**
+  The set of attached programs is kept as one small file each inside a folder,
+  and the write that publishes them stages through a `tmp` sub-folder in that
+  same place. Two parts of the software walked that folder and disagreed about
+  what a sub-folder means: one skipped anything that was not a plain file, the
+  other tried to read it as a record. That produced two failures that look
+  unrelated and share one cause. On a freshly created setup, every agent and
+  script command failed outright — reporting that a directory is not a file —
+  until the empty staging folder was deleted by hand. And because "I could not
+  read the list" is deliberately treated as "do not retire, something may still
+  be attached", a service whose staging folder happened to exist could never
+  retire at all, which is the one thing a shutdown rule is not allowed to do.
+  Underneath both sat a third problem pointing the other way: an unreadable
+  folder used to be reported as an empty one, so a service could conclude that
+  nothing was attached and shut down while a program was still using it. There
+  is now a single walk of that folder shared by both parts. It skips only what
+  it can prove is not a file, and anything it genuinely cannot read is reported
+  as a failure to read rather than as an absence, so the three different
+  questions — nothing is attached, this is not a record, I could not tell —
+  get three different answers instead of one.
+
+- **A running agent session appears in its folder again.** The sidebar shows a
+  session twice on purpose: once under Live Sessions, and once inside the folder
+  it is working in. The second one had quietly stopped appearing. Two separate
+  pieces of code were each removing one of the two candidates for that slot —
+  one dropped the saved-transcript row because the running row was going to
+  cover it, and the other dropped the running row because a saved-transcript row
+  existed — so between them they removed both and the folder came out empty
+  while still displaying a count of what it contained. The only sessions that
+  escaped were the ones with no transcript on disk at all, which is why the
+  folder looked merely inconsistent rather than broken. One rule now decides
+  what fills that slot.
+
 - **Every app-control verb now works from both programs.** The command surface
   that agents and scripts drive was written out twice, once in each of the two
   programs that answer it, and the two copies had drifted: six commands existed

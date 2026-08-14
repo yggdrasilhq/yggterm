@@ -314,44 +314,94 @@ from inside in three pieces (parent accept+spawn 44–48 µs · child pre-closur
 measurement; schedule S4 on stability and observability, NEVER on cores**
 (<0.001 cores/daemon).
 
-## ⛔ [6.3] ONE SESSION RENDERS AS TWO ROWS, AT TWO DIFFERENT NESTING DEPTHS
+## ⛔ [6.3] A SESSION KEY IS BEING USED AS A ROW KEY, AND DUAL PRESENCE MAKES IT AMBIGUOUS
 
 **Status:** OPEN
 
-*Found by the coverage report's row count, not by looking at the sidebar — which is
-why it survived: an off-by-one in a 378-row listing reads as a rounding artefact.*
+*Filed by the lane that widened it, in the same session. Read the dual-presence
+half of `AGENTS.md` before touching this.*
 
-**378 session rows, 377 distinct paths.** One session path is emitted twice:
+A live session renders **twice on purpose**: once under Live Sessions, once in
+its cwd folder. Both rows carry the same `full_path`, deliberately — that path is
+the SESSION's identity, and single source of truth applies to the session object
+rather than its display location.
 
-```
-local://<a session id>   x2      outline_prefix 6.2
-  depth=2   kind=Session  live_member=true  expanded=true  hidden_by_collapsed_set=false
-  depth=4   kind=Session  live_member=true  expanded=true  hidden_by_collapsed_set=false
-```
+⛔ **So `full_path` cannot answer a question about a ROW.** Roughly 150 sites
+resolve a row with `find(|row| row.full_path == …)` and some then read fields
+that are properties of the PLACEMENT rather than of the session: `depth`,
+`child_count`, row-set headship, and the row's INDEX in the list. Those get the
+first match, which is the rail copy only because the rail happens to be pushed
+before the stored rows.
 
-Both entries claim to be live members, both expanded, both unhidden, identical labels —
-they differ **only in `depth`**. So this is not a collapsed-set artefact and not one row
-shadowing another; the same session is genuinely placed at two points in the tree.
+**It has misfired once already.** When a verb force-expanded the tree,
+`resolve_app_control_row` matched the cwd-tree copy — which heads no set — and
+`row-expanded` began refusing. See the row-set collapse entry, which records it.
 
-⚠ **It may not be a display bug at all.** The duplicated session is also the one whose
-transcript **does not exist** — a row that was created and never inhabited. *"A row that
-never lived"* and *"a row that renders twice"* are plausibly one birth defect rather than
-two, and if so the interesting half is in row creation, not in rendering. **Do not assume
-the rendering half is the bug.**
+⚠ **Exposure grew when the cwd-tree regression was fixed.** Before that fix only
+a session with no transcript on disk was dual-present in the local tree; now
+every local live agent session is, which is the correct behaviour and also means
+the ambiguity is no longer rare. **Nothing observed is broken today** — the rail
+is first, so first-match is currently right — but the correctness rests on list
+order rather than on anything that states it.
 
-⛔ **Single source of truth is the law here** and this is a direct violation: the sidebar
-tree and the row inventory must not be able to answer "where does this session sit" two
-ways. Whatever emits the second entry is a second encoding of placement.
+**Two candidate shapes, and the choice is the work:**
 
-**Falsifier / where to start:** `server app rows` and count `row_count` against
-`len({r.path})` — they must be equal. Then find the front-insert or re-parent path that
-can place an existing session without removing its previous placement; the
-*"A NEW ROW ALWAYS LANDS AT THE HEAD — ten front-insert sites, one missing owner"* entry
-is the nearest known relative and may share the owner.
+1. Make the ordering a CONTRACT — assert rail-before-tree in the merged list and
+   have the resolvers say which copy they want, so the rule is written down
+   instead of inherited.
+2. Give a row an identity distinct from its session's, and let consumers that
+   want the session keep asking by `session_id`.
 
-⚠ **No live 6.3 seat.** Row identity is the sidebar-truth lane's subject and that lane is
-dead (last assistant record ends on `tool_use` in the 2026-08-13 mass cut). This entry is
-filed rather than fixed, and needs that seat spawned before anyone edits placement code.
+⛔ **Do NOT "fix" this by de-duplicating the tree.** That is the regression this
+entry's sibling just removed, and it is a spec violation in as many words.
+
+**Falsifier:** with a live local agent session, resolve its path against a
+force-expanded row list and assert the row you get is the one that heads its set.
+
+## ⛔ A LOCAL LAUNCH INTO A DIRECTORY THAT DOES NOT EXIST LEAVES A KEEP-ALIVE HUSK
+
+**Status:** OPEN
+
+*Found 2026-08-14 while root-causing the cwd-tree entry below it; it is the
+session that entry was filed against.*
+
+An agent session was created **locally on the GUI host with a working directory
+that exists only on the build host**. The directory is absent there, so the agent
+CLI never started and never wrote a transcript. What remains is a row that is
+`live`, `keep_alive`, idle forever, and has never had a process.
+
+**Three things it costs, none of them cosmetic:**
+
+1. The row holds a keep-alive seat and a sidebar number that read as a working
+   lane.
+2. **The condition is already detectable and is already being swallowed.** A
+   local CC row's `session_id` IS its transcript id from birth
+   (`id_assigned_at_birth`, `claude --session-id <uuid>`), so
+   `local_cc_session_jsonl_path(&session.id)` returning `None` means the CLI
+   never wrote anything. `daemon.rs` names that exact signal *"stuck launch
+   hint"* — and then `continue`s past it inside a title poll, so nothing
+   surfaces and the row keeps looking healthy.
+3. It was the only session in the whole inventory exempt from a dedup guard that
+   keyed on having a transcript, so it rendered where all its healthy siblings
+   had been deleted, and **the anomaly got filed as the bug**.
+
+⛔ **There is NO row-identity component, and an earlier draft of this entry said
+there was.** It claimed the `session_id` stays a daemon runtime key that only a
+successful start repoints. That is wrong for Claude Code on both the local and
+remote paths: the id is assigned up front and handed to the CLI, so the row id is
+the authoritative transcript id from birth and no rebind is involved. The
+transcript is absent because nothing ever ran, not because the id names a
+different namespace. ⇒ **This is launch validation end to end**, and the sidebar
+lane holds no part of it.
+
+**What should happen instead:** a launch whose cwd does not exist on the target
+host fails loudly at launch, rather than yielding a session object that will
+never run. ⚠ Whether the deeper defect is the missing existence check or a launch
+that chose the local host for a path belonging to another machine is not settled
+here.
+
+**Falsifier:** create a local agent session with `--cwd` naming a path that does
+not exist, and read the row back.
 
 ## ⛔⛔ [6.4] THREE PRIVATE IDENTIFIERS REACHED origin/main AND ARE STILL IN HISTORY
 
@@ -1180,6 +1230,41 @@ first. ⚠ Falsifier before building it: the tear-down's own `replace_with` targ
 nodes that were never inserted, so prove the repair does not fault on the very
 damage it is repairing.
 
+### ⇒ THE SECOND OWNER REPORT IS THIS BUG, AND IT IS MEASURED LIVE ON HIS GUI
+
+*"in EVERY yggterm session no matter what sidebar I click"* (2026-08-13) was
+filed separately as **every sidebar button opens the notification sidebar**. It
+is this defect and that entry is folded in; do not re-open it.
+
+**Measured on his running GUI, 2026-08-14, read-only, at 3.0.154:**
+
+```
+webview_edit_faults: 2
+right_panel.rendered_mode / requested_mode / reveal_mode : notifications
+the glass                                                : the SETTINGS rail
+```
+
+The model and the screen disagree, and **time is excluded**: three screenshots
+were each BRACKETED by a state read before and after, and all six reads returned
+`notifications` while every frame showed a fully drawn Settings rail, gear
+highlighted. ⚠ That bracketing is the whole method — a single state read taken
+near a screenshot cannot tell a disagreement from a mode that simply moved
+between the two samples.
+
+⇒ From his side the freeze reads as *"whatever I click, I get the same rail"*,
+which is exactly what he reported, with the frozen content being whichever rail
+was painted last. **It is the same discriminator as the 2026-08-08 sighting and
+the blank body: the model advances, the subtree does not.**
+
+⭐ **And it refines the damage.** His rail is NOT blank right now — it is
+populated and frozen, so this is a LATER truncation point than the placeholder
+case above, on a GUI carrying two faults. ⇒ The repair below has a live target
+today, and a repair that only handles a placeholder body would not cure this one.
+
+⚠ **`rendered_mode` is not a report about the screen.** It names the mode the
+host believes it rendered; on a diverged webview it is confidently wrong, and it
+is the field most likely to be quoted as proof that the rail is fine.
+
 ### ⛔ DEAD ENDS — MEASURED, DO NOT RE-DERIVE
 
 - **Not a build regression, and the bisect is retracted.** 4338 changed lines
@@ -1749,6 +1834,157 @@ output says "silent 5 s" — so a reader wired to either field alone cannot pass
 ⇒ **Still open:** the SIDEBAR. A wedged row still renders `idle · Ready`, so the
 human remains the only detector of the state the daemon can now see. That is the
 next wiring, and `input_unanswered_ms()` is already there to read.
+
+## ⛔⛔ [6.8] THE YEDIT DOCUMENT SURFACE PAINTS GARBAGE WHILE ITS MODEL HOLDS 34 CHARACTERS
+
+**Status:** OPEN
+
+*Owner-reported 2026-08-14 with two screenshots, on a FRESH GUI at 3.0.154 — so it
+is **not** the stale-binary defect fixed the same morning.*
+
+**The Document view of a `New Yedit` row renders a screenful of corrupted glyph
+clusters** -- dense mojibake laid out in terminal-like rows across the top of the
+canvas -- while the surface's own status bar reads:
+
+```
+7 words · 4 lines · 34 chars
+```
+
+⇒ **The model is tiny and the RENDER is garbage.** Whatever is being painted is not
+the document.
+
+### ⭐ The discriminating evidence, and it is already in hand
+
+- **The Terminal view of the SAME row is clean.** It shows the launch cleanly:
+  `yedit: document surface opened` preceded by a secrets-fetch failure the app
+  emits at startup. So the row, the PTY and the terminal renderer are all fine.
+- ⇒ **The corruption is confined to the Document surface**, and the layout of the
+  garbage is terminal-shaped -- cells, not prose.
+
+### Falsifier / where to start
+
+1. Open a document surface on a scratch row and capture a **faithful** frame
+   (`capture_faithful: true`, backend `xterm_canvas_composite_over_dom`). ⛔ A
+   `faithful:false` frame is canvas-blind and cannot settle this.
+2. ⚠ **Suspect the compositing path before the text path.** The screenshot backend
+   composites the xterm canvas with the DOM; a Document view should not be painting
+   terminal cells at all, and what is on screen looks like exactly that -- a cell
+   grid full of uninitialised or mis-decoded content.
+3. Check whether the status-bar counts and the painted content come from the same
+   buffer. They disagree by three orders of magnitude, so at least one of them is
+   reading something it does not own.
+
+⚠ **The owner also reports a recurring dropped-glyph issue alongside this.** Do not
+assume the two are one defect: dropped glyphs were also visible on the stale
+12-hour GUI and improved when it was retired, so there may be a render-path bug
+that the stale binary made worse rather than caused.
+
+## ⛔⛔ [6.7] THE BOOTER TYPES A BARE `\r` INTO A ROW THAT MAY BE SHOWING A BILLING CHOICE
+
+**Status:** OPEN
+
+*Owner-raised 2026-08-14, and the owner named the mechanism himself.*
+
+*His question: when a session hits the plan limit, the CLI shows a three-option
+prompt -- stop and wait for the reset, switch to a team account, or use API
+billing -- and the first must be dismissed with Enter. "I was thinking when booter
+hits such a session, what happens. Maybe only the question gets dissolved with the
+passed return key and on the next booter the actual booting happens ... It happened
+to us last night and I do not know how all the sessions recovered."*
+
+### ⛔ THE ANSWER IS WORSE THAN THE HYPOTHESIS, AND THAT IS WHY THIS IS FILED HIGH
+
+`wake()` writes a message and then a **lone `\r`**. Against a row parked on a
+modal choice, that `\r` **selects whatever option is highlighted**. The owner's
+model -- one boot spent dismissing the dialog, the real boot on the next tick -- is
+correct *only if the highlighted option is the harmless one*.
+
+⇒ **If the highlight is not on "stop and wait", a watchdog silently selects a
+BILLING CHANGE on the owner's account.** No agent decided that; a timer did. That
+is categorically different from a wasted boot, and it is the reason this cannot sit
+behind "it seemed to recover".
+
+### ⚠ THE EXISTING QUOTA GUARD DOES NOT COVER THIS
+
+The booter already classifies `RATE_LIMITED` and holds the whole fleet on one
+sighting -- but it is keyed on the CLI's own `apiErrorStatus: 429` record, **not on
+the interactive dialog**. A row parked on the choice prompt has not necessarily
+recorded a 429 in the shape the classifier reads, so the guard can be entirely
+correct and still not fire on the state the owner is describing.
+
+⛔ **And the shapes are indistinguishable from outside:** a row sitting on a modal
+is idle, its transcript is not growing, and its last record is a completed turn.
+That is the same signature as a stall, which is exactly what the booter exists to
+act on.
+
+### Falsifier / where to start
+
+1. Reproduce the dialog on a scratch row (never the owner's) and read what the
+   screen holds -- `terminal read-buffer <row> --mode screen`. The dialog text is
+   on the screen even when the transcript says nothing.
+2. ⭐ **Screen-content detection is the discriminator, and it is cheap.** The
+   classifier reads the transcript; this state is only visible in the *screen*.
+3. ⛔ **Then REFUSE, do not get clever.** A row showing a choice the user must make
+   is a row the watchdog must not touch -- the same rule as the never-arm ledger,
+   for the same reason: this thing types.
+
+### ⇒ THE SPEC, so it is settled before the code is
+
+- ⛔ **Never send a bare `\r` into a row whose screen is showing a prompt this
+  watchdog did not put there.** Detect, hold, and report.
+- ⛔ **A quota window is not a stall and must never be booted** -- the account
+  cannot spend, so waking the session buys a refused turn and burns a boot.
+- ⭐ **Recovery must be OBSERVABLE.** The owner's real complaint is not the boot,
+  it is *"I do not know how all the sessions recovered."* Whatever the booter does
+  here has to leave a record that answers that afterwards.
+
+## ⛔⛔ [6.7] APP ROWS ARE BORN `keep_alive: false`, SO A GUI RESTART DESTROYS THE USER'S OWN GROUP
+
+**Status:** OPEN
+
+*Owner-hit 2026-08-14. He lost a row group he had built -- one `New Yedit` header and
+four `New Ychrome` rows -- to a GUI restart, and reported it in those words: "a row
+group of mine is gone ... I cannot see it after the restart".*
+
+**The rows were `kind: shell`, `keep_alive: false`.** Second-class rows die with the
+GUI by design, and that design is correct for a scratch shell. It is wrong for a row
+the user **deliberately created from an app verb** and arranged into a group: from his
+side there is nothing "scratch" about it, and nothing in the UI says it is disposable.
+
+```
+"title": "New Ychrome", "kind": "shell", "keep_alive": false, "cwd": "/home/user"
+```
+
+⛔ **THE CONSTITUTION SAYS THE OPPOSITE IN AS MANY WORDS:** *"Plain shells are
+first-class and must survive a bump like anything else."* These did not.
+
+⚠ **It is not recorded as a removal either.** `removed-rows.json` has no entry for
+them, so nothing distinguishes "the user closed this" from "this evaporated" -- and
+`sessions restore` answers `not_found`, because the ids are gone from the GUI's live
+set even though `server-state.json` still lists them under `live_sessions`. **Two
+stores disagree about whether the row exists**, which is its own defect.
+
+### What is NOT lost, and what is
+
+- ✅ **Profile data is safe.** Each row was a shell running `ychrome`; the profile
+  directories persist on disk. Nothing the user had stored was destroyed.
+- ⛔ **Which profiles were open is NOT recoverable** from state: the persisted record
+  carries `title`, `kind`, `cwd` and `ssh_target` and **no app arguments**, so a
+  restore cannot reconstruct which profile each row held.
+
+### Falsifier / where to start
+
+1. `server app launch-app ychrome new`, then read the row back out of
+   `~/.yggterm/server-state.json` -- it must not be born `keep_alive: false`.
+2. There is **no CLI verb to set keep-alive on an existing row** (`--keep-alive` is
+   documented only as unnecessary for agent-CLI kinds, which are born keep-alive).
+   A user who wants to protect a row they already have cannot.
+3. The persisted record needs to carry the app **verb and args**, or a restore can
+   only ever produce a blank instance of the app.
+
+⇒ **Three separable fixes, and the first is the one the owner felt:** rows created
+from an app verb are born keep-alive; a keep-alive toggle exists for any row; and the
+stored record round-trips the launch arguments.
 
 ## ⛔⛔ [6.7] THE GUI IS BURNING A WHOLE CORE, AND IT IS USER-TIME, NOT SYSCALLS
 
@@ -2889,27 +3125,6 @@ healthy widgets is not.
 **Falsifier:** a surface declared from a shell on another machine either shows
 that machine's open documents, or names the endpoint it failed to reach.
 
-## ⛔⛔ [6.3] EVERY SIDEBAR BUTTON OPENS THE NOTIFICATION SIDEBAR
-
-**Status:** OPEN
-
-*reported 2026-08-13, "in EVERY yggterm session no matter what sidebar I click"*
-
-Whatever sidebar is requested, the notification sidebar is what opens. Reported
-as appearing suddenly, on every session, after the fleet had been running for
-two days without a restart.
-
-**Prior art in this file:** the right panel is a **global slot** — one app's rail
-renders over another app's row (tracked separately below). This is almost
-certainly the same slot, now failing closed onto one occupant instead of
-occasionally showing the wrong one. ⇒ the two should be diagnosed together, and
-if they are one bug, the entries collapse into one.
-
-**Falsifier:** click each sidebar affordance in turn and read back which rail
-the GUI believes it opened. If the GUI's own model says "files" while the
-notification rail is on screen, the bug is in the render slot; if the model
-itself says "notifications", it is in the request.
-
 ## ⛔ [6.3] ychrome's VAULT AND SETTINGS RAILS SAY "Loading…" FOREVER
 
 **Status:** OPEN
@@ -3029,6 +3244,67 @@ proxy's own coverage.
 find the owner of a row it holds no preserved-owner record for — asking its live
 siblings rather than only endpoints it already knows. ⚠ Bound the fan-out; the
 TTL cache is already in place for the asking half.
+
+### ⭐ THE DISCOVERY IS SETTLED, AND THREE TRAPS ARE MEASURED — read before building
+
+**Discovery costs no round trips and is already built.** `socket_sweep` proves
+daemon liveness POSITIVELY from **one `/proc/net/unix` read**
+(`SocketCensus::gather`), which is how it sweeps ~700 socket files without
+issuing a request. ⛔ **Do NOT enumerate peers with `status`** — that is the gate
+measured to hang 16 live daemons at once.
+
+**Measured on the GUI host 2026-08-14: 5 live listening daemon sockets, one of
+them self.** So the fan-out is FOUR peers, not a fleet.
+
+1. ⛔ **THE OLD DAEMONS DO ANSWER, AND ONLY A REQUEST REACHES THEM.**
+   `ServerRequest::WorkingFlags` has existed since **2.10.2** (2026-07-10), older
+   than every live daemon on that host, so each answers for the rows it owns.
+   ⇒ **A "have the owner PUSH its flags" design cannot work**, however much
+   cheaper it looks: the daemons owning the dark rows shipped before any push
+   would exist and will never write it. Asking is the only mechanism that
+   reaches the population that matters.
+2. ⛔⛔ **FANNING OUT RECURSES.** `ServerRequest::WorkingFlags` is served by
+   `working_flags_including_proxied` itself (`daemon.rs`), so once two daemons
+   both discover each other they ask each other forever. It is invisible today
+   only because proxying landed 2026-08-13 and exactly ONE daemon on that host is
+   new enough to do it — **the cycle arrives as the fleet upgrades.** ⇒ A daemon
+   SERVING this request must answer from local plus already-cached flags and
+   issue no new peer request, which also caps cross-daemon depth at 1. That costs
+   nothing, because a discovering daemon reaches every owner directly.
+3. ⚠ **A SLOW PEER MUST NOT BLOCK THE DOT.** `WorkingFlags` takes the default
+   client IO timeout, so one hung peer stalls a refresh that runs every 1.5 s.
+   ⇒ Discovery belongs on the chore thread, following
+   `run_preserved_owner_revalidation_if_due` — the precedent in this file for
+   exactly this, and its doc comment states the rule: *talks ONLY to other
+   daemons' sockets and the trace file, never to this daemon's in-memory state.*
+   The fast path then asks only endpoints already known to own a wanted row.
+
+⇒ **Shape:** a chore-thread discovery pass records `session_path → endpoint` for
+what each sibling answered; `working_flags_including_proxied` consults preserved
+owners first and that memo second. ⛔ The memo is derived state of THIS
+subsystem and must never be written into `preserved_terminal_owners` — that
+registry drives hot-update handover, and a learned dot-owner is not an ownership
+claim.
+
+### ⚠ THAT SHAPE IS NOW BUILT, AND THE ENTRY STAYS OPEN UNTIL IT IS MEASURED
+
+Landed: `run_working_flag_owner_discovery_if_due` on the existing chore tick,
+the `discovered_working_flag_owners` memo consulted after the registry, and the
+recursion cut — `WorkingFlags` is now served from local screens plus the cache
+and issues no peer request, so fan-out happens on the refresh path alone. Unit
+tests cover the selection (self excluded, non-daemon sockets ignored, stable
+order) and both structural rules, and both structural tests were confirmed
+FAILING against the pre-fix shape.
+
+⛔ **None of that is the defect's own falsifier, which is why this is still
+OPEN.** What is proven is that the mechanism exists and cannot recurse. What is
+NOT proven is the number this entry is actually about: whether the 21-of-31 rows
+reporting `working: None` becomes near-zero. That needs the transcript-growth
+run above, against rows this session did not start, on a GUI old enough to have
+the dark rows — and the sidebar is drawn by the GUI process, so it needs a GUI
+carrying the build. ⚠ **Do not mark this fixed on the strength of the tests**;
+they measure the wiring, and the wiring was already measured necessary and
+insufficient once.
 
 ⚠ **And the ground truth got coarser as the fleet grew.** Two rows now read as
 false positives against the growth test, which the earlier 21-row sample did not

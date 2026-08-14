@@ -86,6 +86,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -350,6 +351,33 @@ def ygg(host, *args):
         return json.loads(r.stdout[r.stdout.find("{"):])
     except Exception:
         return {}
+
+
+def _host_serves_rows(host):
+    """TRI-STATE: True serves a row plane · False answered-and-does-not · None could-not-ask.
+
+    ⛔ `ygg()` returns {} for a transport failure AND for a host that replied with
+    nothing useful, so it cannot answer this question. The distinction decides
+    whether a bad `--host` is refused (it should be) or a network blip leaves a
+    live row unarmed (it must not)."""
+    try:
+        if host == this_host():
+            cmd = [str(Path.home() / ".local" / "bin" / "yggterm"), "server", "app", "rows"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        else:
+            r = subprocess.run(["ssh", "-o", "ConnectTimeout=10", host,
+                                "$HOME/.yggterm/bin/yggterm server app rows"],
+                               capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None                       # could not ask
+    body = r.stdout[r.stdout.find("{"):] if "{" in r.stdout else ""
+    if not body:
+        return None                       # no JSON at all ⇒ we never reached the verb
+    try:
+        d = json.loads(body)
+    except Exception:
+        return None
+    return ((d.get("data") or {}).get("rows") is not None)
 
 
 def sub_path(uuid):
@@ -715,6 +743,56 @@ def cmd_subscribe(args):
     if not uuid:
         log("no row given and $YGGTERM_SESSION_ID is unset — nothing to subscribe")
         return 2
+    # ⛔⛔ AN ADDRESS THIS WATCHDOG CANNOT RESOLVE IS A SUBSCRIPTION THAT DELETES
+    # ITSELF, AND IT READS AS ARMED THE WHOLE TIME. `row_presence` asks the row
+    # plane at `--host`; a bare uuid or a host with no GUI client makes the plane
+    # answer, truthfully, that nothing lives at that address. That is `False`, not
+    # `None` — so the tri-state below behaves perfectly, counts three consecutive
+    # absences, and unsubscribes a live row with the line "GONE — absent from 3
+    # consecutive row listings". Indistinguishable from a genuine retirement.
+    #
+    # Reported 2026-08-14 by an orchestrator who repaired a live instance: a
+    # delegate stored `row=<bare-uuid>, host=dev` while the GUI runs elsewhere.
+    # ⚠ AND THE ROOT IS STRUCTURAL, NOT CARELESSNESS. Their spawn wrapper raced
+    # (the transcript takes ~75 s to appear, the check waited 60), exited non-zero
+    # on a spawn that had SUCCEEDED, and never reached its arming step — so a human
+    # compensated with a hand-rolled subscribe, and the hand-rolled call reproduced
+    # the exact failure the wrapper existed to prevent. **Whenever a wrapper fails,
+    # the fallback is a hand-rolled call.** That is why this check belongs here, at
+    # the moment someone can still fix it, rather than in the wrapper.
+    if args.row:
+        if not re.match(r"^[a-z][a-z0-9+.-]*://[^/]+/[0-9a-fA-F-]{36}$", args.row.rstrip("/")):
+            log(f"⛔ REFUSING to arm — --row {args.row!r} is not an addressable row.")
+            log("   It must be <scheme>://<machine>/<full-uuid>, e.g.")
+            log("     remote-cc://dev/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+            log("   A bare uuid resolves ABSENT on every tick, and this watchdog")
+            log("   then unsubscribes it as retired — silently, and looking healthy")
+            log("   in `list` until it vanishes. Fix the address, not this check.")
+            return 6
+    host = args.host or resolve_gui_host(None)
+    # ⛔⛔ TRI-STATE, AND I GOT THIS WRONG ON THE FIRST WRITE. The first version
+    # refused whenever the probe came back empty — collapsing "this host answered
+    # and has no row plane" (a bad address, refuse) into "I could not reach this
+    # host at all" (a blip, which must NOT leave a live row unarmed). That is the
+    # exact collapse this file's own `row_presence` exists to prevent, committed
+    # one screen away from the comment warning about it.
+    # ⇒ `ygg()` returns {} for BOTH, so ask the transport directly.
+    presence = _host_serves_rows(host)
+    if presence is False:
+        log(f"⛔ REFUSING to arm {uuid[:8]} — host {host!r} answered, and serves no row plane.")
+        log("   App control resolves ONLY where the GUI runs, so a subscription")
+        log("   pointed at a host with no GUI client can never see its own row.")
+        log("   It would read absent on every tick and lapse as 'GONE'.")
+        log("   Pass --host <the GUI host>.")
+        return 6
+    if presence is None:
+        # ⚠ Store, and say so. An unwatched row is the failure this tool exists to
+        #   prevent; a possibly-misaddressed one now LAPSES VISIBLY rather than
+        #   vanishing, so storing is the safer side of this particular blindness.
+        log(f"⚠ COULD NOT VERIFY host {host!r} (transport failed, not a refusal).")
+        log("   Arming anyway — an unwatched row is the worse failure. If the")
+        log("   address is wrong you will see it LAPSE in `list` rather than")
+        log("   silently disappear.")
     opted_out = disarmed_rows()
     if opted_out is None:
         log(f"⛔ REFUSING to arm {uuid[:8]} — {DISARMED_LEDGER} is unreadable.")
@@ -772,6 +850,14 @@ def cmd_subscribe(args):
         prior = json.loads(sub_path(uuid).read_text())
     except Exception:
         prior = {}
+    # ⭐ SAY THAT A LAPSE IS BEING CLEARED. `rec` is built fresh, so `lapsed` drops
+    #   out on its own — but a re-arm that silently un-lapses is the same
+    #   invisibility running backwards, and it hides how long the row went
+    #   unwatched. That interval is the whole cost of the incident this records.
+    if prior.get("lapsed"):
+        mins = int((time.time() - prior.get("lapsed_at", time.time())) // 60)
+        log(f"⭐ CLEARING A LAPSE on {uuid[:8]} — it was unwatched for ~{mins}m "
+            f"({prior.get('lapsed_reason', 'no reason recorded')})")
     rec = {
         "uuid": uuid,
         "row": row,
@@ -1413,11 +1499,21 @@ def cmd_list(args):
     if not subs:
         log(f"no subscribers (reading {SUBS})")
         return 0
+    lapsed = 0
     for s in subs:
         age_h = (time.time() - s["subscribed_at"]) / 3600
+        # ⛔ A LAPSE MUST READ AS A LAPSE. Deleting the record made "it expired"
+        #   and "it was never armed" the same observation.
+        mark = ""
+        if s.get("lapsed"):
+            lapsed += 1
+            mins = int((time.time() - s.get("lapsed_at", 0)) // 60)
+            mark = (f"  ⛔ LAPSED {mins}m ago — {s.get('lapsed_reason', 'no reason recorded')}"
+                    f" · NOT WATCHED; re-subscribe to clear")
         log(f"{s['uuid'][:8]}  {s.get('campaign') or '-':<12} "
-            f"age={age_h:4.1f}h boots={s['boots']} {s['row']}")
-    log(f"{len(subs)} subscription(s) in {SUBS}")
+            f"age={age_h:4.1f}h boots={s['boots']} {s['row']}{mark}")
+    log(f"{len(subs)} subscription(s) in {SUBS}"
+        + (f" — ⛔ {lapsed} LAPSED and no longer watched" if lapsed else ""))
     return 0
 
 
@@ -1505,6 +1601,43 @@ def boot(host, row, dry):
     return ""
 
 
+CHOICE_PROMPT_MARKERS = (
+    "hit your session limit", "session limit", "usage limit", "upgrade to max",
+    "switch to a team account", "team account", "api billing", "pay per token",
+    "select an option", "choose an option", "1. stop and wait", "stop and wait",
+)
+
+
+def _screen_shows_a_choice(host, row):
+    """TRI-STATE: True a prompt is on screen · False none · None could not look.
+
+    ⛔⛔ THE DEFECT THIS EXISTS FOR, RAISED BY THE OWNER 2026-08-14. When the plan's
+    limit is hit the CLI parks on a three-option prompt -- stop and wait, switch to
+    a team account, or use API billing -- and the first is dismissed with Enter.
+    `_pty_type_and_enter` finishes with a **lone `\\r`**, which does not "dismiss"
+    anything: **it selects whatever option is highlighted.** If the highlight is not
+    on the harmless one, a timer silently changes billing on the owner's account.
+    Nobody decided that; a watchdog did.
+
+    ⚠ `--refuse-if-draft` does NOT cover this. It guards a half-typed DRAFT, and a
+    modal is not a draft — so the existing guard passes and the Enter still lands.
+
+    ⚠ Nor does the `RATE_LIMITED` classifier: that keys on the CLI's own
+    `apiErrorStatus: 429` record in the TRANSCRIPT, and a row parked on a modal has
+    not necessarily written one. **The dialog is only visible on the SCREEN**, which
+    is why this reads the screen and not the transcript.
+
+    ⛔ REFUSE ON DOUBT. `None` (could not look) is treated as a refusal by the
+    caller, for the same reason the never-arm ledger is: this thing types."""
+    r = _run(host, ["server", "app", "terminal", "read-buffer", row,
+                    "--mode", "screen"], "")
+    body = (r.stdout or "")
+    if not body.strip():
+        return None                      # could not look
+    low = body.lower()
+    return any(m in low for m in CHOICE_PROMPT_MARKERS)
+
+
 def _pty_type_and_enter(host, row):
     """Type the boot text, pause, then press Enter — as TWO writes.
 
@@ -1520,6 +1653,18 @@ def _pty_type_and_enter(host, row):
     ⚠ A pre-3.0.83 owner ignores the flag, so acceptance is not proof the guard
     ran. That is the honest limit and it is why the return distinguishes a
     refusal rather than folding it into failure."""
+    # ⛔⛔ SCREEN FIRST. The Enter below SELECTS a highlighted option, so a row
+    # parked on a choice prompt must never be typed into. Refuse on doubt.
+    choice = _screen_shows_a_choice(host, row)
+    if choice is True:
+        log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — its SCREEN is showing a "
+            f"prompt awaiting a choice (plan limit / billing). A bare Enter here "
+            f"SELECTS an option; that decision is the owner's, not a timer's.")
+        return "refused-choice-prompt"
+    if choice is None:
+        log(f"⛔ NOT BOOTING {row.rsplit('/', 1)[-1][:8]} — could not read its screen, "
+            f"so it cannot be ruled out that a prompt is waiting. Blind is not clear.")
+        return "refused-screen-unreadable"
     typed = _run(host, ["server", "terminal", "write", row, "--stdin",
                         "--refuse-if-draft"], BOOT_TEXT)
     if _field(typed.stdout or "", "refused_for_draft") is True:
@@ -1637,9 +1782,23 @@ def tick(args):
     for s in subs:
         uuid, row, host = s["uuid"], s["row"], s.get("host", args.host)
         age_h = (time.time() - s["subscribed_at"]) / 3600
+        if s.get("lapsed"):
+            # Already reported once; stay quiet but stay VISIBLE in `list`.
+            continue
         if s.get("max_hours") and age_h > s["max_hours"]:
-            log(f"{uuid[:8]} EXPIRED after {age_h:.1f}h — unsubscribing")
-            sub_path(uuid).unlink(missing_ok=True)
+            # ⛔⛔ THE SECOND SILENT-UNLINK PATH, and the likelier cause of the
+            # nine-hour outage: a campaign found all three of its subscriptions
+            # simply absent, with max_hours=12.0 and ~10.6h elapsed, and could not
+            # tell expiry from loss because BOTH leave the same nothing. An expiry
+            # is a legitimate decision; deleting the evidence of it is not.
+            s["lapsed"] = True
+            s["lapsed_at"] = int(time.time())
+            s["lapsed_reason"] = f"max_hours {s['max_hours']} exceeded at {age_h:.1f}h"
+            log(f"{uuid[:8]} LAPSED — EXPIRED after {age_h:.1f}h (max_hours "
+                f"{s['max_hours']}); keeping the record so this is visible. "
+                f"Re-subscribe to clear it.")
+            if not args.dry_run:
+                update_sub(uuid, s)
             continue
         # ⛔ ROW LIST FIRST. A retired row's transcript is frozen mid-turn forever
         #    and is indistinguishable from a live wedge; booting a corpse is a
@@ -1652,9 +1811,26 @@ def tick(args):
         if presence is False:
             s["gone_sightings"] = s.get("gone_sightings", 0) + 1
             if s["gone_sightings"] >= GONE_SIGHTINGS:
-                log(f"{uuid[:8]} GONE — absent from {GONE_SIGHTINGS} consecutive "
-                    f"row listings, unsubscribing")
-                sub_path(uuid).unlink(missing_ok=True)
+                # ⛔⛔ LAPSE LOUDLY. This used to DELETE the record, and an arm that
+                # lapses then becomes indistinguishable from an arm that was never
+                # set — the same failure signature as the thing this tool exists to
+                # eliminate. Reported 2026-08-14 by a campaign that lost all three
+                # of its subscriptions overnight: a seat hit its plan's session
+                # limit at 01:44, the limit reset at 02:20, nothing woke it, and it
+                # was found dead at 10:49 with a release unshipped. Nine hours. The
+                # subscriptions had not been refused, they had simply gone, and
+                # `list` showed an absence rather than a story.
+                # ⇒ Keep the record, mark it, and let `list` show it. A subscriber
+                #   that can vanish without a trace is not a safety net.
+                s["lapsed"] = True
+                s["lapsed_at"] = int(time.time())
+                s["lapsed_reason"] = (f"absent from {GONE_SIGHTINGS} consecutive row "
+                                      f"listings on host {host!r}")
+                log(f"{uuid[:8]} LAPSED — absent from {GONE_SIGHTINGS} consecutive "
+                    f"row listings; keeping the record so this is visible. "
+                    f"Re-subscribe to clear it.")
+                if not args.dry_run:
+                    update_sub(uuid, s)
                 continue
             log(f"{uuid[:8]} absent from the row list "
                 f"({s['gone_sightings']}/{GONE_SIGHTINGS}) — waiting for confirmation")
@@ -1702,8 +1878,25 @@ def tick(args):
                                     f"No boot can clear this; relay the campaign to a "
                                     f"fresh session.")
                 s["escalated"] = True
-            log(f"{uuid[:8]} CONTEXT-DEAD — unsubscribing (a boot cannot fix this)")
-            sub_path(uuid).unlink(missing_ok=True)
+            # ⛔⛔ THE THIRD SILENT-UNLINK PATH, AND IT SURVIVED THE FIX TO THE
+            # OTHER TWO. GONE and EXPIRED were both taught to lapse loudly on
+            # 2026-08-14 because a subscription that vanishes without a trace is
+            # indistinguishable from one that was never set. This one does the
+            # same thing for the same reason and was left deleting the record —
+            # the shape where one case is handled and its sibling is not, which
+            # this fleet has now paid for four times in a week.
+            # ⇒ Context exhaustion is the MOST common death here, so the path
+            #   most likely to erase the evidence was the one still doing it.
+            # ⚠ Lapse rather than retire: the SESSION is unrecoverable, but the
+            #   ROW is routinely re-claimed by a successor, and re-subscribing
+            #   clears the lapse and reports how long it went uncovered.
+            s["lapsed"] = True
+            s["lapsed_at"] = int(time.time())
+            s["lapsed_reason"] = "context exhausted and unrecoverable; escalated"
+            log(f"{uuid[:8]} LAPSED — CONTEXT-DEAD (a boot cannot fix this); "
+                f"keeping the record so this is visible. Re-subscribe to clear it.")
+            if not args.dry_run:
+                update_sub(uuid, s)
             continue
         if state == "RATE_LIMITED":
             # ⛔⛔ THE PREMISE BELOW WAS FALSE FOR 7.5 HOURS AND TOOK THE WHOLE
@@ -1724,18 +1917,25 @@ def tick(args):
             if row_process_absent(uuid):
                 log(f"{uuid[:8]} QUOTA-DEAD — no process; its quota tail is history, "
                     f"not a live refusal. Unsubscribing instead of holding the fleet.")
-                try:
-                    STATE.mkdir(parents=True, exist_ok=True)
-                    with RETIRED_LEDGER.open("a") as fh:
-                        fh.write("%s\t%s\t%s\t%s\n" % (
-                            time.strftime("%Y-%m-%dT%H:%M:%S%z"), uuid,
-                            "booter tick (auto)",
-                            "classified RATE_LIMITED with no process running as this row: "
-                            "a corpse whose last words were a quota message. Retrying it "
-                            "re-armed the fleet-wide hold on every tick."))
-                except Exception as exc:
-                    log(f"   ⚠ could not record the retirement: {exc}")
-                sub_path(uuid).unlink(missing_ok=True)
+                # ⛔ A DRY RUN MUST NOT MUTATE, and this path did both things a
+                # dry run is promised not to do: it appended to the retired
+                # ledger and deleted the subscription. Every other mutation in
+                # this tick is guarded; this one was missed, so `tick --dry-run`
+                # — the command someone reaches for precisely BECAUSE they are
+                # unsure — was the one that quietly retired rows.
+                if not args.dry_run:
+                    try:
+                        STATE.mkdir(parents=True, exist_ok=True)
+                        with RETIRED_LEDGER.open("a") as fh:
+                            fh.write("%s\t%s\t%s\t%s\n" % (
+                                time.strftime("%Y-%m-%dT%H:%M:%S%z"), uuid,
+                                "booter tick (auto)",
+                                "classified RATE_LIMITED with no process running as this row: "
+                                "a corpse whose last words were a quota message. Retrying it "
+                                "re-armed the fleet-wide hold on every tick."))
+                    except Exception as exc:
+                        log(f"   ⚠ could not record the retirement: {exc}")
+                    sub_path(uuid).unlink(missing_ok=True)
                 continue
             # A LIVE row refused on quota is the real thing: hold the FLEET, do
             # not escalate (a human cannot grant quota), and do not unsubscribe

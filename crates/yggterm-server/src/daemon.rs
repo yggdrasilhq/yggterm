@@ -3877,6 +3877,22 @@ struct DaemonRuntime {
     /// [`PROXIED_WORKING_REFRESH_MS`]; the snapshot only reads it.
     proxied_working_flags: HashMap<String, bool>,
     proxied_working_refreshed_ms: u128,
+    /// Which live sibling daemon answered a working flag for a row this daemon
+    /// does not own, learned by the chore-thread discovery pass.
+    ///
+    /// It exists because `preserved_owner_endpoint_for_request` can only name an
+    /// owner this daemon already has a RECORD of, and most dark rows are owned
+    /// by a daemon it has no record of at all — so the proxy was skipping them
+    /// entirely and no amount of better transport could widen its coverage.
+    ///
+    /// ⛔ **NOT an ownership record, and it must never be written into
+    /// `preserved_terminal_owners`.** That registry drives hot-update handover;
+    /// "answered a question about a dot" is not a claim on the terminal. This is
+    /// in-memory only, rebuilt by discovery, and discarded on restart — so the
+    /// worst a stale entry can do is cost one refused request, after which the
+    /// unreachable backoff applies.
+    discovered_working_flag_owners: HashMap<String, ServerEndpoint>,
+    discovered_working_owners_scanned_ms: u64,
     /// The shared-scope ledger order AS THIS DAEMON BOOTED — the arrangement the
     /// user left behind on the daemon we are succeeding.
     ///
@@ -4132,6 +4148,8 @@ impl DaemonRuntime {
             preserved_terminal_owners,
             row_order_ledger,
             proxied_working_flags: HashMap::new(),
+            discovered_working_flag_owners: HashMap::new(),
+            discovered_working_owners_scanned_ms: 0,
             proxied_working_refreshed_ms: 0,
             booted_with_row_order,
             live_row_tombstones,
@@ -4401,6 +4419,21 @@ impl DaemonRuntime {
         self.proxied_working_flags = proxied;
     }
 
+    /// Local screens plus whatever the last refresh learned from siblings.
+    ///
+    /// Issues no peer request, so it cannot recurse and cannot be slowed by a
+    /// hung peer — see the note at the `WorkingFlags` request arm.
+    fn working_flags_from_local_and_cache(&self) -> Vec<(String, bool)> {
+        let mut flags = self.working_flags();
+        let answered: HashSet<String> = flags.iter().map(|(path, _)| path.clone()).collect();
+        for (path, working) in &self.proxied_working_flags {
+            if !answered.contains(path) {
+                flags.push((path.clone(), *working));
+            }
+        }
+        flags
+    }
+
     fn working_flags_including_proxied(&mut self) -> Vec<(String, bool)> {
         let mut flags = self.working_flags();
         let mut answered: HashSet<String> =
@@ -4420,7 +4453,15 @@ impl DaemonRuntime {
         let mut owners: Vec<ServerEndpoint> = Vec::new();
         for path in &unanswered {
             let runtime_key = self.terminal_runtime_key_for_path(path);
-            let Some(owner) = self.preserved_owner_endpoint_for_request(&runtime_key) else {
+            // The registry first: it is authoritative and free. Then what
+            // discovery learned, which is the only answer for a row whose owner
+            // this daemon holds no record of — measured to be MOST of them, and
+            // the reason wiring the proxy into the snapshot was necessary and
+            // not sufficient.
+            let owner = self
+                .preserved_owner_endpoint_for_request(&runtime_key)
+                .or_else(|| self.discovered_working_flag_owner(path));
+            let Some(owner) = owner else {
                 continue;
             };
             let label = owner_endpoint_label(&owner);
@@ -5308,6 +5349,57 @@ impl DaemonRuntime {
             return None;
         }
         Some(endpoint)
+    }
+
+    /// A sibling that answered for this row last time discovery ran, unless it
+    /// is inside the unreachable backoff.
+    ///
+    /// Shares that backoff with the registry deliberately: a peer that just
+    /// timed out is the same peer whichever map named it, and one negative
+    /// cache is one answer to "is this endpoint worth a request right now".
+    fn discovered_working_flag_owner(&self, session_path: &str) -> Option<ServerEndpoint> {
+        let endpoint = self.discovered_working_flag_owners.get(session_path)?.clone();
+        let label = owner_endpoint_label(&endpoint);
+        if let Some(until) = self.preserved_owner_unreachable_until_ms.get(&label)
+            && (crate::app_control::current_millis() as u64) < *until
+        {
+            return None;
+        }
+        Some(endpoint)
+    }
+
+    /// Record what a discovery pass learned. Rows nobody claimed are DROPPED
+    /// rather than remembered as unowned: an absent entry retries next pass,
+    /// and a remembered "nobody" would need its own expiry to ever recover.
+    fn adopt_discovered_working_flag_owners(
+        &mut self,
+        learned: HashMap<String, ServerEndpoint>,
+        scanned_ms: u64,
+    ) {
+        self.discovered_working_flag_owners = learned;
+        self.discovered_working_owners_scanned_ms = scanned_ms;
+    }
+
+    fn discovered_working_owners_scan_due(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.discovered_working_owners_scanned_ms)
+            >= WORKING_FLAG_OWNER_DISCOVERY_INTERVAL_MS
+    }
+
+    /// The live sibling daemons on this host: every listening versioned server
+    /// socket in this daemon's own home, minus itself.
+    ///
+    /// ⛔ Deliberately NOT a `status` probe per socket. That is the gate measured
+    /// to hang 16 live daemons at once, and the census answers the same question
+    /// from one `/proc/net/unix` read with no request at all. An INCOMPLETE
+    /// census yields nothing rather than a short list — "I could not look" must
+    /// never read as "nothing is alive".
+    fn live_sibling_endpoints(&self) -> Vec<ServerEndpoint> {
+        let home = self.store.home_dir();
+        let census = crate::socket_sweep::LiveDaemonCensus::gather(home);
+        if !census.is_complete() {
+            return Vec::new();
+        }
+        sibling_endpoints_from_census(census.listening_paths(), &default_endpoint(home))
     }
 
     fn mark_preserved_owner_unreachable(&mut self, owner_endpoint: &ServerEndpoint) {
@@ -8098,8 +8190,22 @@ impl DaemonRuntime {
         let response = match request {
             ServerRequest::Ping => ServerResponse::Pong,
             ServerRequest::Status => ServerResponse::Status(self.status()),
+            // ⛔ ANSWERED FROM THE CACHE, AND THAT IS WHAT MAKES THE FAN-OUT
+            // SAFE TO WIDEN. This request is served by the very path that
+            // proxies it, so a daemon that asks a sibling here would be asking
+            // something that asks back — and once discovery lets two daemons
+            // find each other, that is an unbounded mutual recursion, one
+            // request timeout per hop. It is invisible today only because
+            // proxying landed 2026-08-13 and exactly one daemon on the GUI host
+            // is new enough to do it; it would arrive with the fleet upgrade.
+            //
+            // Making the SERVE a pure read cuts it by construction, with no wire
+            // change and nothing for an older daemon to fail to understand.
+            // Fan-out now happens on exactly ONE path — the refresh below, which
+            // the snapshot drives — so the GUI's own poll still gets proxied
+            // answers, from a cache at most `PROXIED_WORKING_REFRESH_MS` old.
             ServerRequest::WorkingFlags => ServerResponse::WorkingFlags {
-                flags: self.working_flags_including_proxied(),
+                flags: self.working_flags_from_local_and_cache(),
             },
             ServerRequest::Snapshot => {
                 // The dot's answer for rows an older coexisting daemon owns.
@@ -12400,6 +12506,150 @@ pub fn working_flags(endpoint: &ServerEndpoint) -> Result<Vec<(String, bool)>> {
 /// an owner left empty, and queue preserved-owner registry removals for the
 /// request loop to apply. Talks ONLY to other daemons' sockets + the trace
 /// file — never to this daemon's in-memory state.
+/// Which listening sockets are OTHER daemons worth asking — pure and total, so
+/// the selection can be tested without a running fleet.
+///
+/// Three rules, and each one has a way of going wrong that costs something:
+/// a name that is not a versioned server socket is not a daemon (the home holds
+/// other sockets); this daemon's own address must be dropped or it interrogates
+/// itself under its own lock; and the result is SORTED, because the census is a
+/// set and the first sibling to claim a row is the one recorded — unordered,
+/// that record would be a coin toss between passes.
+#[cfg(unix)]
+fn sibling_endpoints_from_census(
+    listening: &HashSet<PathBuf>,
+    own: &ServerEndpoint,
+) -> Vec<ServerEndpoint> {
+    let mut endpoints: Vec<ServerEndpoint> = Vec::new();
+    for path in listening {
+        if parse_versioned_server_socket_name(path).is_none() {
+            continue;
+        }
+        let endpoint = ServerEndpoint::UnixSocket(path.clone());
+        if server_endpoints_same_target(&endpoint, own) {
+            continue;
+        }
+        let label = owner_endpoint_label(&endpoint);
+        if endpoints
+            .iter()
+            .any(|seen| owner_endpoint_label(seen) == label)
+        {
+            continue;
+        }
+        endpoints.push(endpoint);
+    }
+    endpoints.sort_by_key(owner_endpoint_label);
+    endpoints
+}
+
+/// How often to re-learn which sibling owns a row this daemon cannot answer for.
+///
+/// Ownership changes only when a session is taken or lost, so this is rare work
+/// deliberately kept off the 1.5 s dot cadence. Once a row's owner is learned the
+/// refresh reaches it directly at that faster cadence — discovery is what makes
+/// the row reachable, not what keeps its flag fresh.
+const WORKING_FLAG_OWNER_DISCOVERY_INTERVAL_MS: u64 = 30_000;
+
+/// Learn which live sibling daemon owns each row this daemon holds no
+/// preserved-owner record for (background chore thread).
+///
+/// **The gap this closes.** `working_flags_including_proxied` asks
+/// `preserved_owner_endpoint_for_request`, which can only name an owner already
+/// in the registry — and measured on the GUI host at 3.0.135, 21 of 31 seated
+/// rows still reported `working: None` because their owner was not in it. Wiring
+/// the proxy into the snapshot was necessary and could never be sufficient: it
+/// improved the transport, and the coverage was the problem.
+///
+/// **Why a chore and not the request path.** `WorkingFlags` takes the default
+/// client IO timeout, so a single hung peer would stall a refresh that runs
+/// every 1.5 s. This follows `run_preserved_owner_revalidation_if_due`, the
+/// precedent in this file for exactly that, and obeys the same rule: it talks
+/// ONLY to other daemons' sockets and the trace file, never to this daemon's
+/// in-memory state while the I/O is in flight.
+///
+/// ⛔ It records a DOT answer, not an ownership claim — see
+/// `discovered_working_flag_owners`.
+#[cfg(unix)]
+fn run_working_flag_owner_discovery_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) {
+    let now_ms = current_millis_u64();
+    let (wanted, endpoints, home_dir) = {
+        let Ok(mut runtime) = runtime.lock() else {
+            return;
+        };
+        if !runtime.discovered_working_owners_scan_due(now_ms) {
+            return;
+        }
+        // Claim the window BEFORE the I/O, so a pass that outruns the interval
+        // cannot be entered a second time on the next tick.
+        runtime.discovered_working_owners_scanned_ms = now_ms;
+        let answered: HashSet<String> = runtime
+            .working_flags()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        let wanted: HashSet<String> = runtime
+            .server
+            .live_sessions()
+            .iter()
+            .map(|session| session.session_path.clone())
+            .filter(|path| !answered.contains(path))
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        (
+            wanted,
+            runtime.live_sibling_endpoints(),
+            runtime.store.home_dir().to_path_buf(),
+        )
+    };
+    if endpoints.is_empty() {
+        return;
+    }
+
+    let mut learned: HashMap<String, ServerEndpoint> = HashMap::new();
+    let mut unreachable: Vec<ServerEndpoint> = Vec::new();
+    for endpoint in &endpoints {
+        match working_flags(endpoint) {
+            Ok(flags) => {
+                for (path, _) in flags {
+                    // Only rows we could not answer for ourselves, and the first
+                    // sibling to claim one keeps it — `live_sibling_endpoints`
+                    // is sorted so "first" is the same across passes.
+                    if wanted.contains(&path) {
+                        learned.entry(path).or_insert_with(|| endpoint.clone());
+                    }
+                }
+            }
+            Err(_) => unreachable.push(endpoint.clone()),
+        }
+    }
+
+    let Ok(mut runtime) = runtime.lock() else {
+        return;
+    };
+    let learned_count = learned.len();
+    runtime.adopt_discovered_working_flag_owners(learned, now_ms);
+    for endpoint in &unreachable {
+        runtime.mark_preserved_owner_unreachable(endpoint);
+    }
+    // ⛔ The counts are traced rather than capped. A host with far more live
+    // daemons than the five measured here has a drain problem, and silently
+    // asking a subset would hide it while still reporting a healthy dot.
+    append_trace_event(
+        &home_dir,
+        "daemon",
+        "working_flags",
+        "owner_discovery",
+        serde_json::json!({
+            "siblings_asked": endpoints.len(),
+            "siblings_unreachable": unreachable.len(),
+            "rows_wanted": wanted.len(),
+            "rows_learned": learned_count,
+        }),
+    );
+}
+
 const PRESERVED_OWNER_REVALIDATE_INTERVAL_MS: u64 = 5 * 60_000;
 static PRESERVED_OWNER_LAST_REVALIDATE_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -17662,6 +17912,10 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 run_preserved_owner_revalidation_if_due(&runtime);
+                // Rides this EXISTING tick for the same reason the reap below
+                // does: a timer of its own would be a standing idle cost, and
+                // this pass is a no-op on any daemon that owns all its rows.
+                run_working_flag_owner_discovery_if_due(&runtime);
                 // Pre-declared ephemerality (docs/pending-bugs.md, the immortal
                 // tenant class): rides this EXISTING tick rather than adding a
                 // timer, so an installation where nothing is ever declared
@@ -20317,6 +20571,8 @@ mod tests {
         hot_restart_deadline_verdict, hot_update_handoff_would_refuse_binary, role_gate,
     };
     use crate::live_row_tombstones::LiveRowTombstones;
+    #[cfg(unix)]
+    use super::{ServerEndpoint, owner_endpoint_label, sibling_endpoints_from_census};
 
     /// The live case, fed to the guard exactly as it occurred: GUI 3.0.96
     /// promising itself as the handoff target while
@@ -20820,6 +21076,140 @@ mod tests {
         assert!(
             !pass.contains("std::thread::spawn") && !pass.contains("sleep"),
             "the pass must do its work on the caller's tick, not start anything"
+        );
+    }
+
+    /// ⛔⛔ THE SERVED REQUEST MUST NOT ASK A PEER.
+    ///
+    /// `WorkingFlags` is served by the same code that PROXIES it, so the moment
+    /// two daemons can discover each other, each ask makes the other ask back —
+    /// an unbounded mutual recursion at one client IO timeout per hop. It is
+    /// invisible today only because proxying landed 2026-08-13 and one daemon on
+    /// the GUI host is new enough to do it; the fleet upgrade is what would
+    /// deliver it.
+    ///
+    /// Cutting it in the SERVE rather than on the wire is what keeps every older
+    /// daemon reachable — and they are the ones that own the dark rows, so a
+    /// protocol change here would have missed the whole point.
+    #[test]
+    fn the_served_working_flags_request_issues_no_peer_request() {
+        let source = daemon_product_source();
+        let arm = source
+            .as_str()
+            .split("ServerRequest::WorkingFlags => ServerResponse::WorkingFlags {")
+            .nth(1)
+            .expect("the WorkingFlags request arm")
+            .split("},")
+            .next()
+            .expect("the body of that arm");
+        assert!(
+            arm.contains("working_flags_from_local_and_cache"),
+            "the served request must answer from local screens plus the cache; \
+             arm was: {arm}"
+        );
+        assert!(
+            !arm.contains("working_flags_including_proxied"),
+            "the served request fans out again — two discovering daemons will \
+             now ask each other without bound. Arm was: {arm}"
+        );
+    }
+
+    /// Discovery rides the EXISTING chore tick, for the reason the ephemeral
+    /// reap does, plus one of its own: a peer that hangs must never be able to
+    /// stall the 1.5 s refresh the dot is drawn from.
+    #[test]
+    fn working_flag_owner_discovery_rides_the_chore_tick_and_never_the_request_loop() {
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let chore = source
+            .split("run_preserved_owner_revalidation_if_due(&runtime);")
+            .nth(1)
+            .expect("the chore tick that already exists")
+            .split("match run_background_copy_chore(")
+            .next()
+            .expect("the end of that tick's preamble");
+        assert!(
+            chore.contains("run_working_flag_owner_discovery_if_due(&runtime)"),
+            "discovery must be CALLED from the existing chore tick, or no row \
+             whose owner is unknown is ever asked about"
+        );
+        let call_sites = source
+            .matches("run_working_flag_owner_discovery_if_due(&runtime)")
+            .count();
+        assert_eq!(
+            call_sites, 1,
+            "one caller only — a second scheduler for this is a second policy"
+        );
+        // ⚠ NOT `daemon_fn_body`: it terminates on the next 4-space-indented
+        // `fn`, which is a METHOD. This is a free function, so that helper reads
+        // straight past its end and into code that legitimately sleeps and
+        // spawns — the assertions below would then be about the wrong bytes and
+        // would fail for a reason that has nothing to do with this pass.
+        let pass = source
+            .split("fn run_working_flag_owner_discovery_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) {")
+            .nth(1)
+            .expect("the discovery pass is gone; the lock over it is stale")
+            .split("\nconst ")
+            .next()
+            .expect("the end of the pass")
+            .split("\nfn ")
+            .next()
+            .expect("the end of the pass");
+        assert!(
+            !pass.contains("std::thread::spawn") && !pass.contains("sleep"),
+            "the pass must do its work on the caller's tick, not start anything"
+        );
+        // ⛔ `status` is the gate measured to hang 16 live daemons at once. The
+        // census answers the same question from one /proc/net/unix read.
+        assert!(
+            !pass.contains("ServerRequest::Status") && !pass.contains("status("),
+            "discovery must not probe peers with `status`; the socket census is \
+             the cheap positive proof of liveness"
+        );
+    }
+
+    /// Self is dropped, non-daemon sockets are ignored, and the order is stable.
+    ///
+    /// ⚠ The self case is the one that bites: this runs on the chore thread
+    /// while the request loop may hold the runtime lock, so a daemon that asked
+    /// its own socket would be waiting on itself.
+    #[cfg(unix)]
+    #[test]
+    fn sibling_endpoints_from_census_drops_self_and_anything_that_is_not_a_daemon() {
+        use std::path::PathBuf;
+        let own = ServerEndpoint::UnixSocket(PathBuf::from("/h/.yggterm/server-3-0-9.sock"));
+        let listening: std::collections::HashSet<PathBuf> = [
+            "/h/.yggterm/server-3-0-9.sock",  // self
+            "/h/.yggterm/server-3-0-70.sock", // sibling
+            "/h/.yggterm/server-2-10-2.sock", // sibling, older
+            "/h/.yggterm/app-control.sock",   // not a daemon
+            "/h/.yggterm/server-nope.sock",   // unparseable version
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+
+        let siblings = sibling_endpoints_from_census(&listening, &own);
+        let labels: Vec<String> = siblings.iter().map(owner_endpoint_label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                owner_endpoint_label(&ServerEndpoint::UnixSocket(PathBuf::from(
+                    "/h/.yggterm/server-2-10-2.sock"
+                ))),
+                owner_endpoint_label(&ServerEndpoint::UnixSocket(PathBuf::from(
+                    "/h/.yggterm/server-3-0-70.sock"
+                ))),
+            ],
+            "exactly the two sibling daemons, self excluded, sorted"
+        );
+
+        // A set has no order of its own; the same input must produce the same
+        // list twice, or "the first sibling to claim a row" is a coin toss.
+        assert_eq!(
+            siblings,
+            sibling_endpoints_from_census(&listening, &own),
+            "the selection must be stable across passes"
         );
     }
 
