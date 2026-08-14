@@ -739,11 +739,26 @@ def cmd_subscribe(args):
         log(f"⚠ {uuid} does not resolve to a live row on {args.host} — "
             f"subscribing anyway; the first tick will retire it if it stays gone")
         row = args.row or uuid
+    # ⛔ A RE-SUBSCRIBE MUST NOT ERASE WHAT IT DOES NOT MENTION. This record was
+    #    rebuilt from scratch every time, so `subscribe --campaign X` on an
+    #    existing subscriber wrote `note: None` and silently blanked a note the
+    #    caller never referred to. Measured on a sibling campaign: four
+    #    subscriptions lost their notes while someone was fixing something else.
+    #    ⚠ It bites hardest because the note is normally set FOR you —
+    #    `ygg-claim.sh` rejects a `--note` flag while passing one internally — so
+    #    the only way most callers ever touch it is by destroying it.
+    #    ⇒ Carry forward any field the caller left unspecified. `boots` and
+    #    `subscribed_at` still reset by design: re-subscribing is a fresh watch.
+    prior = {}
+    try:
+        prior = json.loads(sub_path(uuid).read_text())
+    except Exception:
+        prior = {}
     rec = {
         "uuid": uuid,
         "row": row,
-        "campaign": args.campaign,
-        "note": args.note,
+        "campaign": args.campaign or prior.get("campaign"),
+        "note": args.note or prior.get("note"),
         "host": args.host,
         "subscribed_at": time.time(),
         "max_hours": args.max_hours,

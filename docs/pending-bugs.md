@@ -11291,6 +11291,25 @@ become tooling.** The named dreams, each with a measured cost from that night:
 (a monitor stayed silent through the state that mattered) · an honest `reap` ·
 binary/daemon resolution that never fails silently.
 
+
+### ⛔ A SIXTH, MEASURED 2026-08-14: `server app session remove` CANNOT REPORT FAILURE
+
+Against the fiction `local://deadbeef-dead-4bee-8dad-deadbeefdead` — a path that has
+never existed — it answers:
+
+```
+row_still_listed: false   verified: true   error: null
+```
+
+**Removing nothing trivially satisfies "not listed".** The verb confirms its own
+postcondition without ever checking that it acted, so *success* and *there was nothing
+there* are the same answer.
+
+⚠ **It has already cost a real reap:** a row was removed using a uuid whose suffix had
+been fabricated from an 8-character display prefix; the call answered `verified: true`
+and the row was still on screen. ⇒ **Confirm a reap by re-reading `server app rows`,
+never by this verb's own answer** — and resolve a full uuid from the artefact
+(`ls ~/.claude/projects/*/<prefix>*.jsonl`) rather than composing one from a listing.
 ## ⚠ AN EXPLICIT TITLE CAN STILL BE OVERWRITTEN ON A ROW WHOSE AGENT HAS EXITED
 
 **Status:** OPEN
