@@ -87,54 +87,68 @@ different one in `outline_prefix`, so it renders with two numbers. That is the
 already-documented double-numbering trap and is cosmetic here, but it is why the
 row reads as more broken than it is.
 
-## ⚠ [6.2] `server app close` MAY NOT RUN THE GRACEFUL CLOSE PATH AT ALL
+## ⛔⛔ [6.2] THE GUI CLOSE PATH NEVER RUNS, SO THE "DIES WITH THE GUI" TIER IS VESTIGIAL
 
-**Status:** OPEN
+**Status:** AWAITING A DECISION
 
-*Split out 2026-08-14 from a wider entry whose main question has since been
-answered — see the note at the bottom, because the answer changes what this one
-is worth.*
+**Who decides:** the owner, or 6.0 on his behalf. Repairing this would START
+destroying rows that survive today — see "why this is a decision" below.
 
-`PrepareClientClose` is the only path that closes a non-keep-alive row, and the
-GUI sends it from `maybe_shutdown_daemon_for_last_client`. Every step traces:
-`keep_alive_flush_before_close`, then `shutdown_check` / `shutdown_suppressed` /
-`shutdown_unintentional`, then `client_close_prepared`.
+*Measured 2026-08-14 on the desktop host, read-only, plus a private sandbox.*
 
-**In a private sandbox, two different closes started the path and died inside
-it.** Both `swaymsg kill` on the toplevel and `server app close` left the GUI
-process gone with `keep_alive_flush_before_close` written, **no `shutdown_check`
-and no `client_close_prepared`**, the client-instance file still on disk, and a
-non-keep-alive row still alive. The reap only ran when
-`{"kind":"prepare_client_close"}` was written to the daemon socket by hand.
+**Nine GUI launches in the retained traces (`register` × 9). Zero events from any
+step of the shutdown path.** Not one of:
 
-**On the desktop host, across all 16 retained trace files: zero
-`client_close_prepared`, zero `shutdown_check`, zero
-`keep_alive_flush_before_close`.** The only close-shaped names present are
-`native_close` (web surfaces) and `explicit_remote_session_close_requested`.
+`keep_alive_flush_before_close` · `force_exit_after_close_timeout` ·
+`shutdown_check` · `shutdown_suppressed` · `shutdown_unintentional` ·
+`client_close_prepared` · `client_close_preserved_for_update`
 
-⇒ **`server app close` may not be a faithful stand-in for a user closing the
-window, and several lanes use it as one.** A lane that closes the GUI to prove a
-row went away is proving something else.
+⇒ **`PrepareClientClose` — the only thing that closes a non-keep-alive row — has
+not been sent once in the retained window.** The tier documented as "second-class
+rows die with the GUI" does not, in practice, die with the GUI. It is not being
+enforced at all.
 
-### Falsifier / where to start
+A sandbox reproduces it from the other side: both a toplevel kill and
+`server app close` left the GUI gone with the flush written and **nothing after
+it**, the client-instance file still on disk, and a non-keep-alive row still
+alive. The reap only ran when `{"kind":"prepare_client_close"}` was written to the
+daemon socket by hand.
 
-- ⚠ **The absence is bounded by RETENTION, not by history.** Traces rotate per
-  GUI launch and 16 files are kept, so this says "not in the retained window",
-  never "never". Settle it by closing a GUI deliberately and reading the trace
-  back.
-- `spawn_close_force_exit_watchdog` force-exits the process after a timeout and
-  is the obvious suspect for a path that starts and does not finish.
+### Mechanism — a hypothesis with a named falsifier, not a conclusion
 
-### ⭐ WHAT THIS ENTRY NO LONGER CLAIMS
+`finalize_client_shutdown` is called from exactly two places: **after
+`dioxus::LaunchBuilder::launch(app)` returns**, and from the 2.5 s
+`spawn_close_force_exit_watchdog`. On Linux the winit/tao event loop is
+documented as diverging — `run` never returns — which would make the first
+callsite dead code and leave the watchdog as the only sender. And the watchdog
+never fired either, so the process is going away inside 2.5 s by a route that
+runs neither.
 
-It was opened asking whether the close path running or not explained the app
-rows the owner lost. **It does not, and the actual cause is now known: they were
-never closed.** The persist filter dropped them from the state file at an
-update-restart, so the successor daemon never learned they existed — four local
-rows in one persist, two of them named in the trace as the rows he reported
-losing. That is fixed (born keep-alive skips the drop gate) and now leaves a
-`persist-dropped` record. **What remains here is only the instrument question**:
-whether a verb named `close` performs a close. Worth settling, no longer urgent.
+- **Falsify by**: closing a GUI deliberately and reading the trace back. One
+  event from that list disproves the whole entry.
+- ⚠ **Bounded by RETENTION, not by history** — traces rotate per GUI launch and
+  16 files are kept. This says "not in the retained window", never "never".
+- ⚠ Note `finalize_client_shutdown` also `swap(false)`s the intentional-shutdown
+  flag, so whichever caller runs first CONSUMES it and a second caller silently
+  takes the `shutdown_unintentional` arm. That matters once either callsite
+  starts working.
+
+### ⚖ Why this is a DECISION and not a fix to take
+
+**Repairing the close path would newly destroy rows that survive today.** Every
+non-keep-alive row on the machine is currently outliving GUI closes it was
+designed to die with; making the path work would start reaping them, on a fleet
+whose users have had the opposite behaviour for an unknown period.
+
+⇒ It also cuts the other way, and this is the part worth the owner's attention:
+**`spec-app-row-survival.md` §5's warning that a GUI kill is destructive to app
+rows appears to be false in practice** — nothing is reaping them. The rows lost
+on 2026-08-13 were taken by the persist filter, not by a close.
+
+**Recommendation (6.2):** do NOT repair the close path. Retire the tier instead —
+if no row has died with the GUI in the retained history, the tier is a promise the
+product has not been keeping, and honouring it now is a regression wearing a
+bugfix. Confirm the mechanism first with the falsifier above.
 
 ## ⛔⛔ [6.1] THE SUCCESSOR RETIRES AND THE PREDECESSOR KEEPS THE SESSION — THE DRAIN INVERTS
 
@@ -3441,6 +3455,54 @@ healthy widgets is not.
 **Falsifier:** a surface declared from a shell on another machine either shows
 that machine's open documents, or names the endpoint it failed to reach.
 
+### ⛔⛔ THE STATED CAUSE WAS ALREADY HANDLED NINETEEN DAYS BEFORE THIS WAS
+### MEASURED — so the diagnosis above is wrong a second time
+
+*added 2026-08-14 by the lane that root-caused the document body. Not closed —
+sharpened. ⚠ Read this before spending a session on "the declare should carry a
+host", which is the fix this entry currently implies and which would be building
+a second mechanism beside a working one.*
+
+**A forward already exists, and its own comment names this exact problem.**
+`resolve_control_endpoint_url` is called on every declare that CREATES a
+contribution, and it does the right thing:
+
+```rust
+// The GUI fetches this endpoint over a plain socket, so a remote
+// loopback needs an `ssh -L` forward — NOT the webview's SOCKS proxy.
+```
+
+⇒ It rewrites `http://127.0.0.1:<remote-port>` to `http://127.0.0.1:<local-port>`
+over an `ssh -L` child. **It landed 2026-07-25; this defect was measured
+2026-08-13.** The mechanism was in the binary the whole time the surface rendered
+empty, so **"the declare carries a loopback with no host" cannot be the cause** —
+something is skipping the forward, not missing it.
+
+**Where to look, and it is one line:**
+
+```rust
+let Some(target) = ssh_target.filter(|t| !ssh_target_host_is_loopback(t)) else {
+    return (url.to_string(), None);          // ⇐ no forward, silently
+};
+```
+
+⇒ **With `ssh_target: None` the forward is skipped and the declared loopback is
+kept verbatim** — which produces precisely the reported state: the GUI resolves
+`127.0.0.1:<remote-port>` on its own machine, finds nothing, and renders a
+healthy empty surface. The question this entry should be asking is **why
+`ssh_target` was `None` for that row**, not why the declare had no host in it.
+
+**Falsifier, replacing the one above:** reproduce the empty surface and read the
+declare's own trace — `ui/sidebar_contribution/declare` carries `control`, and
+the resolution logs `forwarded`. `forwarded: false` on a row whose PTY is on
+another machine is the defect, and it localises it to the caller that supplies
+`ssh_target` rather than to the app, the declare format or the GUI's fetch.
+
+⚠ **Not re-measured live.** This is a code fact plus a date, which is enough to
+retire the wrong direction and not enough to close the entry. ⛔ Whoever takes it
+must still run the falsifier — see the sibling entry closed the same day, where
+two published attributions were both overturned by one A/B.
+
 ## ⛔ [6.3] ychrome's VAULT AND SETTINGS RAILS SAY "Loading…" FOREVER
 
 **Status:** OPEN
@@ -3765,63 +3827,6 @@ screen last looked like**.
 ⇒ The thumbnail is the point: it is what makes the surface lively rather than a
 list of hostnames, and it answers "which machine was I on" the way the eye
 answers it.
-
-## ⛔⛔ [6.5] A DOCUMENT SURFACE'S BODY DOES NOT PAINT, AND ITS CONTRACT SAYS TWO DIFFERENT THINGS
-
-**Status:** OPEN
-
-*measured 2026-08-13 on a real GUI (an isolated sandbox, not the owner's)*
-
-Reported symptom: an app's viewport pane renders its top bar and leaves the body
-blank, while every telemetry field reads healthy — `has_schema: true`,
-`stale: false`, `error: null`. Two lanes have now spent time on it. It has been
-attributed to the read-only shadow client; **it is not the shadow.**
-
-**Half of it is a contract that disagrees with itself, and that half is
-actionable now.** yggterm's own deserialiser says:
-
-> Chrome widgets (tabs, buttons, toggles, labels) form a top bar; `markdown` and
-> multiline `text-input` widgets are the scrolling body.
-
-`.agents/skills/libyggterm-surfaces/SKILL.md` says multiline `text-input` **and
-`list-row`** "render at document scale". ⇒ **`list-row` is chrome in a viewport
-pane.** An app that believes the prose declares a list of rows as its document
-body, gets a blank page, and has no way to find out why — nothing failed. The
-host is the SSOT; the prose is wrong and should be corrected.
-
-**The other half is a real defect and is NOT explained by the above.** With the
-rows replaced by a `markdown` widget the body is *still* blank:
-
-| what was checked | result |
-|---|---|
-| the schema actually served | `markdown` widget, `id` + `source`, **928 chars** of real content over HTTP |
-| the same schema in the RAIL, same app, same minute | renders **completely** — cards, sections, status dots, rows, tabs, search box, footer |
-| the field names | `section.text`, `tabs.active`, `markdown.source` — all matched against the host's enum |
-| "the refetch is racing the re-stamp" | **falsified** — same blank with the app re-stamping every 120 s |
-
-⇒ The same-app rail control is what separates this from an app bug: the schema
-is good, and the viewport placement is not painting a widget it says it paints.
-
-⛔ **NOT the lost-edit-batch class — checked 2026-08-14, and the check is now one
-field.** The [6.3] entry root-causes a different "renders nothing while state
-reports it correctly": a webview edit batch that throws is acked as applied, so
-the host never re-sends it and that subtree freezes for the life of the process.
-**Two of this entry's own measurements rule it out.** A frozen subtree is frozen
-because ITS mutations were lost — it cannot render the identical schema
-completely in the rail in the same minute; and the class requires a fault to have
-already happened, whereas this reproduces on demand. ⇒ **Read
-`webview_edit_faults` in `server app state` when you next reproduce it.** Zero
-confirms this is a real render-path defect in the viewport placement, and closes
-the question for good; non-zero would mean the opposite and this entry folds into
-[6.3]. ⚠ Stated as reasoning plus an instrument, NOT as a run: 6.3 has the
-fault-injection harness but no way to declare a document surface, which needs
-this lane's app.
-
-⚠ **Falsifier, not yet run:** drive the shipped pilot editor through the
-identical path in the same sandbox and confirm ITS markdown body paints. That
-attempt stalled on the editor's own daemon (`Loading…` in the rail, control
-endpoint never answered) and was not retried. If its body is blank too, this is
-the document-surface body path for every app, not one widget.
 
 ## ⚠ [6.5] THE APP SCAFFOLDING HAS THREE HAND-COPIES AND ONE OF THEM FAILED SILENTLY
 
