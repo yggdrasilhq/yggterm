@@ -80996,16 +80996,12 @@ fn remove_stale_client_instance_record(
 fn cleanup_stale_client_instances(dir: &Path, keep_path: Option<&Path>) -> Result<Vec<PathBuf>> {
     fs::create_dir_all(dir)?;
     let mut active = Vec::new();
-    let entries = fs::read_dir(dir)
-        .with_context(|| format!("reading client instances dir {}", dir.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        // The atomic-write staging dir (and anything else that is not a
-        // plain file) is never a record.
-        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
-            continue;
-        }
+    // ⛔ ONE TRAVERSAL, shared with the server's reader. This side knew to skip
+    //    the atomic-write staging dir and the other side did not, and the drift
+    //    was invisible because each copy looked right on its own: there, an
+    //    `EISDIR` from that same directory failed the whole enumeration, which
+    //    the retire gate reads as "I could not ask, do not retire".
+    for path in yggterm_server::client_instance_record_paths(dir)? {
         if keep_path.is_some_and(|keep| keep == path.as_path()) {
             active.push(path);
             continue;

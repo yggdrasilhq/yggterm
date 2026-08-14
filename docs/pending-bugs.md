@@ -279,6 +279,33 @@ about what an unreadable directory means and the careless half wins.
 That one cannot happen today; this one can. Both come from the same `Result` being
 vestigial.
 
+### ⛔⛔ AND ONCE THE FIX LANDED, THE INVERSE BECAME REACHABLE — AND IT DID FIRE
+
+**2026-08-14, routed from the sidebar lane.** Making the error travel is right,
+and it turns any PERMANENT read failure into a permanent refusal to retire. There
+was one: `<scope>/tmp` is the atomic-write staging directory, sitting among the
+records. The shell's cleanup pass skipped non-files; this reader did not, so
+`fs::read` hit a directory, got **`EISDIR`**, and the whole enumeration failed —
+measured killing every `server app` verb on two fresh homes until the directory
+was removed by hand. ⇒ **A daemon whose staging dir existed at sampling time
+could never retire**: not a wrong answer once, a silent permanent block on the
+drain's own gate, which is precisely the non-converging gate the constitution
+forbids.
+
+✅ **Fixed with the durable form rather than the one-line skip:** a single
+`client_instance_record_paths` traversal that both crates call, because a second
+encoding of *how do I enumerate this directory* is what let the two drift while
+each looked correct alone. It skips only what it can PROVE is not a file — an
+entry whose `file_type()` is unreadable is kept, so the caller's fail-closed
+semantics still decide. Falsified: removing the skip reproduces
+`Is a directory (os error 21)` in the new test.
+
+⭐ **The shape, third instance this week and worth the name:** one function
+handles a case and its sibling does not — an unreachable owner pruned by one and
+skipped by the other, an identifier compared by the reporter but not the router,
+and now a directory skipped by the cleaner and read by the reader. **The cost is
+never in the function you are looking at.**
+
 **Fix:** let the callee distinguish *absent* (legitimately no clients ⇒ `Ok`) from
 *unreadable* (⇒ `Err`), so the caller's existing caution becomes reachable.
 
