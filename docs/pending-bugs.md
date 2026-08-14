@@ -47,6 +47,44 @@ killed, so a sweep on the happy path would miss exactly the runs that leak.
 needs its own `rmSync(tmpDir)`, which is a change in `@avikalpa/codex-litellm`,
 not here. Until then the sweep is what bounds it.
 
+### ⛔⛔ IT ALSO LEAKS AS **root**, WHERE OUR MITIGATION DOES NOT REACH — AND THE WATCH COULD NOT SEE IT
+
+*2026-08-14 16:35. This is the half that was missed, and the reason it was missed
+is worth more than the megabytes.*
+
+**14 staging directories, 1,079 MB, owned by `root`**, oldest 2026-08-02 and
+**newest the same day at 15:15**, with zero open file descriptors. So the leak is
+still live, and the `TMPDIR` redirect above only covers the invocations that run
+as us.
+
+⛔ **The watch reported 269 MB while the true figure was 1,323 MB.** Not because
+the pattern missed them — it matched `codex-litellm-*` exactly — but because
+`du` running as an unprivileged user **descends into an unreadable directory,
+fails, and contributes ZERO** without an error. ⇒ **The instrument named the right
+files and called them empty.** That is a worse failure than not finding them,
+because a small number reads as safety. Compare: `du -sm /tmp` as us = 322 MB,
+`sudo du -sm /tmp` = 1,323 MB, same instant.
+
+**Fixed in `scripts/ygg-resource-panic.sh`**, and proven with a control rather
+than assumed: it now prefers `sudo -n du`, and where passwordless sudo is
+unavailable it counts the entries it cannot read and panics with
+*"…MB is a FLOOR, not a measurement"* instead of reporting a clean number. A
+30 MB root-owned directory the caller cannot read moved the reading 191 → 221 MB;
+before the change it moved it by nothing.
+
+⭐ **AND THE RECLAIM SHOWS WHERE tmpfs BYTES ACTUALLY LIVE, which corrects the
+entry's own shorthand.** Deleting the 1,079 MB took `/tmp` from 1,331 → 252 MB
+and **swap from 6,261 → 5,182 MB, while available RAM did not move**. Cold tmpfs
+pages get paged out, so they sit in **swap** — and tmpfs pages can be swapped but
+never dropped, so the kernel can never reclaim them however hard it tries. ⇒ *"a
+tmpfs is RAM"* is the right instinct but the wrong mechanism: **stale tmpfs
+content becomes permanent swap occupancy**, which is exactly the 6 GB swap alarm
+this watch kept firing on and could not explain.
+
+Same fix also clamps `ygg_cores`, which could go **negative** (observed
+`-.06 cores`) when a matched process exits between the two samples and takes its
+ticks out of the second reading — a rate that can never trip its own threshold.
+
 ⭐ **The general rule, because `/tmp` is not free anywhere on this fleet:** a
 tmpfs is RAM wearing a filesystem's clothes. Never stage a large download, a
 screenshot loop, or any recurring artefact there. `scripts/usability-check.sh`
