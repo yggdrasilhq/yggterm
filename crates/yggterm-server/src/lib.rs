@@ -43716,9 +43716,19 @@ terminal_window_id: None,
         {
             let source = std::fs::read_to_string(apps.join(file))
                 .unwrap_or_else(|error| panic!("read {file}: {error}"));
+            // ⭐ UPDATED 2026-08-14, AND IT IS A STRENGTHENING, NOT A RELAXATION.
+            // This used to require the call in EACH binary, which was the best
+            // available shape while `server app` was dispatched twice. The
+            // dispatcher now lives once in `app_control_cli.rs`, so a binary
+            // that still called this would be the second copy coming back. The
+            // invariant is asserted at its new single home below; what stays
+            // per-binary are the clobber checks, which is what a binary could
+            // still grow on its own.
             assert!(
-                source.contains("apply_app_control_target_overrides(&args)"),
-                "{file} no longer routes `server app` targeting through the one owner"
+                !source.contains("fn print_server_app_help"),
+                "{file} grew its own `server app` help back — that is the second \
+                 dispatcher returning, and the two copies drifted by six verbs \
+                 the last time this happened"
             );
             assert_eq!(
                 source
@@ -43737,6 +43747,24 @@ terminal_window_id: None,
                  set-and-clear in main.rs)"
             );
         }
+
+        // The one owner, at the one place that now dispatches for both binaries.
+        let dispatcher = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/app_control_cli.rs");
+        let source = std::fs::read_to_string(&dispatcher)
+            .unwrap_or_else(|error| panic!("read app_control_cli.rs: {error}"));
+        assert!(
+            source.contains("apply_app_control_target_overrides(&args)"),
+            "the shared `server app` dispatcher no longer routes targeting \
+             through the one owner"
+        );
+        assert_eq!(
+            source
+                .matches("apply_app_control_target_overrides(&args)")
+                .count(),
+            1,
+            "targeting is applied more than once in the shared dispatcher"
+        );
     }
 
     #[test]
