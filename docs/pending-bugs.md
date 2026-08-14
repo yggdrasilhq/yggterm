@@ -5299,12 +5299,38 @@ kernel against committed memory instead of by WebKit against residency.
 frugality, and a hard cap on a browser engine turns a memory spike into a dead
 web surface.
 
-⚠ **NOT YET IMPLEMENTED, and deliberately so.** The change is in the LAUNCH path,
-whose failure mode is *the GUI does not start* — and it cannot be verified
-without relaunching the GUI, which is an owner gate. ⛔ Shipping an unverifiable
-launcher change is the one move here with a worse downside than the bug: the bug
-costs memory, a bad launcher costs the whole app. Land it behind a default-off
-switch and turn it on inside a relaunch window.
+### ✅ SHIPPED, DEFAULT ON, AND PROVEN ON ALL THREE LEGS — 2026-08-14 17:00
+
+⚠ **This block used to read "NOT YET IMPLEMENTED, and deliberately so … it cannot
+be verified without relaunching the GUI, which is an owner gate."** Both halves
+were wrong by the time anyone read them: it is implemented and default-on, and a
+**GUI relaunch is explicitly NOT an owner gate** (standing rule — restart without
+asking; the owner is back in 3–4 s). The caution it expressed was sound and has
+been discharged rather than ignored: the launch path still falls through to a
+normal start on every failure, and now says so out loud.
+
+A bound that exists is not a bound that works, so all three legs were measured
+separately:
+
+| leg | how it was proven | result |
+|---|---|---|
+| it **arms** | `gui/startup/linux_memory_scope` trace on the live GUI | `{"outcome":"entered","bounded":true}`, cgroup `memory.high` = 3,776 MB, `memory.swap.max` = 1,888 MB — twice consecutively |
+| it **contains the leaker** | listed `cgroup.procs` of the live scope | `WebKitWebProcess` (the leaking one), `WebKitNetworkProcess`, the GUI and its `ssh` children are all inside it |
+| it **engages** | isolated probe scope, `MemoryHigh=32M`, allocator touching 100 MB | held at `memory.current` = **31 MB**, excess reclaimed to swap, `memory.events high` = **346**, `oom_kill` = **0**, allocator exited **0** |
+
+⇒ **The third leg is the one that could not be assumed**, and it also validates the
+`MemoryHigh`-not-`MemoryMax` choice above from the other direction: the workload
+was throttled 346 times, pushed to swap, and still **completed**. A hard cap would
+have killed it. Probe kept at `~/.yggterm/scratchpad/high-probe.sh`; it runs in its
+own throwaway scope and never touches the GUI.
+
+⚠ **What this does and does not buy, stated so nobody over-claims it.** The leak is
+unchanged — the web process was measured climbing **458 → 547 MB in 38 minutes
+(~140 MB/h)** on the very build that carries the bound. What changed is the
+ENDING: instead of the family growing until the machine swaps to death, it is held
+at 3,776 MB resident plus at most 1,888 MB of swap, after which reclaim pressure
+makes the GUI **slow rather than dead**. ⇒ That is a better failure, not an absence
+of one, and the entry stays OPEN for that reason.
 
 ⚠ **Scope, stated honestly so nobody over-claims it.** The whole yggterm family
 (GUI + 4 WebKit children) commits **≈3.5 GB, of which ≈2.0 GB is swapped**, on a
