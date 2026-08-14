@@ -1100,6 +1100,18 @@ def cmd_retire(args):
     if sub_path(uuid).exists():
         sub_path(uuid).unlink(missing_ok=True)
         log(f"  and dropped its subscription — a boot would have typed at a corpse")
+    # ⛔ AND THE OTHER PLANE. `retire` used to clean the booter and leave the
+    #    MONITOR subscription standing, so a row recorded decided-dead kept
+    #    escalating a corpse to a live orchestrator forever. Found because the
+    #    monitor's coverage crossing started reporting the retired set as
+    #    "subscribed here but not armed" — the gap was invisible until an
+    #    instrument looked in both directions at once.
+    #    ⇒ A death is a fact about the ROW, not about one watcher's bookkeeping;
+    #    every plane that watches it has to hear the same answer.
+    mon = STATE / "monitor" / f"{uuid}.json"
+    if mon.exists():
+        mon.unlink(missing_ok=True)
+        log(f"  and dropped its monitor subscription — a corpse escalates to nobody")
     return 0
 
 
