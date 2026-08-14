@@ -109,8 +109,11 @@ HEIR = "cafecafe-8888-4888-8888-cafecafecafe"
 OLD  = "beefbeef-9999-4999-8999-beefbeefbeef"
 BOSS = "d0d0d0d0-1010-4010-8010-d0d0d0d0d0d0"
 def rows(pairs, ok=True):
-    return (lambda host: ([{"outline_prefix": s, "full_path": f"remote-cc://dev/{u}"}
-                           for s, u in pairs], ok))
+    # pairs are (seat, uuid) or (seat, uuid, label) — the label is what a retiring
+    # row rewrites about ITSELF, and it is the discriminator the repair needs.
+    return (lambda host: ([{"outline_prefix": p[0], "full_path": f"remote-cc://dev/{p[1]}",
+                            "label": (p[2] if len(p) > 2 else f"{p[0]} a working lane")}
+                           for p in pairs], ok))
 def sub(u, seat, esc):
     m.sub_path(u).write_text(json.dumps({"uuid": u, "host": "testhost", "role": "relay",
         "escalate_to": esc, "escalate_host": "testhost", "campaign": "test",
@@ -124,7 +127,7 @@ m._seat_handover_repair("h", False)
 out["remembered"] = json.loads(m.SEAT_MEMORY.read_text()).get("9.2", {}).get("escalate_to") == BOSS
 
 # 2. the successor holds the seat, unsubscribed (a stale `succeed` deleted the record)
-m.sub_path(OLD).unlink()
+m.sub_path(OLD).unlink(missing_ok=True)
 m.live_rows = rows([("9.2", HEIR)])
 r = m._seat_handover_repair("h", False)
 rec = json.loads(m.sub_path(HEIR).read_text()) if m.sub_path(HEIR).exists() else {}
@@ -136,8 +139,28 @@ m.live_rows = rows([("7.7", "0bad0bad-2020-4020-8020-0bad0bad0bad")])
 m._seat_handover_repair("h", False)
 out["never_invents"] = not m.sub_path("0bad0bad-2020-4020-8020-0bad0bad0bad").exists()
 
+# 3b. ⛔⛔ A RETIRED ROW IS STILL A LISTED ROW AND STILL HOLDS ITS SEAT. A seat that
+#     has relayed five times has four corpses under it; the first version restored
+#     ALL of them and resurrected four rows onto the plane in one tick.
+DEAD1 = "deadbeef-ab3a-4a3a-8a3a-deadbeefaaaa"
+DEAD2 = "deadbeef-cd3a-4a3a-8a3a-deadbeefbbbb"
+m.sub_path(HEIR).unlink(missing_ok=True)
+m.live_rows = rows([("9.2", DEAD1, "9.2 RETIRED, succeeded by cafecafe"),
+                    ("9.2", DEAD2, "9.2 RETIRED, succeeded by dead0001"),
+                    ("9.2", HEIR,  "9.2 vault legacy: the live one")])
+m._seat_handover_repair("h", False)
+out["skips_retired"] = (not m.sub_path(DEAD1).exists() and not m.sub_path(DEAD2).exists()
+                        and m.sub_path(HEIR).exists())
+
+# 3c. ⛔ TWO LIVE CLAIMANTS ON ONE SEAT IS A HUMAN'S CALL, NOT A BROADCAST.
+TWIN = "twinbeef-ef4a-4a4a-8a4a-twinbeefcccc"
+m.sub_path(HEIR).unlink(missing_ok=True)
+m.live_rows = rows([("9.2", HEIR, "9.2 one claimant"), ("9.2", TWIN, "9.2 another claimant")])
+m._seat_handover_repair("h", False)
+out["one_holder_only"] = not m.sub_path(HEIR).exists() and not m.sub_path(TWIN).exists()
+
 # 4. an ATTENDED row is refused even with a remembered seat
-m.sub_path(HEIR).unlink()
+m.sub_path(HEIR).unlink(missing_ok=True)
 m.live_rows = rows([("9.2", HEIR)]); m.screen_ledgers = lambda: ({HEIR[:8]}, set())
 m._seat_handover_repair("h", False)
 out["skips_attended"] = not m.sub_path(HEIR).exists()
@@ -165,6 +188,8 @@ print(json.dumps(out))
         ("remembered", "tick REMEMBERS a healthy seat's membership"),
         ("restored", "⛔ tick RESTORES membership to the seat's next holder"),
         ("never_invents", "⛔ tick NEVER invents membership for a seat that had none"),
+        ("skips_retired", "⛔⛔ tick NEVER restores to a row whose title says RETIRED"),
+        ("one_holder_only", "⛔ tick restores to NO ONE when a seat has two claimants"),
         ("skips_attended", "⛔ tick REFUSES an attended row even with a remembered seat"),
         ("blind_is_not_empty", "⛔ a BLIND row plane repairs nothing"),
         ("unreadable_is_not_empty", "⛔ an UNREADABLE attended list repairs nothing"),

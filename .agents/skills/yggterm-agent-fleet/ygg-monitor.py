@@ -52,6 +52,7 @@ and the why decides the action. This plane adds the judgement:
    cluster row. That is what makes it safe to start something and walk away.
 """
 import argparse
+import collections
 import importlib.util
 import json
 import os
@@ -536,22 +537,50 @@ def _seat_handover_repair(host, dry):
         mem = {}
     subs = {s["uuid"]: s for s in load_subs()}
     repaired = []
-    seen = {}
+    candidates = collections.defaultdict(list)
     for r in rows:
         seat = (r.get("outline_prefix") or "").strip()
         uuid = _bare_uuid(r.get("full_path") or "")
         if not seat or not uuid:
             continue
-        seen[seat] = uuid
         if uuid in subs:                       # healthy: remember this seat's shape
             s = subs[uuid]
             mem[seat] = {"role": s.get("role"), "campaign": s.get("campaign"),
                          "escalate_to": s.get("escalate_to"),
                          "escalate_host": s.get("escalate_host"), "host": s.get("host")}
             continue
-        prev = mem.get(seat)
-        if not prev or uuid[:8] in attended:
+        # ⛔⛔ A RETIRED ROW IS STILL A LISTED ROW, AND IT STILL HOLDS ITS SEAT.
+        # The first version of this restored membership to EVERY unsubscribed
+        # holder of a remembered seat — and a seat that has relayed five times has
+        # four corpses still listed under it. It resurrected all four onto the
+        # supervision plane within one tick, where each would escalate as a
+        # stalled lane, and a boot would have set a corpse racing its live
+        # successor over the same files. **The resurrection hazard, arriving
+        # through the repair built to prevent it.** Caught within 5 minutes by the
+        # seat whose lane relays hourly, monitor-only, before anything was armed.
+        #
+        # ⇒ The row says so ITSELF. A retiring row rewrites its own title to
+        #   "RETIRED, succeeded by <uuid>" — that is the row speaking about
+        #   itself, not a ledger claiming something about it, and it is the most
+        #   trustworthy signal available here.
+        label = (r.get("label") or "")
+        if re.search(r"\bRETIRED\b|succeeded by", label, re.I):
             continue
+        if uuid[:8] in attended:
+            continue
+        if mem.get(seat):
+            candidates[seat].append(uuid)
+    for seat, uuids in candidates.items():
+        prev = mem.get(seat)
+        # ⛔ AT MOST ONE HOLDER PER SEAT. Two live claimants on one seat is a state
+        # that needs a person, not a broadcast — restoring to both would point two
+        # rows at one escalation target and make the duplicate look sanctioned.
+        if len(uuids) != 1:
+            log(f"  ⚠ seat {seat} has {len(uuids)} unsubscribed live holders "
+                f"({', '.join(u[:8] for u in uuids)}) — restoring to NONE; a seat with "
+                f"two claimants is a human's call")
+            continue
+        uuid = uuids[0]
         if not dry:
             rec = dict(prev)
             rec.update({"uuid": uuid, "seat": seat, "owner_pinned": False, "booter": True,
