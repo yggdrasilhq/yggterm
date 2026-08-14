@@ -131,6 +131,86 @@ from inside in three pieces (parent accept+spawn 44–48 µs · child pre-closur
 measurement; schedule S4 on stability and observability, NEVER on cores**
 (<0.001 cores/daemon).
 
+## ⛔ ONE DIRECTORY, TWO READERS, AND ONLY ONE WAS TOLD ABOUT THE STAGING DIR
+
+**Status:** OPEN
+
+*Found 2026-08-14 by the sidebar lane, which could not run a single app-control
+verb against a freshly created GUI until it deleted a directory by hand.*
+
+`client-instances/<scope>/` holds one JSON record per attached client, published
+by an atomic write that stages into a `tmp/` subdirectory of that same folder.
+**Two functions enumerate that directory and they disagree about what a
+non-file entry means:**
+
+| reader | on a directory entry |
+|---|---|
+| `cleanup_stale_client_instances` (yggterm-shell) | skips it — *"the atomic-write staging dir (and anything else that is not a plain file) is never a record"*, with a test that pins it |
+| `collect_client_instance_records` (yggterm-server) | `fs::read` returns **EISDIR (os error 21)**, which is neither `NotFound` nor a parse failure, so it **propagates and fails the whole enumeration** |
+
+**Reproduced twice, on two independently created sandbox homes at 3.0.154.**
+Every `server app` verb died with `reading client instance record …/tmp: Is a
+directory`, and `rmdir` on that one empty directory made them all work.
+
+⛔ **The consequence is larger than a failed verb, and it is the drain's.** The
+comment directly above that read explains that an error there is deliberately
+NOT treated as "no clients": `daemon_should_idle_shutdown` reads an error as *"I
+could not ask, so do not retire."* ⇒ **a daemon whose staging directory exists at
+the sampling moment can never retire**, and that gate is the one the constitution
+rests the drain on.
+
+**Fix:** the one-line `entry.file_type()` skip the other reader already has. ⚠
+Two readers of one directory is the second encoding; the durable fix is one
+traversal both call, since this is exactly the shape where a rule learned on one
+side does not reach the other.
+
+**Falsifier:** create `client-instances/<scope>/tmp/` on a live home and run any
+`server app` verb.
+
+## ⛔ [6.3] A SESSION KEY IS BEING USED AS A ROW KEY, AND DUAL PRESENCE MAKES IT AMBIGUOUS
+
+**Status:** OPEN
+
+*Filed by the lane that widened it, in the same session. Read the dual-presence
+half of `AGENTS.md` before touching this.*
+
+A live session renders **twice on purpose**: once under Live Sessions, once in
+its cwd folder. Both rows carry the same `full_path`, deliberately — that path is
+the SESSION's identity, and single source of truth applies to the session object
+rather than its display location.
+
+⛔ **So `full_path` cannot answer a question about a ROW.** Roughly 150 sites
+resolve a row with `find(|row| row.full_path == …)` and some then read fields
+that are properties of the PLACEMENT rather than of the session: `depth`,
+`child_count`, row-set headship, and the row's INDEX in the list. Those get the
+first match, which is the rail copy only because the rail happens to be pushed
+before the stored rows.
+
+**It has misfired once already.** When a verb force-expanded the tree,
+`resolve_app_control_row` matched the cwd-tree copy — which heads no set — and
+`row-expanded` began refusing. See the row-set collapse entry, which records it.
+
+⚠ **Exposure grew when the cwd-tree regression was fixed.** Before that fix only
+a session with no transcript on disk was dual-present in the local tree; now
+every local live agent session is, which is the correct behaviour and also means
+the ambiguity is no longer rare. **Nothing observed is broken today** — the rail
+is first, so first-match is currently right — but the correctness rests on list
+order rather than on anything that states it.
+
+**Two candidate shapes, and the choice is the work:**
+
+1. Make the ordering a CONTRACT — assert rail-before-tree in the merged list and
+   have the resolvers say which copy they want, so the rule is written down
+   instead of inherited.
+2. Give a row an identity distinct from its session's, and let consumers that
+   want the session keep asking by `session_id`.
+
+⛔ **Do NOT "fix" this by de-duplicating the tree.** That is the regression this
+entry's sibling just removed, and it is a spec violation in as many words.
+
+**Falsifier:** with a live local agent session, resolve its path against a
+force-expanded row list and assert the row you get is the one that heads its set.
+
 ## ⛔ A LOCAL LAUNCH INTO A DIRECTORY THAT DOES NOT EXIST LEAVES A KEEP-ALIVE HUSK
 
 **Status:** OPEN
@@ -2760,6 +2840,47 @@ proxy's own coverage.
 find the owner of a row it holds no preserved-owner record for — asking its live
 siblings rather than only endpoints it already knows. ⚠ Bound the fan-out; the
 TTL cache is already in place for the asking half.
+
+### ⭐ THE DISCOVERY IS SETTLED, AND THREE TRAPS ARE MEASURED — read before building
+
+**Discovery costs no round trips and is already built.** `socket_sweep` proves
+daemon liveness POSITIVELY from **one `/proc/net/unix` read**
+(`SocketCensus::gather`), which is how it sweeps ~700 socket files without
+issuing a request. ⛔ **Do NOT enumerate peers with `status`** — that is the gate
+measured to hang 16 live daemons at once.
+
+**Measured on the GUI host 2026-08-14: 5 live listening daemon sockets, one of
+them self.** So the fan-out is FOUR peers, not a fleet.
+
+1. ⛔ **THE OLD DAEMONS DO ANSWER, AND ONLY A REQUEST REACHES THEM.**
+   `ServerRequest::WorkingFlags` has existed since **2.10.2** (2026-07-10), older
+   than every live daemon on that host, so each answers for the rows it owns.
+   ⇒ **A "have the owner PUSH its flags" design cannot work**, however much
+   cheaper it looks: the daemons owning the dark rows shipped before any push
+   would exist and will never write it. Asking is the only mechanism that
+   reaches the population that matters.
+2. ⛔⛔ **FANNING OUT RECURSES.** `ServerRequest::WorkingFlags` is served by
+   `working_flags_including_proxied` itself (`daemon.rs`), so once two daemons
+   both discover each other they ask each other forever. It is invisible today
+   only because proxying landed 2026-08-13 and exactly ONE daemon on that host is
+   new enough to do it — **the cycle arrives as the fleet upgrades.** ⇒ A daemon
+   SERVING this request must answer from local plus already-cached flags and
+   issue no new peer request, which also caps cross-daemon depth at 1. That costs
+   nothing, because a discovering daemon reaches every owner directly.
+3. ⚠ **A SLOW PEER MUST NOT BLOCK THE DOT.** `WorkingFlags` takes the default
+   client IO timeout, so one hung peer stalls a refresh that runs every 1.5 s.
+   ⇒ Discovery belongs on the chore thread, following
+   `run_preserved_owner_revalidation_if_due` — the precedent in this file for
+   exactly this, and its doc comment states the rule: *talks ONLY to other
+   daemons' sockets and the trace file, never to this daemon's in-memory state.*
+   The fast path then asks only endpoints already known to own a wanted row.
+
+⇒ **Shape:** a chore-thread discovery pass records `session_path → endpoint` for
+what each sibling answered; `working_flags_including_proxied` consults preserved
+owners first and that memo second. ⛔ The memo is derived state of THIS
+subsystem and must never be written into `preserved_terminal_owners` — that
+registry drives hot-update handover, and a learned dot-owner is not an ownership
+claim.
 
 ⚠ **And the ground truth got coarser as the fleet grew.** Two rows now read as
 false positives against the growth test, which the earlier 21-row sample did not
