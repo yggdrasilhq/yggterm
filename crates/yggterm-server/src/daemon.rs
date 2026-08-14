@@ -4018,10 +4018,27 @@ impl DaemonRuntime {
         let mut moved_keys: Vec<String> = Vec::new();
         let mut successor_identity = None::<(u32, u64)>;
         let mut first_failure = None::<String>;
+        // ⛔⛔ ATTEMPT EVERY SESSION. This loop used to `break` on the first
+        // failure, so ONE stuck key abandoned every remaining runtime — measured
+        // live 2026-08-14 as `readers_stood_down: 11, moved: 0`, eleven healthy
+        // sessions held hostage by one, once a minute, for as long as the key
+        // stayed stuck. That is why a daemon could never empty its hands, and it
+        // is the mechanism behind the standing legacy-daemon population.
+        //
+        // ⚠ Continuing makes `Partial` far more likely, and `Partial` is the
+        // outcome that must NEVER exit the process — the daemon is then split
+        // across two owners and exiting would close the descriptors of the
+        // runtimes it still holds. `classify_handoff_sweep` and the caller
+        // already encode that; this only changes how often it is reached.
+        //
+        // `first_failure` keeps its name: the FIRST failure is retained, later
+        // ones do not overwrite it, so the reason a sweep is Partial stays the
+        // reason it first went wrong.
         for key in keys {
             let Some(takeout) = self.terminals.handoff_takeout(&key) else {
-                first_failure = Some(format!("{key}: no live runtime to take"));
-                break;
+                first_failure =
+                    first_failure.or(Some(format!("{key}: no live runtime to take")));
+                continue;
             };
             let metadata = crate::pty_handoff::HandoffMetadata {
                 version: crate::pty_handoff::HANDOFF_WIRE_VERSION,
@@ -4041,8 +4058,8 @@ impl DaemonRuntime {
                     successor_identity = ack.adopter_identity().or(successor_identity);
                 }
                 Err(error) => {
-                    first_failure = Some(format!("{key}: {error}"));
-                    break;
+                    first_failure = first_failure.or(Some(format!("{key}: {error}")));
+                    continue;
                 }
             }
         }
@@ -20032,6 +20049,48 @@ mod tests {
             .split("\n    fn ")
             .next()
             .expect("the end of the function")
+    }
+
+    /// ⛔⛔ ONE STUCK KEY MUST NOT ABANDON THE OTHER TEN.
+    ///
+    /// `hand_off_all_runtimes` used to `break` out of its per-session loop on
+    /// the first failure. Measured live 2026-08-14 during a real handover:
+    /// `readers_stood_down: 11, moved: 0` — eleven healthy runtimes parked and
+    /// then resumed because the FIRST key was stuck, repeating once a minute for
+    /// as long as it stayed stuck. That is why a daemon could never empty its
+    /// hands, and therefore why the legacy population never drains.
+    ///
+    /// The loop must attempt every key and classify at the end. This is a
+    /// structural lock because the loop does real socket IO to a live successor
+    /// and cannot be exercised in a unit test.
+    ///
+    /// ⚠ If this fails because the code was restructured, re-point it — do not
+    /// delete it. The `break` is a one-character regression with a fleet-wide
+    /// consequence.
+    #[test]
+    fn a_handoff_sweep_attempts_every_session_rather_than_stopping_at_the_first_failure() {
+        let source = daemon_product_source();
+        let body = daemon_fn_body(
+            source.as_str(),
+            "fn hand_off_all_runtimes(&mut self, successor_version: &str) -> HandoffSweepOutcome {",
+        );
+        let code = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The two failure arms both used to `break`.
+        assert!(
+            !code.contains("break;"),
+            "the per-session handoff loop must not abandon the remaining \
+             runtimes when one key fails — that is the eleven-hostage bug:\n{code}"
+        );
+        assert!(
+            code.matches("first_failure = first_failure.or(").count() >= 1
+                || code.matches("first_failure.or(").count() >= 1,
+            "the FIRST failure must be retained rather than overwritten, so a \
+             Partial sweep still names what first went wrong:\n{code}"
+        );
     }
 
     /// A later handoff aims at a newer build; converging on the older target
