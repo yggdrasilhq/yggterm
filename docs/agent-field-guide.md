@@ -311,7 +311,8 @@ instrument shared the unit:**
 | face | the unit | what it cost |
 |---|---|---|
 | **STORAGE** | an identifier held at two lengths (8 vs 36) | a `succeed` silently skipped rows and reported a clean count; one seat escalated into a void for hours while the board rendered it healthy |
-| **ACCOUNT** | process vs process **SUBTREE** | a sandbox daemon spawns no children, so it has **no subtree to carry the floor** — `0.00017 cores` was reproducible, honest, and missed a **0.2-core** term because *the quantity was never inside the process being sampled* |
+| **ACCOUNT** | one daemon vs the **POPULATION** | every arm measured a daemon and none measured how MANY — `population ≈ N_reachable × ~0.2 cores`. Per daemon the old and current builds are indistinguishable; the pile is expensive because it is **numerous**, and no amount of precision on one daemon expresses that |
+| **SCOPE** | a sandbox daemon vs a **loaded** one | a sandbox daemon has **no sessions and no peers**, so it reads ~0 and can never exhibit the floor. `0.00017 cores` was reproducible, honest, and blind by construction |
 | **REGIME** | saturated vs idle | flooding a pty with `yes(1)` measured the reader path's **ceiling**; carried to a fleet whose sessions are idle it inverted the whole ledger |
 
 ⭐ **A fourth face is the observer's own:** a unit that silently *includes the
@@ -320,9 +321,26 @@ own write, an "after" window taken in the wake of your own generator.
 
 ⇒ **The tell is agreement without resolution.** When independent instruments
 converge and the number still will not appear, stop improving the instruments and
-ask **what quantity they all decline to express.** Change the unit — measure the
-subtree, not the process; the regime the subject actually occupies, not the one
-that saturates it; compare identifiers by prefix, not equality.
+ask **what quantity they all decline to express.** Change the unit — count the
+population, not the instance; load the subject before pricing it; measure the
+regime it actually occupies, not the one that saturates it; compare identifiers by
+prefix, not equality.
+
+⛔⛔ **AND A RETRACTION THIS TABLE CARRIES AGAINST ITSELF.** The ACCOUNT row above
+originally read *process vs process SUBTREE*, on the reasoning that a sandbox
+daemon spawns no children and so has *no subtree to carry the floor*. **That was
+withdrawn on 2026-08-14** by a read-only two-sample `/proc` walk over 16 daemons
+and 172 descendants: **eleven of sixteen carry 0.13–0.25 cores in the daemon
+process itself with essentially empty subtrees.** The subtree only balloons on
+daemons hosting working agents, where it is a compile and a live turn — somebody's
+work, not daemon overhead. The two framings never disagreed; the distinction was
+invented. ⭐ **The rule its author drew from it is the one to keep: a mechanism is
+a CANDIDATE until a measurement it could have failed has been run.** Two earlier
+mechanisms from the same lane died as cheap hypotheses; this one reached a
+document and two lanes' hands first, and that is the only difference.
+⚠ Corrected here by the orchestrator because the lane that filed it had already
+stood down and the lane that retracted it does not own this file — **an orphaned
+withdrawn claim outlives both of them.**
 
 ⚠ **And a harness that cannot express the term should say so in its own
 documentation**, or it goes on looking general-purpose while being blind by
