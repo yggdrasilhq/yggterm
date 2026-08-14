@@ -144,8 +144,17 @@ copies.
   § *"I CANNOT USE YGGTERM. IT IS SO JANK"*, item 4, and § *FIVE PRE-3.0 DAEMONS
   STILL WALK THE WHOLE TRANSCRIPT CORPUS* for the five that are measurably
   costing him now and are unreachable from the current GUI.
+  ⭐ **PRICED 2026-08-14, so the question is now cheap to answer.** The saving is
+  **2.64–3.35 cores** across 14 legacy daemons, and it is real rather than
+  relocated: their sessions are idle, so nothing is being served by them. But
+  **about half of it is behind a door the machinery cannot open** — the PTY
+  handoff does not exist below **3.0.32**, so the **8 daemons older than that
+  (~1.6 cores) hold 17 sessions that can only leave by ENDING**, and 14 of those
+  are plain shells. **The one question that is actually his: may those old plain
+  shells be closed?** Everything else drains on its own once 3.0.155 lands.
   *Meanwhile:* the pile can no longer GROW — the count held flat across a version
-  bump for the first time — so it shrinks on its own as sessions end.
+  bump for the first time — so it shrinks on its own as sessions end, and nothing
+  is being terminated while this waits.
 
 ## Credentials and real-money actions (the vault and the card rails)
 

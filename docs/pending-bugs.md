@@ -515,6 +515,35 @@ already an open question in the 6.9 lane. Two facts constrain whoever takes it:
 threads* entry, so ⛔ never price this from `/proc/<pid>/task`; and the
 socket-less zeros above make "reachable" the discriminator worth chasing first.
 
+### ⛔⛔ THE DRAIN HAS A VERSION FLOOR: 3.0.32. BELOW IT, SESSIONS CAN ONLY LEAVE BY ENDING
+
+**Measured 2026-08-14 (6.1), two independent artefacts, with a positive control
+in the same run.** A session leaves a daemon either by RELEASE (kill + re-resume,
+which `session_is_migratable` refuses for anything without a store — every plain
+shell) or by the PTY FD HANDOFF, which needs no store. So the handoff is the only
+road out for a shell. It does not exist below 3.0.32:
+
+- `strings /proc/<pid>/exe` on the running 2.12.14 daemon: **0** occurrences of
+  `pty-handoff`. The same probe on the current 3.0.154 binary: **2**. (⚠ The
+  control matters — this literal builds a socket path, so an absent count on a
+  correct build was the failure mode to rule out.)
+- The oldest `pty-handoff-*.sock` ever created on this host is **`3-0-32`**, and
+  **no `2.x` handoff socket exists at all** — an independent artefact agreeing.
+
+**What that costs, against the inventory (34 plain shells and 23 agent sessions
+across the population):**
+
+| | daemons | sessions | ~cores | reachable by the drain? |
+|---|---|---|---|---|
+| pre-3.0.32 legacy | **8** | 17 (14 shells, 3 agent) | ~1.6 | ⛔ **no** — no handoff path exists |
+| 3.0.36–3.0.62 legacy | 6 | 13 (11 shells, 2 agent) | ~1.2 | ✅ yes, once 3.0.155 lands |
+
+⇒ **About half of S1's 2.64–3.35 cores is behind a door the machinery cannot
+open.** Those 17 sessions end when their shells end, and 14 of them are plain
+shells the owner opened weeks ago. ⛔ This is not an argument for killing them —
+the constitution's first-class-shell guarantee is exactly what makes it his call.
+It IS the argument for stating the price when he is asked: → `docs/owner-attention.md`.
+
 ⭐ **ONE daemon is separately and confirmably pathological**: the 2.12.14
 instance re-reads **69 MB/s** (rchar, zero disk — all page cache) with three idle
 shells attached, against 0.15–1.20 MB/s for every other daemon measured. That is
