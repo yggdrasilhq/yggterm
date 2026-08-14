@@ -586,62 +586,58 @@ gaps were found, which is what made the manual repair take long enough to matter
 during a rate limit. Fixing the restore path is therefore upstream of most of
 the rest, and 6.1 is ordered first for that reason.
 
-## ⚠ [6.6] THE `server` VERB SURFACE IS DISPATCHED TWICE TOO — 9 VERBS DIVERGE, TRIAGE INSIDE
+## ⚠ [6.6] FOUR `server` VERBS STILL ANSWER FROM ONE BINARY ONLY, AND EACH NEEDS ITS OWN VERDICT
 
 **Status:** OPEN
 
-*Measured 2026-08-14 after collapsing `server app` onto one dispatcher, because
-the same question was worth asking one level up.*
+*Measured and mostly closed 2026-08-14, after collapsing `server app`.*
 
-`server <verb>` is dispatched in `apps/yggterm/src/main.rs` AND
-`apps/yggterm/src/bin/yggterm-headless.rs`, the same way `server app` was, and
-nine verbs exist on one binary only:
+`server <verb>` is dispatched in both binaries, and nine verbs answered from one
+only. ⛔ **Unlike `server app`, this surface is NOT collapsed wholesale, and that
+is the finding.** `server app` was one homogeneous plane where every verb
+belonged on both binaries, so one owner plus a structural ban was right.
+`server` mixes planes: deploy and relay machinery that is genuinely
+headless-only sits beside daemon operations that are not. A blanket ban would
+forbid a real fork. **The question is asked per verb.**
 
-| only on the headless CLI | only on the GUI binary |
+### ✅ CLOSED — five accidental divergences, fixed
+
+| verb | why it was accidental |
 |---|---|
-| `daemons` ✅ fixed · `gate-screen` · `relay-boundary` · `wpe` | `connect` · `ledger` · `order` · `reorder` · `write-lock` |
+| `daemons` | the census reads a home dir and nothing else |
+| `write-lock` · `order` · `ledger` · `reorder` | each opens with `ensure_local_server_ready_for_cli` + `cli_server_endpoint` and then talks to the DAEMON over the local socket — no window in any of them |
 
-⛔ **UNLIKE `server app`, THIS IS NOT A WHOLESALE COLLAPSE, AND THAT IS THE
-FINDING.** `server app` was one homogeneous surface whose every verb belonged on
-both binaries, so one owner plus a structural ban was right. `server` mixes
-planes: deploy/relay machinery that is genuinely headless-only sits beside
-daemon operations that are not. **The shape must be chosen per verb, and the
-TABLE-or-FORK question asked nine times, not once.** A blanket ban here would
-forbid a fork that is real.
+All five now have one owner (`yggterm_server::server_cli`, plus the census in
+`daemon.rs`) and answer from both binaries. Locked per verb by
+`both_binaries_answer_the_daemon_census` and
+`both_binaries_answer_the_daemon_socket_verbs`. Verified before/after against
+the shipped binary: `unsupported server command: order` becomes a dispatch.
 
-### What is settled
+⭐ **And the helpers went with them.** `cli_server_endpoint` and
+`ensure_local_server_ready_for_cli` were byte-identical private copies in BOTH
+binaries. Sharing the verbs while leaving those in place would have made a
+THIRD copy — worse than the duplication being fixed — so the locals are gone and
+both binaries import the shared pair. The lock bans either growing one back.
 
-- **`daemons` was accidental and is FIXED** (`run_server_daemons_census`, one
-  owner, both binaries, locked by `both_binaries_answer_the_daemon_census`).
-  The census reads a home directory and nothing else — no GUI in it — so
-  `yggterm server daemons` answering `unsupported server command: daemons` was
-  an accident of which file it was typed into. Verified before/after against the
-  shipped binary.
+### ⏳ STILL OPEN — four verbs, and the reading that is not yet a verdict
 
-### What is NOT settled — the triage each remaining verb needs
-
-- **The five GUI-only verbs all call `cli_server_endpoint` /
-  `ensure_local_server_ready_for_cli`** — they talk to the DAEMON, not to a
-  window. That makes them *look* accidental, and the headless CLI is arguably
-  their more natural home. ⛔ **Looks like is not is**: none has been read
-  end-to-end, and `connect` in particular may reasonably need the GUI process.
-- **`gate-screen`, `relay-boundary`, `wpe`** read as deploy/relay machinery that
-  belongs to the headless CLI by design — the FORK side of the question — but
-  that is a reading of their names and callsites, not a verdict.
-
-⇒ Per verb: does the GUI binary answering it make sense, or is its absence the
-design? Move the accidental ones to one owner; record the real forks so the next
-reader does not re-open them.
+- **`connect`** (GUI-only) — reaches `run_server_connect` / `run_server_connect_list`
+  and spawns. The only one of the nine with a plausible reason to be
+  GUI-side. ⛔ Not read end-to-end; do not assume either way.
+- **`gate-screen`, `relay-boundary`, `wpe`** (headless-only) — read as
+  deploy/relay machinery that belongs to the headless CLI by design, i.e. the
+  FORK side. That is a reading of their callsites and usage text, **not a
+  verdict**, and it is the half of this entry still owed.
 
 ### ⚠ THE INSTRUMENT LIED FIRST, AND THE CONTROL CAUGHT IT
 
-The first extractor scanned only `args[1] == "verb"` and reported verb lists
-that **omitted `daemons` entirely** — because that verb is dispatched as
-`args.get(1).is_some_and(...)`. Had a live observation of `daemons` not been in
-hand as a control, a confidently wrong inventory would have been published.
-⇒ **Validate a source scanner against a case you already know the answer to
-before believing its list.** That the dispatch needs four different spellings to
-enumerate is itself evidence for the entry.
+The first extractor scanned only `args[1] == "verb"` and produced verb lists
+that **omitted `daemons` entirely** — that verb is dispatched as
+`args.get(1).is_some_and(...)`. A live observation of `daemons` happened to be
+in hand as a control; without it a confidently wrong inventory would have been
+published. ⇒ **Validate a source scanner against a case whose answer you already
+know.** That enumerating this dispatch needs four different spellings is itself
+evidence for the entry.
 
 ## ⚠ [6.6] A PROCESS-GLOBAL ENV WRITE MAKES THE LAUNCH-COMMAND TESTS FLAKY IN PARALLEL
 
